@@ -1,5 +1,8 @@
 # Clang Tracer
 
+Licensed under [Apache 2.0 with LLVM exceptions](LICENSE)
+(`Apache-2.0 WITH LLVM-exception`). Dependency notices retain their original terms.
+
 Build instructions, runnable callbacks and sample output are included below.
 Generated validation recordings stay local; see [validation and benchmark notes](docs/validation.md)
 for measured results and reproduction commands.
