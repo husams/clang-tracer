@@ -1,0 +1,14 @@
+Recorded sample output; checkout paths normalized for publication.
+
+PRE probe=100726236577831499 call=1 args=[left=int32:6, right=int32:8]
+PRE probe=100726236577831499 call=1 frame=0 kind=1 function=stack_add(int, int) | module=/path/to/clang-tracer/build/libcall-stacks-calculator.so | source=/path/to/clang-tracer/examples/call-stacks/calculator.cpp:3
+PRE probe=100726236577831499 call=1 frame=1 kind=0 function=StackCalculator::multiply(int, int) | module=/path/to/clang-tracer/build/libcall-stacks-calculator.so | source=/path/to/clang-tracer/examples/call-stacks/calculator.cpp:12
+PRE probe=100726236577831499 call=1 frame=2 kind=0 function=library_dispatch(StackCalculator&, int, int) | module=/path/to/clang-tracer/build/libcall-stacks-calculator.so | source=/path/to/clang-tracer/examples/call-stacks/calculator.cpp:16
+PRE probe=100726236577831499 call=1 frame=3 kind=0 function=run_iteration(StackCalculator&, int, int) | module=/path/to/clang-tracer/build/call-stacks-target | source=/path/to/clang-tracer/examples/call-stacks/target.cpp:27
+PRE probe=100726236577831499 call=1 frame=4 kind=0 function=worker_loop(int) | module=/path/to/clang-tracer/build/call-stacks-target | source=/path/to/clang-tracer/examples/call-stacks/target.cpp:38
+POST probe=100726236577831499 call=1 result=int32:14
+POST probe=100726236577831499 call=1 frame=0 kind=1 function=stack_add(int, int) | module=/path/to/clang-tracer/build/libcall-stacks-calculator.so | source=/path/to/clang-tracer/examples/call-stacks/calculator.cpp:3
+POST probe=100726236577831499 call=1 frame=1 kind=0 function=StackCalculator::multiply(int, int) | module=/path/to/clang-tracer/build/libcall-stacks-calculator.so | source=/path/to/clang-tracer/examples/call-stacks/calculator.cpp:12
+POST probe=100726236577831499 call=1 frame=2 kind=0 function=library_dispatch(StackCalculator&, int, int) | module=/path/to/clang-tracer/build/libcall-stacks-calculator.so | source=/path/to/clang-tracer/examples/call-stacks/calculator.cpp:16
+POST probe=100726236577831499 call=1 frame=3 kind=0 function=run_iteration(StackCalculator&, int, int) | module=/path/to/clang-tracer/build/call-stacks-target | source=/path/to/clang-tracer/examples/call-stacks/target.cpp:27
+POST probe=100726236577831499 call=1 frame=4 kind=0 function=worker_loop(int) | module=/path/to/clang-tracer/build/call-stacks-target | source=/path/to/clang-tracer/examples/call-stacks/target.cpp:38

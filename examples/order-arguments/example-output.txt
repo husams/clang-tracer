@@ -1,0 +1,47 @@
+Recorded sample output; checkout paths normalized for publication.
+
+Target source and compilation database unavailable; no includes supplied
+Starting the server and attribute-free target
+no sessions
+TARGET pid=2978764
+Attaching by PID
+attached pid=2978764 session=94aac347-5132-423f-81e0-a1d8f86f0809 state=ATTACHED
+Installing the pointer argument interceptor
+traced pid=2978764 session=94aac347-5132-423f-81e0-a1d8f86f0809 probe=2748609074389252971 symbol=_Z13pointer_totalP5Orderi declaration=double pointer_total(Order*, int) debug_image=/path/to/clang-tracer/build/order-arguments-target
+Installing mixed class-instance/scalar argument interceptor
+traced pid=2978764 session=94aac347-5132-423f-81e0-a1d8f86f0809 probe=2748609074389252972 symbol=_Z5totalR5OrderdRK6CouponS_i declaration=double total(Order&, double, const Coupon&, Order, int) debug_image=/path/to/clang-tracer/build/order-arguments-target
+Viewing readable events
+cursor=1 pid=2978764 tid=2978764 probe=2748609074389252971 this=- args=[order=pointer:0x7fff34a50d80, extra=int32:3] fields=[order.quantity=int32:5, order.unit_price=float64:12.5, extra=int32:3] phase=pre call=1 lost(agent=0,server=0)
+cursor=2 pid=2978764 tid=2978764 probe=2748609074389252971 this=- args=[order=pointer:0x7fff34a50d80, extra=int32:3] fields=[order.quantity=int32:8, order.unit_price=float64:12.5, extra=int32:3] phase=post call=1 result=float64:65.5 lost(agent=0,server=0)
+cursor=3 pid=2978764 tid=2978764 probe=2748609074389252972 this=- args=[order=pointer:0x7fff34a50d80, fee=float64:1.25, coupon=pointer:0x7fff34a50d70, sample=object:0x7fff34a50cb0, count=int32:2] fields=[order.quantity=int32:3, order.unit_price=float64:12.5, coupon.amount=float64:2, coupon.uses=int32:1, sample.quantity=int32:2, sample.unit_price=float64:3.5, fee=float64:1.25, count=int32:2] phase=pre call=1 lost(agent=0,server=0)
+cursor=4 pid=2978764 tid=2978764 probe=2748609074389252972 this=- args=[order=pointer:0x7fff34a50d80, fee=float64:1.25, coupon=pointer:0x7fff34a50d70, sample=object:0x7fff34a50cb0, count=int32:2] fields=[order.quantity=int32:5, order.unit_price=float64:12.5, coupon.amount=float64:2, coupon.uses=int32:1, sample.quantity=int32:2, sample.unit_price=float64:3.5, fee=float64:1.25, count=int32:2] phase=post call=1 result=float64:43.75 lost(agent=0,server=0)
+cursor=5 pid=2978764 tid=2978764 probe=2748609074389252971 this=- args=[order=pointer:0x7fff34a50d80, extra=int32:3] fields=[order.quantity=int32:5, order.unit_price=float64:12.5, extra=int32:3] phase=pre call=2 lost(agent=0,server=0)
+cursor=6 pid=2978764 tid=2978764 probe=2748609074389252971 this=- args=[order=pointer:0x7fff34a50d80, extra=int32:3] fields=[order.quantity=int32:8, order.unit_price=float64:12.5, extra=int32:3] phase=post call=2 result=float64:65.5 lost(agent=0,server=0)
+cursor=7 pid=2978764 tid=2978764 probe=2748609074389252972 this=- args=[order=pointer:0x7fff34a50d80, fee=float64:1.25, coupon=pointer:0x7fff34a50d70, sample=object:0x7fff34a50cb0, count=int32:2] fields=[order.quantity=int32:3, order.unit_price=float64:12.5, coupon.amount=float64:2, coupon.uses=int32:1, sample.quantity=int32:2, sample.unit_price=float64:3.5, fee=float64:1.25, count=int32:2] phase=pre call=2 lost(agent=0,server=0)
+cursor=8 pid=2978764 tid=2978764 probe=2748609074389252972 this=- args=[order=pointer:0x7fff34a50d80, fee=float64:1.25, coupon=pointer:0x7fff34a50d70, sample=object:0x7fff34a50cb0, count=int32:2] fields=[order.quantity=int32:5, order.unit_price=float64:12.5, coupon.amount=float64:2, coupon.uses=int32:1, sample.quantity=int32:2, sample.unit_price=float64:3.5, fee=float64:1.25, count=int32:2] phase=post call=2 result=float64:43.75 lost(agent=0,server=0)
+cursor=9 pid=2978764 tid=2978764 probe=2748609074389252971 this=- args=[order=pointer:0x7fff34a50d80, extra=int32:3] fields=[order.quantity=int32:5, order.unit_price=float64:12.5, extra=int32:3] phase=pre call=3 lost(agent=0,server=0)
+cursor=10 pid=2978764 tid=2978764 probe=2748609074389252971 this=- args=[order=pointer:0x7fff34a50d80, extra=int32:3] fields=[order.quantity=int32:8, order.unit_price=float64:12.5, extra=int32:3] phase=post call=3 result=float64:65.5 lost(agent=0,server=0)
+cursor=11 pid=2978764 tid=2978764 probe=2748609074389252972 this=- args=[order=pointer:0x7fff34a50d80, fee=float64:1.25, coupon=pointer:0x7fff34a50d70, sample=object:0x7fff34a50cb0, count=int32:2] fields=[order.quantity=int32:3, order.unit_price=float64:12.5, coupon.amount=float64:2, coupon.uses=int32:1, sample.quantity=int32:2, sample.unit_price=float64:3.5, fee=float64:1.25, count=int32:2] phase=pre call=3 lost(agent=0,server=0)
+cursor=12 pid=2978764 tid=2978764 probe=2748609074389252972 this=- args=[order=pointer:0x7fff34a50d80, fee=float64:1.25, coupon=pointer:0x7fff34a50d70, sample=object:0x7fff34a50cb0, count=int32:2] fields=[order.quantity=int32:5, order.unit_price=float64:12.5, coupon.amount=float64:2, coupon.uses=int32:1, sample.quantity=int32:2, sample.unit_price=float64:3.5, fee=float64:1.25, count=int32:2] phase=post call=3 result=float64:43.75 lost(agent=0,server=0)
+cursor=13 pid=2978764 tid=2978764 probe=2748609074389252971 this=- args=[order=pointer:0x7fff34a50d80, extra=int32:3] fields=[order.quantity=int32:5, order.unit_price=float64:12.5, extra=int32:3] phase=pre call=4 lost(agent=0,server=0)
+cursor=14 pid=2978764 tid=2978764 probe=2748609074389252971 this=- args=[order=pointer:0x7fff34a50d80, extra=int32:3] fields=[order.quantity=int32:8, order.unit_price=float64:12.5, extra=int32:3] phase=post call=4 result=float64:65.5 lost(agent=0,server=0)
+cursor=15 pid=2978764 tid=2978764 probe=2748609074389252972 this=- args=[order=pointer:0x7fff34a50d80, fee=float64:1.25, coupon=pointer:0x7fff34a50d70, sample=object:0x7fff34a50cb0, count=int32:2] fields=[order.quantity=int32:3, order.unit_price=float64:12.5, coupon.amount=float64:2, coupon.uses=int32:1, sample.quantity=int32:2, sample.unit_price=float64:3.5, fee=float64:1.25, count=int32:2] phase=pre call=4 lost(agent=0,server=0)
+cursor=16 pid=2978764 tid=2978764 probe=2748609074389252972 this=- args=[order=pointer:0x7fff34a50d80, fee=float64:1.25, coupon=pointer:0x7fff34a50d70, sample=object:0x7fff34a50cb0, count=int32:2] fields=[order.quantity=int32:5, order.unit_price=float64:12.5, coupon.amount=float64:2, coupon.uses=int32:1, sample.quantity=int32:2, sample.unit_price=float64:3.5, fee=float64:1.25, count=int32:2] phase=post call=4 result=float64:43.75 lost(agent=0,server=0)
+cursor=17 pid=2978764 tid=2978764 probe=2748609074389252971 this=- args=[order=pointer:0x7fff34a50d80, extra=int32:3] fields=[order.quantity=int32:5, order.unit_price=float64:12.5, extra=int32:3] phase=pre call=5 lost(agent=0,server=0)
+cursor=18 pid=2978764 tid=2978764 probe=2748609074389252971 this=- args=[order=pointer:0x7fff34a50d80, extra=int32:3] fields=[order.quantity=int32:8, order.unit_price=float64:12.5, extra=int32:3] phase=post call=5 result=float64:65.5 lost(agent=0,server=0)
+cursor=19 pid=2978764 tid=2978764 probe=2748609074389252972 this=- args=[order=pointer:0x7fff34a50d80, fee=float64:1.25, coupon=pointer:0x7fff34a50d70, sample=object:0x7fff34a50cb0, count=int32:2] fields=[order.quantity=int32:3, order.unit_price=float64:12.5, coupon.amount=float64:2, coupon.uses=int32:1, sample.quantity=int32:2, sample.unit_price=float64:3.5, fee=float64:1.25, count=int32:2] phase=pre call=5 lost(agent=0,server=0)
+cursor=20 pid=2978764 tid=2978764 probe=2748609074389252972 this=- args=[order=pointer:0x7fff34a50d80, fee=float64:1.25, coupon=pointer:0x7fff34a50d70, sample=object:0x7fff34a50cb0, count=int32:2] fields=[order.quantity=int32:5, order.unit_price=float64:12.5, coupon.amount=float64:2, coupon.uses=int32:1, sample.quantity=int32:2, sample.unit_price=float64:3.5, fee=float64:1.25, count=int32:2] phase=post call=5 result=float64:43.75 lost(agent=0,server=0)
+Detaching both active probes
+detached pid=2978764 session=94aac347-5132-423f-81e0-a1d8f86f0809 state=DETACHED probes=[2748609074389252971:restored=true,2748609074389252972:restored=true]
+After detach: target alive, completed calls 8 -> 14, TracerPid=0
+CALL calls=9 order_before=3 order_after_total=5 order_after_pointer=8 sample=2 fee=1.25 coupon=2 count=2 total=43.75 pointer=65.50 failures=0
+CALL calls=10 order_before=3 order_after_total=5 order_after_pointer=8 sample=2 fee=1.25 coupon=2 count=2 total=43.75 pointer=65.50 failures=0
+CALL calls=11 order_before=3 order_after_total=5 order_after_pointer=8 sample=2 fee=1.25 coupon=2 count=2 total=43.75 pointer=65.50 failures=0
+CALL calls=12 order_before=3 order_after_total=5 order_after_pointer=8 sample=2 fee=1.25 coupon=2 count=2 total=43.75 pointer=65.50 failures=0
+CALL calls=13 order_before=3 order_after_total=5 order_after_pointer=8 sample=2 fee=1.25 coupon=2 count=2 total=43.75 pointer=65.50 failures=0
+CALL calls=14 order_before=3 order_after_total=5 order_after_pointer=8 sample=2 fee=1.25 coupon=2 count=2 total=43.75 pointer=65.50 failures=0
+attached pid=2978809 session=8f80b734-194a-4795-b445-d64a8ca243ee state=ATTACHED
+clang-tracer: no supported matching callable in mapped ELF debug information; build/install matching DWARF symbols
+detached pid=2978809 session=8f80b734-194a-4795-b445-d64a8ca243ee state=DETACHED probes=[]
+Debug-stripped binary rejected; detach succeeded
+Demo logs: /tmp/clang-tracer-order-arguments.VsbX11

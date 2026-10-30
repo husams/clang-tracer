@@ -1,0 +1,23 @@
+Recorded sample output; checkout paths normalized for publication.
+
+Actual output printed INSIDE pre()/post(), recorded 30 October 2026.
+First six of fourteen frames from the same nested invocation; exact lines below.
+Full native callback output: stack-capture-results/2026-10-30-callback-symbols/complete/target.log
+
+PRE probe=6519306381132061890 call=1 frame=0 kind=1 function=stack_add(int, int) | module=/path/to/clang-tracer/build/libcall-stacks-calculator.so | source=/path/to/clang-tracer/examples/call-stacks/calculator.cpp:3
+PRE probe=6519306381132061890 call=1 frame=1 kind=0 function=StackCalculator::multiply(int, int) | module=/path/to/clang-tracer/build/libcall-stacks-calculator.so | source=/path/to/clang-tracer/examples/call-stacks/calculator.cpp:12
+PRE probe=6519306381132061890 call=1 frame=2 kind=2 function=clangtracer_wrapper (verified bridge) | module=- | source=-:0
+PRE probe=6519306381132061890 call=1 frame=3 kind=0 function=library_dispatch(StackCalculator&, int, int) | module=/path/to/clang-tracer/build/libcall-stacks-calculator.so | source=/path/to/clang-tracer/examples/call-stacks/calculator.cpp:16
+PRE probe=6519306381132061890 call=1 frame=4 kind=0 function=run_iteration(StackCalculator&, int, int) | module=/path/to/clang-tracer/build/call-stacks-target | source=/path/to/clang-tracer/examples/call-stacks/target.cpp:27
+PRE probe=6519306381132061890 call=1 frame=5 kind=0 function=worker_loop(int) | module=/path/to/clang-tracer/build/call-stacks-target | source=/path/to/clang-tracer/examples/call-stacks/target.cpp:38
+POST probe=6519306381132061890 call=1 frame=0 kind=1 function=stack_add(int, int) | module=/path/to/clang-tracer/build/libcall-stacks-calculator.so | source=/path/to/clang-tracer/examples/call-stacks/calculator.cpp:3
+POST probe=6519306381132061890 call=1 frame=1 kind=0 function=StackCalculator::multiply(int, int) | module=/path/to/clang-tracer/build/libcall-stacks-calculator.so | source=/path/to/clang-tracer/examples/call-stacks/calculator.cpp:12
+POST probe=6519306381132061890 call=1 frame=2 kind=2 function=clangtracer_wrapper (verified bridge) | module=- | source=-:0
+POST probe=6519306381132061890 call=1 frame=3 kind=0 function=library_dispatch(StackCalculator&, int, int) | module=/path/to/clang-tracer/build/libcall-stacks-calculator.so | source=/path/to/clang-tracer/examples/call-stacks/calculator.cpp:16
+POST probe=6519306381132061890 call=1 frame=4 kind=0 function=run_iteration(StackCalculator&, int, int) | module=/path/to/clang-tracer/build/call-stacks-target | source=/path/to/clang-tracer/examples/call-stacks/target.cpp:27
+POST probe=6519306381132061890 call=1 frame=5 kind=0 function=worker_loop(int) | module=/path/to/clang-tracer/build/call-stacks-target | source=/path/to/clang-tracer/examples/call-stacks/target.cpp:38
+
+detached pid=2986369 session=8ba4e0ae-04b3-4c48-80a7-1e5a36809f65 state=DETACHED probes=[6519306381132061889:restored=true,6519306381132061890:restored=true]
+build/call-stacks-target: OK
+build/libcall-stacks-calculator.so: OK
+After detach: calls 6 -> 26, TracerPid=0, failures=0

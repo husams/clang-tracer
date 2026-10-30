@@ -1,0 +1,47 @@
+Recorded sample output; checkout paths normalized for publication.
+
+Target source and compilation database unavailable; no includes supplied
+Starting the server and attribute-free target
+no sessions
+TARGET pid=2976527
+Attaching by PID
+attached pid=2976527 session=4b54fb4e-3f25-47f2-88a3-a57ab6d3955e state=ATTACHED
+Installing the free-function interceptor
+traced pid=2976527 session=4b54fb4e-3f25-47f2-88a3-a57ab6d3955e probe=2233091137717417479 symbol=_Z3addii declaration=int add(int, int) debug_image=/path/to/clang-tracer/build/cpp-interceptors-target
+Installing the method interceptor with typed field reads
+traced pid=2976527 session=4b54fb4e-3f25-47f2-88a3-a57ab6d3955e probe=2233091137717417480 symbol=_ZNK10Calculator8multiplyEii declaration=int Calculator::multiply(int, int) const debug_image=/path/to/clang-tracer/build/cpp-interceptors-target
+Viewing readable events
+cursor=1 pid=2976527 tid=2976527 probe=2233091137717417479 this=- args=[left=int32:3, right=int32:13] phase=pre call=1 lost(agent=0,server=0)
+cursor=2 pid=2976527 tid=2976527 probe=2233091137717417479 this=- args=[left=int32:3, right=int32:13] phase=post call=1 result=int32:16 lost(agent=0,server=0)
+cursor=3 pid=2976527 tid=2976527 probe=2233091137717417479 this=- args=[left=int32:4, right=int32:14] phase=pre call=2 lost(agent=0,server=0)
+cursor=4 pid=2976527 tid=2976527 probe=2233091137717417479 this=- args=[left=int32:4, right=int32:14] phase=post call=2 result=int32:18 lost(agent=0,server=0)
+cursor=5 pid=2976527 tid=2976527 probe=2233091137717417480 this=0x7ffe1216ed70 args=[value=int32:4, factor=int32:6] fields=[bias=int32:7, calls=int32:3] phase=pre call=1 lost(agent=0,server=0)
+cursor=6 pid=2976527 tid=2976527 probe=2233091137717417480 this=0x7ffe1216ed70 args=[value=int32:4, factor=int32:6] fields=[bias=int32:7, calls=int32:4] phase=post call=1 result=int32:35 lost(agent=0,server=0)
+cursor=7 pid=2976527 tid=2976527 probe=2233091137717417479 this=- args=[left=int32:5, right=int32:15] phase=pre call=3 lost(agent=0,server=0)
+cursor=8 pid=2976527 tid=2976527 probe=2233091137717417479 this=- args=[left=int32:5, right=int32:15] phase=post call=3 result=int32:20 lost(agent=0,server=0)
+cursor=9 pid=2976527 tid=2976527 probe=2233091137717417480 this=0x7ffe1216ed70 args=[value=int32:5, factor=int32:7] fields=[bias=int32:7, calls=int32:4] phase=pre call=2 lost(agent=0,server=0)
+cursor=10 pid=2976527 tid=2976527 probe=2233091137717417480 this=0x7ffe1216ed70 args=[value=int32:5, factor=int32:7] fields=[bias=int32:7, calls=int32:5] phase=post call=2 result=int32:47 lost(agent=0,server=0)
+cursor=11 pid=2976527 tid=2976527 probe=2233091137717417479 this=- args=[left=int32:1, right=int32:11] phase=pre call=4 lost(agent=0,server=0)
+cursor=12 pid=2976527 tid=2976527 probe=2233091137717417479 this=- args=[left=int32:1, right=int32:11] phase=post call=4 result=int32:12 lost(agent=0,server=0)
+cursor=13 pid=2976527 tid=2976527 probe=2233091137717417480 this=0x7ffe1216ed70 args=[value=int32:1, factor=int32:3] fields=[bias=int32:7, calls=int32:5] phase=pre call=3 lost(agent=0,server=0)
+cursor=14 pid=2976527 tid=2976527 probe=2233091137717417480 this=0x7ffe1216ed70 args=[value=int32:1, factor=int32:3] fields=[bias=int32:7, calls=int32:6] phase=post call=3 result=int32:16 lost(agent=0,server=0)
+cursor=15 pid=2976527 tid=2976527 probe=2233091137717417479 this=- args=[left=int32:2, right=int32:12] phase=pre call=5 lost(agent=0,server=0)
+cursor=16 pid=2976527 tid=2976527 probe=2233091137717417479 this=- args=[left=int32:2, right=int32:12] phase=post call=5 result=int32:14 lost(agent=0,server=0)
+cursor=17 pid=2976527 tid=2976527 probe=2233091137717417480 this=0x7ffe1216ed70 args=[value=int32:2, factor=int32:4] fields=[bias=int32:7, calls=int32:6] phase=pre call=4 lost(agent=0,server=0)
+cursor=18 pid=2976527 tid=2976527 probe=2233091137717417480 this=0x7ffe1216ed70 args=[value=int32:2, factor=int32:4] fields=[bias=int32:7, calls=int32:7] phase=post call=4 result=int32:22 lost(agent=0,server=0)
+cursor=19 pid=2976527 tid=2976527 probe=2233091137717417479 this=- args=[left=int32:3, right=int32:13] phase=pre call=6 lost(agent=0,server=0)
+cursor=20 pid=2976527 tid=2976527 probe=2233091137717417479 this=- args=[left=int32:3, right=int32:13] phase=post call=6 result=int32:16 lost(agent=0,server=0)
+Detaching both active probes
+detached pid=2976527 session=4b54fb4e-3f25-47f2-88a3-a57ab6d3955e state=DETACHED probes=[2233091137717417479:restored=true,2233091137717417480:restored=true]
+After detach: target alive, completed calls 8 -> 14, TracerPid=0
+CALL init=1 left=4 right=14 add=18 value=4 factor=6 bias=7 calls=9 multiply=40
+CALL init=1 left=5 right=15 add=20 value=5 factor=7 bias=7 calls=10 multiply=52
+CALL init=1 left=1 right=11 add=12 value=1 factor=3 bias=7 calls=11 multiply=21
+CALL init=1 left=2 right=12 add=14 value=2 factor=4 bias=7 calls=12 multiply=27
+CALL init=1 left=3 right=13 add=16 value=3 factor=5 bias=7 calls=13 multiply=35
+CALL init=1 left=4 right=14 add=18 value=4 factor=6 bias=7 calls=14 multiply=45
+attached pid=2976565 session=b0c79a35-e89c-48ca-905f-4d70780fad4e state=ATTACHED
+clang-tracer: no supported matching callable in mapped ELF debug information; build/install matching DWARF symbols
+detached pid=2976565 session=b0c79a35-e89c-48ca-905f-4d70780fad4e state=DETACHED probes=[]
+Debug-stripped binary rejected; detach succeeded
+Demo logs: /tmp/clang-tracer-dwarf-only.Eij1uh

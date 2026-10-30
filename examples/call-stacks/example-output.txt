@@ -1,0 +1,41 @@
+Recorded sample output; checkout paths normalized for publication.
+
+Recorded 30 October 2026 on Linux x86_64, Clang 21.1.8.
+Exact excerpts; full 24-event output is in stack-capture-results/2026-10-30/complete/events.log.
+
+cursor=4 pid=2985116 tid=2985162 probe=6336392584749513528 this=- args=[left=int32:20, right=int32:10] fields=[stack_frames=uint64:14] phase=pre call=1 lost(agent=0,server=0)
+  entry-stack COMPLETE depth=14/24 (native CFI reached the thread root)
+    #0 TARGET_ENTRY 0x7f8e26d4e340 stack_add(int, int) [/path/to/clang-tracer/build/libcall-stacks-calculator.so+0x340] /path/to/clang-tracer/examples/call-stacks/calculator.cpp:3
+    #1 NATIVE 0x7f8e26d4e3aa StackCalculator::multiply(int, int) [/path/to/clang-tracer/build/libcall-stacks-calculator.so+0x3a9] /path/to/clang-tracer/examples/call-stacks/calculator.cpp:12
+    #2 JIT_BRIDGE 0x7f8e26d4a3c3 clangtracer_wrapper (verified bridge)
+    #3 NATIVE 0x7f8e26d4e3d3 library_dispatch(StackCalculator&, int, int) [/path/to/clang-tracer/build/libcall-stacks-calculator.so+0x3d2] /path/to/clang-tracer/examples/call-stacks/calculator.cpp:16
+    #4 NATIVE 0x4005f6 run_iteration(StackCalculator&, int, int) [/path/to/clang-tracer/build/call-stacks-target+0x4005f5] /path/to/clang-tracer/examples/call-stacks/target.cpp:27
+    #5 NATIVE 0x40071f worker_loop(int) [/path/to/clang-tracer/build/call-stacks-target+0x40071e] /path/to/clang-tracer/examples/call-stacks/target.cpp:38
+    #6 NATIVE 0x401178 void std::__invoke_impl<void, void (*)(int), int>(std::__invoke_other, void (*&&)(int), int&&) [/path/to/clang-tracer/build/call-stacks-target+0x401177] /opt/rh/gcc-toolset-15/root//usr/lib/gcc/x86_64-redhat-linux/15/../../../../include/c++/15/bits/invoke.h:63
+    #7 NATIVE 0x401146 std::__invoke_result<void (*)(int), int>::type std::__invoke<void (*)(int), int>(void (*&&)(int), int&&) [/path/to/clang-tracer/build/call-stacks-target+0x401145] /opt/rh/gcc-toolset-15/root//usr/lib/gcc/x86_64-redhat-linux/15/../../../../include/c++/15/bits/invoke.h:98
+    #8 NATIVE 0x401132 void std::thread::_Invoker<std::tuple<void (*)(int), int>>::_M_invoke<0ul, 1ul>(std::_Index_tuple<0ul, 1ul>) [/path/to/clang-tracer/build/call-stacks-target+0x401131] /opt/rh/gcc-toolset-15/root//usr/lib/gcc/x86_64-redhat-linux/15/../../../../include/c++/15/bits/std_thread.h:303
+    #9 NATIVE 0x401106 std::thread::_Invoker<std::tuple<void (*)(int), int>>::operator()() [/path/to/clang-tracer/build/call-stacks-target+0x401105] /opt/rh/gcc-toolset-15/root//usr/lib/gcc/x86_64-redhat-linux/15/../../../../include/c++/15/bits/std_thread.h:310
+    #10 NATIVE 0x40108a std::thread::_State_impl<std::thread::_Invoker<std::tuple<void (*)(int), int>>>::_M_run() [/path/to/clang-tracer/build/call-stacks-target+0x401089] /opt/rh/gcc-toolset-15/root//usr/lib/gcc/x86_64-redhat-linux/15/../../../../include/c++/15/bits/std_thread.h:255
+    #11 NATIVE 0x7f8e26adbae4 ?? [/usr/lib64/libstdc++.so.6.0.29+0xdbae3]
+    #12 NATIVE 0x7f8e2668b699 start_thread [/usr/lib64/libc.so.6+0x8b698]
+    #13 NATIVE 0x7f8e267108a0 __clone3 [/usr/lib64/libc.so.6+0x11089f]
+
+cursor=9 pid=2985116 tid=2985162 probe=6336392584749513527 this=0x7f8e189fcd88 args=[value=int32:4, factor=int32:5] fields=[bias=int32:9, calls=int32:1] phase=post call=3 result=int32:30 lost(agent=0,server=0)
+  entry-stack COMPLETE depth=12/24 (native CFI reached the thread root)
+    #0 TARGET_ENTRY 0x7f8e26d4e370 StackCalculator::multiply(int, int) [/path/to/clang-tracer/build/libcall-stacks-calculator.so+0x370] /path/to/clang-tracer/examples/call-stacks/calculator.cpp:9
+    #1 NATIVE 0x7f8e26d4e3d3 library_dispatch(StackCalculator&, int, int) [/path/to/clang-tracer/build/libcall-stacks-calculator.so+0x3d2] /path/to/clang-tracer/examples/call-stacks/calculator.cpp:16
+    #2 NATIVE 0x4005f6 run_iteration(StackCalculator&, int, int) [/path/to/clang-tracer/build/call-stacks-target+0x4005f5] /path/to/clang-tracer/examples/call-stacks/target.cpp:27
+    #3 NATIVE 0x40071f worker_loop(int) [/path/to/clang-tracer/build/call-stacks-target+0x40071e] /path/to/clang-tracer/examples/call-stacks/target.cpp:38
+    #4 NATIVE 0x401178 void std::__invoke_impl<void, void (*)(int), int>(std::__invoke_other, void (*&&)(int), int&&) [/path/to/clang-tracer/build/call-stacks-target+0x401177] /opt/rh/gcc-toolset-15/root//usr/lib/gcc/x86_64-redhat-linux/15/../../../../include/c++/15/bits/invoke.h:63
+    #5 NATIVE 0x401146 std::__invoke_result<void (*)(int), int>::type std::__invoke<void (*)(int), int>(void (*&&)(int), int&&) [/path/to/clang-tracer/build/call-stacks-target+0x401145] /opt/rh/gcc-toolset-15/root//usr/lib/gcc/x86_64-redhat-linux/15/../../../../include/c++/15/bits/invoke.h:98
+    #6 NATIVE 0x401132 void std::thread::_Invoker<std::tuple<void (*)(int), int>>::_M_invoke<0ul, 1ul>(std::_Index_tuple<0ul, 1ul>) [/path/to/clang-tracer/build/call-stacks-target+0x401131] /opt/rh/gcc-toolset-15/root//usr/lib/gcc/x86_64-redhat-linux/15/../../../../include/c++/15/bits/std_thread.h:303
+    #7 NATIVE 0x401106 std::thread::_Invoker<std::tuple<void (*)(int), int>>::operator()() [/path/to/clang-tracer/build/call-stacks-target+0x401105] /opt/rh/gcc-toolset-15/root//usr/lib/gcc/x86_64-redhat-linux/15/../../../../include/c++/15/bits/std_thread.h:310
+    #8 NATIVE 0x40108a std::thread::_State_impl<std::thread::_Invoker<std::tuple<void (*)(int), int>>>::_M_run() [/path/to/clang-tracer/build/call-stacks-target+0x401089] /opt/rh/gcc-toolset-15/root//usr/lib/gcc/x86_64-redhat-linux/15/../../../../include/c++/15/bits/std_thread.h:255
+    #9 NATIVE 0x7f8e26adbae4 ?? [/usr/lib64/libstdc++.so.6.0.29+0xdbae3]
+    #10 NATIVE 0x7f8e2668b699 start_thread [/usr/lib64/libc.so.6+0x8b698]
+    #11 NATIVE 0x7f8e267108a0 __clone3 [/usr/lib64/libc.so.6+0x11089f]
+
+detached pid=2985116 session=e3d12798-65cb-4e1e-b3c0-e4e1e265c1e4 state=DETACHED probes=[6336392584749513527:restored=true,6336392584749513528:restored=true]
+build/call-stacks-target: OK
+build/libcall-stacks-calculator.so: OK
+After detach: calls 6 -> 26, TracerPid=0, failures=0

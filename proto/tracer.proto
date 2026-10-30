@@ -1,0 +1,223 @@
+syntax = "proto3";
+package clangtracer.v1;
+
+// All public control and event traffic uses gRPC and binary Protobuf.
+service Tracer {
+  rpc Attach(AttachRequest) returns (Session);
+  rpc AddProbe(AddProbeRequest) returns (Probe);
+  rpc RemoveProbe(RemoveProbeRequest) returns (Probe);
+  rpc Detach(DetachRequest) returns (Session);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc WatchEvents(WatchEventsRequest) returns (stream TraceEvent);
+}
+
+enum ValueType {
+  VALUE_TYPE_UNSPECIFIED = 0;
+  VOID = 1;
+  INT32 = 2;
+  INT64 = 3;
+  UINT64 = 4;
+  FLOAT32 = 5;
+  FLOAT64 = 6;
+  POINTER = 7;
+  OBJECT = 8; // Address of the wrapper's by-value argument snapshot.
+}
+enum CallableKind {
+  CALLABLE_KIND_UNSPECIFIED = 0;
+  FUNCTION = 1; // Includes static member functions.
+  METHOD = 2; // Non-static Itanium ABI method; hidden this pointer is captured.
+}
+enum TracePhase {
+  TRACE_PHASE_UNSPECIFIED = 0;
+  PRE = 1;
+  POST = 2;
+}
+message Signature {
+  CallableKind kind = 1;
+  ValueType result = 2;
+  repeated ValueType arguments = 3; // Up to eight scalar, indirect, or ABI-proven object arguments.
+}
+message ReceiverField {
+  string name = 1;
+  string canonical_type = 2;
+  uint64 bit_offset = 3;
+  uint32 bit_width = 4; // Zero for an ordinary field.
+  uint64 bit_size = 5;
+  uint64 bit_alignment = 6;
+  bool is_mutable = 7;
+  string access = 8; // public, protected, or private.
+  string abi_identity = 9; // Recursive target ABI identity for this field type.
+}
+message ReceiverContext {
+  string translation_unit = 1;
+  string working_directory = 2;
+  repeated string compiler_arguments = 3; // Frozen Clang driver invocation.
+  string record_name = 4;
+  string clang_version = 5;
+  string target_triple = 6;
+  uint64 size = 7;
+  uint64 alignment = 8;
+  repeated ReceiverField fields = 9;
+  bool is_volatile = 10;
+}
+message DebugField {
+  string name = 1;
+  string builtin_type = 2;
+  uint64 byte_offset = 3;
+  uint64 byte_size = 4;
+  string access = 5;
+}
+message DebugInfo {
+  string module = 1;
+  uint64 device = 2;
+  uint64 inode = 3;
+  uint64 file_size = 4;
+  sint64 modification_ns = 5;
+  sint64 change_ns = 6;
+  string selector = 7;
+  string record_name = 8;
+  uint64 record_size = 9;
+  repeated DebugField fields = 10;
+  bool receiver_volatile = 11;
+  repeated DebugArgument arguments = 12;
+  uint64 entry_virtual_address = 13; // Concrete DWARF code range, before ASLR.
+  uint64 entry_size = 14;
+  uint64 runtime_entry = 15; // Revalidated against mapped ELF PT_LOAD identity.
+}
+message DebugArgument {
+  uint32 index = 1;
+  string cpp_type = 2;
+  bool is_reference = 3;
+  bool is_object_value = 4;
+  DebugInfo object_type = 5;
+}
+message HeaderContext {
+  string working_directory = 1;
+  repeated string compiler_arguments = 2; // Flags only; no donor source input.
+  string inference = 3; // Clang's diagnostic identifying the selected command.
+}
+message ProbeSpec {
+  string symbol = 1;       // Linkage name/diagnostic; export required only in raw-symbol mode.
+  Signature signature = 2; // DWARF-inferred or explicitly supplied ABI contract.
+  string callback_source = 3; // Legacy trace_callback or class Interceptor with
+                              // optional pre/post(const Call&).
+  ReceiverContext receiver = 4; // Clang-discovered original class context.
+  string receiver_unavailable_reason = 5;
+  DebugInfo debug_info = 6;
+  repeated string argument_names = 7;
+  repeated string include_headers = 8; // Optional headers; no target source required.
+  HeaderContext header_context = 9; // Optional compilation database flags.
+  uint32 stack_depth = 10; // Zero disables automatic entry capture; otherwise 1..64.
+  bool include_internal_stack_frames = 11; // False defaults to application-only, including old clients.
+  bool print_arguments = 12; // Optional callback PRE rendering; defaults off.
+  bool print_result = 13; // Optional callback POST rendering; defaults off.
+}
+message AttachRequest {
+  uint32 pid = 1;
+  // Libraries are discovered from the target; the former manual allowlist
+  // field is retired and must never be reused.
+  reserved 2;
+  reserved "application_modules";
+}
+message Session {
+  string id = 1;
+  uint32 pid = 2;
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    ATTACHED = 1;
+    DETACHED = 2;
+    EXITED = 3;
+    FAILED = 4;
+  }
+  State state = 3;
+  repeated Probe probes = 4;
+  string error = 5;
+  repeated string application_modules =
+      6; // Automatically discovered, pinned paths.
+}
+message AddProbeRequest {
+  string session_id = 1;
+  ProbeSpec spec = 2;
+}
+message Probe {
+  uint64 id = 1;
+  string session_id = 2;
+  string symbol = 3;
+  Signature signature = 4;
+  bool active = 5;
+  uint64 callback_address = 6;
+  uint64 entry_address = 7;
+  bool original_bytes_restored = 8;
+  uint64 agent_dropped_events = 9;
+  uint64 callback_errors = 10;
+}
+message RemoveProbeRequest {
+  string session_id = 1;
+  uint64 probe_id = 2;
+}
+message DetachRequest { string session_id = 1; }
+message ListSessionsRequest {}
+message ListSessionsResponse { repeated Session sessions = 1; }
+message WatchEventsRequest {
+  repeated string session_ids = 1; // Empty subscribes to all sessions.
+  uint64 after_sequence = 2;       // Resume cursor in bounded server history.
+}
+message Value {
+  ValueType type = 1;
+  oneof data {
+    sint64 signed_value = 2;
+    uint64 unsigned_value = 3;
+    double real_value = 4;
+  }
+}
+message NamedValue {
+  string name = 1;
+  Value value = 2;
+  uint32 argument_index = 3; // Used only in named_arguments.
+}
+message StackFrame {
+  uint64 pc = 1; // Native PC, or return PC for a caller frame.
+  uint64 stack_pointer = 2;
+  enum Kind { NATIVE = 0; TARGET_ENTRY = 1; JIT_BRIDGE = 2; }
+  Kind kind = 3;
+  string module = 4;
+  uint64 module_offset = 5; // ELF lookup address: entry PC, or caller return PC - 1.
+  string function = 6;
+  string file = 7;
+  uint32 line = 8;
+  bool application_frame = 9;
+}
+message StackTrace {
+  enum Status { DISABLED = 0; COMPLETE = 1; TRUNCATED = 2; PARTIAL = 3; }
+  Status status = 1;
+  uint32 requested_depth = 2;
+  repeated StackFrame frames = 3;
+  string detail = 4;
+  bool application_only = 5;
+  uint32 hidden_frames = 6;
+  uint32 captured_depth = 7; // Native depth before filtering; bounded by requested_depth.
+  // This is the invocation's entry stack, including on POST events.
+}
+message TraceEvent {
+  uint32 protocol_version = 1;
+  string session_id = 2;
+  uint64 probe_id = 3;
+  uint32 pid = 4;
+  uint32 tid = 5;
+  uint64 sequence = 6; // Monotonic server cursor, assigned when received.
+  uint64 probe_sequence =
+      7; // Agent sequence; gaps expose agent transport loss.
+  uint64 monotonic_time_ns = 8;
+  uint64 object_address = 9; // Zero for free/static functions.
+  repeated Value arguments = 10;
+  sint64 callback_value = 11;
+  uint64 agent_dropped_events = 12;
+  uint64 server_dropped_events =
+      13; // Cumulative history evictions at publication.
+  TracePhase phase = 14;
+  uint64 call_id = 15; // Correlates PRE/POST for one invocation of this probe.
+  Value result = 16;   // Present only on POST; VOID is represented explicitly.
+  repeated NamedValue named_arguments = 17;
+  repeated NamedValue object_fields = 18;
+  StackTrace stack = 19;
+}

@@ -1,0 +1,10 @@
+#pragma once
+
+namespace tracer {
+inline constexpr char kEmbeddedProtocolHeader[] = R"TRACER_PROTOCOL(
+@TRACER_PROTOCOL_HEADER@
+)TRACER_PROTOCOL";
+inline constexpr char kEmbeddedCallbackHeader[] = R"TRACER_API(
+@TRACER_CALLBACK_HEADER@
+)TRACER_API";
+} // namespace tracer

@@ -1,0 +1,29 @@
+Recorded sample output; checkout paths normalized for publication.
+
+Recorded 30 October 2026; application-only=true by default, no filter flag supplied.
+One nested invocation: every visible PRE and POST frame printed inside callbacks.
+
+PRE probe=8709528481151671139 call=1 frame=0 kind=1 function=stack_add(int, int) | module=/path/to/clang-tracer/build/libcall-stacks-calculator.so | source=/path/to/clang-tracer/examples/call-stacks/calculator.cpp:3
+PRE probe=8709528481151671139 call=1 frame=1 kind=0 function=StackCalculator::multiply(int, int) | module=/path/to/clang-tracer/build/libcall-stacks-calculator.so | source=/path/to/clang-tracer/examples/call-stacks/calculator.cpp:12
+PRE probe=8709528481151671139 call=1 frame=2 kind=0 function=library_dispatch(StackCalculator&, int, int) | module=/path/to/clang-tracer/build/libcall-stacks-calculator.so | source=/path/to/clang-tracer/examples/call-stacks/calculator.cpp:16
+PRE probe=8709528481151671139 call=1 frame=3 kind=0 function=run_iteration(StackCalculator&, int, int) | module=/path/to/clang-tracer/build/call-stacks-target | source=/path/to/clang-tracer/examples/call-stacks/target.cpp:27
+PRE probe=8709528481151671139 call=1 frame=4 kind=0 function=worker_loop(int) | module=/path/to/clang-tracer/build/call-stacks-target | source=/path/to/clang-tracer/examples/call-stacks/target.cpp:38
+POST probe=8709528481151671139 call=1 frame=0 kind=1 function=stack_add(int, int) | module=/path/to/clang-tracer/build/libcall-stacks-calculator.so | source=/path/to/clang-tracer/examples/call-stacks/calculator.cpp:3
+POST probe=8709528481151671139 call=1 frame=1 kind=0 function=StackCalculator::multiply(int, int) | module=/path/to/clang-tracer/build/libcall-stacks-calculator.so | source=/path/to/clang-tracer/examples/call-stacks/calculator.cpp:12
+POST probe=8709528481151671139 call=1 frame=2 kind=0 function=library_dispatch(StackCalculator&, int, int) | module=/path/to/clang-tracer/build/libcall-stacks-calculator.so | source=/path/to/clang-tracer/examples/call-stacks/calculator.cpp:16
+POST probe=8709528481151671139 call=1 frame=3 kind=0 function=run_iteration(StackCalculator&, int, int) | module=/path/to/clang-tracer/build/call-stacks-target | source=/path/to/clang-tracer/examples/call-stacks/target.cpp:27
+POST probe=8709528481151671139 call=1 frame=4 kind=0 function=worker_loop(int) | module=/path/to/clang-tracer/build/call-stacks-target | source=/path/to/clang-tracer/examples/call-stacks/target.cpp:38
+
+Corresponding CLI event (all visible frames):
+cursor=3 pid=2987919 tid=2987957 probe=8709528481151671139 this=- args=[left=int32:12, right=int32:9] fields=[stack_frames=uint64:5] phase=pre call=1 lost(agent=0,server=0)
+  entry-stack COMPLETE depth=5/24 application-only=true captured=14 hidden=9 (native CFI reached the thread root)
+    #0 TARGET_ENTRY 0x7f7e06445340 stack_add(int, int) [/path/to/clang-tracer/build/libcall-stacks-calculator.so+0x340] /path/to/clang-tracer/examples/call-stacks/calculator.cpp:3
+    #1 NATIVE 0x7f7e064453aa StackCalculator::multiply(int, int) [/path/to/clang-tracer/build/libcall-stacks-calculator.so+0x3a9] /path/to/clang-tracer/examples/call-stacks/calculator.cpp:12
+    #2 NATIVE 0x7f7e064453d3 library_dispatch(StackCalculator&, int, int) [/path/to/clang-tracer/build/libcall-stacks-calculator.so+0x3d2] /path/to/clang-tracer/examples/call-stacks/calculator.cpp:16
+    #3 NATIVE 0x4005f6 run_iteration(StackCalculator&, int, int) [/path/to/clang-tracer/build/call-stacks-target+0x4005f5] /path/to/clang-tracer/examples/call-stacks/target.cpp:27
+    #4 NATIVE 0x40071f worker_loop(int) [/path/to/clang-tracer/build/call-stacks-target+0x40071e] /path/to/clang-tracer/examples/call-stacks/target.cpp:38
+
+detached pid=2987919 session=8f498738-dbec-4892-8e74-06b6892d49b2 state=DETACHED probes=[8709528481151671138:restored=true,8709528481151671139:restored=true]
+./build/call-stacks-target: OK
+build/libcall-stacks-calculator.so: OK
+After detach: calls 6 -> 24, TracerPid=0, failures=0
