@@ -1,0 +1,6 @@
+#pragma once
+#include <array>
+namespace tracer::runtime {
+inline constexpr std::array<const char *, @_tracer_jit_count@> jit_flags{{
+@_tracer_jit_entries@}};
+} // namespace tracer::runtime

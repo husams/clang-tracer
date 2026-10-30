@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "runtime_paths.hpp"
 #include "server.hpp"
 
 namespace {
@@ -24,12 +25,14 @@ unsigned parse_positive(const std::string &text, const char *option) {
 }
 
 int usage() {
-  std::cout << "Usage: clang-tracer-server --agent LIBRARY [--listen "
+  std::cout << "Usage: clang-tracer-server [--agent LIBRARY] [--listen "
                "unix:///PATH|127.0.0.1:PORT] "
                "[--timeout SECONDS]\n"
                "Starts the native multi-process tracing gRPC server. Default "
                "endpoint is a "
-               "private Unix socket; Linux x86_64 only.\n";
+               "private Unix socket; Linux x86_64 only.\n"
+               "Agent lookup: --agent, CLANG_TRACER_AGENT, installed library, "
+               "then adjacent build library.\n";
   return 0;
 }
 
@@ -59,7 +62,7 @@ int main(int argc, char **argv) {
         timeout = parse_positive(value, "--timeout");
     }
     if (agent.empty())
-      throw std::invalid_argument("--agent is required (use --help)");
+      agent = tracer::runtime::default_agent_path();
     return tracer::RunServer(agent, listen, std::chrono::seconds(timeout));
   } catch (const std::exception &error) {
     std::cerr << "clang-tracer: " << error.what() << '\n';

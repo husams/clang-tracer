@@ -198,6 +198,15 @@ service bindings from `proto/tracer.proto`; the agent links Protobuf without the
 gRPC client/server library. The integration test uses real target processes and
 real generated gRPC clients.
 
+For RHEL-compatible systems, see [build, toolchain and deployment instructions](docs/build-rhel.md).
+`build-rhel.sh` accepts custom compiler/LLVM paths or a CMake toolchain file;
+`deploy-rhel.sh` installs the build or stages it with `DESTDIR`. Standard CMake
+`CMAKE_INSTALL_PREFIX`, `CMAKE_INSTALL_BINDIR` and `CMAKE_INSTALL_LIBDIR` select
+where the binaries and agent library go. Installed servers find their agent
+automatically, and matching Clang builtin headers are bundled by default.
+`TRACER_JIT_FLAGS` configures the embedded compiler's sysroot, standard-library
+headers and other callback compiler defaults independently of the build compiler.
+
 Start the server:
 
 ```sh

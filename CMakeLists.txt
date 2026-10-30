@@ -10,34 +10,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-find_package(LLVM REQUIRED CONFIG)
-find_package(Clang REQUIRED CONFIG)
+include(GNUInstallDirs)
+include(CTest)
+include(cmake/TracerToolchain.cmake)
 find_package(Threads REQUIRED)
 find_package(Protobuf REQUIRED)
 find_package(gRPC REQUIRED CONFIG)
-if(LLVM_VERSION_MAJOR LESS 21 OR LLVM_VERSION_MAJOR GREATER 22)
-  message(FATAL_ERROR "Use LLVM/Clang 21 or 22; tested version is recorded in README.md")
-endif()
-
-# Embedded LibTooling cannot find builtin headers relative to our executable.
-# Use the resource headers from the same LLVM installation, unless overridden.
-set(TRACER_CLANG_RESOURCE_DIR "" CACHE PATH "Clang builtin resource directory (empty: discover from LLVM's clang)")
-if(TRACER_CLANG_RESOURCE_DIR)
-  set(_tracer_resource_dir "${TRACER_CLANG_RESOURCE_DIR}")
-else()
-  find_program(TRACER_CLANG_DRIVER NAMES clang-${LLVM_VERSION_MAJOR} clang
-    HINTS "${LLVM_TOOLS_BINARY_DIR}" NO_DEFAULT_PATH REQUIRED)
-  get_filename_component(_tracer_clang_driver "${TRACER_CLANG_DRIVER}" REALPATH)
-  execute_process(COMMAND "${_tracer_clang_driver}" --print-resource-dir
-    RESULT_VARIABLE _tracer_resource_status OUTPUT_VARIABLE _tracer_resource_dir
-    OUTPUT_STRIP_TRAILING_WHITESPACE)
-  if(NOT _tracer_resource_status EQUAL 0)
-    message(FATAL_ERROR "Cannot locate Clang builtin headers; set TRACER_CLANG_RESOURCE_DIR")
-  endif()
-endif()
-if(NOT EXISTS "${_tracer_resource_dir}/include/stddef.h")
-  message(FATAL_ERROR "Clang resource headers are missing from ${_tracer_resource_dir}")
-endif()
 
 set(TRACER_PROTO_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 file(MAKE_DIRECTORY ${TRACER_PROTO_DIR})
@@ -84,6 +62,10 @@ target_compile_definitions(clang-tracer PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tr
 target_link_libraries(clang-tracer PRIVATE tracer_grpc clang-cpp LLVM Threads::Threads)
 target_compile_options(clang-tracer PRIVATE -Wall -Wextra -Wpedantic)
 
+include(cmake/TracerInstall.cmake)
+
+option(TRACER_BUILD_EXAMPLES "Build example target programs" ON)
+if(TRACER_BUILD_EXAMPLES OR BUILD_TESTING)
 add_executable(trace-target examples/target.cpp)
 set_target_properties(trace-target PROPERTIES ENABLE_EXPORTS ON)
 target_compile_options(trace-target PRIVATE -O0 -fno-omit-frame-pointer -fcf-protection=none)
@@ -129,7 +111,8 @@ target_link_libraries(trace-threaded-target PRIVATE Threads::Threads trace-stack
 target_compile_options(trace-threaded-target PRIVATE -O0 -fno-omit-frame-pointer
   -fno-optimize-sibling-calls -fcf-protection=none)
 
-include(CTest)
+endif()
+
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   add_library(admission-leaf OBJECT tests/admission_leaf.cpp)

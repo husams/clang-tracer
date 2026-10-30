@@ -1,6 +1,7 @@
 #include "debug_resolver.hpp"
 #include "event_transport.hpp"
 #include "native_stack.hpp"
+#include "runtime_paths.hpp"
 
 #include <algorithm>
 #include <array>
@@ -648,9 +649,10 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
           header_context.ByteSizeLong() > 64 * 1024 ||
           header_context.compiler_arguments_size() > 512)
         throw std::runtime_error("invalid header compilation context");
-      std::vector<std::string> arguments(
-          header_context.compiler_arguments().begin(),
-          header_context.compiler_arguments().end());
+      auto arguments = tracer::runtime::jit_arguments();
+      arguments.insert(arguments.end(),
+                       header_context.compiler_arguments().begin(),
+                       header_context.compiler_arguments().end());
       bool resource_dir = false;
       for (const auto &argument : arguments) {
         if (argument.find('\0') != std::string::npos)
@@ -660,7 +662,7 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
       }
       if (!resource_dir)
         arguments.push_back(std::string("-resource-dir=") +
-                            TRACER_CLANG_RESOURCE_DIR);
+                            tracer::runtime::clang_resource_dir());
       arguments.insert(arguments.end(), {"-x", "c++", "-fsyntax-only"});
       clang::tooling::FixedCompilationDatabase database(directory, arguments);
       auto physical_fs = llvm::vfs::createPhysicalFileSystem();
@@ -688,10 +690,13 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
                                  capture.message());
       output = std::move(units.front());
     } else {
+      auto arguments = tracer::runtime::jit_arguments();
+      arguments.insert(arguments.end(),
+                       {"-std=c++20", "-x", "c++",
+                        std::string("-resource-dir=") +
+                            tracer::runtime::clang_resource_dir()});
       output = clang::tooling::buildASTFromCodeWithArgs(
-          headers,
-          {"-std=c++20", "-x", "c++",
-           std::string("-resource-dir=") + TRACER_CLANG_RESOURCE_DIR},
+          headers, arguments,
           "clang-tracer-debug-types.cc", "clang-tracer",
           std::make_shared<clang::PCHContainerOperations>(),
           clang::tooling::getClangStripOutputAdjuster(), {}, &capture);
@@ -751,8 +756,9 @@ bool build_and_validate_receiver_ast(clangtracer::v1::ProbeSpec &spec,
     error = "receiver Clang version does not match the tracing agent";
     return false;
   }
-  std::vector<std::string> arguments;
+  auto arguments = tracer::runtime::jit_arguments();
   arguments.reserve(
+      arguments.size() +
       static_cast<std::size_t>(receiver.compiler_arguments_size()));
   const auto source_path =
       std::filesystem::path(receiver.translation_unit()).is_absolute()
@@ -2041,9 +2047,14 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
     return false;
   }
   const std::string resource_dir_argument =
-      std::string("-resource-dir=") + TRACER_CLANG_RESOURCE_DIR;
-  std::vector<const char *> args = {
-      "-std=c++20", "-x", "c++", "-fPIC", "-O0", resource_dir_argument.c_str()};
+      std::string("-resource-dir=") + tracer::runtime::clang_resource_dir();
+  auto compiler_arguments = tracer::runtime::jit_arguments();
+  compiler_arguments.insert(compiler_arguments.end(),
+                            {"-std=c++20", "-x", "c++", "-fPIC", "-O0",
+                             resource_dir_argument});
+  std::vector<const char *> args;
+  for (const auto &argument : compiler_arguments)
+    args.push_back(argument.c_str());
   clang::IncrementalCompilerBuilder builder;
   builder.SetCompilerArgs(args);
   auto compiler = builder.CreateCpp();
@@ -2070,9 +2081,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
    * temporary syntax-only translation unit. This keeps callback validation
    * ahead of Interpreter::ParseAndExecute without copying the class text.
    */
-  const std::vector<std::string> syntax_args = {
-      "-std=c++20",         "-x", "c++", "-fPIC", "-O0", "-fsyntax-only",
-      resource_dir_argument};
+  auto syntax_args = compiler_arguments;
+  syntax_args.push_back("-fsyntax-only");
   CallbackShape shape;
   std::string bridge;
   std::string complete_source;
