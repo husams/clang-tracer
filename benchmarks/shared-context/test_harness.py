@@ -61,6 +61,9 @@ class HarnessChecks(unittest.TestCase):
                             'server': {'rss_kib': 4096, 'cpu_ticks': 1}})
         (directory / 'stats.json').write_text(json.dumps(stats))
         (directory / 'commands.jsonl').write_text('')
+        (directory / 'detach.txt').write_text(
+            'probes {\n  id: 1\n  symbol: "bench_root"\n  original_bytes_restored: true\n}\n'
+            'probes {\n  id: 2\n  symbol: "bench_leaf"\n  original_bytes_restored: true\n}\n')
         if batches is not None:
             (directory / 'batches.json').write_text(json.dumps(batches))
         return directory
@@ -101,6 +104,32 @@ class HarnessChecks(unittest.TestCase):
             payload.write_bytes(b'replaced')
             with self.assertRaisesRegex(RuntimeError, 'input changed'):
                 runner.verify_identity(args)
+
+    def test_repeated_latency_batches_are_all_retained(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            runner.record_latency_samples(directory, 'SAMPLES,10,20')
+            runner.record_latency_samples(directory, 'SAMPLES,30,40')
+            self.assertEqual((directory / 'latencies.csv').read_text(),
+                             'SAMPLES,10,20\nSAMPLES,30,40\n')
+
+    def test_broken_target_pipe_does_not_prevent_forced_cleanup(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.stdin.write.side_effect = BrokenPipeError()
+        process.wait.side_effect = [runner.sp.TimeoutExpired('target', 5), 0]
+        runner.stop_process(process, '0 1 0 0\n')
+        process.kill.assert_called_once()
+        process.stdin.close.assert_called_once()
+        process.stdout.close.assert_called_once()
+
+    def test_cleanup_closes_pipes_of_exited_children(self):
+        process = mock.Mock()
+        process.poll.return_value = 0
+        runner.stop_process(process)
+        process.terminate.assert_not_called()
+        process.stdin.close.assert_called_once()
+        process.stdout.close.assert_called_once()
 
     def test_existing_trial_is_rejected_before_any_target_launch(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -194,7 +223,9 @@ class HarnessChecks(unittest.TestCase):
             stats = json.loads((directory / 'stats.json').read_text())
             stats['mode'] = 'small'
             (directory / 'stats.json').write_text(json.dumps(stats))
-            (directory / 'detach.txt').write_text('probes { id: 1 symbol: "bench_root" }')
+            (directory / 'detach.txt').write_text(
+                'probes {\n  id: 1\n  symbol: "bench_root"\n  original_bytes_restored: true\n}\n'
+                'probes {\n  id: 2\n  symbol: "bench_leaf"\n  original_bytes_restored: true\n}\n')
             payload = integer_field(1, 99)
             state = bytes_field(3, payload)
             event = bytes_field(7, state)

@@ -57,9 +57,10 @@ python3 "$BENCH_ROOT/fixture/run.py" --root "$BENCH_ROOT" \
 
 `--bursts` retains each active batch/request in `batches.json`, with the interval
 outside active-call timing. Every fresh process has a separate target and probe
-compilation. Orders rotate and reverse between rounds. Treat processes, rather
-than correlated batches in one process, as independent replicates; keep first
-request latency distinct from a repeated-request average. A handful of tiny
+compilation followed by a 32-leaf-call warmup batch. Orders rotate and reverse
+between rounds. Treat processes, rather than correlated batches in one process,
+as independent replicates; keep first timed-request latency distinct from a
+repeated-request average. A handful of tiny
 single-batch samples cannot establish a small version effect by itself.
 
 Available modes include `off`, `ordinary`, `scoped`, `shared`, `small`, `nested`,
@@ -69,9 +70,11 @@ untraced thread workload. `fresh` traces only the leaf. Ordinary hooks emit two
 PRE/POST events per call; exporting state hooks emit explicit snapshots. Capture
 budgets and overload rejection make these different amounts of work.
 
-For paced leaf samples, add `--latency --pace-us 20000 --count 128`. Sampled leaf
-latency excludes the sleep, while process CPU over the paced interval includes
-helper work. Four-worker requests create and join four threads; do not compare
+For paced leaf samples with one worker, add
+`--latency --pace-us 20000 --count 128`. Sampled leaf latency excludes the sleep,
+while process CPU over the paced interval includes
+helper work. Each sampled batch appends a separate `SAMPLES,...` row to
+`latencies.csv`. Four-worker requests create and join four threads; do not compare
 that whole-request cost to amortized hot leaf overhead as the same metric.
 
 Use `--identity-manifest FILE` with a `sha256sum` manifest containing the frozen
@@ -97,9 +100,11 @@ python3 "$BENCH_ROOT/fixture/analyze.py" "$BENCH_ROOT/results" \
 The input layout is `campaign/trial/stats.json` with sibling logs and frames.
 The analyzer writes `analysis.json` and `samples.csv` to `ROOT/analysis` by default,
 or to the explicit output directory. It refuses the input directory itself and
-existing analysis files. Validation failures produce a nonzero exit status.
-It reports independent
-process count, total timed batches, recorded individual samples and first-batch
+existing analysis files. Missing trial/detach evidence, incomplete ordinary-hook
+delivery, corrupt frames, inconsistent batch totals and validation failures
+produce a nonzero exit status. Snapshot capture remains best effort and reports
+its delivered fraction. The analyzer reports independent process count, total
+timed batches, recorded individual samples and first-batch
 statistics. Legacy aggregated bursts retain their known batch count, but missing
 individual/first-batch samples are not fabricated from the aggregate. Affected
 single-batch cohorts get explicit sampling warnings.

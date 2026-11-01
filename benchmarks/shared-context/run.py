@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Isolated native benchmark. Uses public CLI; never installs runtime artifacts."""
 import argparse
-import csv
+from contextlib import ExitStack, suppress
 import hashlib
 import json
 import os
@@ -55,6 +55,35 @@ def frames(path):
     if pos != len(data): raise RuntimeError('trailing event bytes')
     return values
 
+def record_latency_samples(directory, samples):
+    values = samples.split(',')
+    if values[0] != 'SAMPLES' or len(values) < 2 or any(int(value) < 0 for value in values[1:]):
+        raise RuntimeError('invalid target samples '+samples)
+    with (directory/'latencies.csv').open('a') as stream:
+        stream.write(samples+'\n')
+
+def stop_process(process, request_exit=None):
+    if process is None:
+        return
+    if process.poll() is None:
+        if request_exit is not None:
+            with suppress(BrokenPipeError, OSError):
+                process.stdin.write(request_exit)
+                process.stdin.flush()
+        else:
+            with suppress(ProcessLookupError):
+                process.terminate()
+        try:
+            process.wait(timeout=5)
+        except sp.TimeoutExpired:
+            with suppress(ProcessLookupError):
+                process.kill()
+            process.wait(timeout=5)
+    for stream in (process.stdin, process.stdout):
+        if stream is not None:
+            with suppress(BrokenPipeError, OSError):
+                stream.close()
+
 def trial(args, directory, revision, mode, workers):
     verify_identity(args)
     directory.mkdir(parents=True)
@@ -99,13 +128,14 @@ def trial(args, directory, revision, mode, workers):
             raise RuntimeError('invalid target result '+row)
         if stride:
             samples = target.stdout.readline().strip()
-            if not samples.startswith('SAMPLES,'): raise RuntimeError(samples)
-            (directory / 'latencies.csv').write_text(samples+'\n')
+            record_latency_samples(directory, samples)
         return values[1:]
     try:
         target_log = (directory / 'target.err').open('w'); logs.append(target_log)
         target = sp.Popen(['taskset', '-c', '2' if workers == 1 else '2-5', str(args.root/'fixture/target')],
                           stdin=sp.PIPE, stdout=sp.PIPE, stderr=target_log, text=True, bufsize=1)
+        if not select.select([target.stdout], [], [], 30)[0]:
+            raise RuntimeError('target startup timed out')
         ready = target.stdout.readline().strip()
         if ready != f'READY {target.pid}': raise RuntimeError(ready)
         (directory / 'pid').write_text(str(target.pid))
@@ -172,11 +202,14 @@ def trial(args, directory, revision, mode, workers):
         row = [str(sum(b[i] for b in batches)) if i in (0,2,3,4,7,8,9)
                else str(max(b[i] for b in batches)) for i in range(10)]
         if mode == 'blocked': server.send_signal(signal.SIGCONT)
-        if profiler: profiler.wait(timeout=120)
+        if profiler and profiler.wait(timeout=120):
+            raise RuntimeError('profiler failed')
         time.sleep(.25)
         after = dict(target=proc_stats(target.pid), server=proc_stats(server.pid))
         if watcher:
-            watcher.wait(timeout=12)
+            watch_rc = watcher.wait(timeout=args.watch_timeout+5)
+            if mode in ('ordinary','stack') and watch_rc:
+                raise RuntimeError('event watcher failed; inspect watch.err')
         if mode == 'blocked':
             cli('--format', 'protobuf', '--output', directory/'events.pb', 'events', target.pid,
                 '--count', '100000', '--timeout', '1', check=False)
@@ -192,7 +225,9 @@ def trial(args, directory, revision, mode, workers):
                               '--decode=clangtracer.v1.Session', str(proto)],
                              input=data[0], capture_output=True, check=True).stdout
             (directory/'detach.txt').write_bytes(decoded)
-            if b'original_bytes_restored: true' not in decoded or b'callback_errors:' in decoded:
+            probe_count = len(re.findall(rb'(?m)^probes \{', decoded))
+            if (probe_count < len(probes) or
+                    decoded.count(b'original_bytes_restored: true') != probe_count or b'callback_errors:' in decoded):
                 raise RuntimeError('detach/callback correctness failure')
         batch(32)
         events = frames(directory/'events.pb')
@@ -208,20 +243,22 @@ def trial(args, directory, revision, mode, workers):
         (directory/'stats.json').write_text(json.dumps(stats,indent=2)+'\n')
         return stats
     finally:
-        if server and server.poll() is None: server.send_signal(signal.SIGCONT)
-        if attached:
-            try: cli('detach', target.pid)
-            except Exception: pass
-        if watcher and watcher.poll() is None: watcher.terminate(); watcher.wait()
-        if profiler and profiler.poll() is None: profiler.terminate(); profiler.wait()
-        if target and target.poll() is None:
-            target.stdin.write('0 1 0 0\n'); target.stdin.flush()
-            try: target.wait(timeout=5)
-            except sp.TimeoutExpired: target.terminate(); target.wait()
-        if server and server.poll() is None: server.terminate(); server.wait(timeout=10)
-        for log in logs: log.close()
-        command_log.close()
-        socket_directory.cleanup()
+        # Run every cleanup even if a child has exited or refuses to stop.
+        with ExitStack() as cleanup:
+            cleanup.callback(socket_directory.cleanup)
+            cleanup.callback(command_log.close)
+            for log in logs:
+                cleanup.callback(log.close)
+            cleanup.callback(stop_process, server)
+            cleanup.callback(stop_process, target, '0 1 0 0\n')
+            cleanup.callback(stop_process, profiler)
+            cleanup.callback(stop_process, watcher)
+            if server and server.poll() is None:
+                with suppress(ProcessLookupError):
+                    server.send_signal(signal.SIGCONT)
+            if attached:
+                try: cli('detach', target.pid)
+                except Exception: pass
 
 def main():
     p=argparse.ArgumentParser()

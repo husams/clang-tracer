@@ -10,20 +10,29 @@ import struct
 
 def varint(data,pos):
     value=shift=0
-    while True:
-        b=data[pos];pos+=1;value|=(b&127)<<shift
+    for index in range(10):
+        if pos>=len(data):raise ValueError('truncated protobuf varint')
+        b=data[pos];pos+=1
+        if index==9 and b>1:raise ValueError('protobuf varint exceeds 64 bits')
+        value|=(b&127)<<shift
         if b<128:return value,pos
         shift+=7
+    raise ValueError('protobuf varint exceeds 10 bytes')
 
 def fields(data):
     result=defaultdict(list);pos=0
     while pos<len(data):
         key,pos=varint(data,pos); tag,wire=key>>3,key&7
+        if tag==0:raise ValueError('protobuf field number is zero')
         if wire==0:value,pos=varint(data,pos)
         elif wire==2:
-            size,pos=varint(data,pos);value=data[pos:pos+size];pos+=size
+            size,pos=varint(data,pos)
+            if size>len(data)-pos:raise ValueError('truncated protobuf field')
+            value=data[pos:pos+size];pos+=size
         elif wire in (1,5):
-            size=8 if wire==1 else 4;value=data[pos:pos+size];pos+=size
+            size=8 if wire==1 else 4
+            if size>len(data)-pos:raise ValueError('truncated protobuf fixed-width field')
+            value=data[pos:pos+size];pos+=size
         else:raise ValueError(wire)
         result[tag].append(value)
     return result
@@ -31,10 +40,113 @@ def fields(data):
 def frames(path):
     data=path.read_bytes() if path.exists() else b'';pos=0;rows=[]
     while pos<len(data):
+        if len(data)-pos<4:raise ValueError(f'{path}: truncated frame length')
         size=struct.unpack_from('<I',data,pos)[0];pos+=4
-        assert pos+size<=len(data)
+        if size>len(data)-pos:raise ValueError(f'{path}: incomplete event frame')
         rows.append(fields(data[pos:pos+size]));pos+=size
     return rows
+
+def latency_samples(path):
+    if not path.exists():return []
+    samples=[]
+    for number,line in enumerate(path.read_text().splitlines(),1):
+        values=line.strip().split(',')
+        if not values or values[0]!='SAMPLES':
+            raise ValueError(f'{path}: invalid latency row {number}')
+        try:samples.extend(map(int,values[1:]))
+        except ValueError as error:raise ValueError(f'{path}: invalid latency value in row {number}') from error
+    return samples
+
+EMITTING_MODES={'ordinary','stack','small','nested','durable','shared-stack','blocked'}
+TRACED_MODES=EMITTING_MODES|{'shared','scoped','fresh'}
+SUM_BATCH_FIELDS={0,2,3,4,7,8,9}
+
+def discover_trials(root,errors):
+    trials=[]
+    for path in sorted(root.glob('*/*')):
+        if not path.is_dir() or path.parent.name.startswith('pilot'):continue
+        stats_path=path/'stats.json'
+        if stats_path.is_file():
+            trials.append(stats_path)
+        elif any((path/name).exists() for name in
+                 ('runtime-paths.json','pid','commands.jsonl','detach.txt')):
+            errors.append(f'{path}: started trial has no stats.json')
+    if not trials and not errors:errors.append(f'{root}: no completed trials found')
+    return trials
+
+def message_blocks(text,name):
+    blocks=[]
+    for match in re.finditer(r'\b'+re.escape(name)+r'\s*\{',text):
+        start=match.end();depth=1;pos=start
+        while pos<len(text) and depth:
+            if text[pos]=='{':depth+=1
+            elif text[pos]=='}':depth-=1
+            pos+=1
+        if depth:return blocks,False
+        blocks.append(text[start:pos-1])
+    return blocks,True
+
+def validate_batches(stats,result,directory,errors):
+    bursts=stats.get('bursts')
+    calls_per_batch=stats.get('burst_calls')
+    if bursts is not None and calls_per_batch is not None:
+        try:
+            if result[0]!=int(bursts)*int(calls_per_batch):
+                errors.append(f'{directory}: aggregate call count disagrees with bursts')
+        except (TypeError,ValueError):
+            errors.append(f'{directory}: invalid burst metadata')
+    path=directory/'batches.json'
+    if not path.exists():return
+    try:
+        batches=json.loads(path.read_text())
+        if not isinstance(batches,list) or not batches:
+            raise ValueError('batch list must be nonempty')
+        for index,batch in enumerate(batches):
+            if not isinstance(batch,list) or len(batch)!=10:
+                raise ValueError(f'batch {index} must contain ten result fields')
+            batch[:]=list(map(int,batch))
+            if batch[0]<=0 or batch[2]<=0 or batch[3]<0 or batch[5]!=1:
+                errors.append(f'{directory}: invalid target result in batch {index}')
+            if calls_per_batch is not None and batch[0]!=int(calls_per_batch):
+                errors.append(f'{directory}: batch {index} call count disagrees with burst_calls')
+            if batch[1]!=int(stats['workers']):
+                errors.append(f'{directory}: batch {index} worker count disagrees with stats')
+        expected_batches=stats.get('batch_samples',bursts)
+        if expected_batches is not None and len(batches)!=int(expected_batches):
+            errors.append(f'{directory}: batches.json count disagrees with stats')
+        aggregate=[sum(batch[i] for batch in batches) if i in SUM_BATCH_FIELDS
+                   else max(batch[i] for batch in batches) for i in range(10)]
+        if aggregate!=result:
+            errors.append(f'{directory}: batches.json aggregate disagrees with stats result')
+    except (ValueError,TypeError,KeyError,json.JSONDecodeError) as error:
+        errors.append(f'{directory}: invalid batches.json: {error}')
+
+def validate_trial_files(stats,mode,directory,events,errors):
+    event_path=directory/'events.pb'
+    if mode in EMITTING_MODES and not event_path.is_file():
+        errors.append(f'{directory}: missing events.pb for emitting mode {mode}')
+    detach_path=directory/'detach.txt'
+    if mode in TRACED_MODES:
+        if not detach_path.is_file():
+            errors.append(f'{directory}: missing detach.txt for traced mode {mode}')
+        else:
+            detached=detach_path.read_text()
+            probe_blocks,complete=message_blocks(detached,'probes')
+            expected_probes=1 if mode=='fresh' else 2
+            if not complete:errors.append(f'{directory}: malformed detached probe block')
+            if len(probe_blocks)<expected_probes:
+                errors.append(f'{directory}: expected at least {expected_probes} detached probes, found {len(probe_blocks)}')
+            if any('original_bytes_restored: true' not in block for block in probe_blocks):
+                errors.append(f'{directory}: each detached probe must confirm byte restoration')
+            callback_errors=list(map(int,re.findall(r'callback_errors:\s*(\d+)',detached)))
+            if any(callback_errors):errors.append(f'{directory}: detach evidence reports callback errors')
+    if event_path.is_file():
+        if 'event_count' in stats and int(stats['event_count'])!=len(events):
+            errors.append(f'{directory}: event_count disagrees with events.pb')
+        if 'event_bytes' in stats:
+            actual_bytes=event_path.stat().st_size-4*len(events)
+            if int(stats['event_bytes'])!=actual_bytes:
+                errors.append(f'{directory}: event_bytes disagrees with events.pb')
 
 def quantile(values,q):
     values=sorted(values)
@@ -56,15 +168,22 @@ def main():
     if any((output/name).exists() for name in ('analysis.json','samples.csv')):
         p.error('analysis output already exists; choose a fresh output directory')
     output.mkdir(parents=True,exist_ok=True)
-    rows=[];groups=defaultdict(list);cold=defaultdict(list);errors=[]
-    for path in sorted(a.root.glob('*/*/stats.json')):
+    rows=[];groups=defaultdict(list);cold=defaultdict(list);pooled_latency=defaultdict(list);errors=[]
+    for path in discover_trials(a.root,errors):
         campaign=path.parent.parent.name
         if campaign.startswith('pilot'):continue
         s=json.loads(path.read_text());d=path.parent
         rev,mode,workers=s['revision'],s['mode'],s['workers'];v=list(map(int,s['result']))
+        if len(v)!=10:
+            errors.append(f'{d}: result must contain ten fields')
+            continue
         n,_,wall,cpu,checksum,valid,rss,faults,vol,ivol=v
-        assert valid==1
-        events=frames(d/'events.pb')
+        if n<=0 or wall<=0 or valid!=1:
+            errors.append(f'{d}: invalid aggregate target result')
+        validate_batches(s,v,d,errors)
+        events_path=d/'events.pb'
+        events=frames(events_path)
+        validate_trial_files(s,mode,d,events,errors)
         snapshots=[f for f in events if f.get(20)]
         detached=(d/'detach.txt').read_text() if (d/'detach.txt').exists() else ''
         probe_map={int(i):symbol for i,symbol in re.findall(r'probes \{\s+id: (\d+).*?symbol: "([^"]+)"',detached,re.S)}
@@ -87,9 +206,15 @@ def main():
         ordinary=mode in ('ordinary','stack')
         roots=s.get('bursts',1)
         expected=2*(n+roots) if ordinary else (n+roots if mode in ('small','nested','durable','shared-stack','blocked') else 0)
-        lat=[]
-        if (d/'latencies.csv').exists():
-            lat=list(map(int,(d/'latencies.csv').read_text().strip().split(',')[1:]))
+        if ordinary:
+            if s.get('watch_rc') is not None and int(s['watch_rc'])!=0:
+                errors.append(f'{d}: ordinary event watcher exited with {s["watch_rc"]}')
+            if len(measured_events)!=expected:
+                errors.append(f'{d}: received {len(measured_events)} of {expected} expected ordinary events')
+            if max([f.get(12,[0])[0] for f in events]+[0])>0:
+                errors.append(f'{d}: ordinary events report agent-side drops')
+        lat=latency_samples(d/'latencies.csv')
+        pooled_latency[(campaign,rev,mode,workers)].extend(lat)
         commands=[json.loads(line) for line in (d/'commands.jsonl').read_text().splitlines()]
         batch_details_saved=(d/'batches.json').exists()
         batches=json.loads((d/'batches.json').read_text()) if batch_details_saved else [v]
@@ -121,7 +246,7 @@ def main():
         for metric in ['wall_ns_per_call','cpu_ns_per_call','throughput_calls_s','target_rss_kib','peak_rss_kib',
                        'server_rss_kib','received','measured_received','measured_snapshots','capture_fraction']:
             row[metric]=distribution([v[metric] for v in items if v[metric] is not None])
-        row['pooled_latency_ns']=distribution([x for item in items for x in (list(map(int,(a.root/item['campaign']/item['trial']/'latencies.csv').read_text().strip().split(',')[1:])) if (a.root/item['campaign']/item['trial']/'latencies.csv').exists() else [])])
+        row['pooled_latency_ns']=distribution(pooled_latency[key])
         row['independent_processes']=len(items)
         row['timed_batches']=sum(item['timed_batches'] for item in items)
         row['recorded_batch_samples']=sum(len(item['batch_wall_ns_per_call']) for item in items)
