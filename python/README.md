@@ -193,6 +193,12 @@ Ctrl-C clears an input or cancels a live stream, returning to the prompt. EOF,
 shell command execution. Color-capable terminals show keywords, options, quoted
 strings and numbers in different colors; the standard `NO_COLOR` setting is respected.
 
+Console results use readable summaries for server status, sessions and probes.
+Trace events show PRE/POST phase and call identifiers, named arguments, captured
+object fields, return values when present, and stack frames. Drop counters and
+capture problems remain visible. The Python API still returns complete generated
+Protobuf messages; this display formatting changes neither the API nor recordings.
+
 ## Development
 
 ```sh

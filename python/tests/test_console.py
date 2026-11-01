@@ -72,6 +72,29 @@ def test_server_commands_share_python_runtime():
     client.shutdown_server.assert_called_once_with(timeout=4.0)
 
 
+def test_emit_formats_protobuf_messages_for_people(monkeypatch):
+    from clang_tracer import console as console_module
+
+    captured = {}
+    monkeypatch.setattr(
+        console_module,
+        "print_formatted_text",
+        lambda formatted, **_kwargs: captured.update(
+            text="".join(t for _, t in formatted)
+        ),
+    )
+    console = Console(Mock(), output=DummyOutput())
+    console.emit(
+        pb.TraceEvent(
+            phase=pb.POST, sequence=8, result=pb.Value(type=pb.INT32, signed_value=0)
+        )
+    )
+    assert "trace POST" in captured["text"]
+    assert "sequence=8" in captured["text"]
+    assert "result int32 0" in captured["text"]
+    assert "phase: POST" not in captured["text"]
+
+
 def test_bad_use_preserves_selection():
     client = Mock()
     client.list_sessions.return_value = [pb.Session(id="s2", state=pb.Session.DETACHED)]

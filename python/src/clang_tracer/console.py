@@ -2,13 +2,11 @@
 
 import argparse
 import sys
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import grpc
 from google.protobuf import text_format
-from google.protobuf.message import Message
 from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.completion import NestedCompleter
 from prompt_toolkit.formatted_text import FormattedText
@@ -23,6 +21,7 @@ from .command import (
     CommandValidator,
     parse_command,
 )
+from .display import render
 from .proto import tracer_pb2 as pb
 
 HELP = """server start [--executable PATH] [--agent PATH] [--timeout SECONDS]
@@ -56,6 +55,11 @@ STYLE = Style.from_dict(
         "comment": "italic ansibrightblack",
         "error": "ansired",
         "prompt": "bold ansicyan",
+        "heading": "bold ansicyan",
+        "label": "bold",
+        "ok": "ansigreen",
+        "warning": "ansiyellow",
+        "muted": "ansibrightblack",
     }
 )
 
@@ -67,14 +71,8 @@ class Console:
         self.output = output
 
     def emit(self, value: Any, *, error: bool = False) -> None:
-        if isinstance(value, Message):
-            text = text_format.MessageToString(value).rstrip()
-        elif hasattr(value, "__dataclass_fields__"):
-            text = str(asdict(value))
-        else:
-            text = str(value)
         print_formatted_text(
-            FormattedText([("class:error" if error else "", text)]),
+            render(value, error=error),
             style=STYLE,
             output=self.output,
         )
