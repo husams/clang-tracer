@@ -258,10 +258,15 @@ static_assert(sizeof(shared_invocations) <=
 template <class T>
 void copy_shared_value(T &destination, const T &source) noexcept {
   static_assert(std::is_trivially_copyable_v<T>);
+#if defined(__clang__)
+  // Keep the complete object copy inline, without an interposable memcpy call.
+  __builtin_memcpy_inline(&destination, &source, sizeof(T));
+#else
   auto *out = reinterpret_cast<volatile unsigned char *>(&destination);
   const auto *in = reinterpret_cast<const volatile unsigned char *>(&source);
   for (std::size_t i = 0; i < sizeof(T); ++i)
     out[i] = in[i];
+#endif
 }
 
 // Symbolization may allocate or take metadata locks. Shared hooks only select
