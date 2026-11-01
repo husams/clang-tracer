@@ -229,19 +229,14 @@ if(BUILD_TESTING)
       --callback ${CMAKE_CURRENT_SOURCE_DIR}/examples/trace_callback.cpp
       --output-dir ${CMAKE_CURRENT_BINARY_DIR}/cpp-name-test-results)
   set_tests_properties(grpc_cpp_name_integration PROPERTIES TIMEOUT 180)
+  configure_file(tests/installed_class_interceptor.cmake.in
+    installed_class_interceptor.cmake.in @ONLY)
+  file(GENERATE
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/installed_class_interceptor-$<CONFIG>.cmake
+    INPUT ${CMAKE_CURRENT_BINARY_DIR}/installed_class_interceptor.cmake.in)
   add_test(NAME grpc_class_interceptor_integration
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/class_interceptor_integration.py
-      --server $<TARGET_FILE:clang-tracer-server>
-      --client $<TARGET_FILE:clang-tracer>
-      --agent $<TARGET_FILE:clang_tracer_agent>
-      --target $<TARGET_FILE:trace-target>
-      --threaded-target $<TARGET_FILE:trace-threaded-target>
-      --protoc $<TARGET_FILE:protobuf::protoc>
-      --proto ${CMAKE_CURRENT_SOURCE_DIR}/proto/tracer.proto
-      --compdb ${CMAKE_CURRENT_BINARY_DIR}
-      --source ${CMAKE_CURRENT_SOURCE_DIR}/examples/target.cpp
-      --threaded-source ${CMAKE_CURRENT_SOURCE_DIR}/examples/threaded_target.cpp
-      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/class-interceptor-results)
+    COMMAND ${CMAKE_COMMAND} -P
+      ${CMAKE_CURRENT_BINARY_DIR}/installed_class_interceptor-$<CONFIG>.cmake)
   set_tests_properties(grpc_class_interceptor_integration PROPERTIES TIMEOUT 360)
   add_executable(typed-this-fixture tests/typed_this_fixture.cpp)
   set_target_properties(typed-this-fixture PROPERTIES ENABLE_EXPORTS ON)

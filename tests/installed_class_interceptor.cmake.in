@@ -1,0 +1,33 @@
+# Exercise the deployed runtime so missing private compiler headers cannot be
+# hidden by the source tree used to build the agent.
+set(stage "@CMAKE_CURRENT_BINARY_DIR@/class-interceptor-install-$<CONFIG>")
+file(REMOVE_RECURSE "${stage}")
+execute_process(
+  COMMAND "@CMAKE_COMMAND@" -E env "DESTDIR=${stage}"
+    "@CMAKE_COMMAND@" --install "@CMAKE_CURRENT_BINARY_DIR@" --config "$<CONFIG>"
+  RESULT_VARIABLE install_result
+  OUTPUT_VARIABLE install_output
+  ERROR_VARIABLE install_error)
+file(WRITE "@CMAKE_CURRENT_BINARY_DIR@/class-interceptor-install.log"
+  "${install_output}${install_error}")
+if(NOT install_result EQUAL 0)
+  message(FATAL_ERROR "Runtime installation failed: ${install_error}")
+endif()
+execute_process(
+  COMMAND "@Python3_EXECUTABLE@"
+    "@CMAKE_CURRENT_SOURCE_DIR@/tests/class_interceptor_integration.py"
+    --server "${stage}@CMAKE_INSTALL_FULL_BINDIR@/clang-tracer-server"
+    --client "${stage}@CMAKE_INSTALL_FULL_BINDIR@/clang-tracer"
+    --agent "${stage}@CMAKE_INSTALL_FULL_LIBDIR@/libclang_tracer_agent.so"
+    --target "$<TARGET_FILE:trace-target>"
+    --threaded-target "$<TARGET_FILE:trace-threaded-target>"
+    --protoc "$<TARGET_FILE:protobuf::protoc>"
+    --proto "${stage}@CMAKE_INSTALL_FULL_DATADIR@/clang-tracer/proto/tracer.proto"
+    --compdb "@CMAKE_CURRENT_BINARY_DIR@"
+    --source "@CMAKE_CURRENT_SOURCE_DIR@/examples/target.cpp"
+    --threaded-source "@CMAKE_CURRENT_SOURCE_DIR@/examples/threaded_target.cpp"
+    --output-dir "@CMAKE_CURRENT_BINARY_DIR@/class-interceptor-results"
+  RESULT_VARIABLE test_result)
+if(NOT test_result EQUAL 0)
+  message(FATAL_ERROR "Installed class interceptor integration failed: ${test_result}")
+endif()

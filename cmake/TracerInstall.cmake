@@ -52,7 +52,8 @@ if(TARGET tracer_context_stdlib)
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Runtime)
 endif()
 install(FILES src/context_facade.hpp src/context_analysis.hpp src/context_execution.hpp
-  src/context_engine.hpp src/context_codec.hpp src/bounded_proto.hpp src/bounded_proto.cpp
+  src/context_engine.hpp src/context_codec.hpp src/context_schema.hpp
+  src/bounded_proto.hpp src/bounded_proto.cpp
   DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer/context" COMPONENT Runtime)
 install(DIRECTORY include/tracer
   DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer/context" COMPONENT Runtime)

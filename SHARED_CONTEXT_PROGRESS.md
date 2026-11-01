@@ -2,13 +2,13 @@
 
 Specification: [shared-context design, revision 52](https://chatgpt.com/space/page_6fcc0f77babc819197120f600e001777).
 Worktree: `4916`, based on `2418d9be2f8facbe2eb4ccfed9ab0c679700f70e`.
-Delivery branch: `codex/shared-context`; commit and push are authorized.
-No merge, installation or deployment is included.
+The feature was merged into `main` at `841503d`. Installed-runtime validation
+and its packaging follow-up are recorded below.
 
 ## Current status
 
 All implementation milestones and acceptance checks are complete. The final
-coherent Linux build passes **18/18** tests together (**355.57 seconds**), including
+coherent Linux build passes **18/18** tests together (**190.88 seconds**, two jobs), including
 the complete native shared-context aggregate and live class integration. The
 latest full local macOS build passes **4/4** tests. Focused native two-recording
 durable-delivery and typed-query executables also pass.
@@ -81,3 +81,30 @@ Historical checkpoints are archived in the ignored validation artifact directory
 `build-linux-results/2026-11-01-shared-context/progress-history.md`.
 The final build, complete CTest output, live integration reports and focused
 delivery/query results are retained beside that history.
+
+## Installed-runtime validation
+
+The Linux runtime was rebuilt from merged `main` and installed under
+`/usr/local`. Testing the installed client, server and agent exposed a missing
+private compiler header: `context_codec.hpp` includes `context_schema.hpp`,
+which was absent from the runtime installation. The install now includes that
+header. The existing live class integration stages and uses an installed
+runtime, so the same omission is covered by the normal 18-test suite.
+The complete Linux suite passes all 18 tests in 190.88 seconds with two jobs;
+the installed class integration passes in 126.00 seconds.
+
+With the corrected package, the installed Linux runtime passed the full live
+class integration, including shared-state mutation, typed event decoding,
+pthread propagation and drain, entry stacks, contained PRE failures, native
+exceptions, durable restart and resumed text viewing. The installed server also
+started and answered the CLI without an explicit agent path. Installed binary
+build IDs and the private schema header match the validated build.
+
+The macOS portable build passed all four tests with local network delivery
+enabled (90.10 seconds). A full native configuration rejects macOS with
+`The native tracing backend requires Linux x86_64`; there is no macOS native
+runtime install or live-activation backend in this implementation.
+
+Deployment logs are retained under
+`build-live-final/install-validation/` on `linux-dev`, with local copies under
+`build-linux-results/2026-11-01-install-main/`.
