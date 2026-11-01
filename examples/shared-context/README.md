@@ -9,11 +9,23 @@ request state, including on the worker thread.
 | --- | --- |
 | [target.cpp](target.cpp) | Ordinary application code; no tracer dependency. |
 | [interceptor.cpp](interceptor.cpp) | Commented state declaration and PRE/POST hooks. |
+| [example-output.txt](example-output.txt) | Recorded worker and outer POST snapshots showing both APIs. |
 
 The outer PRE starts the state with `calls = 1`. The worker PRE changes it to
 `2`. Each POST publishes a snapshot; the outer POST finishes the request scope.
 The next request starts with fresh state. `std::thread` uses `pthread_create`
 on this Linux profile, so propagation happens automatically.
+
+The POST hook demonstrates two different operations:
+
+| API | What it does here |
+| --- | --- |
+| `call.field("hook_result", result)` | Adds one named scalar to this call's metadata. |
+| `call.context().event("request.step")` | Publishes a named snapshot of the visible request state. |
+
+The field is recorded before the snapshot. Both trace commands below enable
+`--callback-print-arguments true`, so the context event also carries the
+recorded `hook_result` field. The shared-state fields are captured by `event()`.
 
 ## Run manually
 
@@ -54,10 +66,12 @@ agent and private shared-context runtime automatically.
 clang-tracer attach "$target_pid"
 
 clang-tracer trace "$target_pid" 'process_request(int)' \
-  --callback "$PWD/examples/shared-context/interceptor.cpp"
+  --callback "$PWD/examples/shared-context/interceptor.cpp" \
+  --callback-print-arguments true
 
 clang-tracer trace "$target_pid" 'calculate_total(int)' \
-  --callback "$PWD/examples/shared-context/interceptor.cpp"
+  --callback "$PWD/examples/shared-context/interceptor.cpp" \
+  --callback-print-arguments true
 ```
 
 The target was built with debug information and without optimization. The CLI
@@ -76,6 +90,11 @@ tail -n 5 "$run_dir/target.log"
 Look for `request.step` events. For request `2`, the worker snapshot has
 `calls = 2, last_result = 4`; the outer snapshot has
 `calls = 2, last_result = 5`. The target prints `request=2 result=5`.
+Each event header also shows `fields=[hook_result=int32:4]` for the worker or
+`fields=[hook_result=int32:5]` for the outer call. This is the value recorded by
+`call.field()`, separate from the `RequestState.last_result` snapshot field.
+The [recorded sample output](example-output.txt) shows this pair from the verified
+`linux-dev` run, including the complete headers and all three state fields.
 Early snapshots may have `calls = 1` while only the first probe was installed.
 After both are active, each complete request visits both hooks.
 

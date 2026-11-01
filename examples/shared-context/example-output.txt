@@ -1,0 +1,18 @@
+# Excerpt from a verified linux-dev run; IDs vary between runs.
+
+# Worker POST: calculate_total(2) returns 4.
+cursor=2 pid=3279244 tid=- probe=8813050813604179597 this=- args=[int32:2] fields=[hook_result=int32:4] phase=post call=1 lost(agent=0,server=0)
+  shared-context event=request.step epoch=1 states=1
+    RequestState@201935f390b444a5a87042db4f785110.request_id [revision=88d68c3d739d7907] =int32:2
+    RequestState@201935f390b444a5a87042db4f785110.calls [revision=88d68c3d739d7907] =int32:2
+    RequestState@201935f390b444a5a87042db4f785110.last_result [revision=88d68c3d739d7907] =int32:4
+
+# Outer POST: process_request(2) returns 5.
+cursor=3 pid=3279244 tid=- probe=8813050813604179596 this=- args=[int32:2] fields=[hook_result=int32:5] phase=post call=2 lost(agent=0,server=0)
+  shared-context event=request.step epoch=1 states=1
+    RequestState@201935f390b444a5a87042db4f785110.request_id [revision=88d68c3d739d7907] =int32:2
+    RequestState@201935f390b444a5a87042db4f785110.calls [revision=88d68c3d739d7907] =int32:2
+    RequestState@201935f390b444a5a87042db4f785110.last_result [revision=88d68c3d739d7907] =int32:5
+
+# The target's own output:
+request=2 result=5
