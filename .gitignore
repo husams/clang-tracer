@@ -1,6 +1,7 @@
 /build*/
 /.cache/
 /test-results/
+/benchmark-results/
 /server-test-results/
 /client-test-results/
 /threaded-test-results/
