@@ -317,7 +317,54 @@ bool valid_loopback_uri(const std::string &uri) {
   }
 }
 
+int hex_value(char value) {
+  if (value >= '0' && value <= '9')
+    return value - '0';
+  if (value >= 'a' && value <= 'f')
+    return value - 'a' + 10;
+  if (value >= 'A' && value <= 'F')
+    return value - 'A' + 10;
+  return -1;
+}
+
+std::string encode_symbol_page_token(
+    const clangtracer::v1::ListSymbolsPageToken &token) {
+  std::string serialized;
+  if (!token.SerializeToString(&serialized))
+    throw std::runtime_error("cannot encode symbol page token");
+  constexpr char digits[] = "0123456789abcdef";
+  std::string result;
+  result.reserve(serialized.size() * 2);
+  for (const unsigned char byte : serialized) {
+    result.push_back(digits[byte >> 4]);
+    result.push_back(digits[byte & 0x0f]);
+  }
+  return result;
+}
+
+bool decode_symbol_page_token(
+    const std::string &encoded,
+    clangtracer::v1::ListSymbolsPageToken *token) {
+  if (encoded.empty() || encoded.size() > 65536 || encoded.size() % 2 != 0)
+    return false;
+  std::string serialized;
+  serialized.reserve(encoded.size() / 2);
+  for (std::size_t i = 0; i < encoded.size(); i += 2) {
+    const int high = hex_value(encoded[i]);
+    const int low = hex_value(encoded[i + 1]);
+    if (high < 0 || low < 0)
+      return false;
+    serialized.push_back(static_cast<char>((high << 4) | low));
+  }
+  return token->ParseFromString(serialized);
+}
+
 class EventHub final {
+  struct ProbeIdentity {
+    std::uint32_t pid = 0;
+    std::string function_name;
+  };
+
 public:
   explicit EventHub(std::string path) : path_(std::move(path)) {
     if (path_.size() >= sizeof(((sockaddr_un *)nullptr)->sun_path)) {
@@ -345,24 +392,32 @@ public:
   const std::string &path() const { return path_; }
 
   void set_probe(const std::string &session_id, std::uint64_t probe_id,
-                 std::uint32_t pid, bool active) {
+                 std::uint32_t pid, std::string function_name, bool active) {
     std::lock_guard lock(mutex_);
     const auto key = std::make_pair(session_id, probe_id);
     if (active) {
-      active_probes_[key] = pid;
+      const auto existing = active_probes_.find(key);
+      if (existing != active_probes_.end()) {
+        function_name = existing->second.function_name;
+      } else if (const auto known = known_probes_.find(key);
+                 known != known_probes_.end()) {
+        function_name = known->second.function_name;
+      }
+      ProbeIdentity identity{pid, std::move(function_name)};
+      active_probes_[key] = identity;
       constexpr std::size_t kKnownProbeLimit = 4096;
       bool retain_probe_identity = true;
-      if (!known_probe_pids_.contains(key) &&
-          known_probe_pids_.size() >= kKnownProbeLimit) {
-        const auto stale = std::find_if(known_probe_pids_.begin(), known_probe_pids_.end(),
+      if (!known_probes_.contains(key) &&
+          known_probes_.size() >= kKnownProbeLimit) {
+        const auto stale = std::find_if(known_probes_.begin(), known_probes_.end(),
             [&](const auto &entry) { return !active_probes_.contains(entry.first); });
-        if (stale != known_probe_pids_.end())
-          known_probe_pids_.erase(stale);
+        if (stale != known_probes_.end())
+          known_probes_.erase(stale);
         else
           retain_probe_identity = false;
       }
       if (retain_probe_identity)
-        known_probe_pids_[key] = pid;
+        known_probes_[key] = std::move(identity);
       received_.try_emplace(key, 0);
     } else {
       active_probes_.erase(key);
@@ -545,14 +600,14 @@ public:
       return drop();
     event.mutable_context()->CopyFrom(envelope);
 
-    const std::size_t charge = event.ByteSizeLong();
     std::lock_guard lock(mutex_);
     const auto key = std::make_pair(session_id, probe_id);
-    auto known = known_probe_pids_.find(key);
-    if (known == known_probe_pids_.end()) {
+    auto known = known_probes_.find(key);
+    if (known == known_probes_.end()) {
       const auto active = active_probes_.find(key);
       if (active != active_probes_.end()) {
-        event.set_pid(active->second);
+        event.set_pid(active->second.pid);
+        event.set_function_name(active->second.function_name);
       } else if (verified_native_pid != 0) {
         // The collector may have restarted and lost its in-memory mapping.
         // The engine-supplied PID is accepted only while its process start
@@ -563,8 +618,10 @@ public:
         return true;
       }
     } else {
-      event.set_pid(known->second);
+      event.set_pid(known->second.pid);
+      event.set_function_name(known->second.function_name);
     }
+    const std::size_t charge = event.ByteSizeLong();
     if (charge > kRetainedContextBytesLimit) {
       ++dropped_;
       return true;
@@ -624,6 +681,8 @@ public:
               grpc::ServerWriter<clangtracer::v1::TraceEvent> *writer) {
     std::set<std::string> filter(request->session_ids().begin(),
                                  request->session_ids().end());
+    std::set<std::string> name_filter(request->names().begin(),
+                                      request->names().end());
     std::uint64_t cursor = request->after_sequence();
     for (;;) {
       std::vector<clangtracer::v1::TraceEvent> batch;
@@ -643,7 +702,13 @@ public:
               filter.empty() || filter.count(event.session_id()) != 0;
           const bool pid_matches =
               request->pid() == 0 || event.pid() == request->pid();
-          if (session_matches && pid_matches) {
+          const bool name_matches = name_filter.empty() ||
+              std::any_of(name_filter.begin(), name_filter.end(), [&](const auto &name) {
+                return event.function_name() == name ||
+                       (event.has_context() && event.context().has_event() &&
+                        event.context().event().name() == name);
+              });
+          if (session_matches && pid_matches && name_matches) {
             const auto bytes = event.ByteSizeLong();
             if (!batch.empty() && batch_bytes + bytes > 32 * 1024 * 1024)
               break;
@@ -691,8 +756,8 @@ private:
   std::atomic<bool> stopping_{false};
   std::mutex mutex_;
   std::condition_variable changed_;
-  std::map<std::pair<std::string, std::uint64_t>, std::uint32_t> active_probes_;
-  std::map<std::pair<std::string, std::uint64_t>, std::uint32_t> known_probe_pids_;
+  std::map<std::pair<std::string, std::uint64_t>, ProbeIdentity> active_probes_;
+  std::map<std::pair<std::string, std::uint64_t>, ProbeIdentity> known_probes_;
   std::map<std::pair<std::string, std::uint64_t>, std::uint64_t> received_;
   std::deque<clangtracer::v1::TraceEvent> history_;
   std::size_t context_bytes_ = 0;
@@ -856,11 +921,17 @@ private:
       }
       if (!valid_phase)
         continue;
+      // Function names are assigned by the server from the registered ProbeSpec.
+      if (!event.function_name().empty())
+        continue;
       std::lock_guard lock(mutex_);
       const auto active =
           active_probes_.find({event.session_id(), event.probe_id()});
-      if (active == active_probes_.end() || active->second != event.pid())
+      if (active == active_probes_.end() || active->second.pid != event.pid())
         continue;
+      // Function identity comes from the registered probe, not the agent packet.
+      event.clear_function_name();
+      event.set_function_name(active->second.function_name);
       ++received_[active->first];
       event.set_sequence(next_sequence_++);
       if (history_.size() == kEventHistoryLimit) {
@@ -1035,7 +1106,15 @@ public:
       pending_probe_id = next_probe_id_.fetch_add(1);
       if (pending_probe_id == 0)
         pending_probe_id = next_probe_id_.fetch_add(1);
-      events_.set_probe(session->id(), pending_probe_id, session->pid(), true);
+      const auto &spec = request->spec();
+      const auto &selector = spec.debug_info().selector();
+      const auto function_name =
+          spec.has_debug_info() && !selector.empty() && selector.size() <= 4096 &&
+                  selector.find('\0') == std::string::npos
+              ? selector
+              : spec.symbol();
+      events_.set_probe(session->id(), pending_probe_id, session->pid(),
+                        function_name, true);
       const auto lineage = admit_probe_package(request->spec());
       if (!lineage.retained) {
         std::cerr << "clang-tracer: shared-context source lineage isolated: "
@@ -1133,10 +1212,133 @@ public:
     return grpc::Status::OK;
   }
 
+  grpc::Status ListSymbols(
+      grpc::ServerContext *context,
+      const clangtracer::v1::ListSymbolsRequest *request,
+      clangtracer::v1::ListSymbolsResponse *response) override {
+    if (request->session_id().empty() || request->session_id().size() > 128 ||
+        request->session_id().find('\0') != std::string::npos ||
+        request->query().size() > 4096 || request->query().find('\0') != std::string::npos ||
+        request->module().size() > 4096 || request->module().find('\0') != std::string::npos ||
+        request->page_token().size() > 65536 ||
+        request->page_token().find('\0') != std::string::npos) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "invalid symbol listing request"};
+    }
+    const std::size_t page_size = request->page_size() == 0 ? 100 : request->page_size();
+    if (page_size > 500) {
+      return {grpc::StatusCode::INVALID_ARGUMENT,
+              "symbol page size must be between 1 and 500"};
+    }
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    session->refresh_process_state();
+    if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED) {
+      return {grpc::StatusCode::FAILED_PRECONDITION,
+              "symbol listing requires a live attached session"};
+    }
+    const auto process_start = session->process_start_time();
+    try {
+      if (Session::ProcessStartTime(session->pid()) != process_start) {
+        session->refresh_process_state();
+        return {grpc::StatusCode::FAILED_PRECONDITION,
+                "target process exited or PID was reused"};
+      }
+    } catch (const std::exception &error) {
+      return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
+    }
+
+    clangtracer::v1::ListSymbolsPageToken continuation;
+    if (!request->page_token().empty()) {
+      if (!decode_symbol_page_token(request->page_token(), &continuation) ||
+          continuation.session_id() != request->session_id() ||
+          continuation.pid() != session->pid() ||
+          continuation.process_start_time() != process_start ||
+          continuation.query() != request->query() ||
+          continuation.module() != request->module() ||
+          continuation.page_size() != page_size ||
+          continuation.mapping_fingerprint().empty()) {
+        return {grpc::StatusCode::INVALID_ARGUMENT,
+                "invalid or mismatched symbol page token"};
+      }
+    }
+
+    try {
+      const auto page = client::list_debug_symbols(
+          session->pid(), request->query(), request->module(), page_size,
+          continuation.last_selector(), continuation.last_linkage_symbol(),
+          continuation.last_module_path(), continuation.mapping_fingerprint(),
+          [&] { return context->IsCancelled(); });
+      if (page.cancelled || context->IsCancelled())
+        return {grpc::StatusCode::CANCELLED, "symbol discovery cancelled"};
+      session->refresh_process_state();
+      if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED) {
+        return {grpc::StatusCode::FAILED_PRECONDITION,
+                "target process exited during symbol discovery"};
+      }
+      try {
+        if (Session::ProcessStartTime(session->pid()) != process_start) {
+          session->refresh_process_state();
+          return {grpc::StatusCode::FAILED_PRECONDITION,
+                  "target process exited or PID was reused during symbol discovery"};
+        }
+      } catch (const std::exception &error) {
+        session->refresh_process_state();
+        return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
+      }
+      for (const auto &item : page.symbols) {
+        auto *symbol = response->add_symbols();
+        symbol->set_selector(item.selector);
+        symbol->set_linkage_symbol(item.linkage_symbol);
+        symbol->set_module_path(item.module_path);
+      }
+      if (page.has_more && !page.symbols.empty()) {
+        continuation.set_session_id(request->session_id());
+        continuation.set_pid(session->pid());
+        continuation.set_process_start_time(process_start);
+        continuation.set_query(request->query());
+        continuation.set_module(request->module());
+        continuation.set_page_size(page_size);
+        continuation.set_mapping_fingerprint(page.mapping_fingerprint);
+        continuation.set_last_selector(page.symbols.back().selector);
+        continuation.set_last_linkage_symbol(page.symbols.back().linkage_symbol);
+        continuation.set_last_module_path(page.symbols.back().module_path);
+        response->set_next_page_token(encode_symbol_page_token(continuation));
+      }
+      if (response->ByteSizeLong() > 8 * 1024 * 1024) {
+        return {grpc::StatusCode::RESOURCE_EXHAUSTED,
+                "symbol page exceeds the 8 MiB response budget; reduce page size"};
+      }
+      return grpc::Status::OK;
+    } catch (const std::invalid_argument &error) {
+      const std::string detail = error.what();
+      if (detail.find("mapped images changed") != std::string::npos) {
+        return {grpc::StatusCode::ABORTED, detail};
+      }
+      return {grpc::StatusCode::INVALID_ARGUMENT, detail};
+    } catch (const std::exception &error) {
+      const std::string detail = error.what();
+      if (detail.find("work limit exceeded") != std::string::npos) {
+        return {grpc::StatusCode::RESOURCE_EXHAUSTED, detail};
+      }
+      return status_for(error);
+    }
+  }
+
   grpc::Status WatchEvents(
       grpc::ServerContext *context,
       const clangtracer::v1::WatchEventsRequest *request,
       grpc::ServerWriter<clangtracer::v1::TraceEvent> *writer) override {
+    if (request->names_size() > 64) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "at most 64 name filters are allowed"};
+    }
+    for (const auto &name : request->names()) {
+      if (name.empty() || name.size() > 4096 || name.find('\0') != std::string::npos) {
+        return {grpc::StatusCode::INVALID_ARGUMENT,
+                "each name filter must be 1 to 4096 bytes without NUL"};
+      }
+    }
     if (!events_.stream(context, request, writer)) {
       return {grpc::StatusCode::OUT_OF_RANGE,
               "event cursor is older than retained history"};
@@ -1236,10 +1438,11 @@ private:
         std::none_of(
             snapshot.probes().begin(), snapshot.probes().end(),
             [&](const auto &probe) { return probe.id() == pending_probe_id; }))
-      events_.set_probe(session->id(), pending_probe_id, session->pid(), false);
+      events_.set_probe(session->id(), pending_probe_id, session->pid(), {}, false);
     for (const auto &probe : snapshot.probes()) {
       if (probe.active())
-        events_.set_probe(probe.session_id(), probe.id(), session->pid(), true);
+        events_.set_probe(probe.session_id(), probe.id(), session->pid(),
+                          probe.symbol(), true);
       else
         (void)events_.retire_probe(probe.session_id(), probe.id(),
                                    session->events_sent(probe.id()),

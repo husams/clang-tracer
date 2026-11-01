@@ -12,6 +12,7 @@ service Tracer {
   rpc RemoveProbe(RemoveProbeRequest) returns (Probe);
   rpc Detach(DetachRequest) returns (Session);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc ListSymbols(ListSymbolsRequest) returns (ListSymbolsResponse);
   rpc WatchEvents(WatchEventsRequest) returns (stream TraceEvent);
 }
 
@@ -185,10 +186,39 @@ message RemoveProbeRequest {
 message DetachRequest { string session_id = 1; }
 message ListSessionsRequest {}
 message ListSessionsResponse { repeated Session sessions = 1; }
+message ListSymbolsRequest {
+  string session_id = 1;
+  string query = 2; // Case-sensitive substring of selector or linkage name.
+  string module = 3; // Case-sensitive substring of mapped ELF module path.
+  uint32 page_size = 4; // Zero selects 100; maximum 500.
+  string page_token = 5; // Opaque continuation token from the previous page.
+}
+message FunctionSymbol {
+  string selector = 1; // Full canonical C++ function or method signature.
+  string linkage_symbol = 2;
+  string module_path = 3;
+}
+message ListSymbolsResponse {
+  repeated FunctionSymbol symbols = 1;
+  string next_page_token = 2;
+}
+message ListSymbolsPageToken {
+  string session_id = 1;
+  uint32 pid = 2;
+  uint64 process_start_time = 3;
+  string query = 4;
+  string module = 5;
+  uint32 page_size = 6;
+  string mapping_fingerprint = 7;
+  string last_selector = 8;
+  string last_linkage_symbol = 9;
+  string last_module_path = 10;
+}
 message WatchEventsRequest {
   repeated string session_ids = 1; // Empty subscribes to all sessions.
   uint64 after_sequence = 2;       // Resume cursor in bounded server history.
   uint32 pid = 3;                  // Optional process filter; survives session loss.
+  repeated string names = 4;       // Exact function or emitted context event names; ORed.
 }
 message Value {
   ValueType type = 1;
@@ -249,4 +279,5 @@ message TraceEvent {
   repeated NamedValue object_fields = 18;
   StackTrace stack = 19;
   clangtracer.context.v1.ContextEventEnvelope context = 20;
+  string function_name = 21; // Bounded registered selector or linkage fallback; server-assigned.
 }
