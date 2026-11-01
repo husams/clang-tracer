@@ -8,6 +8,8 @@ The [Python API and interactive console](python/README.md) support all public
 gRPC operations, C++ interceptor injection, trace streaming/recording, and local
 server lifecycle management. The console uses a Lark grammar and live command
 highlighting; name-based Python injection requires rebuilding this server revision.
+Agents in a source checkout can use `$clang-tracer-python` from
+`.agents/skills/clang-tracer-python/SKILL.md` to operate the Python API.
 Generated validation recordings stay local; see [validation and benchmark notes](docs/validation.md)
 for measured results and reproduction commands.
 

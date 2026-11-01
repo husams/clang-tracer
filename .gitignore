@@ -35,5 +35,8 @@ __pycache__/
 .env.*
 *.pem
 *.key
-/.agents/
+/.agents/*
+!/.agents/skills/
+/.agents/skills/*
+!/.agents/skills/clang-tracer-python/
 /.codex/
