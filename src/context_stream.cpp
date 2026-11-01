@@ -707,7 +707,10 @@ void ContextExportClient::run() noexcept {
         bool is_paused = false;
         {
           std::unique_lock lock(mutex_);
-          cv_.wait_for(lock, 10ms, [&] { return stopping_ || control_fault_; });
+          // Poll while idle or paused, but drain queued packets without an
+          // additional idle interval between writes.
+          if (paused_ || hook_ring_.queued_bytes() == 0)
+            cv_.wait_for(lock, 10ms, [&] { return stopping_ || control_fault_; });
           if (stopping_) {
             const auto deadline = shutdown_deadline_;
             lock.unlock();
