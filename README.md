@@ -180,6 +180,10 @@ is needed to trace an existing supported debug binary.
 
 ## Shared context
 
+Start with the [commented shared-context example](examples/shared-context/README.md)
+for a small target and complete manual run commands. The
+[example index](examples/README.md) groups the other demonstrations by concept.
+
 Class interceptors can inject C++ state, share it across compatible probes and
 publish typed snapshots through the live event stream. See the
 [shared-context guide](docs/shared-context.md) for the `State<T>`, `get()` and
@@ -498,8 +502,8 @@ wrappers remain resident for safe late arrivals.
 The previous C++ function interface,
 `extern "C" long long trace_callback(const TraceContext&)`, remains supported
 for entry-only callbacks; `extern "C"` only specifies linkage. See
-[`examples/trace_callback.cpp`](examples/trace_callback.cpp) for that interface
-and [`examples/interceptor.cpp`](examples/interceptor.cpp) for the class API.
+[`examples/legacy-callbacks/callback.cpp`](examples/legacy-callbacks/callback.cpp) for that interface
+and [`examples/basic-callbacks/interceptor.cpp`](examples/basic-callbacks/interceptor.cpp) for the class API.
 Source code is trusted native code: target memory faults are not isolated, and
 initialization must avoid blocking, spawning threads, or changing loader/runtime
 state during compilation.
@@ -527,7 +531,7 @@ Start `./build/trace-target` and use the PID it prints. Attach and trace its
 ```sh
 ./build/clang-tracer attach PID
 ./build/clang-tracer trace PID 'Fixture::overloaded(int)' \
-  --callback examples/trace_callback.cpp
+  --callback examples/legacy-callbacks/callback.cpp
 ```
 
 `trace` prints the resolved declaration, linker symbol, and probe ID. The
@@ -537,7 +541,7 @@ be selected by name too:
 
 ```sh
 ./build/clang-tracer trace PID 'traced_work(int)' \
-  --callback examples/trace_callback.cpp
+  --callback examples/legacy-callbacks/callback.cpp
 ```
 
 Read events continuously (stop with Ctrl-C), or set a count or timeout:

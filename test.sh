@@ -37,7 +37,7 @@ CPP
 
 # Clang resolves the method and signature from the original source.
 ./build/clang-tracer trace "$target_pid" 'Fixture::overloaded(int)' \
-  --source examples/target.cpp \
+  --source tests/fixtures/target.cpp \
   --callback "$run_dir/callback.cpp"
 
 # Display five readable events.

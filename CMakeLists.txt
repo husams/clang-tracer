@@ -86,12 +86,17 @@ include(cmake/TracerInstall.cmake)
 
 option(TRACER_BUILD_EXAMPLES "Build example target programs" ON)
 if(TRACER_BUILD_EXAMPLES OR BUILD_TESTING)
-add_executable(trace-target examples/target.cpp)
+add_executable(trace-target tests/fixtures/target.cpp)
 set_target_properties(trace-target PROPERTIES ENABLE_EXPORTS ON)
 target_compile_options(trace-target PRIVATE -O0 -fno-omit-frame-pointer -fcf-protection=none)
 
 add_executable(cpp-interceptors-target examples/cpp-interceptors/target.cpp)
 target_compile_options(cpp-interceptors-target PRIVATE -g -O0 -fno-omit-frame-pointer
+  -fcf-protection=none)
+
+add_executable(shared-context-target examples/shared-context/target.cpp)
+target_link_libraries(shared-context-target PRIVATE Threads::Threads)
+target_compile_options(shared-context-target PRIVATE -g -O0 -fno-omit-frame-pointer
   -fcf-protection=none)
 
 add_executable(order-arguments-target examples/order-arguments/target.cpp)
@@ -117,12 +122,12 @@ target_link_libraries(call-stacks-filter-target PRIVATE call-stacks-calculator T
 target_compile_options(call-stacks-filter-target PRIVATE -g -O1 -fno-inline -fomit-frame-pointer
   -fno-optimize-sibling-calls -fasynchronous-unwind-tables -fcf-protection=none)
 
-add_executable(trace-threaded-target examples/threaded_target.cpp)
-add_library(trace-stack-b SHARED examples/shared_stack_b.cpp)
-add_library(trace-stack-a SHARED examples/shared_stack_a.cpp)
+add_executable(trace-threaded-target tests/fixtures/threaded/target.cpp)
+add_library(trace-stack-b SHARED tests/fixtures/threaded/shared_stack_b.cpp)
+add_library(trace-stack-a SHARED tests/fixtures/threaded/shared_stack_a.cpp)
 target_link_libraries(trace-stack-a PRIVATE trace-stack-b)
 foreach(stack_target trace-stack-a trace-stack-b)
-  target_include_directories(${stack_target} PUBLIC examples)
+  target_include_directories(${stack_target} PUBLIC tests/fixtures/threaded)
   target_compile_options(${stack_target} PRIVATE -O2 -fomit-frame-pointer
     -fno-optimize-sibling-calls -fasynchronous-unwind-tables -fcf-protection=none)
 endforeach()
@@ -225,8 +230,8 @@ if(BUILD_TESTING)
       --protoc $<TARGET_FILE:protobuf::protoc>
       --proto ${CMAKE_CURRENT_SOURCE_DIR}/proto/tracer.proto
       --compdb ${CMAKE_CURRENT_BINARY_DIR}
-      --source ${CMAKE_CURRENT_SOURCE_DIR}/examples/target.cpp
-      --callback ${CMAKE_CURRENT_SOURCE_DIR}/examples/trace_callback.cpp
+      --source ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/target.cpp
+      --callback ${CMAKE_CURRENT_SOURCE_DIR}/examples/legacy-callbacks/callback.cpp
       --output-dir ${CMAKE_CURRENT_BINARY_DIR}/cpp-name-test-results)
   set_tests_properties(grpc_cpp_name_integration PROPERTIES TIMEOUT 180)
   configure_file(tests/installed_class_interceptor.cmake.in

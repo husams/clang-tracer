@@ -542,7 +542,7 @@ void run(const std::filesystem::path &server_path,
 
   const std::string callback =
       read_file(std::filesystem::path(__FILE__).parent_path().parent_path() /
-                "examples/probe.cpp");
+                "tests/fixtures/probe.cpp");
   std::barrier attach_gate(3);
   auto concurrent_attach = [&]() {
     attach_gate.arrive_and_wait();

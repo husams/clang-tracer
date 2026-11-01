@@ -1,5 +1,8 @@
 # Shared context
 
+For a commented, runnable introduction, start with the
+[two-probe worker example](../examples/shared-context/README.md).
+
 Shared context lets independently compiled class interceptors keep typed C++
 state and publish a snapshot with `Call::context().event()`. The stream carries
 descriptor-backed values, so the CLI can decode fields across schema revisions

@@ -347,7 +347,7 @@ def main() -> int:
 
             callback = args.output_dir / "canonical-interceptor.cpp"
             callback.write_text((Path(__file__).resolve().parents[1] /
-                                 "examples/interceptor.cpp").read_text(encoding="utf-8"),
+                                 "examples/basic-callbacks/interceptor.cpp").read_text(encoding="utf-8"),
                                 encoding="utf-8")
             probe, text = trace(args.client, endpoint, target.pid,
                                 "Fixture::overloaded(int)", callback,

@@ -24,8 +24,8 @@ execute_process(
     --protoc "$<TARGET_FILE:protobuf::protoc>"
     --proto "${stage}@CMAKE_INSTALL_FULL_DATADIR@/clang-tracer/proto/tracer.proto"
     --compdb "@CMAKE_CURRENT_BINARY_DIR@"
-    --source "@CMAKE_CURRENT_SOURCE_DIR@/examples/target.cpp"
-    --threaded-source "@CMAKE_CURRENT_SOURCE_DIR@/examples/threaded_target.cpp"
+    --source "@CMAKE_CURRENT_SOURCE_DIR@/tests/fixtures/target.cpp"
+    --threaded-source "@CMAKE_CURRENT_SOURCE_DIR@/tests/fixtures/threaded/target.cpp"
     --output-dir "@CMAKE_CURRENT_BINARY_DIR@/class-interceptor-results"
   RESULT_VARIABLE test_result)
 if(NOT test_result EQUAL 0)
