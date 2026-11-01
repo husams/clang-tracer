@@ -36,6 +36,10 @@ owned by its caller.
 
 ## Programmatic tracing
 
+The repository's `examples/python/README.md` describes runnable programs for
+attachment, probes, live streams, binary recordings, and server lifecycle,
+including commands for the native example target.
+
 ```python
 from pathlib import Path
 from clang_tracer import Client

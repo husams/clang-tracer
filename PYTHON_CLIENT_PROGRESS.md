@@ -51,3 +51,22 @@ through the additive ResolveProbe RPC. Existing RPCs remain wire-compatible.
 Server shutdown manages only children launched by this API/console; no remote
 shutdown RPC was added. The process manager preserves a child on graceful
 shutdown timeout instead of force-killing a server during target restoration.
+
+## Manual API walkthrough and runnable examples
+
+The installed Linux API was exercised interactively after installation. Actual
+function/method results, DWARF names, receiver fields, stack frames, cursor
+updates, recording/replay, cancellation/deadlines, error statuses, terminal
+Ctrl-C, restoration and server ownership/shutdown were observed. All four new
+scripts in `examples/python/` were run with the installed package and server;
+external-server usage and malformed recording input were checked too. See
+`examples/python/manual-validation.md` for concrete results. The follow-up
+request authorizes review, commit/merge into main, and Linux installation.
+
+Example review found and fixed unconditional deletion of a still-running
+server's private socket directory after a graceful-shutdown timeout. All four
+scripts preserve the directory and report recovery PID/endpoint until child
+exit. Sixteen regressions cover timeout, normal, external-server and construction
+failure cleanup; 85 Python tests pass locally (two Linux-only tests skipped).
+The four reviewed scripts also pass on Linux with a target compiled directly
+from installed example source. Independent re-review has no remaining blockers.
