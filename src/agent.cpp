@@ -1,3 +1,11 @@
+#include "callback_bridge.hpp"
+#include "context_activation.hpp"
+#include "context_agent_delivery.hpp"
+#include "context_analysis.hpp"
+#include "context_engine.hpp"
+#include "context_pthread_detour.hpp"
+#include "context_runtime.hpp"
+#include "context_stdlib.hpp"
 #include "debug_resolver.hpp"
 #include "event_transport.hpp"
 #include "native_stack.hpp"
@@ -16,8 +24,11 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
@@ -38,6 +49,7 @@
 #include <dlfcn.h>
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/SmallString.h>
+#include <llvm/BinaryFormat/Dwarf.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/MC/MCAsmInfo.h>
 #include <llvm/MC/MCContext.h>
@@ -58,6 +70,7 @@
 #include <llvm/TargetParser/Triple.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
 #include <time.h>
@@ -98,13 +111,18 @@ struct Probe {
   std::atomic<bool> callback_enabled{true};
   std::atomic<bool> active{false};
   std::string session_id;
-  long long (*callback)(const tracer::TraceContext *) = nullptr;
+  long long (*callback)(const tracer::TraceContext *, void *, bool *) = nullptr;
   std::vector<std::string> argument_names;
   bool class_callback = false;
   bool has_pre = false;
   bool has_post = false;
   bool transport_active = false;
+  bool scheduler_counted = false;
   void *wrapper = nullptr;
+  std::shared_ptr<const tracer::ContextActivationGeneration> shared_generation;
+  std::shared_ptr<tracer::context_runtime::SharedSourceRuntime> shared_runtime;
+  std::shared_ptr<tracer::context_delivery::ContextAgentDelivery>
+      context_delivery;
 
   ~Probe() {
     if (delivery.socket_fd >= 0) {
@@ -121,7 +139,17 @@ struct Agent {
   std::array<std::atomic<Probe *>, tracer::kMaxProbes> probe_slots{};
   std::size_t retained = 0;
   pid_t pid = 0;
+  tracer::ContextRegistry context_registry;
+  std::unique_ptr<tracer::context_engine::ContextCapturePool> context_capture;
+  unsigned next_context_hook = 0;
   tracer::EventTransport transport{[] { ++callback_depth; }};
+  std::shared_ptr<tracer::context_engine::PropagationLedger> propagation_ledger;
+  std::unique_ptr<tracer::context_scheduler::ContextPthreadDetour>
+      pthread_detour;
+  void *pthread_trampoline = MAP_FAILED;
+  std::size_t pthread_trampoline_size = 0;
+  tracer::Request pthread_patch{};
+  std::size_t context_probe_count = 0;
 
   Agent() {
     for (auto &slot : probe_slots) {
@@ -167,14 +195,29 @@ private:
 extern "C" void tracer_probe_enter(unsigned long long) noexcept;
 extern "C" void tracer_probe_leave(unsigned long long) noexcept;
 extern "C" unsigned long long tracer_next_call_id(unsigned long long) noexcept;
-extern "C" void tracer_capture_stack(const tracer::TraceContext *, unsigned, bool) noexcept;
-extern "C" void tracer_capture_entry_stack(const tracer::TraceContext *, unsigned) noexcept;
-extern "C" long long
-tracer_callback_dispatch(unsigned long long,
-                         const tracer::TraceContext *) noexcept;
+extern "C" void tracer_capture_stack(const tracer::TraceContext *, unsigned,
+                                     bool) noexcept;
+extern "C" void tracer_capture_entry_stack(const tracer::TraceContext *,
+                                           unsigned) noexcept;
+extern "C" long long tracer_callback_dispatch(unsigned long long,
+                                              const tracer::TraceContext *,
+                                              void *) noexcept;
+extern "C" bool tracer_callback_lifecycle_enter(unsigned long long) noexcept;
+extern "C" void tracer_callback_cleanup_enter() noexcept;
+extern "C" void tracer_callback_lifecycle_leave() noexcept;
+extern "C" void tracer_callback_failure(unsigned long long) noexcept;
 extern "C" void tracer_event_dispatch(unsigned long long,
                                       const tracer::TraceContext *,
                                       long long) noexcept;
+extern "C" void tracer_context_check_entry();
+extern "C" void *tracer_shared_enter(unsigned long long,
+                                     const tracer::TraceContext *);
+extern "C" void tracer_shared_leave(void *) noexcept;
+extern "C" void tracer_shared_release(void *) noexcept;
+extern "C" void tracer_shared_dispatch(void *, const tracer::TraceContext *);
+extern "C" void tracer_shared_original_enter(void *);
+extern "C" void tracer_shared_original_leave(void *) noexcept;
+extern "C" void tracer_shared_resume(void *);
 
 std::mutex agent_mutex;
 std::atomic<Agent *> agent{nullptr};
@@ -191,6 +234,310 @@ Probe *find_probe(std::uint64_t id) noexcept {
     }
   }
   return nullptr;
+}
+
+struct SharedInvocationToken {
+  Probe *probe = nullptr;
+  tracer::TraceContext raw{};
+  tracer::StackTrace entry_stack{};
+  tracer::Call call{raw};
+  std::optional<tracer::ContextStdlibImage::Frame> support;
+  std::optional<tracer::context_runtime::SharedSourceRuntime::Invocation>
+      invocation;
+  std::optional<tracer::context_execution::OriginalDispatch> original;
+  alignas(64) std::byte object[4096];
+  int cancel_state = PTHREAD_CANCEL_ENABLE;
+  std::atomic<bool> occupied{false};
+  bool cancel_disabled = false, constructed = false, enabled = false,
+       finished = false;
+};
+std::array<SharedInvocationToken, 256> shared_invocations;
+static_assert(sizeof(shared_invocations) <=
+              tracer::context_engine::kCaptureInvocationWorkspaceBytes);
+
+template <class T>
+void copy_shared_value(T &destination, const T &source) noexcept {
+  static_assert(std::is_trivially_copyable_v<T>);
+  auto *out = reinterpret_cast<volatile unsigned char *>(&destination);
+  const auto *in = reinterpret_cast<const volatile unsigned char *>(&source);
+  for (std::size_t i = 0; i < sizeof(T); ++i)
+    out[i] = in[i];
+}
+
+// Symbolization may allocate or take metadata locks. Shared hooks only select
+// from the immutable invocation-entry snapshot prepared before scope access.
+void shared_capture_stack(const tracer::TraceContext *context, unsigned depth,
+                          bool application_only) noexcept {
+  for (const auto &token : shared_invocations) {
+    if (&token.raw != context ||
+        !token.occupied.load(std::memory_order_acquire))
+      continue;
+    copy_shared_value(context->stack, token.entry_stack);
+    auto &stack = context->stack;
+    const auto count = std::min<unsigned>(depth, token.entry_stack.count);
+    stack.requested_depth = depth;
+    stack.application_only = application_only;
+    stack.captured_depth = count;
+    stack.hidden_frames = 0;
+    stack.count = 0;
+    if (count < token.entry_stack.count) {
+      stack.status = tracer::StackStatus::Truncated;
+      constexpr char detail[] = "entry stack exceeds requested depth";
+      for (std::size_t i = 0; i < sizeof(detail); ++i)
+        stack.detail[i] = detail[i];
+    }
+    for (unsigned i = 0; i < count; ++i) {
+      if (application_only && !token.entry_stack.frames[i].application_frame) {
+        ++stack.hidden_frames;
+        continue;
+      }
+      auto *frame = reinterpret_cast<volatile unsigned char *>(
+          &stack.frames[stack.count++]);
+      const auto *source = reinterpret_cast<const volatile unsigned char *>(
+          &token.entry_stack.frames[i]);
+      for (std::size_t j = 0; j < sizeof(tracer::StackFrame); ++j)
+        frame[j] = source[j];
+    }
+    for (unsigned i = stack.count; i < tracer::kMaxStackDepth; ++i) {
+      auto *frame =
+          reinterpret_cast<volatile unsigned char *>(&stack.frames[i]);
+      for (std::size_t j = 0; j < sizeof(tracer::StackFrame); ++j)
+        frame[j] = 0;
+    }
+    return;
+  }
+}
+
+bool invoke_shared(SharedInvocationToken &token, std::uintptr_t entry,
+                   bool destruction = false) noexcept {
+  const auto &code = token.probe->shared_generation->callback_code();
+  tracer::ContextStdlibImage::Frame frame(
+      code->standard_library(), code.get(),
+      &tracer::PrivateContextCode::unwind_lookup);
+  if (!frame.entered())
+    return false;
+  struct Arguments {
+    SharedInvocationToken *token;
+    std::uintptr_t entry;
+    bool destruction;
+    bool result = false;
+  } args{&token, entry, destruction};
+  return code->standard_library()->invoke(
+             [](void *opaque) {
+               auto &args = *static_cast<Arguments *>(opaque);
+               if (args.destruction) {
+                 reinterpret_cast<void (*)(void *)>(args.entry)(
+                     args.token->object);
+                 args.result = true;
+               } else {
+                 args.result = reinterpret_cast<bool (*)(
+                     void *, const tracer::TraceContext *)>(args.entry)(
+                     args.token->object, &args.token->raw);
+               }
+             },
+             &args) &&
+         args.result;
+}
+
+extern "C" void tracer_context_check_entry() {
+  using namespace tracer::context_execution;
+  if (check_entry(Callee::ApplicationEndpoint) == EntryDecision::Reject) {
+    runtime_diagnostics().record(Severity::error,
+                                 Reason::reentrant_application_call,
+                                 Phase::target, Action::call_rejected);
+    throw tracer::context_engine::Error(
+        tracer::context_engine::ErrorCode::active_access);
+  }
+}
+
+extern "C" void *tracer_shared_enter(unsigned long long id,
+                                     const tracer::TraceContext *raw) {
+  auto *probe = find_probe(id);
+  if (!probe || !raw || callback_depth || !probe->shared_runtime ||
+      !probe->active.load(std::memory_order_acquire) ||
+      tracer::context_execution::check_entry(
+          tracer::context_execution::Callee::ApplicationEndpoint) !=
+          tracer::context_execution::EntryDecision::Trace)
+    return nullptr;
+  const int saved_errno = errno;
+  int prior_type = PTHREAD_CANCEL_DEFERRED;
+  ::pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, &prior_type);
+  if (prior_type == PTHREAD_CANCEL_ASYNCHRONOUS) {
+    ::pthread_setcanceltype(prior_type, nullptr);
+    tracer::context_execution::runtime_diagnostics().record(
+        tracer::context_execution::Severity::warning,
+        tracer::context_execution::Reason::unsupported_effect,
+        tracer::context_execution::Phase::construction,
+        tracer::context_execution::Action::callback_skipped, raw->call_id);
+    errno = saved_errno;
+    return nullptr;
+  }
+  SharedInvocationToken *token = nullptr;
+  for (auto &candidate : shared_invocations) {
+    bool free = false;
+    if (candidate.occupied.compare_exchange_strong(free, true,
+                                                   std::memory_order_acq_rel)) {
+      token = &candidate;
+      break;
+    }
+  }
+  if (!token) {
+    tracer::context_execution::runtime_diagnostics().record(
+        tracer::context_execution::Severity::warning,
+        tracer::context_execution::Reason::access_failure,
+        tracer::context_execution::Phase::construction,
+        tracer::context_execution::Action::callback_skipped, raw->call_id);
+    errno = saved_errno;
+    return nullptr;
+  }
+  token->finished = false;
+  token->probe = probe;
+  copy_shared_value(token->raw, *raw);
+  token->raw.named_count = 0;
+  for (unsigned i = 0;
+       i < token->raw.argument_count && i < tracer::kMaxArguments; ++i)
+    token->raw.argument_names[i] = i < probe->argument_names.size()
+                                       ? probe->argument_names[i].c_str()
+                                       : nullptr;
+  ::pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &token->cancel_state);
+  token->cancel_disabled = true;
+  ++callback_depth;
+  if (probe->shared_generation->requires_stack()) {
+    tracer::capture_native_stack(token->raw, tracer::kMaxStackDepth, false);
+    copy_shared_value(token->entry_stack, token->raw.stack);
+    copy_shared_value(token->raw.stack, raw->stack);
+  }
+  token->raw.stack_capture = &shared_capture_stack;
+  try {
+    const auto &code = probe->shared_generation->callback_code();
+    // Reserve the teardown lane before constructing any generated frame. It
+    // stays pinned through the original call and final owner destruction.
+    token->support.emplace(code->standard_library(), code.get(),
+                           &tracer::PrivateContextCode::unwind_lookup);
+    if (token->support->entered())
+      token->invocation.emplace(*probe->shared_runtime, &token->call);
+    if (token->invocation && token->invocation->entered()) {
+      tracer::context_runtime::LifecycleBoundary lifecycle;
+      token->constructed =
+          lifecycle.entered() &&
+          invoke_shared(*token, probe->shared_generation->construct_entry());
+      token->enabled = token->constructed;
+    }
+  } catch (...) {
+    token->enabled = false;
+  }
+  if (!token->constructed) {
+    probe->callback_errors.fetch_add(1, std::memory_order_relaxed);
+    tracer::context_execution::runtime_diagnostics().record(
+        tracer::context_execution::Severity::error,
+        tracer::context_execution::Reason::constructor_failure,
+        tracer::context_execution::Phase::construction,
+        tracer::context_execution::Action::callback_skipped, raw->call_id);
+  }
+  --callback_depth;
+  copy_shared_value(raw->stack, token->raw.stack);
+  errno = saved_errno;
+  return token;
+}
+
+extern "C" void tracer_shared_resume(void *opaque) {
+  auto *token = static_cast<SharedInvocationToken *>(opaque);
+  if (token && token->cancel_disabled) {
+    token->cancel_disabled = false;
+    ::pthread_setcancelstate(token->cancel_state, nullptr);
+  }
+}
+
+extern "C" void tracer_shared_dispatch(void *opaque,
+                                       const tracer::TraceContext *raw) {
+  auto *token = static_cast<SharedInvocationToken *>(opaque);
+  if (!token || !token->enabled || !raw)
+    return;
+  const int saved_errno = errno;
+  ::pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &token->cancel_state);
+  token->cancel_disabled = true;
+  copy_shared_value(token->raw, *raw);
+  token->raw.stack_capture = &shared_capture_stack;
+  token->raw.named_count = 0;
+  for (unsigned i = 0;
+       i < token->raw.argument_count && i < tracer::kMaxArguments; ++i)
+    token->raw.argument_names[i] = i < token->probe->argument_names.size()
+                                       ? token->probe->argument_names[i].c_str()
+                                       : nullptr;
+  ++callback_depth;
+  const auto entry = raw->phase == tracer::TracePhase::Pre
+                         ? token->probe->shared_generation->pre_entry()
+                         : token->probe->shared_generation->post_entry();
+  if (!invoke_shared(*token, entry)) {
+    token->enabled = false;
+    token->probe->callback_errors.fetch_add(1, std::memory_order_relaxed);
+    tracer::context_execution::runtime_diagnostics().record(
+        tracer::context_execution::Severity::error,
+        tracer::context_execution::Reason::hook_failure,
+        raw->phase == tracer::TracePhase::Pre
+            ? tracer::context_execution::Phase::pre
+            : tracer::context_execution::Phase::post,
+        tracer::context_execution::Action::callback_skipped, raw->call_id);
+  }
+  --callback_depth;
+  copy_shared_value(raw->stack, token->raw.stack);
+  errno = saved_errno;
+  tracer_shared_resume(token);
+}
+
+extern "C" void tracer_shared_original_enter(void *opaque) {
+  auto *token = static_cast<SharedInvocationToken *>(opaque);
+  if (!token || !token->invocation || !token->invocation->entered())
+    return;
+  token->original.emplace();
+  if (!token->original->entered()) {
+    token->original.reset();
+    throw tracer::context_engine::Error(
+        tracer::context_engine::ErrorCode::active_access);
+  }
+}
+extern "C" void tracer_shared_original_leave(void *opaque) noexcept {
+  if (auto *token = static_cast<SharedInvocationToken *>(opaque))
+    token->original.reset();
+}
+extern "C" void tracer_shared_leave(void *opaque) noexcept {
+  auto *token = static_cast<SharedInvocationToken *>(opaque);
+  if (!token || !token->occupied.load(std::memory_order_acquire) ||
+      token->finished)
+    return;
+  const int saved_errno = errno;
+  if (!token->cancel_disabled) {
+    ::pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &token->cancel_state);
+    token->cancel_disabled = true;
+  }
+  token->original.reset();
+  ++callback_depth;
+  if (token->constructed) {
+    tracer::context_runtime::LifecycleBoundary lifecycle;
+    if (!lifecycle.entered() ||
+        !invoke_shared(*token, token->probe->shared_generation->destroy_entry(),
+                       true))
+      tracer::context_execution::runtime_diagnostics().record(
+          tracer::context_execution::Severity::critical,
+          tracer::context_execution::Reason::invalid_ownership,
+          tracer::context_execution::Phase::lifecycle,
+          tracer::context_execution::Action::lifecycle_ignored,
+          token->raw.call_id);
+  }
+  token->constructed = false;
+  token->enabled = false;
+  token->invocation.reset();
+  token->support.reset();
+  --callback_depth;
+  token->probe = nullptr;
+  token->finished = true;
+  errno = saved_errno;
+}
+
+extern "C" void tracer_shared_release(void *opaque) noexcept {
+  auto *token = static_cast<SharedInvocationToken *>(opaque);
+  if (token && token->finished)
+    token->occupied.store(false, std::memory_order_release);
 }
 
 std::uint64_t address_value(auto address) {
@@ -465,6 +812,8 @@ clang::QualType debug_builtin(clang::ASTContext &context,
     return context.SignedCharTy;
   if (type == "unsigned char")
     return context.UnsignedCharTy;
+  if (type == "wchar_t")
+    return context.WCharTy;
   if (type == "short" || type == "short int")
     return context.ShortTy;
   if (type == "unsigned short" || type == "unsigned short int")
@@ -488,6 +837,53 @@ clang::QualType debug_builtin(clang::ASTContext &context,
   if (type == "double")
     return context.DoubleTy;
   throw std::runtime_error("unsupported DWARF builtin: " + type.str());
+}
+
+bool matches_debug_type_chain(clang::QualType type, clang::ASTContext &context,
+                              const clangtracer::v1::DebugField &field) {
+  if (field.type_chain_size() < 1 || field.type_chain_size() > 33)
+    return false;
+  for (int i = 0; i < field.type_chain_size(); ++i) {
+    const auto &level = field.type_chain(i);
+    type = type.getCanonicalType();
+    if (type.isConstQualified() != level.is_const() ||
+        type.isVolatileQualified() != level.is_volatile() ||
+        type.getAddressSpace() != clang::LangAS::Default)
+      return false;
+    if (type->isPointerType()) {
+      if (level.kind() != clangtracer::v1::DebugTypeLevel::POINTER ||
+          context.getTypeSize(type) / 8 != level.byte_size() ||
+          level.dwarf_encoding())
+        return false;
+      type = type->getPointeeType();
+      continue;
+    }
+    if (i + 1 != field.type_chain_size())
+      return false;
+    if (type->isVoidType())
+      return level.kind() == clangtracer::v1::DebugTypeLevel::VOID &&
+             !level.byte_size() && !level.dwarf_encoding();
+    if (!type->isBuiltinType() ||
+        level.kind() != clangtracer::v1::DebugTypeLevel::BUILTIN ||
+        !level.byte_size() ||
+        context.getTypeSize(type) / 8 != level.byte_size())
+      return false;
+    switch (level.dwarf_encoding()) {
+    case llvm::dwarf::DW_ATE_boolean:
+      return type->isBooleanType();
+    case llvm::dwarf::DW_ATE_float:
+      return type->isFloatingType();
+    case llvm::dwarf::DW_ATE_signed:
+    case llvm::dwarf::DW_ATE_signed_char:
+      return type->isSignedIntegerType();
+    case llvm::dwarf::DW_ATE_unsigned:
+    case llvm::dwarf::DW_ATE_unsigned_char:
+      return type->isUnsignedIntegerType() && !type->isBooleanType();
+    default:
+      return false;
+    }
+  }
+  return false; // A pointer chain without its terminal type is incomplete.
 }
 
 DebugRecord construct_debug_record(clang::ASTContext &context,
@@ -569,6 +965,8 @@ DebugRecord construct_debug_record(clang::ASTContext &context,
   clang::PrintingPolicy policy(context.getLangOpts());
   for (auto *field : record->fields()) {
     const auto &expected = info.fields(i);
+    if (!matches_debug_type_chain(field->getType(), context, expected))
+      throw std::runtime_error("receiver field type ABI does not match DWARF");
     if (field->getNameAsString() != expected.name() || field->isBitField() ||
         !context.hasSameType(field->getType(),
                              debug_builtin(context, expected.builtin_type())) ||
@@ -602,15 +1000,16 @@ std::uint64_t validate_debug_entry(const clangtracer::v1::ProbeSpec &spec) {
   const auto checked =
       tracer::client::resolve_debug_callable(::getpid(), info.selector());
   if (!info.runtime_entry() || !info.entry_size() ||
-      checked.spec.debug_info().SerializeAsString() != info.SerializeAsString() ||
+      checked.spec.debug_info().SerializeAsString() !=
+          info.SerializeAsString() ||
       checked.spec.symbol() != spec.symbol() ||
       checked.spec.signature().SerializeAsString() !=
           spec.signature().SerializeAsString() ||
       checked.spec.argument_names().size() != spec.argument_names().size() ||
       !std::equal(spec.argument_names().begin(), spec.argument_names().end(),
                   checked.spec.argument_names().begin())) {
-    throw std::runtime_error(
-        "mapped debug image, entry or callable metadata changed before injection");
+    throw std::runtime_error("mapped debug image, entry or callable metadata "
+                             "changed before injection");
   }
   return checked.spec.debug_info().runtime_entry();
 }
@@ -681,7 +1080,8 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
           private_fs);
       tool.mapVirtualFile(input, headers);
       tool.setDiagnosticConsumer(&capture);
-      tool.appendArgumentsAdjuster(clang::tooling::getClangStripOutputAdjuster());
+      tool.appendArgumentsAdjuster(
+          clang::tooling::getClangStripOutputAdjuster());
       tool.appendArgumentsAdjuster(
           clang::tooling::getClangStripDependencyFileAdjuster());
       std::vector<std::unique_ptr<clang::ASTUnit>> units;
@@ -696,8 +1096,7 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
                         std::string("-resource-dir=") +
                             tracer::runtime::clang_resource_dir()});
       output = clang::tooling::buildASTFromCodeWithArgs(
-          headers, arguments,
-          "clang-tracer-debug-types.cc", "clang-tracer",
+          headers, arguments, "clang-tracer-debug-types.cc", "clang-tracer",
           std::make_shared<clang::PCHContainerOperations>(),
           clang::tooling::getClangStripOutputAdjuster(), {}, &capture);
     }
@@ -757,9 +1156,8 @@ bool build_and_validate_receiver_ast(clangtracer::v1::ProbeSpec &spec,
     return false;
   }
   auto arguments = tracer::runtime::jit_arguments();
-  arguments.reserve(
-      arguments.size() +
-      static_cast<std::size_t>(receiver.compiler_arguments_size()));
+  arguments.reserve(arguments.size() + static_cast<std::size_t>(
+                                           receiver.compiler_arguments_size()));
   const auto source_path =
       std::filesystem::path(receiver.translation_unit()).is_absolute()
           ? std::filesystem::path(receiver.translation_unit())
@@ -1086,15 +1484,15 @@ bool safe_instruction(const llvm::MCInst &inst, const llvm::MCInstrInfo &ins,
   }
   const std::string name = ins.getName(inst.getOpcode()).str();
   static constexpr std::string_view allowed[] = {
-      "PUSH64r",   "POP64r",   "MOV64rr",    "MOV32rr",   "MOV16rr",
-      "MOV8rr",    "MOV32ri",  "MOV64rm",    "MOV32rm",   "MOV16rm",
-      "MOV8rm",    "MOV64mr",  "MOV32mr",    "MOV16mr",   "MOV8mr",
-      "MOVSS",     "MOVSD",    "MOVAPS",     "MOVUPS",    "LEA64r",
-      "LEA32r",    "SUB64ri8", "SUB64ri32",  "ADD64ri8",  "ADD64ri32",
-      "ADD32ri8",  "ADD32ri",  "IMUL32rri8", "IMUL32rri", "IMUL32rmi8",
-      "IMUL32rmi", "XOR64rr",  "XOR32rr",    "TEST64rr",  "TEST32rr",
-      "CMP64rr",   "CMP32rr",  "AND64ri8",   "AND64ri32", "NOP",
-      "NOOP"};
+      "PUSH64r",   "POP64r",    "MOV64rr",    "MOV32rr",   "MOV16rr",
+      "MOV8rr",    "MOV32ri",   "MOV64rm",    "MOV32rm",   "MOV16rm",
+      "MOV8rm",    "MOV64mr",   "MOV32mr",    "MOV16mr",   "MOV8mr",
+      "MOVSS",     "MOVSD",     "MOVAPS",     "MOVUPS",    "LEA64r",
+      "LEA32r",    "SUB64ri8",  "SUB64ri32",  "ADD64ri8",  "ADD64ri32",
+      "ADD32ri8",  "ADD32ri",   "IMUL32rri8", "IMUL32rri", "IMUL32rmi8",
+      "IMUL32rmi", "XOR64rr",   "XOR32rr",    "TEST64rr",  "TEST32rr",
+      "CMP64rr",   "CMP32rr",   "AND64ri8",   "AND64ri32", "NOP",
+      "NOOP",      "MOV64mi32", "MOV32mi",    "MOV16mi",   "MOV8mi"};
   bool known = false;
   for (auto p : allowed) {
     if (name == p || (name.size() > p.size() && name.starts_with(p))) {
@@ -1162,10 +1560,229 @@ bool decode_patch(const std::uint8_t *entry, tracer::Request &req,
   return true;
 }
 
+using PthreadCreate = tracer::context_scheduler::PthreadCreate;
+template <class> struct PthreadCreateSignature;
+template <class Result, class... Arguments>
+struct PthreadCreateSignature<Result (*)(Arguments...)> {
+  using result_type = Result;
+  using argument_types = std::tuple<Arguments...>;
+};
+template <class Result, class... Arguments>
+struct PthreadCreateSignature<Result (*)(Arguments...) noexcept> {
+  using result_type = Result;
+  using argument_types = std::tuple<Arguments...>;
+};
+using NativePthreadCreate = decltype(&::pthread_create);
+using ExpectedPthreadArguments =
+    std::tuple<pthread_t *, const pthread_attr_t *, void *(*)(void *), void *>;
+static_assert(std::is_convertible_v<NativePthreadCreate, PthreadCreate>,
+              "pthread_create pointer must safely convert to detour ABI type");
+static_assert(
+    std::is_same_v<
+        typename PthreadCreateSignature<NativePthreadCreate>::result_type,
+        int> &&
+        std::is_same_v<typename PthreadCreateSignature<
+                           NativePthreadCreate>::argument_types,
+                       ExpectedPthreadArguments>,
+    "pthread_create native argument and return ABI changed");
+
+bool copy_pthread_patch(const tracer::Request &source,
+                        tracer::Request &destination) noexcept {
+  destination.pthread_create_entry = source.pthread_create_entry;
+  destination.pthread_create_trampoline = source.pthread_create_trampoline;
+  destination.pthread_create_wrapper = source.pthread_create_wrapper;
+  destination.pthread_create_patch_size = source.pthread_create_patch_size;
+  std::memcpy(destination.pthread_create_original,
+              source.pthread_create_original,
+              sizeof(destination.pthread_create_original));
+  std::memcpy(destination.pthread_create_installed,
+              source.pthread_create_installed,
+              sizeof(destination.pthread_create_installed));
+  return destination.pthread_create_patch_size != 0;
+}
+
+bool native_cet_disabled(std::string &error) {
+  try {
+    bool checked = false;
+    for (const auto &task :
+         std::filesystem::directory_iterator("/proc/self/task")) {
+      std::ifstream status(task.path() / "status");
+      if (!status) {
+        if (!std::filesystem::exists(task.path()))
+          continue;
+        error = "cannot verify pthread_create control-flow protection state";
+        return false;
+      }
+      bool found = false;
+      for (std::string line; std::getline(status, line);) {
+        constexpr std::string_view prefix = "x86_Thread_features:";
+        if (!line.starts_with(prefix))
+          continue;
+        found = true;
+        if (line.find_first_not_of(" \t\r", prefix.size()) !=
+            std::string::npos) {
+          error = "pthread_create adapter does not support active CET thread "
+                  "features";
+          return false;
+        }
+      }
+      if (!found) {
+        error = "kernel does not expose pthread_create CET admission state";
+        return false;
+      }
+      checked = true;
+    }
+    return checked;
+  } catch (const std::exception &exception) {
+    error = exception.what();
+    return false;
+  }
+}
+
+bool prepare_context_pthread(Agent &owner, Probe &probe, std::string &error) {
+  if (!probe.request.context_required)
+    return true;
+  if (!native_cet_disabled(error))
+    return false;
+  if (owner.pthread_detour) {
+    if (owner.pthread_trampoline == MAP_FAILED ||
+        !owner.pthread_detour->enable_propagation() ||
+        !copy_pthread_patch(owner.pthread_patch, probe.request)) {
+      error = "previous pthread_create detour is not reusable";
+      return false;
+    }
+    return true;
+  }
+
+  ::dlerror();
+  void *symbol = ::dlsym(RTLD_DEFAULT, "pthread_create");
+  if (const char *reason = ::dlerror()) {
+    error = std::string("pthread_create symbol lookup failed: ") + reason;
+    return false;
+  }
+  if (!symbol) {
+    error = "pthread_create symbol lookup returned null";
+    return false;
+  }
+  Dl_info module{};
+  if (::dladdr(symbol, &module) == 0 || !module.dli_fname ||
+      !module.dli_fbase) {
+    error = "pthread_create module identity is unavailable";
+    return false;
+  }
+  const auto module_name =
+      std::filesystem::path(module.dli_fname).filename().string();
+  if (!module_name.starts_with("libc.so") &&
+      !module_name.starts_with("libpthread.so")) {
+    error = "pthread_create is interposed by an unsupported runtime module";
+    return false;
+  }
+  struct stat module_status{};
+  if (::stat(module.dli_fname, &module_status) != 0 ||
+      !S_ISREG(module_status.st_mode) || module_status.st_ino == 0) {
+    error = "pthread_create ELF module identity could not be verified";
+    return false;
+  }
+  std::uintptr_t map_begin = 0, map_end = 0;
+  int protection = 0;
+  if (!mapping(symbol, map_begin, map_end, protection) ||
+      (protection & PROT_EXEC) == 0) {
+    error = "pthread_create is not in an executable mapping";
+    return false;
+  }
+  tracer::Request patch{};
+  auto *patch_entry = static_cast<const std::uint8_t *>(symbol);
+  if (patch_entry[0] == 0xf3 && patch_entry[1] == 0x0f &&
+      patch_entry[2] == 0x1e && patch_entry[3] == 0xfa) {
+    // Preserve libc's landing pad. With CET disabled its four bytes are a
+    // no-op; the relocated prologue begins immediately after it.
+    patch_entry += 4;
+  }
+  patch.pthread_create_entry = reinterpret_cast<std::uintptr_t>(patch_entry);
+  if (!decode_patch(patch_entry, patch, error))
+    return false;
+  patch.pthread_create_patch_size = patch.patch_size;
+  std::memcpy(patch.pthread_create_original, patch.original, patch.patch_size);
+  const auto probe_begin = probe.request.original_entry;
+  const auto probe_end = probe_begin + probe.request.patch_size;
+  const auto scheduler_end = patch.pthread_create_entry + patch.patch_size;
+  if (probe_begin < scheduler_end && patch.pthread_create_entry < probe_end) {
+    error = "pthread_create patch overlaps the target probe";
+    return false;
+  }
+  for (std::size_t i = 0; i < owner.retained; ++i) {
+    const auto *existing = owner.probes[i].get();
+    if (!existing || !existing->active.load(std::memory_order_acquire))
+      continue;
+    const auto existing_begin = existing->request.original_entry;
+    const auto existing_end = existing_begin + existing->request.patch_size;
+    if (existing_begin < scheduler_end &&
+        patch.pthread_create_entry < existing_end) {
+      error = "pthread_create patch overlaps an active target probe";
+      return false;
+    }
+  }
+
+  const long page_size = ::sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) {
+    error = "cannot determine page size for pthread_create trampoline";
+    return false;
+  }
+  const auto trampoline_size = static_cast<std::size_t>(page_size);
+  void *trampoline = ::mmap(nullptr, trampoline_size, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (trampoline == MAP_FAILED) {
+    error = "cannot allocate pthread_create trampoline";
+    return false;
+  }
+  std::memcpy(trampoline, patch.pthread_create_original, patch.patch_size);
+  add_jump(static_cast<std::uint8_t *>(trampoline) + patch.patch_size,
+           patch_entry + patch.patch_size);
+  if (::mprotect(trampoline, trampoline_size, PROT_READ | PROT_EXEC) != 0) {
+    ::munmap(trampoline, trampoline_size);
+    error = "cannot make pthread_create trampoline executable";
+    return false;
+  }
+
+  patch.pthread_create_trampoline =
+      reinterpret_cast<std::uintptr_t>(trampoline);
+  patch.pthread_create_wrapper = reinterpret_cast<std::uintptr_t>(
+      &tracer::context_scheduler::tracer_context_pthread_create_detour);
+  patch.pthread_create_patch_size = patch.patch_size;
+  std::array<std::uint8_t, tracer::kMaxPatchBytes> installed{};
+  add_jump(installed.data(),
+           reinterpret_cast<void *>(patch.pthread_create_wrapper));
+  std::fill(installed.begin() + kJumpBytes,
+            installed.begin() + patch.pthread_create_patch_size, 0x90);
+  std::memcpy(patch.pthread_create_installed, installed.data(),
+              patch.pthread_create_patch_size);
+
+  auto ledger = std::make_shared<tracer::context_engine::PropagationLedger>(
+      tracer::context_engine::PropagationLimits{64, 4096, 3 * 1024 * 1024, 64});
+  auto detour =
+      std::make_unique<tracer::context_scheduler::ContextPthreadDetour>(
+          ledger, &tracer::context_runtime::active_context,
+          &tracer::context_runtime::worker_context,
+          &tracer::context_runtime::exchange_active_context);
+  if (!detour->activate(reinterpret_cast<PthreadCreate>(trampoline))) {
+    ::munmap(trampoline, trampoline_size);
+    error = "cannot activate native pthread_create adapter";
+    return false;
+  }
+  owner.pthread_trampoline = trampoline;
+  owner.pthread_trampoline_size = trampoline_size;
+  owner.pthread_patch = patch;
+  owner.propagation_ledger = std::move(ledger);
+  owner.pthread_detour = std::move(detour);
+  copy_pthread_patch(owner.pthread_patch, probe.request);
+  return true;
+}
+
 std::string make_wrapper(const tracer::Request &r,
                          std::uintptr_t original_trampoline, bool has_pre,
                          bool has_post,
-                         const clangtracer::v1::ProbeSpec *spec = nullptr) {
+                         const clangtracer::v1::ProbeSpec *spec = nullptr,
+                         bool class_mode = false, bool shared_mode = false) {
   auto argument_type = [&](unsigned i) -> std::string {
     if (r.arguments[i] != tracer::ValueType::Object)
       return type_name(r.arguments[i]);
@@ -1179,16 +1796,32 @@ std::string make_wrapper(const tracer::Request &r,
   };
   std::string code =
       "extern \"C\" long long tracer_callback_dispatch(unsigned long "
-      "long,const tracer::TraceContext*) noexcept;\nextern \"C\" void "
+      "long,const tracer::TraceContext*,void*) noexcept;\nextern \"C\" void "
       "tracer_event_dispatch(unsigned long long,const "
       "tracer::TraceContext*,long long) noexcept;\nextern \"C\" void "
       "tracer_probe_enter(unsigned long long) noexcept;\nextern \"C\" void "
       "tracer_probe_leave(unsigned long long) noexcept;\nextern \"C\" "
       "unsigned long long tracer_next_call_id(unsigned long long) noexcept;\n";
-  code += "extern \"C\" void tracer_stack_enter(tracer::TraceContext*,void*) noexcept;\n"
-          "extern \"C\" void tracer_stack_leave(tracer::TraceContext*) noexcept;\n"
-          "extern \"C\" void tracer_capture_entry_stack(const tracer::TraceContext*,unsigned) noexcept;\n"
-          "extern \"C\" void tracer_capture_stack(const tracer::TraceContext*,unsigned,bool) noexcept;\n";
+  code +=
+      "extern \"C\" void tracer_stack_enter(tracer::TraceContext*,void*) "
+      "noexcept;\n"
+      "extern \"C\" void tracer_stack_leave(tracer::TraceContext*) noexcept;\n"
+      "extern \"C\" void tracer_capture_entry_stack(const "
+      "tracer::TraceContext*,unsigned) noexcept;\n"
+      "extern \"C\" void tracer_capture_stack(const "
+      "tracer::TraceContext*,unsigned,bool) noexcept;\n";
+  code += "extern \"C\" void tracer_context_check_entry();\n";
+  if (shared_mode)
+    code += "#include <bits/cxxabi_forced.h>\n"
+            "extern \"C\" void* tracer_shared_enter(unsigned long long,const "
+            "tracer::TraceContext*);\n"
+            "extern \"C\" void tracer_shared_leave(void*) noexcept;\n"
+            "extern \"C\" void tracer_shared_release(void*) noexcept;\n"
+            "extern \"C\" void tracer_shared_resume(void*);\n"
+            "extern \"C\" void tracer_shared_dispatch(void*,const "
+            "tracer::TraceContext*);\n"
+            "extern \"C\" void tracer_shared_original_enter(void*);\n"
+            "extern \"C\" void tracer_shared_original_leave(void*) noexcept;\n";
   code += "using Original= ";
   code += type_name(r.result);
   code += " (*) (";
@@ -1225,7 +1858,8 @@ std::string make_wrapper(const tracer::Request &r,
   if (!comma) {
     code += "void";
   }
-  code += "){\ntracer_probe_enter(" + std::to_string(r.probe_id) +
+  code += "){\ntracer_context_check_entry();\ntracer_probe_enter(" +
+          std::to_string(r.probe_id) +
           "ULL); struct FlightGuard{unsigned long long id; "
           "~FlightGuard(){tracer_probe_leave(id);}} flight{" +
           std::to_string(r.probe_id) +
@@ -1242,8 +1876,9 @@ std::string make_wrapper(const tracer::Request &r,
           "tracer_stack_enter(&ctx,__builtin_frame_address(0));"
           "struct StackGuard { tracer::TraceContext *ctx;"
           "~StackGuard(){tracer_stack_leave(ctx);} } stack_guard{&ctx};\n";
-  code += std::string("ctx.stack_application_only=") +
-          (spec && spec->include_internal_stack_frames() ? "false;\n" : "true;\n");
+  code +=
+      std::string("ctx.stack_application_only=") +
+      (spec && spec->include_internal_stack_frames() ? "false;\n" : "true;\n");
   code += std::string("ctx.printing.arguments=") +
           (spec && spec->print_arguments() ? "true;\n" : "false;\n");
   code += std::string("ctx.printing.result=") +
@@ -1255,10 +1890,24 @@ std::string make_wrapper(const tracer::Request &r,
     fill_value(code, i, r.arguments[i]);
   }
   if (spec && spec->stack_depth())
-    code += "tracer_capture_entry_stack(&ctx," + std::to_string(spec->stack_depth()) + ");\n";
+    code += "tracer_capture_entry_stack(&ctx," +
+            std::to_string(spec->stack_depth()) + ");\n";
+  if (shared_mode) {
+    code += "struct SharedGuard { void* token=nullptr; ~SharedGuard() noexcept "
+            "{ tracer_shared_leave(token); tracer_shared_release(token); } } "
+            "shared_guard;\n"
+            "shared_guard.token=tracer_shared_enter(" +
+            std::to_string(r.probe_id) +
+            "ULL,&ctx);\ntry { tracer_shared_resume(shared_guard.token);\n";
+  } else if (class_mode)
+    code += "tracer_invocation_instance tracer_invocation(ctx);\n";
+  const std::string instance = class_mode ? "&tracer_invocation" : "nullptr";
   if (has_pre) {
-    code += "(void)tracer_callback_dispatch(" + std::to_string(r.probe_id) +
-            "ULL,&ctx);\n";
+    if (shared_mode)
+      code += "tracer_shared_dispatch(shared_guard.token,&ctx);\n";
+    else
+      code += "(void)tracer_callback_dispatch(" + std::to_string(r.probe_id) +
+              "ULL,&ctx," + instance + ");\n";
   }
   code += "auto original=reinterpret_cast<Original>(" +
           std::to_string(original_trampoline) + "ULL);\n";
@@ -1276,10 +1925,20 @@ std::string make_wrapper(const tracer::Request &r,
     comma = true;
   }
   call += ")";
+  if (shared_mode && r.result != tracer::ValueType::Void)
+    code += std::string(type_name(r.result)) + " result;\n";
+  if (shared_mode)
+    code += "{ tracer_shared_original_enter(shared_guard.token); struct "
+            "OriginalGuard { void* token; ~OriginalGuard() noexcept { "
+            "tracer_shared_original_leave(token); } } "
+            "original_guard{shared_guard.token};\n";
   if (r.result == tracer::ValueType::Void) {
-    code += "original_begin: " + call + ";\noriginal_end: ctx.result.type=tracer::ValueType::Void;\n";
+    code += "original_begin: " + call +
+            ";\noriginal_end: ctx.result.type=tracer::ValueType::Void;\n";
   } else {
-    code += std::string(type_name(r.result)) + " result; original_begin: result=" + call + ";\noriginal_end: ;\n";
+    code += (shared_mode ? std::string()
+                         : std::string(type_name(r.result)) + " result; ") +
+            "original_begin: result=" + call + ";\noriginal_end: ;\n";
     code += "ctx.result.type=static_cast<tracer::ValueType>(" +
             std::to_string(static_cast<unsigned>(r.result)) + ");\n";
     switch (r.result) {
@@ -1302,16 +1961,34 @@ std::string make_wrapper(const tracer::Request &r,
       break;
     }
   }
+  if (shared_mode)
+    code += "}\n";
   if (has_post) {
-    code +=
-        "ctx.phase=tracer::TracePhase::Post; (void)tracer_callback_dispatch(" +
-        std::to_string(r.probe_id) + "ULL,&ctx);\n";
+    if (shared_mode)
+      code += "ctx.phase=tracer::TracePhase::Post; "
+              "tracer_shared_dispatch(shared_guard.token,&ctx);\n";
+    else
+      code += "ctx.phase=tracer::TracePhase::Post; "
+              "(void)tracer_callback_dispatch(" +
+              std::to_string(r.probe_id) + "ULL,&ctx," + instance + ");\n";
   }
+  if (shared_mode)
+    code += "tracer_shared_leave(shared_guard.token); "
+            "tracer_shared_resume(shared_guard.token); "
+            "tracer_shared_release(shared_guard.token); "
+            "shared_guard.token=nullptr;\n";
   if (r.result == tracer::ValueType::Void) {
-    code += "return;\n}";
+    code += "return;\n";
   } else {
-    code += "return result;\n}";
+    code += "return result;\n";
   }
+  if (shared_mode)
+    code += "} catch (const __cxxabiv1::__forced_unwind&) { throw; } catch "
+            "(...) { tracer_shared_leave(shared_guard.token); "
+            "tracer_shared_resume(shared_guard.token); "
+            "tracer_shared_release(shared_guard.token); "
+            "shared_guard.token=nullptr; throw; }\n";
+  code += "}";
   return code;
 }
 
@@ -1329,9 +2006,11 @@ bool is_long_long(clang::QualType type) {
   return builtin && builtin->getKind() == clang::BuiltinType::LongLong;
 }
 
-bool is_call_reference(clang::QualType type, llvm::StringRef name) {
+bool is_call_reference(clang::QualType type, llvm::StringRef name,
+                       bool require_const = true) {
   const auto *reference = type->getAs<clang::LValueReferenceType>();
-  if (!reference || !reference->getPointeeType().isConstQualified()) {
+  if (!reference ||
+      (require_const && !reference->getPointeeType().isConstQualified())) {
     return false;
   }
   const auto *record = reference->getPointeeType()->getAsCXXRecordDecl();
@@ -1345,6 +2024,10 @@ bool has_identifier(const clang::NamedDecl &declaration, llvm::StringRef name) {
 
 bool inspect_callback_shape(clang::ASTContext &context, CallbackShape &shape,
                             std::string &error) {
+  error = tracer::context_activation_error(
+      tracer::analyze_context_declarations(context));
+  if (!error.empty())
+    return false;
   const clang::TranslationUnitDecl *unit = context.getTranslationUnitDecl();
   const clang::CXXRecordDecl *interceptor = nullptr;
   const clang::FunctionDecl *legacy = nullptr;
@@ -1428,11 +2111,12 @@ bool inspect_callback_shape(clang::ASTContext &context, CallbackShape &shape,
                                 is_long_long(method->getReturnType());
       if (method->isStatic() || method->getAccess() != clang::AS_public ||
           method->getNumParams() != 1 ||
-          !is_call_reference(method->getParamDecl(0)->getType(),
-                             "tracer::Call") ||
+          !is_call_reference(method->getParamDecl(0)->getType(), "tracer::Call",
+                             false) ||
           !valid_return || !method->hasBody()) {
         error = std::string("Interceptor::") + (is_pre ? "pre" : "post") +
-                " must be a public, defined instance method taking const Call& "
+                " must be a public, defined instance method taking Call& or "
+                "const Call& "
                 "and returning void or long long";
         return false;
       }
@@ -1598,9 +2282,7 @@ public:
     if (shape.class_mode) {
       result_.bridge = make_class_bridge(shape);
     } else {
-      result_.bridge =
-          "extern \"C\" long long tracer_user_dispatch(const "
-          "tracer::TraceContext *raw){ return trace_callback(*raw); }\n";
+      result_.bridge = tracer::make_legacy_callback_bridge();
     }
     result_.valid = true;
   }
@@ -1965,28 +2647,10 @@ private:
 };
 
 std::string make_class_bridge(const CallbackShape &shape) {
-  std::string code = "static Interceptor tracer_interceptor;\n"
-                     "extern \"C\" long long tracer_user_dispatch(const "
-                     "tracer::TraceContext *raw){ tracer::Call call(*raw); ";
-  auto append_hook = [&](const clang::CXXMethodDecl *method, const char *phase,
-                         const char *name) {
-    if (!method) {
-      return;
-    }
-    code += "if(raw->phase==tracer::TracePhase::";
-    code += phase;
-    code += "){ ";
-    if (method->getReturnType()->isVoidType()) {
-      code +=
-          std::string("tracer_interceptor.") + name + "(call); return 0; } ";
-    } else {
-      code += std::string("return tracer_interceptor.") + name + "(call); } ";
-    }
-  };
-  append_hook(shape.pre, "Pre", "pre");
-  append_hook(shape.post, "Post", "post");
-  code += "return 0; }\n";
-  return code;
+  return tracer::make_class_callback_bridge(
+      {"Interceptor", shape.has_pre,
+       !shape.pre || shape.pre->getReturnType()->isVoidType(), shape.has_post,
+       !shape.post || shape.post->getReturnType()->isVoidType()});
 }
 
 std::string argument_aliases(const clangtracer::v1::ProbeSpec &spec) {
@@ -2012,6 +2676,106 @@ std::string argument_aliases(const clangtracer::v1::ProbeSpec &spec) {
   return code + "}\n";
 }
 
+bool compile_shared_probe(Probe &p,
+                          const clangtracer::v1::ProbeSpec &specification,
+                          const std::vector<std::string> &arguments,
+                          const std::string &wrapper_prelude,
+                          std::string &error) {
+  auto *owner = agent.load(std::memory_order_acquire);
+  if (!owner ||
+      owner->next_context_hook >= tracer::context_engine::kCaptureHooks) {
+    error = "shared-context generation capacity exceeded";
+    return false;
+  }
+  tracer::ContextActivationRequest activation;
+  activation.source =
+      argument_aliases(specification) + specification.callback_source();
+  activation.compiler_arguments = arguments;
+  if (!specification.callback_package_path().empty())
+    activation.file_name = specification.callback_package_path();
+  std::copy_n(p.request.source_lineage_id, activation.source_lineage_id.size(),
+              activation.source_lineage_id.begin());
+  if (std::all_of(activation.source_lineage_id.begin(),
+                  activation.source_lineage_id.end(),
+                  [](std::uint8_t byte) { return byte == 0; })) {
+    error = "engine package catalog did not assign a source lineage";
+    return false;
+  }
+  auto generation =
+      tracer::activate_context_source(activation, owner->context_registry);
+  if (!generation) {
+    error = generation.error;
+    return false;
+  }
+  if (!generation.generation->owner_code()->standard_library()->warm_unwind(
+          p.request.original_entry)) {
+    error = "unsupported_unwind_path: original target has no admitted native "
+            "unwind frame";
+    return false;
+  }
+  try {
+    if (!owner->context_capture)
+      owner->context_capture =
+          std::make_unique<tracer::context_engine::ContextCapturePool>();
+    p.context_delivery =
+        tracer::context_delivery::ContextAgentDelivery::acquire(p.request);
+    tracer::context_runtime::EventMetadata metadata;
+    metadata.source_id.assign(
+        reinterpret_cast<const char *>(activation.source_lineage_id.data()),
+        activation.source_lineage_id.size());
+    metadata.task_id = metadata.source_id;
+    metadata.probe_id.assign(16, '\0');
+    for (unsigned i = 0; i < 8; ++i)
+      metadata.probe_id[i] = static_cast<char>(p.request.probe_id >> (8 * i));
+    metadata.print_arguments = specification.print_arguments();
+    metadata.print_result = specification.print_result();
+    metadata.capture_hook_id = owner->next_context_hook++;
+    p.shared_runtime = std::make_shared<
+        tracer::context_runtime::SharedSourceRuntime>(
+        generation.generation->scopes(), *owner->context_capture,
+        std::move(metadata),
+        [](void *opaque, std::span<const std::byte> bytes,
+           const std::shared_ptr<const void> &schema_lease) noexcept {
+          return static_cast<tracer::context_delivery::ContextAgentDelivery *>(
+                     opaque)
+              ->try_publish_capture(bytes, schema_lease);
+        },
+        p.context_delivery.get());
+    p.shared_generation = std::move(generation.generation);
+  } catch (const std::exception &exception) {
+    error = exception.what();
+    return false;
+  }
+  p.class_callback = true;
+  p.has_pre = p.has_post = true;
+  p.request.context_required = true;
+  const auto generated_wrapper =
+      make_wrapper(p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
+                   true, true, &specification, false, true);
+  if (auto failure =
+          p.interpreter->ParseAndExecute(wrapper_prelude + generated_wrapper)) {
+    error = llvm::toString(std::move(failure));
+    return false;
+  }
+  auto wrapper = p.interpreter->getSymbolAddress("clangtracer_wrapper");
+  if (!wrapper) {
+    error = llvm::toString(wrapper.takeError());
+    return false;
+  }
+  p.wrapper = reinterpret_cast<void *>(
+      static_cast<std::uintptr_t>(address_value(*wrapper)));
+  if (!p.shared_generation->owner_code()->standard_library()->warm_unwind(
+          reinterpret_cast<std::uintptr_t>(p.wrapper))) {
+    error = "unsupported_unwind_path: generated native dispatch frame was not "
+            "registered";
+    return false;
+  }
+  p.request.wrapper_address = reinterpret_cast<std::uintptr_t>(p.wrapper);
+  p.request.callback_address = p.shared_generation->pre_entry();
+  p.receiver_ast.reset();
+  return true;
+}
+
 bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
                    std::string &error) {
   const std::string &source = specification.callback_source();
@@ -2026,6 +2790,39 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   llvm::sys::DynamicLibrary::AddSymbol(
       "tracer_callback_dispatch",
       reinterpret_cast<void *>(&tracer_callback_dispatch));
+  llvm::sys::DynamicLibrary::AddSymbol(
+      "tracer_context_check_entry",
+      reinterpret_cast<void *>(&tracer_context_check_entry));
+  llvm::sys::DynamicLibrary::AddSymbol(
+      "tracer_shared_enter", reinterpret_cast<void *>(&tracer_shared_enter));
+  llvm::sys::DynamicLibrary::AddSymbol(
+      "tracer_shared_leave", reinterpret_cast<void *>(&tracer_shared_leave));
+  llvm::sys::DynamicLibrary::AddSymbol(
+      "tracer_shared_release",
+      reinterpret_cast<void *>(&tracer_shared_release));
+  llvm::sys::DynamicLibrary::AddSymbol(
+      "tracer_shared_resume", reinterpret_cast<void *>(&tracer_shared_resume));
+  llvm::sys::DynamicLibrary::AddSymbol(
+      "tracer_shared_dispatch",
+      reinterpret_cast<void *>(&tracer_shared_dispatch));
+  llvm::sys::DynamicLibrary::AddSymbol(
+      "tracer_shared_original_enter",
+      reinterpret_cast<void *>(&tracer_shared_original_enter));
+  llvm::sys::DynamicLibrary::AddSymbol(
+      "tracer_shared_original_leave",
+      reinterpret_cast<void *>(&tracer_shared_original_leave));
+  llvm::sys::DynamicLibrary::AddSymbol(
+      "tracer_callback_lifecycle_enter",
+      reinterpret_cast<void *>(&tracer_callback_lifecycle_enter));
+  llvm::sys::DynamicLibrary::AddSymbol(
+      "tracer_callback_cleanup_enter",
+      reinterpret_cast<void *>(&tracer_callback_cleanup_enter));
+  llvm::sys::DynamicLibrary::AddSymbol(
+      "tracer_callback_lifecycle_leave",
+      reinterpret_cast<void *>(&tracer_callback_lifecycle_leave));
+  llvm::sys::DynamicLibrary::AddSymbol(
+      "tracer_callback_failure",
+      reinterpret_cast<void *>(&tracer_callback_failure));
   llvm::sys::DynamicLibrary::AddSymbol(
       "tracer_event_dispatch",
       reinterpret_cast<void *>(&tracer_event_dispatch));
@@ -2042,16 +2839,17 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   llvm::sys::DynamicLibrary::AddSymbol(
       "tracer_capture_stack", reinterpret_cast<void *>(&tracer_capture_stack));
   llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_capture_entry_stack", reinterpret_cast<void *>(&tracer_capture_entry_stack));
+      "tracer_capture_entry_stack",
+      reinterpret_cast<void *>(&tracer_capture_entry_stack));
   if (!initialize_llvm(error)) {
     return false;
   }
   const std::string resource_dir_argument =
       std::string("-resource-dir=") + tracer::runtime::clang_resource_dir();
   auto compiler_arguments = tracer::runtime::jit_arguments();
-  compiler_arguments.insert(compiler_arguments.end(),
-                            {"-std=c++20", "-x", "c++", "-fPIC", "-O0",
-                             resource_dir_argument});
+  compiler_arguments.insert(
+      compiler_arguments.end(),
+      {"-std=c++20", "-x", "c++", "-fPIC", "-O0", resource_dir_argument});
   std::vector<const char *> args;
   for (const auto &argument : compiler_arguments)
     args.push_back(argument.c_str());
@@ -2074,7 +2872,11 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
       "using uint32_t=std::uint32_t; using uint64_t=std::uint64_t; "
       "using uintptr_t=std::uintptr_t;\n"
       "#define CLANG_TRACER_CALLBACK_TYPES_DEFINED 1\n";
-  const std::string user_source = prelude + argument_aliases(specification) +
+  const std::string context_prelude =
+      std::string(tracer::kEmbeddedContextHeader) +
+      "\n#define CLANG_TRACER_CONTEXT_TYPES_DEFINED 1\n";
+  const std::string user_source = prelude + context_prelude +
+                                  argument_aliases(specification) +
                                   tracer::kEmbeddedCallbackHeader + source;
   /*
    * A typed receiver preflight imports the same real Clang declaration into a
@@ -2094,6 +2896,12 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
       clang::tooling::getClangStripOutputAdjuster(), {}, &user_capture);
   bool shape_valid = false;
   if (user_ast) {
+    const auto context_declarations =
+        tracer::analyze_context_declarations(user_ast->getASTContext());
+    if (context_declarations.requires_context)
+      return compile_shared_probe(
+          p, specification, compiler_arguments,
+          prelude + context_prelude + tracer::kEmbeddedCallbackHeader, error);
     shape_valid = inspect_callback_shape(user_ast->getASTContext(), shape,
                                          baseline_error);
   } else {
@@ -2108,12 +2916,11 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
     if (shape.class_mode) {
       bridge = make_class_bridge(shape);
     } else {
-      bridge = "extern \"C\" long long tracer_user_dispatch(const "
-               "tracer::TraceContext *raw){ return trace_callback(*raw); }\n";
+      bridge = tracer::make_legacy_callback_bridge();
     }
-    const std::string generated =
-        make_wrapper(p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
-                     shape.has_pre, shape.has_post, &specification);
+    const std::string generated = make_wrapper(
+        p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
+        shape.has_pre, shape.has_post, &specification, shape.class_mode);
     complete_source = user_source + "\n" + bridge + "\n" + generated;
     DiagnosticCapture complete_capture(nullptr);
     auto complete_ast = clang::tooling::buildASTFromCodeWithArgs(
@@ -2189,7 +2996,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
     }
 
     std::string typed_user_source =
-        prelude +
+        prelude + context_prelude +
         (p.request.kind == tracer::CallableKind::Method
              ? "#define CLANG_TRACER_HAS_TYPED_RECEIVER 1\n"
              : "") +
@@ -2236,9 +3043,9 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
     shape.has_pre = receiver_shape.has_pre;
     shape.has_post = receiver_shape.has_post;
     bridge = receiver_shape.bridge;
-    const std::string generated =
-        make_wrapper(p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
-                     shape.has_pre, shape.has_post, &specification);
+    const std::string generated = make_wrapper(
+        p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
+        shape.has_pre, shape.has_post, &specification, shape.class_mode);
     complete_source = typed_user_source + "\n" + bridge + "\n" + generated;
     import_error.clear();
     ReceiverCallbackShape final_shape;
@@ -2288,7 +3095,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
     return false;
   }
   p.request.callback_address = address_value(*cb);
-  p.callback = reinterpret_cast<long long (*)(const tracer::TraceContext *)>(
+  p.callback = reinterpret_cast<long long (*)(const tracer::TraceContext *,
+                                              void *, bool *)>(
       static_cast<std::uintptr_t>(p.request.callback_address));
   auto wrapper = p.interpreter->getSymbolAddress("clangtracer_wrapper");
   if (!wrapper) {
@@ -2345,9 +3153,9 @@ tracer_next_call_id(unsigned long long id) noexcept {
   return 0;
 }
 
-extern "C" long long
-tracer_callback_dispatch(unsigned long long id,
-                         const tracer::TraceContext *ctx) noexcept {
+extern "C" long long tracer_callback_dispatch(unsigned long long id,
+                                              const tracer::TraceContext *ctx,
+                                              void *instance) noexcept {
   auto *p = find_probe(id);
   if (!p || !ctx || !p->active.load(std::memory_order_seq_cst) ||
       !p->callback_enabled.load(std::memory_order_relaxed) || callback_depth) {
@@ -2359,15 +3167,18 @@ tracer_callback_dispatch(unsigned long long id,
   bool succeeded = false;
   tracer::TraceContext invocation = *ctx;
   invocation.named_count = 0;
-  for (unsigned i = 0; i < invocation.argument_count && i < tracer::kMaxArguments; ++i)
-    invocation.argument_names[i] = i < p->argument_names.size()
-                                     ? p->argument_names[i].c_str() : nullptr;
+  for (unsigned i = 0;
+       i < invocation.argument_count && i < tracer::kMaxArguments; ++i)
+    invocation.argument_names[i] =
+        i < p->argument_names.size() ? p->argument_names[i].c_str() : nullptr;
   try {
-    value = p->callback(&invocation);
-
-    succeeded = true;
+    value = p->callback(&invocation, instance, &succeeded);
   } catch (...) {
-    p->callback_enabled.store(false, std::memory_order_relaxed);
+    succeeded = false;
+    // Class adapters disable only their failed invocation. Legacy callbacks
+    // retain their existing probe-wide failure behavior.
+    if (!p->class_callback)
+      p->callback_enabled.store(false, std::memory_order_relaxed);
     p->callback_errors.fetch_add(1, std::memory_order_relaxed);
   }
   --callback_depth;
@@ -2378,8 +3189,25 @@ tracer_callback_dispatch(unsigned long long id,
   return value;
 }
 
+extern "C" bool
+tracer_callback_lifecycle_enter(unsigned long long id) noexcept {
+  auto *p = find_probe(id);
+  if (callback_depth || !p || !p->active.load(std::memory_order_seq_cst) ||
+      !p->callback_enabled.load(std::memory_order_relaxed))
+    return false;
+  ++callback_depth;
+  return true;
+}
+extern "C" void tracer_callback_cleanup_enter() noexcept { ++callback_depth; }
+extern "C" void tracer_callback_lifecycle_leave() noexcept { --callback_depth; }
+extern "C" void tracer_callback_failure(unsigned long long id) noexcept {
+  if (auto *p = find_probe(id))
+    p->callback_errors.fetch_add(1, std::memory_order_relaxed);
+}
+
 extern "C" void tracer_capture_stack(const tracer::TraceContext *ctx,
-                                      unsigned depth, bool application_only) noexcept {
+                                     unsigned depth,
+                                     bool application_only) noexcept {
   if (!ctx)
     return;
   const int saved_errno = errno;
@@ -2390,7 +3218,7 @@ extern "C" void tracer_capture_stack(const tracer::TraceContext *ctx,
 }
 
 extern "C" void tracer_capture_entry_stack(const tracer::TraceContext *ctx,
-                                            unsigned depth) noexcept {
+                                           unsigned depth) noexcept {
   if (!callback_depth)
     tracer_capture_stack(ctx, depth, ctx->stack_application_only);
 }
@@ -2575,9 +3403,10 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     // Named tracing uses the target's own independently re-read DWARF and ELF
     // mappings. No dynamic symbol lookup is involved, including for local and
     // hidden functions. Raw-symbol requests retain their explicit dlsym path.
-    void *entry = specification.has_debug_info()
-                      ? reinterpret_cast<void *>(validate_debug_entry(specification))
-                      : ::dlsym(RTLD_DEFAULT, request->symbol);
+    void *entry =
+        specification.has_debug_info()
+            ? reinterpret_cast<void *>(validate_debug_entry(specification))
+            : ::dlsym(RTLD_DEFAULT, request->symbol);
     if (!entry) {
       set_error(request, "target symbol was not found in the process");
       return -1;
@@ -2644,6 +3473,10 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, error.c_str());
       return -1;
     }
+    if (p->request.context_required && !prepare_context_pthread(a, *p, error)) {
+      set_error(request, error.c_str());
+      return -1;
+    }
     p->delivery.socket_fd =
         ::socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (p->delivery.socket_fd < 0) {
@@ -2662,6 +3495,15 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
                   sizeof(addr))) {
       set_error(request, "could not connect event socket");
       return -1;
+    }
+    if (p->request.context_required) {
+      if (!a.pthread_detour || !a.pthread_detour->enable_propagation()) {
+        set_error(request,
+                  "native pthread_create propagation adapter is unavailable");
+        return -1;
+      }
+      p->scheduler_counted = true;
+      ++a.context_probe_count;
     }
     p->session_id = request->session_id;
     a.pid = ::getpid();
@@ -2695,6 +3537,12 @@ extern "C" int tracer_agent_stop(tracer::Request *request) {
       return -1;
     }
     std::lock_guard<std::mutex> lock(agent_mutex);
+    auto *current = agent.load(std::memory_order_acquire);
+    if (!current) {
+      set_error(request, "agent is not initialized");
+      return -1;
+    }
+    Agent &a = *current;
     auto *p = find_probe(request->probe_id);
     if (!p) {
       set_error(request, "probe_id is unknown");
@@ -2720,15 +3568,29 @@ extern "C" int tracer_agent_stop(tracer::Request *request) {
       return -2;
     }
     p->active.exchange(false, std::memory_order_seq_cst);
+    if (p->scheduler_counted) {
+      p->scheduler_counted = false;
+      if (a.context_probe_count != 0)
+        --a.context_probe_count;
+      if (a.context_probe_count == 0 && a.pthread_detour)
+        a.pthread_detour->disable_propagation();
+    }
     tracer::EventTransport::begin_drain(p->delivery);
+    const auto scheduler_tasks =
+        a.pthread_detour ? a.pthread_detour->outstanding_tasks() : 0;
+    p->request.pthread_create_active_tasks =
+        static_cast<std::uint32_t>(std::min<std::size_t>(
+            scheduler_tasks, std::numeric_limits<std::uint32_t>::max()));
     if (p->in_flight.load(std::memory_order_seq_cst) ||
-        p->delivery.pending.load(std::memory_order_acquire)) {
+        p->delivery.pending.load(std::memory_order_acquire) ||
+        (a.context_probe_count == 0 && scheduler_tasks != 0)) {
       p->request.event_drops =
           p->delivery.dropped.load(std::memory_order_relaxed);
       p->request.callback_errors =
           p->callback_errors.load(std::memory_order_relaxed);
       *request = p->request;
-      set_error(request, "probe callbacks or queued events are in flight; "
+      set_error(request, "probe callbacks, accepted pthread tasks or queued "
+                         "events are in flight; "
                          "remove can be retried");
       return 1;
     }

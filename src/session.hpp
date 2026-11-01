@@ -1,10 +1,12 @@
 #pragma once
 
 #include <chrono>
+#include <array>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -22,12 +24,14 @@ class Session final {
 public:
   Session(std::string id, std::uint32_t pid, std::uint64_t process_start,
           std::string agent_path, std::string event_path,
+          std::string context_endpoint, std::string context_durable_directory,
           std::chrono::seconds operation_timeout);
 
   void attach();
   clangtracer::v1::Probe add_probe(const clangtracer::v1::ProbeSpec &spec,
                                    const std::string &source_directory,
-                                   std::uint64_t probe_id);
+                                   std::uint64_t probe_id,
+                                   const std::array<std::uint8_t, 16> &lineage);
   clangtracer::v1::Probe remove_probe(std::uint64_t probe_id);
   void detach();
   void shutdown() noexcept;
@@ -44,6 +48,15 @@ public:
   [[nodiscard]] static std::uint64_t ProcessStartTime(std::uint32_t pid);
 
 private:
+  struct PthreadCreatePatch {
+    std::uintptr_t entry = 0;
+    std::uintptr_t trampoline = 0;
+    std::uintptr_t wrapper = 0;
+    std::uint32_t size = 0;
+    std::array<std::uint8_t, kMaxPatchBytes> original{};
+    std::array<std::uint8_t, kMaxPatchBytes> installed{};
+  };
+
   struct ProbeRecord {
     clangtracer::v1::Probe value;
     std::uintptr_t remote_request = 0;
@@ -57,6 +70,8 @@ private:
   std::uint64_t process_start_;
   std::string agent_path_;
   std::string event_path_;
+  std::string context_endpoint_;
+  std::string context_durable_directory_;
   std::chrono::seconds operation_timeout_;
   std::vector<std::string> discovered_module_paths_;
   std::vector<injector::ApplicationModule> application_modules_;
@@ -67,7 +82,10 @@ private:
   bool unsafe_target_ = false;
   std::uintptr_t start_address_ = 0;
   std::uintptr_t stop_address_ = 0;
+  std::uintptr_t pthread_detour_address_ = 0;
   std::map<std::uint64_t, ProbeRecord> probes_;
+  std::optional<PthreadCreatePatch> pthread_create_patch_;
+  bool pthread_create_patch_committed_ = false;
 
   void attach_process(tracer::injector::Process &process,
                       std::chrono::steady_clock::time_point deadline);

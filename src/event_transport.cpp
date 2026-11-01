@@ -1,6 +1,11 @@
 #include "event_transport.hpp"
+#include "context_execution.hpp"
+#include "context_diagnostic_format.hpp"
 
 #include <cerrno>
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <stdexcept>
 
 #include <poll.h>
@@ -21,6 +26,14 @@ std::uint64_t monotonic_ns() noexcept {
   timespec now{};
   ::clock_gettime(CLOCK_MONOTONIC, &now);
   return std::uint64_t(now.tv_sec) * 1000000000ULL + now.tv_nsec;
+}
+void emit_context_diagnostic(void *,
+                             const context_execution::Diagnostic &d) noexcept {
+  char line[320];
+  const int size = context_execution::format_diagnostic(
+      d, line, sizeof(line));
+  if (size > 0) (void)::write(STDERR_FILENO, line,
+                              static_cast<std::size_t>(std::min<int>(size, sizeof(line))));
 }
 } // namespace
 
@@ -135,8 +148,10 @@ bool EventTransport::send(EventDelivery &delivery, const void *bytes,
 }
 
 void EventTransport::run() noexcept {
+  context_execution::Scope transport_mode(context_execution::Mode::TransportNoTrace);
   if (suppress_callbacks_)
     suppress_callbacks_();
+  auto next_diagnostic = std::chrono::steady_clock::now();
   for (;;) {
     while (ready()) {
       auto &packet = slots_[dequeue_ & (kCapacity - 1)];
@@ -156,11 +171,16 @@ void EventTransport::run() noexcept {
     }
     if (stopping_.load(std::memory_order_acquire))
       return;
+    if (std::chrono::steady_clock::now() >= next_diagnostic) {
+      (void)context_execution::runtime_diagnostics().drain_coalesced(
+          emit_context_diagnostic, nullptr, 32);
+      next_diagnostic = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    }
     notified_.store(false, std::memory_order_release);
     if (ready())
       continue;
     pollfd wake{wake_fd_, POLLIN, 0};
-    (void)::poll(&wake, 1, active_.load(std::memory_order_acquire) ? 1 : -1);
+    (void)::poll(&wake, 1, active_.load(std::memory_order_acquire) ? 1 : 1000);
     std::uint64_t value;
     (void)::read(wake_fd_, &value, sizeof(value));
   }

@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -104,9 +105,13 @@ void copy_signature(const clangtracer::v1::Signature &signature,
 
 Session::Session(std::string id, std::uint32_t pid, std::uint64_t process_start,
                  std::string agent_path, std::string event_path,
+                 std::string context_endpoint,
+                 std::string context_durable_directory,
                  std::chrono::seconds operation_timeout)
     : id_(std::move(id)), pid_(pid), process_start_(process_start),
       agent_path_(std::move(agent_path)), event_path_(std::move(event_path)),
+      context_endpoint_(std::move(context_endpoint)),
+      context_durable_directory_(std::move(context_durable_directory)),
       operation_timeout_(operation_timeout) {}
 
 std::uint64_t Session::ProcessStartTime(std::uint32_t pid) {
@@ -176,7 +181,8 @@ void Session::attach() {
   std::uintptr_t scratch = 0;
   const auto start_offset = agent_path_.size() + 16;
   const auto stop_offset = start_offset + 32;
-  const auto scratch_size = stop_offset + 64;
+  const auto detour_offset = stop_offset + 32;
+  const auto scratch_size = detour_offset + 64;
   try {
     scratch = process.remote_allocate(scratch_size);
     auto put = [&](std::uintptr_t offset, const std::string &text) {
@@ -194,10 +200,14 @@ void Session::attach() {
     }
     const auto start_name = put(start_offset, "tracer_agent_start");
     const auto stop_name = put(stop_offset, "tracer_agent_stop");
+    const auto detour_name = put(detour_offset,
+                                 "tracer_context_pthread_create_detour");
     const auto start =
         process.remote_call(dlsym_address, {handle, start_name}, 2);
     const auto stop =
         process.remote_call(dlsym_address, {handle, stop_name}, 2);
+    const auto pthread_detour =
+        process.remote_call(dlsym_address, {handle, detour_name}, 2);
     if (!start || !stop) {
       throw std::runtime_error(
           "native agent start/stop exports were not found");
@@ -207,6 +217,7 @@ void Session::attach() {
     process.detach();
     start_address_ = start;
     stop_address_ = stop;
+    pthread_detour_address_ = pthread_detour;
   } catch (...) {
     if (process.unsafe()) {
       unsafe_target_ = true;
@@ -234,7 +245,8 @@ Session::ProbeRecord &Session::find_probe_locked(std::uint64_t probe_id) {
 clangtracer::v1::Probe
 Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
                    const std::string &source_directory,
-                   std::uint64_t probe_id) {
+                   std::uint64_t probe_id,
+                   const std::array<std::uint8_t, 16> &lineage) {
   std::lock_guard lock(mutex_);
   check_identity_locked();
   if (state_ != clangtracer::v1::Session::ATTACHED) {
@@ -259,9 +271,31 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     Request request{};
     request.probe_id = probe_id;
     copy_field(request.session_id, id_, "session id");
+    request.context_native_pid = pid_;
+    request.context_process_start_time = process_start_;
     copy_field(request.symbol, spec.symbol(), "symbol");
     copy_field(request.source_path, source_file, "callback source path");
     copy_field(request.event_socket, event_path_, "event socket path");
+    copy_field(request.context_endpoint, context_endpoint_,
+               "shared-context endpoint");
+    if (context_durable_directory_.empty()) {
+      request.context_delivery_profile = 1;
+    } else {
+      request.context_delivery_profile = 2;
+      const auto durable_id = "pid-" + std::to_string(pid_) + "-" +
+                              std::to_string(process_start_);
+      std::filesystem::create_directories(context_durable_directory_);
+      if (::chmod(context_durable_directory_.c_str(), 0700) != 0) {
+        throw std::runtime_error("cannot secure shared-context journal directory");
+      }
+      copy_field(request.context_journal_dir, context_durable_directory_,
+                 "shared-context journal directory");
+      copy_field(request.context_recording_id, durable_id,
+                 "shared-context recording id");
+      copy_field(request.context_sink_id, "default",
+                 "shared-context sink id");
+    }
+    std::copy(lineage.begin(), lineage.end(), request.source_lineage_id);
     copy_signature(spec.signature(), request);
 
     ProbeRecord record;
@@ -342,6 +376,60 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
                      response.patch_size))
       throw std::runtime_error("agent returned identical patch byte sequences");
 
+    std::optional<PthreadCreatePatch> scheduler_patch;
+    if (response.pthread_create_patch_size > kMaxPatchBytes) {
+      throw std::runtime_error("agent returned invalid pthread_create patch metadata");
+    }
+    if (response.pthread_create_patch_size != 0) {
+      if (!response.pthread_create_entry || !response.pthread_create_trampoline ||
+          !response.pthread_create_wrapper ||
+          response.pthread_create_patch_size < 14 ||
+          std::memcmp(response.pthread_create_original,
+                      response.pthread_create_installed,
+                      response.pthread_create_patch_size) == 0) {
+        throw std::runtime_error("agent returned incomplete pthread_create patch metadata");
+      }
+      PthreadCreatePatch candidate;
+      candidate.entry = response.pthread_create_entry;
+      candidate.trampoline = response.pthread_create_trampoline;
+      candidate.wrapper = response.pthread_create_wrapper;
+      candidate.size = response.pthread_create_patch_size;
+      std::copy_n(response.pthread_create_original, candidate.size,
+                  candidate.original.begin());
+      std::copy_n(response.pthread_create_installed, candidate.size,
+                  candidate.installed.begin());
+      const auto proven_entry = process.resolve_remote_symbol("pthread_create");
+      bool proven_patch_entry = candidate.entry == proven_entry;
+      if (!proven_patch_entry &&
+          proven_entry <= std::numeric_limits<std::uintptr_t>::max() - 4 &&
+          candidate.entry == proven_entry + 4) {
+        std::array<unsigned char, 4> landing_pad{};
+        process.remote_read(proven_entry, landing_pad.data(), landing_pad.size());
+        constexpr std::array<unsigned char, 4> kEndbr64{0xf3, 0x0f, 0x1e, 0xfa};
+        proven_patch_entry = landing_pad == kEndbr64;
+      }
+      if (!proven_patch_entry ||
+          candidate.wrapper != pthread_detour_address_) {
+        throw std::runtime_error(
+            "agent pthread_create detour does not match the proven libc symbol and wrapper");
+      }
+      scheduler_patch = candidate;
+      if (pthread_create_patch_committed_ &&
+          (!pthread_create_patch_ ||
+           pthread_create_patch_->entry != candidate.entry ||
+           pthread_create_patch_->trampoline != candidate.trampoline ||
+           pthread_create_patch_->wrapper != candidate.wrapper ||
+           pthread_create_patch_->size != candidate.size ||
+           pthread_create_patch_->original != candidate.original ||
+           pthread_create_patch_->installed != candidate.installed)) {
+        throw std::runtime_error(
+            "agent changed the active pthread_create detour metadata");
+      }
+    } else if (response.context_required) {
+      throw std::runtime_error(
+          "shared-context activation requires a proven pthread_create detour");
+    }
+
     constexpr unsigned kPatchAttempts = 12;
     bool committed = false;
     for (unsigned attempt = 0; attempt < kPatchAttempts; ++attempt) {
@@ -349,15 +437,30 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
         break;
       bool patch_applied = false;
       try {
-        patch_applied =
-            process.patch_code(response.original_entry, response.original,
-                               response.installed, response.patch_size);
+        const injector::CodePatch target_patch{
+            response.original_entry, response.original, response.installed,
+            response.patch_size};
+        if (scheduler_patch && !pthread_create_patch_committed_) {
+          const injector::CodePatch task_patch{
+              scheduler_patch->entry, scheduler_patch->original.data(),
+              scheduler_patch->installed.data(), scheduler_patch->size};
+          const std::array<injector::CodePatch, 2> patch_set{
+              target_patch, task_patch};
+          patch_applied = process.patch_code_batch(patch_set);
+        } else {
+          patch_applied = process.patch_code_batch(
+              std::span<const injector::CodePatch>(&target_patch, 1));
+        }
       } catch (const std::exception &error) {
         // A failed peer release can report an error after the bytes changed.
         // Preserve enough state to identify the probe and leave recovery to a
         // caller that can inspect the parked process.
         it->second.patch_committed = true;
         it->second.value.set_active(true);
+        if (scheduler_patch && !pthread_create_patch_committed_) {
+          pthread_create_patch_ = scheduler_patch;
+          pthread_create_patch_committed_ = true;
+        }
         process.mark_unsafe();
         unsafe_target_ = true;
         set_failed_locked(std::string("entry patch outcome is uncertain; "
@@ -367,6 +470,10 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
       } catch (...) {
         it->second.patch_committed = true;
         it->second.value.set_active(true);
+        if (scheduler_patch && !pthread_create_patch_committed_) {
+          pthread_create_patch_ = scheduler_patch;
+          pthread_create_patch_committed_ = true;
+        }
         process.mark_unsafe();
         unsafe_target_ = true;
         set_failed_locked("entry patch outcome is uncertain; target remains "
@@ -423,6 +530,10 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
       throw std::runtime_error("entry remained busy; probe was not committed");
     }
     it->second.patch_committed = true;
+    if (scheduler_patch && !pthread_create_patch_committed_) {
+      pthread_create_patch_ = scheduler_patch;
+      pthread_create_patch_committed_ = true;
+    }
     it->second.value.set_original_bytes_restored(false);
     it->second.value.set_agent_dropped_events(response.event_drops);
     it->second.value.set_callback_errors(response.callback_errors);
@@ -489,6 +600,10 @@ bool Session::stop_probe_locked(
   const auto operation_deadline =
       std::chrono::steady_clock::now() + operation_timeout_;
   const auto deadline = std::min(operation_deadline, shutdown_deadline);
+  const bool last_active_probe = std::none_of(
+      probes_.begin(), probes_.end(), [&](const auto &entry) {
+        return entry.first != probe.value.id() && entry.second.value.active();
+      });
   for (;;) {
     if (std::chrono::steady_clock::now() >= deadline) {
       const std::string message = "probe cleanup reached shutdown deadline";
@@ -622,6 +737,73 @@ bool Session::stop_probe_locked(
                     response.error;
       set_failed_locked(message);
       throw std::runtime_error(message);
+    }
+    if (last_active_probe && pthread_create_patch_committed_ &&
+        response.pthread_create_active_tasks != 0) {
+      try {
+        process.detach();
+      } catch (const std::exception &error) {
+        process.mark_unsafe();
+        unsafe_target_ = true;
+        set_failed_locked(std::string("could not resume target while waiting "
+                                      "for pthread task completion: ") +
+                          error.what());
+        throw std::runtime_error(error_);
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        const std::string message =
+            "accepted pthread tasks remained active until stop timeout";
+        if (!shutdown_mode)
+          set_failed_locked(message);
+        throw std::runtime_error(message);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      continue;
+    }
+    if (last_active_probe && pthread_create_patch_committed_) {
+      if (!pthread_create_patch_) {
+        process.mark_unsafe();
+        unsafe_target_ = true;
+        set_failed_locked("pthread_create patch ownership metadata is missing");
+        throw std::runtime_error(error_);
+      }
+      const auto &scheduler = *pthread_create_patch_;
+      bool restored_scheduler = false;
+      constexpr unsigned kSchedulerRestoreAttempts = 12;
+      for (unsigned attempt = 0; attempt < kSchedulerRestoreAttempts; ++attempt) {
+        if (std::chrono::steady_clock::now() >= deadline)
+          break;
+        try {
+          const injector::CodePatch restore{
+              scheduler.entry, scheduler.installed.data(),
+              scheduler.original.data(), scheduler.size};
+          if (process.patch_code_batch(
+                  std::span<const injector::CodePatch>(&restore, 1))) {
+            restored_scheduler = true;
+            break;
+          }
+        } catch (const std::exception &error) {
+          process.mark_unsafe();
+          unsafe_target_ = true;
+          set_failed_locked(
+              std::string("pthread_create restore outcome is uncertain: ") +
+              error.what());
+          throw std::runtime_error(error_);
+        }
+        process.detach();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        attach_process(process, deadline);
+      }
+      if (!restored_scheduler) {
+        if (!shutdown_mode)
+          set_failed_locked(
+              "pthread_create remained busy; detour bytes were not restored");
+        process.detach();
+        throw std::runtime_error(
+            "pthread_create remained busy; removal can be retried");
+      }
+      pthread_create_patch_committed_ = false;
+      pthread_create_patch_.reset();
     }
     if (!response.patch_size || response.patch_size > kMaxPatchBytes) {
       process.mark_unsafe();

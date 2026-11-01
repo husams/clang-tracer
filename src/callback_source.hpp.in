@@ -7,4 +7,7 @@ inline constexpr char kEmbeddedProtocolHeader[] = R"TRACER_PROTOCOL(
 inline constexpr char kEmbeddedCallbackHeader[] = R"TRACER_API(
 @TRACER_CALLBACK_HEADER@
 )TRACER_API";
+inline constexpr char kEmbeddedContextHeader[] = R"TRACER_CONTEXT(
+@TRACER_CONTEXT_HEADER@
+)TRACER_CONTEXT";
 } // namespace tracer

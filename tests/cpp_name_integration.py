@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -14,7 +15,8 @@ import time
 from pathlib import Path
 
 from client_integration import decode_file, require, target_rows, wait_for_rows, write_text
-from friendly_client_integration import FriendlyClient, check_events, has_field, save_output
+from friendly_client_integration import FriendlyClient, has_field, save_output
+from class_interceptor_integration import callback_value, wait_binary
 
 
 def read_probe_id(text: str) -> int:
@@ -74,6 +76,7 @@ def main() -> int:
     parser.add_argument("--server", required=True, type=Path)
     parser.add_argument("--client", required=True, type=Path)
     parser.add_argument("--target", required=True, type=Path)
+    parser.add_argument("--negative-target", required=True, type=Path)
     parser.add_argument("--agent", required=True, type=Path)
     parser.add_argument("--protoc", required=True, type=Path)
     parser.add_argument("--proto", required=True, type=Path)
@@ -83,7 +86,7 @@ def main() -> int:
     parser.add_argument("--callback", required=True, type=Path)
     args = parser.parse_args()
     for name in ("server", "client", "target", "agent", "protoc", "proto", "compdb", "source",
-                 "callback"):
+                 "callback", "negative_target"):
         path = getattr(args, name).resolve()
         require(path.exists(), f"{name} does not exist: {path}")
         setattr(args, name, path)
@@ -101,6 +104,8 @@ def main() -> int:
     server = None
     target_log = None
     server_log = None
+    negative_target = None
+    negative_log = None
 
     try:
         with tempfile.TemporaryDirectory(prefix="clang-tracer-cpp-name-") as temp:
@@ -134,7 +139,7 @@ def main() -> int:
                     f"attach did not report the owned target as attached:\n{attach_text}")
             callback = args.callback
 
-            # The ordinary mode relies on the CLI's cwd/build compile database discovery.
+            # DWARF-only resolution needs neither source nor a compilation database.
             autodiscovery_dir = temp_dir / "autodiscovery"
             (autodiscovery_dir / "build").mkdir(parents=True)
             (autodiscovery_dir / "build" / "compile_commands.json").symlink_to(
@@ -143,7 +148,7 @@ def main() -> int:
             resolved_int = trace(
                 FriendlyClient(args.client, endpoint), target.pid,
                 "Fixture::overloaded(int)", callback,
-                "--compdb", str(args.compdb), "--source", str(args.source), timeout=45)
+                timeout=45)
             int_text = save_output(output_dir / "trace-overloaded-int.txt", resolved_int)
             int_probe = read_probe_id(int_text)
             require("Fixture::overloaded(int)" in int_text,
@@ -151,18 +156,16 @@ def main() -> int:
             symbol_match = re.search(r"\bsymbol=([^\s]+)", int_text)
             require(symbol_match is not None and symbol_match.group(1),
                     f"resolved trace did not report its native symbol:\n{int_text}")
-            report.append("C++ declaration trace resolved the int overload from the compilation database")
+            report.append("C++ declaration trace resolved the int overload from mapped DWARF")
 
-            # An omitted --compdb must use cwd/build/compile_commands.json.
-            auto_client = FriendlyClient(args.client, endpoint)
+            # Resolution remains independent of the invoking directory.
             auto_env_cwd = autodiscovery_dir
             auto_result = subprocess.run(
                 [str(args.client), "--endpoint", endpoint, "trace", str(target.pid),
-                 "Fixture::overloaded(long)", "--callback", str(callback), "--source",
-                 str(args.source)], cwd=auto_env_cwd, capture_output=True, timeout=45,
+                 "Fixture::overloaded(long)", "--callback", str(callback)], cwd=auto_env_cwd, capture_output=True, timeout=45,
                 check=False)
             require(auto_result.returncode == 0,
-                    "automatic cwd/build compilation database lookup failed: " +
+                    "source-free DWARF resolution from a different directory failed: " +
                     auto_result.stderr.decode(errors="replace"))
             long_text = (auto_result.stdout + auto_result.stderr).decode("utf-8", errors="replace")
             save_output(output_dir / "trace-overloaded-long.txt",
@@ -180,8 +183,7 @@ def main() -> int:
                        '  return static_cast<long long>(context.arguments[0].real_value * 100 + 17);\n'
                        '}\n')
             inspect_result = trace(client, target.pid, "Fixture::inspect(double) const",
-                                   double_callback, "--compdb", str(args.compdb), "--source",
-                                   str(args.source), timeout=45)
+                                   double_callback, timeout=45)
             inspect_text = save_output(output_dir / "trace-inspect-const.txt", inspect_result)
             inspect_probe = read_probe_id(inspect_text)
             require("Fixture::inspect(double) const" in inspect_text,
@@ -190,36 +192,47 @@ def main() -> int:
             # Rejections use an unreachable endpoint so any gRPC error proves resolution got too far.
             ambiguous = ensure_pre_rpc_rejection(
                 client, target.pid, "Fixture::overloaded", callback,
-                ("--compdb", str(args.compdb), "--source", str(args.source)),
+                (),
                 "ambiguous", output_dir)
             require("overloaded(int)" in ambiguous and "overloaded(long)" in ambiguous,
                     f"ambiguous overload error did not list candidates:\n{ambiguous}")
             missing = ensure_pre_rpc_rejection(
                 client, target.pid, "Fixture::not_a_method(int)", callback,
-                ("--compdb", str(args.compdb), "--source", str(args.source)),
+                (),
                 "missing-name", output_dir)
-            require("not_a_method" in missing, f"missing-name error lacks the requested name:\n{missing}")
+            require("no supported matching callable" in missing.lower(),
+                    f"missing-name error lacks DWARF resolution context:\n{missing}")
             mismatched = ensure_pre_rpc_rejection(
                 client, target.pid, "Fixture::overloaded(int, int)", callback,
-                ("--compdb", str(args.compdb), "--source", str(args.source)),
+                (),
                 "mismatched-parameters", output_dir)
-            require("overloaded" in mismatched, "mismatched-parameter error lacks declaration context")
-            bad_db = ensure_pre_rpc_rejection(
-                client, target.pid, "Fixture::overloaded(int)", callback,
-                ("--compdb", str(temp_dir / "missing-db"), "--source", str(args.source)),
-                "missing-compdb", output_dir)
+            require("no supported matching callable" in mismatched.lower(),
+                    "mismatched-parameter error lacks DWARF resolution context")
+            header = temp_dir / "standalone.hpp"
+            write_text(header, "#pragma once\n")
+            bad_db = save_output(output_dir / "reject-missing-compdb.txt", client.run(
+                "trace", str(target.pid), "Fixture::overloaded(int)", "--callback", str(callback),
+                "--compdb", str(temp_dir / "missing-db"), "--include", str(header),
+                expected_ok=False, timeout=45))
             require("compilation" in bad_db.lower() or "compile" in bad_db.lower() or
                     "database" in bad_db.lower(), f"missing database error is unclear:\n{bad_db}")
 
-            # These synthetic translation units share the real compiler arguments from the
-            # build database, but are never linked into or loaded by the traced target.
+            # Negative callable cases now use a real mapped debug image. Header
+            # compiler flags still come from a donor that need not exist.
+            negative_log = (output_dir / "negative-target.log").open("wb")
+            negative_target = subprocess.Popen([str(args.negative_target)],
+                                               stdout=negative_log, stderr=negative_log)
+            deadline = time.monotonic() + 5
+            while "CPP_NAME_FIXTURE pid=" not in (output_dir / "negative-target.log").read_text(errors="replace"):
+                require(negative_target.poll() is None and time.monotonic() < deadline,
+                        "negative DWARF fixture did not start")
+                time.sleep(.05)
             db_entries = json.loads(compdb_file.read_text(encoding="utf-8"))
             template = next((entry for entry in db_entries
                              if Path(entry["file"]).resolve() == args.source), None)
             require(template is not None, f"compile database has no command for {args.source}")
-            negative_source = repo / "tests" / "cpp_name_fixture.cpp"
-            require(negative_source.is_file(), f"unsupported-type fixture missing: {negative_source}")
-            compiler = (template.get("arguments") or ["clang++"])[0]
+            negative_source = temp_dir / "unavailable-donor.cpp"
+            compiler = (template.get("arguments") or shlex.split(template["command"]))[0]
             command = [compiler, "-std=c++20", "-x", "c++", "-fsyntax-only",
                        str(negative_source)]
             entry = {"directory": str(repo), "file": str(negative_source),
@@ -227,36 +240,39 @@ def main() -> int:
             negative_db = temp_dir / "negative-compile-commands.json"
             write_text(negative_db, json.dumps([entry]))
             unsupported = ensure_pre_rpc_rejection(
-                client, target.pid, "UnsupportedFixture::unsupported(UnsupportedType)", callback,
-                ("--compdb", str(negative_db), "--source", str(negative_source)),
+                client, negative_target.pid, "UnsupportedFixture::unsupported(UnsupportedType)", callback,
+                (),
                 "unsupported-type", output_dir)
             require("unsupported" in unsupported.lower() or "type" in unsupported.lower(),
                     f"unsupported type error lacks type context:\n{unsupported}")
 
-            fixture_options = ("--compdb", str(negative_db), "--source", str(negative_source))
+            fixture_options = ()
             ambiguous_virtual = ensure_pre_rpc_rejection(
-                client, target.pid, "X::f", callback, fixture_options,
-                "virtual-overload-ambiguous", output_dir)
+                client, negative_target.pid, "X::f", callback, fixture_options,
+                "fixture-overload-ambiguous", output_dir)
             require("X::f(int)" in ambiguous_virtual and "X::f(long)" in ambiguous_virtual,
                     f"virtual overload candidate list is incomplete:\n{ambiguous_virtual}")
             virtual_exact = ensure_pre_rpc_rejection(
-                client, target.pid, "X::f(int)", callback, fixture_options,
+                client, negative_target.pid, "VirtualOnly::f(int)", callback, fixture_options,
                 "virtual-exact-unsupported", output_dir)
             require("virtual methods" in virtual_exact.lower() or "virtual" in virtual_exact.lower(),
                     f"exact virtual method was not rejected as unsupported:\n{virtual_exact}")
             volatile_mismatch = ensure_pre_rpc_rejection(
-                client, target.pid, "VolatileOnly::v(int)", callback, fixture_options,
+                client, negative_target.pid, "VolatileOnly::v(int)", callback, fixture_options,
                 "volatile-mismatch", output_dir)
-            require("no callable matched" in volatile_mismatch.lower(),
+            require("no supported matching callable" in volatile_mismatch.lower(),
                     f"non-volatile selector matched a volatile-only method:\n{volatile_mismatch}")
             ensure_resolution_reaches_rpc(
-                client, target.pid, "VolatileOnly::v(int) volatile", callback,
+                client, negative_target.pid, "VolatileOnly::v(int) volatile", callback,
                 fixture_options, "volatile-exact", output_dir)
+            ensure_resolution_reaches_rpc(
+                client, negative_target.pid, "UnsignedOnly::u(unsigned long)", callback,
+                fixture_options, "unsigned-valid", output_dir)
             unsigned_spelling = ensure_pre_rpc_rejection(
-                client, target.pid, "UnsignedOnly::u(unsignedint)", callback, fixture_options,
+                client, negative_target.pid, "UnsignedOnly::u(unsignedlong)", callback, fixture_options,
                 "unsigned-spelling", output_dir)
-            require("no callable matched" in unsigned_spelling.lower(),
-                    f"unsignedint spelling unexpectedly matched unsigned int:\n{unsigned_spelling}")
+            require("no supported matching callable" in unsigned_spelling.lower(),
+                    f"unsignedlong spelling unexpectedly matched unsigned long:\n{unsigned_spelling}")
 
             # The x32 triple selects a 32-bit pointer ABI despite its x86_64 architecture.
             x32_entry = dict(entry)
@@ -264,33 +280,29 @@ def main() -> int:
                                       "x86_64-unknown-linux-gnux32"]
             x32_db = temp_dir / "x32-compile-commands.json"
             write_text(x32_db, json.dumps([x32_entry]))
-            x32_error = ensure_pre_rpc_rejection(
-                client, target.pid, "UnsignedOnly::u(unsigned int)", callback,
-                ("--compdb", str(x32_db), "--source", str(negative_source)),
-                "x32-pointer-abi", output_dir)
+            client.run("attach", str(negative_target.pid))
+            x32_error = save_output(output_dir / "reject-x32-pointer-abi.txt", client.run(
+                "trace", str(negative_target.pid), "HeaderReceiver::read(int) const",
+                "--callback", str(callback), "--compdb", str(x32_db), "--include", str(header),
+                expected_ok=False, timeout=45))
             require("linux x86_64" in x32_error.lower() or "32" in x32_error,
                     f"x32 pointer ABI rejection lacks target context:\n{x32_error}")
 
-            malformed_source = temp_dir / "invalid.cpp"
+            malformed_source = temp_dir / "invalid.hpp"
             write_text(malformed_source, "class Fixture { void broken( ; };\n")
-            malformed_entry = dict(entry)
-            malformed_entry["file"] = str(malformed_source)
-            if "arguments" in malformed_entry:
-                malformed_entry["arguments"] = [str(malformed_source) if x == str(negative_source) else x
-                                                 for x in malformed_entry["arguments"]]
-            else:
-                malformed_entry["command"] = malformed_entry["command"].replace(
-                    str(negative_source), str(malformed_source))
-            malformed_db = temp_dir / "invalid-compile-commands.json"
-            write_text(malformed_db, json.dumps([malformed_entry]))
-            parse_error = ensure_pre_rpc_rejection(
-                client, target.pid, "Fixture::broken", callback,
-                ("--compdb", str(malformed_db), "--source", str(malformed_source)),
-                "parse-error", output_dir)
+            parse_error = save_output(output_dir / "reject-parse-error.txt", client.run(
+                "trace", str(negative_target.pid), "HeaderReceiver::read(int) const",
+                "--callback", str(callback), "--compdb", str(negative_db),
+                "--include", str(malformed_source), expected_ok=False, timeout=45))
             require("error" in parse_error.lower() or "expected" in parse_error.lower(),
                     f"invalid syntax did not produce a parser diagnostic:\n{parse_error}")
-            report.append("ambiguous, missing, mismatched, unsupported, missing-database and parse errors were rejected before RPC")
-            report.append("virtual ambiguity/rejection, volatile qualification, unsigned spelling and x32 ABI regressions passed")
+            valid_header = trace(client, negative_target.pid, "HeaderReceiver::read(int) const",
+                                 callback, "--compdb", str(negative_db), "--include", str(header), timeout=45)
+            require("header_context=" in valid_header.stdout.decode(), "header flag inference was not reported")
+            require(not negative_source.exists(), "header parsing recreated/read the unavailable donor")
+            client.run("detach", str(negative_target.pid), timeout=20)
+            report.append("DWARF ambiguity, missing/mismatched/unsupported callables, virtual methods, volatile qualification and unsigned spelling passed")
+            report.append("optional headers preserved missing-database, malformed-header and x32 ABI rejection, without a donor source file")
 
             # Use the existing real callback with signed integral arguments for both overloads.
             event_client = FriendlyClient(args.client, endpoint)
@@ -315,31 +327,36 @@ def main() -> int:
             int_line = observed[int_probe]
             long_line = observed[long_probe]
             inspect_line = observed[inspect_probe]
-            check_events(int_line, target.pid, {int_probe})
+            require(has_field(int_line, "pid", target.pid) and has_field(int_line, "probe", int_probe),
+                    f"int overload event has the wrong identity: {int_line}")
             require(has_field(long_line, "pid", target.pid) and
                     has_field(long_line, "probe", long_probe),
                     f"long overload event has the wrong PID or probe:\n{long_line}")
-            long_argument = re.search(r"args=\[int64:(-?\d+)", long_line)
-            long_callback = re.search(r"\bcallback=(-?\d+)", long_line)
-            require(long_argument is not None and long_callback is not None,
+            long_argument = re.search(r"args=\[(?:\w+=)?int64:(-?\d+)", long_line)
+            require(long_argument is not None,
                     f"long overload event lacks int64 argument/callback:\n{long_line}")
-            require(int(long_callback.group(1)) == int(long_argument.group(1)) * 100 + 17,
-                    f"long overload callback disagrees with its argument:\n{long_line}")
             require(re.search(r"\bthis=0x(?!0+$)[0-9a-f]+", int_line, re.I),
                     f"int member event lacks an object address: {int_line}")
             require(re.search(r"\bthis=0x(?!0+$)[0-9a-f]+", long_line, re.I),
                     f"long member event lacks an object address: {long_line}")
             require(re.search(r"\bthis=0x(?!0+$)[0-9a-f]+", inspect_line, re.I),
                     f"const member event lacks an object address: {inspect_line}")
-            require("args=[float64:" in inspect_line.lower(),
+            require(re.search(r"args=\[(?:\w+=)?float64:", inspect_line),
                     f"const method event does not contain its inferred double argument:\n{inspect_line}")
-            double_argument = re.search(r"args=\[float64:([-+0-9.eE]+)", inspect_line)
-            double_callback_value = re.search(r"\bcallback=(-?\d+)", inspect_line)
-            require(double_argument is not None and double_callback_value is not None,
+            double_argument = re.search(r"args=\[(?:\w+=)?float64:([-+0-9.eE]+)", inspect_line)
+            require(double_argument is not None,
                     f"const method event lacks its argument or callback value:\n{inspect_line}")
-            require(int(double_callback_value.group(1)) == int(float(double_argument.group(1)) * 100 + 17),
-                    f"double callback did not use the inferred argument:\n{inspect_line}")
-            report.append("readable events carried typed arguments, callback values and live object addresses")
+            for selected_probe, scalar, value_field in (
+                    (int_probe, "INT32", "signed_value"),
+                    (long_probe, "INT64", "signed_value"),
+                    (inspect_probe, "FLOAT64", "real_value")):
+                wire, _ = wait_binary(args.client, endpoint, target.pid, selected_probe,
+                                      output_dir, args.protoc, args.proto, 1, 0)
+                for row in wire:
+                    value = re.search(rf"^arguments\s*\{{\s*type: {scalar}\s+{value_field}:\s*([-+0-9.eE]+)", row, re.M)
+                    require(value and callback_value(row) == int(float(value.group(1)) * 100 + 17),
+                            f"binary callback disagrees with its inferred argument: {row}")
+            report.append("readable events carried typed arguments and object addresses; binary events verified callback values")
 
             # Reinstall in binary-output mode only after restoring the first probes.
             for probe_id in (int_probe, long_probe, inspect_probe):
@@ -359,8 +376,7 @@ def main() -> int:
                 binary_result = subprocess.run(
                     [str(args.client), "--endpoint", endpoint, "--format", "protobuf",
                      "--output", str(binary_path), "trace", str(target.pid), declaration,
-                     "--callback", str(callback_file), "--compdb", str(args.compdb),
-                     "--source", str(args.source)], cwd=repo,
+                     "--callback", str(callback_file)], cwd=repo,
                     capture_output=True, timeout=45, check=False)
                 require(binary_result.returncode == 0,
                         f"protobuf trace for {label} failed: " +
@@ -401,6 +417,11 @@ def main() -> int:
             report.append("C++ name-resolution integration passed")
             return 0
     finally:
+        if negative_target is not None and negative_target.poll() is None:
+            negative_target.terminate()
+            negative_target.wait(timeout=3)
+        if negative_log is not None:
+            negative_log.close()
         if server is not None and server.poll() is None:
             server.terminate()
             try:

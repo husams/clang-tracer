@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cctype>
@@ -13,12 +14,16 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <map>
 #include <sstream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <optional>
 #include <thread>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 #include <google/protobuf/text_format.h>
@@ -26,6 +31,10 @@
 
 #include "debug_resolver.hpp"
 #include "header_context.hpp"
+#include "context_receiver.hpp"
+#include "context_query.hpp"
+#include "context_schema.hpp"
+#include "context_transport.pb.h"
 #include "tracer.grpc.pb.h"
 
 namespace {
@@ -47,6 +56,7 @@ struct Options {
   std::string compdb;
   std::string return_type;
   std::string callback;
+  std::string context_field;
   std::vector<std::string> argument_types;
   std::vector<std::string> sources;
   std::uint64_t pid = 0;
@@ -116,6 +126,7 @@ Options parse_options(int argc, char **argv) {
              "  trace PID (--function NAME|--method NAME) [--return "
              "TYPE [--arg TYPE ...]] --callback FILE\n"
              "  events PID [--count N] [--after N] [--timeout SEC]\n"
+             "    [--context-field path[,path...]] selects typed context fields across schema revisions; omit to show the retained field union.\n"
              "  detach PID | remove PID PROBE_ID | list\n"
              "  CALLBACK FILE may define class Interceptor with optional\n"
              "  pre(const Call&) and post(const Call&) methods; each may\n"
@@ -142,7 +153,8 @@ Options parse_options(int argc, char **argv) {
                a == "--arg" || a == "--callback" || a == "--count" ||
                a == "--after" || a == "--timeout" || a == "--include" ||
                a == "--compdb" || a == "--stack" || a == "--stack-application-only" ||
-               a == "--callback-print-arguments" || a == "--callback-print-result") {
+               a == "--callback-print-arguments" || a == "--callback-print-result" ||
+               a == "--context-field") {
       if (a != "--count" && a != "--timeout") {
         o.direct = true;
       }
@@ -172,6 +184,14 @@ Options parse_options(int argc, char **argv) {
         if (a == "--callback-print-arguments") o.callback_print_arguments = v == "true";
         else o.callback_print_result = v == "true";
         o.callback_print_set = true;
+      } else if (a == "--context-field") {
+        if (v.empty() || v.size() > 4096)
+          throw std::runtime_error("--context-field must contain paths and be at most 4096 bytes");
+        if (v.back() == ',')
+          throw std::runtime_error("--context-field contains an empty path");
+        if (!o.context_field.empty())
+          o.context_field.push_back(',');
+        o.context_field += v;
       } else if (a == "--count") {
         o.count = parse_number(v, a, 1'000'000);
         o.count_set = true;
@@ -418,28 +438,35 @@ void set_deadline(grpc::ClientContext &c, std::uint64_t secs) {
   c.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(secs));
 }
 
-api::Session find_session(api::Tracer::Stub &stub, std::uint32_t pid,
-                          std::uint64_t timeout_seconds) {
+std::optional<api::Session>
+find_attached_session(api::Tracer::Stub &stub, std::uint32_t pid,
+                      std::uint64_t timeout_seconds) {
   api::ListSessionsRequest req;
   api::ListSessionsResponse res;
   grpc::ClientContext ctx;
   set_deadline(ctx, timeout_seconds);
   require_ok(stub.ListSessions(&ctx, req, &res), "ListSessions");
-  const api::Session *found = nullptr;
+  std::optional<api::Session> found;
   for (const auto &s : res.sessions()) {
     if (s.pid() == pid && s.state() == api::Session::ATTACHED) {
       if (found) {
         throw std::runtime_error("multiple attached sessions match PID " +
                                  std::to_string(pid));
       }
-      found = &s;
+      found = s;
     }
   }
+  return found;
+}
+
+api::Session find_session(api::Tracer::Stub &stub, std::uint32_t pid,
+                          std::uint64_t timeout_seconds) {
+  auto found = find_attached_session(stub, pid, timeout_seconds);
   if (!found) {
     throw std::runtime_error("no attached session found for PID " +
                              std::to_string(pid));
   }
-  return *found;
+  return std::move(*found);
 }
 
 const char *state_name(api::Session::State state) {
@@ -515,7 +542,335 @@ std::string value_text(const api::Value &v) {
   }
 }
 
-void print_event(TextWriter &out, const api::TraceEvent &e) {
+class ContextEventDecoder final {
+  struct Epoch final {
+    std::unique_ptr<tracer::context_engine::ContextReceiver> receiver;
+    std::unordered_map<std::uint64_t, std::string> schema_fingerprints;
+    std::size_t fingerprint_bytes = 0;
+    std::string producer_session_id;
+  };
+
+public:
+  ContextEventDecoder() : ledger_(std::make_shared<tracer::context_engine::ReceiverLedger>()) {}
+
+  std::optional<tracer::context_engine::DecodedEvent> decode(
+      const clangtracer::context::v1::ContextEventEnvelope &envelope,
+      std::string &error) {
+    using namespace clangtracer::context::v1;
+    const std::string key = envelope.producer_session_id() +
+                            std::string("\0", 1) +
+                            std::to_string(envelope.epoch_id());
+    auto found = epochs_.find(key);
+    if (found == epochs_.end()) {
+      if (epochs_.size() == 32) {
+        fingerprint_bytes_ -= epochs_.begin()->second.fingerprint_bytes;
+        epochs_.begin()->second.receiver->close_epoch();
+        epochs_.erase(epochs_.begin());
+        ++schema_generation_;
+        field_path_cache_key_.clear();
+      }
+      Epoch value;
+      value.receiver = std::make_unique<tracer::context_engine::ContextReceiver>(ledger_);
+      value.producer_session_id = envelope.producer_session_id();
+      found = epochs_.emplace(key, std::move(value)).first;
+    }
+    auto &epoch = found->second;
+    std::vector<tracer::context_engine::SchemaRegistration> registrations;
+    std::unordered_map<std::uint64_t, std::string> new_fingerprints;
+    std::set<std::uint64_t> ids;
+    for (const auto &schema : envelope.schemas()) {
+      if (schema.epoch_schema_id() == 0 || !ids.insert(schema.epoch_schema_id()).second) {
+        error = "context envelope contains a duplicate or zero schema ID";
+        return std::nullopt;
+      }
+      google::protobuf::FileDescriptorSet descriptors;
+      if (!descriptors.ParseFromString(schema.serialized_file_descriptor_set())) {
+        error = "context envelope has an invalid descriptor set";
+        return std::nullopt;
+      }
+      std::string canonical;
+      if (!descriptors.SerializeToString(&canonical) ||
+          canonical != schema.serialized_file_descriptor_set() ||
+          schema.source_lineage_id().size() != 16) {
+        error = "context envelope schema metadata is not canonical";
+        return std::nullopt;
+      }
+      tracer::context_engine::StateFamilyKey family;
+      std::copy(schema.source_lineage_id().begin(),
+                schema.source_lineage_id().end(),
+                family.source_lineage_id.begin());
+      family.cpp_state_type = schema.cpp_state_type();
+      family.cpp_scope_type = schema.cpp_scope_type();
+      const std::vector<std::string> roles(schema.container_roles().begin(),
+                                           schema.container_roles().end());
+      const auto identity = tracer::context_engine::compute_schema_revision_id(
+          canonical, family, schema.root_type(), roles);
+      if (schema.schema_identity() != identity ||
+          schema.revision_id() != identity) {
+        error = "context envelope schema identity does not match its descriptor revision";
+        return std::nullopt;
+      }
+      const auto wire = schema.SerializeAsString();
+      const auto existing = epoch.schema_fingerprints.find(schema.epoch_schema_id());
+      if (existing != epoch.schema_fingerprints.end()) {
+        if (existing->second != wire) {
+          error = "context envelope redefined a schema ID within an epoch";
+          return std::nullopt;
+        }
+        continue;
+      }
+      tracer::context_engine::SchemaRegistration registration;
+      registration.id = schema.epoch_schema_id();
+      registration.descriptor_set = std::move(descriptors);
+      registration.root = schema.root_type();
+      std::copy(schema.source_lineage_id().begin(), schema.source_lineage_id().end(),
+                registration.family.source_lineage_id.begin());
+      registration.family.cpp_state_type = schema.cpp_state_type();
+      registration.family.cpp_scope_type = schema.cpp_scope_type();
+      registration.container_roles.assign(schema.container_roles().begin(),
+                                           schema.container_roles().end());
+      registrations.push_back(std::move(registration));
+      new_fingerprints.emplace(schema.epoch_schema_id(), wire);
+    }
+    std::size_t additional_fingerprint_bytes = 0;
+    for (const auto &[id, wire] : new_fingerprints) {
+      (void)id;
+      additional_fingerprint_bytes += wire.size();
+    }
+    constexpr std::size_t kFingerprintCacheBytes = 64 * 1024 * 1024;
+    while (fingerprint_bytes_ + additional_fingerprint_bytes >
+               kFingerprintCacheBytes && epochs_.size() > 1) {
+      auto victim = epochs_.begin();
+      if (victim == found)
+        ++victim;
+      if (victim == epochs_.end())
+        break;
+      fingerprint_bytes_ -= victim->second.fingerprint_bytes;
+      victim->second.receiver->close_epoch();
+      epochs_.erase(victim);
+      ++schema_generation_;
+      field_path_cache_key_.clear();
+    }
+    if (fingerprint_bytes_ + additional_fingerprint_bytes >
+        kFingerprintCacheBytes) {
+      error = "context schema fingerprint cache is full";
+      return std::nullopt;
+    }
+    if (!registrations.empty() &&
+        !epoch.receiver->register_schema_set(registrations, &error))
+      return std::nullopt;
+    for (auto &[id, fingerprint] : new_fingerprints) {
+      epoch.fingerprint_bytes += fingerprint.size();
+      fingerprint_bytes_ += fingerprint.size();
+      epoch.schema_fingerprints.emplace(id, std::move(fingerprint));
+    }
+    if (!new_fingerprints.empty()) {
+      ++schema_generation_;
+      field_path_cache_.clear();
+    }
+
+    const auto &event = envelope.event();
+    std::vector<std::vector<tracer::context_engine::CapturePathStep>> paths;
+    std::vector<std::vector<tracer::context_engine::CaptureLimitView>> limits;
+    std::vector<tracer::context_engine::StateAttachmentView> attachments;
+    std::size_t path_count = 0;
+    for (const auto &state : event.states())
+      path_count += static_cast<std::size_t>(state.truncations_size());
+    if (path_count > 4096 || event.states_size() > 256) {
+      error = "context event exceeds receiver attachment limits";
+      return std::nullopt;
+    }
+    paths.reserve(path_count);
+    limits.reserve(event.states_size());
+    attachments.reserve(event.states_size());
+    for (const auto &state : event.states()) {
+      auto &state_limits = limits.emplace_back();
+      state_limits.reserve(state.truncations_size());
+      for (const auto &truncation : state.truncations()) {
+        auto &path = paths.emplace_back();
+        path.reserve(truncation.path_size());
+        for (const auto &step : truncation.path()) {
+          tracer::context_engine::CapturePathStep item;
+          switch (step.value_case()) {
+          case TruncationPathStep::kFieldNumber:
+            item.selector = tracer::context_engine::CapturePathSelector::field_number;
+            item.number = step.field_number(); break;
+          case TruncationPathStep::kListIndex:
+            item.selector = tracer::context_engine::CapturePathSelector::list_index;
+            item.number = step.list_index(); break;
+          case TruncationPathStep::kStringKey:
+            item.selector = tracer::context_engine::CapturePathSelector::string_key;
+            item.string_value = step.string_key(); break;
+          case TruncationPathStep::kSignedKey:
+            item.selector = tracer::context_engine::CapturePathSelector::signed_key;
+            item.signed_value = step.signed_key(); break;
+          case TruncationPathStep::kUnsignedKey:
+            item.selector = tracer::context_engine::CapturePathSelector::unsigned_key;
+            item.number = step.unsigned_key(); break;
+          case TruncationPathStep::kBoolKey:
+            item.selector = tracer::context_engine::CapturePathSelector::bool_key;
+            item.bool_value = step.bool_key(); break;
+          case TruncationPathStep::VALUE_NOT_SET:
+            error = "context event has an empty truncation path step";
+            return std::nullopt;
+          }
+          path.push_back(std::move(item));
+        }
+        state_limits.push_back({path, truncation.total_items(),
+                                truncation.captured_items()});
+      }
+      const auto *bytes = reinterpret_cast<const std::byte *>(state.payload().data());
+      attachments.push_back({state.epoch_schema_id(),
+          std::span<const std::byte>(bytes, state.payload().size()), state_limits});
+    }
+    return epoch.receiver->decode_event(attachments, &error);
+  }
+
+  const std::set<std::string> &field_paths(
+      const tracer::context_engine::StateFamilyKey &family) {
+    const std::string key(
+        reinterpret_cast<const char *>(family.source_lineage_id.data()),
+        family.source_lineage_id.size());
+    std::string family_key = key;
+    family_key.push_back('\0');
+    family_key += family.cpp_state_type;
+    family_key.push_back('\0');
+    family_key += family.cpp_scope_type;
+    if (family_key == field_path_cache_key_ &&
+        field_path_cache_generation_ == schema_generation_)
+      return field_path_cache_;
+    field_path_cache_key_ = std::move(family_key);
+    field_path_cache_generation_ = schema_generation_;
+    field_path_cache_.clear();
+    field_path_cache_truncated_ = false;
+    for (const auto &[epoch_key, epoch] : epochs_) {
+      (void)epoch_key;
+      for (const auto &schema : epoch.receiver->admitted_schemas()) {
+        if (!(schema.family() == family))
+          continue;
+        auto discovered = tracer::context_query::discover_field_paths(schema);
+        field_path_cache_truncated_ |= discovered.truncated;
+        for (auto &path : discovered.paths) {
+          if (field_path_cache_.size() >=
+              tracer::context_query::kDefaultFieldPathLimit) {
+            field_path_cache_truncated_ = true;
+            break;
+          }
+          field_path_cache_.insert(std::move(path));
+        }
+        if (field_path_cache_.size() >=
+            tracer::context_query::kDefaultFieldPathLimit) {
+          field_path_cache_truncated_ = true;
+          break;
+        }
+      }
+      if (field_path_cache_.size() >=
+          tracer::context_query::kDefaultFieldPathLimit) {
+        field_path_cache_truncated_ = true;
+        break;
+      }
+    }
+    return field_path_cache_;
+  }
+
+  bool field_paths_truncated() const noexcept {
+    return field_path_cache_truncated_;
+  }
+
+  std::string query_field(const google::protobuf::Message &message,
+                          const tracer::context_engine::SchemaRecord &record,
+                          std::string_view path) const {
+    for (const auto &[epoch_key, epoch] : epochs_) {
+      (void)epoch_key;
+      for (const auto &schema : epoch.receiver->admitted_schemas()) {
+        if (schema.revision_id() == record.revision_id &&
+            schema.family() == record.family)
+          return tracer::context_query::query_field(message, schema, path);
+      }
+    }
+    return "<missing>";
+  }
+
+private:
+  std::shared_ptr<tracer::context_engine::ReceiverLedger> ledger_;
+  std::map<std::string, Epoch> epochs_;
+  std::size_t fingerprint_bytes_ = 0;
+  std::uint64_t schema_generation_ = 1;
+  std::string field_path_cache_key_;
+  std::uint64_t field_path_cache_generation_ = 0;
+  std::set<std::string> field_path_cache_;
+  bool field_path_cache_truncated_ = false;
+};
+
+std::string family_label(const tracer::context_engine::SchemaRecord &schema) {
+  std::ostringstream lineage;
+  lineage << std::hex << std::setfill('0');
+  for (const auto byte : schema.family.source_lineage_id)
+    lineage << std::setw(2) << static_cast<unsigned>(byte);
+  return schema.family.cpp_state_type + "@" + lineage.str();
+}
+
+std::vector<std::string> selected_field_paths(std::string_view requested) {
+  std::vector<std::string> paths;
+  std::size_t begin = 0;
+  while (begin < requested.size()) {
+    const auto comma = requested.find(',', begin);
+    const auto end = comma == std::string_view::npos ? requested.size() : comma;
+    const auto path = requested.substr(begin, end - begin);
+    if (path.empty() || path.size() > 256 || paths.size() >= 256)
+      throw std::runtime_error("invalid or excessive --context-field paths");
+    paths.emplace_back(path);
+    if (comma == std::string_view::npos)
+      break;
+    begin = comma + 1;
+  }
+  return paths;
+}
+
+void print_context_event(TextWriter &out, const api::TraceEvent &e,
+                         const Options &options, ContextEventDecoder &decoder) {
+  const auto &envelope = e.context();
+  out.line("  shared-context event=", envelope.event().name(),
+           " epoch=", envelope.epoch_id(), " states=", envelope.event().states_size());
+  std::string error;
+  auto decoded = decoder.decode(envelope, error);
+  if (!decoded) {
+    out.line("    context decode failed: ", error);
+    return;
+  }
+  const auto selected = selected_field_paths(options.context_field);
+  bool reported_path_truncation = false;
+  for (const auto &state : decoded->states) {
+    const auto *message = state.message();
+    if (!message)
+      continue;
+    const auto print_field = [&](std::string_view path) {
+      out.line("    ", family_label(*state.schema()), ".", path,
+               " [revision=", state.schema()->revision_id,
+               "] =", decoder.query_field(*message, *state.schema(), path));
+    };
+    if (options.context_field.empty()) {
+      const auto &paths = decoder.field_paths(state.schema()->family);
+      if (decoder.field_paths_truncated() && !reported_path_truncation) {
+        out.line("    field-path discovery truncated at ",
+                 tracer::context_query::kDefaultFieldPathLimit, " paths");
+        reported_path_truncation = true;
+      }
+      for (const auto &path : paths)
+        print_field(path);
+    } else {
+      for (const auto &path : selected)
+        print_field(path);
+    }
+  }
+}
+
+void print_event(TextWriter &out, const api::TraceEvent &e,
+                 const Options &options, ContextEventDecoder &decoder) {
+  const bool show_callback_arguments =
+      !e.has_context() || e.context().event().print_arguments();
+  const bool show_callback_result =
+      !e.has_context() || e.context().event().print_result();
   const char *phase = "unspecified";
   if (e.phase() == api::PRE) {
     phase = "pre";
@@ -523,7 +878,8 @@ void print_event(TextWriter &out, const api::TraceEvent &e) {
     phase = "post";
   }
   out.line(
-      "cursor=", e.sequence(), " pid=", e.pid(), " tid=", e.tid(),
+      "cursor=", e.sequence(), " pid=", e.pid(), " tid=",
+      e.has_context() ? "-" : std::to_string(e.tid()),
       " probe=", e.probe_id(), " this=",
       e.object_address() ? "0x" +
                                [&] {
@@ -537,6 +893,8 @@ void print_event(TextWriter &out, const api::TraceEvent &e) {
       " args=[",
       [&] {
         std::string s;
+        if (!show_callback_arguments)
+          return s;
         for (int i = 0; i < e.arguments_size(); ++i) {
           if (i) {
             s += ", ";
@@ -554,7 +912,7 @@ void print_event(TextWriter &out, const api::TraceEvent &e) {
       }(),
       "]",
       [&] {
-        if (e.object_fields().empty())
+        if (e.object_fields().empty() || !show_callback_arguments)
           return std::string{};
         std::string s = " fields=[";
         for (const auto &field : e.object_fields()) {
@@ -564,11 +922,11 @@ void print_event(TextWriter &out, const api::TraceEvent &e) {
         }
         return s + "]";
       }(),
-      e.named_arguments().empty() && e.object_fields().empty()
+      !e.has_context() && e.named_arguments().empty() && e.object_fields().empty()
           ? " callback=" + std::to_string(e.callback_value())
           : "",
       " phase=", phase, " call=", e.call_id(),
-      e.phase() == api::POST && e.has_result()
+      e.phase() == api::POST && e.has_result() && show_callback_result
           ? " result=" + value_text(e.result())
           : "",
       " lost(agent=", e.agent_dropped_events(),
@@ -592,6 +950,8 @@ void print_event(TextWriter &out, const api::TraceEvent &e) {
                frame.file().empty() ? "" : " " + frame.file() + ":" + std::to_string(frame.line()));
     }
   }
+  if (e.has_context())
+    print_context_event(out, e, options, decoder);
 }
 
 class SignalGuard {
@@ -645,6 +1005,12 @@ private:
   std::atomic<bool> finished_{false};
   std::thread worker_;
 };
+
+void set_callback_package_location(api::ProbeSpec &spec,
+                                   const Options &options) {
+  const auto callback = std::filesystem::canonical(options.callback);
+  spec.set_callback_package_path(callback.string());
+}
 
 int run_direct(const Options &o, api::Tracer::Stub &stub) {
   TextWriter text(o.format == "protobuf" ? std::string{} : o.output_path);
@@ -754,8 +1120,15 @@ int run_direct(const Options &o, api::Tracer::Stub &stub) {
     return 0;
   }
   const auto unary_timeout = o.timeout_set ? o.timeout_seconds : 30;
-  const auto session =
-      find_session(stub, static_cast<std::uint32_t>(o.pid), unary_timeout);
+  api::Session session;
+  std::optional<api::Session> event_session;
+  if (o.command != "events") {
+    session =
+        find_session(stub, static_cast<std::uint32_t>(o.pid), unary_timeout);
+  } else {
+    event_session = find_attached_session(
+        stub, static_cast<std::uint32_t>(o.pid), unary_timeout);
+  }
   if (o.command == "trace") {
     api::AddProbeRequest req;
     req.set_session_id(session.id());
@@ -763,6 +1136,7 @@ int run_direct(const Options &o, api::Tracer::Stub &stub) {
     if (resolved) {
       *spec = resolved->spec;
       spec->set_callback_source(callback_source);
+      set_callback_package_location(*spec, o);
       for (const auto &header : o.sources)
         spec->add_include_headers(std::filesystem::absolute(header).string());
       tracer::client::resolve_header_context(*spec, o.compdb);
@@ -770,6 +1144,7 @@ int run_direct(const Options &o, api::Tracer::Stub &stub) {
       const auto split = o.selector.find(' ');
       spec->set_symbol(o.selector.substr(split + 1));
       spec->set_callback_source(callback_source);
+      set_callback_package_location(*spec, o);
       auto *sig = spec->mutable_signature();
       sig->set_kind(o.selector.starts_with("--method") ? api::METHOD
                                                        : api::FUNCTION);
@@ -832,7 +1207,11 @@ int run_direct(const Options &o, api::Tracer::Stub &stub) {
     return 0;
   }
   api::WatchEventsRequest req;
-  req.add_session_ids(session.id());
+  if (event_session) {
+    req.add_session_ids(event_session->id());
+  } else {
+    req.set_pid(static_cast<std::uint32_t>(o.pid));
+  }
   req.set_after_sequence(o.after);
   grpc::ClientContext ctx;
   if (o.timeout_set) {
@@ -846,12 +1225,13 @@ int run_direct(const Options &o, api::Tracer::Stub &stub) {
   auto reader = stub.WatchEvents(&ctx, req);
   StreamCanceller canceller(ctx);
   api::TraceEvent event;
+  ContextEventDecoder context_decoder;
   std::uint64_t received = 0;
   while ((!o.count_set || received < o.count) && reader->Read(&event)) {
     if (binary) {
       binary->write(event);
     } else {
-      print_event(text, event);
+      print_event(text, event, o, context_decoder);
     }
     ++received;
   }
@@ -950,8 +1330,10 @@ int run_legacy(const Options &o, api::Tracer::Stub &stub) {
 int main(int argc, char **argv) {
   try {
     const auto options = parse_options(argc, argv);
-    auto channel = grpc::CreateChannel(options.endpoint,
-                                       grpc::InsecureChannelCredentials());
+    grpc::ChannelArguments channel_arguments;
+    channel_arguments.SetMaxReceiveMessageSize(32 * 1024 * 1024);
+    auto channel = grpc::CreateCustomChannel(
+        options.endpoint, grpc::InsecureChannelCredentials(), channel_arguments);
     auto stub = api::Tracer::NewStub(channel);
     return options.request_path.empty() ? run_direct(options, *stub)
                                         : run_legacy(options, *stub);

@@ -468,6 +468,19 @@ struct Process::PeerFreeze {
           Peer peer;
           peer.tid = tid;
           if (::ptrace(PTRACE_SEIZE, tid, nullptr, nullptr) == -1) {
+            const int seize_error = errno;
+            if (seize_error == EPERM) {
+              // A churned TID can disappear (or be reused outside this
+              // process) between enumeration and SEIZE. Only a confirmed
+              // missing task is safe to discard; permissions or an existing
+              // tracer on a surviving task must still reject the freeze.
+              const std::string path = "/proc/" + std::to_string(process.tid_) +
+                                       "/task/" + std::to_string(tid);
+              struct stat task_status{};
+              if (::stat(path.c_str(), &task_status) != 0 && errno == ENOENT)
+                continue;
+              errno = seize_error;
+            }
             if (errno == ESRCH || errno == ECHILD) {
               if (thread_exists(process.tid_, tid)) {
                 throw std::runtime_error(
@@ -1089,6 +1102,89 @@ bool Process::patch_code(std::uintptr_t address, const void *expected,
     throw std::runtime_error(
         "code patch failed with an unknown error; target process was stopped "
         "for recovery");
+  }
+  peers.release();
+  return true;
+}
+
+bool Process::patch_code_batch(std::span<const CodePatch> patches) {
+  ensure_usable();
+  if (patches.empty())
+    return true;
+  std::vector<std::size_t> order(patches.size());
+  for (std::size_t i = 0; i < patches.size(); ++i) {
+    const auto &patch = patches[i];
+    if (patch.address == 0 || patch.size == 0 || !patch.expected ||
+        !patch.replacement ||
+        patch.size > std::numeric_limits<std::uintptr_t>::max() - patch.address)
+      throw std::invalid_argument("patch_code_batch contains an invalid range");
+    order[i] = i;
+  }
+  std::sort(order.begin(), order.end(),
+            [&](std::size_t left, std::size_t right) {
+              return patches[left].address < patches[right].address;
+            });
+  for (std::size_t i = 1; i < order.size(); ++i) {
+    const auto &prior = patches[order[i - 1]];
+    const auto &next = patches[order[i]];
+    if (prior.address + prior.size > next.address)
+      throw std::invalid_argument("patch_code_batch ranges overlap");
+  }
+
+  PeerFreeze peers(*this);
+  for (const auto &patch : patches) {
+    if (peers.contains_instruction(patch.address, patch.size)) {
+      peers.release();
+      return false;
+    }
+  }
+
+  std::vector<std::vector<unsigned char>> before;
+  before.reserve(patches.size());
+  for (const auto &patch : patches) {
+    before.push_back(read_remote(tid_, patch.address, patch.size));
+    if (std::memcmp(before.back().data(), patch.expected, patch.size) != 0)
+      throw std::runtime_error(
+          "patch_code_batch precondition did not match target bytes");
+  }
+
+  std::size_t attempted = 0;
+  try {
+    for (std::size_t i = 0; i < patches.size(); ++i) {
+      attempted = i + 1; // write_remote can fail after a partial word write.
+      write_remote(tid_, patches[i].address, patches[i].replacement,
+                   patches[i].size);
+      const auto committed =
+          read_remote(tid_, patches[i].address, patches[i].size);
+      if (std::memcmp(committed.data(), patches[i].replacement,
+                      patches[i].size) != 0)
+        throw std::runtime_error("patch_code_batch verification failed");
+    }
+  } catch (...) {
+    const auto failure = std::current_exception();
+    try {
+      while (attempted != 0) {
+        const auto i = --attempted;
+        write_remote(tid_, patches[i].address, before[i].data(),
+                     before[i].size());
+        const auto restored =
+            read_remote(tid_, patches[i].address, before[i].size());
+        if (std::memcmp(restored.data(), before[i].data(), before[i].size()) !=
+            0)
+          throw std::runtime_error(
+              "patch_code_batch rollback verification failed");
+      }
+    } catch (const std::exception &rollback_error) {
+      poison_process();
+      throw std::runtime_error(
+          std::string("patch batch failed and rollback is uncertain: ") +
+          rollback_error.what() + "; target process was stopped for recovery");
+    } catch (...) {
+      poison_process();
+      throw std::runtime_error("patch batch failed and rollback is uncertain; "
+                               "target process was stopped for recovery");
+    }
+    std::rethrow_exception(failure);
   }
   peers.release();
   return true;

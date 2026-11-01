@@ -47,6 +47,17 @@ endforeach()
 install(TARGETS clang-tracer clang-tracer-server clang_tracer_agent
   RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Runtime
   LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Runtime)
+if(TARGET tracer_context_stdlib)
+  install(TARGETS tracer_context_stdlib
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Runtime)
+endif()
+install(FILES src/context_facade.hpp src/context_analysis.hpp src/context_execution.hpp
+  src/context_engine.hpp src/context_codec.hpp src/bounded_proto.hpp src/bounded_proto.cpp
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer/context" COMPONENT Runtime)
+install(DIRECTORY include/tracer
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer/context" COMPONENT Runtime)
+install(FILES proto/context_transport.proto
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer/proto" COMPONENT Development)
 install(DIRECTORY include/tracer DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}" COMPONENT Development)
 install(FILES proto/tracer.proto DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer/proto" COMPONENT Development)
 install(FILES LICENSE README.md DESTINATION "${CMAKE_INSTALL_DOCDIR}" COMPONENT Runtime)

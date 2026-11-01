@@ -1,6 +1,18 @@
 cmake_minimum_required(VERSION 3.20)
 project(clang_tracer LANGUAGES C CXX)
 
+option(TRACER_CONTEXT_ENGINE_ONLY "Build only portable context engine checks" OFF)
+if(TRACER_CONTEXT_ENGINE_ONLY)
+  include(CTest)
+  include(cmake/TracerContextEngine.cmake)
+  option(TRACER_CONTEXT_ANALYSIS_TESTS "Also build Clang declaration checks" OFF)
+  if(TRACER_CONTEXT_ANALYSIS_TESTS)
+    include(cmake/TracerToolchain.cmake)
+    include(cmake/TracerContextAnalysis.cmake)
+  endif()
+  return()
+endif()
+
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
    NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
   message(FATAL_ERROR "The native tracing backend requires Linux x86_64")
@@ -12,7 +24,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include(GNUInstallDirs)
 include(CTest)
+include(cmake/TracerContextEngine.cmake)
 include(cmake/TracerToolchain.cmake)
+include(cmake/TracerContextAnalysis.cmake)
 find_package(Threads REQUIRED)
 find_package(Protobuf REQUIRED)
 find_package(gRPC REQUIRED CONFIG)
@@ -21,11 +35,13 @@ set(TRACER_PROTO_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 file(MAKE_DIRECTORY ${TRACER_PROTO_DIR})
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/callback.hpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/context.hpp
   ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/protocol.hpp)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/protocol.hpp TRACER_PROTOCOL_HEADER)
 # Incremental input is a synthetic main file, not an includable disk header.
 string(REPLACE "#pragma once" "" TRACER_PROTOCOL_HEADER "${TRACER_PROTOCOL_HEADER}")
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/callback.hpp TRACER_CALLBACK_HEADER)
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/context.hpp TRACER_CONTEXT_HEADER)
 configure_file(src/callback_source.hpp.in
   ${TRACER_PROTO_DIR}/callback_source.hpp @ONLY)
 add_custom_command(
@@ -33,33 +49,37 @@ add_custom_command(
          ${TRACER_PROTO_DIR}/tracer.grpc.pb.cc ${TRACER_PROTO_DIR}/tracer.grpc.pb.h
   COMMAND protobuf::protoc
   ARGS --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto
+       --proto_path=${CMAKE_CURRENT_BINARY_DIR}/context-generated
        --cpp_out=${TRACER_PROTO_DIR} --grpc_out=${TRACER_PROTO_DIR}
        --plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>
        ${CMAKE_CURRENT_SOURCE_DIR}/proto/tracer.proto
-  DEPENDS proto/tracer.proto protobuf::protoc gRPC::grpc_cpp_plugin
+  DEPENDS proto/tracer.proto proto/context_transport.proto protobuf::protoc
+          gRPC::grpc_cpp_plugin tracer_context_transport_proto
   VERBATIM)
 add_library(tracer_proto STATIC ${TRACER_PROTO_DIR}/tracer.pb.cc)
 set_target_properties(tracer_proto PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(tracer_proto PUBLIC ${TRACER_PROTO_DIR})
-target_link_libraries(tracer_proto PUBLIC protobuf::libprotobuf)
+target_link_libraries(tracer_proto PUBLIC protobuf::libprotobuf tracer_context_transport_proto)
 add_library(tracer_grpc STATIC ${TRACER_PROTO_DIR}/tracer.grpc.pb.cc)
 target_link_libraries(tracer_grpc PUBLIC tracer_proto gRPC::grpc++)
 
-add_library(clang_tracer_agent SHARED src/agent.cpp src/debug_resolver.cpp src/native_stack.cpp src/event_transport.cpp)
+add_library(clang_tracer_agent SHARED src/agent.cpp src/debug_resolver.cpp src/native_stack.cpp
+  src/event_transport.cpp src/context_agent_delivery.cpp)
 target_include_directories(clang_tracer_agent PRIVATE include ${TRACER_PROTO_DIR} ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_compile_definitions(clang_tracer_agent PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
-target_link_libraries(clang_tracer_agent PRIVATE tracer_proto clang-cpp LLVM ${CMAKE_DL_LIBS} Threads::Threads)
+target_link_libraries(clang_tracer_agent PRIVATE tracer_context_engine tracer_context_analysis tracer_proto clang-cpp LLVM ${CMAKE_DL_LIBS} Threads::Threads)
 target_compile_options(clang_tracer_agent PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(clang-tracer-server src/main.cpp src/server.cpp src/session.cpp src/injector.cpp src/admission.cpp)
 target_include_directories(clang-tracer-server PRIVATE include ${LLVM_INCLUDE_DIRS})
-target_link_libraries(clang-tracer-server PRIVATE tracer_grpc LLVM ${CMAKE_DL_LIBS} Threads::Threads)
+target_link_libraries(clang-tracer-server PRIVATE tracer_grpc tracer_context_collector
+  LLVM ${CMAKE_DL_LIBS} Threads::Threads)
 target_compile_options(clang-tracer-server PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(clang-tracer src/client.cpp src/debug_resolver.cpp src/header_context.cpp)
 target_include_directories(clang-tracer PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_compile_definitions(clang-tracer PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
-target_link_libraries(clang-tracer PRIVATE tracer_grpc clang-cpp LLVM Threads::Threads)
+target_link_libraries(clang-tracer PRIVATE tracer_grpc tracer_context_analysis clang-cpp LLVM Threads::Threads)
 target_compile_options(clang-tracer PRIVATE -Wall -Wextra -Wpedantic)
 
 include(cmake/TracerInstall.cmake)
@@ -192,12 +212,16 @@ if(BUILD_TESTING)
       --proto ${CMAKE_CURRENT_SOURCE_DIR}/proto/tracer.proto
       --output-dir ${CMAKE_CURRENT_BINARY_DIR}/friendly-test-results)
   set_tests_properties(grpc_friendly_client_integration PROPERTIES TIMEOUT 90)
+  add_executable(cpp-name-fixture tests/cpp_name_fixture.cpp)
+  target_compile_options(cpp-name-fixture PRIVATE -g -O0 -fno-omit-frame-pointer
+    -fcf-protection=none)
   add_test(NAME grpc_cpp_name_integration
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp_name_integration.py
       --server $<TARGET_FILE:clang-tracer-server>
       --client $<TARGET_FILE:clang-tracer>
       --agent $<TARGET_FILE:clang_tracer_agent>
       --target $<TARGET_FILE:trace-target>
+      --negative-target $<TARGET_FILE:cpp-name-fixture>
       --protoc $<TARGET_FILE:protobuf::protoc>
       --proto ${CMAKE_CURRENT_SOURCE_DIR}/proto/tracer.proto
       --compdb ${CMAKE_CURRENT_BINARY_DIR}
@@ -218,7 +242,7 @@ if(BUILD_TESTING)
       --source ${CMAKE_CURRENT_SOURCE_DIR}/examples/target.cpp
       --threaded-source ${CMAKE_CURRENT_SOURCE_DIR}/examples/threaded_target.cpp
       --output-dir ${CMAKE_CURRENT_BINARY_DIR}/class-interceptor-results)
-  set_tests_properties(grpc_class_interceptor_integration PROPERTIES TIMEOUT 180)
+  set_tests_properties(grpc_class_interceptor_integration PROPERTIES TIMEOUT 360)
   add_executable(typed-this-fixture tests/typed_this_fixture.cpp)
   set_target_properties(typed-this-fixture PROPERTIES ENABLE_EXPORTS ON)
   target_compile_options(typed-this-fixture PRIVATE -O0 -fno-omit-frame-pointer
@@ -230,6 +254,8 @@ if(BUILD_TESTING)
       --agent $<TARGET_FILE:clang_tracer_agent>
       --target $<TARGET_FILE:cpp-interceptors-target>
       --unsupported-target $<TARGET_FILE:typed-this-fixture>
+      --protoc $<TARGET_FILE:protobuf::protoc>
+      --proto ${CMAKE_CURRENT_SOURCE_DIR}/proto/tracer.proto
       --compdb ${CMAKE_CURRENT_BINARY_DIR}
       --source ${CMAKE_CURRENT_SOURCE_DIR}/examples/cpp-interceptors/target.cpp
       --unsupported-source ${CMAKE_CURRENT_SOURCE_DIR}/tests/typed_this_fixture.cpp

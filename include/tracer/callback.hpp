@@ -5,6 +5,10 @@
 #include "tracer/protocol.hpp"
 #endif
 
+#ifndef CLANG_TRACER_CONTEXT_TYPES_DEFINED
+#include "tracer/context.hpp"
+#endif
+
 #include <cstddef>
 #include <stdexcept>
 #include <type_traits>
@@ -12,10 +16,13 @@
 namespace tracer {
 
 template <std::size_t> struct ArgumentType;
+namespace context_facade { struct NativeHookContextFactory; }
 
 class Call {
 public:
   explicit Call(const TraceContext &context) noexcept : context_(context) {}
+
+  const Context &context() const;
 
   template <class T> T arg(std::size_t index) const {
     if (index >= context_.argument_count || index >= kMaxArguments) {
@@ -147,6 +154,7 @@ public:
   }
 
 private:
+  friend struct context_facade::NativeHookContextFactory;
   void record(const char *name, const TraceValue &value, std::uint32_t kind,
               std::uint32_t index) const {
     if (!name || !name[0]) {

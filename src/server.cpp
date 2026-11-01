@@ -12,7 +12,9 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -20,12 +22,16 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <fcntl.h>
 #include <grpcpp/grpcpp.h>
+#include <llvm/ADT/StringRef.h>
+#include <llvm/Support/SHA256.h>
 #include <poll.h>
 #include <sys/file.h>
 #include <sys/socket.h>
@@ -34,6 +40,9 @@
 #include <unistd.h>
 
 #include "session.hpp"
+#include "context_collector.hpp"
+#include "context_journal.hpp"
+#include "context_package.hpp"
 
 namespace tracer {
 namespace {
@@ -42,10 +51,121 @@ constexpr std::size_t kSessionLimit = 64;
 constexpr std::size_t kEventHistoryLimit = 4096;
 constexpr std::size_t kMaxCallbackSource = 64 * 1024;
 constexpr std::size_t kMaxEventBytes = 64 * 1024;
+constexpr std::size_t kRetainedContextEventLimit = 128;
+constexpr std::size_t kRetainedContextBytesLimit = 16 * 1024 * 1024;
+
+context_package::PackageLineage admit_probe_package(
+    const clangtracer::v1::ProbeSpec &spec) {
+  const std::filesystem::path source(spec.callback_package_path());
+  if (source.empty() || spec.callback_package_path().front() != '/') {
+    return context_package::PackageCatalog::distinct_unverified(
+        "callback package source path is missing or not absolute");
+  }
+
+  std::ifstream input(source, std::ios::binary);
+  if (!input) {
+    return context_package::PackageCatalog::distinct_unverified(
+        "callback package source cannot be verified");
+  }
+  const std::string contents{std::istreambuf_iterator<char>(input),
+                              std::istreambuf_iterator<char>()};
+  if (input.bad() || contents != spec.callback_source()) {
+    return context_package::PackageCatalog::distinct_unverified(
+        "callback source differs from its package file; lineage isolated");
+  }
+  return context_package::PackageCatalog::admit_source(source);
+}
 
 volatile std::sig_atomic_t interrupted = 0;
 
 void signal_handler(int) { interrupted = 1; }
+
+class LiveContextCapture final {
+public:
+  bool accept(const clangtracer::context::v1::ExportOpen &,
+              const clangtracer::context::v1::ContextEventEnvelope &envelope,
+              std::shared_ptr<const context_engine::DecodedEvent> decoded) {
+    if (!decoded)
+      return false;
+    const auto &event = envelope.event();
+    std::cerr << "shared-context event " << event.name() << " states="
+              << decoded->states.size() << '\n';
+    for (const auto &state : decoded->states) {
+      if (const auto *message = state.message())
+        std::cerr << message->DebugString();
+    }
+    return true;
+  }
+};
+
+class DurableStoreCatalog final {
+public:
+  explicit DurableStoreCatalog(std::filesystem::path root)
+      : root_(std::move(root)) {}
+
+  std::shared_ptr<context_delivery::ContextCollectorStore>
+  acquire(std::string_view recording_id, std::string_view sink_id) {
+    if (recording_id.empty() || sink_id.empty() || recording_id.size() > 1024 ||
+        sink_id.size() > 1024)
+      return {};
+    std::string key;
+    key.reserve(recording_id.size() + sink_id.size() + 24);
+    key += std::to_string(recording_id.size());
+    key.push_back(':');
+    key.append(recording_id);
+    key += std::to_string(sink_id.size());
+    key.push_back(':');
+    key.append(sink_id);
+
+    std::lock_guard lock(mutex_);
+    for (auto current = stores_.begin(); current != stores_.end();) {
+      if (current->second.expired())
+        current = stores_.erase(current);
+      else
+        ++current;
+    }
+    if (const auto found = stores_.find(key); found != stores_.end()) {
+      if (auto existing = found->second.lock())
+        return existing;
+      stores_.erase(found);
+    }
+    if (stores_.size() >= kStoreLimit)
+      return {};
+
+    const auto directory = root_ / digest_directory_name(key);
+    std::error_code error;
+    std::filesystem::create_directories(directory, error);
+    if (error)
+      return {};
+    auto store = std::make_shared<context_delivery::ContextCollectorStore>(
+        directory);
+    stores_.emplace(std::move(key), store);
+    return store;
+  }
+
+private:
+  static constexpr std::size_t kStoreLimit = 64;
+
+  static std::string digest_directory_name(std::string_view key) {
+    llvm::SHA256 hash;
+    hash.update(llvm::StringRef(key.data(), key.size()));
+    const auto digest = hash.final();
+    constexpr char hex[] = "0123456789abcdef";
+    std::string name;
+    name.reserve(digest.size() * 2);
+    for (const auto byte : digest) {
+      name.push_back(hex[byte >> 4]);
+      name.push_back(hex[byte & 0x0f]);
+    }
+    return name;
+  }
+
+  const std::filesystem::path root_;
+  std::mutex mutex_;
+  std::unordered_map<
+      std::string,
+      std::weak_ptr<context_delivery::ContextCollectorStore>> stores_;
+};
 
 std::uint64_t random_probe_seed() {
   std::uint64_t value = 0;
@@ -228,6 +348,19 @@ public:
     const auto key = std::make_pair(session_id, probe_id);
     if (active) {
       active_probes_[key] = pid;
+      constexpr std::size_t kKnownProbeLimit = 4096;
+      bool retain_probe_identity = true;
+      if (!known_probe_pids_.contains(key) &&
+          known_probe_pids_.size() >= kKnownProbeLimit) {
+        const auto stale = std::find_if(known_probe_pids_.begin(), known_probe_pids_.end(),
+            [&](const auto &entry) { return !active_probes_.contains(entry.first); });
+        if (stale != known_probe_pids_.end())
+          known_probe_pids_.erase(stale);
+        else
+          retain_probe_identity = false;
+      }
+      if (retain_probe_identity)
+        known_probe_pids_[key] = pid;
       received_.try_emplace(key, 0);
     } else {
       active_probes_.erase(key);
@@ -235,6 +368,236 @@ public:
       if (found != received_.end() && found->second == 0)
         received_.erase(found);
     }
+  }
+
+  bool publish_context(
+      const clangtracer::context::v1::ExportOpen &open,
+      const clangtracer::context::v1::ContextEventEnvelope &envelope) {
+    const auto drop = [this] {
+      std::lock_guard lock(mutex_);
+      ++dropped_;
+      return true;
+    };
+    const auto &source = envelope.event();
+    const auto parse_decimal = [](const std::string &text) -> std::uint64_t {
+      if (text.empty() || text.size() > 20)
+        return 0;
+      std::uint64_t value = 0;
+      for (const unsigned char c : text) {
+        if (c < '0' || c > '9' || value > (UINT64_MAX - (c - '0')) / 10)
+          return 0;
+        value = value * 10 + (c - '0');
+      }
+      return value;
+    };
+    const auto parse_probe_identity = [&](const std::string &text) {
+      if (text.size() == 16) {
+        const bool decimal = std::all_of(text.begin(), text.end(),
+            [](unsigned char c) { return c >= '0' && c <= '9'; });
+        if (!decimal && std::all_of(text.begin() + 8, text.end(),
+                [](unsigned char c) { return c == 0; })) {
+          std::uint64_t value = 0;
+          for (unsigned i = 0; i < 8; ++i)
+            value |= static_cast<std::uint64_t>(
+                static_cast<unsigned char>(text[i])) << (8 * i);
+          return value;
+        }
+      }
+      return parse_decimal(text);
+    };
+    const auto copy_value = [](const clangtracer::context::v1::TypedTraceValue &in,
+                               clangtracer::v1::Value *out) {
+      out->set_type(static_cast<clangtracer::v1::ValueType>(in.value_type()));
+      switch (in.value_case()) {
+      case clangtracer::context::v1::TypedTraceValue::kSignedValue:
+        out->set_signed_value(in.signed_value());
+        return true;
+      case clangtracer::context::v1::TypedTraceValue::kUnsignedValue:
+        out->set_unsigned_value(in.unsigned_value());
+        return true;
+      case clangtracer::context::v1::TypedTraceValue::kRealValue:
+        out->set_real_value(in.real_value());
+        return true;
+      case clangtracer::context::v1::TypedTraceValue::VALUE_NOT_SET:
+        return in.value_type() == clangtracer::v1::VOID ||
+               in.value_type() == clangtracer::v1::VALUE_TYPE_UNSPECIFIED;
+      }
+      return false;
+    };
+    const auto copy_stack = [](const clangtracer::context::v1::ContextStackTrace &in,
+                               clangtracer::v1::StackTrace *out) {
+      if (in.requested_depth() < 1 || in.requested_depth() > kMaxStackDepth ||
+          in.frames_size() > static_cast<int>(in.requested_depth()) ||
+          in.captured_depth() > in.requested_depth() ||
+          in.hidden_frames() > in.captured_depth() ||
+          (in.captured_depth() == 0
+               ? in.application_only() || in.hidden_frames() != 0
+               : static_cast<std::uint64_t>(in.frames_size()) + in.hidden_frames() !=
+                     in.captured_depth()) ||
+          (!in.application_only() && in.hidden_frames() != 0) ||
+          in.detail().size() > 159 ||
+          (in.status() != clangtracer::context::v1::ContextStackTrace::COMPLETE &&
+           in.status() != clangtracer::context::v1::ContextStackTrace::TRUNCATED &&
+           in.status() != clangtracer::context::v1::ContextStackTrace::PARTIAL))
+        return false;
+      const auto safe_text = [](const std::string &text) {
+        return text.size() <= 256 &&
+            std::none_of(text.begin(), text.end(), [](unsigned char c) {
+              return c < 32 || c == 127;
+            });
+      };
+      for (int i = 0; i < in.frames_size(); ++i) {
+        const auto &frame = in.frames(i);
+        const bool valid_kind = in.application_only()
+            ? frame.application_frame() &&
+                  (frame.kind() == clangtracer::context::v1::ContextStackFrame::TARGET_ENTRY ||
+                   frame.kind() == clangtracer::context::v1::ContextStackFrame::NATIVE)
+            : i == 0
+                  ? frame.kind() == clangtracer::context::v1::ContextStackFrame::TARGET_ENTRY
+                  : (frame.kind() == clangtracer::context::v1::ContextStackFrame::NATIVE ||
+                     frame.kind() == clangtracer::context::v1::ContextStackFrame::JIT_BRIDGE);
+        if (frame.pc() == 0 || !valid_kind || !safe_text(frame.function()) ||
+            !safe_text(frame.module()) || !safe_text(frame.file()))
+          return false;
+      }
+      out->set_status(static_cast<clangtracer::v1::StackTrace::Status>(in.status()));
+      out->set_requested_depth(in.requested_depth());
+      out->set_detail(in.detail());
+      out->set_application_only(in.application_only());
+      out->set_hidden_frames(in.hidden_frames());
+      out->set_captured_depth(in.captured_depth());
+      for (const auto &frame : in.frames()) {
+        auto *copy = out->add_frames();
+        copy->set_pc(frame.pc());
+        copy->set_stack_pointer(frame.stack_pointer());
+        copy->set_kind(static_cast<clangtracer::v1::StackFrame::Kind>(frame.kind()));
+        copy->set_function(frame.function());
+        copy->set_module(frame.module());
+        copy->set_file(frame.file());
+        copy->set_line(frame.line());
+        copy->set_module_offset(frame.module_offset());
+        copy->set_application_frame(frame.application_frame());
+      }
+      return true;
+    };
+    const auto session_id = open.producer_session_id();
+    const auto probe_id = parse_probe_identity(source.probe_id());
+    if (session_id.empty() || probe_id == 0 || !envelope.has_event() ||
+        envelope.producer_session_id() != session_id ||
+        envelope.epoch_id() != open.epoch_id())
+      return drop();
+    std::uint32_t verified_native_pid = 0;
+    if (open.native_pid() != 0 || open.process_start_time() != 0) {
+      if (open.native_pid() == 0 || open.process_start_time() == 0)
+        return drop();
+      try {
+        if (Session::ProcessStartTime(open.native_pid()) !=
+            open.process_start_time())
+          return drop();
+        verified_native_pid = open.native_pid();
+      } catch (...) {
+        return drop();
+      }
+    }
+
+    clangtracer::v1::TraceEvent event;
+    event.set_protocol_version(kProtocolVersion);
+    event.set_session_id(session_id);
+    event.set_probe_id(probe_id);
+    event.set_probe_sequence(source.source_sequence());
+    event.set_monotonic_time_ns(static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()));
+    if (source.invocation_id().size() == 16) {
+      std::uint64_t call_id = 0;
+      for (unsigned i = 0; i < 8; ++i)
+        call_id |= static_cast<std::uint64_t>(
+            static_cast<unsigned char>(source.invocation_id()[i])) << (8 * i);
+      event.set_call_id(call_id);
+    }
+    event.set_phase(source.phase() == 1 ? clangtracer::v1::PRE
+                    : source.phase() == 2 ? clangtracer::v1::POST
+                                          : clangtracer::v1::TRACE_PHASE_UNSPECIFIED);
+    for (const auto &argument : source.arguments()) {
+      auto *value = event.add_arguments();
+      if (!copy_value(argument.value(), value))
+        return drop();
+    }
+    for (const auto &named : source.named_values()) {
+      clangtracer::v1::NamedValue *value = named.kind() == 1
+          ? event.add_named_arguments() : named.kind() == 2
+          ? event.add_object_fields() : nullptr;
+      if (!value)
+        return drop();
+      value->set_name(named.name());
+      value->set_argument_index(named.argument_index());
+      if (!copy_value(named.value(), value->mutable_value()))
+        return drop();
+    }
+    if (source.has_result()) {
+      if (!copy_value(source.result(), event.mutable_result()))
+        return drop();
+    }
+    if (source.has_entry_stack() &&
+        !copy_stack(source.entry_stack(), event.mutable_stack()))
+      return drop();
+    event.mutable_context()->CopyFrom(envelope);
+
+    const std::size_t charge = event.ByteSizeLong();
+    std::lock_guard lock(mutex_);
+    const auto key = std::make_pair(session_id, probe_id);
+    auto known = known_probe_pids_.find(key);
+    if (known == known_probe_pids_.end()) {
+      const auto active = active_probes_.find(key);
+      if (active != active_probes_.end()) {
+        event.set_pid(active->second);
+      } else if (verified_native_pid != 0) {
+        // The collector may have restarted and lost its in-memory mapping.
+        // The engine-supplied PID is accepted only while its process start
+        // time still matches, so PID reuse cannot retarget the event.
+        event.set_pid(verified_native_pid);
+      } else {
+        // An evicted, inactive producer identity cannot be associated safely.
+        return true;
+      }
+    } else {
+      event.set_pid(known->second);
+    }
+    if (charge > kRetainedContextBytesLimit) {
+      ++dropped_;
+      return true;
+    }
+    while (context_event_count_ >= kRetainedContextEventLimit ||
+           context_bytes_ + charge + 64 > kRetainedContextBytesLimit) {
+      const auto oldest = std::find_if(history_.begin(), history_.end(),
+          [](const auto &item) { return item.has_context(); });
+      if (oldest == history_.end())
+        break;
+      context_bytes_ -= oldest->ByteSizeLong();
+      --context_event_count_;
+      history_.erase(oldest);
+      ++dropped_;
+    }
+    if (context_event_count_ >= kRetainedContextEventLimit ||
+        context_bytes_ + charge + 64 > kRetainedContextBytesLimit) {
+      ++dropped_;
+      return true;
+    }
+    event.set_sequence(next_sequence_++);
+    if (history_.size() == kEventHistoryLimit) {
+      if (history_.front().has_context()) {
+        context_bytes_ -= history_.front().ByteSizeLong();
+        --context_event_count_;
+      }
+      history_.pop_front();
+      ++dropped_;
+    }
+    event.set_server_dropped_events(dropped_);
+    context_bytes_ += event.ByteSizeLong();
+    ++context_event_count_;
+    history_.push_back(std::move(event));
+    changed_.notify_all();
+    return true;
   }
 
   bool retire_probe(const std::string &session_id, std::uint64_t probe_id,
@@ -262,6 +625,7 @@ public:
     std::uint64_t cursor = request->after_sequence();
     for (;;) {
       std::vector<clangtracer::v1::TraceEvent> batch;
+      std::size_t batch_bytes = 0;
       {
         std::unique_lock lock(mutex_);
         if (context->IsCancelled())
@@ -273,10 +637,19 @@ public:
         for (const auto &event : history_) {
           if (event.sequence() <= cursor)
             continue;
+          const bool session_matches =
+              filter.empty() || filter.count(event.session_id()) != 0;
+          const bool pid_matches =
+              request->pid() == 0 || event.pid() == request->pid();
+          if (session_matches && pid_matches) {
+            const auto bytes = event.ByteSizeLong();
+            if (!batch.empty() && batch_bytes + bytes > 32 * 1024 * 1024)
+              break;
+            batch.push_back(event);
+            batch_bytes += bytes;
+          }
           cursor = event.sequence();
           found = true;
-          if (filter.empty() || filter.count(event.session_id()))
-            batch.push_back(event);
           if (batch.size() >= 64)
             break;
         }
@@ -317,8 +690,11 @@ private:
   std::mutex mutex_;
   std::condition_variable changed_;
   std::map<std::pair<std::string, std::uint64_t>, std::uint32_t> active_probes_;
+  std::map<std::pair<std::string, std::uint64_t>, std::uint32_t> known_probe_pids_;
   std::map<std::pair<std::string, std::uint64_t>, std::uint64_t> received_;
   std::deque<clangtracer::v1::TraceEvent> history_;
+  std::size_t context_bytes_ = 0;
+  std::size_t context_event_count_ = 0;
   std::uint64_t next_sequence_ = 1;
   std::uint64_t dropped_ = 0;
 
@@ -486,6 +862,10 @@ private:
       ++received_[active->first];
       event.set_sequence(next_sequence_++);
       if (history_.size() == kEventHistoryLimit) {
+        if (history_.front().has_context()) {
+          context_bytes_ -= history_.front().ByteSizeLong();
+          --context_event_count_;
+        }
         history_.pop_front();
         ++dropped_;
       }
@@ -499,14 +879,35 @@ private:
 class TracerService final : public clangtracer::v1::Tracer::Service {
 public:
   TracerService(std::string agent_path, std::string event_path,
-                std::string source_directory, std::chrono::seconds timeout)
+                std::string source_directory, std::chrono::seconds timeout,
+                std::string context_endpoint,
+                std::string context_durable_directory)
       : agent_path_(std::move(agent_path)), event_path_(std::move(event_path)),
         source_directory_(std::move(source_directory)), timeout_(timeout),
+        context_endpoint_(std::move(context_endpoint)),
+        context_durable_directory_(std::move(context_durable_directory)),
         events_(event_path_), next_probe_id_(random_probe_seed()) {}
+
+  void set_context_endpoint(std::string endpoint) {
+    std::lock_guard lock(mutex_);
+    context_endpoint_ = std::move(endpoint);
+    context_endpoint_ready_ = true;
+    context_endpoint_cv_.notify_all();
+  }
+
+  bool publish_context(
+      const clangtracer::context::v1::ExportOpen &open,
+      const clangtracer::context::v1::ContextEventEnvelope &envelope) {
+    return events_.publish_context(open, envelope);
+  }
 
   grpc::Status Attach(grpc::ServerContext *,
                       const clangtracer::v1::AttachRequest *request,
                       clangtracer::v1::Session *response) override {
+    {
+      std::unique_lock lock(mutex_);
+      context_endpoint_cv_.wait(lock, [&] { return context_endpoint_ready_; });
+    }
     const auto pid = request->pid();
     if (pid == 0 || pid == static_cast<std::uint32_t>(::getpid())) {
       return {grpc::StatusCode::INVALID_ARGUMENT,
@@ -557,8 +958,20 @@ public:
                 "an attach for this PID is in progress"};
       }
     }
+    std::string context_endpoint;
+    std::string producer_journal_directory;
+    {
+      std::lock_guard lock(mutex_);
+      context_endpoint = context_endpoint_;
+      if (!context_durable_directory_.empty())
+        producer_journal_directory = context_durable_directory_ +
+                                     "/producer-pid-" + std::to_string(pid) +
+                                     "-" + std::to_string(process_start);
+    }
     auto session = std::make_shared<Session>(
-        id, pid, process_start, agent_path_, event_path_, timeout_);
+        id, pid, process_start, agent_path_, event_path_,
+        std::move(context_endpoint), std::move(producer_journal_directory),
+        timeout_);
     try {
       session->attach();
       std::lock_guard lock(mutex_);
@@ -592,8 +1005,13 @@ public:
       if (pending_probe_id == 0)
         pending_probe_id = next_probe_id_.fetch_add(1);
       events_.set_probe(session->id(), pending_probe_id, session->pid(), true);
+      const auto lineage = admit_probe_package(request->spec());
+      if (!lineage.retained) {
+        std::cerr << "clang-tracer: shared-context source lineage isolated: "
+                  << lineage.diagnostic.substr(0, 240) << '\n';
+      }
       auto probe = session->add_probe(request->spec(), source_directory_,
-                                      pending_probe_id);
+                                      pending_probe_id, lineage.id);
       response->CopyFrom(probe);
       return grpc::Status::OK;
     } catch (const std::invalid_argument &error) {
@@ -751,6 +1169,10 @@ private:
   std::string event_path_;
   std::string source_directory_;
   std::chrono::seconds timeout_;
+  std::string context_endpoint_;
+  std::string context_durable_directory_;
+  std::condition_variable context_endpoint_cv_;
+  bool context_endpoint_ready_ = false;
   EventHub events_;
   std::atomic<std::uint64_t> next_probe_id_;
   std::mutex mutex_;
@@ -824,6 +1246,12 @@ private:
       return (allow_empty || !value.empty()) && value.size() <= limit &&
              value.find('\0') == std::string::npos;
     };
+    if (!valid_text(spec.callback_package_path(), 4095, true) ||
+        (!spec.callback_package_path().empty() &&
+         spec.callback_package_path().front() != '/')) {
+      return {grpc::StatusCode::INVALID_ARGUMENT,
+              "callback package path must be an absolute path up to 4095 bytes"};
+    }
     if (!valid_text(spec.receiver_unavailable_reason(), 4096, true)) {
       return {grpc::StatusCode::INVALID_ARGUMENT,
               "invalid receiver diagnostic"};
@@ -974,7 +1402,8 @@ private:
 } // namespace
 
 int RunServer(const std::string &agent_path, const std::string &listen_uri,
-              std::chrono::seconds operation_timeout) {
+              std::chrono::seconds operation_timeout,
+              const std::string &context_durable_directory) {
   if (agent_path.empty() || operation_timeout.count() < 1 ||
       operation_timeout.count() > 300) {
     throw std::invalid_argument(
@@ -998,18 +1427,47 @@ int RunServer(const std::string &agent_path, const std::string &listen_uri,
   if (!socket_path.empty())
     endpoint_lock = std::make_unique<EndpointLock>(socket_path);
   const std::string event_path = directory.path() + "/events.sock";
+  std::string durable_root;
+  std::shared_ptr<DurableStoreCatalog> durable_catalog;
+  if (!context_durable_directory.empty()) {
+    std::filesystem::create_directories(context_durable_directory);
+    durable_root = std::filesystem::canonical(context_durable_directory).string();
+    durable_catalog = std::make_shared<DurableStoreCatalog>(
+        std::filesystem::path(durable_root) / "collector");
+  }
   TracerService service(canonical_agent, event_path, directory.path(),
-                        operation_timeout);
+                        operation_timeout, endpoint, durable_root);
+  LiveContextCapture live_context;
+  context_delivery::ContextCollector context_collector(
+      {}, {},
+      [&service, &live_context](const auto &open, const auto &envelope, auto decoded) {
+        return service.publish_context(open, envelope) &&
+               live_context.accept(open, envelope, std::move(decoded));
+      },
+      [catalog = durable_catalog](std::string_view recording_id,
+                                 std::string_view sink_id) {
+        return catalog ? catalog->acquire(recording_id, sink_id) : nullptr;
+      });
   grpc::ServerBuilder builder;
+  builder.SetMaxSendMessageSize(32 * 1024 * 1024);
   int selected_port = 0;
   builder.AddListeningPort(endpoint, grpc::InsecureServerCredentials(),
                            &selected_port);
   builder.RegisterService(&service);
+  builder.RegisterService(context_collector.service());
   auto server = builder.BuildAndStart();
   if (!server) {
     throw std::runtime_error(
         "gRPC server could not bind the requested endpoint");
   }
+  std::string actual_endpoint = endpoint;
+  if (socket_path.empty() && selected_port > 0) {
+    const auto separator = endpoint.rfind(':');
+    if (separator != std::string::npos)
+      actual_endpoint = endpoint.substr(0, separator + 1) +
+                        std::to_string(selected_port);
+  }
+  service.set_context_endpoint(std::move(actual_endpoint));
   if (!socket_path.empty()) {
     struct stat socket_info{};
     if (::lstat(socket_path.c_str(), &socket_info) != 0 ||

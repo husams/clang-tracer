@@ -69,10 +69,23 @@ std::string qualified(DWARFDie d) {
 
 std::string compact(const std::string& text) {
   std::string out;
+  bool space = false;
   for (unsigned char c : text) {
-    if (!std::isspace(c)) {
-      out += c;
+    if (std::isspace(c)) {
+      space = true;
+      continue;
     }
+    // Whitespace around punctuation is optional; whitespace separating two
+    // identifier tokens is significant (unsigned long != unsignedlong).
+    const auto identifier = [](unsigned char value) {
+      return std::isalnum(value) || value == '_';
+    };
+    if (space && !out.empty() &&
+        identifier(static_cast<unsigned char>(out.back())) && identifier(c)) {
+      out += ' ';
+    }
+    out += c;
+    space = false;
   }
   return out;
 }
@@ -131,6 +144,7 @@ Type read_type(DWARFDie d, unsigned depth = 0) {
                                                   "char",
                                                   "signed char",
                                                   "unsigned char",
+                                                  "wchar_t",
                                                   "short",
                                                   "short int",
                                                   "unsigned short",
@@ -169,6 +183,39 @@ Type read_type(DWARFDie d, unsigned depth = 0) {
     t.value = api::FLOAT64;
   }
   return t;
+}
+
+void describe_type_chain(DWARFDie type,
+                         google::protobuf::RepeatedPtrField<api::DebugTypeLevel>* chain,
+                         unsigned depth = 0) {
+  if (depth > 32) throw std::runtime_error("debug field type nesting exceeds 32");
+  bool is_const = false, is_volatile = false;
+  unsigned qualifiers = 0;
+  while (type && (type.getTag() == dw::DW_TAG_typedef ||
+                  type.getTag() == dw::DW_TAG_const_type ||
+                  type.getTag() == dw::DW_TAG_volatile_type)) {
+    if (++qualifiers > 32) throw std::runtime_error("debug field qualifiers exceed 32");
+    is_const |= type.getTag() == dw::DW_TAG_const_type;
+    is_volatile |= type.getTag() == dw::DW_TAG_volatile_type;
+    type = type_of(type);
+  }
+  auto* level = chain->Add();
+  level->set_is_const(is_const);
+  level->set_is_volatile(is_volatile);
+  if (!type) { level->set_kind(api::DebugTypeLevel::VOID); return; }
+  if (number(type, dw::DW_AT_address_class))
+    throw std::runtime_error("nondefault debug address space is unsupported");
+  if (type.getTag() == dw::DW_TAG_pointer_type) {
+    level->set_kind(api::DebugTypeLevel::POINTER);
+    level->set_byte_size(number(type, dw::DW_AT_byte_size, 8));
+    describe_type_chain(type_of(type), chain, depth + 1);
+  } else if (type.getTag() == dw::DW_TAG_base_type) {
+    level->set_kind(api::DebugTypeLevel::BUILTIN);
+    level->set_byte_size(number(type, dw::DW_AT_byte_size));
+    level->set_dwarf_encoding(number(type, dw::DW_AT_encoding));
+  } else {
+    throw std::runtime_error("unsupported debug field type chain");
+  }
 }
 
 DWARFDie declaration(DWARFDie d) {
@@ -359,6 +406,7 @@ void describe_record(DWARFDie record, api::DebugInfo& info) {
     auto* f = info.add_fields();
     f->set_name(name(member));
     f->set_builtin_type(t.spelling);
+    describe_type_chain(type_of(member), f->mutable_type_chain());
     f->set_byte_offset(*offset);
     f->set_byte_size(t.size);
     const auto access = number(member, dw::DW_AT_accessibility,

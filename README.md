@@ -178,6 +178,16 @@ three-thread target, a shared library, callbacks, copy-paste commands and record
 CLI output. No target source, class copy, export, rebuild, relink or agent linkage
 is needed to trace an existing supported debug binary.
 
+## Shared context
+
+Class interceptors can inject C++ state, share it across compatible probes and
+publish typed snapshots through the live event stream. See the
+[shared-context guide](docs/shared-context.md) for the `State<T>`, `get()` and
+`with()` APIs, automatic pthread propagation, lineage behavior, event queries
+and optional durable recording. The unchanged
+[nested-state acceptance fixture](tests/fixtures/shared_context_nested.cpp)
+shows the supported state shapes.
+
 ## Build and run
 
 Use Linux x86-64, C++20, matching LLVM/Clang development packages (21 or 22),

@@ -7,6 +7,7 @@ namespace tracer {
 
 // Starts the synchronous gRPC service and returns after orderly shutdown.
 int RunServer(const std::string &agent_path, const std::string &listen_uri,
-              std::chrono::seconds operation_timeout);
+              std::chrono::seconds operation_timeout,
+              const std::string &context_durable_directory = {});
 
 } // namespace tracer

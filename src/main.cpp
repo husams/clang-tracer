@@ -27,10 +27,12 @@ unsigned parse_positive(const std::string &text, const char *option) {
 int usage() {
   std::cout << "Usage: clang-tracer-server [--agent LIBRARY] [--listen "
                "unix:///PATH|127.0.0.1:PORT] "
-               "[--timeout SECONDS]\n"
+               "[--timeout SECONDS] [--context-durable-dir DIRECTORY]\n"
                "Starts the native multi-process tracing gRPC server. Default "
                "endpoint is a "
                "private Unix socket; Linux x86_64 only.\n"
+               "Shared-context streaming is enabled by default; "
+               "--context-durable-dir enables resumable durable recording.\n"
                "Agent lookup: --agent, CLANG_TRACER_AGENT, installed library, "
                "then adjacent build library.\n";
   return 0;
@@ -42,13 +44,14 @@ int main(int argc, char **argv) {
   try {
     std::string agent;
     std::string listen;
+    std::string context_durable_directory;
     unsigned timeout = 10;
     for (int i = 1; i < argc; ++i) {
       const std::string option = argv[i];
       if (option == "--help")
         return usage();
       if (option != "--agent" && option != "--listen" &&
-          option != "--timeout") {
+          option != "--timeout" && option != "--context-durable-dir") {
         throw std::invalid_argument("unknown option: " + option);
       }
       if (++i == argc)
@@ -58,12 +61,15 @@ int main(int argc, char **argv) {
         agent = value;
       else if (option == "--listen")
         listen = value;
+      else if (option == "--context-durable-dir")
+        context_durable_directory = value;
       else
         timeout = parse_positive(value, "--timeout");
     }
     if (agent.empty())
       agent = tracer::runtime::default_agent_path();
-    return tracer::RunServer(agent, listen, std::chrono::seconds(timeout));
+    return tracer::RunServer(agent, listen, std::chrono::seconds(timeout),
+                             context_durable_directory);
   } catch (const std::exception &error) {
     std::cerr << "clang-tracer: " << error.what() << '\n';
     return 1;

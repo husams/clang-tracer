@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <span>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -13,6 +14,13 @@
 #include <sys/types.h>
 
 namespace tracer::injector {
+
+struct CodePatch {
+  std::uintptr_t address = 0;
+  const void *expected = nullptr;
+  const void *replacement = nullptr;
+  std::size_t size = 0;
+};
 
 class IdlePointUnavailable : public std::runtime_error {
 public:
@@ -58,6 +66,10 @@ public:
   // patch (the patch entry address itself is safe).
   [[nodiscard]] bool patch_code(std::uintptr_t address, const void *expected,
                                 const void *replacement, std::size_t size);
+  // Validates and commits the complete disjoint patch set while all target
+  // threads are stopped. A precondition/active-instruction failure changes no
+  // bytes; a write failure rolls back every range before resuming threads.
+  [[nodiscard]] bool patch_code_batch(std::span<const CodePatch> patches);
   void remote_free(std::uintptr_t address, std::size_t size);
 
   [[nodiscard]] std::uintptr_t

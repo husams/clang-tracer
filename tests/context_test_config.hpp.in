@@ -1,0 +1,4 @@
+#pragma once
+inline constexpr const char *kContextSystemArguments[] = {
+@_context_system_arguments@
+};

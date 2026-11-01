@@ -3,6 +3,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <stdexcept>
+#include <pthread.h>
+#include <atomic>
 
 #include <unistd.h>
 
@@ -90,6 +93,61 @@ public:
   }
 };
 
+extern "C" int shared_child_target(int);
+
+namespace {
+std::atomic<unsigned> shared_child_calls{0};
+
+void *shared_context_child_entry(void *opaque) {
+  const auto encoded = reinterpret_cast<std::intptr_t>(opaque);
+  const bool delayed = encoded < 0;
+  const int value = static_cast<int>(delayed ? -encoded : encoded);
+  if (delayed) {
+    timespec delay{1, 500'000'000};
+    while (::nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+  }
+  const int result = shared_child_target(value);
+  return reinterpret_cast<void *>(static_cast<std::intptr_t>(result));
+}
+} // namespace
+
+extern "C" __attribute__((visibility("default"), noinline)) int
+shared_child_target(int value) {
+  shared_child_calls.fetch_add(1, std::memory_order_relaxed);
+  volatile int result = value + 31;
+  return result;
+}
+
+extern "C" __attribute__((visibility("default"), noinline)) int
+shared_context_spawn_join(int value) {
+  pthread_t child{};
+  const int created = ::pthread_create(
+      &child, nullptr, &shared_context_child_entry,
+      reinterpret_cast<void *>(static_cast<std::intptr_t>(value)));
+  if (created != 0) return -created;
+  void *result = nullptr;
+  if (::pthread_join(child, &result) != 0) return -1;
+  return static_cast<int>(reinterpret_cast<std::intptr_t>(result));
+}
+
+extern "C" __attribute__((visibility("default"), noinline)) int
+shared_context_spawn_early(int value) {
+  pthread_t child{};
+  const int created = ::pthread_create(
+      &child, nullptr, &shared_context_child_entry,
+      reinterpret_cast<void *>(-static_cast<std::intptr_t>(value)));
+  if (created != 0) return -created;
+  (void)::pthread_detach(child);
+  volatile int result = value + 47;
+  return result;
+}
+
+extern "C" __attribute__((visibility("default"), noinline)) int
+shared_context_native_throw(int value) {
+  throw std::runtime_error("shared-context native target exception");
+  return value;
+}
+
 // Starts with a branch so the server rejects the deliberately unsafe patch
 // site.
 extern "C" __attribute__((visibility("default"), noinline, naked)) int
@@ -122,6 +180,18 @@ int main() {
     const unsigned long static_result =
         Fixture::static_work(static_cast<unsigned long>(argument));
     const int namespaced_result = fixture::namespaced_work(argument);
+    int shared_join_result = 0;
+    int shared_early_result = 0;
+    int shared_exception_catches = 0;
+    if (argument % 10 == 1) {
+      shared_join_result = shared_context_spawn_join(1);
+      shared_early_result = shared_context_spawn_early(1);
+      try {
+        (void)shared_context_native_throw(argument);
+      } catch (const std::runtime_error &) {
+        shared_exception_catches = 1;
+      }
+    }
     const long long int64_result =
         traced_int64(static_cast<long long>(argument));
     const float float32_result = traced_float32(static_cast<float>(argument));
@@ -130,14 +200,18 @@ int main() {
     std::printf(
         "TARGET pid=%ld entry=%p arg=%d free=%d mixed=%.2f method=%d "
         "long_method=%d const=%d "
-        "static=%lu namespaced=%d int64=%lld float32=%.2f pointer=%d void=%d\n",
+        "static=%lu namespaced=%d int64=%lld float32=%.2f pointer=%d void=%d "
+        "shared_join=%d shared_early=%d shared_exceptions=%d "
+        "shared_children=%u\n",
         static_cast<long>(::getpid()),
         reinterpret_cast<void *>(
             reinterpret_cast<std::uintptr_t>(&traced_work)),
         argument, free_result, mixed_result, method_result, long_method_result,
         const_result, static_result, namespaced_result, int64_result,
         float32_result, pointer_result == &argument ? 1 : 0,
-        static_cast<int>(last_void_argument));
+        static_cast<int>(last_void_argument), shared_join_result,
+        shared_early_result, shared_exception_catches,
+        shared_child_calls.load(std::memory_order_relaxed));
     std::fflush(stdout);
 
     ++argument;

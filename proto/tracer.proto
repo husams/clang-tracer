@@ -1,6 +1,8 @@
 syntax = "proto3";
 package clangtracer.v1;
 
+import "context_transport.proto";
+
 // All public control and event traffic uses gRPC and binary Protobuf.
 service Tracer {
   rpc Attach(AttachRequest) returns (Session);
@@ -66,6 +68,17 @@ message DebugField {
   uint64 byte_offset = 3;
   uint64 byte_size = 4;
   string access = 5;
+  repeated DebugTypeLevel type_chain = 6;
+}
+// Outer type through terminal builtin/void, retaining pointee ABI facts that
+// a spelling and the outer pointer width cannot prove.
+message DebugTypeLevel {
+  enum Kind { UNSPECIFIED = 0; POINTER = 1; BUILTIN = 2; VOID = 3; }
+  Kind kind = 1;
+  uint64 byte_size = 2;
+  uint32 dwarf_encoding = 3;
+  bool is_const = 4;
+  bool is_volatile = 5;
 }
 message DebugInfo {
   string module = 1;
@@ -111,6 +124,12 @@ message ProbeSpec {
   bool include_internal_stack_frames = 11; // False defaults to application-only, including old clients.
   bool print_arguments = 12; // Optional callback PRE rendering; defaults off.
   bool print_result = 13; // Optional callback POST rendering; defaults off.
+  reserved 14;
+  reserved "callback_origin";
+  // Source location is only used to locate retained engine package metadata;
+  // the server assigns the lineage UUID and never accepts one from clients.
+  string callback_package_path = 15;
+  reserved 16;
 }
 message AttachRequest {
   uint32 pid = 1;
@@ -161,6 +180,7 @@ message ListSessionsResponse { repeated Session sessions = 1; }
 message WatchEventsRequest {
   repeated string session_ids = 1; // Empty subscribes to all sessions.
   uint64 after_sequence = 2;       // Resume cursor in bounded server history.
+  uint32 pid = 3;                  // Optional process filter; survives session loss.
 }
 message Value {
   ValueType type = 1;
@@ -220,4 +240,5 @@ message TraceEvent {
   repeated NamedValue named_arguments = 17;
   repeated NamedValue object_fields = 18;
   StackTrace stack = 19;
+  clangtracer.context.v1.ContextEventEnvelope context = 20;
 }

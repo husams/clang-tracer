@@ -3,12 +3,11 @@
 
 namespace tracer {
 inline constexpr std::uint32_t kProtocolVersion = 2;
-// Version 13 adds asynchronous delivery accounting to the stop handshake.
-// It reads a binary ProbeSpec at source_path, including optional
-// Clang receiver context. Preparation and all-thread patch commits remain
-// separate. Older agents reject the version before interpreting the new payload
-// format.
-inline constexpr std::uint32_t kBootstrapVersion = 13;
+// Version 16 replaces caller-provided callback origin text with an
+// engine-assigned package lineage UUID. It reads a binary ProbeSpec at
+// source_path, including optional Clang receiver context. Older agents reject
+// the version before interpreting the expanded bootstrap request.
+inline constexpr std::uint32_t kBootstrapVersion = 18;
 inline constexpr unsigned kMaxPatchBytes = 64;
 inline constexpr unsigned kMaxArguments = 8;
 inline constexpr unsigned kMaxProbes = 32;
@@ -129,6 +128,15 @@ struct Request {
   char symbol[512]{};
   char source_path[1024]{};
   char event_socket[108]{};
+  // Shared-context delivery configuration. Kept in the bootstrap request so
+  // the injected native agent uses the exact endpoint/profile selected by the
+  // owning server session.
+  char context_endpoint[256]{};
+  char context_journal_dir[512]{};
+  char context_recording_id[64]{};
+  char context_sink_id[64]{};
+  std::uint8_t source_lineage_id[16]{};
+  std::uint32_t context_delivery_profile = 1; // 1=best-effort, 2=durable.
   std::uint64_t original_entry = 0;
   std::uint64_t callback_address = 0;
   std::uint64_t wrapper_address = 0;
@@ -138,7 +146,21 @@ struct Request {
   std::uint32_t patch_size = 0;
   std::uint8_t original[kMaxPatchBytes]{};
   std::uint8_t installed[kMaxPatchBytes]{};
+  // Second native patch transaction for the supported pthread_create adapter.
+  // Zero size means the agent could not prove the runtime's ABI/module bytes.
+  std::uint64_t pthread_create_entry = 0;
+  std::uint64_t pthread_create_trampoline = 0;
+  std::uint64_t pthread_create_wrapper = 0;
+  std::uint32_t pthread_create_patch_size = 0;
+  std::uint32_t pthread_create_active_tasks = 0;
+  bool context_required = false;
+  std::uint8_t pthread_create_original[kMaxPatchBytes]{};
+  std::uint8_t pthread_create_installed[kMaxPatchBytes]{};
   char error[2048]{};
+  // Native PID identity for restart-safe shared-context event routing.
+  // These fields are engine-populated from the attached Session.
+  std::uint32_t context_native_pid = 0;
+  std::uint64_t context_process_start_time = 0;
 };
 } // namespace tracer
 

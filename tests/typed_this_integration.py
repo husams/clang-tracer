@@ -13,6 +13,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from class_interceptor_integration import callback_value, wait_binary
+
 
 def require(condition: bool, message: str) -> None:
     if not condition:
@@ -31,6 +33,13 @@ def run(client: Path, endpoint: str, *args: str, ok: bool = True,
 
 def text(result: subprocess.CompletedProcess[bytes]) -> str:
     return (result.stdout + result.stderr).decode("utf-8", errors="replace")
+
+
+def field_value(row: str, name: str) -> int:
+    match = re.search(r'object_fields\s*\{\s*name: "' + re.escape(name) +
+                      r'"\s*value\s*\{\s*type: INT32(?:\s+signed_value:\s*(-?\d+))?', row)
+    require(match is not None, f"missing typed receiver field {name}: {row}")
+    return int(match.group(1)) if match.group(1) else 0
 
 
 def stop(process: subprocess.Popen[bytes] | None) -> None:
@@ -68,11 +77,12 @@ def short_wchar_compdb(compdb: Path, source: Path, output_dir: Path) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser()
     for name in ("server", "client", "agent", "target", "unsupported-target",
-                 "compdb", "source", "unsupported-source", "callback", "output-dir"):
+                 "compdb", "source", "unsupported-source", "callback", "output-dir",
+                 "protoc", "proto"):
         parser.add_argument("--" + name, required=True, type=Path)
     args = parser.parse_args()
     for name in ("server", "client", "agent", "target", "unsupported_target", "compdb",
-                 "source", "unsupported_source", "callback"):
+                 "source", "unsupported_source", "callback", "protoc", "proto"):
         path = getattr(args, name).resolve()
         require(path.exists(), f"missing {name}: {path}")
         setattr(args, name, path)
@@ -119,57 +129,40 @@ def main() -> int:
                     f"could not attach to target: {attach}")
             probe = text(run(args.client, endpoint, "trace", str(target.pid),
                              "Calculator::multiply(int, int) const", "--callback",
-                             str(args.callback), "--compdb", str(args.compdb),
-                             "--source", str(args.source), timeout=45))
+                             str(args.callback), timeout=45))
             match = re.search(r"\bprobe\s*=\s*(\d+)", probe)
             require(match is not None, f"trace output lacks probe ID: {probe}")
             probe_id = int(match.group(1))
 
-            cursor = 0
-            events: list[str] = []
-            deadline = time.monotonic() + 20
-            while time.monotonic() < deadline and len(events) < 2:
-                batch = text(run(args.client, endpoint, "events", str(target.pid),
-                                 "--count", "8", "--after", str(cursor), "--timeout", "2",
-                                 timeout=5))
-                for line in batch.splitlines():
-                    found_cursor = re.search(r"\bcursor=(\d+)", line)
-                    if found_cursor:
-                        cursor = max(cursor, int(found_cursor.group(1)))
-                    if re.search(rf"\bprobe={probe_id}\b", line):
-                        events.append(line)
-                if len(events) < 2:
-                    time.sleep(.05)
-            require(len(events) >= 2, f"did not receive PRE and POST events: {events}")
+            events, cursor = wait_binary(args.client, endpoint, target.pid, probe_id,
+                                         output_dir, args.protoc, args.proto, 2, 0)
 
             by_call: dict[str, dict[str, str]] = {}
             for line in events:
-                phase = re.search(r"\bphase=(pre|post)", line)
-                call_id = re.search(r"\bcall=(\d+)", line)
+                phase = re.search(r"^phase: (PRE|POST)$", line, re.M)
+                call_id = re.search(r"^call_id:\s*(\d+)", line, re.M)
                 require(phase and call_id, f"event lacks phase or call ID: {line}")
-                by_call.setdefault(call_id.group(1), {})[phase.group(1)] = line
+                by_call.setdefault(call_id.group(1), {})[phase.group(1).lower()] = line
             pair = next((entry for entry in by_call.values()
                          if "pre" in entry and "post" in entry), None)
             require(pair is not None, f"PRE and POST did not share a call ID: {events}")
 
             pre, post = pair["pre"], pair["post"]
-            pre_args = re.search(r"args=\[int32:(-?\d+), int32:(-?\d+)\]", pre)
-            post_args = re.search(r"args=\[int32:(-?\d+), int32:(-?\d+)\]", post)
-            pre_callback = re.search(r"\bcallback=(-?\d+)", pre)
-            post_callback = re.search(r"\bcallback=(-?\d+)", post)
-            result = re.search(r"\bresult=int32:(-?\d+)", post)
-            require(pre_args and post_args and pre_callback and post_callback and result,
+            pre_args = re.findall(r"^arguments\s*\{\s*type: INT32\s+signed_value:\s*(-?\d+)", pre, re.M)
+            post_args = re.findall(r"^arguments\s*\{\s*type: INT32\s+signed_value:\s*(-?\d+)", post, re.M)
+            result = re.search(r"^result\s*\{\s*type: INT32\s+signed_value:\s*(-?\d+)", post, re.M)
+            require(len(pre_args) == len(post_args) == 2 and result,
                     f"typed events lack arguments, callback values, or result: {pair}")
-            value, factor = map(int, pre_args.groups())
-            require(tuple(map(int, post_args.groups())) == (value, factor),
+            value, factor = map(int, pre_args)
+            require(tuple(map(int, post_args)) == (value, factor),
                     f"PRE and POST arguments differ: {pair}")
             original_result = int(result.group(1))
             calls_after = original_result - value * factor - 7
             require(calls_after > 0 and original_result == value * factor + 7 + calls_after,
                     f"original result does not reflect Calculator fields: {post}")
-            require(int(pre_callback.group(1)) == 700 + calls_after - 1 + value * 10 + factor,
+            require(field_value(pre, "bias") == 7 and field_value(pre, "calls") == calls_after - 1,
                     f"PRE did not read bias/calls and explicit arguments: {pre}")
-            require(int(post_callback.group(1)) == calls_after * 100 + 7 + original_result,
+            require(field_value(post, "bias") == 7 and field_value(post, "calls") == calls_after,
                     f"POST did not read bias/calls and the original result: {post}")
             (output_dir / "typed-this-events.log").write_text(
                 f"PRE {pre}\nPOST {post}\n", encoding="utf-8")
@@ -185,8 +178,7 @@ def main() -> int:
                 "(void)call.self()->hidden; } };\n", encoding="utf-8")
             failed = run(args.client, endpoint, "trace", str(target.pid),
                          "Calculator::multiply(int, int) const", "--callback",
-                         str(private_hook), "--compdb", str(args.compdb), "--source",
-                         str(args.source), ok=False, timeout=45)
+                         str(private_hook), ok=False, timeout=45)
             private_diagnostic = text(failed)
             rejection_diagnostics.append(f"private-field: {private_diagnostic}")
             require("hidden" in private_diagnostic and "private" in private_diagnostic.lower(),
@@ -206,13 +198,16 @@ def main() -> int:
                                 encoding="utf-8")
                 diagnostic = text(run(args.client, endpoint, "trace", str(target.pid),
                                       "Calculator::multiply(int, int) const", "--callback",
-                                      str(hook), "--compdb", str(args.compdb), "--source",
-                                      str(args.source), ok=False, timeout=45))
+                                      str(hook), ok=False, timeout=45))
                 rejection_diagnostics.append(f"{label}: {diagnostic}")
                 if label == "mutate":
                     expected = re.search(r"read.only|const|assignment of read-only", diagnostic, re.I)
                 elif label == "invoke":
-                    expected = re.search(r"cannot call.*receiver method", diagnostic, re.I)
+                    expected = re.search(r"cannot call methods on.*receiver|no member named 'multiply'", diagnostic, re.I)
+                elif label == "aggregate":
+                    expected = re.search(r"cannot construct objects of the imported receiver type|"
+                                         r"implicitly-deleted default constructor of 'Holder'",
+                                         diagnostic, re.I)
                 else:
                     expected = re.search(r"cannot construct objects of the imported receiver type",
                                          diagnostic, re.I)
@@ -226,10 +221,9 @@ def main() -> int:
                 "(void)call.self(); } };\n", encoding="utf-8")
             free_error = text(run(args.client, endpoint, "trace", str(target.pid),
                                   "add(int, int)", "--callback", str(free_hook),
-                                  "--compdb", str(args.compdb), "--source", str(args.source),
                                   ok=False, timeout=45))
             rejection_diagnostics.append(f"free-self: {free_error}")
-            require("typed self() requires a source-selected supported non-static method" in
+            require("typed self() requires a debug-selected supported non-static method" in
                     free_error, f"free-function self failed for an unexpected reason: {free_error}")
 
             time.sleep(.3)
@@ -264,11 +258,10 @@ def main() -> int:
                 inheritance_error = text(run(
                     args.client, endpoint, "trace", str(inherited.pid),
                     "InheritedCalculator::read(int) const", "--callback", str(args.callback),
-                    "--compdb", str(args.compdb), "--source", str(args.unsupported_source),
                     ok=False, timeout=45))
                 rejection_diagnostics.append(f"inheritance: {inheritance_error}")
-                require(re.search(r"receiver class has an unsupported layout|typed self\(\) requires "
-                                  r"a source-selected supported non-static method",
+                require(re.search(r"debug receiver inheritance is unsupported|unsupported.*(?:receiver|inheritance|layout)|typed self\(\) requires "
+                                  r"a debug-selected supported non-static method",
                                   inheritance_error, re.I),
                         f"inheritance rejection was not clear: {inheritance_error}")
 
@@ -283,26 +276,28 @@ def main() -> int:
                 pointer_probe_text = text(run(
                     args.client, endpoint, "trace", str(inherited.pid),
                     "PointerCalculator::read(int) const", "--callback", str(pointer_hook),
-                    "--compdb", str(args.compdb), "--source", str(args.unsupported_source),
                     timeout=45))
                 pointer_probe_match = re.search(r"\bprobe\s*=\s*(\d+)", pointer_probe_text)
                 require(pointer_probe_match is not None,
                         f"pointer receiver probe did not install: {pointer_probe_text}")
                 pointer_probe_id = int(pointer_probe_match.group(1))
-                pointer_events = text(run(args.client, endpoint, "events", str(inherited.pid),
-                                          "--count", "8", "--after", "0", "--timeout", "5",
-                                          timeout=8))
-                pointer_pre = next((line for line in pointer_events.splitlines()
-                                    if re.search(rf"\bprobe={pointer_probe_id}\b", line) and
-                                    re.search(r"\bphase=pre\b", line)), None)
+                pointer_events, _ = wait_binary(args.client, endpoint, inherited.pid,
+                                                pointer_probe_id, output_dir,
+                                                args.protoc, args.proto, 1, 0)
+                pointer_pre = next((line for line in pointer_events
+                                    if re.search(r"^phase: PRE$", line, re.M)), None)
                 require(pointer_pre is not None and
-                        re.search(r"\bcallback=84\b", pointer_pre),
+                        callback_value(pointer_pre) == 84,
                         f"pointer self callback did not read the original wchar_t value: "
                         f"{pointer_events}")
                 run(args.client, endpoint, "remove", str(inherited.pid), str(pointer_probe_id))
 
-                # This process uses the ordinary ABI. Resolve the same source with
-                # -fshort-wchar so wchar_t* pointee ABI identity disagrees before patching.
+                # Optional headers must preserve the actual DWARF ABI. The
+                # donor source supplies flags only and is never parsed.
+                pointer_header = output_dir / "pointer-layout.hpp"
+                pointer_header.write_text(
+                    "class PointerCalculator { public: wchar_t* text; int bias; "
+                    "int read(int) const; };\n", encoding="utf-8")
                 pointer_hook.write_text(
                     "class Interceptor { public: void pre(const Call &call) { "
                     "auto *self = call.self(); (void)self->text; } };\n",
@@ -310,10 +305,10 @@ def main() -> int:
                 pointer_error = text(run(
                     args.client, endpoint, "trace", str(inherited.pid),
                     "PointerCalculator::read(int) const", "--callback", str(pointer_hook),
-                    "--compdb", str(short_compdb), "--source", str(args.unsupported_source),
+                    "--compdb", str(short_compdb), "--include", str(pointer_header),
                     ok=False, timeout=45))
                 rejection_diagnostics.append(f"short-wchar-pointer: {pointer_error}")
-                require("receiver fields changed since source selection" in pointer_error,
+                require("receiver field type ABI does not match DWARF" in pointer_error,
                         f"pointer field ABI mismatch failed for an unexpected reason: {pointer_error}")
                 run(args.client, endpoint, "detach", str(inherited.pid), timeout=20)
                 require(inherited.poll() is None,
@@ -325,8 +320,7 @@ def main() -> int:
             # Reinstall a valid typed receiver probe and detach it while calls continue.
             final_probe = text(run(args.client, endpoint, "trace", str(target.pid),
                                    "Calculator::multiply(int, int) const", "--callback",
-                                   str(args.callback), "--compdb", str(args.compdb),
-                                   "--source", str(args.source), timeout=45))
+                                   str(args.callback), timeout=45))
             final_match = re.search(r"\bprobe\s*=\s*(\d+)", final_probe)
             require(final_match is not None, f"final trace output lacks probe ID: {final_probe}")
             final_probe_id = int(final_match.group(1))

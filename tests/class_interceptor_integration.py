@@ -39,13 +39,45 @@ def probe_id(text: str) -> int:
 def trace(client: Path, endpoint: str, pid: int, declaration: str, callback: Path,
           compdb: Path, source: Path) -> tuple[int, str]:
     text = output(run(client, endpoint, "trace", str(pid), declaration,
-                      "--callback", str(callback), "--compdb", str(compdb),
-                      "--source", str(source), timeout=45))
+                      "--callback", str(callback), timeout=45))
     return probe_id(text), text
 
 
 def decoded_events(protoc: Path, proto: Path, path: Path) -> list[str]:
     return decode_file(protoc, proto, "TraceEvent", path)
+
+
+def wait_binary(client: Path, endpoint: str, pid: int, probe: int,
+                output_dir: Path, protoc: Path, proto: Path, want: int,
+                after: int) -> tuple[list[str], int]:
+    deadline = time.monotonic() + 20
+    cursor = after
+    rows: list[str] = []
+    while time.monotonic() < deadline and len(rows) < want:
+        path = output_dir / f"probe-{probe}-after-{cursor}.pb"
+        result = subprocess.run(
+            [str(client), "--endpoint", endpoint, "--format", "protobuf",
+             "--output", str(path), "events", str(pid), "--count", "8",
+             "--after", str(cursor), "--timeout", "2"],
+            capture_output=True, timeout=5, check=False)
+        detail = output(result).lower()
+        require(result.returncode == 0 or "timed out" in detail or "deadline exceeded" in detail,
+                f"binary event stream failed: {output(result)}")
+        if not path.exists() or not path.stat().st_size:
+            continue
+        for row in decoded_events(protoc, proto, path):
+            sequence = re.search(r"^sequence:\s*(\d+)", row, re.M)
+            if sequence:
+                cursor = max(cursor, int(sequence.group(1)))
+            if re.search(rf"^probe_id:\s*{probe}\s*$", row, re.M):
+                rows.append(row)
+    require(len(rows) >= want, f"did not receive {want} binary hook events: {rows}")
+    return rows, cursor
+
+
+def callback_value(row: str) -> int:
+    match = re.search(r"^callback_value:\s*(-?\d+)", row, re.M)
+    return int(match.group(1)) if match else 0
 
 
 def wait_readable(client: Path, endpoint: str, pid: int, probe: int,
@@ -81,9 +113,36 @@ def wait_readable(client: Path, endpoint: str, pid: int, probe: int,
     return rows, cursor
 
 
+def wait_event_text(client: Path, endpoint: str, pid: int, probe: int,
+                    after: int = 0) -> str:
+    """Scan one event at a time so a quiet stream need not fill a large count."""
+    deadline = time.monotonic() + 20
+    cursor = after
+    last_text = ""
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            [str(client), "--endpoint", endpoint, "events", str(pid),
+             "--count", "1", "--after", str(cursor), "--timeout", "2"],
+            capture_output=True, timeout=5, check=False)
+        last_text = output(result)
+        sequence = re.search(r"\bcursor=(\d+)", last_text)
+        if sequence:
+            cursor = max(cursor, int(sequence.group(1)))
+        if result.returncode == 0 and re.search(rf"\bprobe={probe}\b", last_text):
+            return last_text
+        if result.returncode != 0:
+            require("timed out" in last_text.lower() or
+                    "deadline exceeded" in last_text.lower(),
+                    f"event stream failed while scanning probe {probe}: {last_text}")
+        time.sleep(.05)
+    raise RuntimeError(
+        f"did not receive readable event for probe {probe}; last output: {last_text}")
+
+
 def watch_session_after(client: Path, endpoint: str, session_id: str, after: int,
-                        output_dir: Path, protoc: Path, proto: Path) -> tuple[list[str], int]:
-    """Use WatchEvents directly so a detached PID need not resolve to an active session."""
+                        output_dir: Path, protoc: Path,
+                        proto: Path) -> tuple[list[str], int]:
+    """Read bounded binary Watch batches for a specific active session."""
     request = output_dir / "detached-watch.textproto"
     write_text(request, f'session_ids: "{session_id}"\nafter_sequence: {after}\n')
     output_path = output_dir / "detached-watch.pb"
@@ -135,6 +194,94 @@ def latest_worker_stats(path: Path) -> dict[int, tuple[int, int]]:
     return stats
 
 
+def wait_shared_context_log(path: Path, minimum_events: int,
+                            timeout: float = 20.0) -> str:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+        events = re.findall(r"^shared-context event request\.completed states=\d+$",
+                            text, re.M)
+        if len(events) >= minimum_events:
+            return text
+        time.sleep(.05)
+    raise RuntimeError(
+        f"server did not decode {minimum_events} shared-context events:\n"
+        f"{path.read_text(encoding='utf-8', errors='replace') if path.exists() else ''}")
+
+
+def shared_context_event_count(path: Path) -> int:
+    text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+    return len(re.findall(r"^shared-context event request\.completed states=\d+$",
+                          text, re.M))
+
+
+def wait_context_watch_cursor(client: Path, endpoint: str, pid: int,
+                              timeout: float = 20.0) -> int:
+    deadline = time.monotonic() + timeout
+    cursor = 0
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            [str(client), "--endpoint", endpoint, "events", str(pid),
+             "--count", "32", "--after", str(cursor), "--timeout", "2"],
+            capture_output=True, timeout=5, check=False)
+        text = output(result)
+        pending = cursor
+        for line in text.splitlines():
+            match = re.search(r"\bcursor=(\d+)", line)
+            if match:
+                pending = int(match.group(1))
+            if "shared-context event=request.completed" in line:
+                return pending
+        if result.returncode != 0:
+            require("timed out" in text.lower() or "deadline exceeded" in text.lower(),
+                    f"WatchEvents failed while locating shared context: {text}")
+        cursor = max(cursor, pending)
+        time.sleep(.05)
+    raise RuntimeError("WatchEvents did not expose a shared-context event")
+
+
+def latest_shared_child_count(path: Path) -> int:
+    text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+    values = re.findall(r"shared_children=(\d+)\b", text)
+    return int(values[-1]) if values else 0
+
+
+def wait_for_shared_pre_diagnostic(path: Path, after: int,
+                                   timeout: float = 8.0) -> str:
+    deadline = time.monotonic() + timeout
+    pattern = re.compile(
+        r"^clang-tracer context diagnostic "
+        r"(?=[^\n]*\breason=hook_failure\b)"
+        r"(?=[^\n]*\bphase=pre\b)"
+        r"(?=[^\n]*\baggregate=0\b)"
+        r"[^\n]*\bcall_id=([1-9]\d*)\b[^\n]*$", re.M)
+    while time.monotonic() < deadline:
+        text = path.read_bytes()[after:].decode("utf-8", errors="replace") \
+            if path.exists() else ""
+        match = pattern.search(text)
+        if match:
+            require(int(match.group(1)) > 0,
+                    f"shared PRE diagnostic lacks a native call ID: {match.group(0)}")
+            return match.group(0)
+        time.sleep(.05)
+    tail = path.read_bytes()[after:].decode("utf-8", errors="replace") \
+        if path.exists() else ""
+    raise RuntimeError(f"target did not emit a correlated shared PRE diagnostic:\n{tail}")
+
+
+def wait_server_ready(client: Path, endpoint: str,
+                      server: subprocess.Popen[bytes], timeout: float = 12.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        require(server.poll() is None, "server exited during startup")
+        result = subprocess.run([str(client), "--endpoint", endpoint, "list"],
+                                capture_output=True, timeout=2, check=False)
+        if result.returncode == 0:
+            return
+        time.sleep(.1)
+    raise RuntimeError("server did not become ready")
+
+
 def stop(process: subprocess.Popen[bytes] | None) -> None:
     if process is None:
         return
@@ -164,6 +311,11 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="clang-tracer-interceptor-") as temp:
         root = Path(temp)
         endpoint = f"unix://{root}/server.sock"
+        # Durable collector state must be isolated per test run. The restart
+        # scenario below reuses this directory within the run; later CTest
+        # invocations must begin with a fresh CREATE checkpoint.
+        durable_directory = root / "context-journal"
+        durable_directory.mkdir()
         target_log = (args.output_dir / "target.log").open("wb")
         server_log = (args.output_dir / "server.log").open("wb")
         target = server = threaded = None
@@ -172,7 +324,8 @@ def main() -> int:
             target = subprocess.Popen([str(args.target)], stdout=target_log,
                                       stderr=target_log)
             server = subprocess.Popen([str(args.server), "--agent", str(args.agent),
-                                       "--listen", endpoint, "--timeout", "10"],
+                                       "--listen", endpoint, "--timeout", "10",
+                                       "--context-durable-dir", str(durable_directory)],
                                       stdout=server_log, stderr=server_log)
             ready_by = time.monotonic() + 12
             while time.monotonic() < ready_by:
@@ -207,25 +360,19 @@ def main() -> int:
             for line in rows:
                 phase = re.search(r"\bphase=(pre|post)", line)
                 call = re.search(r"\bcall=(\d+)", line)
-                value = re.search(r"\bcallback=(-?\d+)", line)
-                argument = re.search(r"args=\[int32:(-?\d+)", line)
+                argument = re.search(r"args=\[(?:\w+=)?int32:(-?\d+)", line)
                 event_pid = re.search(r"\bpid=(\d+)", line)
                 event_tid = re.search(r"\btid=(\d+)", line)
                 result_value = re.search(r"result=int32:(-?\d+)", line)
-                require(phase and call and value and argument and event_pid and event_tid,
+                require(phase and call and argument and event_pid and event_tid,
                         f"readable event omitted typed call data: {line}")
                 item = phases.setdefault(int(call.group(1)), {})
                 item[phase.group(1)] = line
                 item[phase.group(1) + "-pid"] = event_pid.group(1)
                 item[phase.group(1) + "-tid"] = event_tid.group(1)
-                if phase.group(1) == "pre":
-                    expected = int(argument.group(1)) * 100 + 17
-                else:
+                if phase.group(1) == "post":
                     require(result_value is not None,
                             f"post event lacks original method result: {line}")
-                    expected = int(result_value.group(1))
-                require(int(value.group(1)) == expected,
-                        f"wrong {phase.group(1)} callback value: {line}")
                 if phase.group(1) == "post":
                     require(result_value is not None and
                             int(result_value.group(1)) == int(argument.group(1)) + 11,
@@ -277,6 +424,9 @@ def main() -> int:
             require(argument and actual_result and
                     int(actual_result.group(1)) == int(argument.group(1)) + 11,
                     f"protobuf post result is not the original method result: {paired}")
+            require(callback_value(pre_row) == int(argument.group(1)) * 100 + 17 and
+                    callback_value(post_row) == int(actual_result.group(1)),
+                    f"callback return values differ from the typed call: {paired}")
             require("result {" in post_row and "signed_value:" in post_row,
                     f"post event lacks the original typed result: {post_row}")
             remove(args.client, endpoint, target.pid, probe)
@@ -316,6 +466,244 @@ def main() -> int:
                 remove(args.client, endpoint, target.pid, active)
             report.append("pre-only, post-only, and void post hooks ran through CLI tracing")
 
+            # A fresh object spans each PRE/POST pair; member data must never
+            # accumulate across invocations or be shared by concurrent calls.
+            member_hook = args.output_dir / "invocation-members.cpp"
+            write_text(member_hook, """struct Interceptor {
+              int visits = 0;
+              long long pre(Call&) { return ++visits; }
+              long long post(const Call&) { return ++visits; }
+            };""")
+            active, _ = trace(args.client, endpoint, target.pid,
+                              "Fixture::overloaded(int)", member_hook,
+                              args.compdb, args.source)
+            rows, event_cursor = wait_binary(args.client, endpoint, target.pid, active,
+                                            args.output_dir, args.protoc, args.proto,
+                                            6, event_cursor)
+            for row in rows:
+                expected = 1 if re.search(r"^phase: PRE$", row, re.M) else 2
+                require(callback_value(row) == expected,
+                        f"interceptor member lifetime crossed an invocation: {row}")
+            remove(args.client, endpoint, target.pid, active)
+            report.append("each invocation used fresh member state shared by its PRE/POST pair")
+
+            # A failed PRE disables that invocation's POST, while later
+            # invocations still execute their hooks and the original target.
+            recovery_hook = args.output_dir / "invocation-failure.cpp"
+            write_text(recovery_hook, """struct Interceptor {
+              long long pre(const Call& call) {
+                if (call.id() % 2) throw 7;
+                return 1;
+              }
+              long long post(const Call&) { return 2; }
+            };""")
+            active, _ = trace(args.client, endpoint, target.pid,
+                              "Fixture::overloaded(int)", recovery_hook,
+                              args.compdb, args.source)
+            rows, event_cursor = wait_binary(args.client, endpoint, target.pid, active,
+                                            args.output_dir, args.protoc, args.proto,
+                                            4, event_cursor)
+            for row in rows:
+                call = re.search(r"^call_id:\s*(\d+)", row, re.M)
+                require(call and int(call.group(1)) % 2 == 0,
+                        f"failed invocation emitted a successful hook event: {row}")
+            remove_after_callback_failure(args.client, endpoint, target.pid, active,
+                                          args.protoc, args.proto, args.output_dir,
+                                          "invocation-recovery")
+            report.append("PRE failure skipped only the affected invocation and later invocations recovered")
+
+            # Exercise the full schema path through a native target call. The
+            # nested vector/map/optional types are compiled from this exact
+            # source by both probes and decoded by the server's dynamic pool.
+            shared_package = root / "shared-context-package"
+            (shared_package / ".git").mkdir(parents=True)
+            state_hook = shared_package / "shared_context_nested.cpp"
+            write_text(state_hook,
+                       (Path(__file__).resolve().parent / "fixtures" /
+                        "shared_context_nested.cpp").read_text(encoding="utf-8"))
+
+            def trace_shared(declaration: str) -> tuple[int, str]:
+                text = output(run(args.client, endpoint, "trace", str(target.pid),
+                                  declaration, "--callback", str(state_hook),
+                                  timeout=60))
+                return probe_id(text), text
+
+            join_probe, join_text = trace_shared("shared_context_spawn_join(int)")
+            child_probe, child_text = trace_shared("shared_child_target(int)")
+            require(join_probe != child_probe and "shared_context_spawn_join" in join_text and
+                    "shared_child_target" in child_text,
+                    f"shared-context producer probes did not activate: {join_text}; {child_text}")
+            context_log = wait_shared_context_log(args.output_dir / "server.log", 4)
+            for expected in ('request_id: "request-42"', 'sku: "book"',
+                             "quantity: 2", 'key: "billing"',
+                             "calls: 1", "durations_ms: 12.5"):
+                require(expected in context_log,
+                        f"dynamic shared-state receiver omitted {expected!r}: {context_log}")
+            call_one = context_log.find("calls: 1")
+            call_two = context_log.find("calls: 2", call_one + 1)
+            require(call_one >= 0 and call_two > call_one,
+                    "cross-probe child event did not precede the joined parent event")
+            context_cursor = wait_context_watch_cursor(
+                args.client, endpoint, target.pid)
+            event_after = max(0, context_cursor - 1)
+            watch = run(args.client, endpoint, "events", str(target.pid),
+                        "--count", "1", "--after", str(event_after), timeout=10)
+            watch_text = output(watch)
+            require("shared-context event=request.completed" in watch_text and
+                    'request_id [revision=' in watch_text and
+                    'string:"request-42"' in watch_text and
+                    "items.sku [revision=" in watch_text and 'string:"book"' in watch_text,
+                    f"WatchEvents did not expose decoded nested shared state: {watch_text}")
+            query = run(args.client, endpoint, "events", str(target.pid),
+                        "--count", "1", "--after", str(event_after),
+                        "--context-field", "request_id,items.sku", timeout=10)
+            query_text = output(query)
+            require("request_id [revision=" in query_text and
+                    '=string:"request-42"' in query_text and
+                    re.search(r'items\.sku \[revision=[^\]]+\] =\[[^\]]*'
+                              r'string:"book"', query_text) is not None,
+                    f"typed multi-field query missed selected values: {query_text}")
+            missing_query = run(args.client, endpoint, "events", str(target.pid),
+                                "--count", "1", "--after", str(event_after),
+                                "--context-field", "future_field", timeout=10)
+            missing_text = output(missing_query)
+            require("future_field [revision=" in missing_text and
+                    "=<missing>" in missing_text,
+                    f"cross-revision query did not report a schema-missing field: {missing_text}")
+            target_output = (args.output_dir / "target.log").read_text(
+                encoding="utf-8", errors="replace")
+            require(re.search(r"shared_join=32\b", target_output) and
+                    re.search(r"shared_early=48\b", target_output),
+                    "original join/early-return target functions did not preserve their results")
+            remove(args.client, endpoint, target.pid, child_probe)
+            drain_started = time.monotonic()
+            remove(args.client, endpoint, target.pid, join_probe)
+            task_drain_seconds = time.monotonic() - drain_started
+            require(task_drain_seconds >= .25,
+                    f"removal did not wait for accepted child tasks ({task_drain_seconds:.3f}s)")
+            report.append("shared aliases, nested map/vector state, typed event decode, cross-probe order, and accepted pthread drain passed")
+
+            # Stack metadata must survive the shared-context wire envelope and
+            # appear through the same WatchEvents viewer used by ordinary hooks.
+            stack_events_before = shared_context_event_count(
+                args.output_dir / "server.log")
+            stack_probe_text = output(run(
+                args.client, endpoint, "trace", str(target.pid),
+                "shared_child_target(int)", "--callback", str(state_hook),
+                "--stack", "4", timeout=60))
+            stack_probe = probe_id(stack_probe_text)
+            wait_shared_context_log(args.output_dir / "server.log",
+                                    stack_events_before + 1)
+            stack_watch = wait_event_text(
+                args.client, endpoint, target.pid, stack_probe)
+            require(re.search(rf"probe={stack_probe}.*?entry-stack "
+                              r"(?:COMPLETE|TRUNCATED|PARTIAL) depth=\d+/4",
+                              stack_watch, re.S) is not None,
+                    f"shared-context WatchEvents omitted the captured entry stack: {stack_watch}")
+            remove(args.client, endpoint, target.pid, stack_probe)
+            report.append("shared-context WatchEvents retained and displayed bounded entry stacks")
+
+            # A PRE callback failure on the child must not cancel the original
+            # pthread target. Keep the outer shared-state probe active so the
+            # child crosses the real scheduler propagation path.
+            failing_hook = shared_package / "shared-context-failing-pre.cpp"
+            write_text(failing_hook, state_hook.read_text(encoding="utf-8").replace(
+                'state.request_id = "request-42";', 'throw 7;'))
+            target_log_path = args.output_dir / "target.log"
+            diagnostic_start = target_log_path.stat().st_size
+            failed_child_text = output(run(
+                args.client, endpoint, "trace", str(target.pid),
+                "shared_child_target(int)", "--callback", str(failing_hook),
+                timeout=60))
+            failed_child_probe = probe_id(failed_child_text)
+            children_before_failure = latest_shared_child_count(
+                args.output_dir / "target.log")
+            child_deadline = time.monotonic() + 12
+            while (time.monotonic() < child_deadline and
+                   latest_shared_child_count(args.output_dir / "target.log") <=
+                       children_before_failure):
+                time.sleep(.05)
+            require(latest_shared_child_count(args.output_dir / "target.log") >
+                        children_before_failure,
+                    "child target did not execute after shared PRE callback failure")
+            remove_after_callback_failure(
+                args.client, endpoint, target.pid, failed_child_probe,
+                args.protoc, args.proto, args.output_dir, "shared-child-pre")
+            wait_for_shared_pre_diagnostic(target_log_path, diagnostic_start)
+            require(target.poll() is None,
+                    "target did not survive shared child PRE callback failure")
+            remove(args.client, endpoint, target.pid, join_probe)
+            report.append("shared child PRE failure was contained and original pthread target still ran")
+            time.sleep(1.6)  # Let the previously accepted detached child finish.
+
+            # The native throw target is caught by the fixture main loop. Its
+            # shared POST event must be skipped when the original unwinds.
+            throw_probe, _ = trace_shared("shared_context_native_throw(int)")
+            target_log_path = args.output_dir / "target.log"
+            target_log_size = target_log_path.stat().st_size
+            context_events_before_throw = shared_context_event_count(
+                args.output_dir / "server.log")
+            throw_deadline = time.monotonic() + 12
+            observed_caught_throw = False
+            while time.monotonic() < throw_deadline:
+                with target_log_path.open("rb") as log:
+                    log.seek(target_log_size)
+                    new_text = log.read().decode("utf-8", errors="replace")
+                if re.search(r"shared_exceptions=1\b", new_text):
+                    observed_caught_throw = True
+                    break
+                time.sleep(.05)
+            require(observed_caught_throw,
+                    "native target exception was not caught by the fixture")
+            remove(args.client, endpoint, target.pid, throw_probe)
+            require(shared_context_event_count(args.output_dir / "server.log") ==
+                        context_events_before_throw,
+                    "shared POST event was emitted after the native target threw")
+            report.append("native target exception skipped shared POST and remained contained")
+
+            # The producer journal and collector commit ledger must survive a
+            # hard collector restart. The active target keeps its exporter
+            # connected to the same endpoint and resumes from the persisted
+            # durable acknowledgement.
+            reconnect_probe, _ = trace_shared("shared_child_target(int)")
+            before_restart = shared_context_event_count(args.output_dir / "server.log")
+            wait_shared_context_log(args.output_dir / "server.log",
+                                    before_restart + 1)
+            server.kill()
+            server.wait(timeout=5)
+            server = None
+            Path(root, "server.sock").unlink(missing_ok=True)
+            server_log.flush()
+            server = subprocess.Popen(
+                [str(args.server), "--agent", str(args.agent), "--listen", endpoint,
+                 "--timeout", "10", "--context-durable-dir",
+                 str(durable_directory)], stdout=server_log, stderr=server_log)
+            wait_server_ready(args.client, endpoint, server)
+            wait_shared_context_log(args.output_dir / "server.log",
+                                    before_restart + 2, timeout=25)
+            require(target.poll() is None,
+                    "target did not survive durable collector restart")
+            restarted_watch = wait_event_text(
+                args.client, endpoint, target.pid, reconnect_probe)
+            require("shared-context event=request.completed" in restarted_watch and
+                    "request_id [revision=" in restarted_watch and
+                    'string:"request-42"' in restarted_watch and
+                    "items.sku [revision=" in restarted_watch and
+                    'string:"book"' in restarted_watch,
+                    f"post-restart events PID viewer omitted shared payload: {restarted_watch}")
+            report.append("durable reconnect resumed with its PID, probe, and shared payload in Watch")
+
+            # The collector restart intentionally forgets control sessions;
+            # reattach before issuing later trace/remove operations.
+            reattached = output(run(args.client, endpoint, "attach", str(target.pid)))
+            require(re.search(r"state=ATTACHED", reattached, re.I),
+                    f"could not reattach class target after collector restart: {reattached}")
+            session_match = re.search(r"\bsession=([^\s]+)", reattached)
+            require(session_match is not None,
+                    f"reattach output lacks session ID: {reattached}")
+            session_id = session_match.group(1)
+            event_cursor = 0  # The restarted server's event sequence is fresh.
+
             # Floating point and pointer Call accessors use the same paired hooks.
             typed_cases = (
                 ("double", "Fixture::inspect(double) const",
@@ -342,7 +730,6 @@ def main() -> int:
                     write_text(source_text, "class Interceptor {};")
                 failed = run(args.client, endpoint, "trace", str(target.pid),
                              "Fixture::overloaded(int)", "--callback", str(source_text),
-                             "--compdb", str(args.compdb), "--source", str(args.source),
                              ok=False, timeout=45)
                 require(output(failed).strip(), f"{label} callback produced no diagnostic")
             report.append("malformed and no-hook class callbacks were rejected with diagnostics")
