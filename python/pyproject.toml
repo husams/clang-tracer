@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clang-tracer-client"
+version = "0.1.0"
+description = "Python gRPC client and interactive console for Clang Tracer"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0 WITH LLVM-exception"
+license-files = ["LICENSE"]
+dependencies = ["grpcio>=1.71,<2", "protobuf>=5.29,<8", "lark>=1.2,<2", "prompt-toolkit>=3.0.48,<4"]
+
+[project.optional-dependencies]
+dev = ["grpcio-tools==1.71.0", "pytest>=8,<10", "mypy>=1.15,<2", "types-protobuf>=5", "ruff>=0.9,<1", "build>=1.2,<2"]
+
+[project.scripts]
+clang-tracer-console = "clang_tracer.console:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+clang_tracer = ["py.typed", "commands.lark"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["native: requires CLANG_TRACER_NATIVE_BUILD and Linux x86_64 tracing permissions"]
+
+[tool.ruff]
+extend-exclude = ["src/clang_tracer/proto"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+strict = true
+ignore_missing_imports = true
+exclude = ["proto/"]
+
+[[tool.mypy.overrides]]
+module = "clang_tracer.proto.*"
+follow_imports = "skip"

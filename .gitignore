@@ -13,6 +13,13 @@
 /class-interceptor-results/
 /typed-this-results/
 __pycache__/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+/python/build/
+/python/dist/
 
 # Local development recordings and generated files.
 /stack-capture-results/
