@@ -253,12 +253,23 @@ public:
     lock_path_ = socket_path_ + ".lock";
     fd_ = ::open(lock_path_.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW,
                  0600);
-    if (fd_ < 0 || ::flock(fd_, LOCK_EX | LOCK_NB) != 0) {
-      if (fd_ >= 0)
-        ::close(fd_);
+    if (fd_ < 0) {
+      const int error = errno;
+      throw std::runtime_error("cannot open endpoint lock '" + lock_path_ +
+                               "' (errno " + std::to_string(error) + "): " +
+                               std::strerror(error));
+    }
+    if (::flock(fd_, LOCK_EX | LOCK_NB) != 0) {
+      const int error = errno;
+      ::close(fd_);
       fd_ = -1;
-      throw std::runtime_error(
-          "another clang-tracer server owns this endpoint");
+      if (error == EWOULDBLOCK || error == EAGAIN) {
+        throw std::runtime_error(
+            "another clang-tracer server owns this endpoint");
+      }
+      throw std::runtime_error("cannot acquire endpoint lock '" + lock_path_ +
+                               "' (errno " + std::to_string(error) + "): " +
+                               std::strerror(error));
     }
     if (::lstat(socket_path_.c_str(), &info) == 0 || errno != ENOENT) {
       ::flock(fd_, LOCK_UN);

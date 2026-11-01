@@ -29,6 +29,26 @@ launched by Python is always passed this endpoint explicitly. Native servers
 launched separately default to a private Unix socket; use the same explicit
 endpoint on both sides. `unix:///absolute/path/control.sock` is supported.
 
+On `linux-dev`, the normal startup needs no server or agent paths:
+
+```sh
+/home/husam/.local/bin/clang-tracer-console --color always
+```
+
+Then enter `server start` at the prompt. The installed server is found on PATH,
+and it automatically finds its installed agent library. `--agent` is an optional
+override for a custom installation.
+
+For an isolated Unix endpoint, create its directory directly in the launch
+command, avoiding an unset shell variable:
+
+```sh
+/home/husam/.local/bin/clang-tracer-console --color always --endpoint "unix://$(mktemp -d /tmp/clang-tracer-console.XXXXXX)/control.sock"
+```
+
+An empty variable in `unix://$TRACER_RUN/control.sock` produces
+`unix:///control.sock`, which attempts to create a socket under `/`.
+
 The default channel uses the existing service's local insecure transport.
 Programmatic clients can supply a preconfigured gRPC channel, including a secure
 channel when connecting through a TLS endpoint. The supplied channel remains
@@ -188,13 +208,8 @@ propagates; partial data is not reported as a successful complete recording.
 Both the API and console can launch and own a local native server:
 
 ```python
-with Client("unix:///tmp/my-tracer/control.sock") as tracer:
-    tracer.start_server(
-        "/opt/clang-tracer/bin/clang-tracer-server",
-        agent="/opt/clang-tracer/lib/libclang_tracer_agent.so",
-        operation_timeout=10,
-        timeout=30,
-    )
+with Client() as tracer:
+    tracer.start_server()
     print(tracer.status())
     # Attach processes, install probes, and receive events here.
     tracer.shutdown_server(timeout=30)
@@ -231,7 +246,7 @@ Sessions on an external server remain attached until explicitly detached.
 ## Console commands
 
 ```text
-server start --executable /opt/clang-tracer/bin/clang-tracer-server
+server start
 server status
 attach 12345
 sessions

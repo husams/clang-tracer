@@ -145,6 +145,69 @@ def test_real_native_console_commands(native):
         client.close()
 
 
+def test_native_endpoint_lock_reports_path_errors_separately_from_contention(native):
+    import fcntl
+
+    build, _, temporary = native
+    server = build / "clang-tracer-server"
+    agent = build / "libclang_tracer_agent.so"
+
+    missing_parent_endpoint = temporary / "missing-parent" / "control.sock"
+    path_failure = subprocess.run(
+        [
+            server,
+            "--agent",
+            agent,
+            "--listen",
+            f"unix://{missing_parent_endpoint}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert path_failure.returncode != 0
+    assert str(missing_parent_endpoint) + ".lock" in path_failure.stderr
+    assert "errno 2" in path_failure.stderr
+    assert "No such file or directory" in path_failure.stderr
+    assert "another clang-tracer server owns" not in path_failure.stderr
+
+    if os.geteuid() != 0:
+        unwritable = temporary / "unwritable"
+        unwritable.mkdir(mode=0o500)
+        try:
+            denied = subprocess.run(
+                [
+                    server,
+                    "--agent",
+                    agent,
+                    "--listen",
+                    f"unix://{unwritable}/control.sock",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert denied.returncode != 0
+            assert "errno 13" in denied.stderr
+            assert "Permission denied" in denied.stderr
+            assert "another clang-tracer server owns" not in denied.stderr
+        finally:
+            unwritable.chmod(0o700)
+
+    endpoint_path = temporary / "contended.sock"
+    lock_path = Path(f"{endpoint_path}.lock")
+    with lock_path.open("w") as held_lock:
+        fcntl.flock(held_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        contention = subprocess.run(
+            [server, "--agent", agent, "--listen", f"unix://{endpoint_path}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert contention.returncode != 0
+        assert "another clang-tracer server owns this endpoint" in contention.stderr
+
+
 def test_real_native_name_filters_cover_function_and_context_history(native):
     build, target, temporary = native
     endpoint = f"unix://{temporary}/control.sock"
