@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0 WITH LLVM-exception"
 license-files = ["LICENSE"]
-dependencies = ["grpcio>=1.71,<2", "protobuf>=5.29,<8", "lark>=1.2,<2", "prompt-toolkit>=3.0.48,<4"]
+dependencies = ["grpcio>=1.71,<2", "protobuf>=5.29,<8", "lark>=1.2,<2", "prompt-toolkit>=3.0.48,<4", "Pygments>=2,<3"]
 
 [project.optional-dependencies]
 dev = ["grpcio-tools==1.71.0", "pytest>=8,<10", "mypy>=1.15,<2", "types-protobuf>=5", "ruff>=0.9,<1", "build>=1.2,<2"]
@@ -33,6 +33,9 @@ extend-exclude = ["src/clang_tracer/proto"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["clang_tracer"]
 
 [tool.mypy]
 strict = true

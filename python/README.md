@@ -180,18 +180,51 @@ record capture.pb 1000 --timeout 60
 probe remove PROBE_ID
 detach
 server stop
+help probe inject
+help events
+help server start
+help colors
+help !
+! pwd
+! ls -l /usr/local/share/clang-tracer/examples/cpp-interceptors
 exit
 ```
 
 `attach` selects the returned session. Probe commands operate on that selected
 session. Stream commands default to the selected session, or all sessions if
 none is selected; repeated `--session ID` overrides the selection. `help` lists
-every option. Quote selectors and paths containing spaces; both quote styles
+commands; `help COMMAND` shows detailed usage, options, defaults and examples.
+Use `help probe` or `help server` for a command group, and Tab to complete help
+topics. Quote selectors and paths containing spaces; both quote styles
 and escaped quotes are supported. `#` begins a comment outside a quoted value.
 Ctrl-C clears an input or cancels a live stream, returning to the prompt. EOF,
-`exit` and `quit` leave the console. The grammar accepts no Python evaluation or
-shell command execution. Color-capable terminals show keywords, options, quoted
-strings and numbers in different colors; the standard `NO_COLOR` setting is respected.
+`exit` and `quit` leave the console.
+
+An explicit `!` prefix executes the rest of the line with `/bin/sh` **on the
+console's host**, using its current directory, environment and terminal streams.
+Shell quoting, pipes, redirects, variable expansion and shell comments retain
+their usual meaning. For example:
+
+```text
+! printf '%s\n' 'hello console' | tr '[:lower:]' '[:upper:]'
+```
+
+The shell runs as a child process, so `! cd /tmp` and `! export NAME=value` do not
+change later console commands. A failed shell command reports its exit status
+and returns to the prompt. Ctrl-C interrupts the shell command while a server
+managed by the console remains running. Invalid tracer commands produce a
+command error; they are never implicitly executed by a shell.
+
+Commands, help text and trace results use colors; shell input also receives
+syntax highlighting. Configure console colors at launch:
+
+```sh
+clang-tracer-console --color auto    # detect terminal support; honor NO_COLOR
+clang-tracer-console --color always  # explicitly enable colors
+clang-tracer-console --color never   # explicitly disable colors
+```
+
+Shell programs control their own output colors independently.
 
 Console results use readable summaries for server status, sessions and probes.
 Trace events show PRE/POST phase and call identifiers, named arguments, captured
@@ -206,7 +239,7 @@ Protobuf messages; this display formatting changes neither the API nor recording
 .venv/bin/python python/scripts/generate_proto.py
 .venv/bin/python -m pytest -c python/pyproject.toml python/tests
 .venv/bin/python -m ruff check python
-.venv/bin/python -m mypy --strict python/src/clang_tracer
+.venv/bin/python -m mypy --config-file python/pyproject.toml --strict python/src/clang_tracer
 .venv/bin/python -m build python
 # Also run the native Python integration tests after building the server/fixtures:
 CLANG_TRACER_NATIVE_BUILD="$PWD/build" \

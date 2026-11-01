@@ -9,6 +9,16 @@ from lark import Lark, Token, Tree, UnexpectedInput
 from prompt_toolkit.document import Document
 from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.validation import ValidationError, Validator
+from pygments.lexers import BashLexer
+from pygments.token import (
+    Comment,
+    Keyword,
+    Literal,
+    Name,
+    Number,
+    Operator,
+    Punctuation,
+)
 
 PARSER = Lark(
     files("clang_tracer").joinpath("commands.lark").read_text(),
@@ -54,6 +64,13 @@ def parse_command(text: str) -> Command:
         ) from error
     if not isinstance(tree, Tree):
         raise CommandError("expected a command")
+    if tree.data in {"shell", "shell_empty"}:
+        raw = str(tree.children[0])[1:] if tree.data == "shell" else ""
+        if raw[:1] in {" ", "\t"}:
+            raw = raw[1:]
+        if not raw.strip():
+            raise CommandError("shell command cannot be empty")
+        return Command("shell", (raw,))
     arguments = []
     options: dict[str, Any] = {}
     for child in tree.children:
@@ -92,10 +109,52 @@ class CommandLexer(Lexer):
     def lex_document(self, document: Document):  # type: ignore[no-untyped-def]
         lines = document.lines
 
+        def shell_line(line: str) -> list[tuple[str, str]]:
+            bang = line.index("!")
+            fragments = []
+            if bang:
+                fragments.append(("", line[:bang]))
+            fragments.append(("class:keyword", "!"))
+            source = line[bang + 1 :]
+            if source[:1] in {" ", "\t"}:
+                fragments.append(("", source[0]))
+                source = source[1:]
+
+            for start, token, value in BashLexer().get_tokens_unprocessed(source):
+                if token in Comment:
+                    style = "class:comment"
+                elif token in Literal.String:
+                    style = "class:shell-string"
+                elif token in Name.Variable:
+                    style = "class:shell-variable"
+                elif (
+                    token in Keyword or token in Name.Builtin or token in Name.Function
+                ):
+                    style = "class:keyword"
+                elif token in Number:
+                    style = "class:number"
+                elif token in Operator or token in Punctuation:
+                    style = "class:option"
+                else:
+                    style = ""
+
+                if (
+                    value == "#"
+                    and token not in Literal.String
+                    and start > 0
+                    and source[start - 1].isspace()
+                ):
+                    fragments.append(("class:comment", source[start:]))
+                    break
+                fragments.append((style, value))
+            return fragments
+
         def get_line(index: int) -> list[tuple[str, str]]:
             if index >= len(lines):
                 return []
             line = lines[index]
+            if line.lstrip().startswith("!"):
+                return shell_line(line)
             fragments = []
             position = 0
             try:

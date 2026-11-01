@@ -1,6 +1,9 @@
-"""Interactive console; every operation delegates to the public Python API."""
+"""Interactive console; tracing operations delegate to the public Python API."""
 
 import argparse
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -9,8 +12,13 @@ import grpc
 from google.protobuf import text_format
 from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.completion import NestedCompleter
+from prompt_toolkit.data_structures import Size
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.output import create_output
+from prompt_toolkit.output.color_depth import ColorDepth
+from prompt_toolkit.output.plain_text import PlainTextOutput
+from prompt_toolkit.output.vt100 import Vt100_Output
 from prompt_toolkit.styles import Style
 
 from .client import Client
@@ -22,29 +30,8 @@ from .command import (
     parse_command,
 )
 from .display import render
+from .help import help_for
 from .proto import tracer_pb2 as pb
-
-HELP = """server start [--executable PATH] [--agent PATH] [--timeout SECONDS]
-             [--operation-timeout 1..300] [--durable-directory PATH]
-server status | server stop [--timeout SECONDS]
-attach PID                    attach and select the returned session
-sessions                      list sessions and probes
-use SESSION                   select an attached session
-detach [SESSION]              detach a session and restore its probes
-probe resolve "C++ selector" [--include HEADER ...] [--compdb PATH]
-probe inject "C++ selector" --callback FILE [--include HEADER ...] [--compdb PATH]
-             [--stack 0..64] [--internal-frames] [--print-arguments] [--print-result]
-             [--package SERVER_PATH]
-probe add SPEC.pbtxt           install a full Protobuf ProbeSpec
-probe remove PROBE_ID          remove a probe and restore original bytes
-events [--count N] [--session ID ...] [--pid PID] [--after CURSOR] [--timeout SECONDS]
-collect N [stream options]     collect and display at most N events (default: 30s)
-record FILE N [stream options] write binary length-prefixed Protobuf (default: 30s)
-help | exit | quit
-Quote selectors and paths containing spaces. Ctrl-C cancels a stream or clears
-the current input. EOF exits. Exit gracefully stops a server this console launched.
-Connected external servers remain running; explicitly detach their sessions.
-"""
 
 STYLE = Style.from_dict(
     {
@@ -60,21 +47,129 @@ STYLE = Style.from_dict(
         "ok": "ansigreen",
         "warning": "ansiyellow",
         "muted": "ansibrightblack",
+        "shell-string": "ansigreen",
+        "shell-variable": "ansimagenta",
+        "help.heading": "bold ansicyan",
+        "help.label": "bold ansiyellow",
+        "help.text": "",
+        "help.usage": "ansicyan",
+        "help.option": "ansiyellow",
+        "help.example": "ansigreen",
     }
 )
 
 
+def _style_for(color: str) -> Style:
+    if color not in {"auto", "always", "never"}:
+        raise ValueError("color must be auto, always, or never")
+    enabled = color == "always" or (
+        color == "auto" and "NO_COLOR" not in os.environ and sys.stdout.isatty()
+    )
+    return STYLE if enabled else Style.from_dict({})
+
+
+def _color_depth_for(color: str) -> ColorDepth | None:
+    if color == "always":
+        return ColorDepth.DEPTH_8_BIT
+    if color == "never" or (color == "auto" and "NO_COLOR" in os.environ):
+        return ColorDepth.DEPTH_1_BIT
+    return None
+
+
+def _output_for_color(color: str, output: Any) -> Any:
+    if output is not None:
+        return output
+    if color == "always":
+        if not sys.stdout.isatty():
+            size = shutil.get_terminal_size(fallback=(80, 24))
+            return Vt100_Output(
+                sys.stdout,
+                get_size=lambda: Size(rows=size.lines, columns=size.columns),
+                term=os.environ.get("TERM") or "xterm",
+                default_color_depth=ColorDepth.DEPTH_8_BIT,
+                enable_cpr=False,
+            )
+    elif not sys.stdout.isatty():
+        return PlainTextOutput(sys.stdout)
+    return create_output()
+
+
+def build_completer() -> NestedCompleter:
+    return NestedCompleter.from_nested_dict(
+        {
+            "server": {"start": None, "status": None, "stop": None},
+            "probe": {
+                "inject": None,
+                "resolve": None,
+                "add": None,
+                "remove": None,
+            },
+            "help": {
+                "server": {"start": None, "status": None, "stop": None},
+                "probe": {
+                    "inject": None,
+                    "resolve": None,
+                    "add": None,
+                    "remove": None,
+                },
+                **dict.fromkeys(
+                    [
+                        "attach",
+                        "sessions",
+                        "use",
+                        "detach",
+                        "events",
+                        "collect",
+                        "record",
+                        "colors",
+                        "!",
+                        "help",
+                        "shell",
+                        "exit",
+                        "quit",
+                    ]
+                ),
+            },
+            **dict.fromkeys(
+                [
+                    "attach",
+                    "sessions",
+                    "use",
+                    "detach",
+                    "events",
+                    "collect",
+                    "record",
+                    "exit",
+                    "quit",
+                ]
+            ),
+        }
+    )
+
+
 class Console:
-    def __init__(self, client: Client, *, output: Any = None) -> None:
+    def __init__(
+        self,
+        client: Client,
+        *,
+        output: Any = None,
+        color: str = "auto",
+    ) -> None:
         self.client = client
         self.session_id: str | None = None
-        self.output = output
+        self.style = _style_for(color)
+        self.color_depth = _color_depth_for(color)
+        self.output = _output_for_color(color, output)
 
     def emit(self, value: Any, *, error: bool = False) -> None:
+        formatted = (
+            value if isinstance(value, FormattedText) else render(value, error=error)
+        )
         print_formatted_text(
-            render(value, error=error),
-            style=STYLE,
+            formatted,
+            style=self.style,
             output=self.output,
+            color_depth=self.color_depth,
         )
 
     def selected(self) -> str:
@@ -88,7 +183,20 @@ class Console:
         if name == "exit":
             return False
         if name == "help":
-            self.emit(HELP)
+            self.emit(help_for(arguments))
+        elif name == "shell":
+            with subprocess.Popen(["/bin/sh", "-c", str(arguments[0])]) as child:
+                interrupted = False
+                while True:
+                    try:
+                        status = child.wait()
+                        break
+                    except KeyboardInterrupt:
+                        interrupted = True
+            if interrupted:
+                self.emit(f"shell interrupted (status {status})")
+            elif status:
+                self.emit(f"shell exited with status {status}", error=True)
         elif name == "server_start":
             self.emit(self.client.start_server(**options))
         elif name == "server_status":
@@ -171,33 +279,10 @@ class Console:
                 lexer=CommandLexer(),
                 validator=CommandValidator(),
                 validate_while_typing=False,
-                style=STYLE,
+                style=self.style,
+                color_depth=self.color_depth,
                 history=InMemoryHistory(),
-                completer=NestedCompleter.from_nested_dict(
-                    {
-                        "server": {"start": None, "status": None, "stop": None},
-                        "probe": {
-                            "inject": None,
-                            "resolve": None,
-                            "add": None,
-                            "remove": None,
-                        },
-                        **dict.fromkeys(
-                            [
-                                "attach",
-                                "sessions",
-                                "use",
-                                "detach",
-                                "events",
-                                "collect",
-                                "record",
-                                "help",
-                                "exit",
-                                "quit",
-                            ]
-                        ),
-                    }
-                ),
+                completer=build_completer(),
                 output=self.output,
             )
         self.emit("Clang Tracer — type help for commands")
@@ -238,9 +323,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--timeout", type=float, default=30, help="unary RPC deadline in seconds"
     )
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="color policy (auto respects TTY and NO_COLOR)",
+    )
     options = parser.parse_args(argv)
     try:
-        return Console(Client(options.endpoint, timeout=options.timeout)).run()
+        return Console(
+            Client(options.endpoint, timeout=options.timeout), color=options.color
+        ).run()
     except (ValueError, OSError, RuntimeError) as error:
         print(f"clang-tracer-console: {error}", file=sys.stderr)
         return 1

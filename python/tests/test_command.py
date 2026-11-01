@@ -51,6 +51,14 @@ from clang_tracer.command import (
         ("collect 10 --timeout 3", "collect", (10,), {"timeout": 3.0}),
         ('record "events file.pb" 10', "record", ("events file.pb", 10), {}),
         ("quit # done", "exit", (), {}),
+        ("help probe inject", "help", ("probe", "inject"), {}),
+        (
+            "! printf '%s\\n' \"a b\" | sed 's/b/c/' # keep this comment",
+            "shell",
+            ("printf '%s\\n' \"a b\" | sed 's/b/c/' # keep this comment",),
+            {},
+        ),
+        ("!  echo $HOME", "shell", (" echo $HOME",), {}),
     ],
 )
 def test_grammar(text, name, arguments, options):
@@ -78,6 +86,8 @@ def test_grammar(text, name, arguments, options):
         "server stop --agent x",
         "server start --agent --timeout 3",
         r'probe add "C:\Users\invalid"',
+        "!",
+        "!   ",
     ],
 )
 def test_invalid_command_has_no_fallback_execution(text):
@@ -113,3 +123,15 @@ def test_live_highlighting_includes_tokens_and_incomplete_strings():
         )
         == incomplete
     )
+
+
+def test_shell_highlighting_preserves_source_and_highlights_shell_tokens():
+    line = "! printf '%s' \"$HOME\" # demo"
+    fragments = CommandLexer().lex_document(Document(line))(0)
+    assert "".join(text for _, text in fragments) == line
+    assert {style for style, _ in fragments} >= {
+        "class:keyword",
+        "class:shell-string",
+        "class:shell-variable",
+        "class:comment",
+    }

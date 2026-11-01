@@ -1,4 +1,4 @@
-// Commands are parsed by Lark's LALR parser, never evaluated as Python or shell.
+// Commands use Lark's LALR grammar; only a leading ! explicitly invokes /bin/sh.
 ?start: "server" "start" server_option*                  -> server_start
       | "server" "status"                               -> server_status
       | "server" "stop" timeout_option?                  -> server_stop
@@ -13,7 +13,9 @@
       | "events" watch_option*                          -> events
       | "collect" INT stream_option*                    -> collect
       | "record" value INT stream_option*               -> record
-      | "help"                                          -> help
+      | "help" value*                                  -> help
+      | SHELL_COMMAND                                   -> shell
+      | "!"                                             -> shell_empty
       | "exit"                                          -> exit
       | "quit"                                          -> exit
 
@@ -38,6 +40,7 @@
               | "--after" INT                           -> after_sequence
               | timeout_option
 timeout_option: "--timeout" NUMBER                      -> timeout
+SHELL_COMMAND.10: /![ \t][^\n]*/
 ?value: STRING | BARE
 STRING.3: /"(?:[^"\\]|\\.)*"/ | /'(?:[^'\\]|\\.)*'/
 BARE.-1: /[^\s'"#]+/
