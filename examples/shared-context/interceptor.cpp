@@ -25,8 +25,15 @@ struct Interceptor {
   }
 
   void post(const Call& call, RequestState& state) {
-    state.last_result = call.result<int>();
+    const int result = call.result<int>();
+
+    // Add one named scalar to this hook's call metadata.
+    call.field("hook_result", result);
+
+    // Save the result in the state shared by the outer and worker probes.
+    state.last_result = result;
     // Publish a typed snapshot. The CLI decodes it without a hand-written schema.
+    // --callback-print-arguments true includes the call fields recorded above.
     // Worker POST publishes 2 * request_id; outer POST publishes that value + 1.
     call.context().event("request.step");
   }
