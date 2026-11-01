@@ -6,6 +6,8 @@ import "context_transport.proto";
 // All public control and event traffic uses gRPC and binary Protobuf.
 service Tracer {
   rpc Attach(AttachRequest) returns (Session);
+  // Resolve on the tracing host, so remote clients need no target files.
+  rpc ResolveProbe(ResolveProbeRequest) returns (ProbeSpec);
   rpc AddProbe(AddProbeRequest) returns (Probe);
   rpc RemoveProbe(RemoveProbeRequest) returns (Probe);
   rpc Detach(DetachRequest) returns (Session);
@@ -157,6 +159,12 @@ message Session {
 message AddProbeRequest {
   string session_id = 1;
   ProbeSpec spec = 2;
+}
+message ResolveProbeRequest {
+  string session_id = 1;
+  string selector = 2; // C++ declaration, e.g. Calculator::add(int).
+  repeated string include_headers = 3; // Paths on the server host.
+  string compilation_database = 4; // Optional path on the server host.
 }
 message Probe {
   uint64 id = 1;

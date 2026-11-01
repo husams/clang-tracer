@@ -40,6 +40,8 @@
 #include <unistd.h>
 
 #include "session.hpp"
+#include "debug_resolver.hpp"
+#include "header_context.hpp"
 #include "context_collector.hpp"
 #include "context_journal.hpp"
 #include "context_package.hpp"
@@ -987,6 +989,35 @@ public:
     }
     response->CopyFrom(session->snapshot());
     return grpc::Status::OK;
+  }
+
+  grpc::Status ResolveProbe(grpc::ServerContext *,
+                            const clangtracer::v1::ResolveProbeRequest *request,
+                            clangtracer::v1::ProbeSpec *response) override {
+    if (request->selector().empty() || request->selector().size() > 4096 ||
+        request->selector().find('\0') != std::string::npos)
+      return {grpc::StatusCode::INVALID_ARGUMENT, "invalid C++ selector"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    session->refresh_process_state();
+    if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "session is not attached"};
+    try {
+      auto resolved =
+          client::resolve_debug_callable(session->pid(), request->selector());
+      for (const auto &header : request->include_headers())
+        resolved.spec.add_include_headers(header);
+      client::resolve_header_context(resolved.spec,
+                                     request->compilation_database());
+      response->Swap(&resolved.spec);
+      return grpc::Status::OK;
+    } catch (const std::invalid_argument &error) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, error.what()};
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
   }
 
   grpc::Status AddProbe(grpc::ServerContext *,

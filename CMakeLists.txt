@@ -70,10 +70,12 @@ target_compile_definitions(clang_tracer_agent PRIVATE TRACER_CLANG_RESOURCE_DIR=
 target_link_libraries(clang_tracer_agent PRIVATE tracer_context_engine tracer_context_analysis tracer_proto clang-cpp LLVM ${CMAKE_DL_LIBS} Threads::Threads)
 target_compile_options(clang_tracer_agent PRIVATE -Wall -Wextra -Wpedantic)
 
-add_executable(clang-tracer-server src/main.cpp src/server.cpp src/session.cpp src/injector.cpp src/admission.cpp)
-target_include_directories(clang-tracer-server PRIVATE include ${LLVM_INCLUDE_DIRS})
+add_executable(clang-tracer-server src/main.cpp src/server.cpp src/session.cpp src/injector.cpp src/admission.cpp
+  src/debug_resolver.cpp src/header_context.cpp)
+target_include_directories(clang-tracer-server PRIVATE include ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
+target_compile_definitions(clang-tracer-server PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
 target_link_libraries(clang-tracer-server PRIVATE tracer_grpc tracer_context_collector
-  LLVM ${CMAKE_DL_LIBS} Threads::Threads)
+  tracer_context_analysis clang-cpp LLVM ${CMAKE_DL_LIBS} Threads::Threads)
 target_compile_options(clang-tracer-server PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(clang-tracer src/client.cpp src/debug_resolver.cpp src/header_context.cpp)
