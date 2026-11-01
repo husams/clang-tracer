@@ -24,6 +24,7 @@ HELP_TOPICS = {
         usage=(
             "server start|status|stop",
             "attach PID | sessions | use SESSION | detach [SESSION]",
+            "symbols [OPTIONS]",
             "probe resolve|inject|add|remove ...",
             "events [OPTIONS] | collect COUNT [OPTIONS] | record FILE COUNT [OPTIONS]",
             "help [TOPIC] | ! SHELL_COMMAND | exit",
@@ -133,6 +134,31 @@ HELP_TOPICS = {
         usage=("sessions",),
         examples=("sessions",),
     ),
+    "symbols": HelpTopic(
+        "symbols",
+        "List traceable functions and methods from eligible application "
+        "ELF/DWARF on the server host.",
+        usage=(
+            "symbols [--filter TEXT] [--module TEXT] [--limit 1..500] [--page TOKEN]",
+        ),
+        options=(
+            ("--filter TEXT", "Case-sensitive substring of selector or linkage name."),
+            (
+                "--module TEXT",
+                "Narrow by case-sensitive substring of eligible module path.",
+            ),
+            ("--limit N", "Page size; default 100, maximum 500."),
+            ("--page TOKEN", "Continue a previous listing using its opaque token."),
+        ),
+        examples=("symbols --filter Calculator",),
+        notes=(
+            "Requires an attached session. Discovery reads application ELF/DWARF "
+            "on the server; functions without usable debug information are omitted.",
+            "--module narrows the existing eligible application image set; runtime "
+            "libraries are not added by this option.",
+            "Use the full selector shown here with probe resolve or probe inject.",
+        ),
+    ),
     "use": HelpTopic(
         "use",
         "Select an already attached session for probe and event commands.",
@@ -237,7 +263,7 @@ HELP_TOPICS = {
         "Stream live events until interrupted or until --count is reached.",
         usage=(
             "events [--session ID ...] [--pid PID] [--after CURSOR] "
-            "[--count N] [--timeout SECONDS]",
+            "[--name NAME ...] [--count N] [--timeout SECONDS]",
         ),
         options=(
             (
@@ -246,6 +272,13 @@ HELP_TOPICS = {
                 "session, or all sessions.",
             ),
             ("--pid PID", "Filter by process ID."),
+            (
+                "--name NAME",
+                "Exact registered C++ selector/linkage name or emitted "
+                "context event name; long selectors use the linkage name. "
+                "repeatable and ORed (up to 4096 UTF-8 bytes), while ANDed "
+                "with other filters.",
+            ),
             ("--after CURSOR", "Resume strictly after this event sequence; default 0."),
             ("--count N", "Stop after N events; default streams until interrupted."),
             ("--timeout SECONDS", "Total stream deadline; default has no deadline."),
@@ -267,6 +300,12 @@ HELP_TOPICS = {
                 "Filter session; may be repeated. Defaults to selected session or all.",
             ),
             ("--pid PID", "Filter process ID."),
+            (
+                "--name NAME",
+                "Exact registered C++ selector/linkage name or emitted "
+                "context event name; long selectors use the linkage name. "
+                "repeatable and ORed (up to 4096 UTF-8 bytes).",
+            ),
             ("--after CURSOR", "Start strictly after this sequence; default 0."),
             ("--timeout SECONDS", "Total deadline; default 30."),
         ),
@@ -284,6 +323,12 @@ HELP_TOPICS = {
                 "Filter session; may be repeated. Defaults to selected session or all.",
             ),
             ("--pid PID", "Filter process ID."),
+            (
+                "--name NAME",
+                "Exact registered C++ selector/linkage name or emitted "
+                "context event name; long selectors use the linkage name. "
+                "repeatable and ORed (up to 4096 UTF-8 bytes).",
+            ),
             ("--after CURSOR", "Start strictly after this sequence; default 0."),
             ("--timeout SECONDS", "Total deadline; default 30."),
         ),

@@ -48,6 +48,24 @@ from clang_tracer.command import (
             (),
             {"session_ids": ["s1", "s2"], "after_sequence": 42, "count": 3, "pid": 123},
         ),
+        (
+            'events --name "add(int, int)" --name trace.add --pid 123',
+            "events",
+            (),
+            {"names": ["add(int, int)", "trace.add"], "pid": 123},
+        ),
+        (
+            'collect 2 --name "add(int, int)" --name trace.add',
+            "collect",
+            (2,),
+            {"names": ["add(int, int)", "trace.add"]},
+        ),
+        (
+            'record capture.pb 2 --name "add(int, int)" --name trace.add',
+            "record",
+            ("capture.pb", 2),
+            {"names": ["add(int, int)", "trace.add"]},
+        ),
         ("collect 10 --timeout 3", "collect", (10,), {"timeout": 3.0}),
         ('record "events file.pb" 10', "record", ("events file.pb", 10), {}),
         ("quit # done", "exit", (), {}),
@@ -59,6 +77,18 @@ from clang_tracer.command import (
             {},
         ),
         ("!  echo $HOME", "shell", (" echo $HOME",), {}),
+        (
+            "symbols --filter Calculator --module libtarget.so --limit 25 "
+            '--page "next token"',
+            "symbols",
+            (),
+            {
+                "query": "Calculator",
+                "module": "libtarget.so",
+                "page_size": 25,
+                "page_token": "next token",
+            },
+        ),
     ],
 )
 def test_grammar(text, name, arguments, options):

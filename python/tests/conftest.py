@@ -67,17 +67,52 @@ class TracerService(rpc.TracerServicer):
             while context.is_active():
                 self.cancelled.wait(0.01)
             return
-        for i in range(1, 5):
+        fixtures = [
+            ("add(int, int)", "value"),
+            ("Calculator::multiply(int, int) const", "multiply.begin"),
+            ("add(int, int)", "value"),
+            ("other()", "snapshot"),
+        ]
+        for i, (function_name, event_name) in enumerate(fixtures, 1):
             event = pb.TraceEvent(
                 sequence=request.after_sequence + i,
                 session_id="s1",
+                pid=123,
+                function_name=function_name,
                 phase=pb.POST,
                 call_id=i,
                 result=pb.Value(type=pb.INT32, signed_value=42),
             )
             event.stack.frames.add(function="add", line=10)
-            event.context.event.name = "snapshot"
+            event.context.event.name = event_name
+            if request.session_ids and event.session_id not in request.session_ids:
+                continue
+            if request.pid and event.pid != request.pid:
+                continue
+            if request.names and not any(
+                name == event.function_name or name == event.context.event.name
+                for name in request.names
+            ):
+                continue
             yield event
+
+    def ListSymbols(self, request, _context):
+        self.requests.append(request)
+        candidates = [
+            pb.FunctionSymbol(
+                selector="add(int, int)",
+                linkage_symbol="_Z3addii",
+                module_path="/tmp/target",
+            ),
+            pb.FunctionSymbol(
+                selector="Calculator::multiply(int, int) const",
+                linkage_symbol="_ZNK10Calculator8multiplyEii",
+                module_path="/tmp/target",
+            ),
+        ]
+        return pb.ListSymbolsResponse(
+            symbols=[item for item in candidates if request.query in item.selector]
+        )
 
 
 @pytest.fixture

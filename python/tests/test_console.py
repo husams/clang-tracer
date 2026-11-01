@@ -40,6 +40,85 @@ def test_real_prompt_session_accepts_commands_and_eof(peer):
         assert Console(client, output=DummyOutput()).run(prompt) == 0
 
 
+def test_stream_commands_accept_and_forward_repeated_names(peer, tmp_path):
+    client, service = peer
+    console = Console(client, output=DummyOutput())
+    console.execute(
+        parse_command(
+            'collect 2 --name "Calculator::multiply(int, int) const" '
+            "--name snapshot --pid 123"
+        )
+    )
+    collect_request = next(
+        request
+        for request in reversed(service.requests)
+        if isinstance(request, pb.WatchEventsRequest)
+    )
+    assert list(collect_request.names) == [
+        "Calculator::multiply(int, int) const",
+        "snapshot",
+    ]
+    console.execute(
+        parse_command(f'record "{tmp_path / "names.pb"}" 2 --name "add(int, int)"')
+    )
+    record_request = next(
+        request
+        for request in reversed(service.requests)
+        if isinstance(request, pb.WatchEventsRequest)
+    )
+    assert list(record_request.names) == ["add(int, int)"]
+
+
+def test_symbols_command_lists_attached_process_functions(peer):
+    client, _service = peer
+    console = Console(client, output=DummyOutput())
+    console.session_id = "s1"
+    command = parse_command("symbols --filter Calculator --module target --limit 20")
+    assert console.execute(command)
+    request = next(
+        request
+        for request in reversed(_service.requests)
+        if isinstance(request, pb.ListSymbolsRequest)
+    )
+    assert request.session_id == "s1"
+    assert request.query == "Calculator"
+    assert request.module == "target"
+    assert request.page_size == 20
+
+
+def test_symbols_next_page_command_preserves_filters_and_quotes(monkeypatch):
+    client = Mock()
+    client.list_symbols.return_value = pb.ListSymbolsResponse(next_page_token="t ok")
+    console = Console(client, output=DummyOutput())
+    console.session_id = "s1"
+    emitted = []
+    monkeypatch.setattr(console, "emit", lambda value, **_kwargs: emitted.append(value))
+    console.execute(parse_command('symbols --filter "A B" --module "/x y" --limit 15'))
+    assert emitted[-1] == (
+        'next page: symbols --filter "A B" --module "/x y" --limit 15 --page "t ok"'
+    )
+
+
+def test_symbols_next_page_command_roundtrips_non_bmp_filters(monkeypatch):
+    client = Mock()
+    client.list_symbols.return_value = pb.ListSymbolsResponse(next_page_token="🔎")
+    console = Console(client, output=DummyOutput())
+    console.session_id = "s1"
+    emitted = []
+    monkeypatch.setattr(console, "emit", lambda value, **_kwargs: emitted.append(value))
+    command = 'symbols --filter "λ𐐷" --module "模块𐐷"'
+    console.execute(parse_command(command))
+    next_command = emitted[-1]
+    assert isinstance(next_command, str)
+    reparsed = parse_command(next_command.removeprefix("next page: "))
+    assert reparsed.options == {
+        "query": "λ𐐷",
+        "module": "模块𐐷",
+        "page_size": 100,
+        "page_token": "🔎",
+    }
+
+
 def test_prompt_error_and_interrupt_recovery_and_cleanup():
     client = Mock()
     prompt = Mock()
@@ -158,6 +237,7 @@ def test_help_topics_complete_after_help_prefix():
         "probe",
         "attach",
         "events",
+        "symbols",
         "colors",
         "!",
         "help",
@@ -170,6 +250,13 @@ def test_help_topics_complete_after_help_prefix():
         )
     }
     assert probe_completions >= {"inject", "resolve", "add", "remove"}
+    symbol_completions = {
+        item.text
+        for item in build_completer().get_completions(
+            Document("symbols --"), CompleteEvent()
+        )
+    }
+    assert symbol_completions >= {"--filter", "--module", "--limit", "--page"}
 
 
 def test_shell_escape_runs_exact_payload_in_inherited_terminal(monkeypatch):

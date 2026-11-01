@@ -61,6 +61,7 @@ def test_trace_events_show_named_and_fallback_values_result_stack_and_context():
         tid=43,
         sequence=9,
         probe_sequence=21,
+        function_name="Calculator::multiply(int, int) const",
         phase=pb.POST,
         call_id=12,
         object_address=0xABC,
@@ -139,6 +140,7 @@ def test_trace_events_show_named_and_fallback_values_result_stack_and_context():
 
     output = plain(event)
     assert "sequence=9 probe_sequence=21" in output
+    assert "function Calculator::multiply(int, int) const" in output
     assert "object=0xabc" in output
     assert "value=int32 0" in output
     assert "arg1=pointer 0x1234" in output
@@ -204,3 +206,17 @@ def test_display_sanitizes_source_strings_and_colors_error_output():
     error = render("bad\x1b[2J\nnext", error=True)
     assert "".join(text for _, text in error) == "bad\\x1b[2J\nnext"
     assert all(style == "class:error" for style, _ in error)
+
+
+def test_symbol_page_has_readable_names_and_pagination_notice():
+    page = pb.ListSymbolsResponse(next_page_token="opaque")
+    page.symbols.add(
+        selector="Calculator::multiply(int, int) const",
+        linkage_symbol="_ZNK10Calculator8multiplyEii",
+        module_path="/tmp/target",
+    )
+    output = plain(page)
+    assert "Calculator::multiply(int, int) const" in output
+    assert "_ZNK10Calculator8multiplyEii" in output
+    assert "/tmp/target" in output
+    assert "next-page command" in output

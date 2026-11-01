@@ -8,6 +8,7 @@ import pytest
 
 from clang_tracer import Client
 from clang_tracer import messages as pb
+from clang_tracer.client import EventStream
 
 
 def test_generated_messages_keep_package_identity():
@@ -45,6 +46,46 @@ def test_public_control_and_injection(peer):
     assert client.status().running
 
 
+def test_list_symbols_uses_attached_session_and_returns_generated_page(peer):
+    client, service = peer
+    page = client.list_symbols(
+        "s1", query="Calculator", module="target", page_size=20, page_token="opaque"
+    )
+    assert [item.selector for item in page.symbols] == [
+        "Calculator::multiply(int, int) const"
+    ]
+    request = service.requests[-1]
+    assert isinstance(request, pb.ListSymbolsRequest)
+    assert request.session_id == "s1"
+    assert request.query == "Calculator"
+    assert request.module == "target"
+    assert request.page_size == 20
+    assert request.page_token == "opaque"
+
+
+@pytest.mark.parametrize("page_size", [-1, 501, True, 1.5])
+def test_list_symbols_rejects_invalid_page_size(peer, page_size):
+    client, service = peer
+    with pytest.raises(ValueError):
+        client.list_symbols("s1", page_size=page_size)
+    assert not any(isinstance(item, pb.ListSymbolsRequest) for item in service.requests)
+
+
+def test_list_symbols_surfaces_old_server_unimplemented(peer, monkeypatch):
+    client, _service = peer
+
+    class UnsupportedRpc(grpc.RpcError):
+        def code(self):
+            return grpc.StatusCode.UNIMPLEMENTED
+
+    error = UnsupportedRpc()
+    monkeypatch.setattr(client.stub, "ListSymbols", Mock(side_effect=error))
+    with pytest.raises(UnsupportedRpc) as raised:
+        client.list_symbols("s1")
+    assert raised.value is error
+    assert raised.value.code() == grpc.StatusCode.UNIMPLEMENTED
+
+
 def test_all_public_rpcs_have_client_methods():
     methods = {
         "Attach": "attach",
@@ -52,6 +93,7 @@ def test_all_public_rpcs_have_client_methods():
         "RemoveProbe": "remove_probe",
         "Detach": "detach",
         "ListSessions": "list_sessions",
+        "ListSymbols": "list_symbols",
         "WatchEvents": "watch_events",
         "ResolveProbe": "resolve_probe",
     }
@@ -68,7 +110,7 @@ def test_stream_filters_cursor_and_context(peer):
         event = next(stream)
         assert event.sequence == stream.after_sequence == 41
         assert event.stack.frames[0].function == "add"
-        assert event.context.event.name == "snapshot"
+        assert event.context.event.name == "value"
     request = service.requests[-1]
     assert list(request.session_ids) == ["s1", "s2"]
     assert request.pid == 123 and request.after_sequence == 40
@@ -89,6 +131,84 @@ def test_collection_and_binary_recording(peer, tmp_path):
     assert [event.sequence for event in events] == [9, 10, 11]
     with pytest.raises(FileExistsError):
         client.record_traces(path, 1)
+
+
+def test_name_filters_match_function_or_context_event_names_and_compose(peer):
+    client, service = peer
+    names = ["Calculator::multiply(int, int) const", "snapshot"]
+    events = client.collect_traces(
+        2, names=names, session_ids=["s1"], pid=123, timeout=1
+    )
+    assert [event.sequence for event in events] == [2, 4]
+    assert [event.function_name for event in events] == [
+        "Calculator::multiply(int, int) const",
+        "other()",
+    ]
+    request = service.requests[-1]
+    assert list(request.names) == names
+    assert list(request.session_ids) == ["s1"]
+    assert request.pid == 123
+
+
+def test_record_name_filter_records_only_matching_events(peer, tmp_path):
+    client, _service = peer
+    path = tmp_path / "selected.pb"
+    assert client.record_traces(path, 2, names="add(int, int)", timeout=1) == 2
+    raw = path.read_bytes()
+    events = []
+    while raw:
+        size = struct.unpack("<I", raw[:4])[0]
+        events.append(pb.TraceEvent.FromString(raw[4 : 4 + size]))
+        raw = raw[4 + size :]
+    assert [event.sequence for event in events] == [1, 3]
+
+
+@pytest.mark.parametrize("names", ["", [""], ["name\0bad"], ["x" * 4097], [1]])
+def test_invalid_name_filters_are_rejected_before_rpc(peer, names):
+    client, service = peer
+    with pytest.raises(ValueError, match="name"):
+        client.watch_events(names=names)
+    assert not any(
+        isinstance(request, pb.WatchEventsRequest) for request in service.requests
+    )
+
+
+def test_name_filter_accepts_up_to_4096_utf8_bytes(peer):
+    client, service = peer
+    accepted = "é" * 2048
+    assert len(accepted.encode("utf-8")) == 4096
+    assert client.collect_traces(1, names=accepted, timeout=0.02) == []
+    request = next(
+        request
+        for request in service.requests
+        if isinstance(request, pb.WatchEventsRequest)
+    )
+    assert list(request.names) == [accepted]
+
+
+def test_filtered_stream_rejects_old_server_nonmatches_without_advancing_cursor():
+    class FakeCall:
+        def __init__(self, events):
+            self.events = iter(events)
+            self.cancelled = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self.events)
+
+        def cancel(self):
+            self.cancelled = True
+
+    event = pb.TraceEvent(sequence=20, function_name="unrequested()")
+    event.context.event.name = "unrequested.event"
+    call = FakeCall([event])
+    stream = EventStream(call, after_sequence=19, names=("requested()",))
+    with pytest.raises(RuntimeError, match="update clang-tracer-server"):
+        next(stream)
+    assert stream.after_sequence == 19
+    assert call.cancelled
 
 
 def test_rpc_failures_and_deadlines_are_not_hidden(peer):

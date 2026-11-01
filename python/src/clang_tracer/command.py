@@ -82,7 +82,7 @@ def parse_command(text: str) -> Command:
         if token is not None and not isinstance(token, Token):
             raise CommandError("expected an option value")
         value = _value(token) if token is not None else True
-        if key in {"include_headers", "session_ids"}:
+        if key in {"include_headers", "session_ids", "names"}:
             options.setdefault(key, []).append(value)
         elif key in options:
             raise CommandError(f"duplicate option: {key}")

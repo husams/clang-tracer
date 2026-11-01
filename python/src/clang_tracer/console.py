@@ -1,6 +1,7 @@
 """Interactive console; tracing operations delegate to the public Python API."""
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -104,6 +105,12 @@ def build_completer() -> NestedCompleter:
                 "add": None,
                 "remove": None,
             },
+            "symbols": {
+                "--filter": None,
+                "--module": None,
+                "--limit": None,
+                "--page": None,
+            },
             "help": {
                 "server": {"start": None, "status": None, "stop": None},
                 "probe": {
@@ -116,6 +123,7 @@ def build_completer() -> NestedCompleter:
                     [
                         "attach",
                         "sessions",
+                        "symbols",
                         "use",
                         "detach",
                         "events",
@@ -214,6 +222,21 @@ class Console:
                 self.emit("no sessions")
             for session in sessions:
                 self.emit(session)
+        elif name == "symbols":
+            page = self.client.list_symbols(self.selected(), **options)
+            self.emit(page)
+            if page.next_page_token:
+                next_command = ["symbols"]
+                for option, key in (("--filter", "query"), ("--module", "module")):
+                    value = options.get(key, "")
+                    if value:
+                        quoted = json.dumps(value, ensure_ascii=False)
+                        next_command.extend((option, quoted))
+                next_command.extend(("--limit", str(options.get("page_size", 100))))
+                next_command.extend(
+                    ("--page", json.dumps(page.next_page_token, ensure_ascii=False))
+                )
+                self.emit("next page: " + " ".join(next_command))
         elif name == "use":
             selected = str(arguments[0])
             if not any(

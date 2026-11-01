@@ -42,6 +42,29 @@ def uint(value: int, bits: int, name: str, minimum: int = 0) -> int:
     return value
 
 
+def _name_filters(names: Iterable[str]) -> tuple[str, ...]:
+    if isinstance(names, str):
+        values: tuple[str, ...] = (names,)
+    else:
+        collected: list[str] = []
+        try:
+            for name in names:
+                if len(collected) == 64:
+                    raise ValueError("names accepts at most 64 filters")
+                collected.append(name)
+        except TypeError as error:
+            raise ValueError(
+                "names must be a string or an iterable of strings"
+            ) from error
+        values = tuple(collected)
+    for name in values:
+        if not isinstance(name, str) or not name or "\0" in name:
+            raise ValueError("each name filter must be a nonempty string without NUL")
+        if len(name.encode("utf-8")) > 4096:
+            raise ValueError("each name filter must be at most 4096 UTF-8 bytes")
+    return values
+
+
 @dataclass(frozen=True)
 class ServerStatus:
     endpoint: str
@@ -54,15 +77,31 @@ class ServerStatus:
 class EventStream(Iterator[pb.TraceEvent]):
     """A stream has no deadline unless supplied; close it to cancel blocked reads."""
 
-    def __init__(self, call: Any, after_sequence: int = 0) -> None:
+    def __init__(
+        self,
+        call: Any,
+        after_sequence: int = 0,
+        names: Iterable[str] = (),
+    ) -> None:
         self._call = call
         self.after_sequence = after_sequence
+        self.names = _name_filters(names)
 
     def __iter__(self) -> Self:
         return self
 
     def __next__(self) -> pb.TraceEvent:
         event: pb.TraceEvent = next(self._call)
+        if self.names:
+            context_name = ""
+            if event.HasField("context") and event.context.HasField("event"):
+                context_name = event.context.event.name
+            if event.function_name not in self.names and context_name not in self.names:
+                self.close()
+                raise RuntimeError(
+                    "server returned an event outside the requested name filters; "
+                    "update clang-tracer-server to support server-side name filtering"
+                )
         self.after_sequence = event.sequence
         return event
 
@@ -122,6 +161,42 @@ class Client:
                 pb.ListSessionsRequest(), timeout=self.timeout
             ).sessions
         )
+
+    def list_symbols(
+        self,
+        session_id: str,
+        *,
+        query: str = "",
+        module: str = "",
+        page_size: int = 100,
+        page_token: str = "",
+    ) -> pb.ListSymbolsResponse:
+        """List mapped function/method DWARF entries on the target host."""
+        if not isinstance(session_id, str) or not session_id or "\0" in session_id:
+            raise ValueError("session_id must be a nonempty string without NUL")
+        for label, value in (("query", query), ("module", module)):
+            if not isinstance(value, str) or "\0" in value:
+                raise ValueError(f"{label} must be a string without NUL")
+            if len(value.encode("utf-8")) > 4096:
+                raise ValueError(f"{label} exceeds 4096 UTF-8 bytes")
+        if not isinstance(page_token, str) or "\0" in page_token:
+            raise ValueError("page_token must be a string without NUL")
+        if len(page_token.encode("utf-8")) > 65536:
+            raise ValueError("page_token exceeds 65536 UTF-8 bytes")
+        size = uint(page_size, 32, "page_size", 1)
+        if size > 500:
+            raise ValueError("page_size must be between 1 and 500")
+        response: pb.ListSymbolsResponse = self.stub.ListSymbols(
+            pb.ListSymbolsRequest(
+                session_id=session_id,
+                query=query,
+                module=module,
+                page_size=size,
+                page_token=page_token,
+            ),
+            timeout=self.timeout,
+        )
+        return response
 
     def resolve_probe(
         self,
@@ -218,6 +293,7 @@ class Client:
         *,
         after_sequence: int = 0,
         pid: int = 0,
+        names: Iterable[str] = (),
         timeout: float | None = None,
     ) -> EventStream:
         """Subscribe to all sessions or filter; timeout is a total stream deadline.
@@ -227,16 +303,19 @@ class Client:
         """
         if timeout is not None:
             positive_timeout(timeout)
+        name_filters = _name_filters(names)
         return EventStream(
             self.stub.WatchEvents(
                 pb.WatchEventsRequest(
                     session_ids=list(session_ids),
                     after_sequence=uint(after_sequence, 64, "cursor"),
                     pid=uint(pid, 32, "pid"),
+                    names=name_filters,
                 ),
                 timeout=timeout,
             ),
             after_sequence=after_sequence,
+            names=name_filters,
         )
 
     def collect_traces(
@@ -246,13 +325,19 @@ class Client:
         session_ids: Iterable[str] = (),
         after_sequence: int = 0,
         pid: int = 0,
+        names: Iterable[str] = (),
         timeout: float = 30,
     ) -> list[pb.TraceEvent]:
         """Collect at most count events; cancel even on error or interruption."""
         uint(count, 32, "count", 1)
+        name_filters = _name_filters(names)
         events = []
         with self.watch_events(
-            session_ids, after_sequence=after_sequence, pid=pid, timeout=timeout
+            session_ids,
+            after_sequence=after_sequence,
+            pid=pid,
+            names=name_filters,
+            timeout=timeout,
         ) as stream:
             for event in stream:
                 events.append(event)
@@ -268,6 +353,7 @@ class Client:
         session_ids: Iterable[str] = (),
         after_sequence: int = 0,
         pid: int = 0,
+        names: Iterable[str] = (),
         timeout: float = 30,
     ) -> int:
         """Write length-prefixed binary Protobuf without keeping a list in memory.
@@ -277,10 +363,15 @@ class Client:
         compatible with the native client's --format protobuf event output.
         """
         uint(count, 32, "count", 1)
+        name_filters = _name_filters(names)
         written = 0
         with Path(path).open("xb") as output:
             with self.watch_events(
-                session_ids, after_sequence=after_sequence, pid=pid, timeout=timeout
+                session_ids,
+                after_sequence=after_sequence,
+                pid=pid,
+                names=name_filters,
+                timeout=timeout,
             ) as stream:
                 for event in stream:
                     payload = event.SerializeToString()

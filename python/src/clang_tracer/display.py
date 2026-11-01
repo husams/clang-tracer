@@ -277,6 +277,8 @@ def _trace_event(lines: _Lines, event: pb.TraceEvent) -> None:
         f"object={_hex(event.object_address)}",
         style="class:heading",
     )
+    if event.function_name:
+        lines.add("function", event.function_name, indent=1)
     named = {item.argument_index: item for item in event.named_arguments}
     for index in sorted(set(range(len(event.arguments))) | set(named)):
         item = named.get(index)
@@ -306,6 +308,19 @@ def _trace_event(lines: _Lines, event: pb.TraceEvent) -> None:
         _context(lines, event.context)
 
 
+def _symbols(lines: _Lines, page: pb.ListSymbolsResponse) -> None:
+    if not page.symbols:
+        lines.add("symbols", "no matching functions or methods", style="class:muted")
+    for item in page.symbols:
+        lines.add(
+            item.selector,
+            f"{item.linkage_symbol} in {item.module_path}",
+            style="class:heading",
+        )
+    if page.next_page_token:
+        lines.add("more", "use the next-page command printed by the console")
+
+
 def render(value: object, *, error: bool = False) -> FormattedText:
     """Render known tracer objects without exposing Protobuf debug reprs."""
     if isinstance(value, str):
@@ -330,6 +345,8 @@ def render(value: object, *, error: bool = False) -> FormattedText:
         _probe_spec(lines, value)
     elif isinstance(value, pb.TraceEvent):
         _trace_event(lines, value)
+    elif isinstance(value, pb.ListSymbolsResponse):
+        _symbols(lines, value)
     elif isinstance(value, Message):
         lines.add("message", value.DESCRIPTOR.full_name)
     else:

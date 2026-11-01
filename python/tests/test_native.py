@@ -24,6 +24,12 @@ public:
 };
 """
 
+CONTEXT_INTERCEPTOR = """class Interceptor {
+public:
+  void pre(const Call &call) { call.context().event("context.add"); }
+};
+"""
+
 
 @pytest.fixture
 def native(tmp_path):
@@ -137,3 +143,92 @@ def test_real_native_console_commands(native):
         assert target.poll() is None
     finally:
         client.close()
+
+
+def test_real_native_name_filters_cover_function_and_context_history(native):
+    build, target, temporary = native
+    endpoint = f"unix://{temporary}/control.sock"
+    function_name = "add(int, int)"
+    context_name = "context.add"
+    with Client(endpoint, timeout=30) as client:
+        client.start_server(
+            str(build / "clang-tracer-server"),
+            agent=str(build / "libclang_tracer_agent.so"),
+        )
+        session = client.attach(target.pid)
+        probe = client.inject(session.id, function_name, CONTEXT_INTERCEPTOR)
+        selected = client.collect_traces(
+            6,
+            names=[context_name],
+            session_ids=[session.id],
+            pid=target.pid,
+            timeout=10,
+        )
+        assert selected
+        assert all(event.context.event.name == context_name for event in selected)
+        assert all(event.function_name == function_name for event in selected)
+        function_events = client.collect_traces(
+            4,
+            names=function_name,
+            session_ids=[session.id],
+            pid=target.pid,
+            timeout=10,
+        )
+        assert function_events
+        assert all(event.function_name == function_name for event in function_events)
+        assert client.remove_probe(session.id, probe.id).original_bytes_restored
+        assert client.detach(session.id).state == pb.Session.DETACHED
+
+        # Event identity is stored in retained history, so filtering still
+        # works after the active session and probe metadata have been removed.
+        retained = client.collect_traces(
+            1,
+            names=[context_name],
+            session_ids=[session.id],
+            after_sequence=0,
+            timeout=2,
+        )
+        assert retained[0].context.event.name == context_name
+        assert retained[0].function_name == function_name
+        client.shutdown_server()
+
+
+def test_real_native_symbol_listing_is_stable_and_paginated(native):
+    build, target, temporary = native
+    with Client(f"unix://{temporary}/control.sock", timeout=30) as client:
+        client.start_server(
+            str(build / "clang-tracer-server"),
+            agent=str(build / "libclang_tracer_agent.so"),
+        )
+        session = client.attach(target.pid)
+        first = client.list_symbols(session.id, page_size=1)
+        assert len(first.symbols) == 1
+        assert first.next_page_token
+        second = client.list_symbols(
+            session.id, page_size=1, page_token=first.next_page_token
+        )
+        assert len(second.symbols) == 1
+        assert second.symbols[0].selector != first.symbols[0].selector
+        assert second.symbols[0].linkage_symbol
+        assert second.symbols[0].module_path.endswith("/cpp-interceptors-target")
+        with pytest.raises(grpc.RpcError) as mismatched_token:
+            client.list_symbols(
+                session.id,
+                query="Calculator",
+                page_size=1,
+                page_token=first.next_page_token,
+            )
+        assert mismatched_token.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        filtered = client.list_symbols(session.id, query="Calculator::multiply")
+        assert any(
+            item.selector == "Calculator::multiply(int, int) const"
+            for item in filtered.symbols
+        )
+        with pytest.raises(grpc.RpcError) as invalid_token:
+            client.list_symbols(session.id, page_token="not-a-token")
+        assert invalid_token.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        client.detach(session.id)
+        with pytest.raises(grpc.RpcError) as detached:
+            client.list_symbols(session.id)
+        assert detached.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+        client.shutdown_server()

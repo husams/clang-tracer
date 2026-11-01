@@ -88,6 +88,36 @@ Unary RPCs default to a 30-second deadline, configured with `Client(timeout=...)
 Errors retain their original `grpc.RpcError` status and details. The client
 performs no implicit control retries because operations can mutate targets.
 
+## Discover functions and methods
+
+For an attached `session_id`, list callable selectors on the tracing host:
+
+```python
+with Client(endpoint) as tracer:
+    page = tracer.list_symbols(session_id, query="Calculator", page_size=20)
+    for symbol in page.symbols:
+        print(symbol.selector, symbol.linkage_symbol, symbol.module_path)
+    if page.next_page_token:
+        following = tracer.list_symbols(
+            session_id,
+            query="Calculator",
+            page_size=20,
+            page_token=page.next_page_token,
+        )
+```
+
+Returned selectors can be passed to `resolve_probe()` or `inject()`. Discovery
+reads mapped application ELF/DWARF images on the server; it requires no target
+source files on the client. Functions without supported debug signatures are
+omitted. Listing a function does not bypass probe admission checks.
+
+`query` matches a case-sensitive substring of the C++ selector or linkage name;
+`module` matches a substring of the module path. Pages default to 100 entries,
+with a maximum of 500. Keep the same filters and page size when continuing with
+`next_page_token`. Tokens are tied to the attached session and mapped images;
+restart the query if the process or its modules change. This operation requires
+a server supporting the `ListSymbols` RPC.
+
 ## Receiving and recording traces
 
 ```python
@@ -104,6 +134,30 @@ from another thread to cancel a blocked read, or leave its context manager.
 subscribe to every session; `pid` optionally filters by process. Every event
 retains stack frames, shared-context schema/payload bytes, drop counters and
 PRE/POST correlation fields.
+
+The optional `names` filter matches emitted event names and full C++ function
+signatures. For example:
+
+```python
+with Client(endpoint) as tracer:
+    with tracer.watch_events(
+        session_ids=[session_id],
+        names=["snapshot", "Calculator::multiply(int, int) const"],
+        timeout=10,
+    ) as stream:
+        for event in stream:
+            print(event.function_name, event.context.event.name)
+```
+
+Names match exactly, including case, spaces and signature qualifiers. A match
+against either name is sufficient; session and PID filters must also match.
+The displayed `function_name` normally comes from the resolved C++ signature;
+when that signature exceeds 4096 UTF-8 bytes, the server uses its linkage symbol.
+Omit `names` to receive all names. `collect_traces()` and `record_traces()` accept
+the same option and count matching events. Name filtering requires an updated
+server; the client reports an error if a server returns events outside the
+requested names. Events retain their global sequence numbers, so filtered
+results can have expected sequence gaps.
 
 The server's history is bounded. A stale cursor produces `OUT_OF_RANGE`; the
 client does not silently reset it or reconnect. Watch the event drop counters
@@ -182,9 +236,13 @@ server status
 attach 12345
 sessions
 use SESSION_ID
+symbols --filter Calculator --limit 20
+symbols --module my_application
 probe resolve "Calculator::add(int, int)"
 probe inject "Calculator::add(int, int)" --callback interceptor.cpp --stack 24
 events --count 10 --after 0 --timeout 20
+events --name "Calculator::multiply(int, int) const" --count 4 --timeout 10
+events --name snapshot --name finished --timeout 20
 collect 10 --timeout 20
 record capture.pb 1000 --timeout 60
 probe remove PROBE_ID
@@ -207,6 +265,12 @@ commands; `help COMMAND` shows detailed usage, options, defaults and examples.
 Use `help probe` or `help server` for a command group, and Tab to complete help
 topics. Quote selectors and paths containing spaces; both quote styles
 and escaped quotes are supported. `#` begins a comment outside a quoted value.
+`symbols` lists functions and methods for the selected session. Use `--filter`,
+`--module`, and `--limit` to narrow a page; the console prints a complete next-page
+command when more results are available. `help symbols` explains all options.
+Use repeatable `--name NAME` on `events`, `collect`, or `record` to select emitted
+event names or full C++ function signatures with the same matching rules as the
+Python API. The function name is displayed with each trace event.
 Ctrl-C clears an input or cancels a live stream, returning to the prompt. EOF,
 `exit` and `quit` leave the console.
 

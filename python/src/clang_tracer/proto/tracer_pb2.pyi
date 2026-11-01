@@ -334,15 +334,73 @@ class ListSessionsResponse(_message.Message):
     sessions: _containers.RepeatedCompositeFieldContainer[Session]
     def __init__(self, sessions: _Optional[_Iterable[_Union[Session, _Mapping]]] = ...) -> None: ...
 
+class ListSymbolsRequest(_message.Message):
+    __slots__ = ("session_id", "query", "module", "page_size", "page_token")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    QUERY_FIELD_NUMBER: _ClassVar[int]
+    MODULE_FIELD_NUMBER: _ClassVar[int]
+    PAGE_SIZE_FIELD_NUMBER: _ClassVar[int]
+    PAGE_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    query: str
+    module: str
+    page_size: int
+    page_token: str
+    def __init__(self, session_id: _Optional[str] = ..., query: _Optional[str] = ..., module: _Optional[str] = ..., page_size: _Optional[int] = ..., page_token: _Optional[str] = ...) -> None: ...
+
+class FunctionSymbol(_message.Message):
+    __slots__ = ("selector", "linkage_symbol", "module_path")
+    SELECTOR_FIELD_NUMBER: _ClassVar[int]
+    LINKAGE_SYMBOL_FIELD_NUMBER: _ClassVar[int]
+    MODULE_PATH_FIELD_NUMBER: _ClassVar[int]
+    selector: str
+    linkage_symbol: str
+    module_path: str
+    def __init__(self, selector: _Optional[str] = ..., linkage_symbol: _Optional[str] = ..., module_path: _Optional[str] = ...) -> None: ...
+
+class ListSymbolsResponse(_message.Message):
+    __slots__ = ("symbols", "next_page_token")
+    SYMBOLS_FIELD_NUMBER: _ClassVar[int]
+    NEXT_PAGE_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    symbols: _containers.RepeatedCompositeFieldContainer[FunctionSymbol]
+    next_page_token: str
+    def __init__(self, symbols: _Optional[_Iterable[_Union[FunctionSymbol, _Mapping]]] = ..., next_page_token: _Optional[str] = ...) -> None: ...
+
+class ListSymbolsPageToken(_message.Message):
+    __slots__ = ("session_id", "pid", "process_start_time", "query", "module", "page_size", "mapping_fingerprint", "last_selector", "last_linkage_symbol", "last_module_path")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    PID_FIELD_NUMBER: _ClassVar[int]
+    PROCESS_START_TIME_FIELD_NUMBER: _ClassVar[int]
+    QUERY_FIELD_NUMBER: _ClassVar[int]
+    MODULE_FIELD_NUMBER: _ClassVar[int]
+    PAGE_SIZE_FIELD_NUMBER: _ClassVar[int]
+    MAPPING_FINGERPRINT_FIELD_NUMBER: _ClassVar[int]
+    LAST_SELECTOR_FIELD_NUMBER: _ClassVar[int]
+    LAST_LINKAGE_SYMBOL_FIELD_NUMBER: _ClassVar[int]
+    LAST_MODULE_PATH_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    pid: int
+    process_start_time: int
+    query: str
+    module: str
+    page_size: int
+    mapping_fingerprint: str
+    last_selector: str
+    last_linkage_symbol: str
+    last_module_path: str
+    def __init__(self, session_id: _Optional[str] = ..., pid: _Optional[int] = ..., process_start_time: _Optional[int] = ..., query: _Optional[str] = ..., module: _Optional[str] = ..., page_size: _Optional[int] = ..., mapping_fingerprint: _Optional[str] = ..., last_selector: _Optional[str] = ..., last_linkage_symbol: _Optional[str] = ..., last_module_path: _Optional[str] = ...) -> None: ...
+
 class WatchEventsRequest(_message.Message):
-    __slots__ = ("session_ids", "after_sequence", "pid")
+    __slots__ = ("session_ids", "after_sequence", "pid", "names")
     SESSION_IDS_FIELD_NUMBER: _ClassVar[int]
     AFTER_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
     PID_FIELD_NUMBER: _ClassVar[int]
+    NAMES_FIELD_NUMBER: _ClassVar[int]
     session_ids: _containers.RepeatedScalarFieldContainer[str]
     after_sequence: int
     pid: int
-    def __init__(self, session_ids: _Optional[_Iterable[str]] = ..., after_sequence: _Optional[int] = ..., pid: _Optional[int] = ...) -> None: ...
+    names: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, session_ids: _Optional[_Iterable[str]] = ..., after_sequence: _Optional[int] = ..., pid: _Optional[int] = ..., names: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class Value(_message.Message):
     __slots__ = ("type", "signed_value", "unsigned_value", "real_value")
@@ -425,7 +483,7 @@ class StackTrace(_message.Message):
     def __init__(self, status: _Optional[_Union[StackTrace.Status, str]] = ..., requested_depth: _Optional[int] = ..., frames: _Optional[_Iterable[_Union[StackFrame, _Mapping]]] = ..., detail: _Optional[str] = ..., application_only: bool = ..., hidden_frames: _Optional[int] = ..., captured_depth: _Optional[int] = ...) -> None: ...
 
 class TraceEvent(_message.Message):
-    __slots__ = ("protocol_version", "session_id", "probe_id", "pid", "tid", "sequence", "probe_sequence", "monotonic_time_ns", "object_address", "arguments", "callback_value", "agent_dropped_events", "server_dropped_events", "phase", "call_id", "result", "named_arguments", "object_fields", "stack", "context")
+    __slots__ = ("protocol_version", "session_id", "probe_id", "pid", "tid", "sequence", "probe_sequence", "monotonic_time_ns", "object_address", "arguments", "callback_value", "agent_dropped_events", "server_dropped_events", "phase", "call_id", "result", "named_arguments", "object_fields", "stack", "context", "function_name")
     PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     PROBE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -446,6 +504,7 @@ class TraceEvent(_message.Message):
     OBJECT_FIELDS_FIELD_NUMBER: _ClassVar[int]
     STACK_FIELD_NUMBER: _ClassVar[int]
     CONTEXT_FIELD_NUMBER: _ClassVar[int]
+    FUNCTION_NAME_FIELD_NUMBER: _ClassVar[int]
     protocol_version: int
     session_id: str
     probe_id: int
@@ -466,4 +525,5 @@ class TraceEvent(_message.Message):
     object_fields: _containers.RepeatedCompositeFieldContainer[NamedValue]
     stack: StackTrace
     context: _context_transport_pb2.ContextEventEnvelope
-    def __init__(self, protocol_version: _Optional[int] = ..., session_id: _Optional[str] = ..., probe_id: _Optional[int] = ..., pid: _Optional[int] = ..., tid: _Optional[int] = ..., sequence: _Optional[int] = ..., probe_sequence: _Optional[int] = ..., monotonic_time_ns: _Optional[int] = ..., object_address: _Optional[int] = ..., arguments: _Optional[_Iterable[_Union[Value, _Mapping]]] = ..., callback_value: _Optional[int] = ..., agent_dropped_events: _Optional[int] = ..., server_dropped_events: _Optional[int] = ..., phase: _Optional[_Union[TracePhase, str]] = ..., call_id: _Optional[int] = ..., result: _Optional[_Union[Value, _Mapping]] = ..., named_arguments: _Optional[_Iterable[_Union[NamedValue, _Mapping]]] = ..., object_fields: _Optional[_Iterable[_Union[NamedValue, _Mapping]]] = ..., stack: _Optional[_Union[StackTrace, _Mapping]] = ..., context: _Optional[_Union[_context_transport_pb2.ContextEventEnvelope, _Mapping]] = ...) -> None: ...
+    function_name: str
+    def __init__(self, protocol_version: _Optional[int] = ..., session_id: _Optional[str] = ..., probe_id: _Optional[int] = ..., pid: _Optional[int] = ..., tid: _Optional[int] = ..., sequence: _Optional[int] = ..., probe_sequence: _Optional[int] = ..., monotonic_time_ns: _Optional[int] = ..., object_address: _Optional[int] = ..., arguments: _Optional[_Iterable[_Union[Value, _Mapping]]] = ..., callback_value: _Optional[int] = ..., agent_dropped_events: _Optional[int] = ..., server_dropped_events: _Optional[int] = ..., phase: _Optional[_Union[TracePhase, str]] = ..., call_id: _Optional[int] = ..., result: _Optional[_Union[Value, _Mapping]] = ..., named_arguments: _Optional[_Iterable[_Union[NamedValue, _Mapping]]] = ..., object_fields: _Optional[_Iterable[_Union[NamedValue, _Mapping]]] = ..., stack: _Optional[_Union[StackTrace, _Mapping]] = ..., context: _Optional[_Union[_context_transport_pb2.ContextEventEnvelope, _Mapping]] = ..., function_name: _Optional[str] = ...) -> None: ...

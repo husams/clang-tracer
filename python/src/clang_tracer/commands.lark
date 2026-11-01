@@ -4,6 +4,7 @@
       | "server" "stop" timeout_option?                  -> server_stop
       | "attach" INT                                    -> attach
       | "sessions"                                      -> sessions
+      | "symbols" symbol_option*                        -> symbols
       | "use" value                                     -> use
       | "detach" value?                                 -> detach
       | "probe" "inject" value injection_option*        -> inject
@@ -37,8 +38,13 @@
              | stream_option
 ?stream_option: "--session" value                        -> session_ids
               | "--pid" INT                             -> pid
+              | "--name" value                          -> names
               | "--after" INT                           -> after_sequence
               | timeout_option
+?symbol_option: "--filter" value                        -> query
+              | "--module" value                        -> module
+              | "--limit" INT                           -> page_size
+              | "--page" value                          -> page_token
 timeout_option: "--timeout" NUMBER                      -> timeout
 SHELL_COMMAND.10: /![ \t][^\n]*/
 ?value: STRING | BARE
