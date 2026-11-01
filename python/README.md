@@ -150,6 +150,16 @@ with Client("unix:///tmp/my-tracer/control.sock") as tracer:
 checks that the endpoint is unused, launches without a shell, and waits for a
 successful `ListSessions` RPC. Startup output is captured for failure diagnostics.
 `status()` distinguishes service readiness from ownership of a child process.
+Owned channels keep their connection state separate and use bounded reconnect
+delays, so failed status checks before launch cannot leave startup waiting on
+another client's connection backoff. Readiness waits for the RPC to succeed;
+printing a listening address alone does not establish readiness. A startup
+timeout includes the last readiness RPC status. Caller-supplied channels retain
+their own transport settings, and mutating RPCs are not automatically replayed.
+The startup timeout covers both readiness phases; graceful target restoration
+after a failure can take additional time. If the caller's channel cannot become
+ready after launch, the client retains ownership so it can still shut down the
+managed server.
 
 Shutdown sends SIGTERM to the owned child and waits for the native server to
 detach sessions and restore probes. A nonzero exit is an error. If graceful

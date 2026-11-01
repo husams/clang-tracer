@@ -7,6 +7,8 @@ import tempfile
 import time
 from typing import BinaryIO, Self
 
+import grpc
+
 from .client import Client, ServerStatus, positive_timeout
 
 
@@ -64,6 +66,7 @@ class ServerProcess:
             raise ValueError("operation_timeout must be an integer between 1 and 300")
         if not 1 <= operation_timeout <= 300:
             raise ValueError("operation_timeout must be between 1 and 300")
+        deadline = time.monotonic() + timeout
         if platform.system() != "Linux" or platform.machine() not in {
             "x86_64",
             "AMD64",
@@ -73,9 +76,15 @@ class ServerProcess:
             )
         if self.running:
             raise ServerProcessError("server already launched by this manager")
-        if self.status(timeout=min(timeout, 0.5)).running:
+        endpoint_status = self.status(timeout=min(timeout, 0.5))
+        if endpoint_status.running:
             raise ServerProcessError(
                 "endpoint already serves a tracer; refusing to adopt it"
+            )
+        last_rpc_status = endpoint_status.detail or "UNAVAILABLE: endpoint not ready"
+        if time.monotonic() >= deadline:
+            raise ServerProcessError(
+                f"server readiness timed out; last RPC status: {last_rpc_status}"
             )
         command = [
             executable,
@@ -105,7 +114,6 @@ class ServerProcess:
             self._log.close()
             self._log = None
             raise
-        deadline = time.monotonic() + timeout
         try:
             with Client(self.endpoint) as client:
                 while time.monotonic() < deadline:
@@ -114,12 +122,20 @@ class ServerProcess:
                             f"server exited during startup: {self.diagnostics()}"
                         )
                     remaining = deadline - time.monotonic()
-                    if client.status(timeout=max(0.001, min(0.2, remaining))).running:
+                    try:
+                        client._wait_for_ready(timeout=max(0.001, min(0.2, remaining)))
+                    except grpc.RpcError as error:
+                        last_rpc_status = f"{error.code().name}: {error.details()}"
+                    else:
+                        last_rpc_status = "OK"
                         if self.running:
                             return self
                     time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+            detail = self.diagnostics()
+            diagnostic = f"; {detail}" if detail else ""
             raise ServerProcessError(
-                f"server readiness timed out: {self.diagnostics()}"
+                f"server readiness timed out; last RPC status: "
+                f"{last_rpc_status}{diagnostic}"
             )
         except BaseException:
             self.shutdown(timeout=max(6, operation_timeout + 6))

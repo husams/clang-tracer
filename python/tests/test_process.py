@@ -1,9 +1,12 @@
 import os
 import signal
+import socket
 import subprocess
 import sys
+import time
 from unittest.mock import Mock
 
+import grpc
 import pytest
 
 from clang_tracer import Client, ServerProcess, ServerStatus
@@ -25,6 +28,7 @@ def child(monkeypatch):
     monkeypatch.setattr(
         Client, "status", lambda *a, **k: ServerStatus("local", True, False)
     )
+    monkeypatch.setattr(Client, "_wait_for_ready", lambda *a, **k: None)
     return process, spawn
 
 
@@ -108,6 +112,7 @@ class ReadyClient:
     def __enter__(self): return self
     def __exit__(self, *_args): pass
     def status(self, **_kwargs): return ServerStatus("local", True, False)
+    def _wait_for_ready(self, **_kwargs): return None
 process_module.Client = ReadyClient
 ServerProcess.status = lambda self, **_kwargs: ServerStatus(self.endpoint, False, False)
 manager = ServerProcess("unix:///tmp/not-used.sock")
@@ -154,6 +159,68 @@ def test_early_exit_reports_failure_and_reaps(child):
     with pytest.raises(ServerProcessError, match="status 1"):
         manager.start()
     assert not manager.running
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX child process")
+def test_start_waits_through_primed_client_channel_backoff(tmp_path, monkeypatch):
+    monkeypatch.setattr("clang_tracer.process.platform.system", lambda: "Linux")
+    monkeypatch.setattr("clang_tracer.process.platform.machine", lambda: "x86_64")
+    with socket.socket() as reserve:
+        reserve.bind(("127.0.0.1", 0))
+        port = reserve.getsockname()[1]
+    endpoint = f"127.0.0.1:{port}"
+    executable = tmp_path / "delayed_server.py"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import signal, sys, threading, time\n"
+        "from concurrent.futures import ThreadPoolExecutor\n"
+        "import grpc\n"
+        "from clang_tracer.proto import tracer_pb2 as pb, tracer_pb2_grpc as rpc\n"
+        "stopping = threading.Event()\n"
+        "signal.signal(signal.SIGTERM, lambda *_: stopping.set())\n"
+        "time.sleep(2.8)\n"
+        "if stopping.is_set(): sys.exit(0)\n"
+        "class Service(rpc.TracerServicer):\n"
+        "    def ListSessions(self, request, context):\n"
+        "        return pb.ListSessionsResponse()\n"
+        "server = grpc.server(ThreadPoolExecutor(max_workers=2))\n"
+        "rpc.add_TracerServicer_to_server(Service(), server)\n"
+        f"server.add_insecure_port({endpoint!r})\n"
+        "server.start()\n"
+        "stopping.wait(30)\n"
+        "server.stop(0).wait()\n"
+    )
+    executable.chmod(0o755)
+
+    client = Client(endpoint)
+    try:
+        assert not client.status(timeout=0.1).running
+        time.sleep(0.6)
+        assert not client.status(timeout=0.1).running
+        status = client.start_server(str(executable), timeout=4)
+        assert status.running and status.managed
+        assert client.server is not None and client.server.running
+    finally:
+        client.close()
+
+
+def test_startup_timeout_includes_last_rpc_status(child, monkeypatch):
+    class DeadlineError(grpc.RpcError):
+        def code(self):
+            return grpc.StatusCode.DEADLINE_EXCEEDED
+
+        def details(self):
+            return "readiness request deadline"
+
+    def timeout(*_args, **_kwargs):
+        raise DeadlineError()
+
+    monkeypatch.setattr(Client, "_wait_for_ready", timeout)
+    with pytest.raises(
+        ServerProcessError,
+        match="last RPC status: DEADLINE_EXCEEDED: readiness request deadline",
+    ):
+        ServerProcess().start(timeout=0.06)
 
 
 def test_nonzero_shutdown_reports_incomplete_native_cleanup(child):

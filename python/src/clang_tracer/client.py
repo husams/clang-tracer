@@ -2,6 +2,7 @@
 
 import os
 import struct
+import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,14 @@ from .proto import tracer_pb2_grpc as rpc
 
 if TYPE_CHECKING:
     from .process import ServerProcess
+
+
+_CHANNEL_OPTIONS = [
+    ("grpc.max_receive_message_length", 32 * 1024 * 1024),
+    ("grpc.use_local_subchannel_pool", 1),
+    ("grpc.initial_reconnect_backoff_ms", 100),
+    ("grpc.max_reconnect_backoff_ms", 500),
+]
 
 
 def positive_timeout(value: float) -> float:
@@ -71,8 +80,10 @@ class Client:
     """All public Tracer RPCs, with explicit deadlines and no automatic retries.
 
     Returned values are generated Protobuf messages. Supply a secure gRPC channel
-    for TLS endpoints; otherwise the default is an insecure local connection.
-    Closing the client shuts down a server started through this instance.
+    for TLS endpoints; otherwise the default is an insecure connection with a
+    local subchannel pool and bounded reconnect backoff. Caller-supplied channels
+    keep their own connectivity policy. Closing the client shuts down a server
+    started through this instance.
     """
 
     def __init__(
@@ -92,7 +103,7 @@ class Client:
             if channel is not None
             else grpc.insecure_channel(
                 self.endpoint,
-                options=[("grpc.max_receive_message_length", 32 * 1024 * 1024)],
+                options=_CHANNEL_OPTIONS,
             )
         )
         self.stub = rpc.TracerStub(self.channel)
@@ -297,6 +308,14 @@ class Client:
             )
         return ServerStatus(self.endpoint, True, managed, pid)
 
+    def _wait_for_ready(self, *, timeout: float) -> None:
+        """Wait for the endpoint using an idempotent unary readiness RPC."""
+        self.stub.ListSessions(
+            pb.ListSessionsRequest(),
+            timeout=positive_timeout(timeout),
+            wait_for_ready=True,
+        )
+
     def start_server(
         self,
         executable: str = "clang-tracer-server",
@@ -306,22 +325,39 @@ class Client:
         operation_timeout: int = 10,
         durable_directory: str | None = None,
     ) -> ServerStatus:
+        """Start a local child and confirm both managed and client readiness.
+
+        Caller-supplied channels retain their connection policy; if such a
+        channel misses the shared deadline, the started child remains owned by
+        this client and can be stopped with ``shutdown_server``.
+        """
         from .process import ServerProcess
 
+        deadline = time.monotonic() + positive_timeout(timeout)
         if self.server is None:
             self.server = ServerProcess(self.endpoint)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                "server startup deadline expired before launch; no server was started"
+            )
         self.server.start(
             executable,
             agent=agent,
-            timeout=timeout,
+            timeout=remaining,
             operation_timeout=operation_timeout,
             durable_directory=durable_directory,
         )
         # A channel used before a restart may still be reconnecting after a
         # failed status check; wait until this client's channel is usable too.
-        self.stub.ListSessions(
-            pb.ListSessionsRequest(), timeout=timeout, wait_for_ready=True
-        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                "managed server is ready, but this client's channel did not "
+                "become ready before the startup deadline; the server remains "
+                "running and owned by this Client"
+            )
+        self._wait_for_ready(timeout=remaining)
         return ServerStatus(self.endpoint, True, True, self.server.pid)
 
     def shutdown_server(self, *, timeout: float = 30) -> None:

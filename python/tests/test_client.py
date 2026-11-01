@@ -1,6 +1,7 @@
 import pickle
 import struct
 import threading
+from unittest.mock import Mock
 
 import grpc
 import pytest
@@ -150,3 +151,78 @@ def test_shutdown_external_server_is_rejected(peer):
     with pytest.raises(RuntimeError, match="did not launch"):
         client.shutdown_server()
     assert client.status().running
+
+
+def test_owned_channel_uses_bounded_local_reconnect_policy(monkeypatch):
+    created = {}
+
+    def make_channel(endpoint, *, options):
+        created.update(endpoint=endpoint, options=dict(options))
+        return Mock(spec=grpc.Channel)
+
+    monkeypatch.setattr(grpc, "insecure_channel", make_channel)
+    _client = Client("127.0.0.1:50051")
+    assert created["options"]["grpc.use_local_subchannel_pool"] == 1
+    assert created["options"]["grpc.initial_reconnect_backoff_ms"] == 100
+    assert "grpc.min_reconnect_backoff_ms" not in created["options"]
+    assert created["options"]["grpc.max_reconnect_backoff_ms"] == 500
+    caller_channel = Mock(spec=grpc.Channel)
+    assert Client("127.0.0.1:50051", channel=caller_channel).channel is caller_channel
+
+
+def test_start_server_uses_one_readiness_deadline(monkeypatch):
+    from clang_tracer import client as client_module
+    from clang_tracer import process as process_module
+
+    values = {}
+    now = [100.0]
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: now[0])
+
+    class FakeServerProcess:
+        pid = 99
+
+        def __init__(self, endpoint):
+            values["endpoint"] = endpoint
+
+        def start(self, *_args, **kwargs):
+            values["manager_timeout"] = kwargs["timeout"]
+            now[0] += 0.04
+
+    monkeypatch.setattr(process_module, "ServerProcess", FakeServerProcess)
+    client = Client("127.0.0.1:50051", channel=Mock(spec=grpc.Channel))
+    monkeypatch.setattr(
+        client,
+        "_wait_for_ready",
+        lambda *, timeout: values.update(channel_timeout=timeout),
+    )
+    client.start_server(timeout=0.15)
+    assert values["manager_timeout"] == pytest.approx(0.15)
+    assert 0 < values["channel_timeout"] < values["manager_timeout"]
+
+
+def test_start_server_reports_exhausted_shared_deadline(monkeypatch):
+    from clang_tracer import client as client_module
+    from clang_tracer import process as process_module
+
+    now = [200.0]
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: now[0])
+
+    class FakeServerProcess:
+        pid = 99
+
+        def __init__(self, _endpoint):
+            pass
+
+        def start(self, *_args, **_kwargs):
+            now[0] += 0.06
+
+    monkeypatch.setattr(process_module, "ServerProcess", FakeServerProcess)
+    client = Client("127.0.0.1:50051", channel=Mock(spec=grpc.Channel))
+    monkeypatch.setattr(
+        client,
+        "_wait_for_ready",
+        lambda **_kwargs: pytest.fail("readiness call must not exceed the deadline"),
+    )
+    with pytest.raises(TimeoutError, match="server remains running and owned"):
+        client.start_server(timeout=0.05)
+    assert isinstance(client.server, FakeServerProcess)
