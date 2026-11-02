@@ -226,3 +226,23 @@ that the inaccessible external machine has already passed.
 The follow-up installed runtime also passes the same three supported probes
 against the unchanged original GCC 8.5 application. Original application and
 installed-baseline hashes remain unchanged.
+
+The external retest then passed 7/21, including owner activation, but all 14
+native cases still rejected executable file identity on device `0:87`.
+A private OverlayFS namespace reproduced this remaining class of failure:
+`stat(/proc/<pid>/exe)` reported the overlay device/inode while
+`/proc/<pid>/maps` reported the underlying file's device/inode. Copy-up can also
+change the backing inode while preserving the overlay's visible origin inode.
+Thus the merged-segment fix alone does not resolve these identity differences.
+
+The same SDK module-identity executable failed when run from the overlay view
+and passed when run through a private bind mount of its native XFS directory.
+The identity checks remain intact. For this affected arrangement, put the
+build/runtime tree on a normal filesystem and bind-mount it into the container;
+the executable and modules must expose the backing identities shown in their
+process mappings. The demonstrated bind-mount check covers the module-identity
+test, not a rerun of all external tests.
+
+Reproduction script and output are retained at
+`linux-dev:/tmp/tracer-overlay-identity-repro.sh` and
+`linux-dev:/tmp/tracer-overlay-identity-repro.log`.
