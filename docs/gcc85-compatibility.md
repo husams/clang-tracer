@@ -103,6 +103,18 @@ remain part of the fingerprint. Unrelated template instantiations can no
 longer split an otherwise identical scope generation. Quoted `#number` data
 and semantic attribute changes still distinguish generations.
 
+Embedded compilation disables automatic host C++ include discovery and uses
+the native compiler's recorded include roots. This applies to private owner
+activation, SDK agent callbacks, and analysis-test compilation; a newer host
+GCC installation cannot supply optional headers missing from the SDK library.
+For example, GCC 11's `<span>` must not be combined with GCC 8's `type_traits`.
+
+ELF validation checks complete file-backed `PT_LOAD` ranges by device, inode,
+permissions and file offsets, including segments that begin inside a merged
+mapping or span several mappings. Distinct complete load biases remain
+ambiguous and are rejected. Mapping errors now distinguish absent file
+identity from incomplete segment coverage and identify the failing file.
+
 The controller must map the same runtime ELF files as its target. Use the
 SDK-built controller with the original SDK-runtime target. The installed
 modern agent cannot run in that older runtime, and loading an SDK agent's old

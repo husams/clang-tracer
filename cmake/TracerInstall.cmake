@@ -2,7 +2,16 @@ option(TRACER_BUNDLE_CLANG_HEADERS "Install selected Clang builtin headers with 
 set(TRACER_JIT_FLAGS "" CACHE STRING "Semicolon-separated default compiler flags for embedded callback compilation")
 set(_tracer_jit_entries "")
 set(_tracer_jit_count 0)
-foreach(_flag IN LISTS TRACER_JIT_FLAGS)
+set(_tracer_runtime_jit_flags ${TRACER_JIT_FLAGS})
+if(TRACER_SDK_ROOT)
+  # Embedded Clang does not read the SDK driver's configuration files. Select
+  # the native compiler's include profile explicitly, without host C++ fallback.
+  list(APPEND _tracer_runtime_jit_flags -nostdinc++)
+  foreach(_include IN LISTS CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES)
+    list(APPEND _tracer_runtime_jit_flags -isystem "${_include}")
+  endforeach()
+endif()
+foreach(_flag IN LISTS _tracer_runtime_jit_flags)
   string(REPLACE "\\" "\\\\" _escaped "${_flag}")
   string(REPLACE "\"" "\\\"" _escaped "${_escaped}")
   string(REPLACE "\n" "\\n" _escaped "${_escaped}")

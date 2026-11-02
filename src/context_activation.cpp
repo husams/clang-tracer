@@ -147,6 +147,10 @@ bool is_verified_native_record(clang::ASTContext &context,
 std::vector<std::string>
 activation_arguments(const std::vector<std::string> &arguments) {
   auto result = arguments;
+  // The native owner ABI is tied to the compiler-selected library below.
+  // Otherwise a host GCC installation can supply newer optional headers
+  // missing from that library, mixing incompatible standard-library versions.
+  result.emplace_back("-nostdinc++");
   const auto headers = context_header_directory();
   result.emplace_back("-I" + headers);
   // Build-tree public headers are beside src; installed copies are nested in

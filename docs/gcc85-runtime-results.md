@@ -22,6 +22,8 @@ and sealed standard-library image under `install/lib64/`. These binaries retain
 absolute scratch dependency and SDK runtime paths; this install is not a
 relocatable distribution.
 
+The original validation results were:
+
 | Validation | Result |
 | --- | --- |
 | Full SDK native CTest suite | 21/21 passed, 192.47 seconds |
@@ -56,6 +58,10 @@ were performed in the existing scratch layout; the script consolidates that
 recipe rather than claiming a second clean download/build run.
 
 ## Benchmark comparison and limits
+
+The benchmark below records the original compatibility build, before the
+external-machine follow-up described at the end of this report. It has not
+been rerun for that follow-up.
 
 The baseline is the current installed `/usr/local/bin/clang-tracer-server` and
 `/usr/local/lib64/libclang_tracer_agent.so`; the candidate is the SDK build above.
@@ -180,3 +186,43 @@ uses `examples/call-stacks/benchmark.cpp`, C++17, `-g -O2 -fno-inline
 Both executable variants use the same library and force retention of libstdc++;
 the old variant additionally selects the SDK loader and runtime search paths.
 The padding source and exact binary identities are retained with the evidence.
+
+## External-machine failure follow-up
+
+A separate machine reported 6/21 passing, with GCC 11 headers included beside
+SDK GCC 8 headers and native admission failing before attach. The fixes add:
+
+- Explicit native C++ header roots with `-nostdinc++`, rather than automatic
+  host C++ header fallback. A foreign standard-library search-path regression
+  failed before this change. Both production activation and the SDK agent's
+  generated compiler arguments now isolate that profile; test compilation
+  uses the same restriction.
+- Complete interval and file-offset validation of ELF load segments, replacing
+  the assumption that every segment starts a separate mapping. A real merged
+  file mapping reproduces the old rejection and passes with the fix. A
+  same-inode mapping at the wrong offset is still rejected, as are ambiguous
+  complete mappings and changed identities. The fixture also passes with a
+  host GCC 11-built DSO containing four load segments.
+- More specific admission errors, separating missing device/inode identity
+  from incomplete `PT_LOAD` coverage and naming the file involved.
+
+The missing `__udivti3` JIT message in the supplied log belongs to an intentional
+negative test for compiler-generated helpers; that check completed successfully.
+It is not the cause of the subsequent owner-activation parse failure.
+
+The mapping message alone does not establish the external host's exact ELF
+layout. Its updated build still needs to be rerun there. Follow-up source and
+fresh build are under
+`linux-dev:/tmp/tracer-gcc85-external-fix-20261102/`; the application build uses
+the script's SDK configuration and the previously built pinned dependencies.
+Failing-before/fixed-after evidence is retained locally under
+`benchmark-results/gcc85-runtime/external-fix/`.
+
+The follow-up fresh SDK application build passes all 21 native CTests in
+200.82 seconds, including the header-isolation and merged-mapping regressions.
+The modern macOS portable/analysis suite passes 6/6 in 37.57 seconds. These
+results validate the retained Linux host and macOS build; they do not claim
+that the inaccessible external machine has already passed.
+The follow-up installed runtime also passes the same three supported probes
+against the unchanged original GCC 8.5 application. Original application and
+installed-baseline hashes remain unchanged.

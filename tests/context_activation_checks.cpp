@@ -10,6 +10,8 @@
 #include <vector>
 
 #include <google/protobuf/descriptor.pb.h>
+#include <llvm/ADT/SmallString.h>
+#include <llvm/Support/FileSystem.h>
 
 #include "context_activation.hpp"
 #include "context_receiver.hpp"
@@ -114,6 +116,20 @@ bool guarded_destroy(const tracer::ContextActivationGeneration &generation,
 } // namespace
 
 void verify_context_activation() {
+  // A different host GCC installation can expose headers absent from the
+  // selected native library (for example, GCC 11 <span> beside GCC 8 headers).
+  // Model that automatic C++ search path without modifying the host or SDK.
+  struct ForeignHeaders {
+    llvm::SmallString<256> path;
+    ForeignHeaders() {
+      require(!llvm::sys::fs::createUniqueDirectory("tracer-foreign-cxx", path),
+              "cannot create foreign C++ header fixture");
+      std::ofstream file(std::string(path) + "/tracer_foreign_stdlib_probe.hpp");
+      file << "#error foreign standard-library header was selected\n";
+      require(static_cast<bool>(file), "cannot write foreign C++ header fixture");
+    }
+    ~ForeignHeaders() { (void)llvm::sys::fs::remove_directories(path); }
+  } foreign;
   tracer::ContextActivationRequest request;
   request.source_lineage_id[0] = 0x76;
   std::ifstream fixture(TRACER_TEST_SOURCE_DIR
@@ -131,6 +147,14 @@ void verify_context_activation() {
   request.compiler_arguments.insert(request.compiler_arguments.end(),
                                     std::begin(kContextSystemArguments),
                                     std::end(kContextSystemArguments));
+  // Production activation must enforce its own native-library isolation even
+  // when the caller does not already disable automatic C++ include discovery.
+  auto& args = request.compiler_arguments;
+  args.erase(std::remove(args.begin(), args.end(), "-nostdinc++"), args.end());
+  args.insert(args.end(), {"-stdlib++-isystem", std::string(foreign.path)});
+  request.source += "\n#if __has_include(<tracer_foreign_stdlib_probe.hpp>)\n"
+                    "#error activation exposed a foreign C++ library search path\n"
+                    "#endif\n";
   tracer::ContextRegistry registry;
   const auto generation = tracer::activate_context_source(request, registry);
 #if defined(__linux__) && defined(__x86_64__)
