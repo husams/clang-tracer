@@ -77,7 +77,8 @@ public:
               const std::array<std::uintptr_t, 6> &arguments = {},
               std::size_t argument_count = 0);
 
-  [[nodiscard]] std::uintptr_t resolve_remote_symbol(std::string_view name);
+  [[nodiscard]] std::uintptr_t resolve_remote_symbol(
+      std::string_view name, const CodePatch *owned_patch = nullptr);
 
 private:
   struct PeerFreeze;

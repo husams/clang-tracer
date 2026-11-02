@@ -219,6 +219,11 @@ service bindings from `proto/tracer.proto`; the agent links Protobuf without the
 gRPC client/server library. The integration test uses real target processes and
 real generated gRPC clients.
 
+To run the suite from OverlayFS, use
+`tests/overlay_integration.sh "$(realpath build)"`. This optional regression
+runner needs user and mount namespaces plus OverlayFS support; it overlays
+only its private build view and leaves the host build directory unchanged.
+
 For RHEL-compatible systems, see [build, toolchain and deployment instructions](docs/build-rhel.md).
 `build-rhel.sh` accepts custom compiler/LLVM paths or a CMake toolchain file;
 `deploy-rhel.sh` installs the build or stages it with `DESTDIR`. Standard CMake
@@ -338,10 +343,11 @@ Trace a running process by C++ signature using its mapped ELF debug information:
 No target source, compilation database, copied class, or handwritten symbol is
 required. LLVM DWARF APIs discover the code entry/range, scalar ABI, parameter names,
 receiver size, member offsets/types, and access. The agent independently rereads
-its mapped debug images and checks image identity and metadata before constructing
+its mapped debug images and checks mapped paths, entries and metadata before constructing
 Clang AST declarations. Clang verifies receiver size and every member offset and
-size; mismatches fail before patching. Image identity includes device, inode,
-size, modification and change times, and is checked before and after resolution.
+size; mismatches fail before patching. Binaries and debug files are fixed for each
+session; rebuilding or replacing them requires a new session. Device/inode
+equality and live file-timestamp checks are not required.
 Native patchability, admission, stopped-thread patching, and detach safeguards
 remain in force. Inlined or optimized-away calls are not traceable entries. Class arguments are described below.
 
@@ -355,7 +361,7 @@ The target and debug data must be Linux x86-64 LP64 with supported scalar ABI.
 Named tracing requires no exported symbol or ELF symbol-table entry. LLVM reads
 the concrete function's DWARF low/high PC range, then relocates its entry through
 the image's executable ELF PT_LOAD segment and the target's executable mapping.
-Device/inode and full debug-image identity must match; PIE, fixed-address
+Canonical mapped paths and ELF offsets/ranges must match; PIE, fixed-address
 executables and shared libraries use the same translation. The agent independently
 re-resolves the exact entry, range and callable metadata inside the target before
 decoding or preparing a hook. A patch cannot extend beyond the selected function.
@@ -601,7 +607,7 @@ threads, including a CPU-busy leader inside nested C++ functions and methods.
 Admission no longer requires an instruction in `main`, a `main` symbol, or an
 immediate return into libc. LLVM parses `.eh_frame` and unwinds each application
 frame through executable segments of the main ELF image or a DSO in the session's
-discovered snapshot, selecting the matching image and pinned load bias at each
+discovered snapshot, selecting the matching image and captured load bias at each
 frame. Executable and library symbols may be stripped; unwind metadata must
 remain. The walk ends at libc's
 identified `__libc_start_call_main` → `__libc_start_main` startup chain, whose
@@ -615,14 +621,14 @@ signal frames, callbacks that unwind through protected runtimes, undiscovered
 library frames, and incomplete or excessively deep chains are rejected and
 retried within the operation deadline.
 
-The session snapshot retains file handles and pins device/inode, size,
-modification and change timestamps, and load bias. Every control attachment
-revalidates each pinned path, open file, and target mapping before native
-execution, including the sleep admission path. Replacement, modification,
-unmapping, or rebasing invalidates the snapshot instead of approving a new image.
-Module handles are released after logical detach or target exit; discovered-path
-history remains visible. Concurrent module unloading and modification during an
-operation remain outside the lifecycle contract.
+The session snapshots canonical mapped paths and load biases without retaining
+binary file handles or policing file timestamps. Control attachments validate
+the paths and executable ELF mapping ranges, including the sleep admission path.
+Unmapping or rebasing invalidates that snapshot. Rebuilding or replacing binary
+contents requires a new session. Native stack caches refresh after prior probes
+drain; reconnecting a durable collector keeps active probe metadata alive.
+Discovered-path history remains visible after detach. Concurrent module unloading
+or binary modification during an operation remains outside the lifecycle contract.
 
 This is a restricted application rendezvous, not arbitrary-PC injection. The
 bounded startup-chain check does not prove arbitrary runtime or application lock
@@ -676,6 +682,12 @@ signal-handler probes, and control threads holding application/runtime locks are
 outside the current lifecycle contract.
 
 ## Validation and sources
+
+The session-path backport was verified on 2 November 2026 with the normal
+C++20 build on `linux-dev`: **18/18 CTests passed natively in 373.84 seconds**
+and **18/18 passed from OverlayFS in 378.11 seconds**. The build configuration,
+dependencies and standard C++20 APIs remain unchanged; this backport includes
+no GCC 8.5 compatibility profile or library fallbacks.
 
 Class-instance arguments verified on 30 October 2026 through the normal CLI,
 with Order target source and compilation database temporarily unavailable.
@@ -783,9 +795,9 @@ fixtures. Four application frames crossed the two discovered DSOs. Empty and
 partial internal snapshots rejected that stack; these are negative admission
 tests, not caller configuration. Loader callbacks in executable and DSO code,
 signal handlers, and excessive depth were rejected, and every child progressed
-after detach. Separate identity tests discovered 17 distinct loaded fixture
-copies, excluded unmapped files and libc/loader aliases, and rejected changed
-paths or metadata for pinned identities.
+after detach. Module snapshot tests discover loaded fixture copies, exclude
+unmapped files and libc/loader aliases, and reject invalid ELF offsets and
+ambiguous mappings. Metadata-only timestamp changes are accepted.
 
 The complete suite also covers multiple processes, C++ overloads and const/static
 methods, scalar signatures, binary Protobuf CLI responses and events, concurrent
