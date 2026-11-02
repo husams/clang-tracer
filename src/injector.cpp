@@ -12,6 +12,7 @@
 #include <cstring>
 #include <exception>
 #include <fstream>
+#include <istream>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -131,12 +132,7 @@ bool thread_exists(pid_t process_id, pid_t tid) {
   return ::stat(path.c_str(), &status) == 0;
 }
 
-long stopped_syscall(pid_t tid) {
-  std::ifstream input("/proc/" + std::to_string(tid) + "/syscall");
-  if (!input) {
-    throw std::runtime_error(
-        "cannot inspect /proc/<pid>/syscall; refusing an unknown stop");
-  }
+long parse_syscall_number(std::istream &input) {
   std::string first;
   input >> first;
   if (first.empty() || first == "running") {
@@ -148,6 +144,32 @@ long stopped_syscall(pid_t tid) {
   return parsed.ec == std::errc{} && parsed.ptr == first.data() + first.size()
              ? number
              : -1;
+}
+
+long stopped_syscall(pid_t tid) {
+  std::ifstream input("/proc/" + std::to_string(tid) + "/syscall");
+  if (!input) {
+    throw std::runtime_error(
+        "cannot inspect /proc/<pid>/syscall; refusing an unknown stop");
+  }
+  return parse_syscall_number(input);
+}
+
+std::string join_rejections(const std::vector<std::string> &rejections) {
+  constexpr std::size_t kMaxListed = 32;
+  std::string joined;
+  const std::size_t listed = std::min(rejections.size(), kMaxListed);
+  for (std::size_t i = 0; i < listed; ++i) {
+    if (i != 0) {
+      joined += "; ";
+    }
+    joined += rejections[i];
+  }
+  if (rejections.size() > listed) {
+    joined += "; and " + std::to_string(rejections.size() - listed) +
+              " more";
+  }
+  return joined;
 }
 
 std::string_view syscall_name(long number) {
@@ -848,9 +870,14 @@ void Process::attach(pid_t process_id,
     std::vector<Rejection> rejected;
     auto eligible = [&](pid_t candidate_tid) {
       const long syscall_number = stopped_syscall(candidate_tid);
+      const auto registers = read_registers(candidate_tid).general;
+      if (candidate_tid != process_id_ && registers.fs_base == 0) {
+        rejected.push_back({candidate_tid, syscall_number,
+                            "worker has no thread pointer for dlopen"});
+        return false;
+      }
       if (syscall_number == SYS_nanosleep ||
           syscall_number == SYS_clock_nanosleep) {
-        (void)read_registers(candidate_tid);
         return true;
       }
       if (syscall_number >= 0) {
@@ -860,9 +887,7 @@ void Process::attach(pid_t process_id,
       }
       try {
         (void)require_application_rendezvous(
-            process_id_, read_registers(candidate_tid).general,
-            application_modules);
-        (void)read_registers(candidate_tid);
+            process_id_, registers, application_modules);
         return true;
       } catch (const IdlePointUnavailable &error) {
         rejected.push_back({candidate_tid, syscall_number, error.what()});
@@ -882,16 +907,21 @@ void Process::attach(pid_t process_id,
       if (selected_tid < 0) {
         std::ostringstream message;
         message << "no eligible injection thread; blocked TIDs/syscalls:";
+        std::vector<std::string> rejection_lines;
+        rejection_lines.reserve(rejected.size());
         for (const auto &rejection : rejected) {
-          message << " tid=" << rejection.tid << " syscall="
-                  << rejection.syscall_number << "(";
+          std::ostringstream line;
+          line << "tid=" << rejection.tid << " syscall="
+               << rejection.syscall_number << "(";
           if (rejection.syscall_number < 0) {
-            message << "userspace";
+            line << "userspace";
           } else {
-            message << syscall_name(rejection.syscall_number);
+            line << syscall_name(rejection.syscall_number);
           }
-          message << ") reason=" << rejection.reason;
+          line << ") reason=" << rejection.reason;
+          rejection_lines.push_back(line.str());
         }
+        message << " " << join_rejections(rejection_lines);
         freeze.release();
         throw IdlePointUnavailable(message.str());
       }

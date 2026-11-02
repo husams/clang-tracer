@@ -265,6 +265,19 @@ if(BUILD_TESTING)
       --callback ${CMAKE_CURRENT_SOURCE_DIR}/examples/cpp-interceptors/method.cpp
       --output-dir ${CMAKE_CURRENT_BINARY_DIR}/typed-this-results)
   set_tests_properties(grpc_typed_this_integration PROPERTIES TIMEOUT 180)
+  add_executable(blocked-main-fixture tests/fixtures/blocked_main.cpp)
+  target_link_libraries(blocked-main-fixture PRIVATE Threads::Threads)
+  set_target_properties(blocked-main-fixture PROPERTIES ENABLE_EXPORTS ON)
+  target_compile_options(blocked-main-fixture PRIVATE -g -O0 -fno-omit-frame-pointer
+    -fcf-protection=none)
+  add_test(NAME grpc_blocked_main_integration
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/blocked_main_integration.py
+      --server $<TARGET_FILE:clang-tracer-server>
+      --client $<TARGET_FILE:clang-tracer>
+      --agent $<TARGET_FILE:clang_tracer_agent>
+      --target $<TARGET_FILE:blocked-main-fixture>
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/blocked-main-test-results)
+  set_tests_properties(grpc_blocked_main_integration PROPERTIES TIMEOUT 180)
   add_executable(threaded-integration tests/threaded_integration.cpp)
   target_link_libraries(threaded-integration PRIVATE tracer_grpc Threads::Threads)
   target_compile_options(threaded-integration PRIVATE -Wall -Wextra -Wpedantic)

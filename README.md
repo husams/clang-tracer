@@ -625,6 +625,7 @@ userspace admission; such workers can still qualify through the sleep policy.
 
 If no task qualifies before the operation deadline, the server returns
 `FAILED_PRECONDITION` with per-TID syscall numbers, known names and rejection reasons.
+Diagnostics list up to 32 rejected tasks and report the number omitted.
 Fully released admission failures create no failed session to clean up during
 shutdown. Failures after bootstrap retain their normal recovery state.
 
@@ -654,6 +655,11 @@ session takes a fresh snapshot for libraries loaded later; it does not make
 unsupported CFI or runtime behavior safe.
 The existing `nanosleep`/`clock_nanosleep` admission path remains available outside
 critical sections, with its prior interrupted-sleep timing/restart limitation.
+The CLI regression covers sleeping-worker attachment with a leader blocked in
+`futex`, `epoll_wait`, `poll`, `read`, `accept`, `pause`, or `sigwait`. After
+detach, it verifies that the leader remains in its original blocking operation, workers
+remain alive, and every task is untraced. It also verifies the all-blocked
+diagnostic and clean server shutdown after a failed admission.
 Native calls preserve general registers, extended floating-point state, the
 thread's signal mask, and its `errno` value. Signals are blocked during injected
 execution and the saved mask is restored before normal execution resumes.
@@ -697,6 +703,11 @@ signal-handler probes, and control threads holding application/runtime locks are
 outside the current lifecycle contract.
 
 ## Validation and sources
+
+The reconciled worker-admission changes passed **25/25 CTests in 419.70 seconds**
+on `linux-dev` on 2 November 2026; both regression sets also passed from
+OverlayFS (**7/7 in 44.09 seconds**). Main retains C++20. The original overlapping
+local implementation is preserved in the merge's second-parent snapshot.
 
 Blocked-main worker selection was verified on 2 November 2026 on `linux-dev`:
 **24/24 CTests passed in 411.09 seconds**, and the six new regression cases
