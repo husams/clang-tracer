@@ -1,7 +1,7 @@
 # GCC 8.5 SDK compatibility build
 
-This recipe builds clang-tracer against the existing SDK at
-`/opt/toolchain/x86_64-2.6.32-v4.0.137`. Clang provides the C++20 compiler while
+This recipe builds clang-tracer against an explicitly supplied SDK directory.
+Clang provides the C++20 compiler while
 the target remains compatible with the SDK's glibc 2.23 and libstdc++ 8.5
 runtime. It installs all generated dependencies and the application into a
 scratch directory; it does not use `sudo` or install into `/usr/local`.
@@ -15,13 +15,16 @@ Run the script on the Linux build host with the SDK installed and an absolute,
 writable scratch path:
 
 ```sh
-scripts/gcc85-build.sh /var/tmp/clang-tracer-gcc85 3
+scripts/gcc85-build.sh /path/to/toolchain /var/tmp/clang-tracer-gcc85 3
 ```
 
-The second argument is optional and defaults to three jobs. CMake runs from the
+The first argument is the absolute SDK path; the second is the absolute scratch
+path. The third argument is optional and defaults to three jobs. CMake runs from the
 build host, not the SDK; set `TRACER_CMAKE` if it is not available under the
 name `cmake`. The script selects Ninja when `ninja` is installed and otherwise
-uses the host make generator. Set `TRACER_SDK_ROOT` to select another SDK root.
+uses the host make generator. The SDK path has no hardcoded or environment
+default. Direct CMake users must pass `-DTRACER_SDK_ROOT=/path/to/toolchain`
+alongside the toolchain file; compiler-check subprojects inherit that selection.
 The script preserves the scratch tree and refuses to replace an existing gRPC
 checkout if it does not match the pin. It rejects dirty root and recursive
 submodule sources, allowing only its exact protobuf RPATH patch and the pinned

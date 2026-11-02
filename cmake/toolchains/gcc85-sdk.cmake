@@ -1,10 +1,13 @@
 # Native x86-64 compatibility profile; compile with SDK Clang, retain GCC 8's
 # standard-library ABI and the SDK's glibc. Supply SDK-built dependencies through
 # CMAKE_PREFIX_PATH. Never substitute the machine's modern shared dependencies.
-set(TRACER_SDK_ROOT "/opt/toolchain/x86_64-2.6.32-v4.0.137" CACHE PATH "Native GCC 8.5 runtime SDK")
-if(NOT EXISTS "${TRACER_SDK_ROOT}/bin/clang++")
-  message(FATAL_ERROR "TRACER_SDK_ROOT must contain Clang 21 and the GCC 8.5 SDK")
+set(TRACER_SDK_ROOT "" CACHE PATH "Native GCC 8.5 runtime SDK (required)")
+if(NOT IS_ABSOLUTE "${TRACER_SDK_ROOT}" OR
+   NOT EXISTS "${TRACER_SDK_ROOT}/bin/clang++")
+  message(FATAL_ERROR "Pass -DTRACER_SDK_ROOT=/absolute/path/to/sdk containing Clang 21 and the GCC 8.5 SDK")
 endif()
+# Preserve the explicit SDK selection in CMake's compiler-check subprojects.
+list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES TRACER_SDK_ROOT)
 set(CMAKE_C_COMPILER "${TRACER_SDK_ROOT}/bin/clang" CACHE FILEPATH "")
 set(CMAKE_CXX_COMPILER "${TRACER_SDK_ROOT}/bin/clang++" CACHE FILEPATH "")
 set(CMAKE_SYSROOT "${TRACER_SDK_ROOT}/x86_64-1a-linux-gnu/sysroot")

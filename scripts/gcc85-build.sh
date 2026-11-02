@@ -3,30 +3,34 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/gcc85-build.sh ABSOLUTE_SCRATCH_ROOT [JOBS]
+Usage: scripts/gcc85-build.sh ABSOLUTE_SDK_ROOT ABSOLUTE_SCRATCH_ROOT [JOBS]
 
 Build dependencies and clang-tracer with the GCC 8.5-era SDK sysroot. The
 scratch root is preserved; existing dependency checkouts must match their pins.
-SDK defaults to /opt/toolchain/x86_64-2.6.32-v4.0.137 and can be overridden with
-TRACER_SDK_ROOT. Host CMake defaults to `cmake` and can be overridden with
+The SDK path is required; no machine-specific default is used.
+Host CMake defaults to `cmake` and can be overridden with
 TRACER_CMAKE. Jobs defaults to 3.
 EOF
 }
 
-if [[ $# -lt 1 || $# -gt 2 ]]; then
+if [[ $# -lt 2 || $# -gt 3 ]]; then
   usage >&2
   exit 2
 fi
 
-SCRATCH=$1
-JOBS=${2:-3}
-SDK=${TRACER_SDK_ROOT:-/opt/toolchain/x86_64-2.6.32-v4.0.137}
+SDK=$1
+SCRATCH=$2
+JOBS=${3:-3}
 CMAKE=${TRACER_CMAKE:-cmake}
 GRPC_COMMIT=02384e39185f109bd299eb8482306229967dc970
 GRPC_TAG=v1.46.7
 SQLITE_URL=https://www.sqlite.org/2021/sqlite-autoconf-3340100.tar.gz
 SQLITE_EXPECTED_SHA256=${SQLITE_EXPECTED_SHA256:-2a3bca581117b3b88e5361d0ef3803ba6d8da604b1c1a47d902ef785c1b53e89}
 
+if [[ $SDK != /* ]]; then
+  echo "SDK root must be an absolute path: $SDK" >&2
+  exit 2
+fi
 if [[ $SCRATCH != /* ]]; then
   echo "Scratch root must be an absolute path: $SCRATCH" >&2
   exit 2
