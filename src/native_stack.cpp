@@ -19,7 +19,6 @@
 #include <vector>
 
 #include <fcntl.h>
-#include <pthread.h>
 #include <llvm/DebugInfo/DWARF/DWARFContext.h>
 #include <llvm/DebugInfo/DWARF/DWARFDebugFrame.h>
 #include <llvm/DebugInfo/DWARF/LowLevel/DWARFUnwindTable.h>
@@ -27,10 +26,14 @@
 #include <llvm/Object/ELFObjectFile.h>
 #include <llvm/Object/ObjectFile.h>
 #include <llvm/Support/MemoryBuffer.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/uio.h>
 #include <unistd.h>
+
+#include "linux_syscalls.hpp"
+#include "tracer/compat.hpp"
 
 namespace {
 using namespace llvm::ELF;
@@ -270,25 +273,26 @@ bool runtime_module(std::string_view path) {
   // Same runtime families excluded by native admission, plus loader/transport
   // libraries. SONAME is checked too, so renaming a runtime does not hide it.
   constexpr std::string_view prefixes[] = {
-      "libc.so",     "libpthread.so", "libdl.so",    "libstdc++.so",
-      "libgcc_s.so", "libgcc.so",     "libc++.so",   "libc++abi.so",
-      "libllvm",     "libclang",      "libunwind",   "libasan",
-      "libtsan",     "libubsan",      "libomp",      "libgomp",
-      "libatomic",   "libm.so",       "librt.so",    "libresolv.so",
-      "libnss_",     "libutil.so",    "libcrypt.so", "libanl.so",
-      "libgfortran", "clang-tracer",  "libtracer",   "ld-linux",
-      "ld-musl",     "libprotobuf",   "libgrpc",     "libabsl"};
+      "libc-",       "libpthread-",   "libdl-",    "ld-",          "libm-",       "librt-",
+      "libc.so",     "libpthread.so", "libdl.so",  "libstdc++.so", "libgcc_s.so", "libgcc.so",
+      "libc++.so",   "libc++abi.so",  "libllvm",   "libclang",     "libunwind",   "libasan",
+      "libtsan",     "libubsan",      "libomp",    "libgomp",      "libatomic",   "libm.so",
+      "librt.so",    "libresolv.so",  "libnss_",   "libutil.so",   "libcrypt.so", "libanl.so",
+      "libgfortran", "clang-tracer",  "libtracer", "ld-linux",     "ld-musl",     "libprotobuf",
+      "libgrpc",     "libabsl"};
   for (auto prefix : prefixes)
-    if (name.starts_with(prefix))
+    if (::tracer::compat::starts_with(name, prefix)) {
       return true;
+    }
   return false;
 }
 
 bool standard_namespace(std::string_view context) {
   for (std::string_view root : {"std", "__gnu_cxx", "__cxxabiv1"})
-    if (context == root || (context.starts_with(root) &&
-                            context.substr(root.size()).starts_with("::")))
+    if (context == root || (::tracer::compat::starts_with(context, root) &&
+                            ::tracer::compat::starts_with(context.substr(root.size()), "::"))) {
       return true;
+    }
   return false;
 }
 
@@ -601,8 +605,9 @@ const std::vector<llvm::dwarf::UnwindRow> &rows_for(Location loc) {
       continue;
     auto *cie = fde->getLinkedCIE();
     if (!cie || cie->getReturnAddressRegister() != 16 ||
-        cie->getAugmentationString().contains('S'))
+        ::tracer::compat::contains(cie->getAugmentationString(), 'S')) {
       stop("signal or incomplete native CFI frame");
+    }
     auto &cached = loc.image->rows;
     if (const auto found = cached.find(fde->getInitialLocation());
         found != cached.end())
@@ -699,7 +704,7 @@ struct StackMemory {
         iovec source{reinterpret_cast<void *>(low),
                      static_cast<std::size_t>(size)};
         const auto got =
-            ::process_vm_readv(process, &destination, 1, &source, 1, 0);
+            ::tracer::linux_api::process_vm_readv(process, &destination, 1, &source, 1, 0);
         if (got > 0)
           loaded = static_cast<std::size_t>(got);
         count = copy_cached(local, remote, count);
@@ -707,10 +712,10 @@ struct StackMemory {
     }
     // A failed/partial window read never invalidates an otherwise recoverable
     // stack. Read only the still-needed words through the original safe path.
-    if (count &&
-        ::process_vm_readv(process, local, count, remote, count, 0) !=
-            static_cast<ssize_t>(count * sizeof(std::uint64_t)))
+    if (count && ::tracer::linux_api::process_vm_readv(process, local, count, remote, count, 0) !=
+                     static_cast<ssize_t>(count * sizeof(std::uint64_t))) {
       stop("native stack memory is unreadable");
+    }
   }
 };
 

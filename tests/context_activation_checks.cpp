@@ -1,10 +1,3 @@
-#include "context_activation.hpp"
-#include "context_receiver.hpp"
-#include "context_runtime.hpp"
-#include "context_stdlib.hpp"
-#include "context_test_config.hpp"
-#include "context_transport.pb.h"
-
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -18,6 +11,14 @@
 
 #include <google/protobuf/descriptor.pb.h>
 
+#include "context_activation.hpp"
+#include "context_receiver.hpp"
+#include "context_runtime.hpp"
+#include "context_stdlib.hpp"
+#include "context_test_config.hpp"
+#include "context_transport.pb.h"
+#include "tracer/compat.hpp"
+
 namespace {
 void require(bool value, const std::string &message) {
   if (!value)
@@ -28,8 +29,9 @@ void require(bool value, const std::string &message) {
 struct CaptureSink {
   std::vector<clangtracer::context::v1::ContextBatch> batches;
 };
-bool capture_batch(void *opaque, std::span<const std::byte> bytes,
-                   const std::shared_ptr<const void> &schema_token) noexcept {
+
+bool capture_batch(void* opaque, ::tracer::compat::span<const std::byte> bytes,
+                   const std::shared_ptr<const void>& schema_token) noexcept {
   struct ReleaseSchemaLease {
     const std::shared_ptr<const void> &token;
     ~ReleaseSchemaLease() {
@@ -374,9 +376,8 @@ struct Emitter {
               generic_decode_error);
   bool decoded_integer = false, decoded_string = false;
   for (const auto &payload : generic_batch.event().states()) {
-    const auto payload_bytes = std::span<const std::byte>(
-        reinterpret_cast<const std::byte *>(payload.payload().data()),
-        payload.payload().size());
+    const auto payload_bytes = ::tracer::compat::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(payload.payload().data()), payload.payload().size());
     const auto decoded = generic_receiver.decode(
         payload.epoch_schema_id(), payload_bytes, &generic_decode_error);
     const auto *value_field =
@@ -399,9 +400,9 @@ struct Emitter {
           "private generic int/string payloads did not roundtrip (expected "
           "43 and copy!)");
 
-  const auto make_helper_generation = [](int initial_value,
-                                         tracer::ContextRegistry &target,
-                                         bool unrelated_helpers = false) {
+  const auto make_helper_generation = [](int initial_value, tracer::ContextRegistry& target,
+                                         bool unrelated_helpers = false, const char* marker = "#7",
+                                         bool cold_helper = false) {
     tracer::ContextActivationRequest helper_request;
     helper_request.source_lineage_id[0] = 0x79;
     helper_request.file_name = "owner-lifecycle-closure.cc";
@@ -416,16 +417,17 @@ struct Emitter {
     helper_request.compiler_arguments.insert(
         helper_request.compiler_arguments.end(),
         std::begin(kContextSystemArguments), std::end(kContextSystemArguments));
-    helper_request.source =
-        "#include <utility>\n"
-        "namespace fingerprint { struct Scope {}; "
-        "int initialize_value() { return " +
-        std::to_string(initial_value) +
-        "; } "
-        "struct State : state<Scope> { int value; "
-        "State() : value(initialize_value()) {} }; "
-        "struct Interceptor { Interceptor(::tracer::State<State>); "
-        "void pre(const Call&, State&) {} }; }";
+    helper_request.source = "#include <utility>\n"
+                            "namespace fingerprint { struct Scope {}; "
+                            "__attribute__((noinline" +
+                            std::string(cold_helper ? ", cold" : "") +
+                            ")) int initialize_value() { const char marker[] = \"" + marker +
+                            "\"; return marker[0] == '#' ? " + std::to_string(initial_value) +
+                            " : 0; } "
+                            "struct State : state<Scope> { int value; "
+                            "State() : value(initialize_value()) {} }; "
+                            "struct Interceptor { Interceptor(::tracer::State<State>); "
+                            "void pre(const Call&, State&) {} }; }";
     if (unrelated_helpers) {
       helper_request.source +=
           "\nstd::pair<int, int> unrelated_pair_helper() { return {1, 2}; } "
@@ -473,6 +475,22 @@ struct Emitter {
                       .size() == 2,
           "changed reachable lifecycle helper reused or discarded a pinned "
           "owner generation");
+
+  tracer::ContextRegistry literal_registry;
+  const auto literal_seven = make_helper_generation(1, literal_registry);
+  const auto literal_eight = make_helper_generation(1, literal_registry, false, "#8");
+  require(literal_seven && literal_eight &&
+              literal_seven.generation->scopes()[0]->states[0].lifecycle_fingerprint !=
+                  literal_eight.generation->scopes()[0]->states[0].lifecycle_fingerprint,
+          "quoted #number global data was mistaken for an LLVM attribute-group ID");
+
+  tracer::ContextRegistry attribute_registry;
+  const auto ordinary_helper = make_helper_generation(1, attribute_registry);
+  const auto cold_helper = make_helper_generation(1, attribute_registry, false, "#7", true);
+  require(ordinary_helper && cold_helper &&
+              ordinary_helper.generation->scopes()[0]->states[0].lifecycle_fingerprint !=
+                  cold_helper.generation->scopes()[0]->states[0].lifecycle_fingerprint,
+          "semantic function attributes were omitted from the owner closure fingerprint");
 #endif
 }
 
@@ -576,9 +594,8 @@ void verify_context_nested_live() {
                                    &decode_error, registration.container_roles),
           "nested fixture receiver rejected its retained schema: " +
               decode_error);
-  const auto payload_bytes = std::span<const std::byte>(
-      reinterpret_cast<const std::byte *>(wire_state.payload().data()),
-      wire_state.payload().size());
+  const auto payload_bytes = ::tracer::compat::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(wire_state.payload().data()), wire_state.payload().size());
   const auto decoded =
       receiver.decode(registration.id, payload_bytes, &decode_error);
   require(static_cast<bool>(decoded),

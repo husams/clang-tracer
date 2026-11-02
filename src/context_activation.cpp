@@ -21,6 +21,7 @@
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/IR/Attributes.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DebugInfo.h>
 #include <llvm/IR/DerivedTypes.h>
@@ -46,6 +47,7 @@
 #include "context_schema.hpp"
 #include "context_stdlib.hpp"
 #include "context_support_effects.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer {
 namespace {
@@ -110,8 +112,8 @@ bool is_verified_native_record(clang::ASTContext &context,
     if (llvm::sys::fs::real_path(root, canonical_root)) {
       return false;
     }
-    return llvm::StringRef(physical).starts_with(
-        llvm::StringRef(canonical_root).str() + "/");
+    return ::tracer::compat::starts_with(llvm::StringRef(physical),
+                                         llvm::StringRef(canonical_root).str() + "/");
   };
   clang::PrintingPolicy policy(context.getLangOpts());
   policy.FullyQualifiedName = true;
@@ -125,7 +127,7 @@ bool is_verified_native_record(clang::ASTContext &context,
                              .getCanonicalType()
                              .getAsString(policy);
 #endif
-  if (canonical.starts_with("std::")) {
+  if (::tracer::compat::starts_with(canonical, "std::")) {
     llvm::StringRef roots(TRACER_CONTEXT_SYSTEM_ROOTS);
     while (!roots.empty()) {
       const auto pair = roots.split('|');
@@ -137,9 +139,9 @@ bool is_verified_native_record(clang::ASTContext &context,
   }
   llvm::SmallString<256> engine_root;
   return !llvm::sys::fs::real_path(TRACER_CONTEXT_ENGINE_ROOT, engine_root) &&
-         llvm::StringRef(physical).starts_with(
-             llvm::StringRef(engine_root).str() + "/") &&
-         canonical.starts_with("tracer::context_engine::");
+         ::tracer::compat::starts_with(llvm::StringRef(physical),
+                                       llvm::StringRef(engine_root).str() + "/") &&
+         ::tracer::compat::starts_with(canonical, "tracer::context_engine::");
 }
 
 std::vector<std::string>
@@ -423,12 +425,12 @@ std::string lifecycle_closure_fingerprint(
   }
   unsigned helper_index = 0;
   for (const auto *original : ordered_functions) {
-    if (root_roles.contains(original)) {
+    if (::tracer::compat::contains(root_roles, original)) {
       continue;
     }
     auto *function = cloned_functions[original];
     if (function && !function->isDeclaration() &&
-        (function->getName().contains("clangtracer_owner_") ||
+        (::tracer::compat::contains(function->getName(), "clangtracer_owner_") ||
          function->hasLocalLinkage())) {
       function->setName("__context_helper_" + std::to_string(helper_index++));
     }
@@ -442,7 +444,61 @@ std::string lifecycle_closure_fingerprint(
 
   std::string normalized;
   llvm::raw_string_ostream stream(normalized);
-  stream << "clangtracer.owner.lifecycle.v1\n";
+  stream << "clangtracer.owner.lifecycle.v2\n";
+  const auto emit_attributes = [&](const llvm::AttributeList& attributes, unsigned argument_count) {
+    stream << " ret{" << attributes.getRetAttrs().getAsString() << "}"
+           << " fn{" << attributes.getFnAttrs().getAsString() << "}";
+    for (unsigned index = 0; index < argument_count; ++index) {
+      stream << " arg" << index << '{' << attributes.getParamAttrs(index).getAsString() << '}';
+    }
+  };
+  const auto normalize_attribute_group_ids = [](llvm::StringRef text) {
+    std::string result;
+    result.reserve(text.size());
+    bool quoted = false;
+    bool escaped = false;
+    bool comment = false;
+    for (std::size_t index = 0; index < text.size();) {
+      const char ch = text[index];
+      if (comment) {
+        result.push_back(ch);
+        ++index;
+        if (ch == '\n') {
+          comment = false;
+        }
+      } else if (quoted) {
+        result.push_back(ch);
+        ++index;
+        if (escaped) {
+          escaped = false;
+        } else if (ch == '\\') {
+          escaped = true;
+        } else if (ch == '"') {
+          quoted = false;
+        }
+      } else if (ch == '"') {
+        quoted = true;
+        result.push_back(ch);
+        ++index;
+      } else if (ch == ';') {
+        comment = true;
+        result.push_back(ch);
+        ++index;
+      } else if (ch == '#' && index + 1 < text.size() &&
+                 std::isdigit(static_cast<unsigned char>(text[index + 1]))) {
+        // LLVM assigns these group IDs at module scope, so unrelated IR can
+        // renumber them. The complete attribute contents are emitted below.
+        result += "#attribute-group";
+        index += 2;
+        while (index < text.size() && std::isdigit(static_cast<unsigned char>(text[index]))) {
+          ++index;
+        }
+      } else {
+        result.push_back(text[index++]);
+      }
+    }
+    return result;
+  };
   for (const auto *original : ordered_functions) {
     auto *function = cloned_functions[original];
     if (!function) {
@@ -451,8 +507,9 @@ std::string lifecycle_closure_fingerprint(
     if (function->isDeclaration()) {
       stream << "dependency ";
       stream << canonical_type(function->getFunctionType(), 0);
-      stream << " cc=" << function->getCallingConv() << ' '
-             << function->getName() << '\n';
+      stream << " cc=" << function->getCallingConv() << ' ' << function->getName();
+      emit_attributes(function->getAttributes(), function->arg_size());
+      stream << '\n';
       continue;
     }
     for (auto &argument : function->args())
@@ -462,9 +519,21 @@ std::string lifecycle_closure_fingerprint(
       for (auto &instruction : block)
         instruction.setName("");
     }
-    stream << "function ";
-    function->print(stream);
+    std::string printed_function;
+    llvm::raw_string_ostream function_stream(printed_function);
+    function->print(function_stream);
+    function_stream.flush();
+    stream << "function " << normalize_attribute_group_ids(printed_function) << '\n';
+    emit_attributes(function->getAttributes(), function->arg_size());
     stream << '\n';
+    unsigned call_index = 0;
+    for (const auto& instruction : llvm::instructions(function)) {
+      if (const auto* call = llvm::dyn_cast<llvm::CallBase>(&instruction)) {
+        stream << "call-attributes[" << call_index++ << ']';
+        emit_attributes(call->getAttributes(), call->arg_size());
+        stream << '\n';
+      }
+    }
   }
   for (const auto *original : ordered_globals) {
     const auto *global = cloned_globals[original];

@@ -15,6 +15,7 @@
 #include <clang/Lex/Preprocessor.h>
 
 #include "context_schema.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer {
 namespace {
@@ -78,7 +79,8 @@ std::string source_cpp_type(std::string spelling) {
                                                  "char16_t",
                                                  "char32_t",
                                                  "std::nullptr_t"};
-  if (builtins.contains(spelling) || spelling.starts_with("::")) {
+  if (::tracer::compat::contains(builtins, spelling) ||
+      ::tracer::compat::starts_with(spelling, "::")) {
     return spelling;
   }
   return "::" + spelling;
@@ -148,7 +150,7 @@ GeneratedContextOwner generate_context_owner(clang::ASTUnit &unit,
   std::string prefix;
   for (std::size_t attempt = 0;; ++attempt) {
     prefix = "clangtracer_owner_" + std::to_string(attempt) + "_";
-    if (!original.contains(prefix) &&
+    if (!::tracer::compat::contains(original, prefix) &&
         !unit.getPreprocessor().isMacroDefined(prefix)) {
       break;
     }

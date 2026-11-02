@@ -37,6 +37,7 @@
 #include "header_context.hpp"
 #include "sqlite_events.hpp"
 #include "tracer.grpc.pb.h"
+#include "tracer/compat.hpp"
 
 namespace {
 
@@ -230,18 +231,16 @@ Options parse_options(int argc, char **argv) {
       } else {
         o.sources.push_back(v);
       }
-    } else if (a.starts_with("--")) {
+    } else if (::tracer::compat::starts_with(a, "--")) {
       throw std::runtime_error("unknown option: " + a);
     } else if (o.command.empty()) {
       o.command = a;
-    } else if ((o.command == "attach" || o.command == "trace" ||
-                o.command == "events" || o.command == "drain" ||
-                o.command == "detach" || o.command == "remove") &&
+    } else if ((o.command == "attach" || o.command == "trace" || o.command == "events" ||
+                o.command == "drain" || o.command == "detach" || o.command == "remove") &&
                o.pid == 0) {
       o.direct = true;
       o.pid = parse_number(a, "PID", std::numeric_limits<std::uint32_t>::max());
-    } else if (o.command == "trace" && o.pid != 0 &&
-               o.positional_selector.empty()) {
+    } else if (o.command == "trace" && o.pid != 0 && o.positional_selector.empty()) {
       o.direct = true;
       o.positional_selector = a;
     } else if (o.command == "remove" && o.probe_id == 0) {
@@ -760,7 +759,8 @@ public:
       }
       const auto *bytes = reinterpret_cast<const std::byte *>(state.payload().data());
       attachments.push_back({state.epoch_schema_id(),
-          std::span<const std::byte>(bytes, state.payload().size()), state_limits});
+                             ::tracer::compat::span<const std::byte>(bytes, state.payload().size()),
+                             state_limits});
     }
     return epoch.receiver->decode_event(attachments, &error);
   }
@@ -1204,7 +1204,7 @@ int run_direct(const Options &o, api::Tracer::Stub &stub) {
         declaration = resolved->declaration;
       } else {
         const auto expected =
-            o.selector.starts_with("--method") ? api::METHOD : api::FUNCTION;
+            ::tracer::compat::starts_with(o.selector, "--method") ? api::METHOD : api::FUNCTION;
         if (resolved->spec.signature().kind() != expected) {
           throw std::runtime_error("resolved declaration kind does not match " +
                                    o.selector.substr(0, o.selector.find(' ')));
@@ -1275,8 +1275,8 @@ int run_direct(const Options &o, api::Tracer::Stub &stub) {
       spec->set_callback_source(callback_source);
       set_callback_package_location(*spec, o);
       auto *sig = spec->mutable_signature();
-      sig->set_kind(o.selector.starts_with("--method") ? api::METHOD
-                                                       : api::FUNCTION);
+      sig->set_kind(::tracer::compat::starts_with(o.selector, "--method") ? api::METHOD
+                                                                          : api::FUNCTION);
       sig->set_result(parse_type(o.return_type, true));
       for (const auto &t : o.argument_types) {
         sig->add_arguments(parse_type(t, false));

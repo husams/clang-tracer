@@ -3,18 +3,20 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <utility>
-#include <exception>
-#include <cstdio>
+
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "context_scheduler.hpp"
 #include "context_pthread_detour.hpp"
+#include "context_scheduler.hpp"
+#include "tracer/compat.hpp"
 
 namespace {
 namespace ce = tracer::context_engine;
@@ -110,7 +112,7 @@ void inspect_inherited_state(ce::Context& context, const ce::SlotRequest& reques
   cx::CurrentHook current_hook(&hook);
   assert(current_hook.installed());
   ce::HookExit exit(context);
-  ce::HookAccess access(context, std::span(&request, 1));
+  ce::HookAccess access(context, ::tracer::compat::span(&request, 1));
   assert(static_cast<State*>(access.ref(request))->value == 41);
 }
 

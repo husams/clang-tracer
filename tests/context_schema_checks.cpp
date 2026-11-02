@@ -1,17 +1,19 @@
-#include "context_codec.hpp"
-#include "context_receiver.hpp"
-#include "context_test_config.hpp"
-
 #include <algorithm>
 #include <array>
 #include <cassert>
-#include <clang/AST/RecursiveASTVisitor.h>
-#include <clang/Frontend/ASTUnit.h>
-#include <clang/Tooling/Tooling.h>
 #include <cstring>
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
+
+#include <clang/AST/RecursiveASTVisitor.h>
+#include <clang/Frontend/ASTUnit.h>
+#include <clang/Tooling/Tooling.h>
+
+#include "context_codec.hpp"
+#include "context_receiver.hpp"
+#include "context_test_config.hpp"
+#include "tracer/compat.hpp"
 
 void verify_context_schema_roundtrip();
 
@@ -132,7 +134,7 @@ void verify_context_schema() {
   std::shared_ptr<const SchemaRecord> schema_ref = schema.record;
   const std::array<std::string_view, 2> nested_path{"items", "sku"};
   const auto query = query_field_path(
-      std::span<const std::shared_ptr<const SchemaRecord>>(&schema_ref, 1),
+      ::tracer::compat::span<const std::shared_ptr<const SchemaRecord>>(&schema_ref, 1),
       nested_path);
   if (query.size() != 1 || !query[0].present ||
       query[0].kind != SchemaKind::string)
@@ -150,10 +152,9 @@ void verify_context_schema() {
   auto generic_payload_ref =
       std::shared_ptr<const SchemaRecord>(int_payload.record);
   const std::array<std::string_view, 1> generic_value_path{"value"};
-  const auto generic_query =
-      query_field_path(std::span<const std::shared_ptr<const SchemaRecord>>(
-                           &generic_payload_ref, 1),
-                       generic_value_path);
+  const auto generic_query = query_field_path(
+      ::tracer::compat::span<const std::shared_ptr<const SchemaRecord>>(&generic_payload_ref, 1),
+      generic_value_path);
   if (generic_query.size() != 1 || !generic_query[0].present ||
       generic_query[0].cpp_type != "int")
     throw std::runtime_error("generic payload original-type query failed");
@@ -279,8 +280,7 @@ struct EqualState : shared_state<Scope> { std::unordered_map<EqualRecord,int> va
     std::uint32_t field = 0;
   } trunc;
   budget.max_items = 1;
-  budget.truncation = [](void *opaque,
-                         std::span<const EncodeBudget::PathStep> path,
+  budget.truncation = [](void* opaque, ::tracer::compat::span<const EncodeBudget::PathStep> path,
                          std::uint64_t total, std::uint64_t captured) noexcept {
     auto &c = *static_cast<TruncationCheck *>(opaque);
     c.called = true;

@@ -1,6 +1,7 @@
 #include "cpp_resolver.hpp"
 
 #include "../include/tracer/receiver_abi.hpp"
+#include "tracer/compat.hpp"
 
 #ifndef TRACER_CLANG_RESOURCE_DIR
 #error                                                                                             \
@@ -168,25 +169,25 @@ Selector parse_selector(const std::string& text) {
   auto suffix = compact(trim(text.substr(close + 1)));
   while (!suffix.empty()) {
     suffix = trim(std::move(suffix));
-    if (suffix.starts_with("const")) {
+    if (::tracer::compat::starts_with(suffix, "const")) {
       if (selector.is_const) {
         throw std::runtime_error("duplicate const qualifier in selector");
       }
       selector.is_const = true;
       suffix.erase(0, 5);
-    } else if (suffix.starts_with("volatile")) {
+    } else if (::tracer::compat::starts_with(suffix, "volatile")) {
       if (selector.is_volatile) {
         throw std::runtime_error("duplicate volatile qualifier in selector");
       }
       selector.is_volatile = true;
       suffix.erase(0, 8);
-    } else if (suffix.starts_with("&&")) {
+    } else if (::tracer::compat::starts_with(suffix, "&&")) {
       if (selector.ref_qualifier != clang::RQ_None) {
         throw std::runtime_error("duplicate ref qualifier in selector");
       }
       selector.ref_qualifier = clang::RQ_RValue;
       suffix.erase(0, 2);
-    } else if (suffix.starts_with("&")) {
+    } else if (::tracer::compat::starts_with(suffix, "&")) {
       if (selector.ref_qualifier != clang::RQ_None) {
         throw std::runtime_error("duplicate ref qualifier in selector");
       }
@@ -736,7 +737,7 @@ std::string normalized_path(const std::string& path, const std::string& director
 
 bool has_resource_dir_argument(const clang::tooling::CommandLineArguments& arguments) {
   return std::any_of(arguments.begin(), arguments.end(), [](const auto& argument) {
-    return argument == "-resource-dir" || argument.starts_with("-resource-dir=");
+    return argument == "-resource-dir" || ::tracer::compat::starts_with(argument, "-resource-dir=");
   });
 }
 
@@ -784,7 +785,7 @@ ResolvedCallable resolve_cpp_callable(const std::string& name,
       const auto commands = database->getCompileCommands(file);
       bool found = false;
       for (const auto& command : commands) {
-        if (requested.contains(normalized_path(file, command.Directory))) {
+        if (::tracer::compat::contains(requested, normalized_path(file, command.Directory))) {
           found = true;
           break;
         }

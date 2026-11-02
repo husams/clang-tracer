@@ -1,5 +1,11 @@
+# gRPC's module-provider builds reference protobuf targets without finding
+# them, while newer config providers also export upb targets. Prefer the full
+# config export so a legacy FindProtobuf import cannot create a partial set.
+find_package(Protobuf QUIET CONFIG)
+if(NOT Protobuf_FOUND)
+  find_package(Protobuf REQUIRED)
+endif()
 find_package(gRPC REQUIRED CONFIG)
-find_package(Protobuf REQUIRED)
 set(_context_proto_dir ${CMAKE_CURRENT_BINARY_DIR}/context-generated)
 file(MAKE_DIRECTORY ${_context_proto_dir})
 add_custom_command(

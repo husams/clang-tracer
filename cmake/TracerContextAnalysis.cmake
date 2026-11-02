@@ -5,8 +5,14 @@ add_library(tracer_context_analysis STATIC src/context_analysis.cpp src/context_
   src/context_hooks.cpp src/context_schema.cpp src/context_receiver.cpp src/context_stdlib.cpp
   src/context_unwind.cpp src/context_support_effects.cpp src/context_registry.cpp
   src/context_facade.cpp src/context_runtime.cpp src/context_activation.cpp src/context_paths.cpp
-  src/context_query.cpp)
+  src/context_query.cpp src/runtime_identity.cpp)
 set_target_properties(tracer_context_analysis PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# LLVM's default SDK profile may omit RTTI for its polymorphic base classes.
+# The importer and memory-manager translation units derive from LLVM/Clang
+# classes. Keep state/runtime RTTI enabled for std::any/exception contracts.
+if(NOT LLVM_ENABLE_RTTI)
+  set_property(SOURCE src/context_binding.cpp src/agent.cpp APPEND PROPERTY COMPILE_OPTIONS -fno-rtti)
+endif()
 target_compile_features(tracer_context_analysis PUBLIC cxx_std_20)
 target_include_directories(tracer_context_analysis SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_include_directories(tracer_context_analysis PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)

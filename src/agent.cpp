@@ -1,16 +1,3 @@
-#include "callback_bridge.hpp"
-#include "context_activation.hpp"
-#include "context_agent_delivery.hpp"
-#include "context_analysis.hpp"
-#include "context_engine.hpp"
-#include "context_pthread_detour.hpp"
-#include "context_runtime.hpp"
-#include "context_stdlib.hpp"
-#include "debug_resolver.hpp"
-#include "event_transport.hpp"
-#include "native_stack.hpp"
-#include "runtime_paths.hpp"
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -76,8 +63,22 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "callback_bridge.hpp"
 #include "callback_source.hpp"
+#include "context_activation.hpp"
+#include "context_agent_delivery.hpp"
+#include "context_analysis.hpp"
+#include "context_engine.hpp"
+#include "context_pthread_detour.hpp"
+#include "context_runtime.hpp"
+#include "context_stdlib.hpp"
+#include "debug_resolver.hpp"
+#include "event_transport.hpp"
+#include "native_stack.hpp"
+#include "runtime_identity.hpp"
+#include "runtime_paths.hpp"
 #include "tracer.pb.h"
+#include "tracer/compat.hpp"
 #include "tracer/protocol.hpp"
 #include "tracer/receiver_abi.hpp"
 
@@ -783,26 +784,27 @@ bool debug_path_identifier(llvm::StringRef text) {
     if (!debug_identifier(part.first))
       return false;
     if (part.second.empty())
-      return !text.ends_with(".");
+      return !::tracer::compat::ends_with(text, ".");
     text = part.second;
   }
 }
 
 clang::QualType debug_builtin(clang::ASTContext &context,
                               llvm::StringRef type) {
-  if (type.ends_with(" const")) {
+  if (::tracer::compat::ends_with(type, " const")) {
     auto t = debug_builtin(context, type.drop_back(6));
     t.addConst();
     return t;
   }
-  if (type.ends_with(" volatile")) {
+  if (::tracer::compat::ends_with(type, " volatile")) {
     auto t = debug_builtin(context, type.drop_back(9));
     t.addVolatile();
     return t;
   }
-  if (type.ends_with("*"))
+  if (::tracer::compat::ends_with(type, "*")) {
     return context.getPointerType(debug_builtin(context, type.drop_back()));
-  if (type.starts_with("const ")) {
+  }
+  if (::tracer::compat::starts_with(type, "const ")) {
     auto t = debug_builtin(context, type.drop_front(6));
     t.addConst();
     return t;
@@ -910,7 +912,7 @@ DebugRecord construct_debug_record(clang::ASTContext &context,
   if (!record) {
     clang::DeclContext *scope = context.getTranslationUnitDecl();
     llvm::StringRef remaining = info.record_name();
-    while (remaining.contains("::")) {
+    while (::tracer::compat::contains(remaining, "::")) {
       auto part = remaining.split("::");
       if (!debug_identifier(part.first))
         throw std::runtime_error("unsupported debug receiver scope");
@@ -1062,7 +1064,7 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
         if (argument.find('\0') != std::string::npos)
           throw std::runtime_error("invalid header compiler argument");
         resource_dir |= argument == "-resource-dir" ||
-                        argument.starts_with("-resource-dir=");
+                        ::tracer::compat::starts_with(argument, "-resource-dir=");
       }
       if (!resource_dir)
         arguments.push_back(std::string("-resource-dir=") +
@@ -1500,7 +1502,7 @@ bool safe_instruction(const llvm::MCInst &inst, const llvm::MCInstrInfo &ins,
       "NOOP",      "MOV64mi32", "MOV32mi",    "MOV16mi",   "MOV8mi"};
   bool known = false;
   for (auto p : allowed) {
-    if (name == p || (name.size() > p.size() && name.starts_with(p))) {
+    if (name == p || (name.size() > p.size() && ::tracer::compat::starts_with(name, p))) {
       known = true;
       break;
     }
@@ -1621,8 +1623,9 @@ bool native_cet_disabled(std::string &error) {
       bool found = false;
       for (std::string line; std::getline(status, line);) {
         constexpr std::string_view prefix = "x86_Thread_features:";
-        if (!line.starts_with(prefix))
+        if (!::tracer::compat::starts_with(line, prefix)) {
           continue;
+        }
         found = true;
         if (line.find_first_not_of(" \t\r", prefix.size()) !=
             std::string::npos) {
@@ -1675,10 +1678,8 @@ bool prepare_context_pthread(Agent &owner, Probe &probe, std::string &error) {
     error = "pthread_create module identity is unavailable";
     return false;
   }
-  const auto module_name =
-      std::filesystem::path(module.dli_fname).filename().string();
-  if (!module_name.starts_with("libc.so") &&
-      !module_name.starts_with("libpthread.so")) {
+  if (!tracer::runtime::has_soname(symbol, "libc.so.6") &&
+      !tracer::runtime::has_soname(symbol, "libpthread.so.0")) {
     error = "pthread_create is interposed by an unsupported runtime module";
     return false;
   }
@@ -2671,8 +2672,9 @@ std::string argument_aliases(const clangtracer::v1::ProbeSpec &spec) {
         type += " volatile";
       type +=
           (argument.is_reference() || argument.is_object_value()) ? "&" : "*";
-    } else if (argument.is_reference() && !type.starts_with("const "))
+    } else if (argument.is_reference() && !::tracer::compat::starts_with(type, "const ")) {
       type = "const " + type;
+    }
     code += "template<> struct ArgumentType<" +
             std::to_string(argument.index()) + "> { using type=" + type +
             "; static constexpr bool object_value=" +
@@ -2735,12 +2737,10 @@ bool compile_shared_probe(Probe &p,
     metadata.print_arguments = specification.print_arguments();
     metadata.print_result = specification.print_result();
     metadata.capture_hook_id = owner->next_context_hook++;
-    p.shared_runtime = std::make_shared<
-        tracer::context_runtime::SharedSourceRuntime>(
-        generation.generation->scopes(), *owner->context_capture,
-        std::move(metadata),
-        [](void *opaque, std::span<const std::byte> bytes,
-           const std::shared_ptr<const void> &schema_lease) noexcept {
+    p.shared_runtime = std::make_shared<tracer::context_runtime::SharedSourceRuntime>(
+        generation.generation->scopes(), *owner->context_capture, std::move(metadata),
+        [](void* opaque, ::tracer::compat::span<const std::byte> bytes,
+           const std::shared_ptr<const void>& schema_lease) noexcept {
           return static_cast<tracer::context_delivery::ContextAgentDelivery *>(
                      opaque)
               ->try_publish_capture(bytes, schema_lease);

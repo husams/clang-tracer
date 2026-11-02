@@ -1,8 +1,5 @@
 #pragma once
 
-#include "context_facade.hpp"
-#include "context_registry.hpp"
-
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -10,9 +7,12 @@
 #include <functional>
 #include <memory>
 #include <optional>
-#include <span>
 #include <string>
 #include <vector>
+
+#include "context_facade.hpp"
+#include "context_registry.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer::context_runtime {
 

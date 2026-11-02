@@ -1,13 +1,13 @@
-#include "context_capture.hpp"
-#include "context_schema.hpp"
-
-#include "context_transport.pb.h"
-#include "tracer/protocol.hpp"
-
 #include <array>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "context_capture.hpp"
+#include "context_schema.hpp"
+#include "context_transport.pb.h"
+#include "tracer/compat.hpp"
+#include "tracer/protocol.hpp"
 
 namespace tracer::context_engine::test {
 namespace {
@@ -23,8 +23,8 @@ struct LeasedSink {
   std::size_t bytes = 0;
 };
 
-bool retain_capture(void *opaque, std::span<const std::byte> bytes,
-                    const std::shared_ptr<const void> &token) noexcept {
+bool retain_capture(void* opaque, ::tracer::compat::span<const std::byte> bytes,
+                    const std::shared_ptr<const void>& token) noexcept {
   auto &sink = *static_cast<LeasedSink *>(opaque);
   sink.token = token;
   sink.bytes = bytes.size();

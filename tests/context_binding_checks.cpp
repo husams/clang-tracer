@@ -213,17 +213,18 @@ void finalizer_return_pins_generation() {
       std::move(source.module), source.contract, {"finalizer"}));
   auto symbol = take(code->symbol("finalizer"));
   std::weak_ptr<const tracer::PrivateContextCode> lifetime = code;
-  alignas(std::atomic_ref<unsigned>::required_alignment) unsigned flags[2] = {};
+  alignas(std::atomic<unsigned>) unsigned flags[2] = {};
   std::thread native([lease = symbol, &flags] {
     reinterpret_cast<void (*)(unsigned *)>(lease.address())(flags);
     // The lease destructor is native code after the JIT finalizer has returned.
   });
-  while (!std::atomic_ref<unsigned>(flags[0]).load(std::memory_order_acquire))
+  while (!__atomic_load_n(&flags[0], __ATOMIC_ACQUIRE)) {
     std::this_thread::yield();
+  }
   code.reset();
   symbol = {};
   const bool pinned = !lifetime.expired();
-  std::atomic_ref<unsigned>(flags[1]).store(1, std::memory_order_release);
+  __atomic_store_n(&flags[1], 1u, __ATOMIC_RELEASE);
   native.join();
   require(pinned, "generation unloaded inside its running finalizer");
   require(lifetime.expired(),

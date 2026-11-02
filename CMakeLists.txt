@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(clang_tracer LANGUAGES C CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+include(cmake/TracerCompatibility.cmake)
 
 option(TRACER_CONTEXT_ENGINE_ONLY "Build only portable context engine checks" OFF)
 if(TRACER_CONTEXT_ENGINE_ONLY)
@@ -60,7 +64,7 @@ add_custom_command(
 add_library(tracer_proto STATIC ${TRACER_PROTO_DIR}/tracer.pb.cc)
 set_target_properties(tracer_proto PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(tracer_proto PUBLIC ${TRACER_PROTO_DIR})
-target_link_libraries(tracer_proto PUBLIC protobuf::libprotobuf tracer_context_transport_proto)
+target_link_libraries(tracer_proto PUBLIC protobuf::libprotobuf tracer_context_transport_proto tracer_compat)
 add_library(tracer_grpc STATIC ${TRACER_PROTO_DIR}/tracer.grpc.pb.cc)
 target_link_libraries(tracer_grpc PUBLIC tracer_proto gRPC::grpc++)
 
@@ -70,6 +74,7 @@ target_include_directories(clang_tracer_agent PRIVATE include ${TRACER_PROTO_DIR
 target_compile_definitions(clang_tracer_agent PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
 target_link_libraries(clang_tracer_agent PRIVATE tracer_context_engine tracer_context_analysis tracer_proto clang-cpp LLVM ${CMAKE_DL_LIBS} Threads::Threads)
 target_compile_options(clang_tracer_agent PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(clang_tracer_agent PRIVATE "LINKER:--no-undefined")
 
 add_executable(clang-tracer-server src/main.cpp src/server.cpp src/session.cpp src/injector.cpp src/admission.cpp
   src/debug_resolver.cpp src/header_context.cpp)
@@ -90,6 +95,7 @@ include(cmake/TracerInstall.cmake)
 option(TRACER_BUILD_EXAMPLES "Build example target programs" ON)
 if(TRACER_BUILD_EXAMPLES OR BUILD_TESTING)
 add_executable(trace-target tests/fixtures/target.cpp)
+target_link_libraries(trace-target PRIVATE Threads::Threads)
 set_target_properties(trace-target PROPERTIES ENABLE_EXPORTS ON)
 target_compile_options(trace-target PRIVATE -O0 -fno-omit-frame-pointer -fcf-protection=none)
 
@@ -143,12 +149,16 @@ endif()
 
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_executable(runtime-identity-tests tests/runtime_identity_checks.cpp src/runtime_identity.cpp)
+  target_include_directories(runtime-identity-tests PRIVATE src)
+  target_link_libraries(runtime-identity-tests PRIVATE tracer_compat Threads::Threads ${CMAKE_DL_LIBS})
+  add_test(NAME runtime_module_identity COMMAND runtime-identity-tests)
   add_library(admission-leaf OBJECT tests/admission_leaf.cpp)
   target_compile_options(admission-leaf PRIVATE -O2 -fomit-frame-pointer -momit-leaf-frame-pointer
     -fasynchronous-unwind-tables -Wall -Wextra -Wpedantic)
   add_executable(admission-integration tests/admission_integration.cpp src/admission.cpp)
   target_include_directories(admission-integration PRIVATE src ${LLVM_INCLUDE_DIRS})
-  target_link_libraries(admission-integration PRIVATE admission-leaf trace-stack-a trace-stack-b LLVM ${CMAKE_DL_LIBS})
+  target_link_libraries(admission-integration PRIVATE tracer_compat admission-leaf trace-stack-a trace-stack-b LLVM ${CMAKE_DL_LIBS})
   target_compile_options(admission-integration PRIVATE -O2 -fomit-frame-pointer
     -fno-optimize-sibling-calls -fasynchronous-unwind-tables -Wall -Wextra -Wpedantic)
   add_test(NAME native_admission_integration COMMAND admission-integration
@@ -157,7 +167,7 @@ if(BUILD_TESTING)
   set_tests_properties(native_admission_integration PROPERTIES TIMEOUT 30)
   add_executable(admission-frame-pointer-integration tests/admission_integration.cpp src/admission.cpp)
   target_include_directories(admission-frame-pointer-integration PRIVATE src ${LLVM_INCLUDE_DIRS})
-  target_link_libraries(admission-frame-pointer-integration PRIVATE admission-leaf trace-stack-a trace-stack-b LLVM ${CMAKE_DL_LIBS})
+  target_link_libraries(admission-frame-pointer-integration PRIVATE tracer_compat admission-leaf trace-stack-a trace-stack-b LLVM ${CMAKE_DL_LIBS})
   target_compile_options(admission-frame-pointer-integration PRIVATE -O2 -fno-omit-frame-pointer
     -fno-optimize-sibling-calls -fasynchronous-unwind-tables -Wall -Wextra -Wpedantic)
   add_test(NAME native_admission_frame_pointer_integration COMMAND admission-frame-pointer-integration
@@ -185,7 +195,7 @@ if(BUILD_TESTING)
   set_tests_properties(native_admission_stripped_integration PROPERTIES TIMEOUT 30)
   add_executable(module-identity-integration tests/module_identity_integration.cpp src/admission.cpp)
   target_include_directories(module-identity-integration PRIVATE src ${LLVM_INCLUDE_DIRS})
-  target_link_libraries(module-identity-integration PRIVATE LLVM ${CMAKE_DL_LIBS})
+  target_link_libraries(module-identity-integration PRIVATE tracer_compat LLVM ${CMAKE_DL_LIBS})
   target_compile_options(module-identity-integration PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME native_module_identity_integration COMMAND module-identity-integration
     --module $<TARGET_FILE:trace-stack-b>)

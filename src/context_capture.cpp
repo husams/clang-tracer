@@ -1,6 +1,4 @@
 #include "context_capture.hpp"
-#include "context_schema.hpp"
-#include "tracer/protocol.hpp"
 
 #include <algorithm>
 #include <array>
@@ -8,6 +6,10 @@
 #include <cstring>
 #include <utility>
 #include <vector>
+
+#include "context_schema.hpp"
+#include "tracer/compat.hpp"
+#include "tracer/protocol.hpp"
 
 namespace tracer::context_engine {
 struct CaptureArena {
@@ -74,7 +76,7 @@ static_assert(sizeof(TruncationLog) + sizeof(EncodeBudget) +
                   sizeof(BoundedProtoWriter) <=
               64 * 1024);
 
-bool record_truncation(void *opaque, std::span<const CapturePathStep> path,
+bool record_truncation(void* opaque, ::tracer::compat::span<const CapturePathStep> path,
                        std::uint64_t total, std::uint64_t captured) noexcept {
   auto &log = *static_cast<TruncationLog *>(opaque);
   if (log.size == log.entries.size() ||
@@ -310,10 +312,10 @@ void ContextCapturePool::Lease::reset() noexcept {
   schema_token_.reset();
 }
 
-CaptureResult ContextCapturePool::Lease::capture(
-    const CaptureEventMetadata &event,
-    std::span<const CaptureSchemaView> schemas,
-    std::span<const CaptureStateView> states) noexcept {
+CaptureResult
+ContextCapturePool::Lease::capture(const CaptureEventMetadata& event,
+                                   ::tracer::compat::span<const CaptureSchemaView> schemas,
+                                   ::tracer::compat::span<const CaptureStateView> states) noexcept {
   if (!slot_state_ || captured_ || !valid_identifier(event.event_id) ||
       !valid_identifier(event.source_id) || !valid_identifier(event.task_id) ||
       !valid_identifier(event.parent_task_id, true) ||
@@ -383,9 +385,8 @@ CaptureResult ContextCapturePool::Lease::capture(
   limits.visits = 8192; // The codec budget accounts for the other 8192.
   limits.items = 4096;
   limits.depth = 32;
-  const std::span<std::byte> event_storage(slot_state_->arena->storage.data() +
-                                               slot_ * kCaptureEventBytes,
-                                           kCaptureEventBytes);
+  const ::tracer::compat::span<std::byte> event_storage(
+      slot_state_->arena->storage.data() + slot_ * kCaptureEventBytes, kCaptureEventBytes);
   BoundedProtoWriter writer(event_storage, limits);
   if (!writer.string(1, event.event_id) || !writer.string(2, event.source_id) ||
       !writer.u64(3, event.source_sequence) ||
@@ -488,7 +489,7 @@ ContextCapturePool::Lease::schema_lease_token() const noexcept {
   return schema_token_;
 }
 
-std::span<const std::byte> ContextCapturePool::Lease::bytes() const noexcept {
+::tracer::compat::span<const std::byte> ContextCapturePool::Lease::bytes() const noexcept {
   if (!slot_state_ || !captured_)
     return {};
   return {slot_state_->arena->storage.data() + slot_ * kCaptureEventBytes,
@@ -550,7 +551,7 @@ CaptureSchemaSetLease::record(std::size_t index) const noexcept {
   return index < size_ ? records_[index].get() : nullptr;
 }
 
-std::span<const std::byte> CaptureSchemaSetLease::event_bytes() const noexcept {
+::tracer::compat::span<const std::byte> CaptureSchemaSetLease::event_bytes() const noexcept {
   if (!arena_ || !event_bytes_size_ || event_bytes_size_ > kCaptureEventBytes)
     return {};
   return {arena_->storage.data() + slot_ * kCaptureEventBytes,

@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "injector.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer {
 namespace {
@@ -398,7 +399,14 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
                   candidate.original.begin());
       std::copy_n(response.pthread_create_installed, candidate.size,
                   candidate.installed.begin());
-      const auto proven_entry = process.resolve_remote_symbol("pthread_create");
+      injector::CodePatch owned_scheduler_patch{};
+      if (pthread_create_patch_committed_ && pthread_create_patch_) {
+        const auto& owned = *pthread_create_patch_;
+        owned_scheduler_patch = {owned.entry, owned.original.data(), owned.installed.data(),
+                                 owned.size};
+      }
+      const auto proven_entry = process.resolve_remote_symbol(
+          "pthread_create", owned_scheduler_patch.size ? &owned_scheduler_patch : nullptr);
       bool proven_patch_entry = candidate.entry == proven_entry;
       if (!proven_patch_entry &&
           proven_entry <= std::numeric_limits<std::uintptr_t>::max() - 4 &&
@@ -449,7 +457,7 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
           patch_applied = process.patch_code_batch(patch_set);
         } else {
           patch_applied = process.patch_code_batch(
-              std::span<const injector::CodePatch>(&target_patch, 1));
+              ::tracer::compat::span<const injector::CodePatch>(&target_patch, 1));
         }
       } catch (const std::exception &error) {
         // A failed peer release can report an error after the bytes changed.
@@ -778,7 +786,7 @@ bool Session::stop_probe_locked(
               scheduler.entry, scheduler.installed.data(),
               scheduler.original.data(), scheduler.size};
           if (process.patch_code_batch(
-                  std::span<const injector::CodePatch>(&restore, 1))) {
+                  ::tracer::compat::span<const injector::CodePatch>(&restore, 1))) {
             restored_scheduler = true;
             break;
           }

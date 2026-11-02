@@ -1,5 +1,3 @@
-#include "context_runtime.hpp"
-
 #include <any>
 #include <array>
 #include <cstring>
@@ -9,9 +7,11 @@
 #include <thread>
 #include <vector>
 
+#include "context_runtime.hpp"
 #include "context_stdlib.hpp"
 #include "context_transport.pb.h"
 #include "tracer/callback.hpp"
+#include "tracer/compat.hpp"
 
 namespace {
 struct RuntimeScope {};
@@ -120,8 +120,9 @@ struct Sink {
   std::vector<std::byte> last;
   std::shared_ptr<const void> schemas;
 };
-bool publish(void *opaque, std::span<const std::byte> bytes,
-             const std::shared_ptr<const void> &schemas) noexcept {
+
+bool publish(void* opaque, ::tracer::compat::span<const std::byte> bytes,
+             const std::shared_ptr<const void>& schemas) noexcept {
   auto &sink = *static_cast<Sink *>(opaque);
   try {
     sink.last.assign(bytes.begin(), bytes.end());

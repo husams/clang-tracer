@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "tracer/compat.hpp"
+
 namespace tracer::context_query {
 namespace {
 using FD = google::protobuf::FieldDescriptor;
@@ -15,7 +17,8 @@ using context_engine::ReceiverSchemaView;
 
 class RoleIndex final {
 public:
-  explicit RoleIndex(std::span<const std::string> roles) : roles_(roles) {}
+  explicit RoleIndex(::tracer::compat::span<const std::string> roles)
+      : roles_(roles) {}
 
   std::string_view find(std::string_view path) const noexcept {
     for (const auto &role : roles_) {
@@ -28,13 +31,12 @@ public:
   }
 
 private:
-  std::span<const std::string> roles_;
+  ::tracer::compat::span<const std::string> roles_;
 };
 
 bool sequence_role(std::string_view role) noexcept {
-  return role == "vector" || role == "deque" || role == "list" ||
-         role == "set" || role == "unordered_set" ||
-         role.starts_with("array:");
+  return role == "vector" || role == "deque" || role == "list" || role == "set" ||
+         role == "unordered_set" || ::tracer::compat::starts_with(role, "array:");
 }
 
 bool map_role(std::string_view role) noexcept {

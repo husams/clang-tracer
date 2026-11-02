@@ -17,6 +17,8 @@
 #include <llvm/ADT/SmallString.h>
 #include <llvm/Support/FileSystem.h>
 
+#include "tracer/compat.hpp"
+
 namespace tracer::context_engine {
 namespace {
 using FD = google::protobuf::FieldDescriptorProto;
@@ -101,8 +103,9 @@ bool physical_standard_library_header(clang::ASTContext &ast,
       continue;
     llvm::SmallString<256> canonical_root;
     if (!llvm::sys::fs::real_path(pair.first, canonical_root) &&
-        path.starts_with(llvm::StringRef(canonical_root).str() + "/"))
+        ::tracer::compat::starts_with(path, llvm::StringRef(canonical_root).str() + "/")) {
       return true;
+    }
   }
   return false;
 }
@@ -772,9 +775,9 @@ void hash_length_prefixed(std::uint64_t &hash, std::string_view value) {
 }
 } // namespace
 
-std::string compute_schema_revision_id(
-    std::string_view descriptor_bytes, const StateFamilyKey &family,
-    std::string_view root_type, std::span<const std::string> container_roles) {
+std::string compute_schema_revision_id(std::string_view descriptor_bytes,
+                                       const StateFamilyKey& family, std::string_view root_type,
+                                       ::tracer::compat::span<const std::string> container_roles) {
   std::uint64_t hash = 1469598103934665603ULL;
   hash_length_prefixed(hash, "clang-tracer-context-schema-revision-v1");
   hash_length_prefixed(hash, descriptor_bytes);
@@ -812,7 +815,7 @@ SchemaRecord::SchemaRecord(StateFamilyKey f, std::string root, std::string rev,
 }
 
 CodecSourceResult
-render_state_codec_sources(std::span<const clang::CXXRecordDecl *const> roots) {
+render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* const> roots) {
   CodecSourceResult result;
   std::vector<const clang::CXXRecordDecl *> records;
   std::unordered_set<const clang::CXXRecordDecl *> done, active;
@@ -959,10 +962,10 @@ CodecSourceResult render_state_codec_source(const clang::CXXRecordDecl &root) {
   return render_state_codec_sources(roots);
 }
 
-CodecSourceResult render_context_codec_sources(
-    clang::ASTContext &ast,
-    std::span<const clang::CXXRecordDecl *const> state_roots,
-    std::span<const clang::QualType> payload_roots) {
+CodecSourceResult
+render_context_codec_sources(clang::ASTContext& ast,
+                             ::tracer::compat::span<const clang::CXXRecordDecl* const> state_roots,
+                             ::tracer::compat::span<const clang::QualType> payload_roots) {
   std::vector<const clang::CXXRecordDecl *> roots(state_roots.begin(),
                                                   state_roots.end());
   std::unordered_set<const clang::CXXRecordDecl *> seen(roots.begin(),
@@ -1041,8 +1044,8 @@ CodecSourceResult render_payload_codec_source(clang::ASTContext &ast,
 }
 
 std::vector<RevisionField>
-query_field_path(std::span<const std::shared_ptr<const SchemaRecord>> revisions,
-                 std::span<const std::string_view> path) {
+query_field_path(::tracer::compat::span<const std::shared_ptr<const SchemaRecord>> revisions,
+                 ::tracer::compat::span<const std::string_view> path) {
   std::vector<RevisionField> out;
   out.reserve(revisions.size());
   const StateFamilyKey *family = nullptr;

@@ -1,8 +1,5 @@
 #pragma once
 
-#include "bounded_proto.hpp"
-#include "context_schema.hpp"
-
 #include <algorithm>
 #include <array>
 #include <deque>
@@ -10,19 +7,22 @@
 #include <map>
 #include <optional>
 #include <set>
-#include <span>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include "bounded_proto.hpp"
+#include "context_schema.hpp"
+#include "tracer/compat.hpp"
+
 namespace tracer::context_engine {
 
 struct EncodeBudget {
   using Selector = CapturePathSelector;
   using PathStep = CapturePathStep;
-  using Truncation = bool (*)(void *, std::span<const PathStep>, std::uint64_t,
+  using Truncation = bool (*)(void*, ::tracer::compat::span<const PathStep>, std::uint64_t,
                               std::uint64_t) noexcept;
   std::size_t max_items = 100, items = 0, visits = 0, depth = 0, path_size = 0;
   CaptureLimits limits{};

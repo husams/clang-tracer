@@ -1,21 +1,24 @@
 #include "context_stream.hpp"
-#include "context_capture.hpp"
-#include "context_journal.hpp"
-#include "context_schema.hpp"
-#include "context_execution.hpp"
-#include "context_diagnostic_format.hpp"
-#include <grpcpp/channel.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <limits>
-#include <stdexcept>
 #include <random>
-#include <array>
+#include <stdexcept>
 #include <tuple>
-#include <cstdio>
+
+#include <grpcpp/channel.h>
 #include <unistd.h>
+
+#include "context_capture.hpp"
+#include "context_diagnostic_format.hpp"
+#include "context_execution.hpp"
+#include "context_journal.hpp"
+#include "context_schema.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer::context_delivery {
 namespace {
@@ -148,13 +151,14 @@ ContextHookRing::~ContextHookRing() {
   g_live_rings.fetch_sub(1, std::memory_order_relaxed);
 }
 
-bool ContextHookRing::try_publish(std::span<const std::byte> bytes,
+bool ContextHookRing::try_publish(::tracer::compat::span<const std::byte> bytes,
                                   std::shared_ptr<const void> lease) noexcept {
   const HookPacketView packet{bytes, std::move(lease)};
-  return try_publish_batch(std::span<const HookPacketView>(&packet, 1));
+  return try_publish_batch(::tracer::compat::span<const HookPacketView>(&packet, 1));
 }
 
-bool ContextHookRing::try_publish_batch(std::span<const HookPacketView> packets) noexcept {
+bool ContextHookRing::try_publish_batch(
+    ::tracer::compat::span<const HookPacketView> packets) noexcept {
   std::unique_lock lock(mutex_, std::try_to_lock);
   if (!lock.owns_lock() || packets.empty() || packets.size() > packet_limit_) {
     dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -249,8 +253,8 @@ bool ContextHookRing::try_publish_batch(std::span<const HookPacketView> packets)
 }
 
 bool ContextHookRing::try_publish_capture(
-    std::span<const std::byte> event_record,
-    const std::shared_ptr<const void> &schema_lease) noexcept {
+    ::tracer::compat::span<const std::byte> event_record,
+    const std::shared_ptr<const void>& schema_lease) noexcept {
   const auto *schema_set =
       tracer::context_engine::capture_schema_set(schema_lease);
   if (!schema_set || schema_set->size() > kCaptureSchemasPerEvent) {
@@ -479,11 +483,14 @@ bool ContextExportClient::publish_from_worker(const clangtracer::context::v1::Co
   std::string bytes;
   if (!frame.SerializeToString(&bytes) ||
       bytes.size() > limits_.max_packet_bytes - 16) return false;
-  return hook_ring_.try_publish(std::as_bytes(std::span(bytes.data(), bytes.size())), std::move(lease));
+  return hook_ring_.try_publish(
+      ::tracer::compat::as_bytes(::tracer::compat::span(bytes.data(), bytes.size())),
+      std::move(lease));
 }
+
 bool ContextExportClient::try_publish_capture(
-    std::span<const std::byte> event_record,
-    const std::shared_ptr<const void> &schema_lease) noexcept {
+    ::tracer::compat::span<const std::byte> event_record,
+    const std::shared_ptr<const void>& schema_lease) noexcept {
   return hook_ring_.try_publish_capture(event_record, schema_lease);
 }
 ExportCounters ContextExportClient::counters() const noexcept {
@@ -852,7 +859,11 @@ void ContextExportClient::run() noexcept {
           }
           if (has_event && !malformed) {
             for (const auto &state : event.states()) {
-              if (!complete_schema_definitions.contains(state.schema_identity())) { malformed = true; break; }
+              if (!::tracer::compat::contains(complete_schema_definitions,
+                                              state.schema_identity())) {
+                malformed = true;
+                break;
+              }
             }
           }
           if (malformed) {
@@ -1160,8 +1171,10 @@ grpc::Status ContextExportService::Export(grpc::ServerContext *context,
       ExportCounters cumulative;
       {
         std::lock_guard lock(counter_mutex_);
-        if (!counters_by_session_.contains(open.producer_session_id()) && counters_by_session_.size() >= 4096)
+        if (!::tracer::compat::contains(counters_by_session_, open.producer_session_id()) &&
+            counters_by_session_.size() >= 4096) {
           return {grpc::StatusCode::RESOURCE_EXHAUSTED, "producer counter registry full"};
+        }
         auto &last = counters_by_session_[open.producer_session_id()];
         last.capture_failed = std::max(last.capture_failed, packet.counters().capture_failed());
         last.queue_dropped = std::max(last.queue_dropped, packet.counters().queue_dropped());
@@ -1189,8 +1202,9 @@ grpc::Status ContextExportService::Export(grpc::ServerContext *context,
       } else {
         if (schemas.size() == negotiated_schema_count ||
             schema.ByteSizeLong() > negotiated_schema_bytes - schema_bytes ||
-            identities_by_id.contains(schema.epoch_schema_id()))
+            ::tracer::compat::contains(identities_by_id, schema.epoch_schema_id())) {
           return {grpc::StatusCode::RESOURCE_EXHAUSTED, "schema epoch limit exceeded"};
+        }
         schema_bytes += schema.ByteSizeLong(); schemas.emplace(schema.schema_identity(), schema.SerializeAsString());
         schema_ids.emplace(schema.schema_identity(), schema.epoch_schema_id());
         identities_by_id.emplace(schema.epoch_schema_id(), schema.schema_identity());

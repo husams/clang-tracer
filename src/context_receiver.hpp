@@ -1,14 +1,16 @@
 #pragma once
 
-#include "context_schema.hpp"
-#include <google/protobuf/descriptor.h>
-#include <google/protobuf/descriptor.pb.h>
-#include <google/protobuf/dynamic_message.h>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <span>
 #include <unordered_map>
+
+#include <google/protobuf/descriptor.h>
+#include <google/protobuf/descriptor.pb.h>
+#include <google/protobuf/dynamic_message.h>
+
+#include "context_schema.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer::context_engine {
 struct ReceiverLimits {
@@ -36,11 +38,12 @@ struct DecodedCaptureLimit {
 class DecodedState final {
 public:
   DecodedState() = default;
-  const google::protobuf::Message *message() const noexcept {
-    return message_.get();
-  }
-  const SchemaRecord *schema() const noexcept;
-  std::span<const DecodedCaptureLimit> truncations() const noexcept {
+
+  const google::protobuf::Message* message() const noexcept { return message_.get(); }
+
+  const SchemaRecord* schema() const noexcept;
+
+  ::tracer::compat::span<const DecodedCaptureLimit> truncations() const noexcept {
     return truncations_;
   }
 
@@ -53,8 +56,8 @@ private:
 };
 struct StateAttachmentView {
   std::uint64_t schema_id = 0;
-  std::span<const std::byte> payload;
-  std::span<const CaptureLimitView> truncations{};
+  ::tracer::compat::span<const std::byte> payload;
+  ::tracer::compat::span<const CaptureLimitView> truncations{};
 };
 struct DecodedEvent {
   std::vector<DecodedState> states;
@@ -76,7 +79,7 @@ public:
   const StateFamilyKey &family() const noexcept;
   std::string_view root_type() const noexcept;
   std::string_view revision_id() const noexcept;
-  std::span<const std::string> container_roles() const noexcept;
+  ::tracer::compat::span<const std::string> container_roles() const noexcept;
 
 private:
   friend class ContextReceiver;
@@ -93,34 +96,34 @@ public:
   ~ContextReceiver();
   ContextReceiver(const ContextReceiver &) = delete;
   ContextReceiver &operator=(const ContextReceiver &) = delete;
-  bool register_schema(std::uint64_t id,
-                       const google::protobuf::FileDescriptorSet &,
-                       const std::string &root, StateFamilyKey,
-                       std::string *error = nullptr,
-                       std::span<const std::string> container_roles = {});
-  bool register_schema_set(std::span<const SchemaRegistration>,
-                           std::string *error = nullptr);
+  bool register_schema(std::uint64_t id, const google::protobuf::FileDescriptorSet&,
+                       const std::string& root, StateFamilyKey, std::string* error = nullptr,
+                       ::tracer::compat::span<const std::string> container_roles = {});
+  bool register_schema_set(::tracer::compat::span<const SchemaRegistration>,
+                           std::string* error = nullptr);
   // Engine-only compatibility path for descriptor-only legacy records. The
   // synthesized family is bound to this receiver epoch and schema ID.
   bool register_legacy_schema(std::uint64_t id,
                               const google::protobuf::FileDescriptorSet &,
                               const std::string &root,
                               std::string *error = nullptr);
-  std::optional<DecodedState> decode(std::uint64_t id,
-                                     std::span<const std::byte>,
-                                     std::string *error = nullptr);
-  std::optional<DecodedState> decode(std::uint64_t id,
-                                     std::span<const std::byte>,
-                                     std::span<const CaptureLimitView>,
-                                     std::string *error = nullptr);
-  std::optional<DecodedEvent> decode_event(std::span<const StateAttachmentView>,
-                                           std::string *error = nullptr);
+  std::optional<DecodedState> decode(std::uint64_t id, ::tracer::compat::span<const std::byte>,
+                                     std::string* error = nullptr);
+  std::optional<DecodedState> decode(std::uint64_t id, ::tracer::compat::span<const std::byte>,
+                                     ::tracer::compat::span<const CaptureLimitView>,
+                                     std::string* error = nullptr);
+  std::optional<DecodedEvent> decode_event(::tracer::compat::span<const StateAttachmentView>,
+                                           std::string* error = nullptr);
   void close_epoch() noexcept;
   std::size_t schema_count() const noexcept;
   std::vector<ReceiverSchemaView> admitted_schemas() const;
 
 private:
-  struct Mapping;
+  // GCC 8's unordered_map instantiates its node storage at declaration time.
+  struct Mapping {
+    std::shared_ptr<const SchemaEntry> entry;
+    std::shared_ptr<void> epoch_lease;
+  };
   std::shared_ptr<ReceiverLedger> ledger_;
   ReceiverLimits limits_;
   mutable std::mutex mutex_;

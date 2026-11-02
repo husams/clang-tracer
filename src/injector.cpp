@@ -39,9 +39,17 @@
 #include <unistd.h>
 
 #include "admission.hpp"
+#include "runtime_identity.hpp"
+#include "tracer/compat.hpp"
 
 #ifndef NT_X86_XSTATE
 #define NT_X86_XSTATE 0x202
+#endif
+
+// glibc exposes the seize requests even with this SDK's older kernel headers.
+// The running kernel must still support the existing seize/interrupt protocol.
+#ifndef PTRACE_EVENT_STOP
+#define PTRACE_EVENT_STOP 128
 #endif
 
 namespace tracer::injector {
@@ -302,6 +310,7 @@ struct MapEntry {
   unsigned int device_minor = 0;
   std::uint64_t inode = 0;
   std::string path;
+  bool readable = false, executable = false;
 };
 
 std::vector<MapEntry> read_maps(pid_t process_id) {
@@ -318,6 +327,8 @@ std::vector<MapEntry> read_maps(pid_t process_id) {
       continue;
     }
     MapEntry entry;
+    entry.readable = permissions.find('r') != std::string::npos;
+    entry.executable = permissions.find('x') != std::string::npos;
     const auto dash = range.find('-');
     if (dash == std::string::npos) {
       continue;
@@ -436,8 +447,7 @@ std::string elf_build_id(const char *path) {
       }
     }
   }
-  throw std::runtime_error("local symbol module has no GNU ELF build id; "
-                           "refusing address translation");
+  return {}; // Some SDK runtime libraries intentionally omit GNU build IDs.
 }
 
 } // namespace
@@ -833,7 +843,7 @@ void Process::poison_process() noexcept {
 void Process::mark_unsafe() noexcept { poison_process(); }
 
 void Process::attach(pid_t process_id,
-                     std::span<const ApplicationModule> application_modules) {
+                     ::tracer::compat::span<const ApplicationModule> application_modules) {
 #if !defined(__linux__) || !defined(__x86_64__)
   (void)process_id;
   throw std::runtime_error("native injector is supported only on Linux x86_64");
@@ -1107,7 +1117,7 @@ bool Process::patch_code(std::uintptr_t address, const void *expected,
   return true;
 }
 
-bool Process::patch_code_batch(std::span<const CodePatch> patches) {
+bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches) {
   ensure_usable();
   if (patches.empty())
     return true;
@@ -1542,13 +1552,14 @@ Process::remote_call_raw(std::uintptr_t function,
   return result;
 }
 
-std::uintptr_t Process::resolve_remote_symbol(std::string_view name) {
+std::uintptr_t Process::resolve_remote_symbol(std::string_view name, const CodePatch* owned_patch) {
   ensure_usable();
   if (name.empty() || name.find('\0') != std::string_view::npos) {
     throw std::invalid_argument(
         "symbol name must be nonempty and contain no NUL byte");
   }
-  const std::string symbol_name(name);
+  std::string symbol_name(name);
+  const auto remote_maps = read_maps(tid_);
   ::dlerror();
   void *local_address = ::dlsym(RTLD_DEFAULT, symbol_name.c_str());
   if (const char *error = ::dlerror()) {
@@ -1569,12 +1580,52 @@ std::uintptr_t Process::resolve_remote_symbol(std::string_view name) {
   if (::stat(info.dli_fname, &module_status) != 0) {
     throw_errno("stat local symbol module");
   }
+  // Before glibc 2.34, an otherwise ordinary application need not map libdl.
+  // Bootstrap through libc's loader entry points in that case. These are
+  // admitted only through the SAME mapped ELF/build-id checks below; never
+  // translate an offset between different libc versions.
+  const bool mapped =
+      std::any_of(remote_maps.begin(), remote_maps.end(),
+                  [&](const MapEntry& entry) { return same_file(entry, module_status); });
+  if (!mapped && (name == "dlopen" || name == "dlsym" || name == "__errno_location")) {
+    const char* bootstrap = name == "dlopen"  ? "__libc_dlopen_mode"
+                            : name == "dlsym" ? "__libc_dlsym"
+                                              : "__errno_location";
+    // Old libpthread also exports errno_location; a single-threaded target
+    // legitimately uses libc's implementation without mapping libpthread yet.
+    void* libc_handle = name == "__errno_location"
+                            ? ::dlopen("libc.so.6", RTLD_NOLOAD | RTLD_LAZY | RTLD_LOCAL)
+                            : nullptr;
+    ::dlerror();
+    auto* candidate = ::dlsym(libc_handle ? libc_handle : RTLD_DEFAULT, bootstrap);
+    const auto* lookup_error = ::dlerror();
+    Dl_info bootstrap_info{};
+    struct stat bootstrap_status{};
+    if (!lookup_error && candidate && tracer::runtime::has_soname(candidate, "libc.so.6") &&
+        ::dladdr(candidate, &bootstrap_info) && bootstrap_info.dli_fname &&
+        bootstrap_info.dli_fbase && ::stat(bootstrap_info.dli_fname, &bootstrap_status) == 0 &&
+        std::any_of(remote_maps.begin(), remote_maps.end(),
+                    [&](const MapEntry& entry) { return same_file(entry, bootstrap_status); })) {
+      local_address = candidate;
+      info = bootstrap_info;
+      module_status = bootstrap_status;
+      symbol_name = bootstrap;
+    }
+    if (libc_handle) {
+      ::dlclose(libc_handle);
+    }
+  }
   const std::string build_id = elf_build_id(info.dli_fname);
 
   const auto local_maps = read_maps(::getpid());
-  const auto remote_maps = read_maps(tid_);
   const auto local_bias = map_load_bias(local_maps, module_status);
-  const auto remote_bias = map_load_bias(remote_maps, module_status);
+  std::uintptr_t remote_bias = 0;
+  try {
+    remote_bias = map_load_bias(remote_maps, module_status);
+  } catch (const std::exception& error) {
+    throw std::runtime_error("cannot translate " + symbol_name + " from " + info.dli_fname + ": " +
+                             error.what());
+  }
   const auto actual_local_base =
       reinterpret_cast<std::uintptr_t>(info.dli_fbase);
   if (local_bias != actual_local_base) {
@@ -1582,19 +1633,66 @@ std::uintptr_t Process::resolve_remote_symbol(std::string_view name) {
         "local module mapping identity/base is inconsistent for " +
         symbol_name);
   }
-  // Requiring a build id plus matching device/inode on both hosts binds the
-  // translated offset to the exact local ELF image, rather than a same-named
-  // library from a different runtime installation.
-  if (build_id.empty()) {
-    throw std::runtime_error("local module build id is empty for " +
-                             symbol_name);
-  }
   const auto symbol = reinterpret_cast<std::uintptr_t>(local_address);
   if (symbol < local_bias) {
     throw std::runtime_error(
         "local symbol address precedes its module load base");
   }
-  return remote_bias + (symbol - local_bias);
+  const auto remote_symbol = remote_bias + (symbol - local_bias);
+  if (build_id.empty()) {
+    // SDK libc/libdl may lack a GNU build ID. Keep exact device/inode and
+    // load-bias checks, additionally compare the live loader entry bytes in
+    // both processes and verify that its backing file did not change.
+    // This fallback never permits translating between different runtime files.
+    if ((name != "dlopen" && name != "dlsym" && name != "__errno_location" &&
+         name != "pthread_create") ||
+        (!tracer::runtime::has_soname(local_address, "libc.so.6") &&
+         !tracer::runtime::has_soname(local_address, "libdl.so.2") &&
+         !tracer::runtime::has_soname(local_address, "libpthread.so.0"))) {
+      throw std::runtime_error("runtime loader identity is unavailable for " + symbol_name);
+    }
+    constexpr std::size_t bytes = 32;
+    auto contains_entry = [&](const auto& maps, std::uintptr_t address) {
+      return std::any_of(maps.begin(), maps.end(), [&](const MapEntry& entry) {
+        return same_file(entry, module_status) && entry.readable && entry.executable &&
+               address >= entry.start && address < entry.end && bytes <= entry.end - address;
+      });
+    };
+    std::array<std::uint8_t, bytes> remote_entry{};
+    if (!contains_entry(local_maps, symbol) || !contains_entry(remote_maps, remote_symbol)) {
+      throw std::runtime_error("loader entry is outside its verified executable mapping");
+    }
+    remote_read(remote_symbol, remote_entry.data(), remote_entry.size());
+    if (owned_patch) {
+      // A second shared probe sees this session's already-installed pthread
+      // adapter. Verify its complete live bytes, then compare its original
+      // entry to the exact local ELF, without exempting any other patch.
+      if (name != "pthread_create" || !owned_patch->expected || !owned_patch->replacement ||
+          owned_patch->address < remote_symbol || owned_patch->address - remote_symbol > 4 ||
+          !owned_patch->size ||
+          owned_patch->size > bytes - (owned_patch->address - remote_symbol)) {
+        throw std::runtime_error("invalid owned runtime patch identity");
+      }
+      std::array<std::uint8_t, bytes> installed{};
+      remote_read(owned_patch->address, installed.data(), owned_patch->size);
+      if (std::memcmp(installed.data(), owned_patch->replacement, owned_patch->size) != 0) {
+        throw std::runtime_error("owned runtime patch bytes changed");
+      }
+      std::memcpy(remote_entry.data() + (owned_patch->address - remote_symbol),
+                  owned_patch->expected, owned_patch->size);
+    }
+    struct stat after{};
+    if (std::memcmp(local_address, remote_entry.data(), bytes) != 0 ||
+        ::stat(info.dli_fname, &after) != 0 || after.st_dev != module_status.st_dev ||
+        after.st_ino != module_status.st_ino || after.st_size != module_status.st_size ||
+        after.st_mtim.tv_sec != module_status.st_mtim.tv_sec ||
+        after.st_mtim.tv_nsec != module_status.st_mtim.tv_nsec ||
+        after.st_ctim.tv_sec != module_status.st_ctim.tv_sec ||
+        after.st_ctim.tv_nsec != module_status.st_ctim.tv_nsec) {
+      throw std::runtime_error("loader entry or backing image identity changed");
+    }
+  }
+  return remote_symbol;
 }
 
 } // namespace tracer::injector

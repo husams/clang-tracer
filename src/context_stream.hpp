@@ -1,24 +1,24 @@
 #pragma once
 
-#include "context_transport.grpc.pb.h"
-#include "engine_storage.hpp"
-
-#include <condition_variable>
+#include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <span>
-#include <array>
-#include <atomic>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "context_transport.grpc.pb.h"
+#include "engine_storage.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer::context_delivery {
 class ContextCollectorStore;
@@ -81,7 +81,7 @@ struct HookPacket {
   std::uint64_t reservation = 0;
 };
 struct HookPacketView {
-  std::span<const std::byte> serialized_frame;
+  ::tracer::compat::span<const std::byte> serialized_frame;
   std::shared_ptr<const void> lease;
 };
 
@@ -96,12 +96,11 @@ public:
   ~ContextHookRing();
   ContextHookRing(const ContextHookRing &) = delete;
   ContextHookRing &operator=(const ContextHookRing &) = delete;
-  bool try_publish(std::span<const std::byte> serialized_frame,
+  bool try_publish(::tracer::compat::span<const std::byte> serialized_frame,
                    std::shared_ptr<const void> lease = {}) noexcept;
-  bool try_publish_batch(std::span<const HookPacketView> packets) noexcept;
-  bool try_publish_capture(
-      std::span<const std::byte> event_record,
-      const std::shared_ptr<const void> &schema_lease) noexcept;
+  bool try_publish_batch(::tracer::compat::span<const HookPacketView> packets) noexcept;
+  bool try_publish_capture(::tracer::compat::span<const std::byte> event_record,
+                           const std::shared_ptr<const void>& schema_lease) noexcept;
   bool try_take(HookPacket &packet) noexcept; // Worker only.
   bool reserve_worker_staging(std::size_t bytes,
                               HookPacket::StorageCharge &charge) noexcept;
@@ -153,9 +152,8 @@ public:
   // Worker-only compatibility path; callers from hooks must use hook_ring().
   bool publish_from_worker(const clangtracer::context::v1::ContextFrame &frame,
                            std::shared_ptr<const void> lease = {});
-  bool try_publish_capture(
-      std::span<const std::byte> event_record,
-      const std::shared_ptr<const void> &schema_lease) noexcept;
+  bool try_publish_capture(::tracer::compat::span<const std::byte> event_record,
+                           const std::shared_ptr<const void>& schema_lease) noexcept;
   ExportCounters counters() const noexcept;
   bool ready() const noexcept;
   bool paused() const noexcept;

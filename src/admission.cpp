@@ -29,6 +29,8 @@
 #include <unistd.h>
 
 #include "injector.hpp"
+#include "linux_syscalls.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer::injector {
 
@@ -296,6 +298,27 @@ FileImage load_image_fd(const std::string &path, int fd,
         continue;
       }
       const auto candidate = m.begin - expected_vaddr;
+      // Older GNU ld places a small DSO's RX header and RW data segments
+      // on different virtual pages backed by the SAME file page zero. Only
+      // a candidate consistent with every PT_LOAD is an actual load bias.
+      const bool complete =
+          std::all_of(image.loads.begin(), image.loads.end(), [&](const Elf64_Phdr& load) {
+            if (!load.p_filesz) {
+              return true;
+            }
+            const auto segment_page = (load.p_vaddr / page) * page;
+            if (candidate > std::numeric_limits<std::uint64_t>::max() - segment_page) {
+              return false;
+            }
+            return std::any_of(maps.begin(), maps.end(), [&](const Mapping& entry) {
+              return same_file(entry) && entry.offset == (load.p_offset / page) * page &&
+                     entry.begin == candidate + segment_page &&
+                     ((load.p_flags & PF_X) == 0 || entry.executable);
+            });
+          });
+      if (!complete) {
+        continue;
+      }
       if (bias_found && candidate != image.bias) {
         unavailable("ELF header mappings imply inconsistent load biases");
       }
@@ -456,7 +479,11 @@ FileImage load_executable(pid_t pid, const std::vector<Mapping> &maps) {
 
 FileImage load_libc(const std::vector<Mapping> &maps) {
   for (const auto &m : maps) {
-    if (m.inode == 0 || m.path.find("libc.so") == std::string::npos) {
+    const auto basename = m.path.substr(m.path.find_last_of('/') + 1);
+    const bool candidate =
+        basename == "libc.so.6" || (::tracer::compat::starts_with(basename, "libc-") &&
+                                    ::tracer::compat::ends_with(basename, ".so"));
+    if (m.inode == 0 || !candidate) {
       continue;
     }
     std::string path = m.path;
@@ -471,7 +498,10 @@ FileImage load_libc(const std::vector<Mapping> &maps) {
         static_cast<unsigned>(minor(st.st_dev)) != m.minor_no) {
       continue;
     }
-    return load_image(path, maps, st);
+    auto image = load_image(path, maps, st);
+    if (image.soname == "libc.so.6") {
+      return image;
+    }
   }
   unavailable("cannot identify the mapped libc ELF image");
 }
@@ -596,17 +626,16 @@ bool forbidden_soname(std::string soname) {
   std::transform(
       soname.begin(), soname.end(), soname.begin(),
       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  constexpr std::array<std::string_view, 27> denied = {
-      "libc.so",     "libpthread.so", "libdl.so",    "libstdc++.so",
-      "libgcc_s.so", "libgcc.so",     "libc++.so",   "libc++abi.so",
-      "libllvm",     "libclang",      "libunwind",   "libasan",
-      "libtsan",     "libubsan",      "libomp",      "libgomp",
-      "libatomic",   "libm.so",       "librt.so",    "libresolv.so",
-      "libnss_",     "libutil.so",    "libcrypt.so", "libanl.so",
+  constexpr std::array<std::string_view, 33> denied = {
+      "libc-",       "libpthread-",   "libdl-",   "ld-",          "libm-",       "librt-",
+      "libc.so",     "libpthread.so", "libdl.so", "libstdc++.so", "libgcc_s.so", "libgcc.so",
+      "libc++.so",   "libc++abi.so",  "libllvm",  "libclang",     "libunwind",   "libasan",
+      "libtsan",     "libubsan",      "libomp",   "libgomp",      "libatomic",   "libm.so",
+      "librt.so",    "libresolv.so",  "libnss_",  "libutil.so",   "libcrypt.so", "libanl.so",
       "libgfortran", "clang-tracer",  "libtracer"};
-  return std::any_of(
-      denied.begin(), denied.end(),
-      [&](std::string_view prefix) { return soname.starts_with(prefix); });
+  return std::any_of(denied.begin(), denied.end(), [&](std::string_view prefix) {
+    return ::tracer::compat::starts_with(soname, prefix);
+  });
 }
 
 void require_usable_module(const FileImage &image) {
@@ -766,7 +795,7 @@ std::vector<llvm::dwarf::UnwindRow> rows_for(const FileImage &image,
       continue;
     }
     const auto *cie = fde->getLinkedCIE();
-    if (!cie || cie->getAugmentationString().contains('S')) {
+    if (!cie || ::tracer::compat::contains(cie->getAugmentationString(), 'S')) {
       unavailable("signal-frame or incomplete DWARF CFI is not admissible");
     }
     auto table = llvm::dwarf::createUnwindTable(fde);
@@ -923,7 +952,7 @@ std::uint64_t read_remote(pid_t pid, std::uint64_t address,
   std::uint64_t value = 0;
   iovec local{&value, sizeof(value)};
   iovec remote{reinterpret_cast<void *>(address), sizeof(value)};
-  if (::process_vm_readv(pid, &local, 1, &remote, 1, 0) != sizeof(value)) {
+  if (::tracer::linux_api::process_vm_readv(pid, &local, 1, &remote, 1, 0) != sizeof(value)) {
     unavailable("cannot read a stopped target stack frame");
   }
   return value;
@@ -1037,7 +1066,7 @@ std::vector<ApplicationModule> discover_application_modules(pid_t pid) {
   std::vector<Candidate> candidates;
   for (const auto &mapping : maps) {
     if (!mapping.executable || mapping.inode == 0 || mapping.path.empty() ||
-        mapping.path.front() != '/' || mapping.path.ends_with(" (deleted)")) {
+        mapping.path.front() != '/' || ::tracer::compat::ends_with(mapping.path, " (deleted)")) {
       continue;
     }
     const FileKey key{
@@ -1155,7 +1184,7 @@ std::vector<ApplicationModule> discover_application_modules(pid_t pid) {
 }
 
 void validate_application_modules(pid_t pid,
-                                  std::span<const ApplicationModule> modules) {
+                                  ::tracer::compat::span<const ApplicationModule> modules) {
   if (pid <= 0) {
     throw std::invalid_argument("application module process id is invalid");
   }
@@ -1180,8 +1209,8 @@ void validate_application_modules(pid_t pid,
 }
 
 std::size_t
-require_application_rendezvous(pid_t pid, const user_regs_struct &regs,
-                               std::span<const ApplicationModule> modules) {
+require_application_rendezvous(pid_t pid, const user_regs_struct& regs,
+                               ::tracer::compat::span<const ApplicationModule> modules) {
   if (pid <= 0 || regs.rip == 0) {
     unavailable("invalid stopped-process state");
   }
@@ -1198,7 +1227,7 @@ require_application_rendezvous(pid_t pid, const user_regs_struct &regs,
   auto approved = revalidate_modules(identities, maps, protected_files);
   const auto *start_call_main = libc.named("__libc_start_call_main");
   const auto *start_main = libc.named("__libc_start_main");
-  if (!start_call_main || !start_main) {
+  if (!start_main) {
     unavailable("required exact startup function symbols are unavailable");
   }
   const FileImage *current_image =
@@ -1242,6 +1271,22 @@ require_application_rendezvous(pid_t pid, const user_regs_struct &regs,
       pc = return_pc;
       pc_is_return_address = true;
       continue;
+    }
+    if (!start_call_main) {
+      // glibc 2.23 calls main directly from __libc_start_main. Unlike its
+      // newer dedicated wrapper, that routine also runs initializers, so
+      // require the final application frame to be the ELF's exact main.
+      const auto* main = executable.named("main");
+      const auto application_pc = pc_is_return_address ? pc - 1 : pc;
+      if (!main || !main->size || current_image != &executable ||
+          application_pc < executable.runtime(*main) ||
+          application_pc - executable.runtime(*main) >= main->size ||
+          caller_pc < libc.runtime(*start_main) ||
+          caller_pc - libc.runtime(*start_main) >= start_main->size ||
+          !libc.executable_pc(caller_pc, maps)) {
+        unavailable("legacy libc startup requires a proven main application frame");
+      }
+      return application_frames;
     }
     if (caller_pc < libc.runtime(*start_call_main) ||
         caller_pc - libc.runtime(*start_call_main) >= start_call_main->size ||

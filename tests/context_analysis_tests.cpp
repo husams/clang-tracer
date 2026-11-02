@@ -13,6 +13,7 @@
 #include "context_owner.hpp"
 #include "context_test_config.hpp"
 #include "shared_context_nested_generated.hpp"
+#include "tracer/compat.hpp"
 
 void verify_context_binding();
 void verify_generated_owner();
@@ -178,7 +179,7 @@ void verify_owner_rendering() {
   const auto generated = tracer::generate_context_owner(*ast);
   require(generated.error.empty() && generated.states.size() == 1 &&
               generated.states[0].type.state_type == "demo::RequestState" &&
-              generated.compilation_copy.starts_with(before),
+              ::tracer::compat::starts_with(generated.compilation_copy, before),
           "owner renderer changed the original nested example");
   require(sources.getBufferData(sources.getMainFileID()) == before,
           "owner renderer changed the original compiler buffer");
@@ -280,8 +281,8 @@ int main(int argc, char **argv) {
                 interceptor.hooks[1].events &&
                 interceptor.hooks[1].injected == interceptor.hooks[0].injected,
             "injection/snapshot requirements were not discovered");
-    require(tracer::context_activation_error(nested).starts_with(
-                "unsupported_state_support_profile:"),
+    require(::tracer::compat::starts_with(tracer::context_activation_error(nested),
+                                          "unsupported_state_support_profile:"),
             "unvalidated state support was admitted");
 
     const auto ordinary =
@@ -322,18 +323,18 @@ int main(int argc, char **argv) {
     const auto invalid =
         analyze("struct Data {}; struct Hook { Hook(State<Data>); void "
                 "pre(const Call&, Data&) {} }; ");
-    require(invalid.error.starts_with("invalid_state_marker:"),
+    require(::tracer::compat::starts_with(invalid.error, "invalid_state_marker:"),
             "unmarked state was accepted");
     const auto mismatch =
         analyze("struct Scope {}; struct Data : state<Scope> {}; struct Other "
                 "{}; struct Hook { "
                 "Hook(State<Data>); void pre(const Call&, Other&) {} }; ");
-    require(mismatch.error.starts_with("invalid_state_injection:"),
+    require(::tracer::compat::starts_with(mismatch.error, "invalid_state_injection:"),
             "missing dependency was accepted");
     const auto body =
         analyze("struct Scope {}; struct Data : state<Scope> {}; struct Hook { "
                 "Hook(State<Data>) {} void pre(const Call&, Data&) {} }; ");
-    require(body.error.starts_with("invalid_state_constructor:"),
+    require(::tracer::compat::starts_with(body.error, "invalid_state_constructor:"),
             "user constructor body was treated as generated");
     std::cout << "7 Clang context declaration/admission checks passed\n";
   } catch (const std::exception &error) {

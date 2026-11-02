@@ -2,13 +2,14 @@
 
 // Native test owner. Production admission still requires a privately bound,
 // validated owner/support generation; this fixture does not enable that path.
-#include "context_engine.hpp"
-
 #include <map>
 #include <stdexcept>
 #include <type_traits>
 #include <typeindex>
 #include <utility>
+
+#include "context_engine.hpp"
+#include "tracer/compat.hpp"
 
 namespace engine {
 namespace ce = tracer::context_engine;
@@ -90,7 +91,7 @@ private:
 template <class T, class F> void inspect(ce::Context &context, F &&function) {
   const auto slot = request<T>();
   ce::HookExit exit(context);
-  ce::HookAccess access(context, std::span(&slot, 1));
+  ce::HookAccess access(context, ::tracer::compat::span(&slot, 1));
   function(*static_cast<T *>(access.ref(slot)));
 }
 } // namespace engine

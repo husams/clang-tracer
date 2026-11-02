@@ -3,16 +3,15 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
 #include <set>
-#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include <dlfcn.h>
 #include <link.h>
 #include <signal.h>
 #include <sys/auxv.h>
@@ -26,10 +25,12 @@
 #include "admission.hpp"
 #include "injector.hpp"
 #include "shared_stack.hpp"
+#include "tracer/compat.hpp"
 
 extern "C" void admission_busy_leaf(std::uint64_t *calls);
 
 namespace {
+bool legacy_stripped_startup = false;
 
 using namespace std::chrono_literals;
 
@@ -275,7 +276,7 @@ std::vector<tracer::injector::ApplicationModule> verify_module_discovery(
     paths.insert(std::filesystem::canonical(path));
   }
   for (const auto &expected : expected_modules) {
-    require(paths.contains(std::filesystem::canonical(expected)),
+    require(::tracer::compat::contains(paths, std::filesystem::canonical(expected)),
             "automatic discovery omitted expected DSO " + expected.string());
   }
 
@@ -284,7 +285,7 @@ std::vector<tracer::injector::ApplicationModule> verify_module_discovery(
       reinterpret_cast<std::uintptr_t>(&::dl_iterate_phdr));
   require(::dladdr(libc_symbol, &libc_info) != 0 && libc_info.dli_fname,
           "could not identify libc for discovery exclusion check");
-  require(!paths.contains(std::filesystem::canonical(libc_info.dli_fname)),
+  require(!::tracer::compat::contains(paths, std::filesystem::canonical(libc_info.dli_fname)),
           "automatic discovery included libc");
 
   const auto loader_base = ::getauxval(AT_BASE);
@@ -295,18 +296,21 @@ std::vector<tracer::injector::ApplicationModule> verify_module_discovery(
               0 &&
           loader_info.dli_fname,
       "could not identify the dynamic loader for discovery exclusion check");
-  require(!paths.contains(std::filesystem::canonical(loader_info.dli_fname)),
+  require(!::tracer::compat::contains(paths, std::filesystem::canonical(loader_info.dli_fname)),
           "automatic discovery included the dynamic loader");
   std::printf("automatic module snapshot pid=%ld count=%zu\n",
               static_cast<long>(pid), discovered.size());
   return discovered;
 }
 
-void run_case(
-    TracedChild &child, const std::uint64_t *progress, bool expect_admitted,
-    std::size_t minimum_depth, const char *label,
-    std::span<const tracer::injector::ApplicationModule> approved = {},
-    const std::uint64_t *failures = nullptr) {
+void run_case(TracedChild& child, const std::uint64_t* progress, bool expect_admitted,
+              std::size_t minimum_depth, const char* label,
+              ::tracer::compat::span<const tracer::injector::ApplicationModule> approved = {},
+              const std::uint64_t* failures = nullptr) {
+  const bool require_legacy_rejection = legacy_stripped_startup && expect_admitted;
+  if (require_legacy_rejection) {
+    expect_admitted = false;
+  }
   (void)wait_for_progress(progress);
   child.seize_and_stop();
   const auto before = load_progress(progress);
@@ -324,6 +328,11 @@ void run_case(
   require(admitted == expect_admitted,
           std::string(label) + (expect_admitted ? " was rejected: " + rejection
                                                 : " unexpectedly admitted"));
+  if (require_legacy_rejection) {
+    require(rejection == "legacy libc startup requires a proven main application frame",
+            std::string(label) +
+                " did not enforce the stripped legacy-main boundary: " + rejection);
+  }
   if (admitted) {
     require(app_depth >= minimum_depth,
             std::string(label) + " reported too few executable frames: " +
@@ -353,7 +362,11 @@ void run_case(
 
 } // namespace
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) try {
+#if defined(__GLIBC__) && !__GLIBC_PREREQ(2, 34)
+  legacy_stripped_startup =
+      std::filesystem::path(argv[0]).filename() == "admission-integration-stripped";
+#endif
   std::vector<std::filesystem::path> expected_modules;
   for (int index = 1; index < argc; ++index) {
     const std::string option = argv[index];
@@ -486,4 +499,8 @@ int main(int argc, char **argv) {
           "could not release shared progress counters");
   std::puts("admission integration passed");
   return 0;
+} catch (const std::exception& error) {
+
+  std::fprintf(stderr, "admission integration failed: %s\n", error.what());
+  return 1;
 }

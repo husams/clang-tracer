@@ -24,6 +24,8 @@
 #include <llvm/Support/SHA256.h>
 #include <llvm/TargetParser/Triple.h>
 #include <sys/stat.h>
+
+#include "tracer/compat.hpp"
 #if defined(__linux__)
 #include <sys/sysmacros.h>
 #endif
@@ -249,15 +251,15 @@ std::vector<std::string> modules(std::uint32_t pid, bool include_runtime = false
     in >> range >> perms >> offset >> dev >> inode;
     std::getline(in >> std::ws, path);
     if (perms.find('x') == std::string::npos || path.empty() || path[0] != '/' ||
-        path.ends_with(" (deleted)")) {
+        ::tracer::compat::ends_with(path, " (deleted)")) {
       continue;
     }
     const auto base = std::filesystem::path(path).filename().string();
     bool runtime = false;
-    for (const char* prefix :
-         {"libc.", "ld-linux", "libpthread", "libdl.", "librt.", "libm.", "libstdc++", "libgcc_s",
-          "libclang", "libLLVM", "libprotobuf", "libgrpc", "libabsl"}) {
-      if (base.starts_with(prefix)) {
+    for (const char* prefix : {"libc-", "libdl-", "librt-", "libm-", "ld-", "libc.", "ld-linux",
+                               "libpthread", "libdl.", "librt.", "libm.", "libstdc++", "libgcc_s",
+                               "libclang", "libLLVM", "libprotobuf", "libgrpc", "libabsl"}) {
+      if (::tracer::compat::starts_with(base, prefix)) {
         runtime = true;
       }
     }
@@ -317,7 +319,7 @@ std::vector<ExecutableMapping> read_executable_mappings(
       continue;
     }
     std::getline(in >> std::ws, path);
-    if (!path_set.contains(path)) {
+    if (!::tracer::compat::contains(path_set, path)) {
       continue;
     }
     const auto dash = range.find('-');
@@ -641,7 +643,7 @@ struct CallableShape {
 };
 
 CallableShape describe_callable(DWARFDie die, DWARFDie decl) {
-  if (name(decl).starts_with("~") || name(decl) == name(decl.getParent())) {
+  if (::tracer::compat::starts_with(name(decl), "~") || name(decl) == name(decl.getParent())) {
     throw std::runtime_error("debug constructors/destructors are unsupported");
   }
   if (number(decl, dw::DW_AT_calling_convention, dw::DW_CC_normal) != dw::DW_CC_normal) {
@@ -797,7 +799,8 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
         const auto qname = qualified(decl);
         if (!qname.empty() && (compact(qname) == selected_name || name(decl) == selected_name)) {
           try {
-            if (name(decl).starts_with("~") || name(decl) == name(decl.getParent())) {
+            if (::tracer::compat::starts_with(name(decl), "~") ||
+                name(decl) == name(decl.getParent())) {
               throw std::runtime_error("debug constructors/destructors are unsupported");
             }
             if (number(decl, dw::DW_AT_calling_convention, dw::DW_CC_normal) != dw::DW_CC_normal) {

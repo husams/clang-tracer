@@ -11,16 +11,17 @@
 #include <clang/AST/Attr.h>
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/ExprCXX.h>
+#include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/AST/Stmt.h>
 #include <clang/Basic/Linkage.h>
 #include <clang/Frontend/ASTUnit.h>
-#include <clang/AST/RecursiveASTVisitor.h>
 #include <llvm/ADT/SmallString.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Path.h>
 
 #include "context_analysis.hpp"
 #include "context_paths.hpp"
+#include "tracer/compat.hpp"
 
 #ifndef TRACER_CONTEXT_SYSTEM_ROOTS
 #define TRACER_CONTEXT_SYSTEM_ROOTS ""
@@ -47,7 +48,8 @@ bool user_method(const clang::FunctionDecl *function) {
   if (!function || !function->isUserProvided() || !function->hasBody())
     return false;
   const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(function);
-  return !method || !method->getParent()->getQualifiedNameAsString().starts_with("std::");
+  return !method ||
+         !::tracer::compat::starts_with(method->getParent()->getQualifiedNameAsString(), "std::");
 }
 
 bool contains_exception_ptr_impl(
@@ -82,7 +84,9 @@ bool contains_exception_ptr_impl(
   }
   // Walk user records only; standard-library representation internals are
   // deliberately summarized by their template arguments above.
-  if (record->getQualifiedNameAsString().starts_with("std::")) return false;
+  if (::tracer::compat::starts_with(record->getQualifiedNameAsString(), "std::")) {
+    return false;
+  }
   if (const auto *definition = record->getDefinition())
     for (const auto *field : definition->fields())
       if (contains_exception_ptr_impl(field->getType(), seen)) return true;
@@ -238,7 +242,7 @@ public:
         effects_.invalid = exception_ptr_error();
     const auto name = callee->getQualifiedNameAsString();
     const auto short_name = callee->getNameAsString();
-    const bool standard_namespace = name.starts_with("std::");
+    const bool standard_namespace = ::tracer::compat::starts_with(name, "std::");
     if ((standard_namespace &&
          (short_name == "terminate" || short_name == "abort" ||
           short_name == "set_new_handler" || short_name == "set_terminate")) ||
@@ -282,11 +286,12 @@ public:
         effects_.may_throw = true;
       const auto type_name =
           construction->getType().getCanonicalType().getAsString();
-      if ((type_name.starts_with("std::basic_string<") ||
-           type_name.starts_with("std::__1::basic_string<") ||
-           type_name.starts_with("std::__cxx11::basic_string<")) &&
-          construction->getNumArgs() != 0)
+      if ((::tracer::compat::starts_with(type_name, "std::basic_string<") ||
+           ::tracer::compat::starts_with(type_name, "std::__1::basic_string<") ||
+           ::tracer::compat::starts_with(type_name, "std::__cxx11::basic_string<")) &&
+          construction->getNumArgs() != 0) {
         effects_.may_allocate = true;
+      }
     }
     return true;
   }
@@ -301,20 +306,16 @@ public:
   bool VisitCXXMemberCallExpr(clang::CXXMemberCallExpr *call) {
     append_container_mutation(call, effects_, catch_depth_);
     const auto *method = call->getMethodDecl();
-    if (method && method->getParent()->getQualifiedNameAsString().starts_with(
-                      "std::") &&
-        (method->getNameAsString() == "push_back" ||
-         method->getNameAsString() == "emplace_back" ||
-         method->getNameAsString() == "emplace" ||
-         method->getNameAsString() == "insert" ||
+    if (method &&
+        ::tracer::compat::starts_with(method->getParent()->getQualifiedNameAsString(), "std::") &&
+        (method->getNameAsString() == "push_back" || method->getNameAsString() == "emplace_back" ||
+         method->getNameAsString() == "emplace" || method->getNameAsString() == "insert" ||
          method->getNameAsString() == "try_emplace" ||
-         method->getNameAsString() == "insert_or_assign" ||
-         method->getNameAsString() == "append" ||
-         method->getNameAsString() == "assign" ||
-         method->getNameAsString() == "reserve" ||
-         method->getNameAsString() == "resize" ||
-         method->getNameAsString() == "operator+="))
+         method->getNameAsString() == "insert_or_assign" || method->getNameAsString() == "append" ||
+         method->getNameAsString() == "assign" || method->getNameAsString() == "reserve" ||
+         method->getNameAsString() == "resize" || method->getNameAsString() == "operator+=")) {
       effects_.may_allocate = true;
+    }
     return true;
   }
   bool VisitGCCAsmStmt(clang::GCCAsmStmt *) {
@@ -337,8 +338,15 @@ private:
 bool user_source_location(const clang::SourceManager &sources,
                           clang::SourceLocation location) {
   if (!location.isValid()) return false;
+  const auto expansion = sources.getExpansionLoc(location);
   location = sources.getSpellingLoc(location);
-  const auto filename = sources.getFilename(location);
+  auto filename = sources.getFilename(location);
+  // Token-pasted gthread declarations in GCC 8 have scratch-buffer spelling
+  // locations. Their expansion still belongs to the physical SDK header.
+  if (filename.empty() && expansion.isValid()) {
+    location = expansion;
+    filename = sources.getFilename(location);
+  }
   if (filename.empty()) return true;
   llvm::SmallString<256> physical;
   // Header search classification (-isystem, #pragma GCC system_header) is
@@ -353,8 +361,10 @@ bool user_source_location(const clang::SourceManager &sources,
     if (pair.first.empty()) continue;
     llvm::SmallString<256> root;
     if (!llvm::sys::fs::real_path(pair.first, root) &&
-        llvm::StringRef(physical).starts_with(llvm::StringRef(root).str() + "/"))
+        ::tracer::compat::starts_with(llvm::StringRef(physical),
+                                      llvm::StringRef(root).str() + "/")) {
       return false;
+    }
   }
 
   try {
@@ -405,8 +415,9 @@ void collect_nested_user_records(
   const auto *definition = record->getDefinition();
   if (!definition || !seen.insert(record).second) return;
   const auto name = record->getQualifiedNameAsString();
-  const bool standard = name.starts_with("std::") ||
-      name.starts_with("__gnu_cxx::") || name.starts_with("__cxxabiv1::");
+  const bool standard = ::tracer::compat::starts_with(name, "std::") ||
+                        ::tracer::compat::starts_with(name, "__gnu_cxx::") ||
+                        ::tracer::compat::starts_with(name, "__cxxabiv1::");
   if (!standard) records.push_back(definition);
   if (const auto *special =
           llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record)) {
@@ -425,10 +436,11 @@ void collect_nested_user_records(
 }
 
 bool reserved_native_identity(std::string_view name) {
-  return name.starts_with("std::") || name.starts_with("::std::") ||
-      name.starts_with("_Unwind_") || name.starts_with("__cxa_") ||
-      name == "operator new" || name == "operator new[]" ||
-      name == "operator delete" || name == "operator delete[]";
+  return ::tracer::compat::starts_with(name, "std::") ||
+         ::tracer::compat::starts_with(name, "::std::") ||
+         ::tracer::compat::starts_with(name, "_Unwind_") ||
+         ::tracer::compat::starts_with(name, "__cxa_") || name == "operator new" ||
+         name == "operator new[]" || name == "operator delete" || name == "operator delete[]";
 }
 
 class NativeDeclarationGuard final
@@ -445,8 +457,8 @@ public:
       if (spelling == "asm" || spelling == "alias" || spelling == "ifunc" ||
           spelling == "section" || spelling == "target" ||
           spelling == "target_clones") {
-        error_ = "unsupported_context_native_declaration: user " +
-                 std::string(spelling) + " attribute is not admitted";
+        error_ = "unsupported_context_native_declaration: user " + std::string(spelling) +
+                 " attribute is not admitted at " + decl->getLocation().printToString(sources_);
         return true;
       }
     }
@@ -561,12 +573,15 @@ std::string validate(clang::ASTUnit &unit) {
   std::vector<const clang::CXXRecordDecl *> payload_records;
   std::unordered_set<const clang::CXXRecordDecl *> payload_seen;
   for (const auto *record : records)
-    if (state_types.contains(record->getQualifiedNameAsString()))
+    if (::tracer::compat::contains(state_types, record->getQualifiedNameAsString())) {
       collect_nested_user_records(
-          context.getTypeDeclType(static_cast<const clang::TypeDecl *>(record)),
-          payload_records, payload_seen);
+          context.getTypeDeclType(static_cast<const clang::TypeDecl*>(record)), payload_records,
+          payload_seen);
+    }
   for (const auto *record : records) {
-    if (!payload_seen.contains(record->getCanonicalDecl())) continue;
+    if (!::tracer::compat::contains(payload_seen, record->getCanonicalDecl())) {
+      continue;
+    }
     for (const auto *constructor : record->ctors())
       if (constructor->hasBody()) roots.push_back(constructor->getCanonicalDecl());
     if (const auto *destructor = record->getDestructor();
@@ -605,7 +620,7 @@ std::string validate(clang::ASTUnit &unit) {
     if (found == graph.end()) return parent_depth;
     const auto &effects = found->second;
     path_owns |= effects.owns_or_escapes;
-    if (active.contains(function)) {
+    if (::tracer::compat::contains(active, function)) {
       if (parent_depth > 0 || path_owns)
         error = "context_exception_capacity_unbounded: recursive call path "
                 "has active catches or owning/pointer escape";
@@ -664,7 +679,9 @@ std::string validate(clang::ASTUnit &unit) {
              "or allocate";
   }
   for (const auto *function : reachable) {
-    if (!graph.contains(function->getCanonicalDecl())) continue;
+    if (!::tracer::compat::contains(graph, function->getCanonicalDecl())) {
+      continue;
+    }
     const auto *function_type =
         function->getType()->getAs<clang::FunctionProtoType>();
     if (!function_type || !function_type->isNothrow()) continue;

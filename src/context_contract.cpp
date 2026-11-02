@@ -21,6 +21,7 @@
 
 #include "context_binding.hpp"
 #include "context_paths.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer {
 namespace {
@@ -50,9 +51,10 @@ bool physical_standard_library_record(clang::ASTContext &context,
       continue;
     llvm::SmallString<256> root;
     if (!llvm::sys::fs::real_path(pair.first, root) &&
-        llvm::StringRef(physical).starts_with(llvm::StringRef(root).str() +
-                                              "/"))
+        ::tracer::compat::starts_with(llvm::StringRef(physical),
+                                      llvm::StringRef(root).str() + "/")) {
       return true;
+    }
   }
   return false;
 }
@@ -382,12 +384,10 @@ public:
     llvm::SmallString<256> engine;
     if (!llvm::sys::fs::real_path(context_header_directory(), engine)) {
       const auto filename = llvm::sys::path::filename(physical);
-      trusted =
-          llvm::StringRef(physical).starts_with(llvm::StringRef(engine).str() +
-                                                "/") &&
-          (filename == "context_facade.hpp" ||
-           filename == "context_codec.hpp" || filename == "bounded_proto.cpp" ||
-           filename == "bounded_proto.hpp");
+      trusted = ::tracer::compat::starts_with(llvm::StringRef(physical),
+                                              llvm::StringRef(engine).str() + "/") &&
+                (filename == "context_facade.hpp" || filename == "context_codec.hpp" ||
+                 filename == "bounded_proto.cpp" || filename == "bounded_proto.hpp");
       for (const auto &candidate :
            {llvm::StringRef(engine).str() + "/tracer/callback.hpp",
             llvm::StringRef(engine).str() +
@@ -405,8 +405,8 @@ public:
       roots = pair.second;
       llvm::SmallString<256> root;
       if (!pair.first.empty() && !llvm::sys::fs::real_path(pair.first, root) &&
-          llvm::StringRef(physical).starts_with(llvm::StringRef(root).str() +
-                                                "/")) {
+          ::tracer::compat::starts_with(llvm::StringRef(physical),
+                                        llvm::StringRef(root).str() + "/")) {
         trusted = true;
         break;
       }
@@ -466,8 +466,8 @@ void find_records(clang::DeclContext &context, clang::ASTContext &ast_context,
     if (const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(decl)) {
       if (record->isThisDeclarationADefinition() && !record->isImplicit()) {
         const auto canonical = canonical_record_type_name(ast_context, record);
-        if (wanted.contains(record->getQualifiedNameAsString()) ||
-            wanted.contains(canonical)) {
+        if (::tracer::compat::contains(wanted, record->getQualifiedNameAsString()) ||
+            ::tracer::compat::contains(wanted, canonical)) {
           found.push_back(record);
         }
       }
@@ -617,7 +617,7 @@ context_compilation_contract(clang::ASTContext &context,
       matched.insert(canonical_record_type_name(context, record));
     }
     for (const auto &type : wanted) {
-      if (!matched.contains(type) && type.find('<') != std::string::npos) {
+      if (!::tracer::compat::contains(matched, type) && type.find('<') != std::string::npos) {
         return invalid("missing or ambiguous state declaration " + type);
       }
     }

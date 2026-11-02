@@ -3,7 +3,6 @@
 #endif
 
 #include <algorithm>
-#include <barrier>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -29,14 +28,15 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <grpcpp/grpcpp.h>
 #include <spawn.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <grpcpp/grpcpp.h>
-
+#include "../src/linux_syscalls.hpp"
+#include "thread_barrier.hpp"
 #include "tracer.grpc.pb.h"
 
 extern char **environ;
@@ -208,7 +208,7 @@ read_process_memory(pid_t pid, std::uintptr_t address, std::size_t size) {
   std::vector<unsigned char> bytes(size);
   iovec local{bytes.data(), bytes.size()};
   iovec remote{reinterpret_cast<void *>(address), bytes.size()};
-  const auto copied = ::process_vm_readv(pid, &local, 1, &remote, 1, 0);
+  const auto copied = ::tracer::linux_api::process_vm_readv(pid, &local, 1, &remote, 1, 0);
   require(copied == static_cast<ssize_t>(size),
           "could not read target function bytes");
   return bytes;
@@ -543,7 +543,7 @@ void run(const std::filesystem::path &server_path,
   const std::string callback =
       read_file(std::filesystem::path(__FILE__).parent_path().parent_path() /
                 "tests/fixtures/probe.cpp");
-  std::barrier attach_gate(3);
+  ThreadBarrier attach_gate(3);
   auto concurrent_attach = [&]() {
     attach_gate.arrive_and_wait();
     return attach_once(*stub, target_a.pid());

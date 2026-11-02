@@ -1,7 +1,8 @@
 #include "bounded_proto.hpp"
 
 #include <algorithm>
-#include <bit>
+
+#include "tracer/compat.hpp"
 
 namespace tracer::context_engine {
 namespace {
@@ -37,10 +38,11 @@ unsigned encode_varint(std::uint64_t value, std::byte *output) noexcept {
   return size;
 }
 } // namespace
-BoundedProtoWriter::BoundedProtoWriter(std::span<std::byte> storage,
+
+BoundedProtoWriter::BoundedProtoWriter(::tracer::compat::span<std::byte> storage,
                                        CaptureLimits limits) noexcept
-    : storage_(storage.first(std::min(storage.size(), limits.bytes))),
-      limits_(limits) {}
+    : storage_(storage.first(std::min(storage.size(), limits.bytes)))
+    , limits_(limits) {}
 bool BoundedProtoWriter::fail(CaptureStatus status) noexcept {
   if (status_ == CaptureStatus::ok)
     status_ = status;
@@ -85,7 +87,7 @@ bool BoundedProtoWriter::u64(std::uint32_t field,
   return tag(field, 0) && varint(value);
 }
 bool BoundedProtoWriter::s64(std::uint32_t field, std::int64_t value) noexcept {
-  const auto bits = std::bit_cast<std::uint64_t>(value);
+  const auto bits = ::tracer::compat::bit_cast<std::uint64_t>(value);
   return u64(field, (bits << 1) ^ (std::uint64_t{0} - (bits >> 63)));
 }
 bool BoundedProtoWriter::boolean(std::uint32_t field, bool value) noexcept {
@@ -101,10 +103,10 @@ bool BoundedProtoWriter::fixed(std::uint64_t bits, unsigned bytes) noexcept {
   return true;
 }
 bool BoundedProtoWriter::f32(std::uint32_t field, float value) noexcept {
-  return tag(field, 5) && fixed(std::bit_cast<std::uint32_t>(value), 4);
+  return tag(field, 5) && fixed(::tracer::compat::bit_cast<std::uint32_t>(value), 4);
 }
 bool BoundedProtoWriter::f64(std::uint32_t field, double value) noexcept {
-  return tag(field, 1) && fixed(std::bit_cast<std::uint64_t>(value), 8);
+  return tag(field, 1) && fixed(::tracer::compat::bit_cast<std::uint64_t>(value), 8);
 }
 bool BoundedProtoWriter::string(std::uint32_t field,
                                 std::string_view value) noexcept {
@@ -164,10 +166,11 @@ bool BoundedProtoWriter::container_items(std::uint64_t total, std::size_t cap,
   selected = count;
   return true;
 }
-std::span<const std::byte> BoundedProtoWriter::finish() noexcept {
+
+::tracer::compat::span<const std::byte> BoundedProtoWriter::finish() noexcept {
   if (depth_)
     fail(CaptureStatus::incomplete_message);
   return status_ == CaptureStatus::ok ? storage_.first(used_)
-                                      : std::span<const std::byte>{};
+                                      : ::tracer::compat::span<const std::byte>{};
 }
 } // namespace tracer::context_engine

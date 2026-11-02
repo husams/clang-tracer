@@ -4,10 +4,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "tracer/compat.hpp"
 
 namespace clang {
 class ASTContext;
@@ -63,7 +64,7 @@ struct CapturePathStep {
 };
 
 struct CaptureLimitView {
-  std::span<const CapturePathStep> path;
+  ::tracer::compat::span<const CapturePathStep> path;
   std::uint64_t total_items = 0, captured_items = 0;
 };
 
@@ -113,9 +114,9 @@ struct SchemaResult {
 // Canonical, unambiguous identity for one immutable schema revision. The
 // descriptor bytes, family components, root and every ordered role are each
 // length-prefixed before hashing; caller-provided role order is significant.
-std::string compute_schema_revision_id(
-    std::string_view descriptor_bytes, const StateFamilyKey &family,
-    std::string_view root_type, std::span<const std::string> container_roles);
+std::string compute_schema_revision_id(std::string_view descriptor_bytes,
+                                       const StateFamilyKey& family, std::string_view root_type,
+                                       ::tracer::compat::span<const std::string> container_roles);
 
 struct CodecSourceResult {
   std::string source, error;
@@ -146,13 +147,13 @@ SchemaResult build_payload_schema(clang::ASTContext &, clang::QualType payload,
 // appends this source to the checked owner compilation unit; no user mappings.
 CodecSourceResult render_state_codec_source(const clang::CXXRecordDecl &);
 CodecSourceResult
-render_state_codec_sources(std::span<const clang::CXXRecordDecl *const> roots);
+render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* const> roots);
 // Combines marked State<T> record roots and generic payload QualTypes into one
 // deduplicated recursive codec emission pass.
-CodecSourceResult render_context_codec_sources(
-    clang::ASTContext &,
-    std::span<const clang::CXXRecordDecl *const> state_roots,
-    std::span<const clang::QualType> payload_roots);
+CodecSourceResult
+render_context_codec_sources(clang::ASTContext&,
+                             ::tracer::compat::span<const clang::CXXRecordDecl* const> state_roots,
+                             ::tracer::compat::span<const clang::QualType> payload_roots);
 // Emits any required user-record codecs plus a root call that encodes payload
 // as field 1; builtin/string/container roots use encode_value directly.
 CodecSourceResult render_payload_codec_source(clang::ASTContext &,
@@ -160,7 +161,7 @@ CodecSourceResult render_payload_codec_source(clang::ASTContext &,
 // Resolves a dotted logical field path independently against each immutable
 // revision. Missing paths remain explicit; renamed fields are never inferred.
 std::vector<RevisionField>
-query_field_path(std::span<const std::shared_ptr<const SchemaRecord>> revisions,
-                 std::span<const std::string_view> path);
+query_field_path(::tracer::compat::span<const std::shared_ptr<const SchemaRecord>> revisions,
+                 ::tracer::compat::span<const std::string_view> path);
 
 } // namespace tracer::context_engine

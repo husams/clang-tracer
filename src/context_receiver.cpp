@@ -10,6 +10,8 @@
 #include <unordered_set>
 #include <utility>
 
+#include "tracer/compat.hpp"
+
 namespace tracer::context_engine {
 struct SchemaEntry {
   StateFamilyKey family;
@@ -25,10 +27,6 @@ struct ReceiverLedger::State {
   mutable std::mutex mutex;
   ReceiverLimits limits;
   std::size_t schema_bytes = 0, decoded_bytes = 0;
-};
-struct ContextReceiver::Mapping {
-  std::shared_ptr<const SchemaEntry> entry;
-  std::shared_ptr<void> epoch_lease;
 };
 
 ReceiverSchemaView::ReceiverSchemaView(std::shared_ptr<const SchemaEntry> entry)
@@ -55,8 +53,7 @@ std::string_view ReceiverSchemaView::revision_id() const noexcept {
   return entry_->identity;
 }
 
-std::span<const std::string>
-ReceiverSchemaView::container_roles() const noexcept {
+::tracer::compat::span<const std::string> ReceiverSchemaView::container_roles() const noexcept {
   return entry_->record->container_roles;
 }
 
@@ -181,11 +178,11 @@ bool validate_descriptor_shape(const google::protobuf::FileDescriptorSet &set,
     return false;
   for (const auto &file : set.file())
     for (const auto &dependency : file.dependency())
-      if (!files.contains(dependency)) {
+      if (!::tracer::compat::contains(files, dependency)) {
         err = "descriptor dependency closure is incomplete";
         return false;
       }
-  if (!messages.contains(root)) {
+  if (!::tracer::compat::contains(messages, root)) {
     err = "root message absent from descriptor bundle";
     return false;
   }
@@ -200,8 +197,8 @@ bool validate_descriptor_shape(const google::protobuf::FileDescriptorSet &set,
       auto name = f->type_name();
       if (!name.empty() && name.front() == '.')
         name.erase(name.begin());
-      if ((t == F::TYPE_ENUM && !enums.contains(name)) ||
-          (t == F::TYPE_MESSAGE && !messages.contains(name))) {
+      if ((t == F::TYPE_ENUM && !::tracer::compat::contains(enums, name)) ||
+          (t == F::TYPE_MESSAGE && !::tracer::compat::contains(messages, name))) {
         err = "descriptor field references an absent type";
         return false;
       }
@@ -212,8 +209,8 @@ bool validate_descriptor_shape(const google::protobuf::FileDescriptorSet &set,
   }
   return true;
 }
-bool read_varint(std::span<const std::byte> b, std::size_t &pos,
-                 std::uint64_t &v) {
+
+bool read_varint(::tracer::compat::span<const std::byte> b, std::size_t& pos, std::uint64_t& v) {
   v = 0;
   for (unsigned i = 0; i < 10 && pos < b.size(); ++i) {
     auto x = std::to_integer<unsigned char>(b[pos++]);
@@ -262,7 +259,8 @@ bool valid_utf8(std::string_view s) {
   }
   return true;
 }
-bool validate_role_order(std::span<const std::string> roles, std::string &err) {
+
+bool validate_role_order(::tracer::compat::span<const std::string> roles, std::string& err) {
   for (std::size_t i = 1; i < roles.size(); ++i) {
     if (roles[i - 1] == roles[i]) {
       err = "duplicate container role";
@@ -281,9 +279,9 @@ bool canonical_decimal(std::string_view digits) {
 struct PayloadScan {
   std::size_t fields = 0, items = 0, charge = 0;
 };
-bool scan_message(const google::protobuf::Descriptor *d,
-                  std::span<const std::byte> b, std::size_t depth,
-                  PayloadScan &s, std::string &err) {
+
+bool scan_message(const google::protobuf::Descriptor* d, ::tracer::compat::span<const std::byte> b,
+                  std::size_t depth, PayloadScan& s, std::string& err) {
   if (depth > 32) {
     err = "payload nesting limit exceeded";
     return false;
@@ -437,8 +435,9 @@ bool scalar_matches_key(const google::protobuf::FieldDescriptor *f,
     return false;
   }
 }
-bool valid_capture_path(const google::protobuf::Descriptor *root,
-                        std::span<const CapturePathStep> path) {
+
+bool valid_capture_path(const google::protobuf::Descriptor* root,
+                        ::tracer::compat::span<const CapturePathStep> path) {
   const auto *current = root;
   const google::protobuf::FieldDescriptor *pending = nullptr;
   for (const auto &step : path) {
@@ -476,9 +475,9 @@ bool valid_capture_path(const google::protobuf::Descriptor *root,
   }
   return true;
 }
-bool validate_container_roles(const google::protobuf::Descriptor *root,
-                              std::span<const std::string> roles,
-                              std::string &err) {
+
+bool validate_container_roles(const google::protobuf::Descriptor* root,
+                              ::tracer::compat::span<const std::string> roles, std::string& err) {
   if (roles.size() > 8192) {
     err = "container role count exceeds limit";
     return false;
@@ -646,9 +645,11 @@ bool validate_container_roles(const google::protobuf::Descriptor *root,
   }
   return true;
 }
-bool validate_container_roles_proto(
-    const google::protobuf::FileDescriptorSet &set, const std::string &root,
-    std::span<const std::string> roles, std::string &err) {
+
+bool validate_container_roles_proto(const google::protobuf::FileDescriptorSet& set,
+                                    const std::string& root,
+                                    ::tracer::compat::span<const std::string> roles,
+                                    std::string& err) {
   using DP = google::protobuf::DescriptorProto;
   using FP = google::protobuf::FieldDescriptorProto;
   std::unordered_map<std::string, const DP *> messages;
@@ -899,7 +900,7 @@ bool validate_container_roles_proto(
       return true;
     for (const auto &field : message->field()) {
       if (field.label() == FP::LABEL_REPEATED &&
-          !role_targets.contains(&field)) {
+          !::tracer::compat::contains(role_targets, &field)) {
         err =
             "repeated descriptor field has no container role: " + field.name();
         return false;
@@ -930,15 +931,21 @@ std::size_t ReceiverLedger::retained_decoded_bytes() const noexcept {
 const SchemaRecord *DecodedState::schema() const noexcept {
   return entry_ ? entry_->record.get() : nullptr;
 }
-ContextReceiver::ContextReceiver(std::shared_ptr<ReceiverLedger> l,
-                                 ReceiverLimits limits)
-    : ledger_(std::move(l)), limits_(limits),
-      legacy_epoch_nonce_(next_legacy_epoch_nonce()) {}
-ContextReceiver::~ContextReceiver() { close_epoch(); }
-bool ContextReceiver::register_schema(
-    std::uint64_t id, const google::protobuf::FileDescriptorSet &set,
-    const std::string &root, StateFamilyKey family, std::string *error,
-    std::span<const std::string> container_roles) {
+
+ContextReceiver::ContextReceiver(std::shared_ptr<ReceiverLedger> l, ReceiverLimits limits)
+    : ledger_(std::move(l))
+    , limits_(limits)
+    , legacy_epoch_nonce_(next_legacy_epoch_nonce()) {}
+
+ContextReceiver::~ContextReceiver() {
+  close_epoch();
+}
+
+bool ContextReceiver::register_schema(std::uint64_t id,
+                                      const google::protobuf::FileDescriptorSet& set,
+                                      const std::string& root, StateFamilyKey family,
+                                      std::string* error,
+                                      ::tracer::compat::span<const std::string> container_roles) {
   SchemaRegistration registration;
   registration.id = id;
   registration.descriptor_set = set;
@@ -946,11 +953,12 @@ bool ContextReceiver::register_schema(
   registration.family = std::move(family);
   registration.container_roles.assign(container_roles.begin(),
                                       container_roles.end());
-  return register_schema_set(
-      std::span<const SchemaRegistration>(&registration, 1), error);
+  return register_schema_set(::tracer::compat::span<const SchemaRegistration>(&registration, 1),
+                             error);
 }
+
 bool ContextReceiver::register_schema_set(
-    std::span<const SchemaRegistration> registrations, std::string *error) {
+    ::tracer::compat::span<const SchemaRegistration> registrations, std::string* error) {
   auto fail = [&](std::string s) {
     if (error)
       *error = std::move(s);
@@ -1125,8 +1133,9 @@ bool ContextReceiver::register_schema_set(
     if (closed_)
       return fail("epoch closed during schema-set construction");
     for (const auto &item : staged)
-      if (schemas_.contains(item.first))
+      if (::tracer::compat::contains(schemas_, item.first)) {
         return fail("schema ID concurrently published");
+      }
     try {
       schemas_.reserve(schemas_.size() + staged.size());
       for (const auto &item : staged)
@@ -1167,15 +1176,16 @@ bool ContextReceiver::register_legacy_schema(
   }
   return register_schema(id, set, root, std::move(family), error, {});
 }
-std::optional<DecodedState>
-ContextReceiver::decode(std::uint64_t id, std::span<const std::byte> bytes,
-                        std::string *error) {
-  return decode(id, bytes, std::span<const CaptureLimitView>{}, error);
+
+std::optional<DecodedState> ContextReceiver::decode(std::uint64_t id,
+                                                    ::tracer::compat::span<const std::byte> bytes,
+                                                    std::string* error) {
+  return decode(id, bytes, ::tracer::compat::span<const CaptureLimitView>{}, error);
 }
+
 std::optional<DecodedState>
-ContextReceiver::decode(std::uint64_t id, std::span<const std::byte> bytes,
-                        std::span<const CaptureLimitView> limits,
-                        std::string *error) {
+ContextReceiver::decode(std::uint64_t id, ::tracer::compat::span<const std::byte> bytes,
+                        ::tracer::compat::span<const CaptureLimitView> limits, std::string* error) {
   auto fail = [&](std::string s) -> std::optional<DecodedState> {
     if (error)
       *error = std::move(s);
@@ -1272,9 +1282,10 @@ ContextReceiver::decode(std::uint64_t id, std::span<const std::byte> bytes,
   }
   return out;
 }
+
 std::optional<DecodedEvent>
-ContextReceiver::decode_event(std::span<const StateAttachmentView> attachments,
-                              std::string *error) {
+ContextReceiver::decode_event(::tracer::compat::span<const StateAttachmentView> attachments,
+                              std::string* error) {
   auto fail = [&](std::string s) -> std::optional<DecodedEvent> {
     if (error)
       *error = std::move(s);

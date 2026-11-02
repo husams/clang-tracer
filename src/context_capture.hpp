@@ -1,15 +1,15 @@
 #pragma once
 
-#include "bounded_proto.hpp"
-#include "context_codec.hpp"
-
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <span>
 #include <string_view>
+
+#include "bounded_proto.hpp"
+#include "context_codec.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer::context_engine {
 struct SchemaRecord;
@@ -56,7 +56,7 @@ struct CaptureSchemaView {
   std::string_view cpp_state_type;
   std::string_view cpp_scope_type;
   std::string_view revision_id;
-  std::span<const std::string> container_roles;
+  ::tracer::compat::span<const std::string> container_roles;
   std::uint64_t epoch_schema_id = 0;
   std::shared_ptr<const SchemaRecord> retained_record;
 };
@@ -69,7 +69,7 @@ public:
   std::size_t size() const noexcept { return size_; }
   std::uint64_t epoch_schema_id(std::size_t) const noexcept;
   const SchemaRecord *record(std::size_t) const noexcept;
-  std::span<const std::byte> event_bytes() const noexcept;
+  ::tracer::compat::span<const std::byte> event_bytes() const noexcept;
 
 private:
   friend struct CaptureSlotState;
@@ -163,16 +163,15 @@ public:
 
     // Serializes one EventRecord. State payloads are read only during this
     // call; schema metadata remains pinned separately by the slot lease.
-    CaptureResult capture(const CaptureEventMetadata &,
-                          std::span<const CaptureSchemaView>,
-                          std::span<const CaptureStateView>) noexcept;
-    std::span<const std::byte> bytes() const noexcept;
+    CaptureResult capture(const CaptureEventMetadata&,
+                          ::tracer::compat::span<const CaptureSchemaView>,
+                          ::tracer::compat::span<const CaptureStateView>) noexcept;
+    ::tracer::compat::span<const std::byte> bytes() const noexcept;
     // Legacy byte-only publication releases after the callback returns.
-    using Publish = bool (*)(void *, std::span<const std::byte>) noexcept;
+    using Publish = bool (*)(void*, ::tracer::compat::span<const std::byte>) noexcept;
     bool publish(Publish, void *) noexcept;
-    using LeasedPublish =
-        bool (*)(void *, std::span<const std::byte>,
-                 const std::shared_ptr<const void> &) noexcept;
+    using LeasedPublish = bool (*)(void*, ::tracer::compat::span<const std::byte>,
+                                   const std::shared_ptr<const void>&) noexcept;
     bool publish_leased(LeasedPublish, void *) noexcept;
     std::shared_ptr<const void> schema_lease_token() const noexcept;
 

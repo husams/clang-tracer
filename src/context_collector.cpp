@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <utility>
 
+#include "tracer/compat.hpp"
+
 namespace tracer::context_delivery {
 namespace {
 using namespace clangtracer::context::v1;
@@ -271,8 +273,7 @@ private:
           reinterpret_cast<const std::byte *>(state.payload().data());
       attachments.push_back(
           {state.epoch_schema_id(),
-           std::span<const std::byte>(payload, state.payload().size()),
-           state_limits});
+           ::tracer::compat::span<const std::byte>(payload, state.payload().size()), state_limits});
     }
     auto result = receiver_.decode_event(attachments, &error);
     if (!result) {

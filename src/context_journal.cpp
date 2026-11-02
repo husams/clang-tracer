@@ -1,19 +1,20 @@
 #include "context_journal.hpp"
 
-#include "context_transport.pb.h"
-
-#include <array>
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <fstream>
-#include <limits>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <system_error>
 
 #include <fcntl.h>
 #include <unistd.h>
+
+#include "context_transport.pb.h"
+#include "tracer/compat.hpp"
 
 namespace tracer::context_delivery {
 namespace {
@@ -81,7 +82,9 @@ void JournalBudget::release(const std::string &key, std::uint64_t bytes) noexcep
 std::uint64_t JournalBudget::used() const noexcept { std::lock_guard lock(mutex_); return used_; }
 bool JournalBudget::admit_control(const std::string &key) {
   std::lock_guard lock(mutex_);
-  if (control_keys_.contains(key)) return true;
+  if (::tracer::compat::contains(control_keys_, key)) {
+    return true;
+  }
   if (kControlOperationLimit > kControlReserve - control_used_) return false;
   control_keys_.emplace(key, true); control_used_ += kControlOperationLimit; return true;
 }
@@ -255,7 +258,10 @@ bool ContextJournal::recover() {
   std::vector<std::pair<std::uint64_t, std::filesystem::path>> segments;
   for (const auto &entry : std::filesystem::directory_iterator(directory_)) {
     const auto name = entry.path().filename().string();
-    if (!name.starts_with("segment-") || !name.ends_with(".bin")) continue;
+    if (!::tracer::compat::starts_with(name, "segment-") ||
+        !::tracer::compat::ends_with(name, ".bin")) {
+      continue;
+    }
     try { segments.emplace_back(std::stoull(name.substr(8, name.size() - 12)), entry.path()); }
     catch (...) { error_ = "invalid journal segment name"; return false; }
   }
@@ -311,7 +317,8 @@ bool ContextJournal::reclaim_acknowledged() {
     if (ec) continue;
     data_bytes_ -= bytes;
     budget_->release(budget_key_, bytes);
-    std::erase_if(records_, [&](const JournalRecord &record) { return record.segment_index == segment; });
+    ::tracer::compat::erase_if(
+        records_, [&](const JournalRecord& record) { return record.segment_index == segment; });
     if (segment == current_segment_) current_segment_bytes_ = 0;
   }
   if (!records_.empty()) return true;
@@ -466,7 +473,10 @@ bool ContextCollectorStore::recover() {
   std::vector<std::pair<std::uint64_t, std::filesystem::path>> segments;
   for (const auto &entry : std::filesystem::directory_iterator(directory_)) {
     const auto name = entry.path().filename().string();
-    if (!name.starts_with("collector-segment-") || !name.ends_with(".bin")) continue;
+    if (!::tracer::compat::starts_with(name, "collector-segment-") ||
+        !::tracer::compat::ends_with(name, ".bin")) {
+      continue;
+    }
     try { segments.emplace_back(std::stoull(name.substr(18, name.size() - 22)), entry.path()); }
     catch (...) { error_ = "invalid collector segment name"; return false; }
   }

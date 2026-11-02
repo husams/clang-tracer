@@ -16,6 +16,7 @@
 #include "context_analysis.hpp"
 #include "context_execution.hpp"
 #include "tracer/callback.hpp"
+#include "tracer/compat.hpp"
 #include "tracer/context.hpp"
 
 namespace tracer::context_facade {
@@ -286,8 +287,8 @@ template <class Scope, class Payload> void init_scope(Payload &&payload) {
   if (!binding) throw ContextError{1U};
   binding->table->init_scope(
       binding->runtime, ScopeTraits<Scope>::id,
-      PayloadTraits<Scope, std::remove_cvref_t<Payload>>::descriptor.state_id,
-      static_cast<const void *>(std::addressof(payload)));
+      PayloadTraits<Scope, ::tracer::compat::remove_cvref_t<Payload>>::descriptor.state_id,
+      static_cast<const void*>(std::addressof(payload)));
 }
 template <class Scope> void end_scope() {
   const auto *binding = active_generation();

@@ -1,15 +1,16 @@
 #include "context_agent_delivery.hpp"
 
-#include "context_journal.hpp"
-
-#include <grpcpp/grpcpp.h>
-
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+
+#include <grpcpp/grpcpp.h>
 #include <unistd.h>
+
+#include "context_journal.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer::context_delivery {
 namespace {
@@ -121,8 +122,8 @@ ContextAgentDelivery::~ContextAgentDelivery() {
 }
 
 bool ContextAgentDelivery::try_publish_capture(
-    std::span<const std::byte> event_record,
-    const std::shared_ptr<const void> &schema_lease) noexcept {
+    ::tracer::compat::span<const std::byte> event_record,
+    const std::shared_ptr<const void>& schema_lease) noexcept {
   return client_ && client_->try_publish_capture(event_record, schema_lease);
 }
 

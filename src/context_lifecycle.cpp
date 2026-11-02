@@ -1,5 +1,4 @@
 #include "context_lifecycle.hpp"
-#include "context_analysis.hpp"
 
 #include <algorithm>
 
@@ -7,6 +6,9 @@
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/Frontend/ASTUnit.h>
 #include <clang/Lex/Preprocessor.h>
+
+#include "context_analysis.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer {
 namespace {
@@ -126,8 +128,9 @@ public:
       auto *identifier = &context.Idents.get(member);
       if (!unit_.getPreprocessor().isMacroDefined(identifier) &&
           record->lookup(clang::DeclarationName(identifier)).empty() &&
-          !buffer.contains(member))
+          !::tracer::compat::contains(buffer, member)) {
         break;
+      }
       member.clear();
     }
     if (member.empty())

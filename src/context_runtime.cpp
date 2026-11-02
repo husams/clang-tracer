@@ -1,5 +1,4 @@
 #include "context_runtime.hpp"
-#include "context_scheduler.hpp"
 
 #include <algorithm>
 #include <array>
@@ -11,6 +10,9 @@
 #include <stdexcept>
 #include <thread>
 #include <utility>
+
+#include "context_scheduler.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer::context_runtime {
 namespace {
@@ -647,8 +649,8 @@ void *SharedSourceRuntime::native_hook_begin(
       if (!hook.access_lease->entered())
         engine_error(context_engine::ErrorCode::lifecycle_access);
       hook.access = new (hook.access_storage) context_engine::HookAccess(
-          *context, std::span(hook.requests.data(), hook.request_count),
-          all_visible, context_engine::HookAccess::Kind::direct);
+          *context, ::tracer::compat::span(hook.requests.data(), hook.request_count), all_visible,
+          context_engine::HookAccess::Kind::direct);
     }
     hook.active = true;
     return &hook;
@@ -797,8 +799,8 @@ void *SharedSourceRuntime::native_access_begin(
       engine_error(context_engine::ErrorCode::lifecycle_access);
     }
     access.access = new (access.access_storage) context_engine::HookAccess(
-        *context, std::span(access.requests.data(), access.request_count),
-        false, context_engine::HookAccess::Kind::independent);
+        *context, ::tracer::compat::span(access.requests.data(), access.request_count), false,
+        context_engine::HookAccess::Kind::independent);
     access.active = true;
     return &access;
   } catch (...) {
@@ -1030,9 +1032,9 @@ bool SharedSourceRuntime::native_event(void *opaque, const TraceContext *trace,
         trace,
         metadata.print_arguments,
         metadata.print_result};
-    const auto result = lease.capture(
-        event, std::span(captured.schemas.data(), captured.schema_count),
-        std::span(captured.states.data(), captured.state_count));
+    const auto result =
+        lease.capture(event, ::tracer::compat::span(captured.schemas.data(), captured.schema_count),
+                      ::tracer::compat::span(captured.states.data(), captured.state_count));
     if (!result) {
       runtime.capture_drops_.fetch_add(1, std::memory_order_relaxed);
       report_capture_drop(trace, capture_status_name(result.status));
@@ -1052,7 +1054,7 @@ bool SharedSourceRuntime::native_event(void *opaque, const TraceContext *trace,
       engine_error(context_engine::ErrorCode::lifecycle_access);
     {
       context_engine::HookAccess snapshot(
-          *hook.context, std::span<const context_engine::SlotRequest>{}, true,
+          *hook.context, ::tracer::compat::span<const context_engine::SlotRequest>{}, true,
           context_engine::HookAccess::Kind::independent);
       captured = capture(snapshot);
     }

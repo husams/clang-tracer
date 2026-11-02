@@ -39,12 +39,13 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#include "session.hpp"
-#include "debug_resolver.hpp"
-#include "header_context.hpp"
 #include "context_collector.hpp"
 #include "context_journal.hpp"
 #include "context_package.hpp"
+#include "debug_resolver.hpp"
+#include "header_context.hpp"
+#include "session.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer {
 namespace {
@@ -416,10 +417,12 @@ public:
       active_probes_[key] = identity;
       constexpr std::size_t kKnownProbeLimit = 4096;
       bool retain_probe_identity = true;
-      if (!known_probes_.contains(key) &&
+      if (!::tracer::compat::contains(known_probes_, key) &&
           known_probes_.size() >= kKnownProbeLimit) {
-        const auto stale = std::find_if(known_probes_.begin(), known_probes_.end(),
-            [&](const auto &entry) { return !active_probes_.contains(entry.first); });
+        const auto stale =
+            std::find_if(known_probes_.begin(), known_probes_.end(), [&](const auto& entry) {
+              return !::tracer::compat::contains(active_probes_, entry.first);
+            });
         if (stale != known_probes_.end())
           known_probes_.erase(stale);
         else

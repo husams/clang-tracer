@@ -1,14 +1,9 @@
 #include "context_stdlib.hpp"
-#include "context_execution.hpp"
-#include "context_paths.hpp"
-#include "context_unwind.hpp"
-#include "engine_storage.hpp"
 
 #include <algorithm>
 #include <any>
 #include <array>
 #include <atomic>
-#include <bit>
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
@@ -16,6 +11,13 @@
 
 #include <llvm/Object/ELFObjectFile.h>
 #include <llvm/Support/MemoryBuffer.h>
+
+#include "context_execution.hpp"
+#include "context_paths.hpp"
+#include "context_unwind.hpp"
+#include "engine_storage.hpp"
+#include "runtime_identity.hpp"
+#include "tracer/compat.hpp"
 
 #if defined(__linux__) && defined(__x86_64__)
 #include <dlfcn.h>
@@ -155,7 +157,7 @@ struct ContextStdlibImage::Impl {
   std::vector<std::string> exports;
   ContextUnwindTable unwind;
   void *image = nullptr, *unwind_image = nullptr, *exception_image = nullptr;
-  void *memory_image = nullptr;
+  void *memory_image = nullptr, *pthread_image = nullptr;
   void *base = nullptr;
   void *(*get_globals)() = nullptr;
   std::uintptr_t find_fde = 0, forced_unwind = 0;
@@ -175,6 +177,9 @@ struct ContextStdlibImage::Impl {
       ::dlclose(unwind_image);
     if (memory_image)
       ::dlclose(memory_image);
+    if (pthread_image) {
+      ::dlclose(pthread_image);
+    }
 #endif
     if (lanes) {
       for (unsigned i = 0; i < kLanes; ++i)
@@ -209,7 +214,7 @@ struct ContextStdlibImage::Impl {
     auto bits = lane.exceptions.load(std::memory_order_relaxed);
     if (bits == ~std::uint64_t{})
       return nullptr;
-    const auto index = std::countr_zero(~bits);
+    const auto index = ::tracer::compat::countr_zero(~bits);
     lane.exceptions.fetch_or(std::uint64_t{1} << index,
                              std::memory_order_relaxed);
     return lane.buffers[index];
@@ -383,21 +388,28 @@ ContextStdlibImage::acquire() {
   impl->unwind_image = ::dlopen("libgcc_s.so.1", RTLD_NOW | RTLD_LOCAL);
   impl->exception_image = ::dlopen("libstdc++.so.6", RTLD_NOW | RTLD_LOCAL);
   impl->memory_image = ::dlopen("libc.so.6", RTLD_NOW | RTLD_LOCAL);
-  if (!impl->unwind_image || !impl->exception_image || !impl->memory_image)
+  impl->pthread_image = ::dlopen("libpthread.so.0", RTLD_NOW | RTLD_LOCAL);
+  if (!impl->unwind_image || !impl->exception_image || !impl->memory_image ||
+      !impl->pthread_image) {
     return invalid("native unwind/TLS runtime is unavailable");
+  }
   // Native fixed-buffer copies can also be introduced by the host compiler.
   // Shared-state guards also depend on the native mutex entrypoints. Reject
   // application interposition before publishing either memory or lock access.
-  for (const auto *name :
-       {"memcpy", "memmove", "memset", "memcmp", "strlen", "pthread_mutex_lock",
-        "pthread_mutex_trylock", "pthread_mutex_unlock"}) {
-    auto *address = ::dlsym(impl->memory_image, name);
-    if (!address || ::dlsym(RTLD_DEFAULT, name) != address ||
-        !::dladdr(address, &information) || !information.dli_fname ||
-        std::string_view(information.dli_fname).find("libc.so") ==
-            std::string_view::npos)
-      return invalid("native memory/lock primitive is interposed: " +
-                     std::string(name));
+  for (const auto* name : {"memcpy", "memmove", "memset", "memcmp", "strlen", "pthread_mutex_lock",
+                           "pthread_mutex_trylock", "pthread_mutex_unlock"}) {
+    const bool pthread = std::string_view(name).substr(0, 8) == "pthread_";
+    auto* address = ::dlsym(RTLD_DEFAULT, name);
+    const auto* libc_address = ::dlsym(impl->memory_image, name);
+    const auto* pthread_address = pthread ? ::dlsym(impl->pthread_image, name) : nullptr;
+    // Before libpthread was loaded, a single-threaded process can have bound
+    // libc's forwarding lock stubs. Both verified runtime providers are valid;
+    // an application's replacement remains rejected.
+    if (!address || (address != libc_address && address != pthread_address) ||
+        !(runtime::has_soname(address, "libc.so.6") ||
+          (pthread && runtime::has_soname(address, "libpthread.so.0")))) {
+      return invalid("native memory/lock primitive is interposed: " + std::string(name));
+    }
   }
   constexpr const char *names[]{"_Unwind_RaiseException",
                                 "_Unwind_DeleteException",
@@ -445,7 +457,7 @@ ContextStdlibImage::acquire() {
     return invalid("cannot reserve bounded support exception lanes");
   impl->lanes = static_cast<Lane *>(reserve.pointer);
   for (unsigned i = 0; i < kLanes; ++i)
-    std::construct_at(impl->lanes + i);
+    ::tracer::compat::construct_at(impl->lanes + i);
   impl->kernel.domain = impl.get();
   impl->kernel.allocate = &Impl::allocate;
   impl->kernel.release = &Impl::release;
@@ -479,10 +491,10 @@ ContextStdlibImage::acquire() {
 llvm::Expected<std::uintptr_t>
 ContextStdlibImage::symbol(const std::string &name) const {
 #if defined(__linux__) && defined(__x86_64__)
-  if (name.starts_with("clangtracer_stdlib_") ||
-      std::find(impl_->exports.begin(), impl_->exports.end(), name) ==
-          impl_->exports.end())
+  if (::tracer::compat::starts_with(name, "clangtracer_stdlib_") ||
+      std::find(impl_->exports.begin(), impl_->exports.end(), name) == impl_->exports.end()) {
     return invalid("symbol is outside the sealed support catalog: " + name);
+  }
   auto *address = ::dlsym(impl_->image, name.c_str());
   Dl_info info{};
   if (!address || !::dladdr(address, &info) || info.dli_fbase != impl_->base)
