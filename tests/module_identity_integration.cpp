@@ -1,4 +1,5 @@
 #include "../src/admission.hpp"
+#include "../src/mapped_path.hpp"
 
 #include <dlfcn.h>
 #include <elf.h>
@@ -74,6 +75,15 @@ public:
   ~SharedObject() {
     if (handle_ != nullptr) {
       ::dlclose(handle_);
+    }
+  }
+
+  void close() {
+    if (handle_ != nullptr) {
+      if (::dlclose(handle_) != 0) {
+        throw std::runtime_error("dlclose failed for test module");
+      }
+      handle_ = nullptr;
     }
   }
 
@@ -248,24 +258,11 @@ private:
   bool wrong_second_offset_ = false;
 };
 
-struct FileIdentity {
-  dev_t device;
-  ino_t inode;
-};
-
-FileIdentity file_identity(const fs::path &path) {
-  struct stat status{};
-  if (::stat(path.c_str(), &status) != 0) {
-    throw std::runtime_error("stat failed for " + path.string() + ": " +
-                             std::strerror(errno));
-  }
-  return {status.st_dev, status.st_ino};
-}
-
-bool same_identity(const fs::path &left, const fs::path &right) {
-  const FileIdentity a = file_identity(left);
-  const FileIdentity b = file_identity(right);
-  return a.device == b.device && a.inode == b.inode;
+bool same_mapped_path(const fs::path &left, const fs::path &right) {
+  const auto canonical_left =
+      tracer::detail::canonical_mapped_path(left.string());
+  return !canonical_left.empty() &&
+         canonical_left == tracer::detail::canonical_mapped_path(right.string());
 }
 
 std::vector<ApplicationModule>::const_iterator
@@ -273,14 +270,7 @@ find_module(const std::vector<ApplicationModule> &modules,
             const fs::path &path) {
   return std::find_if(modules.begin(), modules.end(),
                       [&](const ApplicationModule &module) {
-                        try {
-                          return same_identity(module.path(), path);
-                        } catch (const std::runtime_error &) {
-                          // A prior discovery can retain a mapping whose
-                          // pathname was later replaced or unlinked; it is not
-                          // a match for a current filesystem path.
-                          return false;
-                        }
+                        return same_mapped_path(module.path(), path);
                       });
 }
 
@@ -333,8 +323,8 @@ int main(int argc, char **argv) {
     TemporaryDirectory temporary;
     const pid_t pid = ::getpid();
 
-    // The fixture copy must be discovered from the live mapping set. Select
-    // its opaque handle by file identity only for the later mutation checks.
+    // The fixture copy must be discovered from the live mapping set and
+    // represented by its canonical mapped path.
     const fs::path pinned_path =
         copy_module(fixture, temporary.path(), "pinned.so");
     SharedObject pinned_handle(pinned_path);
@@ -345,6 +335,15 @@ int main(int argc, char **argv) {
     const auto pinned_it = find_module(discovered, pinned_path);
     std::vector<ApplicationModule> pinned{*pinned_it};
     validate_application_modules(pid, pinned);
+
+    // A literal filename suffix is not procfs's unlinked-file marker when the
+    // complete pathname still resolves to an existing mapped module.
+    const auto literal_deleted =
+        copy_module(fixture, temporary.path(), "literal (deleted)");
+    SharedObject literal_deleted_handle(literal_deleted);
+    discovered = discover_application_modules(pid);
+    require_discovered(discovered, literal_deleted,
+                       "a mapped file with a literal deleted-marker suffix");
 
     // Adjacent same-permission PT_LOADs can become one VMA. Discovery must
     // validate their covered offsets, not require every segment to begin a VMA.
@@ -364,19 +363,7 @@ int main(int argc, char **argv) {
     require_discovered(discovered, alias_path,
                        "a mapped module through its symlink identity");
 
-    // Replacing the path leaves the original mapping pinned to the old inode.
-    const fs::path replacement =
-        copy_module(fixture, temporary.path(), "replacement.so");
-    if (::rename(replacement.c_str(), pinned_path.c_str()) != 0) {
-      throw std::runtime_error("rename replacement failed: " +
-                               std::string(std::strerror(errno)));
-    }
-    expect_throws<std::runtime_error>(
-        [&] { validate_application_modules(pid, pinned); },
-        "replaced pinned module path");
-
-    // Timestamp-only mutation invalidates an approval although mapped bytes
-    // and the loader handle remain unchanged.
+    // Metadata-only changes do not invalidate a session-fixed module path.
     const fs::path touched_path =
         copy_module(fixture, temporary.path(), "touched.so");
     SharedObject touched_handle(touched_path);
@@ -395,9 +382,25 @@ int main(int argc, char **argv) {
       throw std::runtime_error("utimensat failed: " +
                                std::string(std::strerror(errno)));
     }
+    validate_application_modules(pid, touched);
+
+    const fs::path unmapped_after_snapshot_path =
+        copy_module(fixture, temporary.path(), "unmapped-after-snapshot.so");
+    SharedObject unmapped_after_snapshot_handle(unmapped_after_snapshot_path);
+    discovered = discover_application_modules(pid);
+    const auto unmapped_after_snapshot_it =
+        find_module(discovered, unmapped_after_snapshot_path);
+    if (unmapped_after_snapshot_it == discovered.end()) {
+      throw std::runtime_error(
+          "loaded module was missing before unmapping validation");
+    }
+    std::vector<ApplicationModule> unmapped_after_snapshot{
+        *unmapped_after_snapshot_it};
+    validate_application_modules(pid, unmapped_after_snapshot);
+    unmapped_after_snapshot_handle.close();
     expect_throws<std::runtime_error>(
-        [&] { validate_application_modules(pid, touched); },
-        "metadata-changed module");
+        [&] { validate_application_modules(pid, unmapped_after_snapshot); },
+        "module removed from mappings after the session snapshot");
 
     // A present but unmapped file must not enter the automatic snapshot.
     const fs::path unmapped_path =

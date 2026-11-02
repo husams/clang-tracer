@@ -12,7 +12,6 @@
 #include <cstring>
 #include <exception>
 #include <fstream>
-#include <iomanip>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -32,13 +31,13 @@
 #include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
-#include <sys/sysmacros.h>
 #include <sys/uio.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "admission.hpp"
+#include "mapped_path.hpp"
 #include "runtime_identity.hpp"
 #include "tracer/compat.hpp"
 
@@ -306,10 +305,8 @@ struct MapEntry {
   std::uintptr_t start = 0;
   std::uintptr_t end = 0;
   std::uintptr_t offset = 0;
-  unsigned int device_major = 0;
-  unsigned int device_minor = 0;
-  std::uint64_t inode = 0;
   std::string path;
+  std::string module_path;
   bool readable = false, executable = false;
 };
 
@@ -340,29 +337,23 @@ std::vector<MapEntry> read_maps(pid_t process_id) {
     if (colon == std::string::npos) {
       continue;
     }
-    entry.device_major = static_cast<unsigned int>(
-        std::stoul(device.substr(0, colon), nullptr, 16));
-    entry.device_minor = static_cast<unsigned int>(
-        std::stoul(device.substr(colon + 1), nullptr, 16));
-    entry.inode = std::stoull(inode);
     std::getline(row >> std::ws, entry.path);
+    entry.module_path = tracer::detail::canonical_mapped_path(entry.path);
     maps.push_back(std::move(entry));
   }
   return maps;
 }
 
-bool same_file(const MapEntry &map, const struct stat &status) {
-  return map.inode == static_cast<std::uint64_t>(status.st_ino) &&
-         map.device_major == static_cast<unsigned int>(major(status.st_dev)) &&
-         map.device_minor == static_cast<unsigned int>(minor(status.st_dev));
+bool same_module_path(const MapEntry &map, const std::string &path) {
+  return !path.empty() && map.module_path == path;
 }
 
 std::uintptr_t map_load_bias(const std::vector<MapEntry> &maps,
-                             const struct stat &status) {
+                             const std::string &path) {
   std::uintptr_t bias = 0;
   bool found = false;
   for (const auto &map : maps) {
-    if (!same_file(map, status)) {
+    if (!same_module_path(map, path)) {
       continue;
     }
     const auto candidate = map.start - map.offset;
@@ -376,78 +367,6 @@ std::uintptr_t map_load_bias(const std::vector<MapEntry> &maps,
         "module backing file is not mapped in the target process");
   }
   return bias;
-}
-
-std::string elf_build_id(const char *path) {
-  std::ifstream file(path, std::ios::binary);
-  if (!file) {
-    throw std::runtime_error(
-        "cannot read local ELF module to verify its build id");
-  }
-  Elf64_Ehdr header{};
-  file.read(reinterpret_cast<char *>(&header), sizeof(header));
-  if (!file || std::memcmp(header.e_ident, ELFMAG, SELFMAG) != 0 ||
-      header.e_ident[EI_CLASS] != ELFCLASS64 ||
-      header.e_ident[EI_DATA] != ELFDATA2LSB || header.e_machine != EM_X86_64 ||
-      header.e_phentsize != sizeof(Elf64_Phdr)) {
-    throw std::runtime_error(
-        "local symbol module is not a compatible ELF64 x86_64 image");
-  }
-  if (header.e_phnum == 0 || header.e_phnum > 4096) {
-    throw std::runtime_error(
-        "local ELF module has an invalid program-header table");
-  }
-  file.seekg(static_cast<std::streamoff>(header.e_phoff));
-  std::vector<Elf64_Phdr> programs(header.e_phnum);
-  file.read(reinterpret_cast<char *>(programs.data()),
-            static_cast<std::streamsize>(programs.size() * sizeof(Elf64_Phdr)));
-  if (!file) {
-    throw std::runtime_error("cannot read local ELF program headers");
-  }
-  for (const auto &program : programs) {
-    if (program.p_type != PT_NOTE || program.p_filesz == 0 ||
-        program.p_filesz > 1024 * 1024) {
-      continue;
-    }
-    std::vector<unsigned char> notes(
-        static_cast<std::size_t>(program.p_filesz));
-    file.seekg(static_cast<std::streamoff>(program.p_offset));
-    file.read(reinterpret_cast<char *>(notes.data()),
-              static_cast<std::streamsize>(notes.size()));
-    if (!file) {
-      throw std::runtime_error("cannot read local ELF note segment");
-    }
-    std::size_t offset = 0;
-    while (offset + sizeof(Elf64_Nhdr) <= notes.size()) {
-      Elf64_Nhdr note{};
-      std::memcpy(&note, notes.data() + offset, sizeof(note));
-      offset += sizeof(note);
-      const auto name_size = static_cast<std::size_t>(note.n_namesz);
-      const auto description_size = static_cast<std::size_t>(note.n_descsz);
-      const auto padded_name = (name_size + 3) & ~std::size_t{3};
-      const auto padded_description = (description_size + 3) & ~std::size_t{3};
-      if (padded_name > notes.size() - offset) {
-        break;
-      }
-      const auto *name = notes.data() + offset;
-      offset += padded_name;
-      if (padded_description > notes.size() - offset) {
-        break;
-      }
-      const auto *description = notes.data() + offset;
-      offset += padded_description;
-      if (note.n_type == NT_GNU_BUILD_ID && name_size >= 3 &&
-          std::memcmp(name, "GNU", 3) == 0 && description_size != 0) {
-        std::ostringstream encoded;
-        encoded << std::hex << std::setfill('0');
-        for (std::size_t i = 0; i < description_size; ++i) {
-          encoded << std::setw(2) << static_cast<unsigned int>(description[i]);
-        }
-        return encoded.str();
-      }
-    }
-  }
-  return {}; // Some SDK runtime libraries intentionally omit GNU build IDs.
 }
 
 } // namespace
@@ -1576,17 +1495,17 @@ std::uintptr_t Process::resolve_remote_symbol(std::string_view name, const CodeP
     throw std::runtime_error("dladdr could not identify the local module for " +
                              symbol_name);
   }
-  struct stat module_status{};
-  if (::stat(info.dli_fname, &module_status) != 0) {
-    throw_errno("stat local symbol module");
+  auto module_path = tracer::detail::canonical_mapped_path(info.dli_fname);
+  if (module_path.empty()) {
+    throw std::runtime_error("cannot resolve local symbol module path");
   }
   // Before glibc 2.34, an otherwise ordinary application need not map libdl.
   // Bootstrap through libc's loader entry points in that case. These are
-  // admitted only through the SAME mapped ELF/build-id checks below; never
-  // translate an offset between different libc versions.
+  // admitted through the same session path, mapped range and live-entry checks
+  // below. Runtime files remain fixed for the duration of the session.
   const bool mapped =
       std::any_of(remote_maps.begin(), remote_maps.end(),
-                  [&](const MapEntry& entry) { return same_file(entry, module_status); });
+                  [&](const MapEntry& entry) { return same_module_path(entry, module_path); });
   if (!mapped && (name == "dlopen" || name == "dlsym" || name == "__errno_location")) {
     const char* bootstrap = name == "dlopen"  ? "__libc_dlopen_mode"
                             : name == "dlsym" ? "__libc_dlsym"
@@ -1600,28 +1519,28 @@ std::uintptr_t Process::resolve_remote_symbol(std::string_view name, const CodeP
     auto* candidate = ::dlsym(libc_handle ? libc_handle : RTLD_DEFAULT, bootstrap);
     const auto* lookup_error = ::dlerror();
     Dl_info bootstrap_info{};
-    struct stat bootstrap_status{};
     if (!lookup_error && candidate && tracer::runtime::has_soname(candidate, "libc.so.6") &&
         ::dladdr(candidate, &bootstrap_info) && bootstrap_info.dli_fname &&
-        bootstrap_info.dli_fbase && ::stat(bootstrap_info.dli_fname, &bootstrap_status) == 0 &&
+        bootstrap_info.dli_fbase &&
         std::any_of(remote_maps.begin(), remote_maps.end(),
-                    [&](const MapEntry& entry) { return same_file(entry, bootstrap_status); })) {
+                    [&](const MapEntry& entry) {
+                      return same_module_path(entry, tracer::detail::canonical_mapped_path(
+                                                         bootstrap_info.dli_fname));
+                    })) {
       local_address = candidate;
       info = bootstrap_info;
-      module_status = bootstrap_status;
+      module_path = tracer::detail::canonical_mapped_path(info.dli_fname);
       symbol_name = bootstrap;
     }
     if (libc_handle) {
       ::dlclose(libc_handle);
     }
   }
-  const std::string build_id = elf_build_id(info.dli_fname);
-
   const auto local_maps = read_maps(::getpid());
-  const auto local_bias = map_load_bias(local_maps, module_status);
+  const auto local_bias = map_load_bias(local_maps, module_path);
   std::uintptr_t remote_bias = 0;
   try {
-    remote_bias = map_load_bias(remote_maps, module_status);
+    remote_bias = map_load_bias(remote_maps, module_path);
   } catch (const std::exception& error) {
     throw std::runtime_error("cannot translate " + symbol_name + " from " + info.dli_fname + ": " +
                              error.what());
@@ -1639,11 +1558,9 @@ std::uintptr_t Process::resolve_remote_symbol(std::string_view name, const CodeP
         "local symbol address precedes its module load base");
   }
   const auto remote_symbol = remote_bias + (symbol - local_bias);
-  if (build_id.empty()) {
-    // SDK libc/libdl may lack a GNU build ID. Keep exact device/inode and
-    // load-bias checks, additionally compare the live loader entry bytes in
-    // both processes and verify that its backing file did not change.
-    // This fallback never permits translating between different runtime files.
+  {
+    // Verify the instructions involved in runtime calls and owned detours.
+    // Filesystem identities and rebuild polling are not part of this check.
     if ((name != "dlopen" && name != "dlsym" && name != "__errno_location" &&
          name != "pthread_create") ||
         (!tracer::runtime::has_soname(local_address, "libc.so.6") &&
@@ -1654,7 +1571,7 @@ std::uintptr_t Process::resolve_remote_symbol(std::string_view name, const CodeP
     constexpr std::size_t bytes = 32;
     auto contains_entry = [&](const auto& maps, std::uintptr_t address) {
       return std::any_of(maps.begin(), maps.end(), [&](const MapEntry& entry) {
-        return same_file(entry, module_status) && entry.readable && entry.executable &&
+        return same_module_path(entry, module_path) && entry.readable && entry.executable &&
                address >= entry.start && address < entry.end && bytes <= entry.end - address;
       });
     };
@@ -1681,15 +1598,8 @@ std::uintptr_t Process::resolve_remote_symbol(std::string_view name, const CodeP
       std::memcpy(remote_entry.data() + (owned_patch->address - remote_symbol),
                   owned_patch->expected, owned_patch->size);
     }
-    struct stat after{};
-    if (std::memcmp(local_address, remote_entry.data(), bytes) != 0 ||
-        ::stat(info.dli_fname, &after) != 0 || after.st_dev != module_status.st_dev ||
-        after.st_ino != module_status.st_ino || after.st_size != module_status.st_size ||
-        after.st_mtim.tv_sec != module_status.st_mtim.tv_sec ||
-        after.st_mtim.tv_nsec != module_status.st_mtim.tv_nsec ||
-        after.st_ctim.tv_sec != module_status.st_ctim.tv_sec ||
-        after.st_ctim.tv_nsec != module_status.st_ctim.tv_nsec) {
-      throw std::runtime_error("loader entry or backing image identity changed");
+    if (std::memcmp(local_address, remote_entry.data(), bytes) != 0) {
+      throw std::runtime_error("runtime entry instructions do not match");
     }
   }
   return remote_symbol;

@@ -6,6 +6,11 @@ The compatibility implementation is in branch `c++17`, based on
 The primary checkout, installed baseline, and original application
 binaries were preserved.
 
+The current session contract treats binaries/debug files as fixed until
+detach. A rebuild requires a new session. Canonical mapped paths and ELF load
+ranges replace device/inode equality and live binary-rebuild policing; the
+historical bind-mount workaround below is superseded by this policy.
+
 ## Build and application validation
 
 On `linux-dev`, the full native build uses SDK
@@ -237,12 +242,39 @@ Thus the merged-segment fix alone does not resolve these identity differences.
 
 The same SDK module-identity executable failed when run from the overlay view
 and passed when run through a private bind mount of its native XFS directory.
-The identity checks remain intact. For this affected arrangement, put the
-build/runtime tree on a normal filesystem and bind-mount it into the container;
-the executable and modules must expose the backing identities shown in their
-process mappings. The demonstrated bind-mount check covers the module-identity
-test, not a rerun of all external tests.
+At that point the identity checks remained intact. The interim workaround used
+a normal filesystem bind-mounted into the container, with executable/module
+identities matching their process mappings. That check covered the module-identity
+test rather than a rerun of all external tests; the session-fixed policy below
+supersedes this workaround.
 
 Reproduction script and output are retained at
 `linux-dev:/tmp/tracer-overlay-identity-repro.sh` and
 `linux-dev:/tmp/tracer-overlay-identity-repro.log`.
+
+## Session-fixed binary policy
+
+The user confirmed that rebuilding requires a new tracing session. Native
+admission, symbol relocation, runtime-call translation and stack-image lookup
+now use canonical mapped paths plus ELF offsets, executable ranges and load
+bias. Device/inode equality and file timestamp/rebuild polling have been
+removed from binary validation. File-format, size, CFI, mapping ambiguity,
+runtime-entry instructions and installed probe-byte checks remain in place.
+
+Native stack metadata is shared by probes in a session and cleared for a new
+session after all prior-session callbacks and transport have drained. This
+also handles the agent remaining loaded after detach without reusing old ELF
+metadata for a later session.
+
+The focused admission/module tests accept metadata-only timestamp changes,
+still reject unmapped modules and incorrect ELF file offsets, and pass from a
+private OverlayFS mount. The full-suite overlay runner is retained as
+`tests/overlay_integration.sh`; it mounts only inside a private test namespace.
+
+The full SDK suite passes **21/21 inside OverlayFS** in 210.17 seconds, including
+attach, threaded/busy/shared-module tracing, native stack capture and durable
+collector reconnect. A focused overlay regression also accepts an existing
+module whose literal filename ends in ` (deleted)` (1/1 passed).
+The runner preserves the host network namespace for TCP delivery tests and
+does not modify the host build tree. Threaded fixtures now wait for their own
+child PID's startup record, avoiding stale log data during overlay copy-up.

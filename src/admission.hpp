@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstddef>
-#include <ctime>
 #include <memory>
 #include <string>
 #include <vector>
@@ -34,11 +33,11 @@ private:
   friend void validate_application_modules(pid_t, ::tracer::compat::span<const ApplicationModule>);
 };
 
-// Snapshot mapped application DSOs once per session. Returned values pin the
-// identities discovered from this process mapping set for the session lifetime.
+// Snapshot canonical mapped application paths once per session. Returned
+// values retain the ELF path and load bias for later mapping validation.
 std::vector<ApplicationModule> discover_application_modules(pid_t pid);
 
-// Revalidate all pinned module identities and mappings after each target stop.
+// Revalidate the session's module paths and ELF mappings after each target stop.
 void validate_application_modules(pid_t pid,
                                   ::tracer::compat::span<const ApplicationModule> modules);
 

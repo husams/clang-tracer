@@ -39,11 +39,11 @@ Direct CMake builds accept `-DCMAKE_SYSROOT=/path/to/sysroot` and
 when changing SDK, sysroot or loader so cached compiler/linker settings cannot
 silently retain the previous profile.
 
-In containers affected by OverlayFS identity differences, put scratch/build
-output on a bind-mounted normal filesystem. Executables and SDK/runtime module
-files must expose the backing device/inode identities shown in process maps;
-use bind-mounted SDK/runtime paths as needed. See the external-machine
-follow-up in the validation report for the reproduced failure and workaround.
+Binaries and debug files are fixed for each tracing session. Rebuilding or
+replacing one requires a new session. Module lookup uses canonical mapped paths
+and ELF load offsets/ranges, without comparing filesystem device/inode numbers
+or polling binary timestamps. OverlayFS builds do not require a bind-mounted
+filesystem to satisfy file identity checks.
 
 The script preserves the scratch tree and refuses to replace an existing gRPC
 checkout if it does not match the pin. It rejects dirty root and recursive
@@ -96,12 +96,13 @@ the SDK loader explicitly. This keeps the binaries and shared libraries tied
 to the intended older runtime instead of depending on whichever loader happens
 to be first on the host.
 
-The loader validates actual ELF SONAMEs and file identities, including older
+The loader validates actual ELF SONAMEs and mapped paths, including older
 `libc-2.23.so` and `libpthread-2.23.so` filenames. For an application without
 libdl loaded, bootstrap uses the matching libc's private loader entry points.
-Libraries without GNU build IDs remain subject to exact mapped device/inode,
-load-bias, executable-entry-byte and unchanged-file checks. A second shared
-probe can normalize only this session's verified existing pthread detour.
+Runtime calls use the canonical mapped module path and load bias, with live
+entry-instruction checks for the loader and pthread entry points. GNU build IDs
+and binary rebuild polling are not required. A second shared probe can normalize
+only this session's verified existing pthread detour.
 
 The SDK's libc process-vm wrappers are stubs; native memory reads/writes use
 the supported x86-64 kernel syscalls directly. The running kernel must still
@@ -129,11 +130,22 @@ activation, SDK agent callbacks, and analysis-test compilation; a newer host
 GCC installation cannot supply optional headers missing from the SDK library.
 For example, GCC 11's `<span>` must not be combined with GCC 8's `type_traits`.
 
-ELF validation checks complete file-backed `PT_LOAD` ranges by device, inode,
+ELF validation checks complete file-backed `PT_LOAD` ranges by canonical path,
 permissions and file offsets, including segments that begin inside a merged
 mapping or span several mappings. Distinct complete load biases remain
-ambiguous and are rejected. Mapping errors now distinguish absent file
-identity from incomplete segment coverage and identify the failing file.
+ambiguous and are rejected. Missing mappings and incomplete segment coverage
+remain errors. Native stack caches are reset for a new session after prior
+callbacks drain; adding probes within the same session reuses those caches.
+
+The optional Linux regression runner mounts an overlay only inside its private
+test namespace and leaves the host build tree unchanged:
+
+```sh
+tests/overlay_integration.sh /absolute/build/directory -j2
+```
+
+It requires user/mount namespaces and OverlayFS support. Normal tracer use does
+not create filesystems or require these test facilities.
 
 The controller must map the same runtime ELF files as its target. Use the
 SDK-built controller with the original SDK-runtime target. The installed

@@ -1027,8 +1027,8 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
                           DebugRecords &records) {
   try {
     const auto &info = spec.debug_info();
-    // Re-read mapped debug information in the target and compare the complete
-    // image identity, signature and type metadata before constructing any AST.
+    // Match the mapped entry, signature and type metadata before constructing
+    // any AST. Binary contents remain fixed for the tracing session.
     validate_debug_entry(spec);
     bool has_record = !info.record_name().empty();
     for (const auto &argument : info.arguments())
@@ -3398,6 +3398,23 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, "the process has reached its 32 retained-probe limit");
       return -1;
     }
+    // A durable collector can reconnect while old probes are still active.
+    // Keep their shared metadata alive; refresh a new session only after the
+    // previous callback cohort has drained.
+    bool native_cache_quiescent = true;
+    for (std::size_t i = 0; i < a.retained; ++i) {
+      const auto *prior = a.probes[i].get();
+      if (prior &&
+          (prior->active.load(std::memory_order_seq_cst) ||
+           prior->in_flight.load(std::memory_order_seq_cst) ||
+           prior->delivery.pending.load(std::memory_order_acquire) ||
+           prior->transport_active)) {
+        native_cache_quiescent = false;
+        break;
+      }
+    }
+    if (native_cache_quiescent)
+      tracer::begin_native_stack_session(request->session_id);
     auto p = std::make_unique<Probe>();
     p->request = *request;
     clangtracer::v1::ProbeSpec specification;

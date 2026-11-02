@@ -169,7 +169,8 @@ struct TargetInfo {
   std::string mode;
 };
 
-std::optional<TargetInfo> find_target_info(const std::filesystem::path &path) {
+std::optional<TargetInfo> find_target_info(const std::filesystem::path &path,
+                                         pid_t expected_pid) {
   std::istringstream input(read_file(path));
   std::string line;
   while (std::getline(input, line)) {
@@ -185,6 +186,7 @@ std::optional<TargetInfo> find_target_info(const std::filesystem::path &path) {
                     "busy=%d mode=%15s",
                     &pid, &free_entry, &method_entry, &callback_gate,
                     &callbacks_active, &busy_main, mode) == 7 &&
+        pid == expected_pid &&
         free_entry && method_entry && callback_gate && callbacks_active) {
       return TargetInfo{reinterpret_cast<std::uintptr_t>(free_entry),
                         reinterpret_cast<std::uintptr_t>(method_entry),
@@ -198,10 +200,11 @@ std::optional<TargetInfo> find_target_info(const std::filesystem::path &path) {
 }
 
 TargetInfo wait_target_info(const std::filesystem::path &path,
+                            pid_t expected_pid,
                             std::chrono::milliseconds timeout) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   do {
-    if (auto info = find_target_info(path)) {
+    if (auto info = find_target_info(path, expected_pid)) {
       return *info;
     }
     std::this_thread::sleep_for(20ms);
@@ -214,9 +217,9 @@ read_process_memory(pid_t pid, std::uintptr_t address, std::size_t size) {
   std::vector<unsigned char> bytes(size);
   iovec local{bytes.data(), bytes.size()};
   iovec remote{reinterpret_cast<void *>(address), bytes.size()};
-  require(::tracer::linux_api::process_vm_readv(pid, &local, 1, &remote, 1, 0) ==
-              static_cast<ssize_t>(size),
-          "could not read target function bytes");
+  const auto read = ::tracer::linux_api::process_vm_readv(pid, &local, 1, &remote, 1, 0);
+  require(read == static_cast<ssize_t>(size),
+          "could not read target function bytes: " + std::string(std::strerror(errno)));
   return bytes;
 }
 
@@ -820,7 +823,7 @@ void run(const std::filesystem::path &server_path,
   }
   ChildProcess target = spawn(target_arguments, output_dir / "target.log");
   require(target.running(), "threaded target failed to start");
-  const auto target_info = wait_target_info(output_dir / "target.log", 3s);
+  const auto target_info = wait_target_info(output_dir / "target.log", target.pid(), 3s);
   require(target_info.busy_main == busy_main,
           "target did not report the requested main-thread mode");
   const std::string expected_mode =
@@ -859,9 +862,8 @@ void run(const std::filesystem::path &server_path,
   const auto session = attach(*stub, target.pid(), output_dir, "attach");
   require_session_modules(session, expected_modules, "Attach response");
   const auto pinned_modules = session_module_paths(session);
-  wait_for_server_module_fd_count(server.pid(), pinned_modules,
-                                  pinned_modules.size(), 3s);
-  report(report_file, "server retained discovered application-module pins");
+  wait_for_server_module_fd_count(server.pid(), pinned_modules, 0, 3s);
+  report(report_file, "session snapshots module paths without retaining binary file descriptors");
   if (busy_main) {
     last_main =
         wait_for_main_progress(output_dir / "target.log", last_main, 5s);
