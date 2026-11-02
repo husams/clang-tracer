@@ -16,6 +16,9 @@ writable scratch path:
 
 ```sh
 scripts/gcc85-build.sh /path/to/toolchain /var/tmp/clang-tracer-gcc85 3
+# Optional explicit runtime paths:
+scripts/gcc85-build.sh /path/to/toolchain /var/tmp/clang-tracer-custom 3 \
+  --sysroot /path/to/sysroot --dynamic-loader /path/to/ld-linux-x86-64.so.2
 ```
 
 The first argument is the absolute SDK path; the second is the absolute scratch
@@ -25,6 +28,23 @@ name `cmake`. The script selects Ninja when `ninja` is installed and otherwise
 uses the host make generator. The SDK path has no hardcoded or environment
 default. Direct CMake users must pass `-DTRACER_SDK_ROOT=/path/to/toolchain`
 alongside the toolchain file; compiler-check subprojects inherit that selection.
+`--sysroot` overrides the SDK-layout default for dependency compilation, SQLite,
+the tracer and embedded JIT flags. `--dynamic-loader` overrides the executable
+interpreter for dependency tools and tracer binaries. The loader defaults to
+`lib64/ld-linux-x86-64.so.2` beneath the selected sysroot. Both effective paths
+are recorded in `build-environment.txt`.
+
+Direct CMake builds accept `-DCMAKE_SYSROOT=/path/to/sysroot` and
+`-DTRACER_DYNAMIC_LOADER=/path/to/loader`. Use a fresh scratch/build directory
+when changing SDK, sysroot or loader so cached compiler/linker settings cannot
+silently retain the previous profile.
+
+In containers affected by OverlayFS identity differences, put scratch/build
+output on a bind-mounted normal filesystem. Executables and SDK/runtime module
+files must expose the backing device/inode identities shown in process maps;
+use bind-mounted SDK/runtime paths as needed. See the external-machine
+follow-up in the validation report for the reproduced failure and workaround.
+
 The script preserves the scratch tree and refuses to replace an existing gRPC
 checkout if it does not match the pin. It rejects dirty root and recursive
 submodule sources, allowing only its exact protobuf RPATH patch and the pinned

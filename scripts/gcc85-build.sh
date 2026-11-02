@@ -4,23 +4,58 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage: scripts/gcc85-build.sh ABSOLUTE_SDK_ROOT ABSOLUTE_SCRATCH_ROOT [JOBS]
+       [--sysroot ABSOLUTE_SYSROOT] [--dynamic-loader ABSOLUTE_LOADER]
 
 Build dependencies and clang-tracer with the GCC 8.5-era SDK sysroot. The
 scratch root is preserved; existing dependency checkouts must match their pins.
 The SDK path is required; no machine-specific default is used.
+Sysroot and dynamic loader default to the supplied SDK's layout; both can be
+overridden explicitly. Use a fresh scratch directory when changing the profile.
 Host CMake defaults to `cmake` and can be overridden with
 TRACER_CMAKE. Jobs defaults to 3.
 EOF
 }
 
-if [[ $# -lt 2 || $# -gt 3 ]]; then
+if [[ ${1:-} == --help || ${1:-} == -h ]]; then
+  usage
+  exit 0
+fi
+if [[ $# -lt 2 ]]; then
   usage >&2
   exit 2
 fi
 
 SDK=$1
 SCRATCH=$2
-JOBS=${3:-3}
+shift 2
+JOBS=3
+if [[ $# -gt 0 && $1 != --* ]]; then
+  JOBS=$1
+  shift
+fi
+SDK_SYSROOT=''
+SDK_LOADER=''
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --sysroot|--dynamic-loader)
+      if [[ $# -lt 2 || -z $2 ]]; then
+        echo "Missing path for $1" >&2
+        exit 2
+      fi
+      if [[ $1 == --sysroot ]]; then
+        SDK_SYSROOT=$2
+      else
+        SDK_LOADER=$2
+      fi
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
 CMAKE=${TRACER_CMAKE:-cmake}
 GRPC_COMMIT=02384e39185f109bd299eb8482306229967dc970
 GRPC_TAG=v1.46.7
@@ -54,8 +89,16 @@ SQLITE_PREFIX="$DEPS"
 APP_BUILD="$BUILD/clang-tracer"
 APP_PREFIX="$SCRATCH/install"
 SDK_TRIPLE="$SDK/x86_64-1a-linux-gnu"
-SDK_SYSROOT="$SDK_TRIPLE/sysroot"
-SDK_LOADER="$SDK_SYSROOT/lib64/ld-linux-x86-64.so.2"
+SDK_SYSROOT=${SDK_SYSROOT:-"$SDK_TRIPLE/sysroot"}
+SDK_LOADER=${SDK_LOADER:-"$SDK_SYSROOT/lib64/ld-linux-x86-64.so.2"}
+if [[ $SDK_SYSROOT != /* || ! -d $SDK_SYSROOT ]]; then
+  echo "Sysroot must be an existing absolute directory: $SDK_SYSROOT" >&2
+  exit 2
+fi
+if [[ $SDK_LOADER != /* || ! -f $SDK_LOADER || ! -x $SDK_LOADER ]]; then
+  echo "Dynamic loader must be an executable absolute file: $SDK_LOADER" >&2
+  exit 2
+fi
 
 for tool in "$SDK/bin/clang" "$SDK/bin/clang++"; do
   if [[ ! -x $tool ]]; then
@@ -75,10 +118,6 @@ if command -v ninja >/dev/null 2>&1; then
 else
   NINJA_INFO='unavailable; using the host make generator'
 fi
-if [[ ! -x $SDK_LOADER ]]; then
-  echo "SDK dynamic loader is missing: $SDK_LOADER" >&2
-  exit 1
-fi
 for tool in git python3 curl sha256sum make; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "Required host tool not found in PATH: $tool" >&2
@@ -91,6 +130,8 @@ mkdir -p "$DEPS/src" "$BUILD" "$LOGS" "$APP_PREFIX"
   printf 'host_cmake %s\n' "$($CMAKE_BIN --version | head -n 1)"
   printf 'ninja %s\n' "$NINJA_INFO"
   printf 'sdk %s\n' "$SDK"
+  printf 'sysroot %s\n' "$SDK_SYSROOT"
+  printf 'dynamic_loader %s\n' "$SDK_LOADER"
   printf 'scratch %s\n' "$SCRATCH"
   printf 'jobs %s\n' "$JOBS"
 } > "$SCRATCH/build-environment.txt"
@@ -262,6 +303,7 @@ PY
 "$CMAKE_BIN" -S "$GRPC_SOURCE" -B "$GRPC_BUILD" "${GENERATOR_ARGS[@]}" \
   -DCMAKE_C_COMPILER="$SDK/bin/clang" \
   -DCMAKE_CXX_COMPILER="$SDK/bin/clang++" \
+  -DCMAKE_SYSROOT="$SDK_SYSROOT" \
   -DCMAKE_CXX_STANDARD=17 \
   -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
   -DBUILD_SHARED_LIBS=ON \
@@ -309,7 +351,7 @@ fi
 (
   cd "$SQLITE_SOURCE"
   CC="$SDK/bin/clang" \
-  CFLAGS='-O2 -fPIC' \
+  CFLAGS="-O2 -fPIC --sysroot=$SDK_SYSROOT" \
   LDFLAGS="$EXE_LINKER_FLAGS" \
     ./configure --prefix="$SQLITE_PREFIX" --disable-readline --disable-tcl
   make -j"$JOBS"
@@ -321,6 +363,8 @@ APP_RPATH="$DEPS/lib;$DEPS/lib64;$SDK_TRIPLE/lib64;$SDK_SYSROOT/lib64;$SDK/lib.l
 "$CMAKE_BIN" -S "$SOURCE_ROOT" -B "$APP_BUILD" "${GENERATOR_ARGS[@]}" \
   -DCMAKE_TOOLCHAIN_FILE="$SOURCE_ROOT/cmake/toolchains/gcc85-sdk.cmake" \
   -DTRACER_SDK_ROOT="$SDK" \
+  -DCMAKE_SYSROOT="$SDK_SYSROOT" \
+  -DTRACER_DYNAMIC_LOADER="$SDK_LOADER" \
   -DCMAKE_PREFIX_PATH="$DEPS" \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_INSTALL_PREFIX="$APP_PREFIX" \
