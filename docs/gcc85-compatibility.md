@@ -19,6 +19,9 @@ scripts/gcc85-build.sh /path/to/toolchain /var/tmp/clang-tracer-gcc85 3
 # Optional explicit runtime paths:
 scripts/gcc85-build.sh /path/to/toolchain /var/tmp/clang-tracer-custom 3 \
   --sysroot /path/to/sysroot --dynamic-loader /path/to/ld-linux-x86-64.so.2
+# Optional only for filesystem or mapping changes:
+scripts/gcc85-build.sh /path/to/toolchain /var/tmp/clang-tracer-overlay 3 \
+  --overlay-tests
 ```
 
 The first argument is the absolute SDK path; the second is the absolute scratch
@@ -31,8 +34,9 @@ alongside the toolchain file; compiler-check subprojects inherit that selection.
 `--sysroot` overrides the SDK-layout default for dependency compilation, SQLite,
 the tracer and embedded JIT flags. `--dynamic-loader` overrides the executable
 interpreter for dependency tools and tracer binaries. The loader defaults to
-`lib64/ld-linux-x86-64.so.2` beneath the selected sysroot. Both effective paths
-are recorded in `build-environment.txt`.
+`lib64/ld-linux-x86-64.so.2` beneath the selected sysroot. Both effective paths,
+the selected host CTest path, and the OverlayFS test mode are recorded in
+`build-environment.txt`.
 
 Direct CMake builds accept `-DCMAKE_SYSROOT=/path/to/sysroot` and
 `-DTRACER_DYNAMIC_LOADER=/path/to/loader`. Use a fresh scratch/build directory
@@ -70,28 +74,36 @@ application with `cmake/toolchains/gcc85-sdk.cmake`, `RelWithDebInfo`, and
 `BUILD_TESTING=ON`. The application is installed under
 `<scratch>/install`.
 
-## Test
+## Tests
 
-After building with the selected GCC 8.5 SDK, run the normal CTest suite by default:
+The build script runs the normal CTest suite after building the application
+and before installing it. A test failure stops the script before installation.
+It uses the host CTest executable beside the selected host CMake when available,
+otherwise the host `ctest` found before adding the SDK to `PATH`. Test output is
+saved to `<scratch>/logs/tracer-tests.log`.
+
+To rerun the normal suite against an existing build:
 
 ```sh
 ctest --test-dir /var/tmp/clang-tracer-gcc85/build/clang-tracer --output-on-failure
 ```
 
-Run OverlayFS tests only when filesystem or process-mapping code changes, such
-as mapped-path resolution, `/proc` mapping parsing, or ELF load-segment mapping.
-For those changes, run the normal suite above and then:
+OverlayFS tests remain opt-in and should be used only when filesystem or
+process-mapping code changes, such as mapped-path resolution, `/proc` mapping
+parsing, or ELF load-segment mapping. Pass `--overlay-tests` to run them after
+the normal suite and before installation:
 
 ```sh
-tests/overlay_integration.sh /var/tmp/clang-tracer-gcc85/build/clang-tracer
+scripts/gcc85-build.sh /path/to/toolchain \
+  /var/tmp/clang-tracer-gcc85-overlay 3 --overlay-tests
 ```
 
 The OverlayFS runner uses a private test namespace and leaves the host build
 tree unchanged. It requires user/mount namespaces and OverlayFS support;
-ordinary builds and tracer use do not require these test facilities.
-
-The build script does not run tests automatically. No build or test result is
-implied by this procedure.
+ordinary builds and tracer use do not require these test facilities. Its output
+is saved to `<scratch>/logs/tracer-overlay-tests.log`. The script uses the
+selected host CTest directory for this run and stops before installation if
+either suite fails.
 
 ## Compatibility details
 

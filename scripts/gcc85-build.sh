@@ -5,6 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/gcc85-build.sh ABSOLUTE_SDK_ROOT ABSOLUTE_SCRATCH_ROOT [JOBS]
        [--sysroot ABSOLUTE_SYSROOT] [--dynamic-loader ABSOLUTE_LOADER]
+       [--overlay-tests]
 
 Build dependencies and clang-tracer with the GCC 8.5-era SDK sysroot. The
 scratch root is preserved; existing dependency checkouts must match their pins.
@@ -13,6 +14,8 @@ Sysroot and dynamic loader default to the supplied SDK's layout; both can be
 overridden explicitly. Use a fresh scratch directory when changing the profile.
 Host CMake defaults to `cmake` and can be overridden with
 TRACER_CMAKE. Jobs defaults to 3.
+The normal CTest suite runs after the application build and before install.
+OverlayFS tests are opt-in with --overlay-tests.
 EOF
 }
 
@@ -35,6 +38,7 @@ if [[ $# -gt 0 && $1 != --* ]]; then
 fi
 SDK_SYSROOT=''
 SDK_LOADER=''
+OVERLAY_TESTS=0
 while [[ $# -gt 0 ]]; do
   case $1 in
     --sysroot|--dynamic-loader)
@@ -48,6 +52,10 @@ while [[ $# -gt 0 ]]; do
         SDK_LOADER=$2
       fi
       shift 2
+      ;;
+    --overlay-tests)
+      OVERLAY_TESTS=1
+      shift
       ;;
     *)
       echo "Unknown argument: $1" >&2
@@ -111,6 +119,14 @@ if ! command -v "$CMAKE" >/dev/null 2>&1; then
   exit 1
 fi
 CMAKE_BIN=$(command -v "$CMAKE")
+CTEST_BIN="$(dirname -- "$CMAKE_BIN")/ctest"
+if [[ ! -x $CTEST_BIN ]]; then
+  CTEST_BIN=$(command -v ctest || true)
+fi
+if [[ -z $CTEST_BIN || ! -x $CTEST_BIN ]]; then
+  echo "Host CTest not found beside $CMAKE_BIN or in PATH" >&2
+  exit 1
+fi
 GENERATOR_ARGS=()
 if command -v ninja >/dev/null 2>&1; then
   GENERATOR_ARGS=(-G Ninja)
@@ -127,13 +143,19 @@ done
 
 mkdir -p "$DEPS/src" "$BUILD" "$LOGS" "$APP_PREFIX"
 {
-  printf 'host_cmake %s\n' "$($CMAKE_BIN --version | head -n 1)"
+  printf 'host_cmake %s\n' "$("$CMAKE_BIN" --version | head -n 1)"
+  printf 'host_ctest %s\n' "$CTEST_BIN"
   printf 'ninja %s\n' "$NINJA_INFO"
   printf 'sdk %s\n' "$SDK"
   printf 'sysroot %s\n' "$SDK_SYSROOT"
   printf 'dynamic_loader %s\n' "$SDK_LOADER"
   printf 'scratch %s\n' "$SCRATCH"
   printf 'jobs %s\n' "$JOBS"
+  if [[ $OVERLAY_TESTS == 1 ]]; then
+    printf 'overlay_tests enabled\n'
+  else
+    printf 'overlay_tests disabled\n'
+  fi
 } > "$SCRATCH/build-environment.txt"
 RPATH="$DEPS/lib;$DEPS/lib64;$SDK_TRIPLE/lib64;$SDK_SYSROOT/lib64"
 EXE_LINKER_FLAGS="-Wl,--dynamic-linker=$SDK_LOADER -Wl,-rpath,$DEPS/lib:$DEPS/lib64:$SDK_TRIPLE/lib64:$SDK_SYSROOT/lib64"
@@ -374,6 +396,13 @@ APP_RPATH="$DEPS/lib;$DEPS/lib64;$SDK_TRIPLE/lib64;$SDK_SYSROOT/lib64;$SDK/lib.l
   2>&1 | tee "$LOGS/tracer-configure.log"
 "$CMAKE_BIN" --build "$APP_BUILD" --parallel "$JOBS" \
   2>&1 | tee "$LOGS/tracer-build.log"
+"$CTEST_BIN" --test-dir "$APP_BUILD" --output-on-failure \
+  2>&1 | tee "$LOGS/tracer-tests.log"
+if [[ $OVERLAY_TESTS == 1 ]]; then
+  PATH="$(dirname -- "$CTEST_BIN"):$PATH" \
+    "$SOURCE_ROOT/tests/overlay_integration.sh" "$APP_BUILD" \
+    2>&1 | tee "$LOGS/tracer-overlay-tests.log"
+fi
 "$CMAKE_BIN" --install "$APP_BUILD" \
   2>&1 | tee "$LOGS/tracer-install.log"
 
