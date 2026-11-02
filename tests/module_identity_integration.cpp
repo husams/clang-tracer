@@ -1,8 +1,10 @@
 #include "../src/admission.hpp"
 
 #include <dlfcn.h>
+#include <elf.h>
 #include <fcntl.h>
 #include <link.h>
+#include <sys/mman.h>
 #include <sys/auxv.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -12,8 +14,10 @@
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -98,6 +102,152 @@ fs::path copy_module(const fs::path &fixture, const fs::path &directory,
   return destination;
 }
 
+class CoalescedLoadMapping final {
+public:
+  CoalescedLoadMapping(const fs::path &fixture, const fs::path &directory,
+                       std::string_view name, bool wrong_second_offset = false)
+      : path_(copy_module(fixture, directory, name)),
+        wrong_second_offset_(wrong_second_offset) {
+    const long page_size = ::sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+      throw std::runtime_error("could not get page size for coalesced ELF fixture");
+    }
+    page_size_ = static_cast<std::size_t>(page_size);
+    const int fd = ::open(path_.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+      throw std::runtime_error("could not open coalesced ELF fixture: " +
+                               std::string(std::strerror(errno)));
+    }
+    try {
+      struct stat status{};
+      Elf64_Ehdr header{};
+      if (::fstat(fd, &status) != 0 || status.st_size < 2 * page_size ||
+          ::pread(fd, &header, sizeof(header), 0) != sizeof(header) ||
+          std::memcmp(header.e_ident, ELFMAG, SELFMAG) != 0 ||
+          header.e_phentsize != sizeof(Elf64_Phdr) ||
+          header.e_phoff > static_cast<std::uint64_t>(status.st_size) ||
+          header.e_phnum >
+              (static_cast<std::uint64_t>(status.st_size) - header.e_phoff) /
+                  sizeof(Elf64_Phdr)) {
+        throw std::runtime_error("fixture is not a usable ELF shared object");
+      }
+      std::vector<Elf64_Phdr> headers(header.e_phnum);
+      if (::pread(fd, headers.data(), headers.size() * sizeof(Elf64_Phdr),
+                  static_cast<off_t>(header.e_phoff)) !=
+          static_cast<ssize_t>(headers.size() * sizeof(Elf64_Phdr))) {
+        throw std::runtime_error("could not read coalesced ELF program headers");
+      }
+      std::vector<std::size_t> load_indices;
+      for (std::size_t index = 0; index < headers.size(); ++index) {
+        if (headers[index].p_type == PT_LOAD) {
+          load_indices.push_back(index);
+        }
+      }
+      if (load_indices.size() < 2 || status.st_size < 2 * page_size) {
+        throw std::runtime_error("fixture must have at least two load segments and two file pages");
+      }
+      for (std::size_t index = 0; index < 2; ++index) {
+        auto &segment = headers[load_indices[index]];
+        segment.p_offset = index * page_size_;
+        segment.p_vaddr = index * page_size_;
+        segment.p_paddr = segment.p_vaddr;
+        segment.p_filesz = page_size_;
+        segment.p_memsz = page_size_;
+        segment.p_flags = PF_R | PF_X;
+        segment.p_align = page_size_;
+      }
+      for (std::size_t index = 2; index < load_indices.size(); ++index) {
+        headers[load_indices[index]].p_type = PT_NULL;
+      }
+      if (::pwrite(fd, headers.data(), headers.size() * sizeof(Elf64_Phdr),
+                   static_cast<off_t>(header.e_phoff)) !=
+          static_cast<ssize_t>(headers.size() * sizeof(Elf64_Phdr))) {
+        throw std::runtime_error("could not write coalesced ELF program headers");
+      }
+      mapping_size_ = 2 * page_size_;
+      mapping_ = ::mmap(nullptr, mapping_size_, PROT_NONE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      if (mapping_ == MAP_FAILED) {
+        mapping_ = nullptr;
+        throw std::runtime_error("could not reserve coalesced ELF mapping range");
+      }
+      if (::mmap(mapping_, page_size_, PROT_READ | PROT_EXEC,
+                 MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED ||
+          ::mmap(static_cast<char *>(mapping_) + page_size_, page_size_,
+                 PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_FIXED, fd,
+                 static_cast<off_t>(wrong_second_offset_ ? 0 : page_size_)) ==
+              MAP_FAILED) {
+        ::munmap(mapping_, mapping_size_);
+        mapping_ = nullptr;
+        throw std::runtime_error("could not map adjacent coalesced ELF segments");
+      }
+    } catch (...) {
+      ::close(fd);
+      throw;
+    }
+    ::close(fd);
+    if (wrong_second_offset_) {
+      verify_split_mapping();
+    } else {
+      verify_coalesced_mapping();
+    }
+  }
+
+  ~CoalescedLoadMapping() {
+    if (mapping_) {
+      ::munmap(mapping_, mapping_size_);
+    }
+  }
+
+  CoalescedLoadMapping(const CoalescedLoadMapping &) = delete;
+  CoalescedLoadMapping &operator=(const CoalescedLoadMapping &) = delete;
+
+  [[nodiscard]] const fs::path &path() const noexcept { return path_; }
+
+private:
+  void verify_coalesced_mapping() const {
+    std::ostringstream range;
+    range << std::hex << reinterpret_cast<std::uintptr_t>(mapping_) << '-'
+          << reinterpret_cast<std::uintptr_t>(mapping_) + mapping_size_;
+    std::ifstream maps("/proc/self/maps");
+    for (std::string line; std::getline(maps, line);) {
+      if (line.rfind(range.str() + " r-xp ", 0) == 0 &&
+          line.find(path_.string()) != std::string::npos) {
+        return;
+      }
+    }
+    throw std::runtime_error(
+        "kernel did not coalesce adjacent same-permission ELF file mappings");
+  }
+
+  void verify_split_mapping() const {
+    std::ostringstream first, second;
+    first << std::hex << reinterpret_cast<std::uintptr_t>(mapping_) << '-'
+          << reinterpret_cast<std::uintptr_t>(mapping_) + page_size_;
+    second << std::hex
+           << reinterpret_cast<std::uintptr_t>(mapping_) + page_size_ << '-'
+           << reinterpret_cast<std::uintptr_t>(mapping_) + mapping_size_;
+    bool found_first = false, found_second = false;
+    std::ifstream maps("/proc/self/maps");
+    for (std::string line; std::getline(maps, line);) {
+      found_first |= line.rfind(first.str() + " r-xp 00000000 ", 0) == 0 &&
+                     line.find(path_.string()) != std::string::npos;
+      found_second |= line.rfind(second.str() + " r-xp 00000000 ", 0) == 0 &&
+                      line.find(path_.string()) != std::string::npos;
+    }
+    if (!found_first || !found_second) {
+      throw std::runtime_error(
+          "kernel did not retain the wrong-offset mappings as separate VMAs");
+    }
+  }
+
+  fs::path path_;
+  void *mapping_ = nullptr;
+  std::size_t page_size_ = 0;
+  std::size_t mapping_size_ = 0;
+  bool wrong_second_offset_ = false;
+};
+
 struct FileIdentity {
   dev_t device;
   ino_t inode;
@@ -137,8 +287,19 @@ find_module(const std::vector<ApplicationModule> &modules,
 void require_discovered(const std::vector<ApplicationModule> &modules,
                         const fs::path &path, std::string_view description) {
   if (find_module(modules, path) == modules.end()) {
-    throw std::runtime_error("automatic discovery omitted " +
-                             std::string(description));
+    std::ostringstream details;
+    details << "automatic discovery omitted " << description << "; target map entries:";
+    std::ifstream maps("/proc/self/maps");
+    for (std::string line; std::getline(maps, line);) {
+      if (line.find(path.string()) != std::string::npos) {
+        details << "\n  " << line;
+      }
+    }
+    details << "; discovered paths:";
+    for (const auto &module : modules) {
+      details << "\n  " << module.path();
+    }
+    throw std::runtime_error(details.str());
   }
 }
 
@@ -184,6 +345,19 @@ int main(int argc, char **argv) {
     const auto pinned_it = find_module(discovered, pinned_path);
     std::vector<ApplicationModule> pinned{*pinned_it};
     validate_application_modules(pid, pinned);
+
+    // Adjacent same-permission PT_LOADs can become one VMA. Discovery must
+    // validate their covered offsets, not require every segment to begin a VMA.
+    CoalescedLoadMapping coalesced(fixture, temporary.path(),
+                                   "coalesced-loads.so");
+    discovered = discover_application_modules(pid);
+    require_discovered(discovered, coalesced.path(),
+                       "a valid ELF with coalesced adjacent PT_LOAD mappings");
+    CoalescedLoadMapping wrong_offset(fixture, temporary.path(),
+                                      "wrong-offset-load.so", true);
+    discovered = discover_application_modules(pid);
+    require_excluded(discovered, wrong_offset.path(),
+                     "same-file mappings with an incorrect PT_LOAD file offset");
 
     const fs::path alias_path = temporary.path() / "alias.so";
     fs::create_symlink(pinned_path, alias_path);

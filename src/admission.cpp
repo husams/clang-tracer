@@ -285,36 +285,104 @@ FileImage load_image_fd(const std::string &path, int fd,
            m.major_no == static_cast<unsigned>(major(identity.st_dev)) &&
            m.minor_no == static_cast<unsigned>(minor(identity.st_dev));
   };
+  const auto file_page_range = [&](const Elf64_Phdr &segment,
+                                   std::uint64_t &file_begin,
+                                   std::uint64_t &virtual_begin,
+                                   std::uint64_t &length) {
+    if (segment.p_filesz == 0 || segment.p_offset % page !=
+                                    segment.p_vaddr % page) {
+      return false;
+    }
+    const auto file_end = segment.p_offset + segment.p_filesz;
+    const auto virtual_end = segment.p_vaddr + segment.p_filesz;
+    if (file_end > std::numeric_limits<std::uint64_t>::max() - (page - 1) ||
+        virtual_end > std::numeric_limits<std::uint64_t>::max() - (page - 1)) {
+      return false;
+    }
+    file_begin = (segment.p_offset / page) * page;
+    virtual_begin = (segment.p_vaddr / page) * page;
+    const auto file_page_end = ((file_end + page - 1) / page) * page;
+    const auto virtual_page_end = ((virtual_end + page - 1) / page) * page;
+    if (file_page_end < file_begin || virtual_page_end < virtual_begin ||
+        file_page_end - file_begin != virtual_page_end - virtual_begin) {
+      return false;
+    }
+    length = file_page_end - file_begin;
+    return length != 0;
+  };
+  const auto mapping_covers_range = [&](std::uint64_t load_bias,
+                                       const Elf64_Phdr &segment) {
+    std::uint64_t file_begin = 0, virtual_begin = 0, length = 0;
+    if (!file_page_range(segment, file_begin, virtual_begin, length) ||
+        virtual_begin >
+            std::numeric_limits<std::uint64_t>::max() - load_bias) {
+      return false;
+    }
+    const auto address_begin = load_bias + virtual_begin;
+    if (length > std::numeric_limits<std::uint64_t>::max() - address_begin) {
+      return false;
+    }
+    const auto address_end = address_begin + length;
+    auto cursor = address_begin;
+    while (cursor < address_end) {
+      auto covered_until = cursor;
+      for (const auto &mapping : maps) {
+        if (!same_file(mapping) ||
+            ((segment.p_flags & PF_X) != 0 && !mapping.executable) ||
+            cursor < mapping.begin || cursor >= mapping.end) {
+          continue;
+        }
+        const auto address_delta = cursor - address_begin;
+        const auto mapping_delta = cursor - mapping.begin;
+        if (address_delta >
+                std::numeric_limits<std::uint64_t>::max() - file_begin ||
+            mapping_delta >
+                std::numeric_limits<std::uint64_t>::max() - mapping.offset ||
+            file_begin + address_delta != mapping.offset + mapping_delta) {
+          continue;
+        }
+        covered_until = std::max(covered_until,
+                                 std::min(address_end, mapping.end));
+      }
+      if (covered_until == cursor) {
+        return false;
+      }
+      cursor = covered_until;
+    }
+    return true;
+  };
   bool bias_found = false;
+  bool header_identity_found = false;
   for (const auto &p : image.loads) {
     if (p.p_offset != 0 || p.p_filesz == 0) {
       continue;
     }
-    const auto expected_offset = (p.p_offset / page) * page;
-    const auto expected_vaddr = (p.p_vaddr / page) * page;
+    std::uint64_t expected_offset = 0, expected_vaddr = 0, range_length = 0;
+    if (!file_page_range(p, expected_offset, expected_vaddr, range_length)) {
+      unavailable("ELF header load segment has invalid page alignment for " +
+                  path);
+    }
     for (const auto &m : maps) {
-      if (!same_file(m) || m.offset != expected_offset ||
-          m.begin < expected_vaddr) {
+      if (!same_file(m) || m.offset > expected_offset) {
         continue;
       }
-      const auto candidate = m.begin - expected_vaddr;
-      // Older GNU ld places a small DSO's RX header and RW data segments
-      // on different virtual pages backed by the SAME file page zero. Only
-      // a candidate consistent with every PT_LOAD is an actual load bias.
+      const auto file_delta = expected_offset - m.offset;
+      if (file_delta >= m.end - m.begin ||
+          file_delta > std::numeric_limits<std::uint64_t>::max() - m.begin) {
+        continue;
+      }
+      const auto header_address = m.begin + file_delta;
+      if (header_address < expected_vaddr) {
+        continue;
+      }
+      header_identity_found = true;
+      const auto candidate = header_address - expected_vaddr;
+      // A VMA may cover several adjacent PT_LOAD ranges after the kernel
+      // coalesces mappings with matching protections and file offsets. Check
+      // byte-page coverage and file-offset correspondence across the range.
       const bool complete =
-          std::all_of(image.loads.begin(), image.loads.end(), [&](const Elf64_Phdr& load) {
-            if (!load.p_filesz) {
-              return true;
-            }
-            const auto segment_page = (load.p_vaddr / page) * page;
-            if (candidate > std::numeric_limits<std::uint64_t>::max() - segment_page) {
-              return false;
-            }
-            return std::any_of(maps.begin(), maps.end(), [&](const Mapping& entry) {
-              return same_file(entry) && entry.offset == (load.p_offset / page) * page &&
-                     entry.begin == candidate + segment_page &&
-                     ((load.p_flags & PF_X) == 0 || entry.executable);
-            });
+          std::all_of(image.loads.begin(), image.loads.end(), [&](const auto &load) {
+            return load.p_filesz == 0 || mapping_covers_range(candidate, load);
           });
       if (!complete) {
         continue;
@@ -327,27 +395,17 @@ FileImage load_image_fd(const std::string &path, int fd,
     }
   }
   if (!bias_found) {
-    unavailable("no target ELF header mapping matches the file identity");
-  }
-  for (const auto &p : image.loads) {
-    if (p.p_filesz == 0) {
-      continue;
+    if (!header_identity_found) {
+      unavailable("no target ELF header mapping matches file identity for " +
+                  path + " (device " +
+                  std::to_string(static_cast<unsigned>(major(identity.st_dev))) +
+                  ":" +
+                  std::to_string(static_cast<unsigned>(minor(identity.st_dev))) +
+                  ", inode " + std::to_string(identity.st_ino) + ")");
     }
-    const auto expected_offset = (p.p_offset / page) * page;
-    const auto segment_page = (p.p_vaddr / page) * page;
-    if (segment_page > std::numeric_limits<std::uint64_t>::max() - image.bias) {
-      unavailable("ELF segment address overflows the target address space");
-    }
-    const auto expected_begin = image.bias + segment_page;
-    const bool mapped =
-        std::any_of(maps.begin(), maps.end(), [&](const Mapping &m) {
-          return same_file(m) && m.offset == expected_offset &&
-                 m.begin == expected_begin &&
-                 ((p.p_flags & PF_X) == 0 || m.executable);
-        });
-    if (!mapped) {
-      unavailable("ELF program headers do not match target file mappings");
-    }
+    unavailable("target ELF header identity found but PT_LOAD file coverage "
+                "is incomplete for " +
+                path);
   }
   if (eh->e_type == ET_EXEC && image.bias != 0) {
     unavailable("unexpected load bias for fixed-address ELF");
