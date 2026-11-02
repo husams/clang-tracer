@@ -1,0 +1,65 @@
+// Commands use Lark's LALR grammar; only a leading ! explicitly invokes /bin/sh.
+?start: "server" "start" server_option*                  -> server_start
+      | "server" "status"                               -> server_status
+      | "server" "stop" timeout_option?                  -> server_stop
+      | "attach" INT                                    -> attach
+      | "sessions"                                      -> sessions
+      | "symbols" symbol_option*                        -> symbols
+      | "use" value                                     -> use
+      | "detach" value?                                 -> detach
+      | "probe" "inject" value injection_option*        -> inject
+      | "probe" "resolve" value resolution_option*      -> resolve
+      | "probe" "add" value                             -> add_spec
+      | "probe" "remove" INT                            -> remove
+      | "events" watch_option*                          -> events
+      | "collect" INT stream_option*                    -> collect
+      | "record" value INT record_option*               -> record
+      | "drain" value drain_option*                     -> drain
+      | "help" value*                                  -> help
+      | SHELL_COMMAND                                   -> shell
+      | "!"                                             -> shell_empty
+      | "exit"                                          -> exit
+      | "quit"                                          -> exit
+
+?server_option: "--executable" value                     -> executable
+              | "--agent" value                         -> agent
+              | "--durable-directory" value             -> durable_directory
+              | "--operation-timeout" INT               -> operation_timeout
+              | "--event-history-limit" INT             -> event_history_limit
+              | "--context-history-limit" INT           -> context_history_limit
+              | "--context-history-bytes" INT           -> context_history_bytes
+              | timeout_option
+?injection_option: "--callback" value                    -> callback
+                 | "--stack" INT                        -> stack_depth
+                 | "--internal-frames"                  -> internal_frames
+                 | "--print-arguments"                  -> print_arguments
+                 | "--print-result"                     -> print_result
+                 | "--package" value                    -> callback_package_path
+                 | resolution_option
+?resolution_option: "--include" value                    -> include_headers
+                  | "--compdb" value                    -> compilation_database
+?watch_option: "--count" INT                             -> count
+             | stream_option
+?record_option: "--sqlite"                              -> sqlite
+              | stream_option
+?drain_option: "--listen"                               -> listen
+             | watch_option
+?stream_option: "--session" value                        -> session_ids
+              | "--pid" INT                             -> pid
+              | "--name" value                          -> names
+              | "--after" INT                           -> after_sequence
+              | timeout_option
+?symbol_option: "--filter" value                        -> query
+              | "--module" value                        -> module
+              | "--limit" INT                           -> page_size
+              | "--page" value                          -> page_token
+timeout_option: "--timeout" NUMBER                      -> timeout
+SHELL_COMMAND.10: /![ \t][^\n]*/
+?value: STRING | BARE
+STRING.3: /"(?:[^"\\]|\\.)*"/ | /'(?:[^'\\]|\\.)*'/
+BARE.-1: /[^\s'"#]+/
+INT.1: /[0-9]+/
+NUMBER.2: /[0-9]+(?:\.[0-9]+)?/
+%import common.WS
+%ignore WS
+%ignore /#[^\n]*/

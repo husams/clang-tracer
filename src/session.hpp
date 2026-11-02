@@ -44,6 +44,7 @@ public:
                                    std::uint32_t pid) const;
   [[nodiscard]] std::string id() const { return id_; }
   [[nodiscard]] std::uint32_t pid() const { return pid_; }
+  [[nodiscard]] std::uint64_t process_start_time() const { return process_start_; }
   [[nodiscard]] std::mutex &operation_mutex() { return operation_mutex_; }
   [[nodiscard]] static std::uint64_t ProcessStartTime(std::uint32_t pid);
 

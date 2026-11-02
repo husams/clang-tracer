@@ -40,6 +40,8 @@
 #include <unistd.h>
 
 #include "session.hpp"
+#include "debug_resolver.hpp"
+#include "header_context.hpp"
 #include "context_collector.hpp"
 #include "context_journal.hpp"
 #include "context_package.hpp"
@@ -48,11 +50,8 @@ namespace tracer {
 namespace {
 
 constexpr std::size_t kSessionLimit = 64;
-constexpr std::size_t kEventHistoryLimit = 4096;
 constexpr std::size_t kMaxCallbackSource = 64 * 1024;
 constexpr std::size_t kMaxEventBytes = 64 * 1024;
-constexpr std::size_t kRetainedContextEventLimit = 128;
-constexpr std::size_t kRetainedContextBytesLimit = 16 * 1024 * 1024;
 
 context_package::PackageLineage admit_probe_package(
     const clangtracer::v1::ProbeSpec &spec) {
@@ -251,12 +250,23 @@ public:
     lock_path_ = socket_path_ + ".lock";
     fd_ = ::open(lock_path_.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW,
                  0600);
-    if (fd_ < 0 || ::flock(fd_, LOCK_EX | LOCK_NB) != 0) {
-      if (fd_ >= 0)
-        ::close(fd_);
+    if (fd_ < 0) {
+      const int error = errno;
+      throw std::runtime_error("cannot open endpoint lock '" + lock_path_ +
+                               "' (errno " + std::to_string(error) + "): " +
+                               std::strerror(error));
+    }
+    if (::flock(fd_, LOCK_EX | LOCK_NB) != 0) {
+      const int error = errno;
+      ::close(fd_);
       fd_ = -1;
-      throw std::runtime_error(
-          "another clang-tracer server owns this endpoint");
+      if (error == EWOULDBLOCK || error == EAGAIN) {
+        throw std::runtime_error(
+            "another clang-tracer server owns this endpoint");
+      }
+      throw std::runtime_error("cannot acquire endpoint lock '" + lock_path_ +
+                               "' (errno " + std::to_string(error) + "): " +
+                               std::strerror(error));
     }
     if (::lstat(socket_path_.c_str(), &info) == 0 || errno != ENOENT) {
       ::flock(fd_, LOCK_UN);
@@ -315,9 +325,57 @@ bool valid_loopback_uri(const std::string &uri) {
   }
 }
 
+int hex_value(char value) {
+  if (value >= '0' && value <= '9')
+    return value - '0';
+  if (value >= 'a' && value <= 'f')
+    return value - 'a' + 10;
+  if (value >= 'A' && value <= 'F')
+    return value - 'A' + 10;
+  return -1;
+}
+
+std::string encode_symbol_page_token(
+    const clangtracer::v1::ListSymbolsPageToken &token) {
+  std::string serialized;
+  if (!token.SerializeToString(&serialized))
+    throw std::runtime_error("cannot encode symbol page token");
+  constexpr char digits[] = "0123456789abcdef";
+  std::string result;
+  result.reserve(serialized.size() * 2);
+  for (const unsigned char byte : serialized) {
+    result.push_back(digits[byte >> 4]);
+    result.push_back(digits[byte & 0x0f]);
+  }
+  return result;
+}
+
+bool decode_symbol_page_token(
+    const std::string &encoded,
+    clangtracer::v1::ListSymbolsPageToken *token) {
+  if (encoded.empty() || encoded.size() > 65536 || encoded.size() % 2 != 0)
+    return false;
+  std::string serialized;
+  serialized.reserve(encoded.size() / 2);
+  for (std::size_t i = 0; i < encoded.size(); i += 2) {
+    const int high = hex_value(encoded[i]);
+    const int low = hex_value(encoded[i + 1]);
+    if (high < 0 || low < 0)
+      return false;
+    serialized.push_back(static_cast<char>((high << 4) | low));
+  }
+  return token->ParseFromString(serialized);
+}
+
 class EventHub final {
+  struct ProbeIdentity {
+    std::uint32_t pid = 0;
+    std::string function_name;
+  };
+
 public:
-  explicit EventHub(std::string path) : path_(std::move(path)) {
+  explicit EventHub(std::string path, EventHistoryLimits limits)
+      : path_(std::move(path)), limits_(limits), instance_id_(make_id()) {
     if (path_.size() >= sizeof(((sockaddr_un *)nullptr)->sun_path)) {
       throw std::runtime_error("event socket path is too long");
     }
@@ -343,24 +401,32 @@ public:
   const std::string &path() const { return path_; }
 
   void set_probe(const std::string &session_id, std::uint64_t probe_id,
-                 std::uint32_t pid, bool active) {
+                 std::uint32_t pid, std::string function_name, bool active) {
     std::lock_guard lock(mutex_);
     const auto key = std::make_pair(session_id, probe_id);
     if (active) {
-      active_probes_[key] = pid;
+      const auto existing = active_probes_.find(key);
+      if (existing != active_probes_.end()) {
+        function_name = existing->second.function_name;
+      } else if (const auto known = known_probes_.find(key);
+                 known != known_probes_.end()) {
+        function_name = known->second.function_name;
+      }
+      ProbeIdentity identity{pid, std::move(function_name)};
+      active_probes_[key] = identity;
       constexpr std::size_t kKnownProbeLimit = 4096;
       bool retain_probe_identity = true;
-      if (!known_probe_pids_.contains(key) &&
-          known_probe_pids_.size() >= kKnownProbeLimit) {
-        const auto stale = std::find_if(known_probe_pids_.begin(), known_probe_pids_.end(),
+      if (!known_probes_.contains(key) &&
+          known_probes_.size() >= kKnownProbeLimit) {
+        const auto stale = std::find_if(known_probes_.begin(), known_probes_.end(),
             [&](const auto &entry) { return !active_probes_.contains(entry.first); });
-        if (stale != known_probe_pids_.end())
-          known_probe_pids_.erase(stale);
+        if (stale != known_probes_.end())
+          known_probes_.erase(stale);
         else
           retain_probe_identity = false;
       }
       if (retain_probe_identity)
-        known_probe_pids_[key] = pid;
+        known_probes_[key] = std::move(identity);
       received_.try_emplace(key, 0);
     } else {
       active_probes_.erase(key);
@@ -543,14 +609,14 @@ public:
       return drop();
     event.mutable_context()->CopyFrom(envelope);
 
-    const std::size_t charge = event.ByteSizeLong();
     std::lock_guard lock(mutex_);
     const auto key = std::make_pair(session_id, probe_id);
-    auto known = known_probe_pids_.find(key);
-    if (known == known_probe_pids_.end()) {
+    auto known = known_probes_.find(key);
+    if (known == known_probes_.end()) {
       const auto active = active_probes_.find(key);
       if (active != active_probes_.end()) {
-        event.set_pid(active->second);
+        event.set_pid(active->second.pid);
+        event.set_function_name(active->second.function_name);
       } else if (verified_native_pid != 0) {
         // The collector may have restarted and lost its in-memory mapping.
         // The engine-supplied PID is accepted only while its process start
@@ -561,34 +627,40 @@ public:
         return true;
       }
     } else {
-      event.set_pid(known->second);
+      event.set_pid(known->second.pid);
+      event.set_function_name(known->second.function_name);
     }
-    if (charge > kRetainedContextBytesLimit) {
+    event.set_server_instance_id(instance_id_);
+    const std::size_t charge = event.ByteSizeLong();
+    if (charge + 64 > limits_.context_bytes) {
       ++dropped_;
       return true;
     }
-    while (context_event_count_ >= kRetainedContextEventLimit ||
-           context_bytes_ + charge + 64 > kRetainedContextBytesLimit) {
+    while (context_event_count_ >= limits_.context_events ||
+           context_bytes_ + charge + 64 > limits_.context_bytes) {
       const auto oldest = std::find_if(history_.begin(), history_.end(),
           [](const auto &item) { return item.has_context(); });
       if (oldest == history_.end())
         break;
       context_bytes_ -= oldest->ByteSizeLong();
       --context_event_count_;
+      evicted_through_ = std::max(evicted_through_, oldest->sequence());
       history_.erase(oldest);
       ++dropped_;
     }
-    if (context_event_count_ >= kRetainedContextEventLimit ||
-        context_bytes_ + charge + 64 > kRetainedContextBytesLimit) {
+    if (context_event_count_ >= limits_.context_events ||
+        context_bytes_ + charge + 64 > limits_.context_bytes) {
       ++dropped_;
       return true;
     }
     event.set_sequence(next_sequence_++);
-    if (history_.size() == kEventHistoryLimit) {
+    if (history_.size() == limits_.events) {
       if (history_.front().has_context()) {
         context_bytes_ -= history_.front().ByteSizeLong();
         --context_event_count_;
       }
+      evicted_through_ =
+          std::max(evicted_through_, history_.front().sequence());
       history_.pop_front();
       ++dropped_;
     }
@@ -622,6 +694,8 @@ public:
               grpc::ServerWriter<clangtracer::v1::TraceEvent> *writer) {
     std::set<std::string> filter(request->session_ids().begin(),
                                  request->session_ids().end());
+    std::set<std::string> name_filter(request->names().begin(),
+                                      request->names().end());
     std::uint64_t cursor = request->after_sequence();
     for (;;) {
       std::vector<clangtracer::v1::TraceEvent> batch;
@@ -630,9 +704,9 @@ public:
         std::unique_lock lock(mutex_);
         if (context->IsCancelled())
           return true;
-        if (cursor != 0 && !history_.empty() &&
-            history_.front().sequence() > cursor + 1)
+        if (cursor != 0 && cursor < evicted_through_) {
           return false;
+        }
         bool found = false;
         for (const auto &event : history_) {
           if (event.sequence() <= cursor)
@@ -641,7 +715,13 @@ public:
               filter.empty() || filter.count(event.session_id()) != 0;
           const bool pid_matches =
               request->pid() == 0 || event.pid() == request->pid();
-          if (session_matches && pid_matches) {
+          const bool name_matches = name_filter.empty() ||
+              std::any_of(name_filter.begin(), name_filter.end(), [&](const auto &name) {
+                return event.function_name() == name ||
+                       (event.has_context() && event.context().has_event() &&
+                        event.context().event().name() == name);
+              });
+          if (session_matches && pid_matches && name_matches) {
             const auto bytes = event.ByteSizeLong();
             if (!batch.empty() && batch_bytes + bytes > 32 * 1024 * 1024)
               break;
@@ -669,6 +749,92 @@ public:
     }
   }
 
+  grpc::Status read(const clangtracer::v1::ReadEventsRequest &request,
+                    clangtracer::v1::ReadEventsResponse &response) {
+    std::lock_guard lock(mutex_);
+    if ((!request.server_instance_id().empty() &&
+         request.server_instance_id() != instance_id_) ||
+        (request.through_sequence() != 0 &&
+         request.server_instance_id().empty())) {
+      return {grpc::StatusCode::FAILED_PRECONDITION,
+              "snapshot server instance changed or missing"};
+    }
+    if (request.through_sequence() >= next_sequence_) {
+      return {grpc::StatusCode::INVALID_ARGUMENT,
+              "snapshot watermark exceeds the current server sequence"};
+    }
+    const auto through = request.through_sequence() == 0
+                             ? next_sequence_ - 1
+                             : request.through_sequence();
+    response.set_server_instance_id(instance_id_);
+    response.set_through_sequence(through);
+    response.set_server_dropped_events(dropped_);
+    const auto &filter = request.filter();
+    const auto limit = request.limit() == 0 ? 256 : request.limit();
+    std::size_t bytes = 0;
+    for (const auto &event : history_) {
+      if (event.sequence() > through) {
+        break;
+      }
+      if (event.sequence() <= filter.after_sequence() ||
+          (filter.pid() != 0 && event.pid() != filter.pid()) ||
+          (!filter.session_ids().empty() &&
+           std::find(filter.session_ids().begin(), filter.session_ids().end(),
+                     event.session_id()) == filter.session_ids().end()) ||
+          (!filter.names().empty() &&
+           std::none_of(filter.names().begin(), filter.names().end(),
+                        [&](const auto &name) {
+                          return event.function_name() == name ||
+                                 (event.has_context() &&
+                                  event.context().has_event() &&
+                                  event.context().event().name() == name);
+                        }))) {
+        continue;
+      }
+      const auto charge = event.ByteSizeLong() + 16;
+      if (charge > 31 * 1024 * 1024) {
+        return {grpc::StatusCode::RESOURCE_EXHAUSTED,
+                "event exceeds drain response budget"};
+      }
+      if (bytes + charge > 31 * 1024 * 1024) {
+        break;
+      }
+      response.add_events()->CopyFrom(event);
+      bytes += charge;
+      if (response.events_size() >= static_cast<int>(limit)) {
+        break;
+      }
+    }
+    return grpc::Status::OK;
+  }
+
+  grpc::Status
+  acknowledge(const clangtracer::v1::AcknowledgeEventsRequest &request,
+              clangtracer::v1::AcknowledgeEventsResponse &response) {
+    std::lock_guard lock(mutex_);
+    if (request.server_instance_id() != instance_id_) {
+      return {grpc::StatusCode::FAILED_PRECONDITION,
+              "acknowledgement belongs to another server instance"};
+    }
+    const std::set<std::uint64_t> sequences(request.sequences().begin(),
+                                            request.sequences().end());
+    for (auto it = history_.begin(); it != history_.end();) {
+      if (sequences.count(it->sequence()) == 0) {
+        ++it;
+        continue;
+      }
+      if (it->has_context()) {
+        context_bytes_ -= it->ByteSizeLong();
+        --context_event_count_;
+      }
+      evicted_through_ = std::max(evicted_through_, it->sequence());
+      it = history_.erase(it);
+      response.set_removed(response.removed() + 1);
+    }
+    changed_.notify_all();
+    return grpc::Status::OK;
+  }
+
   void stop() noexcept {
     stopping_.store(true);
     changed_.notify_all();
@@ -684,13 +850,16 @@ public:
 
 private:
   std::string path_;
+  EventHistoryLimits limits_;
+  std::string instance_id_;
+  std::uint64_t evicted_through_ = 0;
   int fd_ = -1;
   std::thread receiver_;
   std::atomic<bool> stopping_{false};
   std::mutex mutex_;
   std::condition_variable changed_;
-  std::map<std::pair<std::string, std::uint64_t>, std::uint32_t> active_probes_;
-  std::map<std::pair<std::string, std::uint64_t>, std::uint32_t> known_probe_pids_;
+  std::map<std::pair<std::string, std::uint64_t>, ProbeIdentity> active_probes_;
+  std::map<std::pair<std::string, std::uint64_t>, ProbeIdentity> known_probes_;
   std::map<std::pair<std::string, std::uint64_t>, std::uint64_t> received_;
   std::deque<clangtracer::v1::TraceEvent> history_;
   std::size_t context_bytes_ = 0;
@@ -854,18 +1023,27 @@ private:
       }
       if (!valid_phase)
         continue;
+      // Function names are assigned by the server from the registered ProbeSpec.
+      if (!event.function_name().empty())
+        continue;
       std::lock_guard lock(mutex_);
       const auto active =
           active_probes_.find({event.session_id(), event.probe_id()});
-      if (active == active_probes_.end() || active->second != event.pid())
+      if (active == active_probes_.end() || active->second.pid != event.pid())
         continue;
+      // Function identity comes from the registered probe, not the agent packet.
+      event.clear_function_name();
+      event.set_function_name(active->second.function_name);
       ++received_[active->first];
       event.set_sequence(next_sequence_++);
-      if (history_.size() == kEventHistoryLimit) {
+      event.set_server_instance_id(instance_id_);
+      if (history_.size() == limits_.events) {
         if (history_.front().has_context()) {
           context_bytes_ -= history_.front().ByteSizeLong();
           --context_event_count_;
         }
+        evicted_through_ =
+            std::max(evicted_through_, history_.front().sequence());
         history_.pop_front();
         ++dropped_;
       }
@@ -881,12 +1059,13 @@ public:
   TracerService(std::string agent_path, std::string event_path,
                 std::string source_directory, std::chrono::seconds timeout,
                 std::string context_endpoint,
-                std::string context_durable_directory)
+                std::string context_durable_directory,
+                EventHistoryLimits limits)
       : agent_path_(std::move(agent_path)), event_path_(std::move(event_path)),
         source_directory_(std::move(source_directory)), timeout_(timeout),
         context_endpoint_(std::move(context_endpoint)),
         context_durable_directory_(std::move(context_durable_directory)),
-        events_(event_path_), next_probe_id_(random_probe_seed()) {}
+        events_(event_path_, limits), next_probe_id_(random_probe_seed()) {}
 
   void set_context_endpoint(std::string endpoint) {
     std::lock_guard lock(mutex_);
@@ -989,6 +1168,35 @@ public:
     return grpc::Status::OK;
   }
 
+  grpc::Status ResolveProbe(grpc::ServerContext *,
+                            const clangtracer::v1::ResolveProbeRequest *request,
+                            clangtracer::v1::ProbeSpec *response) override {
+    if (request->selector().empty() || request->selector().size() > 4096 ||
+        request->selector().find('\0') != std::string::npos)
+      return {grpc::StatusCode::INVALID_ARGUMENT, "invalid C++ selector"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    session->refresh_process_state();
+    if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "session is not attached"};
+    try {
+      auto resolved =
+          client::resolve_debug_callable(session->pid(), request->selector());
+      for (const auto &header : request->include_headers())
+        resolved.spec.add_include_headers(header);
+      client::resolve_header_context(resolved.spec,
+                                     request->compilation_database());
+      response->Swap(&resolved.spec);
+      return grpc::Status::OK;
+    } catch (const std::invalid_argument &error) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, error.what()};
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
+  }
+
   grpc::Status AddProbe(grpc::ServerContext *,
                         const clangtracer::v1::AddProbeRequest *request,
                         clangtracer::v1::Probe *response) override {
@@ -1004,7 +1212,15 @@ public:
       pending_probe_id = next_probe_id_.fetch_add(1);
       if (pending_probe_id == 0)
         pending_probe_id = next_probe_id_.fetch_add(1);
-      events_.set_probe(session->id(), pending_probe_id, session->pid(), true);
+      const auto &spec = request->spec();
+      const auto &selector = spec.debug_info().selector();
+      const auto function_name =
+          spec.has_debug_info() && !selector.empty() && selector.size() <= 4096 &&
+                  selector.find('\0') == std::string::npos
+              ? selector
+              : spec.symbol();
+      events_.set_probe(session->id(), pending_probe_id, session->pid(),
+                        function_name, true);
       const auto lineage = admit_probe_package(request->spec());
       if (!lineage.retained) {
         std::cerr << "clang-tracer: shared-context source lineage isolated: "
@@ -1102,15 +1318,169 @@ public:
     return grpc::Status::OK;
   }
 
+  grpc::Status ListSymbols(
+      grpc::ServerContext *context,
+      const clangtracer::v1::ListSymbolsRequest *request,
+      clangtracer::v1::ListSymbolsResponse *response) override {
+    if (request->session_id().empty() || request->session_id().size() > 128 ||
+        request->session_id().find('\0') != std::string::npos ||
+        request->query().size() > 4096 || request->query().find('\0') != std::string::npos ||
+        request->module().size() > 4096 || request->module().find('\0') != std::string::npos ||
+        request->page_token().size() > 65536 ||
+        request->page_token().find('\0') != std::string::npos) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "invalid symbol listing request"};
+    }
+    const std::size_t page_size = request->page_size() == 0 ? 100 : request->page_size();
+    if (page_size > 500) {
+      return {grpc::StatusCode::INVALID_ARGUMENT,
+              "symbol page size must be between 1 and 500"};
+    }
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    session->refresh_process_state();
+    if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED) {
+      return {grpc::StatusCode::FAILED_PRECONDITION,
+              "symbol listing requires a live attached session"};
+    }
+    const auto process_start = session->process_start_time();
+    try {
+      if (Session::ProcessStartTime(session->pid()) != process_start) {
+        session->refresh_process_state();
+        return {grpc::StatusCode::FAILED_PRECONDITION,
+                "target process exited or PID was reused"};
+      }
+    } catch (const std::exception &error) {
+      return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
+    }
+
+    clangtracer::v1::ListSymbolsPageToken continuation;
+    if (!request->page_token().empty()) {
+      if (!decode_symbol_page_token(request->page_token(), &continuation) ||
+          continuation.session_id() != request->session_id() ||
+          continuation.pid() != session->pid() ||
+          continuation.process_start_time() != process_start ||
+          continuation.query() != request->query() ||
+          continuation.module() != request->module() ||
+          continuation.page_size() != page_size ||
+          continuation.mapping_fingerprint().empty()) {
+        return {grpc::StatusCode::INVALID_ARGUMENT,
+                "invalid or mismatched symbol page token"};
+      }
+    }
+
+    try {
+      const auto page = client::list_debug_symbols(
+          session->pid(), request->query(), request->module(), page_size,
+          continuation.last_selector(), continuation.last_linkage_symbol(),
+          continuation.last_module_path(), continuation.mapping_fingerprint(),
+          [&] { return context->IsCancelled(); });
+      if (page.cancelled || context->IsCancelled())
+        return {grpc::StatusCode::CANCELLED, "symbol discovery cancelled"};
+      session->refresh_process_state();
+      if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED) {
+        return {grpc::StatusCode::FAILED_PRECONDITION,
+                "target process exited during symbol discovery"};
+      }
+      try {
+        if (Session::ProcessStartTime(session->pid()) != process_start) {
+          session->refresh_process_state();
+          return {grpc::StatusCode::FAILED_PRECONDITION,
+                  "target process exited or PID was reused during symbol discovery"};
+        }
+      } catch (const std::exception &error) {
+        session->refresh_process_state();
+        return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
+      }
+      for (const auto &item : page.symbols) {
+        auto *symbol = response->add_symbols();
+        symbol->set_selector(item.selector);
+        symbol->set_linkage_symbol(item.linkage_symbol);
+        symbol->set_module_path(item.module_path);
+      }
+      if (page.has_more && !page.symbols.empty()) {
+        continuation.set_session_id(request->session_id());
+        continuation.set_pid(session->pid());
+        continuation.set_process_start_time(process_start);
+        continuation.set_query(request->query());
+        continuation.set_module(request->module());
+        continuation.set_page_size(page_size);
+        continuation.set_mapping_fingerprint(page.mapping_fingerprint);
+        continuation.set_last_selector(page.symbols.back().selector);
+        continuation.set_last_linkage_symbol(page.symbols.back().linkage_symbol);
+        continuation.set_last_module_path(page.symbols.back().module_path);
+        response->set_next_page_token(encode_symbol_page_token(continuation));
+      }
+      if (response->ByteSizeLong() > 8 * 1024 * 1024) {
+        return {grpc::StatusCode::RESOURCE_EXHAUSTED,
+                "symbol page exceeds the 8 MiB response budget; reduce page size"};
+      }
+      return grpc::Status::OK;
+    } catch (const std::invalid_argument &error) {
+      const std::string detail = error.what();
+      if (detail.find("mapped images changed") != std::string::npos) {
+        return {grpc::StatusCode::ABORTED, detail};
+      }
+      return {grpc::StatusCode::INVALID_ARGUMENT, detail};
+    } catch (const std::exception &error) {
+      const std::string detail = error.what();
+      if (detail.find("work limit exceeded") != std::string::npos) {
+        return {grpc::StatusCode::RESOURCE_EXHAUSTED, detail};
+      }
+      return status_for(error);
+    }
+  }
+
   grpc::Status WatchEvents(
       grpc::ServerContext *context,
       const clangtracer::v1::WatchEventsRequest *request,
       grpc::ServerWriter<clangtracer::v1::TraceEvent> *writer) override {
+    if (request->names_size() > 64) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "at most 64 name filters are allowed"};
+    }
+    for (const auto &name : request->names()) {
+      if (name.empty() || name.size() > 4096 || name.find('\0') != std::string::npos) {
+        return {grpc::StatusCode::INVALID_ARGUMENT,
+                "each name filter must be 1 to 4096 bytes without NUL"};
+      }
+    }
     if (!events_.stream(context, request, writer)) {
       return {grpc::StatusCode::OUT_OF_RANGE,
               "event cursor is older than retained history"};
     }
     return grpc::Status::OK;
+  }
+
+  grpc::Status
+  ReadEvents(grpc::ServerContext *,
+             const clangtracer::v1::ReadEventsRequest *request,
+             clangtracer::v1::ReadEventsResponse *response) override {
+    if (request->limit() > 256 || request->filter().names_size() > 64 ||
+        request->filter().session_ids_size() > 64) {
+      return {grpc::StatusCode::INVALID_ARGUMENT,
+              "drain limit is at most 256; filters at most 64"};
+    }
+    for (const auto &name : request->filter().names()) {
+      if (name.empty() || name.size() > 4096 ||
+          name.find('\0') != std::string::npos) {
+        return {grpc::StatusCode::INVALID_ARGUMENT,
+                "invalid event name filter"};
+      }
+    }
+    return events_.read(*request, *response);
+  }
+
+  grpc::Status AcknowledgeEvents(
+      grpc::ServerContext *,
+      const clangtracer::v1::AcknowledgeEventsRequest *request,
+      clangtracer::v1::AcknowledgeEventsResponse *response) override {
+    if (request->server_instance_id().empty() ||
+        request->sequences_size() > 256) {
+      return {grpc::StatusCode::INVALID_ARGUMENT,
+              "server instance and at most 256 sequences required"};
+    }
+    return events_.acknowledge(*request, *response);
   }
 
   bool shutdown_sessions() {
@@ -1205,10 +1575,11 @@ private:
         std::none_of(
             snapshot.probes().begin(), snapshot.probes().end(),
             [&](const auto &probe) { return probe.id() == pending_probe_id; }))
-      events_.set_probe(session->id(), pending_probe_id, session->pid(), false);
+      events_.set_probe(session->id(), pending_probe_id, session->pid(), {}, false);
     for (const auto &probe : snapshot.probes()) {
       if (probe.active())
-        events_.set_probe(probe.session_id(), probe.id(), session->pid(), true);
+        events_.set_probe(probe.session_id(), probe.id(), session->pid(),
+                          probe.symbol(), true);
       else
         (void)events_.retire_probe(probe.session_id(), probe.id(),
                                    session->events_sent(probe.id()),
@@ -1403,7 +1774,15 @@ private:
 
 int RunServer(const std::string &agent_path, const std::string &listen_uri,
               std::chrono::seconds operation_timeout,
-              const std::string &context_durable_directory) {
+              const std::string &context_durable_directory,
+              EventHistoryLimits history_limits) {
+  if (history_limits.events == 0 || history_limits.context_events == 0 ||
+      history_limits.context_bytes == 0 ||
+      history_limits.context_bytes >
+          std::numeric_limits<std::size_t>::max() / 2) {
+    throw std::invalid_argument(
+        "history limits must be positive and fit size_t / 2");
+  }
   if (agent_path.empty() || operation_timeout.count() < 1 ||
       operation_timeout.count() > 300) {
     throw std::invalid_argument(
@@ -1436,7 +1815,8 @@ int RunServer(const std::string &agent_path, const std::string &listen_uri,
         std::filesystem::path(durable_root) / "collector");
   }
   TracerService service(canonical_agent, event_path, directory.path(),
-                        operation_timeout, endpoint, durable_root);
+                        operation_timeout, endpoint, durable_root,
+                        history_limits);
   LiveContextCapture live_context;
   context_delivery::ContextCollector context_collector(
       {}, {},

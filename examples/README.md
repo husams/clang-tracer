@@ -11,6 +11,7 @@ commands; start with basic callbacks, then shared context.
 | [Shared context](shared-context/README.md) | Share one request's state across two probes and a worker thread. |
 | [Call stacks](call-stacks/README.md) | Capture and display symbolized native stacks. |
 | [Legacy callbacks](legacy-callbacks/README.md) | Use the older entry-only TraceContext interface. |
+| [Python API](python/README.md) | Launch a server, attach, install probes, stream events, and record/replay binary traces. |
 
 The shared-context example has commented source and manual commands for the
 complete build → attach → trace → view → detach lifecycle.

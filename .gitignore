@@ -14,6 +14,13 @@
 /class-interceptor-results/
 /typed-this-results/
 __pycache__/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+/python/build/
+/python/dist/
 
 # Local development recordings and generated files.
 /stack-capture-results/
@@ -29,5 +36,8 @@ __pycache__/
 .env.*
 *.pem
 *.key
-/.agents/
+/.agents/*
+!/.agents/skills/
+/.agents/skills/*
+!/.agents/skills/clang-tracer-python/
 /.codex/

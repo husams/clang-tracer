@@ -4,6 +4,12 @@ Licensed under [Apache 2.0 with LLVM exceptions](LICENSE)
 (`Apache-2.0 WITH LLVM-exception`). Dependency notices retain their original terms.
 
 Build instructions, runnable callbacks and sample output are included below.
+The [Python API and interactive console](python/README.md) support all public
+gRPC operations, C++ interceptor injection, trace streaming/recording, and local
+server lifecycle management. The console uses a Lark grammar and live command
+highlighting; name-based Python injection requires rebuilding this server revision.
+Agents in a source checkout can use `$clang-tracer-python` from
+`.agents/skills/clang-tracer-python/SKILL.md` to operate the Python API.
 Generated validation recordings stay local; see [validation and benchmark notes](docs/validation.md)
 for measured results and reproduction commands.
 
@@ -195,7 +201,8 @@ shows the supported state shapes.
 ## Build and run
 
 Use Linux x86-64, C++20, matching LLVM/Clang development packages (21 or 22),
-Protobuf with `protoc`, gRPC C++ with `grpc_cpp_plugin`, CMake, and Ninja.
+Protobuf with `protoc`, gRPC C++ with `grpc_cpp_plugin`, SQLite development
+headers, CMake, and Ninja.
 
 ```sh
 cmake -S . -B build -G Ninja \
@@ -293,7 +300,25 @@ available for status inspection. Session history is bounded to 64 entries per
 server lifetime; the agent retains at most 32 prepared probe generations per
 process lifetime.
 
-The event history holds 4,096 messages. Each event has a server cursor, a per-probe
+The event history holds 4,096 messages by default; configure it with server
+`--event-history-limit N`. Shared-context history additionally defaults to 128
+events and 16 MiB of serialized bytes, configured with `--context-history-limit N`
+and `--context-history-bytes N`. These are positive startup settings, not a cap on
+total process RAM. Old events are evicted when limits are reached.
+
+Save events on the client host with `clang-tracer events PID --sqlite capture.db`.
+To save and consume retained events, use `clang-tracer drain --sqlite capture.db`;
+add an optional PID filter and `--listen` to keep draining generated events.
+For example, `clang-tracer drain 12345 --sqlite capture.db --listen --timeout 60`.
+The console equivalents are `record capture.db 100 --sqlite` and
+`drain capture.db --listen`. Both writers append complete Protobuf payloads to
+SQLite and deduplicate by server lifetime and event sequence. Drain acknowledges
+exact events only after their SQLite transaction commits, so failed writes do
+not consume history. Existing transport and overflow losses remain possible.
+See [event storage](docs/event-storage.md) for snapshot, retry and shared-reader
+semantics. SQLite development headers are required to build the native CLI.
+
+Each event has a server cursor, a per-probe
 sequence, PID/TID, monotonic timestamp, probe/session IDs, typed arguments, a
 method object address, callback value, phase, per-probe call ID, and loss counters.
 POST events include the typed original result. A nonzero resume cursor

@@ -11,7 +11,7 @@ Typical RHEL-compatible package names are:
 
 ```sh
 sudo dnf install cmake ninja-build gcc-c++ clang clang-devel clang-libs llvm-devel \
-  protobuf-compiler protobuf-devel grpc-devel grpc-plugins
+  protobuf-compiler protobuf-devel grpc-devel grpc-plugins sqlite-devel
 ```
 
 Repository availability and LLVM versions vary. Confirm the selected packages

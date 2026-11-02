@@ -1,0 +1,3 @@
+interface:
+  display_name: "Clang Tracer Python"
+  short_description: "Trace native processes with the Python client"
