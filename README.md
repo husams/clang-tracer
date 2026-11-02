@@ -637,9 +637,14 @@ must itself be thread-safe. Per-probe sequence values are unique, but concurrent
 threads can deliver them out of order; server sequence records arrival order.
 
 Only supported, complete prologue instructions are copied into the trampoline.
-Branches, PC-relative operands, CET entries, and unsupported instructions are
-rejected. The fixtures include selected optimized unwind cases; broader code
-without supported CFI or complete prologues remains unsupported. Module unload,
+Supported RIP-relative memory operands, including PIE global loads, stores and
+address calculations, retain their original addresses through checked disp32
+relocation. The trampoline is allocated in a range that can reach every such
+operand; preparation fails without patching the entry if no suitable mapping
+is available. Branches, calls, EIP-relative or segment-relative RIP operands,
+memory accesses overlapping the patch window, CET entries, and unsupported
+instructions are rejected. The fixtures include selected optimized unwind cases;
+broader code without supported CFI or complete prologues remains unsupported. Module unload,
 signal handlers, allocator/runtime hooks, and unusual control transfers need
 separate backend work. macOS and Windows backends are not implemented.
 

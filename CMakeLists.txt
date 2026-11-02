@@ -63,7 +63,7 @@ target_link_libraries(tracer_proto PUBLIC protobuf::libprotobuf tracer_context_t
 add_library(tracer_grpc STATIC ${TRACER_PROTO_DIR}/tracer.grpc.pb.cc)
 target_link_libraries(tracer_grpc PUBLIC tracer_proto gRPC::grpc++)
 
-add_library(clang_tracer_agent SHARED src/agent.cpp src/debug_resolver.cpp src/native_stack.cpp
+add_library(clang_tracer_agent SHARED src/agent.cpp src/native_detour.cpp src/debug_resolver.cpp src/native_stack.cpp
   src/event_transport.cpp src/context_agent_delivery.cpp)
 target_include_directories(clang_tracer_agent PRIVATE include ${TRACER_PROTO_DIR} ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_compile_definitions(clang_tracer_agent PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
@@ -142,6 +142,19 @@ endif()
 
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_executable(native-detour-tests tests/native_detour_tests.cpp src/native_detour.cpp)
+  target_include_directories(native-detour-tests PRIVATE include src ${LLVM_INCLUDE_DIRS})
+  target_link_libraries(native-detour-tests PRIVATE LLVM)
+  target_compile_options(native-detour-tests PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME native_detour_relocation COMMAND native-detour-tests)
+  set_tests_properties(native_detour_relocation PROPERTIES TIMEOUT 30)
+
+  # Exercise the unchanged fixture with PIE regardless of the driver default.
+  add_executable(trace-target-pie tests/fixtures/target.cpp)
+  set_target_properties(trace-target-pie PROPERTIES ENABLE_EXPORTS ON)
+  target_compile_options(trace-target-pie PRIVATE -g -O0 -fPIE
+    -fno-omit-frame-pointer -fcf-protection=none)
+  target_link_options(trace-target-pie PRIVATE -pie)
   add_library(admission-leaf OBJECT tests/admission_leaf.cpp)
   target_compile_options(admission-leaf PRIVATE -O2 -fomit-frame-pointer -momit-leaf-frame-pointer
     -fasynchronous-unwind-tables -Wall -Wextra -Wpedantic)
@@ -199,6 +212,13 @@ if(BUILD_TESTING)
       --target $<TARGET_FILE:trace-target>
       --output-dir ${CMAKE_CURRENT_BINARY_DIR}/test-results)
   set_tests_properties(grpc_native_integration PROPERTIES TIMEOUT 120)
+  add_test(NAME grpc_native_pie_integration
+    COMMAND server-integration
+      --server $<TARGET_FILE:clang-tracer-server>
+      --agent $<TARGET_FILE:clang_tracer_agent>
+      --target $<TARGET_FILE:trace-target-pie>
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/pie-test-results)
+  set_tests_properties(grpc_native_pie_integration PROPERTIES TIMEOUT 120)
   add_test(NAME grpc_client_integration
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/client_integration.py
       --server $<TARGET_FILE:clang-tracer-server>

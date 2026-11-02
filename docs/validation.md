@@ -29,6 +29,41 @@ truncated and disabled capture, nested calls, multiple calling threads and
 restoration after detach. Additional scripts in `examples/call-stacks/` compare
 frame metadata and optional callback values with the emitted events.
 
+## PIE detour regression checks
+
+`native_detour_relocation` executes relocated global loads, stores, immediate
+stores, address calculations, scalar SIMD loads and instructions with multiple
+references. It checks positive and negative displacements, both signed-32-bit
+range boundaries, memory accesses straddling the patch window, unreadable page
+boundaries, failed preparation without partial publication, and RX trampoline
+permissions. Unsupported control transfers and addressing forms remain rejected.
+
+`grpc_native_pie_integration` builds `tests/fixtures/target.cpp` with explicit
+`-fPIE -pie` and runs the complete native integration against it. The source of
+`traced_void` stays unchanged: its early global store must be relocated. The
+integration checks events for that probe, verifies the target's global value,
+and exercises detach, reattach and server-shutdown restoration.
+
+Verified on 2 November 2026 with Clang/LLVM 21.1.8 on Linux x86_64:
+**20/20 CTests passed in 390.88 seconds**. The exact PIE binary that previously
+failed at `traced_void` also passed the complete native integration with its
+SHA-256 unchanged (`de71b39aec9a05bc2bbefba0f843908508048d6b8703106e5aebb9e14c30b7da`).
+The relocation execution tests passed with AddressSanitizer and
+UndefinedBehaviorSanitizer; function-type instrumentation was disabled for the
+tests' deliberately generated machine-code entry points. Focused clang-tidy
+checks reported no findings in the changed source. Local evidence is retained
+under `test-results/pie-detour-20261102/` and on
+`linux-dev:/tmp/clang-tracer-pie-fix-20261102/`.
+
+These results cover base `60d85f8` plus this fix. During validation, main advanced
+to `e985625` with separate event-storage changes. The full fix patch applies
+cleanly to that revision; the complete suite was run on the isolated base above.
+
+```sh
+ctest --test-dir build --output-on-failure \
+  -R '^(native_detour_relocation|grpc_native_pie_integration)$'
+```
+
 ## Measured tracing overhead
 
 Measurements on 30 October 2026 used an eight-vCPU Linux x86_64 VM, Clang21.1.8
