@@ -70,11 +70,25 @@ application with `cmake/toolchains/gcc85-sdk.cmake`, `RelWithDebInfo`, and
 `BUILD_TESTING=ON`. The application is installed under
 `<scratch>/install`.
 
-To run the configured tests after the build:
+## Test
+
+After building with the selected GCC 8.5 SDK, run the normal CTest suite by default:
 
 ```sh
 ctest --test-dir /var/tmp/clang-tracer-gcc85/build/clang-tracer --output-on-failure
 ```
+
+Run OverlayFS tests only when filesystem or process-mapping code changes, such
+as mapped-path resolution, `/proc` mapping parsing, or ELF load-segment mapping.
+For those changes, run the normal suite above and then:
+
+```sh
+tests/overlay_integration.sh /var/tmp/clang-tracer-gcc85/build/clang-tracer
+```
+
+The OverlayFS runner uses a private test namespace and leaves the host build
+tree unchanged. It requires user/mount namespaces and OverlayFS support;
+ordinary builds and tracer use do not require these test facilities.
 
 The build script does not run tests automatically. No build or test result is
 implied by this procedure.
@@ -136,16 +150,6 @@ mapping or span several mappings. Distinct complete load biases remain
 ambiguous and are rejected. Missing mappings and incomplete segment coverage
 remain errors. Native stack caches are reset for a new session after prior
 callbacks drain; adding probes within the same session reuses those caches.
-
-The optional Linux regression runner mounts an overlay only inside its private
-test namespace and leaves the host build tree unchanged:
-
-```sh
-tests/overlay_integration.sh /absolute/build/directory -j2
-```
-
-It requires user/mount namespaces and OverlayFS support. Normal tracer use does
-not create filesystems or require these test facilities.
 
 The controller must map the same runtime ELF files as its target. Use the
 SDK-built controller with the original SDK-runtime target. The installed
