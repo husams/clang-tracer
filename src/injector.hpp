@@ -27,9 +27,14 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+class InitialAdmissionUnavailable final : public IdlePointUnavailable {
+public:
+  using IdlePointUnavailable::IdlePointUnavailable;
+};
+
 // A deliberately narrow Linux x86_64 ptrace controller. attach() admits a
-// sleeping leader or a CPU-busy leader within a validated application call
-// chain. Admission does not certify arbitrary loader-lock state.
+// sleeping task or a CPU-busy task within a validated application call chain.
+// Admission does not certify arbitrary loader-lock state.
 class Process final {
 public:
   Process() noexcept = default;
@@ -52,7 +57,7 @@ public:
 
   [[nodiscard]] bool unsafe() const noexcept { return poisoned_; }
 
-  [[nodiscard]] pid_t pid() const noexcept { return tid_; }
+  [[nodiscard]] pid_t pid() const noexcept { return process_id_; }
 
   [[nodiscard]] std::uintptr_t instruction_pointer() const;
 
@@ -82,6 +87,7 @@ public:
 
 private:
   struct PeerFreeze;
+  pid_t process_id_ = -1;
   pid_t tid_ = -1;
   std::vector<std::pair<pid_t, int>> traced_peers_;
   int pending_signal_ = 0;

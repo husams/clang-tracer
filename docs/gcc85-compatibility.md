@@ -157,6 +157,14 @@ dependency effects; they do not isolate just the compatibility helpers.
 
 Legacy libc lacks the newer dedicated main-call wrapper. Busy-main admission
 therefore requires the exact ELF `main` function and a direct startup chain.
+If that leader is blocked in another syscall, an eligible existing worker can
+host injection. A sleeping worker retains the original interrupted-sleep policy;
+a directly started pthread worker in userspace must have bounded application CFI
+ending at exact `start_thread` in the mapped SDK `libpthread.so.0`, then exact
+`__clone` in the mapped libc. No arbitrary blocked syscall becomes an injection
+host. Worker TLS and the separation between the process PID and host TID are
+validated. Unsupported all-blocked and external job-stop cases report
+`FAILED_PRECONDITION` after safe release, without false shutdown cleanup errors.
 A fully stripped busy executable without that proof is rejected; idle attach
 remains available. The legacy stripped-admission regression checks that
 rejection and subsequent progress, while the modern-runtime regression still

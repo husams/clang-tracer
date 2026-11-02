@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -530,6 +531,24 @@ FileImage load_libc(const std::vector<Mapping> &maps) {
     }
   }
   unavailable("cannot identify the mapped libc ELF image");
+}
+
+std::optional<FileImage> load_libpthread(const std::vector<Mapping> &maps) {
+  for (const auto &mapping : maps) {
+    const auto basename =
+        mapping.path.substr(mapping.path.find_last_of('/') + 1);
+    const bool candidate =
+        basename == "libpthread.so.0" ||
+        ::tracer::compat::starts_with(basename, "libpthread-");
+    if (!candidate || mapping.canonical_path.empty()) {
+      continue;
+    }
+    auto image = load_image(mapping.canonical_path, maps);
+    if (image.soname == "libpthread.so.0") {
+      return image;
+    }
+  }
+  return std::nullopt;
 }
 
 using ExecutableMapRecord =
@@ -1149,6 +1168,7 @@ require_application_rendezvous(pid_t pid, const user_regs_struct& regs,
   bool pc_is_return_address = false;
   std::size_t application_frames = 1;
   std::size_t traversed_frames = 1;
+  std::optional<FileImage> pthread;
   std::set<std::pair<std::uint64_t, std::uint64_t>> seen;
   seen.emplace(regs.rip, regs.rsp);
 
@@ -1177,44 +1197,73 @@ require_application_rendezvous(pid_t pid, const user_regs_struct& regs,
       pc_is_return_address = true;
       continue;
     }
-    if (!start_call_main) {
+    const auto within = [&](const FileImage &image,
+                            const FileImage::Function *function,
+                            std::uint64_t address) {
+      return function && address >= image.runtime(*function) &&
+             address - image.runtime(*function) < function->size &&
+             image.executable_pc(address, maps);
+    };
+    if (!start_call_main && within(libc, start_main, caller_pc)) {
       // glibc 2.23 calls main directly from __libc_start_main. Unlike its
       // newer dedicated wrapper, that routine also runs initializers, so
       // require the final application frame to be the ELF's exact main.
-      const auto* main = executable.named("main");
+      const auto *main = executable.named("main");
       const auto application_pc = pc_is_return_address ? pc - 1 : pc;
       if (!main || !main->size || current_image != &executable ||
           application_pc < executable.runtime(*main) ||
-          application_pc - executable.runtime(*main) >= main->size ||
-          caller_pc < libc.runtime(*start_main) ||
-          caller_pc - libc.runtime(*start_main) >= start_main->size ||
-          !libc.executable_pc(caller_pc, maps)) {
-        unavailable("legacy libc startup requires a proven main application frame");
+          application_pc - executable.runtime(*main) >= main->size) {
+        unavailable(
+            "legacy libc startup requires a proven main application frame");
       }
       return application_frames;
     }
-    if (caller_pc < libc.runtime(*start_call_main) ||
-        caller_pc - libc.runtime(*start_call_main) >= start_call_main->size ||
-        !libc.executable_pc(caller_pc, maps)) {
-      unavailable(
-          "application unwind leaves the executable outside libc startup");
+    if (within(libc, start_call_main, caller_pc)) {
+      if (traversed_frames + 2 > 128) {
+        unavailable("startup unwind exceeds the 128-frame admission bound");
+      }
+      ++traversed_frames;
+      auto startup_caller =
+          unwind_one(pid, libc, return_pc, caller, known, stack, true);
+      const auto startup_return_pc = startup_caller.rip;
+      if (startup_return_pc == 0 ||
+          !within(libc, start_main, startup_return_pc - 1)) {
+        unavailable(
+            "libc startup caller chain does not reach __libc_start_main");
+      }
+      return application_frames;
     }
-    if (traversed_frames + 2 > 128) {
-      unavailable("startup unwind exceeds the 128-frame admission bound");
+
+    const FileImage::Function *thread_start = libc.named("start_thread");
+    const FileImage *thread_image = &libc;
+    if (!thread_start) {
+      pthread = load_libpthread(maps);
+      if (pthread) {
+        thread_start = pthread->named("start_thread");
+        if (thread_start) {
+          thread_image = &*pthread;
+        }
+      }
+    }
+    if (!thread_start || !within(*thread_image, thread_start, caller_pc) ||
+        traversed_frames + 2 > 128) {
+      unavailable(
+          "application unwind leaves approved modules outside exact libc or "
+          "libpthread start_thread");
     }
 
     ++traversed_frames;
-    auto startup_caller =
-        unwind_one(pid, libc, return_pc, caller, known, stack, true);
-    const auto startup_return_pc = startup_caller.rip;
-    if (startup_return_pc == 0) {
-      unavailable("libc startup CFI produced an invalid return address");
-    }
-    const auto startup_pc = startup_return_pc - 1;
-    if (startup_pc < libc.runtime(*start_main) ||
-        startup_pc - libc.runtime(*start_main) >= start_main->size ||
-        !libc.executable_pc(startup_pc, maps)) {
-      unavailable("libc startup caller chain does not reach __libc_start_main");
+    auto thread_caller =
+        unwind_one(pid, *thread_image, return_pc, caller, known, stack, true);
+    const auto thread_return_pc = thread_caller.rip;
+    const auto clone_pc = thread_return_pc == 0 ? 0 : thread_return_pc - 1;
+    const auto *clone = libc.named("__clone");
+    const auto *clone3 = libc.named("__clone3");
+    if (thread_return_pc == 0 ||
+        (!within(libc, clone, clone_pc) && !within(libc, clone3, clone_pc))) {
+      unavailable(
+          "pthread startup chain does not reach exact libc __clone or "
+          "__clone3");
     }
     return application_frames;
   }

@@ -278,3 +278,34 @@ module whose literal filename ends in ` (deleted)` (1/1 passed).
 The runner preserves the host network namespace for TCP delivery tests and
 does not modify the host build tree. Threaded fixtures now wait for their own
 child PID's startup record, avoiding stale log data during overlay copy-up.
+
+## Blocked-main attach backport
+
+The blocked-main fixes from `main` commit `ecb3930` were backported to `c++17`
+and tested on `linux-dev` on 2 November 2026. The fresh tracer build used the
+supplied SDK's Clang/LLVM 21.1.8, GCC 8.5 headers and libstdc++, glibc 2.23,
+and SDK loader. It reused the existing pinned SDK-built gRPC, Protobuf and
+SQLite dependencies; no host runtime dependencies were substituted.
+
+The full SDK suite passed **28/28 in 422.76 seconds**. The seven blocked-main
+regressions also passed from OverlayFS (**7/7 in 43.89 seconds**), including
+sleeping and raw pthread workers, all-blocked failures, and preserved external
+job-control stops. Legacy worker CFI validates exact `start_thread` in the
+separate mapped `libpthread.so.0`, then exact `__clone` in libc. The existing
+exact-main startup proof remains available without requiring libpthread.
+
+A separate fixture was compiled with actual **GCC 8.5.0 and `-std=c++17`**.
+The same binary failed with the previous tracer (gRPC 13 and shutdown status 1)
+and passed with the backport across futex, epoll, poll, pipe read, accept,
+pause and sigwait. Probe events, removal, detach, thread release, no-host
+`FAILED_PRECONDITION`, and clean shutdown were verified. Its SHA-256 remained
+`8fbd4452d33a62f2c0d6ee1495816ba2b1afd0fc1b2c664aaf66eb731bcbe265`.
+
+Old-header test fixtures provide guarded Linux ptracer constants. The SDK's
+process-vm stubs use the existing direct syscall wrapper, and an explicit NOP
+test entry keeps the supported patch subset stable with SDK PIE code generation.
+Production instruction decoding and blocked-syscall eligibility were not widened.
+
+Build logs, test output, compiler/runtime checks and the GCC-built fixture are
+retained at `linux-dev:/tmp/tracer-gcc85-blocked-main-20261102/`. Earlier benchmark
+measurements above remain historical; this backport did not rerun benchmarks.

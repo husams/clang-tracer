@@ -44,6 +44,7 @@
 #include "context_package.hpp"
 #include "debug_resolver.hpp"
 #include "header_context.hpp"
+#include "injector.hpp"
 #include "session.hpp"
 #include "tracer/compat.hpp"
 
@@ -1160,6 +1161,13 @@ public:
       pending_pids_.erase(pid);
       sessions_.emplace(id, session);
       active_by_pid_[pid] = id;
+    } catch (const injector::InitialAdmissionUnavailable &error) {
+      // Admission is read-only and Process::attach has confirmed that all
+      // seized tasks were released. Do not retain a failed session that owns
+      // no target resources.
+      std::lock_guard lock(mutex_);
+      pending_pids_.erase(pid);
+      return status_for(error);
     } catch (const std::exception &error) {
       session->record_failure(error.what());
       std::lock_guard lock(mutex_);
@@ -1733,6 +1741,9 @@ private:
 
   static grpc::Status status_for(const std::exception &error) {
     const std::string message = error.what();
+    if (dynamic_cast<const injector::IdlePointUnavailable *>(&error)) {
+      return {grpc::StatusCode::FAILED_PRECONDITION, message};
+    }
     if (message.find("already hooked") != std::string::npos ||
         message.find("overlaps an already") != std::string::npos) {
       return {grpc::StatusCode::ALREADY_EXISTS, message};

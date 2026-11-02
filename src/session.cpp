@@ -170,15 +170,19 @@ void Session::attach() {
   if (state_ != clangtracer::v1::Session::ATTACHED) {
     throw std::runtime_error("session is not attachable");
   }
-  application_modules_ =
-      injector::discover_application_modules(static_cast<pid_t>(pid_));
-  discovered_module_paths_.clear();
-  for (const auto &module : application_modules_)
-    discovered_module_paths_.push_back(module.path());
-  check_identity_locked();
   injector::Process process;
   const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
-  attach_process(process, deadline);
+  try {
+    application_modules_ =
+        injector::discover_application_modules(static_cast<pid_t>(pid_));
+    discovered_module_paths_.clear();
+    for (const auto &module : application_modules_)
+      discovered_module_paths_.push_back(module.path());
+    check_identity_locked();
+    attach_process(process, deadline);
+  } catch (const injector::IdlePointUnavailable &error) {
+    throw injector::InitialAdmissionUnavailable(error.what());
+  }
   std::uintptr_t scratch = 0;
   const auto start_offset = agent_path_.size() + 16;
   const auto stop_offset = start_offset + 32;
