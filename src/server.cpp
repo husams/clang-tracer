@@ -42,6 +42,7 @@
 #include "session.hpp"
 #include "debug_resolver.hpp"
 #include "header_context.hpp"
+#include "injector.hpp"
 #include "context_collector.hpp"
 #include "context_journal.hpp"
 #include "context_package.hpp"
@@ -1729,6 +1730,9 @@ private:
   }
 
   static grpc::Status status_for(const std::exception &error) {
+    if (dynamic_cast<const tracer::injector::IdlePointUnavailable *>(&error)) {
+      return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
+    }
     const std::string message = error.what();
     if (message.find("already hooked") != std::string::npos ||
         message.find("overlaps an already") != std::string::npos) {

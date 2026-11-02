@@ -639,6 +639,14 @@ session takes a fresh snapshot for libraries loaded later; it does not make
 unsupported CFI or runtime behavior safe.
 The existing `nanosleep`/`clock_nanosleep` admission path remains available outside
 critical sections, with its prior interrupted-sleep timing/restart limitation.
+The leader is tried first. If it is blocked in a non-sleep syscall (for example
+`futex`, `epoll_wait`, `poll`, `read`, `accept`, `pause`, or `sigwait`), any other
+thread stopped in `nanosleep`/`clock_nanosleep` may host injection under the same
+interrupted-sleep limitation. Blocked threads are never interrupted to host, and
+CPU-only workers do not qualify because the application rendezvous requires libc
+startup frames that a worker stack never reaches. If no thread qualifies, the
+operation fails after the deadline with `FAILED_PRECONDITION` listing thread IDs
+and syscall numbers.
 Native calls preserve general registers, extended floating-point state, the
 thread's signal mask, and its `errno` value. Signals are blocked during injected
 execution and the saved mask is restored before normal execution resumes.

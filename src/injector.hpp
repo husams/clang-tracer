@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <span>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -28,8 +29,9 @@ public:
 };
 
 // A deliberately narrow Linux x86_64 ptrace controller. attach() admits a
-// sleeping leader or a CPU-busy leader within a validated application call
-// chain. Admission does not certify arbitrary loader-lock state.
+// sleeping thread of the process, or a CPU-busy leader within a validated
+// application call chain. Admission does not certify arbitrary loader-lock
+// state.
 class Process final {
 public:
   Process() noexcept = default;
@@ -52,7 +54,7 @@ public:
 
   [[nodiscard]] bool unsafe() const noexcept { return poisoned_; }
 
-  [[nodiscard]] pid_t pid() const noexcept { return tid_; }
+  [[nodiscard]] pid_t pid() const noexcept { return process_id_; }
 
   [[nodiscard]] std::uintptr_t instruction_pointer() const;
 
@@ -82,6 +84,8 @@ public:
 
 private:
   struct PeerFreeze;
+  // Process (thread-group) id; tid_ is the thread hosting injection.
+  pid_t process_id_ = -1;
   pid_t tid_ = -1;
   std::vector<std::pair<pid_t, int>> traced_peers_;
   int pending_signal_ = 0;
@@ -92,6 +96,9 @@ private:
   bool poisoned_ = false;
   bool tracee_stopped_ = false;
 
+  [[nodiscard]] bool try_admit_host(pid_t tid,
+                                    std::span<const ApplicationModule> modules,
+                                    std::vector<std::string> &rejections);
   void ensure_attached() const;
   void ensure_usable() const;
   void poison_process() noexcept;

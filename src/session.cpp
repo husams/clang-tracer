@@ -957,6 +957,14 @@ void Session::shutdown() noexcept {
   if (state_ == clangtracer::v1::Session::DETACHED ||
       state_ == clangtracer::v1::Session::EXITED || unsafe_target_)
     return;
+  // Attach failed before any agent state existed; there is nothing to clean.
+  if (state_ == clangtracer::v1::Session::FAILED && !unsafe_target_ &&
+      start_address_ == 0 && probes_.empty()) {
+    state_ = clangtracer::v1::Session::DETACHED;
+    application_modules_.clear();
+    error_.clear();
+    return;
+  }
   std::string first_error =
       state_ == clangtracer::v1::Session::FAILED ? error_ : std::string{};
   const auto shutdown_deadline =

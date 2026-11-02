@@ -12,6 +12,7 @@
 #include <cstring>
 #include <exception>
 #include <fstream>
+#include <istream>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -131,12 +132,7 @@ bool thread_exists(pid_t process_id, pid_t tid) {
   return ::stat(path.c_str(), &status) == 0;
 }
 
-long stopped_syscall(pid_t tid) {
-  std::ifstream input("/proc/" + std::to_string(tid) + "/syscall");
-  if (!input) {
-    throw std::runtime_error(
-        "cannot inspect /proc/<pid>/syscall; refusing an unknown stop");
-  }
+long parse_syscall_number(std::istream &input) {
   std::string first;
   input >> first;
   if (first.empty() || first == "running") {
@@ -148,6 +144,39 @@ long stopped_syscall(pid_t tid) {
   return parsed.ec == std::errc{} && parsed.ptr == first.data() + first.size()
              ? number
              : -1;
+}
+
+long stopped_syscall(pid_t tid) {
+  std::ifstream input("/proc/" + std::to_string(tid) + "/syscall");
+  if (!input) {
+    throw std::runtime_error(
+        "cannot inspect /proc/<pid>/syscall; refusing an unknown stop");
+  }
+  return parse_syscall_number(input);
+}
+
+// Non-throwing look at a thread that has not been seized. "running", an
+// unreadable file, or an unparsable value all yield -1.
+long peek_task_syscall(pid_t process_id, pid_t tid) {
+  std::ifstream input("/proc/" + std::to_string(process_id) + "/task/" +
+                      std::to_string(tid) + "/syscall");
+  return input ? parse_syscall_number(input) : -1;
+}
+
+std::string join_rejections(const std::vector<std::string> &rejections) {
+  constexpr std::size_t kMaxListed = 32;
+  std::string joined;
+  const std::size_t listed = std::min(rejections.size(), kMaxListed);
+  for (std::size_t i = 0; i < listed; ++i) {
+    if (i != 0) {
+      joined += "; ";
+    }
+    joined += rejections[i];
+  }
+  if (rejections.size() > listed) {
+    joined += "; and " + std::to_string(rejections.size() - listed) + " more";
+  }
+  return joined;
 }
 
 void verify_target_executable(pid_t process_id) {
@@ -382,7 +411,7 @@ struct Process::PeerFreeze {
     try {
       for (;;) {
         bool added = false;
-        for (const pid_t tid : thread_ids(process.tid_)) {
+        for (const pid_t tid : thread_ids(process.process_id_)) {
           if (tid == process.tid_ || find(tid) != peers.end()) {
             continue;
           }
@@ -395,15 +424,16 @@ struct Process::PeerFreeze {
               // process) between enumeration and SEIZE. Only a confirmed
               // missing task is safe to discard; permissions or an existing
               // tracer on a surviving task must still reject the freeze.
-              const std::string path = "/proc/" + std::to_string(process.tid_) +
-                                       "/task/" + std::to_string(tid);
+              const std::string path =
+                  "/proc/" + std::to_string(process.process_id_) + "/task/" +
+                  std::to_string(tid);
               struct stat task_status{};
               if (::stat(path.c_str(), &task_status) != 0 && errno == ENOENT)
                 continue;
               errno = seize_error;
             }
             if (errno == ESRCH || errno == ECHILD) {
-              if (thread_exists(process.tid_, tid)) {
+              if (thread_exists(process.process_id_, tid)) {
                 throw std::runtime_error(
                     "PTRACE_SEIZE reported a missing peer that remains in "
                     "/proc; refusing an incomplete freeze");
@@ -418,7 +448,7 @@ struct Process::PeerFreeze {
           added = true;
           if (::ptrace(PTRACE_INTERRUPT, tid, nullptr, nullptr) == -1) {
             if (errno == ESRCH || errno == ECHILD) {
-              if (thread_exists(process.tid_, tid)) {
+              if (thread_exists(process.process_id_, tid)) {
                 throw std::runtime_error(
                     "PTRACE_INTERRUPT reported a missing peer that remains in "
                     "/proc; refusing an incomplete freeze");
@@ -430,7 +460,7 @@ struct Process::PeerFreeze {
             throw_errno("PTRACE_INTERRUPT peer thread");
           }
           try {
-            wait_peer(peers.back(), deadline, process.tid_);
+            wait_peer(peers.back(), deadline, process.process_id_);
           } catch (...) {
             update_signal(tid, peers.back().pending_signal);
             throw;
@@ -443,7 +473,7 @@ struct Process::PeerFreeze {
 
         // Threads may be created while the current snapshot is being stopped.
         // Repeat until a full enumeration adds no peer.
-        const auto current = thread_ids(process.tid_);
+        const auto current = thread_ids(process.process_id_);
         const bool missing =
             std::any_of(current.begin(), current.end(), [&](pid_t tid) {
               return tid != process.tid_ && find(tid) == peers.end();
@@ -491,9 +521,9 @@ struct Process::PeerFreeze {
       }
       if (process.poisoned_ && it->pending_signal != 0 &&
           it->pending_signal != SIGSTOP &&
-          ::syscall(SYS_tgkill, process.tid_, it->tid, it->pending_signal) !=
-              0 &&
-          !(errno == ESRCH && !thread_exists(process.tid_, it->tid))) {
+          ::syscall(SYS_tgkill, process.process_id_, it->tid,
+                    it->pending_signal) != 0 &&
+          !(errno == ESRCH && !thread_exists(process.process_id_, it->tid))) {
         if (!failure) {
           try {
             throw_errno("preserve peer signal before poisoned detach");
@@ -510,7 +540,7 @@ struct Process::PeerFreeze {
                    reinterpret_cast<void *>(
                        static_cast<std::uintptr_t>(detach_signal))) == -1) {
         if (errno == ESRCH || errno == ECHILD) {
-          if (!thread_exists(process.tid_, it->tid)) {
+          if (!thread_exists(process.process_id_, it->tid)) {
             it->seized = false;
             forget(it->tid);
             continue;
@@ -524,7 +554,7 @@ struct Process::PeerFreeze {
               ::ptrace(PTRACE_INTERRUPT, it->tid, nullptr, nullptr) == 0) {
             try {
               wait_peer(*it, std::chrono::steady_clock::now() + kStopTimeout,
-                        process.tid_);
+                        process.process_id_);
             } catch (...) {
             }
             update_signal(it->tid, it->pending_signal);
@@ -537,7 +567,7 @@ struct Process::PeerFreeze {
             it->seized = false;
             forget(it->tid);
           } else if ((errno == ESRCH || errno == ECHILD) &&
-                     !thread_exists(process.tid_, it->tid)) {
+                     !thread_exists(process.process_id_, it->tid)) {
             it->seized = false;
             forget(it->tid);
           } else {
@@ -655,7 +685,7 @@ private:
 Process::~Process() {
   if (attached()) {
     if (poisoned_) {
-      const pid_t unsafe_pid = tid_;
+      const pid_t unsafe_pid = process_id_;
       try {
         preserve_poisoned_stop();
       } catch (const std::exception &error) {
@@ -678,7 +708,8 @@ Process::~Process() {
 }
 
 Process::Process(Process &&other) noexcept
-    : tid_(std::exchange(other.tid_, -1)),
+    : process_id_(std::exchange(other.process_id_, -1)),
+      tid_(std::exchange(other.tid_, -1)),
       traced_peers_(std::move(other.traced_peers_)),
       pending_signal_(std::exchange(other.pending_signal_, 0)),
       scratch_stack_(std::exchange(other.scratch_stack_, 0)),
@@ -697,7 +728,7 @@ Process &Process::operator=(Process &&other) noexcept {
       std::fprintf(stderr,
                    "injector: refusing move assignment over poisoned PID %d; "
                    "it remains ptrace-stopped\n",
-                   static_cast<int>(tid_));
+                   static_cast<int>(process_id_));
       return *this;
     }
     try {
@@ -706,16 +737,17 @@ Process &Process::operator=(Process &&other) noexcept {
       std::fprintf(
           stderr,
           "injector: cannot release PID %d during move assignment: %s\n",
-          static_cast<int>(tid_), error.what());
+          static_cast<int>(process_id_), error.what());
       return *this;
     } catch (...) {
       std::fprintf(stderr,
                    "injector: cannot release PID %d during move assignment; "
                    "ownership retained\n",
-                   static_cast<int>(tid_));
+                   static_cast<int>(process_id_));
       return *this;
     }
   }
+  process_id_ = std::exchange(other.process_id_, -1);
   tid_ = std::exchange(other.tid_, -1);
   traced_peers_ = std::move(other.traced_peers_);
   pending_signal_ = std::exchange(other.pending_signal_, 0);
@@ -744,10 +776,10 @@ void Process::ensure_usable() const {
 
 void Process::poison_process() noexcept {
   poisoned_ = true;
-  if (tid_ > 0 && ::kill(tid_, SIGSTOP) != 0 && errno != ESRCH) {
+  if (process_id_ > 0 && ::kill(process_id_, SIGSTOP) != 0 && errno != ESRCH) {
     std::fprintf(stderr,
                  "injector: could not request SIGSTOP for unsafe PID %d: %s\n",
-                 static_cast<int>(tid_), std::strerror(errno));
+                 static_cast<int>(process_id_), std::strerror(errno));
   }
 }
 
@@ -757,6 +789,7 @@ void Process::attach(pid_t process_id,
                      std::span<const ApplicationModule> application_modules) {
 #if !defined(__linux__) || !defined(__x86_64__)
   (void)process_id;
+  (void)application_modules;
   throw std::runtime_error("native injector is supported only on Linux x86_64");
 #else
   if (attached()) {
@@ -766,10 +799,72 @@ void Process::attach(pid_t process_id,
     throw std::invalid_argument("process id must be positive");
   }
   verify_target_executable(process_id);
-  if (::ptrace(PTRACE_SEIZE, process_id, nullptr, nullptr) == -1) {
+  process_id_ = process_id;
+  std::vector<std::string> rejections;
+  try {
+    // The leader keeps its historical behaviour: sleeping or CPU-busy within
+    // a validated application call chain.
+    if (try_admit_host(process_id, application_modules, rejections)) {
+      return;
+    }
+    for (const pid_t tid : thread_ids(process_id)) {
+      if (tid == process_id) {
+        continue;
+      }
+      // Peek without seizing. require_application_rendezvous needs the unwind
+      // to reach __libc_start_main, which a worker's stack never does, so a
+      // worker can only qualify through the interrupted-sleep path. Stopping
+      // busy or blocked workers on every retry would only perturb them.
+      const long syscall_number = peek_task_syscall(process_id, tid);
+      if (syscall_number != SYS_nanosleep &&
+          syscall_number != SYS_clock_nanosleep) {
+        rejections.push_back("tid " + std::to_string(tid) +
+                             (syscall_number >= 0
+                                  ? " syscall " + std::to_string(syscall_number)
+                                  : std::string(" running")));
+        continue;
+      }
+      if (try_admit_host(tid, application_modules, rejections)) {
+        return;
+      }
+    }
+  } catch (...) {
+    // Poison paths retain ownership; every other failure leaves no host.
+    if (!poisoned_) {
+      tid_ = -1;
+      process_id_ = -1;
+    }
+    throw;
+  }
+  tid_ = -1;
+  process_id_ = -1;
+  throw IdlePointUnavailable("no thread is at an injection point: " +
+                             join_rejections(rejections));
+#endif
+}
+
+bool Process::try_admit_host(
+    pid_t tid, std::span<const ApplicationModule> application_modules,
+    std::vector<std::string> &rejections) {
+#if !defined(__linux__) || !defined(__x86_64__)
+  (void)tid;
+  (void)application_modules;
+  (void)rejections;
+  throw std::runtime_error("native injector is supported only on Linux x86_64");
+#else
+  const bool leader = tid == process_id_;
+  const std::string label = "tid " + std::to_string(tid);
+  if (::ptrace(PTRACE_SEIZE, tid, nullptr, nullptr) == -1) {
+    const int seize_error = errno;
+    if (!leader &&
+        (seize_error == ESRCH ||
+         (seize_error == EPERM && !thread_exists(process_id_, tid)))) {
+      return false; // The thread vanished before it could be seized.
+    }
+    errno = seize_error;
     throw_errno("PTRACE_SEIZE (check ptrace permissions and target ownership)");
   }
-  tid_ = process_id;
+  tid_ = tid;
   bool stopped = false;
   try {
     ptrace_checked(PTRACE_INTERRUPT, tid_, nullptr, nullptr,
@@ -788,7 +883,7 @@ void Process::attach(pid_t process_id,
     if (event == PTRACE_EVENT_STOP && WSTOPSIG(status) != SIGTRAP) {
       pending_signal_ = WSTOPSIG(status);
       throw std::runtime_error(
-          "target leader is in a job-control group stop; refusing injection");
+          "target thread is in a job-control group stop; refusing injection");
     }
     if (event != PTRACE_EVENT_STOP) {
       // Preserve a genuine signal-delivery stop if one raced with interrupt.
@@ -796,32 +891,66 @@ void Process::attach(pid_t process_id,
     }
     validate_application_modules(tid_, application_modules);
     const long syscall_number = stopped_syscall(tid_);
-    if (syscall_number != SYS_nanosleep &&
-        syscall_number != SYS_clock_nanosleep) {
-      if (syscall_number >= 0) {
-        throw IdlePointUnavailable(
-            "busy-main admission requires a userspace stop");
+    if (syscall_number == SYS_nanosleep ||
+        syscall_number == SYS_clock_nanosleep) {
+      // A thread created by raw clone without TLS must not run dlopen.
+      if (!leader && read_registers(tid_).general.fs_base == 0) {
+        throw IdlePointUnavailable(label + " has no thread pointer");
       }
-      (void)require_application_rendezvous(tid_, read_registers(tid_).general,
-                                           application_modules);
+    } else if (syscall_number >= 0) {
+      throw IdlePointUnavailable(label + " syscall " +
+                                 std::to_string(syscall_number));
+    } else if (leader) {
+      try {
+        (void)require_application_rendezvous(
+            tid_, read_registers(tid_).general, application_modules);
+      } catch (const IdlePointUnavailable &unavailable) {
+        throw IdlePointUnavailable(label + " running: " + unavailable.what());
+      }
+    } else {
+      throw IdlePointUnavailable(label + " running");
     }
     (void)read_registers(
         tid_); // Fail early if complete register preservation is unavailable.
   } catch (...) {
     const auto original_failure = std::current_exception();
+    const auto reset_host = [this] {
+      tid_ = -1;
+      pending_signal_ = 0;
+      tracee_stopped_ = false;
+    };
+    // A worker that exited while seized must never poison the whole process.
+    const auto worker_gone = [&] {
+      return !leader && !thread_exists(process_id_, tid);
+    };
     if (!stopped) {
       // A timeout does not prove the tracee stopped. Keep ownership if it
       // cannot be stopped; detaching a running tracee would be unsafe.
       (void)::ptrace(PTRACE_INTERRUPT, tid_, nullptr, nullptr);
       int recovery_status = 0;
-      stopped =
-          wait_stopped(tid_, std::chrono::steady_clock::now() + kStopTimeout,
-                       recovery_status);
+      std::exception_ptr wait_failure;
+      try {
+        stopped =
+            wait_stopped(tid_, std::chrono::steady_clock::now() + kStopTimeout,
+                         recovery_status);
+      } catch (...) {
+        wait_failure = std::current_exception();
+      }
       tracee_stopped_ = stopped;
       if (stopped && ((static_cast<unsigned int>(recovery_status) >> 16) !=
                           PTRACE_EVENT_STOP ||
                       WSTOPSIG(recovery_status) != SIGTRAP)) {
         pending_signal_ = WSTOPSIG(recovery_status);
+      }
+      if (!stopped) {
+        if (worker_gone()) {
+          reset_host();
+          return false;
+        }
+        if (wait_failure && leader && !thread_exists(process_id_, tid)) {
+          reset_host();
+          std::rethrow_exception(wait_failure);
+        }
       }
     }
     if (!stopped) {
@@ -831,22 +960,32 @@ void Process::attach(pid_t process_id,
           "injector retains ptrace "
           "ownership; do not resume or kill the target blindly");
     }
-    try {
-      ptrace_checked(PTRACE_DETACH, tid_, nullptr,
-                     reinterpret_cast<void *>(
-                         static_cast<std::uintptr_t>(pending_signal_)),
-                     "detach after failed attach");
-    } catch (const std::exception &error) {
+    errno = 0;
+    if (::ptrace(PTRACE_DETACH, tid_, nullptr,
+                 reinterpret_cast<void *>(
+                     static_cast<std::uintptr_t>(pending_signal_))) == -1) {
+      const int detach_error = errno;
+      if (detach_error == ESRCH && worker_gone()) {
+        reset_host();
+        return false;
+      }
       poison_process();
       throw std::runtime_error(
           std::string("attach failed and cleanup could not detach: ") +
-          error.what() + "; injector retains ptrace ownership");
+          "detach after failed attach: " + std::strerror(detach_error) +
+          "; injector retains ptrace ownership");
     }
-    tid_ = -1;
-    pending_signal_ = 0;
-    tracee_stopped_ = false;
-    std::rethrow_exception(original_failure);
+    reset_host();
+    try {
+      std::rethrow_exception(original_failure);
+    } catch (const IdlePointUnavailable &unavailable) {
+      rejections.emplace_back(unavailable.what());
+      return false;
+    } catch (...) {
+      throw;
+    }
   }
+  return true;
 #endif
 }
 
@@ -868,6 +1007,7 @@ void Process::detach() {
       reinterpret_cast<void *>(static_cast<std::uintptr_t>(pending_signal_)),
       "PTRACE_DETACH");
   tid_ = -1;
+  process_id_ = -1;
   pending_signal_ = 0;
   tracee_stopped_ = false;
   scratch_stack_ = 0;
@@ -878,11 +1018,12 @@ void Process::detach() {
 
 void Process::preserve_poisoned_stop() {
   ensure_attached();
-  const pid_t unsafe_pid = tid_;
+  const pid_t unsafe_pid = process_id_;
+  const pid_t host_tid = tid_;
   if (!tracee_stopped_) {
-    ptrace_checked(PTRACE_INTERRUPT, unsafe_pid, nullptr, nullptr,
+    ptrace_checked(PTRACE_INTERRUPT, host_tid, nullptr, nullptr,
                    "interrupt unsafe tracee before preserving stop");
-    wait_stopped_or_throw(unsafe_pid,
+    wait_stopped_or_throw(host_tid,
                           std::chrono::steady_clock::now() + kStopTimeout,
                           "stop unsafe tracee before detach");
     tracee_stopped_ = true;
@@ -925,13 +1066,14 @@ void Process::preserve_poisoned_stop() {
   }
   traced_peers_.clear();
   if (pending_signal_ != 0 && pending_signal_ != SIGSTOP &&
-      ::syscall(SYS_tgkill, unsafe_pid, unsafe_pid, pending_signal_) != 0) {
-    throw_errno("preserve leader signal during poisoned stop");
+      ::syscall(SYS_tgkill, process_id_, tid_, pending_signal_) != 0) {
+    throw_errno("preserve host signal during poisoned stop");
   }
-  ptrace_checked(PTRACE_DETACH, unsafe_pid, nullptr,
+  ptrace_checked(PTRACE_DETACH, host_tid, nullptr,
                  reinterpret_cast<void *>(static_cast<std::uintptr_t>(SIGSTOP)),
                  "detach poisoned tracee while delivering SIGSTOP");
   tid_ = -1;
+  process_id_ = -1;
   pending_signal_ = 0;
   tracee_stopped_ = false;
   scratch_stack_ = 0;
@@ -1491,7 +1633,7 @@ std::uintptr_t Process::resolve_remote_symbol(std::string_view name, const CodeP
     throw std::runtime_error("cannot resolve local symbol module path");
   }
   const auto local_maps = read_maps(::getpid());
-  const auto remote_maps = read_maps(tid_);
+  const auto remote_maps = read_maps(process_id_);
   const auto local_bias = map_load_bias(local_maps, module_path);
   const auto remote_bias = map_load_bias(remote_maps, module_path);
   const auto actual_local_base =
