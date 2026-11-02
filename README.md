@@ -604,14 +604,29 @@ the server and attempts to restore active hooks.
 
 The native backend supports Linux x86-64 processes with concurrent application
 threads, including a CPU-busy leader inside nested C++ functions and methods.
+Attachment prefers the leader and can select an eligible existing worker when
+the leader is blocked in futex, epoll, pipe reads, or another unsupported syscall.
+The process PID remains the session identity; the selected TID runs native
+control operations. Tasks in `nanosleep` or `clock_nanosleep` retain the existing
+sleep admission policy. Other blocked syscalls are left intact, and external
+job-control stops are preserved.
+
 Admission no longer requires an instruction in `main`, a `main` symbol, or an
 immediate return into libc. LLVM parses `.eh_frame` and unwinds each application
 frame through executable segments of the main ELF image or a DSO in the session's
 discovered snapshot, selecting the matching image and captured load bias at each
 frame. Executable and library symbols may be stripped; unwind metadata must
 remain. The walk ends at libc's
-identified `__libc_start_call_main` → `__libc_start_main` startup chain, whose
-symbols are still required.
+identified `__libc_start_call_main` → `__libc_start_main` startup chain, or, for
+a directly started pthread worker, exact `start_thread` → `__clone`/`__clone3`
+functions. The relevant startup symbols are required. Additional runtime wrapper
+frames, including unproven C++ thread-library wrappers, remain unsupported for
+userspace admission; such workers can still qualify through the sleep policy.
+
+If no task qualifies before the operation deadline, the server returns
+`FAILED_PRECONDITION` with per-TID syscall numbers, known names and rejection reasons.
+Fully released admission failures create no failed session to clean up during
+shutdown. Failures after bootstrap retain their normal recovery state.
 
 The complete chain is bounded to 128 frames including startup. Each recovered
 stack pointer must advance within the original readable stack mapping, and saved
@@ -682,6 +697,11 @@ signal-handler probes, and control threads holding application/runtime locks are
 outside the current lifecycle contract.
 
 ## Validation and sources
+
+Blocked-main worker selection was verified on 2 November 2026 on `linux-dev`:
+**24/24 CTests passed in 411.09 seconds**, and the six new regression cases
+passed from OverlayFS in 35.26 seconds. The supplied condition-variable/sleeping
+worker reproduction also attached, detached and shut down successfully.
 
 The session-path backport was verified on 2 November 2026 with the normal
 C++20 build on `linux-dev`: **18/18 CTests passed natively in 373.84 seconds**

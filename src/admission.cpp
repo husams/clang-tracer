@@ -1131,9 +1131,9 @@ require_application_rendezvous(pid_t pid, const user_regs_struct &regs,
   auto approved = revalidate_modules(identities, maps, protected_files);
   const auto *start_call_main = libc.named("__libc_start_call_main");
   const auto *start_main = libc.named("__libc_start_main");
-  if (!start_call_main || !start_main) {
-    unavailable("required exact startup function symbols are unavailable");
-  }
+  const auto *thread_start = libc.named("start_thread");
+  const auto *clone = libc.named("__clone");
+  const auto *clone3 = libc.named("__clone3");
   const FileImage *current_image =
       application_image_for(regs.rip, executable, approved, maps);
   if (!current_image) {
@@ -1176,28 +1176,43 @@ require_application_rendezvous(pid_t pid, const user_regs_struct &regs,
       pc_is_return_address = true;
       continue;
     }
-    if (caller_pc < libc.runtime(*start_call_main) ||
-        caller_pc - libc.runtime(*start_call_main) >= start_call_main->size ||
-        !libc.executable_pc(caller_pc, maps)) {
-      unavailable(
-          "application unwind leaves the executable outside libc startup");
+    const auto within = [&](const FileImage::Function *function,
+                            std::uint64_t address) {
+      return function && address >= libc.runtime(*function) &&
+             address - libc.runtime(*function) < function->size &&
+             libc.executable_pc(address, maps);
+    };
+    if (within(start_call_main, caller_pc)) {
+      if (!start_main || traversed_frames + 2 > 128) {
+        unavailable("required exact main startup symbols are unavailable");
+      }
+      ++traversed_frames;
+      auto startup_caller =
+          unwind_one(pid, libc, return_pc, caller, known, stack, true);
+      const auto startup_return_pc = startup_caller.rip;
+      if (startup_return_pc == 0 ||
+          !within(start_main, startup_return_pc - 1)) {
+        unavailable(
+            "libc startup caller chain does not reach __libc_start_main");
+      }
+      return application_frames;
     }
-    if (traversed_frames + 2 > 128) {
-      unavailable("startup unwind exceeds the 128-frame admission bound");
+    if (!within(thread_start, caller_pc) || traversed_frames + 2 > 128) {
+      unavailable(
+          "application unwind leaves the executable outside a validated "
+          "libc startup chain");
     }
 
     ++traversed_frames;
-    auto startup_caller =
+    auto thread_caller =
         unwind_one(pid, libc, return_pc, caller, known, stack, true);
-    const auto startup_return_pc = startup_caller.rip;
-    if (startup_return_pc == 0) {
-      unavailable("libc startup CFI produced an invalid return address");
-    }
-    const auto startup_pc = startup_return_pc - 1;
-    if (startup_pc < libc.runtime(*start_main) ||
-        startup_pc - libc.runtime(*start_main) >= start_main->size ||
-        !libc.executable_pc(startup_pc, maps)) {
-      unavailable("libc startup caller chain does not reach __libc_start_main");
+    const auto thread_return_pc = thread_caller.rip;
+    const auto clone_pc = thread_return_pc == 0 ? 0 : thread_return_pc - 1;
+    if (thread_return_pc == 0 ||
+        (!within(clone, clone_pc) && !within(clone3, clone_pc))) {
+      unavailable(
+          "pthread startup caller chain does not reach exact __clone or "
+          "__clone3");
     }
     return application_frames;
   }
