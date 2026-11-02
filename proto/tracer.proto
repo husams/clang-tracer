@@ -14,6 +14,9 @@ service Tracer {
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc ListSymbols(ListSymbolsRequest) returns (ListSymbolsResponse);
   rpc WatchEvents(WatchEventsRequest) returns (stream TraceEvent);
+  // Snapshot retained events; acknowledge only after storage commits.
+  rpc ReadEvents(ReadEventsRequest) returns (ReadEventsResponse);
+  rpc AcknowledgeEvents(AcknowledgeEventsRequest) returns (AcknowledgeEventsResponse);
 }
 
 enum ValueType {
@@ -220,6 +223,25 @@ message WatchEventsRequest {
   uint32 pid = 3;                  // Optional process filter; survives session loss.
   repeated string names = 4;       // Exact function or emitted context event names; ORed.
 }
+message ReadEventsRequest {
+  WatchEventsRequest filter = 1;
+  uint32 limit = 2; // 1..256; zero uses 256.
+  uint64 through_sequence = 3; // Zero snapshots the latest server sequence.
+  string server_instance_id = 4; // Required when continuing a snapshot.
+}
+message ReadEventsResponse {
+  string server_instance_id = 1;
+  uint64 through_sequence = 2;
+  repeated TraceEvent events = 3;
+  uint64 server_dropped_events = 4;
+}
+message AcknowledgeEventsRequest {
+  string server_instance_id = 1;
+  repeated uint64 sequences = 2; // Exact stored events, at most 256.
+}
+message AcknowledgeEventsResponse {
+  uint32 removed = 1; // Repeating an acknowledgement is harmless.
+}
 message Value {
   ValueType type = 1;
   oneof data {
@@ -280,4 +302,5 @@ message TraceEvent {
   StackTrace stack = 19;
   clangtracer.context.v1.ContextEventEnvelope context = 20;
   string function_name = 21; // Bounded registered selector or linkage fallback; server-assigned.
+  string server_instance_id = 22; // Unique server lifetime; sequence alone is not durable identity.
 }

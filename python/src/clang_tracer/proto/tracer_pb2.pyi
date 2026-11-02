@@ -402,6 +402,44 @@ class WatchEventsRequest(_message.Message):
     names: _containers.RepeatedScalarFieldContainer[str]
     def __init__(self, session_ids: _Optional[_Iterable[str]] = ..., after_sequence: _Optional[int] = ..., pid: _Optional[int] = ..., names: _Optional[_Iterable[str]] = ...) -> None: ...
 
+class ReadEventsRequest(_message.Message):
+    __slots__ = ("filter", "limit", "through_sequence", "server_instance_id")
+    FILTER_FIELD_NUMBER: _ClassVar[int]
+    LIMIT_FIELD_NUMBER: _ClassVar[int]
+    THROUGH_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    SERVER_INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
+    filter: WatchEventsRequest
+    limit: int
+    through_sequence: int
+    server_instance_id: str
+    def __init__(self, filter: _Optional[_Union[WatchEventsRequest, _Mapping]] = ..., limit: _Optional[int] = ..., through_sequence: _Optional[int] = ..., server_instance_id: _Optional[str] = ...) -> None: ...
+
+class ReadEventsResponse(_message.Message):
+    __slots__ = ("server_instance_id", "through_sequence", "events", "server_dropped_events")
+    SERVER_INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
+    THROUGH_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    EVENTS_FIELD_NUMBER: _ClassVar[int]
+    SERVER_DROPPED_EVENTS_FIELD_NUMBER: _ClassVar[int]
+    server_instance_id: str
+    through_sequence: int
+    events: _containers.RepeatedCompositeFieldContainer[TraceEvent]
+    server_dropped_events: int
+    def __init__(self, server_instance_id: _Optional[str] = ..., through_sequence: _Optional[int] = ..., events: _Optional[_Iterable[_Union[TraceEvent, _Mapping]]] = ..., server_dropped_events: _Optional[int] = ...) -> None: ...
+
+class AcknowledgeEventsRequest(_message.Message):
+    __slots__ = ("server_instance_id", "sequences")
+    SERVER_INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
+    SEQUENCES_FIELD_NUMBER: _ClassVar[int]
+    server_instance_id: str
+    sequences: _containers.RepeatedScalarFieldContainer[int]
+    def __init__(self, server_instance_id: _Optional[str] = ..., sequences: _Optional[_Iterable[int]] = ...) -> None: ...
+
+class AcknowledgeEventsResponse(_message.Message):
+    __slots__ = ("removed",)
+    REMOVED_FIELD_NUMBER: _ClassVar[int]
+    removed: int
+    def __init__(self, removed: _Optional[int] = ...) -> None: ...
+
 class Value(_message.Message):
     __slots__ = ("type", "signed_value", "unsigned_value", "real_value")
     TYPE_FIELD_NUMBER: _ClassVar[int]
@@ -483,7 +521,7 @@ class StackTrace(_message.Message):
     def __init__(self, status: _Optional[_Union[StackTrace.Status, str]] = ..., requested_depth: _Optional[int] = ..., frames: _Optional[_Iterable[_Union[StackFrame, _Mapping]]] = ..., detail: _Optional[str] = ..., application_only: bool = ..., hidden_frames: _Optional[int] = ..., captured_depth: _Optional[int] = ...) -> None: ...
 
 class TraceEvent(_message.Message):
-    __slots__ = ("protocol_version", "session_id", "probe_id", "pid", "tid", "sequence", "probe_sequence", "monotonic_time_ns", "object_address", "arguments", "callback_value", "agent_dropped_events", "server_dropped_events", "phase", "call_id", "result", "named_arguments", "object_fields", "stack", "context", "function_name")
+    __slots__ = ("protocol_version", "session_id", "probe_id", "pid", "tid", "sequence", "probe_sequence", "monotonic_time_ns", "object_address", "arguments", "callback_value", "agent_dropped_events", "server_dropped_events", "phase", "call_id", "result", "named_arguments", "object_fields", "stack", "context", "function_name", "server_instance_id")
     PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     PROBE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -505,6 +543,7 @@ class TraceEvent(_message.Message):
     STACK_FIELD_NUMBER: _ClassVar[int]
     CONTEXT_FIELD_NUMBER: _ClassVar[int]
     FUNCTION_NAME_FIELD_NUMBER: _ClassVar[int]
+    SERVER_INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
     protocol_version: int
     session_id: str
     probe_id: int
@@ -526,4 +565,5 @@ class TraceEvent(_message.Message):
     stack: StackTrace
     context: _context_transport_pb2.ContextEventEnvelope
     function_name: str
-    def __init__(self, protocol_version: _Optional[int] = ..., session_id: _Optional[str] = ..., probe_id: _Optional[int] = ..., pid: _Optional[int] = ..., tid: _Optional[int] = ..., sequence: _Optional[int] = ..., probe_sequence: _Optional[int] = ..., monotonic_time_ns: _Optional[int] = ..., object_address: _Optional[int] = ..., arguments: _Optional[_Iterable[_Union[Value, _Mapping]]] = ..., callback_value: _Optional[int] = ..., agent_dropped_events: _Optional[int] = ..., server_dropped_events: _Optional[int] = ..., phase: _Optional[_Union[TracePhase, str]] = ..., call_id: _Optional[int] = ..., result: _Optional[_Union[Value, _Mapping]] = ..., named_arguments: _Optional[_Iterable[_Union[NamedValue, _Mapping]]] = ..., object_fields: _Optional[_Iterable[_Union[NamedValue, _Mapping]]] = ..., stack: _Optional[_Union[StackTrace, _Mapping]] = ..., context: _Optional[_Union[_context_transport_pb2.ContextEventEnvelope, _Mapping]] = ..., function_name: _Optional[str] = ...) -> None: ...
+    server_instance_id: str
+    def __init__(self, protocol_version: _Optional[int] = ..., session_id: _Optional[str] = ..., probe_id: _Optional[int] = ..., pid: _Optional[int] = ..., tid: _Optional[int] = ..., sequence: _Optional[int] = ..., probe_sequence: _Optional[int] = ..., monotonic_time_ns: _Optional[int] = ..., object_address: _Optional[int] = ..., arguments: _Optional[_Iterable[_Union[Value, _Mapping]]] = ..., callback_value: _Optional[int] = ..., agent_dropped_events: _Optional[int] = ..., server_dropped_events: _Optional[int] = ..., phase: _Optional[_Union[TracePhase, str]] = ..., call_id: _Optional[int] = ..., result: _Optional[_Union[Value, _Mapping]] = ..., named_arguments: _Optional[_Iterable[_Union[NamedValue, _Mapping]]] = ..., object_fields: _Optional[_Iterable[_Union[NamedValue, _Mapping]]] = ..., stack: _Optional[_Union[StackTrace, _Mapping]] = ..., context: _Optional[_Union[_context_transport_pb2.ContextEventEnvelope, _Mapping]] = ..., function_name: _Optional[str] = ..., server_instance_id: _Optional[str] = ...) -> None: ...

@@ -13,7 +13,8 @@
       | "probe" "remove" INT                            -> remove
       | "events" watch_option*                          -> events
       | "collect" INT stream_option*                    -> collect
-      | "record" value INT stream_option*               -> record
+      | "record" value INT record_option*               -> record
+      | "drain" value drain_option*                     -> drain
       | "help" value*                                  -> help
       | SHELL_COMMAND                                   -> shell
       | "!"                                             -> shell_empty
@@ -24,6 +25,9 @@
               | "--agent" value                         -> agent
               | "--durable-directory" value             -> durable_directory
               | "--operation-timeout" INT               -> operation_timeout
+              | "--event-history-limit" INT             -> event_history_limit
+              | "--context-history-limit" INT           -> context_history_limit
+              | "--context-history-bytes" INT           -> context_history_bytes
               | timeout_option
 ?injection_option: "--callback" value                    -> callback
                  | "--stack" INT                        -> stack_depth
@@ -36,6 +40,10 @@
                   | "--compdb" value                    -> compilation_database
 ?watch_option: "--count" INT                             -> count
              | stream_option
+?record_option: "--sqlite"                              -> sqlite
+              | stream_option
+?drain_option: "--listen"                               -> listen
+             | watch_option
 ?stream_option: "--session" value                        -> session_ids
               | "--pid" INT                             -> pid
               | "--name" value                          -> names

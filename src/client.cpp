@@ -13,28 +13,29 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
-#include <memory>
 #include <map>
-#include <sstream>
+#include <memory>
+#include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <optional>
 #include <thread>
-#include <utility>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <google/protobuf/text_format.h>
 #include <grpcpp/grpcpp.h>
 
-#include "debug_resolver.hpp"
-#include "header_context.hpp"
-#include "context_receiver.hpp"
 #include "context_query.hpp"
+#include "context_receiver.hpp"
 #include "context_schema.hpp"
 #include "context_transport.pb.h"
+#include "debug_resolver.hpp"
+#include "header_context.hpp"
+#include "sqlite_events.hpp"
 #include "tracer.grpc.pb.h"
 
 namespace {
@@ -57,6 +58,8 @@ struct Options {
   std::string return_type;
   std::string callback;
   std::string context_field;
+  std::string sqlite_path;
+  bool listen = false;
   std::vector<std::string> argument_types;
   std::vector<std::string> sources;
   std::uint64_t pid = 0;
@@ -118,7 +121,8 @@ Options parse_options(int argc, char **argv) {
              "  attach PID\n"
              "  trace PID 'C++ declaration' --callback FILE "
              "[--include HEADER ...] [--compdb FILE|DIR] [--stack DEPTH]\n"
-             "    --stack-application-only true|false (default: true); false shows all frames.\n"
+             "    --stack-application-only true|false (default: true); false "
+             "shows all frames.\n"
              "    --callback-print-arguments true|false (default: false)\n"
              "    --callback-print-result true|false (default: false)\n"
              "    Header flags are auto-detected or inferred by Clang from "
@@ -126,7 +130,15 @@ Options parse_options(int argc, char **argv) {
              "  trace PID (--function NAME|--method NAME) [--return "
              "TYPE [--arg TYPE ...]] --callback FILE\n"
              "  events PID [--count N] [--after N] [--timeout SEC]\n"
-             "    [--context-field path[,path...]] selects typed context fields across schema revisions; omit to show the retained field union.\n"
+             "    --sqlite FILE saves events without consuming history.\n"
+             "  drain [PID] --sqlite FILE [--listen] [--count N] [--after N] "
+             "[--timeout SEC]\n"
+             "    Commit retained events to SQLite, then consume them; "
+             "--listen continues until "
+             "interrupted.\n"
+             "    [--context-field path[,path...]] selects typed context "
+             "fields across schema "
+             "revisions; omit to show the retained field union.\n"
              "  detach PID | remove PID PROBE_ID | list\n"
              "  CALLBACK FILE may define class Interceptor with optional\n"
              "  pre(const Call&) and post(const Call&) methods; each may\n"
@@ -136,8 +148,15 @@ Options parse_options(int argc, char **argv) {
              "attach|add|remove|detach|list|watch\n";
       std::exit(0);
     }
-    if (a == "--endpoint" || a == "--request" || a == "--output" ||
-        a == "--format") {
+    if (a == "--listen") {
+      o.listen = true;
+    } else if (a == "--sqlite") {
+      o.sqlite_path = take_value(i, argc, argv, a);
+      if (o.sqlite_path.empty()) {
+        throw std::runtime_error("--sqlite requires a filename");
+      }
+    } else if (a == "--endpoint" || a == "--request" || a == "--output" ||
+               a == "--format") {
       const auto v = take_value(i, argc, argv, a);
       if (a == "--endpoint") {
         o.endpoint = v;
@@ -152,9 +171,10 @@ Options parse_options(int argc, char **argv) {
     } else if (a == "--function" || a == "--method" || a == "--return" ||
                a == "--arg" || a == "--callback" || a == "--count" ||
                a == "--after" || a == "--timeout" || a == "--include" ||
-               a == "--compdb" || a == "--stack" || a == "--stack-application-only" ||
-               a == "--callback-print-arguments" || a == "--callback-print-result" ||
-               a == "--context-field") {
+               a == "--compdb" || a == "--stack" ||
+               a == "--stack-application-only" ||
+               a == "--callback-print-arguments" ||
+               a == "--callback-print-result" || a == "--context-field") {
       if (a != "--count" && a != "--timeout") {
         o.direct = true;
       }
@@ -215,8 +235,8 @@ Options parse_options(int argc, char **argv) {
     } else if (o.command.empty()) {
       o.command = a;
     } else if ((o.command == "attach" || o.command == "trace" ||
-                o.command == "events" || o.command == "detach" ||
-                o.command == "remove") &&
+                o.command == "events" || o.command == "drain" ||
+                o.command == "detach" || o.command == "remove") &&
                o.pid == 0) {
       o.direct = true;
       o.pid = parse_number(a, "PID", std::numeric_limits<std::uint32_t>::max());
@@ -239,6 +259,9 @@ Options parse_options(int argc, char **argv) {
     throw std::runtime_error("--format must be text or protobuf");
   }
   if (!o.request_path.empty()) {
+    if (!o.sqlite_path.empty() || o.listen) {
+      throw std::runtime_error("SQLite and listen require direct commands");
+    }
     if (o.direct) {
       throw std::runtime_error(
           "--request cannot be combined with direct command arguments");
@@ -298,11 +321,27 @@ Options parse_options(int argc, char **argv) {
     if (o.pid == 0 || o.probe_id == 0) {
       throw std::runtime_error("remove requires PID and PROBE_ID");
     }
-  } else if (o.command != "list") {
+  } else if (o.command != "list" && o.command != "drain") {
     throw std::runtime_error("unknown command: " + o.command);
   }
-  if (o.command != "events" && (o.count_set || o.after_set)) {
-    throw std::runtime_error("--count and --after are only valid for events");
+  if (o.command != "events" && o.command != "drain" &&
+      (o.count_set || o.after_set)) {
+    throw std::runtime_error(
+        "--count and --after are only valid for events or drain");
+  }
+  if (o.listen && o.command != "drain") {
+    throw std::runtime_error("--listen is only valid for drain");
+  }
+  if (o.command == "drain" && o.sqlite_path.empty()) {
+    throw std::runtime_error("drain requires --sqlite FILE");
+  }
+  if (!o.sqlite_path.empty() &&
+      (o.command != "events" && o.command != "drain")) {
+    throw std::runtime_error("--sqlite is only valid for events or drain");
+  }
+  if (!o.sqlite_path.empty() && (o.format_set || !o.output_path.empty())) {
+    throw std::runtime_error(
+        "--sqlite cannot be combined with --format or --output");
   }
   const bool has_trace_args =
       !o.selector.empty() || !o.return_type.empty() ||
@@ -1012,7 +1051,97 @@ void set_callback_package_location(api::ProbeSpec &spec,
   spec.set_callback_package_path(callback.string());
 }
 
+int run_drain(const Options &o, api::Tracer::Stub &stub) {
+  tracer::client::SQLiteEvents storage(o.sqlite_path);
+  SignalGuard signals;
+  const auto deadline = o.timeout_set
+                            ? std::chrono::system_clock::now() +
+                                  std::chrono::seconds(o.timeout_seconds)
+                            : std::chrono::system_clock::time_point::max();
+  std::string instance;
+  std::uint64_t through = 0, received = 0, reported_drops = 0;
+  while (!interrupted.load(std::memory_order_relaxed) &&
+         std::chrono::system_clock::now() < deadline) {
+    api::ReadEventsRequest request;
+    request.mutable_filter()->set_pid(static_cast<std::uint32_t>(o.pid));
+    request.mutable_filter()->set_after_sequence(o.after);
+    request.set_limit(static_cast<std::uint32_t>(
+        o.count_set ? std::min<std::uint64_t>(256, o.count - received) : 256));
+    request.set_through_sequence(through);
+    request.set_server_instance_id(instance);
+    api::ReadEventsResponse batch;
+    grpc::ClientContext read_context;
+    read_context.set_deadline(std::min(
+        deadline, std::chrono::system_clock::now() + std::chrono::seconds(30)));
+    StreamCanceller read_canceller(read_context);
+    const auto read_status = stub.ReadEvents(&read_context, request, &batch);
+    read_canceller.stop();
+    if (interrupted.load(std::memory_order_relaxed)) {
+      break;
+    }
+    require_ok(read_status, "ReadEvents");
+    if (instance.empty()) {
+      instance = batch.server_instance_id();
+    }
+    if (instance.empty() || instance != batch.server_instance_id()) {
+      throw std::runtime_error("snapshot server instance changed or missing");
+    }
+    if (through == 0) {
+      through = batch.through_sequence();
+    }
+    if (batch.server_dropped_events() > reported_drops) {
+      reported_drops = batch.server_dropped_events();
+      std::cerr << "warning: server reports " << reported_drops
+                << " history drops\n";
+    }
+    if (batch.events().empty()) {
+      if (!o.listen) {
+        break;
+      }
+      through = 0;
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      continue;
+    }
+    api::AcknowledgeEventsRequest acknowledgement;
+    acknowledgement.set_server_instance_id(instance);
+    for (const auto &event : batch.events()) {
+      if (event.server_instance_id() != instance) {
+        throw std::runtime_error("event server instance differs from snapshot");
+      }
+      acknowledgement.add_sequences(event.sequence());
+    }
+    storage.write(batch.events());
+    api::AcknowledgeEventsResponse result;
+    grpc::ClientContext ack_context;
+    ack_context.set_deadline(std::min(
+        deadline, std::chrono::system_clock::now() + std::chrono::seconds(30)));
+    StreamCanceller ack_canceller(ack_context);
+    const auto ack_status =
+        stub.AcknowledgeEvents(&ack_context, acknowledgement, &result);
+    ack_canceller.stop();
+    if (interrupted.load(std::memory_order_relaxed)) {
+      break;
+    }
+    require_ok(
+        ack_status,
+        "AcknowledgeEvents (batch committed; retry with the same SQLite file)");
+    received += static_cast<std::uint64_t>(batch.events_size());
+    if (o.count_set && received >= o.count) {
+      break;
+    }
+  }
+  std::cout << "drained " << received << " events to " << o.sqlite_path << '\n';
+  return 0;
+}
+
 int run_direct(const Options &o, api::Tracer::Stub &stub) {
+  if (o.command == "drain") {
+    return run_drain(o, stub);
+  }
+  std::unique_ptr<tracer::client::SQLiteEvents> storage;
+  if (!o.sqlite_path.empty()) {
+    storage = std::make_unique<tracer::client::SQLiteEvents>(o.sqlite_path);
+  }
   TextWriter text(o.format == "protobuf" ? std::string{} : o.output_path);
   std::unique_ptr<FrameWriter> binary;
   if (o.format == "protobuf") {
@@ -1228,7 +1357,9 @@ int run_direct(const Options &o, api::Tracer::Stub &stub) {
   ContextEventDecoder context_decoder;
   std::uint64_t received = 0;
   while ((!o.count_set || received < o.count) && reader->Read(&event)) {
-    if (binary) {
+    if (storage) {
+      storage->write(std::array{event});
+    } else if (binary) {
       binary->write(event);
     } else {
       print_event(text, event, o, context_decoder);

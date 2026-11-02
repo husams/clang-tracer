@@ -3,6 +3,7 @@
 import os
 import struct
 import time
+import warnings
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,7 @@ import grpc
 
 from .proto import tracer_pb2 as pb
 from .proto import tracer_pb2_grpc as rpc
+from .storage import SQLiteEventStore
 
 if TYPE_CHECKING:
     from .process import ServerProcess
@@ -382,6 +384,172 @@ class Client:
                         break
         return written
 
+    def read_events(
+        self,
+        *,
+        session_ids: Iterable[str] = (),
+        after_sequence: int = 0,
+        pid: int = 0,
+        names: Iterable[str] = (),
+        limit: int = 256,
+        through_sequence: int = 0,
+        server_instance_id: str = "",
+        timeout: float | None = None,
+    ) -> pb.ReadEventsResponse:
+        """Read a bounded snapshot without removing it from server history."""
+        uint(limit, 32, "limit", 1)
+        if limit > 256:
+            raise ValueError("limit must be at most 256")
+        response: pb.ReadEventsResponse = self.stub.ReadEvents(
+            pb.ReadEventsRequest(
+                filter=pb.WatchEventsRequest(
+                    session_ids=session_ids,
+                    after_sequence=uint(after_sequence, 64, "after_sequence"),
+                    pid=uint(pid, 32, "pid"),
+                    names=_name_filters(names),
+                ),
+                limit=limit,
+                through_sequence=uint(through_sequence, 64, "through_sequence"),
+                server_instance_id=server_instance_id,
+            ),
+            timeout=self.timeout if timeout is None else positive_timeout(timeout),
+        )
+        return response
+
+    def acknowledge_events(
+        self,
+        server_instance_id: str,
+        sequences: Iterable[int],
+        *,
+        timeout: float | None = None,
+    ) -> int:
+        """Consume exact committed event IDs from this server lifetime."""
+        values = tuple(uint(value, 64, "sequence", 1) for value in sequences)
+        if not server_instance_id or len(values) > 256:
+            raise ValueError("server instance and at most 256 sequences required")
+        return int(
+            self.stub.AcknowledgeEvents(
+                pb.AcknowledgeEventsRequest(
+                    server_instance_id=server_instance_id,
+                    sequences=values,
+                ),
+                timeout=self.timeout if timeout is None else positive_timeout(timeout),
+            ).removed
+        )
+
+    def record_sqlite(
+        self,
+        path: str | Path,
+        count: int,
+        *,
+        session_ids: Iterable[str] = (),
+        after_sequence: int = 0,
+        pid: int = 0,
+        names: Iterable[str] = (),
+        timeout: float = 30,
+    ) -> int:
+        """Save a bounded live stream without consuming retained history."""
+        uint(count, 32, "count", 1)
+        written = 0
+        with SQLiteEventStore(path) as store:
+            with self.watch_events(
+                session_ids,
+                after_sequence=after_sequence,
+                pid=pid,
+                names=names,
+                timeout=timeout,
+            ) as stream:
+                for event in stream:
+                    store.write([event])
+                    written += 1
+                    if written >= count:
+                        break
+        return written
+
+    def drain_traces(
+        self,
+        path: str | Path,
+        *,
+        listen: bool = False,
+        count: int | None = None,
+        session_ids: Iterable[str] = (),
+        after_sequence: int = 0,
+        pid: int = 0,
+        names: Iterable[str] = (),
+        timeout: float | None = None,
+    ) -> int:
+        """Commit retained events to SQLite, then consume them; optionally poll live.
+
+        Ctrl-C stops polling. Failed acknowledgements can be retried by calling
+        again with the same database. Overflow can still lose uncollected events.
+        """
+        if count is not None:
+            uint(count, 32, "count", 1)
+        deadline = (
+            None if timeout is None else time.monotonic() + positive_timeout(timeout)
+        )
+        session_ids, names = tuple(session_ids), _name_filters(names)
+        written, through, instance, reported_drops = 0, 0, "", 0
+        with SQLiteEventStore(path) as store:
+            while True:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return written
+                batch = self.read_events(
+                    session_ids=session_ids,
+                    after_sequence=after_sequence,
+                    pid=pid,
+                    names=names,
+                    limit=256 if count is None else min(256, count - written),
+                    through_sequence=through,
+                    server_instance_id=instance,
+                    timeout=None
+                    if deadline is None
+                    else max(0.001, min(self.timeout, deadline - time.monotonic())),
+                )
+                if not instance:
+                    instance = batch.server_instance_id
+                if not instance or batch.server_instance_id != instance:
+                    raise RuntimeError("snapshot server instance changed")
+                if through == 0:
+                    through = batch.through_sequence
+                if batch.server_dropped_events > reported_drops:
+                    reported_drops = batch.server_dropped_events
+                    warnings.warn(
+                        f"server reports {reported_drops} history drops",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                if batch.events:
+                    if any(
+                        event.server_instance_id != instance for event in batch.events
+                    ):
+                        raise RuntimeError(
+                            "event server instance differs from snapshot"
+                        )
+                    store.write(batch.events)
+                    self.acknowledge_events(
+                        instance,
+                        (e.sequence for e in batch.events),
+                        timeout=None
+                        if deadline is None
+                        else max(0.001, min(self.timeout, deadline - time.monotonic())),
+                    )
+                    written += len(batch.events)
+                    if count is not None and written >= count:
+                        return written
+                elif not listen:
+                    return written
+                else:
+                    # Refresh only after finishing the previous snapshot. Pin the
+                    # instance even between snapshots so restarts fail explicitly.
+                    through = 0
+                    remaining = (
+                        0.1
+                        if deadline is None
+                        else max(0, min(0.1, deadline - time.monotonic()))
+                    )
+                    time.sleep(remaining)
+
     def status(self, *, timeout: float = 1) -> ServerStatus:
         managed = self.server is not None and self.server.running
         pid = self.server.pid if managed and self.server else None
@@ -415,6 +583,9 @@ class Client:
         timeout: float = 30,
         operation_timeout: int = 10,
         durable_directory: str | None = None,
+        event_history_limit: int | None = None,
+        context_history_limit: int | None = None,
+        context_history_bytes: int | None = None,
     ) -> ServerStatus:
         """Start a local child and confirm both managed and client readiness.
 
@@ -438,6 +609,9 @@ class Client:
             timeout=remaining,
             operation_timeout=operation_timeout,
             durable_directory=durable_directory,
+            event_history_limit=event_history_limit,
+            context_history_limit=context_history_limit,
+            context_history_bytes=context_history_bytes,
         )
         # A channel used before a restart may still be reconnecting after a
         # failed status check; wait until this client's channel is usable too.

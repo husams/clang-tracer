@@ -50,11 +50,8 @@ namespace tracer {
 namespace {
 
 constexpr std::size_t kSessionLimit = 64;
-constexpr std::size_t kEventHistoryLimit = 4096;
 constexpr std::size_t kMaxCallbackSource = 64 * 1024;
 constexpr std::size_t kMaxEventBytes = 64 * 1024;
-constexpr std::size_t kRetainedContextEventLimit = 128;
-constexpr std::size_t kRetainedContextBytesLimit = 16 * 1024 * 1024;
 
 context_package::PackageLineage admit_probe_package(
     const clangtracer::v1::ProbeSpec &spec) {
@@ -377,7 +374,8 @@ class EventHub final {
   };
 
 public:
-  explicit EventHub(std::string path) : path_(std::move(path)) {
+  explicit EventHub(std::string path, EventHistoryLimits limits)
+      : path_(std::move(path)), limits_(limits), instance_id_(make_id()) {
     if (path_.size() >= sizeof(((sockaddr_un *)nullptr)->sun_path)) {
       throw std::runtime_error("event socket path is too long");
     }
@@ -632,33 +630,37 @@ public:
       event.set_pid(known->second.pid);
       event.set_function_name(known->second.function_name);
     }
+    event.set_server_instance_id(instance_id_);
     const std::size_t charge = event.ByteSizeLong();
-    if (charge > kRetainedContextBytesLimit) {
+    if (charge + 64 > limits_.context_bytes) {
       ++dropped_;
       return true;
     }
-    while (context_event_count_ >= kRetainedContextEventLimit ||
-           context_bytes_ + charge + 64 > kRetainedContextBytesLimit) {
+    while (context_event_count_ >= limits_.context_events ||
+           context_bytes_ + charge + 64 > limits_.context_bytes) {
       const auto oldest = std::find_if(history_.begin(), history_.end(),
           [](const auto &item) { return item.has_context(); });
       if (oldest == history_.end())
         break;
       context_bytes_ -= oldest->ByteSizeLong();
       --context_event_count_;
+      evicted_through_ = std::max(evicted_through_, oldest->sequence());
       history_.erase(oldest);
       ++dropped_;
     }
-    if (context_event_count_ >= kRetainedContextEventLimit ||
-        context_bytes_ + charge + 64 > kRetainedContextBytesLimit) {
+    if (context_event_count_ >= limits_.context_events ||
+        context_bytes_ + charge + 64 > limits_.context_bytes) {
       ++dropped_;
       return true;
     }
     event.set_sequence(next_sequence_++);
-    if (history_.size() == kEventHistoryLimit) {
+    if (history_.size() == limits_.events) {
       if (history_.front().has_context()) {
         context_bytes_ -= history_.front().ByteSizeLong();
         --context_event_count_;
       }
+      evicted_through_ =
+          std::max(evicted_through_, history_.front().sequence());
       history_.pop_front();
       ++dropped_;
     }
@@ -702,9 +704,9 @@ public:
         std::unique_lock lock(mutex_);
         if (context->IsCancelled())
           return true;
-        if (cursor != 0 && !history_.empty() &&
-            history_.front().sequence() > cursor + 1)
+        if (cursor != 0 && cursor < evicted_through_) {
           return false;
+        }
         bool found = false;
         for (const auto &event : history_) {
           if (event.sequence() <= cursor)
@@ -747,6 +749,92 @@ public:
     }
   }
 
+  grpc::Status read(const clangtracer::v1::ReadEventsRequest &request,
+                    clangtracer::v1::ReadEventsResponse &response) {
+    std::lock_guard lock(mutex_);
+    if ((!request.server_instance_id().empty() &&
+         request.server_instance_id() != instance_id_) ||
+        (request.through_sequence() != 0 &&
+         request.server_instance_id().empty())) {
+      return {grpc::StatusCode::FAILED_PRECONDITION,
+              "snapshot server instance changed or missing"};
+    }
+    if (request.through_sequence() >= next_sequence_) {
+      return {grpc::StatusCode::INVALID_ARGUMENT,
+              "snapshot watermark exceeds the current server sequence"};
+    }
+    const auto through = request.through_sequence() == 0
+                             ? next_sequence_ - 1
+                             : request.through_sequence();
+    response.set_server_instance_id(instance_id_);
+    response.set_through_sequence(through);
+    response.set_server_dropped_events(dropped_);
+    const auto &filter = request.filter();
+    const auto limit = request.limit() == 0 ? 256 : request.limit();
+    std::size_t bytes = 0;
+    for (const auto &event : history_) {
+      if (event.sequence() > through) {
+        break;
+      }
+      if (event.sequence() <= filter.after_sequence() ||
+          (filter.pid() != 0 && event.pid() != filter.pid()) ||
+          (!filter.session_ids().empty() &&
+           std::find(filter.session_ids().begin(), filter.session_ids().end(),
+                     event.session_id()) == filter.session_ids().end()) ||
+          (!filter.names().empty() &&
+           std::none_of(filter.names().begin(), filter.names().end(),
+                        [&](const auto &name) {
+                          return event.function_name() == name ||
+                                 (event.has_context() &&
+                                  event.context().has_event() &&
+                                  event.context().event().name() == name);
+                        }))) {
+        continue;
+      }
+      const auto charge = event.ByteSizeLong() + 16;
+      if (charge > 31 * 1024 * 1024) {
+        return {grpc::StatusCode::RESOURCE_EXHAUSTED,
+                "event exceeds drain response budget"};
+      }
+      if (bytes + charge > 31 * 1024 * 1024) {
+        break;
+      }
+      response.add_events()->CopyFrom(event);
+      bytes += charge;
+      if (response.events_size() >= static_cast<int>(limit)) {
+        break;
+      }
+    }
+    return grpc::Status::OK;
+  }
+
+  grpc::Status
+  acknowledge(const clangtracer::v1::AcknowledgeEventsRequest &request,
+              clangtracer::v1::AcknowledgeEventsResponse &response) {
+    std::lock_guard lock(mutex_);
+    if (request.server_instance_id() != instance_id_) {
+      return {grpc::StatusCode::FAILED_PRECONDITION,
+              "acknowledgement belongs to another server instance"};
+    }
+    const std::set<std::uint64_t> sequences(request.sequences().begin(),
+                                            request.sequences().end());
+    for (auto it = history_.begin(); it != history_.end();) {
+      if (sequences.count(it->sequence()) == 0) {
+        ++it;
+        continue;
+      }
+      if (it->has_context()) {
+        context_bytes_ -= it->ByteSizeLong();
+        --context_event_count_;
+      }
+      evicted_through_ = std::max(evicted_through_, it->sequence());
+      it = history_.erase(it);
+      response.set_removed(response.removed() + 1);
+    }
+    changed_.notify_all();
+    return grpc::Status::OK;
+  }
+
   void stop() noexcept {
     stopping_.store(true);
     changed_.notify_all();
@@ -762,6 +850,9 @@ public:
 
 private:
   std::string path_;
+  EventHistoryLimits limits_;
+  std::string instance_id_;
+  std::uint64_t evicted_through_ = 0;
   int fd_ = -1;
   std::thread receiver_;
   std::atomic<bool> stopping_{false};
@@ -945,11 +1036,14 @@ private:
       event.set_function_name(active->second.function_name);
       ++received_[active->first];
       event.set_sequence(next_sequence_++);
-      if (history_.size() == kEventHistoryLimit) {
+      event.set_server_instance_id(instance_id_);
+      if (history_.size() == limits_.events) {
         if (history_.front().has_context()) {
           context_bytes_ -= history_.front().ByteSizeLong();
           --context_event_count_;
         }
+        evicted_through_ =
+            std::max(evicted_through_, history_.front().sequence());
         history_.pop_front();
         ++dropped_;
       }
@@ -965,12 +1059,13 @@ public:
   TracerService(std::string agent_path, std::string event_path,
                 std::string source_directory, std::chrono::seconds timeout,
                 std::string context_endpoint,
-                std::string context_durable_directory)
+                std::string context_durable_directory,
+                EventHistoryLimits limits)
       : agent_path_(std::move(agent_path)), event_path_(std::move(event_path)),
         source_directory_(std::move(source_directory)), timeout_(timeout),
         context_endpoint_(std::move(context_endpoint)),
         context_durable_directory_(std::move(context_durable_directory)),
-        events_(event_path_), next_probe_id_(random_probe_seed()) {}
+        events_(event_path_, limits), next_probe_id_(random_probe_seed()) {}
 
   void set_context_endpoint(std::string endpoint) {
     std::lock_guard lock(mutex_);
@@ -1357,6 +1452,37 @@ public:
     return grpc::Status::OK;
   }
 
+  grpc::Status
+  ReadEvents(grpc::ServerContext *,
+             const clangtracer::v1::ReadEventsRequest *request,
+             clangtracer::v1::ReadEventsResponse *response) override {
+    if (request->limit() > 256 || request->filter().names_size() > 64 ||
+        request->filter().session_ids_size() > 64) {
+      return {grpc::StatusCode::INVALID_ARGUMENT,
+              "drain limit is at most 256; filters at most 64"};
+    }
+    for (const auto &name : request->filter().names()) {
+      if (name.empty() || name.size() > 4096 ||
+          name.find('\0') != std::string::npos) {
+        return {grpc::StatusCode::INVALID_ARGUMENT,
+                "invalid event name filter"};
+      }
+    }
+    return events_.read(*request, *response);
+  }
+
+  grpc::Status AcknowledgeEvents(
+      grpc::ServerContext *,
+      const clangtracer::v1::AcknowledgeEventsRequest *request,
+      clangtracer::v1::AcknowledgeEventsResponse *response) override {
+    if (request->server_instance_id().empty() ||
+        request->sequences_size() > 256) {
+      return {grpc::StatusCode::INVALID_ARGUMENT,
+              "server instance and at most 256 sequences required"};
+    }
+    return events_.acknowledge(*request, *response);
+  }
+
   bool shutdown_sessions() {
     std::vector<std::shared_ptr<Session>> copy;
     {
@@ -1648,7 +1774,15 @@ private:
 
 int RunServer(const std::string &agent_path, const std::string &listen_uri,
               std::chrono::seconds operation_timeout,
-              const std::string &context_durable_directory) {
+              const std::string &context_durable_directory,
+              EventHistoryLimits history_limits) {
+  if (history_limits.events == 0 || history_limits.context_events == 0 ||
+      history_limits.context_bytes == 0 ||
+      history_limits.context_bytes >
+          std::numeric_limits<std::size_t>::max() / 2) {
+    throw std::invalid_argument(
+        "history limits must be positive and fit size_t / 2");
+  }
   if (agent_path.empty() || operation_timeout.count() < 1 ||
       operation_timeout.count() > 300) {
     throw std::invalid_argument(
@@ -1681,7 +1815,8 @@ int RunServer(const std::string &agent_path, const std::string &listen_uri,
         std::filesystem::path(durable_root) / "collector");
   }
   TracerService service(canonical_agent, event_path, directory.path(),
-                        operation_timeout, endpoint, durable_root);
+                        operation_timeout, endpoint, durable_root,
+                        history_limits);
   LiveContextCapture live_context;
   context_delivery::ContextCollector context_collector(
       {}, {},
