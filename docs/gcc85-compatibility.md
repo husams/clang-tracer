@@ -70,6 +70,23 @@ application with `cmake/toolchains/gcc85-sdk.cmake`, `RelWithDebInfo`, and
 `BUILD_TESTING=ON`. The application is installed under
 `<scratch>/install`.
 
+gRPC, protobuf and gRPC's bundled dependencies are built as static PIC archives.
+Use a fresh scratch directory when switching from the earlier shared-dependency
+recipe. The injected agent localizes their symbols with a linker version script
+and exports only `tracer_agent_start`, `tracer_agent_stop` and
+`tracer_context_pthread_create_detour`. Callback JIT helpers are registered by
+address directly in each interpreter, without relying on ELF exports or LLVM's
+process-wide symbol registry. This prevents the application's protobuf/gRPC
+definitions from replacing the agent's copies and prevents the agent from
+exporting replacements into the application. Shared LLVM/Clang and the target's
+C/C++ runtime remain dependencies.
+A build-time audit, also registered as `agent_symbol_isolation` in CTest, rejects
+extra exports or shared transport dependencies. `grpc_agent_dependency_collision`
+attaches and traces a target exporting deliberately incompatible protobuf/gRPC
+definitions; `grpc_agent_shared_dependency_collision` also exercises shared-state
+gRPC delivery and pthread propagation in that target. These checks do not establish
+safe recovery from an arbitrary abort inside a loaded library.
+
 ## Test
 
 After building with the selected GCC 8.5 SDK, run the normal CTest suite by default:

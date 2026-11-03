@@ -1,0 +1,10 @@
+/* The injector resolves these three names with dlsym. Callback JIT helpers
+   are registered by address; neither they nor bundled libraries are public. */
+{
+  global:
+    tracer_agent_start;
+    tracer_agent_stop;
+    tracer_context_pthread_create_detour;
+  local:
+    *;
+};
