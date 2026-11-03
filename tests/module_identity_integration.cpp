@@ -35,8 +35,8 @@ namespace {
 class TemporaryDirectory final {
 public:
   TemporaryDirectory() {
-    std::array<char, 32> pattern{};
     constexpr std::string_view prefix = "/tmp/clang-tracer-modules-XXXXXX";
+    std::array<char, prefix.size() + 1> pattern{};
     std::copy(prefix.begin(), prefix.end(), pattern.begin());
     pattern[prefix.size()] = '\0';
     const char *created = ::mkdtemp(pattern.data());
@@ -110,6 +110,108 @@ fs::path copy_module(const fs::path &fixture, const fs::path &directory,
   const fs::path destination = directory / name;
   fs::copy_file(fixture, destination, fs::copy_options::overwrite_existing);
   return destination;
+}
+
+std::vector<ApplicationModule>::const_iterator
+find_module(const std::vector<ApplicationModule> &modules,
+            const fs::path &path);
+
+void corrupt_eh_frame_length(const fs::path &path) {
+  const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+  if (fd < 0) {
+    throw std::runtime_error("could not open module for CFI mutation: " +
+                             std::string(std::strerror(errno)));
+  }
+  try {
+    struct stat status{};
+    Elf64_Ehdr header{};
+    if (::fstat(fd, &status) != 0 || status.st_size < 0 ||
+        ::pread(fd, &header, sizeof(header), 0) !=
+            static_cast<ssize_t>(sizeof(header)) ||
+        header.e_shentsize != sizeof(Elf64_Shdr) ||
+        header.e_shstrndx >= header.e_shnum ||
+        header.e_shoff > static_cast<std::uint64_t>(status.st_size) ||
+        header.e_shnum >
+            (static_cast<std::uint64_t>(status.st_size) - header.e_shoff) /
+                sizeof(Elf64_Shdr)) {
+      throw std::runtime_error("could not inspect CFI mutation fixture");
+    }
+    std::vector<Elf64_Shdr> sections(header.e_shnum);
+    if (::pread(fd, sections.data(), sections.size() * sizeof(Elf64_Shdr),
+                static_cast<off_t>(header.e_shoff)) !=
+        static_cast<ssize_t>(sections.size() * sizeof(Elf64_Shdr))) {
+      throw std::runtime_error("could not read CFI mutation sections");
+    }
+    const auto &names = sections[header.e_shstrndx];
+    if (names.sh_offset > static_cast<std::uint64_t>(status.st_size) ||
+        names.sh_size >
+            static_cast<std::uint64_t>(status.st_size) - names.sh_offset) {
+      throw std::runtime_error("CFI mutation section names are malformed");
+    }
+    std::vector<char> section_names(static_cast<std::size_t>(names.sh_size));
+    if (::pread(fd, section_names.data(), section_names.size(),
+                static_cast<off_t>(names.sh_offset)) !=
+        static_cast<ssize_t>(section_names.size())) {
+      throw std::runtime_error("could not read CFI mutation section names");
+    }
+    const auto eh_frame = std::find_if(
+        sections.begin(), sections.end(), [&](const Elf64_Shdr &section) {
+          if (section.sh_name >= names.sh_size) {
+            return false;
+          }
+          const char *name = section_names.data() + section.sh_name;
+          return std::memchr(name, 0, names.sh_size - section.sh_name) &&
+                 std::strcmp(name, ".eh_frame") == 0;
+        });
+    if (eh_frame == sections.end() ||
+        eh_frame->sh_size < sizeof(std::uint32_t) ||
+        eh_frame->sh_offset > static_cast<std::uint64_t>(status.st_size) ||
+        eh_frame->sh_size >
+            static_cast<std::uint64_t>(status.st_size) - eh_frame->sh_offset) {
+      throw std::runtime_error("CFI mutation fixture has no valid .eh_frame");
+    }
+    constexpr std::uint32_t malformed_length = 0x7fffffff;
+    if (::pwrite(fd, &malformed_length, sizeof(malformed_length),
+                 static_cast<off_t>(eh_frame->sh_offset)) !=
+        static_cast<ssize_t>(sizeof(malformed_length))) {
+      throw std::runtime_error("could not corrupt CFI mutation fixture");
+    }
+  } catch (...) {
+    ::close(fd);
+    throw;
+  }
+  ::close(fd);
+}
+
+void verify_cfi_snapshot_cache(pid_t pid, const fs::path &fixture,
+                               const fs::path &directory) {
+  const fs::path module_path =
+      copy_module(fixture, directory, "changed-cfi.so");
+  SharedObject handle(module_path);
+  const auto discovered = discover_application_modules(pid);
+  const auto module_it = find_module(discovered, module_path);
+  if (module_it == discovered.end()) {
+    throw std::runtime_error("loaded CFI mutation module was not discovered");
+  }
+  std::vector<ApplicationModule> module{*module_it};
+  validate_application_modules(pid, module);
+
+  struct stat before{};
+  if (::stat(module_path.c_str(), &before) != 0) {
+    throw std::runtime_error("stat before timestamp update failed: " +
+                             std::string(std::strerror(errno)));
+  }
+  const timespec times[2] = {{0, UTIME_OMIT}, {before.st_mtime + 10, 0}};
+  if (::utimensat(AT_FDCWD, module_path.c_str(), times, 0) != 0) {
+    throw std::runtime_error("utimensat failed: " +
+                             std::string(std::strerror(errno)));
+  }
+  validate_application_modules(pid, module);
+
+  corrupt_eh_frame_length(module_path);
+  expect_throws<std::runtime_error>(
+      [&] { validate_application_modules(pid, module); },
+      "changed malformed CFI after module discovery");
 }
 
 class CoalescedLoadMapping final {
@@ -314,14 +416,22 @@ std::string loaded_path(const void *address, std::string_view description) {
 
 int main(int argc, char **argv) {
   try {
-    if (argc != 3 || std::string_view(argv[1]) != "--module") {
-      throw std::invalid_argument(
-          "usage: module_identity_integration --module PATH");
+    const bool cfi_cache_only =
+        argc == 4 && std::string_view(argv[3]) == "--cfi-cache-only";
+    if ((argc != 3 && !cfi_cache_only) ||
+        std::string_view(argv[1]) != "--module") {
+      throw std::invalid_argument("usage: module_identity_integration --module "
+                                  "PATH [--cfi-cache-only]");
     }
 
     const fs::path fixture = fs::canonical(argv[2]);
     TemporaryDirectory temporary;
     const pid_t pid = ::getpid();
+    if (cfi_cache_only) {
+      verify_cfi_snapshot_cache(pid, fixture, temporary.path());
+      std::cout << "module CFI snapshot cache checks passed\n";
+      return 0;
+    }
 
     // The fixture copy must be discovered from the live mapping set and
     // represented by its canonical mapped path.
@@ -383,6 +493,8 @@ int main(int argc, char **argv) {
                                std::string(std::strerror(errno)));
     }
     validate_application_modules(pid, touched);
+
+    verify_cfi_snapshot_cache(pid, fixture, temporary.path());
 
     const fs::path unmapped_after_snapshot_path =
         copy_module(fixture, temporary.path(), "unmapped-after-snapshot.so");

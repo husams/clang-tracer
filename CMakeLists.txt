@@ -250,6 +250,9 @@ if(BUILD_TESTING)
   add_test(NAME native_module_identity_integration COMMAND module-identity-integration
     --module $<TARGET_FILE:trace-stack-b>)
   set_tests_properties(native_module_identity_integration PROPERTIES TIMEOUT 30)
+  add_test(NAME native_module_cfi_cache_integration COMMAND module-identity-integration
+    --module $<TARGET_FILE:trace-stack-b> --cfi-cache-only)
+  set_tests_properties(native_module_cfi_cache_integration PROPERTIES TIMEOUT 30)
   add_executable(server-integration tests/server_integration.cpp)
   target_link_libraries(server-integration PRIVATE tracer_grpc Threads::Threads)
   target_compile_options(server-integration PRIVATE -Wall -Wextra -Wpedantic)

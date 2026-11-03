@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -40,6 +41,11 @@ namespace detail {
 struct ApprovedModuleIdentity {
   std::string path;
   std::uint64_t load_bias = 0;
+  std::uint16_t elf_type = 0;
+  std::string soname;
+  std::uint64_t eh_frame_addr = 0;
+  std::string eh_frame;
+  std::vector<Elf64_Phdr> loads;
 };
 } // namespace detail
 
@@ -59,8 +65,67 @@ namespace {
 }
 
 template <class T>
-bool range_ok(std::size_t size, std::uint64_t offset, std::uint64_t count) {
+bool file_range_ok(std::uint64_t size, std::uint64_t offset,
+                   std::uint64_t count) {
   return offset <= size && count <= (size - offset) / sizeof(T);
+}
+
+void pread_exact(int fd, std::uint64_t file_size, std::uint64_t offset,
+                 void *destination, std::size_t length,
+                 std::string_view description) {
+  if (offset > file_size || length > file_size - offset ||
+      offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
+    unavailable(std::string(description) + " is outside the ELF file");
+  }
+  auto *out = static_cast<std::uint8_t *>(destination);
+  std::size_t read = 0;
+  while (read < length) {
+    if (read > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) -
+                   offset) {
+      unavailable(std::string(description) + " offset overflows off_t");
+    }
+    const auto n = ::pread(fd, out + read, length - read,
+                           static_cast<off_t>(offset + read));
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    if (n <= 0) {
+      unavailable("could not read " + std::string(description));
+    }
+    read += static_cast<std::size_t>(n);
+  }
+}
+
+template <class T>
+std::vector<T> read_file_objects(int fd, std::uint64_t file_size,
+                                 std::uint64_t offset, std::uint64_t count,
+                                 std::string_view description) {
+  if (!file_range_ok<T>(file_size, offset, count) ||
+      count > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+    unavailable(std::string(description) + " is outside the ELF file");
+  }
+  std::vector<T> result(static_cast<std::size_t>(count));
+  if (!result.empty()) {
+    pread_exact(fd, file_size, offset, result.data(), result.size() * sizeof(T),
+                description);
+  }
+  return result;
+}
+
+std::vector<std::uint8_t> read_file_bytes(int fd, std::uint64_t file_size,
+                                          std::uint64_t offset,
+                                          std::uint64_t length,
+                                          std::string_view description) {
+  if (offset > file_size || length > file_size - offset ||
+      length > std::numeric_limits<std::size_t>::max()) {
+    unavailable(std::string(description) + " is outside the ELF file");
+  }
+  std::vector<std::uint8_t> result(static_cast<std::size_t>(length));
+  if (!result.empty()) {
+    pread_exact(fd, file_size, offset, result.data(), result.size(),
+                description);
+  }
+  return result;
 }
 
 struct Mapping {
@@ -125,7 +190,6 @@ struct FileImage {
   std::uint16_t elf_type = 0;
   std::string soname;
   std::string interpreter;
-  std::vector<std::uint8_t> bytes;
   std::uint64_t bias = 0;
   std::vector<Elf64_Phdr> loads;
 
@@ -196,7 +260,8 @@ struct FileImage {
 };
 
 FileImage load_image_fd(const std::string &path, int fd,
-                        const std::vector<Mapping> &maps) {
+                        const std::vector<Mapping> &maps,
+                        bool collect_startup_symbols = false) {
   FileImage image;
   image.path = path;
   struct stat st{};
@@ -207,39 +272,32 @@ FileImage load_image_fd(const std::string &path, int fd,
       static_cast<std::uint64_t>(st.st_size) > 512ULL * 1024 * 1024) {
     unavailable("mapped ELF has an unsupported size");
   }
-  image.bytes.resize(static_cast<std::size_t>(st.st_size));
-  std::size_t got = 0;
-  while (got < image.bytes.size()) {
-    const auto n = ::pread(fd, image.bytes.data() + got,
-                           image.bytes.size() - got, static_cast<off_t>(got));
-    if (n <= 0) {
-      unavailable("could not read complete mapped ELF image");
-    }
-    got += static_cast<std::size_t>(n);
-  }
-  const auto *eh = reinterpret_cast<const Elf64_Ehdr *>(image.bytes.data());
-  if (std::memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 ||
-      eh->e_ident[EI_CLASS] != ELFCLASS64 ||
-      eh->e_ident[EI_DATA] != ELFDATA2LSB || eh->e_machine != EM_X86_64 ||
-      eh->e_phentsize != sizeof(Elf64_Phdr) ||
-      eh->e_shentsize != sizeof(Elf64_Shdr) ||
-      (eh->e_type != ET_DYN && eh->e_type != ET_EXEC) ||
-      !range_ok<Elf64_Phdr>(image.bytes.size(), eh->e_phoff, eh->e_phnum) ||
-      !range_ok<Elf64_Shdr>(image.bytes.size(), eh->e_shoff, eh->e_shnum)) {
+  const auto file_size = static_cast<std::uint64_t>(st.st_size);
+  Elf64_Ehdr eh{};
+  pread_exact(fd, file_size, 0, &eh, sizeof(eh), "mapped ELF header");
+  if (std::memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
+      eh.e_ident[EI_CLASS] != ELFCLASS64 ||
+      eh.e_ident[EI_DATA] != ELFDATA2LSB || eh.e_machine != EM_X86_64 ||
+      eh.e_phentsize != sizeof(Elf64_Phdr) ||
+      eh.e_shentsize != sizeof(Elf64_Shdr) ||
+      (eh.e_type != ET_DYN && eh.e_type != ET_EXEC) ||
+      !file_range_ok<Elf64_Phdr>(file_size, eh.e_phoff, eh.e_phnum) ||
+      !file_range_ok<Elf64_Shdr>(file_size, eh.e_shoff, eh.e_shnum)) {
     unavailable("mapped image is not a supported x86_64 ELF");
   }
-  image.elf_type = eh->e_type;
-  const auto *ph =
-      reinterpret_cast<const Elf64_Phdr *>(image.bytes.data() + eh->e_phoff);
-  for (unsigned i = 0; i < eh->e_phnum; ++i) {
+  image.elf_type = eh.e_type;
+  const auto ph = read_file_objects<Elf64_Phdr>(
+      fd, file_size, eh.e_phoff, eh.e_phnum, "ELF program headers");
+  for (unsigned i = 0; i < eh.e_phnum; ++i) {
     if (ph[i].p_type == PT_INTERP) {
-      if (ph[i].p_offset > image.bytes.size() || ph[i].p_filesz == 0 ||
+      if (ph[i].p_offset > file_size || ph[i].p_filesz == 0 ||
           ph[i].p_filesz > 4096 ||
-          ph[i].p_filesz > image.bytes.size() - ph[i].p_offset) {
+          ph[i].p_filesz > file_size - ph[i].p_offset) {
         unavailable("ELF interpreter path is malformed");
       }
-      const char *interp =
-          reinterpret_cast<const char *>(image.bytes.data() + ph[i].p_offset);
+      const auto interp_bytes = read_file_bytes(
+          fd, file_size, ph[i].p_offset, ph[i].p_filesz, "ELF interpreter");
+      const char *interp = reinterpret_cast<const char *>(interp_bytes.data());
       const auto *terminator =
           static_cast<const char *>(std::memchr(interp, 0, ph[i].p_filesz));
       if (!terminator || terminator == interp || interp[0] != '/') {
@@ -248,9 +306,8 @@ FileImage load_image_fd(const std::string &path, int fd,
       image.interpreter.assign(interp, terminator);
     }
     if (ph[i].p_type == PT_LOAD) {
-      if (ph[i].p_filesz > ph[i].p_memsz ||
-          ph[i].p_offset > image.bytes.size() ||
-          ph[i].p_filesz > image.bytes.size() - ph[i].p_offset ||
+      if (ph[i].p_filesz > ph[i].p_memsz || ph[i].p_offset > file_size ||
+          ph[i].p_filesz > file_size - ph[i].p_offset ||
           ph[i].p_memsz >
               std::numeric_limits<std::uint64_t>::max() - ph[i].p_vaddr) {
         unavailable("ELF load segment is malformed");
@@ -388,60 +445,64 @@ FileImage load_image_fd(const std::string &path, int fd,
                 "is incomplete for " +
                 path);
   }
-  if (eh->e_type == ET_EXEC && image.bias != 0) {
+  if (eh.e_type == ET_EXEC && image.bias != 0) {
     unavailable("unexpected load bias for fixed-address ELF");
   }
 
-  const auto *sh =
-      reinterpret_cast<const Elf64_Shdr *>(image.bytes.data() + eh->e_shoff);
-  if (eh->e_shstrndx >= eh->e_shnum) {
+  const auto sh = read_file_objects<Elf64_Shdr>(
+      fd, file_size, eh.e_shoff, eh.e_shnum, "ELF section headers");
+  if (eh.e_shstrndx >= eh.e_shnum) {
     unavailable("ELF section names are unavailable");
   }
-  const auto &names = sh[eh->e_shstrndx];
-  if (names.sh_offset > image.bytes.size() ||
-      names.sh_size > image.bytes.size() - names.sh_offset) {
+  const auto &names = sh[eh.e_shstrndx];
+  if (names.sh_offset > file_size ||
+      names.sh_size > file_size - names.sh_offset) {
     unavailable("ELF section-name table is malformed");
   }
-  const char *strtab =
-      reinterpret_cast<const char *>(image.bytes.data() + names.sh_offset);
-  for (unsigned i = 0; i < eh->e_shnum; ++i) {
+  const auto section_names = read_file_bytes(
+      fd, file_size, names.sh_offset, names.sh_size, "ELF section names");
+  const char *strtab = reinterpret_cast<const char *>(section_names.data());
+  for (unsigned i = 0; i < eh.e_shnum; ++i) {
     if (sh[i].sh_name < names.sh_size) {
       const char *name = strtab + sh[i].sh_name;
       const auto rem = names.sh_size - sh[i].sh_name;
       if (std::memchr(name, 0, rem) && std::strcmp(name, ".eh_frame") == 0 &&
           sh[i].sh_type != SHT_NOBITS) {
-        if (sh[i].sh_offset > image.bytes.size() ||
-            sh[i].sh_size > image.bytes.size() - sh[i].sh_offset) {
+        if (sh[i].sh_offset > file_size ||
+            sh[i].sh_size > file_size - sh[i].sh_offset) {
           unavailable("ELF .eh_frame section is malformed");
         }
         image.eh_frame_addr = sh[i].sh_addr;
-        image.eh_frame.assign(reinterpret_cast<const char *>(
-                                  image.bytes.data() + sh[i].sh_offset),
-                              sh[i].sh_size);
+        const auto bytes = read_file_bytes(fd, file_size, sh[i].sh_offset,
+                                           sh[i].sh_size, "ELF .eh_frame");
+        image.eh_frame.assign(reinterpret_cast<const char *>(bytes.data()),
+                              bytes.size());
       }
     }
     if (sh[i].sh_type != SHT_DYNAMIC || sh[i].sh_entsize != sizeof(Elf64_Dyn) ||
-        sh[i].sh_link >= eh->e_shnum || sh[i].sh_offset > image.bytes.size() ||
-        sh[i].sh_size > image.bytes.size() - sh[i].sh_offset) {
+        sh[i].sh_link >= eh.e_shnum || sh[i].sh_offset > file_size ||
+        sh[i].sh_size > file_size - sh[i].sh_offset) {
       continue;
     }
     const auto &dynamic_strings = sh[sh[i].sh_link];
-    if (dynamic_strings.sh_offset > image.bytes.size() ||
-        dynamic_strings.sh_size >
-            image.bytes.size() - dynamic_strings.sh_offset) {
+    if (dynamic_strings.sh_offset > file_size ||
+        dynamic_strings.sh_size > file_size - dynamic_strings.sh_offset) {
       continue;
     }
-    const char *dynstr = reinterpret_cast<const char *>(
-        image.bytes.data() + dynamic_strings.sh_offset);
-    const auto *entries = reinterpret_cast<const Elf64_Dyn *>(
-        image.bytes.data() + sh[i].sh_offset);
+    const auto dynstr =
+        read_file_bytes(fd, file_size, dynamic_strings.sh_offset,
+                        dynamic_strings.sh_size, "ELF dynamic strings");
+    const auto entries = read_file_objects<Elf64_Dyn>(
+        fd, file_size, sh[i].sh_offset, sh[i].sh_size / sizeof(Elf64_Dyn),
+        "ELF dynamic entries");
     const auto count = sh[i].sh_size / sizeof(Elf64_Dyn);
     for (std::uint64_t j = 0; j < count; ++j) {
       if (entries[j].d_tag != DT_SONAME ||
           entries[j].d_un.d_val >= dynamic_strings.sh_size) {
         continue;
       }
-      const char *value = dynstr + entries[j].d_un.d_val;
+      const char *value =
+          reinterpret_cast<const char *>(dynstr.data()) + entries[j].d_un.d_val;
       const auto available = dynamic_strings.sh_size - entries[j].d_un.d_val;
       const auto *end =
           static_cast<const char *>(std::memchr(value, 0, available));
@@ -450,54 +511,70 @@ FileImage load_image_fd(const std::string &path, int fd,
       }
     }
   }
-  for (unsigned i = 0; i < eh->e_shnum; ++i) {
-    if (sh[i].sh_type != SHT_SYMTAB && sh[i].sh_type != SHT_DYNSYM) {
-      continue;
-    }
-    if (sh[i].sh_link >= eh->e_shnum || sh[i].sh_entsize != sizeof(Elf64_Sym) ||
-        sh[i].sh_offset > image.bytes.size() ||
-        sh[i].sh_size > image.bytes.size() - sh[i].sh_offset) {
-      continue;
-    }
-    const auto &strings = sh[sh[i].sh_link];
-    if (strings.sh_offset > image.bytes.size() ||
-        strings.sh_size > image.bytes.size() - strings.sh_offset) {
-      continue;
-    }
-    const char *string_data =
-        reinterpret_cast<const char *>(image.bytes.data() + strings.sh_offset);
-    const auto *symbols = reinterpret_cast<const Elf64_Sym *>(
-        image.bytes.data() + sh[i].sh_offset);
-    const auto count = sh[i].sh_size / sizeof(Elf64_Sym);
-    for (std::uint64_t j = 0; j < count; ++j) {
-      const auto &sym = symbols[j];
-      if (ELF64_ST_TYPE(sym.st_info) != STT_FUNC ||
-          sym.st_name >= strings.sh_size || !sym.st_size) {
+  if (collect_startup_symbols) {
+    constexpr std::array<std::string_view, 5> startup_symbols = {
+        "__libc_start_call_main", "__libc_start_main", "start_thread",
+        "__clone", "__clone3"};
+    for (unsigned i = 0; i < eh.e_shnum; ++i) {
+      if (sh[i].sh_type != SHT_SYMTAB && sh[i].sh_type != SHT_DYNSYM) {
         continue;
       }
-      const char *name = string_data + sym.st_name;
-      if (!std::memchr(name, 0, strings.sh_size - sym.st_name)) {
+      if (sh[i].sh_link >= eh.e_shnum ||
+          sh[i].sh_entsize != sizeof(Elf64_Sym) ||
+          sh[i].sh_offset > file_size ||
+          sh[i].sh_size > file_size - sh[i].sh_offset) {
         continue;
       }
-      image.functions.push_back({name, sym.st_value, sym.st_size});
+      const auto &strings = sh[sh[i].sh_link];
+      if (strings.sh_offset > file_size ||
+          strings.sh_size > file_size - strings.sh_offset) {
+        continue;
+      }
+      const auto string_data =
+          read_file_bytes(fd, file_size, strings.sh_offset, strings.sh_size,
+                          "ELF symbol strings");
+      const auto symbols = read_file_objects<Elf64_Sym>(
+          fd, file_size, sh[i].sh_offset, sh[i].sh_size / sizeof(Elf64_Sym),
+          "ELF symbols");
+      const auto count = sh[i].sh_size / sizeof(Elf64_Sym);
+      for (std::uint64_t j = 0; j < count; ++j) {
+        const auto &sym = symbols[j];
+        if (ELF64_ST_TYPE(sym.st_info) != STT_FUNC ||
+            sym.st_name >= strings.sh_size || !sym.st_size) {
+          continue;
+        }
+        const char *name =
+            reinterpret_cast<const char *>(string_data.data()) + sym.st_name;
+        const auto *terminator = static_cast<const char *>(
+            std::memchr(name, 0, strings.sh_size - sym.st_name));
+        if (!terminator) {
+          continue;
+        }
+        const std::string_view function_name(
+            name, static_cast<std::size_t>(terminator - name));
+        if (std::find(startup_symbols.begin(), startup_symbols.end(),
+                      function_name) != startup_symbols.end()) {
+          image.functions.push_back(
+              {std::string(function_name), sym.st_value, sym.st_size});
+        }
+      }
     }
   }
   if (image.eh_frame.empty()) {
     unavailable("mapped ELF has no usable .eh_frame section");
   }
-  image.bytes.clear();
-  image.bytes.shrink_to_fit();
   return image;
 }
 
-FileImage load_image(const std::string &path, const std::vector<Mapping> &maps) {
+FileImage load_image(const std::string &path, const std::vector<Mapping> &maps,
+                     bool collect_startup_symbols = false) {
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     unavailable("cannot open mapped ELF image");
   }
   FileImage image;
   try {
-    image = load_image_fd(path, fd, maps);
+    image = load_image_fd(path, fd, maps, collect_startup_symbols);
   } catch (...) {
     ::close(fd);
     throw;
@@ -525,7 +602,7 @@ FileImage load_libc(const std::vector<Mapping> &maps) {
       continue;
     }
     const auto &path = m.canonical_path;
-    auto image = load_image(path, maps);
+    auto image = load_image(path, maps, true);
     if (image.soname == "libc.so.6") {
       return image;
     }
@@ -682,6 +759,25 @@ void require_usable_module(const FileImage &image) {
   }
 }
 
+bool same_validation_inputs(const detail::ApprovedModuleIdentity &identity,
+                            const FileImage &image) {
+  if (identity.elf_type != image.elf_type || identity.soname != image.soname ||
+      identity.eh_frame_addr != image.eh_frame_addr ||
+      identity.eh_frame != image.eh_frame ||
+      identity.loads.size() != image.loads.size()) {
+    return false;
+  }
+  return std::equal(
+      identity.loads.begin(), identity.loads.end(), image.loads.begin(),
+      [](const auto &left, const auto &right) {
+        return left.p_type == right.p_type && left.p_flags == right.p_flags &&
+               left.p_offset == right.p_offset &&
+               left.p_vaddr == right.p_vaddr && left.p_paddr == right.p_paddr &&
+               left.p_filesz == right.p_filesz &&
+               left.p_memsz == right.p_memsz && left.p_align == right.p_align;
+      });
+}
+
 std::vector<FileImage> revalidate_modules(
     const std::vector<std::shared_ptr<const detail::ApprovedModuleIdentity>>
         &modules,
@@ -720,7 +816,9 @@ std::vector<FileImage> revalidate_modules(
     FileImage image;
     try {
       image = load_image(identity.path, maps);
-      require_usable_module(image);
+      if (!same_validation_inputs(identity, image)) {
+        require_usable_module(image);
+      }
       if (image.bias != identity.load_bias) {
         throw std::runtime_error(
             "approved application module load bias changed");
@@ -1096,6 +1194,11 @@ std::vector<ApplicationModule> discover_application_modules(pid_t pid) {
     auto identity = std::make_shared<detail::ApprovedModuleIdentity>();
     identity->path = candidate.path;
     identity->load_bias = image.bias;
+    identity->elf_type = image.elf_type;
+    identity->soname = image.soname;
+    identity->eh_frame_addr = image.eh_frame_addr;
+    identity->eh_frame = std::move(image.eh_frame);
+    identity->loads = std::move(image.loads);
     ::close(fd);
     result.emplace_back(ApplicationModule(std::move(identity)));
   }
