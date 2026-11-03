@@ -14,6 +14,7 @@ class TracerService(rpc.TracerServicer):
     def __init__(self):
         self.requests = []
         self.cancelled = __import__("threading").Event()
+        self.watch_time_remaining = []
 
     def Attach(self, request, context):
         self.requests.append(request)
@@ -64,6 +65,7 @@ class TracerService(rpc.TracerServicer):
 
     def WatchEvents(self, request, context):
         self.requests.append(request)
+        self.watch_time_remaining.append(context.time_remaining())
         context.add_callback(self.cancelled.set)
         if request.after_sequence == 999:
             context.abort(grpc.StatusCode.OUT_OF_RANGE, "cursor evicted")

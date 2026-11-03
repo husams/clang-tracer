@@ -301,8 +301,14 @@ class Console:
                 count = self.client.drain_traces(str(arguments[0]), **options)
                 self.emit(f"drained {count} events to SQLite")
             elif name == "collect":
-                for event in self.client.collect_traces(int(arguments[0]), **options):
-                    self.emit(event)
+                count = int(arguments[0]) if arguments else None
+                if count is not None and count < 1:
+                    raise CommandError("count must be positive")
+                with self.client.watch_events(**options) as stream:
+                    for i, event in enumerate(stream, 1):
+                        self.emit(event)
+                        if count is not None and i >= count:
+                            break
             elif name == "record":
                 record = (
                     self.client.record_sqlite

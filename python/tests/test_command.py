@@ -81,6 +81,8 @@ from clang_tracer.command import (
             (2,),
             {"names": ["add(int, int)", "trace.add"]},
         ),
+        ("collect", "collect", (), {}),
+        ("collect --timeout 3", "collect", (), {"timeout": 3.0}),
         (
             'record capture.pb 2 --name "add(int, int)" --name trace.add',
             "record",

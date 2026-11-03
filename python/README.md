@@ -340,7 +340,7 @@ probe inject "Calculator::add(int, int)" --callback interceptor.cpp --stack 24
 events --count 10 --after 0 --timeout 20
 events --name "Calculator::multiply(int, int) const" --count 4 --timeout 10
 events --name snapshot --name finished --timeout 20
-collect 10 --timeout 20
+collect
 record capture.pb 1000 --timeout 60
 probe remove PROBE_ID
 detach
@@ -368,8 +368,11 @@ command when more results are available. `help symbols` explains all options.
 Use repeatable `--name NAME` on `events`, `collect`, or `record` to select emitted
 event names or full C++ function signatures with the same matching rules as the
 Python API. The function name is displayed with each trace event.
-Ctrl-C clears an input or cancels a live stream, returning to the prompt. EOF,
-`exit` and `quit` leave the console.
+`events` and bare `collect` have no default deadline and run until Ctrl-C.
+`collect COUNT` runs until COUNT matching events arrive or Ctrl-C. Set
+`--timeout SECONDS` to add a total deadline. Ctrl-C clears input or cancels a
+live operation and returns to the prompt. EOF, `exit` and `quit` leave the
+console.
 
 An explicit `!` prefix executes the rest of the line with `/bin/sh` **on the
 console's host**, using its current directory, environment and terminal streams.

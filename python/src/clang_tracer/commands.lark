@@ -14,7 +14,7 @@
       | "probe" "add" value                             -> add_spec
       | "probe" "remove" INT                            -> remove
       | "events" watch_option*                          -> events
-      | "collect" INT stream_option*                    -> collect
+      | "collect" INT? stream_option*                   -> collect
       | "record" value INT record_option*               -> record
       | "drain" value drain_option*                     -> drain
       | "help" value*                                  -> help

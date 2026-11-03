@@ -154,9 +154,7 @@ HELP_TOPICS = {
         "symbols",
         "List traceable functions and methods from eligible application "
         "ELF/DWARF on the server host.",
-        usage=(
-            "symbols [--filter TEXT] [--module TEXT] [--limit N] [--page TOKEN]",
-        ),
+        usage=("symbols [--filter TEXT] [--module TEXT] [--limit N] [--page TOKEN]",),
         options=(
             ("--filter TEXT", "Case-sensitive substring of selector or linkage name."),
             (
@@ -345,10 +343,13 @@ HELP_TOPICS = {
     ),
     "collect": HelpTopic(
         "collect",
-        "Collect a bounded list of events in memory and display each one.",
-        usage=("collect COUNT [STREAM_OPTIONS]",),
+        "Stream and display events until interrupted or an optional limit is reached.",
+        usage=("collect [COUNT] [STREAM_OPTIONS]",),
         options=(
-            ("COUNT", "Required positive event count."),
+            (
+                "COUNT",
+                "Optional positive event count; default streams until interrupted.",
+            ),
             (
                 "--session ID",
                 "Filter session; may be repeated. Defaults to selected session or all.",
@@ -361,7 +362,7 @@ HELP_TOPICS = {
                 "repeatable and ORed (up to 4096 UTF-8 bytes).",
             ),
             ("--after CURSOR", "Start strictly after this sequence; default 0."),
-            ("--timeout SECONDS", "Total deadline; default 30."),
+            ("--timeout SECONDS", "Total deadline; default has no deadline."),
         ),
         examples=("collect 20 --timeout 10",),
     ),

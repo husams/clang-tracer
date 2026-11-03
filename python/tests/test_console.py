@@ -1,3 +1,8 @@
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -94,6 +99,117 @@ def test_stream_commands_accept_and_forward_repeated_names(peer, tmp_path):
         if isinstance(request, pb.WatchEventsRequest)
     )
     assert list(record_request.names) == ["add(int, int)"]
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_timeout"),
+    [
+        ("collect", None),
+        ("collect 1", None),
+        ("collect 1 --timeout 4", 4.0),
+    ],
+)
+def test_collect_defaults_to_unbounded_stream_and_keeps_explicit_options(
+    peer, command, expected_timeout
+):
+    client, service = peer
+    console = Console(client, output=DummyOutput())
+    assert console.execute(parse_command(command))
+    request = next(
+        request
+        for request in reversed(service.requests)
+        if isinstance(request, pb.WatchEventsRequest)
+    )
+    if expected_timeout is None:
+        assert service.watch_time_remaining[-1] > 300
+    else:
+        assert 0 < service.watch_time_remaining[-1] <= expected_timeout + 0.1
+    assert len(list(request.session_ids)) == 0
+
+
+def test_collect_count_stops_after_the_requested_number_of_events(peer):
+    client, _service = peer
+    console = Console(client, output=DummyOutput())
+    displayed = []
+
+    def capture(event):
+        displayed.append(event)
+
+    console.emit = capture
+    assert console.execute(parse_command("collect 1"))
+    assert len(displayed) == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a POSIX pseudo-terminal")
+@pytest.mark.parametrize("command", ["collect", "events"])
+def test_bare_stream_ctrl_c_cancels_live_stream_and_returns_to_prompt(peer, command):
+    import fcntl
+    import pty
+    import select
+    import termios
+
+    _client, service = peer
+    endpoint = _client.endpoint
+    master_fd, slave_fd = pty.openpty()
+    env = os.environ.copy()
+    env["CLANG_TRACER_ENDPOINT"] = endpoint
+    env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    env["TERM"] = "xterm"
+
+    def set_controlling_terminal():
+        os.setsid()
+        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os; from clang_tracer.client import Client; "
+            "from clang_tracer.console import Console; "
+            "raise SystemExit(Console(Client("
+            "os.environ['CLANG_TRACER_ENDPOINT'])).run())",
+        ],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+        preexec_fn=set_controlling_terminal,
+    )
+    os.close(slave_fd)
+
+    def read_until(needle, timeout=5):
+        received = bytearray()
+        deadline = time.monotonic() + timeout
+        while needle not in received and time.monotonic() < deadline:
+            ready, _, _ = select.select([master_fd], [], [], 0.1)
+            if ready:
+                received.extend(os.read(master_fd, 4096))
+        assert needle in received, received.decode(errors="replace")
+        return bytes(received)
+
+    try:
+        read_until(b"tracer>")
+        os.write(master_fd, f"{command} --pid 999\n".encode())
+        deadline = time.monotonic() + 5
+        while not any(
+            isinstance(req, pb.WatchEventsRequest) for req in service.requests
+        ):
+            assert time.monotonic() < deadline, (
+                f"{command} did not start its gRPC stream"
+            )
+            time.sleep(0.01)
+        assert service.watch_time_remaining[-1] > 300
+        os.write(master_fd, b"\x03")
+        output = read_until(b"tracer>")
+        assert b"cancelled" in output
+        assert service.cancelled.wait(5), "Ctrl-C did not cancel the gRPC stream"
+        os.write(master_fd, b"exit\n")
+        assert process.wait(timeout=5) == 0
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+        os.close(master_fd)
 
 
 def test_symbols_command_lists_attached_process_functions(peer):
