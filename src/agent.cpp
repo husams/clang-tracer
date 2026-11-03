@@ -1001,8 +1001,10 @@ DebugRecord construct_debug_record(clang::ASTContext &context,
 
 std::uint64_t validate_debug_entry(const clangtracer::v1::ProbeSpec &spec) {
   const auto &info = spec.debug_info();
+  tracer::client::DebugLookupOptions lookup;
+  lookup.module = info.module();
   const auto checked =
-      tracer::client::resolve_debug_callable(::getpid(), info.selector());
+      tracer::client::resolve_debug_callable(::getpid(), info.selector(), lookup);
   if (!info.runtime_entry() || !info.entry_size() ||
       checked.spec.debug_info().SerializeAsString() !=
           info.SerializeAsString() ||

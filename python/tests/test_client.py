@@ -31,12 +31,18 @@ def test_public_control_and_injection(peer):
         print_arguments=True,
         print_result=True,
         callback_package_path="/srv/interceptor.cpp",
+        module="target",
+        debug_max_entries=2_000_001,
+        debug_max_depth=256,
     )
     assert probe.id == 7
     resolution, addition = service.requests[-2:]
     assert resolution.selector == "add(int, int)"
     assert list(resolution.include_headers) == ["/srv/add.hpp"]
     assert resolution.compilation_database == "/srv/build"
+    assert resolution.module == "target"
+    assert resolution.debug_max_entries == 2_000_001
+    assert resolution.debug_max_depth == 256
     assert addition.spec.stack_depth == 24
     assert addition.spec.print_arguments and addition.spec.print_result
     assert addition.spec.callback_package_path == "/srv/interceptor.cpp"
@@ -84,6 +90,16 @@ def test_list_symbols_defaults_to_unlimited(peer):
     assert service.requests[-1].page_size == 0
 
 
+def test_list_modules_and_default_lookup_limits(peer):
+    client, service = peer
+    assert client.list_modules("s1") == ["/srv/target", "/srv/libexample.so"]
+    assert service.requests[-1].session_id == "s1"
+    client.resolve_probe("s1", "add")
+    request = service.requests[-1]
+    assert not request.module
+    assert request.debug_max_entries == request.debug_max_depth == 0
+
+
 def test_list_symbols_does_not_cap_filters_or_tokens(peer):
     client, service = peer
     client.list_symbols(
@@ -117,6 +133,7 @@ def test_all_public_rpcs_have_client_methods():
         "Detach": "detach",
         "ListSessions": "list_sessions",
         "ListSymbols": "list_symbols",
+        "ListModules": "list_modules",
         "WatchEvents": "watch_events",
         "ResolveProbe": "resolve_probe",
         "ReadEvents": "read_events",

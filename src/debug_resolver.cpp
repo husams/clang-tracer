@@ -17,6 +17,7 @@
 #include <llvm/BinaryFormat/Dwarf.h>
 #include <llvm/DebugInfo/DWARF/DWARFContext.h>
 #include <llvm/DebugInfo/DWARF/DWARFDie.h>
+#include <llvm/Demangle/Demangle.h>
 #include <llvm/Object/Binary.h>
 #include <llvm/Object/ELFObjectFile.h>
 #include <llvm/Object/ObjectFile.h>
@@ -711,10 +712,44 @@ std::pair<std::uint64_t, std::uint64_t> callable_code_range(DWARFDie die) {
   }
   return {low, high};
 }
+
+bool lists_symbol(const llvm::object::ELF64LEObjectFile &object,
+                  const std::string &selected, const std::string &selected_name) {
+  const auto matches = [&](const llvm::object::SymbolRef &symbol) {
+    auto flags = symbol.getFlags();
+    if (!flags) {
+      llvm::consumeError(flags.takeError());
+      return false;
+    }
+    if (*flags & llvm::object::SymbolRef::SF_Undefined)
+      return false;
+    auto symbol_name = symbol.getName();
+    if (!symbol_name) {
+      llvm::consumeError(symbol_name.takeError());
+      return false;
+    }
+    const auto raw = compact(symbol_name->str());
+    const auto demangled = compact(llvm::demangle(symbol_name->str()));
+    const auto name = demangled.substr(0, demangled.find('('));
+    const auto scope = name.rfind("::");
+    return raw == selected || demangled == selected || name == selected_name ||
+           (scope != std::string::npos && name.substr(scope + 2) == selected_name);
+  };
+  for (const auto &symbol : object.symbols())
+    if (matches(symbol)) return true;
+  for (const auto &symbol : object.getDynamicSymbolIterators())
+    if (matches(symbol)) return true;
+  return false;
+}
 } // namespace
 
-ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& selector) {
-  if (selector.empty() || selector.size() > 4096) {
+std::vector<std::string> list_debug_modules(std::uint32_t pid) {
+  return modules(pid);
+}
+
+ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& selector,
+                                       const DebugLookupOptions &options) {
+  if (selector.empty() || selector.find('\0') != std::string::npos) {
     throw std::runtime_error("invalid debug selector");
   }
   const auto selected = compact(selector);
@@ -722,7 +757,14 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
   const auto selected_name = selected.substr(0, paren);
   std::map<std::string, ResolvedCallable> matches;
   std::string rejected;
+  std::uint64_t visited = 0;
   for (const auto& path : modules(pid)) {
+    if (options.is_cancelled())
+      throw std::runtime_error("debug lookup cancelled");
+    if (!options.module.empty() &&
+        (options.module.front() == '/' ? path != options.module
+                                      : path.find(options.module) == std::string::npos))
+      continue;
     api::DebugInfo before;
     identity(before, path);
     auto binary = llvm::object::createBinary(path);
@@ -735,15 +777,20 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
         object->getBytesInAddress() != 8 || !object->isLittleEndian()) {
       continue;
     }
+    if (options.module.empty() && !lists_symbol(*object, selected, selected_name))
+      continue;
     auto dwarf = llvm::DWARFContext::create(*object);
-    std::size_t visited = 0;
-    std::function<void(DWARFDie, unsigned)> visit = [&](DWARFDie die, unsigned depth) {
+    const auto visit = [&](DWARFDie die, std::size_t depth) {
       if (!die) {
         return;
       }
-      if (depth > 128 || ++visited > 1000000) {
-        throw std::runtime_error("debug traversal limits exceeded");
-      }
+      if (options.is_cancelled())
+        throw std::runtime_error("debug lookup cancelled");
+      if (options.max_entries && visited >= options.max_entries)
+        throw DebugLookupLimit("debug entry limit exceeded; increase --debug-max-entries or use 0");
+      ++visited;
+      if (options.max_depth && depth > options.max_depth)
+        throw DebugLookupLimit("debug depth limit exceeded; increase --debug-max-depth or use 0");
       if (die.getTag() == dw::DW_TAG_subprogram) {
         auto decl = declaration(die);
         const auto qname = qualified(decl);
@@ -793,12 +840,20 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
           }
         }
       }
-      for (auto child : die.children()) {
-        visit(child, depth + 1);
-      }
     };
     for (const auto& unit : dwarf->compile_units()) {
-      visit(unit->getUnitDIE(false), 0);
+      std::vector<std::pair<DWARFDie, std::size_t>> pending{{unit->getUnitDIE(false), 0}};
+      while (!pending.empty()) {
+        const auto [die, depth] = pending.back();
+        pending.pop_back();
+        visit(die, depth);
+        if (die) {
+          const auto children_begin = pending.size();
+          for (auto child : die.children())
+            pending.emplace_back(child, depth + 1);
+          std::reverse(pending.begin() + children_begin, pending.end());
+        }
+      }
     }
   }
   if (matches.size() != 1) {
