@@ -2,6 +2,7 @@
 
 import os
 import platform
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -527,3 +528,89 @@ def test_real_native_symbol_listing_is_stable_and_paginated(native):
             client.list_symbols(session.id)
         assert detached.value.code() == grpc.StatusCode.FAILED_PRECONDITION
         client.shutdown_server()
+
+
+def test_native_symbol_listing_has_no_implicit_limits(native):
+    build, _target, temporary = native
+    source = temporary / "many_symbols.cpp"
+    executable = temporary / "many-symbols"
+    prefix = "symbol_" + "x" * 24_000
+    count = 720
+    namespaces = [f"depth_{i}" for i in range(160)]
+    deep_selector = "::".join([*namespaces, "deep_callable()"])
+    with source.open("w") as output:
+        output.write("#include <sys/prctl.h>\n#include <unistd.h>\n")
+        output.write(
+            "#ifndef PR_SET_PTRACER\n#define PR_SET_PTRACER 0x59616d61\n#endif\n"
+            "#ifndef PR_SET_PTRACER_ANY\n"
+            "#define PR_SET_PTRACER_ANY ((unsigned long)-1)\n"
+            "#endif\n"
+        )
+        for i in range(count):
+            output.write(f"void {prefix}{i:04}() {{}}\n")
+        for namespace in namespaces:
+            output.write(f"namespace {namespace} {{\n")
+        output.write("void deep_callable() {}\n" + "}\n" * len(namespaces))
+        output.write(
+            "int main() { prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY); "
+            "while (true) usleep(10000); }\n"
+        )
+    subprocess.run(
+        [
+            os.getenv("CXX", "clang++"),
+            *shlex.split(os.getenv("CXXFLAGS", "")),
+            "-g",
+            "-O0",
+            str(source),
+            "-o",
+            str(executable),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
+    target = subprocess.Popen([executable])
+    try:
+        # Wait until main has enabled tracing, rather than racing the new child.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if target.poll() is not None:
+                pytest.fail("large-symbol target exited before readiness")
+            status = Path(f"/proc/{target.pid}/status").read_text()
+            if "State:\tS" in status:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("large-symbol target did not become ready")
+        with Client(f"unix://{temporary}/unlimited.sock", timeout=120) as client:
+            client.start_server(
+                str(build / "clang-tracer-server"),
+                agent=str(build / "libclang_tracer_agent.so"),
+            )
+            session = client.attach(target.pid)
+            # Use a raw default request too: unlimited is a server contract.
+            all_symbols = client.stub.ListSymbols(
+                pb.ListSymbolsRequest(session_id=session.id), timeout=120
+            )
+            assert not all_symbols.next_page_token
+            matches = [s for s in all_symbols.symbols if s.selector.startswith(prefix)]
+            assert len(matches) == count
+            assert deep_selector in {s.selector for s in all_symbols.symbols}
+            assert all_symbols.ByteSize() > 32 * 1024 * 1024
+            first = client.list_symbols(session.id, page_size=501)
+            assert len(first.symbols) == 501
+            assert len(first.next_page_token) > 65536
+            second = client.list_symbols(
+                session.id, page_size=501, page_token=first.next_page_token
+            )
+            assert not second.next_page_token
+            assert [*first.symbols, *second.symbols] == list(all_symbols.symbols)
+            largest_page = client.list_symbols(session.id, page_size=2**32 - 1)
+            assert largest_page == all_symbols
+            filtered = client.list_symbols(session.id, query="x" * 5000)
+            assert len(filtered.symbols) == count
+            assert not client.list_symbols(session.id, module="m" * 5000).symbols
+            client.detach(session.id)
+    finally:
+        target.terminate()
+        target.wait(timeout=5)

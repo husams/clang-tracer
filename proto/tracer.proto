@@ -193,7 +193,7 @@ message ListSymbolsRequest {
   string session_id = 1;
   string query = 2; // Case-sensitive substring of selector or linkage name.
   string module = 3; // Case-sensitive substring of mapped ELF module path.
-  uint32 page_size = 4; // Zero selects 100; maximum 500.
+  uint32 page_size = 4; // Zero returns all matches; positive values opt into pagination.
   string page_token = 5; // Opaque continuation token from the previous page.
 }
 message FunctionSymbol {

@@ -50,7 +50,7 @@ DWARFDie type_of(DWARFDie d) {
 
 std::string qualified(DWARFDie d) {
   std::vector<std::string> parts;
-  for (unsigned depth = 0; d && depth < 64; ++depth, d = d.getParent()) {
+  for (; d; d = d.getParent()) {
     const auto tag = d.getTag();
     if (tag == dw::DW_TAG_namespace || tag == dw::DW_TAG_class_type ||
         tag == dw::DW_TAG_structure_type || tag == dw::DW_TAG_subprogram) {
@@ -270,9 +270,6 @@ std::vector<std::string> modules(std::uint32_t pid, bool include_runtime = false
     if (!runtime || include_runtime) {
       paths.insert(path);
     }
-    if (paths.size() > 256) {
-      throw std::runtime_error("debug discovery exceeds 256 mapped images");
-    }
   }
   return {paths.begin(), paths.end()};
 }
@@ -333,9 +330,6 @@ std::vector<ExecutableMapping> read_executable_mappings(
     } catch (...) {
       continue;
     }
-    if (result.size() > 65536) {
-      throw std::runtime_error("executable mapping count exceeds 65536");
-    }
   }
   std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
     return left.raw < right.raw;
@@ -347,18 +341,11 @@ std::string mapping_fingerprint(
     const std::vector<std::string>& image_paths,
     const std::vector<ExecutableMapping>& executable_mappings) {
   llvm::SHA256 hash;
-  std::uint64_t image_bytes = 0;
-  constexpr std::uint64_t kMaxMappedImageBytes = 2ULL * 1024 * 1024 * 1024;
   for (const auto& path : image_paths) {
     struct stat st{};
     if (::stat(path.c_str(), &st) != 0) {
       throw std::runtime_error("cannot stat mapped debug image");
     }
-    const auto file_size = static_cast<std::uint64_t>(st.st_size);
-    if (file_size > kMaxMappedImageBytes - image_bytes) {
-      throw std::runtime_error("symbol discovery image budget exceeded (2 GiB)");
-    }
-    image_bytes += file_size;
     std::string identity = path;
     identity.push_back('\0');
     hash.update(identity);
@@ -836,9 +823,6 @@ DebugSymbolPage list_debug_symbols(
     const std::string& after_linkage_symbol, const std::string& after_module_path,
     const std::string& expected_mapping_fingerprint,
     const std::function<bool()>& is_cancelled) {
-  if (page_size == 0 || page_size > 500) {
-    throw std::invalid_argument("symbol page size must be between 1 and 500");
-  }
   const auto image_paths = modules(pid);
   const auto mappings = read_executable_mappings(pid, image_paths);
   const auto current_fingerprint = mapping_fingerprint(image_paths, mappings);
@@ -850,8 +834,6 @@ DebugSymbolPage list_debug_symbols(
   using Key = std::tuple<std::string, std::string, std::string>;
   const Key after{after_selector, after_linkage_symbol, after_module_path};
   std::map<Key, DebugSymbol> candidates;
-  std::size_t visited = 0;
-  constexpr std::size_t kMaxVisitedDies = 2'000'000;
   bool cancelled = false;
   for (const auto& path : image_paths) {
     if (is_cancelled()) {
@@ -880,15 +862,11 @@ DebugSymbolPage list_debug_symbols(
     const auto mapped_ranges =
         mapped_executable_ranges(*object, module_identity, segments, module_mappings);
     auto dwarf = llvm::DWARFContext::create(*object);
-    std::function<void(DWARFDie, unsigned)> visit = [&](DWARFDie die, unsigned depth) {
+    const auto visit = [&](DWARFDie die) {
       if (!die || cancelled) {
         return;
       }
-      if (depth > 128 || ++visited > kMaxVisitedDies) {
-        throw std::runtime_error(
-            "symbol discovery work limit exceeded; narrow --module and retry");
-      }
-      if ((visited & 1023U) == 0 && is_cancelled()) {
+      if (is_cancelled()) {
         cancelled = true;
         return;
       }
@@ -910,16 +888,10 @@ DebugSymbolPage list_debug_symbols(
             describe_record(shape.receiver, receiver_info);
           }
           const auto& selector = shape.selector;
-          if (selector.size() > 4096) {
-            throw std::runtime_error("callable selector exceeds 4096 bytes");
-          }
-          if (path.size() > 4096) {
-            throw std::runtime_error("mapped module path exceeds 4096 bytes");
-          }
           const char* linkage = die.getName(llvm::DINameKind::LinkageName);
           const std::string linkage_symbol = linkage ? linkage : name(decl);
-          if (linkage_symbol.empty() || linkage_symbol.size() > 4096) {
-            throw std::runtime_error("callable linkage name exceeds 4096 bytes");
+          if (linkage_symbol.empty()) {
+            throw std::runtime_error("callable has no linkage name");
           }
           if (selector.find(query) != std::string::npos ||
               linkage_symbol.find(query) != std::string::npos) {
@@ -927,7 +899,8 @@ DebugSymbolPage list_debug_symbols(
             if (key > after) {
               candidates.try_emplace(
                   key, DebugSymbol{selector, linkage_symbol, path});
-              if (candidates.size() > page_size + 1) {
+              if (page_size != 0 && candidates.size() > page_size &&
+                  candidates.size() - page_size > 1) {
                 candidates.erase(std::prev(candidates.end()));
               }
             }
@@ -937,19 +910,25 @@ DebugSymbolPage list_debug_symbols(
           // that the existing DWARF resolver can accept.
         }
       }
-      for (auto child : die.children()) {
-        visit(child, depth + 1);
-        if (cancelled) {
-          return;
-        }
-      }
     };
     for (const auto& unit : dwarf->compile_units()) {
       if (is_cancelled()) {
         cancelled = true;
         break;
       }
-      visit(unit->getUnitDIE(false), 0);
+      // Keep traversal storage on the heap so deep DWARF does not impose a
+      // recursion limit. Results are ordered by key, independent of visit order.
+      std::vector<DWARFDie> pending{unit->getUnitDIE(false)};
+      while (!pending.empty() && !cancelled) {
+        const auto die = pending.back();
+        pending.pop_back();
+        visit(die);
+        if (die && !cancelled) {
+          for (auto child : die.children()) {
+            pending.push_back(child);
+          }
+        }
+      }
       if (cancelled) {
         break;
       }
@@ -971,7 +950,7 @@ DebugSymbolPage list_debug_symbols(
   DebugSymbolPage page;
   page.mapping_fingerprint = current_fingerprint;
   page.cancelled = cancelled;
-  page.has_more = candidates.size() > page_size;
+  page.has_more = page_size != 0 && candidates.size() > page_size;
   auto end = candidates.end();
   if (page.has_more) {
     --end;
