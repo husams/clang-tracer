@@ -1462,7 +1462,8 @@ int main(int argc, char **argv) {
   try {
     const auto options = parse_options(argc, argv);
     grpc::ChannelArguments channel_arguments;
-    channel_arguments.SetMaxReceiveMessageSize(32 * 1024 * 1024);
+    channel_arguments.SetMaxReceiveMessageSize(-1);
+    channel_arguments.SetMaxSendMessageSize(-1);
     auto channel = grpc::CreateCustomChannel(
         options.endpoint, grpc::InsecureChannelCredentials(), channel_arguments);
     auto stub = api::Tracer::NewStub(channel);

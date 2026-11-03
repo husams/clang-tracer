@@ -235,7 +235,7 @@ class Console:
                     if value:
                         quoted = json.dumps(value, ensure_ascii=False)
                         next_command.extend((option, quoted))
-                next_command.extend(("--limit", str(options.get("page_size", 100))))
+                next_command.extend(("--limit", str(options.get("page_size", 0))))
                 next_command.extend(
                     ("--page", json.dumps(page.next_page_token, ensure_ascii=False))
                 )

@@ -24,6 +24,7 @@ struct DebugSymbolPage {
   bool cancelled = false;
 };
 
+// page_size == 0 returns all matches; positive values opt into pagination.
 DebugSymbolPage list_debug_symbols(
     std::uint32_t pid, const std::string &query, const std::string &module,
     std::size_t page_size, const std::string &after_selector,

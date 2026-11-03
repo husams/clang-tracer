@@ -149,7 +149,7 @@ HELP_TOPICS = {
         "List traceable functions and methods from eligible application "
         "ELF/DWARF on the server host.",
         usage=(
-            "symbols [--filter TEXT] [--module TEXT] [--limit 1..500] [--page TOKEN]",
+            "symbols [--filter TEXT] [--module TEXT] [--limit N] [--page TOKEN]",
         ),
         options=(
             ("--filter TEXT", "Case-sensitive substring of selector or linkage name."),
@@ -157,7 +157,7 @@ HELP_TOPICS = {
                 "--module TEXT",
                 "Narrow by case-sensitive substring of eligible module path.",
             ),
-            ("--limit N", "Page size; default 100, maximum 500."),
+            ("--limit N", "Optional page size; default unlimited, 0 means unlimited."),
             ("--page TOKEN", "Continue a previous listing using its opaque token."),
         ),
         examples=("symbols --filter Calculator",),

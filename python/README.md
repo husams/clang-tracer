@@ -150,8 +150,10 @@ source files on the client. Functions without supported debug signatures are
 omitted. Listing a function does not bypass probe admission checks.
 
 `query` matches a case-sensitive substring of the C++ selector or linkage name;
-`module` matches a substring of the module path. Pages default to 100 entries,
-with a maximum of 500. Keep the same filters and page size when continuing with
+`module` matches a substring of the module path. Listing returns all matches by
+default (`page_size=None` or `0`). A positive `page_size` opts into pagination;
+the server imposes no page-size ceiling or discovery work budget. Keep the same
+filters and page size when continuing with
 `next_page_token`. Tokens are tied to the attached session and mapped images;
 restart the query if the process or its modules change. This operation requires
 a server supporting the `ListSymbols` RPC.

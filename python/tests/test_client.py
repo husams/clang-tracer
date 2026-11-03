@@ -63,12 +63,35 @@ def test_list_symbols_uses_attached_session_and_returns_generated_page(peer):
     assert request.page_token == "opaque"
 
 
-@pytest.mark.parametrize("page_size", [-1, 501, True, 1.5])
+@pytest.mark.parametrize("page_size", [-1, 2**32, True, 1.5])
 def test_list_symbols_rejects_invalid_page_size(peer, page_size):
     client, service = peer
     with pytest.raises(ValueError):
         client.list_symbols("s1", page_size=page_size)
     assert not any(isinstance(item, pb.ListSymbolsRequest) for item in service.requests)
+
+
+@pytest.mark.parametrize("page_size", [None, 0, 501, 100_000, 2**32 - 1])
+def test_list_symbols_accepts_unlimited_and_large_pages(peer, page_size):
+    client, service = peer
+    client.list_symbols("s1", page_size=page_size)
+    assert service.requests[-1].page_size == (page_size or 0)
+
+
+def test_list_symbols_defaults_to_unlimited(peer):
+    client, service = peer
+    client.list_symbols("s1")
+    assert service.requests[-1].page_size == 0
+
+
+def test_list_symbols_does_not_cap_filters_or_tokens(peer):
+    client, service = peer
+    client.list_symbols(
+        "s1", query="q" * 5000, module="m" * 5000, page_token="a" * 70000
+    )
+    assert len(service.requests[-1].query) == 5000
+    assert len(service.requests[-1].module) == 5000
+    assert len(service.requests[-1].page_token) == 70000
 
 
 def test_list_symbols_surfaces_old_server_unimplemented(peer, monkeypatch):
@@ -288,6 +311,8 @@ def test_owned_channel_uses_bounded_local_reconnect_policy(monkeypatch):
     assert created["options"]["grpc.initial_reconnect_backoff_ms"] == 100
     assert "grpc.min_reconnect_backoff_ms" not in created["options"]
     assert created["options"]["grpc.max_reconnect_backoff_ms"] == 500
+    assert created["options"]["grpc.max_receive_message_length"] == -1
+    assert created["options"]["grpc.max_send_message_length"] == -1
     caller_channel = Mock(spec=grpc.Channel)
     assert Client("127.0.0.1:50051", channel=caller_channel).channel is caller_channel
 
