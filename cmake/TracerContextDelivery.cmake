@@ -1,5 +1,10 @@
+# Module-provider gRPC packages reference protobuf targets without finding
+# them. Prefer the complete protobuf config export before importing gRPC.
+find_package(Protobuf QUIET CONFIG)
+if(NOT Protobuf_FOUND)
+  find_package(Protobuf REQUIRED)
+endif()
 find_package(gRPC REQUIRED CONFIG)
-find_package(Protobuf REQUIRED)
 set(_context_proto_dir ${CMAKE_CURRENT_BINARY_DIR}/context-generated)
 file(MAKE_DIRECTORY ${_context_proto_dir})
 add_custom_command(

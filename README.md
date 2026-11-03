@@ -202,22 +202,26 @@ shows the supported state shapes.
 
 Use Linux x86-64, C++20, matching LLVM/Clang development packages (21 or 22),
 Protobuf with `protoc`, gRPC C++ with `grpc_cpp_plugin`, SQLite development
-headers, CMake, and Ninja.
+headers, CMake, and Ninja. Supply PIC static Protobuf/gRPC and their transport
+dependencies to isolate the injected agent from the application's libraries.
 
 ```sh
 cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
   -DLLVM_DIR=/usr/lib64/llvm21/lib64/cmake/llvm \
-  -DClang_DIR=/usr/lib64/cmake/clang
+  -DClang_DIR=/usr/lib64/cmake/clang \
+  -DCMAKE_PREFIX_PATH=/path/to/static-dependencies \
+  -DProtobuf_USE_STATIC_LIBS=ON
 cmake --build build -j4
 ctest --test-dir build --output-on-failure
 ```
 
 Adjust package paths for your installation. CMake generates the C++ message and
-service bindings from `proto/tracer.proto`; the agent links Protobuf without the
-gRPC client/server library. The integration test uses real target processes and
-real generated gRPC clients.
+service bindings from `proto/tracer.proto`. The agent's Protobuf and shared-context
+gRPC transport are linked privately; its build rejects dependency symbol exports
+and shared transport dependencies. The integration tests use real target processes
+and generated gRPC clients, including a target with incompatible dependency symbols.
 
 To run the suite from OverlayFS, use
 `tests/overlay_integration.sh "$(realpath build)"`. This optional regression
