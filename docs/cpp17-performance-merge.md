@@ -12,7 +12,7 @@ Source commits: ba71e27, 90a3919 and fdbfeb9.
 - [x] Preserve signature ABI checks, side-effect-free validation and forced-header order.
 - [x] Complete independent modern Linux checks.
 - [x] Validate the matching GCC 8.5 / glibc 2.23 SDK profile.
-- [ ] Merge the validated port into c++17.
+- [x] Merge the validated port into c++17.
 
 ## Compatibility adaptations
 
@@ -124,9 +124,10 @@ archive is retained in the shared-context-benchmark worktree under
 benchmark-results/2026-11-01-ordinary-036-high-precision/stopped-2026-11-03/;
 STOP-PRESERVATION.md records the full archive path, SHA256 and inventory.
 
-## Remaining merge checks
+## Merge completion
 
 Final source commit: 98e149bb07e21935fbb5597075d7c5f6afcafa1b. Independent source
 review approves merging with the reproduced baseline cleanup gap documented.
-Retain the final SDK evidence, fetch the current c++17 head again and merge the
-validated port. The target branch remains at 7add3a8 until that merge.
+The current remote c++17 head was re-fetched at 7add3a8. The clean c++17 worktree
+then fast-forwarded to integration commit 0af5370, including all validated source
+and evidence documentation. The primary feature worktree remains untouched.
