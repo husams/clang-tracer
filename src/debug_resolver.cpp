@@ -1038,9 +1038,12 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
   std::map<std::string, ResolvedCallable> matches;
   std::string rejected;
   std::uint64_t visited = 0;
-  for (const auto& path : modules(pid)) {
+  const auto check_cancelled = [&] {
     if (options.is_cancelled())
       throw std::runtime_error("debug lookup cancelled");
+  };
+  for (const auto &path : modules(pid)) {
+    check_cancelled();
     if (!options.module.empty() &&
         (options.module.front() == '/' ? path != options.module
                                       : path.find(options.module) == std::string::npos))
@@ -1082,13 +1085,19 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
       if (!die) {
         return;
       }
-      if (options.is_cancelled())
-        throw std::runtime_error("debug lookup cancelled");
-      if (options.max_entries && visited >= options.max_entries)
+      // RPC cancellation checks are expensive. Bound unchecked traversal to
+      // 128 entries while retaining checks at work boundaries and completion.
+      if ((visited % 128) == 0)
+        check_cancelled();
+      if (options.max_entries && visited >= options.max_entries) {
+        check_cancelled();
         throw DebugLookupLimit("debug entry limit exceeded; increase --debug-max-entries or use 0");
+      }
       ++visited;
-      if (options.max_depth && depth > options.max_depth)
+      if (options.max_depth && depth > options.max_depth) {
+        check_cancelled();
         throw DebugLookupLimit("debug depth limit exceeded; increase --debug-max-depth or use 0");
+      }
       if (die.getTag() == dw::DW_TAG_subprogram) {
         auto decl = declaration(die);
         const auto qname = qualified(decl);
@@ -1164,6 +1173,7 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
       }
     };
     for (const auto& unit : dwarf->compile_units()) {
+      check_cancelled();
       std::vector<std::pair<DWARFDie, std::size_t>> pending{{unit->getUnitDIE(false), 0}};
       while (!pending.empty()) {
         const auto [die, depth] = pending.back();
@@ -1178,6 +1188,7 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
       }
     }
   }
+  check_cancelled();
   if (matches.size() != 1) {
     std::string error = matches.empty()
                             ? "no supported matching callable in mapped ELF debug information; "

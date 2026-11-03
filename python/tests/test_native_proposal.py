@@ -147,6 +147,39 @@ int forced_initializer = []() {{
         assert_no_probes(client, session)
 
 
+def test_forced_header_abi_applies_before_cached_standard_headers(proposal_client):
+    client, session, temporary = proposal_client
+    # Warm the ordinary common-header profile before choosing a different ABI
+    # through a forced header, whose text precedes all tracer API declarations.
+    assert_success(client.validate_probe(session.id, "add(int, int)", CALLBACK))
+    header = temporary / "old_string_abi.hpp"
+    header.write_text("#define _GLIBCXX_USE_CXX11_ABI 0\n")
+    source = (
+        """
+#include <string>
+static_assert(sizeof(std::string) == sizeof(void*),
+              "forced header was applied after standard headers");
+"""
+        + CALLBACK
+    )
+    options = ["-include", str(header)]
+    for level in ("syntax", "compile"):
+        assert_success(
+            client.validate_probe(
+                session.id,
+                "add(int, int)",
+                source,
+                compile_options=options,
+                level=level,
+            )
+        )
+        assert_no_probes(client, session)
+    probe = client.inject(session.id, "add(int, int)", source, compile_options=options)
+    events = client.collect_traces(4, session_ids=[session.id], timeout=10)
+    assert events and all(event.probe_id == probe.id for event in events)
+    assert client.remove_probe(session.id, probe.id).original_bytes_restored
+
+
 def test_validate_and_inject_share_cpp17_include_options(proposal_client):
     client, session, temporary = proposal_client
     (temporary / "proposal_config.hpp").write_text(

@@ -8,6 +8,14 @@ output=$(cd "$2" && pwd)
 functions=${3:-10000}
 compiler=${CXX:-clang++-21}
 llvm_config=${LLVM_CONFIG:-llvm-config-21}
+compiler_flags=()
+link_flags=()
+if [[ -n "${TRACER_BENCH_CXX_FLAGS:-}" ]]; then
+  read -r -a compiler_flags <<< "$TRACER_BENCH_CXX_FLAGS"
+fi
+if [[ -n "${TRACER_BENCH_LINK_FLAGS:-}" ]]; then
+  read -r -a link_flags <<< "$TRACER_BENCH_LINK_FLAGS"
+fi
 fixtures=${ATTACH_FIXTURES:-$output/fixtures}
 if [[ -e "$output/identity.sha256" || -e "$output/modules-0.csv" ]]; then
   echo "Choose a new output directory; existing measurements are preserved" >&2
@@ -25,26 +33,27 @@ else
     for (i=0; i<n; i++)
       printf "extern \"C\" __attribute__((noinline)) int fixture_%d(int x) { volatile int y = x + %d; return y; }\n", i, i;
   }' > "$fixtures/module.cpp"
-  "$compiler" -shared -fPIC -O0 -g -fasynchronous-unwind-tables \
-    "$fixtures/module.cpp" -o "$fixtures/module-0.so"
+  "$compiler" "${compiler_flags[@]}" -shared -fPIC -O0 -g -fasynchronous-unwind-tables \
+    "$fixtures/module.cpp" "${link_flags[@]}" -o "$fixtures/module-0.so"
   for ((i=1; i<16; i++)); do
     cp "$fixtures/module-0.so" "$fixtures/module-$i.so"
   done
   cp "$fixtures/module-0.so" "$fixtures/injected.so"
-  "$compiler" -O0 -g "$source_root/benchmarks/attach/target.cpp" -ldl \
+  "$compiler" "${compiler_flags[@]}" -O0 -g "$source_root/benchmarks/attach/target.cpp" \
+    "${link_flags[@]}" -ldl \
     -o "$fixtures/target"
   echo "$functions" > "$fixtures/functions.txt"
 fi
 
-"$compiler" -O2 -g -std=c++20 -I"$source_root/src" \
+"$compiler" "${compiler_flags[@]}" -O2 -g -std=c++20 -I"$source_root/src" -I"$source_root/include" \
   $("$llvm_config" --cxxflags | sed 's/-std=[^ ]*//g; s/-fno-exceptions//g') \
   "$source_root/benchmarks/attach/metadata.cpp" "$source_root/src/admission.cpp" \
-  $("$llvm_config" --ldflags --libs --system-libs) -ldl -o "$output/metadata"
-"$compiler" -O2 -g -std=c++20 -I"$source_root/src" \
+  $("$llvm_config" --ldflags --libs --system-libs) "${link_flags[@]}" -ldl -o "$output/metadata"
+"$compiler" "${compiler_flags[@]}" -O2 -g -std=c++20 -I"$source_root/src" -I"$source_root/include" \
   $("$llvm_config" --cxxflags | sed 's/-std=[^ ]*//g; s/-fno-exceptions//g') \
   "$source_root/benchmarks/attach/bootstrap.cpp" \
   "$source_root/src/admission.cpp" "$source_root/src/injector.cpp" \
-  $("$llvm_config" --ldflags --libs --system-libs) -ldl -pthread \
+  $("$llvm_config" --ldflags --libs --system-libs) "${link_flags[@]}" -ldl -pthread \
   -o "$output/bootstrap"
 
 "$compiler" --version > "$output/compiler.txt"

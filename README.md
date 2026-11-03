@@ -364,9 +364,22 @@ Canonical mapped paths and ELF offsets/ranges must match; PIE, fixed-address
 executables and shared libraries use the same translation. The agent independently
 re-resolves the exact entry, range and callable metadata inside the target before
 decoding or preparing a hook. A patch cannot extend beyond the selected function.
+That verified result is reused during the same injection's receiver setup;
+each new injection performs its own verification. Cancellation is checked at
+module/unit boundaries, periodically during traversal, and before completion;
+explicit entry/depth budgets still apply to every visited entry.
 No target relinking or rebuilding is needed when supported DWARF is already
 present. Missing concrete code ranges, ambiguous mappings and unpatchable entries
 fail closed. Fragmented DWARF range lists are currently unsupported.
+
+Callback compilation lazily precompiles its common standard C++ headers once per
+agent process, with separate artifacts for syntax validation and incremental
+JIT compilation. Each injector restores the matching headers into fresh compiler
+and JIT state. Callback source, argument aliases and receiver declarations remain
+private to that injector, and the existing syntax/layout checks still run.
+Changed headers or include-search results invalidate the cache. Unsupported
+compiler profiles, unavailable cache storage, and headers with startup or
+shutdown effects use the original compilation path.
 
 Normal CLI verification covered non-exported free functions and methods in
 already-running PIE and fixed-address executables, plus a mapped shared library,
@@ -641,6 +654,11 @@ retried within the operation deadline.
 The session snapshots canonical mapped paths and load biases without retaining
 binary file handles or policing file timestamps. Control attachments validate
 the paths and executable ELF mapping ranges, including the sleep admission path.
+Admission reads the required ELF metadata and unwind sections without copying
+unrelated debug sections or application symbol tables. Each discovered module
+retains its successful CFI validation inputs; later attachments reuse that
+validation only when fresh unwind bytes, load headers, type, and SONAME match
+exactly. Mapping and load-bias checks still run on every attachment.
 Unmapping or rebasing invalidates that snapshot. Rebuilding or replacing binary
 contents requires a new session. Native stack caches refresh after prior probes
 drain; reconnecting a durable collector keeps active probe metadata alive.

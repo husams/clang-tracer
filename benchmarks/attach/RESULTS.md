@@ -1,5 +1,8 @@
 # Attach metadata optimization — 2026-11-03
 
+> **C++17 port:** These are the original C++20 measurements, not C++17 results.
+> See [C++17 integration and validation](../../docs/cpp17-performance-merge.md).
+
 Source baseline: `0dca368` (main). Candidate branch:
 `perf/attach-and-unbounded-streams`.
 

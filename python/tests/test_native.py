@@ -351,6 +351,163 @@ def test_real_native_api_resolution_injection_and_shutdown_restore(native):
         assert missing.value.code() == grpc.StatusCode.NOT_FOUND
 
 
+def test_real_native_add_probe_rejects_tampered_resolved_metadata(native):
+    build, target, temporary = native
+    with Client(f"unix://{temporary}/control.sock", timeout=30) as client:
+        client.start_server(
+            str(build / "clang-tracer-server"),
+            agent=str(build / "libclang_tracer_agent.so"),
+        )
+        session = client.attach(target.pid)
+        resolved = client.resolve_probe(session.id, "add(int, int)")
+
+        def assert_no_active_probes():
+            current = next(
+                value for value in client.list_sessions() if value.id == session.id
+            )
+            assert not any(probe.active for probe in current.probes)
+
+        tampered_specs = []
+        changed_debug_info = pb.ProbeSpec()
+        changed_debug_info.CopyFrom(resolved)
+        changed_debug_info.debug_info.entry_size += 1
+        tampered_specs.append(changed_debug_info)
+
+        changed_signature = pb.ProbeSpec()
+        changed_signature.CopyFrom(resolved)
+        changed_signature.signature.arguments.clear()
+        changed_signature.signature.arguments.extend([pb.INT64, pb.INT32])
+        tampered_specs.append(changed_signature)
+
+        changed_argument_name = pb.ProbeSpec()
+        changed_argument_name.CopyFrom(resolved)
+        changed_argument_name.argument_names.clear()
+        changed_argument_name.argument_names.extend(
+            ["altered_argument", resolved.argument_names[1]]
+        )
+        tampered_specs.append(changed_argument_name)
+
+        for spec in tampered_specs:
+            spec.callback_source = INTERCEPTOR
+            with pytest.raises(grpc.RpcError) as rejected:
+                client.add_probe(session.id, spec)
+            assert (
+                "mapped debug image, entry or callable metadata changed"
+                in rejected.value.details()
+            )
+            assert_no_active_probes()
+
+        valid_spec = pb.ProbeSpec()
+        valid_spec.CopyFrom(resolved)
+        valid_spec.callback_source = INTERCEPTOR
+        probe = client.add_probe(session.id, valid_spec)
+        assert probe.active
+        events = client.collect_traces(4, session_ids=[session.id], timeout=10)
+        assert events
+        assert all(event.probe_id == probe.id for event in events)
+        assert client.remove_probe(session.id, probe.id).original_bytes_restored
+        assert_no_active_probes()
+        assert client.detach(session.id).state == pb.Session.DETACHED
+
+
+def test_native_common_headers_preserve_callback_isolation_and_typed_receivers(native):
+    build, target, temporary = native
+    rejected_source = """
+#define TRACER_FAILED_CALLBACK_MARKER 1
+namespace callback_scope { struct RejectedType {}; }
+struct Interceptor {
+  void pre(const Call &) { missing_callback_symbol(); }
+};
+"""
+    function_source = """
+#ifdef TRACER_FAILED_CALLBACK_MARKER
+#error rejected callback macros leaked
+#endif
+#define TRACER_PREVIOUS_CALLBACK_MARKER 1
+namespace callback_scope { using RejectedType = int; }
+static int probe_counter = 0;
+static constexpr int identity = 11;
+struct Interceptor {
+  void pre(const Call &call) {
+    call.field("identity", identity);
+    call.field("counter", ++probe_counter);
+    call.field("first", call.argument<0>());
+  }
+};
+"""
+    method_source = """
+#ifdef TRACER_FAILED_CALLBACK_MARKER
+#error rejected callback macros leaked
+#endif
+#ifdef TRACER_PREVIOUS_CALLBACK_MARKER
+#error another callback's macros leaked
+#endif
+namespace callback_scope { struct RejectedType {}; }
+static int probe_counter = 0;
+static constexpr int identity = 22;
+struct Interceptor {
+  void pre(const Call &call) {
+    call.field("identity", identity);
+    call.field("counter", ++probe_counter);
+    call.field(call.self()->bias);
+  }
+};
+"""
+    with Client(f"unix://{temporary}/control.sock", timeout=30) as client:
+        client.start_server(
+            str(build / "clang-tracer-server"),
+            agent=str(build / "libclang_tracer_agent.so"),
+        )
+        session = client.attach(target.pid)
+
+        def reject_callback():
+            with pytest.raises(grpc.RpcError) as rejected:
+                client.inject(session.id, "add(int, int)", rejected_source)
+            assert "missing_callback_symbol" in rejected.value.details()
+            assert target.poll() is None
+
+        # A failed cold compile must leave the reusable headers usable.
+        reject_callback()
+        function = client.inject(session.id, "add(int, int)", function_source)
+        # Exercise rejection again after a successful compile, with a live probe.
+        with pytest.raises(grpc.RpcError) as rejected:
+            client.inject(
+                session.id, "Calculator::multiply(int, int) const", rejected_source
+            )
+        assert "missing_callback_symbol" in rejected.value.details()
+        method = client.inject(
+            session.id, "Calculator::multiply(int, int) const", method_source
+        )
+        seen = set()
+        with client.watch_events([session.id], timeout=10) as events:
+            for event in events:
+                if event.phase != pb.PRE:
+                    continue
+                fields = {
+                    item.name: item.value.signed_value for item in event.object_fields
+                }
+                if event.probe_id == function.id:
+                    assert fields["identity"] == 11
+                    assert fields["first"] == event.arguments[0].signed_value
+                elif event.probe_id == method.id:
+                    assert fields["identity"] == 22
+                    assert fields["bias"] == 7
+                    assert event.object_address
+                else:
+                    pytest.fail(f"unexpected probe event: {event.probe_id}")
+                if event.probe_id not in seen:
+                    assert fields["counter"] == 1
+                seen.add(event.probe_id)
+                if seen == {function.id, method.id}:
+                    break
+            else:
+                pytest.fail("did not observe both independent callbacks")
+        assert client.remove_probe(session.id, method.id).original_bytes_restored
+        assert client.remove_probe(session.id, function.id).original_bytes_restored
+        assert target.poll() is None
+        assert client.detach(session.id).state == pb.Session.DETACHED
+
+
 def test_real_native_console_commands(native):
     build, target, temporary = native
     callback = temporary / "callback.cpp"
@@ -634,6 +791,32 @@ def test_native_symbol_listing_has_no_implicit_limits(native):
             )
             session = client.attach(target.pid)
             assert str(unrelated) in client.list_modules(session.id)
+            cancelled_lookup = client.stub.ResolveProbe.future(
+                pb.ResolveProbeRequest(
+                    session_id=session.id,
+                    selector="clang_tracer_cancel_missing_selector",
+                ),
+                timeout=120,
+            )
+            # Cancellation can race a fast lookup on another machine. Accept
+            # either an observed cancellation or the expected missing-name
+            # result, without requiring the scan to take a minimum duration.
+            if cancelled_lookup.cancel():
+                assert cancelled_lookup.cancelled()
+                with pytest.raises(grpc.FutureCancelledError):
+                    cancelled_lookup.result()
+                assert cancelled_lookup.code() == grpc.StatusCode.CANCELLED
+            else:
+                with pytest.raises(grpc.RpcError) as completed_lookup:
+                    cancelled_lookup.result(timeout=120)
+                assert completed_lookup.value.code() == grpc.StatusCode.INTERNAL
+                assert (
+                    "no supported matching callable" in completed_lookup.value.details()
+                )
+            current = next(
+                value for value in client.list_sessions() if value.id == session.id
+            )
+            assert not any(probe.active for probe in current.probes)
             # Use a raw default request too: unlimited is a server contract.
             all_symbols = client.stub.ListSymbols(
                 pb.ListSymbolsRequest(session_id=session.id), timeout=120

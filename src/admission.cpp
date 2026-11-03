@@ -259,9 +259,31 @@ struct FileImage {
   }
 };
 
-FileImage load_image_fd(const std::string &path, int fd,
-                        const std::vector<Mapping> &maps,
-                        bool collect_startup_symbols = false) {
+enum class StartupSymbolSet {
+  none,
+  libc,
+  executable,
+  pthread,
+};
+
+bool is_startup_symbol(StartupSymbolSet set, std::string_view name) {
+  switch (set) {
+  case StartupSymbolSet::libc:
+    return name == "__libc_start_call_main" || name == "__libc_start_main" ||
+           name == "start_thread" || name == "__clone" || name == "__clone3";
+  case StartupSymbolSet::executable:
+    return name == "main";
+  case StartupSymbolSet::pthread:
+    return name == "start_thread";
+  case StartupSymbolSet::none:
+    return false;
+  }
+  return false;
+}
+
+FileImage
+load_image_fd(const std::string &path, int fd, const std::vector<Mapping> &maps,
+              StartupSymbolSet startup_symbols = StartupSymbolSet::none) {
   FileImage image;
   image.path = path;
   struct stat st{};
@@ -511,10 +533,7 @@ FileImage load_image_fd(const std::string &path, int fd,
       }
     }
   }
-  if (collect_startup_symbols) {
-    constexpr std::array<std::string_view, 5> startup_symbols = {
-        "__libc_start_call_main", "__libc_start_main", "start_thread",
-        "__clone", "__clone3"};
+  if (startup_symbols != StartupSymbolSet::none) {
     for (unsigned i = 0; i < eh.e_shnum; ++i) {
       if (sh[i].sh_type != SHT_SYMTAB && sh[i].sh_type != SHT_DYNSYM) {
         continue;
@@ -552,8 +571,7 @@ FileImage load_image_fd(const std::string &path, int fd,
         }
         const std::string_view function_name(
             name, static_cast<std::size_t>(terminator - name));
-        if (std::find(startup_symbols.begin(), startup_symbols.end(),
-                      function_name) != startup_symbols.end()) {
+        if (is_startup_symbol(startup_symbols, function_name)) {
           image.functions.push_back(
               {std::string(function_name), sym.st_value, sym.st_size});
         }
@@ -566,15 +584,16 @@ FileImage load_image_fd(const std::string &path, int fd,
   return image;
 }
 
-FileImage load_image(const std::string &path, const std::vector<Mapping> &maps,
-                     bool collect_startup_symbols = false) {
+FileImage
+load_image(const std::string &path, const std::vector<Mapping> &maps,
+           StartupSymbolSet startup_symbols = StartupSymbolSet::none) {
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     unavailable("cannot open mapped ELF image");
   }
   FileImage image;
   try {
-    image = load_image_fd(path, fd, maps, collect_startup_symbols);
+    image = load_image_fd(path, fd, maps, startup_symbols);
   } catch (...) {
     ::close(fd);
     throw;
@@ -583,13 +602,16 @@ FileImage load_image(const std::string &path, const std::vector<Mapping> &maps,
   return image;
 }
 
-FileImage load_executable(pid_t pid, const std::vector<Mapping> &maps) {
+FileImage load_executable(pid_t pid, const std::vector<Mapping> &maps,
+                          bool collect_main = false) {
   const std::string proc_path = "/proc/" + std::to_string(pid) + "/exe";
   const auto path = ::tracer::detail::canonical_mapped_path(proc_path);
   if (path.empty()) {
     unavailable("cannot identify the target executable");
   }
-  return load_image(path, maps);
+  return load_image(path, maps,
+                    collect_main ? StartupSymbolSet::executable
+                                 : StartupSymbolSet::none);
 }
 
 FileImage load_libc(const std::vector<Mapping> &maps) {
@@ -602,7 +624,7 @@ FileImage load_libc(const std::vector<Mapping> &maps) {
       continue;
     }
     const auto &path = m.canonical_path;
-    auto image = load_image(path, maps, true);
+    auto image = load_image(path, maps, StartupSymbolSet::libc);
     if (image.soname == "libc.so.6") {
       return image;
     }
@@ -620,7 +642,8 @@ std::optional<FileImage> load_libpthread(const std::vector<Mapping> &maps) {
     if (!candidate || mapping.canonical_path.empty()) {
       continue;
     }
-    auto image = load_image(mapping.canonical_path, maps);
+    auto image =
+        load_image(mapping.canonical_path, maps, StartupSymbolSet::pthread);
     if (image.soname == "libpthread.so.0") {
       return image;
     }
@@ -1242,7 +1265,7 @@ require_application_rendezvous(pid_t pid, const user_regs_struct& regs,
     unavailable("invalid stopped-process state");
   }
   const auto maps = read_mappings(pid);
-  auto executable = load_executable(pid, maps);
+  auto executable = load_executable(pid, maps, true);
   auto libc = load_libc(maps);
   const auto loader = loader_identity(executable, maps);
   const auto protected_files = protected_runtime_identities(maps, libc, loader);

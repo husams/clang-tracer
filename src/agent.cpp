@@ -73,6 +73,7 @@
 #include <unistd.h>
 
 #include "callback_bridge.hpp"
+#include "callback_pch.hpp"
 #include "callback_source.hpp"
 #include "context_activation.hpp"
 #include "context_agent_delivery.hpp"
@@ -112,6 +113,11 @@ struct OrcErrorCapture {
   std::mutex mutex;
   std::condition_variable ready;
   std::string message;
+};
+
+struct VerifiedDebugEntry {
+  const clangtracer::v1::ProbeSpec *spec = nullptr;
+  std::uint64_t runtime_entry = 0;
 };
 
 struct Probe {
@@ -234,6 +240,12 @@ public:
   bool had_error() const { return had_error_; }
   const std::vector<CapturedDiagnostic> &diagnostics() const {
     return diagnostics_;
+  }
+
+  void reset_capture() {
+    message_.clear();
+    diagnostics_.clear();
+    had_error_ = false;
   }
 
 private:
@@ -1455,12 +1467,18 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
                           std::unique_ptr<clang::ASTUnit> &output,
                           clang::CXXRecordDecl *&record, std::string &error,
                           DebugRecords &records,
-                          const std::string &callback_includes) {
+                          const std::string &callback_includes,
+                          const VerifiedDebugEntry *verified_entry) {
   try {
     const auto &info = spec.debug_info();
-    // Match the mapped entry, signature and type metadata before constructing
-    // any AST. Binary contents remain fixed for the tracing session.
-    validate_debug_entry(spec);
+    // tracer_agent_start performed the full serialized metadata comparison
+    // and entry lookup. Reuse only that operation's result; never cache across
+    // requests or sessions. The spec address guards against passing a token
+    // verified for a different request.
+    if (!verified_entry || verified_entry->spec != &spec ||
+        verified_entry->runtime_entry != info.runtime_entry())
+      throw std::runtime_error(
+          "debug entry verification does not match probe");
     bool has_record = !info.record_name().empty();
     for (const auto &argument : info.arguments())
       has_record |= argument.has_object_type();
@@ -1660,10 +1678,11 @@ bool build_and_validate_receiver_ast(clangtracer::v1::ProbeSpec &spec,
                                      clang::CXXRecordDecl *&output_record,
                                      std::string &error,
                                      DebugRecords &records,
-                                     const std::string &callback_includes) {
+                                     const std::string &callback_includes,
+                                     const VerifiedDebugEntry *verified_entry) {
   if (spec.has_debug_info())
     return build_debug_receiver(spec, output, output_record, error, records,
-                                callback_includes);
+                                callback_includes, verified_entry);
   if (!spec.has_receiver()) {
     return true;
   }
@@ -4133,7 +4152,8 @@ bool bind_probe_symbols(clang::Interpreter &interpreter,
 bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
                    std::string &error, bool run_initializers = true,
                    bool syntax_only = false,
-                   clangtracer::v1::ValidationReport *report = nullptr) {
+                   clangtracer::v1::ValidationReport *report = nullptr,
+                   const VerifiedDebugEntry *verified_entry = nullptr) {
   const auto validate_options = [&error](const auto &first, const auto &last,
                                          const char *source,
                                          bool allow_toolchain = false) {
@@ -4217,12 +4237,25 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   if (!validate_object_abi_evidence(specification, callback_includes,
                                     forced_include_source, error))
     return false;
+  std::optional<VerifiedDebugEntry> local_verified_entry;
+  if (specification.has_debug_info() && !verified_entry) {
+    try {
+      const auto runtime_entry = validate_debug_entry(specification);
+      local_verified_entry =
+          VerifiedDebugEntry{&specification, runtime_entry};
+      verified_entry = &*local_verified_entry;
+    } catch (const std::exception &exception) {
+      error = exception.what();
+      return false;
+    }
+  }
   p.argument_names.assign(specification.argument_names().begin(),
                           specification.argument_names().end());
   clang::CXXRecordDecl *receiver_record = nullptr;
   if (!build_and_validate_receiver_ast(specification, p.request, p.receiver_ast,
                                        receiver_record, error,
-                                       p.debug_records, type_header_prefix)) {
+                                       p.debug_records, type_header_prefix,
+                                       verified_entry)) {
     return false;
   }
   bool result_sret = false;
@@ -4251,7 +4284,39 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
     error = llvm::toString(compiler.takeError());
     return false;
   }
+  std::optional<tracer::callback_pch::Artifact> interpreter_pch;
+  std::optional<tracer::callback_pch::Artifact> syntax_pch;
+  // C++17 extracts user -include options into source text. Keep the PCH out of
+  // both frontends in that case so macro and include order stay unchanged.
+  if (forced_include_source.empty()) {
+    interpreter_pch = tracer::callback_pch::prepare(
+        (*compiler)->getInvocation(), tracer::callback_pch::Mode::Interpreter);
+    syntax_pch = tracer::callback_pch::prepare(
+        (*compiler)->getInvocation(), tracer::callback_pch::Mode::Syntax);
+  }
+  if (interpreter_pch) {
+    try {
+      tracer::callback_pch::attach((*compiler)->getInvocation(),
+                                   *interpreter_pch);
+    } catch (...) {
+      tracer::callback_pch::disable(*interpreter_pch);
+      interpreter_pch.reset();
+    }
+  }
   auto created = clang::Interpreter::create(std::move(*compiler));
+  if (!created && interpreter_pch) {
+    llvm::consumeError(created.takeError());
+    tracer::callback_pch::disable(*interpreter_pch);
+    interpreter_pch.reset();
+    clang::IncrementalCompilerBuilder fallback_builder;
+    fallback_builder.SetCompilerArgs(args);
+    auto fallback_compiler = fallback_builder.CreateCpp();
+    if (!fallback_compiler) {
+      error = llvm::toString(fallback_compiler.takeError());
+      return false;
+    }
+    created = clang::Interpreter::create(std::move(*fallback_compiler));
+  }
   if (!created) {
     error = llvm::toString(created.takeError());
     return false;
@@ -4286,15 +4351,60 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
    */
   auto syntax_args = interpreter_arguments;
   syntax_args.push_back("-fsyntax-only");
+  auto syntax_pch_args = syntax_args;
+  if (syntax_pch)
+    tracer::callback_pch::append_syntax_args(syntax_pch_args, *syntax_pch);
+  const auto build_callback_ast =
+      [&](const std::string &code, const char *file_name,
+          DiagnosticCapture &capture) -> std::unique_ptr<clang::ASTUnit> {
+    auto ast = clang::tooling::buildASTFromCodeWithArgs(
+        code, syntax_pch ? syntax_pch_args : syntax_args, file_name,
+        "clang-tracer", std::make_shared<clang::PCHContainerOperations>(),
+        clang::tooling::getClangStripOutputAdjuster(), {}, &capture);
+    if ((!ast || capture.had_error()) && syntax_pch) {
+      capture.reset_capture();
+      auto fallback = clang::tooling::buildASTFromCodeWithArgs(
+          code, syntax_args, file_name, "clang-tracer",
+          std::make_shared<clang::PCHContainerOperations>(),
+          clang::tooling::getClangStripOutputAdjuster(), {}, &capture);
+      if (fallback && !capture.had_error()) {
+        tracer::callback_pch::disable(*syntax_pch);
+        syntax_pch.reset();
+        syntax_pch_args = syntax_args;
+      }
+      return fallback;
+    }
+    return ast;
+  };
+  const auto run_callback_tool = [&](auto &&make_action,
+                                     const std::string &code,
+                                     auto &&postcondition) {
+    const auto run = [&](const std::vector<std::string> &arguments) {
+      const bool frontend_succeeded = clang::tooling::runToolOnCodeWithArgs(
+          make_action(), code, arguments, "clang-tracer-callback.cc",
+          "clang-tracer", std::make_shared<clang::PCHContainerOperations>());
+      return frontend_succeeded && postcondition();
+    };
+    const bool tried_pch = syntax_pch.has_value();
+    const bool succeeded = run(tried_pch ? syntax_pch_args : syntax_args);
+    if (!succeeded && tried_pch) {
+      const bool fallback_succeeded = run(syntax_args);
+      if (fallback_succeeded) {
+        tracer::callback_pch::disable(*syntax_pch);
+        syntax_pch.reset();
+        syntax_pch_args = syntax_args;
+      }
+      return fallback_succeeded;
+    }
+    return succeeded;
+  };
   CallbackShape shape;
   std::string bridge;
   std::string complete_source;
   std::string baseline_error;
   DiagnosticCapture user_capture(nullptr);
-  auto user_ast = clang::tooling::buildASTFromCodeWithArgs(
-      user_source, syntax_args, "clang-tracer-callback.cc", "clang-tracer",
-      std::make_shared<clang::PCHContainerOperations>(),
-      clang::tooling::getClangStripOutputAdjuster(), {}, &user_capture);
+  auto user_ast =
+      build_callback_ast(user_source, "clang-tracer-callback.cc", user_capture);
   bool shape_valid = false;
   if (user_ast) {
     const auto context_declarations =
@@ -4352,10 +4462,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
                       specialized_signature_assert(user_ast->getASTContext(),
                                                    shape) +
                       bridge + "\n" + generated;
-    auto complete_ast = clang::tooling::buildASTFromCodeWithArgs(
-        complete_source, syntax_args, "clang-tracer-callback.cc",
-        "clang-tracer", std::make_shared<clang::PCHContainerOperations>(),
-        clang::tooling::getClangStripOutputAdjuster(), {}, &complete_capture);
+    auto complete_ast = build_callback_ast(
+        complete_source, "clang-tracer-callback.cc", complete_capture);
     baseline_preflight_succeeded =
         complete_ast && !complete_capture.had_error();
     if (!baseline_preflight_succeeded) {
@@ -4458,15 +4566,20 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
         "#line 1 \"callback_source\"\n" + callback_body;
     std::string import_error;
     ReceiverCallbackShape receiver_shape;
-    receiver_shape.argument_names = p.argument_names;
-    auto typed_action = std::make_unique<ReceiverImportAction>(
-        p.receiver_ast->getASTContext(), p.receiver_ast->getFileManager(),
-        receiver_record, receiver_shape, &specification.receiver(),
-        receiver_record, &import_error, &p.debug_records, &specification);
-    const bool user_syntax_ok = clang::tooling::runToolOnCodeWithArgs(
-        std::move(typed_action), typed_user_source, syntax_args,
-        "clang-tracer-callback.cc", "clang-tracer",
-        std::make_shared<clang::PCHContainerOperations>());
+    const auto make_user_action =
+        [&]() -> std::unique_ptr<clang::FrontendAction> {
+      receiver_shape = ReceiverCallbackShape{};
+      receiver_shape.argument_names = p.argument_names;
+      import_error.clear();
+      return std::make_unique<ReceiverImportAction>(
+          p.receiver_ast->getASTContext(), p.receiver_ast->getFileManager(),
+          receiver_record, receiver_shape, &specification.receiver(),
+          receiver_record, &import_error, &p.debug_records, &specification);
+    };
+    const bool user_syntax_ok =
+        run_callback_tool(make_user_action, typed_user_source, [&] {
+          return receiver_shape.valid && import_error.empty();
+        });
     if (!user_syntax_ok || !receiver_shape.valid || !import_error.empty()) {
       error = import_error.empty() ? receiver_shape.error : import_error;
       if (error.empty()) {
@@ -4506,15 +4619,20 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
                       bridge + "\n" + generated;
     import_error.clear();
     ReceiverCallbackShape final_shape;
-    final_shape.argument_names = p.argument_names;
-    auto final_action = std::make_unique<ReceiverImportAction>(
-        p.receiver_ast->getASTContext(), p.receiver_ast->getFileManager(),
-        receiver_record, final_shape, &specification.receiver(),
-        receiver_record, &import_error, &p.debug_records, &specification);
-    const bool complete_syntax_ok = clang::tooling::runToolOnCodeWithArgs(
-        std::move(final_action), complete_source, syntax_args,
-        "clang-tracer-callback.cc", "clang-tracer",
-        std::make_shared<clang::PCHContainerOperations>());
+    const auto make_final_action =
+        [&]() -> std::unique_ptr<clang::FrontendAction> {
+      final_shape = ReceiverCallbackShape{};
+      final_shape.argument_names = p.argument_names;
+      import_error.clear();
+      return std::make_unique<ReceiverImportAction>(
+          p.receiver_ast->getASTContext(), p.receiver_ast->getFileManager(),
+          receiver_record, final_shape, &specification.receiver(),
+          receiver_record, &import_error, &p.debug_records, &specification);
+    };
+    const bool complete_syntax_ok =
+        run_callback_tool(make_final_action, complete_source, [&] {
+          return final_shape.valid && import_error.empty();
+        });
     if (!complete_syntax_ok || !final_shape.valid || !import_error.empty()) {
       error = import_error.empty() ? final_shape.error : import_error;
       if (error.empty()) {
@@ -4886,10 +5004,15 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     // Named tracing uses the target's own independently re-read DWARF and ELF
     // mappings. No dynamic symbol lookup is involved, including for local and
     // hidden functions. Raw-symbol requests retain their explicit dlsym path.
-    void *entry =
-        specification.has_debug_info()
-            ? reinterpret_cast<void *>(validate_debug_entry(specification))
-            : ::dlsym(RTLD_DEFAULT, request->symbol);
+    std::optional<VerifiedDebugEntry> verified_debug_entry;
+    void *entry = nullptr;
+    if (specification.has_debug_info()) {
+      const auto runtime_entry = validate_debug_entry(specification);
+      verified_debug_entry = VerifiedDebugEntry{&specification, runtime_entry};
+      entry = reinterpret_cast<void *>(runtime_entry);
+    } else {
+      entry = ::dlsym(RTLD_DEFAULT, request->symbol);
+    }
     if (!entry) {
       set_error(request, "target symbol was not found in the process");
       return -1;
@@ -4952,7 +5075,9 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, "could not make trampoline executable");
       return -1;
     }
-    if (!compile_probe(*p, specification, error)) {
+    if (!compile_probe(
+            *p, specification, error, true, false, nullptr,
+            verified_debug_entry ? &*verified_debug_entry : nullptr)) {
       set_error(request, error.c_str());
       return -1;
     }

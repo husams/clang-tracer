@@ -68,7 +68,7 @@ target_link_libraries(tracer_proto PUBLIC protobuf::libprotobuf tracer_context_t
 add_library(tracer_grpc STATIC ${TRACER_PROTO_DIR}/tracer.grpc.pb.cc)
 target_link_libraries(tracer_grpc PUBLIC tracer_proto gRPC::grpc++)
 
-add_library(clang_tracer_agent SHARED src/agent.cpp src/debug_resolver.cpp src/native_stack.cpp
+add_library(clang_tracer_agent SHARED src/agent.cpp src/callback_pch.cpp src/debug_resolver.cpp src/native_stack.cpp
   src/event_transport.cpp src/context_agent_delivery.cpp)
 target_include_directories(clang_tracer_agent PRIVATE include ${TRACER_PROTO_DIR} ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_compile_definitions(clang_tracer_agent PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
@@ -167,6 +167,16 @@ endif()
 
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_executable(callback-pch-tests tests/callback_pch_tests.cpp src/callback_pch.cpp)
+  target_include_directories(callback-pch-tests PRIVATE src ${TRACER_PROTO_DIR})
+  target_include_directories(callback-pch-tests SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
+  target_link_libraries(callback-pch-tests PRIVATE clang-cpp LLVM tracer_compat)
+  target_compile_options(callback-pch-tests PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME callback_pch_reuse
+    COMMAND callback-pch-tests "${_tracer_resource_dir}")
+  add_test(NAME callback_pch_unavailable
+    COMMAND callback-pch-tests "${_tracer_resource_dir}" --unavailable-cache)
+  set_tests_properties(callback_pch_reuse callback_pch_unavailable PROPERTIES TIMEOUT 60)
   add_test(NAME agent_symbol_isolation
     COMMAND ${CMAKE_COMMAND} -DAGENT=$<TARGET_FILE:clang_tracer_agent>
       -DNM=${CMAKE_NM} -DREADELF=${CMAKE_READELF}
