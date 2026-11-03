@@ -10,7 +10,7 @@ Source commits: ba71e27, 90a3919 and fdbfeb9.
 - [x] Port cancellation polling and operation-local debug verification reuse.
 - [x] Port common-header PCH reuse into signature and validation paths.
 - [x] Preserve signature ABI checks, side-effect-free validation and forced-header order.
-- [ ] Complete independent modern Linux checks.
+- [x] Complete independent modern Linux checks.
 - [ ] Validate the matching GCC 8.5 / glibc 2.23 SDK profile.
 - [ ] Merge the validated port into c++17.
 
@@ -37,9 +37,20 @@ links tracer_compat for SDK filesystem/runtime dependencies.
 
 ## Validation and outstanding work
 
-Local Python before the extra native regression: 192 passed, 44 native skips.
-Native checks require Linux; standalone helper checks are also being run with
+Local Python: 192 passed, 45 native skips. Both actual PCH helper modes pass with
 macOS LLVM 22 and C++17 callback input.
+
+The independent Ubuntu/Clang 21 build completes all 183 actions. Both cache
+tests, native/fallback compatibility checks, export audit, single dependency
+collision, native gRPC integration and CFI-cache integration pass. Python native
+checks pass: all eight proposal/validation cases (including forced-header ABI
+selection), eleven signature/reference/object-return cases, and seven
+injection/restore/metadata/cache/retention/context/stream cases.
+
+Five modern-host test failures reproduce with the exact 7add3a8 baseline: shared
+dependency collision and typed-this fail the same overloaded-callable lookup;
+the three admission variants fail the same exact libc/pthread unwind boundary.
+They are recorded as baseline coverage gaps, not passing tests.
 
 The exact SDK is available only on linux-dev, where the registered performance
 study remains active. The user explicitly chose to wait for that study before
@@ -51,3 +62,18 @@ The reports in benchmarks/attach and benchmarks/injection preserve the original
 C++20 measurements. Their speedups have not been re-established for this port.
 Build/test evidence and snapshots are staged under
 /tmp/clang-tracer-cpp17-20261103.
+
+The checksum-verified modern validation archive is also retained at
+[benchmark-results/2026-11-03-cpp17/results](../benchmark-results/2026-11-03-cpp17/results/).
+Its summary records 8 passing and 5 baseline-reproduced failing CTests, plus
+26 passing native Python cases. The disposable namespace has been removed;
+the final completion-marker check still found the registered study running.
+
+## Resume after the benchmark
+
+Verify the registered run's completion marker before copying the SDK. Validate
+this port with scripts/gcc85-build.sh and the native proposal/signature/cache
+regressions using the matching compiler, sysroot, loader and runtime paths.
+Fetch the current c++17 head again, integrate any intervening changes and retain
+the validation evidence before merging perf/cpp17-attach-injection into c++17.
+The c++17 branch remains at 7add3a8 until that validation is complete.

@@ -7,6 +7,10 @@ bash benchmarks/attach/run-metadata.sh "$PWD" /tmp/attach-baseline
 ```
 
 Set `CXX` and `LLVM_CONFIG` for another matching supported LLVM installation.
+For an SDK profile, TRACER_BENCH_CXX_FLAGS and TRACER_BENCH_LINK_FLAGS accept
+space-separated trusted compiler/linker flags. Match the SDK sysroot, loader
+and runtime paths; GCC 8 filesystem users also need -lstdc++fs when linking
+the metadata/bootstrap helpers.
 The harness loads 0, 1, 8 and 16 copies of a generated shared library with
 10,000 function symbols and unwind records each. It records five discovery and
 mapping-validation samples, including the first sample. CSV module counts also

@@ -5,6 +5,10 @@ including separate first-in-process and subsequent injection timings.
 
 Build the fixture once on an isolated Linux x86-64 host with Clang 21:
 
+This branch builds the fixture in C++17 mode. For an SDK profile, set CXX to
+the matching compiler and use TRACER_BENCH_CXX_FLAGS/TRACER_BENCH_LINK_FLAGS for
+the same sysroot, loader and runtime paths used by the tracer.
+
 ```bash
 bash benchmarks/injection/build-fixture.sh /tmp/injection-fixture
 ```
