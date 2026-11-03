@@ -113,6 +113,54 @@ retained shared-context package. Omitting it follows the native service's
 isolated source-lineage behavior. The client never assumes a local callback
 path exists remotely.
 
+`compile_options` is an ordered list of compiler arguments for resolving and
+compiling the callback. Pass it to either `resolve_probe()` or `inject()`;
+`inject()` carries the same options through resolution and `AddProbe`, and
+`add_probe()` preserves options already stored in the `ProbeSpec`. Include
+directories and any header/compilation-database paths are interpreted on the
+server host. For example, use `compile_options=["-std=c++17", "-I/opt/app/include"]`
+when the target headers live under `/opt/app/include` on that host.
+Supported options cover include paths (`-I`, `-isystem`, `-iquote`, `-include`),
+defines and undefines (`-D`, `-U`), language standard (`-std=`), common warning,
+optimization and debug flags. A compilation database can also supply its
+matching `--sysroot` and `--gcc-toolchain` settings; target triples are checked
+against the engine. Unsupported compiler flags are rejected before preflight
+or installation.
+Forced `-include` headers are processed in source order during preparation;
+preflight does not execute their global initializers.
+Standard-library types such as `std::string` use the real target headers, and
+their ABI macros (including `_GLIBCXX_USE_CXX11_ABI`) must match the target
+build. For example, a `std::string` callback validated against a target built
+with the new libstdc++ ABI must keep `_GLIBCXX_USE_CXX11_ABI=1`.
+Object arguments and by-value results are exposed as borrowed references during
+the callback; a returned object is available only during POST.
+
+Use `validate_probe()` to check callback source without installing a probe:
+
+```python
+report = tracer.validate_probe(
+    session.id,
+    "Calculator::add(int, int)",
+    Path("interceptor.cpp").read_text(),
+    compile_options=["-std=c++17", "-I/opt/app/include"],
+    level="compile",
+)
+if not report.success:
+    for diagnostic in report.diagnostics:
+        print(diagnostic.stage, diagnostic.file, diagnostic.line,
+              diagnostic.column, diagnostic.message)
+```
+
+`level="syntax"` checks parsing and reports source diagnostics. The default,
+`level="compile"`, also generates and checks the complete callback wrapper and
+its method bindings. Validation does not install or execute callbacks and
+does not run callback global initializers. The report includes `success`,
+diagnostics with severity, stage and source location, and the ordered compiler
+options supplied for the callback. The console exposes the same operation as
+`probe validate SESSION SELECTOR --callback FILE --level compile`; add repeated
+`--compile-option ARG` flags for ordered compiler arguments. Validation requires
+the server's additive `ValidateProbe` RPC.
+
 `resolve_probe(session_id, selector, ...)` returns the complete inferred spec
 without installing it. `add_probe(session_id, spec)` accepts a generated
 `clang_tracer.messages.ProbeSpec`, preserving access to every advanced field

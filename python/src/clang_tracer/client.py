@@ -68,6 +68,31 @@ def _name_filters(names: Iterable[str]) -> tuple[str, ...]:
     return values
 
 
+def _compiler_options(options: Iterable[str]) -> tuple[str, ...]:
+    if isinstance(options, str):
+        raise ValueError("compile_options must be an iterable of strings")
+    values: list[str] = []
+    total = 0
+    try:
+        for option in options:
+            if len(values) == 128:
+                raise ValueError("compile_options accepts at most 128 options")
+            if not isinstance(option, str) or not option or "\0" in option:
+                raise ValueError(
+                    "each compile option must be nonempty and contain no NUL"
+                )
+            size = len(option.encode("utf-8"))
+            if size > 4096:
+                raise ValueError("each compile option must be at most 4096 UTF-8 bytes")
+            total += size + 1
+            if total > 65536:
+                raise ValueError("compile_options must total at most 64 KiB")
+            values.append(option)
+    except TypeError as error:
+        raise ValueError("compile_options must be an iterable of strings") from error
+    return tuple(values)
+
+
 @dataclass(frozen=True)
 class ServerStatus:
     endpoint: str
@@ -212,14 +237,73 @@ class Client:
         module: str = "",
         debug_max_entries: int = 0,
         debug_max_depth: int = 0,
+        compile_options: Iterable[str] = (),
     ) -> pb.ProbeSpec:
         """Infer the signature from DWARF on the server (requires ResolveProbe)."""
+        options = _compiler_options(compile_options)
         response: pb.ProbeSpec = self.stub.ResolveProbe(
             pb.ResolveProbeRequest(
                 session_id=session_id,
                 selector=selector,
                 include_headers=list(include_headers),
                 compilation_database=compilation_database,
+                module=module,
+                debug_max_entries=uint(debug_max_entries, 64, "debug_max_entries"),
+                debug_max_depth=uint(debug_max_depth, 32, "debug_max_depth"),
+                compile_options=options,
+            ),
+            timeout=self.timeout,
+        )
+        response.compile_options[:] = options
+        return response
+
+    def validate_probe(
+        self,
+        session_id: str,
+        selector: str,
+        callback_source: str,
+        *,
+        include_headers: Iterable[str] = (),
+        compilation_database: str = "",
+        compile_options: Iterable[str] = (),
+        level: str = "compile",
+        module: str = "",
+        debug_max_entries: int = 0,
+        debug_max_depth: int = 0,
+    ) -> pb.ValidationReport:
+        """Check callback syntax or full compilation without installing it."""
+        if not isinstance(session_id, str) or not session_id or "\0" in session_id:
+            raise ValueError("session_id must be a nonempty string without NUL")
+        if not isinstance(selector, str) or not selector or "\0" in selector:
+            raise ValueError("selector must be a nonempty string without NUL")
+        if (
+            not isinstance(callback_source, str)
+            or not callback_source.strip()
+            or "\0" in callback_source
+        ):
+            raise ValueError("callback_source must be nonempty and contain no NUL")
+        if len(callback_source.encode("utf-8")) > 64 * 1024:
+            raise ValueError("callback_source exceeds 64 KiB")
+        if level not in {"syntax", "compile"}:
+            raise ValueError("level must be 'syntax' or 'compile'")
+        if not isinstance(compilation_database, str) or "\0" in compilation_database:
+            raise ValueError("compilation_database must be a string without NUL")
+        if not isinstance(module, str) or "\0" in module:
+            raise ValueError("module must be a string without NUL")
+        options = _compiler_options(compile_options)
+        response: pb.ValidationReport = self.stub.ValidateProbe(
+            pb.ValidateProbeRequest(
+                session_id=session_id,
+                selector=selector,
+                callback_source=callback_source,
+                include_headers=list(include_headers),
+                compilation_database=compilation_database,
+                compile_options=options,
+                level=(
+                    pb.ValidateProbeRequest.SYNTAX
+                    if level == "syntax"
+                    else pb.ValidateProbeRequest.COMPILE
+                ),
                 module=module,
                 debug_max_entries=uint(debug_max_entries, 64, "debug_max_entries"),
                 debug_max_depth=uint(debug_max_depth, 32, "debug_max_depth"),
@@ -254,6 +338,7 @@ class Client:
         module: str = "",
         debug_max_entries: int = 0,
         debug_max_depth: int = 0,
+        compile_options: Iterable[str] = (),
     ) -> pb.Probe:
         """Compile and install a C++ interceptor without manual ABI declarations.
 
@@ -267,6 +352,7 @@ class Client:
         uint(stack_depth, 32, "stack_depth")
         if stack_depth > 64:
             raise ValueError("stack_depth must be between 0 and 64")
+        options = _compiler_options(compile_options)
         spec = self.resolve_probe(
             session_id,
             selector,
@@ -275,7 +361,9 @@ class Client:
             module=module,
             debug_max_entries=debug_max_entries,
             debug_max_depth=debug_max_depth,
+            compile_options=options,
         )
+        spec.compile_options[:] = options
         spec.callback_source = callback_source
         spec.stack_depth = stack_depth
         spec.include_internal_stack_frames = include_internal_stack_frames

@@ -15,6 +15,31 @@ target_compile_options(tracer_context_engine PRIVATE -Wall -Wextra -Wpedantic)
 # preemption points when this archive is linked into the injected agent.
 target_compile_options(tracer_context_engine PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
 if(BUILD_TESTING)
+  foreach(result_kind IN ITEMS scalar object)
+    add_executable(inferred-${result_kind}-cpp17 tests/inferred_call_checks.cpp)
+    set_target_properties(inferred-${result_kind}-cpp17 PROPERTIES CXX_STANDARD 17
+      CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+    target_include_directories(inferred-${result_kind}-cpp17 PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(inferred-${result_kind}-cpp17 PRIVATE -UNDEBUG)
+    if(result_kind STREQUAL "object")
+      target_compile_definitions(inferred-${result_kind}-cpp17 PRIVATE
+        TRACER_TEST_OBJECT_RESULT=1)
+    endif()
+    add_test(NAME inferred_${result_kind}_cpp17 COMMAND inferred-${result_kind}-cpp17)
+  endforeach()
+  add_executable(legacy-call-cpp17 tests/legacy_call_checks.cpp)
+  set_target_properties(legacy-call-cpp17 PROPERTIES CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+  target_include_directories(legacy-call-cpp17 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_options(legacy-call-cpp17 PRIVATE -UNDEBUG)
+  add_test(NAME legacy_call_cpp17 COMMAND legacy-call-cpp17)
+  add_executable(bool-call-cpp17 tests/bool_call_checks.cpp)
+  set_target_properties(bool-call-cpp17 PROPERTIES CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+  target_include_directories(bool-call-cpp17 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_options(bool-call-cpp17 PRIVATE -UNDEBUG)
+  add_test(NAME bool_call_cpp17 COMMAND bool-call-cpp17)
   foreach(profile native fallback)
     add_executable(compat-${profile}-tests tests/compat_checks.cpp)
     target_link_libraries(compat-${profile}-tests PRIVATE tracer_compat)

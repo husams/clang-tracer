@@ -56,6 +56,7 @@ struct Options {
   std::string selector;
   std::string positional_selector;
   std::string compdb;
+  std::string module;
   std::string return_type;
   std::string callback;
   std::string context_field;
@@ -63,11 +64,15 @@ struct Options {
   bool listen = false;
   std::vector<std::string> argument_types;
   std::vector<std::string> sources;
+  std::vector<std::string> compile_options;
+  std::string validation_level = "compile";
   std::uint64_t pid = 0;
   std::uint64_t probe_id = 0;
   std::uint64_t count = 0;
   std::uint64_t after = 0;
   std::uint64_t timeout_seconds = 0;
+  std::uint64_t debug_max_entries = 0;
+  std::uint32_t debug_max_depth = 0;
   unsigned stack_depth = 0;
   bool stack_application_only = true;
   bool stack_application_only_set = false;
@@ -81,6 +86,7 @@ struct Options {
   bool direct = false;
   bool compdb_set = false;
   bool return_set = false;
+  bool validation_level_set = false;
 };
 
 std::uint64_t parse_number(const std::string &text, std::string_view name,
@@ -121,7 +127,15 @@ Options parse_options(int argc, char **argv) {
              "COMMAND\n"
              "  attach PID\n"
              "  trace PID 'C++ declaration' --callback FILE "
-             "[--include HEADER ...] [--compdb FILE|DIR] [--stack DEPTH]\n"
+             "[--include HEADER ...] [--compdb FILE|DIR] "
+             "[--compile-option ARG ...] [--stack DEPTH]\n"
+             "  resolve PID 'C++ selector' [--module PATH] "
+             "[--debug-max-entries N] [--debug-max-depth N] "
+             "[--compile-option ARG ...]\n"
+             "  validate PID 'C++ declaration' --callback FILE "
+             "[--include HEADER ...] [--compdb FILE|DIR] "
+             "[--module PATH] [--level syntax|compile] "
+             "[--compile-option ARG ...]\n"
              "    --stack-application-only true|false (default: true); false "
              "shows all frames.\n"
              "    --callback-print-arguments true|false (default: false)\n"
@@ -173,6 +187,9 @@ Options parse_options(int argc, char **argv) {
                a == "--arg" || a == "--callback" || a == "--count" ||
                a == "--after" || a == "--timeout" || a == "--include" ||
                a == "--compdb" || a == "--stack" ||
+               a == "--compile-option" || a == "--level" ||
+               a == "--module" || a == "--debug-max-entries" ||
+               a == "--debug-max-depth" ||
                a == "--stack-application-only" ||
                a == "--callback-print-arguments" ||
                a == "--callback-print-result" || a == "--context-field") {
@@ -228,6 +245,20 @@ Options parse_options(int argc, char **argv) {
           throw std::runtime_error("provide one nonempty --compdb FILE|DIR");
         o.compdb = v;
         o.compdb_set = true;
+      } else if (a == "--compile-option") {
+        o.compile_options.push_back(v);
+      } else if (a == "--level") {
+        if (v != "syntax" && v != "compile")
+          throw std::runtime_error("--level must be syntax or compile");
+        o.validation_level = v;
+        o.validation_level_set = true;
+      } else if (a == "--module") {
+        o.module = v;
+      } else if (a == "--debug-max-entries") {
+        o.debug_max_entries = parse_number(v, a, std::numeric_limits<std::uint64_t>::max(), true);
+      } else if (a == "--debug-max-depth") {
+        o.debug_max_depth = static_cast<std::uint32_t>(
+            parse_number(v, a, std::numeric_limits<std::uint32_t>::max(), true));
       } else {
         o.sources.push_back(v);
       }
@@ -235,12 +266,16 @@ Options parse_options(int argc, char **argv) {
       throw std::runtime_error("unknown option: " + a);
     } else if (o.command.empty()) {
       o.command = a;
-    } else if ((o.command == "attach" || o.command == "trace" || o.command == "events" ||
-                o.command == "drain" || o.command == "detach" || o.command == "remove") &&
+    } else if ((o.command == "attach" || o.command == "trace" ||
+                o.command == "validate" || o.command == "resolve" ||
+                o.command == "events" || o.command == "drain" ||
+                o.command == "detach" || o.command == "remove") &&
                o.pid == 0) {
       o.direct = true;
       o.pid = parse_number(a, "PID", std::numeric_limits<std::uint32_t>::max());
-    } else if (o.command == "trace" && o.pid != 0 && o.positional_selector.empty()) {
+    } else if ((o.command == "trace" || o.command == "validate" ||
+                o.command == "resolve") &&
+               o.pid != 0 && o.positional_selector.empty()) {
       o.direct = true;
       o.positional_selector = a;
     } else if (o.command == "remove" && o.probe_id == 0) {
@@ -311,6 +346,26 @@ Options parse_options(int argc, char **argv) {
       throw std::runtime_error("positional C++ declarations cannot be combined "
                                "with --return or --arg");
     }
+  } else if (o.command == "validate") {
+    if (o.pid == 0 || o.callback.empty() || o.positional_selector.empty())
+      throw std::runtime_error("validate requires PID, a C++ selector, and --callback FILE");
+    if (o.compdb_set && o.sources.empty())
+      throw std::runtime_error("--compdb requires --include HEADER");
+    if (o.return_set || !o.argument_types.empty() || o.stack_depth ||
+        o.stack_application_only_set || o.callback_print_set) {
+      throw std::runtime_error(
+          "--return, --arg, and trace display options are only valid for trace");
+    }
+  } else if (o.command == "resolve") {
+    if (o.pid == 0 || o.positional_selector.empty())
+      throw std::runtime_error("resolve requires PID and a C++ selector");
+    if (o.compdb_set && o.sources.empty())
+      throw std::runtime_error("--compdb requires --include HEADER");
+    if (!o.callback.empty() || o.return_set || !o.argument_types.empty() ||
+        o.stack_depth || o.stack_application_only_set || o.callback_print_set) {
+      throw std::runtime_error(
+          "callback, ABI, and trace display options are not valid for resolve");
+    }
   } else if (o.command == "attach" || o.command == "events" ||
              o.command == "detach") {
     if (o.pid == 0) {
@@ -323,6 +378,8 @@ Options parse_options(int argc, char **argv) {
   } else if (o.command != "list" && o.command != "drain") {
     throw std::runtime_error("unknown command: " + o.command);
   }
+  if (o.validation_level_set && o.command != "validate")
+    throw std::runtime_error("--level is only valid for validate");
   if (o.command != "events" && o.command != "drain" &&
       (o.count_set || o.after_set)) {
     throw std::runtime_error(
@@ -346,8 +403,10 @@ Options parse_options(int argc, char **argv) {
       !o.selector.empty() || !o.return_type.empty() ||
       !o.argument_types.empty() || !o.callback.empty() ||
       !o.positional_selector.empty() || o.compdb_set || !o.sources.empty() || o.stack_depth ||
+      !o.module.empty() || o.debug_max_entries || o.debug_max_depth ||
+      !o.compile_options.empty() ||
       o.stack_application_only_set || o.callback_print_set;
-  if (o.command != "trace" && has_trace_args) {
+  if (o.command != "trace" && o.command != "validate" && o.command != "resolve" && has_trace_args) {
     throw std::runtime_error("--function, --method, --return, --arg, and "
                              "--callback are only valid for trace");
   }
@@ -360,6 +419,9 @@ api::ValueType parse_type(std::string s, bool allow_void) {
   }
   if (s == "int32") {
     return api::INT32;
+  }
+  if (s == "bool") {
+    return api::BOOL;
   }
   if (s == "int64") {
     return api::INT64;
@@ -381,7 +443,7 @@ api::ValueType parse_type(std::string s, bool allow_void) {
   }
   throw std::runtime_error(
       "invalid type '" + s +
-      "' (expected int32, int64, uint64, float32, float64, pointer" +
+      "' (expected bool, int32, int64, uint64, float32, float64, pointer" +
       (allow_void ? ", or void" : "") + ")");
 }
 
@@ -549,6 +611,8 @@ std::string value_text(const api::Value &v) {
   case api::INT32:
     type = "int32";
     return std::string(type) + ":" + std::to_string(v.signed_value());
+  case api::BOOL:
+    return std::string("bool:") + (v.signed_value() ? "true" : "false");
   case api::INT64:
     type = "int64";
     return std::string(type) + ":" + std::to_string(v.signed_value());
@@ -1197,9 +1261,13 @@ int run_direct(const Options &o, api::Tracer::Stub &stub) {
       const auto name = o.positional_selector.empty()
                             ? o.selector.substr(o.selector.find(' ') + 1)
                             : o.positional_selector;
+      tracer::client::DebugLookupOptions debug_options;
+      debug_options.module = o.module;
+      debug_options.max_entries = o.debug_max_entries;
+      debug_options.max_depth = o.debug_max_depth;
       resolved = std::make_unique<tracer::client::ResolvedCallable>(
           tracer::client::resolve_debug_callable(
-              static_cast<std::uint32_t>(o.pid), name));
+              static_cast<std::uint32_t>(o.pid), name, debug_options));
       if (!o.positional_selector.empty()) {
         declaration = resolved->declaration;
       } else {
@@ -1258,6 +1326,86 @@ int run_direct(const Options &o, api::Tracer::Stub &stub) {
     event_session = find_attached_session(
         stub, static_cast<std::uint32_t>(o.pid), unary_timeout);
   }
+  if (o.command == "resolve") {
+    api::ResolveProbeRequest req;
+    req.set_session_id(session.id());
+    req.set_selector(o.positional_selector);
+    req.set_compilation_database(o.compdb);
+    req.set_module(o.module);
+    req.set_debug_max_entries(o.debug_max_entries);
+    req.set_debug_max_depth(o.debug_max_depth);
+    for (const auto &header : o.sources)
+      req.add_include_headers(std::filesystem::absolute(header).string());
+    for (const auto &option : o.compile_options)
+      req.add_compile_options(option);
+    api::ProbeSpec res;
+    grpc::ClientContext ctx;
+    set_deadline(ctx, unary_timeout);
+    require_ok(stub.ResolveProbe(&ctx, req, &res), "ResolveProbe");
+    if (binary) {
+      binary->write(res);
+    } else {
+      text.line("resolved selector=", res.debug_info().selector(),
+                " symbol=", res.symbol(), " kind=", res.signature().kind(),
+                " result=", res.signature().result(),
+                " arguments=", res.signature().arguments_size());
+      for (const auto &option : res.compile_options())
+        text.line("compile_option=", option);
+      if (res.has_header_context())
+        text.line("header_context=", res.header_context().inference(),
+                  " directory=", res.header_context().working_directory());
+    }
+    return 0;
+  }
+  if (o.command == "validate") {
+    std::ifstream callback(o.callback);
+    if (!callback)
+      throw std::runtime_error("cannot open callback file: " + o.callback);
+    std::string source;
+    char ch;
+    while (callback.get(ch)) {
+      if (source.size() == 64 * 1024)
+        throw std::runtime_error("callback file exceeds 64 KiB");
+      source.push_back(ch);
+    }
+    if (source.empty() || source.find('\0') != std::string::npos)
+      throw std::runtime_error("callback source must be nonempty and contain no NUL");
+    api::ValidateProbeRequest req;
+    req.set_session_id(session.id());
+    req.set_selector(o.positional_selector);
+    req.set_callback_source(source);
+    req.set_compilation_database(o.compdb);
+    req.set_module(o.module);
+    req.set_debug_max_entries(o.debug_max_entries);
+    req.set_debug_max_depth(o.debug_max_depth);
+    req.set_level(o.validation_level == "syntax"
+                      ? api::ValidateProbeRequest::SYNTAX
+                      : api::ValidateProbeRequest::COMPILE);
+    for (const auto &header : o.sources)
+      req.add_include_headers(std::filesystem::absolute(header).string());
+    for (const auto &option : o.compile_options)
+      req.add_compile_options(option);
+    api::ValidationReport res;
+    grpc::ClientContext ctx;
+    set_deadline(ctx, unary_timeout);
+    require_ok(stub.ValidateProbe(&ctx, req, &res), "ValidateProbe");
+    if (binary) {
+      binary->write(res);
+    } else {
+      text.line("validation success=", res.success() ? "true" : "false",
+                " level=", res.level() == api::ValidateProbeRequest::SYNTAX
+                                ? "syntax"
+                                : "compile");
+      for (const auto &diagnostic : res.diagnostics())
+        text.line(diagnostic.file(), diagnostic.line() ? ":" : "",
+                  diagnostic.line() ? std::to_string(diagnostic.line()) : "",
+                  diagnostic.column() ? ":" : "",
+                  diagnostic.column() ? std::to_string(diagnostic.column()) : "",
+                  diagnostic.file().empty() ? "" : ": ", diagnostic.severity(),
+                  " [", diagnostic.stage(), "] ", diagnostic.message());
+    }
+    return res.success() ? 0 : 1;
+  }
   if (o.command == "trace") {
     api::AddProbeRequest req;
     req.set_session_id(session.id());
@@ -1268,6 +1416,8 @@ int run_direct(const Options &o, api::Tracer::Stub &stub) {
       set_callback_package_location(*spec, o);
       for (const auto &header : o.sources)
         spec->add_include_headers(std::filesystem::absolute(header).string());
+      for (const auto &option : o.compile_options)
+        spec->add_compile_options(option);
       tracer::client::resolve_header_context(*spec, o.compdb);
     } else {
       const auto split = o.selector.find(' ');
@@ -1281,6 +1431,8 @@ int run_direct(const Options &o, api::Tracer::Stub &stub) {
       for (const auto &t : o.argument_types) {
         sig->add_arguments(parse_type(t, false));
       }
+      for (const auto &option : o.compile_options)
+        spec->add_compile_options(option);
     }
     spec->set_stack_depth(o.stack_depth);
     spec->set_include_internal_stack_frames(!o.stack_application_only);

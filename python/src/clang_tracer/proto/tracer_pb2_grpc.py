@@ -45,6 +45,11 @@ class TracerStub(object):
                 request_serializer=tracer__pb2.ResolveProbeRequest.SerializeToString,
                 response_deserializer=tracer__pb2.ProbeSpec.FromString,
                 _registered_method=True)
+        self.ValidateProbe = channel.unary_unary(
+                '/clangtracer.v1.Tracer/ValidateProbe',
+                request_serializer=tracer__pb2.ValidateProbeRequest.SerializeToString,
+                response_deserializer=tracer__pb2.ValidationReport.FromString,
+                _registered_method=True)
         self.AddProbe = channel.unary_unary(
                 '/clangtracer.v1.Tracer/AddProbe',
                 request_serializer=tracer__pb2.AddProbeRequest.SerializeToString,
@@ -105,6 +110,12 @@ class TracerServicer(object):
     def ResolveProbe(self, request, context):
         """Resolve on the tracing host, so remote clients need no target files.
         """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ValidateProbe(self, request, context):
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -176,6 +187,11 @@ def add_TracerServicer_to_server(servicer, server):
                     servicer.ResolveProbe,
                     request_deserializer=tracer__pb2.ResolveProbeRequest.FromString,
                     response_serializer=tracer__pb2.ProbeSpec.SerializeToString,
+            ),
+            'ValidateProbe': grpc.unary_unary_rpc_method_handler(
+                    servicer.ValidateProbe,
+                    request_deserializer=tracer__pb2.ValidateProbeRequest.FromString,
+                    response_serializer=tracer__pb2.ValidationReport.SerializeToString,
             ),
             'AddProbe': grpc.unary_unary_rpc_method_handler(
                     servicer.AddProbe,
@@ -278,6 +294,33 @@ class Tracer(object):
             '/clangtracer.v1.Tracer/ResolveProbe',
             tracer__pb2.ResolveProbeRequest.SerializeToString,
             tracer__pb2.ProbeSpec.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ValidateProbe(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/ValidateProbe',
+            tracer__pb2.ValidateProbeRequest.SerializeToString,
+            tracer__pb2.ValidationReport.FromString,
             options,
             channel_credentials,
             insecure,

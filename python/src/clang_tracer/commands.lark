@@ -10,6 +10,7 @@
       | "detach" value?                                 -> detach
       | "probe" "inject" value injection_option*        -> inject
       | "probe" "resolve" value resolution_option*      -> resolve
+      | "probe" "validate" value validation_option*     -> validate
       | "probe" "add" value                             -> add_spec
       | "probe" "remove" INT                            -> remove
       | "events" watch_option*                          -> events
@@ -39,9 +40,13 @@
                  | resolution_option
 ?resolution_option: "--include" value                    -> include_headers
                   | "--compdb" value                    -> compilation_database
+                  | "--compile-option" value            -> compile_options
                   | "--module" value                    -> module
                   | "--debug-max-entries" INT            -> debug_max_entries
                   | "--debug-max-depth" INT              -> debug_max_depth
+?validation_option: "--callback" value                   -> callback
+                  | "--level" value                     -> validation_level
+                  | resolution_option
 ?watch_option: "--count" INT                             -> count
              | stream_option
 ?record_option: "--sqlite"                              -> sqlite

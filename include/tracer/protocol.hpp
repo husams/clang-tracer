@@ -60,7 +60,8 @@ enum class ValueType : std::uint32_t {
   Float32 = 5,
   Float64 = 6,
   Pointer = 7,
-  Object = 8
+  Object = 8,
+  Bool = 9
 };
 enum class CallableKind : std::uint32_t {
   Unspecified = 0,
@@ -162,7 +163,19 @@ struct Request {
   std::uint32_t context_native_pid = 0;
   std::uint64_t context_process_start_time = 0;
 };
+
+// Side-effect-free callback preparation request. The agent reads a serialized
+// ProbeSpec from spec_path and writes a serialized ValidationReport to
+// report_path. Level values match clangtracer::v1::ValidateProbeRequest.
+struct ValidationRequest {
+  std::uint32_t version = kBootstrapVersion;
+  std::uint32_t level = 0; // 0=full compilation, 1=syntax only.
+  char spec_path[1024]{};
+  char report_path[1024]{};
+  char error[2048]{};
+};
 } // namespace tracer
 
 extern "C" int tracer_agent_start(tracer::Request *request);
 extern "C" int tracer_agent_stop(tracer::Request *request);
+extern "C" int tracer_agent_validate(tracer::ValidationRequest *request);

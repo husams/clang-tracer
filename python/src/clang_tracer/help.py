@@ -195,6 +195,7 @@ HELP_TOPICS = {
         usage=(
             'probe resolve "C++ selector" [OPTIONS]',
             'probe inject "C++ selector" --callback FILE [OPTIONS]',
+            'probe validate "C++ selector" --callback FILE [OPTIONS]',
             "probe add SPEC.pbtxt",
             "probe remove PROBE_ID",
         ),
@@ -212,6 +213,10 @@ HELP_TOPICS = {
             (
                 "--compdb PATH",
                 "Compilation database directory or JSON file on the server host.",
+            ),
+            (
+                "--compile-option ARG",
+                "Append one compiler option; may be repeated in order.",
             ),
         ),
         examples=('probe resolve "Calculator::multiply(int, int) const"',),
@@ -240,9 +245,13 @@ HELP_TOPICS = {
                 "Include the original result in trace snapshots and display.",
             ),
             ("--include HEADER", "Header on the server host; may be repeated."),
-            ("--module TEXT", "Mapped path or path substring to search explicitly."),
+            (
+                "--compile-option ARG",
+                "Append one compiler option; may be repeated in order.",
+            ),
             ("--debug-max-entries N", "Optional DWARF entry limit; 0 is unlimited."),
             ("--debug-max-depth N", "Optional DWARF depth limit; 0 is unlimited."),
+            ("--module TEXT", "Mapped path or path substring to search explicitly."),
             (
                 "--compdb PATH",
                 "Compilation database directory or JSON file on the server host.",
@@ -273,6 +282,29 @@ HELP_TOPICS = {
         "Install a full Protobuf ProbeSpec parsed from a text-format file.",
         usage=("probe add SPEC.pbtxt",),
         examples=("probe add /tmp/probe.pbtxt",),
+    ),
+    "probe validate": HelpTopic(
+        "probe validate",
+        "Check callback syntax or complete compilation without installing a probe.",
+        usage=('probe validate "C++ selector" --callback FILE [OPTIONS]',),
+        options=(
+            ("--callback FILE", "Callback source file on the console host."),
+            (
+                "--level syntax|compile",
+                "Select syntax parsing or full code generation and symbol checks.",
+            ),
+            ("--include HEADER", "Header on the server host; may be repeated."),
+            ("--compdb PATH", "Compilation database on the server host."),
+            (
+                "--compile-option ARG",
+                "Append one compiler option; may be repeated in order.",
+            ),
+            ("--debug-max-entries N", "Optional DWARF entry limit; 0 is unlimited."),
+            ("--debug-max-depth N", "Optional DWARF depth limit; 0 is unlimited."),
+            ("--module TEXT", "Mapped path or path substring to search explicitly."),
+        ),
+        examples=('probe validate "add(int, int)" --callback interceptor.cpp',),
+        notes=("Validation does not install a probe or execute callback code.",),
     ),
     "probe remove": HelpTopic(
         "probe remove",

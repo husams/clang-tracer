@@ -18,6 +18,7 @@ class ValueType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     FLOAT64: _ClassVar[ValueType]
     POINTER: _ClassVar[ValueType]
     OBJECT: _ClassVar[ValueType]
+    BOOL: _ClassVar[ValueType]
 
 class CallableKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -30,6 +31,12 @@ class TracePhase(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     TRACE_PHASE_UNSPECIFIED: _ClassVar[TracePhase]
     PRE: _ClassVar[TracePhase]
     POST: _ClassVar[TracePhase]
+
+class RecordCallingConvention(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    RECORD_CALLING_CONVENTION_UNSPECIFIED: _ClassVar[RecordCallingConvention]
+    RECORD_PASS_BY_VALUE: _ClassVar[RecordCallingConvention]
+    RECORD_PASS_BY_REFERENCE: _ClassVar[RecordCallingConvention]
 VALUE_TYPE_UNSPECIFIED: ValueType
 VOID: ValueType
 INT32: ValueType
@@ -39,12 +46,16 @@ FLOAT32: ValueType
 FLOAT64: ValueType
 POINTER: ValueType
 OBJECT: ValueType
+BOOL: ValueType
 CALLABLE_KIND_UNSPECIFIED: CallableKind
 FUNCTION: CallableKind
 METHOD: CallableKind
 TRACE_PHASE_UNSPECIFIED: TracePhase
 PRE: TracePhase
 POST: TracePhase
+RECORD_CALLING_CONVENTION_UNSPECIFIED: RecordCallingConvention
+RECORD_PASS_BY_VALUE: RecordCallingConvention
+RECORD_PASS_BY_REFERENCE: RecordCallingConvention
 
 class Signature(_message.Message):
     __slots__ = ("kind", "result", "arguments")
@@ -143,7 +154,7 @@ class DebugTypeLevel(_message.Message):
     def __init__(self, kind: _Optional[_Union[DebugTypeLevel.Kind, str]] = ..., byte_size: _Optional[int] = ..., dwarf_encoding: _Optional[int] = ..., is_const: bool = ..., is_volatile: bool = ...) -> None: ...
 
 class DebugInfo(_message.Message):
-    __slots__ = ("module", "device", "inode", "file_size", "modification_ns", "change_ns", "selector", "record_name", "record_size", "fields", "receiver_volatile", "arguments", "entry_virtual_address", "entry_size", "runtime_entry")
+    __slots__ = ("module", "device", "inode", "file_size", "modification_ns", "change_ns", "selector", "record_name", "record_size", "fields", "receiver_volatile", "arguments", "entry_virtual_address", "entry_size", "runtime_entry", "result_object_type", "result_cpp_type", "result_is_object_value", "result_is_reference", "result_pass_by_reference", "methods", "record_pass_by_reference", "record_is_opaque", "record_alignment", "record_calling_convention")
     MODULE_FIELD_NUMBER: _ClassVar[int]
     DEVICE_FIELD_NUMBER: _ClassVar[int]
     INODE_FIELD_NUMBER: _ClassVar[int]
@@ -159,6 +170,16 @@ class DebugInfo(_message.Message):
     ENTRY_VIRTUAL_ADDRESS_FIELD_NUMBER: _ClassVar[int]
     ENTRY_SIZE_FIELD_NUMBER: _ClassVar[int]
     RUNTIME_ENTRY_FIELD_NUMBER: _ClassVar[int]
+    RESULT_OBJECT_TYPE_FIELD_NUMBER: _ClassVar[int]
+    RESULT_CPP_TYPE_FIELD_NUMBER: _ClassVar[int]
+    RESULT_IS_OBJECT_VALUE_FIELD_NUMBER: _ClassVar[int]
+    RESULT_IS_REFERENCE_FIELD_NUMBER: _ClassVar[int]
+    RESULT_PASS_BY_REFERENCE_FIELD_NUMBER: _ClassVar[int]
+    METHODS_FIELD_NUMBER: _ClassVar[int]
+    RECORD_PASS_BY_REFERENCE_FIELD_NUMBER: _ClassVar[int]
+    RECORD_IS_OPAQUE_FIELD_NUMBER: _ClassVar[int]
+    RECORD_ALIGNMENT_FIELD_NUMBER: _ClassVar[int]
+    RECORD_CALLING_CONVENTION_FIELD_NUMBER: _ClassVar[int]
     module: str
     device: int
     inode: int
@@ -174,7 +195,45 @@ class DebugInfo(_message.Message):
     entry_virtual_address: int
     entry_size: int
     runtime_entry: int
-    def __init__(self, module: _Optional[str] = ..., device: _Optional[int] = ..., inode: _Optional[int] = ..., file_size: _Optional[int] = ..., modification_ns: _Optional[int] = ..., change_ns: _Optional[int] = ..., selector: _Optional[str] = ..., record_name: _Optional[str] = ..., record_size: _Optional[int] = ..., fields: _Optional[_Iterable[_Union[DebugField, _Mapping]]] = ..., receiver_volatile: bool = ..., arguments: _Optional[_Iterable[_Union[DebugArgument, _Mapping]]] = ..., entry_virtual_address: _Optional[int] = ..., entry_size: _Optional[int] = ..., runtime_entry: _Optional[int] = ...) -> None: ...
+    result_object_type: DebugInfo
+    result_cpp_type: str
+    result_is_object_value: bool
+    result_is_reference: bool
+    result_pass_by_reference: bool
+    methods: _containers.RepeatedCompositeFieldContainer[DebugMethod]
+    record_pass_by_reference: bool
+    record_is_opaque: bool
+    record_alignment: int
+    record_calling_convention: RecordCallingConvention
+    def __init__(self, module: _Optional[str] = ..., device: _Optional[int] = ..., inode: _Optional[int] = ..., file_size: _Optional[int] = ..., modification_ns: _Optional[int] = ..., change_ns: _Optional[int] = ..., selector: _Optional[str] = ..., record_name: _Optional[str] = ..., record_size: _Optional[int] = ..., fields: _Optional[_Iterable[_Union[DebugField, _Mapping]]] = ..., receiver_volatile: bool = ..., arguments: _Optional[_Iterable[_Union[DebugArgument, _Mapping]]] = ..., entry_virtual_address: _Optional[int] = ..., entry_size: _Optional[int] = ..., runtime_entry: _Optional[int] = ..., result_object_type: _Optional[_Union[DebugInfo, _Mapping]] = ..., result_cpp_type: _Optional[str] = ..., result_is_object_value: bool = ..., result_is_reference: bool = ..., result_pass_by_reference: bool = ..., methods: _Optional[_Iterable[_Union[DebugMethod, _Mapping]]] = ..., record_pass_by_reference: bool = ..., record_is_opaque: bool = ..., record_alignment: _Optional[int] = ..., record_calling_convention: _Optional[_Union[RecordCallingConvention, str]] = ...) -> None: ...
+
+class DebugMethod(_message.Message):
+    __slots__ = ("name", "linkage_symbol", "cpp_result_type", "cpp_parameter_types", "is_const", "is_volatile", "is_static", "is_virtual", "runtime_entry", "calling_convention", "ref_qualifier", "is_variadic")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    LINKAGE_SYMBOL_FIELD_NUMBER: _ClassVar[int]
+    CPP_RESULT_TYPE_FIELD_NUMBER: _ClassVar[int]
+    CPP_PARAMETER_TYPES_FIELD_NUMBER: _ClassVar[int]
+    IS_CONST_FIELD_NUMBER: _ClassVar[int]
+    IS_VOLATILE_FIELD_NUMBER: _ClassVar[int]
+    IS_STATIC_FIELD_NUMBER: _ClassVar[int]
+    IS_VIRTUAL_FIELD_NUMBER: _ClassVar[int]
+    RUNTIME_ENTRY_FIELD_NUMBER: _ClassVar[int]
+    CALLING_CONVENTION_FIELD_NUMBER: _ClassVar[int]
+    REF_QUALIFIER_FIELD_NUMBER: _ClassVar[int]
+    IS_VARIADIC_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    linkage_symbol: str
+    cpp_result_type: str
+    cpp_parameter_types: _containers.RepeatedScalarFieldContainer[str]
+    is_const: bool
+    is_volatile: bool
+    is_static: bool
+    is_virtual: bool
+    runtime_entry: int
+    calling_convention: int
+    ref_qualifier: str
+    is_variadic: bool
+    def __init__(self, name: _Optional[str] = ..., linkage_symbol: _Optional[str] = ..., cpp_result_type: _Optional[str] = ..., cpp_parameter_types: _Optional[_Iterable[str]] = ..., is_const: bool = ..., is_volatile: bool = ..., is_static: bool = ..., is_virtual: bool = ..., runtime_entry: _Optional[int] = ..., calling_convention: _Optional[int] = ..., ref_qualifier: _Optional[str] = ..., is_variadic: bool = ...) -> None: ...
 
 class DebugArgument(_message.Message):
     __slots__ = ("index", "cpp_type", "is_reference", "is_object_value", "object_type")
@@ -201,7 +260,7 @@ class HeaderContext(_message.Message):
     def __init__(self, working_directory: _Optional[str] = ..., compiler_arguments: _Optional[_Iterable[str]] = ..., inference: _Optional[str] = ...) -> None: ...
 
 class ProbeSpec(_message.Message):
-    __slots__ = ("symbol", "signature", "callback_source", "receiver", "receiver_unavailable_reason", "debug_info", "argument_names", "include_headers", "header_context", "stack_depth", "include_internal_stack_frames", "print_arguments", "print_result", "callback_package_path")
+    __slots__ = ("symbol", "signature", "callback_source", "receiver", "receiver_unavailable_reason", "debug_info", "argument_names", "include_headers", "header_context", "stack_depth", "include_internal_stack_frames", "print_arguments", "print_result", "callback_package_path", "compile_options")
     SYMBOL_FIELD_NUMBER: _ClassVar[int]
     SIGNATURE_FIELD_NUMBER: _ClassVar[int]
     CALLBACK_SOURCE_FIELD_NUMBER: _ClassVar[int]
@@ -216,6 +275,7 @@ class ProbeSpec(_message.Message):
     PRINT_ARGUMENTS_FIELD_NUMBER: _ClassVar[int]
     PRINT_RESULT_FIELD_NUMBER: _ClassVar[int]
     CALLBACK_PACKAGE_PATH_FIELD_NUMBER: _ClassVar[int]
+    COMPILE_OPTIONS_FIELD_NUMBER: _ClassVar[int]
     symbol: str
     signature: Signature
     callback_source: str
@@ -230,7 +290,8 @@ class ProbeSpec(_message.Message):
     print_arguments: bool
     print_result: bool
     callback_package_path: str
-    def __init__(self, symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., callback_source: _Optional[str] = ..., receiver: _Optional[_Union[ReceiverContext, _Mapping]] = ..., receiver_unavailable_reason: _Optional[str] = ..., debug_info: _Optional[_Union[DebugInfo, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., stack_depth: _Optional[int] = ..., include_internal_stack_frames: bool = ..., print_arguments: bool = ..., print_result: bool = ..., callback_package_path: _Optional[str] = ...) -> None: ...
+    compile_options: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., callback_source: _Optional[str] = ..., receiver: _Optional[_Union[ReceiverContext, _Mapping]] = ..., receiver_unavailable_reason: _Optional[str] = ..., debug_info: _Optional[_Union[DebugInfo, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., stack_depth: _Optional[int] = ..., include_internal_stack_frames: bool = ..., print_arguments: bool = ..., print_result: bool = ..., callback_package_path: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class AttachRequest(_message.Message):
     __slots__ = ("pid",)
@@ -275,7 +336,7 @@ class AddProbeRequest(_message.Message):
     def __init__(self, session_id: _Optional[str] = ..., spec: _Optional[_Union[ProbeSpec, _Mapping]] = ...) -> None: ...
 
 class ResolveProbeRequest(_message.Message):
-    __slots__ = ("session_id", "selector", "include_headers", "compilation_database", "module", "debug_max_entries", "debug_max_depth")
+    __slots__ = ("session_id", "selector", "include_headers", "compilation_database", "module", "debug_max_entries", "debug_max_depth", "compile_options")
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     SELECTOR_FIELD_NUMBER: _ClassVar[int]
     INCLUDE_HEADERS_FIELD_NUMBER: _ClassVar[int]
@@ -283,6 +344,7 @@ class ResolveProbeRequest(_message.Message):
     MODULE_FIELD_NUMBER: _ClassVar[int]
     DEBUG_MAX_ENTRIES_FIELD_NUMBER: _ClassVar[int]
     DEBUG_MAX_DEPTH_FIELD_NUMBER: _ClassVar[int]
+    COMPILE_OPTIONS_FIELD_NUMBER: _ClassVar[int]
     session_id: str
     selector: str
     include_headers: _containers.RepeatedScalarFieldContainer[str]
@@ -290,7 +352,66 @@ class ResolveProbeRequest(_message.Message):
     module: str
     debug_max_entries: int
     debug_max_depth: int
-    def __init__(self, session_id: _Optional[str] = ..., selector: _Optional[str] = ..., include_headers: _Optional[_Iterable[str]] = ..., compilation_database: _Optional[str] = ..., module: _Optional[str] = ..., debug_max_entries: _Optional[int] = ..., debug_max_depth: _Optional[int] = ...) -> None: ...
+    compile_options: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, session_id: _Optional[str] = ..., selector: _Optional[str] = ..., include_headers: _Optional[_Iterable[str]] = ..., compilation_database: _Optional[str] = ..., module: _Optional[str] = ..., debug_max_entries: _Optional[int] = ..., debug_max_depth: _Optional[int] = ..., compile_options: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class ValidateProbeRequest(_message.Message):
+    __slots__ = ("session_id", "selector", "callback_source", "include_headers", "compilation_database", "compile_options", "level", "module", "debug_max_entries", "debug_max_depth")
+    class Level(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = ()
+        COMPILE: _ClassVar[ValidateProbeRequest.Level]
+        SYNTAX: _ClassVar[ValidateProbeRequest.Level]
+    COMPILE: ValidateProbeRequest.Level
+    SYNTAX: ValidateProbeRequest.Level
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    SELECTOR_FIELD_NUMBER: _ClassVar[int]
+    CALLBACK_SOURCE_FIELD_NUMBER: _ClassVar[int]
+    INCLUDE_HEADERS_FIELD_NUMBER: _ClassVar[int]
+    COMPILATION_DATABASE_FIELD_NUMBER: _ClassVar[int]
+    COMPILE_OPTIONS_FIELD_NUMBER: _ClassVar[int]
+    LEVEL_FIELD_NUMBER: _ClassVar[int]
+    MODULE_FIELD_NUMBER: _ClassVar[int]
+    DEBUG_MAX_ENTRIES_FIELD_NUMBER: _ClassVar[int]
+    DEBUG_MAX_DEPTH_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    selector: str
+    callback_source: str
+    include_headers: _containers.RepeatedScalarFieldContainer[str]
+    compilation_database: str
+    compile_options: _containers.RepeatedScalarFieldContainer[str]
+    level: ValidateProbeRequest.Level
+    module: str
+    debug_max_entries: int
+    debug_max_depth: int
+    def __init__(self, session_id: _Optional[str] = ..., selector: _Optional[str] = ..., callback_source: _Optional[str] = ..., include_headers: _Optional[_Iterable[str]] = ..., compilation_database: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ..., level: _Optional[_Union[ValidateProbeRequest.Level, str]] = ..., module: _Optional[str] = ..., debug_max_entries: _Optional[int] = ..., debug_max_depth: _Optional[int] = ...) -> None: ...
+
+class ValidationDiagnostic(_message.Message):
+    __slots__ = ("stage", "severity", "file", "line", "column", "message")
+    STAGE_FIELD_NUMBER: _ClassVar[int]
+    SEVERITY_FIELD_NUMBER: _ClassVar[int]
+    FILE_FIELD_NUMBER: _ClassVar[int]
+    LINE_FIELD_NUMBER: _ClassVar[int]
+    COLUMN_FIELD_NUMBER: _ClassVar[int]
+    MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    stage: str
+    severity: str
+    file: str
+    line: int
+    column: int
+    message: str
+    def __init__(self, stage: _Optional[str] = ..., severity: _Optional[str] = ..., file: _Optional[str] = ..., line: _Optional[int] = ..., column: _Optional[int] = ..., message: _Optional[str] = ...) -> None: ...
+
+class ValidationReport(_message.Message):
+    __slots__ = ("success", "level", "effective_options", "diagnostics")
+    SUCCESS_FIELD_NUMBER: _ClassVar[int]
+    LEVEL_FIELD_NUMBER: _ClassVar[int]
+    EFFECTIVE_OPTIONS_FIELD_NUMBER: _ClassVar[int]
+    DIAGNOSTICS_FIELD_NUMBER: _ClassVar[int]
+    success: bool
+    level: ValidateProbeRequest.Level
+    effective_options: _containers.RepeatedScalarFieldContainer[str]
+    diagnostics: _containers.RepeatedCompositeFieldContainer[ValidationDiagnostic]
+    def __init__(self, success: bool = ..., level: _Optional[_Union[ValidateProbeRequest.Level, str]] = ..., effective_options: _Optional[_Iterable[str]] = ..., diagnostics: _Optional[_Iterable[_Union[ValidationDiagnostic, _Mapping]]] = ...) -> None: ...
 
 class Probe(_message.Message):
     __slots__ = ("id", "session_id", "symbol", "signature", "active", "callback_address", "entry_address", "original_bytes_restored", "agent_dropped_events", "callback_errors")

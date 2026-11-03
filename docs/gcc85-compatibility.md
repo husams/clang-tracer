@@ -77,7 +77,7 @@ application with `cmake/toolchains/gcc85-sdk.cmake`, `RelWithDebInfo`, and
 gRPC, protobuf and gRPC's bundled dependencies are built as static PIC archives.
 Use a fresh scratch directory when switching from the earlier shared-dependency
 recipe. The injected agent localizes their symbols with a linker version script
-and exports only `tracer_agent_start`, `tracer_agent_stop` and
+and exports only `tracer_agent_start`, `tracer_agent_stop`, `tracer_agent_validate` and
 `tracer_context_pthread_create_detour`. Callback JIT helpers are registered by
 address directly in each interpreter, without relying on ELF exports or LLVM's
 process-wide symbol registry. This prevents the application's protobuf/gRPC
@@ -203,8 +203,9 @@ remains available. The legacy stripped-admission regression checks that
 rejection and subsequent progress, while the modern-runtime regression still
 checks successful stripped busy-main admission.
 
-Entry instruction relocation and the supported C++ object/signature subset
-are unchanged. In particular, this work does not add arbitrary RIP-relative
-entry relocation or GCC 8 by-value class ABI evidence. Positive test fixtures
+Entry instruction relocation retains its existing restrictions. The separate
+[signature Interceptor implementation](signature-interceptor-progress.md) adds
+ABI-proven object forwarding; the SDK profile alone does not establish GCC 8
+by-value class ABI evidence or arbitrary RIP-relative entry relocation. Positive test fixtures
 use stack locals before global accesses so compiler PIE defaults do not turn
 them into tests of that separate entry-relocation limitation.

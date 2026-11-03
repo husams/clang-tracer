@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -23,6 +24,8 @@
 
 namespace tracer {
 namespace {
+
+std::atomic<std::uint64_t> validation_sequence{1};
 
 std::uint64_t read_process_start(std::uint32_t pid) {
   std::ifstream input("/proc/" + std::to_string(pid) + "/stat");
@@ -187,7 +190,7 @@ void Session::attach() {
   const auto start_offset = agent_path_.size() + 16;
   const auto stop_offset = start_offset + 32;
   const auto detour_offset = stop_offset + 32;
-  const auto scratch_size = detour_offset + 64;
+  const auto scratch_size = detour_offset + 96;
   try {
     scratch = process.remote_allocate(scratch_size);
     auto put = [&](std::uintptr_t offset, const std::string &text) {
@@ -211,6 +214,9 @@ void Session::attach() {
         process.remote_call(dlsym_address, {handle, start_name}, 2);
     const auto stop =
         process.remote_call(dlsym_address, {handle, stop_name}, 2);
+    const auto validate_name = put(detour_offset + 48, "tracer_agent_validate");
+    const auto validate =
+        process.remote_call(dlsym_address, {handle, validate_name}, 2);
     const auto pthread_detour =
         process.remote_call(dlsym_address, {handle, detour_name}, 2);
     if (!start || !stop) {
@@ -222,6 +228,7 @@ void Session::attach() {
     process.detach();
     start_address_ = start;
     stop_address_ = stop;
+    validate_address_ = validate;
     pthread_detour_address_ = pthread_detour;
   } catch (...) {
     if (process.unsafe()) {
@@ -234,6 +241,74 @@ void Session::attach() {
         process.remote_free(scratch, scratch_size);
       } catch (...) {
       }
+    }
+    throw;
+  }
+}
+
+clangtracer::v1::ValidationReport
+Session::validate_probe(const clangtracer::v1::ProbeSpec &spec,
+                        const std::string &source_directory,
+                        clangtracer::v1::ValidateProbeRequest::Level level) {
+  std::lock_guard lock(mutex_);
+  check_identity_locked();
+  if (state_ != clangtracer::v1::Session::ATTACHED) {
+    throw std::runtime_error("session is not attached");
+  }
+  if (!validate_address_) {
+    throw std::runtime_error("loaded native agent does not support validation");
+  }
+  const auto sequence = validation_sequence.fetch_add(1);
+  const auto stem = source_directory + "/" + id_ + "-validate-" +
+                    std::to_string(sequence);
+  const auto spec_path = stem + ".pb";
+  const auto report_path = stem + ".report.pb";
+  write_file_0600(spec_path, spec.SerializeAsString());
+  struct RemoveFiles {
+    std::string first;
+    std::string second;
+    ~RemoveFiles() {
+      ::unlink(first.c_str());
+      ::unlink(second.c_str());
+    }
+  } remove_files{spec_path, report_path};
+
+  injector::Process process;
+  const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
+  std::uintptr_t remote_request = 0;
+  try {
+    attach_process(process, deadline);
+    remote_request = process.remote_allocate(sizeof(ValidationRequest));
+    ValidationRequest request{};
+    request.level = static_cast<std::uint32_t>(level);
+    copy_field(request.spec_path, spec_path, "validation spec path");
+    copy_field(request.report_path, report_path, "validation report path");
+    process.remote_write(remote_request, &request, sizeof(request));
+    const auto status = process.remote_call(validate_address_, {remote_request}, 1);
+    process.remote_read(remote_request, &request, sizeof(request));
+    process.remote_free(remote_request, sizeof(ValidationRequest));
+    remote_request = 0;
+    process.detach();
+    if (status != 0) {
+      throw std::runtime_error(std::string("agent validation failed: ") +
+                               request.error);
+    }
+    std::ifstream report_input(report_path, std::ios::binary);
+    clangtracer::v1::ValidationReport report;
+    if (!report_input || !report.ParseFromIstream(&report_input)) {
+      throw std::runtime_error("agent returned an invalid validation report");
+    }
+    return report;
+  } catch (...) {
+    if (remote_request) {
+      try {
+        process.remote_free(remote_request, sizeof(ValidationRequest));
+      } catch (...) {
+      }
+    }
+    if (process.unsafe()) {
+      unsafe_target_ = true;
+      set_failed_locked("validation recovery is uncertain; target remains stopped");
     }
     throw;
   }

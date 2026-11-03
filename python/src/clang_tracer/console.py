@@ -103,6 +103,7 @@ def build_completer() -> NestedCompleter:
             "probe": {
                 "inject": None,
                 "resolve": None,
+                "validate": None,
                 "add": None,
                 "remove": None,
             },
@@ -118,6 +119,7 @@ def build_completer() -> NestedCompleter:
                 "probe": {
                     "inject": None,
                     "resolve": None,
+                    "validate": None,
                     "add": None,
                     "remove": None,
                 },
@@ -274,6 +276,15 @@ class Console:
             )
             self.emit(
                 self.client.inject(selected, str(arguments[0]), source, **options)
+            )
+        elif name == "validate":
+            selected = self.selected()
+            source = Path(options.pop("callback")).read_text()
+            options["level"] = options.pop("validation_level", "compile")
+            self.emit(
+                self.client.validate_probe(
+                    selected, str(arguments[0]), source, **options
+                )
             )
         elif name == "add_spec":
             selected = self.selected()

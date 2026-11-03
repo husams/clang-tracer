@@ -1,4 +1,5 @@
 #include <string>
+#include <string_view>
 
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Interpreter/Interpreter.h>
@@ -19,6 +20,16 @@ llvm::Expected<CompiledContextModule>
 compile_context_module(const std::string &source,
                        const std::vector<std::string> &compiler_arguments,
                        const std::vector<std::string> &state_types) {
+  for (const auto &argument : compiler_arguments) {
+    const std::string_view value(argument);
+    if (value == "-include" || value.rfind("-include", 0) == 0 ||
+        value == "-imacros" || value.rfind("-imacros", 0) == 0) {
+      return llvm::createStringError(
+          llvm::inconvertibleErrorCode(),
+          "forced headers must be lowered into controlled source before "
+          "creating a context interpreter");
+    }
+  }
   if (auto error = initialize_private_context_target()) {
     return std::move(error);
   }

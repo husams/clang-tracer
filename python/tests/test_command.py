@@ -48,6 +48,19 @@ from clang_tracer.command import (
             ("add(int, int)",),
             {"callback": "λ test.cpp", "stack_depth": 24, "print_result": True},
         ),
+        (
+            'probe validate "add(int, int)" --callback interceptor.cpp '
+            '--level syntax --compile-option "-std=c++17" '
+            '--compile-option "-DORDER=1" --include /srv/add.hpp',
+            "validate",
+            ("add(int, int)",),
+            {
+                "callback": "interceptor.cpp",
+                "validation_level": "syntax",
+                "compile_options": ["-std=c++17", "-DORDER=1"],
+                "include_headers": ["/srv/add.hpp"],
+            },
+        ),
         ("probe add spec.pbtxt", "add_spec", ("spec.pbtxt",), {}),
         ("probe remove 7", "remove", (7,), {}),
         (
@@ -117,6 +130,7 @@ def test_grammar(text, name, arguments, options):
         "attach 12 trailing",
         "attach 1; sessions",
         'probe inject "add(int)"',
+        'probe validate "add(int)"',
         'probe inject "unterminated',
         "events --typo 3",
         "events --pid 1 --pid 2",
