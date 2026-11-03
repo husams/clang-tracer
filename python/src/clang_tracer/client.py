@@ -21,7 +21,8 @@ if TYPE_CHECKING:
 
 
 _CHANNEL_OPTIONS = [
-    ("grpc.max_receive_message_length", 32 * 1024 * 1024),
+    ("grpc.max_receive_message_length", -1),
+    ("grpc.max_send_message_length", -1),
     ("grpc.use_local_subchannel_pool", 1),
     ("grpc.initial_reconnect_backoff_ms", 100),
     ("grpc.max_reconnect_backoff_ms", 500),
@@ -164,30 +165,31 @@ class Client:
             ).sessions
         )
 
+    def list_modules(self, session_id: str) -> list[str]:
+        """List current eligible mapped application image paths on the server."""
+        response = self.stub.ListModules(
+            pb.ListModulesRequest(session_id=session_id), timeout=self.timeout
+        )
+        return list(response.modules)
+
     def list_symbols(
         self,
         session_id: str,
         *,
         query: str = "",
         module: str = "",
-        page_size: int = 100,
+        page_size: int | None = None,
         page_token: str = "",
     ) -> pb.ListSymbolsResponse:
-        """List mapped function/method DWARF entries on the target host."""
+        """List all mapped callables; a positive page_size enables pagination."""
         if not isinstance(session_id, str) or not session_id or "\0" in session_id:
             raise ValueError("session_id must be a nonempty string without NUL")
         for label, value in (("query", query), ("module", module)):
             if not isinstance(value, str) or "\0" in value:
                 raise ValueError(f"{label} must be a string without NUL")
-            if len(value.encode("utf-8")) > 4096:
-                raise ValueError(f"{label} exceeds 4096 UTF-8 bytes")
         if not isinstance(page_token, str) or "\0" in page_token:
             raise ValueError("page_token must be a string without NUL")
-        if len(page_token.encode("utf-8")) > 65536:
-            raise ValueError("page_token exceeds 65536 UTF-8 bytes")
-        size = uint(page_size, 32, "page_size", 1)
-        if size > 500:
-            raise ValueError("page_size must be between 1 and 500")
+        size = 0 if page_size is None else uint(page_size, 32, "page_size")
         response: pb.ListSymbolsResponse = self.stub.ListSymbols(
             pb.ListSymbolsRequest(
                 session_id=session_id,
@@ -207,6 +209,9 @@ class Client:
         *,
         include_headers: Iterable[str] = (),
         compilation_database: str = "",
+        module: str = "",
+        debug_max_entries: int = 0,
+        debug_max_depth: int = 0,
     ) -> pb.ProbeSpec:
         """Infer the signature from DWARF on the server (requires ResolveProbe)."""
         response: pb.ProbeSpec = self.stub.ResolveProbe(
@@ -215,6 +220,9 @@ class Client:
                 selector=selector,
                 include_headers=list(include_headers),
                 compilation_database=compilation_database,
+                module=module,
+                debug_max_entries=uint(debug_max_entries, 64, "debug_max_entries"),
+                debug_max_depth=uint(debug_max_depth, 32, "debug_max_depth"),
             ),
             timeout=self.timeout,
         )
@@ -243,6 +251,9 @@ class Client:
         print_arguments: bool = False,
         print_result: bool = False,
         callback_package_path: str = "",
+        module: str = "",
+        debug_max_entries: int = 0,
+        debug_max_depth: int = 0,
     ) -> pb.Probe:
         """Compile and install a C++ interceptor without manual ABI declarations.
 
@@ -261,6 +272,9 @@ class Client:
             selector,
             include_headers=include_headers,
             compilation_database=compilation_database,
+            module=module,
+            debug_max_entries=debug_max_entries,
+            debug_max_depth=debug_max_depth,
         )
         spec.callback_source = callback_source
         spec.stack_depth = stack_depth

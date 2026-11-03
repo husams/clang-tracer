@@ -150,11 +150,27 @@ source files on the client. Functions without supported debug signatures are
 omitted. Listing a function does not bypass probe admission checks.
 
 `query` matches a case-sensitive substring of the C++ selector or linkage name;
-`module` matches a substring of the module path. Pages default to 100 entries,
-with a maximum of 500. Keep the same filters and page size when continuing with
+`module` matches a substring of the module path. Listing returns all matches by
+default (`page_size=None` or `0`). A positive `page_size` opts into pagination;
+the server imposes no page-size ceiling or discovery work budget. Keep the same
+filters and page size when continuing with
 `next_page_token`. Tokens are tied to the attached session and mapped images;
 restart the query if the process or its modules change. This operation requires
 a server supporting the `ListSymbols` RPC.
+
+`tracer.list_modules(session_id)` and console `modules` list the current mapped
+application image paths eligible for discovery. By default, probe resolution
+reads DWARF only in images whose ELF symbol tables list the requested symbol;
+unrelated images are not traversed. `module="/mapped/image"` (console
+`--module /mapped/image`) explicitly selects an exact absolute path, or use a
+path substring. Explicit selection also permits DWARF lookup without an ELF
+symbol-table match. The injected agent revalidates only the selected image.
+
+Debug traversal is unlimited by default. `resolve_probe()` and `inject()` accept
+`debug_max_entries` and `debug_max_depth`; zero means unlimited. The console
+accepts `--debug-max-entries N` and `--debug-max-depth N` on `probe resolve` and
+`probe inject`. If an opted-in limit is reached, increase it or pass zero;
+the server returns `RESOURCE_EXHAUSTED` with the relevant option name.
 
 ## Receiving and recording traces
 

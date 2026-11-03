@@ -27,6 +27,10 @@ class TracerService(rpc.TracerServicer):
             sessions=[pb.Session(id="s1", pid=123, state=pb.Session.ATTACHED)]
         )
 
+    def ListModules(self, request, context):
+        self.requests.append(request)
+        return pb.ListModulesResponse(modules=["/srv/target", "/srv/libexample.so"])
+
     def ResolveProbe(self, request, context):
         self.requests.append(request)
         return pb.ProbeSpec(

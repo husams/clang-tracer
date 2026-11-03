@@ -31,12 +31,18 @@ def test_public_control_and_injection(peer):
         print_arguments=True,
         print_result=True,
         callback_package_path="/srv/interceptor.cpp",
+        module="target",
+        debug_max_entries=2_000_001,
+        debug_max_depth=256,
     )
     assert probe.id == 7
     resolution, addition = service.requests[-2:]
     assert resolution.selector == "add(int, int)"
     assert list(resolution.include_headers) == ["/srv/add.hpp"]
     assert resolution.compilation_database == "/srv/build"
+    assert resolution.module == "target"
+    assert resolution.debug_max_entries == 2_000_001
+    assert resolution.debug_max_depth == 256
     assert addition.spec.stack_depth == 24
     assert addition.spec.print_arguments and addition.spec.print_result
     assert addition.spec.callback_package_path == "/srv/interceptor.cpp"
@@ -63,12 +69,45 @@ def test_list_symbols_uses_attached_session_and_returns_generated_page(peer):
     assert request.page_token == "opaque"
 
 
-@pytest.mark.parametrize("page_size", [-1, 501, True, 1.5])
+@pytest.mark.parametrize("page_size", [-1, 2**32, True, 1.5])
 def test_list_symbols_rejects_invalid_page_size(peer, page_size):
     client, service = peer
     with pytest.raises(ValueError):
         client.list_symbols("s1", page_size=page_size)
     assert not any(isinstance(item, pb.ListSymbolsRequest) for item in service.requests)
+
+
+@pytest.mark.parametrize("page_size", [None, 0, 501, 100_000, 2**32 - 1])
+def test_list_symbols_accepts_unlimited_and_large_pages(peer, page_size):
+    client, service = peer
+    client.list_symbols("s1", page_size=page_size)
+    assert service.requests[-1].page_size == (page_size or 0)
+
+
+def test_list_symbols_defaults_to_unlimited(peer):
+    client, service = peer
+    client.list_symbols("s1")
+    assert service.requests[-1].page_size == 0
+
+
+def test_list_modules_and_default_lookup_limits(peer):
+    client, service = peer
+    assert client.list_modules("s1") == ["/srv/target", "/srv/libexample.so"]
+    assert service.requests[-1].session_id == "s1"
+    client.resolve_probe("s1", "add")
+    request = service.requests[-1]
+    assert not request.module
+    assert request.debug_max_entries == request.debug_max_depth == 0
+
+
+def test_list_symbols_does_not_cap_filters_or_tokens(peer):
+    client, service = peer
+    client.list_symbols(
+        "s1", query="q" * 5000, module="m" * 5000, page_token="a" * 70000
+    )
+    assert len(service.requests[-1].query) == 5000
+    assert len(service.requests[-1].module) == 5000
+    assert len(service.requests[-1].page_token) == 70000
 
 
 def test_list_symbols_surfaces_old_server_unimplemented(peer, monkeypatch):
@@ -94,6 +133,7 @@ def test_all_public_rpcs_have_client_methods():
         "Detach": "detach",
         "ListSessions": "list_sessions",
         "ListSymbols": "list_symbols",
+        "ListModules": "list_modules",
         "WatchEvents": "watch_events",
         "ResolveProbe": "resolve_probe",
         "ReadEvents": "read_events",
@@ -288,6 +328,8 @@ def test_owned_channel_uses_bounded_local_reconnect_policy(monkeypatch):
     assert created["options"]["grpc.initial_reconnect_backoff_ms"] == 100
     assert "grpc.min_reconnect_backoff_ms" not in created["options"]
     assert created["options"]["grpc.max_reconnect_backoff_ms"] == 500
+    assert created["options"]["grpc.max_receive_message_length"] == -1
+    assert created["options"]["grpc.max_send_message_length"] == -1
     caller_channel = Mock(spec=grpc.Channel)
     assert Client("127.0.0.1:50051", channel=caller_channel).channel is caller_channel
 
