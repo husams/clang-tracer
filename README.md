@@ -380,6 +380,9 @@ private to that injector, and the existing syntax/layout checks still run.
 Changed headers or include-search results invalidate the cache. Unsupported
 compiler profiles, unavailable cache storage, and headers with startup or
 shutdown effects use the original compilation path.
+With the GCC 8 runtime, only `cstdint` and `cstddef` are cached; the remaining
+headers stay textual to preserve compatibility and include order. The recorded
+C++20 cache speedup has not been established for this reduced prefix.
 
 Normal CLI verification covered non-exported free functions and methods in
 already-running PIE and fixed-address executables, plus a mapped shared library,
