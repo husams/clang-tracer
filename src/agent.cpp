@@ -79,6 +79,7 @@
 #include "context_agent_delivery.hpp"
 #include "context_analysis.hpp"
 #include "context_engine.hpp"
+#include "context_execution.hpp"
 #include "context_pthread_detour.hpp"
 #include "context_runtime.hpp"
 #include "context_stdlib.hpp"
@@ -4303,25 +4304,37 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
       interpreter_pch.reset();
     }
   }
-  auto created = clang::Interpreter::create(std::move(*compiler));
-  if (!created && interpreter_pch) {
-    llvm::consumeError(created.takeError());
-    tracer::callback_pch::disable(*interpreter_pch);
-    interpreter_pch.reset();
-    clang::IncrementalCompilerBuilder fallback_builder;
-    fallback_builder.SetCompilerArgs(args);
-    auto fallback_compiler = fallback_builder.CreateCpp();
-    if (!fallback_compiler) {
-      error = llvm::toString(fallback_compiler.takeError());
+  {
+    // Interpreter creation may initialize the PCH's initial header IR and
+    // start LLVM worker threads. Those are compiler workers, not application
+    // child tasks; do not associate them with an active shared context.
+    tracer::context_execution::Scope compiler_startup(
+        tracer::context_execution::Mode::LifecycleNoTrace);
+    if (!compiler_startup.entered()) {
+      error = "cannot suppress context propagation during interpreter "
+              "creation";
       return false;
     }
-    created = clang::Interpreter::create(std::move(*fallback_compiler));
+    auto created = clang::Interpreter::create(std::move(*compiler));
+    if (!created && interpreter_pch) {
+      llvm::consumeError(created.takeError());
+      tracer::callback_pch::disable(*interpreter_pch);
+      interpreter_pch.reset();
+      clang::IncrementalCompilerBuilder fallback_builder;
+      fallback_builder.SetCompilerArgs(args);
+      auto fallback_compiler = fallback_builder.CreateCpp();
+      if (!fallback_compiler) {
+        error = llvm::toString(fallback_compiler.takeError());
+        return false;
+      }
+      created = clang::Interpreter::create(std::move(*fallback_compiler));
+    }
+    if (!created) {
+      error = llvm::toString(created.takeError());
+      return false;
+    }
+    p.interpreter = std::move(*created);
   }
-  if (!created) {
-    error = llvm::toString(created.takeError());
-    return false;
-  }
-  p.interpreter = std::move(*created);
   if (!capture_orc_errors(p, error))
     return false;
   if (!bind_probe_symbols(*p.interpreter, specification, error)) {
