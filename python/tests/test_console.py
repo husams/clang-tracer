@@ -94,6 +94,17 @@ def test_symbols_command_defaults_to_unlimited(peer):
     assert service.requests[-1].page_size == 0
 
 
+def test_modules_command_uses_selected_session(peer, monkeypatch):
+    client, service = peer
+    console = Console(client, output=DummyOutput())
+    console.session_id = "s1"
+    emitted = []
+    monkeypatch.setattr(console, "emit", lambda value: emitted.append(value))
+    assert console.execute(parse_command("modules"))
+    assert service.requests[-1].session_id == "s1"
+    assert emitted == ["/srv/target", "/srv/libexample.so"]
+
+
 def test_symbols_next_page_command_preserves_filters_and_quotes(monkeypatch):
     client = Mock()
     client.list_symbols.return_value = pb.ListSymbolsResponse(next_page_token="t ok")

@@ -165,6 +165,13 @@ class Client:
             ).sessions
         )
 
+    def list_modules(self, session_id: str) -> list[str]:
+        """List current eligible mapped application image paths on the server."""
+        response = self.stub.ListModules(
+            pb.ListModulesRequest(session_id=session_id), timeout=self.timeout
+        )
+        return list(response.modules)
+
     def list_symbols(
         self,
         session_id: str,
@@ -202,6 +209,9 @@ class Client:
         *,
         include_headers: Iterable[str] = (),
         compilation_database: str = "",
+        module: str = "",
+        debug_max_entries: int = 0,
+        debug_max_depth: int = 0,
     ) -> pb.ProbeSpec:
         """Infer the signature from DWARF on the server (requires ResolveProbe)."""
         response: pb.ProbeSpec = self.stub.ResolveProbe(
@@ -210,6 +220,9 @@ class Client:
                 selector=selector,
                 include_headers=list(include_headers),
                 compilation_database=compilation_database,
+                module=module,
+                debug_max_entries=uint(debug_max_entries, 64, "debug_max_entries"),
+                debug_max_depth=uint(debug_max_depth, 32, "debug_max_depth"),
             ),
             timeout=self.timeout,
         )
@@ -238,6 +251,9 @@ class Client:
         print_arguments: bool = False,
         print_result: bool = False,
         callback_package_path: str = "",
+        module: str = "",
+        debug_max_entries: int = 0,
+        debug_max_depth: int = 0,
     ) -> pb.Probe:
         """Compile and install a C++ interceptor without manual ABI declarations.
 
@@ -256,6 +272,9 @@ class Client:
             selector,
             include_headers=include_headers,
             compilation_database=compilation_database,
+            module=module,
+            debug_max_entries=debug_max_entries,
+            debug_max_depth=debug_max_depth,
         )
         spec.callback_source = callback_source
         spec.stack_depth = stack_depth

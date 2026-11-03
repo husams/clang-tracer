@@ -275,16 +275,22 @@ class AddProbeRequest(_message.Message):
     def __init__(self, session_id: _Optional[str] = ..., spec: _Optional[_Union[ProbeSpec, _Mapping]] = ...) -> None: ...
 
 class ResolveProbeRequest(_message.Message):
-    __slots__ = ("session_id", "selector", "include_headers", "compilation_database")
+    __slots__ = ("session_id", "selector", "include_headers", "compilation_database", "module", "debug_max_entries", "debug_max_depth")
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     SELECTOR_FIELD_NUMBER: _ClassVar[int]
     INCLUDE_HEADERS_FIELD_NUMBER: _ClassVar[int]
     COMPILATION_DATABASE_FIELD_NUMBER: _ClassVar[int]
+    MODULE_FIELD_NUMBER: _ClassVar[int]
+    DEBUG_MAX_ENTRIES_FIELD_NUMBER: _ClassVar[int]
+    DEBUG_MAX_DEPTH_FIELD_NUMBER: _ClassVar[int]
     session_id: str
     selector: str
     include_headers: _containers.RepeatedScalarFieldContainer[str]
     compilation_database: str
-    def __init__(self, session_id: _Optional[str] = ..., selector: _Optional[str] = ..., include_headers: _Optional[_Iterable[str]] = ..., compilation_database: _Optional[str] = ...) -> None: ...
+    module: str
+    debug_max_entries: int
+    debug_max_depth: int
+    def __init__(self, session_id: _Optional[str] = ..., selector: _Optional[str] = ..., include_headers: _Optional[_Iterable[str]] = ..., compilation_database: _Optional[str] = ..., module: _Optional[str] = ..., debug_max_entries: _Optional[int] = ..., debug_max_depth: _Optional[int] = ...) -> None: ...
 
 class Probe(_message.Message):
     __slots__ = ("id", "session_id", "symbol", "signature", "active", "callback_address", "entry_address", "original_bytes_restored", "agent_dropped_events", "callback_errors")
@@ -333,6 +339,18 @@ class ListSessionsResponse(_message.Message):
     SESSIONS_FIELD_NUMBER: _ClassVar[int]
     sessions: _containers.RepeatedCompositeFieldContainer[Session]
     def __init__(self, sessions: _Optional[_Iterable[_Union[Session, _Mapping]]] = ...) -> None: ...
+
+class ListModulesRequest(_message.Message):
+    __slots__ = ("session_id",)
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    def __init__(self, session_id: _Optional[str] = ...) -> None: ...
+
+class ListModulesResponse(_message.Message):
+    __slots__ = ("modules",)
+    MODULES_FIELD_NUMBER: _ClassVar[int]
+    modules: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, modules: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class ListSymbolsRequest(_message.Message):
     __slots__ = ("session_id", "query", "module", "page_size", "page_token")

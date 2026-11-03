@@ -24,7 +24,7 @@ HELP_TOPICS = {
         usage=(
             "server start|status|stop",
             "attach PID | sessions | use SESSION | detach [SESSION]",
-            "symbols [OPTIONS]",
+            "modules | symbols [OPTIONS]",
             "probe resolve|inject|add|remove ...",
             "events [OPTIONS] | collect COUNT [OPTIONS] | record FILE COUNT [OPTIONS]",
             "drain DATABASE [--listen] [--count N] [STREAM_OPTIONS]",
@@ -144,6 +144,12 @@ HELP_TOPICS = {
         usage=("sessions",),
         examples=("sessions",),
     ),
+    "modules": HelpTopic(
+        "modules",
+        "List current eligible mapped application image paths on the server.",
+        usage=("modules",),
+        examples=("modules",),
+    ),
     "symbols": HelpTopic(
         "symbols",
         "List traceable functions and methods from eligible application "
@@ -197,9 +203,12 @@ HELP_TOPICS = {
     "probe resolve": HelpTopic(
         "probe resolve",
         "Ask the server to infer a C++ callable signature from target DWARF.",
-        usage=('probe resolve "C++ selector" [--include HEADER ...] [--compdb PATH]',),
+        usage=('probe resolve "C++ selector" [OPTIONS]',),
         options=(
             ("--include HEADER", "Add a header on the server host; may be repeated."),
+            ("--module TEXT", "Mapped path or path substring to search explicitly."),
+            ("--debug-max-entries N", "Optional DWARF entry limit; 0 is unlimited."),
+            ("--debug-max-depth N", "Optional DWARF depth limit; 0 is unlimited."),
             (
                 "--compdb PATH",
                 "Compilation database directory or JSON file on the server host.",
@@ -231,6 +240,9 @@ HELP_TOPICS = {
                 "Include the original result in trace snapshots and display.",
             ),
             ("--include HEADER", "Header on the server host; may be repeated."),
+            ("--module TEXT", "Mapped path or path substring to search explicitly."),
+            ("--debug-max-entries N", "Optional DWARF entry limit; 0 is unlimited."),
+            ("--debug-max-depth N", "Optional DWARF depth limit; 0 is unlimited."),
             (
                 "--compdb PATH",
                 "Compilation database directory or JSON file on the server host.",

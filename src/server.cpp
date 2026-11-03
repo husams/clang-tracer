@@ -1179,10 +1179,10 @@ public:
     return grpc::Status::OK;
   }
 
-  grpc::Status ResolveProbe(grpc::ServerContext *,
+  grpc::Status ResolveProbe(grpc::ServerContext *context,
                             const clangtracer::v1::ResolveProbeRequest *request,
                             clangtracer::v1::ProbeSpec *response) override {
-    if (request->selector().empty() || request->selector().size() > 4096 ||
+    if (request->selector().empty() ||
         request->selector().find('\0') != std::string::npos)
       return {grpc::StatusCode::INVALID_ARGUMENT, "invalid C++ selector"};
     auto session = find_session(request->session_id());
@@ -1193,17 +1193,28 @@ public:
     if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED)
       return {grpc::StatusCode::FAILED_PRECONDITION, "session is not attached"};
     try {
+      if (request->module().find('\0') != std::string::npos)
+        return {grpc::StatusCode::INVALID_ARGUMENT, "invalid debug module"};
+      client::DebugLookupOptions lookup;
+      lookup.module = request->module();
+      lookup.max_entries = request->debug_max_entries();
+      lookup.max_depth = request->debug_max_depth();
+      lookup.is_cancelled = [&] { return context->IsCancelled(); };
       auto resolved =
-          client::resolve_debug_callable(session->pid(), request->selector());
+          client::resolve_debug_callable(session->pid(), request->selector(), lookup);
       for (const auto &header : request->include_headers())
         resolved.spec.add_include_headers(header);
       client::resolve_header_context(resolved.spec,
                                      request->compilation_database());
       response->Swap(&resolved.spec);
       return grpc::Status::OK;
+    } catch (const client::DebugLookupLimit &error) {
+      return {grpc::StatusCode::RESOURCE_EXHAUSTED, error.what()};
     } catch (const std::invalid_argument &error) {
       return {grpc::StatusCode::INVALID_ARGUMENT, error.what()};
     } catch (const std::exception &error) {
+      if (context->IsCancelled())
+        return {grpc::StatusCode::CANCELLED, "debug lookup cancelled"};
       return status_for(error);
     }
   }
@@ -1327,6 +1338,25 @@ public:
       response->add_sessions()->CopyFrom(snapshot);
     }
     return grpc::Status::OK;
+  }
+
+  grpc::Status ListModules(
+      grpc::ServerContext *, const clangtracer::v1::ListModulesRequest *request,
+      clangtracer::v1::ListModulesResponse *response) override {
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    session->refresh_process_state();
+    if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "session is not attached"};
+    try {
+      for (const auto &path : client::list_debug_modules(session->pid()))
+        response->add_modules(path);
+      return grpc::Status::OK;
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
   }
 
   grpc::Status ListSymbols(
