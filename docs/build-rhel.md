@@ -134,9 +134,15 @@ resource lookup **in the process doing compilation**. For injected callbacks,
 set it in the target's environment before starting the target; setting it only
 on the tracing server does not change an existing target's environment.
 
-Shared LLVM, Clang, gRPC, Protobuf and other system dependencies must be available
+The injected agent requires PIC static gRPC, Protobuf and their transport
+dependencies so they can be isolated from copies already loaded by the target.
+Supply a static gRPC CMake package through `CMAKE_PREFIX_PATH` and set
+`-DProtobuf_USE_STATIC_LIBS=ON`; the GCC 8.5 recipe in
+[gcc85-compatibility.md](gcc85-compatibility.md) builds matching archives.
+The agent build rejects extra exports and shared transport dependencies.
+Shared LLVM, Clang and other remaining system dependencies must be available
 on the deployment host. The install adds a relative agent-library search path
-and CMake's external link paths; it does not bundle dependency libraries. For
+and CMake's external link paths; it does not copy dependency DSOs. For
 nonstandard dependency locations, configure their deployment locations using
 `CMAKE_INSTALL_RPATH` or arrange the loader environment on the host, including
 in the target process for the injected agent. Keep deployment ABI versions

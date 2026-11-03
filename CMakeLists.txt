@@ -74,7 +74,19 @@ target_include_directories(clang_tracer_agent PRIVATE include ${TRACER_PROTO_DIR
 target_compile_definitions(clang_tracer_agent PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
 target_link_libraries(clang_tracer_agent PRIVATE tracer_context_engine tracer_context_analysis tracer_proto clang-cpp LLVM ${CMAKE_DL_LIBS} Threads::Threads)
 target_compile_options(clang_tracer_agent PRIVATE -Wall -Wextra -Wpedantic)
-target_link_options(clang_tracer_agent PRIVATE "LINKER:--no-undefined")
+# Localize archive definitions as well as symbols emitted by agent sources.
+# --exclude-libs,ALL would also hide the required pthread detour entry point
+# from tracer_context_engine; the version script preserves that exact export.
+target_link_options(clang_tracer_agent PRIVATE
+  "LINKER:--no-undefined,-Bsymbolic,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/agent_exports.map")
+set_property(TARGET clang_tracer_agent APPEND PROPERTY LINK_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/agent_exports.map
+  ${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckAgentSymbols.cmake)
+add_custom_command(TARGET clang_tracer_agent POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -DAGENT=$<TARGET_FILE:clang_tracer_agent>
+    -DNM=${CMAKE_NM} -DREADELF=${CMAKE_READELF}
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckAgentSymbols.cmake
+  VERBATIM)
 
 add_executable(clang-tracer-server src/main.cpp src/server.cpp src/session.cpp src/injector.cpp src/admission.cpp
   src/debug_resolver.cpp src/header_context.cpp)
@@ -149,6 +161,38 @@ endif()
 
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME agent_symbol_isolation
+    COMMAND ${CMAKE_COMMAND} -DAGENT=$<TARGET_FILE:clang_tracer_agent>
+      -DNM=${CMAKE_NM} -DREADELF=${CMAKE_READELF}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckAgentSymbols.cmake)
+  add_executable(trace-collision-target tests/fixtures/target.cpp
+    tests/fixtures/dependency_collision.cpp)
+  set_target_properties(trace-collision-target PROPERTIES ENABLE_EXPORTS ON)
+  target_link_libraries(trace-collision-target PRIVATE Threads::Threads)
+  target_compile_options(trace-collision-target PRIVATE -O0 -fno-omit-frame-pointer
+    -fcf-protection=none)
+  add_test(NAME grpc_agent_dependency_collision
+    COMMAND server-integration
+      --server $<TARGET_FILE:clang-tracer-server>
+      --agent $<TARGET_FILE:clang_tracer_agent>
+      --target $<TARGET_FILE:trace-collision-target>
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/collision-test-results)
+  set_tests_properties(agent_symbol_isolation PROPERTIES TIMEOUT 30)
+  set_tests_properties(grpc_agent_dependency_collision PROPERTIES TIMEOUT 120)
+  add_test(NAME grpc_agent_shared_dependency_collision
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/class_interceptor_integration.py
+      --server $<TARGET_FILE:clang-tracer-server>
+      --client $<TARGET_FILE:clang-tracer>
+      --agent $<TARGET_FILE:clang_tracer_agent>
+      --target $<TARGET_FILE:trace-collision-target>
+      --threaded-target $<TARGET_FILE:trace-threaded-target>
+      --protoc $<TARGET_FILE:protobuf::protoc>
+      --proto ${CMAKE_CURRENT_SOURCE_DIR}/proto/tracer.proto
+      --compdb ${CMAKE_CURRENT_BINARY_DIR}
+      --source ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/target.cpp
+      --threaded-source ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/threaded/target.cpp
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/collision-class-results)
+  set_tests_properties(grpc_agent_shared_dependency_collision PROPERTIES TIMEOUT 360)
   add_executable(runtime-identity-tests tests/runtime_identity_checks.cpp src/runtime_identity.cpp)
   target_include_directories(runtime-identity-tests PRIVATE src)
   target_link_libraries(runtime-identity-tests PRIVATE tracer_compat Threads::Threads ${CMAKE_DL_LIBS})
