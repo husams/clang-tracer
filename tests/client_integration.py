@@ -190,6 +190,46 @@ def main() -> int:
             require(f"pid: {target.pid}\n" in attach_text, "Attach response returned the wrong PID")
             require("state: ATTACHED" in attach_text, "Attach response is not ATTACHED")
 
+            invalid_callback = output_dir / "invalid-interceptor.cpp"
+            write_text(invalid_callback, "struct Interceptor {\n  void pre(\n")
+            validation = subprocess.run(
+                [str(args.client), "--endpoint", endpoint, "validate", str(target.pid),
+                 "traced_work(int)", "--callback", str(invalid_callback), "--level", "syntax",
+                 "--module", str(args.target), "--debug-max-entries", "2000001",
+                 "--debug-max-depth", "256"],
+                capture_output=True,
+                timeout=20,
+                check=False,
+            )
+            validation_output = (validation.stdout + validation.stderr).decode(
+                "utf-8", errors="replace"
+            )
+            require(validation.returncode == 1,
+                    f"failed callback validation exited {validation.returncode}: {validation_output}")
+            require("validation success=false" in validation_output and ":2:" in validation_output,
+                    f"syntax diagnostic omitted its source location: {validation_output}")
+
+            valid_callback = output_dir / "valid-interceptor.cpp"
+            write_text(valid_callback,
+                       "class Interceptor { public: void pre(const Call&) {} };\n")
+            validation = subprocess.run(
+                [str(args.client), "--endpoint", endpoint, "validate", str(target.pid),
+                 "traced_work(int)", "--callback", str(valid_callback), "--level", "compile"],
+                capture_output=True,
+                timeout=20,
+                check=False,
+            )
+            validation_output = (validation.stdout + validation.stderr).decode(
+                "utf-8", errors="replace"
+            )
+            require(validation.returncode == 0 and "validation success=true" in validation_output,
+                    f"valid callback compilation failed: {validation_output}")
+            after_validation = output_dir / "after-validation.pb"
+            run_client(args.client, endpoint, list_request, after_validation, "list")
+            sessions = decode_file(args.protoc, args.proto, "ListSessionsResponse", after_validation)[0]
+            require("probes {" not in sessions,
+                    "side-effect-free validation installed a target probe")
+
             callback = ('extern "C" long long trace_callback(const TraceContext& context) '
                         '{ return context.arguments[0].signed_value * 100 + 17; }\n')
             add_request = requests / "add.textproto"

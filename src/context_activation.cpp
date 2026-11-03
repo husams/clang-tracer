@@ -1278,19 +1278,28 @@ ContextActivationGeneration::ContextActivationGeneration(
       requires_stack_(requires_stack) {}
 
 ContextActivationResult
-activate_context_source(const ContextActivationRequest &request,
-                        ContextRegistry &registry) {
+prepare_context_source(const ContextActivationRequest &request,
+                       ContextRegistry *registry, bool preflight,
+                       bool syntax_only) {
   ContextActivationResult result;
   const auto fail = [&](std::string message) {
     result.error = std::move(message);
     return result;
   };
+  auto lineage_id = request.source_lineage_id;
+  const bool missing_lineage = std::all_of(
+      lineage_id.begin(), lineage_id.end(),
+      [](std::uint8_t byte) { return byte == 0; });
+  if (preflight && missing_lineage) {
+    // This identity is used only while validating derived schemas. It is never
+    // published to the context registry or retained after preflight returns.
+    lineage_id = {0x43, 0x54, 0x50, 0x52, 0x45, 0x46, 0x4c, 0x49,
+                  0x47, 0x48, 0x54, 0x31, 0x00, 0x00, 0x00, 0x01};
+  }
   if (request.source.empty() || request.compiler_arguments.empty() ||
       request.maximum_object_bytes == 0 ||
       request.maximum_object_alignment == 0 ||
-      std::all_of(request.source_lineage_id.begin(),
-                  request.source_lineage_id.end(),
-                  [](std::uint8_t byte) { return byte == 0; })) {
+      (!preflight && missing_lineage)) {
     return fail("invalid_context_activation: missing source, compiler profile "
                 "or lineage");
   }
@@ -1323,7 +1332,7 @@ activate_context_source(const ContextActivationRequest &request,
   std::vector<std::string> lineage_diagnostics;
   std::string lineage_error;
   const auto family_lineages = resolve_family_lineages(
-      *ast, declarations, request.source_lineage_id, arguments,
+      *ast, declarations, lineage_id, arguments,
       request.file_name, lineage_diagnostics, lineage_error);
   if (!lineage_error.empty()) {
     return fail(std::move(lineage_error));
@@ -1382,73 +1391,6 @@ activate_context_source(const ContextActivationRequest &request,
         "return 1; }\n";
   }
 
-  auto standard_library = ContextStdlibImage::acquire();
-  if (!standard_library) {
-    return fail("unsupported_context_activation: private standard runtime: " +
-                error_text(standard_library.takeError()));
-  }
-  if (!(*standard_library)->validate_runtime()) {
-    return fail("unsupported_context_activation: private standard runtime "
-                "failed admission");
-  }
-  auto owner_module = compile_context_module(generated_owner.compilation_copy,
-                                             arguments, types);
-  if (!owner_module) {
-    return fail("invalid_context_owner: " +
-                error_text(owner_module.takeError()));
-  }
-  if (!generated_owner.states.empty()) {
-    auto fingerprint_error = owner_module->module.withModuleDo(
-        [&](llvm::Module &module) -> llvm::Error {
-          for (auto &state : generated_owner.states) {
-            const std::array<std::pair<std::string, std::string>, 4> roots{{
-                {ir_symbol(owner_module->contract, state.construct),
-                 "construct"},
-                {ir_symbol(owner_module->contract, state.destroy), "destroy"},
-                {ir_symbol(owner_module->contract, state.address), "address"},
-                {ir_symbol(owner_module->contract, state.serialize),
-                 "serialize"},
-            }};
-            state.lifecycle_fingerprint =
-                lifecycle_closure_fingerprint(module, roots);
-            if (state.lifecycle_fingerprint.empty()) {
-              return llvm::createStringError(
-                  llvm::inconvertibleErrorCode(),
-                  "owner lifecycle entrypoint closure could not be "
-                  "fingerprinted");
-            }
-          }
-          return llvm::Error::success();
-        });
-    if (fingerprint_error) {
-      return fail("invalid_context_owner: " +
-                  error_text(std::move(fingerprint_error)));
-    }
-  }
-  auto native_owner_abi = native_owner_abi_contract(
-      generated_owner, arguments, request.file_name + ".owner-abi.cc");
-  if (!native_owner_abi) {
-    return fail("unsupported_context_activation: " +
-                error_text(native_owner_abi.takeError()));
-  }
-  if (!validate_owner_bridge_abi(owner_module->contract, *native_owner_abi,
-                                 generated_owner, result.error)) {
-    return result;
-  }
-  std::vector<std::string> owner_exports{"clangtracer_owner_anchor_v1"};
-  for (const auto &state : generated_owner.states) {
-    owner_exports.push_back(ir_symbol(owner_module->contract, state.construct));
-    owner_exports.push_back(ir_symbol(owner_module->contract, state.destroy));
-    owner_exports.push_back(ir_symbol(owner_module->contract, state.address));
-    owner_exports.push_back(ir_symbol(owner_module->contract, state.serialize));
-  }
-  auto owner_code = PrivateContextCode::load(
-      std::move(owner_module->module), std::move(owner_module->contract),
-      std::move(owner_exports), {}, PrivateContextCode::Role::owner,
-      *standard_library);
-  if (!owner_code) {
-    return fail("invalid_context_owner: " + error_text(owner_code.takeError()));
-  }
 
   std::vector<context_facade::FacadeIdentity> identities;
   for (const auto &identity :
@@ -1528,6 +1470,84 @@ activate_context_source(const ContextActivationRequest &request,
   }
   callback_source = hooks_source + wrappers;
 
+  if (preflight && syntax_only) {
+    auto wrapper_ast = parse_source(callback_source, arguments,
+                                    request.file_name + ".preflight.cc");
+    if (!wrapper_ast || wrapper_ast->getDiagnostics().hasErrorOccurred()) {
+      return fail("invalid_context_activation: lowered wrapper syntax failed");
+    }
+    result.preflight_success = true;
+    return result;
+  }
+
+  auto standard_library = ContextStdlibImage::acquire();
+  if (!standard_library) {
+    return fail("unsupported_context_activation: private standard runtime: " +
+                error_text(standard_library.takeError()));
+  }
+  if (!(*standard_library)->validate_runtime()) {
+    return fail("unsupported_context_activation: private standard runtime "
+                "failed admission");
+  }
+  auto owner_module = compile_context_module(generated_owner.compilation_copy,
+                                             arguments, types);
+  if (!owner_module) {
+    return fail("invalid_context_owner: " +
+                error_text(owner_module.takeError()));
+  }
+  if (!generated_owner.states.empty()) {
+    auto fingerprint_error = owner_module->module.withModuleDo(
+        [&](llvm::Module &module) -> llvm::Error {
+          for (auto &state : generated_owner.states) {
+            const std::array<std::pair<std::string, std::string>, 4> roots{{
+                {ir_symbol(owner_module->contract, state.construct),
+                 "construct"},
+                {ir_symbol(owner_module->contract, state.destroy), "destroy"},
+                {ir_symbol(owner_module->contract, state.address), "address"},
+                {ir_symbol(owner_module->contract, state.serialize),
+                 "serialize"},
+            }};
+            state.lifecycle_fingerprint =
+                lifecycle_closure_fingerprint(module, roots);
+            if (state.lifecycle_fingerprint.empty()) {
+              return llvm::createStringError(
+                  llvm::inconvertibleErrorCode(),
+                  "owner lifecycle entrypoint closure could not be "
+                  "fingerprinted");
+            }
+          }
+          return llvm::Error::success();
+        });
+    if (fingerprint_error) {
+      return fail("invalid_context_owner: " +
+                  error_text(std::move(fingerprint_error)));
+    }
+  }
+  auto native_owner_abi = native_owner_abi_contract(
+      generated_owner, arguments, request.file_name + ".owner-abi.cc");
+  if (!native_owner_abi) {
+    return fail("unsupported_context_activation: " +
+                error_text(native_owner_abi.takeError()));
+  }
+  if (!validate_owner_bridge_abi(owner_module->contract, *native_owner_abi,
+                                 generated_owner, result.error)) {
+    return result;
+  }
+  std::vector<std::string> owner_exports{"clangtracer_owner_anchor_v1"};
+  for (const auto &state : generated_owner.states) {
+    owner_exports.push_back(ir_symbol(owner_module->contract, state.construct));
+    owner_exports.push_back(ir_symbol(owner_module->contract, state.destroy));
+    owner_exports.push_back(ir_symbol(owner_module->contract, state.address));
+    owner_exports.push_back(ir_symbol(owner_module->contract, state.serialize));
+  }
+  auto owner_code = PrivateContextCode::load(
+      std::move(owner_module->module), std::move(owner_module->contract),
+      std::move(owner_exports), {}, PrivateContextCode::Role::owner,
+      *standard_library);
+  if (!owner_code) {
+    return fail("invalid_context_owner: " + error_text(owner_code.takeError()));
+  }
+
   auto native_imports = ContextNativeSymbol::catalog(
       "#include \"context_facade.hpp\"\n", arguments, native_addresses());
   if (!native_imports) {
@@ -1560,9 +1580,28 @@ activate_context_source(const ContextActivationRequest &request,
                 error_text(callback_code.takeError()));
   }
 
+  if (preflight) {
+    for (const char *name : {"clangtracer_context_construct",
+                             "clangtracer_context_pre",
+                             "clangtracer_context_post",
+                             "clangtracer_context_destroy"}) {
+      auto symbol = (*callback_code)->symbol(name);
+      if (!symbol) {
+        return fail("invalid_context_callback: " +
+                    expected_error(symbol));
+      }
+    }
+    result.preflight_success = true;
+    return result;
+  }
+
+  if (!registry) {
+    return fail("invalid_context_activation: missing context registry");
+  }
+
   ContextRegistryResult registered;
   if (!generated_owner.states.empty()) {
-    registered = registry.register_owner(request.source_lineage_id, *owner_code,
+    registered = registry->register_owner(lineage_id, *owner_code,
                                          generated_owner, schemas);
     if (!registered) {
       return fail(registered.error);
@@ -1616,6 +1655,20 @@ activate_context_source(const ContextActivationRequest &request,
                   selected->hooks.begin(), selected->hooks.end(),
                   [](const auto &hook) { return hook.captures_stack; })));
   return result;
+}
+
+ContextActivationResult
+activate_context_source(const ContextActivationRequest &request,
+                        ContextRegistry &registry) {
+  return prepare_context_source(request, &registry, false, false);
+}
+
+ContextPreflightResult
+preflight_context_source(const ContextActivationRequest &request,
+                         bool syntax_only) {
+  const auto prepared =
+      prepare_context_source(request, nullptr, true, syntax_only);
+  return {prepared.error};
 }
 
 } // namespace tracer

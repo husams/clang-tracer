@@ -32,6 +32,10 @@ public:
                                    const std::string &source_directory,
                                    std::uint64_t probe_id,
                                    const std::array<std::uint8_t, 16> &lineage);
+  clangtracer::v1::ValidationReport
+  validate_probe(const clangtracer::v1::ProbeSpec &spec,
+                 const std::string &source_directory,
+                 clangtracer::v1::ValidateProbeRequest::Level level);
   clangtracer::v1::Probe remove_probe(std::uint64_t probe_id);
   void detach();
   void shutdown() noexcept;
@@ -83,6 +87,7 @@ private:
   bool unsafe_target_ = false;
   std::uintptr_t start_address_ = 0;
   std::uintptr_t stop_address_ = 0;
+  std::uintptr_t validate_address_ = 0;
   std::uintptr_t pthread_detour_address_ = 0;
   std::map<std::uint64_t, ProbeRecord> probes_;
   std::optional<PthreadCreatePatch> pthread_create_patch_;

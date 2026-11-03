@@ -14,6 +14,7 @@ def test_repl_uses_api_and_binary_transport(peer, tmp_path):
     client, service = peer
     callback = tmp_path / "interceptor.cpp"
     callback.write_text("struct Interceptor {};")
+    client.validate_probe = Mock(return_value=pb.ValidationReport(success=True))
     console = Console(client, output=DummyOutput())
     for command in [
         "attach 123",
@@ -38,6 +39,32 @@ def test_real_prompt_session_accepts_commands_and_eof(peer):
         prompt = PromptSession(input=pipe, output=DummyOutput(), lexer=CommandLexer())
         pipe.send_text("attach 123\nsessions\nexit\n")
         assert Console(client, output=DummyOutput()).run(prompt) == 0
+
+
+def test_validate_console_command_forwards_options_without_injection(peer, tmp_path):
+    client, _service = peer
+    callback = tmp_path / "interceptor.cpp"
+    callback.write_text("struct Interceptor {};")
+    client.validate_probe = Mock(return_value=pb.ValidationReport(success=True))
+    console = Console(client, output=DummyOutput())
+    console.session_id = "s1"
+    command = (
+        f'probe validate "add(int, int)" --callback "{callback}" '
+        '--level syntax --compile-option "-std=c++17" '
+        '--compile-option "-DORDER=1" --module target '
+        "--debug-max-entries 2000001 --debug-max-depth 256"
+    )
+    assert console.execute(parse_command(command))
+    client.validate_probe.assert_called_once_with(
+        "s1",
+        "add(int, int)",
+        "struct Interceptor {};",
+        level="syntax",
+        compile_options=["-std=c++17", "-DORDER=1"],
+        module="target",
+        debug_max_entries=2000001,
+        debug_max_depth=256,
+    )
 
 
 def test_stream_commands_accept_and_forward_repeated_names(peer, tmp_path):
@@ -86,6 +113,25 @@ def test_symbols_command_lists_attached_process_functions(peer):
     assert request.page_size == 20
 
 
+def test_symbols_command_defaults_to_unlimited(peer):
+    client, service = peer
+    console = Console(client, output=DummyOutput())
+    console.session_id = "s1"
+    assert console.execute(parse_command("symbols"))
+    assert service.requests[-1].page_size == 0
+
+
+def test_modules_command_uses_selected_session(peer, monkeypatch):
+    client, service = peer
+    console = Console(client, output=DummyOutput())
+    console.session_id = "s1"
+    emitted = []
+    monkeypatch.setattr(console, "emit", lambda value: emitted.append(value))
+    assert console.execute(parse_command("modules"))
+    assert service.requests[-1].session_id == "s1"
+    assert emitted == ["/srv/target", "/srv/libexample.so"]
+
+
 def test_symbols_next_page_command_preserves_filters_and_quotes(monkeypatch):
     client = Mock()
     client.list_symbols.return_value = pb.ListSymbolsResponse(next_page_token="t ok")
@@ -114,7 +160,7 @@ def test_symbols_next_page_command_roundtrips_non_bmp_filters(monkeypatch):
     assert reparsed.options == {
         "query": "λ𐐷",
         "module": "模块𐐷",
-        "page_size": 100,
+        "page_size": 0,
         "page_token": "🔎",
     }
 
@@ -249,7 +295,7 @@ def test_help_topics_complete_after_help_prefix():
             Document("help probe "), CompleteEvent()
         )
     }
-    assert probe_completions >= {"inject", "resolve", "add", "remove"}
+    assert probe_completions >= {"inject", "resolve", "validate", "add", "remove"}
     symbol_completions = {
         item.text
         for item in build_completer().get_completions(

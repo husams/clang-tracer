@@ -2,6 +2,7 @@
 
 import os
 import platform
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -497,6 +498,19 @@ def test_real_native_symbol_listing_is_stable_and_paginated(native):
         )
         session = client.attach(target.pid)
         first = client.list_symbols(session.id, page_size=1)
+        modules = client.list_modules(session.id)
+        assert any(path.endswith("/cpp-interceptors-target") for path in modules)
+        with pytest.raises(grpc.RpcError) as limited:
+            client.resolve_probe(session.id, "add(int, int)", debug_max_entries=1)
+        assert limited.value.code() == grpc.StatusCode.RESOURCE_EXHAUSTED
+        assert "--debug-max-entries" in limited.value.details()
+        spec = client.resolve_probe(
+            session.id,
+            "add(int, int)",
+            module="cpp-interceptors-target",
+            debug_max_entries=1_000_001,
+        )
+        assert spec.debug_info.module in modules
         assert len(first.symbols) == 1
         assert first.next_page_token
         second = client.list_symbols(
@@ -523,7 +537,142 @@ def test_real_native_symbol_listing_is_stable_and_paginated(native):
             client.list_symbols(session.id, page_token="not-a-token")
         assert invalid_token.value.code() == grpc.StatusCode.INVALID_ARGUMENT
         client.detach(session.id)
+        with pytest.raises(grpc.RpcError) as detached_modules:
+            client.list_modules(session.id)
+        assert detached_modules.value.code() == grpc.StatusCode.FAILED_PRECONDITION
         with pytest.raises(grpc.RpcError) as detached:
             client.list_symbols(session.id)
         assert detached.value.code() == grpc.StatusCode.FAILED_PRECONDITION
         client.shutdown_server()
+
+
+def test_native_symbol_listing_has_no_implicit_limits(native):
+    build, _target, temporary = native
+    source = temporary / "many_symbols.cpp"
+    executable = temporary / "many-symbols"
+    prefix = "symbol_" + "x" * 24_000
+    count = 720
+    namespaces = ["n"] * 160
+    deep_selector = "::".join([*namespaces, "deep_callable(int)"])
+    with source.open("w") as output:
+        output.write(
+            "#include <sys/prctl.h>\n#include <unistd.h>\n#include <dlfcn.h>\n"
+        )
+        output.write(
+            "#ifndef PR_SET_PTRACER\n#define PR_SET_PTRACER 0x59616d61\n#endif\n"
+            "#ifndef PR_SET_PTRACER_ANY\n"
+            "#define PR_SET_PTRACER_ANY ((unsigned long)-1)\n"
+            "#endif\n"
+        )
+        for i in range(count):
+            output.write(f"void {prefix}{i:04}() {{}}\n")
+        for namespace in namespaces:
+            output.write(f"namespace {namespace} {{\n")
+        output.write("int deep_callable(int value) { return value + 1; }\n")
+        output.write("}\n" * len(namespaces))
+        output.write(
+            "int main(int argc, char **argv) { "
+            "prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY); "
+            "if (argc > 1 && !dlopen(argv[1], RTLD_NOW)) return 2; "
+            "while (true) { "
+            + "::".join([*namespaces, "deep_callable(1)"])
+            + "; usleep(10000); } }\n"
+        )
+    unrelated_source = temporary / "unrelated.cpp"
+    unrelated = temporary / "libunrelated.so"
+    unrelated_source.write_text(
+        "namespace u {\n" * 220 + "int unrelated() { return 0; }\n" + "}\n" * 220
+    )
+    compiler = [os.getenv("CXX", "clang++"), *shlex.split(os.getenv("CXXFLAGS", ""))]
+    subprocess.run(
+        [
+            *compiler,
+            "-g",
+            "-O0",
+            "-shared",
+            "-fPIC",
+            str(unrelated_source),
+            "-o",
+            str(unrelated),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
+    subprocess.run(
+        [
+            os.getenv("CXX", "clang++"),
+            *shlex.split(os.getenv("CXXFLAGS", "")),
+            "-g",
+            "-O0",
+            str(source),
+            "-o",
+            str(executable),
+            "-ldl",
+        ],
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
+    target = subprocess.Popen([executable, unrelated])
+    try:
+        # Wait until main has enabled tracing, rather than racing the new child.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if target.poll() is not None:
+                pytest.fail("large-symbol target exited before readiness")
+            status = Path(f"/proc/{target.pid}/status").read_text()
+            if "State:\tS" in status:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("large-symbol target did not become ready")
+        with Client(f"unix://{temporary}/unlimited.sock", timeout=120) as client:
+            client.start_server(
+                str(build / "clang-tracer-server"),
+                agent=str(build / "libclang_tracer_agent.so"),
+            )
+            session = client.attach(target.pid)
+            assert str(unrelated) in client.list_modules(session.id)
+            # Use a raw default request too: unlimited is a server contract.
+            all_symbols = client.stub.ListSymbols(
+                pb.ListSymbolsRequest(session_id=session.id), timeout=120
+            )
+            assert not all_symbols.next_page_token
+            matches = [s for s in all_symbols.symbols if s.selector.startswith(prefix)]
+            assert len(matches) == count
+            assert deep_selector in {s.selector for s in all_symbols.symbols}
+            with pytest.raises(grpc.RpcError) as depth_limited:
+                client.resolve_probe(session.id, deep_selector, debug_max_depth=128)
+            assert depth_limited.value.code() == grpc.StatusCode.RESOURCE_EXHAUSTED
+            # The unrelated image is deeper than this budget. It must never
+            # consume lookup work for a symbol defined only in the executable.
+            deep = client.resolve_probe(session.id, deep_selector, debug_max_depth=200)
+            assert deep.debug_info.selector == deep_selector
+            assert client.resolve_probe(session.id, deep_selector) == deep
+            assert all_symbols.ByteSize() > 32 * 1024 * 1024
+            first = client.list_symbols(session.id, page_size=501)
+            assert len(first.symbols) == 501
+            assert len(first.next_page_token) > 65536
+            second = client.list_symbols(
+                session.id, page_size=501, page_token=first.next_page_token
+            )
+            assert not second.next_page_token
+            assert [*first.symbols, *second.symbols] == list(all_symbols.symbols)
+            largest_page = client.list_symbols(session.id, page_size=2**32 - 1)
+            assert largest_page == all_symbols
+            filtered = client.list_symbols(session.id, query="x" * 5000)
+            assert len(filtered.symbols) == count
+            assert not client.list_symbols(session.id, module="m" * 5000).symbols
+            probe = client.inject(
+                session.id,
+                deep_selector,
+                "struct Interceptor { void pre(const Call &) {} };",
+                debug_max_depth=200,
+            )
+            assert client.collect_traces(2, session_ids=[session.id], timeout=10)
+            assert client.remove_probe(session.id, probe.id).original_bytes_restored
+            client.detach(session.id)
+    finally:
+        target.terminate()
+        target.wait(timeout=5)

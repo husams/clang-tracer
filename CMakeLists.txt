@@ -115,6 +115,12 @@ add_executable(cpp-interceptors-target examples/cpp-interceptors/target.cpp)
 target_compile_options(cpp-interceptors-target PRIVATE -g -O0 -fno-omit-frame-pointer
   -fcf-protection=none)
 
+add_executable(signature-interceptor-fixture tests/signature_interceptor_fixture.cpp)
+set_target_properties(signature-interceptor-fixture PROPERTIES ENABLE_EXPORTS ON
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+target_compile_options(signature-interceptor-fixture PRIVATE -g -O0
+  -fno-omit-frame-pointer -fcf-protection=none)
+
 add_executable(shared-context-target examples/shared-context/target.cpp)
 target_link_libraries(shared-context-target PRIVATE Threads::Threads)
 target_compile_options(shared-context-target PRIVATE -g -O0 -fno-omit-frame-pointer

@@ -321,6 +321,26 @@ def _symbols(lines: _Lines, page: pb.ListSymbolsResponse) -> None:
         lines.add("more", "use the next-page command printed by the console")
 
 
+def _validation_report(lines: _Lines, report: pb.ValidationReport) -> None:
+    level = "syntax" if report.level == pb.ValidateProbeRequest.SYNTAX else "compile"
+    lines.add(
+        "validation",
+        f"{'success' if report.success else 'failed'} level={level}",
+        style="class:ok" if report.success else "class:error",
+    )
+    for option in report.effective_options:
+        lines.add("option", option, indent=1)
+    for diagnostic in report.diagnostics:
+        location = diagnostic.file
+        if diagnostic.line:
+            location += f":{diagnostic.line}"
+            if diagnostic.column:
+                location += f":{diagnostic.column}"
+        label = f"{diagnostic.severity} [{diagnostic.stage}]"
+        lines.add(label, location, indent=1, style="class:error")
+        lines.add("message", diagnostic.message, indent=2)
+
+
 def render(value: object, *, error: bool = False) -> FormattedText:
     """Render known tracer objects without exposing Protobuf debug reprs."""
     if isinstance(value, str):
@@ -347,6 +367,8 @@ def render(value: object, *, error: bool = False) -> FormattedText:
         _trace_event(lines, value)
     elif isinstance(value, pb.ListSymbolsResponse):
         _symbols(lines, value)
+    elif isinstance(value, pb.ValidationReport):
+        _validation_report(lines, value)
     elif isinstance(value, Message):
         lines.add("message", value.DESCRIPTOR.full_name)
     else:

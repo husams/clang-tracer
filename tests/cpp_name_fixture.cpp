@@ -1,11 +1,14 @@
 #include <cstdio>
 #include <unistd.h>
 
-struct UnsupportedType {};
-
 class UnsupportedFixture {
 public:
-  __attribute__((noinline)) UnsupportedType unsupported(UnsupportedType value) { return value; }
+  __attribute__((noinline)) long double unsupported(long double value) { return value + 1.0L; }
+};
+
+class BoolOnly {
+public:
+  __attribute__((noinline)) bool b(bool value) { return !value; }
 };
 
 class X {
@@ -37,6 +40,7 @@ public:
 
 int main() {
   UnsupportedFixture unsupported;
+  BoolOnly bool_only;
   X overloads;
   VirtualOnly virtual_only;
   volatile VolatileOnly volatile_only;
@@ -45,7 +49,8 @@ int main() {
   std::printf("CPP_NAME_FIXTURE pid=%ld\n", static_cast<long>(::getpid()));
   std::fflush(stdout);
   for (;;) {
-    (void)unsupported.unsupported({});
+    (void)unsupported.unsupported(1.0L);
+    (void)bool_only.b(false);
     volatile int result = overloads.f(1) + overloads.f(2L) + virtual_only.f(3) +
                           volatile_only.v(4) + unsigned_only.u(5) + header_receiver.read(6);
     (void)result;

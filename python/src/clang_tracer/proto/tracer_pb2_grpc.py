@@ -45,6 +45,11 @@ class TracerStub(object):
                 request_serializer=tracer__pb2.ResolveProbeRequest.SerializeToString,
                 response_deserializer=tracer__pb2.ProbeSpec.FromString,
                 _registered_method=True)
+        self.ValidateProbe = channel.unary_unary(
+                '/clangtracer.v1.Tracer/ValidateProbe',
+                request_serializer=tracer__pb2.ValidateProbeRequest.SerializeToString,
+                response_deserializer=tracer__pb2.ValidationReport.FromString,
+                _registered_method=True)
         self.AddProbe = channel.unary_unary(
                 '/clangtracer.v1.Tracer/AddProbe',
                 request_serializer=tracer__pb2.AddProbeRequest.SerializeToString,
@@ -64,6 +69,11 @@ class TracerStub(object):
                 '/clangtracer.v1.Tracer/ListSessions',
                 request_serializer=tracer__pb2.ListSessionsRequest.SerializeToString,
                 response_deserializer=tracer__pb2.ListSessionsResponse.FromString,
+                _registered_method=True)
+        self.ListModules = channel.unary_unary(
+                '/clangtracer.v1.Tracer/ListModules',
+                request_serializer=tracer__pb2.ListModulesRequest.SerializeToString,
+                response_deserializer=tracer__pb2.ListModulesResponse.FromString,
                 _registered_method=True)
         self.ListSymbols = channel.unary_unary(
                 '/clangtracer.v1.Tracer/ListSymbols',
@@ -104,6 +114,12 @@ class TracerServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ValidateProbe(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def AddProbe(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -123,6 +139,12 @@ class TracerServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def ListSessions(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListModules(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -166,6 +188,11 @@ def add_TracerServicer_to_server(servicer, server):
                     request_deserializer=tracer__pb2.ResolveProbeRequest.FromString,
                     response_serializer=tracer__pb2.ProbeSpec.SerializeToString,
             ),
+            'ValidateProbe': grpc.unary_unary_rpc_method_handler(
+                    servicer.ValidateProbe,
+                    request_deserializer=tracer__pb2.ValidateProbeRequest.FromString,
+                    response_serializer=tracer__pb2.ValidationReport.SerializeToString,
+            ),
             'AddProbe': grpc.unary_unary_rpc_method_handler(
                     servicer.AddProbe,
                     request_deserializer=tracer__pb2.AddProbeRequest.FromString,
@@ -185,6 +212,11 @@ def add_TracerServicer_to_server(servicer, server):
                     servicer.ListSessions,
                     request_deserializer=tracer__pb2.ListSessionsRequest.FromString,
                     response_serializer=tracer__pb2.ListSessionsResponse.SerializeToString,
+            ),
+            'ListModules': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListModules,
+                    request_deserializer=tracer__pb2.ListModulesRequest.FromString,
+                    response_serializer=tracer__pb2.ListModulesResponse.SerializeToString,
             ),
             'ListSymbols': grpc.unary_unary_rpc_method_handler(
                     servicer.ListSymbols,
@@ -262,6 +294,33 @@ class Tracer(object):
             '/clangtracer.v1.Tracer/ResolveProbe',
             tracer__pb2.ResolveProbeRequest.SerializeToString,
             tracer__pb2.ProbeSpec.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ValidateProbe(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/ValidateProbe',
+            tracer__pb2.ValidateProbeRequest.SerializeToString,
+            tracer__pb2.ValidationReport.FromString,
             options,
             channel_credentials,
             insecure,
@@ -370,6 +429,33 @@ class Tracer(object):
             '/clangtracer.v1.Tracer/ListSessions',
             tracer__pb2.ListSessionsRequest.SerializeToString,
             tracer__pb2.ListSessionsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListModules(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/ListModules',
+            tracer__pb2.ListModulesRequest.SerializeToString,
+            tracer__pb2.ListModulesResponse.FromString,
             options,
             channel_credentials,
             insecure,

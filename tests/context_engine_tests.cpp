@@ -1,4 +1,5 @@
 #include <atomic>
+#include <chrono>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -614,12 +615,27 @@ void closure_and_admission_race_cannot_resurrect_records() {
     while (!ready)
       std::this_thread::yield();
     race = true;
-    {
-      ce::HookExit exit(context);
-      context.end_scope(1);
-    }
+    // Capture and closure intentionally compete for the admission gate.
+    // Closing uses a nonblocking try-lock, so contention is a retry rather
+    // than a failed lifecycle invariant. Release the hook before yielding.
+    auto close_status = ce::ErrorCode::active_access;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(5);
+    do {
+      {
+        ce::HookExit exit(context);
+        close_status = context.try_end_scope(1);
+      }
+      if (close_status != ce::ErrorCode::active_access)
+        break;
+      std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < deadline);
+    // Always release and join the worker before reporting an unexpected
+    // result; unwinding past its joinable thread would call terminate().
     closed = true;
     worker.join();
+    require(close_status == ce::ErrorCode::ok,
+            "closure/admission race could not close the scope before deadline");
     require(!resurrected && ledger->outstanding() == 0 && lifecycle == "Aa",
             "closure/admission race resurrected state or leaked ownership");
   }

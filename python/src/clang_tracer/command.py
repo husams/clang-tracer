@@ -82,7 +82,7 @@ def parse_command(text: str) -> Command:
         if token is not None and not isinstance(token, Token):
             raise CommandError("expected an option value")
         value = _value(token) if token is not None else True
-        if key in {"include_headers", "session_ids", "names"}:
+        if key in {"include_headers", "session_ids", "names", "compile_options"}:
             options.setdefault(key, []).append(value)
         elif key in options:
             raise CommandError(f"duplicate option: {key}")
@@ -90,6 +90,8 @@ def parse_command(text: str) -> Command:
             options[key] = value
     if tree.data == "inject" and "callback" not in options:
         raise CommandError("probe inject requires --callback FILE")
+    if tree.data == "validate" and "callback" not in options:
+        raise CommandError("probe validate requires --callback FILE")
     return Command(str(tree.data), tuple(arguments), options)
 
 

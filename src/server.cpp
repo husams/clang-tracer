@@ -47,6 +47,7 @@
 #include "injector.hpp"
 #include "session.hpp"
 #include "tracer/compat.hpp"
+#include "tracer/compiler_options.hpp"
 
 namespace tracer {
 namespace {
@@ -54,6 +55,55 @@ namespace {
 constexpr std::size_t kSessionLimit = 64;
 constexpr std::size_t kMaxCallbackSource = 64 * 1024;
 constexpr std::size_t kMaxEventBytes = 64 * 1024;
+
+template <class Headers, class Options>
+grpc::Status validate_resolution_inputs(std::string_view selector,
+                                        std::string_view module,
+                                        std::string_view compdb,
+                                        const Headers &headers,
+                                        const Options &options) {
+  const auto valid_text = [](std::string_view value, std::size_t limit,
+                             bool allow_empty = false) {
+    return (allow_empty || !value.empty()) && value.size() <= limit &&
+           value.find('\0') == std::string_view::npos;
+  };
+  if (!valid_text(selector, 4096) || !valid_text(module, 4095, true) ||
+      !valid_text(compdb, 4095, true)) {
+    return {grpc::StatusCode::INVALID_ARGUMENT,
+            "invalid selector, module, or compilation database path"};
+  }
+  if (!compdb.empty() && headers.empty()) {
+    return {grpc::StatusCode::INVALID_ARGUMENT,
+            "--compdb requires --include HEADER"};
+  }
+  if (headers.size() > 16) {
+    return {grpc::StatusCode::INVALID_ARGUMENT,
+            "at most 16 include headers are allowed"};
+  }
+  for (const auto &header : headers) {
+    if (!valid_text(header, 4095) || header.front() != '/' ||
+        header.find_first_of("\"\r\n") != std::string::npos) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "invalid optional include"};
+    }
+  }
+  if (options.size() > 128) {
+    return {grpc::StatusCode::INVALID_ARGUMENT,
+            "at most 128 compiler options are allowed"};
+  }
+  std::size_t option_bytes = 0;
+  for (const auto &option : options) {
+    option_bytes += option.size() + 1;
+    if (!valid_text(option, 4096) || option_bytes > 65536) {
+      return {grpc::StatusCode::INVALID_ARGUMENT,
+              "compiler options must be nonempty and total at most 64 KiB"};
+    }
+  }
+  if (!safe_preflight_compiler_arguments(options.begin(), options.end())) {
+    return {grpc::StatusCode::INVALID_ARGUMENT,
+            "compiler options contain an unsupported preflight option"};
+  }
+  return grpc::Status::OK;
+}
 
 context_package::PackageLineage admit_probe_package(
     const clangtracer::v1::ProbeSpec &spec) {
@@ -355,7 +405,7 @@ std::string encode_symbol_page_token(
 bool decode_symbol_page_token(
     const std::string &encoded,
     clangtracer::v1::ListSymbolsPageToken *token) {
-  if (encoded.empty() || encoded.size() > 65536 || encoded.size() % 2 != 0)
+  if (encoded.empty() || encoded.size() % 2 != 0)
     return false;
   std::string serialized;
   serialized.reserve(encoded.size() / 2);
@@ -480,12 +530,23 @@ public:
       out->set_type(static_cast<clangtracer::v1::ValueType>(in.value_type()));
       switch (in.value_case()) {
       case clangtracer::context::v1::TypedTraceValue::kSignedValue:
+        if (in.value_type() != clangtracer::v1::INT32 &&
+            in.value_type() != clangtracer::v1::BOOL &&
+            in.value_type() != clangtracer::v1::INT64)
+          return false;
         out->set_signed_value(in.signed_value());
         return true;
       case clangtracer::context::v1::TypedTraceValue::kUnsignedValue:
+        if (in.value_type() != clangtracer::v1::UINT64 &&
+            in.value_type() != clangtracer::v1::POINTER &&
+            in.value_type() != clangtracer::v1::OBJECT)
+          return false;
         out->set_unsigned_value(in.unsigned_value());
         return true;
       case clangtracer::context::v1::TypedTraceValue::kRealValue:
+        if (in.value_type() != clangtracer::v1::FLOAT32 &&
+            in.value_type() != clangtracer::v1::FLOAT64)
+          return false;
         out->set_real_value(in.real_value());
         return true;
       case clangtracer::context::v1::TypedTraceValue::VALUE_NOT_SET:
@@ -903,6 +964,7 @@ private:
         const auto type = argument.type();
         const auto data = argument.data_case();
         const bool valid = ((type == clangtracer::v1::INT32 ||
+                             type == clangtracer::v1::BOOL ||
                              type == clangtracer::v1::INT64) &&
                             data == clangtracer::v1::Value::kSignedValue) ||
                            ((type == clangtracer::v1::UINT64 ||
@@ -925,6 +987,7 @@ private:
         if (type == clangtracer::v1::VOID)
           return data == clangtracer::v1::Value::DATA_NOT_SET;
         return ((type == clangtracer::v1::INT32 ||
+                 type == clangtracer::v1::BOOL ||
                  type == clangtracer::v1::INT64) &&
                 data == clangtracer::v1::Value::kSignedValue) ||
                ((type == clangtracer::v1::UINT64 ||
@@ -1179,12 +1242,14 @@ public:
     return grpc::Status::OK;
   }
 
-  grpc::Status ResolveProbe(grpc::ServerContext *,
+  grpc::Status ResolveProbe(grpc::ServerContext *context,
                             const clangtracer::v1::ResolveProbeRequest *request,
                             clangtracer::v1::ProbeSpec *response) override {
-    if (request->selector().empty() || request->selector().size() > 4096 ||
-        request->selector().find('\0') != std::string::npos)
-      return {grpc::StatusCode::INVALID_ARGUMENT, "invalid C++ selector"};
+    const auto request_valid = validate_resolution_inputs(
+        request->selector(), request->module(), request->compilation_database(),
+        request->include_headers(), request->compile_options());
+    if (!request_valid.ok())
+      return request_valid;
     auto session = find_session(request->session_id());
     if (!session)
       return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
@@ -1193,17 +1258,92 @@ public:
     if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED)
       return {grpc::StatusCode::FAILED_PRECONDITION, "session is not attached"};
     try {
+      client::DebugLookupOptions lookup;
+      lookup.module = request->module();
+      lookup.max_entries = request->debug_max_entries();
+      lookup.max_depth = request->debug_max_depth();
+      lookup.is_cancelled = [&] { return context->IsCancelled(); };
       auto resolved =
-          client::resolve_debug_callable(session->pid(), request->selector());
+          client::resolve_debug_callable(session->pid(), request->selector(), lookup);
       for (const auto &header : request->include_headers())
         resolved.spec.add_include_headers(header);
+      for (const auto &option : request->compile_options())
+        resolved.spec.add_compile_options(option);
       client::resolve_header_context(resolved.spec,
                                      request->compilation_database());
       response->Swap(&resolved.spec);
       return grpc::Status::OK;
+    } catch (const client::DebugLookupLimit &error) {
+      return {grpc::StatusCode::RESOURCE_EXHAUSTED, error.what()};
     } catch (const std::invalid_argument &error) {
       return {grpc::StatusCode::INVALID_ARGUMENT, error.what()};
     } catch (const std::exception &error) {
+      if (context->IsCancelled())
+        return {grpc::StatusCode::CANCELLED, "debug lookup cancelled"};
+      return status_for(error);
+    }
+  }
+
+  grpc::Status ValidateProbe(grpc::ServerContext *context,
+                             const clangtracer::v1::ValidateProbeRequest *request,
+                             clangtracer::v1::ValidationReport *response) override {
+    if (request->selector().empty() ||
+        request->selector().find('\0') != std::string::npos ||
+        request->callback_source().empty() ||
+        request->callback_source().size() > kMaxCallbackSource ||
+        request->callback_source().find('\0') != std::string::npos) {
+      return {grpc::StatusCode::INVALID_ARGUMENT,
+              "selector and callback source must be nonempty and contain no NUL"};
+    }
+    if (request->level() != clangtracer::v1::ValidateProbeRequest::COMPILE &&
+        request->level() != clangtracer::v1::ValidateProbeRequest::SYNTAX) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "unknown validation level"};
+    }
+    const auto request_valid = validate_resolution_inputs(
+        request->selector(), request->module(), request->compilation_database(),
+        request->include_headers(), request->compile_options());
+    if (!request_valid.ok())
+      return request_valid;
+    auto session = find_session(request->session_id());
+    if (!session) {
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    }
+    std::lock_guard operation_lock(session->operation_mutex());
+    session->refresh_process_state();
+    if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED) {
+      return {grpc::StatusCode::FAILED_PRECONDITION, "session is not attached"};
+    }
+    try {
+      client::DebugLookupOptions lookup;
+      lookup.module = request->module();
+      lookup.max_entries = request->debug_max_entries();
+      lookup.max_depth = request->debug_max_depth();
+      lookup.is_cancelled = [&] { return context->IsCancelled(); };
+      auto resolved =
+          client::resolve_debug_callable(session->pid(), request->selector(), lookup);
+      for (const auto &header : request->include_headers())
+        resolved.spec.add_include_headers(header);
+      for (const auto &option : request->compile_options())
+        resolved.spec.add_compile_options(option);
+      client::resolve_header_context(resolved.spec,
+                                     request->compilation_database());
+      resolved.spec.set_callback_source(request->callback_source());
+      const auto input_valid = validate_probe(resolved.spec);
+      if (!input_valid.ok())
+        return input_valid;
+      *response = session->validate_probe(resolved.spec, source_directory_,
+                                          request->level());
+      if (response->effective_options().empty())
+        for (const auto &option : request->compile_options())
+          response->add_effective_options(option);
+      return grpc::Status::OK;
+    } catch (const client::DebugLookupLimit &error) {
+      return {grpc::StatusCode::RESOURCE_EXHAUSTED, error.what()};
+    } catch (const std::invalid_argument &error) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, error.what()};
+    } catch (const std::exception &error) {
+      if (context->IsCancelled())
+        return {grpc::StatusCode::CANCELLED, "probe validation cancelled"};
       return status_for(error);
     }
   }
@@ -1329,23 +1469,37 @@ public:
     return grpc::Status::OK;
   }
 
+  grpc::Status ListModules(
+      grpc::ServerContext *, const clangtracer::v1::ListModulesRequest *request,
+      clangtracer::v1::ListModulesResponse *response) override {
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    session->refresh_process_state();
+    if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "session is not attached"};
+    try {
+      for (const auto &path : client::list_debug_modules(session->pid()))
+        response->add_modules(path);
+      return grpc::Status::OK;
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
+  }
+
   grpc::Status ListSymbols(
       grpc::ServerContext *context,
       const clangtracer::v1::ListSymbolsRequest *request,
       clangtracer::v1::ListSymbolsResponse *response) override {
-    if (request->session_id().empty() || request->session_id().size() > 128 ||
+    if (request->session_id().empty() ||
         request->session_id().find('\0') != std::string::npos ||
-        request->query().size() > 4096 || request->query().find('\0') != std::string::npos ||
-        request->module().size() > 4096 || request->module().find('\0') != std::string::npos ||
-        request->page_token().size() > 65536 ||
+        request->query().find('\0') != std::string::npos ||
+        request->module().find('\0') != std::string::npos ||
         request->page_token().find('\0') != std::string::npos) {
       return {grpc::StatusCode::INVALID_ARGUMENT, "invalid symbol listing request"};
     }
-    const std::size_t page_size = request->page_size() == 0 ? 100 : request->page_size();
-    if (page_size > 500) {
-      return {grpc::StatusCode::INVALID_ARGUMENT,
-              "symbol page size must be between 1 and 500"};
-    }
+    const std::size_t page_size = request->page_size();
     auto session = find_session(request->session_id());
     if (!session)
       return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
@@ -1423,10 +1577,6 @@ public:
         continuation.set_last_module_path(page.symbols.back().module_path);
         response->set_next_page_token(encode_symbol_page_token(continuation));
       }
-      if (response->ByteSizeLong() > 8 * 1024 * 1024) {
-        return {grpc::StatusCode::RESOURCE_EXHAUSTED,
-                "symbol page exceeds the 8 MiB response budget; reduce page size"};
-      }
       return grpc::Status::OK;
     } catch (const std::invalid_argument &error) {
       const std::string detail = error.what();
@@ -1435,10 +1585,6 @@ public:
       }
       return {grpc::StatusCode::INVALID_ARGUMENT, detail};
     } catch (const std::exception &error) {
-      const std::string detail = error.what();
-      if (detail.find("work limit exceeded") != std::string::npos) {
-        return {grpc::StatusCode::RESOURCE_EXHAUSTED, detail};
-      }
       return status_for(error);
     }
   }
@@ -1638,6 +1784,23 @@ private:
       return {grpc::StatusCode::INVALID_ARGUMENT,
               "invalid receiver diagnostic"};
     }
+    if (spec.compile_options_size() > 128) {
+      return {grpc::StatusCode::INVALID_ARGUMENT,
+              "at most 128 compiler options are allowed"};
+    }
+    std::size_t compile_option_bytes = 0;
+    for (const auto &option : spec.compile_options()) {
+      compile_option_bytes += option.size() + 1;
+      if (!valid_text(option, 4096) || compile_option_bytes > 65536) {
+        return {grpc::StatusCode::INVALID_ARGUMENT,
+                "compiler options must be nonempty and total at most 64 KiB"};
+      }
+    }
+    if (!safe_preflight_compiler_arguments(spec.compile_options().begin(),
+                                          spec.compile_options().end())) {
+      return {grpc::StatusCode::INVALID_ARGUMENT,
+              "compiler options contain an unsupported preflight option"};
+    }
     if (spec.argument_names_size() > 8 || spec.include_headers_size() > 16 ||
         (spec.has_debug_info() &&
          (spec.debug_info().ByteSizeLong() > 64 * 1024 ||
@@ -1648,6 +1811,10 @@ private:
           spec.debug_info().entry_size() >
               std::numeric_limits<std::uint64_t>::max() -
                   spec.debug_info().runtime_entry() ||
+          spec.debug_info().record_calling_convention() <
+              clangtracer::v1::RECORD_CALLING_CONVENTION_UNSPECIFIED ||
+          spec.debug_info().record_calling_convention() >
+              clangtracer::v1::RECORD_PASS_BY_REFERENCE ||
           spec.debug_info().fields_size() > 128 ||
           spec.debug_info().arguments_size() > 8))) {
       return {grpc::StatusCode::INVALID_ARGUMENT,
@@ -1677,6 +1844,11 @@ private:
         if (!valid_text(argument, 65536, true))
           return {grpc::StatusCode::INVALID_ARGUMENT,
                   "invalid header compiler argument"};
+      if (!safe_preflight_compiler_arguments(
+              context.compiler_arguments().begin(),
+              context.compiler_arguments().end(), true))
+        return {grpc::StatusCode::INVALID_ARGUMENT,
+                "header compiler arguments contain an unsupported preflight option"};
     }
     if (spec.has_receiver()) {
       const auto &receiver = spec.receiver();
@@ -1709,6 +1881,12 @@ private:
         return {grpc::StatusCode::INVALID_ARGUMENT,
                 "receiver compiler arguments exceed 64 KiB or omit driver"};
       }
+      if (!safe_preflight_compiler_arguments(
+              receiver.compiler_arguments().begin() + 1,
+              receiver.compiler_arguments().end(), true)) {
+        return {grpc::StatusCode::INVALID_ARGUMENT,
+                "receiver compiler arguments contain an unsupported preflight option"};
+      }
       for (const auto &field : receiver.fields()) {
         if (!valid_text(field.name(), 4096, true) ||
             !valid_text(field.canonical_type(), 4096)) {
@@ -1720,11 +1898,19 @@ private:
     const auto valid_value = [](clangtracer::v1::ValueType type,
                                 bool allow_void) {
       return type >= clangtracer::v1::VOID &&
-             type <= (allow_void ? clangtracer::v1::POINTER
-                                 : clangtracer::v1::OBJECT) &&
+             (type <= (allow_void ? clangtracer::v1::POINTER
+                                  : clangtracer::v1::OBJECT) ||
+              type == clangtracer::v1::BOOL) &&
              (allow_void || type != clangtracer::v1::VOID);
     };
-    if (!valid_value(signature.result(), true) ||
+    const bool object_result_proven =
+        signature.result() == clangtracer::v1::OBJECT &&
+        spec.has_debug_info() && spec.debug_info().result_is_object_value() &&
+        !spec.debug_info().result_is_reference() &&
+        !spec.debug_info().result_cpp_type().empty() &&
+        spec.debug_info().has_result_object_type() &&
+        !spec.debug_info().result_object_type().record_name().empty();
+    if ((!valid_value(signature.result(), true) && !object_result_proven) ||
         signature.arguments_size() > static_cast<int>(kMaxArguments)) {
       return {grpc::StatusCode::INVALID_ARGUMENT,
               "signature has unsupported result or too many arguments"};
@@ -1843,7 +2029,8 @@ int RunServer(const std::string &agent_path, const std::string &listen_uri,
         return catalog ? catalog->acquire(recording_id, sink_id) : nullptr;
       });
   grpc::ServerBuilder builder;
-  builder.SetMaxSendMessageSize(32 * 1024 * 1024);
+  builder.SetMaxSendMessageSize(-1);
+  builder.SetMaxReceiveMessageSize(-1);
   int selected_port = 0;
   builder.AddListeningPort(endpoint, grpc::InsecureServerCredentials(),
                            &selected_port);

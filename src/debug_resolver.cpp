@@ -9,6 +9,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -17,9 +18,13 @@
 #include <llvm/BinaryFormat/Dwarf.h>
 #include <llvm/DebugInfo/DWARF/DWARFContext.h>
 #include <llvm/DebugInfo/DWARF/DWARFDie.h>
+#include <llvm/Demangle/Demangle.h>
 #include <llvm/Object/Binary.h>
 #include <llvm/Object/ELFObjectFile.h>
+#include <llvm/Object/BuildID.h>
 #include <llvm/Object/ObjectFile.h>
+#include <llvm/Support/CRC.h>
+#include <llvm/Support/Endian.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/SHA256.h>
 #include <llvm/TargetParser/Triple.h>
@@ -51,7 +56,7 @@ DWARFDie type_of(DWARFDie d) {
 
 std::string qualified(DWARFDie d) {
   std::vector<std::string> parts;
-  for (unsigned depth = 0; d && depth < 64; ++depth, d = d.getParent()) {
+  for (; d; d = d.getParent()) {
     const auto tag = d.getTag();
     if (tag == dw::DW_TAG_namespace || tag == dw::DW_TAG_class_type ||
         tag == dw::DW_TAG_structure_type || tag == dw::DW_TAG_subprogram) {
@@ -172,6 +177,9 @@ Type read_type(DWARFDie d, unsigned depth = 0) {
     throw std::runtime_error("unsupported debug builtin: " + t.spelling);
   }
   const auto enc = number(d, dw::DW_AT_encoding);
+  if (enc == dw::DW_ATE_boolean && t.size == 1) {
+    t.value = api::BOOL;
+  }
   if (enc == dw::DW_ATE_signed && t.size == 4) {
     t.value = api::INT32;
   }
@@ -271,9 +279,6 @@ std::vector<std::string> modules(std::uint32_t pid, bool include_runtime = false
     if (!runtime || include_runtime) {
       paths.insert(path);
     }
-    if (paths.size() > 256) {
-      throw std::runtime_error("debug discovery exceeds 256 mapped images");
-    }
   }
   return {paths.begin(), paths.end()};
 }
@@ -334,9 +339,6 @@ std::vector<ExecutableMapping> read_executable_mappings(
     } catch (...) {
       continue;
     }
-    if (result.size() > 65536) {
-      throw std::runtime_error("executable mapping count exceeds 65536");
-    }
   }
   std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
     return left.raw < right.raw;
@@ -348,18 +350,11 @@ std::string mapping_fingerprint(
     const std::vector<std::string>& image_paths,
     const std::vector<ExecutableMapping>& executable_mappings) {
   llvm::SHA256 hash;
-  std::uint64_t image_bytes = 0;
-  constexpr std::uint64_t kMaxMappedImageBytes = 2ULL * 1024 * 1024 * 1024;
   for (const auto& path : image_paths) {
     struct stat st{};
     if (::stat(path.c_str(), &st) != 0) {
       throw std::runtime_error("cannot stat mapped debug image");
     }
-    const auto file_size = static_cast<std::uint64_t>(st.st_size);
-    if (file_size > kMaxMappedImageBytes - image_bytes) {
-      throw std::runtime_error("symbol discovery image budget exceeded (2 GiB)");
-    }
-    image_bytes += file_size;
     std::string identity = path;
     identity.push_back('\0');
     hash.update(identity);
@@ -543,34 +538,62 @@ void describe_record(DWARFDie record, api::DebugInfo& info) {
   }
   info.set_record_name(qualified(record));
   info.set_record_size(number(record, dw::DW_AT_byte_size));
+  const auto record_calling_convention =
+      number(record, dw::DW_AT_calling_convention, 0);
+  info.set_record_pass_by_reference(
+      record_calling_convention == dw::DW_CC_pass_by_reference);
+  info.set_record_calling_convention(
+      record_calling_convention == dw::DW_CC_pass_by_value
+          ? api::RECORD_PASS_BY_VALUE
+          : (record_calling_convention == dw::DW_CC_pass_by_reference
+                 ? api::RECORD_PASS_BY_REFERENCE
+                 : api::RECORD_CALLING_CONVENTION_UNSPECIFIED));
   info.set_receiver_volatile(false);
-  if (info.record_name().empty() || !info.record_size()) {
-    throw std::runtime_error("incomplete receiver debug information");
-  }
+  if (info.record_name().empty())
+    throw std::runtime_error("incomplete debug record identity");
+  bool opaque = !info.record_size();
   for (auto member : record.children()) {
     if (member.getTag() == dw::DW_TAG_inheritance) {
-      throw std::runtime_error("debug receiver inheritance is unsupported");
+      opaque = true;
+      continue;
     }
     if (member.getTag() != dw::DW_TAG_member) {
       continue;
     }
+    // Static data members have no object offset. Ignore only declarations
+    // explicitly marked external/declaration; a missing location on an
+    // ordinary member means the instance layout is incomplete.
     if (member.find(dw::DW_AT_bit_size)) {
-      throw std::runtime_error("debug receiver bitfields are unsupported");
+      opaque = true;
+      continue;
     }
     auto location = member.find(dw::DW_AT_data_member_location);
     if (!location) {
-      continue; // Static member, not object storage.
+      if (number(member, dw::DW_AT_external) ||
+          number(member, dw::DW_AT_declaration))
+        continue;
+      opaque = true;
+      continue;
     }
     auto offset = location->getAsUnsignedConstant();
     if (!offset || name(member).empty() || info.fields_size() == 128) {
-      throw std::runtime_error("unsupported debug member location");
+      opaque = true;
+      continue;
     }
-    auto t = read_type(type_of(member));
+    Type t;
+    try {
+      t = read_type(type_of(member));
+    } catch (const std::exception &) {
+      opaque = true;
+      continue;
+    }
     if (!t.size || *offset > info.record_size() || t.size > info.record_size() - *offset) {
-      throw std::runtime_error("debug field is outside the receiver layout");
+      opaque = true;
+      continue;
     }
     if (t.record) {
-      throw std::runtime_error("nested object fields are unsupported");
+      opaque = true;
+      continue;
     }
     auto* f = info.add_fields();
     f->set_name(name(member));
@@ -585,13 +608,127 @@ void describe_record(DWARFDie record, api::DebugInfo& info) {
                   : access == dw::DW_ACCESS_protected ? "protected"
                                                       : "public");
   }
+  if (opaque)
+    info.clear_fields();
   std::uint64_t natural_alignment = 1;
   for (const auto& field : info.fields()) {
     natural_alignment = std::max(natural_alignment, std::min<std::uint64_t>(field.byte_size(), 8));
   }
   const auto declared_alignment = number(record, dw::DW_AT_alignment);
-  if (declared_alignment && declared_alignment != natural_alignment) {
+  if (!opaque && declared_alignment && declared_alignment != natural_alignment) {
     throw std::runtime_error("nonordinary debug record alignment is unsupported");
+  }
+  info.set_record_alignment(declared_alignment
+                                ? declared_alignment
+                                : (opaque ? 0 : natural_alignment));
+  info.set_record_is_opaque(opaque || info.fields_size() == 0);
+}
+
+void describe_methods(DWARFDie record, api::DebugInfo &info) {
+  std::set<std::string> seen;
+  for (auto method_die : record.children()) {
+    if (method_die.getTag() != dw::DW_TAG_subprogram)
+      continue;
+    auto method = declaration(method_die);
+    if (name(method) == name(record) ||
+        ::tracer::compat::starts_with(name(method), "~"))
+      continue;
+    const auto accessibility = number(
+        method, dw::DW_AT_accessibility,
+        record.getTag() == dw::DW_TAG_class_type ? dw::DW_ACCESS_private
+                                                 : dw::DW_ACCESS_public);
+    const char *linkage = method_die.getName(llvm::DINameKind::LinkageName);
+    if (accessibility != dw::DW_ACCESS_public || !linkage || !*linkage ||
+        info.methods_size() >= 128 || !seen.insert(linkage).second)
+      continue;
+    api::DebugMethod described;
+    described.set_name(name(method));
+    described.set_linkage_symbol(linkage);
+    const auto calling_convention =
+        number(method, dw::DW_AT_calling_convention, dw::DW_CC_normal);
+    described.set_calling_convention(calling_convention);
+    bool variadic = false;
+    for (auto child : method_die.children())
+      variadic |= child.getTag() == dw::DW_TAG_unspecified_parameters;
+    described.set_is_variadic(variadic);
+    described.set_is_virtual(number(method, dw::DW_AT_virtuality) != 0);
+    if (auto return_die = type_of(method)) {
+      try {
+        described.set_cpp_result_type(read_type(return_die).spelling);
+      } catch (const std::exception &) {
+        continue;
+      }
+    } else {
+      described.set_cpp_result_type("void");
+    }
+    bool has_this = false;
+    bool unsupported = calling_convention != dw::DW_CC_normal || variadic;
+    DWARFDie object_pointer = method_die.getAttributeValueAsReferencedDie(
+        dw::DW_AT_object_pointer);
+    if (!object_pointer)
+      object_pointer = method.getAttributeValueAsReferencedDie(
+          dw::DW_AT_object_pointer);
+    bool first_formal = true;
+    for (auto parameter : method_die.children()) {
+      if (parameter.getTag() != dw::DW_TAG_formal_parameter)
+        continue;
+      const bool is_object_pointer =
+          (object_pointer &&
+           object_pointer.getOffset() == parameter.getOffset()) ||
+          (!object_pointer && first_formal &&
+           number(parameter, dw::DW_AT_artificial));
+      first_formal = false;
+      if (is_object_pointer) {
+        has_this = true;
+        auto this_type = type_of(parameter);
+        while (this_type && (this_type.getTag() == dw::DW_TAG_const_type ||
+                             this_type.getTag() == dw::DW_TAG_volatile_type ||
+                             this_type.getTag() == dw::DW_TAG_typedef)) {
+          described.set_is_const(described.is_const() ||
+                                 this_type.getTag() == dw::DW_TAG_const_type);
+          described.set_is_volatile(
+              described.is_volatile() ||
+              this_type.getTag() == dw::DW_TAG_volatile_type);
+          this_type = type_of(this_type);
+        }
+        if (!this_type || this_type.getTag() != dw::DW_TAG_pointer_type) {
+          unsupported = true;
+          break;
+        }
+        this_type = type_of(this_type);
+        while (this_type && (this_type.getTag() == dw::DW_TAG_const_type ||
+                             this_type.getTag() == dw::DW_TAG_volatile_type ||
+                             this_type.getTag() == dw::DW_TAG_typedef)) {
+          described.set_is_const(described.is_const() ||
+                                 this_type.getTag() == dw::DW_TAG_const_type);
+          described.set_is_volatile(
+              described.is_volatile() ||
+              this_type.getTag() == dw::DW_TAG_volatile_type);
+          this_type = type_of(this_type);
+        }
+        continue;
+      }
+      if (number(parameter, dw::DW_AT_artificial) ||
+          described.cpp_parameter_types_size() >= 8) {
+        unsupported = true;
+        break;
+      }
+      try {
+        described.add_cpp_parameter_types(read_type(type_of(parameter)).spelling);
+      } catch (const std::exception &) {
+        unsupported = true;
+        break;
+      }
+    }
+    described.set_is_static(!has_this);
+    described.set_ref_qualifier(
+        number(method, dw::DW_AT_rvalue_reference)
+            ? "&&"
+            : (number(method, dw::DW_AT_reference) ? "&" : ""));
+    // Keep unsupported declarations in metadata so the agent can fail closed
+    // before either a header declaration or a process symbol can bind them.
+    (void)unsupported;
+    *info.add_methods() = std::move(described);
   }
 }
 
@@ -619,7 +756,7 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl) {
 
   CallableShape result;
   const auto return_type = read_type(type_of(decl));
-  if (return_type.value == api::VALUE_TYPE_UNSPECIFIED || return_type.value == api::OBJECT) {
+  if (return_type.value == api::VALUE_TYPE_UNSPECIFIED) {
     throw std::runtime_error("unsupported debug return ABI");
   }
   result.signature.set_result(return_type.value);
@@ -675,12 +812,8 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl) {
     argument.set_is_reference(type.reference);
     argument.set_is_object_value(type.value == api::OBJECT);
     if (type.record) {
-      if (type.value == api::OBJECT &&
-          number(type.record, dw::DW_AT_calling_convention) != dw::DW_CC_pass_by_value) {
-        throw std::runtime_error(
-            "by-value class arguments require explicit DWARF pass-by-value ABI evidence");
-      }
       describe_record(type.record, *argument.mutable_object_type());
+      describe_methods(type.record, *argument.mutable_object_type());
     }
     result.arguments.push_back(std::move(argument));
     result.signature.add_arguments(type.value);
@@ -725,10 +858,178 @@ std::pair<std::uint64_t, std::uint64_t> callable_code_range(DWARFDie die) {
   }
   return {low, high};
 }
+
+void resolve_method_symbols(const llvm::object::ELF64LEObjectFile &object,
+                            std::uint32_t pid,
+                            const api::DebugInfo &module_identity,
+                            api::DebugInfo &record) {
+  for (auto &method : *record.mutable_methods()) {
+    if (method.linkage_symbol().empty())
+      continue;
+    for (const auto &symbol : object.symbols()) {
+      auto symbol_name = symbol.getName();
+      if (!symbol_name) {
+        llvm::consumeError(symbol_name.takeError());
+        continue;
+      }
+      if (*symbol_name != method.linkage_symbol())
+        continue;
+      auto symbol_type = symbol.getType();
+      if (!symbol_type) {
+        llvm::consumeError(symbol_type.takeError());
+        continue;
+      }
+      if (*symbol_type != llvm::object::SymbolRef::ST_Function)
+        continue;
+      auto address = symbol.getAddress();
+      auto size = symbol.getSize();
+      if (!address) {
+        llvm::consumeError(address.takeError());
+        continue;
+      }
+      if (size == 0 || *address > UINT64_MAX - size)
+        continue;
+      try {
+        method.set_runtime_entry(runtime_entry(pid, object, module_identity,
+                                               *address, *address + size));
+      } catch (const std::exception &) {
+        continue;
+      }
+      break;
+    }
+  }
+}
+
+bool lists_symbol(const llvm::object::ELF64LEObjectFile &object,
+                  const std::string &selected, const std::string &selected_name) {
+  const auto matches = [&](const llvm::object::SymbolRef &symbol) {
+    auto flags = symbol.getFlags();
+    if (!flags) {
+      llvm::consumeError(flags.takeError());
+      return false;
+    }
+    if (*flags & llvm::object::SymbolRef::SF_Undefined)
+      return false;
+    auto symbol_name = symbol.getName();
+    if (!symbol_name) {
+      llvm::consumeError(symbol_name.takeError());
+      return false;
+    }
+    const auto raw = compact(symbol_name->str());
+    const auto demangled = compact(llvm::demangle(symbol_name->str()));
+    const auto name = demangled.substr(0, demangled.find('('));
+    const auto scope = name.rfind("::");
+    return raw == selected || demangled == selected || name == selected_name ||
+           (scope != std::string::npos && name.substr(scope + 2) == selected_name);
+  };
+  for (const auto &symbol : object.symbols())
+    if (matches(symbol)) return true;
+  for (const auto &symbol : object.getDynamicSymbolIterators())
+    if (matches(symbol)) return true;
+  return false;
+}
+
+std::optional<std::string> separate_debug_file(
+    const std::string &path, const llvm::object::ELF64LEObjectFile &object) {
+  const auto main_build_id = llvm::object::getBuildID(&object);
+  std::string debuglink_name;
+  std::optional<std::uint32_t> debuglink_crc;
+  for (const auto &section : object.sections()) {
+    auto section_name = section.getName();
+    if (!section_name || *section_name != ".gnu_debuglink") {
+      if (!section_name)
+        llvm::consumeError(section_name.takeError());
+      continue;
+    }
+    auto contents = section.getContents();
+    if (!contents) {
+      llvm::consumeError(contents.takeError());
+      break;
+    }
+    const auto nul = contents->find('\0');
+    if (nul == llvm::StringRef::npos || nul + 1 >= contents->size())
+      break;
+    debuglink_name = contents->substr(0, nul).str();
+    std::size_t crc_offset = (nul + 1 + 3) & ~std::size_t(3);
+    if (crc_offset > contents->size() ||
+        contents->size() - crc_offset < sizeof(std::uint32_t))
+      break;
+    debuglink_crc = llvm::support::endian::read32le(
+        reinterpret_cast<const std::uint8_t *>(contents->data() + crc_offset));
+    break;
+  }
+
+  std::vector<std::pair<std::string, bool>> candidates;
+  const auto module_path = std::filesystem::path(path);
+  if (!debuglink_name.empty() && debuglink_crc) {
+    candidates.emplace_back(
+        (module_path.parent_path() / debuglink_name).string(), false);
+    candidates.emplace_back(
+        (module_path.parent_path() / ".debug" / debuglink_name).string(), false);
+    candidates.emplace_back(
+        (std::filesystem::path("/usr/lib/debug") /
+         module_path.parent_path().relative_path() / debuglink_name)
+            .string(),
+        false);
+  }
+  if (!main_build_id.empty()) {
+    std::string build_id;
+    for (const auto byte : main_build_id) {
+      constexpr char digits[] = "0123456789abcdef";
+      build_id.push_back(digits[byte >> 4]);
+      build_id.push_back(digits[byte & 0x0f]);
+    }
+    candidates.emplace_back(
+        "/usr/lib/debug/.build-id/" + build_id.substr(0, 2) + "/" +
+            build_id.substr(2) + ".debug",
+        true);
+  }
+
+  for (const auto &[candidate, require_build_id] : candidates) {
+    std::ifstream input(candidate, std::ios::binary);
+    if (!input)
+      continue;
+    std::string bytes((std::istreambuf_iterator<char>(input)),
+                      std::istreambuf_iterator<char>());
+    if (bytes.empty())
+      continue;
+    if (debuglink_crc) {
+      const auto crc = llvm::crc32(llvm::ArrayRef<std::uint8_t>(
+          reinterpret_cast<const std::uint8_t *>(bytes.data()), bytes.size()));
+      if (crc != *debuglink_crc)
+        continue;
+    }
+    auto debug_binary = llvm::object::createBinary(candidate);
+    if (!debug_binary) {
+      llvm::consumeError(debug_binary.takeError());
+      continue;
+    }
+    const auto *debug_object = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(
+        debug_binary->getBinary());
+    if (!debug_object || !debug_object->isELF() ||
+        debug_object->getArch() != llvm::Triple::x86_64 ||
+        !debug_object->isLittleEndian())
+      continue;
+    const auto debug_build_id = llvm::object::getBuildID(debug_object);
+    if (require_build_id && debug_build_id.empty())
+      continue;
+    if (!main_build_id.empty() && !debug_build_id.empty() &&
+        !std::equal(main_build_id.begin(), main_build_id.end(),
+                    debug_build_id.begin(), debug_build_id.end()))
+      continue;
+    return candidate;
+  }
+  return std::nullopt;
+}
 } // namespace
 
-ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& selector) {
-  if (selector.empty() || selector.size() > 4096) {
+std::vector<std::string> list_debug_modules(std::uint32_t pid) {
+  return modules(pid);
+}
+
+ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& selector,
+                                       const DebugLookupOptions &options) {
+  if (selector.empty() || selector.find('\0') != std::string::npos) {
     throw std::runtime_error("invalid debug selector");
   }
   const auto selected = compact(selector);
@@ -736,7 +1037,14 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
   const auto selected_name = selected.substr(0, paren);
   std::map<std::string, ResolvedCallable> matches;
   std::string rejected;
+  std::uint64_t visited = 0;
   for (const auto& path : modules(pid)) {
+    if (options.is_cancelled())
+      throw std::runtime_error("debug lookup cancelled");
+    if (!options.module.empty() &&
+        (options.module.front() == '/' ? path != options.module
+                                      : path.find(options.module) == std::string::npos))
+      continue;
     api::DebugInfo before;
     identity(before, path);
     auto binary = llvm::object::createBinary(path);
@@ -749,15 +1057,38 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
         object->getBytesInAddress() != 8 || !object->isLittleEndian()) {
       continue;
     }
-    auto dwarf = llvm::DWARFContext::create(*object);
-    std::size_t visited = 0;
-    std::function<void(DWARFDie, unsigned)> visit = [&](DWARFDie die, unsigned depth) {
+    if (options.module.empty() && !lists_symbol(*object, selected, selected_name))
+      continue;
+    std::optional<llvm::object::OwningBinary<llvm::object::Binary>>
+        separate_debug_binary;
+    const llvm::object::ELF64LEObjectFile *dwarf_object = object;
+    if (const auto debug_path = separate_debug_file(path, *object)) {
+      auto loaded_debug = llvm::object::createBinary(*debug_path);
+      if (loaded_debug) {
+        const auto *candidate = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(
+            loaded_debug->getBinary());
+        if (candidate && candidate->isELF() &&
+            candidate->getArch() == llvm::Triple::x86_64 &&
+            candidate->isLittleEndian()) {
+          separate_debug_binary.emplace(std::move(*loaded_debug));
+          dwarf_object = candidate;
+        }
+      } else {
+        llvm::consumeError(loaded_debug.takeError());
+      }
+    }
+    auto dwarf = llvm::DWARFContext::create(*dwarf_object);
+    const auto visit = [&](DWARFDie die, std::size_t depth) {
       if (!die) {
         return;
       }
-      if (depth > 128 || ++visited > 1000000) {
-        throw std::runtime_error("debug traversal limits exceeded");
-      }
+      if (options.is_cancelled())
+        throw std::runtime_error("debug lookup cancelled");
+      if (options.max_entries && visited >= options.max_entries)
+        throw DebugLookupLimit("debug entry limit exceeded; increase --debug-max-entries or use 0");
+      ++visited;
+      if (options.max_depth && depth > options.max_depth)
+        throw DebugLookupLimit("debug depth limit exceeded; increase --debug-max-depth or use 0");
       if (die.getTag() == dw::DW_TAG_subprogram) {
         auto decl = declaration(die);
         const auto qname = qualified(decl);
@@ -793,11 +1124,34 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
             info->set_selector(shape.selector);
             if (shape.receiver) {
               describe_record(shape.receiver, *info);
+              describe_methods(shape.receiver, *info);
               info->set_receiver_volatile(shape.receiver_volatile);
+            }
+            {
+              const auto result_type = read_type(type_of(declaration(die)));
+              info->set_result_cpp_type(result_type.spelling);
+              info->set_result_is_object_value(result_type.value == api::OBJECT);
+              info->set_result_is_reference(result_type.reference);
+              if (result_type.record) {
+                describe_record(result_type.record,
+                                *info->mutable_result_object_type());
+                describe_methods(result_type.record,
+                                 *info->mutable_result_object_type());
+                info->set_result_pass_by_reference(
+                    info->result_object_type().record_pass_by_reference());
+              }
             }
             for (const auto& argument : shape.arguments) {
               *info->add_arguments() = argument;
             }
+            resolve_method_symbols(*object, pid, before, *info);
+            for (auto &argument : *info->mutable_arguments())
+              if (argument.has_object_type())
+                resolve_method_symbols(*object, pid, before,
+                                       *argument.mutable_object_type());
+            if (info->has_result_object_type())
+              resolve_method_symbols(*object, pid, before,
+                                     *info->mutable_result_object_type());
             found.spec.set_symbol(symbol);
             found.declaration = shape.result_spelling + " " + shape.selector;
             found.source = path;
@@ -808,12 +1162,20 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
           }
         }
       }
-      for (auto child : die.children()) {
-        visit(child, depth + 1);
-      }
     };
     for (const auto& unit : dwarf->compile_units()) {
-      visit(unit->getUnitDIE(false), 0);
+      std::vector<std::pair<DWARFDie, std::size_t>> pending{{unit->getUnitDIE(false), 0}};
+      while (!pending.empty()) {
+        const auto [die, depth] = pending.back();
+        pending.pop_back();
+        visit(die, depth);
+        if (die) {
+          const auto children_begin = pending.size();
+          for (auto child : die.children())
+            pending.emplace_back(child, depth + 1);
+          std::reverse(pending.begin() + children_begin, pending.end());
+        }
+      }
     }
   }
   if (matches.size() != 1) {
@@ -838,9 +1200,6 @@ DebugSymbolPage list_debug_symbols(
     const std::string& after_linkage_symbol, const std::string& after_module_path,
     const std::string& expected_mapping_fingerprint,
     const std::function<bool()>& is_cancelled) {
-  if (page_size == 0 || page_size > 500) {
-    throw std::invalid_argument("symbol page size must be between 1 and 500");
-  }
   const auto image_paths = modules(pid);
   const auto mappings = read_executable_mappings(pid, image_paths);
   const auto current_fingerprint = mapping_fingerprint(image_paths, mappings);
@@ -852,8 +1211,6 @@ DebugSymbolPage list_debug_symbols(
   using Key = std::tuple<std::string, std::string, std::string>;
   const Key after{after_selector, after_linkage_symbol, after_module_path};
   std::map<Key, DebugSymbol> candidates;
-  std::size_t visited = 0;
-  constexpr std::size_t kMaxVisitedDies = 2'000'000;
   bool cancelled = false;
   for (const auto& path : image_paths) {
     if (is_cancelled()) {
@@ -881,16 +1238,30 @@ DebugSymbolPage list_debug_symbols(
                  [&](const auto& mapping) { return mapping.path == path; });
     const auto mapped_ranges =
         mapped_executable_ranges(*object, module_identity, segments, module_mappings);
-    auto dwarf = llvm::DWARFContext::create(*object);
-    std::function<void(DWARFDie, unsigned)> visit = [&](DWARFDie die, unsigned depth) {
+    std::optional<llvm::object::OwningBinary<llvm::object::Binary>>
+        separate_debug_binary;
+    const llvm::object::ELF64LEObjectFile *dwarf_object = object;
+    if (const auto debug_path = separate_debug_file(path, *object)) {
+      auto loaded_debug = llvm::object::createBinary(*debug_path);
+      if (loaded_debug) {
+        const auto *candidate = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(
+            loaded_debug->getBinary());
+        if (candidate && candidate->isELF() &&
+            candidate->getArch() == llvm::Triple::x86_64 &&
+            candidate->isLittleEndian()) {
+          separate_debug_binary.emplace(std::move(*loaded_debug));
+          dwarf_object = candidate;
+        }
+      } else {
+        llvm::consumeError(loaded_debug.takeError());
+      }
+    }
+    auto dwarf = llvm::DWARFContext::create(*dwarf_object);
+    const auto visit = [&](DWARFDie die) {
       if (!die || cancelled) {
         return;
       }
-      if (depth > 128 || ++visited > kMaxVisitedDies) {
-        throw std::runtime_error(
-            "symbol discovery work limit exceeded; narrow --module and retry");
-      }
-      if ((visited & 1023U) == 0 && is_cancelled()) {
+      if (is_cancelled()) {
         cancelled = true;
         return;
       }
@@ -912,16 +1283,10 @@ DebugSymbolPage list_debug_symbols(
             describe_record(shape.receiver, receiver_info);
           }
           const auto& selector = shape.selector;
-          if (selector.size() > 4096) {
-            throw std::runtime_error("callable selector exceeds 4096 bytes");
-          }
-          if (path.size() > 4096) {
-            throw std::runtime_error("mapped module path exceeds 4096 bytes");
-          }
           const char* linkage = die.getName(llvm::DINameKind::LinkageName);
           const std::string linkage_symbol = linkage ? linkage : name(decl);
-          if (linkage_symbol.empty() || linkage_symbol.size() > 4096) {
-            throw std::runtime_error("callable linkage name exceeds 4096 bytes");
+          if (linkage_symbol.empty()) {
+            throw std::runtime_error("callable has no linkage name");
           }
           if (selector.find(query) != std::string::npos ||
               linkage_symbol.find(query) != std::string::npos) {
@@ -929,7 +1294,8 @@ DebugSymbolPage list_debug_symbols(
             if (key > after) {
               candidates.try_emplace(
                   key, DebugSymbol{selector, linkage_symbol, path});
-              if (candidates.size() > page_size + 1) {
+              if (page_size != 0 && candidates.size() > page_size &&
+                  candidates.size() - page_size > 1) {
                 candidates.erase(std::prev(candidates.end()));
               }
             }
@@ -939,19 +1305,25 @@ DebugSymbolPage list_debug_symbols(
           // that the existing DWARF resolver can accept.
         }
       }
-      for (auto child : die.children()) {
-        visit(child, depth + 1);
-        if (cancelled) {
-          return;
-        }
-      }
     };
     for (const auto& unit : dwarf->compile_units()) {
       if (is_cancelled()) {
         cancelled = true;
         break;
       }
-      visit(unit->getUnitDIE(false), 0);
+      // Keep traversal storage on the heap so deep DWARF does not impose a
+      // recursion limit. Results are ordered by key, independent of visit order.
+      std::vector<DWARFDie> pending{unit->getUnitDIE(false)};
+      while (!pending.empty() && !cancelled) {
+        const auto die = pending.back();
+        pending.pop_back();
+        visit(die);
+        if (die && !cancelled) {
+          for (auto child : die.children()) {
+            pending.push_back(child);
+          }
+        }
+      }
       if (cancelled) {
         break;
       }
@@ -973,7 +1345,7 @@ DebugSymbolPage list_debug_symbols(
   DebugSymbolPage page;
   page.mapping_fingerprint = current_fingerprint;
   page.cancelled = cancelled;
-  page.has_more = candidates.size() > page_size;
+  page.has_more = page_size != 0 && candidates.size() > page_size;
   auto end = candidates.end();
   if (page.has_more) {
     --end;

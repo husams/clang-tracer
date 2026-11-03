@@ -15,6 +15,7 @@ struct tracer_invocation_instance final {
   code += "  std::optional<" + plan.type + "> interceptor;\n";
   code += R"CPP(
   bool hooks_enabled = false;
+  bool cleaned = false;
   explicit tracer_invocation_instance(const tracer::TraceContext &raw) noexcept {
     const int saved_errno = errno;
     if (tracer_callback_lifecycle_enter(raw.probe_id)) {
@@ -28,7 +29,9 @@ struct tracer_invocation_instance final {
   tracer_invocation_instance &operator=(const tracer_invocation_instance &) = delete;
   tracer_invocation_instance(tracer_invocation_instance &&) = delete;
   tracer_invocation_instance &operator=(tracer_invocation_instance &&) = delete;
-  ~tracer_invocation_instance() noexcept {
+  void destroy() noexcept {
+    if (cleaned) return;
+    cleaned = true;
     if (!interceptor) return;
     const int saved_errno = errno;
     tracer_callback_cleanup_enter();
@@ -36,6 +39,7 @@ struct tracer_invocation_instance final {
     tracer_callback_lifecycle_leave();
     errno = saved_errno;
   }
+  ~tracer_invocation_instance() noexcept { destroy(); }
 };
 )CPP";
   code += "static_assert(std::is_nothrow_destructible_v<" + plan.type +

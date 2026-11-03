@@ -137,6 +137,7 @@ bool write_typed_trace_value(BoundedProtoWriter &writer, std::uint32_t field,
   bool ok = true;
   switch (value.type) {
   case tracer::ValueType::Int32:
+  case tracer::ValueType::Bool:
   case tracer::ValueType::Int64:
     ok = writer.s64(2, value.signed_value);
     break;

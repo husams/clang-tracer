@@ -220,3 +220,24 @@ def test_symbol_page_has_readable_names_and_pagination_notice():
     assert "_ZNK10Calculator8multiplyEii" in output
     assert "/tmp/target" in output
     assert "next-page command" in output
+
+
+def test_validation_report_displays_status_options_and_diagnostic_location():
+    report = pb.ValidationReport(
+        success=False,
+        level=pb.ValidateProbeRequest.SYNTAX,
+        effective_options=["-std=c++17"],
+    )
+    report.diagnostics.add(
+        stage="parse",
+        severity="error",
+        file="callback.cpp",
+        line=3,
+        column=8,
+        message="expected ;",
+    )
+    output = plain(report)
+    assert "validation failed level=syntax" in output
+    assert "-std=c++17" in output
+    assert "error [parse] callback.cpp:3:8" in output
+    assert "expected ;" in output

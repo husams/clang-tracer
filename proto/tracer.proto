@@ -8,10 +8,12 @@ service Tracer {
   rpc Attach(AttachRequest) returns (Session);
   // Resolve on the tracing host, so remote clients need no target files.
   rpc ResolveProbe(ResolveProbeRequest) returns (ProbeSpec);
+  rpc ValidateProbe(ValidateProbeRequest) returns (ValidationReport);
   rpc AddProbe(AddProbeRequest) returns (Probe);
   rpc RemoveProbe(RemoveProbeRequest) returns (Probe);
   rpc Detach(DetachRequest) returns (Session);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc ListModules(ListModulesRequest) returns (ListModulesResponse);
   rpc ListSymbols(ListSymbolsRequest) returns (ListSymbolsResponse);
   rpc WatchEvents(WatchEventsRequest) returns (stream TraceEvent);
   // Snapshot retained events; acknowledge only after storage commits.
@@ -28,7 +30,8 @@ enum ValueType {
   FLOAT32 = 5;
   FLOAT64 = 6;
   POINTER = 7;
-  OBJECT = 8; // Address of the wrapper's by-value argument snapshot.
+  OBJECT = 8; // Borrowed object argument or POST result address; callback-scoped.
+  BOOL = 9;
 }
 enum CallableKind {
   CALLABLE_KIND_UNSPECIFIED = 0;
@@ -86,6 +89,11 @@ message DebugTypeLevel {
   bool is_const = 4;
   bool is_volatile = 5;
 }
+enum RecordCallingConvention {
+  RECORD_CALLING_CONVENTION_UNSPECIFIED = 0;
+  RECORD_PASS_BY_VALUE = 1;
+  RECORD_PASS_BY_REFERENCE = 2;
+}
 message DebugInfo {
   string module = 1;
   uint64 device = 2;
@@ -102,6 +110,30 @@ message DebugInfo {
   uint64 entry_virtual_address = 13; // Concrete DWARF code range, before ASLR.
   uint64 entry_size = 14;
   uint64 runtime_entry = 15; // Revalidated against mapped ELF PT_LOAD identity.
+  DebugInfo result_object_type = 16;
+  string result_cpp_type = 17;
+  bool result_is_object_value = 18;
+  bool result_is_reference = 19;
+  bool result_pass_by_reference = 20;
+  repeated DebugMethod methods = 21;
+  bool record_pass_by_reference = 22;
+  bool record_is_opaque = 23;
+  uint64 record_alignment = 24;
+  RecordCallingConvention record_calling_convention = 25;
+}
+message DebugMethod {
+  string name = 1;
+  string linkage_symbol = 2;
+  string cpp_result_type = 3;
+  repeated string cpp_parameter_types = 4;
+  bool is_const = 5;
+  bool is_volatile = 6;
+  bool is_static = 7;
+  bool is_virtual = 8;
+  uint64 runtime_entry = 9;
+  uint32 calling_convention = 10;
+  string ref_qualifier = 11;
+  bool is_variadic = 12;
 }
 message DebugArgument {
   uint32 index = 1;
@@ -136,6 +168,7 @@ message ProbeSpec {
   // the server assigns the lineage UUID and never accepts one from clients.
   string callback_package_path = 15;
   reserved 16;
+  repeated string compile_options = 17;
 }
 message AttachRequest {
   uint32 pid = 1;
@@ -169,6 +202,37 @@ message ResolveProbeRequest {
   string selector = 2; // C++ declaration, e.g. Calculator::add(int).
   repeated string include_headers = 3; // Paths on the server host.
   string compilation_database = 4; // Optional path on the server host.
+  string module = 5; // Optional mapped path substring; empty uses ELF symbol tables.
+  uint64 debug_max_entries = 6; // Zero is unlimited.
+  uint32 debug_max_depth = 7; // Zero is unlimited.
+  repeated string compile_options = 8;
+}
+message ValidateProbeRequest {
+  string session_id = 1;
+  string selector = 2;
+  string callback_source = 3;
+  repeated string include_headers = 4;
+  string compilation_database = 5;
+  repeated string compile_options = 6;
+  enum Level { COMPILE = 0; SYNTAX = 1; }
+  Level level = 7;
+  string module = 8;
+  uint64 debug_max_entries = 9;
+  uint32 debug_max_depth = 10;
+}
+message ValidationDiagnostic {
+  string stage = 1;
+  string severity = 2;
+  string file = 3;
+  uint32 line = 4;
+  uint32 column = 5;
+  string message = 6;
+}
+message ValidationReport {
+  bool success = 1;
+  ValidateProbeRequest.Level level = 2;
+  repeated string effective_options = 3;
+  repeated ValidationDiagnostic diagnostics = 4;
 }
 message Probe {
   uint64 id = 1;
@@ -189,11 +253,13 @@ message RemoveProbeRequest {
 message DetachRequest { string session_id = 1; }
 message ListSessionsRequest {}
 message ListSessionsResponse { repeated Session sessions = 1; }
+message ListModulesRequest { string session_id = 1; }
+message ListModulesResponse { repeated string modules = 1; }
 message ListSymbolsRequest {
   string session_id = 1;
   string query = 2; // Case-sensitive substring of selector or linkage name.
   string module = 3; // Case-sensitive substring of mapped ELF module path.
-  uint32 page_size = 4; // Zero selects 100; maximum 500.
+  uint32 page_size = 4; // Zero returns all matches; positive values opt into pagination.
   string page_token = 5; // Opaque continuation token from the previous page.
 }
 message FunctionSymbol {

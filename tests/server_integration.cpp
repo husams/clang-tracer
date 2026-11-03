@@ -683,6 +683,62 @@ void run(const std::filesystem::path &server_path,
   report(report_file,
          "wrong callback signature rejected: " + wrong_status.error_message());
 
+  api::ProbeSpec invalid_compile_option = free_spec;
+  invalid_compile_option.add_compile_options("");
+  api::Probe invalid_compile_option_response;
+  const auto invalid_compile_option_status =
+      add_probe(*stub, session_a.id(), invalid_compile_option,
+                &invalid_compile_option_response);
+  require_failure_category(invalid_compile_option_status,
+                           "empty compiler option",
+                           {"compiler options must be nonempty"});
+  report(report_file, "empty compiler option rejected before native preparation");
+
+  api::ValidateProbeRequest invalid_validation_option;
+  invalid_validation_option.set_selector("target(int)");
+  invalid_validation_option.set_callback_source("struct Interceptor {};");
+  invalid_validation_option.add_compile_options("");
+  api::ValidationReport invalid_validation_response;
+  grpc::ClientContext invalid_validation_context;
+  set_rpc_deadline(invalid_validation_context);
+  const auto invalid_validation_status = stub->ValidateProbe(
+      &invalid_validation_context, invalid_validation_option,
+      &invalid_validation_response);
+  require(invalid_validation_status.error_code() ==
+              grpc::StatusCode::INVALID_ARGUMENT &&
+              invalid_validation_status.error_message().find("compiler options") !=
+                  std::string::npos,
+          "ValidateProbe accepted an empty compiler option");
+  report(report_file,
+         "ValidateProbe rejects malformed compiler options before resolution");
+
+  const std::vector<std::string> unsafe_preflight_options = {
+      "@/tmp/clang-tracer-args.rsp", "--config=/tmp/clang-tracer.cfg",
+      "-fplugin=/tmp/plugin.so", "-fpass-plugin=/tmp/pass-plugin.so",
+      "-Xclang", "-Xclang=-load", "-Wp,-load,/tmp/plugin.so",
+      "-Xpreprocessor", "--driver-mode=cl",
+      "/clang:-fplugin=/tmp/plugin.so", "--config-user-dir=/tmp/clang",
+      "-mllvm", "-target=x86_64-unknown-linux-gnu", "-m32",
+      "-fpack-struct", "-include-pch=/tmp/header.pch", "-imacros",
+      "-c",
+      "-fsyntax-only"};
+  for (const auto &option : unsafe_preflight_options) {
+    api::ValidateProbeRequest request;
+    request.set_selector("target(int)");
+    request.set_callback_source("struct Interceptor {};");
+    request.add_compile_options(option);
+    api::ValidationReport response;
+    grpc::ClientContext context;
+    set_rpc_deadline(context);
+    const auto status = stub->ValidateProbe(&context, request, &response);
+    require(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT &&
+                status.error_message().find("compiler options") !=
+                    std::string::npos,
+            "ValidateProbe accepted unsafe preflight option: " + option);
+  }
+  report(report_file,
+         "ValidateProbe rejects plugin, opaque, response-file, and ABI options before resolution");
+
   api::ProbeSpec unsafe = free_spec;
   unsafe.set_symbol("unsafe_target");
   api::Probe unsafe_response;

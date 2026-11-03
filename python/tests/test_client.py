@@ -31,15 +31,32 @@ def test_public_control_and_injection(peer):
         print_arguments=True,
         print_result=True,
         callback_package_path="/srv/interceptor.cpp",
+        module="target",
+        debug_max_entries=2_000_001,
+        debug_max_depth=256,
+        compile_options=["-std=c++17", "-DORDER=1", "-I/srv/include"],
     )
     assert probe.id == 7
     resolution, addition = service.requests[-2:]
     assert resolution.selector == "add(int, int)"
     assert list(resolution.include_headers) == ["/srv/add.hpp"]
     assert resolution.compilation_database == "/srv/build"
+    assert resolution.module == "target"
+    assert resolution.debug_max_entries == 2_000_001
+    assert resolution.debug_max_depth == 256
+    assert list(resolution.compile_options) == [
+        "-std=c++17",
+        "-DORDER=1",
+        "-I/srv/include",
+    ]
     assert addition.spec.stack_depth == 24
     assert addition.spec.print_arguments and addition.spec.print_result
     assert addition.spec.callback_package_path == "/srv/interceptor.cpp"
+    assert list(addition.spec.compile_options) == [
+        "-std=c++17",
+        "-DORDER=1",
+        "-I/srv/include",
+    ]
     assert not addition.spec.include_internal_stack_frames
     assert client.remove_probe("s1", 7).original_bytes_restored
     assert client.detach("s1").state == pb.Session.DETACHED
@@ -63,12 +80,77 @@ def test_list_symbols_uses_attached_session_and_returns_generated_page(peer):
     assert request.page_token == "opaque"
 
 
-@pytest.mark.parametrize("page_size", [-1, 501, True, 1.5])
+@pytest.mark.parametrize("page_size", [-1, 2**32, True, 1.5])
 def test_list_symbols_rejects_invalid_page_size(peer, page_size):
     client, service = peer
     with pytest.raises(ValueError):
         client.list_symbols("s1", page_size=page_size)
     assert not any(isinstance(item, pb.ListSymbolsRequest) for item in service.requests)
+
+
+@pytest.mark.parametrize("page_size", [None, 0, 501, 100_000, 2**32 - 1])
+def test_list_symbols_accepts_unlimited_and_large_pages(peer, page_size):
+    client, service = peer
+    client.list_symbols("s1", page_size=page_size)
+    assert service.requests[-1].page_size == (page_size or 0)
+
+
+def test_list_symbols_defaults_to_unlimited(peer):
+    client, service = peer
+    client.list_symbols("s1")
+    assert service.requests[-1].page_size == 0
+
+
+def test_list_modules_and_default_lookup_limits(peer):
+    client, service = peer
+    assert client.list_modules("s1") == ["/srv/target", "/srv/libexample.so"]
+    assert service.requests[-1].session_id == "s1"
+    client.resolve_probe("s1", "add")
+    request = service.requests[-1]
+    assert not request.module
+    assert request.debug_max_entries == request.debug_max_depth == 0
+
+
+def test_resolve_probe_preserves_ordered_compiler_options(peer):
+    client, service = peer
+    spec = client.resolve_probe(
+        "s1",
+        "add(int, int)",
+        compile_options=["-std=c++17", "-DVALUE=1", "-I/opt/app/include"],
+    )
+    request = service.requests[-1]
+    assert list(request.compile_options) == [
+        "-std=c++17",
+        "-DVALUE=1",
+        "-I/opt/app/include",
+    ]
+    assert list(spec.compile_options) == list(request.compile_options)
+
+
+def test_add_probe_preserves_options_in_the_complete_spec(peer):
+    client, service = peer
+    spec = pb.ProbeSpec(
+        symbol="_Z3addii",
+        callback_source="struct Interceptor {};",
+        compile_options=["-std=c++17", "-DVALUE=1"],
+    )
+    spec.signature.kind = pb.FUNCTION
+    spec.signature.result = pb.INT32
+    spec.signature.arguments.extend([pb.INT32, pb.INT32])
+    client.add_probe("s1", spec)
+    request = service.requests[-1]
+    assert isinstance(request, pb.AddProbeRequest)
+    assert list(request.spec.compile_options) == ["-std=c++17", "-DVALUE=1"]
+
+
+def test_list_symbols_does_not_cap_filters_or_tokens(peer):
+    client, service = peer
+    client.list_symbols(
+        "s1", query="q" * 5000, module="m" * 5000, page_token="a" * 70000
+    )
+    assert len(service.requests[-1].query) == 5000
+    assert len(service.requests[-1].module) == 5000
+    assert len(service.requests[-1].page_token) == 70000
 
 
 def test_list_symbols_surfaces_old_server_unimplemented(peer, monkeypatch):
@@ -94,8 +176,10 @@ def test_all_public_rpcs_have_client_methods():
         "Detach": "detach",
         "ListSessions": "list_sessions",
         "ListSymbols": "list_symbols",
+        "ListModules": "list_modules",
         "WatchEvents": "watch_events",
         "ResolveProbe": "resolve_probe",
+        "ValidateProbe": "validate_probe",
         "ReadEvents": "read_events",
         "AcknowledgeEvents": "acknowledge_events",
     }
@@ -103,6 +187,68 @@ def test_all_public_rpcs_have_client_methods():
         m.name for m in pb.DESCRIPTOR.services_by_name["Tracer"].methods
     }
     assert all(callable(getattr(Client, name)) for name in methods.values())
+
+
+def test_validation_transmits_ordered_options_and_returns_diagnostics(
+    peer, monkeypatch
+):
+    client, _service = peer
+    report = pb.ValidationReport(success=False, level=pb.ValidateProbeRequest.SYNTAX)
+    report.diagnostics.add(
+        stage="parse",
+        severity="error",
+        file="callback.cpp",
+        line=3,
+        column=8,
+        message="expected ;",
+    )
+    calls = []
+
+    def validate(request, timeout=None):
+        calls.append((request, timeout))
+        return report
+
+    monkeypatch.setattr(client.stub, "ValidateProbe", validate)
+    result = client.validate_probe(
+        "s1",
+        "add(int, int)",
+        "struct Interceptor {};",
+        include_headers=["/srv/add.hpp"],
+        compilation_database="/srv/build",
+        compile_options=["-std=c++17", "-DORDER=1"],
+        level="syntax",
+        module="target",
+        debug_max_entries=2000001,
+        debug_max_depth=256,
+    )
+    assert result is report
+    request, timeout = calls[0]
+    assert request.session_id == "s1"
+    assert request.selector == "add(int, int)"
+    assert request.callback_source == "struct Interceptor {};"
+    assert list(request.include_headers) == ["/srv/add.hpp"]
+    assert request.compilation_database == "/srv/build"
+    assert list(request.compile_options) == ["-std=c++17", "-DORDER=1"]
+    assert request.level == pb.ValidateProbeRequest.SYNTAX
+    assert request.module == "target"
+    assert request.debug_max_entries == 2000001
+    assert request.debug_max_depth == 256
+    assert timeout == client.timeout
+
+
+@pytest.mark.parametrize(
+    "options",
+    ["-std=c++17", [""], ["bad\0option"], ["x" * 4097], ["-D1"] * 129],
+)
+def test_validation_rejects_invalid_compile_options_before_rpc(peer, options):
+    client, service = peer
+    with pytest.raises(ValueError, match="compile_options|compile option"):
+        client.validate_probe(
+            "s1", "add", "struct Interceptor {};", compile_options=options
+        )
+    assert not any(
+        isinstance(request, pb.ValidateProbeRequest) for request in service.requests
+    )
 
 
 def test_stream_filters_cursor_and_context(peer):
@@ -288,6 +434,8 @@ def test_owned_channel_uses_bounded_local_reconnect_policy(monkeypatch):
     assert created["options"]["grpc.initial_reconnect_backoff_ms"] == 100
     assert "grpc.min_reconnect_backoff_ms" not in created["options"]
     assert created["options"]["grpc.max_reconnect_backoff_ms"] == 500
+    assert created["options"]["grpc.max_receive_message_length"] == -1
+    assert created["options"]["grpc.max_send_message_length"] == -1
     caller_channel = Mock(spec=grpc.Channel)
     assert Client("127.0.0.1:50051", channel=caller_channel).channel is caller_channel
 

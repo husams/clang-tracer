@@ -24,7 +24,7 @@ HELP_TOPICS = {
         usage=(
             "server start|status|stop",
             "attach PID | sessions | use SESSION | detach [SESSION]",
-            "symbols [OPTIONS]",
+            "modules | symbols [OPTIONS]",
             "probe resolve|inject|add|remove ...",
             "events [OPTIONS] | collect COUNT [OPTIONS] | record FILE COUNT [OPTIONS]",
             "drain DATABASE [--listen] [--count N] [STREAM_OPTIONS]",
@@ -144,12 +144,18 @@ HELP_TOPICS = {
         usage=("sessions",),
         examples=("sessions",),
     ),
+    "modules": HelpTopic(
+        "modules",
+        "List current eligible mapped application image paths on the server.",
+        usage=("modules",),
+        examples=("modules",),
+    ),
     "symbols": HelpTopic(
         "symbols",
         "List traceable functions and methods from eligible application "
         "ELF/DWARF on the server host.",
         usage=(
-            "symbols [--filter TEXT] [--module TEXT] [--limit 1..500] [--page TOKEN]",
+            "symbols [--filter TEXT] [--module TEXT] [--limit N] [--page TOKEN]",
         ),
         options=(
             ("--filter TEXT", "Case-sensitive substring of selector or linkage name."),
@@ -157,7 +163,7 @@ HELP_TOPICS = {
                 "--module TEXT",
                 "Narrow by case-sensitive substring of eligible module path.",
             ),
-            ("--limit N", "Page size; default 100, maximum 500."),
+            ("--limit N", "Optional page size; default unlimited, 0 means unlimited."),
             ("--page TOKEN", "Continue a previous listing using its opaque token."),
         ),
         examples=("symbols --filter Calculator",),
@@ -189,6 +195,7 @@ HELP_TOPICS = {
         usage=(
             'probe resolve "C++ selector" [OPTIONS]',
             'probe inject "C++ selector" --callback FILE [OPTIONS]',
+            'probe validate "C++ selector" --callback FILE [OPTIONS]',
             "probe add SPEC.pbtxt",
             "probe remove PROBE_ID",
         ),
@@ -197,12 +204,19 @@ HELP_TOPICS = {
     "probe resolve": HelpTopic(
         "probe resolve",
         "Ask the server to infer a C++ callable signature from target DWARF.",
-        usage=('probe resolve "C++ selector" [--include HEADER ...] [--compdb PATH]',),
+        usage=('probe resolve "C++ selector" [OPTIONS]',),
         options=(
             ("--include HEADER", "Add a header on the server host; may be repeated."),
+            ("--module TEXT", "Mapped path or path substring to search explicitly."),
+            ("--debug-max-entries N", "Optional DWARF entry limit; 0 is unlimited."),
+            ("--debug-max-depth N", "Optional DWARF depth limit; 0 is unlimited."),
             (
                 "--compdb PATH",
                 "Compilation database directory or JSON file on the server host.",
+            ),
+            (
+                "--compile-option ARG",
+                "Append one compiler option; may be repeated in order.",
             ),
         ),
         examples=('probe resolve "Calculator::multiply(int, int) const"',),
@@ -231,6 +245,13 @@ HELP_TOPICS = {
                 "Include the original result in trace snapshots and display.",
             ),
             ("--include HEADER", "Header on the server host; may be repeated."),
+            (
+                "--compile-option ARG",
+                "Append one compiler option; may be repeated in order.",
+            ),
+            ("--debug-max-entries N", "Optional DWARF entry limit; 0 is unlimited."),
+            ("--debug-max-depth N", "Optional DWARF depth limit; 0 is unlimited."),
+            ("--module TEXT", "Mapped path or path substring to search explicitly."),
             (
                 "--compdb PATH",
                 "Compilation database directory or JSON file on the server host.",
@@ -261,6 +282,29 @@ HELP_TOPICS = {
         "Install a full Protobuf ProbeSpec parsed from a text-format file.",
         usage=("probe add SPEC.pbtxt",),
         examples=("probe add /tmp/probe.pbtxt",),
+    ),
+    "probe validate": HelpTopic(
+        "probe validate",
+        "Check callback syntax or complete compilation without installing a probe.",
+        usage=('probe validate "C++ selector" --callback FILE [OPTIONS]',),
+        options=(
+            ("--callback FILE", "Callback source file on the console host."),
+            (
+                "--level syntax|compile",
+                "Select syntax parsing or full code generation and symbol checks.",
+            ),
+            ("--include HEADER", "Header on the server host; may be repeated."),
+            ("--compdb PATH", "Compilation database on the server host."),
+            (
+                "--compile-option ARG",
+                "Append one compiler option; may be repeated in order.",
+            ),
+            ("--debug-max-entries N", "Optional DWARF entry limit; 0 is unlimited."),
+            ("--debug-max-depth N", "Optional DWARF depth limit; 0 is unlimited."),
+            ("--module TEXT", "Mapped path or path substring to search explicitly."),
+        ),
+        examples=('probe validate "add(int, int)" --callback interceptor.cpp',),
+        notes=("Validation does not install a probe or execute callback code.",),
     ),
     "probe remove": HelpTopic(
         "probe remove",

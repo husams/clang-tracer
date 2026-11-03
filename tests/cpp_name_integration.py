@@ -240,11 +240,22 @@ def main() -> int:
             negative_db = temp_dir / "negative-compile-commands.json"
             write_text(negative_db, json.dumps([entry]))
             unsupported = ensure_pre_rpc_rejection(
-                client, negative_target.pid, "UnsupportedFixture::unsupported(UnsupportedType)", callback,
+                client, negative_target.pid, "UnsupportedFixture::unsupported(long double)", callback,
                 (),
                 "unsupported-type", output_dir)
             require("unsupported" in unsupported.lower() or "type" in unsupported.lower(),
                     f"unsupported type error lacks type context:\n{unsupported}")
+            bool_header = temp_dir / "bool_only.hpp"
+            write_text(bool_header,
+                       "#pragma once\nclass BoolOnly { public: bool b(bool); };\n")
+            client.run("attach", str(negative_target.pid))
+            bool_trace = trace(
+                client, negative_target.pid, "BoolOnly::b(bool)", callback,
+                "--compdb", str(negative_db), "--include", str(bool_header), timeout=45)
+            bool_text = save_output(output_dir / "trace-bool-header-route.txt", bool_trace)
+            read_probe_id(bool_text)
+            require("BoolOnly::b(bool)" in bool_text,
+                    f"BOOL header-route trace lacks its resolved declaration:\n{bool_text}")
 
             fixture_options = ()
             ambiguous_virtual = ensure_pre_rpc_rejection(
@@ -280,12 +291,12 @@ def main() -> int:
                                       "x86_64-unknown-linux-gnux32"]
             x32_db = temp_dir / "x32-compile-commands.json"
             write_text(x32_db, json.dumps([x32_entry]))
-            client.run("attach", str(negative_target.pid))
             x32_error = save_output(output_dir / "reject-x32-pointer-abi.txt", client.run(
                 "trace", str(negative_target.pid), "HeaderReceiver::read(int) const",
                 "--callback", str(callback), "--compdb", str(x32_db), "--include", str(header),
                 expected_ok=False, timeout=45))
-            require("linux x86_64" in x32_error.lower() or "32" in x32_error,
+            require("does not match the engine target" in x32_error.lower() or
+                    "linux x86_64" in x32_error.lower() or "32" in x32_error,
                     f"x32 pointer ABI rejection lacks target context:\n{x32_error}")
 
             malformed_source = temp_dir / "invalid.hpp"
@@ -301,7 +312,7 @@ def main() -> int:
             require("header_context=" in valid_header.stdout.decode(), "header flag inference was not reported")
             require(not negative_source.exists(), "header parsing recreated/read the unavailable donor")
             client.run("detach", str(negative_target.pid), timeout=20)
-            report.append("DWARF ambiguity, missing/mismatched/unsupported callables, virtual methods, volatile qualification and unsigned spelling passed")
+            report.append("DWARF ambiguity, missing/mismatched/unsupported callables, BOOL header route, virtual methods, volatile qualification and unsigned spelling passed")
             report.append("optional headers preserved missing-database, malformed-header and x32 ABI rejection, without a donor source file")
 
             # Use the existing real callback with signed integral arguments for both overloads.
