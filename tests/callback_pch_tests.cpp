@@ -122,13 +122,13 @@ void check_fresh_interpreters(const std::vector<std::string> &arguments) {
 
 void check_dependencies(const std::vector<std::string> &base_arguments) {
   TemporaryDirectory temporary;
-  const auto wrapper = temporary.path / "stdexcept";
+  const auto wrapper = temporary.path / "cstddef";
   const auto earlier = temporary.path / "earlier";
   fs::create_directory(earlier);
   const auto write_wrapper = [&](int sentinel) {
     std::ofstream output(wrapper);
     output << "#pragma once\n#define TRACER_PCH_TEST_SENTINEL " << sentinel
-           << "\n#include_next <stdexcept>\n"
+           << "\n#include_next <cstddef>\n"
               "#if __has_include(\"appearing.hpp\")\n"
               "#include \"appearing.hpp\"\n"
               "#else\n#define TRACER_PCH_TEST_APPEARED 0\n#endif\n";
@@ -185,8 +185,8 @@ void check_dependencies(const std::vector<std::string> &base_arguments) {
 
   // A previously absent earlier search result must supersede the old header.
   {
-    std::ofstream shadow(earlier / "stdexcept");
-    shadow << "#pragma once\n#include_next <stdexcept>\n"
+    std::ofstream shadow(earlier / "cstddef");
+    shadow << "#pragma once\n#include_next <cstddef>\n"
               "#undef TRACER_PCH_TEST_SENTINEL\n"
               "#define TRACER_PCH_TEST_SENTINEL 3\n";
     shadow.close();
@@ -208,8 +208,8 @@ void check_dependencies(const std::vector<std::string> &base_arguments) {
 
   // Header initialization must not move ahead of callback syntax validation.
   {
-    std::ofstream shadow(earlier / "stdexcept");
-    shadow << "#pragma once\n#include_next <stdexcept>\n"
+    std::ofstream shadow(earlier / "cstddef");
+    shadow << "#pragma once\n#include_next <cstddef>\n"
               "extern int initialize_pch_user_state();\n"
               "inline int pch_user_state = initialize_pch_user_state();\n";
     shadow.close();
@@ -233,8 +233,8 @@ void check_dependencies(const std::vector<std::string> &base_arguments) {
         " inline static int value = initialize_template_state();\n"
         "};\ninline int* use_template = &Holder<int>::value;\n",
         "asm(\"\");\n"}) {
-    std::ofstream shadow(earlier / "stdexcept");
-    shadow << "#pragma once\n#include_next <stdexcept>\n" << unsafe;
+    std::ofstream shadow(earlier / "cstddef");
+    shadow << "#pragma once\n#include_next <cstddef>\n" << unsafe;
     shadow.close();
     require(static_cast<bool>(shadow), "cannot create header cleanup input");
     if (tracer::callback_pch::prepare(compiler->getInvocation(),
