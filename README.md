@@ -845,6 +845,10 @@ under `auto-test-results/`. Reproduce the focused live test with
 new evidence is written under `build/auto-test-results/`. Earlier milestone
 results remain recorded in `PROGRESS.md` (local recording).
 
+The [native C++17 REPL](docs/native-repl.md) adds an interactive client with owned
+server startup, PID/process attach, interceptor upload, continuous event collection,
+recording, offline inspection and local C++ analysis.
+
 Implementation references: [Clang Interpreter](https://clang.llvm.org/docs/ClangRepl.html),
 [LLVM ORC](https://llvm.org/docs/ORCv2.html),
 [gRPC C++](https://grpc.io/docs/languages/cpp/basics/), and
