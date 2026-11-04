@@ -7,6 +7,7 @@ from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.formatted_text.utils import fragment_list_to_text
 
 from .client import ServerStatus
+from .context_values import state_values
 from .proto import context_transport_pb2 as cpb
 from .proto import tracer_pb2 as pb
 
@@ -258,6 +259,8 @@ def _context(lines: _Lines, envelope: cpb.ContextEventEnvelope) -> None:
             f"bytes={len(state.payload)} truncations={len(state.truncations)}",
             indent=2,
         )
+        for name, value in state_values(envelope, state):
+            lines.add(name, f"= {value}", indent=3)
         for truncation in state.truncations:
             lines.add(
                 "truncation",

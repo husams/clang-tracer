@@ -1,3 +1,6 @@
+import pytest
+from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+
 from clang_tracer import context
 from clang_tracer import messages as pb
 from clang_tracer.client import ServerStatus
@@ -6,6 +9,76 @@ from clang_tracer.display import render
 
 def plain(value) -> str:
     return "".join(text for _, text in render(value))
+
+
+def string_state_event():
+    files = descriptor_pb2.FileDescriptorSet()
+    file = files.file.add(name="snapshot.proto", package="test", syntax="proto3")
+    root = file.message_type.add(name="Snapshot")
+    field = root.field.add(name="f1", number=1, type=9, label=1)
+    option = field.options.uninterpreted_option.add(string_value=b"message")
+    option.name.add(name_part="tracer_cpp_field_name", is_extension=False)
+    root.field.add(name="empty", number=2, type=9, label=1)
+    root.field.add(name="count", number=3, type=5, label=1)
+    root.field.add(name="tags", number=4, type=9, label=3)
+    root.field.add(name="child", number=5, type=11, type_name=".test.Child", label=1)
+    child = file.message_type.add(name="Child")
+    child.field.add(name="text", number=1, type=9, label=1)
+    pool = descriptor_pool.DescriptorPool()
+    pool.Add(file)
+    value = message_factory.GetMessageClass(
+        pool.FindMessageTypeByName("test.Snapshot")
+    )()
+    value.f1 = "request-42\x1b[2J"
+    value.tags.extend(["book", "café"])
+    value.child.text = "nested"
+    event = pb.TraceEvent()
+    event.context.schemas.add(
+        epoch_schema_id=1,
+        schema_identity=b"revision",
+        root_type="test.Snapshot",
+        serialized_file_descriptor_set=files.SerializeToString(),
+    )
+    event.context.event.states.add(
+        epoch_schema_id=1,
+        schema_identity=b"revision",
+        payload=value.SerializeToString(),
+    )
+    return event
+
+
+def test_state_payload_shows_strings_defaults_repeated_and_nested_values():
+    output = plain(string_state_event())
+    assert 'message = "request-42\\u001b[2J"' in output
+    assert 'empty = ""' in output
+    assert "count = 0" in output
+    assert 'tags[0] = "book"' in output
+    assert 'tags[1] = "café"' in output
+    assert 'child.text = "nested"' in output
+    assert "\x1b" not in output
+
+
+@pytest.mark.parametrize("damage", ["schema", "payload", "root", "identity"])
+def test_invalid_state_payload_is_reported_without_crashing(damage):
+    event = string_state_event()
+    if damage == "schema":
+        event.context.schemas[0].serialized_file_descriptor_set = b"\xff"
+    elif damage == "payload":
+        event.context.event.states[0].payload = b"\xff"
+    elif damage == "root":
+        event.context.schemas[0].root_type = "Missing"
+    else:
+        event.context.event.states[0].schema_identity = b"other"
+    assert "decode unavailable" in plain(event)
+
+
+def test_large_state_display_is_bounded():
+    event = string_state_event()
+    # A valid length-delimited string, larger than the console's value budget.
+    event.context.event.states[0].payload = b"\x0a\x80\x80\x04" + b"x" * 65536
+    output = plain(event)
+    assert "<truncated>" in output
+    assert len(output) < 20000
 
 
 def test_status_sessions_probes_and_specs_are_concise():
