@@ -130,7 +130,7 @@ public:
         return false;
       }
       std::string marker = "/*__TRACER_CONTEXT_PLACEHOLDER_BEGIN:" +
-          record->getQualifiedNameAsString() + ":" + method_name +
+          context_class_type_name(*record) + ":" + method_name +
           "__*/\n#pragma clang diagnostic push\n#pragma clang diagnostic ignored \"-Wnull-dereference\"\n";
       if (dependencies.size() == 1) {
         marker += "::" + dependencies.front().first +
@@ -163,7 +163,7 @@ private:
   clang::ASTUnit &unit;
 };
 std::string qualified(const clang::CXXRecordDecl &record) {
-  return record.getQualifiedNameAsString();
+  return context_class_type_name(record);
 }
 std::string render(const ContextHookPlan &hook, const clang::CXXRecordDecl &r,
                    const std::string &facade) {

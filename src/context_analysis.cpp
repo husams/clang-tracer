@@ -14,6 +14,17 @@
 #include "tracer/compat.hpp"
 
 namespace tracer {
+std::string context_class_type_name(const clang::CXXRecordDecl &record) {
+  if (!llvm::isa<clang::ClassTemplateSpecializationDecl>(record))
+    return record.getQualifiedNameAsString();
+  auto &context = record.getASTContext();
+  clang::PrintingPolicy policy(context.getLangOpts());
+  policy.SuppressTagKeyword = true;
+  policy.SuppressDefaultTemplateArgs = false;
+  policy.SuppressInlineNamespace = false;
+  return context.getRecordType(&record).getAsString(policy);
+}
+
 namespace {
 const clang::ClassTemplateSpecializationDecl *
 specialization(clang::QualType type, const char *name) {
@@ -1052,7 +1063,7 @@ public:
       }
     }
     ContextClassPlan plan;
-    plan.type = record->getQualifiedNameAsString();
+    plan.type = context_class_type_name(*record);
     unsigned dependency_constructors = 0;
     for (const auto *constructor : record->ctors()) {
       bool has_dependency = false;

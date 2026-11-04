@@ -429,7 +429,30 @@ def main() -> int:
                     f"callback return values differ from the typed call: {paired}")
             require("result {" in post_row and "signed_value:" in post_row,
                     f"post event lacks the original typed result: {post_row}")
+            # Failed replacement must leave the installed callback usable.
+            broken = args.output_dir / "broken-replacement.cpp"
+            write_text(broken, "struct Interceptor { broken }; ")
+            run(args.client, endpoint, "trace", str(target.pid),
+                "Fixture::overloaded(int)", "--callback", str(broken), ok=False)
+            _, event_cursor = wait_binary(
+                args.client, endpoint, target.pid, probe, args.output_dir,
+                args.protoc, args.proto, 2, event_cursor)
+            replacement = args.output_dir / "replacement.cpp"
+            write_text(replacement, """struct Interceptor {
+              long long pre(const Call&) { return 9001; }
+            };""")
+            previous_probe = probe
+            probe, _ = trace(args.client, endpoint, target.pid,
+                             "Fixture::overloaded(int)", replacement,
+                             args.compdb, args.source)
+            require(probe != previous_probe, "replacement reused the old probe ID")
+            replaced_rows, event_cursor = wait_binary(
+                args.client, endpoint, target.pid, probe, args.output_dir,
+                args.protoc, args.proto, 2, event_cursor)
+            require(all(callback_value(row) == 9001 for row in replaced_rows),
+                    f"replacement did not run the new callback: {replaced_rows}")
             remove(args.client, endpoint, target.pid, probe)
+            report.append("reprobing replaced the callback and compile failure preserved the old hook")
             report.append("class pre/post events exposed typed arguments, results, object address, and matching call IDs")
 
             # Optional pre-only and post-only methods, including a void-returning hook.

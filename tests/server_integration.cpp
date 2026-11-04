@@ -591,7 +591,7 @@ void run(const std::filesystem::path &server_path,
 
   const auto free_spec = make_spec("traced_work", api::FUNCTION, api::INT32,
                                    {api::INT32}, callback);
-  const auto free_a =
+  auto free_a =
       add_probe_ok(*stub, session_a.id(), free_spec, output_dir, "free-a");
   require(free_a.entry_address() == *target_a_entry,
           "server resolved traced_work to an unexpected address");
@@ -643,10 +643,13 @@ void run(const std::filesystem::path &server_path,
   api::Probe duplicate_probe;
   const auto duplicate_probe_status =
       add_probe(*stub, session_a.id(), free_spec, &duplicate_probe);
-  require_failure_category(duplicate_probe_status, "duplicate probe",
-                           {"already hooked"});
-  report(report_file,
-         "duplicate probe rejected: " + duplicate_probe_status.error_message());
+  require(duplicate_probe_status.ok(),
+          "replacement probe failed: " + duplicate_probe_status.error_message());
+  require(duplicate_probe.active() && duplicate_probe.id() != free_a.id() &&
+              duplicate_probe.entry_address() == free_a.entry_address(),
+          "replacement did not activate a new probe at the same entry");
+  free_a = duplicate_probe;
+  report(report_file, "same-session probe replaced with a new version");
 
   api::ProbeSpec missing = free_spec;
   missing.set_symbol("missing_target_symbol");

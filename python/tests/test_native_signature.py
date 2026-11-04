@@ -569,3 +569,77 @@ public:
     finally:
         for probe in reversed(owned):
             client.remove_probe(session.id, probe.id)
+
+
+@pytest.mark.parametrize("typed_interceptor", [False, True])
+def test_string_reference_shared_event_and_replacement(
+    signature_client, typed_interceptor
+):
+    from clang_tracer.display import render
+
+    client, session = signature_client
+    build = Path(os.environ["CLANG_TRACER_NATIVE_BUILD"]).resolve()
+    header = (
+        Path(__file__).resolve().parents[2] / "tests/fixtures/signature_fixture_api.hpp"
+    )
+    selector = (
+        client.list_symbols(session.id, query="string_target").symbols[0].selector
+    )
+    callback = f'''#include "{header.name}"
+struct TextScope {{}};
+struct TextState : state<TextScope> {{ std::string message; }};
+struct Interceptor {{
+public:
+  Interceptor(State<TextState>);
+  void post(const Call& call) {{
+    auto& snapshot = call.context().get<TextState>();
+    snapshot.message = call.argument<0>();
+    call.context().event("string.snapshot");
+  }}
+}};
+'''
+    if typed_interceptor:
+        callback = callback.replace(
+            "struct Interceptor {",
+            "template <> class Interceptor<bool(const std::string&)> {",
+        )
+    options = dict(
+        include_headers=[str(header)],
+        compilation_database=str(build / "compile_commands.json"),
+        compile_options=["-std=c++17", f"-I{header.parent}"],
+    )
+    for level in ("syntax", "compile"):
+        assert_success(
+            client.validate_probe(
+                session.id, selector, callback, level=level, **options
+            )
+        )
+    probe = client.inject(session.id, selector, callback, **options)
+    try:
+        events = client.collect_traces(
+            1, session_ids=[session.id], names=["string.snapshot"], timeout=15
+        )
+        assert 'message = "signature fixture"' in "".join(
+            t for _, t in render(events[0])
+        )
+        updated = callback.replace(
+            "snapshot.message = call.argument<0>();",
+            'snapshot.message = "updated string value";',
+        )
+        previous = probe
+        probe = client.inject(session.id, selector, updated, **options)
+        assert probe.id != previous.id
+        session_state = next(s for s in client.list_sessions() if s.id == session.id)
+        assert not next(p for p in session_state.probes if p.id == previous.id).active
+        with client.watch_events(
+            session_ids=[session.id],
+            names=["string.snapshot"],
+            after_sequence=events[-1].sequence,
+            timeout=15,
+        ) as stream:
+            event = next(event for event in stream if event.probe_id == probe.id)
+        assert 'message = "updated string value"' in "".join(
+            t for _, t in render(event)
+        )
+    finally:
+        assert client.remove_probe(session.id, probe.id).original_bytes_restored

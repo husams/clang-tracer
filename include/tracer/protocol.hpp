@@ -7,7 +7,8 @@ inline constexpr std::uint32_t kProtocolVersion = 2;
 // engine-assigned package lineage UUID. It reads a binary ProbeSpec at
 // source_path, including optional Clang receiver context. Older agents reject
 // the version before interpreting the expanded bootstrap request.
-inline constexpr std::uint32_t kBootstrapVersion = 18;
+// Version 19 reports a prepared replacement's previous probe ID.
+inline constexpr std::uint32_t kBootstrapVersion = 19;
 inline constexpr unsigned kMaxPatchBytes = 64;
 inline constexpr unsigned kMaxArguments = 8;
 inline constexpr unsigned kMaxProbes = 32;
@@ -162,6 +163,8 @@ struct Request {
   // These fields are engine-populated from the attached Session.
   std::uint32_t context_native_pid = 0;
   std::uint64_t context_process_start_time = 0;
+  // Agent-selected same-session probe to drain after replacement preparation.
+  std::uint64_t replaced_probe_id = 0;
 };
 
 // Side-effect-free callback preparation request. The agent reads a serialized

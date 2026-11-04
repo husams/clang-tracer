@@ -58,7 +58,7 @@ struct RecordFinder final : clang::RecursiveASTVisitor<RecordFinder> {
 
   bool VisitCXXRecordDecl(clang::CXXRecordDecl *record) {
     if (record->isThisDeclarationADefinition() && !record->isImplicit() &&
-        record->getQualifiedNameAsString() == name) {
+        context_class_type_name(*record) == name) {
       found = record;
     }
     return true;
@@ -1176,12 +1176,9 @@ extern "C" bool clangtracer_context_post(void* storage,
               "&& clangtracer_owner_anchor_v1() == 1; }\n";
   }
   source += "extern \"C\" void clangtracer_context_destroy(void* storage) "
-            "{ if (storage) static_cast<::" +
-            class_name + "*>(storage)->~" +
-            class_name.substr(class_name.rfind("::") == std::string::npos
-                                  ? 0
-                                  : class_name.rfind("::") + 2) +
-            "(); }\n";
+            "{ using InterceptorType = ::" + class_name +
+            "; if (storage) static_cast<InterceptorType*>(storage)"
+            "->~InterceptorType(); }\n";
   return source;
 }
 

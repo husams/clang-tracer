@@ -11,6 +11,7 @@
 
 namespace tracer::context_scheduler {
 namespace {
+thread_local unsigned pthread_bypass_depth = 0;
 struct Record {
   std::atomic<bool> occupied{false};
   std::atomic<unsigned> references{0};
@@ -261,6 +262,9 @@ std::uint64_t next_source_sequence() noexcept {
   return ++thread_metadata.sequence;
 }
 
+ScopedPthreadBypass::ScopedPthreadBypass() noexcept { ++pthread_bypass_depth; }
+ScopedPthreadBypass::~ScopedPthreadBypass() noexcept { --pthread_bypass_depth; }
+
 NativePthreadAdapter::NativePthreadAdapter(
     std::shared_ptr<context_engine::PropagationLedger> ledger, ActiveContextGetter current_context,
     WorkerContextGetter worker_context, ActiveContextSetter set_context,
@@ -277,12 +281,17 @@ int NativePthreadAdapter::create(PthreadCreate original, pthread_t* thread,
   if (!original) {
     return EINVAL;
   }
-  if (!start || context_execution::current().mode != context_execution::Mode::Application) {
+  if (!start || pthread_bypass_depth ||
+      context_execution::current().mode != context_execution::Mode::Application) {
     return original(thread, attributes, start, argument);
   }
 
   ensure_thread_metadata();
   auto* parent_context = current_context_ ? current_context_() : nullptr;
+  // No context can be propagated from an unrelated runtime worker. Wrapping
+  // such long-lived threads would make removal wait for their process lifetime.
+  if (!parent_context)
+    return original(thread, attributes, start, argument);
   if (parent_context && !parent_context->permits_cross_domain_capture()) {
     report_admission_failure(diagnostics_, "pthread_context_confinement");
     return original(thread, attributes, start, argument);

@@ -218,10 +218,41 @@ void* admission_failure_start(void* opaque) {
   return nullptr;
 }
 
+int require_unwrapped_start(pthread_t*, const pthread_attr_t*,
+                            void* (*start)(void*), void*) {
+  assert(start == &admission_failure_start);
+  return EAGAIN;
+}
+
 } // namespace
 
 void verify_context_scheduler() {
   using namespace std::chrono_literals;
+  {
+    Fixture fixture;
+    auto* previous = set_context(nullptr);
+    assert(fixture.adapter.create(&require_unwrapped_start, nullptr, nullptr,
+                                  &admission_failure_start, nullptr) == EAGAIN);
+    set_context(previous);
+    assert(cs::NativePthreadAdapter::outstanding_wrapper_count() == 0);
+  }
+  {
+    Fixture fixture;
+    AdmissionFailureWork work;
+    pthread_t thread{};
+    {
+      cs::ScopedPthreadBypass compiler_threads;
+      cs::ScopedPthreadBypass nested_compiler_work;
+      assert(fixture.adapter.create(&pthread_create, &thread, nullptr,
+                                    &admission_failure_start, &work) == 0);
+      assert(pthread_join(thread, nullptr) == 0);
+      assert(!work.inherited && fixture.ledger->outstanding() == 0);
+    }
+    assert(fixture.adapter.create(&pthread_create, &thread, nullptr,
+                                  &admission_failure_start, &work) == 0);
+    assert(pthread_join(thread, nullptr) == 0);
+    assert(work.inherited && fixture.ledger->outstanding() == 0);
+  }
   {
     Fixture fixture;
     Work work{};

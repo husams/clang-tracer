@@ -41,6 +41,16 @@ using WorkerContextGetter = context_engine::Context& (*)();
 // value so the adapter can restore the worker exactly after task completion.
 using ActiveContextSetter = context_engine::Context* (*)(context_engine::Context*) noexcept;
 
+// Agent/compiler threads must not inherit application context or keep the
+// application pthread detour alive for the lifetime of a JIT worker.
+class ScopedPthreadBypass final {
+public:
+  ScopedPthreadBypass() noexcept;
+  ~ScopedPthreadBypass() noexcept;
+  ScopedPthreadBypass(const ScopedPthreadBypass &) = delete;
+  ScopedPthreadBypass &operator=(const ScopedPthreadBypass &) = delete;
+};
+
 class NativePthreadAdapter final {
 public:
   explicit NativePthreadAdapter(std::shared_ptr<context_engine::PropagationLedger> ledger,

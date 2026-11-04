@@ -961,8 +961,15 @@ bool debug_record_identity_matches(clang::ASTContext &context,
                   normalized_cpp_type(expected);
     return false;
   }
-  const auto actual_primary = normalized_cpp_type(
-      specialization->getSpecializedTemplate()->getQualifiedNameAsString());
+  // getQualifiedNameAsString uses a default policy that can hide ABI-bearing
+  // inline namespaces such as std::__cxx11. Use the same explicit policy as
+  // the complete record and its template arguments.
+  std::string primary_name;
+  llvm::raw_string_ostream primary_output(primary_name);
+  specialization->getSpecializedTemplate()->printQualifiedName(primary_output,
+                                                               policy);
+  primary_output.flush();
+  const auto actual_primary = normalized_cpp_type(primary_name);
   if (actual_primary != expected_primary) {
     if (mismatch)
       *mismatch = "candidate-primary=" + actual_primary +
@@ -3024,7 +3031,9 @@ bool validate_specialized_signature(
             argument.has_object_type() ? &argument.object_type() : nullptr,
             argument.is_reference(), argument.is_object_value())) {
       error = "Interceptor signature argument " + std::to_string(i) +
-              " type does not match target DWARF";
+              " type does not match target DWARF (callback: " +
+              function->getParamType(i).getAsString() + "; target: " +
+              argument.cpp_type() + ")";
       return false;
     }
   }
@@ -3942,6 +3951,7 @@ bool compile_shared_probe(Probe &p,
                            ? std::string()
                            : recovered_record_declarations(specification)) +
                       argument_aliases(specification) +
+                      interceptor_template_prelude(specification.callback_source()) +
                       callback_body + "\n" + signature_assert;
   activation.compiler_arguments = arguments;
   if (!specification.callback_package_path().empty())
@@ -4960,6 +4970,7 @@ bool validate_request(const tracer::Request &r, std::string &error) {
 
 extern "C" int tracer_agent_start(tracer::Request *request) {
   try {
+    tracer::context_scheduler::ScopedPthreadBypass compiler_threads;
     if (!request || request->version != tracer::kBootstrapVersion) {
       return -1;
     }
@@ -5037,16 +5048,30 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, "target symbol is not in an executable mapping");
       return -1;
     }
+    Probe *replaced = nullptr;
     for (std::size_t i = 0; i < a.retained; ++i) {
       auto *other = a.probes[i].get();
       if (other && other->active.load() &&
           other->request.original_entry == p->request.original_entry) {
-        set_error(request, "target symbol address is already hooked");
-        return -1;
+        if (other->session_id != request->session_id || replaced ||
+            std::memcmp(entry, other->request.installed,
+                        other->request.patch_size) != 0) {
+          set_error(request,
+                    "target symbol address is already hooked by another probe");
+          return -1;
+        }
+        replaced = other;
       }
     }
-    if (!decode_patch(static_cast<const std::uint8_t *>(entry), p->request,
-                      error)) {
+    if (replaced) {
+      // Compile the new callback before touching the live hook. Decode neither
+      // its detour nor its wrapper: the trampoline needs the original prologue.
+      p->request.replaced_probe_id = replaced->request.probe_id;
+      p->request.patch_size = replaced->request.patch_size;
+      std::memcpy(p->request.original, replaced->request.original,
+                  p->request.patch_size);
+    } else if (!decode_patch(static_cast<const std::uint8_t *>(entry), p->request,
+                             error)) {
       set_error(request, error.c_str());
       return -1;
     }
@@ -5057,7 +5082,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     }
     for (std::size_t i = 0; i < a.retained; ++i) {
       auto *other = a.probes[i].get();
-      if (!other || !other->active.load()) {
+      if (!other || other == replaced || !other->active.load()) {
         continue;
       }
       const auto x = other->request.original_entry,
@@ -5153,6 +5178,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
 }
 
 extern "C" int tracer_agent_validate(tracer::ValidationRequest *request) {
+  tracer::context_scheduler::ScopedPthreadBypass compiler_threads;
   const auto set_error = [&](const std::string &message) {
     if (!request)
       return;

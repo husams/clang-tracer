@@ -106,6 +106,18 @@ resulting `ProbeSpec` with the interceptor source. It requires the additive
 server from this revision before using it; an older server returns gRPC
 `UNIMPLEMENTED`. Existing RPCs remain compatible with older servers.
 
+Injecting a target already hooked in the same session replaces that probe with
+a new ID. Compilation failure leaves the existing hook active. A successful
+replacement restores and drains the old hook before installing the new one, so
+there is a brief interval without tracing. The existing 32 retained-probe limit
+also counts replaced versions. Rebuild the server and agent together for this
+behavior; an already loaded older agent requires restarting the target.
+
+The console decodes shared-state payloads using each event's bundled schema and
+shows field values, including strings, nested records, and containers, beneath
+the payload summary. Invalid payloads produce a diagnostic, and large values
+are visibly truncated. Pointer arguments still display their captured address.
+
 Callback source is transmitted by value. Optional `include_headers`,
 `compilation_database` and `callback_package_path` refer to paths **on the server
 host**. Package location is optional; pass it when the source belongs to a

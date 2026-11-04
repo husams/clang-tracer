@@ -517,6 +517,19 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
           "shared-context activation requires a proven pthread_create detour");
     }
 
+    if (response.replaced_probe_id) {
+      auto &previous = find_probe_locked(response.replaced_probe_id);
+      if (!previous.value.active() || !previous.patch_committed ||
+          previous.value.entry_address() != response.original_entry)
+        throw std::runtime_error("agent returned an invalid replacement probe");
+      // Preparation succeeded while the previous callback stayed live. Restore
+      // and drain it through the normal removal path before installing the new
+      // detour; never chain one wrapper through another.
+      process.detach();
+      stop_probe_locked(previous, false);
+      attach_process(process, deadline);
+    }
+
     constexpr unsigned kPatchAttempts = 12;
     bool committed = false;
     for (unsigned attempt = 0; attempt < kPatchAttempts; ++attempt) {

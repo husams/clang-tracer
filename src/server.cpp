@@ -1379,6 +1379,7 @@ public:
       }
       auto probe = session->add_probe(request->spec(), source_directory_,
                                       pending_probe_id, lineage.id);
+      sync_event_probes(session);
       response->CopyFrom(probe);
       return grpc::Status::OK;
     } catch (const std::invalid_argument &error) {

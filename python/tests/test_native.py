@@ -17,8 +17,72 @@ from clang_tracer import Client
 from clang_tracer import messages as pb
 from clang_tracer.command import parse_command
 from clang_tracer.console import Console
+from clang_tracer.display import render
 
 pytestmark = pytest.mark.native
+
+
+def test_reprobe_keeps_old_hook_on_compile_error_and_displays_string_state(native):
+    build, target, temporary = native
+    with Client(f"unix://{temporary}/control.sock", timeout=60) as client:
+        client.start_server(
+            str(build / "clang-tracer-server"),
+            agent=str(build / "libclang_tracer_agent.so"),
+        )
+        session = client.attach(target.pid)
+        first = client.inject(session.id, "add(int, int)", INTERCEPTOR)
+        before = client.collect_traces(2, session_ids=[session.id], timeout=10)
+        cursor = before[-1].sequence
+        with pytest.raises(grpc.RpcError):
+            client.inject(session.id, "add(int, int)", "struct Interceptor { broken };")
+        assert next(
+            p for p in client.list_sessions()[0].probes if p.id == first.id
+        ).active
+        alive = client.collect_traces(
+            2, session_ids=[session.id], after_sequence=cursor, timeout=10
+        )
+        assert all(event.probe_id == first.id for event in alive)
+        source = """#include <string>
+struct Scope {};
+struct Snapshot : state<Scope> { std::string message; };
+struct Interceptor {
+  Interceptor(State<Snapshot>);
+  void pre(const Call &call, Snapshot &snapshot) {
+    snapshot.message = "actual string value";
+    call.context().event("snapshot.ready");
+  }
+};
+"""
+        callback = temporary / "interceptor.cpp"
+        callback.write_text(source)
+        console = Console(client, output=DummyOutput())
+        console.session_id = session.id
+        installed = []
+        console.emit = installed.append
+        console.execute(
+            parse_command(f'probe inject "add(int, int)" --callback "{callback}"')
+        )
+        second = installed[-1]
+        assert isinstance(second, pb.Probe) and second.active
+        assert second.id != first.id
+        previous = next(p for p in client.list_sessions()[0].probes if p.id == first.id)
+        assert not previous.active and previous.original_bytes_restored
+        events = client.collect_traces(
+            2,
+            session_ids=[session.id],
+            names=["snapshot.ready"],
+            after_sequence=alive[-1].sequence,
+            timeout=10,
+        )
+        assert all(event.probe_id == second.id for event in events)
+        text = "".join(fragment for _, fragment in render(events[-1]))
+        assert 'message = "actual string value"' in text
+        # Replace a shared-context hook too, then restore the true original bytes.
+        third = client.inject(session.id, "add(int, int)", INTERCEPTOR)
+        assert third.id != second.id
+        assert client.remove_probe(session.id, third.id).original_bytes_restored
+        client.detach(session.id)
+        assert target.poll() is None
 
 
 def test_native_retention_snapshot_ack_and_cli_storage(native):
@@ -375,13 +439,13 @@ def test_real_native_add_probe_rejects_tampered_resolved_metadata(native):
 
         changed_signature = pb.ProbeSpec()
         changed_signature.CopyFrom(resolved)
-        changed_signature.signature.arguments.clear()
+        changed_signature.signature.ClearField("arguments")
         changed_signature.signature.arguments.extend([pb.INT64, pb.INT32])
         tampered_specs.append(changed_signature)
 
         changed_argument_name = pb.ProbeSpec()
         changed_argument_name.CopyFrom(resolved)
-        changed_argument_name.argument_names.clear()
+        changed_argument_name.ClearField("argument_names")
         changed_argument_name.argument_names.extend(
             ["altered_argument", resolved.argument_names[1]]
         )

@@ -267,6 +267,8 @@ HELP_TOPICS = {
             "/usr/local/share/clang-tracer/examples/cpp-interceptors/method.cpp",
         ),
         notes=(
+            "Injecting the same target again replaces its active probe in this "
+            "session. The new callback compiles before the old hook is removed.",
             "Callback source is sent by value; include and compilation-"
             "database paths refer to the server host.",
             "If --compdb is omitted, the server can infer compiler flags from the "
