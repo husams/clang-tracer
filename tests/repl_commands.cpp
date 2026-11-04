@@ -30,6 +30,10 @@ int main() {
   require(!parse_command("%events").has("--count"));
   require(!parse_command("%collect --as live").has("--count"));
   require(parse_command("%collect --as cpp").option("--as") == "cpp");
+  require(parse_command("%help Event").arguments.at(0) == "Event");
+  require(parse_command("%complete \"data.at(0).\"").kind ==
+          CommandKind::complete);
+  bad("%complete");
   require(parse_command("%events show batch --index 0").kind ==
           CommandKind::event_show);
   bad("%attach 12345 trailing");

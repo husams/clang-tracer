@@ -1,11 +1,14 @@
 #include "interpreter.hpp"
+#include "completion.hpp"
 
 #include <clang/AST/ASTContext.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Interpreter/Interpreter.h>
+#include <clang/Interpreter/PartialTranslationUnit.h>
 #include <clang/Interpreter/Value.h>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/IR/Module.h>
 #include <llvm/Support/DynamicLibrary.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/TargetSelect.h>
@@ -27,6 +30,9 @@
 namespace tracer_repl {
 struct CppEngine::Impl {
   std::unique_ptr<clang::Interpreter> interpreter;
+  std::vector<std::string> arguments;
+  std::string history;
+  bool synchronized = true;
 };
 
 CppEngine::CppEngine(Facade &facade, std::vector<std::string> arguments)
@@ -130,17 +136,53 @@ void CppEngine::initialize() {
   }
   impl_ = std::make_unique<Impl>();
   impl_->interpreter = std::move(*interpreter);
+  impl_->arguments = std::move(args);
+  impl_->history = prelude.str() + "\n";
+}
+
+CppCompletions CppEngine::complete(const std::string &source) {
+  initialize();
+  if (!impl_->synchronized)
+    throw std::runtime_error(
+        "C++ completion requires %cpp reset after a parse error; tracing "
+        "commands and explicitly terminated statements remain available");
+  return complete_cpp(impl_->arguments, impl_->history, source);
+}
+
+std::string CppEngine::describe_api(const std::string &topic) {
+  initialize();
+  return describe_cpp_api(*impl_->interpreter->getCompilerInstance(), topic);
 }
 
 bool CppEngine::evaluate(const std::string &source) {
   initialize();
-  clang::Value value;
-  if (auto error = impl_->interpreter->ParseAndExecute(source, &value)) {
+  // Clang's value printer drops a void expression when its semicolon is
+  // omitted. Classify without running code, then execute the original once.
+  const bool terminate = needs_void_terminator(
+      impl_->interpreter->getCompilerInstance()->getLangOpts(),
+      impl_->arguments, impl_->history, source, impl_->synchronized);
+  const auto report = [](llvm::Error error) {
     llvm::logAllUnhandledErrors(std::move(error), llvm::errs(), "C++ input: ");
     llvm::errs() << "Use %cpp reset if earlier C++ declarations no longer "
                     "resolve; tracing commands remain available.\n";
     return false;
+  };
+  auto parsed = impl_->interpreter->Parse(terminate ? source + "\n;" : source);
+  if (!parsed) {
+    impl_->synchronized = false;
+    return report(parsed.takeError());
   }
+  // Declarations remain in Clang even if execution later throws. Keep discovery
+  // synchronized at the parse/execute boundary, without replaying side effects.
+  impl_->history += "\n#line 1\n" + source + "\n;\n";
+  if (parsed->TheModule)
+    if (auto error = impl_->interpreter->Execute(*parsed))
+      return report(std::move(error));
+  // The public ParseAndExecute interface transfers Clang's pending captured
+  // value. An empty input retrieves it without executing the user's cell again.
+  clang::Value value;
+  if (auto error = impl_->interpreter->ParseAndExecute("", &value))
+    return report(std::move(error));
   if (value.hasValue()) {
 #if LLVM_VERSION_MAJOR >= 22
     value.print(llvm::outs());

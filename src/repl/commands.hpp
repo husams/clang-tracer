@@ -40,6 +40,7 @@ enum class CommandKind {
   record,
   cpp_load,
   cpp_reset,
+  complete,
   help,
   quit
 };

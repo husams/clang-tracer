@@ -124,5 +124,6 @@ public:
                      unsigned timeout_seconds = 30);
   Collection batch(const std::string &name) const;
   void print(const Event &event) const;
+  void print(const Collection &collection) const;
 };
 } // namespace tracer_repl

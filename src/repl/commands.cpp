@@ -80,6 +80,7 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"record", K::record},
                                         {"cpp load", K::cpp_load},
                                         {"cpp reset", K::cpp_reset},
+                                        {"complete", K::complete},
                                         {"help", K::help},
                                         {"quit", K::quit},
                                         {"exit", K::quit}};
@@ -220,6 +221,9 @@ const std::vector<std::string> &command_names() {
     for (const auto &entry : kinds) {
       result.push_back("%" + entry.first);
     }
+    for (const auto &topic : {"api", "tracer", "Event", "Collection",
+                              "SessionHandle", "ScalarValue"})
+      result.push_back(std::string("%help ") + topic);
     return result;
   }();
   return names;

@@ -103,6 +103,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitComplete(TracerCommandsParser::CompleteContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitHelp(TracerCommandsParser::HelpContext *ctx) override {
     return visitChildren(ctx);
   }

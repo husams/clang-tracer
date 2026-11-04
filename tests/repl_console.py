@@ -31,7 +31,16 @@ def main():
 %events show batch --index 1
 %events calls batch
 auto data = tracer.batch("batch");
+std::cout << "event-print-start" << std::endl;
+tracer.print(data.at(1));
+std::cout << "event-print-end" << std::endl;
+std::cout << "exact-print-start" << std::endl;
+tracer.print(data.at(0))
+std::cout << "exact-print-end" << std::endl;
 std::cout << "cpp-size=" << data.size() << " result=" << data.at(1).result() << std::endl;
+int typed_sum = data.at(0).argument_as<int>(0) + data.at(1).result_as<int>();
+std::cout << "typed-sum=" << typed_sum << std::endl;
+try {{ data.at(1).result_as<bool>(); }} catch (const std::invalid_argument&) {{ std::cout << "typed-mismatch-rejected" << std::endl; }}
 auto captured = session;
 auto another = tracer.collect(captured, 4);
 std::cout << "collected-cpp=" << another.size() << std::endl;
@@ -41,14 +50,30 @@ std::cout << "retained-session=" << session.pid << std::endl;
 %events open "{capture}" --as saved
 %events export saved --format json --output "{export}"
 %events stats saved
-%detach
+tracer.detach(session)
 %quit
 '''
             run = subprocess.run([console, "--endpoint", endpoint, "--fail-fast"], input=commands, text=True, capture_output=True, timeout=45)
             assert run.returncode == 0, (run.stdout, run.stderr)
-            for expected in ["installed probe=5", "cpp-size=4 result=42", "collected-cpp=4", "retained-session=7", "duration_ns=10", "paired=2", "detached session=s1"]:
+            for expected in ["installed probe=5", "cpp-size=4 result=42", "typed-sum=63", "typed-mismatch-rejected", "collected-cpp=4", "retained-session=7", "duration_ns=10", "paired=2", "detached session=s1"]:
                 assert expected in run.stdout, (expected, run.stdout, run.stderr)
             assert len(json.loads(export.read_text())) == 4
+            printed = run.stdout.split("event-print-start\n", 1)[1].split("event-print-end", 1)[0]
+            assert "phase: POST" in printed and "signed_value: 42" in printed, printed
+            printed = run.stdout.split("exact-print-start\n", 1)[1].split("exact-print-end", 1)[0]
+            assert "phase: PRE" in printed and "signed_value: 21" in printed, printed
+            discovery = subprocess.run([console, "--fail-fast"], input='''%help api
+%help Event
+%complete "tracer.pr"
+tracer_repl::Collection empty;
+%complete "empty.rec"
+tracer.print(empty)
+%status
+%quit
+''', text=True, capture_output=True, timeout=20)
+            assert discovery.returncode == 0, (discovery.stdout, discovery.stderr)
+            for expected in ("T result_as() const", "std::uint64_t received", "  print", "  received", "Collection retained=0", "ready=unconnected"):
+                assert expected in discovery.stdout, (expected, discovery.stdout, discovery.stderr)
             # Disk recording must remain available when named memory collections are full.
             disk_only = root / "full-buffer-recording.pb"
             full = subprocess.run([console, "--endpoint", endpoint, "--buffer-events", "4", "--fail-fast"],

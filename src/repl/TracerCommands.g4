@@ -3,7 +3,7 @@ grammar TracerCommands;
 line : '%' command EOF;
 command : server | attach | processes | sessions | use | status | detach
         | modules | symbols | probe | interceptor | events | collect | record
-        | cpp | help | quit;
+        | cpp | complete | help | quit;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
 serverOption : ('--executable' | '--agent') value;
 attach : 'attach' UINT?;
@@ -35,6 +35,7 @@ streamOption : ('--count' | '--timeout' | '--after' | '--probe') UINT
              | '--phase' ('PRE' | 'POST')
              | ('--as' | '--name' | '--session') value | '--all';
 cpp : 'cpp' ('load' value | 'reset');
+complete : 'complete' value;
 help : 'help' value?;
 quit : 'quit' | 'exit';
 value : STRING | WORD | UINT | keyword;
@@ -43,7 +44,7 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'probe' | 'resolve' | 'inject' | 'validate' | 'remove' | 'probes'
         | 'interceptor' | 'load' | 'edit' | 'show' | 'upload' | 'events'
         | 'list' | 'calls' | 'stats' | 'clear' | 'open' | 'export' | 'json'
-        | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'help' | 'quit' | 'exit';
+        | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'complete' | 'help' | 'quit' | 'exit';
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';

@@ -69,6 +69,7 @@ public:
   Collection batch(const std::string &name) const;
   void draft(const std::string &name, std::string source);
   void print(const Event &event) const;
+  void print(const Collection &collection) const;
   std::vector<std::pair<unsigned, std::string>>
   processes(const std::string &filter) const;
   void

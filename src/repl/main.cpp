@@ -36,27 +36,46 @@ struct Signals {
 class Input {
   bool terminal_ = ::isatty(STDIN_FILENO);
   replxx::Replxx editor_;
+  tr::CppEngine *cpp_ = nullptr;
 
 public:
   Input() {
     editor_.set_max_history_size(1000);
-    editor_.set_completion_callback([](const std::string &input, int &length) {
-      replxx::Replxx::completions_t completions;
-      if (!input.empty() && input.front() == '%') {
-        // Command completions never perform RPCs on the editor's input thread.
-        for (const auto &name : tr::command_names()) {
-          if (name.rfind(input, 0) == 0) {
-            completions.emplace_back(name);
+    editor_.set_double_tab_completion(false);
+    editor_.set_completion_callback(
+        [this](const std::string &input, int &length) {
+          replxx::Replxx::completions_t completions;
+          const auto first = input.find_first_not_of(" \t\r\n");
+          if (first == std::string::npos)
+            return completions;
+          const auto entered = input.substr(first);
+          if (entered.front() == '%') {
+            // Command completions never perform RPCs on the editor's input
+            // thread.
+            for (const auto &name : tr::command_names()) {
+              if (name.rfind(entered, 0) == 0) {
+                completions.emplace_back(name);
+              }
+            }
+            // Matching command prefixes are ASCII; preserve replxx's code-point
+            // context length for arbitrary UTF-8 argument text.
+            if (!completions.empty()) {
+              length = static_cast<int>(entered.size());
+            }
+          } else if (cpp_) {
+            try {
+              const auto candidates = cpp_->complete(input);
+              length = static_cast<int>(std::count_if(
+                  candidates.prefix.begin(), candidates.prefix.end(),
+                  [](unsigned char byte) { return (byte & 0xc0) != 0x80; }));
+              for (const auto &candidate : candidates.items)
+                completions.emplace_back(candidate);
+            } catch (const std::exception &error) {
+              editor_.print("C++ completion: %s\n", error.what());
+            }
           }
-        }
-        // Matching command prefixes are ASCII; preserve replxx's code-point
-        // context length for arbitrary UTF-8 argument text.
-        if (!completions.empty()) {
-          length = static_cast<int>(input.size());
-        }
-      }
-      return completions;
-    });
+          return completions;
+        });
     editor_.set_highlighter_callback(
         [](const std::string &input, auto &colors) {
           if (!input.empty() && input.front() == '%') {
@@ -67,6 +86,7 @@ public:
   }
 
   bool terminal() const { return terminal_; }
+  void use_cpp(tr::CppEngine &cpp) { cpp_ = &cpp; }
 
   std::optional<std::string> read(const std::string &prompt) {
     if (!terminal_) {
@@ -117,7 +137,8 @@ int main(int argc, char **argv) {
                      "  --cpp-arg ARG (repeatable) --fail-fast\n"
                      "C++17; replxx 0.0.4; ANTLR generator/runtime 4.13.2; "
                      "LLVM 21 or 22.\n"
-                     "Use %help for tracing commands. Without --endpoint, "
+                     "Use %help for tracing commands and %help api for C++ "
+                     "APIs. Tab completes C++ members. Without --endpoint, "
                      "startup is local and owned.\n";
         return 0;
       }
@@ -175,6 +196,7 @@ int main(int argc, char **argv) {
     tr::Controller controller(settings, std::cout);
     tr::Facade facade(controller);
     tr::CppEngine cpp(facade, std::move(cpp_args));
+    input.use_cpp(cpp);
     auto choose = [&](const std::string &prompt) {
       return input.read(prompt).value_or("");
     };
@@ -184,7 +206,8 @@ int main(int argc, char **argv) {
       controller.select_process(process, choose);
     }
     if (input.terminal()) {
-      std::cout << "Clang Tracer native C++17 REPL. %help lists commands.\n";
+      std::cout << "Clang Tracer native C++17 REPL. %help lists commands; "
+                   "%help api describes C++ APIs; Tab completes members.\n";
     }
     bool failed = false;
     while (const auto line = input.read(controller.prompt())) {
@@ -204,7 +227,36 @@ int main(int argc, char **argv) {
           continue;
         }
         const auto command = tr::parse_command(*line);
-        if (command.kind == tr::CommandKind::cpp_reset) {
+        const bool api_help =
+            command.kind == tr::CommandKind::help &&
+            !command.arguments.empty() &&
+            std::find(tr::command_names().begin(), tr::command_names().end(),
+                      "%help " + command.arguments[0]) !=
+                tr::command_names().end();
+        if (api_help) {
+          std::cout
+              << "C++ APIs from the loaded header (namespace tracer_repl; "
+                 "tracer is a Facade).\n"
+                 "After collecting: auto data = tracer.batch(\"batch\"); "
+                 "tracer.print(data);\n"
+                 "Print one event: tracer.print(data.at(0)); — a trailing "
+                 "semicolon is optional.\n"
+                 "Typed access: event.argument_as<int>(0), "
+                 "event.result_as<bool>(); types must match.\n"
+                 "Typed values support bools and numbers; inspect object "
+                 "fields and shared state with print/describe.\n"
+                 "Use event.has_result() before reading a result (normally "
+                 "POST); private implementation members are hidden.\n"
+              << cpp.describe_api(command.arguments[0]) << std::flush;
+        } else if (command.kind == tr::CommandKind::complete) {
+          const auto candidates = cpp.complete(command.arguments.at(0));
+          std::cout << "C++ completions (prefix=\"" << candidates.prefix
+                    << "\"):\n";
+          for (const auto &candidate : candidates.items)
+            std::cout << "  " << candidate << '\n';
+          if (candidates.items.empty())
+            std::cout << "  (none)\n";
+        } else if (command.kind == tr::CommandKind::cpp_reset) {
           cpp.reset();
           std::cout << "C++ analysis reset; tracing sessions retained\n";
         } else if (command.kind == tr::CommandKind::cpp_load) {

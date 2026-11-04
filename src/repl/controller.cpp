@@ -365,7 +365,19 @@ Collection Controller::batch(const std::string &name) const {
 }
 
 void Controller::print(const Event &event) const {
-  out_ << event.describe() << '\n';
+  out_ << event.describe() << '\n' << std::flush;
+}
+
+void Controller::print(const Collection &collection) const {
+  out_ << "Collection retained=" << collection.size()
+       << " received=" << collection.received
+       << " evicted=" << collection.evicted
+       << " complete=" << (collection.complete ? "true" : "false")
+       << " cancelled=" << (collection.cancelled ? "true" : "false")
+       << " timed_out=" << (collection.timed_out ? "true" : "false") << '\n';
+  for (const auto &event : collection)
+    print(event);
+  out_ << std::flush;
 }
 
 void Controller::watch(const Command &command, bool display,
@@ -866,10 +878,15 @@ bool Controller::execute(const Command &command) {
          << "%events open FILE.pb --as NAME; %events export NAME --format json "
             "--output "
             "NEW_FILE.json; %events clear NAME\n"
-         << "%cpp load FILE; %cpp reset; %quit\n";
+         << "%cpp load FILE; %cpp reset; %quit\n"
+         << "%help api describes the C++ API; %help Event / Collection / "
+            "tracer show public declarations.\n"
+         << "Tab completes C++ members; %complete \"tracer.\" lists candidates "
+            "without executing code.\n";
     return true;
   case K::cpp_load:
   case K::cpp_reset:
+  case K::complete:
   case K::draft_edit:
     throw std::logic_error("command requires the interactive driver");
   }
@@ -934,4 +951,7 @@ Collection Facade::batch(const std::string &name) const {
 }
 
 void Facade::print(const Event &event) const { controller_->print(event); }
+void Facade::print(const Collection &collection) const {
+  controller_->print(collection);
+}
 } // namespace tracer_repl
