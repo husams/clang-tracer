@@ -12,7 +12,10 @@ void application_function() {}
 
 int main() {
   using tracer::runtime::has_soname;
-  if (!has_soname(reinterpret_cast<const void*>(&::memcpy), "libc.so.6") ||
+  // In a non-PIE executable &memcpy can name its PLT stub, whose owner really
+  // is the executable. Resolve the provider exactly as production lookups do.
+  const auto memcpy_address = ::dlsym(RTLD_DEFAULT, "memcpy");
+  if (!has_soname(memcpy_address, "libc.so.6") ||
       has_soname(reinterpret_cast<const void*>(&application_function), "libc.so.6") ||
       has_soname(nullptr, "libc.so.6")) {
     throw std::runtime_error("runtime identity accepted an application or rejected libc");

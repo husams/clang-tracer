@@ -298,8 +298,8 @@ class Console:
             if "session_ids" not in options and self.session_id is not None:
                 options["session_ids"] = [self.session_id]
             if name == "drain":
-                count = self.client.drain_traces(str(arguments[0]), **options)
-                self.emit(f"drained {count} events to SQLite")
+                drained = self.client.drain_traces(str(arguments[0]), **options)
+                self.emit(f"drained {drained} events to SQLite")
             elif name == "collect":
                 count = int(arguments[0]) if arguments else None
                 if count is not None and count < 1:

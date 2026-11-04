@@ -29,7 +29,7 @@ testpaths = ["tests"]
 markers = ["native: requires CLANG_TRACER_NATIVE_BUILD and Linux x86_64 tracing permissions"]
 
 [tool.ruff]
-extend-exclude = ["src/clang_tracer/proto"]
+extend-exclude = ["src/clang_tracer/proto", "build"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]

@@ -200,8 +200,11 @@ def test_bare_stream_ctrl_c_cancels_live_stream_and_returns_to_prompt(peer, comm
             time.sleep(0.01)
         assert service.watch_time_remaining[-1] > 300
         os.write(master_fd, b"\x03")
-        output = read_until(b"tracer>")
-        assert b"cancelled" in output
+        output = read_until(b"cancelled")
+        # A redraw of the submitted command also contains tracer>; only the
+        # prompt after cancellation proves the console resumed accepting input.
+        if b"tracer>" not in output.split(b"cancelled", 1)[1]:
+            read_until(b"tracer>")
         assert service.cancelled.wait(5), "Ctrl-C did not cancel the gRPC stream"
         os.write(master_fd, b"exit\n")
         assert process.wait(timeout=5) == 0
