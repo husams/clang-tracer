@@ -64,7 +64,7 @@ def main():
         assert server.stdout.readline().strip() == "ready"
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 160, 0, 0))
         env = dict(os.environ, TERM="xterm-256color")
-        child = subprocess.Popen([console, "--endpoint", endpoint, "--fail-fast"],
+        child = subprocess.Popen([console, "--endpoint", endpoint],
                                  stdin=slave, stdout=slave, stderr=slave,
                                  env=env, start_new_session=True)
         os.close(slave)
@@ -91,6 +91,21 @@ def main():
         until(rb"%help api")
         send("\r")
         until(rb"template <class T> T result_as\(\) const;.*tracer\[7\]> ")
+        # Enter must keep an unfinished block in the editor; Ctrl+C discards it.
+        send("for (const auto& e : data.events) {\r")
+        send("tracer.print(e);\r")
+        send("\x03")
+        until(rb"tracer\[7\]> ")
+        send('std::cout << "cancel-kept-" << data.received << std::endl;\r')
+        until(rb"(?m)^cancel-kept-4\n.*tracer\[7\]> ")
+        send("for (const auto& e : data.events) {\rtracer.print(e);\r}\r")
+        until(rb"phase: PRE.*phase: POST.*tracer\[7\]> ")
+        send("data.at(0).argument<bool>(0)\r")
+        until(rb"error:.*tracer\[7\]> ")
+        send("data.rec\t")
+        until(rb"data\.received")
+        send("\x15tracer.print(data.at(0))\r")
+        until(rb"phase: PRE.*tracer\[7\]> ")
         send("%quit\r")
         until(rb"detached session=s1")
         child.wait(timeout=15)

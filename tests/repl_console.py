@@ -81,8 +81,17 @@ tracer.print(empty)
                 text=True, capture_output=True, timeout=15)
             assert full.returncode == 0 and disk_only.stat().st_size > 0, (full.stdout, full.stderr)
             # A partial C++ input must leave commands responsive.
-            rejected = subprocess.run([console], input="int broken = ;\n%status\n%quit\n", text=True, capture_output=True, timeout=20)
+            rejected = subprocess.run([console], input='''int kept = 42;
+int broken = ;
+for (int e : {1,2}) { int unfinished = 0;
+std::cout << "recovered=" << kept << std::endl;
+%complete "kep"
+%status
+%quit
+''', text=True, capture_output=True, timeout=20)
             assert rejected.returncode == 1 and "ready=unconnected" in rejected.stdout
+            assert "recovered=42" in rejected.stdout and "  kept" in rejected.stdout, (rejected.stdout, rejected.stderr)
+            assert rejected.stderr.count("error:") == 2 and "%cpp reset" not in rejected.stderr, rejected.stderr
             # Explicit unreachable endpoint never starts a local replacement.
             unavailable = subprocess.run([console, "--endpoint", "unix:///nonexistent/tracer.sock", "--fail-fast"], input="%sessions\n", text=True, capture_output=True, timeout=10)
             assert unavailable.returncode == 1 and "server ready" not in unavailable.stdout

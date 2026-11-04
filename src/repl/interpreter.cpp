@@ -1,7 +1,9 @@
 #include "interpreter.hpp"
+#include "check_process.hpp"
 #include "completion.hpp"
 
 #include <clang/AST/ASTContext.h>
+#include <clang/Basic/SourceManager.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Interpreter/Interpreter.h>
 #include <clang/Interpreter/PartialTranslationUnit.h>
@@ -23,6 +25,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -32,7 +35,47 @@ struct CppEngine::Impl {
   std::unique_ptr<clang::Interpreter> interpreter;
   std::vector<std::string> arguments;
   std::string history;
+  std::string check_history;
+  const std::filesystem::path directory = std::filesystem::current_path();
+  using Stamp = std::pair<std::uintmax_t, std::filesystem::file_time_type>;
+  std::map<std::filesystem::path, Stamp> headers;
   bool synchronized = true;
+  void verify_inputs() const {
+    if (std::filesystem::current_path() != directory)
+      throw std::runtime_error("C++ working directory changed; restore it or "
+                               "use %cpp reset; previous variables retained");
+    for (const auto &[path, stamp] : headers) {
+      std::error_code error;
+      const auto size = std::filesystem::file_size(path, error);
+      const auto time = std::filesystem::last_write_time(path, error);
+      if (error || Stamp{size, time} != stamp)
+        throw std::runtime_error(
+            "C++ header changed: " + path.string() +
+            "; restore it or use %cpp reset; previous variables retained");
+    }
+  }
+  void remember(const std::string &cell) {
+    check_history += std::to_string(cell.size()) + "\n" + cell;
+    if (cell.empty())
+      return;
+    const auto &sources =
+        interpreter->getCompilerInstance()->getSourceManager();
+    for (auto it = sources.fileinfo_begin(); it != sources.fileinfo_end();
+         ++it) {
+      const auto *cache = it->second;
+      if (!cache->OrigEntry)
+        continue;
+      const auto path =
+          std::filesystem::absolute(cache->OrigEntry->getName().str());
+      if (headers.count(path))
+        continue;
+      std::error_code error;
+      const auto size = std::filesystem::file_size(path, error);
+      const auto time = std::filesystem::last_write_time(path, error);
+      if (!error)
+        headers.emplace(path, Stamp{size, time});
+    }
+  }
 };
 
 CppEngine::CppEngine(Facade &facade, std::vector<std::string> arguments)
@@ -107,6 +150,20 @@ void CppEngine::initialize() {
   if (!engine) {
     throw std::runtime_error(llvm::toString(engine.takeError()));
   }
+  std::vector<std::string> initial_cells;
+  // The public factory parses its own runtime declarations before user input.
+  // Replay those exact buffers in the syntax-only checker as well, retaining
+  // their macros and incremental source numbering on both Clang 21 and 22.
+  const auto &sources =
+      (*interpreter)->getCompilerInstance()->getSourceManager();
+  for (unsigned index = 0; index < sources.local_sloc_entry_size(); ++index) {
+    const auto &entry = sources.getLocalSLocEntry(index);
+    if (!entry.isFile())
+      continue;
+    const auto buffer = entry.getFile().getContentCache().getBufferIfLoaded();
+    if (buffer && buffer->getBufferIdentifier().starts_with("input_line_"))
+      initial_cells.push_back(buffer->getBuffer().str());
+  }
 #if LLVM_VERSION_MAJOR == 21
   // Clang 21 does not emit its value-capture runtime tag until explicitly
   // asked.
@@ -115,6 +172,7 @@ void CppEngine::initialize() {
   if (auto error = (*interpreter)->ParseAndExecute(tag)) {
     throw std::runtime_error(llvm::toString(std::move(error)));
   }
+  initial_cells.push_back(tag);
 #endif
   auto header = std::filesystem::path(executable_path()).parent_path() /
                 TRACER_REPL_API_RELATIVE;
@@ -138,15 +196,32 @@ void CppEngine::initialize() {
   impl_->interpreter = std::move(*interpreter);
   impl_->arguments = std::move(args);
   impl_->history = prelude.str() + "\n";
+  for (const auto &cell : initial_cells)
+    impl_->remember(cell);
+  impl_->remember(prelude.str());
 }
 
 CppCompletions CppEngine::complete(const std::string &source) {
   initialize();
+  impl_->verify_inputs();
   if (!impl_->synchronized)
     throw std::runtime_error(
         "C++ completion requires %cpp reset after a parse error; tracing "
         "commands and explicitly terminated statements remain available");
-  return complete_cpp(impl_->arguments, impl_->history, source);
+  if (source.size() > 65536)
+    return {};
+  const auto helper = std::filesystem::path(executable_path()).parent_path() /
+                      "clang-tracer-repl-check";
+  const auto reply = run_cpp_analysis(helper.string(), "complete",
+                                      impl_->arguments, impl_->history, source);
+  if (reply.status != 0)
+    throw std::runtime_error(reply.output);
+  CppCompletions result;
+  std::istringstream lines(reply.output);
+  std::getline(lines, result.prefix);
+  for (std::string item; std::getline(lines, item);)
+    result.items.push_back(std::move(item));
+  return result;
 }
 
 std::string CppEngine::describe_api(const std::string &topic) {
@@ -156,15 +231,25 @@ std::string CppEngine::describe_api(const std::string &topic) {
 
 bool CppEngine::evaluate(const std::string &source) {
   initialize();
+  impl_->verify_inputs();
   // Clang's value printer drops a void expression when its semicolon is
   // omitted. Classify without running code, then execute the original once.
-  const bool terminate = needs_void_terminator(
-      impl_->interpreter->getCompilerInstance()->getLangOpts(),
-      impl_->arguments, impl_->history, source, impl_->synchronized);
+  if (!impl_->synchronized)
+    throw std::runtime_error(
+        "C++ compiler state diverged; use %cpp reset to recover");
+  const auto helper = std::filesystem::path(executable_path()).parent_path() /
+                      "clang-tracer-repl-check";
+  const auto checked = run_cpp_analysis(
+      helper.string(), "check", impl_->arguments, impl_->check_history, source);
+  if (checked.status != 0 && checked.status != 2) {
+    llvm::errs() << checked.output;
+    llvm::errs().flush();
+    return false;
+  }
+  const bool terminate = checked.status == 2;
+  impl_->verify_inputs();
   const auto report = [](llvm::Error error) {
     llvm::logAllUnhandledErrors(std::move(error), llvm::errs(), "C++ input: ");
-    llvm::errs() << "Use %cpp reset if earlier C++ declarations no longer "
-                    "resolve; tracing commands remain available.\n";
     return false;
   };
   auto parsed = impl_->interpreter->Parse(terminate ? source + "\n;" : source);
@@ -175,12 +260,14 @@ bool CppEngine::evaluate(const std::string &source) {
   // Declarations remain in Clang even if execution later throws. Keep discovery
   // synchronized at the parse/execute boundary, without replaying side effects.
   impl_->history += "\n#line 1\n" + source + "\n;\n";
+  impl_->remember(terminate ? source + "\n;" : source);
   if (parsed->TheModule)
     if (auto error = impl_->interpreter->Execute(*parsed))
       return report(std::move(error));
   // The public ParseAndExecute interface transfers Clang's pending captured
   // value. An empty input retrieves it without executing the user's cell again.
   clang::Value value;
+  impl_->remember("");
   if (auto error = impl_->interpreter->ParseAndExecute("", &value))
     return report(std::move(error));
   if (value.hasValue()) {

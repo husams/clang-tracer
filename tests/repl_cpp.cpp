@@ -1,8 +1,15 @@
 #include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
+#include <unistd.h>
 
+#include "check_process.hpp"
+#include "completion.hpp"
 #include "controller.hpp"
 #include "interpreter.hpp"
 
@@ -17,14 +24,63 @@ bool contains(const CppCompletions &results, const std::string &name) {
   return std::find(results.items.begin(), results.items.end(), name) !=
          results.items.end();
 }
+struct TemporaryDirectory {
+  std::filesystem::path path;
+  TemporaryDirectory() {
+    char name[] = "/tmp/tracer-repl-input-test.XXXXXX";
+    const auto *created = ::mkdtemp(name);
+    if (!created)
+      throw std::runtime_error("cannot create test directory");
+    path = created;
+  }
+  ~TemporaryDirectory() {
+    std::error_code error;
+    std::filesystem::remove_all(path, error);
+  }
+};
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  if (argc > 1 && std::string(argv[1]) == "wait-checker") {
+    for (;;)
+      ::pause();
+  }
   try {
     std::ostringstream output;
     Controller controller(Settings{}, output);
     Facade facade(controller);
     CppEngine cpp(facade, {});
+    require(incomplete_cpp("for (const auto &e : data) {"),
+            "Enter continues an unfinished block");
+    require(!incomplete_cpp("for (int e : {1,2}) { (void)e; }"),
+            "a finished block can be submitted");
+    require(!incomplete_cpp("const char *s = R\"tag({\"[)tag\";"),
+            "raw strings do not open editor blocks");
+    require(incomplete_cpp("/* unfinished comment"),
+            "Enter continues an unfinished comment");
+    require(!incomplete_cpp("#define OPEN {"),
+            "macro definitions are submitted without balancing their bodies");
+    require(incomplete_cpp("const char *s = \"unfinished"),
+            "Enter continues an unfinished string");
+    require(!incomplete_cpp("/* closed */ // not a block /*"),
+            "comment contents do not create continuation blocks");
+    const auto started = std::chrono::steady_clock::now();
+    std::thread interrupt_check([] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      interrupted = true;
+    });
+    bool cancelled = false;
+    try {
+      (void)run_cpp_analysis(executable_path(), "wait-checker", {}, "", "");
+    } catch (const std::runtime_error &error) {
+      cancelled =
+          std::string(error.what()).find("cancelled") != std::string::npos;
+    }
+    interrupt_check.join();
+    interrupted = false;
+    require(cancelled && std::chrono::steady_clock::now() - started <
+                             std::chrono::seconds(3),
+            "interrupt cancels and reaps a stuck checker promptly");
     const auto help = cpp.describe_api("api");
     require(help.find("result_as") != std::string::npos &&
                 help.find("argument_as") != std::string::npos &&
@@ -112,23 +168,99 @@ int main() {
             "printing an empty collection is visible");
     require(!cpp.evaluate(
                 "#define RETAINED_MACRO() after_throw()\nbogus compile_error;"),
-            "a rejected cell can retain preprocessor state");
-    try {
-      cpp.evaluate("RETAINED_MACRO()");
-      throw std::logic_error("bare call silently accepted after a parse error");
-    } catch (const std::runtime_error &error) {
-      require(std::string(error.what()).find("%cpp reset") != std::string::npos,
-              "ambiguous state gives explicit recovery guidance");
-    }
-    require(cpp.evaluate("RETAINED_MACRO();"),
-            "explicitly terminated calls use the live macro state");
+            "a rejected cell is checked without touching the live compiler");
     require(cpp.evaluate(
-                "if (exception_effects != 2) throw "
-                "std::runtime_error(\"retained macro did not execute once\");"),
-            "retained macro state never silently drops side effects");
+                "#ifdef RETAINED_MACRO\n#error rejected macro leaked\n#endif"),
+            "rejected preprocessor changes do not leak");
+    require(!cpp.evaluate("for (int e : {1,2}) {"),
+            "an unfinished block is rejected without a diagnostic loop");
+    require(!cpp.evaluate("for (int e : {1,2}) { int unfinished = 0;"),
+            "a semicolon does not bypass unfinished-input checks");
+    require(cpp.evaluate("#define OPEN {"),
+            "define a macro that opens a block");
+    require(!cpp.evaluate("for (int e : {1,2}) OPEN"),
+            "macro-expanded unfinished blocks cannot hang the live compiler");
+    require(!cpp.evaluate(
+                "#if __INCLUDE_LEVEL__ > 0\nfor (int e : {1,2}) {\n#endif"),
+            "preflight and live input share the same include depth");
+    require(cpp.evaluate(
+                "#if __INCLUDE_LEVEL__ == 1\nint depth_kept = 17;\n#endif"),
+            "conditional declarations use the live interpreter context");
+    require(cpp.evaluate("if (depth_kept != 17) throw "
+                         "std::runtime_error(\"wrong include depth\");"),
+            "accepted conditional declarations survive subsequent checks");
+    require(!cpp.evaluate("data.at(0).argument<bool>(0)"),
+            "the user's non-template accessor error is rejected safely");
+    require(!cpp.evaluate("data.at(0).argument_as<std::string>(0)"),
+            "unsupported typed access does not damage earlier declarations");
+    require(contains(cpp.complete("data.rec"), "received"),
+            "completion works immediately after rejected input");
+    require(cpp.evaluate("after_throw()"),
+            "bare void expressions work after rejected input without reset");
+    require(
+        cpp.evaluate(
+            "if (exception_effects != 2) throw "
+            "std::runtime_error(\"retained macro did not execute once\");"),
+        "rejected input preserves variables without replaying side effects");
     cpp.reset();
     require(!contains(cpp.complete("make_th"), "make_thing"),
             "reset removes old completion declarations");
+    TemporaryDirectory directory;
+    const auto header = directory.path / "forced.hpp";
+    const std::string contents =
+        "#pragma once\n#include <iostream>\ninline int forced_initializer = [] "
+        "{ std::cout << \"forced-once\\n\"; return 9; }();\n";
+    {
+      std::ofstream(header) << contents;
+    }
+    CppEngine forced(facade, {"-include", header.string()});
+    std::ostringstream initializers;
+    auto *saved_output = std::cout.rdbuf(initializers.rdbuf());
+    try {
+      require(forced.evaluate("if (forced_initializer != 9) throw "
+                              "std::runtime_error(\"initializer skipped\");"),
+              "forced include initializes in the live interpreter");
+      require(forced.evaluate("if (forced_initializer != 9) throw "
+                              "std::runtime_error(\"initializer repeated\");"),
+              "checks do not execute forced-header initializers");
+    } catch (...) {
+      std::cout.rdbuf(saved_output);
+      throw;
+    }
+    std::cout.rdbuf(saved_output);
+    require(initializers.str() == "forced-once\n",
+            "syntax checks never repeat forced-header side effects");
+    const auto stamp = std::filesystem::last_write_time(header);
+    {
+      std::ofstream(header, std::ios::app) << "#define BODY {}\n";
+    }
+    bool changed = false;
+    try {
+      (void)forced.evaluate("for (int n : {1,2}) BODY");
+    } catch (const std::runtime_error &error) {
+      changed =
+          std::string(error.what()).find("header changed") != std::string::npos;
+    }
+    require(changed, "changed headers cannot bypass the parser safety check");
+    {
+      std::ofstream(header) << contents;
+    }
+    std::filesystem::last_write_time(header, stamp);
+    const auto original = std::filesystem::current_path();
+    std::filesystem::current_path(directory.path);
+    changed = false;
+    try {
+      (void)forced.evaluate("for (int n : {1,2}) BODY");
+    } catch (const std::runtime_error &error) {
+      changed = std::string(error.what()).find("working directory changed") !=
+                std::string::npos;
+    }
+    std::filesystem::current_path(original);
+    require(changed,
+            "changed directories cannot bypass the parser safety check");
+    require(forced.evaluate("if (forced_initializer != 9) throw "
+                            "std::runtime_error(\"lost state\");"),
+            "restoring compiler inputs preserves variables without a reset");
     std::cout << "C++ discovery checks passed\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

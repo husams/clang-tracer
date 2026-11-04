@@ -4,6 +4,7 @@
 #include "completion.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <set>
 #include <stdexcept>
 
@@ -14,6 +15,7 @@
 #include <clang/Frontend/ASTUnit.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendActions.h>
+#include <clang/Frontend/TextDiagnosticPrinter.h>
 #include <clang/Interpreter/Interpreter.h>
 #include <clang/Lex/Lexer.h>
 #include <clang/Lex/Preprocessor.h>
@@ -21,8 +23,12 @@
 #include <clang/Sema/CodeCompleteConsumer.h>
 #include <clang/Sema/Sema.h>
 #include <llvm/Config/llvm-config.h>
+#include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/raw_ostream.h>
+#if LLVM_VERSION_MAJOR >= 22
+#include <clang/Interpreter/IncrementalExecutor.h>
+#endif
 
 namespace tracer_repl {
 namespace {
@@ -81,14 +87,30 @@ public:
   }
 };
 
-class VoidStatementAction final : public clang::SyntaxOnlyAction {
-  bool &missing_;
-
+class CheckInterpreter final : public clang::Interpreter {
 public:
-  explicit VoidStatementAction(bool &missing) : missing_(missing) {}
-  std::unique_ptr<clang::ASTConsumer>
-  CreateASTConsumer(clang::CompilerInstance &, llvm::StringRef) override {
-    return std::make_unique<VoidStatementConsumer>(missing_);
+  CheckInterpreter(std::unique_ptr<clang::CompilerInstance> ci,
+                   llvm::Error &error, bool &missing)
+      : clang::Interpreter(std::move(ci), error, nullptr,
+                           std::make_unique<VoidStatementConsumer>(missing)) {}
+};
+
+// Clang's incremental parser can loop on an end-of-input annotation inside an
+// unfinished statement, even after a fatal diagnostic. The checker has no live
+// session state: stop it on the first error, before parser recovery can loop.
+class CheckDiagnostics final : public clang::TextDiagnosticPrinter {
+public:
+  explicit CheckDiagnostics(clang::DiagnosticOptions &options)
+      : clang::TextDiagnosticPrinter(llvm::errs(), options) {}
+  void HandleDiagnostic(clang::DiagnosticsEngine::Level level,
+                        const clang::Diagnostic &diagnostic) override {
+    if (level < clang::DiagnosticsEngine::Error)
+      return;
+    clang::TextDiagnosticPrinter::HandleDiagnostic(level, diagnostic);
+    if (level >= clang::DiagnosticsEngine::Error) {
+      llvm::errs().flush();
+      std::_Exit(1);
+    }
   }
 };
 
@@ -131,41 +153,86 @@ void print_function(llvm::raw_ostream &out, const clang::FunctionDecl &function,
 }
 } // namespace
 
-bool needs_void_terminator(const clang::LangOptions &language,
-                           const std::vector<std::string> &arguments,
-                           const std::string &history,
-                           const std::string &source, bool synchronized) {
+bool check_cpp_source(const std::vector<std::string> &arguments,
+                      const std::vector<std::string> &history,
+                      const std::string &source) {
+  auto ci = compiler_for(arguments);
+  ci->getDiagnostics().setSuppressAllDiagnostics(false);
+  auto diagnostics =
+      std::make_unique<CheckDiagnostics>(ci->getDiagnosticOpts());
+  ci->getDiagnostics().setClient(diagnostics.release());
+  // Syntax-only prevents the Interpreter constructor from running initializers
+  // from forced includes. It still uses the real incremental parser/PTUs.
+  ci->getFrontendOpts().ProgramAction = clang::frontend::ParseSyntaxOnly;
+  bool missing = false;
+  llvm::Error error = llvm::Error::success();
+  auto interpreter =
+      std::make_unique<CheckInterpreter>(std::move(ci), error, missing);
+  if (error)
+    throw std::runtime_error(llvm::toString(std::move(error)));
+  for (const auto &cell : history) {
+    auto parsed = interpreter->Parse(cell);
+    if (!parsed)
+      throw std::runtime_error(llvm::toString(parsed.takeError()));
+  }
+  missing = false;
+  auto parsed = interpreter->Parse(source);
+  if (!parsed)
+    throw std::runtime_error(llvm::toString(parsed.takeError()));
+  return missing;
+}
+
+bool incomplete_cpp(const std::string &source) {
+  const auto first = source.find_first_not_of(" \t\r\n");
+  if (first != std::string::npos && source[first] == '#')
+    return !source.empty() && source.back() == '\\';
+  clang::LangOptions language;
+  language.CPlusPlus = language.CPlusPlus11 = language.CPlusPlus14 =
+      language.CPlusPlus17 = true;
+  language.LineComment = true;
+  language.Digraphs = true;
   clang::Lexer lexer({}, language, source.data(), source.data(),
                      source.data() + source.size());
-  lexer.SetCommentRetentionState(false);
+  lexer.SetCommentRetentionState(true);
+  std::vector<clang::tok::TokenKind> brackets;
   clang::Token token;
-  auto last = clang::tok::eof;
   do {
+    const auto *before = lexer.getBufferLocation();
     lexer.LexFromRawLexer(token);
-    if (token.isNot(clang::tok::eof) && token.isNot(clang::tok::comment))
-      last = token.getKind();
+    const auto kind = token.getKind();
+    if (kind == clang::tok::eof) {
+      // The raw lexer discards an unterminated block comment at EOF.
+      const std::string remaining(before, source.data() + source.size());
+      const auto start = remaining.find_first_not_of(" \t\r\n");
+      if (start != std::string::npos &&
+          remaining.compare(start, 2, "/*") == 0 &&
+          remaining.find("*/", start + 2) == std::string::npos)
+        return true;
+    }
+    if (kind == clang::tok::l_paren || kind == clang::tok::l_brace ||
+        kind == clang::tok::l_square) {
+      brackets.push_back(kind);
+    } else if (kind == clang::tok::r_paren || kind == clang::tok::r_brace ||
+               kind == clang::tok::r_square) {
+      if (brackets.empty())
+        return false; // Let the checker report a mismatch.
+      const auto opening = brackets.back();
+      brackets.pop_back();
+      if (!((opening == clang::tok::l_paren && kind == clang::tok::r_paren) ||
+            (opening == clang::tok::l_brace && kind == clang::tok::r_brace) ||
+            (opening == clang::tok::l_square && kind == clang::tok::r_square)))
+        return false;
+    } else if (kind == clang::tok::unknown || kind == clang::tok::comment) {
+      const auto text = source.substr(token.getLocation().getRawEncoding(),
+                                      token.getLength());
+      if ((text.rfind("/*", 0) == 0 &&
+           (text.size() < 4 || text.substr(text.size() - 2) != "*/")) ||
+          (kind == clang::tok::unknown &&
+           text.find_first_of("\"'") != std::string::npos))
+        return true;
+    }
   } while (token.isNot(clang::tok::eof));
-  if (last == clang::tok::eof || last == clang::tok::semi)
-    return false;
-  if (!synchronized)
-    throw std::runtime_error(
-        "C++ state changed after a parse error; add ';' to execute the "
-        "statement explicitly, or use %cpp reset before bare expressions");
-  auto ci = compiler_for(arguments);
-  const std::string filename = "input_line_[TracerVoidCheck]";
-  ci->getFrontendOpts().Inputs[0] = clang::FrontendInputFile(
-      filename, clang::Language::CXX, clang::InputKind::Source);
-  ci->getPreprocessorOpts().addRemappedFile(
-      filename, llvm::MemoryBuffer::getMemBufferCopy(
-                    history + "\n#line 1\n" + source, filename)
-                    .release());
-  bool missing = false;
-  VoidStatementAction action(missing);
-  if (!ci->ExecuteAction(action))
-    throw std::runtime_error(
-        "cannot classify C++ input safely; add ';' for compiler diagnostics, "
-        "or use %cpp reset after earlier errors");
-  return missing;
+  return !brackets.empty();
 }
 
 CppCompletions complete_cpp(const std::vector<std::string> &arguments,

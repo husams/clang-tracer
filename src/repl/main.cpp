@@ -12,6 +12,7 @@
 #include <replxx.hxx>
 #include <unistd.h>
 
+#include "completion.hpp"
 #include "controller.hpp"
 #include "interpreter.hpp"
 
@@ -42,6 +43,15 @@ public:
   Input() {
     editor_.set_max_history_size(1000);
     editor_.set_double_tab_completion(false);
+    editor_.bind_key(replxx::Replxx::KEY::ENTER, [this](char32_t key) {
+      const std::string source = editor_.get_state().text();
+      const auto first = source.find_first_not_of(" \t\r\n");
+      const bool more = first != std::string::npos && source[first] != '%' &&
+                        tr::incomplete_cpp(source);
+      return editor_.invoke(more ? replxx::Replxx::ACTION::NEW_LINE
+                                 : replxx::Replxx::ACTION::COMMIT_LINE,
+                            key);
+    });
     editor_.set_completion_callback(
         [this](const std::string &input, int &length) {
           replxx::Replxx::completions_t completions;

@@ -11,10 +11,11 @@ namespace tracer_repl {
 CppCompletions complete_cpp(const std::vector<std::string> &arguments,
                             const std::string &history,
                             const std::string &source);
-bool needs_void_terminator(const clang::LangOptions &language,
-                           const std::vector<std::string> &arguments,
-                           const std::string &history,
-                           const std::string &source, bool synchronized);
+// Runs only in the disposable checker. Errors terminate that helper.
+bool check_cpp_source(const std::vector<std::string> &arguments,
+                      const std::vector<std::string> &history,
+                      const std::string &source);
+bool incomplete_cpp(const std::string &source);
 std::string describe_cpp_api(clang::CompilerInstance &parent,
                              const std::string &topic);
 } // namespace tracer_repl

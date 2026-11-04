@@ -258,13 +258,34 @@ consistently across LLVM versions. Typed getters currently cover bools and
 numbers; target object fields and shared state remain available through event
 inspection, rather than reconstruction as arbitrary local C++ objects.
 
-Use Ctrl+J for a newline within replxx's multiline editor, or `%cpp load FILE`
-for a multiline source file. `%cpp reset` destroys C++ declarations and values
-while preserving the tracing controller and sessions. Recoverable C++ input
-errors leave commands available; use `%cpp reset` if later expressions still
-fail after an interpreter error. Arbitrary native C++ runs with the console's
-permissions and can terminate its process; it has no execution rollback or
-guaranteed interruption. Ctrl+C cancellation applies to tracing operations.
+Enter continues an unfinished C++ block, parenthesis, bracket, string, or block
+comment in the multiline editor. Ctrl+C discards the entire pending input;
+earlier variables and tracing sessions remain available. Ctrl+J always inserts
+a newline; `%cpp load FILE` submits a multiline source file.
+
+Every submitted C++ cell is checked in a disposable `clang-tracer-repl-check`
+process before the live interpreter parses or executes it. The checker parses
+the accepted cells in their original order without executing them, preserving
+macro state and incremental source context. A rejected cell cannot change live
+variables or macros, and completion and expressions remain available without
+`%cpp reset`. The checker stops at the first compiler error. Ctrl+C cancels a
+pending check; analysis also has a 15-second deadline and a 64-KiB output limit.
+Tab completion runs in the same isolated, bounded helper. Install the helper
+alongside `clang-tracer-repl` (CMake installs both).
+
+Checks require the session's working directory and previously included headers
+to remain unchanged. If either changes, input is rejected before live parsing:
+restore those inputs to keep using the existing variables, or explicitly reset
+to adopt the new compilation context. After C++ itself changes the working
+directory, reset adopts that directory. Other compiler inputs, including header
+search results and conditional include availability, must also remain stable;
+the file checks detect ordinary size/timestamp changes to loaded headers.
+
+`%cpp reset` explicitly destroys C++ declarations and values while preserving
+the tracing controller and sessions; it is no longer routine error recovery.
+Executed native C++ still runs in the console's process: runtime side effects
+cannot be rolled back, and arbitrary native loops or crashes do not have
+guaranteed interruption. Ctrl+C also cancels tracing operations.
 Completion covers command names and local C++ declarations/members. Dynamic
 completion of remote tracing symbols remains follow-up work.
 
