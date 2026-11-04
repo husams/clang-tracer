@@ -59,3 +59,59 @@ local process selection; explicit remote PID attach works through the service.
 
 Delivery uses the isolated `codex/native-repl-cpp17` branch and a pull request
 targeting `c++17`; merging and live installation are separate operations.
+
+## Typed scalar accessors follow-up — 4 November 2026
+
+- Complete in isolated `codex/native-repl-typed-values` worktrees, based on the
+  merged `c++17` commit `76c91ab`.
+- Added `argument_as<T>(index)`, `result_as<T>()`, presence checking and owning
+  scalar variants; existing text accessors remain compatible.
+- Type/payload checks and integer/floating range checks cover native and
+  shared-context events. Bool, numeric, missing-value and malformed-value
+  regression tests pass; the initial tests reproduced the missing API.
+- macOS LLVM 22.1.8 and Linux LLVM 21.1.8: 4/4 CTests pass on each host. The
+  decoder uses oneof case accessors compatible with Linux's Protobuf 3.14.
+- Reinstalled the runtime and facade header under `/usr/local` on `linux-dev`;
+  their hashes match the new build and source header.
+- The installed console passes live integer arithmetic, bool arguments/results,
+  typed bool recording replay, attach/upload/collection and restoration checks.
+  Linux evidence is in the remote typed-values worktree's
+  `build-repl/native-integration.log`; the prior binary/header are retained there
+  for rollback. Delivery target: `origin/c++17`.
+
+## Printing and API discovery follow-up — 4 November 2026
+
+- Reproduced the exact `tracer.print(data.at(0))` report without a semicolon on
+  both LLVM versions. Clang's void value-capture path discarded the call.
+  A disposable syntax-only compiler now identifies bare void expressions;
+  the live interpreter terminates and executes them once. Counter, print and
+  detach regressions cover the fix.
+- Added batch printing (including empty summaries), explicit event flushing,
+  `%help api` / `%help Event` / `%help Collection` / `%help tracer`, and Tab
+  completion for local C++ declarations, public fields and methods.
+- API help reads the actual public AST declarations. Completion uses Clang
+  semantic analysis of successful session inputs and never executes that code;
+  `%complete "data.at(0)."` provides the same discovery in scripted sessions.
+- Six CTests pass on macOS LLVM 22.1.8 and Linux LLVM 21.1.8. Terminal tests
+  exercise the exact bare print spelling, real Tab insertion and help display.
+  Format/grammar regeneration checks and Clang static analysis pass.
+- Reinstalled the runtime/header on `linux-dev`; build and installed hashes
+  match. The installed terminal check and real attach/upload/collection,
+  bool/numeric analysis, recording/replay and restoration checks pass.
+  Evidence: remote `build-repl/discovery-ctest.log` and
+  `build-repl/discovery-integration.log`. The preceding installation is retained
+  as `previous-discovery-repl` / `previous-discovery-api.hpp` in that build.
+- Source is maintained in isolated typed-values worktrees for delivery to `c++17`. Dynamic
+  completion of remote tracing symbols and typed target-object reconstruction
+  remain follow-up work; scalar typed access and structured inspection work.
+
+### Publication review
+
+- Independent review approved after regressions for comments ending in `;`,
+  declarations retained across runtime exceptions, source-line-dependent
+  return types, and macros retained after parse errors.
+- Raw Clang tokenization distinguishes actual terminators from comments.
+  Discovery records accepted declarations before execution, mirrors each cell's
+  logical line 1, and rejects ambiguous state after parse errors with explicit
+  recovery guidance. Pending values are transferred through the public
+  interpreter API without repeating the user cell.

@@ -176,17 +176,70 @@ only the configured bounded window. Use recording for long captures.
 
 ## Analyze in C++
 
+Discover the API from the prompt before writing analysis:
+
+```text
+%help api
+%help tracer
+%help Event
+%help Collection
+%complete "tracer."
+```
+
+Help prints public fields, method signatures, templates and defaults from the
+loaded facade declarations. Tab completes C++ names and members, including
+`tracer.`, `data.`, and `data.at(0).`, using Clang's semantic analysis and the
+session's semantically accepted inputs. `%complete "data.at(0)."` prints the same candidates
+when `data` has been declared. Completion parses code without executing it or
+issuing tracing operations. It runs on Tab, rather than on each keystroke;
+longer sessions can increase completion time. `%cpp reset` clears that session.
+Declarations remain discoverable after an execution exception. After a C++
+parse error, use `%cpp reset` to restore synchronized completion and bare
+expressions; tracing commands, API help and statements terminated with `;`
+remain available. Ambiguous bare input reports recovery guidance instead of
+silently dropping a call.
+
 ```cpp
 auto data = tracer.batch("batch");
 data.size()
 data.at(0).argument(0)
 std::cout << data.at(1).result() << std::endl;
+tracer.print(data.at(0))
+tracer.print(data)
+int argument = data.at(0).argument_as<int>(0);
+for (const auto &event : data) { if (event.has_result()) std::cout << event.result_as<int>() + argument << std::endl; }
 for (const auto &event : data) tracer.print(event);
 auto captured_session = session;
 auto more = tracer.collect(captured_session, 100, 10);
 more.complete
 more.timed_out
 ```
+
+`argument_as<T>(index)` and `result_as<T>()` return ordinary C++ scalars for
+live and replayed events, including shared-context events. For a function with
+a captured boolean argument/result:
+
+```cpp
+bool input = event.argument_as<bool>(0);
+bool output = event.result_as<bool>();
+if (output && input) std::cout << "both true" << std::endl;
+```
+
+Bool access requires a captured `BOOL`; integral access requires `INT32`,
+`INT64`, or `UINT64`; floating access requires `FLOAT32` or `FLOAT64`.
+Integer conversions check the destination range, including signed/unsigned
+boundaries. Floating conversions check range and round to the requested
+precision; NaN and infinity are preserved. Mismatched types, missing/invalid
+payloads, void, and pointer/object values throw `std::invalid_argument`.
+Out-of-range numeric conversions and argument indices throw `std::out_of_range`.
+A missing result throws `std::runtime_error`; use `has_result()` to check
+presence before accessing it. Native PRE events normally have no result.
+
+`result_value()` and `argument_value(index)` return a `ScalarValue`, defined as
+`std::variant<bool, std::int64_t, std::uint64_t, double>`, for generic analysis
+with `std::get`, `std::get_if`, or `std::visit`. The existing `result()` and
+`argument(index)` methods remain text formatters. Inspect a complete event with
+`tracer.print(event)` or `%events show batch --index 1`.
 
 The prelude provides `tracer` and a selected-session reference named `session`.
 Copying `session` makes a handle that retains that server/session identity;
@@ -195,6 +248,16 @@ tracing operations. The facade also provides `attach`, `inject`, and `detach`.
 The interpreter initializes only for C++ input, so command-only startup does
 not initialize Clang.
 
+`tracer.print(event)` writes the full event immediately. `tracer.print(collection)`
+prints its retention/completion summary and every retained event, including a
+visible summary for an empty collection. Bare void calls work with or without
+a trailing semicolon; the console works around Clang's void value-printing
+behavior without executing calls twice. For text returned by `describe()` or
+the text accessors, use `std::cout << value << std::endl` to display its contents
+consistently across LLVM versions. Typed getters currently cover bools and
+numbers; target object fields and shared state remain available through event
+inspection, rather than reconstruction as arbitrary local C++ objects.
+
 Use Ctrl+J for a newline within replxx's multiline editor, or `%cpp load FILE`
 for a multiline source file. `%cpp reset` destroys C++ declarations and values
 while preserving the tracing controller and sessions. Recoverable C++ input
@@ -202,8 +265,8 @@ errors leave commands available; use `%cpp reset` if later expressions still
 fail after an interpreter error. Arbitrary native C++ runs with the console's
 permissions and can terminate its process; it has no execution rollback or
 guaranteed interruption. Ctrl+C cancellation applies to tracing operations.
-Current completion covers command names; dynamic symbol and C++ semantic
-completion are follow-up work.
+Completion covers command names and local C++ declarations/members. Dynamic
+completion of remote tracing symbols remains follow-up work.
 
 ## Cleanup and scripted use
 
@@ -249,9 +312,14 @@ Generated grammar actions never perform target operations.
 ## Validation
 
 The native client was built and tested on macOS with LLVM 22.1.8 and on Linux
-x86-64 with LLVM 21.1.8. All three client CTests pass on both hosts. A separate
+x86-64 with LLVM 21.1.8. All six client CTests pass on both hosts. A separate
 real Linux integration check covers owned-server startup, PID/name attach,
 interceptor deployment, live event collection/inspection, local C++ analysis,
-recording/replay, probe restoration and cleanup. Staged installations on both
+recording/replay, probe restoration and cleanup. Typed-value tests cover bools,
+integers, floating values, type/payload errors and range boundaries. The Linux
+check also verifies native bool arguments/results and typed recording replay.
+Terminal tests exercise the user's bare `tracer.print(data.at(0))` spelling,
+batch printing, actual Tab insertion for methods/fields, and in-prompt API help.
+Staged installations on both
 hosts evaluate C++ through the installed facade header. See
 `NATIVE_REPL_PROGRESS.md` for evidence and the exact validation scope.
