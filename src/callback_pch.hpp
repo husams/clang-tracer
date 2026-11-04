@@ -16,6 +16,7 @@ struct Artifact {
   std::string pch_path;
   std::string prefix_path;
   std::string key;
+  std::string target_triple;
 };
 
 // Build a process-local PCH for the common standard-header prefix, or return

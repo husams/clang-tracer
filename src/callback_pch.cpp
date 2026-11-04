@@ -17,6 +17,7 @@
 #include <clang/AST/Attr.h>
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/Basic/Diagnostic.h>
+#include <clang/Basic/TargetOptions.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/CompilerInvocation.h>
 #include <clang/Frontend/FrontendActions.h>
@@ -39,7 +40,7 @@ namespace tracer::callback_pch {
 namespace {
 namespace fs = std::filesystem;
 
-// GCC 8's string headers can leave an internal char_traits template undefined
+// GCC 8–11 string headers can leave an internal char_traits template undefined
 // when loaded from a PCH. Keep that suffix textual, including type_traits, to
 // preserve its order after string_view and stdexcept on that runtime.
 constexpr std::string_view kCommonPrefix = R"PCH(
@@ -47,7 +48,7 @@ constexpr std::string_view kCommonPrefix = R"PCH(
 #include <cstdint>
 #include <cstddef>
 #if !defined(__GLIBCXX__) || !defined(_GLIBCXX_RELEASE) || \
-    _GLIBCXX_RELEASE > 8
+    _GLIBCXX_RELEASE > 11
 #include <string_view>
 #include <stdexcept>
 #include <type_traits>
@@ -360,7 +361,8 @@ public:
     if (!dependencies) {
       return std::nullopt;
     }
-    Artifact artifact{pch_path.string(), prefix_path_.string(), key};
+    Artifact artifact{pch_path.string(), prefix_path_.string(), key,
+                      base.getTargetOpts().Triple};
     entries_.emplace(key, CachedPch{artifact, std::move(*dependencies), false});
     return artifact;
   }
@@ -534,6 +536,9 @@ void attach(clang::CompilerInvocation &invocation, const Artifact &artifact) {
 
 void append_syntax_args(std::vector<std::string> &arguments,
                         const Artifact &artifact) {
+  // IncrementalCompilerBuilder and tooling can have different vendor defaults.
+  // The consumer must use the same target as the invocation that built the PCH.
+  arguments.push_back("--target=" + artifact.target_triple);
   arguments.push_back("-fmodules-validate-system-headers");
   arguments.push_back("-include-pch");
   arguments.push_back(artifact.pch_path);
