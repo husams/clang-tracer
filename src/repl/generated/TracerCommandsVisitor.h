@@ -1,0 +1,76 @@
+
+// Generated from src/repl/TracerCommands.g4 by ANTLR 4.13.2
+
+#pragma once
+
+
+#include "antlr4-runtime.h"
+#include "TracerCommandsParser.h"
+
+
+
+/**
+ * This class defines an abstract visitor for a parse tree
+ * produced by TracerCommandsParser.
+ */
+class  TracerCommandsVisitor : public antlr4::tree::AbstractParseTreeVisitor {
+public:
+
+  /**
+   * Visit parse trees produced by TracerCommandsParser.
+   */
+    virtual std::any visitLine(TracerCommandsParser::LineContext *context) = 0;
+
+    virtual std::any visitCommand(TracerCommandsParser::CommandContext *context) = 0;
+
+    virtual std::any visitServer(TracerCommandsParser::ServerContext *context) = 0;
+
+    virtual std::any visitServerOption(TracerCommandsParser::ServerOptionContext *context) = 0;
+
+    virtual std::any visitAttach(TracerCommandsParser::AttachContext *context) = 0;
+
+    virtual std::any visitProcesses(TracerCommandsParser::ProcessesContext *context) = 0;
+
+    virtual std::any visitSessions(TracerCommandsParser::SessionsContext *context) = 0;
+
+    virtual std::any visitUse(TracerCommandsParser::UseContext *context) = 0;
+
+    virtual std::any visitStatus(TracerCommandsParser::StatusContext *context) = 0;
+
+    virtual std::any visitDetach(TracerCommandsParser::DetachContext *context) = 0;
+
+    virtual std::any visitModules(TracerCommandsParser::ModulesContext *context) = 0;
+
+    virtual std::any visitSymbols(TracerCommandsParser::SymbolsContext *context) = 0;
+
+    virtual std::any visitSymbolOption(TracerCommandsParser::SymbolOptionContext *context) = 0;
+
+    virtual std::any visitProbe(TracerCommandsParser::ProbeContext *context) = 0;
+
+    virtual std::any visitResolveOption(TracerCommandsParser::ResolveOptionContext *context) = 0;
+
+    virtual std::any visitDeployOption(TracerCommandsParser::DeployOptionContext *context) = 0;
+
+    virtual std::any visitInterceptor(TracerCommandsParser::InterceptorContext *context) = 0;
+
+    virtual std::any visitEvents(TracerCommandsParser::EventsContext *context) = 0;
+
+    virtual std::any visitCollect(TracerCommandsParser::CollectContext *context) = 0;
+
+    virtual std::any visitRecord(TracerCommandsParser::RecordContext *context) = 0;
+
+    virtual std::any visitStreamOption(TracerCommandsParser::StreamOptionContext *context) = 0;
+
+    virtual std::any visitCpp(TracerCommandsParser::CppContext *context) = 0;
+
+    virtual std::any visitHelp(TracerCommandsParser::HelpContext *context) = 0;
+
+    virtual std::any visitQuit(TracerCommandsParser::QuitContext *context) = 0;
+
+    virtual std::any visitValue(TracerCommandsParser::ValueContext *context) = 0;
+
+    virtual std::any visitKeyword(TracerCommandsParser::KeywordContext *context) = 0;
+
+
+};
+
