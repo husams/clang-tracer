@@ -130,6 +130,9 @@ function(tracer_add_native_repl)
     target_link_libraries(repl-client-tests PRIVATE tracer_repl_client)
     add_test(NAME native_repl_client COMMAND repl-client-tests)
     set_tests_properties(native_repl_client PROPERTIES TIMEOUT 30)
+    add_executable(repl-value-tests tests/repl_values.cpp)
+    target_link_libraries(repl-value-tests PRIVATE tracer_repl_client)
+    add_test(NAME native_repl_values COMMAND repl-value-tests)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_test(NAME native_repl_console
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_console.py"

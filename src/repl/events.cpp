@@ -73,6 +73,53 @@ context_value(const clangtracer::context::v1::TypedTraceValue &value) {
   return scalar_text(value, value.value_type());
 }
 
+auto scalar_payload_case(const api::Value &value) { return value.data_case(); }
+
+auto scalar_payload_case(
+    const clangtracer::context::v1::TypedTraceValue &value) {
+  return value.value_case();
+}
+
+template <class Value>
+ScalarValue typed_scalar(const Value &value, unsigned type) {
+  const auto payload = scalar_payload_case(value);
+  switch (type) {
+  case api::BOOL:
+    if (payload == Value::kUnsignedValue && value.unsigned_value() <= 1)
+      return value.unsigned_value() != 0;
+    if (payload == Value::kSignedValue && value.signed_value() >= 0 &&
+        value.signed_value() <= 1)
+      return value.signed_value() != 0;
+    break;
+  case api::INT32:
+  case api::INT64:
+    if (payload == Value::kSignedValue &&
+        (type == api::INT64 ||
+         (value.signed_value() >= std::numeric_limits<std::int32_t>::min() &&
+          value.signed_value() <= std::numeric_limits<std::int32_t>::max())))
+      return static_cast<std::int64_t>(value.signed_value());
+    break;
+  case api::UINT64:
+    if (payload == Value::kUnsignedValue)
+      return static_cast<std::uint64_t>(value.unsigned_value());
+    break;
+  case api::FLOAT32:
+  case api::FLOAT64:
+    if (payload == Value::kRealValue &&
+        (type == api::FLOAT64 || !std::isfinite(value.real_value()) ||
+         (value.real_value() >= std::numeric_limits<float>::lowest() &&
+          value.real_value() <= std::numeric_limits<float>::max())))
+      return value.real_value();
+    break;
+  default:
+    throw std::invalid_argument(
+        "event value is not a bool or numeric scalar (type=" +
+        std::to_string(type) + ")");
+  }
+  throw std::invalid_argument(
+      "event scalar has a missing, invalid, or mismatched payload");
+}
+
 void decoded_states(const api::TraceEvent &event, std::ostream &out) {
   if (!event.has_context()) {
     return;
@@ -164,6 +211,38 @@ std::string Event::phase() const {
 
 std::string Event::function_name() const {
   return data_->message.function_name();
+}
+
+bool Event::has_result() const {
+  const auto &event = data_->message;
+  return (event.has_context() && event.context().event().has_result()) ||
+         event.has_result();
+}
+
+ScalarValue Event::argument_value(std::size_t index) const {
+  const auto &event = data_->message;
+  if (event.has_context()) {
+    for (const auto &arg : event.context().event().arguments()) {
+      if (arg.index() == index)
+        return typed_scalar(arg.value(), arg.value().value_type());
+    }
+    throw std::out_of_range("argument index");
+  }
+  if (index >= static_cast<std::size_t>(event.arguments_size()))
+    throw std::out_of_range("argument index");
+  const auto &arg = event.arguments(static_cast<int>(index));
+  return typed_scalar(arg, arg.type());
+}
+
+ScalarValue Event::result_value() const {
+  const auto &event = data_->message;
+  if (event.has_context() && event.context().event().has_result()) {
+    const auto &value = event.context().event().result();
+    return typed_scalar(value, value.value_type());
+  }
+  if (!event.has_result())
+    throw std::runtime_error("event result unavailable; inspect a POST event");
+  return typed_scalar(event.result(), event.result().type());
 }
 
 std::string Event::argument(std::size_t index) const {
