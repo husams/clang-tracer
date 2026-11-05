@@ -315,6 +315,7 @@ message Value {
     uint64 unsigned_value = 3;
     double real_value = 4;
   }
+  clangtracer.context.v1.ValueSnapshot snapshot = 5;
 }
 message NamedValue {
   string name = 1;

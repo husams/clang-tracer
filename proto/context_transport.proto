@@ -124,6 +124,20 @@ message TypedTraceValue {
     uint64 unsigned_value = 3;
     double real_value = 4;
   }
+  ValueSnapshot snapshot = 5;
+}
+// Owned capture-time data; never a target-memory image or a borrowed address.
+// Payload is a field-1 wrapper described by descriptor_set/root_type.
+message ValueSnapshot {
+  enum Status { UNSPECIFIED = 0; COMPLETE = 1; UNSUPPORTED = 2; LIMIT_EXCEEDED = 3; FAILED = 4; }
+  string cpp_type = 1;
+  string root_type = 2;
+  bytes descriptor_set = 3;
+  bytes payload = 4;
+  Status status = 5;
+  string detail = 6;
+  repeated string container_roles = 7;
+  repeated string record_types = 8; // protobuf message name=C++ canonical name
 }
 message TraceArgument {
   uint32 index = 1;
