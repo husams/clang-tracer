@@ -1,6 +1,7 @@
 #include "interpreter.hpp"
 #include "check_process.hpp"
 #include "completion.hpp"
+#include "mapping_cache.hpp"
 
 #include <clang/AST/ASTContext.h>
 #include <clang/Basic/SourceManager.h>
@@ -15,6 +16,8 @@
 #include <llvm/Support/Error.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/ADT/SmallString.h>
+#include <llvm/Support/VirtualFileSystem.h>
 
 #include "repl_config.hpp"
 #include "server_process.hpp"
@@ -75,6 +78,7 @@ struct CppEngine::Impl {
   const std::filesystem::path directory = std::filesystem::current_path();
   using Stamp = std::pair<std::uintmax_t, std::filesystem::file_time_type>;
   std::map<std::filesystem::path, Stamp> headers;
+  std::map<std::pair<std::string, std::filesystem::path>, std::string> mappings;
   bool synchronized = true;
   bool user_cells = false;
   void verify_inputs() const {
@@ -102,8 +106,11 @@ struct CppEngine::Impl {
       const auto *cache = it->second;
       if (!cache->OrigEntry)
         continue;
-      const auto path =
-          std::filesystem::absolute(cache->OrigEntry->getName().str());
+      llvm::SmallString<256> filename(cache->OrigEntry->getName());
+      if (interpreter->getCompilerInstance()->getFileManager()
+              .getVirtualFileSystem().makeAbsolute(filename))
+        throw std::runtime_error("cannot resolve C++ input header");
+      const auto path = std::filesystem::weakly_canonical(filename.str().str());
       if (headers.count(path))
         continue;
       std::error_code error;
@@ -126,11 +133,15 @@ std::vector<std::string> CppEngine::effective_compiler_options() const {
   return profile_arguments(arguments_);
 }
 
-void CppEngine::set_compiler_options(std::vector<std::string> arguments) {
+void CppEngine::require_compiler_options_mutable() const {
   if (impl_ && impl_->user_cells)
     throw std::runtime_error(
         "compiler options are locked after C++ input; use --cpp-arg at startup "
         "or %cpp reset before changing them; variables retained");
+}
+
+void CppEngine::set_compiler_options(std::vector<std::string> arguments) {
+  require_compiler_options_mutable();
   std::size_t bytes = 0;
   for (const auto &argument : arguments) {
     bytes += argument.size();
@@ -152,28 +163,92 @@ void CppEngine::set_compiler_options(std::vector<std::string> arguments) {
   arguments_ = std::move(arguments);
 }
 
-std::string CppEngine::import_header(const std::string &header,
-                                     const std::vector<std::string> &types) {
-  initialize();
-  impl_->verify_inputs();
+CppEngine::MappingHeader CppEngine::mapping_header(const std::string &header,
+    const std::vector<std::string> &types, const std::string &output,
+    bool standalone) {
+  if (impl_) impl_->verify_inputs();
+  const bool independent = standalone || !impl_ || !impl_->user_cells;
+  const auto arguments = profile_arguments(arguments_);
+  const auto api = api_header();
+  const auto helper = std::filesystem::path(executable_path()).parent_path() /
+                      "clang-tracer-repl-check";
+  std::ostringstream identity;
+  identity << "mapping-cache-v1\n" << std::quoted(header) << '\n'
+           << std::quoted(std::filesystem::current_path().string()) << '\n'
+           << std::quoted(api) << '\n' << mapping_file_digest(helper) << '\n';
+  for (const auto &argument : arguments) identity << std::quoted(argument) << '\n';
+  identity << "types\n";
+  for (const auto &type : types) identity << std::quoted(type) << '\n';
+  for (const auto *variable : {"CPATH", "CPLUS_INCLUDE_PATH", "C_INCLUDE_PATH",
+       "OBJC_INCLUDE_PATH", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET",
+       "SOURCE_DATE_EPOCH", "CCC_OVERRIDE_OPTIONS"}) {
+    const auto *value = std::getenv(variable);
+    identity << variable << '=' << std::quoted(value ? value : "") << '\n';
+  }
+  const auto request_key = mapping_digest(identity.str());
+  auto key = request_key;
+  auto path = output.empty() ? mapping_cache_directory() / (key + ".hpp")
+                            : std::filesystem::absolute(output);
+  if (path.string().find_first_of("\"\\\r\n") != std::string::npos)
+    throw std::runtime_error("unsupported character in generated output path");
+  const bool simple_profile = std::none_of(arguments.begin(), arguments.end(), [](const auto &argument) {
+    for (const auto *prefix : {"-include", "-imacros", "-fmodule", "-ivfsoverlay", "--config"})
+      if (argument.rfind(prefix, 0) == 0) return true;
+    return false;
+  });
+  if (!standalone && impl_ && simple_profile) {
+    for (const auto &[request, stored_key] : impl_->mappings) {
+      if (request.first != request_key ||
+          (!output.empty() && request.second != std::filesystem::weakly_canonical(path))) continue;
+      if (valid_mapping_header(request.second, stored_key))
+        return {request.second.string(), request_key, stored_key, true};
+    }
+  }
+  const bool already_included = impl_ && impl_->headers.count(std::filesystem::weakly_canonical(path));
+  if ((independent || already_included) && simple_profile && valid_mapping_header(path, key)) {
+    return {path.string(), request_key, key, true};
+  }
+  const auto prelude = "#include \"" + api + "\"\n";
+  const auto history = independent ? std::to_string(prelude.size()) + "\n" + prelude
+                                   : impl_->check_history;
   std::ostringstream request;
   request << std::quoted(header) << '\n';
   for (const auto &type : types)
     request << std::quoted(type) << '\n';
-  const auto helper = std::filesystem::path(executable_path()).parent_path() /
-                      "clang-tracer-repl-check";
   const auto generated =
-      run_cpp_analysis(helper.string(), "reflect", impl_->arguments,
-                       impl_->check_history, request.str());
+      run_cpp_analysis(helper.string(), "reflect", arguments, history, request.str());
   if (generated.status != 0)
     throw std::runtime_error(
         "automatic mapping generation failed; previous C++ state retained. "
         "For bulk imports, select supported roots with --type QualifiedType:\n" +
         generated.output);
-  impl_->verify_inputs();
-  if (!evaluate(generated.output))
+  if (impl_) impl_->verify_inputs();
+  const auto first_line = generated.output.find('\n') + 1;
+  const auto body = generated.output.substr(0, first_line) + prelude +
+                    generated.output.substr(first_line);
+  if (!independent) {
+    key = mapping_digest(key + body);
+    if (output.empty()) path = mapping_cache_directory() / (key + ".hpp");
+  }
+  save_mapping_header(path, key, body);
+  return {path.string(), request_key, key, false};
+}
+
+std::string CppEngine::generate_header(const std::string &header,
+    const std::vector<std::string> &types, const std::string &output) {
+  const auto saved = mapping_header(header, types, output, true);
+  return mapping_header_summary(saved.path) + "\n" +
+         (saved.reused ? "reused generated header: " : "saved generated header: ") + saved.path;
+}
+
+std::string CppEngine::import_header(const std::string &header,
+    const std::vector<std::string> &types, const std::string &output) {
+  const auto saved = mapping_header(header, types, output, false);
+  if (!evaluate("#include \"" + saved.path + "\"\n"))
     throw std::runtime_error("application header import failed");
-  return generated.output.substr(3, generated.output.find('\n') - 3);
+  impl_->mappings[{saved.request_key, std::filesystem::weakly_canonical(saved.path)}] = saved.stored_key;
+  return mapping_header_summary(saved.path) + "\n" +
+         (saved.reused ? "reused generated header: " : "saved generated header: ") + saved.path;
 }
 
 void CppEngine::initialize() {

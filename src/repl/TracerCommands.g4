@@ -3,7 +3,7 @@ grammar TracerCommands;
 line : '%' command EOF;
 command : server | attach | processes | sessions | use | status | detach
         | modules | symbols | probe | interceptor | events | collect | record
-        | cpp | complete | help | quit;
+        | cpp | shell | complete | help | quit;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
 serverOption : ('--executable' | '--agent') value;
 attach : 'attach' UINT?;
@@ -34,8 +34,11 @@ record : 'record' value streamOption*;
 streamOption : ('--count' | '--timeout' | '--after' | '--probe') UINT
              | '--phase' ('PRE' | 'POST')
              | ('--as' | '--name' | '--session') value | '--all';
-cpp : 'cpp' ('load' value | 'reset' | 'import' value ('--type' value)*
-            | 'options' ('add' value+ | 'clear')?);
+cpp : 'cpp' ('load' value | 'reset'
+            | ('import' | 'generate') value (('--type' | '--output') value)*
+            | 'options' ('add' (value | SHELL)+ | 'clear'
+                        | 'compdb' value '--file' value)?);
+shell : 'shell' value;
 complete : 'complete' value;
 help : 'help' value?;
 quit : 'quit' | 'exit';
@@ -46,9 +49,11 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'interceptor' | 'load' | 'edit' | 'show' | 'upload' | 'events'
         | 'list' | 'calls' | 'stats' | 'clear' | 'open' | 'export' | 'json'
         | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'import'
-        | 'options' | 'add' | 'complete' | 'help' | 'quit' | 'exit';
+        | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
+        | 'complete' | 'help' | 'quit' | 'exit';
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';
-WORD : ~[ \t\r\n"'\\%]+;
+SHELL : '`' ~[`\r\n]+ '`';
+WORD : ~[ \t\r\n"'\\%`]+;
 WS : [ \t\r\n]+ -> skip;

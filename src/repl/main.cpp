@@ -15,6 +15,8 @@
 #include "completion.hpp"
 #include "controller.hpp"
 #include "interpreter.hpp"
+#include "compiler_profile.hpp"
+#include "shell.hpp"
 
 namespace tr = tracer_repl;
 
@@ -248,7 +250,11 @@ int main(int argc, char **argv) {
           std::cout << "%cpp options lists the local C++ compiler arguments.\n"
                        "%cpp options add \"-I/path/to/application/include\" \"-DFEATURE=1\"\n"
                        "Configure options before C++ input; --cpp-arg ARG also works at startup.\n"
-                       "%cpp import \"application/types.hpp\" generates EventRecord mappings.\n"
+                       "%cpp import \"application/types.hpp\" caches and loads EventRecord mappings.\n"
+                       "%cpp generate HEADER [--output FILE] generates the entire include using only its AST.\n"
+                       "Saved headers can be reused with #include or %cpp load; generation never links or runs application code.\n"
+                       "%cpp options compdb DATABASE --file FILE uses an exact entry, then same-directory C++ source.\n"
+                       "%shell \"COMMAND\" captures output; %cpp options add `COMMAND` adds stdout flags.\n"
                        "Use --type QualifiedType (repeatable) to select records; nested dependencies are automatic.\n"
                        "Existing EventRecord/EventCodec mappings are retained. Public supported fields and\n"
                        "accessible default construction are required; incompatible types are reported.\n"
@@ -256,21 +262,44 @@ int main(int argc, char **argv) {
                        "requires an explicit %cpp reset, which clears C++ variables and retains tracing sessions.\n"
                        "Probe compiler options remain separate: --include/--compile-option refer to the server.\n";
         } else if (command.kind == tr::CommandKind::cpp_options) {
+          if (!command.arguments.empty()) cpp.require_compiler_options_mutable();
           if (command.arguments.empty()) {
             std::cout << "Local C++ compiler arguments (in order):\n";
             for (const auto &argument : cpp.effective_compiler_options())
               std::cout << "  " << argument << '\n';
+          } else if (command.arguments[0] == "compdb") {
+            const auto profile = tr::compilation_database_profile(command.arguments.at(1), command.option("--file"));
+            cpp.set_compiler_options(profile.arguments);
+            std::cout << "Local C++ compiler options loaded from " << profile.source << '\n';
           } else {
             auto arguments = cpp.compiler_options();
             if (command.arguments[0] == "clear") arguments.clear();
-            else arguments.insert(arguments.end(), command.arguments.begin() + 1, command.arguments.end());
+            else for (std::size_t i = 1; i < command.arguments.size(); ++i) {
+              if (std::find(command.shell_arguments.begin(), command.shell_arguments.end(), i) == command.shell_arguments.end()) {
+                arguments.push_back(command.arguments[i]);
+                continue;
+              }
+              const auto reply = tr::run_shell(command.arguments[i]);
+              std::cerr << reply.error;
+              if (reply.status) throw std::runtime_error("shell returned " + std::to_string(reply.status) + "; compiler options retained");
+              const auto flags = tr::split_compiler_flags(reply.output);
+              arguments.insert(arguments.end(), flags.begin(), flags.end());
+            }
             cpp.set_compiler_options(std::move(arguments));
             std::cout << "Local C++ compiler options updated; tracing sessions retained\n";
           }
-        } else if (command.kind == tr::CommandKind::cpp_import) {
+        } else if (command.kind == tr::CommandKind::cpp_import ||
+                   command.kind == tr::CommandKind::cpp_generate) {
           const auto selected = command.options.find("--type");
           const auto types = selected == command.options.end() ? std::vector<std::string>{} : selected->second;
-          std::cout << cpp.import_header(command.arguments.at(0), types) << '\n';
+          std::cout << (command.kind == tr::CommandKind::cpp_generate
+              ? cpp.generate_header(command.arguments.at(0), types, command.option("--output"))
+              : cpp.import_header(command.arguments.at(0), types, command.option("--output"))) << '\n';
+        } else if (command.kind == tr::CommandKind::shell) {
+          const auto reply = tr::run_shell(command.arguments.at(0));
+          std::cout << reply.output;
+          std::cerr << reply.error;
+          if (reply.status) throw std::runtime_error("shell returned " + std::to_string(reply.status));
         } else if (api_help) {
           std::cout
               << "C++ APIs from the loaded header (namespace tracer_repl; "

@@ -23,8 +23,9 @@ public:
     T__50 = 51, T__51 = 52, T__52 = 53, T__53 = 54, T__54 = 55, T__55 = 56,
     T__56 = 57, T__57 = 58, T__58 = 59, T__59 = 60, T__60 = 61, T__61 = 62,
     T__62 = 63, T__63 = 64, T__64 = 65, T__65 = 66, T__66 = 67, T__67 = 68,
-    T__68 = 69, T__69 = 70, T__70 = 71, T__71 = 72, UINT = 73, STRING = 74,
-    WORD = 75, WS = 76
+    T__68 = 69, T__69 = 70, T__70 = 71, T__71 = 72, T__72 = 73, T__73 = 74,
+    T__74 = 75, T__75 = 76, UINT = 77, STRING = 78, SHELL = 79, WORD = 80,
+    WS = 81
   };
 
   enum {
@@ -33,8 +34,8 @@ public:
     RuleDetach = 9, RuleModules = 10, RuleSymbols = 11, RuleSymbolOption = 12,
     RuleProbe = 13, RuleResolveOption = 14, RuleDeployOption = 15, RuleInterceptor = 16,
     RuleEvents = 17, RuleCollect = 18, RuleRecord = 19, RuleStreamOption = 20,
-    RuleCpp = 21, RuleComplete = 22, RuleHelp = 23, RuleQuit = 24, RuleValue = 25,
-    RuleKeyword = 26
+    RuleCpp = 21, RuleShell = 22, RuleComplete = 23, RuleHelp = 24, RuleQuit = 25,
+    RuleValue = 26, RuleKeyword = 27
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -76,6 +77,7 @@ public:
   class RecordContext;
   class StreamOptionContext;
   class CppContext;
+  class ShellContext;
   class CompleteContext;
   class HelpContext;
   class QuitContext;
@@ -115,6 +117,7 @@ public:
     CollectContext *collect();
     RecordContext *record();
     CppContext *cpp();
+    ShellContext *shell();
     CompleteContext *complete();
     HelpContext *help();
     QuitContext *quit();
@@ -398,6 +401,8 @@ public:
     virtual size_t getRuleIndex() const override;
     std::vector<ValueContext *> value();
     ValueContext* value(size_t i);
+    std::vector<antlr4::tree::TerminalNode *> SHELL();
+    antlr4::tree::TerminalNode* SHELL(size_t i);
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -405,6 +410,19 @@ public:
   };
 
   CppContext* cpp();
+
+  class  ShellContext : public antlr4::ParserRuleContext {
+  public:
+    ShellContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  ShellContext* shell();
 
   class  CompleteContext : public antlr4::ParserRuleContext {
   public:

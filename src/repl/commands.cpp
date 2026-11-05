@@ -81,7 +81,9 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"cpp load", K::cpp_load},
                                         {"cpp reset", K::cpp_reset},
                                         {"cpp import", K::cpp_import},
+                                        {"cpp generate", K::cpp_generate},
                                         {"cpp options", K::cpp_options},
+                                        {"shell", K::shell},
                                         {"complete", K::complete},
                                         {"help", K::help},
                                         {"quit", K::quit},
@@ -111,7 +113,9 @@ public:
                                             "--name", "--type"};
     for (; i + 1 < ts.size(); ++i) {
       const auto text = ts[i]->getText();
-      if (result.kind != K::cpp_options && ts[i]->getType() != TracerCommandsLexer::STRING &&
+      const bool profile_add = result.kind == K::cpp_options &&
+                               !result.arguments.empty() && result.arguments.front() == "add";
+      if (!profile_add && ts[i]->getType() != TracerCommandsLexer::STRING &&
           text.rfind("--", 0) == 0) {
         if (result.has(text) && !repeated.count(text)) {
           throw std::invalid_argument("duplicate option: " + text);
@@ -119,7 +123,10 @@ public:
         result.options[text].push_back(
             flags.count(text) ? "true" : decode(ts[++i]->getText()));
       } else {
-        result.arguments.push_back(decode(text));
+        if (ts[i]->getType() == TracerCommandsLexer::SHELL) {
+          result.shell_arguments.push_back(result.arguments.size());
+          result.arguments.push_back(text.substr(1, text.size() - 2));
+        } else result.arguments.push_back(decode(text));
       }
     }
     return {};

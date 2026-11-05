@@ -47,6 +47,16 @@ int main() {
   bad("%cpp options add");
   bad("%cpp options clear trailing");
   bad("%cpp import");
+  require(parse_command("%cpp generate app.hpp --output mappings.hpp").kind == CommandKind::cpp_generate);
+  require(parse_command("%cpp options compdb build --file src/app.hpp").option("--file") == "src/app.hpp");
+  auto shell_flags = parse_command("%cpp options add `cat flags.txt` \"-DMORE=1\"");
+  require(shell_flags.shell_arguments.size() == 1 && shell_flags.shell_arguments.at(0) == 1);
+  require(shell_flags.arguments.at(1) == "cat flags.txt");
+  require(parse_command("%shell \"printf hello\"").kind == CommandKind::shell);
+  bad("%cpp generate app.hpp --output one --output two");
+  bad("%cpp options compdb build");
+  bad("%cpp options add `unfinished");
+  bad("%cpp import `cat flags.txt`");
   require(parse_command("%events show batch --index 0").kind ==
           CommandKind::event_show);
   bad("%attach 12345 trailing");

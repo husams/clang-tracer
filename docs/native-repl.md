@@ -305,6 +305,81 @@ An explicit `%cpp reset` clears C++ variables and unlocks configuration while
 retaining tracing sessions. Local options do not change remote probe settings:
 `--include`, `--compile-option` and `--compdb` still refer to the server.
 
+### Save and reuse generated wrappers
+
+`%cpp import` saves its generated `EventRecord<T>` mappings and prints the
+header's absolute path. Independent imports reuse an unchanged mapping across
+sessions. The default directory is `$XDG_CACHE_HOME/clang-tracer/repl/mappings`,
+or `~/.cache/clang-tracer/repl/mappings` when XDG_CACHE_HOME is unset. Cache keys
+include the include name, selected types, compiler profile, working directory,
+generator binary and compiler include-path environment settings. Checksums
+cover the generated source and all physical
+headers seen by the AST, including transitive dependencies. Include-search
+lookups are also recorded, so newly created higher-priority headers and changes
+to `__has_include` results invalidate reuse. Changed or missing dependencies
+cause regeneration; unusual header-map/framework lookups that cannot be
+represented reliably are regenerated. Imports after user C++ declarations generate
+against the live declaration history and save a session-specific mapping.
+Such imports may depend on earlier C++ declarations. Use `generate` for a
+self-contained mapping header based on the application include alone.
+Profiles with forced includes, precompiled headers, modules or VFS overlays
+are regenerated rather than taking a potentially stale automatic cache hit.
+
+Generate an entire include without loading it into the interpreter:
+
+```text
+%cpp options add "-I/path/to/application/include" "-DAPP_FEATURE=1"
+%cpp generate "application/types.hpp" --output "application-events.hpp"
+```
+
+Omit `--type` to generate every eligible application record in the include;
+repeat `--type QualifiedType` to select roots. `--output` also works with
+`%cpp import`. Generation uses only Clang's syntax-only AST helper: it does not
+start a JIT, link application symbols, run static initializers or execute user
+constructors. Headers containing declarations of unavailable application
+functions can therefore be analyzed. Structural eligibility and generated
+decoder bodies are still checked by the compiler.
+`generate` ignores live C++ variables and declarations; `import` honors them.
+
+The saved header includes the resolved application header and the local event
+API. Reuse it with `#include "/absolute/path/application-events.hpp"` in a
+later REPL session with compatible compiler settings. Ordinary C++ loading and
+decoding still require any function definitions they actually use. Automatic
+cache lookup verifies dependencies; explicitly including a saved header has
+normal C++ include semantics. Writes replace generated headers atomically;
+unrelated existing files and application dependencies are never overwritten.
+
+### Shell output and compilation databases
+
+```text
+%shell "pkg-config --cflags some-library"
+%cpp options add `pkg-config --cflags some-library`
+%cpp options add `cat ./compiler-flags.txt` "-DLOCAL_FEATURE=1"
+%cpp options compdb "/path/to/build/compile_commands.json" --file "/path/to/app/types.hpp"
+```
+
+Backticks must occupy a complete argument to `options add`. Their stdout is
+split into compiler arguments with quoted paths and escaped characters
+preserved; it is never evaluated as a second shell command. Stderr is displayed
+separately. `%shell` takes one quoted command and displays captured stdout and
+stderr. Commands run locally with closed stdin, a ten-second deadline and a
+64-KiB limit per output stream. Cancellation, timeout, malformed flag quoting,
+or a nonzero exit leaves compiler options unchanged. Remaining background
+children of a shell command are stopped when that command finishes.
+
+`options compdb` accepts a database file or its containing directory and
+**replaces** the local user compiler profile. It first selects an exact file
+entry. If none exists, it chooses a C++ source entry in the requested file's
+same directory, reporting the source selected. Multiple fallback files are
+ordered by normalized filename; multiple exact entries use database order.
+There is no fallback to another directory. Relative paths use the selected
+entry's working directory. Source inputs, compiler launchers, output,
+dependency-generation, language-action and linker arguments are removed;
+defines, include paths, language-standard and other compile settings remain.
+Compiler commands in JSON are parsed, never executed. Response-file arguments
+must be expanded before loading the profile. Invalid profiles retain the
+previous options; the existing before-first-C++-cell configuration rule applies.
+
 Automatic mappings require accessible default/move construction and destruction,
 public assignable supported fields, and no inheritance, unions or bit-fields.
 Generation is bounded to 128 records, 128 fields per record and 60 KiB of source;

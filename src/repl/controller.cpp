@@ -878,8 +878,10 @@ bool Controller::execute(const Command &command) {
          << "%events open FILE.pb --as NAME; %events export NAME --format json "
             "--output "
             "NEW_FILE.json; %events clear NAME\n"
-         << "%cpp import HEADER [--type QUALIFIED_TYPE]; %cpp load FILE; %cpp reset\n"
-         << "%cpp options [add ARG... | clear]; %help cpp; %quit\n"
+         << "%cpp import HEADER [--type TYPE] [--output FILE]; %cpp load FILE; %cpp reset\n"
+         << "%cpp generate HEADER [--output FILE] generates the whole include from its AST\n"
+         << "%cpp options [add ARG... | clear | compdb DATABASE --file FILE]\n"
+         << "%shell \"COMMAND\"; %cpp options add `COMMAND`; %help cpp; %quit\n"
          << "%help api describes the C++ API; %help Event / Collection / "
             "tracer show public declarations.\n"
          << "Tab completes C++ members; %complete \"tracer.\" lists candidates "
@@ -889,6 +891,8 @@ bool Controller::execute(const Command &command) {
   case K::cpp_reset:
   case K::cpp_import:
   case K::cpp_options:
+  case K::cpp_generate:
+  case K::shell:
   case K::complete:
   case K::draft_edit:
     throw std::logic_error("command requires the interactive driver");

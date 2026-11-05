@@ -63,6 +63,8 @@ public:
 
     virtual std::any visitCpp(TracerCommandsParser::CppContext *context) = 0;
 
+    virtual std::any visitShell(TracerCommandsParser::ShellContext *context) = 0;
+
     virtual std::any visitComplete(TracerCommandsParser::CompleteContext *context) = 0;
 
     virtual std::any visitHelp(TracerCommandsParser::HelpContext *context) = 0;

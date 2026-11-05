@@ -3,9 +3,12 @@
 // See LICENSES/LLVM.txt. Session input is parsed for types, never executed.
 #include "completion.hpp"
 #include "record_mappings.hpp"
+#include "mapping_cache.hpp"
 
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
+#include <map>
 #include <set>
 #include <iomanip>
 #include <sstream>
@@ -30,6 +33,11 @@
 #include <clang/Lex/Lexer.h>
 #include <clang/Lex/Preprocessor.h>
 #include <clang/Lex/PreprocessorOptions.h>
+#include <clang/Lex/PPCallbacks.h>
+#include <clang/Lex/HeaderSearch.h>
+#include <clang/Lex/HeaderSearchOptions.h>
+#include <llvm/ADT/SmallString.h>
+#include <llvm/Support/VirtualFileSystem.h>
 #include <clang/Sema/CodeCompleteConsumer.h>
 #include <clang/Sema/Sema.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
@@ -43,6 +51,101 @@
 
 namespace tracer_repl {
 namespace {
+std::string absolute_input(clang::CompilerInstance &compiler, llvm::StringRef name) {
+  llvm::SmallString<256> path(name);
+  if (compiler.getFileManager().getVirtualFileSystem().makeAbsolute(path))
+    throw std::runtime_error("cannot resolve application header path");
+  return std::filesystem::weakly_canonical(path.str().str()).string();
+}
+class HeaderInclude final : public clang::PPCallbacks {
+  clang::CompilerInstance &compiler_;
+  const std::string requested_;
+  std::string &resolved_;
+  std::map<std::string, std::string> &lookups_;
+  std::map<std::string, std::string> &roots_;
+  bool &reusable_;
+  void lookup(clang::SourceLocation location, llvm::StringRef filename, bool angled,
+              clang::OptionalFileEntryRef file) {
+    std::set<std::filesystem::path> directories;
+    std::set<std::filesystem::path> frameworks;
+    auto &sources = compiler_.getSourceManager();
+    if (!angled) {
+      const auto parent = sources.getFilename(sources.getSpellingLoc(location));
+      directories.insert(std::filesystem::path(parent.str()).parent_path());
+    }
+    for (const auto &dir : compiler_.getPreprocessor().getHeaderSearchInfo().search_dir_range()) {
+      if (dir.isNormalDir()) directories.insert(dir.getName().str());
+      else if (dir.isFramework()) frameworks.insert(dir.getName().str());
+      else reusable_ = false; // Header maps require regeneration.
+    }
+    const auto &options = compiler_.getHeaderSearchOpts();
+    for (const auto &entry : options.UserEntries) {
+      std::filesystem::path path(entry.Path);
+      if (!entry.IgnoreSysRoot && path.is_absolute() && !options.Sysroot.empty())
+        path = std::filesystem::path(options.Sysroot) / path.relative_path();
+      if (entry.IsFramework) frameworks.insert(path);
+      else directories.insert(path);
+    }
+    for (const auto *entries : {&directories, &frameworks}) for (const auto &directory : *entries) {
+      llvm::SmallString<256> root(directory.string());
+      if (compiler_.getFileManager().getVirtualFileSystem().makeAbsolute(root))
+        throw std::runtime_error("cannot resolve include root");
+      const auto path = std::filesystem::path(root.str().str()).lexically_normal();
+      const auto state = mapping_search_root(path);
+      const auto previous = roots_.find(path.string());
+      if (previous != roots_.end() && previous->second != state)
+        throw std::runtime_error("include root changed during AST analysis");
+      roots_[path.string()] = state;
+      if (state.rfind("file:", 0) == 0) reusable_ = false;
+    }
+    if (std::filesystem::path(filename.str()).is_absolute()) directories = {""};
+    bool represented = !file;
+    const auto selected = file ? absolute_input(compiler_, file->getName()) : "";
+    std::set<std::filesystem::path> candidates;
+    for (const auto &directory : directories) candidates.insert(directory / filename.str());
+    const auto slash = filename.find('/');
+    if (!std::filesystem::path(filename.str()).is_absolute() && slash != llvm::StringRef::npos) {
+      for (const auto &framework : frameworks) {
+        const auto bundle = framework / (filename.substr(0, slash).str() + ".framework");
+        candidates.insert(bundle / "Headers" / filename.substr(slash + 1).str());
+        candidates.insert(bundle / "PrivateHeaders" / filename.substr(slash + 1).str());
+      }
+    }
+    for (const auto &entry : candidates) {
+      llvm::SmallString<256> candidate(entry.string());
+      if (compiler_.getFileManager().getVirtualFileSystem().makeAbsolute(candidate))
+        throw std::runtime_error("cannot resolve include search path");
+      const auto path = std::filesystem::path(candidate.str().str()).lexically_normal();
+      const auto actual = std::filesystem::is_regular_file(path)
+          ? std::filesystem::weakly_canonical(path).string() : "";
+      const auto previous = lookups_.find(path.string());
+      if (previous != lookups_.end() && previous->second != actual)
+        throw std::runtime_error("include search changed during AST analysis");
+      lookups_[path.string()] = actual;
+      represented |= actual == selected;
+      if (lookups_.size() > 20000) throw std::runtime_error("include search manifest is too large");
+    }
+    reusable_ &= represented;
+  }
+public:
+  HeaderInclude(clang::CompilerInstance &compiler, std::string requested, std::string &resolved,
+                std::map<std::string, std::string> &lookups,
+                std::map<std::string, std::string> &roots, bool &reusable)
+      : compiler_(compiler), requested_(std::move(requested)), resolved_(resolved),
+        lookups_(lookups), roots_(roots), reusable_(reusable) {}
+  void InclusionDirective(clang::SourceLocation location, const clang::Token &, llvm::StringRef filename,
+                           bool angled, clang::CharSourceRange, clang::OptionalFileEntryRef file,
+                           llvm::StringRef, llvm::StringRef, const clang::Module *, bool,
+                           clang::SrcMgr::CharacteristicKind) override {
+    if (resolved_.empty() && filename == requested_ && file)
+      resolved_ = absolute_input(compiler_, file->getName());
+    lookup(location, filename, angled, file);
+  }
+  void HasInclude(clang::SourceLocation location, llvm::StringRef filename, bool angled,
+                  clang::OptionalFileEntryRef file, clang::SrcMgr::CharacteristicKind) override {
+    lookup(location, filename, angled, file);
+  }
+};
 #if LLVM_VERSION_MAJOR >= 22
 namespace compiler_options = clang::options;
 using clang::getDriverOptTable;
@@ -238,7 +341,6 @@ std::string reflect_cpp_header(const std::vector<std::string> &arguments,
     if (!parsed) throw std::runtime_error(llvm::toString(parsed.takeError()));
     return *parsed;
   };
-  for (const auto &cell : history) parse(cell);
   std::istringstream input(request);
   std::string header;
   if (!(input >> std::quoted(header)) || header.empty() || header.size() > 4095 ||
@@ -251,8 +353,17 @@ std::string reflect_cpp_header(const std::vector<std::string> &arguments,
     types.push_back(type);
   }
   const auto include = "#include \"" + header + "\"\n";
-  parse(include);
   auto &compiler = *interpreter->getCompilerInstance();
+  std::string resolved;
+  std::map<std::string, std::string> lookups;
+  std::map<std::string, std::string> roots;
+  bool reusable = true;
+  compiler.getPreprocessor().addPPCallbacks(
+      std::make_unique<HeaderInclude>(compiler, header, resolved, lookups, roots, reusable));
+  for (const auto &cell : history) parse(cell);
+  parse(include);
+  if (resolved.empty() || resolved.find_first_of("\"\\\r\n") != std::string::npos)
+    throw std::runtime_error("cannot resolve reusable application include");
   unsigned index = 0;
   const auto viable = [&](const std::string &expression) {
     const auto symbol = "__tracer_mapping_trait_" + std::to_string(index++);
@@ -279,7 +390,39 @@ std::string reflect_cpp_header(const std::vector<std::string> &arguments,
   }
   // Only the header and mappings enter the live interpreter; no checker-only
   // trait variables or decoder validation cells are executed or retained.
-  return generated.source.substr(0, generated.source.find('\n') + 1) + include +
+  std::ostringstream manifest;
+  if (!reusable) manifest << "// tracer-repl-no-reuse\n";
+  for (const auto &[path, state] : roots) {
+    if (path.find_first_of("\r\n") != std::string::npos || state.find_first_of("\r\n") != std::string::npos)
+      throw std::runtime_error("unsupported newline in include root");
+    manifest << "// tracer-repl-search-root " << std::quoted(path) << ' ' << std::quoted(state) << '\n';
+  }
+  for (const auto &[path, actual] : lookups) {
+    if (path.find_first_of("\r\n") != std::string::npos || actual.find_first_of("\r\n") != std::string::npos)
+      throw std::runtime_error("unsupported newline in include search filename");
+    manifest << "// tracer-repl-lookup " << std::quoted(path) << ' ' << std::quoted(actual) << '\n';
+  }
+  std::set<std::string> files;
+  const auto &sources = compiler.getSourceManager();
+  for (auto it = sources.fileinfo_begin(); it != sources.fileinfo_end(); ++it) {
+    const auto *cache = it->second;
+    if (!cache->OrigEntry) continue;
+    const auto path = absolute_input(compiler, cache->OrigEntry->getName());
+    const auto basename = std::filesystem::path(path).filename().string();
+    if (!std::filesystem::is_regular_file(path) &&
+        (basename.rfind("input_line_", 0) == 0 || (!basename.empty() && basename.front() == '<')))
+      continue; // Clang's incremental cells are virtual FileEntries.
+    if (path.find_first_of("\r\n") != std::string::npos)
+      throw std::runtime_error("unsupported newline in dependency filename");
+    if (!files.insert(path).second) continue;
+    const auto digest = mapping_file_digest(path);
+    if (const auto buffer = cache->getBufferIfLoaded(); buffer &&
+        mapping_digest(buffer->getBuffer().str()) != digest)
+      throw std::runtime_error("header changed during AST analysis: " + path);
+    manifest << "// tracer-repl-dependency " << digest << ' ' << std::quoted(path) << '\n';
+  }
+  return generated.source.substr(0, generated.source.find('\n') + 1) +
+         "#pragma once\n" + manifest.str() + "#include \"" + resolved + "\"\n" +
          generated.source.substr(generated.source.find('\n') + 1);
 }
 

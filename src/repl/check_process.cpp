@@ -108,9 +108,10 @@ AnalysisReply run_cpp_analysis(const std::string &helper, const char *mode,
     std::array<char, 4096> buffer{};
     const auto count = ::read(output.fd, buffer.data(), buffer.size());
     if (count > 0) {
-      if (reply.output.size() + static_cast<std::size_t>(count) > 65536)
+      const auto limit = std::string(mode) == "reflect" ? 4U * 1024U * 1024U : 65536U;
+      if (reply.output.size() + static_cast<std::size_t>(count) > limit)
         throw std::runtime_error(
-            "C++ checker output exceeded 64 KiB; previous variables retained");
+            "C++ checker output exceeded its limit; previous variables retained");
       reply.output.append(buffer.data(), static_cast<std::size_t>(count));
     } else if (count == 0) {
       int status = 0;
