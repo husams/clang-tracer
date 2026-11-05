@@ -80,6 +80,8 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"record", K::record},
                                         {"cpp load", K::cpp_load},
                                         {"cpp reset", K::cpp_reset},
+                                        {"cpp import", K::cpp_import},
+                                        {"cpp options", K::cpp_options},
                                         {"complete", K::complete},
                                         {"help", K::help},
                                         {"quit", K::quit},
@@ -106,10 +108,10 @@ public:
     const std::set<std::string> flags = {"--all", "--print-arguments",
                                          "--print-result"};
     const std::set<std::string> repeated = {"--include", "--compile-option",
-                                            "--name"};
+                                            "--name", "--type"};
     for (; i + 1 < ts.size(); ++i) {
       const auto text = ts[i]->getText();
-      if (ts[i]->getType() != TracerCommandsLexer::STRING &&
+      if (result.kind != K::cpp_options && ts[i]->getType() != TracerCommandsLexer::STRING &&
           text.rfind("--", 0) == 0) {
         if (result.has(text) && !repeated.count(text)) {
           throw std::invalid_argument("duplicate option: " + text);
@@ -222,7 +224,7 @@ const std::vector<std::string> &command_names() {
       result.push_back("%" + entry.first);
     }
     for (const auto &topic : {"api", "tracer", "Event", "Collection",
-                              "SessionHandle", "ScalarValue", "EventValue"})
+                              "SessionHandle", "ScalarValue", "EventValue", "cpp"})
       result.push_back(std::string("%help ") + topic);
     return result;
   }();

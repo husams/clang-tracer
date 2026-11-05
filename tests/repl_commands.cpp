@@ -34,6 +34,19 @@ int main() {
   require(parse_command("%complete \"data.at(0).\"").kind ==
           CommandKind::complete);
   bad("%complete");
+  require(
+      parse_command(
+          "%cpp import \"app/types.hpp\" --type app::Order --type app::Address")
+          .kind == CommandKind::cpp_import);
+  auto options = parse_command("%cpp options add \"-I/path with spaces\" "
+                               "\"-DFEATURE=1\" --sysroot=/sdk");
+  require(options.kind == CommandKind::cpp_options &&
+          options.arguments.size() == 4);
+  require(options.arguments.at(1) == "-I/path with spaces");
+  require(parse_command("%cpp options").arguments.empty());
+  bad("%cpp options add");
+  bad("%cpp options clear trailing");
+  bad("%cpp import");
   require(parse_command("%events show batch --index 0").kind ==
           CommandKind::event_show);
   bad("%attach 12345 trailing");

@@ -878,7 +878,8 @@ bool Controller::execute(const Command &command) {
          << "%events open FILE.pb --as NAME; %events export NAME --format json "
             "--output "
             "NEW_FILE.json; %events clear NAME\n"
-         << "%cpp load FILE; %cpp reset; %quit\n"
+         << "%cpp import HEADER [--type QUALIFIED_TYPE]; %cpp load FILE; %cpp reset\n"
+         << "%cpp options [add ARG... | clear]; %help cpp; %quit\n"
          << "%help api describes the C++ API; %help Event / Collection / "
             "tracer show public declarations.\n"
          << "Tab completes C++ members; %complete \"tracer.\" lists candidates "
@@ -886,6 +887,8 @@ bool Controller::execute(const Command &command) {
     return true;
   case K::cpp_load:
   case K::cpp_reset:
+  case K::cpp_import:
+  case K::cpp_options:
   case K::complete:
   case K::draft_edit:
     throw std::logic_error("command requires the interactive driver");

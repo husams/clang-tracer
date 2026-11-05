@@ -31,6 +31,42 @@
 #include <stdexcept>
 
 namespace tracer_repl {
+namespace {
+std::vector<std::string>
+profile_arguments(const std::vector<std::string> &user) {
+  const auto directory = std::filesystem::path(executable_path()).parent_path();
+  auto resource = directory / TRACER_REPL_RESOURCE_RELATIVE;
+  if (const auto *override_path =
+          std::getenv("CLANG_TRACER_CLANG_RESOURCE_DIR");
+      override_path && *override_path) {
+    resource = override_path;
+    if (!resource.is_absolute() ||
+        !std::filesystem::is_regular_file(resource / "include/stddef.h"))
+      throw std::runtime_error("CLANG_TRACER_CLANG_RESOURCE_DIR must name an "
+                               "absolute Clang resource directory");
+  } else if (!std::filesystem::is_regular_file(resource / "include/stddef.h")) {
+    resource = TRACER_REPL_RESOURCE_DIR;
+  }
+  if (!std::filesystem::is_regular_file(resource / "include/stddef.h"))
+    throw std::runtime_error("Clang builtin headers are unavailable");
+  std::vector<std::string> result{"-std=c++17", "-fPIC", "-O0", "-resource-dir",
+                                  resource.string()};
+  for (const auto *argument : repl_compiler_arguments)
+    result.emplace_back(argument);
+  result.insert(result.end(), user.begin(), user.end());
+  return result;
+}
+std::string api_header() {
+  auto header = std::filesystem::path(executable_path()).parent_path() /
+                TRACER_REPL_API_RELATIVE;
+  if (!std::filesystem::is_regular_file(header))
+    header = TRACER_REPL_API_HEADER;
+  const auto path = header.string();
+  if (path.find_first_of("\"\\\r\n") != std::string::npos)
+    throw std::runtime_error("unsupported character in facade header path");
+  return path;
+}
+} // namespace
 struct CppEngine::Impl {
   std::unique_ptr<clang::Interpreter> interpreter;
   std::vector<std::string> arguments;
@@ -40,6 +76,7 @@ struct CppEngine::Impl {
   using Stamp = std::pair<std::uintmax_t, std::filesystem::file_time_type>;
   std::map<std::filesystem::path, Stamp> headers;
   bool synchronized = true;
+  bool user_cells = false;
   void verify_inputs() const {
     if (std::filesystem::current_path() != directory)
       throw std::runtime_error("C++ working directory changed; restore it or "
@@ -85,6 +122,60 @@ CppEngine::~CppEngine() = default;
 
 void CppEngine::reset() { impl_.reset(); }
 
+std::vector<std::string> CppEngine::effective_compiler_options() const {
+  return profile_arguments(arguments_);
+}
+
+void CppEngine::set_compiler_options(std::vector<std::string> arguments) {
+  if (impl_ && impl_->user_cells)
+    throw std::runtime_error(
+        "compiler options are locked after C++ input; use --cpp-arg at startup "
+        "or %cpp reset before changing them; variables retained");
+  std::size_t bytes = 0;
+  for (const auto &argument : arguments) {
+    bytes += argument.size();
+    if (argument.empty() || argument.find('\0') != std::string::npos ||
+        bytes > 65536 || arguments.size() > 128)
+      throw std::invalid_argument("compiler options must be nonempty and total "
+                                  "at most 128 arguments / 64 KiB");
+  }
+  const auto helper = std::filesystem::path(executable_path()).parent_path() /
+                      "clang-tracer-repl-check";
+  const auto checked =
+      run_cpp_analysis(helper.string(), "check", profile_arguments(arguments),
+                       "", "#include \"" + api_header() + "\"\n");
+  if (checked.status != 0)
+    throw std::runtime_error(
+        "compiler options rejected; previous options retained:\n" +
+        checked.output);
+  impl_.reset();
+  arguments_ = std::move(arguments);
+}
+
+std::string CppEngine::import_header(const std::string &header,
+                                     const std::vector<std::string> &types) {
+  initialize();
+  impl_->verify_inputs();
+  std::ostringstream request;
+  request << std::quoted(header) << '\n';
+  for (const auto &type : types)
+    request << std::quoted(type) << '\n';
+  const auto helper = std::filesystem::path(executable_path()).parent_path() /
+                      "clang-tracer-repl-check";
+  const auto generated =
+      run_cpp_analysis(helper.string(), "reflect", impl_->arguments,
+                       impl_->check_history, request.str());
+  if (generated.status != 0)
+    throw std::runtime_error(
+        "automatic mapping generation failed; previous C++ state retained. "
+        "For bulk imports, select supported roots with --type QualifiedType:\n" +
+        generated.output);
+  impl_->verify_inputs();
+  if (!evaluate(generated.output))
+    throw std::runtime_error("application header import failed");
+  return generated.output.substr(3, generated.output.find('\n') - 3);
+}
+
 void CppEngine::initialize() {
   if (impl_) {
     return;
@@ -96,28 +187,7 @@ void CppEngine::initialize() {
     llvm::InitializeNativeTargetAsmParser();
     llvm::sys::DynamicLibrary::LoadLibraryPermanently(nullptr);
   });
-  const auto binary_directory =
-      std::filesystem::path(executable_path()).parent_path();
-  auto resource = binary_directory / TRACER_REPL_RESOURCE_RELATIVE;
-  if (const auto *override_path =
-          std::getenv("CLANG_TRACER_CLANG_RESOURCE_DIR");
-      override_path && *override_path) {
-    resource = override_path;
-    if (!resource.is_absolute() ||
-        !std::filesystem::is_regular_file(resource / "include/stddef.h"))
-      throw std::runtime_error("CLANG_TRACER_CLANG_RESOURCE_DIR must name an "
-                               "absolute Clang resource directory");
-  } else if (!std::filesystem::is_regular_file(resource / "include/stddef.h")) {
-    resource = TRACER_REPL_RESOURCE_DIR;
-  }
-  if (!std::filesystem::is_regular_file(resource / "include/stddef.h"))
-    throw std::runtime_error("Clang builtin headers are unavailable");
-  std::vector<std::string> args = {"-std=c++17", "-fPIC", "-O0",
-                                   "-resource-dir", resource.string()};
-  for (const auto *arg : repl_compiler_arguments) {
-    args.emplace_back(arg);
-  }
-  args.insert(args.end(), arguments_.begin(), arguments_.end());
+  auto args = profile_arguments(arguments_);
   std::vector<const char *> argv;
   for (const auto &arg : args) {
     argv.push_back(arg.c_str());
@@ -174,15 +244,7 @@ void CppEngine::initialize() {
   }
   initial_cells.push_back(tag);
 #endif
-  auto header = std::filesystem::path(executable_path()).parent_path() /
-                TRACER_REPL_API_RELATIVE;
-  if (!std::filesystem::is_regular_file(header)) {
-    header = TRACER_REPL_API_HEADER;
-  }
-  const auto path = header.string();
-  if (path.find_first_of("\"\r\n") != std::string::npos) {
-    throw std::runtime_error("unsupported character in facade header path");
-  }
+  const auto path = api_header();
   std::ostringstream prelude;
   prelude << "#include \"" << path << "\"\n#include <iostream>\n"
           << "auto &tracer = *reinterpret_cast<tracer_repl::Facade *>("
@@ -259,6 +321,7 @@ bool CppEngine::evaluate(const std::string &source) {
   }
   // Declarations remain in Clang even if execution later throws. Keep discovery
   // synchronized at the parse/execute boundary, without replaying side effects.
+  impl_->user_cells = true;
   impl_->history += "\n#line 1\n" + source + "\n;\n";
   impl_->remember(terminate ? source + "\n;" : source);
   if (parsed->TheModule)

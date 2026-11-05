@@ -24,6 +24,13 @@ public:
   bool evaluate(const std::string &source);
   CppCompletions complete(const std::string &source);
   std::string describe_api(const std::string &topic = "api");
+  const std::vector<std::string> &compiler_options() const {
+    return arguments_;
+  }
+  std::vector<std::string> effective_compiler_options() const;
+  void set_compiler_options(std::vector<std::string> arguments);
+  std::string import_header(const std::string &header,
+                            const std::vector<std::string> &types = {});
   void reset();
 };
 } // namespace tracer_repl

@@ -18,12 +18,16 @@ struct Address {
   int postal_code = 0;
 };
 
+template <class T> struct Box { T value{}; };
+
 // Public fields are captured; methods can be called on the reconstructed copy.
 class Account {
 public:
   int id = 7;
   std::string owner = "Ada";
   Address address{"London", 100};
+  Box<int> priority{3};
+  Box<double> score{1.5};
 
   std::string describe() const {
     return owner + " #" + std::to_string(id) + " in " + address.city;

@@ -24,6 +24,12 @@ if [[ ${2:-} == --check ]]; then
 fi
 "${TRACER_REPL_JAVA:-java}" -jar "$jar_path" -Dlanguage=Cpp -visitor -no-listener \
   -Xexact-output-dir -o "$output_dir" src/repl/TracerCommands.g4
+# Keep generated tables reproducible without trailing blanks or mixed tab
+# indentation; apply the same normalization when checking checked-in outputs.
+for source in "$output_dir"/*.cpp "$output_dir"/*.h; do
+  expand -t 2 "$source" | sed 's/[[:blank:]]*$//' >"$source.clean"
+  mv -- "$source.clean" "$source"
+done
 if [[ ${2:-} == --check ]]; then
   diff -ru -- src/repl/generated "$output_dir"
 fi

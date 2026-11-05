@@ -14,6 +14,8 @@ user_types(Address address, Account account) {
   volatile int padding_a = 0, padding_b = 0;
   account.id += 1 + padding_a + padding_b;
   account.address = address;
+  account.priority.value += 2;
+  account.score.value += 0.5;
   return account;
 }
 

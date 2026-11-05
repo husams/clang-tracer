@@ -15,6 +15,9 @@ CppCompletions complete_cpp(const std::vector<std::string> &arguments,
 bool check_cpp_source(const std::vector<std::string> &arguments,
                       const std::vector<std::string> &history,
                       const std::string &source);
+std::string reflect_cpp_header(const std::vector<std::string> &arguments,
+                               const std::vector<std::string> &history,
+                               const std::string &request);
 bool incomplete_cpp(const std::string &source);
 std::string describe_cpp_api(clang::CompilerInstance &parent,
                              const std::string &topic);

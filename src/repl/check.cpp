@@ -30,7 +30,7 @@ int main(int argc, char **argv) {
         std::cout << item << '\n';
       return 0;
     }
-    if (std::string(argv[1]) != "check")
+    if (std::string(argv[1]) != "check" && std::string(argv[1]) != "reflect")
       return 1;
     std::vector<std::string> history;
     std::size_t cursor = 0;
@@ -44,6 +44,11 @@ int main(int argc, char **argv) {
         throw std::runtime_error("invalid checker cell length");
       history.push_back(content.substr(cursor, length));
       cursor += length;
+    }
+    if (std::string(argv[1]) == "reflect") {
+      std::cout << tracer_repl::reflect_cpp_header(arguments, history,
+                                                   content.substr(offset));
+      return 0;
     }
     return tracer_repl::check_cpp_source(arguments, history,
                                          content.substr(offset))

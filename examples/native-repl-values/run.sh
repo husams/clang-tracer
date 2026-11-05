@@ -26,6 +26,8 @@ demo_pid=
 cleanup() {
   if [[ -n "$demo_pid" ]]; then
     kill "$demo_pid" 2>/dev/null || true
+    # Deliver termination even if a failed attach left our fixture stopped.
+    kill -CONT "$demo_pid" 2>/dev/null || true
     wait "$demo_pid" 2>/dev/null || true
   fi
   rm -rf -- "$run_dir"
@@ -53,6 +55,8 @@ for current in "${categories[@]}"; do
   setup() {
     printf '%%probe inject "value_examples::%s" --callback "%s/interceptor.cpp" --include "%s/types.hpp"\n' "$function_name" "$example_dir" "$example_dir"
     printf '%%collect --count 6 --phase POST --timeout 20 --as demo\n'
+    printf '%%cpp options add "-I%s"\n' "$example_dir"
+    printf '%%cpp import "types.hpp"\n'
     printf '%%cpp load "%s/%s.cpp"\n' "$example_dir" "$current"
   }
   printf '\nRunning %s values example\n' "$current"

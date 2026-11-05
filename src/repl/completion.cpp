@@ -2,36 +2,54 @@
 // ASTUnit setup follows LLVM's clang/lib/Interpreter/CodeCompletion.cpp.
 // See LICENSES/LLVM.txt. Session input is parsed for types, never executed.
 #include "completion.hpp"
+#include "record_mappings.hpp"
 
 #include <algorithm>
 #include <cstdlib>
 #include <set>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/DeclTemplate.h>
 #include <clang/AST/Expr.h>
 #include <clang/AST/PrettyPrinter.h>
+#include <llvm/Config/llvm-config.h>
+#if LLVM_VERSION_MAJOR >= 22
+#include <clang/Options/Options.h>
+#else
+#include <clang/Driver/Options.h>
+#endif
 #include <clang/Frontend/ASTUnit.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendActions.h>
 #include <clang/Frontend/TextDiagnosticPrinter.h>
 #include <clang/Interpreter/Interpreter.h>
+#include <clang/Interpreter/PartialTranslationUnit.h>
 #include <clang/Lex/Lexer.h>
 #include <clang/Lex/Preprocessor.h>
 #include <clang/Lex/PreprocessorOptions.h>
 #include <clang/Sema/CodeCompleteConsumer.h>
 #include <clang/Sema/Sema.h>
-#include <llvm/Config/llvm-config.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Option/ArgList.h>
+#include <llvm/Option/OptTable.h>
 #if LLVM_VERSION_MAJOR >= 22
 #include <clang/Interpreter/IncrementalExecutor.h>
 #endif
 
 namespace tracer_repl {
 namespace {
+#if LLVM_VERSION_MAJOR >= 22
+namespace compiler_options = clang::options;
+using clang::getDriverOptTable;
+#else
+namespace compiler_options = clang::driver::options;
+using clang::driver::getDriverOptTable;
+#endif
 class Consumer final : public clang::CodeCompleteConsumer {
   CppCompletions &out_;
   std::shared_ptr<clang::GlobalCodeCompletionAllocator> allocator_ =
@@ -119,11 +137,34 @@ compiler_for(const std::vector<std::string> &arguments) {
   std::vector<const char *> argv;
   for (const auto &argument : arguments)
     argv.push_back(argument.c_str());
+  unsigned missing_index = 0, missing_count = 0;
+  const auto parsed_arguments = getDriverOptTable().ParseArgs(
+      argv, missing_index, missing_count);
+  if (missing_count)
+    throw std::runtime_error("C++ compiler option is missing its value");
+  for (const auto *argument : parsed_arguments)
+    if (argument->getOption().matches(compiler_options::OPT_UNKNOWN) ||
+        argument->getOption().matches(compiler_options::OPT_INPUT))
+      throw std::runtime_error("unrecognized compiler option or unexpected input file: " + argument->getAsString(parsed_arguments));
   clang::IncrementalCompilerBuilder builder;
   builder.SetCompilerArgs(argv);
   auto instance = builder.CreateCpp();
   if (!instance)
     throw std::runtime_error(llvm::toString(instance.takeError()));
+  if ((*instance)->getDiagnostics().hasErrorOccurred())
+    throw std::runtime_error("invalid C++ compiler arguments");
+  switch ((*instance)->getFrontendOpts().ProgramAction) {
+  case clang::frontend::EmitAssembly:
+  case clang::frontend::EmitBC:
+  case clang::frontend::EmitLLVM:
+  case clang::frontend::EmitLLVMOnly:
+  case clang::frontend::EmitCodeGenOnly:
+  case clang::frontend::EmitObj:
+    break;
+  default:
+    throw std::runtime_error("compiler options must preserve C++ code generation; "
+                             "preprocessing and syntax-only actions are unsupported");
+  }
   (*instance)->getDiagnostics().setSuppressAllDiagnostics(true);
   return std::move(*instance);
 }
@@ -180,6 +221,66 @@ bool check_cpp_source(const std::vector<std::string> &arguments,
   if (!parsed)
     throw std::runtime_error(llvm::toString(parsed.takeError()));
   return missing;
+}
+
+std::string reflect_cpp_header(const std::vector<std::string> &arguments,
+    const std::vector<std::string> &history, const std::string &request) {
+  auto ci = compiler_for(arguments);
+  ci->getDiagnostics().setSuppressAllDiagnostics(false);
+  ci->getDiagnostics().setClient(new CheckDiagnostics(ci->getDiagnosticOpts()));
+  ci->getFrontendOpts().ProgramAction = clang::frontend::ParseSyntaxOnly;
+  bool missing = false;
+  llvm::Error error = llvm::Error::success();
+  auto interpreter = std::make_unique<CheckInterpreter>(std::move(ci), error, missing);
+  if (error) throw std::runtime_error(llvm::toString(std::move(error)));
+  const auto parse = [&](const std::string &source) -> clang::PartialTranslationUnit & {
+    auto parsed = interpreter->Parse(source);
+    if (!parsed) throw std::runtime_error(llvm::toString(parsed.takeError()));
+    return *parsed;
+  };
+  for (const auto &cell : history) parse(cell);
+  std::istringstream input(request);
+  std::string header;
+  if (!(input >> std::quoted(header)) || header.empty() || header.size() > 4095 ||
+      header.find_first_of("\"\\\r\n") != std::string::npos || header.find('\0') != std::string::npos)
+    throw std::runtime_error("invalid application header name");
+  std::vector<std::string> types;
+  for (std::string type; input >> std::quoted(type);) {
+    if (type.empty() || type.size() > 4096 || types.size() >= 128)
+      throw std::runtime_error("invalid record selector");
+    types.push_back(type);
+  }
+  const auto include = "#include \"" + header + "\"\n";
+  parse(include);
+  auto &compiler = *interpreter->getCompilerInstance();
+  unsigned index = 0;
+  const auto viable = [&](const std::string &expression) {
+    const auto symbol = "__tracer_mapping_trait_" + std::to_string(index++);
+    const auto &unit = parse("[[maybe_unused]] constexpr bool " + symbol + "=(" + expression + ");");
+    for (const auto *decl : unit.TUPart->decls()) {
+      if (const auto *value = llvm::dyn_cast<clang::VarDecl>(decl)) {
+        if (value->getName() != symbol || !value->hasInit()) continue;
+        bool result = false;
+        if (value->getInit()->EvaluateAsBooleanCondition(result, compiler.getASTContext()))
+          return result;
+      }
+    }
+    throw std::runtime_error("could not check record construction traits");
+  };
+  auto generated = generate_record_mappings(compiler, types, viable);
+  parse(generated.source);
+  std::string validation;
+  for (const auto &type : generated.types)
+    validation += "[[maybe_unused]] auto __tracer_mapping_decode_" + std::to_string(index++) +
+        "=&tracer_repl::EventCodec<::" + type + ">::decode;\n";
+  if (!validation.empty()) {
+    parse(validation);
+    compiler.getSema().PerformPendingInstantiations();
+  }
+  // Only the header and mappings enter the live interpreter; no checker-only
+  // trait variables or decoder validation cells are executed or retained.
+  return generated.source.substr(0, generated.source.find('\n') + 1) + include +
+         generated.source.substr(generated.source.find('\n') + 1);
 }
 
 bool incomplete_cpp(const std::string &source) {

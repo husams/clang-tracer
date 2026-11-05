@@ -67,7 +67,7 @@ instead of compiling it again; the runner still starts and stops its own process
 ## 1. User-defined structs and classes
 
 [`types.hpp`](types.hpp) defines a struct `Address` and a class `Account` with a
-nested `Address`. The target receives both **by value** and returns an updated
+nested `Address`, `Box<int>` and `Box<double>` fields. The target receives both **by value** and returns an updated
 `Account` by value. [`user.cpp`](user.cpp) compares the captured input with the
 returned object, calls a method on the reconstructed class, and inspects nested
 fields without converting to a user-defined C++ type.
@@ -81,10 +81,13 @@ auto city = event.argument_snapshot(1).field("address").field("city")
                 .as<std::string>();
 ```
 
-[`mappings.hpp`](mappings.hpp) contains explicit `EventRecord<T>` field mappings
-for reconstructing these local types. The same `Address` mapping also works
-inside `std::vector<Address>`. Automatic capture requires public serializable
-fields; the example class deliberately uses public fields. A local
+The runner uses `%cpp import "types.hpp"` to generate `EventRecord<T>` mappings
+from the application header after configuring `%cpp options add "-I/path/to/include"`.
+Nested `Address`, template specializations and `std::vector<Address>`
+reuse that mapping automatically; there is no manual field registration.
+[`mappings.hpp`](mappings.hpp) remains an optional manual-mapping reference.
+Automatic capture requires public serializable fields; the example class
+deliberately uses public fields. A local
 `EventCodec<T>::decode(const EventValue&)` factory is an alternative for local
 types that cannot be default-constructed/assigned; it does not expose private
 fields of a target class.
@@ -95,6 +98,7 @@ Expected output includes:
 struct Address: Paris, 75001
 class Account before: Ada #7 in London
 class Account returned: Ada #8 in Paris
+nested template fields: 5, 2
 field inspection: Ada, London
 example passed: user
 ```

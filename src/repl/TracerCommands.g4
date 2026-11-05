@@ -34,7 +34,8 @@ record : 'record' value streamOption*;
 streamOption : ('--count' | '--timeout' | '--after' | '--probe') UINT
              | '--phase' ('PRE' | 'POST')
              | ('--as' | '--name' | '--session') value | '--all';
-cpp : 'cpp' ('load' value | 'reset');
+cpp : 'cpp' ('load' value | 'reset' | 'import' value ('--type' value)*
+            | 'options' ('add' value+ | 'clear')?);
 complete : 'complete' value;
 help : 'help' value?;
 quit : 'quit' | 'exit';
@@ -44,7 +45,8 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'probe' | 'resolve' | 'inject' | 'validate' | 'remove' | 'probes'
         | 'interceptor' | 'load' | 'edit' | 'show' | 'upload' | 'events'
         | 'list' | 'calls' | 'stats' | 'clear' | 'open' | 'export' | 'json'
-        | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'complete' | 'help' | 'quit' | 'exit';
+        | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'import'
+        | 'options' | 'add' | 'complete' | 'help' | 'quit' | 'exit';
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';

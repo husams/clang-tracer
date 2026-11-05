@@ -243,7 +243,35 @@ int main(int argc, char **argv) {
             std::find(tr::command_names().begin(), tr::command_names().end(),
                       "%help " + command.arguments[0]) !=
                 tr::command_names().end();
-        if (api_help) {
+        if (command.kind == tr::CommandKind::help && !command.arguments.empty() &&
+            command.arguments[0] == "cpp") {
+          std::cout << "%cpp options lists the local C++ compiler arguments.\n"
+                       "%cpp options add \"-I/path/to/application/include\" \"-DFEATURE=1\"\n"
+                       "Configure options before C++ input; --cpp-arg ARG also works at startup.\n"
+                       "%cpp import \"application/types.hpp\" generates EventRecord mappings.\n"
+                       "Use --type QualifiedType (repeatable) to select records; nested dependencies are automatic.\n"
+                       "Existing EventRecord/EventCodec mappings are retained. Public supported fields and\n"
+                       "accessible default construction are required; incompatible types are reported.\n"
+                       "Import errors keep earlier variables. Changing compiler options after C++ input\n"
+                       "requires an explicit %cpp reset, which clears C++ variables and retains tracing sessions.\n"
+                       "Probe compiler options remain separate: --include/--compile-option refer to the server.\n";
+        } else if (command.kind == tr::CommandKind::cpp_options) {
+          if (command.arguments.empty()) {
+            std::cout << "Local C++ compiler arguments (in order):\n";
+            for (const auto &argument : cpp.effective_compiler_options())
+              std::cout << "  " << argument << '\n';
+          } else {
+            auto arguments = cpp.compiler_options();
+            if (command.arguments[0] == "clear") arguments.clear();
+            else arguments.insert(arguments.end(), command.arguments.begin() + 1, command.arguments.end());
+            cpp.set_compiler_options(std::move(arguments));
+            std::cout << "Local C++ compiler options updated; tracing sessions retained\n";
+          }
+        } else if (command.kind == tr::CommandKind::cpp_import) {
+          const auto selected = command.options.find("--type");
+          const auto types = selected == command.options.end() ? std::vector<std::string>{} : selected->second;
+          std::cout << cpp.import_header(command.arguments.at(0), types) << '\n';
+        } else if (api_help) {
           std::cout
               << "C++ APIs from the loaded header (namespace tracer_repl; "
                  "tracer is a Facade).\n"
@@ -258,7 +286,8 @@ int main(int argc, char **argv) {
                  "Inspect objects: "
                  "event.argument_snapshot(0).field(\"name\").as<std::string>()."
                  "\n"
-                 "For argument_as<MyType>(), specialize EventRecord<MyType>: "
+                 "Use %cpp import HEADER to generate mappings for argument_as<MyType>(). "
+                 "For manual mappings, specialize EventRecord<MyType>: "
                  "type_name plus fields() returning a tuple of "
                  "event_member(\"name\", &MyType::member).\n"
                  "Use EventCodec<T>::decode(const EventValue&) for "

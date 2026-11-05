@@ -266,10 +266,51 @@ auto fields = value.fields();
 auto samples = value.field("samples").as<std::vector<int>>();
 ```
 
-C++17 has no language reflection for constructing arbitrary local classes.
-Register named members to get an actual local C++ object, independent of the
-target's memory layout. Nested records each need a mapping; standard strings,
-vectors, arrays, lists, deques, maps, sets, and optionals decode recursively.
+Import application headers to generate mappings from Clang's AST, including
+nested records and record types inside standard containers:
+
+```text
+%cpp options add "-I/path/to/application/include" "-DAPP_FEATURE=1"
+%cpp options
+%cpp import "application/types.hpp"
+```
+
+After collecting events, `event.argument_as<application::Order>(0)` constructs a
+local C++ object. Standard strings, vectors, arrays, lists, deques, maps, sets
+and optionals decode recursively without registrations. The header is parsed
+with the same local compiler options as ordinary C++ input. At startup,
+repeatable `--cpp-arg ARG` remains available; for example
+`clang-tracer-repl --cpp-arg -I/path/to/include --cpp-arg -DAPP_FEATURE=1`.
+
+Bulk import maps eligible non-system application records visible after the
+include. Use `%cpp import HEADER --type application::Order` to select a type;
+repeat `--type` for more roots. Nested dependencies are generated automatically,
+including named, nondependent template instantiations and aliases. Existing
+explicit `EventRecord<T>` and `EventCodec<T>` definitions are preserved.
+Structurally unsupported records are reported and skipped; an explicitly
+selected unsupported type rejects the import. Generated conversions are checked in the disposable helper
+before entering the live interpreter. Header/generation errors retain previous
+variables and tracing sessions. An accepted header has normal C++ semantics,
+including execution of its static initializers.
+
+If a generated decoder fails to compile (for example, a set element lacks its
+required comparison operator), the entire import is rejected without changing
+live state. Retry with `--type` to select supported roots; no partial mappings
+are installed from the failed import.
+
+Configure options before the first accepted C++ cell. Help/completion alone do
+not lock them; `%cpp options clear` restores the default profile at that point.
+After C++ input, changing options is rejected without dropping variables.
+An explicit `%cpp reset` clears C++ variables and unlocks configuration while
+retaining tracing sessions. Local options do not change remote probe settings:
+`--include`, `--compile-option` and `--compdb` still refer to the server.
+
+Automatic mappings require accessible default/move construction and destruction,
+public assignable supported fields, and no inheritance, unions or bit-fields.
+Generation is bounded to 128 records, 128 fields per record and 60 KiB of source;
+select fewer roots with `--type` when necessary. Use `%help cpp` for commands.
+
+Manual mappings remain available when you want explicit control:
 
 ```cpp
 struct Order { int id; std::string name; std::vector<int> samples; };
