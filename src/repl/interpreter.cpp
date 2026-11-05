@@ -71,6 +71,7 @@ std::string api_header() {
 }
 } // namespace
 struct CppEngine::Impl {
+  CppCheckSession checker;
   std::unique_ptr<clang::Interpreter> interpreter;
   std::vector<std::string> arguments;
   std::string history;
@@ -382,8 +383,8 @@ bool CppEngine::evaluate(const std::string &source) {
         "C++ compiler state diverged; use %cpp reset to recover");
   const auto helper = std::filesystem::path(executable_path()).parent_path() /
                       "clang-tracer-repl-check";
-  const auto checked = run_cpp_analysis(
-      helper.string(), "check", impl_->arguments, impl_->check_history, source);
+  const auto checked = impl_->checker.check(
+      helper.string(), impl_->arguments, impl_->check_history, source);
   if (checked.status != 0 && checked.status != 2) {
     llvm::errs() << checked.output;
     llvm::errs().flush();

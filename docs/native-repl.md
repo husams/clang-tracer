@@ -310,6 +310,14 @@ expressions; tracing commands, API help and statements terminated with `;`
 remain available. Ambiguous bare input reports recovery guidance instead of
 silently dropping a call.
 
+Ordinary C++ checks retain accepted syntax in a separate, syntax-only compiler
+process. Each new input is checked in a disposable fork, so rejected declarations
+and macros cannot corrupt the retained state or execute initializers. Later inputs
+avoid reparsing the API and earlier cells; first use still initializes both
+compilers. `%cpp reset` releases this checker along with the local C++ state.
+Cancellation and the existing 15-second check deadline terminate only the owned
+checker process group. Completion and header generation use separate helpers.
+
 ```cpp
 auto data = tracer.batch("batch");
 data.size()

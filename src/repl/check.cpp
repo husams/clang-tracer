@@ -17,11 +17,15 @@ int main(int argc, char **argv) {
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmPrinter();
     llvm::InitializeNativeTargetAsmParser();
+    const std::vector<std::string> arguments(argv + 3, argv + argc);
+    if (std::string(argv[1]) == "serve") {
+      tracer_repl::serve_cpp_checks(arguments);
+      return 0;
+    }
     const std::string content{std::istreambuf_iterator<char>(std::cin), {}};
     const auto offset = std::stoull(argv[2]);
     if (offset > content.size())
       return 1;
-    const std::vector<std::string> arguments(argv + 3, argv + argc);
     if (std::string(argv[1]) == "complete") {
       const auto result = tracer_repl::complete_cpp(
           arguments, content.substr(0, offset), content.substr(offset));

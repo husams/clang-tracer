@@ -15,6 +15,7 @@ CppCompletions complete_cpp(const std::vector<std::string> &arguments,
 bool check_cpp_source(const std::vector<std::string> &arguments,
                       const std::vector<std::string> &history,
                       const std::string &source);
+void serve_cpp_checks(const std::vector<std::string> &arguments);
 std::string reflect_cpp_header(const std::vector<std::string> &arguments,
                                const std::vector<std::string> &history,
                                const std::string &request);

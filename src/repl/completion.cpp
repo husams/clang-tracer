@@ -6,6 +6,9 @@
 #include "mapping_cache.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
@@ -13,6 +16,8 @@
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/DeclTemplate.h>
@@ -324,6 +329,179 @@ bool check_cpp_source(const std::vector<std::string> &arguments,
   if (!parsed)
     throw std::runtime_error(llvm::toString(parsed.takeError()));
   return missing;
+}
+
+void serve_cpp_checks(const std::vector<std::string>& arguments) {
+  // This executable is a single-threaded, syntax-only compiler. Never fork the
+  // live REPL/JIT, whose execution engine and user code can create threads.
+  ::alarm(0); // Idle sessions have no deadline; the caller bounds each request.
+  const auto read = [](std::size_t size) {
+    std::string text(size, '\0');
+    std::size_t offset = 0;
+    while (offset < size) {
+      const auto n = ::read(STDIN_FILENO, text.data() + offset, size - offset);
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      if (n <= 0) {
+        throw std::runtime_error("truncated C++ checker request");
+      }
+      offset += static_cast<std::size_t>(n);
+    }
+    return text;
+  };
+  const auto write = [](const std::string& text) {
+    std::size_t offset = 0;
+    while (offset < text.size()) {
+      const auto n = ::write(STDOUT_FILENO, text.data() + offset, text.size() - offset);
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      if (n <= 0) {
+        throw std::runtime_error("cannot write C++ checker response");
+      }
+      offset += static_cast<std::size_t>(n);
+    }
+  };
+  std::unique_ptr<CheckInterpreter> interpreter;
+  bool missing = false;
+  std::string replayed;
+  for (;;) {
+    std::string header;
+    for (;;) {
+      char ch;
+      const auto n = ::read(STDIN_FILENO, &ch, 1);
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      if (n == 0 && header.empty()) {
+        return;
+      }
+      if (n <= 0) {
+        throw std::runtime_error("truncated C++ checker frame");
+      }
+      if (ch == '\n') {
+        break;
+      }
+      if (header.size() >= 128) {
+        throw std::runtime_error("invalid C++ checker frame");
+      }
+      header += ch;
+    }
+    constexpr std::size_t limit = 64U * 1024U * 1024U;
+    std::size_t history_size = 0, source_size = 0;
+    std::istringstream frame(header);
+    std::string extra;
+    if (!(frame >> history_size >> source_size) || (frame >> extra) || history_size > limit ||
+        source_size > limit - history_size) {
+      throw std::runtime_error("invalid C++ checker frame size");
+    }
+    ::alarm(15); // Bound replay even if the console dies during a request.
+    const auto history = read(history_size);
+    const auto source = read(source_size);
+    if (!interpreter || history.compare(0, replayed.size(), replayed) != 0) {
+      interpreter.reset();
+      replayed.clear();
+      auto ci = compiler_for(arguments);
+      ci->getDiagnostics().setSuppressAllDiagnostics(false);
+      auto diagnostics = std::make_unique<CheckDiagnostics>(ci->getDiagnosticOpts());
+      ci->getDiagnostics().setClient(diagnostics.release());
+      ci->getFrontendOpts().ProgramAction = clang::frontend::ParseSyntaxOnly;
+      llvm::Error error = llvm::Error::success();
+      interpreter = std::make_unique<CheckInterpreter>(std::move(ci), error, missing);
+      if (error) {
+        throw std::runtime_error(llvm::toString(std::move(error)));
+      }
+    }
+    std::size_t cursor = replayed.size();
+    while (cursor < history.size()) {
+      const auto end = history.find('\n', cursor);
+      if (end == std::string::npos) {
+        throw std::runtime_error("invalid checker history");
+      }
+      const auto length_text = history.substr(cursor, end - cursor);
+      std::size_t used = 0;
+      const auto length = std::stoull(length_text, &used);
+      cursor = end + 1;
+      if (used != length_text.size() || length > history.size() - cursor) {
+        throw std::runtime_error("invalid checker history length");
+      }
+      auto parsed = interpreter->Parse(history.substr(cursor, length));
+      if (!parsed) {
+        throw std::runtime_error(llvm::toString(parsed.takeError()));
+      }
+      cursor += length;
+    }
+    replayed = history;
+
+    int descriptors[2];
+    if (::pipe(descriptors) != 0) {
+      throw std::runtime_error("cannot capture C++ diagnostics");
+    }
+    const auto child = ::fork();
+    if (child < 0) {
+      ::close(descriptors[0]);
+      ::close(descriptors[1]);
+      throw std::runtime_error("cannot fork C++ syntax check");
+    }
+    if (child == 0) {
+      ::close(descriptors[0]);
+      if (::dup2(descriptors[1], STDOUT_FILENO) < 0 || ::dup2(descriptors[1], STDERR_FILENO) < 0) {
+        std::_Exit(1);
+      }
+      ::close(descriptors[1]);
+      std::signal(SIGALRM, SIG_DFL);
+      ::alarm(15);
+      // Changes in this copy, including failed parses/macros, never enter the
+      // retained compiler. Only the next caller-supplied history advances it.
+      missing = false;
+      auto parsed = interpreter->Parse(source);
+      if (!parsed) {
+        llvm::logAllUnhandledErrors(parsed.takeError(), llvm::errs(), "C++ check: ");
+        llvm::errs().flush();
+        std::_Exit(1);
+      }
+      std::_Exit(missing ? 2 : 0);
+    }
+    ::close(descriptors[1]);
+    std::string diagnostics;
+    bool too_large = false;
+    for (;;) {
+      std::array<char, 4096> buffer{};
+      const auto n = ::read(descriptors[0], buffer.data(), buffer.size());
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      if (n <= 0) {
+        break;
+      }
+      if (diagnostics.size() + static_cast<std::size_t>(n) <= 65536) {
+        diagnostics.append(buffer.data(), static_cast<std::size_t>(n));
+      } else {
+        too_large = true;
+      }
+    }
+    ::close(descriptors[0]);
+    int status = 0;
+    pid_t waited;
+    do {
+      waited = ::waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    int result = 1;
+    if (waited == child && WIFEXITED(status)) {
+      result = WEXITSTATUS(status);
+    }
+    if (result > 2 || waited != child || !WIFEXITED(status)) {
+      result = 1;
+      diagnostics += "C++ checker stopped unexpectedly; previous variables retained\n";
+    }
+    if (too_large || diagnostics.size() > 65536) {
+      result = 1;
+      diagnostics = "C++ checker output exceeded 64 KiB; previous variables retained\n";
+    }
+    write(std::to_string(result) + " " + std::to_string(diagnostics.size()) + "\n" + diagnostics);
+    ::alarm(0);
+  }
 }
 
 std::string reflect_cpp_header(const std::vector<std::string> &arguments,

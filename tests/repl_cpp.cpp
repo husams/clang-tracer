@@ -45,6 +45,12 @@ int main(int argc, char **argv) {
     for (;;)
       ::pause();
   }
+  if (argc > 1 && std::string(argv[1]) == "serve") {
+    if (argc > 3 && std::string(argv[3]) == "die")
+      return 1;
+    for (;;)
+      ::pause();
+  }
   try {
     std::ostringstream output;
     Controller controller(Settings{}, output);
@@ -81,6 +87,32 @@ int main(int argc, char **argv) {
     require(cancelled && std::chrono::steady_clock::now() - started <
                              std::chrono::seconds(3),
             "interrupt cancels and reaps a stuck checker promptly");
+    {
+      CppCheckSession checks;
+      std::thread interrupt_session([] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        interrupted = true;
+      });
+      bool session_cancelled = false;
+      try {
+        (void)checks.check(executable_path(), {}, "", "1+1");
+      } catch (const std::runtime_error &error) {
+        session_cancelled = std::string(error.what()).find("cancelled") != std::string::npos;
+      }
+      interrupt_session.join();
+      interrupted = false;
+      require(session_cancelled, "persistent checks remain cancellable");
+      bool stopped = false;
+      try {
+        (void)checks.check(executable_path(), {"die"}, "", "1+1");
+      } catch (const std::runtime_error &) {
+        stopped = true;
+      }
+      require(stopped, "a dead checker cannot terminate the console via SIGPIPE");
+      const auto helper = std::filesystem::path(executable_path()).parent_path() / "clang-tracer-repl-check";
+      require(checks.check(helper.string(), cpp.effective_compiler_options(), "", "1+1").status == 0,
+              "a checker session restarts after cancellation or death");
+    }
     const auto help = cpp.describe_api("api");
     require(help.find("result_as") != std::string::npos &&
                 help.find("argument_as") != std::string::npos &&
