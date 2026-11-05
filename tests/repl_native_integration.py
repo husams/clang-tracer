@@ -8,6 +8,48 @@ import subprocess
 import tempfile
 import time
 
+SYNC_RANGE_CHECKS = r'''bool native_sync_checked = [] {
+  auto sync = tracer.events(session, 12, 10);
+  if (!sync.snapshot().complete || !sync.error().empty()) throw std::runtime_error("sync range failed");
+  auto data = sync | to_vector();
+  auto post = [](const auto& e) { return e.phase() == "POST"; };
+  auto results = sync | filter(post) | take(2) | transform([](const tracer_repl::Event& e) { return e.result_as<int>(); }) | to_vector();
+  if (results.size() != 2 || results.at(0) <= 0) throw std::runtime_error("filter/take/transform failed");
+  auto head = sync | first();
+  if (!head || head->sequence() != data.front().sequence()) throw std::runtime_error("first failed");
+  auto tail = sync | drop(2) | to_vector();
+  auto backwards = sync | reverse();
+  if (tail.size() != 10 || backwards.front().sequence() != data.back().sequence()) throw std::runtime_error("drop/reverse failed");
+  auto cutoff = data.at(2).sequence();
+  auto early = [cutoff](const auto& e) { return e.sequence() <= cutoff; };
+  if ((sync | take_while(early) | to_vector()).size() != 3 || (sync | drop_while(early) | to_vector()).size() != 9) throw std::runtime_error("prefix adaptors failed");
+  std::size_t count = 0;
+  for (const auto& [index, event] : sync | stride(2) | enumerate()) {
+    if (index != count || event.sequence() != data.at(count * 2).sequence()) throw std::runtime_error("stride/enumerate failed");
+    ++count;
+  }
+  if (count != 6) throw std::runtime_error("range count failed");
+  std::cout << "native-sync-adaptors=11-passed" << std::endl;
+  return true;
+}();'''
+# Piped input submits one C++ cell per line; retain readable source above.
+RANGE_CHECKS = " ".join(SYNC_RANGE_CHECKS.splitlines()) + "\n" + r'''#include <thread>
+#include <chrono>
+auto background = std::make_optional(tracer.events_async(session));
+%status
+std::cout << "native-prompt-during-async=" << background->running() << std::endl;
+if (!background->running() || background->snapshot().received < 6 || !background->error().empty()) throw std::runtime_error("async capture failed");
+auto background_sample = *background | take(3) | to_vector();
+if (background_sample.size() != 3) throw std::runtime_error("async pipeline failed");
+auto earlier_received = background->snapshot().received;
+std::this_thread::sleep_for(std::chrono::milliseconds(600));
+if (background->snapshot().received <= earlier_received) throw std::runtime_error("background did not receive new target calls");
+background->stop();
+if (background->running() || !background->snapshot().cancelled) throw std::runtime_error("async stop failed");
+background.reset();
+std::cout << "native-async-range=passed" << std::endl;
+'''
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -65,6 +107,7 @@ std::cout << "native-cpp-size=" << captured.size() << std::endl;
 int numeric_checks = 0;
 for (const auto& e : captured) {{ if (e.has_result() && e.argument_as<int>(0) > 0 && e.argument_as<int>(1) > 0 && e.result_as<int>() > 0) ++numeric_checks; }}
 std::cout << "native-numeric-checks=" << numeric_checks << std::endl;
+{RANGE_CHECKS}
 %record "{recording}" --count 6 --timeout 10
 %events open "{recording}" --as saved
 %events stats saved
@@ -75,12 +118,14 @@ try {{ tracer.detach(saved_session); std::cout << "stale-detach-accepted" << std
 %quit
 ''')
                 console.stdin.flush()
-                stdout, stderr = console.communicate(timeout=75)
+                stdout, stderr = console.communicate(timeout=150)
                 text = "".join(transcript) + stdout
                 assert console.returncode == 0, (text, stderr)
                 for expected in ("ownership=this-console", "Calculator::multiply", "received=6", "native-cpp-size=6", "native-numeric-checks=3", "object_fields {", 'name: "bias"', "stack {", "phase: POST", "result {", "restored=true", "detached session=", "owned server stopped after restoration", "stale-detach-rejected"):
                     assert expected in text, (expected, text, stderr)
                 assert "stale-detach-accepted" not in text
+                for expected in ("native-sync-adaptors=11-passed", "native-prompt-during-async=1", "native-async-range=passed"):
+                    assert expected in text, (text, stderr)
                 bare_print = text.split("native-bare-print-start\n", 1)[1].split("native-bare-print-end", 1)[0]
                 assert "phase: PRE" in bare_print and "object_fields {" in bare_print, bare_print
                 assert "T result_as() const" in text and "  result_as\n" in text, text
