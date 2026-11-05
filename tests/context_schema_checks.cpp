@@ -73,6 +73,55 @@ void verify_context_schema() {
   if (!codec_ast || codec_ast->getDiagnostics().hasErrorOccurred())
     throw std::runtime_error(
         "generated recursive C++ codec did not compile in the fixture AST");
+  const std::string template_source = R"cpp(
+namespace schema_template {
+template<class T> struct Box { T value{}; };
+struct Outer { Box<int> count; Box<double> ratio; };
+}
+)cpp";
+  auto template_ast = clang::tooling::buildASTFromCodeWithArgs(
+      template_source, arguments, "template-schema-fixture.cc");
+  if (!template_ast || template_ast->getDiagnostics().hasErrorOccurred())
+    throw std::runtime_error("template schema fixture failed to parse");
+  SchemaRecordFinder template_finder;
+  template_finder.name = "schema_template::Outer";
+  template_finder.TraverseDecl(
+      template_ast->getASTContext().getTranslationUnitDecl());
+  if (!template_finder.record)
+    throw std::runtime_error("template outer record not found");
+  const auto template_type = clang::QualType(
+      template_finder.record->getTypeForDecl(), 0);
+  StateFamilyKey template_family;
+  template_family.source_lineage_id[0] = 0x74;
+  template_family.cpp_state_type = "schema_template::Outer";
+  template_family.cpp_scope_type = "schema_template::Scope";
+  const auto template_schema = build_payload_schema(
+      template_ast->getASTContext(), template_type, template_family);
+  if (!template_schema)
+    throw std::runtime_error("template schema failed: " + template_schema.error);
+  assert(template_schema.record->root->fields.size() == 1);
+  assert(template_schema.record->root->fields[0].message);
+  const auto &template_fields =
+      template_schema.record->root->fields[0].message->fields;
+  assert(template_fields.size() == 2);
+  assert(template_fields[0].cpp_type == "schema_template::Box<int>");
+  assert(template_fields[1].cpp_type == "schema_template::Box<double>");
+  assert(template_fields[0].message && template_fields[1].message);
+  assert(template_fields[0].message->cpp_type == template_fields[0].cpp_type);
+  assert(template_fields[1].message->cpp_type == template_fields[1].cpp_type);
+  assert(template_fields[0].message->full_name !=
+         template_fields[1].message->full_name);
+  const auto template_codec = render_payload_codec_source(
+      template_ast->getASTContext(), template_type);
+  if (!template_codec)
+    throw std::runtime_error("template codec failed: " + template_codec.error);
+  auto template_codec_ast = clang::tooling::buildASTFromCodeWithArgs(
+      "#include \"context_codec.hpp\"\n" + template_source +
+          template_codec.source,
+      arguments, "template-codec-fixture.cc");
+  if (!template_codec_ast ||
+      template_codec_ast->getDiagnostics().hasErrorOccurred())
+    throw std::runtime_error("generated template codec did not compile");
   StateFamilyKey family;
   family.source_lineage_id[0] = 1;
   family.cpp_state_type = "demo::RequestState";

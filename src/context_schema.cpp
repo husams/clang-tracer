@@ -26,9 +26,16 @@ using MP = google::protobuf::DescriptorProto;
 using FP = google::protobuf::FileDescriptorProto;
 using FDS = google::protobuf::FileDescriptorSet;
 
+std::string record_spelling(const clang::CXXRecordDecl *record) {
+  clang::PrintingPolicy policy(record->getASTContext().getLangOpts());
+  policy.SuppressTagKeyword = true;
+  return clang::QualType(record->getTypeForDecl(), 0)
+      .getCanonicalType().getAsString(policy);
+}
+
 std::string canonical(clang::QualType t) {
   if (const auto *r = t.getCanonicalType()->getAsCXXRecordDecl()) {
-    return r->getQualifiedNameAsString();
+    return record_spelling(r);
   }
   return t.getCanonicalType().getAsString();
 }
@@ -461,7 +468,7 @@ struct Builder {
   std::shared_ptr<const SchemaMessage> message(const clang::CXXRecordDecl *r,
                                                unsigned depth) {
     auto result = std::make_shared<SchemaMessage>();
-    result->cpp_type = r->getQualifiedNameAsString();
+    result->cpp_type = record_spelling(r);
     result->full_name = result->cpp_type;
     if (auto i = cache.find(r); i != cache.end()) {
       return i->second;
@@ -909,9 +916,9 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
           }
           auto *br = base.getType()->getAsCXXRecordDecl();
           if (br) {
-            source << "  if (!Codec<::" << br->getQualifiedNameAsString()
+            source << "  if (!Codec<::" << record_spelling(br)
                    << ">::write_fields(w, static_cast<const ::"
-                   << br->getQualifiedNameAsString()
+                   << record_spelling(br)
                    << "&>(value), budget, field_number)) return false;\n";
           }
         }
@@ -933,7 +940,7 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
       };
   for (const auto *r : records) {
     std::uint32_t number = 1;
-    const auto type_name = r->getQualifiedNameAsString();
+    const auto type_name = record_spelling(r);
     source << "template <> struct Codec<::" << type_name << "> {\n"
            << " static bool write_fields(BoundedProtoWriter& w, const ::"
            << type_name
