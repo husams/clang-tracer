@@ -40,6 +40,7 @@ auto background = std::make_optional(tracer.events_async(session));
 std::cout << "native-prompt-during-async=" << background->running() << std::endl;
 if (!background->running() || background->snapshot().received < 6 || !background->error().empty()) throw std::runtime_error("async capture failed");
 auto background_sample = *background | take(3) | to_vector();
+background->snapshot().size()
 if (background_sample.size() != 3) throw std::runtime_error("async pipeline failed");
 auto earlier_received = background->snapshot().received;
 std::this_thread::sleep_for(std::chrono::milliseconds(600));

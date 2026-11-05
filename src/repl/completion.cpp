@@ -206,6 +206,17 @@ public:
       if (!statement || !statement->isSemiMissing())
         continue;
       const auto *expr = llvm::dyn_cast<clang::Expr>(statement->getStmt());
+      // Incremental syntax-only parsing accepts a missing statement terminator
+      // even on a loop/if. Code-generating Parse can then crash in
+      // ExtractValueFromExpr, rather than diagnose the malformed statement.
+      // Only bare expressions participate in the REPL's value-printing syntax.
+      if (!expr) {
+        auto &diagnostics = statement->getASTContext().getDiagnostics();
+        const auto id = diagnostics.getCustomDiagID(
+            clang::DiagnosticsEngine::Error, "expected ';' after statement");
+        diagnostics.Report(statement->getEndLoc(), id);
+        return false;
+      }
       if (expr && expr->getType()->isVoidType())
         missing_ = true;
     }

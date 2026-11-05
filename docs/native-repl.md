@@ -128,6 +128,12 @@ implicitly transferred into the target.
 
 ## Collect and inspect
 
+Missing semicolons inside loops or conditionals are syntax errors. They are
+rejected by the isolated checker before the live interpreter parses the cell;
+earlier variables, sessions and background collectors remain usable. Bare
+top-level void calls retain their optional trailing semicolon. Temporary
+collections can be inspected directly, including `live.snapshot().size()`.
+
 ### C++17 event ranges
 
 Synchronous collection waits for the count, timeout (30 seconds by default),

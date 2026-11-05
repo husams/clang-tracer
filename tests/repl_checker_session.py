@@ -127,6 +127,22 @@ def main():
                 "missing_semicolon()", history + (b"void missing_semicolon() {}",)
             )
             assert status == 2, "missing void semicolon was not classified separately"
+            for source in (
+                "int values[1] = {}; for (const auto& value : values) (void)value",
+                "int values[1] = {}; for (int i = 0; i < 1; ++i) (void)i",
+                "if (true) (void)0",
+                "while (false) (void)0",
+            ):
+                status, diagnostic = checker.request(source)
+                assert status == 1 and b"expected ';'" in diagnostic, (source, status, diagnostic)
+            assert checker.request("int values[1] = {}; for (const auto& value : values) (void)value;")[0] == 0
+            assert checker.request("int values[1] = {}; for (const auto& value : values) { (void)value; }")[0] == 0
+            legacy = subprocess.run(
+                [args.checker, "check", "0", *compiler_args],
+                input="int values[1] = {}; for (const auto& value : values) (void)value",
+                text=True, capture_output=True, timeout=20,
+            )
+            assert legacy.returncode == 1 and "expected ';'" in legacy.stderr, (legacy.stdout, legacy.stderr)
 
             path_literal = json.dumps(str(marker))
             side_effect = (

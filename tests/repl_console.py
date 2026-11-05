@@ -102,6 +102,11 @@ tracer.print(empty)
             assert discovery.returncode == 0, (discovery.stdout, discovery.stderr)
             for expected in ("T result_as() const", "std::uint64_t received", "  print", "  received", "Collection retained=0", "ready=unconnected"):
                 assert expected in discovery.stdout, (expected, discovery.stdout, discovery.stderr)
+            temporary = subprocess.run([console, "--fail-fast"], input='''tracer_repl::Collection{}.size()
+std::cout << "temporary-collection-ok" << std::endl;
+%quit
+''', text=True, capture_output=True, timeout=20)
+            assert temporary.returncode == 0 and "temporary-collection-ok" in temporary.stdout, (temporary.stdout, temporary.stderr)
             # Disk recording must remain available when named memory collections are full.
             disk_only = root / "full-buffer-recording.pb"
             full = subprocess.run([console, "--endpoint", endpoint, "--buffer-events", "4", "--fail-fast"],
@@ -120,6 +125,16 @@ std::cout << "recovered=" << kept << std::endl;
             assert rejected.returncode == 1 and "ready=unconnected" in rejected.stdout
             assert "recovered=42" in rejected.stdout and "  kept" in rejected.stdout, (rejected.stdout, rejected.stderr)
             assert rejected.stderr.count("error:") == 2 and "%cpp reset" not in rejected.stderr, rejected.stderr
+            malformed_loop = subprocess.run([console], input='''std::vector<int> values; for (const auto& value : values) (void)value
+int recovered_after_loop = 42;
+std::cout << "loop-recovered=" << recovered_after_loop << std::endl;
+std::vector<int> values; for (const auto& value : values) (void)value;
+%status
+%quit
+''', text=True, capture_output=True, timeout=20)
+            assert malformed_loop.returncode == 1, (malformed_loop.stdout, malformed_loop.stderr)
+            assert "expected ';'" in malformed_loop.stderr and "loop-recovered=42" in malformed_loop.stdout, (malformed_loop.stdout, malformed_loop.stderr)
+            assert "redefinition" not in malformed_loop.stderr and "reset" not in malformed_loop.stderr, malformed_loop.stderr
             # Explicit unreachable endpoint never starts a local replacement.
             unavailable = subprocess.run([console, "--endpoint", "unix:///nonexistent/tracer.sock", "--fail-fast"], input="%sessions\n", text=True, capture_output=True, timeout=10)
             assert unavailable.returncode == 1 and "server ready" not in unavailable.stdout
@@ -148,6 +163,7 @@ std::cout << "recovered=" << kept << std::endl;
         assert live_server.stdout.readline().strip() == "ready"
         commands = '''%attach 7
 auto live = tracer.events_async(session);
+live.snapshot().size()
 if (!live.running()) throw std::runtime_error("background stopped");
 std::cout << "prompt-usable-during-capture" << std::endl;
 %sessions

@@ -57,6 +57,14 @@ public:
 };
 
 struct Collection {
+  Collection() = default;
+  Collection(const Collection &) = default;
+  Collection(Collection &&) noexcept = default;
+  Collection &operator=(const Collection &) = default;
+  Collection &operator=(Collection &&) noexcept = default;
+  // Export a stable destructor for JIT temporaries instead of relying on an
+  // inline destructor being emitted by an earlier input cell.
+  ~Collection();
   std::vector<Event> events;
   std::uint64_t received = 0;
   std::uint64_t evicted = 0;

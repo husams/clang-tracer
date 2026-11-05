@@ -739,6 +739,8 @@ Collection EventBuffer::snapshot() const {
   return result;
 }
 
+Collection::~Collection() = default;
+
 void event_statistics(const EventBuffer &buffer, std::ostream &out,
                       bool calls) {
   using Key = std::tuple<std::string, std::string, std::uint64_t, std::uint32_t,
