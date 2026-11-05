@@ -181,6 +181,13 @@ function(tracer_add_native_repl)
           --target $<TARGET_FILE:repl-complex-fixture>
           --header "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/repl_complex_types.hpp")
       set_tests_properties(native_repl_complex_integration PROPERTIES TIMEOUT 600)
+      add_test(NAME native_repl_value_examples
+        COMMAND "${CMAKE_COMMAND}" -E env
+          "CLANG_TRACER_REPL=$<TARGET_FILE:clang-tracer-repl>"
+          "CLANG_TRACER_SERVER=$<TARGET_FILE:clang-tracer-server>"
+          "CLANG_TRACER_VALUES_TARGET=$<TARGET_FILE:repl-values-example-target>"
+          bash "${CMAKE_CURRENT_SOURCE_DIR}/examples/native-repl-values/run.sh" all)
+      set_tests_properties(native_repl_value_examples PROPERTIES TIMEOUT 600)
     endif()
   endif()
 endfunction()

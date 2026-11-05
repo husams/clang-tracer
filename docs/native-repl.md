@@ -1,5 +1,9 @@
 # Native C++17 REPL
 
+For runnable examples of structs/classes, strings, optionals, sequence
+containers, maps, sets and nested containers, see
+[`examples/native-repl-values`](../examples/native-repl-values/README.md).
+
 `clang-tracer-repl` manages a tracing session from one prompt. Commands start
 an owned local server, attach to a process, upload C++ interceptor source, and
 collect and inspect events. Ordinary C++ input runs locally through Clang

@@ -134,6 +134,14 @@ target_compile_options(cpp-interceptors-target PRIVATE -g -O0 -fno-omit-frame-po
 
 add_executable(signature-interceptor-fixture tests/signature_interceptor_fixture.cpp)
 add_executable(repl-complex-fixture tests/repl_complex_fixture.cpp)
+if(BUILD_TESTING)
+  add_executable(repl-values-example-target examples/native-repl-values/target.cpp)
+  target_link_libraries(repl-values-example-target PRIVATE Threads::Threads)
+  set_target_properties(repl-values-example-target PROPERTIES ENABLE_EXPORTS ON
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+  target_compile_options(repl-values-example-target PRIVATE -g -O0
+    -fno-omit-frame-pointer -fcf-protection=none)
+endif()
 target_link_libraries(repl-complex-fixture PRIVATE Threads::Threads)
 set_target_properties(repl-complex-fixture PROPERTIES ENABLE_EXPORTS ON CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 target_compile_options(repl-complex-fixture PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
