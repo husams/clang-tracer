@@ -172,6 +172,67 @@ than calling the facade from user-created threads.
 Use `%help EventRange` for the range API. Existing `tracer.collect(...)` and
 named collection commands retain their behavior.
 
+### C++17 collection adaptors
+
+`take`, `drop`, `filter`, `take_while`, `drop_while`, `transform`, `stride`,
+`enumerate`, `reverse`, `to_vector`, and `first` are available directly in
+the REPL. They also work with `Collection` values from `collect`, `batch`, and
+`snapshot`:
+
+```cpp
+auto events = tracer.events(session, 100, 10);
+for (const auto& e : events | take(10)) tracer.print(e);
+auto is_post = [](const auto& e) { return e.phase() == "POST"; };
+for (const auto& e : events | filter(is_post) | take(10)) tracer.print(e);
+for (const auto& e : events | drop(5) | take(10)) tracer.print(e);
+auto early = [](const auto& e) { return e.sequence() < 50; };
+for (const auto& e : events | take_while(early)) tracer.print(e);
+auto first_post = events | filter([](const auto& e) {
+  return e.phase() == "POST";
+}) | first();
+if (first_post) tracer.print(*first_post);
+auto names = events | transform([](const auto& e) {
+  return e.function_name();
+}) | to_vector();
+for (const auto& [index, e] : events | stride(2) | enumerate()) {
+  std::cout << index << ": " << e.function_name() << std::endl;
+}
+auto newest_first = events | reverse();
+auto tail = events | drop_while([](const auto& e) {
+  return e.sequence() < 50;
+}) | to_vector();
+```
+
+`take(n)` returns at most the first n events; `drop(n)` skips the first n;
+`filter(predicate)` keeps matching events; `take_while(predicate)` stops at the
+first non-match. `first()` is a terminal adaptor returning an owned
+`std::optional<Event>`, empty when there is no match. Counts must be nonnegative.
+Predicates are evaluated lazily during iteration, and pipe order matters:
+`filter(p) | take(10)` takes ten matches, while `take(10) | filter(p)` tests only
+the first ten events. `take(0)` does not evaluate predicates.
+
+Declare predicates before using them in a top-level REPL loop, or store the
+pipeline in a variable first. Clang Interpreter can crash while mangling an
+inline lambda inside a top-level loop; ordinary compiled C++ accepts it.
+
+`drop_while(p)` skips only the initial matching prefix. `transform(f)` lazily
+projects each event into an owned value, such as its name, sequence or typed
+argument. `stride(n)` selects every nth element, starting with the first; n
+must be positive. `enumerate()` pairs each element with a zero-based index in
+the current pipeline. `to_vector()` materializes the selected values into an
+owned vector; `reverse()` materializes a vector in reverse order. These two
+operations evaluate their input immediately. Materialized results and views
+can be piped into further adaptors. Exceptions from predicates/projections
+propagate on the foreground thread.
+
+Views own their input: lvalue collections are copied and temporaries are moved,
+so stored pipelines remain valid. An event-range view retains its collector
+handle and takes a fresh, non-consuming snapshot at each loop's start. Thus
+`live | take(10)` inspects up to ten **currently retained** events; it does not
+wait for ten new arrivals or limit background collection. Use
+`tracer.events_async(session, 10, 5)` to limit collection itself. Other C++ code
+can include `event_ranges.hpp` and use the `tracer_repl` namespace explicitly.
+
 ### Console commands
 
 ```text

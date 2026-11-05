@@ -359,6 +359,12 @@ int main(int argc, char **argv) {
                 "background start returns promptly");
         wait_for([&] { return live.snapshot().received == 4; });
         require(live.running(), "collector remains active between REPL inputs");
+        auto first_event = live | take(1) | first();
+        require(first_event && first_event->sequence() == 3,
+                "adaptors inspect a background snapshot without blocking");
+        auto post_event = live | filter([](const auto &e) { return e.phase() == "POST"; }) | take(1) | first();
+        require(post_event && post_event->sequence() == 4,
+                "event predicates compose with limits");
         background.execute(parse_command("%sessions"));
         const auto snapshot = live.snapshot();
         require(snapshot.size() == 2 && snapshot.evicted == 2,

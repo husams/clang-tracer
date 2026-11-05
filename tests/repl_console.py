@@ -54,6 +54,25 @@ auto sync_range = tracer.events(session, 4, 5);
 int range_count = 0;
 for (const auto &event : sync_range) {{ ++range_count; }}
 std::cout << "sync-range-count=" << range_count << std::endl;
+auto selected_events = sync_range | filter([](const auto& e) {{ return e.phase() == "POST"; }}) | take(1);
+int selected_count = 0;
+for (const auto& e : selected_events) {{ if (e.sequence() != 2) throw std::runtime_error("wrong filtered event"); ++selected_count; }}
+auto first_event = sync_range | drop(1) | first();
+if (!first_event || first_event->sequence() != 2) throw std::runtime_error("first failed");
+int prefix_count = 0;
+for (const auto& e : sync_range.snapshot() | take_while([](const auto& e) {{ return e.sequence() < 3; }})) {{ ++prefix_count; }}
+std::cout << "adaptors=" << selected_count << ":" << prefix_count << std::endl;
+auto sequences = sync_range | filter([](const auto& e) {{ return e.phase() == "POST"; }}) | transform([](const auto& e) {{ return e.sequence(); }}) | to_vector();
+if (sequences.size() != 2 || sequences.at(1) != 4) throw std::runtime_error("transform failed");
+auto tail = sequences | drop_while([](auto n) {{ return n < 4; }}) | to_vector();
+if (tail.size() != 1 || tail.at(0) != 4) throw std::runtime_error("drop_while failed");
+auto is_post = [](const auto& e) {{ return e.phase() == "POST"; }};
+for (const auto& e : sync_range | filter(is_post) | take(1)) {{ if (e.sequence() != 2) throw std::runtime_error("inline filter failed"); }}
+auto backwards = sync_range | reverse();
+if (backwards.at(0).sequence() != 4) throw std::runtime_error("reverse failed");
+int numbered = 0;
+for (const auto& [index, e] : sync_range | stride(2) | enumerate()) {{ if (e.sequence() != index * 2 + 1) throw std::runtime_error("enumerate failed"); ++numbered; }}
+if (numbered != 2) throw std::runtime_error("stride failed");
 %cpp reset
 %record "{capture}" --count 4
 %events open "{capture}" --as saved
@@ -64,7 +83,7 @@ tracer.detach(session)
 '''
             run = subprocess.run([console, "--endpoint", endpoint, "--fail-fast"], input=commands, text=True, capture_output=True, timeout=45)
             assert run.returncode == 0, (run.stdout, run.stderr)
-            for expected in ["installed probe=5", "cpp-size=4 result=42", "typed-sum=63", "typed-mismatch-rejected", "collected-cpp=4", "retained-session=7", "duration_ns=10", "paired=2", "detached session=s1", "background-prompt-ready", "sync-range-count=4", "EventRange"]:
+            for expected in ["installed probe=5", "cpp-size=4 result=42", "typed-sum=63", "typed-mismatch-rejected", "collected-cpp=4", "retained-session=7", "duration_ns=10", "paired=2", "detached session=s1", "background-prompt-ready", "sync-range-count=4", "EventRange", "adaptors=1:2"]:
                 assert expected in run.stdout, (expected, run.stdout, run.stderr)
             assert len(json.loads(export.read_text())) == 4
             printed = run.stdout.split("event-print-start\n", 1)[1].split("event-print-end", 1)[0]

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "event_value.hpp"
+#include "event_ranges.hpp"
 
 namespace tracer_repl {
 class Controller;

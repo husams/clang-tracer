@@ -324,7 +324,13 @@ void CppEngine::initialize() {
   prelude << "#include \"" << path << "\"\n#include <iostream>\n"
           << "auto &tracer = *reinterpret_cast<tracer_repl::Facade *>("
           << reinterpret_cast<std::uintptr_t>(&facade_) << "ULL);\n"
-          << "const auto &session = tracer.selected_session();\n";
+          << "const auto &session = tracer.selected_session();\n"
+          << "using tracer_repl::take; using tracer_repl::drop; "
+             "using tracer_repl::filter; using tracer_repl::take_while; "
+             "using tracer_repl::first; using tracer_repl::transform; "
+             "using tracer_repl::drop_while; using tracer_repl::stride; "
+             "using tracer_repl::enumerate; using tracer_repl::reverse; "
+             "using tracer_repl::to_vector;\n";
   if (auto error = (*interpreter)->ParseAndExecute(prelude.str())) {
     throw std::runtime_error("cannot initialize C++ facade: " +
                              llvm::toString(std::move(error)));
