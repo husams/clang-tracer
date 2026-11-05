@@ -14,6 +14,8 @@
 #include <grpcpp/grpcpp.h>
 #include <unistd.h>
 
+#include "background_events.hpp"
+
 namespace tracer_repl {
 namespace api = clangtracer::v1;
 static_assert(std::atomic<bool>::is_always_lock_free,
@@ -109,6 +111,7 @@ void Controller::connect(const std::string &endpoint) {
       },
       2);
   endpoint_ = endpoint;
+  stop_background();
   stub_ = std::move(next);
   selected_ = {};
   ++connection_;
@@ -131,6 +134,7 @@ void Controller::start_server(const Command &command) {
 }
 
 void Controller::disconnect() {
+  stop_background();
   stub_.reset();
   selected_ = {};
   ++connection_;
@@ -274,6 +278,7 @@ void Controller::detach(const SessionHandle &session) {
   if (!stub_ || session.id.empty() || session.connection != connection_) {
     throw std::runtime_error("invalid session handle");
   }
+  stop_background(session.id);
   api::DetachRequest request;
   request.set_session_id(session.id);
   auto response = unary<api::Session>(
@@ -399,7 +404,8 @@ void Controller::watch(const Command &command, bool display,
   }
   const auto collection_name =
       command.option("--as", display ? "live" : "batch");
-  std::size_t used_bytes = 0, used_events = 0;
+  const auto reserved = background_storage();
+  std::size_t used_events = reserved.first, used_bytes = reserved.second;
   if (record_path.empty()) {
     for (const auto &entry : batches_) {
       if (entry.first == collection_name) {
@@ -412,7 +418,7 @@ void Controller::watch(const Command &command, bool display,
   if (used_bytes >= settings_.max_bytes ||
       used_events >= settings_.max_events) {
     throw std::runtime_error(
-        "collection storage is full; use %events clear NAME");
+        "collection storage is full; clear collections or release event ranges");
   }
   EventBuffer next(settings_.max_events - used_events,
                    settings_.max_bytes - used_bytes);
@@ -517,6 +523,68 @@ Collection Controller::collect(const SessionHandle &session,
                      {"--as", {"cpp"}}};
   watch(command, false);
   return batch("cpp");
+}
+
+std::pair<std::size_t, std::size_t> Controller::background_storage() const {
+  std::pair<std::size_t, std::size_t> used{};
+  for (const auto& weak : background_) {
+    if (auto state = weak.lock()) {
+      used.first += state->max_events;
+      used.second += state->max_bytes;
+    }
+  }
+  return used;
+}
+
+void Controller::stop_background(const std::string& session_id) {
+  for (auto it = background_.begin(); it != background_.end();) {
+    if (auto state = it->lock()) {
+      if (session_id.empty() || state->session.id == session_id) {
+        state->stop();
+      }
+      ++it;
+    } else {
+      it = background_.erase(it);
+    }
+  }
+}
+
+EventRange Controller::events(const SessionHandle& session, std::uint64_t count, unsigned timeout) {
+  if (!count || !timeout || timeout > 86400) {
+    throw std::invalid_argument(
+        "collection count and timeout must be positive; timeout at most 86400 seconds");
+  }
+  auto range = events_async(session, count, timeout);
+  while (range.running() && !interrupted) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  range.stop();
+  return range;
+}
+
+EventRange Controller::events_async(const SessionHandle& session, std::uint64_t count,
+                                    unsigned timeout) {
+  require_session(session);
+  if (timeout > 86400) {
+    throw std::invalid_argument("event timeout must be at most 86400 seconds");
+  }
+  auto used = background_storage();
+  for (const auto& entry : batches_) {
+    used.first += entry.second.events().size();
+    used.second += entry.second.bytes();
+  }
+  if (used.first >= settings_.max_events || used.second >= settings_.max_bytes) {
+    throw std::runtime_error(
+        "collection storage is full; clear collections or release event ranges");
+  }
+  auto state = std::make_shared<BackgroundEvents>(endpoint_, session, count, timeout,
+                                                  settings_.max_events - used.first,
+                                                  settings_.max_bytes - used.second);
+  background_.erase(std::remove_if(background_.begin(), background_.end(),
+                                   [](const auto& weak) { return weak.expired(); }),
+                    background_.end());
+  background_.push_back(state);
+  return EventRange(std::move(state));
 }
 
 std::vector<std::pair<unsigned, std::string>>
@@ -815,7 +883,8 @@ bool Controller::execute(const Command &command) {
       throw std::runtime_error("collection already exists: " + name +
                                "; choose a new name or use %events clear NAME");
     }
-    std::size_t bytes = 0, events = 0;
+    const auto reserved = background_storage();
+    std::size_t events = reserved.first, bytes = reserved.second;
     for (const auto &b : batches_) {
       if (b.first != command.option("--as")) {
         bytes += b.second.bytes();
@@ -901,6 +970,7 @@ bool Controller::execute(const Command &command) {
 }
 
 void Controller::shutdown() {
+  stop_background();
   std::string failures;
   for (const auto &id : std::vector<std::string>(owned_sessions_.begin(),
                                                  owned_sessions_.end())) {
@@ -951,6 +1021,15 @@ std::uint64_t Facade::inject(const SessionHandle &session,
 Collection Facade::collect(const SessionHandle &session, std::uint64_t count,
                            unsigned timeout) {
   return controller_->collect(session, count, timeout);
+}
+
+EventRange Facade::events(const SessionHandle& session, std::uint64_t count, unsigned timeout) {
+  return controller_->events(session, count, timeout);
+}
+
+EventRange Facade::events_async(const SessionHandle& session, std::uint64_t count,
+                                unsigned timeout) {
+  return controller_->events_async(session, count, timeout);
 }
 
 Collection Facade::batch(const std::string &name) const {

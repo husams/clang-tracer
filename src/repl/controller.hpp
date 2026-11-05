@@ -37,6 +37,9 @@ class Controller {
   std::map<std::uint32_t, PendingAttach> pending_attaches_;
   std::map<std::string, std::string> drafts_;
   std::map<std::string, EventBuffer> batches_;
+  std::vector<std::weak_ptr<BackgroundEvents>> background_;
+  void stop_background(const std::string& session_id = {});
+  std::pair<std::size_t, std::size_t> background_storage() const;
   std::ostream &out_;
   void ensure_connected();
   void start_server(const Command &command);
@@ -66,6 +69,8 @@ public:
                        const Command &options);
   Collection collect(const SessionHandle &session, std::uint64_t count,
                      unsigned timeout);
+  EventRange events(const SessionHandle& session, std::uint64_t count, unsigned timeout);
+  EventRange events_async(const SessionHandle& session, std::uint64_t count, unsigned timeout);
   Collection batch(const std::string &name) const;
   void draft(const std::string &name, std::string source);
   void print(const Event &event) const;

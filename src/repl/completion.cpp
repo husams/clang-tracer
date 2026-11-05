@@ -536,12 +536,11 @@ std::string describe_cpp_api(clang::CompilerInstance &parent,
                              const std::string &requested) {
   const auto topic = requested == "tracer" ? "Facade" : requested;
   const bool all = topic == "api";
-  const std::set<std::string> types = {"Facade", "Event", "EventValue",
-                                       "Collection", "SessionHandle"};
+  const std::set<std::string> types = {"Facade",     "Event",         "EventValue",
+                                       "Collection", "SessionHandle", "EventRange"};
   if (!all && !types.count(topic) && topic != "ScalarValue")
-    throw std::invalid_argument(
-        "API topics: api, tracer, Event, EventValue, Collection, "
-        "SessionHandle, ScalarValue");
+    throw std::invalid_argument("API topics: api, tracer, Event, EventValue, Collection, "
+                                "SessionHandle, ScalarValue, EventRange");
   std::string text;
   llvm::raw_string_ostream out(text);
   clang::PrintingPolicy policy(parent.getLangOpts());

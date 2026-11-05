@@ -230,9 +230,10 @@ const std::vector<std::string> &command_names() {
     for (const auto &entry : kinds) {
       result.push_back("%" + entry.first);
     }
-    for (const auto &topic : {"api", "tracer", "Event", "Collection",
-                              "SessionHandle", "ScalarValue", "EventValue", "cpp"})
+    for (const auto& topic : {"api", "tracer", "Event", "Collection", "SessionHandle",
+                              "ScalarValue", "EventValue", "EventRange", "cpp"}) {
       result.push_back(std::string("%help ") + topic);
+    }
     return result;
   }();
   return names;

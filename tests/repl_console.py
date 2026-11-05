@@ -46,6 +46,15 @@ auto another = tracer.collect(captured, 4);
 std::cout << "collected-cpp=" << another.size() << std::endl;
 %cpp reset
 std::cout << "retained-session=" << session.pid << std::endl;
+auto live_range = tracer.events_async(session, 4, 5);
+std::cout << "background-prompt-ready" << std::endl;
+%help EventRange
+%cpp reset
+auto sync_range = tracer.events(session, 4, 5);
+int range_count = 0;
+for (const auto &event : sync_range) {{ ++range_count; }}
+std::cout << "sync-range-count=" << range_count << std::endl;
+%cpp reset
 %record "{capture}" --count 4
 %events open "{capture}" --as saved
 %events export saved --format json --output "{export}"
@@ -55,7 +64,7 @@ tracer.detach(session)
 '''
             run = subprocess.run([console, "--endpoint", endpoint, "--fail-fast"], input=commands, text=True, capture_output=True, timeout=45)
             assert run.returncode == 0, (run.stdout, run.stderr)
-            for expected in ["installed probe=5", "cpp-size=4 result=42", "typed-sum=63", "typed-mismatch-rejected", "collected-cpp=4", "retained-session=7", "duration_ns=10", "paired=2", "detached session=s1"]:
+            for expected in ["installed probe=5", "cpp-size=4 result=42", "typed-sum=63", "typed-mismatch-rejected", "collected-cpp=4", "retained-session=7", "duration_ns=10", "paired=2", "detached session=s1", "background-prompt-ready", "sync-range-count=4", "EventRange"]:
                 assert expected in run.stdout, (expected, run.stdout, run.stderr)
             assert len(json.loads(export.read_text())) == 4
             printed = run.stdout.split("event-print-start\n", 1)[1].split("event-print-end", 1)[0]
@@ -112,6 +121,38 @@ std::cout << "recovered=" << kept << std::endl;
     finally:
         server.terminate()
         server.communicate(timeout=10)
+    # A live stream remains open while later C++ cells and commands execute.
+    live_server = subprocess.Popen([fixture, "--listen-live", endpoint],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True)
+    try:
+        assert live_server.stdout.readline().strip() == "ready"
+        commands = '''%attach 7
+auto live = tracer.events_async(session);
+if (!live.running()) throw std::runtime_error("background stopped");
+std::cout << "prompt-usable-during-capture" << std::endl;
+%sessions
+live.stop();
+if (live.running()) throw std::runtime_error("stop failed");
+%cpp reset
+auto live_again = tracer.events_async(session);
+%cpp reset
+auto sync = tracer.events(session, 4, 5);
+if (!sync.snapshot().complete) throw std::runtime_error("incomplete sync range");
+int visited = 0;
+for (const auto &event : sync) { ++visited; }
+std::cout << "live-sync-visited=" << visited << std::endl;
+%quit
+'''
+        result = subprocess.run([console, "--endpoint", endpoint, "--fail-fast"],
+                                input=commands, text=True, capture_output=True,
+                                timeout=45)
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert "prompt-usable-during-capture" in result.stdout, result.stdout
+        assert "live-sync-visited=4" in result.stdout, result.stdout
+    finally:
+        live_server.terminate()
+        live_server.communicate(timeout=10)
     print("native console executable checks passed")
 
 

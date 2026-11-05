@@ -128,6 +128,52 @@ implicitly transferred into the target.
 
 ## Collect and inspect
 
+### C++17 event ranges
+
+Synchronous collection waits for the count, timeout (30 seconds by default),
+or Ctrl+C, then returns an iterable snapshot range:
+
+```cpp
+auto captured = tracer.events(session, 100, 10);
+for (const auto &event : captured) tracer.print(event);
+```
+
+Background collection returns immediately so the prompt remains usable:
+
+```cpp
+auto live = tracer.events_async(session);
+// Enter other REPL commands while collection continues.
+for (const auto &event : live) tracer.print(event);
+auto data = live.snapshot();
+live.running();
+live.error();
+live.stop();
+```
+
+Each loop visits a stable snapshot of currently retained events, without waiting
+for new arrivals or consuming them. Later loops can include the same events.
+`snapshot()` returns a `Collection` with received/evicted counters and completion,
+cancellation and timeout flags. Stream failures appear in `error()` in either
+mode; partial results remain inspectable. `events_async(session, 100, 10)` stops
+at 100 events or 10 seconds; zero count/timeout means no corresponding limit.
+Synchronous counts and timeouts must be positive. Both modes use C++17, without
+coroutines or C++20 ranges.
+
+A range reserves the remaining shared event-count and byte budget. While it is
+retained, another capture may have no room; release all copies of the range
+(for example, with `%cpp reset`) to free that reservation. Snapshots can retain
+their owned events beyond that point. The oldest events are evicted at the
+budget limit. Stopping preserves the range and its reservation. The last range
+copy's destruction, session detach, disconnection and console shutdown cancel
+and join its worker. Workers never execute user C++ or print into the prompt.
+The controller/facade remains a foreground API; use these range handles rather
+than calling the facade from user-created threads.
+
+Use `%help EventRange` for the range API. Existing `tracer.collect(...)` and
+named collection commands retain their behavior.
+
+### Console commands
+
 ```text
 %events
 %collect --as live

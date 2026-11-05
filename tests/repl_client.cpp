@@ -32,6 +32,8 @@ public:
   std::atomic<unsigned> installed{0}, detached{0};
   std::atomic<bool> pair_created{false}, detached_s1{false}, detached_s2{false};
   std::function<void()> on_watch;
+  std::atomic<int> watch_mode{0};
+  std::atomic<unsigned> active_watches{0};
 
   grpc::Status ListSessions(grpc::ServerContext *,
                             const api::ListSessionsRequest *,
@@ -115,6 +117,24 @@ public:
   grpc::Status
   WatchEvents(grpc::ServerContext *c, const api::WatchEventsRequest *q,
               grpc::ServerWriter<api::TraceEvent> *writer) override {
+    struct Active {
+      std::atomic<unsigned>& count;
+
+      explicit Active(std::atomic<unsigned>& n)
+          : count(n) {
+        ++count;
+      }
+
+      ~Active() { --count; }
+    } active(active_watches);
+
+    const int mode = watch_mode;
+    if (mode && (q->session_ids_size() != 1 || q->session_ids(0) != "s1")) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "missing session filter"};
+    }
+    if (mode == 2) {
+      return {grpc::StatusCode::UNAVAILABLE, "background failure"};
+    }
     if (on_watch)
       on_watch();
     if (q->after_sequence() == 900) {
@@ -123,7 +143,7 @@ public:
       }
       return {grpc::StatusCode::CANCELLED, "cancelled"};
     }
-    for (unsigned i = 1; i <= 4; ++i) {
+    for (unsigned i = 1; mode != 3 && i <= 4; ++i) {
       api::TraceEvent e;
       e.set_sequence(i);
       e.set_session_id("s1");
@@ -145,6 +165,11 @@ public:
         break;
       }
     }
+    if (mode == 1 || mode == 3) {
+      while (!c->IsCancelled()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+    }
     return grpc::Status::OK;
   }
 };
@@ -153,7 +178,11 @@ public:
 int main(int argc, char **argv) {
   try {
     Service service;
-    if (argc == 3 && std::string(argv[1]) == "--listen") {
+    if (argc == 3 &&
+        (std::string(argv[1]) == "--listen" || std::string(argv[1]) == "--listen-live")) {
+      if (std::string(argv[1]) == "--listen-live") {
+        service.watch_mode = 1;
+      }
       grpc::ServerBuilder builder;
       builder.AddListeningPort(argv[2], grpc::InsecureServerCredentials());
       builder.RegisterService(&service);
@@ -299,6 +328,115 @@ int main(int argc, char **argv) {
     }
     service.pair_created = false;
     service.attach_mode = 0;
+    auto wait_for = [](auto predicate) {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+      while (!predicate()) {
+        require(std::chrono::steady_clock::now() < deadline, "background operation did not finish");
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+    };
+    settings.max_events = 2;
+    service.watch_mode = 1;
+    {
+      Controller background(settings, out);
+      Facade tracer(background);
+      auto session = tracer.attach(7);
+      {
+        auto sync = tracer.events(session, 4, 2);
+        require(!sync.running() && sync.snapshot().complete,
+                "synchronous range waits for requested events");
+        unsigned count = 0;
+        for (const auto& event : sync) {
+          (void)event;
+          ++count;
+        }
+        require(count == 2, "sync range preserves bounded retention");
+      }
+      {
+        const auto start = std::chrono::steady_clock::now();
+        auto live = tracer.events_async(session);
+        require(std::chrono::steady_clock::now() - start < std::chrono::seconds(1),
+                "background start returns promptly");
+        wait_for([&] { return live.snapshot().received == 4; });
+        require(live.running(), "collector remains active between REPL inputs");
+        background.execute(parse_command("%sessions"));
+        const auto snapshot = live.snapshot();
+        require(snapshot.size() == 2 && snapshot.evicted == 2,
+                "background retention respects the shared count budget");
+        unsigned count = 0;
+        for (const auto& event : live) {
+          require(event.sequence() == ++count + 2, "C++17 snapshot range order");
+          live.stop();
+        }
+        require(count == 2 && !live.running() && live.snapshot().cancelled && live.error().empty(),
+                "stop preserves iterable snapshots");
+        live.stop();
+        try {
+          (void)tracer.events_async(session);
+          throw std::logic_error("exceeded background storage reservation");
+        } catch (const std::runtime_error&) {
+        }
+      }
+      wait_for([&] { return service.active_watches == 0; });
+      {
+        auto counted = tracer.events_async(session, 4, 2);
+        wait_for([&] { return !counted.running(); });
+        require(counted.snapshot().complete && counted.snapshot().received == 4,
+                "counted collection completes automatically");
+      }
+      service.watch_mode = 3;
+      {
+        auto timed = tracer.events(session, 1, 1);
+        require(!timed.running() && timed.snapshot().timed_out,
+                "synchronous quiet collection returns on deadline");
+      }
+      {
+        std::thread cancel([] {
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          interrupted = true;
+        });
+        auto cancelled = tracer.events(session, 1, 10);
+        cancel.join();
+        interrupted = false;
+        require(cancelled.snapshot().cancelled, "synchronous collection responds to Ctrl+C");
+      }
+      {
+        auto quiet = tracer.events_async(session, 0, 1);
+        unsigned count = 0;
+        for (const auto& event : quiet) {
+          (void)event;
+          ++count;
+        }
+        require(count == 0 && quiet.running(), "empty iteration does not wait");
+        wait_for([&] { return !quiet.running(); });
+        require(quiet.snapshot().timed_out && quiet.error().empty(),
+                "quiet stream deadline is reported");
+      }
+      {
+        auto abandoned = tracer.events_async(session);
+        wait_for([&] { return service.active_watches == 1; });
+      }
+      wait_for([&] { return service.active_watches == 0; });
+      service.watch_mode = 2;
+      {
+        auto broken = tracer.events_async(session);
+        wait_for([&] { return !broken.running(); });
+        require(broken.error().find("background failure") != std::string::npos,
+                "worker reports RPC errors without throwing on another input");
+      }
+      service.watch_mode = 3;
+      auto quiet = tracer.events_async(session);
+      wait_for([&] { return service.active_watches == 1; });
+      tracer.detach(session);
+      require(!quiet.running(), "detach joins the session's worker");
+    }
+    {
+      Controller background(settings, out);
+      auto live = background.events_async(background.attach(7), 0, 0);
+      background.shutdown();
+      require(!live.running(), "shutdown joins workers while handles survive");
+    }
+    service.watch_mode = 0;
     server->Shutdown();
     EventBuffer limited(2, 4096);
     for (unsigned i = 0; i < 5; ++i) {

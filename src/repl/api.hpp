@@ -1,5 +1,4 @@
 #pragma once
-#include "event_value.hpp"
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -8,12 +7,16 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
+
+#include "event_value.hpp"
 
 namespace tracer_repl {
 class Controller;
 struct EventData;
+class BackgroundEvents;
 
 struct SessionHandle {
   std::string id;
@@ -69,6 +72,44 @@ struct Collection {
   auto end() const { return events.end(); }
 };
 
+// Iteration visits a stable snapshot of the events retained at begin().
+// It never waits for new events; collection continues independently.
+class EventRange {
+  std::shared_ptr<BackgroundEvents> state_;
+  explicit EventRange(std::shared_ptr<BackgroundEvents> state);
+  friend class Controller;
+
+public:
+  struct Sentinel {};
+
+  class Iterator {
+    std::shared_ptr<const Collection> snapshot_;
+    std::size_t index_ = 0;
+
+  public:
+    explicit Iterator(Collection snapshot)
+        : snapshot_(std::make_shared<const Collection>(std::move(snapshot))) {}
+
+    const Event& operator*() const { return snapshot_->at(index_); }
+
+    Iterator& operator++() {
+      ++index_;
+      return *this;
+    }
+
+    bool operator!=(Sentinel) const { return index_ < snapshot_->size(); }
+  };
+
+  Collection snapshot() const;
+  bool running() const;
+  std::string error() const;
+  void stop();
+
+  Iterator begin() const { return Iterator(snapshot()); }
+
+  Sentinel end() const { return {}; }
+};
+
 class Facade {
   Controller *controller_;
 
@@ -82,6 +123,10 @@ public:
                        const std::string &callback_file);
   Collection collect(const SessionHandle &session, std::uint64_t count,
                      unsigned timeout_seconds = 30);
+  EventRange events(const SessionHandle& session, std::uint64_t count,
+                    unsigned timeout_seconds = 30);
+  EventRange events_async(const SessionHandle& session, std::uint64_t count = 0,
+                          unsigned timeout_seconds = 0);
   Collection batch(const std::string &name) const;
   void print(const Event &event) const;
   void print(const Collection &collection) const;

@@ -95,7 +95,8 @@ int main(int argc, char **argv) {
                 help.find("controller_") == std::string::npos,
             "API help hides implementation details");
     require(contains(cpp.complete("tracer."), "batch") &&
-                contains(cpp.complete("tracer.pr"), "print"),
+                contains(cpp.complete("tracer.pr"), "print") &&
+                contains(cpp.complete("tracer.events"), "events_async"),
             "facade completion uses the active compiler");
     require(cpp.complete("tracer.pr").prefix == "pr",
             "only the identifier is replaced");
