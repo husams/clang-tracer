@@ -323,8 +323,10 @@ def main() -> int:
         try:
             target = subprocess.Popen([str(args.target)], stdout=target_log,
                                       stderr=target_log)
+            # Match the REPL's operation budget: installed schema preparation
+            # includes parsing the complete target and standard-library types.
             server = subprocess.Popen([str(args.server), "--agent", str(args.agent),
-                                       "--listen", endpoint, "--timeout", "10",
+                                       "--listen", endpoint, "--timeout", "30",
                                        "--context-durable-dir", str(durable_directory)],
                                       stdout=server_log, stderr=server_log)
             ready_by = time.monotonic() + 12
@@ -343,8 +345,6 @@ def main() -> int:
                     f"could not attach to class target: {attached}")
             session_match = re.search(r"\bsession=([^\s]+)", attached)
             require(session_match is not None, f"attach output lacks session ID: {attached}")
-            session_id = session_match.group(1)
-
             callback = args.output_dir / "canonical-interceptor.cpp"
             callback.write_text((Path(__file__).resolve().parents[1] /
                                  "examples/basic-callbacks/interceptor.cpp").read_text(encoding="utf-8"),
@@ -724,7 +724,6 @@ def main() -> int:
             session_match = re.search(r"\bsession=([^\s]+)", reattached)
             require(session_match is not None,
                     f"reattach output lacks session ID: {reattached}")
-            session_id = session_match.group(1)
             event_cursor = 0  # The restarted server's event sequence is fresh.
 
             # Floating point and pointer Call accessors use the same paired hooks.

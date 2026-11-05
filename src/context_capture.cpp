@@ -154,6 +154,21 @@ bool write_typed_trace_value(BoundedProtoWriter &writer, std::uint32_t field,
   case tracer::ValueType::Void:
     break;
   }
+  if (ok && value.snapshot) {
+    const auto &snapshot = *value.snapshot;
+    const auto text = [](const char *value) { return value ? std::string_view(value) : std::string_view{}; };
+    ok = snapshot.descriptor_size <= 4096 && snapshot.payload_size <= 4096 && snapshot.container_role_count <= 128 && snapshot.record_type_count <= 128 &&
+         writer.begin_message(5) && writer.string(1, text(snapshot.cpp_type)) &&
+         writer.string(2, text(snapshot.root_type)) &&
+         writer.string(3, snapshot.descriptor ? std::string_view(snapshot.descriptor, snapshot.descriptor_size) : std::string_view{}) &&
+         writer.string(4, snapshot.payload ? std::string_view(reinterpret_cast<const char *>(snapshot.payload), snapshot.payload_size) : std::string_view{}) &&
+         writer.u64(5, static_cast<std::uint32_t>(snapshot.status)) && writer.string(6, text(snapshot.detail));
+    for (std::size_t i = 0; ok && i < snapshot.container_role_count; ++i)
+      ok = writer.string(7, text(snapshot.container_roles[i]));
+    for (std::size_t i = 0; ok && i < snapshot.record_type_count; ++i)
+      ok = writer.string(8, text(snapshot.record_types[i]));
+    ok = ok && writer.end_message();
+  }
   return ok && writer.end_message();
 }
 

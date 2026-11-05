@@ -528,6 +528,7 @@ public:
     const auto copy_value = [](const clangtracer::context::v1::TypedTraceValue &in,
                                clangtracer::v1::Value *out) {
       out->set_type(static_cast<clangtracer::v1::ValueType>(in.value_type()));
+      if (in.has_snapshot()) *out->mutable_snapshot() = in.snapshot();
       switch (in.value_case()) {
       case clangtracer::context::v1::TypedTraceValue::kSignedValue:
         if (in.value_type() != clangtracer::v1::INT32 &&

@@ -145,6 +145,11 @@ function(tracer_add_native_repl)
     add_executable(repl-value-tests tests/repl_values.cpp)
     target_link_libraries(repl-value-tests PRIVATE tracer_repl_client)
     add_test(NAME native_repl_values COMMAND repl-value-tests)
+    add_executable(repl-snapshot-storage-tests tests/value_snapshot_storage.cpp "${CMAKE_CURRENT_SOURCE_DIR}/src/value_snapshot_storage.cpp")
+    target_include_directories(repl-snapshot-storage-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(repl-snapshot-storage-tests PRIVATE Threads::Threads)
+    add_test(NAME native_repl_snapshot_storage COMMAND repl-snapshot-storage-tests)
+    set_tests_properties(native_repl_snapshot_storage PROPERTIES TIMEOUT 30)
     add_executable(repl-cpp-tests tests/repl_cpp.cpp "${_repl}/interpreter.cpp" "${_repl}/completion.cpp" "${_repl}/check_process.cpp")
     add_dependencies(repl-cpp-tests clang-tracer-repl-check)
     target_include_directories(repl-cpp-tests SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
@@ -170,6 +175,12 @@ function(tracer_add_native_repl)
           --bool-target $<TARGET_FILE:signature-interceptor-fixture>
           --callback "${CMAKE_CURRENT_SOURCE_DIR}/examples/cpp-interceptors/method.cpp")
       set_tests_properties(native_repl_integration PROPERTIES TIMEOUT 240)
+      add_test(NAME native_repl_complex_integration
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_complex_integration.py"
+          --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+          --target $<TARGET_FILE:repl-complex-fixture>
+          --header "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/repl_complex_types.hpp")
+      set_tests_properties(native_repl_complex_integration PROPERTIES TIMEOUT 600)
     endif()
   endif()
 endfunction()

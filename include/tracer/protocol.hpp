@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 namespace tracer {
@@ -8,7 +9,8 @@ inline constexpr std::uint32_t kProtocolVersion = 2;
 // source_path, including optional Clang receiver context. Older agents reject
 // the version before interpreting the expanded bootstrap request.
 // Version 19 reports a prepared replacement's previous probe ID.
-inline constexpr std::uint32_t kBootstrapVersion = 19;
+// Version 20 adds capture-time owned value snapshots to TraceValue.
+inline constexpr std::uint32_t kBootstrapVersion = 20;
 inline constexpr unsigned kMaxPatchBytes = 64;
 inline constexpr unsigned kMaxArguments = 8;
 inline constexpr unsigned kMaxProbes = 32;
@@ -71,12 +73,34 @@ enum class CallableKind : std::uint32_t {
 };
 enum class TracePhase : std::uint32_t { Pre = 1, Post = 2 };
 
+struct ValueSnapshot {
+  enum Status : std::uint32_t {
+    Complete = 1,
+    Unsupported = 2,
+    LimitExceeded = 3,
+    Failed = 4
+  };
+  const char *cpp_type = nullptr;
+  const char *root_type = nullptr;
+  const char *descriptor = nullptr;
+  std::size_t descriptor_size = 0;
+  const std::byte *payload = nullptr;
+  std::size_t payload_size = 0;
+  Status status = Unsupported;
+  const char *detail = nullptr;
+  const char *const *container_roles = nullptr;
+  std::size_t container_role_count = 0;
+  const char *const *record_types = nullptr;
+  std::size_t record_type_count = 0;
+};
+
 struct TraceValue {
   ValueType type{};
   std::uint32_t reserved = 0;
   std::int64_t signed_value = 0;
   std::uint64_t unsigned_value = 0;
   double real_value = 0;
+  const ValueSnapshot *snapshot = nullptr;
 };
 
 struct CallbackPrintOptions {

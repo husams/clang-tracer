@@ -532,9 +532,11 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
 
     constexpr unsigned kPatchAttempts = 12;
     bool committed = false;
+    unsigned patch_attempts = 0;
     for (unsigned attempt = 0; attempt < kPatchAttempts; ++attempt) {
       if (std::chrono::steady_clock::now() >= deadline)
         break;
+      ++patch_attempts;
       bool patch_applied = false;
       try {
         const injector::CodePatch target_patch{
@@ -627,6 +629,8 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
       probes_.erase(it);
       prepared = false;
       process.detach();
+      if (!patch_attempts)
+        throw std::runtime_error("operation deadline expired before the first entry patch attempt; increase --timeout");
       throw std::runtime_error("entry remained busy; probe was not committed");
     }
     it->second.patch_committed = true;
