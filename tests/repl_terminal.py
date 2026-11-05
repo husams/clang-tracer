@@ -91,6 +91,10 @@ def main():
         until(rb"%help api")
         send("\r")
         until(rb"template <class T> T result_as\(\) const;.*tracer\[7\]> ")
+        send("data.at(0).argument_snapshot(0).cpp_t\t")
+        until(rb"argument_snapshot\(0\)\.cpp_type")
+        send("\x15%help EventV\t\r")
+        until(rb"EventValue \{.*elements\(\) const;.*tracer\[7\]> ")
         # Enter must keep an unfinished block in the editor; Ctrl+C discards it.
         send("for (const auto& e : data.events) {\r")
         send("tracer.print(e);\r")

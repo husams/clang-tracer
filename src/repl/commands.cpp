@@ -222,7 +222,7 @@ const std::vector<std::string> &command_names() {
       result.push_back("%" + entry.first);
     }
     for (const auto &topic : {"api", "tracer", "Event", "Collection",
-                              "SessionHandle", "ScalarValue"})
+                              "SessionHandle", "ScalarValue", "EventValue"})
       result.push_back(std::string("%help ") + topic);
     return result;
   }();

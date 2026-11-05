@@ -87,6 +87,10 @@ int main(int argc, char **argv) {
                 help.find("events") != std::string::npos &&
                 help.find("print") != std::string::npos,
             "API help lists actual public declarations");
+    require(help.find("argument_snapshot") != std::string::npos &&
+                help.find("EventValue") != std::string::npos &&
+                help.find("elements") != std::string::npos,
+            "API help describes owned complex value inspection");
     require(help.find("scalar_as") == std::string::npos &&
                 help.find("controller_") == std::string::npos,
             "API help hides implementation details");
@@ -108,6 +112,9 @@ int main(int argc, char **argv) {
                 !contains(members, "data_"),
             "chained expression completion uses return types and hides private "
             "members");
+    require(contains(cpp.complete("data.at(0).argument_snapshot(0).cpp_t"), "cpp_type") &&
+                contains(cpp.complete("data.at(0).argument_snapshot(0).ele"), "elements"),
+            "completion follows the owned complex-value API");
     require(
         cpp.evaluate(
             "int effects = 0; struct Thing { int count; bool ready() const { "
@@ -191,8 +198,8 @@ int main(int argc, char **argv) {
             "accepted conditional declarations survive subsequent checks");
     require(!cpp.evaluate("data.at(0).argument<bool>(0)"),
             "the user's non-template accessor error is rejected safely");
-    require(!cpp.evaluate("data.at(0).argument_as<std::string>(0)"),
-            "unsupported typed access does not damage earlier declarations");
+    require(!cpp.evaluate("data.at(0).argument_as<std::string, bool>(0)"),
+            "invalid typed access does not damage earlier declarations");
     require(contains(cpp.complete("data.rec"), "received"),
             "completion works immediately after rejected input");
     require(cpp.evaluate("after_throw()"),

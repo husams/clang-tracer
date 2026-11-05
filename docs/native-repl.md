@@ -215,7 +215,7 @@ more.complete
 more.timed_out
 ```
 
-`argument_as<T>(index)` and `result_as<T>()` return ordinary C++ scalars for
+`argument_as<T>(index)` and `result_as<T>()` return owned C++ values for
 live and replayed events, including shared-context events. For a function with
 a captured boolean argument/result:
 
@@ -230,7 +230,8 @@ Bool access requires a captured `BOOL`; integral access requires `INT32`,
 Integer conversions check the destination range, including signed/unsigned
 boundaries. Floating conversions check range and round to the requested
 precision; NaN and infinity are preserved. Mismatched types, missing/invalid
-payloads, void, and pointer/object values throw `std::invalid_argument`.
+payloads and void throw `std::invalid_argument`. Addresses without a captured
+snapshot cannot become a string or local object.
 Out-of-range numeric conversions and argument indices throw `std::out_of_range`.
 A missing result throws `std::runtime_error`; use `has_result()` to check
 presence before accessing it. Native PRE events normally have no result.
@@ -240,6 +241,67 @@ presence before accessing it. Native PRE events normally have no result.
 with `std::get`, `std::get_if`, or `std::visit`. The existing `result()` and
 `argument(index)` methods remain text formatters. Inspect a complete event with
 `tracer.print(event)` or `%events show batch --index 1`.
+
+### Strings and class/struct values
+
+New captures copy string and record contents while the target objects are
+alive. `argument_as<std::string>(index)` and `result_as<std::string>()` return
+owned strings, preserving empty strings, embedded NUL and arbitrary bytes.
+Reference/value arguments are snapshotted at entry; POST events retain that
+entry snapshot even if the function mutates or frees the original contents.
+Return objects are captured at return, before leaving their valid lifetime.
+
+Inspect a record without declaring a local C++ type:
+
+```cpp
+auto value = event.argument_snapshot(0);
+value.cpp_type()
+int id = value.field("id").as<int>();
+std::string name = value.field("name").as<std::string>();
+auto fields = value.fields();
+auto samples = value.field("samples").as<std::vector<int>>();
+```
+
+C++17 has no language reflection for constructing arbitrary local classes.
+Register named members to get an actual local C++ object, independent of the
+target's memory layout. Nested records each need a mapping; standard strings,
+vectors, arrays, lists, deques, maps, sets, and optionals decode recursively.
+
+```cpp
+struct Order { int id; std::string name; std::vector<int> samples; };
+template<> struct tracer_repl::EventRecord<Order> {
+  static constexpr const char* type_name = "Order"; // canonical target type
+  static auto fields() {
+    return std::make_tuple(
+      tracer_repl::event_member("id", &Order::id),
+      tracer_repl::event_member("name", &Order::name),
+      tracer_repl::event_member("samples", &Order::samples));
+  }
+};
+Order order = event.argument_as<Order>(0);
+Order returned = event.result_as<Order>();
+```
+
+The mapping checks the remote record name, required field names, field kinds,
+and numeric ranges. For classes with constructor-only/const members, specialize
+`EventCodec<T>` with `static T decode(const EventValue&)` and return an object
+from your constructor or factory. This custom conversion runs locally.
+
+Automatic target capture supports complete ABI-validated records with public
+serializable fields, including nested records and supported STL members.
+Private/protected fields, unions, bit-fields, volatile data, arbitrary raw
+pointees and wide/custom-character strings are explicitly unavailable.
+There is a 4-KiB payload limit per value, a 16-KiB thread-local capture arena,
+and bounded schema/item/depth limits. Missing, unsupported, truncated, malformed
+or over-budget snapshots throw; partial objects are never returned as complete.
+Older recordings containing only object addresses need a new capture to supply
+contents. The old scalar variant/text APIs remain available.
+
+Snapshots survive detach, target exit, collection clearing and recording replay.
+Both native and shared-context event envelopes carry the same owned data.
+Use `%help EventValue` for the loaded inspection API and Tab on
+`event.argument_snapshot(0).` for its methods. Backend/agent bootstrap version
+20 is required for new captures; install the server and agent together.
 
 The prelude provides `tracer` and a selected-session reference named `session`.
 Copying `session` makes a handle that retains that server/session identity;
@@ -254,9 +316,8 @@ visible summary for an empty collection. Bare void calls work with or without
 a trailing semicolon; the console works around Clang's void value-printing
 behavior without executing calls twice. For text returned by `describe()` or
 the text accessors, use `std::cout << value << std::endl` to display its contents
-consistently across LLVM versions. Typed getters currently cover bools and
-numbers; target object fields and shared state remain available through event
-inspection, rather than reconstruction as arbitrary local C++ objects.
+consistently across LLVM versions. Typed getters also decode owned string,
+container and mapped record snapshots as described above.
 
 Enter continues an unfinished C++ block, parenthesis, bracket, string, or block
 comment in the multiline editor. Ctrl+C discards the entire pending input;
