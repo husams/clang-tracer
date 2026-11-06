@@ -157,7 +157,8 @@ void ServerProcess::start(const std::string &executable,
   if (log < 0) {
     throw std::runtime_error("cannot create server log: " + log_path);
   }
-  std::vector<std::string> args = {binary, "--listen", endpoint_};
+  std::vector<std::string> args = {binary, "--listen", endpoint_,
+                                   "--timeout", std::to_string(timeout_seconds)};
   if (!agent.empty()) {
     args.push_back("--agent");
     args.push_back(agent);
