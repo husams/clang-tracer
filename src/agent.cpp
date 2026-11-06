@@ -1497,8 +1497,21 @@ std::uint64_t validate_debug_entry(const clangtracer::v1::ProbeSpec &spec) {
   const auto &info = spec.debug_info();
   tracer::client::DebugLookupOptions lookup;
   lookup.module = info.module();
+  const auto live_patch = [](std::uint64_t address) -> tracer::client::PreparedCodePatch {
+    const auto *current = agent.load(std::memory_order_acquire);
+    if (current) {
+      for (const auto &probe : current->probes) {
+        if (probe && probe->active.load() && probe->request.original_entry == address) {
+          const auto &patch = probe->request;
+          return {{reinterpret_cast<const char *>(patch.original), patch.patch_size},
+                  {reinterpret_cast<const char *>(patch.installed), patch.patch_size}};
+        }
+      }
+    }
+    return {};
+  };
   const auto checked = spec.has_prepared()
-      ? tracer::client::bind_prepared_callable(::getpid(), spec.prepared(), lookup)
+      ? tracer::client::bind_prepared_callable(::getpid(), spec.prepared(), lookup, live_patch)
       : tracer::client::resolve_debug_callable(::getpid(), info.selector(), lookup);
   if (!info.runtime_entry() || !info.entry_size() ||
       checked.spec.debug_info().SerializeAsString() !=

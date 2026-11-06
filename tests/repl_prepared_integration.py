@@ -83,10 +83,13 @@ def main():
                 offline.stdout + offline.stderr)
 
             target = subprocess.Popen([args.target], stdout=target_log, stderr=subprocess.STDOUT)
-            prefix = f'''%probe resolve {selector} --prepared "{package}" --prepared-mode require
-%probe validate {selector} --callback "{callback}" --prepared "{package}" --prepared-mode require
-%probe inject {selector} --callback "{callback}" --prepared "{package}" --prepared-mode require
-'''
+            prepared = f'--prepared "{package}" --prepared-mode require'
+            validate = f'%probe validate {selector} --callback "{callback}" {prepared}\n'
+            prefix = (
+                f'%probe resolve {selector} {prepared}\n'
+                f'{validate}'
+                f'%probe inject {selector} --callback "{callback}" {prepared}\n'
+            )
             suffix = '''%collect --count 4 --timeout 15 --phase POST --as captured
 auto captured = tracer.batch("captured");
 bool correct = captured.size() == 4;
@@ -95,9 +98,12 @@ std::cout << "PREPARED_TYPED_RESULTS=" << correct << std::endl;
 %probe remove PROBE_ID
 %quit
 '''
-            text = interact(prefix, suffix, target)
+            # Validation must recognize the original bytes under a live detour
+            # even when the target image has no build ID.
+            text = interact(prefix, validate + suffix, target)
+            assert text.count("prepared_used: true") == 2, text
             assert "format_version: 2" in text and "module_sha256:" not in text, text
-            assert "prepared_used: true" in text and "PREPARED_TYPED_RESULTS=1" in text, text
+            assert "PREPARED_TYPED_RESULTS=1" in text, text
             subprocess.run([args.compiler, "-std=c++17", "-DFIRST_DIRECTORY_ENTRY", "-fsyntax-only",
                             package / "generated/adapter.cpp"], check=True)
             assert not (package / "interceptor.cpp").exists()
