@@ -133,7 +133,7 @@ int main(int argc, char **argv) {
   try {
     tr::Settings settings;
     std::uint32_t pid = 0;
-    std::string process;
+    std::string process, startup_path;
     std::vector<std::string> cpp_args;
     bool fail_fast = false;
     if (const auto *endpoint = std::getenv("CLANG_TRACER_ENDPOINT")) {
@@ -146,7 +146,7 @@ int main(int argc, char **argv) {
                      "FILTER] [--endpoint ENDPOINT]\n"
                      "  --server PATH --agent PATH --timeout SECONDS "
                      "--buffer-events N --buffer-bytes N\n"
-                     "  --cpp-arg ARG (repeatable) --fail-fast\n"
+                     "  --cpp-arg ARG (repeatable) --startup FILE --fail-fast\n"
                      "C++17; replxx 0.0.4; ANTLR generator/runtime 4.13.2; "
                      "LLVM 21 or 22.\n"
                      "Use %help for tracing commands and %help api for C++ "
@@ -188,6 +188,8 @@ int main(int argc, char **argv) {
       } else if (option == "--buffer-bytes") {
         settings.max_bytes =
             tr::unsigned_number(value, "buffer bytes", 1024ULL * 1024 * 1024);
+      } else if (option == "--startup") {
+        startup_path = value;
       } else if (option == "--cpp-arg") {
         cpp_args.push_back(value);
       } else {
@@ -202,6 +204,12 @@ int main(int argc, char **argv) {
     if (pid && !process.empty()) {
       throw std::invalid_argument(
           "--attach and --process are mutually exclusive");
+    }
+    std::ifstream startup;
+    if (!startup_path.empty()) {
+      startup.open(startup_path);
+      if (!startup)
+        throw std::runtime_error("cannot open REPL startup file: " + startup_path);
     }
     Signals signals;
     Input input;
@@ -232,9 +240,22 @@ int main(int argc, char **argv) {
           std::cerr << "prepared C++ import skipped: " << error.what() << '\n';
         }
       }
-      const auto line = input.read(controller.prompt());
+      const auto line = [&]() -> std::optional<std::string> {
+        if (startup.is_open()) {
+          std::string command;
+          if (std::getline(startup, command)) {
+            std::cout << controller.prompt() << command << '\n';
+            return command;
+          }
+          if (!startup.eof())
+            throw std::runtime_error("cannot read REPL startup file: " + startup_path);
+          startup.close();
+        }
+        return input.read(controller.prompt());
+      }();
       if (!line)
         break;
+      const bool stop_on_error = fail_fast || startup.is_open();
       const auto first = line->find_first_not_of(" \t\r\n");
       if (first == std::string::npos) {
         continue;
@@ -244,7 +265,7 @@ int main(int argc, char **argv) {
         if ((*line)[first] != '%') {
           if (!cpp.evaluate(*line)) {
             failed = true;
-            if (fail_fast) {
+            if (stop_on_error) {
               break;
             }
           }
@@ -352,7 +373,7 @@ int main(int argc, char **argv) {
         } else if (command.kind == tr::CommandKind::cpp_load) {
           if (!cpp.evaluate(tr::read_source(command.arguments.at(0)))) {
             failed = true;
-            if (fail_fast) {
+            if (stop_on_error) {
               break;
             }
           }
@@ -386,7 +407,7 @@ int main(int argc, char **argv) {
       } catch (const std::exception &error) {
         std::cerr << "error: " << error.what() << '\n';
         failed = true;
-        if (fail_fast) {
+        if (stop_on_error) {
           break;
         }
       }
@@ -394,7 +415,7 @@ int main(int argc, char **argv) {
     // Destroy JIT values before their facade/controller and before detaching.
     cpp.reset();
     controller.shutdown();
-    return (fail_fast || !input.terminal()) && failed ? 1 : 0;
+    return (fail_fast || startup.is_open() || !input.terminal()) && failed ? 1 : 0;
   } catch (const std::exception &error) {
     std::cerr << "clang-tracer-repl: " << error.what() << '\n';
     return 1;

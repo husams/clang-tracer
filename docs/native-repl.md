@@ -435,6 +435,14 @@ to import, the probe stays installed and the snapshots remain
 available. For a package reused from another session, use `%cpp import`
 to select the local application header explicitly.
 
+Named `tracer::Context` events expose their state as owned C++ values.
+`event.state_snapshot(index)` returns an `EventValue` for field inspection.
+`event.state_as<T>(index)` uses the same conversions and record mappings as
+`argument_as<T>`. The index defaults to the first state. Select the custom
+event with `%collect --name NAME`. See the
+[prepared method example](../examples/prepared-injectors/README.md#typed-custom-event)
+for a nested record captured from typed arguments.
+
 ### Save and reuse generated wrappers
 
 `%cpp import` saves its generated `EventRecord<T>` mappings and prints the

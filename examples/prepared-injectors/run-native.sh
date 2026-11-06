@@ -8,7 +8,8 @@ repl=${CLANG_TRACER_REPL:-$build/clang-tracer-repl}
 server=${CLANG_TRACER_SERVER:-$build/clang-tracer-server}
 agent=${CLANG_TRACER_AGENT:-$build/libclang_tracer_agent.so}
 example=prepared-injectors-target
-if [[ ${1:-} == --methods ]]; then
+demo_mode=${1:-}
+if [[ $demo_mode == --methods || $demo_mode == --state ]]; then
   example=prepared-methods-target
   shift
 fi
@@ -16,11 +17,11 @@ target=${CLANG_TRACER_PREPARED_TARGET:-$build/examples/prepared-injectors/$examp
 compdb=${CLANG_TRACER_PREPARED_COMPDB:-$build/compile_commands.json}
 
 if [[ ${1:-} == --help ]]; then
-  printf '%s\n' 'Use --methods for the typed method demo and --smoke for an automated demonstration.'
+  printf '%s\n' 'Use --methods for typed method snapshots or --state for a named event with typed state. Add --smoke for automation.'
   exit 0
 fi
 if [[ $# -gt 1 || ( $# == 1 && $1 != --smoke ) ]]; then
-  printf '%s\n' 'Usage: run-native.sh [--methods] [--smoke|--help]' >&2
+  printf '%s\n' 'Usage: run-native.sh [--methods|--state] [--smoke|--help]' >&2
   exit 2
 fi
 for required in "$repl" "$server" "$agent" "$target" "$compdb"; do
@@ -43,7 +44,28 @@ cd -- "$run"
 unset CLANG_TRACER_ENDPOINT
 
 printf 'Native C++ REPL example: %s\nTarget PID: %s\n' "$run" "$target_pid"
-if [[ $example == prepared-methods-target ]]; then
+if [[ $demo_mode == --state ]]; then
+  if [[ ${1:-} == --smoke ]]; then
+    {
+      cat demo/methods/try-state.repl
+      cat <<'REPL'
+auto value = e.state_snapshot().field("adjustment").field("delta").as<int>();
+std::cout << "NATIVE_STATE_RESULTS=" << (reading.label == "deposit" && reading.parts == std::vector<int>({2, 5}) && reading.adjustment.delta == 4 && reading.adjustment.limit.value() == 30 && value == 4) << std::endl;
+%quit
+REPL
+    } | "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60 \
+                --startup demo/methods/setup-state.repl --fail-fast | tee "$run/smoke.log"
+    grep -q '^NATIVE_STATE_RESULTS=1$' "$run/smoke.log"
+    [[ -f $run/prepared/prepared.pb && ! -e $run/prepared/generated ]]
+  else
+    printf 'Preparing the package, installing the hook, and collecting one event.\n'
+    printf 'Once setup finishes, inspect the native Reading with these commands.\n\n'
+    cat demo/methods/try-state.repl
+    printf '\n%%quit exits the REPL. The metadata package will be in %s/prepared.\n' "$run"
+    "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60 \
+            --startup demo/methods/setup-state.repl
+  fi
+elif [[ $example == prepared-methods-target ]]; then
   if [[ ${1:-} == --smoke ]]; then
     {
       cat demo/methods/try.repl
