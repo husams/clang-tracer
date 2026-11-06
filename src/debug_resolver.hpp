@@ -26,6 +26,10 @@ ResolvedCallable resolve_debug_callable(
     std::uint32_t pid, const std::string &selector,
     const DebugLookupOptions &options = {});
 
+ResolvedCallable bind_prepared_callable(
+    std::uint32_t pid, const clangtracer::v1::PreparedInjector &prepared,
+    const DebugLookupOptions &options = {});
+
 struct DebugSymbol {
   std::string selector;
   std::string linkage_symbol;

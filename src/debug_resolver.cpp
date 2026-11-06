@@ -29,6 +29,7 @@
 #include <llvm/Support/SHA256.h>
 #include <llvm/TargetParser/Triple.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 
 #include "tracer/compat.hpp"
 #include "mapped_path.hpp"
@@ -1025,6 +1026,189 @@ std::optional<std::string> separate_debug_file(
 
 std::vector<std::string> list_debug_modules(std::uint32_t pid) {
   return modules(pid);
+}
+
+ResolvedCallable bind_prepared_callable(std::uint32_t pid,
+                                        const api::PreparedInjector &prepared,
+                                        const DebugLookupOptions &options) {
+  const auto scalar = [](api::ValueType type, bool result) {
+    return (result && type == api::VOID) || type == api::INT32 ||
+           type == api::INT64 || type == api::UINT64 || type == api::FLOAT32 ||
+           type == api::FLOAT64;
+  };
+  const auto &signature = prepared.signature();
+  const bool pinned = prepared.format_version() == 1 &&
+                      prepared.module_sha256().size() == 32 && !prepared.module_name().empty();
+  const bool source_only = prepared.format_version() == 2 &&
+                           prepared.module_sha256().empty() && prepared.module_name().empty();
+  if (prepared.ByteSizeLong() > 64 * 1024 || (!pinned && !source_only) ||
+      prepared.selector().empty() ||
+      prepared.selector().size() > 4096 ||
+      prepared.selector().find('\0') != std::string::npos ||
+      prepared.symbol().empty() || prepared.symbol().size() > 511 ||
+      prepared.symbol().find('\0') != std::string::npos ||
+      prepared.module_name().size() > 4095 ||
+      prepared.module_name().find_first_of("/\0", 0, 2) != std::string::npos ||
+      prepared.target_triple().size() > 256 ||
+      prepared.target_triple().find('\0') != std::string::npos ||
+      !::tracer::compat::starts_with(prepared.target_triple(), "x86_64-") ||
+      prepared.target_triple().find("linux") == std::string::npos ||
+      prepared.target_triple().find("gnux32") != std::string::npos ||
+      signature.kind() != api::FUNCTION || !scalar(signature.result(), true) ||
+      signature.arguments_size() > 8 ||
+      prepared.argument_names_size() != signature.arguments_size())
+    throw std::invalid_argument(
+        "invalid or unsupported prepared injector contract");
+  for (int i = 0; i < signature.arguments_size(); ++i) {
+    const auto &name = prepared.argument_names(i);
+    if (!scalar(signature.arguments(i), false) || name.empty() ||
+        name.size() > 63 || name.find('\0') != std::string::npos)
+      throw std::invalid_argument("invalid prepared argument");
+  }
+  std::vector<ResolvedCallable> matches;
+  for (const auto &path : modules(pid)) {
+    if (options.is_cancelled())
+      throw std::runtime_error("prepared lookup cancelled");
+    if (!options.module.empty()) {
+      if (options.module.front() == '/'
+              ? path != options.module
+              : path.find(options.module) == std::string::npos)
+        continue;
+    } else if (pinned && std::filesystem::path(path).filename() !=
+                            prepared.module_name()) {
+      continue;
+    }
+    struct stat before{};
+    if (::stat(path.c_str(), &before) != 0)
+      throw std::runtime_error("cannot stat prepared module");
+    auto binary = llvm::object::createBinary(path);
+    if (!binary) {
+      llvm::consumeError(binary.takeError());
+      continue;
+    }
+    const auto *object =
+        llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(binary->getBinary());
+    if (!object || object->getArch() != llvm::Triple::x86_64)
+      continue;
+    const auto bytes = binary->getBinary()->getMemoryBufferRef().getBuffer();
+    if (pinned) {
+      const auto digest = llvm::SHA256::hash(llvm::ArrayRef<std::uint8_t>(
+          reinterpret_cast<const std::uint8_t *>(bytes.data()), bytes.size()));
+      if (std::string(reinterpret_cast<const char *>(digest.data()),
+                      digest.size()) != prepared.module_sha256())
+        continue;
+    }
+    std::set<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    const auto visit = [&](const llvm::object::SymbolRef &symbol) {
+      auto name = symbol.getName();
+      if (!name) {
+        llvm::consumeError(name.takeError());
+        return;
+      }
+      if (*name != prepared.symbol())
+        return;
+      auto flags = symbol.getFlags();
+      if (!flags) {
+        llvm::consumeError(flags.takeError());
+        return;
+      }
+      auto type = symbol.getType();
+      if (!type) {
+        llvm::consumeError(type.takeError());
+        return;
+      }
+      if ((*flags & llvm::object::SymbolRef::SF_Undefined) ||
+          *type != llvm::object::SymbolRef::ST_Function ||
+          llvm::object::ELFSymbolRef(symbol).getELFType() !=
+              llvm::ELF::STT_FUNC)
+        return;
+      auto address = symbol.getAddress();
+      if (!address) {
+        llvm::consumeError(address.takeError());
+        return;
+      }
+      const auto size = llvm::object::ELFSymbolRef(symbol).getSize();
+      if (size && size <= std::numeric_limits<std::uint64_t>::max() - *address)
+        ranges.emplace(*address, size);
+    };
+    for (const auto &symbol : object->symbols())
+      visit(symbol);
+    for (const auto &symbol : object->getDynamicSymbolIterators())
+      visit(symbol);
+    if (ranges.empty() && source_only)
+      continue;
+    if (ranges.size() != 1)
+      throw std::runtime_error(
+          "prepared function has no unique concrete ELF symbol");
+
+    api::DebugInfo info;
+    identity(info, path);
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0)
+      throw std::runtime_error("prepared module disappeared");
+    if (before.st_dev != st.st_dev || before.st_ino != st.st_ino ||
+        before.st_size != st.st_size ||
+        before.st_mtim.tv_sec != st.st_mtim.tv_sec ||
+        before.st_mtim.tv_nsec != st.st_mtim.tv_nsec ||
+        before.st_ctim.tv_sec != st.st_ctim.tv_sec ||
+        before.st_ctim.tv_nsec != st.st_ctim.tv_nsec ||
+        static_cast<std::uint64_t>(st.st_size) != bytes.size())
+      throw std::runtime_error("prepared module changed while looking up the symbol");
+    // A replaced file at the same path must not describe the old live mapping.
+    for (const auto &mapping : read_executable_mappings(pid, {path})) {
+      std::istringstream row(mapping.raw);
+      std::string range, permissions, offset, device;
+      std::uint64_t inode = 0;
+      row >> range >> permissions >> offset >> device >> inode;
+      const auto colon = device.find(':');
+      if (colon == std::string::npos ||
+          inode != static_cast<std::uint64_t>(st.st_ino) ||
+          std::stoul(device.substr(0, colon), nullptr, 16) !=
+              major(st.st_dev) ||
+          std::stoul(device.substr(colon + 1), nullptr, 16) != minor(st.st_dev))
+        throw std::runtime_error("prepared module mapping identity changed");
+    }
+    const auto [entry, size] = *ranges.begin();
+    info.set_entry_virtual_address(entry);
+    info.set_entry_size(size);
+    info.set_runtime_entry(
+        runtime_entry(pid, *object, info, entry, entry + size));
+    info.set_selector(prepared.selector());
+    const auto spelling = [](api::ValueType type) -> std::string {
+      switch (type) {
+      case api::VOID: return "void";
+      case api::INT32: return "int";
+      case api::INT64: return "long long";
+      case api::UINT64: return "unsigned long long";
+      case api::FLOAT32: return "float";
+      case api::FLOAT64: return "double";
+      default: throw std::runtime_error("unsupported prepared scalar type");
+      }
+    };
+    info.set_result_cpp_type(spelling(signature.result()));
+    for (int i = 0; i < signature.arguments_size(); ++i) {
+      auto *argument = info.add_arguments();
+      argument->set_index(i);
+      argument->set_cpp_type(spelling(signature.arguments(i)));
+    }
+    ResolvedCallable found;
+    *found.spec.mutable_debug_info() = std::move(info);
+    *found.spec.mutable_prepared() = prepared;
+    *found.spec.mutable_signature() = signature;
+    found.spec.set_symbol(prepared.symbol());
+    for (const auto &name : prepared.argument_names())
+      found.spec.add_argument_names(name);
+    found.declaration = spelling(signature.result()) + " " + prepared.selector();
+    found.source = path;
+    matches.push_back(std::move(found));
+  }
+  if (matches.empty())
+    throw std::runtime_error(pinned
+        ? "PREPARED_MODULE_MISMATCH: no mapped module matches the prepared image digest"
+        : "prepared symbol was not found in the target's mapped modules: " + prepared.symbol());
+  if (matches.size() != 1)
+    throw std::runtime_error("prepared module is ambiguous; select an exact --module path");
+  return std::move(matches.front());
 }
 
 ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& selector,

@@ -15,11 +15,14 @@ detach : 'detach' value?;
 modules : 'modules';
 symbols : 'symbols' symbolOption*;
 symbolOption : ('--filter' | '--module' | '--page') value | '--limit' UINT;
-probe : 'probe' ('resolve' value resolveOption*
+probe : 'probe' ('prepare' value prepareOption+
+      | 'resolve' value resolveOption*
       | 'inject' value '--callback' value deployOption*
       | 'validate' value '--callback' value resolveOption*
       | 'remove' UINT) | 'probes';
-resolveOption : ('--include' | '--compdb' | '--module' | '--compile-option') value;
+prepareOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--output') value;
+resolveOption : ('--include' | '--compdb' | '--module' | '--compile-option'
+                | '--prepared' | '--prepared-mode') value;
 deployOption : resolveOption | '--stack-depth' UINT | '--print-arguments' | '--print-result';
 interceptor : 'interceptor' ('load' value '--as' value | 'edit' value | 'show' value
             | 'upload' value '--target' value deployOption*);
@@ -45,7 +48,7 @@ quit : 'quit' | 'exit';
 value : STRING | WORD | UINT | keyword;
 keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'processes' | 'sessions' | 'use' | 'detach' | 'modules' | 'symbols'
-        | 'probe' | 'resolve' | 'inject' | 'validate' | 'remove' | 'probes'
+        | 'probe' | 'prepare' | 'resolve' | 'inject' | 'validate' | 'remove' | 'probes'
         | 'interceptor' | 'load' | 'edit' | 'show' | 'upload' | 'events'
         | 'list' | 'calls' | 'stats' | 'clear' | 'open' | 'export' | 'json'
         | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'import'

@@ -10,11 +10,19 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <cctype>
+#include <cstdlib>
+#include <cerrno>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <system_error>
 
 #include <grpcpp/grpcpp.h>
 #include <unistd.h>
 
 #include "background_events.hpp"
+
+extern char **environ;
 
 namespace tracer_repl {
 namespace api = clangtracer::v1;
@@ -79,6 +87,67 @@ void resolution_options(api::ResolveProbeRequest &request,
       request.include_headers().empty()) {
     throw std::invalid_argument(
         "--compdb requires --include with a server-host header path");
+  }
+}
+
+std::string compact_selector(const std::string &value) {
+  std::string result;
+  bool space = false;
+  const auto identifier = [](unsigned char c) { return std::isalnum(c) || c == '_'; };
+  for (unsigned char c : value) {
+    if (std::isspace(c)) {
+      space = true;
+      continue;
+    }
+    if (space && !result.empty() && identifier(result.back()) && identifier(c))
+      result += ' ';
+    result += static_cast<char>(c);
+    space = false;
+  }
+  return result;
+}
+
+enum class PreparedMode { off, prefer, require };
+
+template <class Request>
+PreparedMode prepared_options(Request &request, const Command &options,
+                              const std::map<std::string, std::string> &packages,
+                              std::ostream &out) {
+  const auto selector = compact_selector(request.selector());
+  auto directory = options.option("--prepared");
+  if (!options.has("--prepared")) {
+    const auto package = packages.find(selector);
+    if (package != packages.end()) directory = package->second;
+  }
+  const auto mode = options.option("--prepared-mode", directory.empty() ? "off" : "prefer");
+  if (mode == "off") return PreparedMode::off;
+  if (mode != "require" && mode != "prefer")
+    throw std::invalid_argument("--prepared-mode must be off, prefer or require");
+  try {
+    if (directory.empty())
+      throw std::invalid_argument(
+          "No prepared package for this selector. Run %probe prepare or pass --prepared DIRECTORY.");
+    const auto file = std::filesystem::path(directory) / "prepared.pb";
+    if (std::filesystem::file_size(file) > 65536)
+      throw std::runtime_error("prepared metadata exceeds 64 KiB");
+    std::ifstream input(file, std::ios::binary);
+    api::PreparedInjector prepared;
+    if (!input || !prepared.ParseFromIstream(&input))
+      throw std::runtime_error("invalid prepared contract");
+    const bool pinned = prepared.format_version() == 1 &&
+                        prepared.module_sha256().size() == 32 && !prepared.module_name().empty();
+    const bool source_only = prepared.format_version() == 2 &&
+                             prepared.module_sha256().empty() && prepared.module_name().empty();
+    if ((!pinned && !source_only) ||
+        compact_selector(prepared.selector()) != selector)
+      throw std::runtime_error("invalid prepared contract or selector mismatch");
+    *request.mutable_prepared() = prepared;
+    request.set_selector(prepared.selector());
+    return mode == "require" ? PreparedMode::require : PreparedMode::prefer;
+  } catch (const std::exception &error) {
+    if (mode == "require") throw;
+    out << "prepared metadata unavailable; falling back to DWARF: " << error.what() << '\n';
+    return PreparedMode::off;
   }
 }
 } // namespace
@@ -310,13 +379,89 @@ void Controller::detach(const SessionHandle &session) {
 api::ProbeSpec Controller::resolve(const std::string &selector,
                                    const Command &command) {
   require_session(selected_);
+  return resolve_for(selected_, selector, command);
+}
+
+api::ProbeSpec Controller::resolve_for(const SessionHandle &session,
+                                       const std::string &selector,
+                                       const Command &command) {
   api::ResolveProbeRequest request;
-  request.set_session_id(selected_.id);
+  request.set_session_id(session.id);
   request.set_selector(selector);
   resolution_options(request, command);
-  return unary<api::ProbeSpec>(
-      [&](auto &c, auto &r) { return stub_->ResolveProbe(&c, request, &r); },
-      settings_.timeout_seconds);
+  const auto prepared = prepared_options(request, command, prepared_packages_, out_);
+  const auto resolve = [&] {
+    return unary<api::ProbeSpec>(
+        [&](auto &c, auto &r) { return stub_->ResolveProbe(&c, request, &r); },
+        settings_.timeout_seconds);
+  };
+  try {
+    auto spec = resolve();
+    if (prepared != PreparedMode::off &&
+        (!spec.has_prepared() || spec.prepared().SerializeAsString() !=
+                                    request.prepared().SerializeAsString()))
+      throw std::runtime_error("server does not support the prepared contract");
+    return spec;
+  } catch (const std::exception &error) {
+    if (prepared != PreparedMode::prefer) throw;
+    out_ << "prepared contract rejected; falling back to DWARF: " << error.what() << '\n';
+    request.clear_prepared();
+    request.set_selector(selector);
+    return resolve();
+  }
+}
+
+void Controller::prepare(const std::string &selector, const Command &options) {
+  const auto database = options.option("--compdb", "compile_commands.json");
+  if (!options.has("--compdb") && !std::filesystem::is_regular_file(database))
+    throw std::invalid_argument(
+        "compile_commands.json was not found in the current directory. Pass --compdb FILE.");
+  const char *configured = std::getenv("TRACER_PREPARE_EXECUTABLE");
+  std::string executable = "clang-tracer-prepare-injectors-native";
+  if (configured && *configured) {
+    executable = configured;
+  }
+#ifdef __linux__
+  else {
+    std::error_code error;
+    const auto self = std::filesystem::read_symlink("/proc/self/exe", error);
+    if (!error) {
+      const auto sibling = self.parent_path() / executable;
+      if (std::filesystem::is_regular_file(sibling, error)) executable = sibling.string();
+    }
+  }
+#endif
+  std::vector<std::string> arguments{executable, "--selector", selector, "--compdb", database};
+  for (const auto *key : {"--translation-unit", "--module"}) {
+    if (options.has(key)) {
+      arguments.emplace_back(key);
+      arguments.push_back(options.option(key));
+    }
+  }
+  for (const auto *key : {"--include", "--output"}) {
+    const auto found = options.options.find(key);
+    if (found == options.options.end())
+      throw std::invalid_argument(std::string("preparation requires ") + key);
+    for (const auto &value : found->second) {
+      arguments.emplace_back(key);
+      arguments.push_back(value);
+    }
+  }
+  std::vector<char *> argv;
+  for (auto &argument : arguments) argv.push_back(argument.data());
+  argv.push_back(nullptr);
+  pid_t pid = 0;
+  const int started = ::posix_spawnp(&pid, argv.front(), nullptr, nullptr, argv.data(), environ);
+  if (started)
+    throw std::system_error(started, std::generic_category(), "cannot start native preparer");
+  int status = 0;
+  while (::waitpid(pid, &status, 0) < 0)
+    if (errno != EINTR) throw std::runtime_error("cannot wait for native preparation");
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    throw std::runtime_error("native header preparation failed");
+  const auto directory = std::filesystem::absolute(options.option("--output"));
+  prepared_packages_.insert_or_assign(compact_selector(selector), directory.string());
+  out_ << "prepared directory=" << directory << '\n';
 }
 
 std::uint64_t Controller::inject(const SessionHandle &session,
@@ -324,13 +469,7 @@ std::uint64_t Controller::inject(const SessionHandle &session,
                                  const std::string &source,
                                  const Command &options) {
   require_session(session);
-  api::ResolveProbeRequest resolution;
-  resolution.set_session_id(session.id);
-  resolution.set_selector(selector);
-  resolution_options(resolution, options);
-  auto spec = unary<api::ProbeSpec>(
-      [&](auto &c, auto &r) { return stub_->ResolveProbe(&c, resolution, &r); },
-      settings_.timeout_seconds);
+  auto spec = resolve_for(session, selector, options);
   spec.set_callback_source(source);
   spec.set_stack_depth(
       static_cast<unsigned>(options.number("--stack-depth", 0)));
@@ -788,6 +927,9 @@ bool Controller::execute(const Command &command) {
     }
     return true;
   }
+  case K::prepare:
+    prepare(args.at(0), command);
+    return true;
   case K::resolve:
     out_ << resolve(args.at(0), command).DebugString();
     return true;
@@ -807,9 +949,22 @@ bool Controller::execute(const Command &command) {
     *request.mutable_compile_options() = resolution.compile_options();
     request.set_module(resolution.module());
     request.set_compilation_database(resolution.compilation_database());
-    const auto response = unary<api::ValidationReport>(
+    const auto prepared = prepared_options(request, command, prepared_packages_, out_);
+    const auto validate = [&] { return unary<api::ValidationReport>(
         [&](auto &c, auto &r) { return stub_->ValidateProbe(&c, request, &r); },
-        settings_.timeout_seconds);
+        settings_.timeout_seconds); };
+    api::ValidationReport response;
+    try {
+      response = validate();
+      if (prepared != PreparedMode::off && !response.prepared_used())
+        throw std::runtime_error("server does not support prepared validation");
+    } catch (const std::exception &error) {
+      if (prepared != PreparedMode::prefer) throw;
+      out_ << "prepared validation rejected; falling back to DWARF: " << error.what() << '\n';
+      request.clear_prepared();
+      request.set_selector(args.at(0));
+      response = validate();
+    }
     out_ << response.DebugString();
     if (!response.success()) {
       throw std::runtime_error("interceptor validation failed");
@@ -925,6 +1080,12 @@ bool Controller::execute(const Command &command) {
          << "%probe resolve SELECTOR; %probe inject SELECTOR --callback FILE; "
             "%probe validate "
             "SELECTOR --callback FILE\n"
+         << "%probe prepare SELECTOR --include HEADER --output NEW_DIRECTORY\n"
+         << "  overrides: --compdb FILE --translation-unit FILE --module ELF (pin to a build)\n"
+         << "  preparation defaults to compile_commands.json in the current directory\n"
+         << "  uses the first compile command for a source beside the first header\n"
+         << "  uses the prepared package for this selector when available, otherwise DWARF\n"
+         << "  overrides: --prepared DIRECTORY --prepared-mode off|prefer|require\n"
          << "  options: --include SERVER_HEADER --compdb SERVER_PATH "
             "--compile-option FLAG "
             "--module TEXT\n"
@@ -1008,6 +1169,23 @@ SessionHandle Facade::attach(std::uint32_t pid) {
   return controller_->attach(pid);
 }
 
+void Facade::prepare(const std::string &selector, const std::string &header,
+                     const std::string &output, const std::string &compdb,
+                     const std::string &translation_unit) {
+  prepare(selector, header, compdb, translation_unit, {}, output);
+}
+
+void Facade::prepare(const std::string &selector, const std::string &header,
+                     const std::string &compdb, const std::string &translation_unit,
+                     const std::string &module, const std::string &output) {
+  Command options;
+  options.options = {{"--include", {header}}, {"--output", {output}}};
+  if (!compdb.empty()) options.options["--compdb"] = {compdb};
+  if (!translation_unit.empty()) options.options["--translation-unit"] = {translation_unit};
+  if (!module.empty()) options.options["--module"] = {module};
+  controller_->prepare(selector, options);
+}
+
 void Facade::detach(const SessionHandle &session) {
   controller_->detach(session);
 }
@@ -1034,6 +1212,14 @@ EventRange Facade::events_async(const SessionHandle& session, std::uint64_t coun
 
 Collection Facade::batch(const std::string &name) const {
   return controller_->batch(name);
+}
+
+std::uint64_t Facade::inject(const SessionHandle &session,
+                            const std::string &selector, const std::string &file,
+                            const std::string &prepared, const std::string &mode) {
+  Command options;
+  options.options = {{"--prepared", {prepared}}, {"--prepared-mode", {mode}}};
+  return controller_->inject(session, selector, read_source(file), options);
 }
 
 void Facade::print(const Event &event) const { controller_->print(event); }

@@ -13,6 +13,9 @@ struct ResolvedCallable {
   std::string source;
 };
 
+ResolvedCallable resolve_header_callable(const std::string& selector,
+                                         const clangtracer::v1::ProbeSpec& header_context);
+
 // Resolves a C++ callable using the project's compilation database. The
 // selector may include an explicit parameter list and member qualifiers.
 // Throws std::runtime_error for missing, ambiguous, or unsupported callables.

@@ -86,6 +86,30 @@ function(tracer_add_native_repl)
   set(CMAKE_REQUIRED_FLAGS "${_saved_required_flags}")
   set(CMAKE_REQUIRED_LIBRARIES "${_saved_required_libraries}")
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/TracerToolchain.cmake")
+  add_executable(clang-tracer-prepare-injectors-native
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/prepare_injectors_main.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp_resolver.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/header_context.cpp")
+  target_include_directories(clang-tracer-prepare-injectors-native PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  target_include_directories(clang-tracer-prepare-injectors-native SYSTEM PRIVATE
+    ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
+  target_compile_definitions(clang-tracer-prepare-injectors-native PRIVATE
+    TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
+  target_link_libraries(clang-tracer-prepare-injectors-native PRIVATE
+    tracer_repl_rpc clang-cpp LLVM)
+  if(NOT TRACER_REPL_FILESYSTEM_LINKS)
+    target_link_libraries(clang-tracer-prepare-injectors-native PRIVATE stdc++fs)
+  endif()
+  if(TRACER_SDK_ROOT AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(clang-tracer-prepare-injectors-native PRIVATE
+      "-Wl,--push-state,--no-as-needed" rt pthread dl "-Wl,--pop-state")
+  endif()
+  set_target_properties(clang-tracer-prepare-injectors-native PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
+  if(NOT LLVM_ENABLE_RTTI)
+    target_compile_options(clang-tracer-prepare-injectors-native PRIVATE -fno-rtti)
+  endif()
+  install(TARGETS clang-tracer-prepare-injectors-native RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Runtime)
   set(_repl_api_destination "${CMAKE_INSTALL_FULL_DATADIR}/clang-tracer/repl/api.hpp")
   file(RELATIVE_PATH _repl_api_relative "${CMAKE_INSTALL_FULL_BINDIR}" "${_repl_api_destination}")
   file(RELATIVE_PATH _repl_resource_relative "${CMAKE_INSTALL_FULL_BINDIR}"
@@ -117,7 +141,7 @@ function(tracer_add_native_repl)
   endif()
   set_target_properties(clang-tracer-repl-check PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
   add_executable(clang-tracer-repl "${_repl}/main.cpp" "${_repl}/interpreter.cpp" "${_repl}/completion.cpp" "${_repl}/record_mappings.cpp" "${_repl}/check_process.cpp" "${_repl}/check_session.cpp" "${_repl}/shell.cpp" "${_repl}/compiler_profile.cpp" "${_repl}/mapping_cache.cpp")
-  add_dependencies(clang-tracer-repl clang-tracer-repl-check)
+  add_dependencies(clang-tracer-repl clang-tracer-repl-check clang-tracer-prepare-injectors-native)
   target_include_directories(clang-tracer-repl SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
   target_include_directories(clang-tracer-repl PRIVATE "${_generated}")
   target_link_libraries(clang-tracer-repl PRIVATE tracer_repl_client replxx::replxx clang-cpp LLVM)
@@ -190,6 +214,16 @@ function(tracer_add_native_repl)
         $<TARGET_FILE:clang-tracer-repl>)
     set_tests_properties(native_repl_header_reuse PROPERTIES TIMEOUT 240)
     if(NOT TRACER_REPL_ONLY)
+      add_test(NAME native_repl_prepared_integration
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_prepared_integration.py"
+          --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+          --agent $<TARGET_FILE:clang_tracer_agent>
+          --target $<TARGET_FILE:prepared-injectors-target>
+          --changed-target $<TARGET_FILE:prepared-injectors-changed-target>
+          --example "${CMAKE_CURRENT_SOURCE_DIR}/examples/prepared-injectors"
+          --compdb "${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json"
+          --compiler "${CMAKE_CXX_COMPILER}")
+      set_tests_properties(native_repl_prepared_integration PROPERTIES TIMEOUT 240)
       add_test(NAME native_repl_integration
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_native_integration.py"
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>

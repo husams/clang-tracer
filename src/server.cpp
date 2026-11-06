@@ -1264,8 +1264,11 @@ public:
       lookup.max_entries = request->debug_max_entries();
       lookup.max_depth = request->debug_max_depth();
       lookup.is_cancelled = [&] { return context->IsCancelled(); };
-      auto resolved =
-          client::resolve_debug_callable(session->pid(), request->selector(), lookup);
+      if (request->has_prepared() && request->prepared().selector() != request->selector())
+        return {grpc::StatusCode::INVALID_ARGUMENT, "prepared selector mismatch"};
+      auto resolved = request->has_prepared()
+          ? client::bind_prepared_callable(session->pid(), request->prepared(), lookup)
+          : client::resolve_debug_callable(session->pid(), request->selector(), lookup);
       for (const auto &header : request->include_headers())
         resolved.spec.add_include_headers(header);
       for (const auto &option : request->compile_options())
@@ -1281,6 +1284,8 @@ public:
     } catch (const std::exception &error) {
       if (context->IsCancelled())
         return {grpc::StatusCode::CANCELLED, "debug lookup cancelled"};
+      if (request->has_prepared())
+        return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
       return status_for(error);
     }
   }
@@ -1320,8 +1325,11 @@ public:
       lookup.max_entries = request->debug_max_entries();
       lookup.max_depth = request->debug_max_depth();
       lookup.is_cancelled = [&] { return context->IsCancelled(); };
-      auto resolved =
-          client::resolve_debug_callable(session->pid(), request->selector(), lookup);
+      if (request->has_prepared() && request->prepared().selector() != request->selector())
+        return {grpc::StatusCode::INVALID_ARGUMENT, "prepared selector mismatch"};
+      auto resolved = request->has_prepared()
+          ? client::bind_prepared_callable(session->pid(), request->prepared(), lookup)
+          : client::resolve_debug_callable(session->pid(), request->selector(), lookup);
       for (const auto &header : request->include_headers())
         resolved.spec.add_include_headers(header);
       for (const auto &option : request->compile_options())
@@ -1334,6 +1342,7 @@ public:
         return input_valid;
       *response = session->validate_probe(resolved.spec, source_directory_,
                                           request->level());
+      response->set_prepared_used(request->has_prepared());
       if (response->effective_options().empty())
         for (const auto &option : request->compile_options())
           response->add_effective_options(option);
@@ -1345,6 +1354,8 @@ public:
     } catch (const std::exception &error) {
       if (context->IsCancelled())
         return {grpc::StatusCode::CANCELLED, "probe validation cancelled"};
+      if (request->has_prepared())
+        return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
       return status_for(error);
     }
   }
@@ -1747,6 +1758,8 @@ private:
   }
 
   grpc::Status validate_probe(const clangtracer::v1::ProbeSpec &spec) const {
+    if (spec.has_prepared() && !spec.has_debug_info())
+      return {grpc::StatusCode::INVALID_ARGUMENT, "prepared probe requires a live binding"};
     if (spec.stack_depth() > tracer::kMaxStackDepth)
       return {grpc::StatusCode::INVALID_ARGUMENT, "stack depth must be between 0 and 64"};
     if (spec.ByteSizeLong() > 256 * 1024) {

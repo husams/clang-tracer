@@ -71,6 +71,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitPrepareOption(TracerCommandsParser::PrepareOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitResolveOption(TracerCommandsParser::ResolveOptionContext *ctx) override {
     return visitChildren(ctx);
   }

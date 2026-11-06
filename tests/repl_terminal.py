@@ -83,6 +83,8 @@ def main():
         until(rb"Collection retained=4 received=4.*tracer\[7\]> ")
         send("tracer.bat\t")
         until(rb"tracer\.batch")
+        send("\x15tracer.events_a\t")
+        until(rb"tracer\.events_async")
         send("\x15data.rec\t")
         until(rb"data\.received")
         send("\x15data.at(0).desc\t")
