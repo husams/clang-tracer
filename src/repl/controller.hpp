@@ -36,6 +36,7 @@ class Controller {
   };
   std::map<std::uint32_t, PendingAttach> pending_attaches_;
   std::map<std::string, std::string> drafts_;
+  std::map<std::string, std::string> prepared_packages_;
   std::map<std::string, EventBuffer> batches_;
   std::vector<std::weak_ptr<BackgroundEvents>> background_;
   void stop_background(const std::string& session_id = {});
@@ -48,6 +49,9 @@ class Controller {
   std::string reconcile_attaches(bool *snapshot_available = nullptr);
   clangtracer::v1::ProbeSpec resolve(const std::string &selector,
                                      const Command &command);
+  clangtracer::v1::ProbeSpec resolve_for(const SessionHandle &session,
+                                        const std::string &selector,
+                                        const Command &command);
   void watch(const Command &command, bool display,
              const std::string &record_path = {});
   const EventBuffer &buffer(const std::string &name) const;
@@ -61,6 +65,7 @@ public:
   const SessionHandle &selected_session() const { return selected_; }
 
   std::string prompt() const;
+  void prepare(const std::string &selector, const Command &options);
   SessionHandle attach(std::uint32_t pid);
   void detach(const SessionHandle &session);
   void require_session(const SessionHandle &session);

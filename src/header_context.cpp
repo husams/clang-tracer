@@ -1,9 +1,11 @@
 #include "header_context.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 
 #include <clang/Tooling/ArgumentsAdjusters.h>
@@ -37,7 +39,8 @@ bool same_engine_target(const std::string& target) {
 
 } // namespace
 
-void resolve_header_context(clangtracer::v1::ProbeSpec& spec, const std::string& database_path) {
+void resolve_header_context(clangtracer::v1::ProbeSpec& spec, const std::string& database_path,
+                            const std::string& translation_unit, HeaderCommandSelection selection) {
   namespace tooling = clang::tooling;
   if (spec.include_headers().empty()) {
     if (!database_path.empty()) {
@@ -65,15 +68,36 @@ void resolve_header_context(clangtracer::v1::ProbeSpec& spec, const std::string&
       throw std::runtime_error("cannot load compilation database: " + error);
     }
   }
-  database = tooling::inferMissingCompileCommands(tooling::inferTargetAndDriverMode(
-      tooling::expandResponseFiles(std::move(database), llvm::vfs::getRealFileSystem())));
-  const auto commands = database->getCompileCommands(spec.include_headers(0));
-  if (commands.empty()) {
-    throw std::runtime_error("compilation database has no usable header command");
+  database = tooling::inferTargetAndDriverMode(
+      tooling::expandResponseFiles(std::move(database), llvm::vfs::getRealFileSystem()));
+  tooling::CompileCommand donor;
+  if (translation_unit.empty() && selection == HeaderCommandSelection::first_in_header_directory) {
+    const auto directory = std::filesystem::canonical(spec.include_headers(0)).parent_path();
+    const auto commands = database->getAllCompileCommands();
+    const auto match = std::find_if(commands.begin(), commands.end(), [&](const auto& candidate) {
+      const auto source = std::filesystem::path(candidate.Directory) / candidate.Filename;
+      std::error_code path_error;
+      const auto source_directory = std::filesystem::weakly_canonical(source.parent_path(), path_error);
+      return !path_error && source_directory == directory;
+    });
+    if (match == commands.end())
+      throw std::runtime_error("no compile command for a source in " + directory.string() +
+                               ". Pass --translation-unit FILE.");
+    donor = *match;
+  } else {
+    if (translation_unit.empty())
+      database = tooling::inferMissingCompileCommands(std::move(database));
+    auto commands = database->getCompileCommands(
+        translation_unit.empty() ? spec.include_headers(0)
+                                : std::filesystem::absolute(translation_unit).lexically_normal().string());
+    if (!translation_unit.empty() && commands.size() != 1)
+      throw std::runtime_error("--translation-unit must have exactly one compile command");
+    if (commands.empty())
+      throw std::runtime_error("compilation database has no usable header command");
+    donor = std::move(commands.front());
   }
-  // Clang ranks donors using filename and directory similarity. All requested
-  // headers form one translation unit, using the first header's configuration.
-  auto command = tooling::transferCompileCommand(commands.front(), "clang-tracer-debug-types.cc");
+  // All requested headers share the selected command's configuration.
+  auto command = tooling::transferCompileCommand(donor, "clang-tracer-debug-types.cc");
   auto arguments =
       tooling::getClangStripDependencyFileAdjuster()(command.CommandLine, command.Filename);
   arguments = tooling::getClangStripOutputAdjuster()(arguments, command.Filename);
@@ -85,8 +109,7 @@ void resolve_header_context(clangtracer::v1::ProbeSpec& spec, const std::string&
   auto* context = spec.mutable_header_context();
   context->set_working_directory(
       std::filesystem::absolute(command.Directory).lexically_normal().string());
-  context->set_inference(commands.front().Heuristic.empty() ? "exact header command"
-                                                            : commands.front().Heuristic);
+  context->set_inference(donor.Heuristic.empty() ? "exact header command" : donor.Heuristic);
   // Omit argv[0] and the transferred input: only flags cross the wire.
   std::size_t bytes = 0;
   for (std::size_t i = 1; i + 2 < arguments.size(); ++i) {

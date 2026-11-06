@@ -47,6 +47,8 @@ public:
 
     virtual std::any visitProbe(TracerCommandsParser::ProbeContext *context) = 0;
 
+    virtual std::any visitPrepareOption(TracerCommandsParser::PrepareOptionContext *context) = 0;
+
     virtual std::any visitResolveOption(TracerCommandsParser::ResolveOptionContext *context) = 0;
 
     virtual std::any visitDeployOption(TracerCommandsParser::DeployOptionContext *context) = 0;

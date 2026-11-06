@@ -350,6 +350,9 @@ public:
     policy.SuppressScope = false;
     for (const auto* parameter : declaration->parameters()) {
       candidate.parameter_spellings.push_back(type_spelling(parameter->getType(), policy));
+      candidate.spec.add_argument_names(parameter->getName().empty()
+          ? "arg" + std::to_string(candidate.parameter_spellings.size() - 1)
+          : parameter->getNameAsString());
     }
     for (unsigned i = 0; i < prototype->getNumParams(); ++i) {
       candidate.canonical_parameter_spellings.push_back(
@@ -765,6 +768,44 @@ bool matches(const Candidate& candidate, const Selector& selector) {
 
 } // namespace
 
+static ResolvedCallable select_cpp_candidate(std::vector<Candidate> candidates,
+                                                const Selector& selector,
+                                                const std::string& name) {
+  std::unordered_map<std::string, Candidate> unique;
+  for (auto& candidate : candidates) {
+    if (!matches(candidate, selector)) {
+      continue;
+    }
+    const auto existing = unique.find(candidate.symbol);
+    if (existing == unique.end()) {
+      unique.try_emplace(candidate.symbol, std::move(candidate));
+    } else if (existing->second.canonical_identity != candidate.canonical_identity ||
+               existing->second.unsupported_reason != candidate.unsupported_reason) {
+      throw std::runtime_error("conflicting declarations resolve to the same symbol '" +
+                               existing->second.spec.symbol() + "'");
+    }
+  }
+  if (unique.empty()) {
+    throw std::runtime_error("no callable matched '" + name + "'");
+  }
+  if (unique.size() != 1) {
+    std::string message = "callable selector is ambiguous; candidates:";
+    for (const auto& [_, candidate] : unique) {
+      message += "\n  " + candidate.declaration;
+    }
+    throw std::runtime_error(message);
+  }
+  auto candidate = std::move(unique.begin()->second);
+  if (!candidate.unsupported_reason.empty()) {
+    throw std::runtime_error("callable is unsupported: " + candidate.unsupported_reason);
+  }
+  ResolvedCallable resolved;
+  resolved.spec = std::move(candidate.spec);
+  resolved.declaration = std::move(candidate.declaration);
+  resolved.source = std::move(candidate.source);
+  return resolved;
+}
+
 ResolvedCallable resolve_cpp_callable(const std::string& name,
                                       const std::string& compilation_database,
                                       const std::vector<std::string>& sources) {
@@ -862,38 +903,45 @@ ResolvedCallable resolve_cpp_callable(const std::string& name,
                              "diagnostics or restrict --source");
   }
 
-  std::unordered_map<std::string, Candidate> unique;
-  for (auto& candidate : candidates) {
-    if (!matches(candidate, selector)) {
-      continue;
-    }
-    const auto existing = unique.find(candidate.symbol);
-    if (existing == unique.end()) {
-      unique.try_emplace(candidate.symbol, std::move(candidate));
-    } else if (existing->second.canonical_identity != candidate.canonical_identity ||
-               existing->second.unsupported_reason != candidate.unsupported_reason) {
-      throw std::runtime_error("conflicting declarations resolve to the same symbol '" +
-                               existing->second.spec.symbol() + "'");
-    }
-  }
-  if (unique.empty()) {
-    throw std::runtime_error("no callable matched '" + name + "'");
-  }
-  if (unique.size() != 1) {
-    std::string message = "callable selector is ambiguous; candidates:";
-    for (const auto& [_, candidate] : unique) {
-      message += "\n  " + candidate.declaration;
-    }
-    throw std::runtime_error(message);
-  }
-  auto candidate = std::move(unique.begin()->second);
-  if (!candidate.unsupported_reason.empty()) {
-    throw std::runtime_error("callable is unsupported: " + candidate.unsupported_reason);
-  }
-  ResolvedCallable resolved;
-  resolved.spec = std::move(candidate.spec);
-  resolved.declaration = std::move(candidate.declaration);
-  resolved.source = std::move(candidate.source);
+  return select_cpp_candidate(std::move(candidates), selector, name);
+}
+
+ResolvedCallable resolve_header_callable(const std::string& name,
+                                         const api::ProbeSpec& headers) {
+  const auto selector = parse_selector(name);
+  if (!selector.has_parameters || headers.include_headers().empty() ||
+      !headers.has_header_context())
+    throw std::runtime_error("prepared generation requires an explicit selector and header context");
+  std::vector<std::string> arguments(headers.header_context().compiler_arguments().begin(),
+                                     headers.header_context().compiler_arguments().end());
+  arguments.push_back("-resource-dir=" + std::string(TRACER_CLANG_RESOURCE_DIR));
+  arguments.insert(arguments.end(), {"-x", "c++"});
+  const auto source = (fs::path(headers.header_context().working_directory()) /
+                       "clang-tracer-prepared-headers.cc").string();
+  std::string code;
+  for (const auto& header : headers.include_headers())
+    code += "#include \"" + header + "\"\n";
+  clang::tooling::FixedCompilationDatabase database(
+      headers.header_context().working_directory(), arguments);
+  clang::tooling::ClangTool tool(database, {source});
+  tool.mapVirtualFile(source, code);
+  std::vector<Candidate> candidates;
+  std::string target_error, invocation_error;
+  FrozenInvocation invocation;
+  tool.appendArgumentsAdjuster([&](const clang::tooling::CommandLineArguments& args,
+                                   llvm::StringRef filename) {
+    invocation.arguments = args;
+    invocation.source_argument = filename.str();
+    return args;
+  });
+  ActionFactory factory(candidates, target_error, selector.qualified_name, invocation,
+                        invocation_error);
+  const auto result = tool.run(&factory);
+  if (!target_error.empty() || !invocation_error.empty() || result != 0)
+    throw std::runtime_error("cannot parse prepared headers: " + target_error + invocation_error);
+  auto resolved = select_cpp_candidate(std::move(candidates), selector, name);
+  if (resolved.spec.signature().kind() != api::FUNCTION)
+    throw std::runtime_error("prepared generation currently supports free functions only");
   return resolved;
 }
 

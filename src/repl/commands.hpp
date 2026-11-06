@@ -19,6 +19,7 @@ enum class CommandKind {
   detach,
   modules,
   symbols,
+  prepare,
   resolve,
   inject,
   validate,

@@ -59,6 +59,7 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"detach", K::detach},
                                         {"modules", K::modules},
                                         {"symbols", K::symbols},
+                                        {"probe prepare", K::prepare},
                                         {"probe resolve", K::resolve},
                                         {"probe inject", K::inject},
                                         {"probe validate", K::validate},
@@ -180,6 +181,19 @@ Command parse_command(const std::string &input) {
   Builder visitor(tokens);
   visitor.visit(tree);
   auto command = std::move(visitor.result);
+  if (command.kind == K::prepare) {
+    for (const auto* option : {"--include", "--output"})
+      if (!command.has(option) || command.option(option).empty())
+        throw std::invalid_argument(std::string("%probe prepare requires ") + option);
+    for (const auto* option : {"--compdb", "--translation-unit", "--module"})
+      if (command.has(option) && command.option(option).empty())
+        throw std::invalid_argument(std::string(option) + " requires a path");
+  }
+  const auto mode = command.option("--prepared-mode", "prefer");
+  if (mode != "off" && mode != "prefer" && mode != "require")
+    throw std::invalid_argument("--prepared-mode must be off, prefer or require");
+  if (mode != "off" && command.has("--prepared") && command.option("--prepared").empty())
+    throw std::invalid_argument("--prepared requires a directory");
   for (const auto &key : {"--count", "--timeout", "--after", "--probe",
                           "--index", "--limit", "--stack-depth"}) {
     if (command.has(key)) {

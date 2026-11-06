@@ -126,10 +126,21 @@ public:
   explicit Facade(Controller &controller);
   const SessionHandle &selected_session() const;
   SessionHandle attach(std::uint32_t pid);
+  void prepare(const std::string &selector, const std::string &header,
+               const std::string &output, const std::string &compdb = {},
+               const std::string &translation_unit = {});
+  void prepare(const std::string &selector, const std::string &header,
+               const std::string &compdb, const std::string &translation_unit,
+               const std::string &module, const std::string &output);
   void detach(const SessionHandle &session);
   std::uint64_t inject(const SessionHandle &session,
                        const std::string &selector,
                        const std::string &callback_file);
+  std::uint64_t inject(const SessionHandle &session,
+                       const std::string &selector,
+                       const std::string &callback_file,
+                       const std::string &prepared_directory,
+                       const std::string &prepared_mode = "require");
   Collection collect(const SessionHandle &session, std::uint64_t count,
                      unsigned timeout_seconds = 30);
   EventRange events(const SessionHandle& session, std::uint64_t count,

@@ -20,6 +20,23 @@ int main() {
     throw std::runtime_error("accepted malformed command: " + s);
   };
   require(parse_command("%attach 12345").kind == CommandKind::attach);
+  require(parse_command("%probe prepare \"demo::compute(int)\" --include api.hpp "
+      "--compdb build --translation-unit src/api.cpp --module app --output prepared").kind
+          == CommandKind::prepare);
+  const auto prepare = parse_command("%probe prepare \"demo::compute(int)\" --include api.hpp "
+      "--output prepared");
+  require(prepare.kind == CommandKind::prepare && !prepare.has("--compdb") &&
+          !prepare.has("--translation-unit") && !prepare.has("--module"));
+  bad("%probe prepare f --include api.hpp --compdb \"\" "
+      "--translation-unit src/api.cpp --module app --output prepared");
+  bad("%probe prepare f --include api.hpp --translation-unit \"\" --module app --output prepared");
+  require(parse_command("%probe inject \"demo::compute(int)\" --callback hook.cpp "
+      "--prepared prepared --prepared-mode require").option("--prepared-mode") == "require");
+  bad("%probe prepare \"demo::compute(int)\" --include api.hpp");
+  const auto inject = parse_command("%probe inject f --callback h --prepared-mode require");
+  require(inject.option("--prepared-mode") == "require" && !inject.has("--prepared"));
+  bad("%probe inject f --callback h --prepared-mode require --prepared \"\"");
+  bad("%probe inject f --callback h --prepared d --prepared-mode typo");
   auto p = parse_command(
       "%probe inject \"Calculator::multiply(int, int) const\" --callback 'my "
       "callback.cpp' --stack-depth 16");

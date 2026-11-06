@@ -147,6 +147,16 @@ message HeaderContext {
   repeated string compiler_arguments = 2; // Flags only; no donor source input.
   string inference = 3; // Clang's diagnostic identifying the selected command.
 }
+message PreparedInjector {
+  uint32 format_version = 1; // 1 pins a binary, 2 carries source-derived metadata only.
+  bytes module_sha256 = 2; // Required in format 1 and empty in format 2.
+  string module_name = 3; // Required in format 1 and empty in format 2.
+  string selector = 4;
+  string symbol = 5;
+  Signature signature = 6;
+  repeated string argument_names = 7;
+  string target_triple = 8;
+}
 message ProbeSpec {
   string symbol = 1;       // Linkage name/diagnostic; export required only in raw-symbol mode.
   Signature signature = 2; // DWARF-inferred or explicitly supplied ABI contract.
@@ -169,6 +179,7 @@ message ProbeSpec {
   string callback_package_path = 15;
   reserved 16;
   repeated string compile_options = 17;
+  PreparedInjector prepared = 18;
 }
 message AttachRequest {
   uint32 pid = 1;
@@ -206,6 +217,7 @@ message ResolveProbeRequest {
   uint64 debug_max_entries = 6; // Zero is unlimited.
   uint32 debug_max_depth = 7; // Zero is unlimited.
   repeated string compile_options = 8;
+  PreparedInjector prepared = 9;
 }
 message ValidateProbeRequest {
   string session_id = 1;
@@ -219,6 +231,7 @@ message ValidateProbeRequest {
   string module = 8;
   uint64 debug_max_entries = 9;
   uint32 debug_max_depth = 10;
+  PreparedInjector prepared = 11;
 }
 message ValidationDiagnostic {
   string stage = 1;
@@ -233,6 +246,7 @@ message ValidationReport {
   ValidateProbeRequest.Level level = 2;
   repeated string effective_options = 3;
   repeated ValidationDiagnostic diagnostics = 4;
+  bool prepared_used = 5;
 }
 message Probe {
   uint64 id = 1;
