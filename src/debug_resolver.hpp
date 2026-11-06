@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <stdexcept>
 #include <vector>
 
@@ -26,9 +27,17 @@ ResolvedCallable resolve_debug_callable(
     std::uint32_t pid, const std::string &selector,
     const DebugLookupOptions &options = {});
 
+struct PreparedCodePatch {
+  std::string_view original;
+  std::string_view installed;
+};
+
+// The agent supplies its active patch, if any, when checking images without
+// a mapped build ID. The returned views are borrowed for the duration of lookup.
 ResolvedCallable bind_prepared_callable(
     std::uint32_t pid, const clangtracer::v1::PreparedInjector &prepared,
-    const DebugLookupOptions &options = {});
+    const DebugLookupOptions &options = {},
+    const std::function<PreparedCodePatch(std::uint64_t)> &live_patch = {});
 
 struct DebugSymbol {
   std::string selector;

@@ -23,11 +23,14 @@ endfunction()
 
 prepared_demo_target(prepared-injectors-target calculator.cpp "${PREPARED_DEMO_BIAS}")
 if(BUILD_TESTING AND TRACER_BUILD_REPL)
+  # Exercise prepared binding both with and without a loaded ELF build ID.
+  target_link_options(prepared-injectors-target PRIVATE -Wl,--build-id=none)
   # Give the ABI-compatible rebuild its own compile command. The original
   # calculator.cpp stays available as an unambiguous explicit flags donor.
   configure_file(calculator.cpp calculator-changed.cpp COPYONLY)
   prepared_demo_target(prepared-injectors-changed-target
     "${CMAKE_CURRENT_BINARY_DIR}/calculator-changed.cpp" 8)
+  target_link_options(prepared-injectors-changed-target PRIVATE -Wl,--build-id)
 endif()
 
 add_executable(prepared-methods-target methods/target.cpp methods/account.cpp)

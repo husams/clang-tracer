@@ -1,6 +1,7 @@
 #include "debug_resolver.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <filesystem>
 #include <fstream>
@@ -29,9 +30,9 @@
 #include <llvm/Support/SHA256.h>
 #include <llvm/TargetParser/Triple.h>
 #include <sys/stat.h>
-#include <sys/sysmacros.h>
 
 #include "tracer/compat.hpp"
+#include "linux_syscalls.hpp"
 #include "mapped_path.hpp"
 
 namespace tracer::client {
@@ -458,7 +459,8 @@ bool contains_code_range(const std::vector<MappedExecutableRange>& ranges,
 // executable mapping. This handles PIE/DSO relocation and ET_EXEC without
 // assuming that a mapping's start or file offset equals the ELF load base.
 std::uint64_t runtime_entry(std::uint32_t pid, const llvm::object::ELF64LEObjectFile& object,
-                            const api::DebugInfo& info, std::uint64_t low, std::uint64_t high) {
+                            const api::DebugInfo& info, std::uint64_t low, std::uint64_t high,
+                            std::uint64_t* resolved_file_offset = nullptr) {
   const auto& elf = object.getELFFile();
   const auto kind = elf.getHeader().e_type;
   if (kind != llvm::ELF::ET_EXEC && kind != llvm::ELF::ET_DYN) {
@@ -501,10 +503,9 @@ std::uint64_t runtime_entry(std::uint32_t pid, const llvm::object::ELF64LEObject
     if (tracer::detail::canonical_mapped_path(path) != info.module()) {
       continue;
     }
-    const auto colon = device.find(':');
     const auto dash = range.find('-');
-    if (colon == std::string::npos || dash == std::string::npos) {
-      throw std::runtime_error("invalid target mapping identity");
+    if (dash == std::string::npos) {
+      throw std::runtime_error("invalid target mapping range");
     }
     const auto begin = std::stoull(range.substr(0, dash), nullptr, 16);
     const auto end = std::stoull(range.substr(dash + 1), nullptr, 16);
@@ -521,12 +522,65 @@ std::uint64_t runtime_entry(std::uint32_t pid, const llvm::object::ELF64LEObject
         continue;
       }
       entries.insert(entry);
+      if (resolved_file_offset)
+        *resolved_file_offset = file_offset;
     }
   }
   if (entries.size() != 1) {
     throw std::runtime_error("DWARF entry has no unique path-matched executable mapping");
   }
   return *entries.begin();
+}
+
+bool matches_process_bytes(std::uint32_t pid, std::uint64_t address,
+                           std::string_view expected) {
+  if (expected.size() > std::numeric_limits<std::uint64_t>::max() - address)
+    return false;
+  std::array<char, 4096> buffer;
+  while (!expected.empty()) {
+    const auto size = std::min(expected.size(), buffer.size());
+    iovec local{buffer.data(), size};
+    iovec remote{reinterpret_cast<void *>(address), size};
+    if (linux_api::process_vm_readv(pid, &local, 1, &remote, 1, 0) !=
+            static_cast<ssize_t>(size) ||
+        std::string_view(buffer.data(), size) != expected.substr(0, size))
+      return false;
+    address += size;
+    expected.remove_prefix(size);
+  }
+  return true;
+}
+
+std::optional<bool> matches_mapped_build_id(
+    std::uint32_t pid, const llvm::object::ELF64LEObjectFile &object,
+    std::uint64_t load_bias) {
+  const auto id = llvm::object::getBuildID(&object);
+  if (id.empty())
+    return std::nullopt;
+  // LLVM returns a view of the note descriptor in this ELF buffer.
+  const auto *image = reinterpret_cast<const std::uint8_t *>(
+      object.getMemoryBufferRef().getBufferStart());
+  const auto offset = static_cast<std::uint64_t>(id.data() - image);
+  auto programs = object.getELFFile().program_headers();
+  if (!programs) {
+    llvm::consumeError(programs.takeError());
+    return std::nullopt;
+  }
+  bool loadable = false;
+  for (const auto &segment : *programs) {
+    if (segment.p_type != llvm::ELF::PT_LOAD || offset < segment.p_offset)
+      continue;
+    const auto delta = offset - segment.p_offset;
+    const auto limit = std::numeric_limits<std::uint64_t>::max() - load_bias;
+    if (delta > segment.p_filesz || id.size() > segment.p_filesz - delta ||
+        segment.p_vaddr > limit || delta > limit - segment.p_vaddr)
+      continue;
+    loadable = true;
+    if (matches_process_bytes(pid, load_bias + segment.p_vaddr + delta,
+                              {reinterpret_cast<const char *>(id.data()), id.size()}))
+      return true;
+  }
+  return loadable ? std::optional<bool>(false) : std::nullopt;
 }
 
 void describe_record(DWARFDie record, api::DebugInfo& info) {
@@ -1030,7 +1084,9 @@ std::vector<std::string> list_debug_modules(std::uint32_t pid) {
 
 ResolvedCallable bind_prepared_callable(std::uint32_t pid,
                                         const api::PreparedInjector &prepared,
-                                        const DebugLookupOptions &options) {
+                                        const DebugLookupOptions &options,
+                                        const std::function<PreparedCodePatch(
+                                            std::uint64_t)> &live_patch) {
   const auto scalar = [](api::ValueType type, bool result) {
     return (result && type == api::VOID) || type == api::INT32 ||
            type == api::INT64 || type == api::UINT64 || type == api::FLOAT32 ||
@@ -1151,9 +1207,6 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
                             prepared.module_name()) {
       continue;
     }
-    struct stat before{};
-    if (::stat(path.c_str(), &before) != 0)
-      throw std::runtime_error("cannot stat prepared module");
     auto binary = llvm::object::createBinary(path);
     if (!binary) {
       llvm::consumeError(binary.takeError());
@@ -1215,37 +1268,32 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
           "prepared function has no unique concrete ELF symbol");
 
     api::DebugInfo info = types;
-    identity(info, path);
-    struct stat st{};
-    if (::stat(path.c_str(), &st) != 0)
-      throw std::runtime_error("prepared module disappeared");
-    if (before.st_dev != st.st_dev || before.st_ino != st.st_ino ||
-        before.st_size != st.st_size ||
-        before.st_mtim.tv_sec != st.st_mtim.tv_sec ||
-        before.st_mtim.tv_nsec != st.st_mtim.tv_nsec ||
-        before.st_ctim.tv_sec != st.st_ctim.tv_sec ||
-        before.st_ctim.tv_nsec != st.st_ctim.tv_nsec ||
-        static_cast<std::uint64_t>(st.st_size) != bytes.size())
-      throw std::runtime_error("prepared module changed while looking up the symbol");
-    // A replaced file at the same path must not describe the old live mapping.
-    for (const auto &mapping : read_executable_mappings(pid, {path})) {
-      std::istringstream row(mapping.raw);
-      std::string range, permissions, offset, device;
-      std::uint64_t inode = 0;
-      row >> range >> permissions >> offset >> device >> inode;
-      const auto colon = device.find(':');
-      if (colon == std::string::npos ||
-          inode != static_cast<std::uint64_t>(st.st_ino) ||
-          std::stoul(device.substr(0, colon), nullptr, 16) !=
-              major(st.st_dev) ||
-          std::stoul(device.substr(colon + 1), nullptr, 16) != minor(st.st_dev))
-        throw std::runtime_error("prepared module mapping identity changed");
-    }
+    info.set_module(path);
+    info.set_file_size(bytes.size());
     const auto [entry, size] = *ranges.begin();
+    std::uint64_t file_offset = 0;
+    const auto address = runtime_entry(pid, *object, info, entry, entry + size,
+                                       &file_offset);
+    // Verify against bytes in the running process.
+    // For images without a build ID the agent checks the function body, using
+    // its saved prefix when replacing one of its own detours.
+    if (address < entry)
+      throw std::runtime_error("invalid prepared image load bias");
+    if (const auto matched = matches_mapped_build_id(pid, *object, address - entry)) {
+      if (!*matched)
+        throw std::runtime_error("prepared module build ID differs from the live image");
+    } else if (live_patch) {
+      const auto code = std::string_view(bytes.data() + file_offset, size);
+      const auto patch = live_patch(address);
+      const auto prefix_size = patch.original.size();
+      if (code.substr(0, prefix_size) != patch.original ||
+          !matches_process_bytes(pid, address, patch.installed) ||
+          !matches_process_bytes(pid, address + prefix_size, code.substr(prefix_size)))
+        throw std::runtime_error("prepared function code differs from the live image");
+    }
     info.set_entry_virtual_address(entry);
     info.set_entry_size(size);
-    info.set_runtime_entry(
-        runtime_entry(pid, *object, info, entry, entry + size));
+    info.set_runtime_entry(address);
     info.set_selector(prepared.selector());
     const auto spelling = [](api::ValueType type) -> std::string {
       switch (type) {
