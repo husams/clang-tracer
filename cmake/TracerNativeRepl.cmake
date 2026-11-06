@@ -86,12 +86,14 @@ function(tracer_add_native_repl)
   set(CMAKE_REQUIRED_FLAGS "${_saved_required_flags}")
   set(CMAKE_REQUIRED_LIBRARIES "${_saved_required_libraries}")
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/TracerToolchain.cmake")
+  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/TracerJitConfig.cmake")
   add_executable(clang-tracer-prepare-injectors-native
     "${CMAKE_CURRENT_SOURCE_DIR}/src/prepare_injectors_main.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp_resolver.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/header_context.cpp")
   target_include_directories(clang-tracer-prepare-injectors-native PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${PROJECT_BINARY_DIR}/generated")
   target_include_directories(clang-tracer-prepare-injectors-native SYSTEM PRIVATE
     ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
   target_compile_definitions(clang-tracer-prepare-injectors-native PRIVATE
@@ -224,6 +226,16 @@ function(tracer_add_native_repl)
           --compdb "${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json"
           --compiler "${CMAKE_CXX_COMPILER}")
       set_tests_properties(native_repl_prepared_integration PROPERTIES TIMEOUT 240)
+      add_test(NAME native_repl_prepared_methods
+        COMMAND "${CMAKE_COMMAND}" -E env
+          "CLANG_TRACER_PREPARED_BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+          "CLANG_TRACER_REPL=$<TARGET_FILE:clang-tracer-repl>"
+          "CLANG_TRACER_SERVER=$<TARGET_FILE:clang-tracer-server>"
+          "CLANG_TRACER_AGENT=$<TARGET_FILE:clang_tracer_agent>"
+          "CLANG_TRACER_PREPARED_TARGET=$<TARGET_FILE:prepared-methods-target>"
+          bash "${CMAKE_CURRENT_SOURCE_DIR}/examples/prepared-injectors/run-native.sh"
+          --methods --smoke)
+      set_tests_properties(native_repl_prepared_methods PROPERTIES TIMEOUT 120)
       add_test(NAME native_repl_integration
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_native_integration.py"
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>

@@ -11,7 +11,7 @@ inline constexpr std::uint32_t kProtocolVersion = 2;
 // Version 19 reports a prepared replacement's previous probe ID.
 // Version 20 adds capture-time owned value snapshots to TraceValue.
 // Version 21 verifies header-prepared scalar contracts without rescanning DWARF.
-inline constexpr std::uint32_t kBootstrapVersion = 21;
+inline constexpr std::uint32_t kBootstrapVersion = 22;
 inline constexpr unsigned kMaxPatchBytes = 64;
 inline constexpr unsigned kMaxArguments = 8;
 inline constexpr unsigned kMaxProbes = 32;
@@ -112,6 +112,7 @@ struct CallbackPrintOptions {
 struct TraceContext {
   std::uint64_t probe_id = 0;
   std::uint64_t object_address = 0;
+  const ValueSnapshot *receiver_snapshot = nullptr;
   std::uint32_t argument_count = 0;
   std::uint32_t reserved = 0;
   TraceValue arguments[kMaxArguments]{};

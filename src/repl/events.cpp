@@ -343,7 +343,7 @@ class SnapshotDecoder {
         const auto &member = *type->field(i);
         auto name = snapshot_option(member.options(), "tracer_cpp_field_name");
         if (name.empty())
-          name = member.name();
+          name = member.has_json_name() ? member.json_name() : member.name();
         fields.emplace(
             std::move(name),
             decode_field(nested, member,
@@ -575,6 +575,9 @@ ScalarValue Event::result_value() const {
   return typed_scalar(event.result(), event.result().type());
 }
 
+// The native REPL JIT needs a stable destructor for snapshot temporaries.
+EventValue::~EventValue() = default;
+
 EventValue Event::argument_snapshot(std::size_t index) const {
   const auto &event = data_->message;
   if (event.has_context()) {
@@ -596,6 +599,13 @@ EventValue Event::argument_snapshot(std::size_t index) const {
     return std::visit([](auto value) { return EventValue{value}; },
                       typed_scalar(argument, argument.type()));
   return decode_snapshot(argument.snapshot());
+}
+
+EventValue Event::receiver_snapshot() const {
+  const auto &event = data_->message;
+  if (!event.has_receiver_snapshot())
+    throw std::runtime_error("event has no receiver snapshot");
+  return decode_snapshot(event.receiver_snapshot());
 }
 
 EventValue Event::result_snapshot() const {

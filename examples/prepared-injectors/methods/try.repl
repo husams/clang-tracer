@@ -1,0 +1,31 @@
+%probe prepare "prepared_demo::Account::apply(const std::string &, std::vector<int>, prepared_demo::Adjustment, std::unique_ptr<int>, const std::shared_ptr<int> &, const std::weak_ptr<int> &, Choice)" --include demo/methods/account.hpp --output prepared
+%probe resolve "prepared_demo::Account::apply(const std::string &, std::vector<int>, prepared_demo::Adjustment, std::unique_ptr<int>, const std::shared_ptr<int> &, const std::weak_ptr<int> &, Choice)"
+%probe inject "prepared_demo::Account::apply(const std::string &, std::vector<int>, prepared_demo::Adjustment, std::unique_ptr<int>, const std::shared_ptr<int> &, const std::weak_ptr<int> &, Choice)" --callback demo/methods/interceptor.cpp
+%collect --count 2 --timeout 15 --phase POST --as captured
+auto e = tracer.batch("captured").at(0);
+std::cout << e.argument_as<std::string>(0) << std::endl;
+e.argument_snapshot(1).at(1).as<int>()
+e.argument_snapshot(2).field("delta").as<int>()
+e.result_snapshot().field("total").as<int>()
+e.receiver_snapshot().field("prepared_demo::Account::account_id").as<int>()
+e.receiver_snapshot().field("reserve").as<int>()
+e.receiver_snapshot().field("balance").as<int>()
+e.receiver_snapshot().field("ledger_id").as<int>()
+e.receiver_snapshot().field("ledger_version").as<int>()
+std::cout << e.receiver_snapshot().field("ledger_owner").as<std::string>() << std::endl;
+e.receiver_snapshot().field("audit_id").as<int>()
+e.receiver_snapshot().field("prepared_demo::Audit::account_id").as<int>()
+e.receiver_snapshot().field("ledger_flags").as<int>()
+std::cout << e.receiver_snapshot().field("limits").field("second").as<std::string>() << std::endl;
+std::cout << e.receiver_snapshot().field("description").field("item_1").as<std::string>() << std::endl;
+e.receiver_snapshot().field("recent").at(1).as<int>()
+std::cout << e.receiver_snapshot().field("category").as<std::string>() << std::endl;
+e.argument_snapshot(3).field("value").as<int>()
+e.argument_snapshot(4).field("value").as<int>()
+e.argument_snapshot(5).field("expired").as<bool>()
+std::cout << std::get<2>(e.argument_as<std::variant<std::monostate, int, std::string, int>>(6)) << std::endl;
+e.receiver_snapshot().field("ledger_credit").field("value").field("delta").as<int>()
+e.receiver_snapshot().field("ledger_total").field("value").as<int>()
+e.receiver_snapshot().field("ledger_total_ref").field("expired").as<bool>()
+e.receiver_snapshot().field("ledger_choice").field("index").as<unsigned>()
+e.receiver_snapshot().field("ledger_choice").field("alternative_3").as<int>()

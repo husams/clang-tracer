@@ -29,3 +29,11 @@ if(BUILD_TESTING AND TRACER_BUILD_REPL)
   prepared_demo_target(prepared-injectors-changed-target
     "${CMAKE_CURRENT_BINARY_DIR}/calculator-changed.cpp" 8)
 endif()
+
+add_executable(prepared-methods-target methods/target.cpp methods/account.cpp)
+set_target_properties(prepared-methods-target PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+# The runnable demo has no debug information. Its package is bound by ELF
+# linkage and its typed metadata comes from account.hpp.
+target_compile_options(prepared-methods-target PRIVATE
+  -g0 -O0 -fno-omit-frame-pointer -fcf-protection=none)

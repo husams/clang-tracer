@@ -42,6 +42,8 @@ public:
   ScalarValue result_value() const;
   EventValue argument_snapshot(std::size_t index) const;
   EventValue result_snapshot() const;
+  // Owned receiver fields at method entry, available on PRE and POST.
+  EventValue receiver_snapshot() const;
 
   template <class T> T argument_as(std::size_t index) const {
     return argument_snapshot(index).template as<T>();

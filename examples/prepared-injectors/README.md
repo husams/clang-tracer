@@ -131,15 +131,12 @@ and falls back to DWARF when it cannot use the package. Pass
 `--prepared DIRECTORY` to select a package in another directory or from another
 REPL session. Fallback happens during resolution, before the hook is installed.
 
-This native draft supports Linux x86-64 free functions with supported primitive
-value arguments/results: signed 32/64-bit integers, unsigned 64-bit integers,
-float, double, and void results. It excludes methods, object values, pointers,
-references, bool, and variadic functions. Native inferred type names are
-normalized to the scalar ABI. The source declarations and build flags must
-describe the running function's ABI. A source-only package can be reused across
-builds with the same symbol and ABI. Injection locates the symbol in the target's
-loaded modules and compiles the callback. If more than one module defines the
-symbol, pass `--module PATH` when injecting to select the intended module.
+Prepared packages support Linux x86-64 free functions and non-static,
+non-virtual methods. Typed packages retain the declared C++ signature and
+header layout. The declarations and build flags must describe the running
+function's ABI. Injection binds the package to the symbol in the mapped ELF
+image and checks the header types before compiling the callback. If multiple
+modules define the symbol, pass `--module PATH` to select one.
 
 To run the same workflow automatically through the native REPL:
 
@@ -151,3 +148,46 @@ Expect `NATIVE_EVENT_COUNT=4`, `NATIVE_RESULTS=1`, and `detached session=...`.
 This variant restores its hook by detaching through `tracer.detach(session)`.
 
 Set `CLANG_TRACER_PREPARED_BUILD` to use a different CMake build directory.
+
+## Typed method example
+
+Build `prepared-methods-target` and launch with `--methods`. The method demo
+target has no DWARF. The launcher prints the commands and full selector from
+`methods/try.repl` and starts the native C++ REPL.
+
+The method declaration and fields are in `methods/account.hpp`. The callback
+in `methods/interceptor.cpp` specializes `Interceptor<Signature>` with the
+method’s concrete argument and result types. Preparation and injection use the
+same selector. The REPL finds the package registered by `%probe prepare`.
+
+The event accessors return owned snapshots of supported arguments, results,
+and receiver fields. `e.receiver_snapshot()` captures the declaring class
+and its bases at method entry. PRE and POST events for the same call share that
+entry snapshot. Fields at every access level use their short names when unique.
+For hidden fields, use the qualified name, such as
+`e.receiver_snapshot().field("prepared_demo::Audit::account_id").as<int>()`.
+
+The method example exercises strings and string views, a vector by value,
+optional values, a nested user record, a pair, a tuple, an array, a signed
+bit-field, and fields inherited through private and protected bases. It also
+passes owning and weak smart pointers and a variant as typed method arguments.
+The inherited fields exercise a non-null and a null unique pointer, a shared
+pointer, live and expired weak pointers, and variants holding duplicate types
+and `std::monostate`.
+
+An owning smart pointer snapshot exposes `address` and an owned copy under
+`value` when it points to a supported object. A null pointer has address zero.
+Array, opaque, and non-owning aliasing pointers are captured by address.
+A weak pointer records `expired` without acquiring ownership. A variant records
+its `index` and the matching `alternative_N`. For decodable alternatives,
+`argument_as<std::variant<...>>()` reconstructs an owned variant. A valueless
+variant retains its `std::variant_npos` index in the snapshot. Pointer values and
+variants use the same bounded capture budget as the other fields.
+
+Variadic and virtual methods, constructors and destructors, ambiguous repeated
+non-virtual base subobjects, unions, and private reference members are outside
+this example's automatic capture support. Unique pointers with custom deleters
+and recursive pointee graphs also report unavailable snapshots.
+
+Run `./examples/prepared-injectors/run-native.sh --methods --smoke` to check
+the prepared binding and the field values through the native REPL.

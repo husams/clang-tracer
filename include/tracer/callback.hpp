@@ -338,7 +338,9 @@ private:
 
   template <class T> static T decode(const TraceValue &value) {
     using U = std::remove_cv_t<T>;
-    if constexpr (std::is_pointer_v<U>) {
+    if constexpr (std::is_enum_v<U>) {
+      return static_cast<U>(decode<std::underlying_type_t<U>>(value));
+    } else if constexpr (std::is_pointer_v<U>) {
       require_type(value, ValueType::Pointer);
       return reinterpret_cast<U>(
           static_cast<std::uintptr_t>(value.unsigned_value));

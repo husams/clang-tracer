@@ -1037,10 +1037,16 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
            type == api::FLOAT64;
   };
   const auto &signature = prepared.signature();
-  const bool pinned = prepared.format_version() == 1 &&
+  const auto version = prepared.format_version();
+  const bool typed = version == 3;
+  const bool pinned = (version == 1 || typed) &&
                       prepared.module_sha256().size() == 32 && !prepared.module_name().empty();
-  const bool source_only = prepared.format_version() == 2 &&
+  const bool source_only = (version == 2 || typed) &&
                            prepared.module_sha256().empty() && prepared.module_name().empty();
+  const auto supported = [&](api::ValueType type, bool result) {
+    return scalar(type, result) ||
+           (typed && (type == api::BOOL || type == api::POINTER || type == api::OBJECT));
+  };
   if (prepared.ByteSizeLong() > 64 * 1024 || (!pinned && !source_only) ||
       prepared.selector().empty() ||
       prepared.selector().size() > 4096 ||
@@ -1054,16 +1060,83 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
       !::tracer::compat::starts_with(prepared.target_triple(), "x86_64-") ||
       prepared.target_triple().find("linux") == std::string::npos ||
       prepared.target_triple().find("gnux32") != std::string::npos ||
-      signature.kind() != api::FUNCTION || !scalar(signature.result(), true) ||
+      (signature.kind() != api::FUNCTION && !(typed && signature.kind() == api::METHOD)) ||
+      !supported(signature.result(), true) ||
       signature.arguments_size() > 8 ||
       prepared.argument_names_size() != signature.arguments_size())
     throw std::invalid_argument(
         "invalid or unsupported prepared injector contract");
   for (int i = 0; i < signature.arguments_size(); ++i) {
     const auto &name = prepared.argument_names(i);
-    if (!scalar(signature.arguments(i), false) || name.empty() ||
+    if (!supported(signature.arguments(i), false) || name.empty() ||
         name.size() > 63 || name.find('\0') != std::string::npos)
       throw std::invalid_argument("invalid prepared argument");
+  }
+  api::DebugInfo types;
+  if (typed) {
+    // Only accept source layout and signature facts from the artifact.
+    // Live addresses, recovered fields and method entrypoints must never
+    // be copied from a package.
+    const auto &source = prepared.header_types();
+    const auto copy_record = [](const api::DebugInfo &from, api::DebugInfo &to) {
+      if (from.record_name().empty() || from.record_size() == 0 ||
+          from.record_alignment() == 0 || from.prepared_layout_sha256().size() != 32 ||
+          !from.record_is_opaque() ||
+          from.record_calling_convention() != (from.record_pass_by_reference()
+              ? api::RECORD_PASS_BY_REFERENCE : api::RECORD_PASS_BY_VALUE))
+        throw std::invalid_argument("invalid prepared record layout");
+      to.set_record_name(from.record_name());
+      to.set_record_size(from.record_size());
+      to.set_record_alignment(from.record_alignment());
+      to.set_record_is_opaque(true);
+      to.set_record_pass_by_reference(from.record_pass_by_reference());
+      to.set_record_calling_convention(from.record_calling_convention());
+      to.set_prepared_layout_sha256(from.prepared_layout_sha256());
+    };
+    const auto validate_type = [](api::ValueType wire, const std::string &spelling,
+                                  bool object, bool reference, bool record) {
+      if (spelling.empty() || spelling.size() > 4096 ||
+          spelling.find('\0') != std::string::npos ||
+          object != (wire == api::OBJECT) || (object && (!record || reference)) ||
+          (reference && wire != api::POINTER) || (record && !object && !reference))
+        throw std::invalid_argument("invalid prepared C++ type");
+    };
+    if (!prepared.has_header_context() || prepared.include_headers_size() < 1 ||
+        prepared.include_headers_size() > 16 ||
+        source.arguments_size() != signature.arguments_size() ||
+        source.record_name().empty() == (signature.kind() == api::METHOD))
+      throw std::invalid_argument("invalid prepared header metadata");
+    if (signature.kind() == api::METHOD) {
+      copy_record(source, types);
+      types.set_receiver_volatile(source.receiver_volatile());
+    }
+    validate_type(signature.result(), source.result_cpp_type(),
+                  source.result_is_object_value(), source.result_is_reference(),
+                  source.has_result_object_type());
+    types.set_result_cpp_type(source.result_cpp_type());
+    types.set_result_is_reference(source.result_is_reference());
+    types.set_result_is_object_value(source.result_is_object_value());
+    if (source.has_result_object_type()) {
+      copy_record(source.result_object_type(), *types.mutable_result_object_type());
+      types.set_result_pass_by_reference(source.result_object_type().record_pass_by_reference());
+    }
+    for (int i = 0; i < source.arguments_size(); ++i) {
+      const auto &from = source.arguments(i);
+      validate_type(signature.arguments(i), from.cpp_type(), from.is_object_value(),
+                    from.is_reference(), from.has_object_type());
+      auto &to = *types.add_arguments();
+      to.set_index(i);
+      to.set_cpp_type(from.cpp_type());
+      to.set_is_reference(from.is_reference());
+      to.set_is_object_value(from.is_object_value());
+      if (from.has_object_type())
+        copy_record(from.object_type(), *to.mutable_object_type());
+    }
+    if (types.SerializeAsString() != source.SerializeAsString())
+      throw std::invalid_argument("prepared metadata contains unexpected fields");
+  } else if (prepared.has_header_types() || prepared.has_header_context() ||
+             !prepared.include_headers().empty()) {
+    throw std::invalid_argument("unexpected header metadata in scalar package");
   }
   std::vector<ResolvedCallable> matches;
   for (const auto &path : modules(pid)) {
@@ -1141,7 +1214,7 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
       throw std::runtime_error(
           "prepared function has no unique concrete ELF symbol");
 
-    api::DebugInfo info;
+    api::DebugInfo info = types;
     identity(info, path);
     struct stat st{};
     if (::stat(path.c_str(), &st) != 0)
@@ -1185,11 +1258,13 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
       default: throw std::runtime_error("unsupported prepared scalar type");
       }
     };
-    info.set_result_cpp_type(spelling(signature.result()));
-    for (int i = 0; i < signature.arguments_size(); ++i) {
-      auto *argument = info.add_arguments();
-      argument->set_index(i);
-      argument->set_cpp_type(spelling(signature.arguments(i)));
+    if (!typed) {
+      info.set_result_cpp_type(spelling(signature.result()));
+      for (int i = 0; i < signature.arguments_size(); ++i) {
+        auto *argument = info.add_arguments();
+        argument->set_index(i);
+        argument->set_cpp_type(spelling(signature.arguments(i)));
+      }
     }
     ResolvedCallable found;
     *found.spec.mutable_debug_info() = std::move(info);
@@ -1198,7 +1273,11 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
     found.spec.set_symbol(prepared.symbol());
     for (const auto &name : prepared.argument_names())
       found.spec.add_argument_names(name);
-    found.declaration = spelling(signature.result()) + " " + prepared.selector();
+    found.declaration = found.spec.debug_info().result_cpp_type() + " " + prepared.selector();
+    if (typed) {
+      *found.spec.mutable_include_headers() = prepared.include_headers();
+      *found.spec.mutable_header_context() = prepared.header_context();
+    }
     found.source = path;
     matches.push_back(std::move(found));
   }

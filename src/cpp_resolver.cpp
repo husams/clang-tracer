@@ -1,4 +1,6 @@
 #include "cpp_resolver.hpp"
+#include "prepared_types.hpp"
+#include "tracer_runtime_config.hpp"
 
 #include "../include/tracer/receiver_abi.hpp"
 #include "tracer/compat.hpp"
@@ -305,30 +307,16 @@ api::ValueType scalar_type(clang::QualType type, clang::ASTContext& context, boo
   throw std::runtime_error("aggregate, vector, and other non-scalar types are unsupported");
 }
 
-std::string mangle(const clang::FunctionDecl* declaration, clang::ASTContext& context) {
-  auto mangler = std::unique_ptr<clang::MangleContext>(context.createMangleContext());
-  if (!mangler->shouldMangleDeclName(declaration)) {
-    if (declaration->getLanguageLinkage() == clang::CLanguageLinkage) {
-      return declaration->getNameAsString();
-    }
-    throw std::runtime_error("callable has no supported C++ mangled symbol");
-  }
-  std::string symbol;
-  llvm::raw_string_ostream output(symbol);
-  mangler->mangleName(clang::GlobalDecl(declaration), output);
-  output.flush();
-  return symbol;
-}
-
 class Collector : public clang::RecursiveASTVisitor<Collector> {
 public:
   Collector(std::vector<Candidate>& candidates, const std::string& qualified_name,
-            FrozenInvocation invocation, std::string translation_unit, std::string target_triple)
+            FrozenInvocation invocation, std::string translation_unit, std::string target_triple,
+            clang::Sema *sema)
       : candidates_(candidates)
       , qualified_name_(qualified_name)
       , invocation_(std::move(invocation))
       , translation_unit_(std::move(translation_unit))
-      , target_triple_(std::move(target_triple)) {}
+      , target_triple_(std::move(target_triple)), sema_(sema) {}
 
   bool VisitFunctionDecl(clang::FunctionDecl* declaration) {
     if (declaration->getQualifiedNameAsString() != qualified_name_) {
@@ -389,7 +377,7 @@ public:
         "|volatile=" + (candidate.is_volatile ? "1" : "0") +
         "|ref=" + std::to_string(static_cast<int>(candidate.ref_qualifier));
 
-    if (method && !method->isStatic()) {
+    if (method && !method->isStatic() && !sema_) {
       set_receiver(candidate, method, policy);
       if (candidate.spec.has_receiver()) {
         candidate.canonical_identity += receiver_layout_identity(candidate.spec.receiver());
@@ -438,13 +426,17 @@ public:
       if (method && !method->isStatic() && !method->getParent()->isCompleteDefinition()) {
         throw std::runtime_error("incomplete class method is unsupported");
       }
-      candidate.spec.set_symbol(mangle(declaration, *context_));
+      candidate.spec.set_symbol(tracer::prepared::mangle(declaration, *context_));
       candidate.spec.mutable_signature()->set_kind(method && !method->isStatic() ? api::METHOD
                                                                                  : api::FUNCTION);
-      auto* signature = candidate.spec.mutable_signature();
-      signature->set_result(scalar_type(declaration->getReturnType(), *context_, true));
-      for (const auto* parameter : declaration->parameters()) {
-        signature->add_arguments(scalar_type(parameter->getType(), *context_, false));
+      if (sema_) {
+        tracer::prepared::describe_prepared_callable(*context_, *declaration, method,
+                                                    candidate.spec, sema_);
+      } else {
+        auto *signature = candidate.spec.mutable_signature();
+        signature->set_result(scalar_type(declaration->getReturnType(), *context_, true));
+        for (const auto *parameter : declaration->parameters())
+          signature->add_arguments(scalar_type(parameter->getType(), *context_, false));
       }
       candidate.symbol = candidate.spec.symbol();
     } catch (const std::exception& error) {
@@ -455,7 +447,10 @@ public:
     return true;
   }
 
-  void set_context(clang::ASTContext& context) { context_ = &context; }
+  void set_context(clang::ASTContext& context, clang::Sema *sema) {
+    context_ = &context;
+    sema_ = sema;
+  }
 
 private:
   void set_receiver(Candidate& candidate, const clang::CXXMethodDecl* method,
@@ -563,18 +558,19 @@ private:
   FrozenInvocation invocation_;
   std::string translation_unit_;
   std::string target_triple_;
+  clang::Sema *sema_;
 };
 
 class Action : public clang::ASTFrontendAction {
 public:
   explicit Action(std::vector<Candidate>& candidates, std::string& target_error,
                   const std::string& qualified_name, FrozenInvocation& frozen_invocation,
-                  std::string& invocation_error)
+                  std::string& invocation_error, bool prepared = false)
       : candidates_(candidates)
       , target_error_(target_error)
       , qualified_name_(qualified_name)
       , frozen_invocation_(frozen_invocation)
-      , invocation_error_(invocation_error) {}
+      , invocation_error_(invocation_error), prepared_(prepared) {}
 
   bool BeginSourceFileAction(clang::CompilerInstance& compiler) override {
     const auto& target = compiler.getTarget();
@@ -596,22 +592,25 @@ private:
   const std::string& qualified_name_;
   FrozenInvocation& frozen_invocation_;
   std::string& invocation_error_;
+  bool prepared_;
 };
 
 class Consumer : public clang::ASTConsumer {
 public:
   Consumer(std::vector<Candidate>& candidates, const std::string& qualified_name,
-           FrozenInvocation invocation, std::string translation_unit, std::string target_triple)
+           FrozenInvocation invocation, std::string translation_unit, std::string target_triple,
+            clang::CompilerInstance *compiler)
       : visitor_(candidates, qualified_name, std::move(invocation), std::move(translation_unit),
-                 std::move(target_triple)) {}
+                 std::move(target_triple), nullptr), compiler_(compiler) {}
 
   void HandleTranslationUnit(clang::ASTContext& context) override {
-    visitor_.set_context(context);
+    visitor_.set_context(context, compiler_ ? &compiler_->getSema() : nullptr);
     visitor_.TraverseDecl(context.getTranslationUnitDecl());
   }
 
 private:
   Collector visitor_;
+  clang::CompilerInstance *compiler_;
 };
 
 std::unique_ptr<clang::ASTConsumer> Action::CreateASTConsumer(clang::CompilerInstance& compiler,
@@ -620,7 +619,7 @@ std::unique_ptr<clang::ASTConsumer> Action::CreateASTConsumer(clang::CompilerIns
   if (compiler.getFrontendOpts().Inputs.empty()) {
     invocation_error_ = "Clang action has no main translation unit input";
     return std::make_unique<Consumer>(candidates_, qualified_name_, std::move(invocation), "",
-                                      compiler.getTarget().getTriple().str());
+                                      compiler.getTarget().getTriple().str(), prepared_ ? &compiler : nullptr);
   }
   const auto input = compiler.getFrontendOpts().Inputs.front().getFile().str();
   auto& vfs = compiler.getFileManager().getVirtualFileSystem();
@@ -629,7 +628,7 @@ std::unique_ptr<clang::ASTConsumer> Action::CreateASTConsumer(clang::CompilerIns
     invocation_error_ =
         "cannot read Clang VFS working directory: " + vfs_working_directory.getError().message();
     return std::make_unique<Consumer>(candidates_, qualified_name_, std::move(invocation), "",
-                                      compiler.getTarget().getTriple().str());
+                                      compiler.getTarget().getTriple().str(), prepared_ ? &compiler : nullptr);
   }
   auto absolute_vfs_path = [&vfs](llvm::StringRef path) {
     llvm::SmallString<256> normalized(path);
@@ -666,23 +665,23 @@ std::unique_ptr<clang::ASTConsumer> Action::CreateASTConsumer(clang::CompilerIns
   }
   invocation.arguments = std::move(normalized_arguments);
   return std::make_unique<Consumer>(candidates_, qualified_name_, std::move(invocation),
-                                    absolute_input, compiler.getTarget().getTriple().str());
+                                    absolute_input, compiler.getTarget().getTriple().str(), prepared_ ? &compiler : nullptr);
 }
 
 class ActionFactory : public clang::tooling::FrontendActionFactory {
 public:
   ActionFactory(std::vector<Candidate>& candidates, std::string& target_error,
                 const std::string& qualified_name, FrozenInvocation& frozen_invocation,
-                std::string& invocation_error)
+                std::string& invocation_error, bool prepared = false)
       : candidates_(candidates)
       , target_error_(target_error)
       , qualified_name_(qualified_name)
       , frozen_invocation_(frozen_invocation)
-      , invocation_error_(invocation_error) {}
+      , invocation_error_(invocation_error), prepared_(prepared) {}
 
   std::unique_ptr<clang::FrontendAction> create() override {
     return std::make_unique<Action>(candidates_, target_error_, qualified_name_, frozen_invocation_,
-                                    invocation_error_);
+                                    invocation_error_, prepared_);
   }
 
 private:
@@ -691,6 +690,7 @@ private:
   const std::string& qualified_name_;
   FrozenInvocation& frozen_invocation_;
   std::string& invocation_error_;
+  bool prepared_;
 };
 
 std::unique_ptr<clang::tooling::CompilationDatabase> load_database(const std::string& requested) {
@@ -912,8 +912,10 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   if (!selector.has_parameters || headers.include_headers().empty() ||
       !headers.has_header_context())
     throw std::runtime_error("prepared generation requires an explicit selector and header context");
-  std::vector<std::string> arguments(headers.header_context().compiler_arguments().begin(),
-                                     headers.header_context().compiler_arguments().end());
+  // Parse with the same implicit SDK defaults used for the live wrapper.
+  std::vector<std::string> arguments(runtime::jit_flags.begin(), runtime::jit_flags.end());
+  arguments.insert(arguments.end(), headers.header_context().compiler_arguments().begin(),
+                   headers.header_context().compiler_arguments().end());
   arguments.push_back("-resource-dir=" + std::string(TRACER_CLANG_RESOURCE_DIR));
   arguments.insert(arguments.end(), {"-x", "c++"});
   const auto source = (fs::path(headers.header_context().working_directory()) /
@@ -935,14 +937,11 @@ ResolvedCallable resolve_header_callable(const std::string& name,
     return args;
   });
   ActionFactory factory(candidates, target_error, selector.qualified_name, invocation,
-                        invocation_error);
+                        invocation_error, true);
   const auto result = tool.run(&factory);
   if (!target_error.empty() || !invocation_error.empty() || result != 0)
     throw std::runtime_error("cannot parse prepared headers: " + target_error + invocation_error);
-  auto resolved = select_cpp_candidate(std::move(candidates), selector, name);
-  if (resolved.spec.signature().kind() != api::FUNCTION)
-    throw std::runtime_error("prepared generation currently supports free functions only");
-  return resolved;
+  return select_cpp_candidate(std::move(candidates), selector, name);
 }
 
 } // namespace tracer::client

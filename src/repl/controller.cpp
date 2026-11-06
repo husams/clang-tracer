@@ -134,9 +134,10 @@ PreparedMode prepared_options(Request &request, const Command &options,
     api::PreparedInjector prepared;
     if (!input || !prepared.ParseFromIstream(&input))
       throw std::runtime_error("invalid prepared contract");
-    const bool pinned = prepared.format_version() == 1 &&
+    const bool typed = prepared.format_version() == 3;
+    const bool pinned = (prepared.format_version() == 1 || typed) &&
                         prepared.module_sha256().size() == 32 && !prepared.module_name().empty();
-    const bool source_only = prepared.format_version() == 2 &&
+    const bool source_only = (prepared.format_version() == 2 || typed) &&
                              prepared.module_sha256().empty() && prepared.module_name().empty();
     if ((!pinned && !source_only) ||
         compact_selector(prepared.selector()) != selector)
