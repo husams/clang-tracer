@@ -47,20 +47,23 @@ printf 'Native C++ REPL example: %s\nTarget PID: %s\n' "$run" "$target_pid"
 if [[ $demo_mode == --state ]]; then
   if [[ ${1:-} == --smoke ]]; then
     {
-      sed '/^%probe inject /s/$/ --prepared-mode require/' demo/methods/try-state.repl
+      cat demo/methods/try-state.repl
       cat <<'REPL'
 auto value = e.state_snapshot().field("adjustment").field("delta").as<int>();
 std::cout << "NATIVE_STATE_RESULTS=" << (reading.label == "deposit" && reading.parts == std::vector<int>({2, 5}) && reading.adjustment.delta == 4 && reading.adjustment.limit.value() == 30 && value == 4) << std::endl;
 %quit
 REPL
-    } | "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60 --fail-fast | tee "$run/smoke.log"
+    } | "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60 \
+                --startup demo/methods/setup-state.repl --fail-fast | tee "$run/smoke.log"
     grep -q '^NATIVE_STATE_RESULTS=1$' "$run/smoke.log"
     [[ -f $run/prepared/prepared.pb && ! -e $run/prepared/generated ]]
   else
-    printf 'Paste these commands at the native tracer prompt.\n\n'
+    printf 'Preparing the package, installing the hook, and collecting one event.\n'
+    printf 'Once setup finishes, inspect the native Reading with these commands.\n\n'
     cat demo/methods/try-state.repl
     printf '\n%%quit exits the REPL. The metadata package will be in %s/prepared.\n' "$run"
-    "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60
+    "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60 \
+            --startup demo/methods/setup-state.repl
   fi
 elif [[ $example == prepared-methods-target ]]; then
   if [[ ${1:-} == --smoke ]]; then

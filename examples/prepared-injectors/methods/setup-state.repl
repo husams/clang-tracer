@@ -1,0 +1,6 @@
+%probe prepare "prepared_demo::Account::apply(const std::string &, std::vector<int>, prepared_demo::Adjustment, std::unique_ptr<int>, const std::shared_ptr<int> &, const std::weak_ptr<int> &, Choice)" --include demo/methods/account.hpp --include demo/methods/reading.hpp --output prepared --metadata-only
+%probe inject "prepared_demo::Account::apply(const std::string &, std::vector<int>, prepared_demo::Adjustment, std::unique_ptr<int>, const std::shared_ptr<int> &, const std::weak_ptr<int> &, Choice)" --callback demo/methods/state_interceptor.cpp --prepared-mode require
+%collect --name account.adjusted --count 1 --timeout 15 --as adjusted
+if (tracer.batch("adjusted").size() == 0) throw std::runtime_error("account.adjusted produced no events");
+auto e = tracer.batch("adjusted").at(0);
+auto reading = e.state_as<prepared_demo::Reading>();

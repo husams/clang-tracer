@@ -195,9 +195,11 @@ the prepared binding and the field values through the native REPL.
 
 ## Typed custom event
 
-Launch the example with `--state`. The launcher prints the native REPL
-commands in `methods/try-state.repl`. The example prepares the method with
-`--metadata-only`. The smoke test requires that package during injection.
+Launch the example with `--state`. The launcher runs
+`methods/setup-state.repl` in the native REPL to prepare the package, install
+the probe, collect an event, and bind `reading`. Use the inspection commands
+in `methods/try-state.repl` at the prompt. The example prepares the method
+with `--metadata-only` and requires the package during injection.
 Omit `--metadata-only` to keep the separate generated C++ adapter files
 alongside the metadata.
 
