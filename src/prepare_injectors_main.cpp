@@ -1,5 +1,6 @@
 #include "cpp_resolver.hpp"
 #include "header_context.hpp"
+#include "prepared_contract.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -124,12 +125,19 @@ int main(int argc, char **argv) {
                  !legacy(signature.result(), types.result_cpp_type());
     for (int i = 0; i < signature.arguments_size(); ++i)
       typed |= !legacy(signature.arguments(i), types.arguments(i).cpp_type());
-    api::PreparedInjector prepared;
-    prepared.set_format_version(typed ? 3 : module.empty() ? 2 : 1);
+    auto prepared = resolved.spec.prepared();
+    for (const auto &option : context.header_context().compiler_arguments())
+      if (tracer::prepared::abi_option(option))
+        prepared.add_adapter_abi_options(option);
+    tracer::client::verify_prepared_adapter(options.at("--selector"), prepared, resolved);
+    const auto adapter = tracer::prepared::adapter_source(prepared);
+    prepared.set_format_version(typed ? tracer::prepared::typed_version : module.empty() ? 2 : 1);
     if (typed) {
       *prepared.mutable_header_types() = types;
-      *prepared.mutable_header_context() = context.header_context();
-      *prepared.mutable_include_headers() = context.include_headers();
+    } else {
+      prepared.clear_adapter_declarations();
+      prepared.clear_adapter_standard_headers();
+      prepared.clear_adapter_abi_options();
     }
     if (!module.empty()) {
       prepared.set_module_sha256(digest);
@@ -150,9 +158,7 @@ int main(int argc, char **argv) {
         arguments += ", ";
       arguments += arg.cpp_type();
     }
-    std::string declaration = "#pragma once\n";
-    for (const auto &header : headers)
-      declaration += "#include \"" + header + "\"\n";
+    std::string declaration = "#pragma once\n" + adapter;
     declaration += "namespace tracer_prepared {\nusing Result = " +
                    types.result_cpp_type() + ";\nusing Signature = Result(" +
                    arguments + ");\n";

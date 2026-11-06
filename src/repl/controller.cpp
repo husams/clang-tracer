@@ -1,4 +1,5 @@
 #include "controller.hpp"
+#include "../prepared_contract.hpp"
 
 #include <algorithm>
 #include <utility>
@@ -135,7 +136,9 @@ PreparedMode prepared_options(Request &request, const Command &options,
     api::PreparedInjector prepared;
     if (!input || !prepared.ParseFromIstream(&input))
       throw std::runtime_error("invalid prepared contract");
-    const bool typed = prepared.format_version() == 3;
+    if (prepared.format_version() == 3)
+      throw std::runtime_error("legacy typed prepared package requires regeneration");
+    const bool typed = prepared.format_version() == tracer::prepared::typed_version;
     const bool pinned = (prepared.format_version() == 1 || typed) &&
                         prepared.module_sha256().size() == 32 && !prepared.module_name().empty();
     const bool source_only = (prepared.format_version() == 2 || typed) &&
@@ -464,22 +467,16 @@ void Controller::prepare(const std::string &selector, const Command &options) {
     throw std::runtime_error("native header preparation failed");
   const auto directory = std::filesystem::absolute(options.option("--output"));
   PreparedPackage package{directory.string(), {}};
-  for (const auto &header : options.options.at("--include")) {
-    std::error_code error;
-    const auto path = std::filesystem::canonical(header, error);
-    if (error) {
-      // The package is still usable even if a header disappeared after the
-      // preparer exited. Import only a complete locally selected header list.
-      package.local_headers.clear();
-      break;
-    }
-    package.local_headers.push_back(path.string());
-  }
+  const auto file = directory / "prepared.pb";
+  std::ifstream input(file, std::ios::binary);
+  if (!input || std::filesystem::file_size(file) > 65536 ||
+      !package.artifact.ParseFromIstream(&input))
+    throw std::runtime_error("cannot read newly generated prepared package");
   prepared_packages_.insert_or_assign(compact_selector(selector), std::move(package));
   out_ << "prepared directory=" << directory << '\n';
 }
 
-std::vector<std::vector<std::string>> Controller::take_pending_imports() {
+std::vector<std::string> Controller::take_pending_imports() {
   return std::exchange(pending_imports_, {});
 }
 
@@ -503,14 +500,14 @@ std::uint64_t Controller::inject(const SessionHandle &session,
   if (!result.active()) {
     throw std::runtime_error("probe installation did not become active");
   }
-  // A resolved package can come from disk or another host. Only import
-  // headers selected explicitly by the user in this REPL.
-  const auto &headers = request.spec().prepared().include_headers();
+  // Only import declarations generated locally in this REPL and returned
+  // intact by resolution.
+  const auto &artifact = request.spec().prepared();
   const auto package = prepared_packages_.find(compact_selector(selector));
-  if (!headers.empty() && package != prepared_packages_.end() &&
-      std::equal(headers.begin(), headers.end(),
-                 package->second.local_headers.begin(), package->second.local_headers.end()))
-    pending_imports_.push_back(package->second.local_headers);
+  if (artifact.format_version() == tracer::prepared::typed_version &&
+      package != prepared_packages_.end() &&
+      artifact.SerializeAsString() == package->second.artifact.SerializeAsString())
+    pending_imports_.push_back(tracer::prepared::adapter_source(package->second.artifact));
   out_ << "installed probe=" << result.id()
        << " session=" << result.session_id() << '\n';
   return result.id();

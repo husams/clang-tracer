@@ -46,6 +46,28 @@ unset CLANG_TRACER_ENDPOINT
 printf 'Native C++ REPL example: %s\nTarget PID: %s\n' "$run" "$target_pid"
 if [[ $demo_mode == --state ]]; then
   if [[ ${1:-} == --smoke ]]; then
+    mkdir -p application/include application/build
+    cp demo/methods/account.hpp demo/methods/reading.hpp application/include/
+    cat > application/include/unrelated.hpp <<'HEADER'
+#include <iostream>
+namespace unrelated {
+template <class E> void raise(const E &error) { throw error; }
+struct RuntimeOnly { virtual int in_another_library(); };
+inline RuntimeOnly object;
+inline int initialized = object.in_another_library();
+}
+HEADER
+    printf '\n#include "unrelated.hpp"\n' >> application/include/account.hpp
+    printf '[{"directory":"%s/application/build","file":"../include/account.cpp","arguments":["clang++","-std=c++17","-c","../include/account.cpp"]}]\n' \
+      "$run" > application/build/compile_commands.json
+    {
+      IFS= read -r prepare
+      IFS= read -r inject
+      printf '%s --compdb application/build/compile_commands.json\n' "${prepare//demo\/methods\//application\/include\/}"
+      printf '%s\n' '%shell "unlink application/include/account.hpp && unlink application/include/reading.hpp && unlink application/include/unrelated.hpp && unlink application/build/compile_commands.json && rmdir application/include application/build application && echo APPLICATION_HEADERS_REMOVED"'
+      printf '%s\n' "${inject/#%probe inject/%probe validate}" "$inject"
+      cat
+    } < demo/methods/setup-state.repl > setup-without-headers.repl
     {
       cat demo/methods/try-state.repl
       cat <<'REPL'
@@ -54,9 +76,11 @@ std::cout << "NATIVE_STATE_RESULTS=" << (reading.label == "deposit" && reading.p
 %quit
 REPL
     } | "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60 \
-                --startup demo/methods/setup-state.repl --fail-fast | tee "$run/smoke.log"
+                --startup setup-without-headers.repl --fail-fast | tee "$run/smoke.log"
+    grep -q '^APPLICATION_HEADERS_REMOVED$' "$run/smoke.log"
+    grep -q '^prepared_used: true$' "$run/smoke.log"
     grep -q '^NATIVE_STATE_RESULTS=1$' "$run/smoke.log"
-    [[ -f $run/prepared/prepared.pb && ! -e $run/prepared/generated ]]
+    [[ ! -e application && -f $run/prepared/prepared.pb && ! -e $run/prepared/generated ]]
   else
     printf 'Preparing the package, installing the hook, and collecting one event.\n'
     printf 'Once setup finishes, inspect the native Reading with these commands.\n\n'

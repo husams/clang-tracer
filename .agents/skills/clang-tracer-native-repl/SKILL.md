@@ -79,10 +79,10 @@ EOF detaches sessions owned by this REPL and stops its owned server.
   `call.context().event("name")`. Collect the event with
   `%collect --name name --count 1 --timeout 15 --as captured`. Then read
   `state_snapshot()` for fields or `state_as<Payload>()` for a supported
-  C++ value. Include the payload declaration in preparation. Injection
-  attempts to import mappings from the local headers registered by preparation
-  in that session. If a mapping is unavailable, inspect the import diagnostic
-  before using an explicit `%cpp import`. See the demo for supported types and
+  C++ value. Supply the payload declaration as an additional header during
+  preparation. Injection attempts to import mappings from the standalone
+  adapter generated in that session. If a mapping is unavailable, inspect the
+  import diagnostic before using an explicit `%cpp import`. See the demo for supported types and
   capture limits.
 - **Live capture and replay.** Use `tracer.events(session, count, seconds)` for
   a synchronous range or `tracer.events_async(session, count, seconds)` for a

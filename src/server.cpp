@@ -1,4 +1,5 @@
 #include "server.hpp"
+#include "prepared_contract.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1266,6 +1267,9 @@ public:
       lookup.is_cancelled = [&] { return context->IsCancelled(); };
       if (request->has_prepared() && request->prepared().selector() != request->selector())
         return {grpc::StatusCode::INVALID_ARGUMENT, "prepared selector mismatch"};
+      if (request->prepared().format_version() == tracer::prepared::typed_version &&
+          !request->include_headers().empty())
+        return {grpc::StatusCode::INVALID_ARGUMENT, "standalone prepared injection does not accept application headers"};
       auto resolved = request->has_prepared()
           ? client::bind_prepared_callable(session->pid(), request->prepared(), lookup)
           : client::resolve_debug_callable(session->pid(), request->selector(), lookup);
@@ -1327,6 +1331,9 @@ public:
       lookup.is_cancelled = [&] { return context->IsCancelled(); };
       if (request->has_prepared() && request->prepared().selector() != request->selector())
         return {grpc::StatusCode::INVALID_ARGUMENT, "prepared selector mismatch"};
+      if (request->prepared().format_version() == tracer::prepared::typed_version &&
+          !request->include_headers().empty())
+        return {grpc::StatusCode::INVALID_ARGUMENT, "standalone prepared injection does not accept application headers"};
       auto resolved = request->has_prepared()
           ? client::bind_prepared_callable(session->pid(), request->prepared(), lookup)
           : client::resolve_debug_callable(session->pid(), request->selector(), lookup);
@@ -1760,6 +1767,9 @@ private:
   grpc::Status validate_probe(const clangtracer::v1::ProbeSpec &spec) const {
     if (spec.has_prepared() && !spec.has_debug_info())
       return {grpc::StatusCode::INVALID_ARGUMENT, "prepared probe requires a live binding"};
+    if (spec.prepared().format_version() == tracer::prepared::typed_version &&
+        (spec.has_header_context() || !spec.include_headers().empty()))
+      return {grpc::StatusCode::INVALID_ARGUMENT, "standalone prepared injection does not accept application headers"};
     if (spec.stack_depth() > tracer::kMaxStackDepth)
       return {grpc::StatusCode::INVALID_ARGUMENT, "stack depth must be between 0 and 64"};
     if (spec.ByteSizeLong() > 256 * 1024) {

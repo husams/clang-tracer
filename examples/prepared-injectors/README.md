@@ -41,11 +41,12 @@ prepared/
     adapter.cpp
 ```
 
-The native runtime consumes `prepared.pb`. The generated adapter files expose a
-typed function pointer separately from the user-owned interceptor. They are not
-inserted into `interceptor.cpp`, and you do not need to compile them manually.
-Use `--metadata-only` to save just `prepared.pb`. The output directory must
-be new each time.
+The native runtime consumes `prepared.pb`. A typed package embeds the generated
+declarations and the standard library headers they need. Preparation uses the
+application headers to extract and verify the adapter. Injection uses the
+adapter from the package. Use `--metadata-only` to save just `prepared.pb`,
+including the embedded adapter. The optional adapter files remain separate from
+the interceptor. Use a new output directory each time.
 
 ## 2. Validate against the running application
 
@@ -136,8 +137,15 @@ Prepared packages support Linux x86-64 free functions and non-static,
 non-virtual methods. Typed packages retain the declared C++ signature and
 header layout. The declarations and build flags must describe the running
 function's ABI. Injection binds the package to the symbol in the mapped ELF
-image and checks the header types before compiling the callback. If multiple
+image and checks the adapter's ABI and layouts before compiling the callback. If multiple
 modules define the symbol, pass `--module PATH` to select one.
+
+Regenerate version 3 typed packages to obtain the standalone adapter. Generated
+record declarations support layout and value inspection. The current adapter
+generator supports namespace-scope records, enums, inheritance without virtual
+bases, and supported standard library types. Polymorphic records, user-defined
+class templates, and custom copy, move, or destruction code need a different
+representation. Preparation rejects types whose ABI it cannot reproduce.
 
 To run the same workflow automatically through the native REPL:
 
@@ -205,8 +213,13 @@ alongside the metadata.
 
 The interceptor saves a copy of three typed arguments in a scoped
 `prepared_demo::Reading` and publishes `account.adjusted` on return.
-The public payload definition is in `methods/reading.hpp`. Preparation
-registers both application headers for the REPL's automatic mapping import.
+The public payload definition is in `methods/reading.hpp`. Additional
+`--include` inputs can supply callback payload types. After injection, the
+same REPL imports mappings from its generated adapter.
+
+The `--state --smoke` run deletes the staged application headers and compilation
+database after preparation. It requires prepared validation and injection and
+checks the decoded `Reading` in the native REPL.
 
 ```text
 %collect --name account.adjusted --count 1 --timeout 15 --as adjusted

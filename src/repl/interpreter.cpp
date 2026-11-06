@@ -259,6 +259,13 @@ std::string CppEngine::import_headers(const std::vector<std::string> &headers,
          (saved.reused ? "reused generated header: " : "saved generated header: ") + saved.path;
 }
 
+std::string CppEngine::import_prepared_adapter(const std::string &source) {
+  const auto key = mapping_digest(source);
+  const auto path = mapping_cache_directory() / ("prepared-" + key + ".hpp");
+  save_mapping_header(path, key, "#pragma once\n" + source);
+  return import_headers({path.string()});
+}
+
 void CppEngine::initialize() {
   if (impl_) {
     return;
