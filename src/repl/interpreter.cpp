@@ -164,7 +164,7 @@ void CppEngine::set_compiler_options(std::vector<std::string> arguments) {
   arguments_ = std::move(arguments);
 }
 
-CppEngine::MappingHeader CppEngine::mapping_header(const std::string &header,
+CppEngine::MappingHeader CppEngine::mapping_header(const std::vector<std::string> &headers,
     const std::vector<std::string> &types, const std::string &output,
     bool standalone) {
   if (impl_) impl_->verify_inputs();
@@ -174,8 +174,9 @@ CppEngine::MappingHeader CppEngine::mapping_header(const std::string &header,
   const auto helper = std::filesystem::path(executable_path()).parent_path() /
                       "clang-tracer-repl-check";
   std::ostringstream identity;
-  identity << "mapping-cache-v1\n" << std::quoted(header) << '\n'
-           << std::quoted(std::filesystem::current_path().string()) << '\n'
+  identity << (headers.size() == 1 ? "mapping-cache-v1\n" : "mapping-cache-v2\n");
+  for (const auto &header : headers) identity << std::quoted(header) << '\n';
+  identity << std::quoted(std::filesystem::current_path().string()) << '\n'
            << std::quoted(api) << '\n' << mapping_file_digest(helper) << '\n';
   for (const auto &argument : arguments) identity << std::quoted(argument) << '\n';
   identity << "types\n";
@@ -213,7 +214,8 @@ CppEngine::MappingHeader CppEngine::mapping_header(const std::string &header,
   const auto history = independent ? std::to_string(prelude.size()) + "\n" + prelude
                                    : impl_->check_history;
   std::ostringstream request;
-  request << std::quoted(header) << '\n';
+  request << headers.size() << '\n';
+  for (const auto &header : headers) request << std::quoted(header) << '\n';
   for (const auto &type : types)
     request << std::quoted(type) << '\n';
   const auto generated =
@@ -237,14 +239,19 @@ CppEngine::MappingHeader CppEngine::mapping_header(const std::string &header,
 
 std::string CppEngine::generate_header(const std::string &header,
     const std::vector<std::string> &types, const std::string &output) {
-  const auto saved = mapping_header(header, types, output, true);
+  const auto saved = mapping_header({header}, types, output, true);
   return mapping_header_summary(saved.path) + "\n" +
          (saved.reused ? "reused generated header: " : "saved generated header: ") + saved.path;
 }
 
 std::string CppEngine::import_header(const std::string &header,
     const std::vector<std::string> &types, const std::string &output) {
-  const auto saved = mapping_header(header, types, output, false);
+  return import_headers({header}, types, output);
+}
+
+std::string CppEngine::import_headers(const std::vector<std::string> &headers,
+    const std::vector<std::string> &types, const std::string &output) {
+  const auto saved = mapping_header(headers, types, output, false);
   if (!evaluate("#include \"" + saved.path + "\"\n"))
     throw std::runtime_error("application header import failed");
   impl_->mappings[{saved.request_key, std::filesystem::weakly_canonical(saved.path)}] = saved.stored_key;

@@ -1,6 +1,7 @@
 #include "controller.hpp"
 
 #include <algorithm>
+#include <utility>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -109,15 +110,15 @@ std::string compact_selector(const std::string &value) {
 
 enum class PreparedMode { off, prefer, require };
 
-template <class Request>
+template <class Request, class Packages>
 PreparedMode prepared_options(Request &request, const Command &options,
-                              const std::map<std::string, std::string> &packages,
+                              const Packages &packages,
                               std::ostream &out) {
   const auto selector = compact_selector(request.selector());
   auto directory = options.option("--prepared");
   if (!options.has("--prepared")) {
     const auto package = packages.find(selector);
-    if (package != packages.end()) directory = package->second;
+    if (package != packages.end()) directory = package->second.directory;
   }
   const auto mode = options.option("--prepared-mode", directory.empty() ? "off" : "prefer");
   if (mode == "off") return PreparedMode::off;
@@ -461,8 +462,24 @@ void Controller::prepare(const std::string &selector, const Command &options) {
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
     throw std::runtime_error("native header preparation failed");
   const auto directory = std::filesystem::absolute(options.option("--output"));
-  prepared_packages_.insert_or_assign(compact_selector(selector), directory.string());
+  PreparedPackage package{directory.string(), {}};
+  for (const auto &header : options.options.at("--include")) {
+    std::error_code error;
+    const auto path = std::filesystem::canonical(header, error);
+    if (error) {
+      // The package is still usable even if a header disappeared after the
+      // preparer exited. Import only a complete locally selected header list.
+      package.local_headers.clear();
+      break;
+    }
+    package.local_headers.push_back(path.string());
+  }
+  prepared_packages_.insert_or_assign(compact_selector(selector), std::move(package));
   out_ << "prepared directory=" << directory << '\n';
+}
+
+std::vector<std::vector<std::string>> Controller::take_pending_imports() {
+  return std::exchange(pending_imports_, {});
 }
 
 std::uint64_t Controller::inject(const SessionHandle &session,
@@ -485,6 +502,14 @@ std::uint64_t Controller::inject(const SessionHandle &session,
   if (!result.active()) {
     throw std::runtime_error("probe installation did not become active");
   }
+  // A resolved package can come from disk or another host. Only import
+  // headers selected explicitly by the user in this REPL.
+  const auto &headers = request.spec().prepared().include_headers();
+  const auto package = prepared_packages_.find(compact_selector(selector));
+  if (!headers.empty() && package != prepared_packages_.end() &&
+      std::equal(headers.begin(), headers.end(),
+                 package->second.local_headers.begin(), package->second.local_headers.end()))
+    pending_imports_.push_back(package->second.local_headers);
   out_ << "installed probe=" << result.id()
        << " session=" << result.session_id() << '\n';
   return result.id();

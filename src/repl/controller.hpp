@@ -36,7 +36,12 @@ class Controller {
   };
   std::map<std::uint32_t, PendingAttach> pending_attaches_;
   std::map<std::string, std::string> drafts_;
-  std::map<std::string, std::string> prepared_packages_;
+  struct PreparedPackage {
+    std::string directory;
+    std::vector<std::string> local_headers;
+  };
+  std::map<std::string, PreparedPackage> prepared_packages_;
+  std::vector<std::vector<std::string>> pending_imports_;
   std::map<std::string, EventBuffer> batches_;
   std::vector<std::weak_ptr<BackgroundEvents>> background_;
   void stop_background(const std::string& session_id = {});
@@ -66,6 +71,7 @@ public:
 
   std::string prompt() const;
   void prepare(const std::string &selector, const Command &options);
+  std::vector<std::vector<std::string>> take_pending_imports();
   SessionHandle attach(std::uint32_t pid);
   void detach(const SessionHandle &session);
   void require_session(const SessionHandle &session);
