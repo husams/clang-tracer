@@ -45,6 +45,7 @@ public:
   std::string import_headers(const std::vector<std::string> &headers,
                              const std::vector<std::string> &types = {},
                              const std::string &output = {});
+  std::string import_prepared_adapter(const std::string &source);
   std::string generate_header(const std::string &header,
                               const std::vector<std::string> &types = {},
                               const std::string &output = {});

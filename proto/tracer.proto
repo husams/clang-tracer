@@ -149,7 +149,7 @@ message HeaderContext {
   string inference = 3; // Clang's diagnostic identifying the selected command.
 }
 message PreparedInjector {
-  uint32 format_version = 1; // 1/2 are scalar; 3 carries typed header metadata.
+  uint32 format_version = 1; // 1/2 are scalar, 4 carries a standalone typed adapter.
   bytes module_sha256 = 2; // Required for pinned packages, empty otherwise.
   string module_name = 3; // Required for pinned packages, empty otherwise.
   string selector = 4;
@@ -158,8 +158,11 @@ message PreparedInjector {
   repeated string argument_names = 7;
   string target_triple = 8;
   DebugInfo header_types = 9; // Source types and layouts, with no live addresses.
-  repeated string include_headers = 10;
-  HeaderContext header_context = 11;
+  repeated string include_headers = 10; // Legacy version 3.
+  HeaderContext header_context = 11; // Legacy version 3.
+  string adapter_declarations = 12;
+  repeated string adapter_standard_headers = 13;
+  repeated string adapter_abi_options = 14;
 }
 message ProbeSpec {
   string symbol = 1;       // Linkage name/diagnostic; export required only in raw-symbol mode.

@@ -426,14 +426,12 @@ An explicit `%cpp reset` clears C++ variables and unlocks configuration while
 retaining tracing sessions. Local options do not change remote probe settings:
 `--include`, `--compile-option` and `--compdb` still refer to the server.
 
-Successful injection with a typed package prepared in the same REPL loads its
-locally selected headers and eligible mappings automatically. For
-`tracer.inject(...)`, the mappings become available at the next input after
-the call. Imports use the local compiler profile and execute header
-initializers just like an explicit import. If a header or mapping fails
-to import, the probe stays installed and the snapshots remain
-available. For a package reused from another session, use `%cpp import`
-to select the local application header explicitly.
+Successful injection with a typed package prepared in the same REPL imports
+eligible mappings from its standalone adapter. For `tracer.inject(...)`,
+the mappings become available at the next input after the call. The import
+uses the local compiler profile. If the mapping import fails, the probe stays
+installed and snapshots remain available. For a package reused from another
+session, `%cpp import` can load its exported `generated/adapter.hpp`.
 
 Named `tracer::Context` events expose their state as owned C++ values.
 `event.state_snapshot(index)` returns an `EventValue` for field inspection.

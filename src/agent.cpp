@@ -25,6 +25,7 @@
 #include "value_snapshot_storage.hpp"
 #include "context_paths.hpp"
 #include "prepared_types.hpp"
+#include "prepared_contract.hpp"
 
 #include <clang/AST/ASTImporter.h>
 #include <clang/AST/DeclCXX.h>
@@ -1525,14 +1526,6 @@ std::uint64_t validate_debug_entry(const clangtracer::v1::ProbeSpec &spec) {
     throw std::runtime_error("mapped debug image, entry or callable metadata "
                              "changed before injection");
   }
-  if (spec.prepared().format_version() == 3 &&
-      (checked.spec.header_context().SerializeAsString() !=
-           spec.header_context().SerializeAsString() ||
-       spec.include_headers_size() < checked.spec.include_headers_size() ||
-       !std::equal(checked.spec.include_headers().begin(),
-                   checked.spec.include_headers().end(),
-                   spec.include_headers().begin())))
-    throw std::runtime_error("prepared header context changed before injection");
   return checked.spec.debug_info().runtime_entry();
 }
 
@@ -2485,7 +2478,7 @@ std::string make_wrapper(const tracer::Request &r,
                          bool class_mode = false, bool shared_mode = false,
                          bool result_sret = false,
                          const tracer::ValueSnapshotCode *snapshots = nullptr) {
-  const bool typed = spec && spec->prepared().format_version() == 3;
+  const bool typed = spec && spec->prepared().format_version() == tracer::prepared::typed_version;
   const auto indirect_argument = [&](unsigned i) {
     return typed && r.arguments[i] == tracer::ValueType::Object &&
            spec->debug_info().arguments(i).object_type().record_pass_by_reference();
@@ -3076,7 +3069,7 @@ bool validate_specialized_signature(
   }
   // Prepared aliases retain the exact Clang type. The generated
   // static_assert compares the complete signature in the same TU.
-  if (spec.prepared().format_version() == 3)
+  if (spec.prepared().format_version() == tracer::prepared::typed_version)
     return true;
   const auto &info = spec.debug_info();
   if (function->getNumParams() != info.arguments_size()) {
@@ -3661,7 +3654,7 @@ std::string argument_aliases(const clangtracer::v1::ProbeSpec &spec) {
   std::string code =
       "namespace tracer { template<unsigned long> struct ArgumentType; "
       "template<unsigned long> struct ResultType;\n";
-  const bool typed = spec.prepared().format_version() == 3;
+  const bool typed = spec.prepared().format_version() == tracer::prepared::typed_version;
   if (typed)
     code += "template<unsigned> struct PreparedArgument;\n"
             "template<unsigned N> using ResolvedArgument = typename PreparedArgument<N>::type;\n";
@@ -4039,10 +4032,12 @@ bool compile_shared_probe(Probe &p,
   tracer::ContextActivationRequest activation;
   const auto [callback_includes, callback_body] =
       split_callback_includes(specification.callback_source());
-  std::string requested_header_source;
+  const bool typed_prepared = specification.prepared().format_version() == tracer::prepared::typed_version;
+  std::string requested_header_source = typed_prepared
+      ? tracer::prepared::adapter_source(specification.prepared()) : std::string();
   for (const auto &header : specification.include_headers())
     requested_header_source += "#include \"" + header + "\"\n";
-  const bool has_real_headers = specification.has_header_context() ||
+  const bool has_real_headers = typed_prepared || specification.has_header_context() ||
                                 specification.include_headers_size() != 0 ||
                                 !callback_includes.empty() ||
                                 !forced_include_source.empty();
@@ -4057,7 +4052,6 @@ bool compile_shared_probe(Probe &p,
   // Scalar shared wrappers need no user declarations. Recompiling their full
   // callback headers here can consume the operation deadline before admission.
   const auto *wrapper_snapshots = snapshots.arguments.empty() ? nullptr : &snapshots;
-  const bool typed_prepared = specification.prepared().format_version() == 3;
   const std::string wrapper_types = !wrapper_snapshots && !typed_prepared ? std::string() :
       callback_includes + requested_header_source +
       (has_real_headers ? std::string() : recovered_record_declarations(specification)) +
@@ -4304,7 +4298,7 @@ bool validate_prepared_types(clang::ASTUnit &unit,
     finder.TraverseDecl(ast.getTranslationUnitDecl());
     const auto *decl = finder.decl;
     if (!decl)
-      throw std::runtime_error("prepared declaration is absent from its headers");
+      throw std::runtime_error("prepared declaration is absent from its adapter");
     const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(decl);
     const auto *function = decl->getType()->getAs<clang::FunctionProtoType>();
     if (!function || function->isVariadic() || function->getCallConv() != clang::CC_C ||
@@ -4387,15 +4381,11 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
             "receiver context", true)))) {
     return false;
   }
-  const bool typed_prepared = specification.prepared().format_version() == 3;
-  if (typed_prepared) {
-    const auto &directory = specification.header_context().working_directory();
-    if (directory.empty() || directory.front() != '/' || directory.size() > 4095 ||
-        directory.find('\0') != std::string::npos ||
-        !std::filesystem::is_directory(directory)) {
-      error = "prepared header working directory is unavailable";
-      return false;
-    }
+  const bool typed_prepared = specification.prepared().format_version() == tracer::prepared::typed_version;
+  if (typed_prepared &&
+      (specification.has_header_context() || specification.include_headers_size())) {
+    error = "standalone prepared injection does not accept application headers";
+    return false;
   }
   const std::string &source = specification.callback_source();
   const auto [callback_includes, callback_body] =
@@ -4408,13 +4398,14 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
     return false;
   const std::string type_header_prefix =
       forced_include_source + callback_includes;
-  std::string requested_header_source;
+  std::string requested_header_source = typed_prepared
+      ? tracer::prepared::adapter_source(specification.prepared()) : std::string();
   for (const auto &header : specification.include_headers())
     requested_header_source += "#include \"" + header + "\"\n";
   const std::string callback_header_source =
       callback_includes + requested_header_source;
   const bool callback_headers_available =
-      specification.has_header_context() ||
+      typed_prepared || specification.has_header_context() ||
       specification.include_headers_size() != 0 ||
       !callback_includes.empty() || !forced_include_source.empty();
   const std::string callback_type_declarations =
@@ -4442,7 +4433,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
       return false;
     }
   }
-  if (!validate_object_abi_evidence(specification, callback_includes,
+  if (!typed_prepared && !validate_object_abi_evidence(specification, callback_includes,
                                     forced_include_source, error))
     return false;
   std::optional<VerifiedDebugEntry> local_verified_entry;
@@ -4500,13 +4491,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
     }
   }
   if (typed_prepared) {
-    const auto &context = specification.header_context();
-    compiler_arguments.push_back("-working-directory=" + context.working_directory());
-    compiler_arguments.insert(compiler_arguments.end(), context.compiler_arguments().begin(),
-                              context.compiler_arguments().end());
-    // The callback's frontend uses its own codegen settings. Header ABI
-    // and preprocessing flags still come from the frozen compile command.
-    compiler_arguments.insert(compiler_arguments.end(), {"-fPIC", "-O0"});
+    const auto &options = specification.prepared().adapter_abi_options();
+    compiler_arguments.insert(compiler_arguments.end(), options.begin(), options.end());
   }
   compiler_arguments.insert(compiler_arguments.end(), user_options.begin(),
                             user_options.end());

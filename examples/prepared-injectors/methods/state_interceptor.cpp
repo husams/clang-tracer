@@ -1,4 +1,4 @@
-// The prepared package supplies the application declarations. The scope holds
+// The prepared package supplies the standalone declarations. The scope holds
 // an owned copy of the incoming values until the named event is published.
 template <>
 class Interceptor<prepared_demo::Receipt(const std::string &, std::vector<int>,

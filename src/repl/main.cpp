@@ -233,9 +233,9 @@ int main(int argc, char **argv) {
     while (true) {
       // tracer.inject() can execute inside a JIT cell. Import after the cell
       // returns so the live interpreter is never re-entered.
-      for (const auto &headers : controller.take_pending_imports()) {
+      for (const auto &adapter : controller.take_pending_imports()) {
         try {
-          std::cout << cpp.import_headers(headers) << '\n';
+          std::cout << cpp.import_prepared_adapter(adapter) << '\n';
         } catch (const std::exception &error) {
           std::cerr << "prepared C++ import skipped: " << error.what() << '\n';
         }

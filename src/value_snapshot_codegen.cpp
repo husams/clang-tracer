@@ -2,6 +2,7 @@
 #include "context_paths.hpp"
 #include "context_schema.hpp"
 #include "tracer.pb.h"
+#include "prepared_contract.hpp"
 
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/DeclCXX.h>
@@ -193,7 +194,7 @@ make_value_snapshot_code(clang::ASTContext &ast,
     std::string error;
   };
   std::vector<Entry> entries;
-  const auto access = spec.prepared().format_version() == 3
+  const auto access = spec.prepared().format_version() == tracer::prepared::typed_version
       ? context_engine::CodecAccess::snapshot_members
       : context_engine::CodecAccess::public_members;
   const auto add = [&](unsigned index, Role role, clang::QualType type) {

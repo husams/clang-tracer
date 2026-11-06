@@ -16,6 +16,10 @@ struct ResolvedCallable {
 ResolvedCallable resolve_header_callable(const std::string& selector,
                                          const clangtracer::v1::ProbeSpec& header_context);
 
+void verify_prepared_adapter(const std::string &selector,
+                             const clangtracer::v1::PreparedInjector &adapter,
+                             const ResolvedCallable &original);
+
 // Resolves a C++ callable using the project's compilation database. The
 // selector may include an explicit parameter list and member qualifiers.
 // Throws std::runtime_error for missing, ambiguous, or unsupported callables.

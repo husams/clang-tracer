@@ -1,5 +1,7 @@
 #include "cpp_resolver.hpp"
 #include "prepared_types.hpp"
+#include "prepared_adapter.hpp"
+#include "prepared_contract.hpp"
 #include "tracer_runtime_config.hpp"
 
 #include "../include/tracer/receiver_abi.hpp"
@@ -221,6 +223,7 @@ struct FrozenInvocation {
   std::string working_directory;
   std::string source_argument;
   std::vector<std::string> arguments;
+  std::vector<std::string> prepared_headers;
 };
 
 bool is_receiver_field_type(clang::QualType type) {
@@ -432,6 +435,14 @@ public:
       if (sema_) {
         tracer::prepared::describe_prepared_callable(*context_, *declaration, method,
                                                     candidate.spec, sema_);
+        if (!invocation_.prepared_headers.empty()) {
+          auto adapter = tracer::prepared::AdapterEmitter(*context_).emit(
+              *declaration, invocation_.prepared_headers);
+          auto &package = *candidate.spec.mutable_prepared();
+          package.set_adapter_declarations(std::move(adapter.source));
+          for (const auto &header : adapter.standard_headers)
+            package.add_adapter_standard_headers(header);
+        }
       } else {
         auto *signature = candidate.spec.mutable_signature();
         signature->set_result(scalar_type(declaration->getReturnType(), *context_, true));
@@ -930,6 +941,8 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   std::vector<Candidate> candidates;
   std::string target_error, invocation_error;
   FrozenInvocation invocation;
+  invocation.prepared_headers.assign(headers.include_headers().begin(),
+                                     headers.include_headers().end());
   tool.appendArgumentsAdjuster([&](const clang::tooling::CommandLineArguments& args,
                                    llvm::StringRef filename) {
     invocation.arguments = args;
@@ -942,6 +955,32 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   if (!target_error.empty() || !invocation_error.empty() || result != 0)
     throw std::runtime_error("cannot parse prepared headers: " + target_error + invocation_error);
   return select_cpp_candidate(std::move(candidates), selector, name);
+}
+
+void verify_prepared_adapter(const std::string &name, const api::PreparedInjector &adapter,
+                             const ResolvedCallable &original) {
+  const auto selector = parse_selector(name);
+  std::vector<std::string> arguments(runtime::jit_flags.begin(), runtime::jit_flags.end());
+  arguments.insert(arguments.end(), {"-std=c++20", "-x", "c++",
+      "-resource-dir=" + std::string(TRACER_CLANG_RESOURCE_DIR)});
+  arguments.insert(arguments.end(), adapter.adapter_abi_options().begin(),
+                   adapter.adapter_abi_options().end());
+  auto unit = clang::tooling::buildASTFromCodeWithArgs(
+      tracer::prepared::adapter_source(adapter), arguments, "prepared-adapter.cc");
+  if (!unit || unit->getDiagnostics().hasErrorOccurred())
+    throw std::runtime_error("generated prepared adapter does not compile independently");
+  std::vector<Candidate> candidates;
+  Collector visitor(candidates, selector.qualified_name, {}, "", "", &unit->getSema());
+  visitor.set_context(unit->getASTContext(), &unit->getSema());
+  visitor.TraverseDecl(unit->getASTContext().getTranslationUnitDecl());
+  // Match by linkage because the adapter writes canonical parameter types.
+  const auto candidate = std::find_if(candidates.begin(), candidates.end(), [&](const auto &item) {
+    return item.symbol == original.spec.symbol() && item.unsupported_reason.empty();
+  });
+  if (candidate == candidates.end() ||
+      candidate->spec.signature().SerializeAsString() != original.spec.signature().SerializeAsString() ||
+      candidate->spec.debug_info().SerializeAsString() != original.spec.debug_info().SerializeAsString())
+    throw std::runtime_error("generated prepared adapter does not reproduce the target ABI and layout");
 }
 
 } // namespace tracer::client

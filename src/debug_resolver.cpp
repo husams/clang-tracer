@@ -34,6 +34,7 @@
 #include "tracer/compat.hpp"
 #include "linux_syscalls.hpp"
 #include "mapped_path.hpp"
+#include "prepared_contract.hpp"
 
 namespace tracer::client {
 namespace {
@@ -1094,7 +1095,9 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
   };
   const auto &signature = prepared.signature();
   const auto version = prepared.format_version();
-  const bool typed = version == 3;
+  if (version == 3)
+    throw std::invalid_argument("legacy typed prepared package requires regeneration");
+  const bool typed = version == tracer::prepared::typed_version;
   const bool pinned = (version == 1 || typed) &&
                       prepared.module_sha256().size() == 32 && !prepared.module_name().empty();
   const bool source_only = (version == 2 || typed) &&
@@ -1157,8 +1160,8 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
           (reference && wire != api::POINTER) || (record && !object && !reference))
         throw std::invalid_argument("invalid prepared C++ type");
     };
-    if (!prepared.has_header_context() || prepared.include_headers_size() < 1 ||
-        prepared.include_headers_size() > 16 ||
+    (void)tracer::prepared::adapter_source(prepared);
+    if (prepared.has_header_context() || prepared.include_headers_size() != 0 ||
         source.arguments_size() != signature.arguments_size() ||
         source.record_name().empty() == (signature.kind() == api::METHOD))
       throw std::invalid_argument("invalid prepared header metadata");
@@ -1191,7 +1194,8 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
     if (types.SerializeAsString() != source.SerializeAsString())
       throw std::invalid_argument("prepared metadata contains unexpected fields");
   } else if (prepared.has_header_types() || prepared.has_header_context() ||
-             !prepared.include_headers().empty()) {
+             !prepared.include_headers().empty() || !prepared.adapter_declarations().empty() ||
+             !prepared.adapter_standard_headers().empty() || !prepared.adapter_abi_options().empty()) {
     throw std::invalid_argument("unexpected header metadata in scalar package");
   }
   std::vector<ResolvedCallable> matches;
@@ -1322,10 +1326,6 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
     for (const auto &name : prepared.argument_names())
       found.spec.add_argument_names(name);
     found.declaration = found.spec.debug_info().result_cpp_type() + " " + prepared.selector();
-    if (typed) {
-      *found.spec.mutable_include_headers() = prepared.include_headers();
-      *found.spec.mutable_header_context() = prepared.header_context();
-    }
     found.source = path;
     matches.push_back(std::move(found));
   }
