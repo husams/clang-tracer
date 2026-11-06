@@ -226,16 +226,18 @@ function(tracer_add_native_repl)
           --compdb "${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json"
           --compiler "${CMAKE_CXX_COMPILER}")
       set_tests_properties(native_repl_prepared_integration PROPERTIES TIMEOUT 240)
-      add_test(NAME native_repl_prepared_methods
-        COMMAND "${CMAKE_COMMAND}" -E env
-          "CLANG_TRACER_PREPARED_BUILD=${CMAKE_CURRENT_BINARY_DIR}"
-          "CLANG_TRACER_REPL=$<TARGET_FILE:clang-tracer-repl>"
-          "CLANG_TRACER_SERVER=$<TARGET_FILE:clang-tracer-server>"
-          "CLANG_TRACER_AGENT=$<TARGET_FILE:clang_tracer_agent>"
-          "CLANG_TRACER_PREPARED_TARGET=$<TARGET_FILE:prepared-methods-target>"
-          bash "${CMAKE_CURRENT_SOURCE_DIR}/examples/prepared-injectors/run-native.sh"
-          --methods --smoke)
-      set_tests_properties(native_repl_prepared_methods PROPERTIES TIMEOUT 120)
+      foreach(_example methods state)
+        add_test(NAME native_repl_prepared_${_example}
+          COMMAND "${CMAKE_COMMAND}" -E env
+            "CLANG_TRACER_PREPARED_BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+            "CLANG_TRACER_REPL=$<TARGET_FILE:clang-tracer-repl>"
+            "CLANG_TRACER_SERVER=$<TARGET_FILE:clang-tracer-server>"
+            "CLANG_TRACER_AGENT=$<TARGET_FILE:clang_tracer_agent>"
+            "CLANG_TRACER_PREPARED_TARGET=$<TARGET_FILE:prepared-methods-target>"
+            bash "${CMAKE_CURRENT_SOURCE_DIR}/examples/prepared-injectors/run-native.sh"
+            --${_example} --smoke)
+        set_tests_properties(native_repl_prepared_${_example} PROPERTIES TIMEOUT 120)
+      endforeach()
       add_test(NAME native_repl_integration
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_native_integration.py"
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>

@@ -59,7 +59,9 @@ if(!empty || !sso || !heap || !binary || !limited) throw std::runtime_error("str
                 run("round_trip", record_check, record=True)
                 run("mutate_argument", '''for(const auto& e:data) { auto a=e.argument_as<repl_fixture::Record>(0); if(a.id!=7 || a.label!="heap-backed snapshot label longer than SSO" || a.samples!=std::vector<int>({1,3,5}) || !e.result_as<bool>()) throw std::runtime_error("entry snapshot was mutated/freed"); }
 ''')
-                run("round_trip", record_check, callback=shared, extra="--print-arguments --print-result")
+                run("round_trip", record_check + """
+if (data.at(0).state_snapshot().field("calls").as<int>() < 1) throw std::runtime_error("marked state snapshot missing");
+""", callback=shared, extra="--print-arguments --print-result")
             finally:
                 target.terminate()
                 target.wait(timeout=10)

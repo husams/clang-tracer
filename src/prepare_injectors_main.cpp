@@ -50,16 +50,23 @@ int main(int argc, char **argv) {
   try {
     std::map<std::string, std::string> options;
     std::vector<std::string> headers;
+    bool metadata_only = false;
     for (int i = 1; i < argc; ++i) {
       const std::string option = argv[i];
       if (option == "--help") {
         std::cout << "Native header preparation: --selector SELECTOR --include "
                      "HEADER "
                      "--compdb FILE [--translation-unit FILE] "
-                     "--output NEW_DIRECTORY [--module ELF]\n"
+                     "--output NEW_DIRECTORY [--module ELF] [--metadata-only]\n"
                      "By default, uses the first compile command for a source "
                      "beside the first header. --module pins the package to an ELF image.\n";
         return 0;
+      }
+      if (option == "--metadata-only") {
+        if (metadata_only)
+          throw std::runtime_error("duplicate option: " + option);
+        metadata_only = true;
+        continue;
       }
       if (option != "--include" && option != "--selector" &&
           option != "--compdb" && option != "--translation-unit" &&
@@ -163,9 +170,11 @@ int main(int argc, char **argv) {
     if (!fs::create_directory(output))
       throw std::runtime_error("cannot create new output directory");
     try {
-      fs::create_directory(output / "generated");
-      write(output / "generated/adapter.hpp", declaration);
-      write(output / "generated/adapter.cpp", wrapper);
+      if (!metadata_only) {
+        fs::create_directory(output / "generated");
+        write(output / "generated/adapter.hpp", declaration);
+        write(output / "generated/adapter.cpp", wrapper);
+      }
       write(output / "prepared.pb", prepared.SerializeAsString());
     } catch (...) {
       fs::remove_all(output);

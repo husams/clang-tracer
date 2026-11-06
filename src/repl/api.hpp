@@ -44,6 +44,12 @@ public:
   EventValue result_snapshot() const;
   // Owned receiver fields at method entry, available on PRE and POST.
   EventValue receiver_snapshot() const;
+  // Owned state from a named Context event, in the event's state order.
+  EventValue state_snapshot(std::size_t index = 0) const;
+
+  template <class T> T state_as(std::size_t index = 0) const {
+    return state_snapshot(index).template as<T>();
+  }
 
   template <class T> T argument_as(std::size_t index) const {
     return argument_snapshot(index).template as<T>();

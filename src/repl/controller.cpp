@@ -434,6 +434,7 @@ void Controller::prepare(const std::string &selector, const Command &options) {
   }
 #endif
   std::vector<std::string> arguments{executable, "--selector", selector, "--compdb", database};
+  if (options.has("--metadata-only")) arguments.push_back("--metadata-only");
   for (const auto *key : {"--translation-unit", "--module"}) {
     if (options.has(key)) {
       arguments.emplace_back(key);
@@ -1106,7 +1107,8 @@ bool Controller::execute(const Command &command) {
          << "%probe resolve SELECTOR; %probe inject SELECTOR --callback FILE; "
             "%probe validate "
             "SELECTOR --callback FILE\n"
-         << "%probe prepare SELECTOR --include HEADER --output NEW_DIRECTORY\n"
+         << "%probe prepare SELECTOR --include HEADER --output NEW_DIRECTORY [--metadata-only]\n"
+         << "  --metadata-only writes prepared.pb without the separate C++ adapter files\n"
          << "  overrides: --compdb FILE --translation-unit FILE --module ELF (pin to a build)\n"
          << "  preparation defaults to compile_commands.json in the current directory\n"
          << "  uses the first compile command for a source beside the first header\n"

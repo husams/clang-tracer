@@ -11,6 +11,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
@@ -91,6 +92,7 @@ public:
 private:
   Data data_;
   std::string type_;
+  std::string descriptor_type_;
 
 public:
   EventValue() = default;
@@ -99,8 +101,11 @@ public:
   EventValue &operator=(const EventValue &) = default;
   EventValue &operator=(EventValue &&) noexcept = default;
   ~EventValue();
-  explicit EventValue(Data data, std::string cpp_type = {})
-      : data_(std::move(data)), type_(std::move(cpp_type)) {}
+  explicit EventValue(Data data, std::string cpp_type = {},
+                      std::string descriptor_type = {})
+      : data_(std::move(data)), type_(std::move(cpp_type)),
+        descriptor_type_(std::move(descriptor_type)) {}
+  bool matches_record_type(std::string_view name) const;
   const std::string &cpp_type() const { return type_; }
   const Data &data() const { return data_; }
   bool is_null() const { return std::holds_alternative<std::monostate>(data_); }
@@ -173,7 +178,7 @@ template <class T>
 struct EventCodec<T, std::void_t<decltype(EventRecord<T>::fields()),
                                  decltype(EventRecord<T>::type_name)>> {
   static T decode(const EventValue &value) {
-    if (value.cpp_type() != EventRecord<T>::type_name)
+    if (!value.matches_record_type(EventRecord<T>::type_name))
       throw std::invalid_argument("event record type mismatch: " +
                                   value.cpp_type());
     T result{};

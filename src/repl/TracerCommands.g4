@@ -20,7 +20,8 @@ probe : 'probe' ('prepare' value prepareOption+
       | 'inject' value '--callback' value deployOption*
       | 'validate' value '--callback' value resolveOption*
       | 'remove' UINT) | 'probes';
-prepareOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--output') value;
+prepareOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--output') value
+              | METADATA_ONLY;
 resolveOption : ('--include' | '--compdb' | '--module' | '--compile-option'
                 | '--prepared' | '--prepared-mode') value;
 deployOption : resolveOption | '--stack-depth' UINT | '--print-arguments' | '--print-result';
@@ -58,5 +59,6 @@ UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';
 SHELL : '`' ~[`\r\n]+ '`';
+METADATA_ONLY : '--metadata-only';
 WORD : ~[ \t\r\n"'\\%`]+;
 WS : [ \t\r\n]+ -> skip;

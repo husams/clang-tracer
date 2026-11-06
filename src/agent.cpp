@@ -4017,6 +4017,7 @@ bool compile_shared_probe(Probe &p,
                           const std::vector<std::string> &arguments,
                           const std::string &wrapper_prelude,
                           const std::string &forced_include_source,
+                          const std::string &receiver_alias,
                           const std::string &signature_assert,
                           std::string &error, bool run_initializers,
                           clangtracer::v1::ValidationReport *report,
@@ -4043,10 +4044,11 @@ bool compile_shared_probe(Probe &p,
   // Scalar shared wrappers need no user declarations. Recompiling their full
   // callback headers here can consume the operation deadline before admission.
   const auto *wrapper_snapshots = snapshots.arguments.empty() ? nullptr : &snapshots;
-  const std::string wrapper_types = !wrapper_snapshots ? std::string() :
+  const bool typed_prepared = specification.prepared().format_version() == 3;
+  const std::string wrapper_types = !wrapper_snapshots && !typed_prepared ? std::string() :
       callback_includes + requested_header_source +
       (has_real_headers ? std::string() : recovered_record_declarations(specification)) +
-      argument_aliases(specification);
+      receiver_alias + argument_aliases(specification);
   activation.compiler_arguments = arguments;
   if (!specification.callback_package_path().empty())
     activation.file_name = specification.callback_package_path();
@@ -4653,10 +4655,6 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
     const auto context_declarations =
         tracer::analyze_context_declarations(user_ast->getASTContext());
     if (context_declarations.requires_context) {
-      if (typed_prepared) {
-        error = "typed prepared callbacks do not support shared-context state yet";
-        return false;
-      }
       std::string signature_assert;
       if (!interceptor_template_prelude(source).empty()) {
         shape_valid = inspect_callback_shape(user_ast->getASTContext(), shape,
@@ -4677,7 +4675,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
           p, specification, interpreter_arguments,
           forced_include_source + prelude + context_prelude +
               tracer::kEmbeddedCallbackHeader,
-          forced_include_source,
+          forced_include_source, receiver_alias,
           signature_assert, error, run_initializers, report, result_sret,
           syntax_only, tracer::make_value_snapshot_code(user_ast->getASTContext(), specification));
     }

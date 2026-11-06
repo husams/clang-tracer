@@ -44,7 +44,8 @@ prepared/
 The native runtime consumes `prepared.pb`. The generated adapter files expose a
 typed function pointer separately from the user-owned interceptor. They are not
 inserted into `interceptor.cpp`, and you do not need to compile them manually.
-The output directory must be new; use another name if you repeat generation.
+Use `--metadata-only` to save just `prepared.pb`. The output directory must
+be new each time.
 
 ## 2. Validate against the running application
 
@@ -191,3 +192,29 @@ and recursive pointee graphs also report unavailable snapshots.
 
 Run `./examples/prepared-injectors/run-native.sh --methods --smoke` to check
 the prepared binding and the field values through the native REPL.
+
+## Typed custom event
+
+Launch the example with `--state`. The launcher prints the native REPL
+commands in `methods/try-state.repl`. The example prepares the method with
+`--metadata-only`. The smoke test requires that package during injection.
+Omit `--metadata-only` to keep the separate generated C++ adapter files
+alongside the metadata.
+
+The interceptor saves a copy of three typed arguments in a scoped
+`prepared_demo::Reading` and publishes `account.adjusted` on return.
+The public payload definition is in `methods/reading.hpp`. Preparation
+registers both application headers for the REPL's automatic mapping import.
+
+```text
+%collect --name account.adjusted --count 1 --timeout 15 --as adjusted
+auto event = tracer.batch("adjusted").at(0);
+auto reading = event.state_as<prepared_demo::Reading>();
+reading.parts.at(1)
+reading.adjustment.delta
+```
+
+The label is `deposit`, the vector is `{2, 5}`, and the nested adjustment
+has delta `4` and limit `30`. Use `event.state_snapshot()` for field access
+without a C++ mapping. Both forms read owned capture-time data. A truncated
+state reports an error.

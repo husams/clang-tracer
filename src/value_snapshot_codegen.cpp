@@ -365,7 +365,7 @@ template<class T> void encode(tracer::ValueSnapshot& snapshot, const T& value) n
               ".record_type_count=" + std::to_string(record_types.size()) +
               ";\n";
     }
-    const auto expr = receiver ? "*tracer::Call(ctx).self()"
+    const auto expr = receiver ? "*reinterpret_cast<const tracer::ResolvedTarget*>(ctx.object_address)"
                                : result ? "tracer::Call(ctx).result()"
                                         : "tracer::Call(ctx).argument<" +
                                               std::to_string(entry.index) + ">()";

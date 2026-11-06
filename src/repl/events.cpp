@@ -135,11 +135,28 @@ std::string snapshot_option(const Options &options, const char *name) {
   return {};
 }
 
+// Shared-context schemas name messages using the canonical C++ type.
+std::string context_descriptor_type(std::string_view cpp_type) {
+  std::uint64_t hash = 1469598103934665603ULL;
+  for (unsigned char byte : cpp_type) {
+    hash ^= byte;
+    hash *= 1099511628211ULL;
+  }
+  std::ostringstream name;
+  name << "tracer.generated.state.M_" << std::hex << hash;
+  return name.str();
+}
+
+std::string field_path(const std::string &parent, int number) {
+  return (parent.empty() ? "" : parent + ".") + std::to_string(number);
+}
+
 class SnapshotDecoder {
   std::map<std::string, std::string> roles_;
   std::map<std::string, std::string> types_;
   std::size_t visited_ = 0;
   const std::string &payload_;
+  bool context_state_;
   static std::uint64_t
   read_integer(google::protobuf::io::CodedInputStream &input,
                std::string_view bytes, int end) {
@@ -178,11 +195,11 @@ class SnapshotDecoder {
         reinterpret_cast<const std::uint8_t *>(bytes.data()),
         static_cast<int>(bytes.size()));
     std::set<int> present;
-    const auto field_path = [&](int number) {
+    const auto wire_path = [&](int number) {
       if (map_entry)
         return path + (number == 1 ? "/key" : "/value");
       return wrapper && number == 1 ? path
-                                    : path + "." + std::to_string(number);
+                                    : field_path(path, number);
     };
     for (std::uint32_t tag; (tag = input.ReadTag()) != 0;) {
       const auto *field = type.FindFieldByNumber(static_cast<int>(tag >> 3));
@@ -211,7 +228,7 @@ class SnapshotDecoder {
             static_cast<std::size_t>(input.CurrentPosition()), length);
         if (!input.Skip(static_cast<int>(length)))
           throw std::runtime_error("invalid snapshot message length");
-        auto child = field_path(field->number());
+        auto child = wire_path(field->number());
         const auto role = roles_.find(child);
         const bool child_map =
             field->is_repeated() && role != roles_.end() &&
@@ -253,7 +270,7 @@ class SnapshotDecoder {
       throw std::runtime_error("invalid snapshot wire ending");
     for (int i = 0; i < type.field_count(); ++i) {
       const auto *field = type.field(i);
-      const auto role = roles_.find(field_path(field->number()));
+      const auto role = roles_.find(wire_path(field->number()));
       if (!field->is_repeated() &&
           (role == roles_.end() || role->second != "optional") &&
           !present.count(field->number()))
@@ -338,22 +355,11 @@ class SnapshotDecoder {
       if (role != roles_.end() && role->second != "optional" &&
           type->field_count() == 1 && type->field(0)->is_repeated())
         return decode_field(nested, *type->field(0), path, depth + 1);
-      EventValue::Object fields;
-      for (int i = 0; i < type->field_count(); ++i) {
-        const auto &member = *type->field(i);
-        auto name = snapshot_option(member.options(), "tracer_cpp_field_name");
-        if (name.empty())
-          name = member.has_json_name() ? member.json_name() : member.name();
-        fields.emplace(
-            std::move(name),
-            decode_field(nested, member,
-                         path + "." + std::to_string(member.number()),
-                         depth + 1));
-      }
       const auto mapped = types_.find(std::string(type->full_name()));
-      return EventValue{std::move(fields), mapped == types_.end()
-                                               ? std::string()
-                                               : mapped->second};
+      return EventValue{
+          record_fields(nested, path, depth),
+          mapped == types_.end() ? std::string() : mapped->second,
+          context_state_ ? std::string(type->full_name()) : std::string()};
     }
     }
     throw std::runtime_error("unsupported snapshot field");
@@ -373,25 +379,48 @@ class SnapshotDecoder {
     return EventValue{std::move(values)};
   }
 
+  EventValue::Object record_fields(const google::protobuf::Message &message,
+                                   const std::string &path, unsigned depth) {
+    EventValue::Object fields;
+    const auto *type = message.GetDescriptor();
+    for (int i = 0; i < type->field_count(); ++i) {
+      const auto &member = *type->field(i);
+      auto name = snapshot_option(member.options(), "tracer_cpp_field_name");
+      if (name.empty())
+        name = member.has_json_name() ? member.json_name() : member.name();
+      fields.emplace(std::move(name),
+                     decode_field(message, member, field_path(path, member.number()),
+                                  depth + 1));
+    }
+    return fields;
+  }
+
 public:
-  explicit SnapshotDecoder(
-      const clangtracer::context::v1::ValueSnapshot &snapshot)
-      : payload_(snapshot.payload()) {
-    for (const auto &type : snapshot.record_types()) {
+  SnapshotDecoder(const std::string &payload,
+                  const google::protobuf::RepeatedPtrField<std::string> &roles,
+                  const google::protobuf::RepeatedPtrField<std::string> &types,
+                  bool context_state)
+      : payload_(payload), context_state_(context_state) {
+    for (const auto &type : types) {
       const auto split = type.find('=');
       if (split == std::string::npos ||
           !types_.emplace(type.substr(0, split), type.substr(split + 1)).second)
         throw std::runtime_error("invalid snapshot record types");
     }
-    for (const auto &role : snapshot.container_roles()) {
+    for (const auto &role : roles) {
       const auto split = role.find('=');
       if (split == std::string::npos ||
           !roles_.emplace(role.substr(0, split), role.substr(split + 1)).second)
         throw std::runtime_error("invalid snapshot container roles");
     }
   }
+
   EventValue decode(const google::protobuf::Message &message,
-                    const std::string &type) {
+                    const std::string &type, bool wrapped) {
+    if (!wrapped) {
+      validate(*message.GetDescriptor(), payload_, "", false, false, 0);
+      return EventValue{record_fields(message, "", 0), type};
+    }
     validate(*message.GetDescriptor(), payload_, "1", true, false, 0);
     const auto *field = message.GetDescriptor()->FindFieldByNumber(1);
     if (!field || message.GetDescriptor()->field_count() != 1)
@@ -401,18 +430,20 @@ public:
   }
 };
 
-EventValue
-decode_snapshot(const clangtracer::context::v1::ValueSnapshot &snapshot) {
-  using Snapshot = clangtracer::context::v1::ValueSnapshot;
-  if (snapshot.status() != Snapshot::COMPLETE)
-    throw std::runtime_error("event snapshot unavailable: " +
-                             snapshot.detail());
-  if (snapshot.cpp_type().empty() || snapshot.root_type().empty() ||
-      snapshot.descriptor_set().size() > 16384 ||
-      snapshot.payload().size() > 65536)
+EventValue decode_owned_value(
+    const std::string &cpp_type, const std::string &root_type,
+    const std::string &descriptors, const std::string &payload,
+    const google::protobuf::RepeatedPtrField<std::string> &roles,
+    const google::protobuf::RepeatedPtrField<std::string> &types,
+    bool context_state, bool wrapped) {
+  const auto descriptor_limit = context_state ? 1024 * 1024 : 16384;
+  const auto payload_limit = context_state ? 256 * 1024 : 65536;
+  if (cpp_type.empty() || root_type.empty() ||
+      descriptors.size() > static_cast<std::size_t>(descriptor_limit) ||
+      payload.size() > static_cast<std::size_t>(payload_limit))
     throw std::runtime_error("invalid or oversized event snapshot");
   google::protobuf::FileDescriptorSet files;
-  if (!files.ParseFromString(snapshot.descriptor_set()) ||
+  if (!files.ParseFromString(descriptors) ||
       files.file_size() > 16)
     throw std::runtime_error("invalid event snapshot descriptors");
   google::protobuf::DescriptorPool pool;
@@ -437,7 +468,7 @@ decode_snapshot(const clangtracer::context::v1::ValueSnapshot &snapshot) {
     if (!progress)
       throw std::runtime_error("unresolved snapshot schema dependencies");
   }
-  const auto *root = pool.FindMessageTypeByName(snapshot.root_type());
+  const auto *root = pool.FindMessageTypeByName(root_type);
   if (!root)
     throw std::runtime_error("snapshot root type not found");
   google::protobuf::DynamicMessageFactory factory(&pool);
@@ -445,9 +476,19 @@ decode_snapshot(const clangtracer::context::v1::ValueSnapshot &snapshot) {
   if (!prototype)
     throw std::runtime_error("invalid snapshot root prototype");
   std::unique_ptr<google::protobuf::Message> value(prototype->New());
-  if (!value->ParseFromString(snapshot.payload()))
+  if (!value->ParseFromString(payload))
     throw std::runtime_error("invalid event snapshot payload");
-  return SnapshotDecoder(snapshot).decode(*value, snapshot.cpp_type());
+  return SnapshotDecoder(payload, roles, types, context_state).decode(*value, cpp_type, wrapped);
+}
+
+EventValue decode_snapshot(const clangtracer::context::v1::ValueSnapshot &snapshot) {
+  using Snapshot = clangtracer::context::v1::ValueSnapshot;
+  if (snapshot.status() != Snapshot::COMPLETE)
+    throw std::runtime_error("event snapshot unavailable: " + snapshot.detail());
+  return decode_owned_value(snapshot.cpp_type(), snapshot.root_type(),
+                            snapshot.descriptor_set(), snapshot.payload(),
+                            snapshot.container_roles(), snapshot.record_types(),
+                            false, true);
 }
 
 void decoded_states(const api::TraceEvent &event, std::ostream &out) {
@@ -578,6 +619,13 @@ ScalarValue Event::result_value() const {
 // The native REPL JIT needs a stable destructor for snapshot temporaries.
 EventValue::~EventValue() = default;
 
+bool EventValue::matches_record_type(std::string_view name) const {
+  if (!type_.empty())
+    return std::string_view(type_) == name;
+  return !descriptor_type_.empty() && descriptor_type_ == context_descriptor_type(name);
+}
+
+
 EventValue Event::argument_snapshot(std::size_t index) const {
   const auto &event = data_->message;
   if (event.has_context()) {
@@ -599,6 +647,34 @@ EventValue Event::argument_snapshot(std::size_t index) const {
     return std::visit([](auto value) { return EventValue{value}; },
                       typed_scalar(argument, argument.type()));
   return decode_snapshot(argument.snapshot());
+}
+
+EventValue Event::state_snapshot(std::size_t index) const {
+  const auto &event = data_->message;
+  if (!event.has_context() ||
+      index >= static_cast<std::size_t>(event.context().event().states_size()))
+    throw std::out_of_range("event state index");
+  const auto &state = event.context().event().states(static_cast<int>(index));
+  if (!state.truncations().empty())
+    throw std::runtime_error("event state was truncated at capture");
+  for (const auto &schema : event.context().schemas()) {
+    const bool matches = state.epoch_schema_id()
+        ? schema.epoch_schema_id() == state.epoch_schema_id()
+        : !state.schema_identity().empty() &&
+              schema.schema_identity() == state.schema_identity();
+    if (!matches)
+      continue;
+    const auto &type = schema.cpp_state_type();
+    const bool wrapped = schema.root_type() ==
+        context_descriptor_type("__tracer_payload_root<" + type + ">");
+    if (!wrapped && schema.root_type() != context_descriptor_type(type))
+      throw std::runtime_error("event state type does not match its schema");
+    return decode_owned_value(type, schema.root_type(),
+                              schema.serialized_file_descriptor_set(),
+                              state.payload(), schema.container_roles(), {},
+                              true, wrapped);
+  }
+  throw std::runtime_error("event state schema is unavailable");
 }
 
 EventValue Event::receiver_snapshot() const {
