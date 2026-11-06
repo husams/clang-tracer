@@ -94,6 +94,11 @@ private:
 
 public:
   EventValue() = default;
+  EventValue(const EventValue &) = default;
+  EventValue(EventValue &&) noexcept = default;
+  EventValue &operator=(const EventValue &) = default;
+  EventValue &operator=(EventValue &&) noexcept = default;
+  ~EventValue();
   explicit EventValue(Data data, std::string cpp_type = {})
       : data_(std::move(data)), type_(std::move(cpp_type)) {}
   const std::string &cpp_type() const { return type_; }
@@ -182,6 +187,37 @@ struct EventCodec<T, std::void_t<decltype(EventRecord<T>::fields()),
         },
         EventRecord<T>::fields());
     return result;
+  }
+};
+
+template <> struct EventCodec<std::monostate> {
+  static std::monostate decode(const EventValue &value) {
+    if (!value.fields().empty())
+      throw std::invalid_argument("event monostate is not empty");
+    return {};
+  }
+};
+
+template <class... T> struct EventCodec<std::variant<T...>> {
+  using Variant = std::variant<T...>;
+
+  template <std::size_t I = 0>
+  static Variant decode_at(std::size_t index, const EventValue &value) {
+    if (index == I)
+      return Variant(std::in_place_index<I>,
+                     value.template as<std::variant_alternative_t<I, Variant>>());
+    if constexpr (I + 1 < sizeof...(T))
+      return decode_at<I + 1>(index, value);
+    throw std::out_of_range("event variant alternative is out of range");
+  }
+
+  static Variant decode(const EventValue &value) {
+    const auto index = value.field("index").template as<std::uint64_t>();
+    if (index == std::variant_npos)
+      throw std::invalid_argument("event variant was valueless by exception");
+    if (index >= sizeof...(T))
+      throw std::out_of_range("event variant alternative is out of range");
+    return decode_at(index, value.field("alternative_" + std::to_string(index)));
   }
 };
 

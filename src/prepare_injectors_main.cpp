@@ -100,13 +100,30 @@ int main(int argc, char **argv) {
         tracer::client::HeaderCommandSelection::first_in_header_directory);
     const auto resolved = tracer::client::resolve_header_callable(
         options.at("--selector"), context);
-    if (resolved.spec.signature().result() == api::POINTER)
-      throw std::runtime_error("native prepared draft supports primitive value types only");
-    for (const auto type : resolved.spec.signature().arguments())
-      if (type == api::POINTER)
-        throw std::runtime_error("native prepared draft supports primitive value types only");
+    const auto &signature = resolved.spec.signature();
+    const auto &types = resolved.spec.debug_info();
+    const auto legacy = [](api::ValueType type, const std::string &spelling) {
+      switch (type) {
+      case api::VOID: return spelling == "void";
+      case api::INT32: return spelling == "int";
+      case api::INT64: return spelling == "long long";
+      case api::UINT64: return spelling == "unsigned long long";
+      case api::FLOAT32: return spelling == "float";
+      case api::FLOAT64: return spelling == "double";
+      default: return false;
+      }
+    };
+    bool typed = signature.kind() == api::METHOD ||
+                 !legacy(signature.result(), types.result_cpp_type());
+    for (int i = 0; i < signature.arguments_size(); ++i)
+      typed |= !legacy(signature.arguments(i), types.arguments(i).cpp_type());
     api::PreparedInjector prepared;
-    prepared.set_format_version(module.empty() ? 2 : 1);
+    prepared.set_format_version(typed ? 3 : module.empty() ? 2 : 1);
+    if (typed) {
+      *prepared.mutable_header_types() = types;
+      *prepared.mutable_header_context() = context.header_context();
+      *prepared.mutable_include_headers() = context.include_headers();
+    }
     if (!module.empty()) {
       prepared.set_module_sha256(digest);
       prepared.set_module_name(module.filename().string());
@@ -118,26 +135,31 @@ int main(int argc, char **argv) {
     prepared.set_target_triple("x86_64-unknown-linux-gnu");
     if (!module.empty() && image_digest(module) != digest)
       throw std::runtime_error("module changed during preparation");
-    const auto paren = options.at("--selector").find('(');
-    if (paren == std::string::npos)
-      throw std::runtime_error(
-          "use an explicit parameter list in the selector");
-    const auto name = options.at("--selector").substr(0, paren);
-    const auto marker = resolved.declaration.find(" " + name + "(");
-    if (marker == std::string::npos || resolved.declaration.back() != ')')
-      throw std::runtime_error("unsupported prepared declaration");
-    const auto result = resolved.declaration.substr(0, marker);
-    const auto arguments =
-        resolved.declaration.substr(marker + name.size() + 2);
+    if (prepared.ByteSizeLong() > 64 * 1024)
+      throw std::runtime_error("prepared metadata exceeds 64 KiB");
+    std::string arguments;
+    for (const auto &arg : types.arguments()) {
+      if (!arguments.empty())
+        arguments += ", ";
+      arguments += arg.cpp_type();
+    }
     std::string declaration = "#pragma once\n";
     for (const auto &header : headers)
       declaration += "#include \"" + header + "\"\n";
-    declaration += "namespace tracer_prepared {\nusing Function = " + result +
-                   " (*)(" + arguments + ";\nFunction target() noexcept;\n}\n";
-    const auto wrapper =
-        "#include \"adapter.hpp\"\nnamespace tracer_prepared {\n"
-        "Function target() noexcept { return static_cast<Function>(&" +
-        name + "); }\n}\n";
+    declaration += "namespace tracer_prepared {\nusing Result = " +
+                   types.result_cpp_type() + ";\nusing Signature = Result(" +
+                   arguments + ");\n";
+    std::string wrapper = "#include \"adapter.hpp\"\n";
+    const auto name = options.at("--selector").substr(0, options.at("--selector").find('('));
+    if (signature.kind() == api::METHOD) {
+      declaration += "using Receiver = " + types.record_name() + ";\n";
+    } else if (!typed) {
+      declaration += "using Function = Signature*;\nFunction target() noexcept;\n";
+      wrapper += "namespace tracer_prepared {\n"
+                 "Function target() noexcept { return static_cast<Function>(&" +
+                 name + "); }\n}\n";
+    }
+    declaration += "}\n";
     if (!fs::create_directory(output))
       throw std::runtime_error("cannot create new output directory");
     try {

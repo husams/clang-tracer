@@ -1273,8 +1273,8 @@ public:
         resolved.spec.add_include_headers(header);
       for (const auto &option : request->compile_options())
         resolved.spec.add_compile_options(option);
-      client::resolve_header_context(resolved.spec,
-                                     request->compilation_database());
+      if (!resolved.spec.has_header_context())
+        client::resolve_header_context(resolved.spec, request->compilation_database());
       response->Swap(&resolved.spec);
       return grpc::Status::OK;
     } catch (const client::DebugLookupLimit &error) {
@@ -1334,8 +1334,8 @@ public:
         resolved.spec.add_include_headers(header);
       for (const auto &option : request->compile_options())
         resolved.spec.add_compile_options(option);
-      client::resolve_header_context(resolved.spec,
-                                     request->compilation_database());
+      if (!resolved.spec.has_header_context())
+        client::resolve_header_context(resolved.spec, request->compilation_database());
       resolved.spec.set_callback_source(request->callback_source());
       const auto input_valid = validate_probe(resolved.spec);
       if (!input_valid.ok())

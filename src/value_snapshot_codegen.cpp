@@ -7,6 +7,7 @@
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/DeclTemplate.h>
 #include <clang/AST/Type.h>
+#include <algorithm>
 #include <functional>
 #include <google/protobuf/descriptor.pb.h>
 #include <iomanip>
@@ -36,23 +37,25 @@ std::string message_name(const std::string &name) {
   out << "M_" << std::hex << hash;
   return out.str();
 }
-const clang::FunctionProtoType *signature(clang::ASTContext &ast) {
+clang::QualType tracer_alias(clang::ASTContext &ast, llvm::StringRef name) {
   for (const auto *decl : ast.getTranslationUnitDecl()->decls()) {
     const auto *space = llvm::dyn_cast<clang::NamespaceDecl>(decl);
     if (!space || space->getName() != "tracer")
       continue;
     for (const auto *member : space->decls()) {
       const auto *alias = llvm::dyn_cast<clang::TypeAliasDecl>(member);
-      if (alias && alias->getName() == "ResolvedSignature")
-        return alias->getUnderlyingType()->getAs<clang::FunctionProtoType>();
+      if (alias && alias->getName() == name)
+        return alias->getUnderlyingType();
     }
   }
-  return nullptr;
+  return {};
 }
 bool codec_types_supported(clang::QualType type,
                            std::set<const clang::CXXRecordDecl *> &seen) {
   if (type.getNonReferenceType().isVolatileQualified())
     return false;
+  if (const auto *array = type->getAsArrayTypeUnsafe())
+    return codec_types_supported(array->getElementType(), seen);
   const auto *record = type.getNonReferenceType()->getAsCXXRecordDecl();
   if (!record || !seen.insert(record->getCanonicalDecl()).second)
     return true;
@@ -61,7 +64,7 @@ bool codec_types_supported(clang::QualType type,
     const auto name =
         special->getSpecializedTemplate()->getQualifiedNameAsString();
     const auto &args = special->getTemplateArgs();
-    if (name.find("basic_string") != std::string::npos &&
+    if (special->getSpecializedTemplate()->getName() == "basic_string" &&
         name.rfind("std::", 0) == 0) {
       if (args.size() == 0 ||
           args[0].getKind() != clang::TemplateArgument::Type)
@@ -88,10 +91,25 @@ bool codec_types_supported(clang::QualType type,
           return false;
       }
     }
+    const auto primary = special->getSpecializedTemplate()->getName();
+    if (name.rfind("std::", 0) == 0 &&
+        (primary == "unique_ptr" || primary == "shared_ptr" || primary == "weak_ptr")) {
+      const auto pointee = args[0].getAsType();
+      if (primary == "weak_ptr" || !pointee->isObjectType() || pointee->isArrayType() ||
+          pointee->isIncompleteType() || pointee.isVolatileQualified())
+        return true;
+      return codec_types_supported(pointee, seen);
+    }
     if (name.rfind("std::", 0) == 0) {
+      const auto supported = [&](auto &&check, const clang::TemplateArgument &argument) -> bool {
+        if (argument.getKind() == clang::TemplateArgument::Pack)
+          return std::all_of(argument.pack_begin(), argument.pack_end(),
+                             [&](const auto &item) { return check(check, item); });
+        return argument.getKind() != clang::TemplateArgument::Type ||
+               codec_types_supported(argument.getAsType(), seen);
+      };
       for (const auto &argument : args.asArray())
-        if (argument.getKind() == clang::TemplateArgument::Type &&
-            !codec_types_supported(argument.getAsType(), seen))
+        if (!supported(supported, argument))
           return false;
       return true;
     }
@@ -159,26 +177,33 @@ make_value_snapshot_code(clang::ASTContext &ast,
   ValueSnapshotCode code;
   if (!spec.has_debug_info())
     return code;
-  const auto *function = signature(ast);
+  const auto signature = tracer_alias(ast, "ResolvedSignature");
+  if (signature.isNull())
+    return code;
+  const auto *function = signature->getAs<clang::FunctionProtoType>();
   if (!function)
     return code;
+  enum class Role { argument, result, receiver };
   struct Entry {
     unsigned index;
-    bool result;
+    Role role;
     clang::QualType type;
     std::string cpp_type;
     context_engine::SchemaResult schema;
     std::string error;
   };
   std::vector<Entry> entries;
-  const auto add = [&](unsigned index, bool result, clang::QualType type) {
+  const auto access = spec.prepared().format_version() == 3
+      ? context_engine::CodecAccess::snapshot_members
+      : context_engine::CodecAccess::public_members;
+  const auto add = [&](unsigned index, Role role, clang::QualType type) {
     const bool is_volatile = type.getNonReferenceType().isVolatileQualified();
     type = type.getNonReferenceType().getUnqualifiedType().getCanonicalType();
     if (type->isPointerType() || type->isVoidType())
       return;
     clang::PrintingPolicy policy(ast.getLangOpts());
     policy.SuppressTagKeyword = true;
-    Entry entry{index, result, type, type.getAsString(policy), {}, {}};
+    Entry entry{index, role, type, type.getAsString(policy), {}, {}};
     context_engine::StateFamilyKey family;
     family.source_lineage_id[0] = 1;
     if (const auto *record = type->getAsCXXRecordDecl();
@@ -188,12 +213,12 @@ make_value_snapshot_code(clang::ASTContext &ast,
       family.cpp_state_type = type.getAsString();
     family.cpp_scope_type = "tracer::EventValueSnapshot";
     context_engine::SchemaLimits limits;
-    limits.descriptor_bytes = 2048;
+    limits.descriptor_bytes = 4096;
     limits.fields = 128;
     limits.depth = 16;
     entry.schema = context_engine::build_payload_schema(
-        ast, type, std::move(family), limits);
-    const auto codec = context_engine::render_payload_codec_source(ast, type);
+        ast, type, std::move(family), limits, access);
+    const auto codec = context_engine::render_payload_codec_source(ast, type, access);
     if (!entry.schema)
       entry.error = entry.schema.error;
     else if (!codec)
@@ -220,11 +245,19 @@ make_value_snapshot_code(clang::ASTContext &ast,
        ++i) {
     const auto &argument = spec.debug_info().arguments(i);
     if (argument.is_reference() || argument.is_object_value())
-      add(unsigned(i), false, function->getParamType(unsigned(i)));
+      add(unsigned(i), Role::argument, function->getParamType(unsigned(i)));
   }
   const auto &info = spec.debug_info();
   if (info.result_is_reference() || info.result_is_object_value())
-    add(0, true, function->getReturnType());
+    add(0, Role::result, function->getReturnType());
+  if (access == context_engine::CodecAccess::snapshot_members &&
+      spec.signature().kind() == clangtracer::v1::METHOD) {
+    const auto receiver = tracer_alias(ast, "ResolvedTarget");
+    // A method can destroy its receiver. Both events retain the owned
+    // entry snapshot instead of accessing the object after the call.
+    if (!receiver.isNull())
+      add(0, Role::receiver, receiver);
+  }
   if (entries.empty())
     return code;
   const std::string scope = R"(
@@ -245,7 +278,7 @@ struct Scope { std::size_t mark = tracer_snapshot_mark(); bool active=true;
       types.push_back(entry.type);
   if (!types.empty()) {
     const auto codecs =
-        context_engine::render_context_codec_sources(ast, {}, types);
+        context_engine::render_context_codec_sources(ast, {}, types, access);
     if (!codecs) {
       for (auto &entry : entries)
         if (entry.error.empty())
@@ -290,14 +323,16 @@ template<class T> void encode(tracer::ValueSnapshot& snapshot, const T& value) n
 }
 )";
   for (const auto &entry : entries) {
-    const auto id = entry.result ? std::string("result")
-                                 : "arg" + std::to_string(entry.index);
-    const auto value =
-        entry.result ? "ctx.result"
-                     : "ctx.arguments[" + std::to_string(entry.index) + "]";
-    auto &body = entry.result ? code.result : code.arguments;
-    body += "tracer::ValueSnapshot snapshot_" + id + "; " + value +
-            ".snapshot=&snapshot_" + id + ";\n";
+    const bool receiver = entry.role == Role::receiver;
+    const bool result = entry.role == Role::result;
+    const auto id = receiver ? "receiver"
+                             : result ? "result" : "arg" + std::to_string(entry.index);
+    const auto slot = receiver ? "ctx.receiver_snapshot"
+                               : result ? "ctx.result.snapshot"
+                                        : "ctx.arguments[" + std::to_string(entry.index) + "].snapshot";
+    auto &body = result ? code.result : code.arguments;
+    body += "tracer::ValueSnapshot snapshot_" + id + "; " + slot +
+            "=&snapshot_" + id + ";\n";
     body += "snapshot_" + id + ".cpp_type=" + literal(entry.cpp_type) + ";\n";
     if (!entry.error.empty()) {
       body += "snapshot_" + id +
@@ -330,9 +365,10 @@ template<class T> void encode(tracer::ValueSnapshot& snapshot, const T& value) n
               ".record_type_count=" + std::to_string(record_types.size()) +
               ";\n";
     }
-    const auto expr = entry.result ? "tracer::Call(ctx).result()"
-                                   : "tracer::Call(ctx).argument<" +
-                                         std::to_string(entry.index) + ">()";
+    const auto expr = receiver ? "*tracer::Call(ctx).self()"
+                               : result ? "tracer::Call(ctx).result()"
+                                        : "tracer::Call(ctx).argument<" +
+                                              std::to_string(entry.index) + ">()";
     body +=
         "tracer_snapshot_detail::encode(snapshot_" + id + "," + expr + ");\n";
   }

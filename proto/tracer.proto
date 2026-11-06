@@ -120,6 +120,7 @@ message DebugInfo {
   bool record_is_opaque = 23;
   uint64 record_alignment = 24;
   RecordCallingConvention record_calling_convention = 25;
+  bytes prepared_layout_sha256 = 26;
 }
 message DebugMethod {
   string name = 1;
@@ -148,14 +149,17 @@ message HeaderContext {
   string inference = 3; // Clang's diagnostic identifying the selected command.
 }
 message PreparedInjector {
-  uint32 format_version = 1; // 1 pins a binary, 2 carries source-derived metadata only.
-  bytes module_sha256 = 2; // Required in format 1 and empty in format 2.
-  string module_name = 3; // Required in format 1 and empty in format 2.
+  uint32 format_version = 1; // 1/2 are scalar; 3 carries typed header metadata.
+  bytes module_sha256 = 2; // Required for pinned packages, empty otherwise.
+  string module_name = 3; // Required for pinned packages, empty otherwise.
   string selector = 4;
   string symbol = 5;
   Signature signature = 6;
   repeated string argument_names = 7;
   string target_triple = 8;
+  DebugInfo header_types = 9; // Source types and layouts, with no live addresses.
+  repeated string include_headers = 10;
+  HeaderContext header_context = 11;
 }
 message ProbeSpec {
   string symbol = 1;       // Linkage name/diagnostic; export required only in raw-symbol mode.
@@ -384,4 +388,5 @@ message TraceEvent {
   clangtracer.context.v1.ContextEventEnvelope context = 20;
   string function_name = 21; // Bounded registered selector or linkage fallback; server-assigned.
   string server_instance_id = 22; // Unique server lifetime; sequence alone is not durable identity.
+  clangtracer.context.v1.ValueSnapshot receiver_snapshot = 23;
 }

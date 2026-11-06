@@ -24,6 +24,7 @@
 #include "value_snapshot_codegen.hpp"
 #include "value_snapshot_storage.hpp"
 #include "context_paths.hpp"
+#include "prepared_types.hpp"
 
 #include <clang/AST/ASTImporter.h>
 #include <clang/AST/DeclCXX.h>
@@ -33,6 +34,9 @@
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/Basic/Diagnostic.h>
 #include <clang/Basic/Version.h>
+#include <clang/CodeGen/CGFunctionInfo.h>
+#include <clang/CodeGen/CodeGenABITypes.h>
+#include <clang/CodeGen/ModuleBuilder.h>
 #include <clang/Frontend/ASTUnit.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendActions.h>
@@ -1508,6 +1512,14 @@ std::uint64_t validate_debug_entry(const clangtracer::v1::ProbeSpec &spec) {
     throw std::runtime_error("mapped debug image, entry or callable metadata "
                              "changed before injection");
   }
+  if (spec.prepared().format_version() == 3 &&
+      (checked.spec.header_context().SerializeAsString() !=
+           spec.header_context().SerializeAsString() ||
+       spec.include_headers_size() < checked.spec.include_headers_size() ||
+       !std::equal(checked.spec.include_headers().begin(),
+                   checked.spec.include_headers().end(),
+                   spec.include_headers().begin())))
+    throw std::runtime_error("prepared header context changed before injection");
   return checked.spec.debug_info().runtime_entry();
 }
 
@@ -1986,7 +1998,8 @@ const char *type_name(tracer::ValueType type) {
   }
 }
 
-void fill_value(std::string &code, unsigned i, tracer::ValueType type) {
+void fill_value(std::string &code, unsigned i, tracer::ValueType type,
+                bool indirect_object) {
   code += "ctx.arguments[" + std::to_string(i) +
           "].type=static_cast<tracer::ValueType>(" +
           std::to_string(static_cast<unsigned>(type)) + ");\n";
@@ -2017,11 +2030,13 @@ void fill_value(std::string &code, unsigned i, tracer::ValueType type) {
             "].unsigned_value=reinterpret_cast<uintptr_t>(a" +
             std::to_string(i) + ");\n";
     break;
-  case tracer::ValueType::Object:
+  case tracer::ValueType::Object: {
+    const auto argument = "a" + std::to_string(i);
+    const auto address = indirect_object ? argument : "__builtin_addressof(" + argument + ")";
     code += "ctx.arguments[" + std::to_string(i) +
-            "].unsigned_value=reinterpret_cast<uintptr_t>(&a" +
-            std::to_string(i) + ");\n";
+            "].unsigned_value=reinterpret_cast<uintptr_t>(" + address + ");\n";
     break;
+  }
   default:
     break;
   }
@@ -2457,19 +2472,28 @@ std::string make_wrapper(const tracer::Request &r,
                          bool class_mode = false, bool shared_mode = false,
                          bool result_sret = false,
                          const tracer::ValueSnapshotCode *snapshots = nullptr) {
-  auto result_type = [&]() -> std::string {
+  const bool typed = spec && spec->prepared().format_version() == 3;
+  const auto indirect_argument = [&](unsigned i) {
+    return typed && r.arguments[i] == tracer::ValueType::Object &&
+           spec->debug_info().arguments(i).object_type().record_pass_by_reference();
+  };
+  const auto result_type = [&]() -> std::string {
+    if (typed && r.result != tracer::ValueType::Pointer)
+      return "tracer::ResolvedResult";
     if (r.result != tracer::ValueType::Object)
       return type_name(r.result);
-    if (!spec || !spec->has_debug_info() ||
-        spec->debug_info().result_cpp_type().empty())
+    if (!spec || spec->debug_info().result_cpp_type().empty())
       throw std::runtime_error("missing object result ABI metadata");
     return spec->debug_info().result_cpp_type();
   };
-  auto argument_type = [&](unsigned i) -> std::string {
+  const auto argument_type = [&](unsigned i) -> std::string {
+    if (indirect_argument(i))
+      return "void*";
+    if (typed && r.arguments[i] != tracer::ValueType::Pointer)
+      return "tracer::ResolvedArgument<" + std::to_string(i) + ">";
     if (r.arguments[i] != tracer::ValueType::Object)
       return type_name(r.arguments[i]);
-    if (!spec || !spec->has_debug_info() ||
-        i >= static_cast<unsigned>(spec->debug_info().arguments_size()))
+    if (!spec || i >= static_cast<unsigned>(spec->debug_info().arguments_size()))
       throw std::runtime_error("missing object argument ABI metadata");
     const auto &argument = spec->debug_info().arguments(i);
     if (!argument.is_object_value() || !argument.has_object_type())
@@ -2579,7 +2603,7 @@ std::string make_wrapper(const tracer::Request &r,
     code += "ctx.object_address=reinterpret_cast<uintptr_t>(self);\n";
   }
   for (unsigned i = 0; i < r.argument_count; ++i) {
-    fill_value(code, i, r.arguments[i]);
+    fill_value(code, i, r.arguments[i], indirect_argument(i));
   }
   if (snapshots) code += snapshots->arguments;
   if (spec && spec->stack_depth())
@@ -2616,7 +2640,9 @@ std::string make_wrapper(const tracer::Request &r,
     if (comma) {
       call += ",";
     }
-    call += "a" + std::to_string(i);
+    const auto argument = "a" + std::to_string(i);
+    call += typed && r.arguments[i] == tracer::ValueType::Object && !indirect_argument(i)
+                ? "std::move_if_noexcept(" + argument + ")" : argument;
     comma = true;
   }
   call += ")";
@@ -2681,7 +2707,7 @@ std::string make_wrapper(const tracer::Request &r,
       break;
     case tracer::ValueType::Object:
       code +=
-          "ctx.result.unsigned_value=reinterpret_cast<uintptr_t>(&result);\n";
+          "ctx.result.unsigned_value=reinterpret_cast<uintptr_t>(__builtin_addressof(result));\n";
       break;
     default:
       break;
@@ -3035,6 +3061,10 @@ bool validate_specialized_signature(
     error = "Interceptor template argument must be a function signature";
     return false;
   }
+  // Prepared aliases retain the exact Clang type. The generated
+  // static_assert compares the complete signature in the same TU.
+  if (spec.prepared().format_version() == 3)
+    return true;
   const auto &info = spec.debug_info();
   if (function->getNumParams() != info.arguments_size()) {
     error = "Interceptor signature argument count does not match target";
@@ -3618,6 +3648,10 @@ std::string argument_aliases(const clangtracer::v1::ProbeSpec &spec) {
   std::string code =
       "namespace tracer { template<unsigned long> struct ArgumentType; "
       "template<unsigned long> struct ResultType;\n";
+  const bool typed = spec.prepared().format_version() == 3;
+  if (typed)
+    code += "template<unsigned> struct PreparedArgument;\n"
+            "template<unsigned N> using ResolvedArgument = typename PreparedArgument<N>::type;\n";
   for (const auto &argument : spec.debug_info().arguments()) {
     // Preserve the full DWARF pointer chain. Multi-level pointers to records
     // are rejected by signature validation until their CV chain is modeled.
@@ -3626,6 +3660,10 @@ std::string argument_aliases(const clangtracer::v1::ProbeSpec &spec) {
     if (argument.is_object_value()) {
       type = "const " + argument.cpp_type() + "&";
     }
+    if (typed)
+      code += "template<> struct PreparedArgument<" +
+              std::to_string(argument.index()) + "> { using type = " +
+              argument.cpp_type() + "; };\n";
     code += "template<> struct ArgumentType<" +
             std::to_string(argument.index()) + "> { using type=" + type +
             "; static constexpr bool object_value=" +
@@ -3641,7 +3679,8 @@ std::string argument_aliases(const clangtracer::v1::ProbeSpec &spec) {
             "; static constexpr bool object_value=" +
             (info.result_is_object_value() ? "true" : "false") + "; };\n";
   }
-  code += "using ResolvedSignature=" + info.result_cpp_type() + "(";
+  code += "using ResolvedResult=" + info.result_cpp_type() + ";\n";
+  code += "using ResolvedSignature=ResolvedResult(";
   for (int i = 0; i < info.arguments_size(); ++i) {
     if (i)
       code += ",";
@@ -4219,6 +4258,80 @@ bool bind_probe_symbols(clang::Interpreter &interpreter,
   return true;
 }
 
+bool validate_prepared_types(clang::ASTUnit &unit,
+                             const clangtracer::v1::ProbeSpec &spec,
+                             bool &result_sret, std::string &error) {
+  using namespace clangtracer::v1;
+  auto &ast = unit.getASTContext();
+  class Finder : public clang::RecursiveASTVisitor<Finder> {
+  public:
+    Finder(clang::ASTContext &ast, const ProbeSpec &spec)
+        : ast(ast), spec(spec), name(spec.prepared().selector().substr(
+              0, spec.prepared().selector().find('('))) {
+      name.erase(0, name.find_first_not_of(" \t"));
+      name.erase(name.find_last_not_of(" \t") + 1);
+      if (name.compare(0, 2, "::") == 0)
+        name.erase(0, 2);
+    }
+    bool VisitFunctionDecl(clang::FunctionDecl *candidate) {
+      if (candidate->getQualifiedNameAsString() != name ||
+          tracer::prepared::mangle(candidate, ast) != spec.symbol())
+        return true;
+      decl = candidate;
+      return false;
+    }
+    clang::ASTContext &ast;
+    const ProbeSpec &spec;
+    std::string name;
+    clang::FunctionDecl *decl = nullptr;
+  } finder(ast, spec);
+  try {
+    finder.TraverseDecl(ast.getTranslationUnitDecl());
+    const auto *decl = finder.decl;
+    if (!decl)
+      throw std::runtime_error("prepared declaration is absent from its headers");
+    const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(decl);
+    const auto *function = decl->getType()->getAs<clang::FunctionProtoType>();
+    if (!function || function->isVariadic() || function->getCallConv() != clang::CC_C ||
+        decl->hasAttr<clang::AsmLabelAttr>() || (method && method->isVirtual()))
+      throw std::runtime_error("prepared declaration now has an unsupported ABI");
+    const auto function_info = function->getExtInfo();
+    if (function_info.getHasRegParm() || function_info.getProducesResult() ||
+        function_info.getNoCallerSavedRegs() || function_info.getCmseNSCall())
+      throw std::runtime_error("prepared declaration now has an ABI-changing attribute");
+    if (function->hasExtParameterInfos())
+      for (const auto &parameter : function->getExtParameterInfos())
+        if (parameter != clang::FunctionProtoType::ExtParameterInfo{})
+          throw std::runtime_error("prepared declaration now has an ABI-annotated parameter");
+    ProbeSpec actual;
+    actual.mutable_signature()->set_kind(method && !method->isStatic() ? METHOD : FUNCTION);
+    tracer::prepared::describe_prepared_callable(ast, *decl, method, actual,
+                                                unit.hasSema() ? &unit.getSema() : nullptr);
+    if (actual.debug_info().SerializeAsString() != spec.prepared().header_types().SerializeAsString() ||
+        actual.signature().SerializeAsString() != spec.signature().SerializeAsString())
+      throw std::runtime_error("prepared types or record layout changed; prepare again");
+    if (spec.signature().result() == OBJECT) {
+      llvm::LLVMContext llvm;
+      clang::CodeGenOptions options;
+      auto fs = llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem>(
+          &unit.getFileManager().getVirtualFileSystem());
+      std::unique_ptr<clang::CodeGenerator> generator(clang::CreateLLVMCodeGen(
+          unit.getDiagnostics(), "prepared-abi", std::move(fs),
+          unit.getHeaderSearchOpts(), unit.getPreprocessorOpts(), options, llvm));
+      generator->Initialize(ast);
+      const auto &abi = actual.signature().kind() == METHOD
+          ? clang::CodeGen::arrangeCXXMethodType(generator->CGM(), method->getParent(), function, method)
+          : clang::CodeGen::arrangeFreeFunctionType(generator->CGM(),
+                ast.getCanonicalType(decl->getType()).getAs<clang::FunctionProtoType>());
+      result_sret = abi.getReturnInfo().isIndirect();
+    }
+    return true;
+  } catch (const std::exception &exception) {
+    error = exception.what();
+    return false;
+  }
+}
+
 bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
                    std::string &error, bool run_initializers = true,
                    bool syntax_only = false,
@@ -4259,6 +4372,16 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
             "receiver context", true)))) {
     return false;
   }
+  const bool typed_prepared = specification.prepared().format_version() == 3;
+  if (typed_prepared) {
+    const auto &directory = specification.header_context().working_directory();
+    if (directory.empty() || directory.front() != '/' || directory.size() > 4095 ||
+        directory.find('\0') != std::string::npos ||
+        !std::filesystem::is_directory(directory)) {
+      error = "prepared header working directory is unavailable";
+      return false;
+    }
+  }
   const std::string &source = specification.callback_source();
   const auto [callback_includes, callback_body] =
       split_callback_includes(source);
@@ -4282,7 +4405,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   const std::string callback_type_declarations =
       callback_headers_available ? std::string()
                                  : recovered_record_declarations(specification);
-  if (specification.has_debug_info() &&
+  if (!typed_prepared && specification.has_debug_info() &&
       !interceptor_template_prelude(source).empty()) {
     const auto has_multiple_pointers = [](const std::string &type) {
       return std::count(type.begin(), type.end(), '*') > 1;
@@ -4322,14 +4445,16 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   p.argument_names.assign(specification.argument_names().begin(),
                           specification.argument_names().end());
   clang::CXXRecordDecl *receiver_record = nullptr;
-  if (!build_and_validate_receiver_ast(specification, p.request, p.receiver_ast,
+  if (!typed_prepared &&
+      !build_and_validate_receiver_ast(specification, p.request, p.receiver_ast,
                                        receiver_record, error,
                                        p.debug_records, type_header_prefix,
                                        verified_entry)) {
     return false;
   }
   bool result_sret = false;
-  if (!determine_object_result_sret(specification, p.debug_records,
+  if (!typed_prepared &&
+      !determine_object_result_sret(specification, p.debug_records,
                                     result_sret, error))
     return false;
   if (!initialize_llvm(error)) {
@@ -4342,7 +4467,9 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
       compiler_arguments.end(),
       {"-std=c++20", "-x", "c++", "-fPIC", "-O0", resource_dir_argument});
   const auto &snapshot_debug = specification.debug_info();
-  const bool needs_snapshot_headers = snapshot_debug.result_is_reference() ||
+  const bool needs_snapshot_headers =
+      (typed_prepared && specification.signature().kind() == clangtracer::v1::METHOD) ||
+      snapshot_debug.result_is_reference() ||
       snapshot_debug.result_is_object_value() ||
       std::any_of(snapshot_debug.arguments().begin(), snapshot_debug.arguments().end(),
                   [](const auto &argument) {
@@ -4356,6 +4483,15 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
     } catch (const std::exception &) {
       // Scalar/legacy hooks use embedded headers and need no snapshot codecs.
     }
+  }
+  if (typed_prepared) {
+    const auto &context = specification.header_context();
+    compiler_arguments.push_back("-working-directory=" + context.working_directory());
+    compiler_arguments.insert(compiler_arguments.end(), context.compiler_arguments().begin(),
+                              context.compiler_arguments().end());
+    // The callback's frontend uses its own codegen settings. Header ABI
+    // and preprocessing flags still come from the frozen compile command.
+    compiler_arguments.insert(compiler_arguments.end(), {"-fPIC", "-O0"});
   }
   compiler_arguments.insert(compiler_arguments.end(), user_options.begin(),
                             user_options.end());
@@ -4434,9 +4570,16 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   const std::string context_prelude =
       std::string(tracer::kEmbeddedContextHeader) +
       "\n#define CLANG_TRACER_CONTEXT_TYPES_DEFINED 1\n";
+  const std::string receiver_alias =
+      typed_prepared && specification.signature().kind() == clangtracer::v1::METHOD
+          ? "namespace tracer { using ResolvedTarget = " +
+                std::string(snapshot_debug.receiver_volatile() ? "volatile " : "") +
+                snapshot_debug.record_name() +
+                "; }\n#define CLANG_TRACER_HAS_TYPED_RECEIVER 1\n"
+          : std::string();
   const std::string user_source = forced_include_source + prelude + context_prelude +
                                   callback_header_source +
-                                  callback_type_declarations +
+                                  callback_type_declarations + receiver_alias +
                                   tracer::kEmbeddedCallbackHeader +
                                   argument_aliases(specification) +
                                   interceptor_template_prelude(source) +
@@ -4505,9 +4648,15 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
       build_callback_ast(user_source, "clang-tracer-callback.cc", user_capture);
   bool shape_valid = false;
   if (user_ast) {
+    if (typed_prepared && !validate_prepared_types(*user_ast, specification, result_sret, error))
+      return false;
     const auto context_declarations =
         tracer::analyze_context_declarations(user_ast->getASTContext());
     if (context_declarations.requires_context) {
+      if (typed_prepared) {
+        error = "typed prepared callbacks do not support shared-context state yet";
+        return false;
+      }
       std::string signature_assert;
       if (!interceptor_template_prelude(source).empty()) {
         shape_valid = inspect_callback_shape(user_ast->getASTContext(), shape,
@@ -4966,6 +5115,11 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
           static_cast<std::uint64_t>(now.tv_sec) * 1000000000ULL + now.tv_nsec);
     }
     event.set_object_address(ctx->object_address);
+    if (ctx->receiver_snapshot) {
+      tracer::TraceValue receiver;
+      receiver.snapshot = ctx->receiver_snapshot;
+      *event.mutable_receiver_snapshot() = to_proto_value(receiver).snapshot();
+    }
     for (std::uint32_t i = 0;
          i < ctx->argument_count && i < tracer::kMaxArguments; ++i) {
       *event.add_arguments() = to_proto_value(ctx->arguments[i]);
@@ -5009,20 +5163,22 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
         p->delivery.dropped.load(std::memory_order_relaxed));
     // Preserve the event when positional/named snapshot duplication exceeds
     // the native packet budget; the typed getter reports explicit truncation.
-    const auto discard_snapshot = [](clangtracer::v1::Value &value) {
-      auto *snapshot = value.mutable_snapshot(); snapshot->Clear();
+    const auto discard_snapshot = [](clangtracer::context::v1::ValueSnapshot *snapshot) {
+      snapshot->Clear();
       snapshot->set_status(clangtracer::context::v1::ValueSnapshot::LIMIT_EXCEEDED);
       snapshot->set_detail("snapshot exceeds native event packet budget");
     };
     for (int i = 0; i < event.arguments_size() && event.ByteSizeLong() > tracer::EventTransport::kMaxEventBytes; ++i) {
       auto &value = *event.mutable_arguments(i);
       if (!value.has_snapshot()) continue;
-      discard_snapshot(value);
+      discard_snapshot(value.mutable_snapshot());
       for (auto &named : *event.mutable_named_arguments())
         if (named.argument_index() == static_cast<unsigned>(i)) *named.mutable_value() = value;
     }
     if (event.ByteSizeLong() > tracer::EventTransport::kMaxEventBytes && event.has_result() && event.result().has_snapshot())
-      discard_snapshot(*event.mutable_result());
+      discard_snapshot(event.mutable_result()->mutable_snapshot());
+    if (event.ByteSizeLong() > tracer::EventTransport::kMaxEventBytes && event.has_receiver_snapshot())
+      discard_snapshot(event.mutable_receiver_snapshot());
     const auto size = event.ByteSizeLong();
     if (size <= tracer::EventTransport::kMaxEventBytes) {
       packet->bytes.resize(size);
