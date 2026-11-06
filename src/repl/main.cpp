@@ -222,7 +222,19 @@ int main(int argc, char **argv) {
                    "%help api describes C++ APIs; Tab completes members.\n";
     }
     bool failed = false;
-    while (const auto line = input.read(controller.prompt())) {
+    while (true) {
+      // tracer.inject() can execute inside a JIT cell. Import after the cell
+      // returns so the live interpreter is never re-entered.
+      for (const auto &headers : controller.take_pending_imports()) {
+        try {
+          std::cout << cpp.import_headers(headers) << '\n';
+        } catch (const std::exception &error) {
+          std::cerr << "prepared C++ import skipped: " << error.what() << '\n';
+        }
+      }
+      const auto line = input.read(controller.prompt());
+      if (!line)
+        break;
       const auto first = line->find_first_not_of(" \t\r\n");
       if (first == std::string::npos) {
         continue;

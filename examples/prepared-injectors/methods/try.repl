@@ -5,6 +5,9 @@
 auto e = tracer.batch("captured").at(0);
 std::cout << e.argument_as<std::string>(0) << std::endl;
 e.argument_snapshot(1).at(1).as<int>()
+auto adjustment = e.argument_as<prepared_demo::Adjustment>(2);
+adjustment.delta
+adjustment.limit.value()
 e.argument_snapshot(2).field("delta").as<int>()
 e.result_snapshot().field("total").as<int>()
 e.receiver_snapshot().field("prepared_demo::Account::account_id").as<int>()

@@ -23,7 +23,7 @@ class CppEngine {
   Facade &facade_;
   std::vector<std::string> arguments_;
   void initialize();
-  MappingHeader mapping_header(const std::string &header,
+  MappingHeader mapping_header(const std::vector<std::string> &headers,
                              const std::vector<std::string> &types,
                              const std::string &output, bool standalone);
 
@@ -42,6 +42,9 @@ public:
   std::string import_header(const std::string &header,
                             const std::vector<std::string> &types = {},
                             const std::string &output = {});
+  std::string import_headers(const std::vector<std::string> &headers,
+                             const std::vector<std::string> &types = {},
+                             const std::string &output = {});
   std::string generate_header(const std::string &header,
                               const std::vector<std::string> &types = {},
                               const std::string &output = {});

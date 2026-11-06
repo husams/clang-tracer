@@ -59,6 +59,7 @@ correct = correct && e.receiver_snapshot().field("limits").field("second").as<st
 correct = correct && e.receiver_snapshot().field("balance_address").as<unsigned long>() != 0 && e.receiver_snapshot().field("category").as<std::string>() == "savings";
 auto receiver = e.receiver_snapshot();
 correct = correct && e.argument_snapshot(3).field("value").as<int>() == 5 && e.argument_snapshot(4).field("value").as<int>() == 2 && !e.argument_snapshot(5).field("expired").as<bool>();
+correct = correct && adjustment.delta == 4 && adjustment.limit.value() == 30;
 correct = correct && std::get<2>(e.argument_as<std::variant<std::monostate, int, std::string, int>>(6)) == "argument choice";
 correct = correct && receiver.field("ledger_credit").field("value").field("delta").as<int>() == 6 && receiver.field("empty_credit").field("address").as<unsigned long>() == 0 && receiver.field("empty_credit").field("value").is_null();
 correct = correct && receiver.field("ledger_total").field("value").as<int>() == 81 && !receiver.field("ledger_total_ref").field("expired").as<bool>() && receiver.field("expired_total_ref").field("expired").as<bool>();

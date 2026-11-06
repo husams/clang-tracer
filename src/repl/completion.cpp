@@ -64,8 +64,7 @@ std::string absolute_input(clang::CompilerInstance &compiler, llvm::StringRef na
 }
 class HeaderInclude final : public clang::PPCallbacks {
   clang::CompilerInstance &compiler_;
-  const std::string requested_;
-  std::string &resolved_;
+  std::map<std::string, std::string> &resolved_;
   std::map<std::string, std::string> &lookups_;
   std::map<std::string, std::string> &roots_;
   bool &reusable_;
@@ -133,17 +132,20 @@ class HeaderInclude final : public clang::PPCallbacks {
     reusable_ &= represented;
   }
 public:
-  HeaderInclude(clang::CompilerInstance &compiler, std::string requested, std::string &resolved,
+  HeaderInclude(clang::CompilerInstance &compiler, std::map<std::string, std::string> &resolved,
                 std::map<std::string, std::string> &lookups,
                 std::map<std::string, std::string> &roots, bool &reusable)
-      : compiler_(compiler), requested_(std::move(requested)), resolved_(resolved),
+      : compiler_(compiler), resolved_(resolved),
         lookups_(lookups), roots_(roots), reusable_(reusable) {}
   void InclusionDirective(clang::SourceLocation location, const clang::Token &, llvm::StringRef filename,
                            bool angled, clang::CharSourceRange, clang::OptionalFileEntryRef file,
                            llvm::StringRef, llvm::StringRef, const clang::Module *, bool,
                            clang::SrcMgr::CharacteristicKind) override {
-    if (resolved_.empty() && filename == requested_ && file)
-      resolved_ = absolute_input(compiler_, file->getName());
+    if (file) {
+      const auto requested = resolved_.find(filename.str());
+      if (requested != resolved_.end() && requested->second.empty())
+        requested->second = absolute_input(compiler_, file->getName());
+    }
     lookup(location, filename, angled, file);
   }
   void HasInclude(clang::SourceLocation location, llvm::StringRef filename, bool angled,
@@ -531,28 +533,43 @@ std::string reflect_cpp_header(const std::vector<std::string> &arguments,
     return *parsed;
   };
   std::istringstream input(request);
-  std::string header;
-  if (!(input >> std::quoted(header)) || header.empty() || header.size() > 4095 ||
-      header.find_first_of("\"\\\r\n") != std::string::npos || header.find('\0') != std::string::npos)
-    throw std::runtime_error("invalid application header name");
+  std::size_t count = 0;
+  if (!(input >> count) || count == 0 || count > 16)
+    throw std::runtime_error("provide 1..16 application headers");
+  std::vector<std::string> headers;
+  std::map<std::string, std::string> resolved;
+  std::string include;
+  for (std::size_t i = 0; i < count; ++i) {
+    std::string header;
+    if (!(input >> std::quoted(header)) || header.empty() || header.size() > 4095 ||
+        header.find_first_of("\"\\\r\n") != std::string::npos ||
+        header.find('\0') != std::string::npos)
+      throw std::runtime_error("invalid application header name");
+    headers.push_back(header);
+    resolved.try_emplace(header);
+    include += "#include \"" + header + "\"\n";
+  }
   std::vector<std::string> types;
   for (std::string type; input >> std::quoted(type);) {
     if (type.empty() || type.size() > 4096 || types.size() >= 128)
       throw std::runtime_error("invalid record selector");
     types.push_back(type);
   }
-  const auto include = "#include \"" + header + "\"\n";
   auto &compiler = *interpreter->getCompilerInstance();
-  std::string resolved;
   std::map<std::string, std::string> lookups;
   std::map<std::string, std::string> roots;
   bool reusable = true;
   compiler.getPreprocessor().addPPCallbacks(
-      std::make_unique<HeaderInclude>(compiler, header, resolved, lookups, roots, reusable));
+      std::make_unique<HeaderInclude>(compiler, resolved, lookups, roots, reusable));
   for (const auto &cell : history) parse(cell);
   parse(include);
-  if (resolved.empty() || resolved.find_first_of("\"\\\r\n") != std::string::npos)
-    throw std::runtime_error("cannot resolve reusable application include");
+  std::string resolved_includes;
+  for (const auto &header : headers) {
+    const auto &path = resolved.at(header);
+    if (path.empty() || path.find_first_of("\"\\\r\n") != std::string::npos)
+      throw std::runtime_error("cannot resolve reusable application include: " + header);
+    resolved_includes += "#include \"" + path + "\"\n";
+  }
   unsigned index = 0;
   const auto viable = [&](const std::string &expression) {
     const auto symbol = "__tracer_mapping_trait_" + std::to_string(index++);
@@ -611,7 +628,7 @@ std::string reflect_cpp_header(const std::vector<std::string> &arguments,
     manifest << "// tracer-repl-dependency " << digest << ' ' << std::quoted(path) << '\n';
   }
   return generated.source.substr(0, generated.source.find('\n') + 1) +
-         "#pragma once\n" + manifest.str() + "#include \"" + resolved + "\"\n" +
+         "#pragma once\n" + manifest.str() + resolved_includes +
          generated.source.substr(generated.source.find('\n') + 1);
 }
 
