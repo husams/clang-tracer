@@ -8,6 +8,13 @@
 #include <sys/prctl.h>
 #include <unistd.h>
 
+#ifndef PR_SET_PTRACER
+#define PR_SET_PTRACER 0x59616d61
+#endif
+#ifndef PR_SET_PTRACER_ANY
+#define PR_SET_PTRACER_ANY (~0UL)
+#endif
+
 namespace {
 volatile std::sig_atomic_t running = 1;
 void stop(int) { running = 0; }
