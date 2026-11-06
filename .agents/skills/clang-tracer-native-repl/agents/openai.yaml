@@ -1,0 +1,3 @@
+interface:
+  display_name: "Clang Tracer Native REPL"
+  short_description: "Trace with native C++ REPL commands and scripts"
