@@ -133,8 +133,11 @@ and falls back to DWARF when it cannot use the package. Pass
 `--prepared DIRECTORY` to select a package in another directory or from another
 REPL session. Fallback happens during resolution, before the hook is installed.
 
-Prepared packages support Linux x86-64 free functions and non-static,
-non-virtual methods. Typed packages retain the declared C++ signature and
+Prepared packages support concrete Linux x86-64 free functions and methods.
+For virtual dispatch, select the override, such as `Derived::run(int) const`.
+Calls through a base pointer are captured when dispatch reaches that
+implementation, including calls through an adjusting thunk. A selector
+installs one hook at its executable entry. Typed packages retain the declared C++ signature and
 header layout. The declarations and build flags must describe the running
 function's ABI. Injection binds the package to the symbol in the mapped ELF
 image and checks the adapter's ABI and layouts before compiling the callback. If multiple
@@ -142,10 +145,17 @@ modules define the symbol, pass `--module PATH` to select one.
 
 Regenerate version 3 typed packages to obtain the standalone adapter. Generated
 record declarations support layout and value inspection. The current adapter
-generator supports namespace-scope records, enums, inheritance without virtual
-bases, and supported standard library types. Polymorphic records, user-defined
-class templates, and custom copy, move, or destruction code need a different
-representation. Preparation rejects types whose ABI it cannot reproduce.
+generator supports namespace-scope records, enums, polymorphic bases, concrete
+class template specializations, and supported standard library types.
+Preparation checks virtual base layout and rejects types whose ABI it cannot
+reproduce.
+
+Use explicit template arguments and the concrete parameter list to prepare
+template functions and methods, for example `twice<int>(int)`,
+`Handler::convert<double>(double) const`, or `Box<int, 5>::apply(int) const`.
+The preparer resolves the concrete declaration without building the target.
+Injection requires the instance to have an executable symbol and a safe patch
+window in the target.
 
 To run the same workflow automatically through the native REPL:
 

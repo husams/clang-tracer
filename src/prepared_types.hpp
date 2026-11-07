@@ -7,6 +7,7 @@
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/DeclTemplate.h>
 #include <clang/AST/RecordLayout.h>
+#include <clang/AST/VTableBuilder.h>
 #include <clang/AST/Mangle.h>
 #include <clang/Sema/Sema.h>
 #include <llvm/Support/raw_ostream.h>
@@ -44,6 +45,17 @@ inline std::string record_layout(clang::ASTContext &ast,
     number(layout.getSize().getQuantity());
     number(layout.getAlignment().getQuantity());
     number(record->canPassInRegisters());
+    if (record->getNumVBases()) {
+      // A snapshot's derived-to-virtual-base cast reads these offsets from
+      // the original object's vtable. Check the slot as well as the layout.
+      auto &vtables = *static_cast<clang::ItaniumVTableContext *>(ast.getVTableContext());
+      for (const auto &base : record->vbases()) {
+        const auto *decl = base.getType()->getAsCXXRecordDecl()->getDefinition();
+        add(type_name(ast, base.getType()));
+        number(layout.getVBaseClassOffset(decl).getQuantity());
+        number(vtables.getVirtualBaseOffsetOffset(record, decl).getQuantity());
+      }
+    }
     // An owning pointer's storage does not describe the pointee we read.
     if (const auto *special =
             llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record);
@@ -200,6 +212,25 @@ inline std::string mangle(const clang::FunctionDecl* declaration, clang::ASTCont
   mangler->mangleName(clang::GlobalDecl(declaration), output);
   output.flush();
   return symbol;
+}
+
+inline bool template_instance(const clang::FunctionDecl &declaration) {
+  if (declaration.getTemplateSpecializationArgs())
+    return true;
+  if (const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(&declaration))
+    return llvm::isa<clang::ClassTemplateSpecializationDecl>(method->getParent());
+  return false;
+}
+
+inline bool adapter_callable(const clang::FunctionDecl &declaration,
+                             clang::ASTContext &ast, const std::string &name,
+                             const std::string &symbol) {
+  if (const auto *label = declaration.getAttr<clang::AsmLabelAttr>())
+    return label->getLabel() == symbol;
+  return declaration.getQualifiedNameAsString() == name &&
+         !declaration.getDeclContext()->isDependentContext() &&
+         !declaration.getType()->isDependentType() &&
+         mangle(&declaration, ast) == symbol;
 }
 
 } // namespace tracer::prepared

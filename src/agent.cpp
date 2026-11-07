@@ -4283,8 +4283,7 @@ bool validate_prepared_types(clang::ASTUnit &unit,
         name.erase(0, 2);
     }
     bool VisitFunctionDecl(clang::FunctionDecl *candidate) {
-      if (candidate->getQualifiedNameAsString() != name ||
-          tracer::prepared::mangle(candidate, ast) != spec.symbol())
+      if (!tracer::prepared::adapter_callable(*candidate, ast, name, spec.symbol()))
         return true;
       decl = candidate;
       return false;
@@ -4301,8 +4300,7 @@ bool validate_prepared_types(clang::ASTUnit &unit,
       throw std::runtime_error("prepared declaration is absent from its adapter");
     const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(decl);
     const auto *function = decl->getType()->getAs<clang::FunctionProtoType>();
-    if (!function || function->isVariadic() || function->getCallConv() != clang::CC_C ||
-        decl->hasAttr<clang::AsmLabelAttr>() || (method && method->isVirtual()))
+    if (!function || function->isVariadic() || function->getCallConv() != clang::CC_C)
       throw std::runtime_error("prepared declaration now has an unsupported ABI");
     const auto function_info = function->getExtInfo();
     if (function_info.getHasRegParm() || function_info.getProducesResult() ||
