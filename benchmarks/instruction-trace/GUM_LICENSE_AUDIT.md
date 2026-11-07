@@ -68,6 +68,8 @@ notices and license texts, exact corresponding LGPL source and changes,
 and a compliant way for recipients to modify the LGPL components and relink
 the plugin. The alternative of replaceable shared dependencies would need
 its own link, ABI and license validation. A release that also ships the
-devkit would have to cover the archive-only components. The 564 GNU
-property warnings from the SDK linker also remain open.
+devkit would have to cover the archive-only components. The pilot resolves
+the original GNU property warnings by linking with GNU BFD 2.35.2
+against the SDK sysroot. The relinking instructions describe the linker
+selection.
 [GLib license, sections 5 and 6](https://github.com/frida-forks/glib/blob/f11db6352345ad21deb5f5783bb988bfca2a3d85/COPYING)

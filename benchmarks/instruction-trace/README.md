@@ -155,9 +155,14 @@ The native-only fixture added no third-party library. The Gum devkit download
 was 12,791,284 bytes and its static archive was 87,510,768 bytes. The SDK-linked
 Gum module was 23,109,304 bytes before stripping and 10,319,976 bytes after
 stripping. The native executable was 27,248 bytes after stripping.
-The SDK GNU linker 2.30 emitted
-564 unsupported GNU property warnings while reading the devkit objects.
-The tested runtime still passed the fixture.
+The original SDK GNU linker 2.30 emitted 564 unsupported GNU property
+warnings from the devkit objects. The first source relink emitted 298
+from the retained objects. The pilot now uses host GNU BFD 2.35.2 with the
+SDK Clang driver and SDK sysroot for the plugin link. The original archive
+and rebuilt libraries link with zero warnings. Linker warnings fail the
+build, and the devkit's object notes are preserved in the link inputs.
+[Clang linker selection](https://clang.llvm.org/doxygen/ToolChain_8cpp_source.html),
+[GNU ld warning handling](https://sourceware.org/binutils/docs/ld.html)
 
 The updated live SDK module was 10,322,360 bytes after stripping. It exposed five
 pilot symbols and had full RELRO, immediate binding and a nonexecutable
@@ -177,7 +182,7 @@ and 282 members linked into the original pilot, including LGPL GLib code.
 The relinking bundle contains the license texts, original source notices,
 pinned source trees, and 149 retained Gum, Capstone and liblzma objects.
 It builds the plugin from replacement GLib, GObject, libffi and PCRE2
-libraries. The SDK linker warnings remain open.
+libraries.
 
 From the repository root on Linux x86-64, use the verified SDK compiler
 and Meson to assemble the bundle and produce an archive.

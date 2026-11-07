@@ -20,9 +20,12 @@ links to the notices for embedded code.
 
 Use Linux x86-64, Bash, GNU binutils, Python 3, Meson 1.4 or newer, Ninja,
 pkg-config, and a C/C++ toolchain targeting glibc 2.23 or earlier. The
-verified toolchain used Clang 21.1.8 with the GCC 8.5 SDK
-`x86_64-2.6.32-v4.0.137` and Meson 1.9.2. Set `SDK` to the installed SDK
-directory. Verify the package before making any source changes.
+verified build used Clang 21.1.8 with the GCC 8.5 SDK
+`x86_64-2.6.32-v4.0.137`, Meson 1.9.2, and GNU BFD 2.35.2.
+The plugin link uses Clang with `/usr/bin/ld.bfd` and the SDK sysroot.
+Set `PILOT_GUM_LINKER` to an alternate BFD executable if needed. The
+plugin link treats linker warnings as errors. Set `SDK` to the installed
+SDK directory and verify the package before making any source changes.
 
 ```sh
 sha256sum --check --quiet SHA256SUMS
