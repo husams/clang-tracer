@@ -254,6 +254,7 @@ can include `event_ranges.hpp` and use the `tracer_repl` namespace explicitly.
 %events calls batch
 %events stats batch
 %record capture.pb --count 1000
+%record capture.db --sqlite --count 1000
 %events open capture.pb --as saved
 %events open capture.db --as stored
 %events export saved --format json --output events.json
@@ -290,11 +291,13 @@ Loss statistics sum the latest observed cumulative agent counter per probe and
 server counter per server lifetime, without counting repeated samples twice.
 Unknown native phases remain inspectable and are counted outside PRE/POST pairs.
 
-Recordings use the Python client's four-byte little-endian length plus Protobuf
-TraceEvent framing, with a 32 MiB per-frame limit. Recording and export create
-new files exclusively. Replay rejects truncated headers/bodies and invalid
-messages. A failed recording keeps its partial file; offline loading retains
-only the configured bounded window. Use recording for long captures.
+By default, `%record` uses four-byte little-endian lengths and Protobuf
+TraceEvent frames, with a 32 MiB per-frame limit. Framed recording and export
+create new files exclusively. `%record FILE --sqlite` creates or appends to a
+SQLite recording and deduplicates events by server instance and sequence.
+Replay rejects truncated headers/bodies and invalid messages. A failed
+recording keeps its partial file. Offline loading retains the configured
+bounded window.
 
 ### Query a recording offline
 
@@ -328,8 +331,8 @@ all matches and retains the latest events that fit the memory budget.
 SQLite read-only and works after the target and tracing server have exited.
 The results support the same typed accessors and C++ adaptors as live events.
 
-The native SQLite recorder (`clang-tracer events --sqlite` or
-`clang-tracer drain --sqlite`) saves the standalone C++ type bundle for
+The native SQLite recorders (`%record FILE --sqlite`, `clang-tracer events
+--sqlite`, and `clang-tracer drain --sqlite`) save the standalone C++ type bundle for
 prepared probes with custom state. Opening the database or calling
 `tracer.replay` makes those types and their generated mappings available at
 the next prompt. A fresh REPL can reconstruct the recorded C++ value without

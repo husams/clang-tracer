@@ -97,6 +97,12 @@ int main() {
   bad("%collect --count 10 %detach");
   bad("%record");
   bad("%record \"\"");
+  const auto sqlite = parse_command("%record capture.db --count 10 --sqlite --name account.adjusted");
+  require(sqlite.kind == CommandKind::record && sqlite.arguments.at(0) == "capture.db" &&
+          sqlite.has("--sqlite") && sqlite.number("--count", 0) == 10 &&
+          sqlite.option("--name") == "account.adjusted");
+  bad("%record capture.db --sqlite --sqlite");
+  bad("%collect --sqlite");
   bad("%events --probe 0");
   bad("%events --after 999999999999999999999999999999999");
   bad("%symbols --limit 4294967296");

@@ -34,7 +34,13 @@ clang-tracer drain --sqlite capture.db
 clang-tracer drain 12345 --sqlite capture.db --listen --timeout 60
 ```
 
-Console commands:
+In the native REPL, save without consuming retained history:
+
+```text
+%record capture.db --sqlite --name account.adjusted --count 12
+```
+
+Python console commands:
 
 ```text
 record capture.db 100 --sqlite --timeout 30

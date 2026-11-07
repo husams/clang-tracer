@@ -32,11 +32,13 @@ selector='prepared_demo::Account::apply(const std::string &, std::vector<int>, p
   printf '%%probe prepare "%s" --include account.hpp --include reading.hpp --output prepared --metadata-only\n' "$selector"
   printf '%s\n' '%shell "unlink account.hpp && unlink reading.hpp && unlink compile_commands.json"'
   printf '%%probe inject "%s" --callback state_interceptor.cpp --prepared-mode require\n' "$selector"
+  printf '%s\n' '%record capture.db --sqlite --name account.adjusted --count 12 --timeout 8'
   printf '%%shell "\047%s\047 events %s --sqlite streamed.db --count 12 --timeout 8"\n' "$client" "$target_pid"
   printf '%%shell "\047%s\047 drain %s --sqlite drained.db --count 12 --timeout 8"\n' "$client" "$target_pid"
   printf '%s\n' '%quit'
 } | "$repl" --attach "$target_pid" --timeout 60 --fail-fast | tee capture.log
 grep -q '^installed probe=' capture.log
+grep -q '^received=12 .*complete=true .*recording=capture.db$' capture.log
 grep -q '^drained 12 events' capture.log
 test ! -e account.hpp
 test ! -e reading.hpp
@@ -46,18 +48,18 @@ trap - EXIT
 unset CLANG_TRACER_ENDPOINT
 
 mkdir offline
-mv streamed.db drained.db offline/
+mv capture.db streamed.db drained.db offline/
 cd offline
-for recording in streamed drained; do
+for recording in capture streamed drained; do
   export XDG_CACHE_HOME="$run/offline-$recording-cache"
   {
-    if [[ "$recording" == streamed ]]; then
+    if [[ "$recording" != drained ]]; then
       cat <<'REPL'
 tracer_repl::EventQuery query;
 query.names = {"account.adjusted"};
 query.count = 1;
-auto matches = tracer.replay("streamed.db", query);
 REPL
+      printf 'auto matches = tracer.replay("%s.db", query);\n' "$recording"
     else
       printf '%s\n' '%events open drained.db --as saved' 'auto matches = tracer.batch("saved");'
     fi

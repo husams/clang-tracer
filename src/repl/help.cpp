@@ -83,8 +83,8 @@ const CommandTopic commands[] = {
      "Write the retained events to a new JSON file."},
     {"collect", "%collect [STREAM OPTIONS] [--as NAME]", "Capture events into a bounded collection named batch by default.",
      "%collect --count 10 --timeout 15 --phase POST --as results"},
-    {"record", "%record NEW_FILE.pb [STREAM OPTIONS]", "Write events to a new recording file for later replay.",
-     "%record capture.pb --count 10"},
+    {"record", "%record FILE [--sqlite] [STREAM OPTIONS]", "Save events for replay. Use --sqlite to create or append to a SQLite recording with available prepared C++ types.",
+     "%record capture.db --sqlite --count 10"},
 
     {"cpp", "", "Load C++, configure the local compiler, or generate mappings for captured values."},
     {"cpp load", "%cpp load FILE", "Evaluate a local C++ source file in the current interpreter."},
