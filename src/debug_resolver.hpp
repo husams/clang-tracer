@@ -23,6 +23,7 @@ public:
 };
 
 std::vector<std::string> list_debug_modules(std::uint32_t pid);
+clangtracer::v1::ListModulesResponse list_debug_module_mappings(std::uint32_t pid);
 ResolvedCallable resolve_debug_callable(
     std::uint32_t pid, const std::string &selector,
     const DebugLookupOptions &options = {});
@@ -43,6 +44,8 @@ struct DebugSymbol {
   std::string selector;
   std::string linkage_symbol;
   std::string module_path;
+  std::uint64_t runtime_address = 0;
+  std::uint64_t elf_address = 0;
 };
 
 struct DebugSymbolPage {
@@ -58,5 +61,6 @@ DebugSymbolPage list_debug_symbols(
     std::size_t page_size, const std::string &after_selector,
     const std::string &after_linkage_symbol, const std::string &after_module_path,
     const std::string &expected_mapping_fingerprint,
-    const std::function<bool()> &is_cancelled);
+    const std::function<bool()> &is_cancelled,
+    bool include_addresses = false, std::uint64_t address = 0);
 } // namespace tracer::client

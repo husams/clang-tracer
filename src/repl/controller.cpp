@@ -1,5 +1,6 @@
 #include "controller.hpp"
 #include "../prepared_contract.hpp"
+#include "../proc_identity.hpp"
 
 #include <algorithm>
 #include <utility>
@@ -8,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -33,6 +35,15 @@ static_assert(std::atomic<bool>::is_always_lock_free,
 std::atomic<bool> interrupted{false};
 
 namespace {
+std::string printable_proc_text(std::string value) {
+  for (char &ch : value) {
+    const auto byte = static_cast<unsigned char>(ch);
+    if (byte < 32 || byte == 127)
+      ch = '?';
+  }
+  return value;
+}
+
 template <class Response, class Call>
 Response unary(Call call, unsigned timeout = 30) {
   grpc::ClientContext context;
@@ -284,7 +295,9 @@ void Controller::require_session(const SessionHandle &session) {
   throw std::runtime_error("session is no longer attached: " + session.id);
 }
 
-SessionHandle Controller::attach(std::uint32_t pid) {
+SessionHandle Controller::attach(std::uint32_t pid,
+                                 std::uint64_t expected_start_time,
+                                 const std::string &expected_executable) {
   if (!pid || pid > INT32_MAX) {
     throw std::invalid_argument("PID must be positive and fit a native PID");
   }
@@ -299,6 +312,9 @@ SessionHandle Controller::attach(std::uint32_t pid) {
       [&](auto &c, auto &r) { return stub_->ListSessions(&c, list, &r); });
   for (const auto &s : before.sessions()) {
     if (s.pid() == pid && s.state() == api::Session::ATTACHED) {
+      if ((expected_start_time && s.process_start_time() != expected_start_time) ||
+          (!expected_executable.empty() && s.executable() != expected_executable))
+        throw std::runtime_error("target identity changed; refresh process selection");
       selected_ = {s.id(), s.pid(), connection_};
       out_ << "selected existing session=" << s.id() << " pid=" << pid << '\n';
       return selected_;
@@ -306,6 +322,8 @@ SessionHandle Controller::attach(std::uint32_t pid) {
   }
   api::AttachRequest request;
   request.set_pid(pid);
+  request.set_expected_process_start_time(expected_start_time);
+  request.set_expected_executable(expected_executable);
   out_ << "attaching pid=" << pid << " endpoint=" << endpoint_ << " ...\n"
        << std::flush;
   grpc::ClientContext context;
@@ -341,6 +359,11 @@ SessionHandle Controller::attach(std::uint32_t pid) {
   if (response.state() != api::Session::ATTACHED) {
     throw std::runtime_error("attach did not complete; session=" +
                              response.id() + " " + response.error());
+  }
+  if ((expected_start_time && response.process_start_time() != expected_start_time) ||
+      (!expected_executable.empty() && response.executable() != expected_executable)) {
+    detach({response.id(), response.pid(), connection_});
+    throw std::runtime_error("server did not confirm the selected target identity");
   }
   selected_ = {response.id(), response.pid(), connection_};
   out_ << "attached session=" << selected_.id << " pid=" << selected_.pid
@@ -762,14 +785,14 @@ EventRange Controller::events_async(const SessionHandle& session, std::uint64_t 
   return EventRange(std::move(state));
 }
 
-std::vector<std::pair<unsigned, std::string>>
+std::vector<Controller::ProcessChoice>
 Controller::processes(const std::string &filter) const {
 #ifdef __linux__
   if (server_.pid() < 0) {
     throw std::runtime_error("process listing is local-owned-server only; "
                              "remote attach requires an explicit PID");
   }
-  std::vector<std::pair<unsigned, std::string>> result;
+  std::vector<ProcessChoice> result;
   for (const auto &entry : std::filesystem::directory_iterator("/proc")) {
     const auto name = entry.path().filename().string();
     if (name.empty() ||
@@ -782,22 +805,26 @@ Controller::processes(const std::string &filter) const {
         pid == static_cast<unsigned>(server_.pid())) {
       continue;
     }
-    std::error_code error;
-    const auto executable =
-        std::filesystem::read_symlink(entry.path() / "exe", error).string();
-    if (error ||
-        (!filter.empty() && executable.find(filter) == std::string::npos)) {
-      continue;
-    }
-    std::ifstream input(entry.path() / "cmdline", std::ios::binary);
-    std::string command;
-    std::getline(input, command);
-    std::replace(command.begin(), command.end(), '\0', ' ');
-    if (!command.empty()) {
-      result.emplace_back(pid, std::move(command));
+    try {
+      const auto start = tracer::proc::start_time(entry.path() / "stat");
+      std::error_code error;
+      auto executable =
+          std::filesystem::read_symlink(entry.path() / "exe", error).string();
+      if (error || executable.find(filter) == std::string::npos)
+        continue;
+      std::ifstream input(entry.path() / "cmdline", std::ios::binary);
+      std::string command(4096, '\0');
+      input.read(command.data(), command.size());
+      command.resize(input.gcount());
+      std::replace(command.begin(), command.end(), '\0', ' ');
+      if (tracer::proc::start_time(entry.path() / "stat") == start)
+        result.push_back({pid, start, std::move(executable), std::move(command)});
+    } catch (const std::runtime_error &) {
+      // A process may exit or become inaccessible while reading /proc.
     }
   }
-  std::sort(result.begin(), result.end());
+  std::sort(result.begin(), result.end(),
+            [](const auto &left, const auto &right) { return left.pid < right.pid; });
   return result;
 #else
   (void)filter;
@@ -814,23 +841,26 @@ void Controller::select_process(
   if (choices.empty()) {
     throw std::runtime_error("no matching processes");
   }
-  if (choices.size() == 1) {
-    attach(choices[0].first);
-    return;
+  auto selected = choices.begin();
+  if (choices.size() > 1) {
+    for (const auto &choice : choices)
+      out_ << choice.pid << " start=" << choice.start_time << " exe="
+           << std::quoted(printable_proc_text(choice.executable)) << " "
+           << printable_proc_text(choice.command) << '\n';
+    const auto choice = read("Attach PID (empty cancels)> ");
+    if (choice.empty())
+      return;
+    const auto pid = unsigned_number(choice, "PID", INT32_MAX);
+    selected = std::find_if(choices.begin(), choices.end(),
+                            [&](const auto &p) { return p.pid == pid; });
+    if (selected == choices.end())
+      throw std::invalid_argument("PID was not in the displayed process list");
   }
-  for (const auto &choice : choices) {
-    out_ << choice.first << "  " << choice.second << '\n';
-  }
-  const auto choice = read("Attach PID (empty cancels)> ");
-  if (choice.empty()) {
-    return;
-  }
-  const auto pid = unsigned_number(choice, "PID", INT32_MAX);
-  if (std::none_of(choices.begin(), choices.end(),
-                   [&](const auto &p) { return p.first == pid; })) {
-    throw std::invalid_argument("PID was not in the displayed process list");
-  }
-  attach(static_cast<unsigned>(pid));
+  const auto proc = tracer::proc::directory(selected->pid);
+  if (tracer::proc::start_time(proc / "stat") != selected->start_time ||
+      std::filesystem::read_symlink(proc / "exe") != selected->executable)
+    throw std::runtime_error("target identity changed; refresh process selection");
+  attach(selected->pid, selected->start_time, selected->executable);
 }
 
 bool Controller::execute(const Command &command) {
@@ -890,8 +920,8 @@ bool Controller::execute(const Command &command) {
     return true;
   }
   case K::attach:
-    attach(
-        static_cast<unsigned>(unsigned_number(args.at(0), "PID", INT32_MAX)));
+    attach(static_cast<unsigned>(unsigned_number(args.at(0), "PID", INT32_MAX)),
+           command.number("--start-time", 0));
     return true;
   case K::sessions:
   case K::use:
@@ -937,11 +967,36 @@ bool Controller::execute(const Command &command) {
     require_session(selected_);
     api::ListModulesRequest request;
     request.set_session_id(selected_.id);
+    request.set_include_mappings(command.has("--details"));
     const auto response = unary<api::ListModulesResponse>(
         [&](auto &c, auto &r) { return stub_->ListModules(&c, request, &r); });
-    for (const auto &module : response.modules()) {
-      out_ << module << '\n';
+    if (!command.has("--details")) {
+      for (const auto &module : response.modules())
+        out_ << module << '\n';
+    } else {
+      if (response.mapping_token().empty())
+        throw std::runtime_error("server does not support mapped module details");
+      out_ << "mapping=" << response.mapping_token() << '\n';
+      for (const auto &entry : response.mappings()) {
+        out_ << "0x" << std::hex << entry.begin_address() << "-0x"
+             << entry.end_address() << " offset=0x" << entry.file_offset()
+             << std::dec << " device=" << entry.device() << " inode="
+             << entry.inode() << " build_id="
+             << (entry.build_id().empty() ? "unavailable" : entry.build_id())
+             << " " << std::quoted(printable_proc_text(entry.path())) << '\n';
+      }
     }
+    return true;
+  }
+  case K::threads: {
+    require_session(selected_);
+    api::ListThreadsRequest request;
+    request.set_session_id(selected_.id);
+    const auto response = unary<api::ListThreadsResponse>(
+        [&](auto &c, auto &r) { return stub_->ListThreads(&c, request, &r); });
+    for (const auto &thread : response.threads())
+      out_ << "tid=" << thread.tid() << " start=" << thread.start_time()
+           << " name=" << std::quoted(printable_proc_text(thread.name())) << '\n';
     return true;
   }
   case K::symbols: {
@@ -953,10 +1008,26 @@ bool Controller::execute(const Command &command) {
     request.set_page_size(static_cast<unsigned>(
         unsigned_number(command.option("--limit", "0"), "limit", UINT32_MAX)));
     request.set_page_token(command.option("--page"));
+    request.set_mapping_token(command.option("--mapping"));
+    request.set_include_addresses(command.has("--addresses"));
+    if (command.has("--address"))
+      request.set_address(address_number(command.option("--address")));
     const auto response = unary<api::ListSymbolsResponse>(
         [&](auto &c, auto &r) { return stub_->ListSymbols(&c, request, &r); });
+    const bool addresses = request.include_addresses() || request.address();
+    if (addresses) {
+      if (response.mapping_token().empty())
+        throw std::runtime_error("server does not support symbol address lookup");
+      out_ << "mapping=" << response.mapping_token() << '\n';
+    }
     for (const auto &symbol : response.symbols()) {
-      out_ << symbol.selector() << " [" << symbol.module_path() << "]\n";
+      out_ << symbol.selector() << " [" << symbol.module_path() << "]";
+      if (symbol.runtime_address())
+        out_ << " address=0x" << std::hex << symbol.runtime_address()
+             << " elf=0x" << symbol.elf_address() << std::dec;
+      else if (addresses)
+        out_ << " address=unavailable";
+      out_ << '\n';
     }
     if (!response.next_page_token().empty()) {
       out_ << "next_page=" << response.next_page_token() << '\n';
@@ -1104,7 +1175,9 @@ bool Controller::execute(const Command &command) {
   case K::processes:
     ensure_connected();
     for (const auto &p : processes(command.option("--filter"))) {
-      out_ << p.first << " " << p.second << '\n';
+      out_ << p.pid << " start=" << p.start_time << " exe="
+           << std::quoted(printable_proc_text(p.executable)) << " "
+           << printable_proc_text(p.command) << '\n';
     }
     return true;
   case K::help:

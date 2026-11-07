@@ -41,6 +41,8 @@ public:
 
     virtual std::any visitModules(TracerCommandsParser::ModulesContext *context) = 0;
 
+    virtual std::any visitThreads(TracerCommandsParser::ThreadsContext *context) = 0;
+
     virtual std::any visitSymbols(TracerCommandsParser::SymbolsContext *context) = 0;
 
     virtual std::any visitSymbolOption(TracerCommandsParser::SymbolOptionContext *context) = 0;

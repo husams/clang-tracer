@@ -14,6 +14,7 @@ service Tracer {
   rpc Detach(DetachRequest) returns (Session);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc ListModules(ListModulesRequest) returns (ListModulesResponse);
+  rpc ListThreads(ListThreadsRequest) returns (ListThreadsResponse);
   rpc ListSymbols(ListSymbolsRequest) returns (ListSymbolsResponse);
   rpc WatchEvents(WatchEventsRequest) returns (stream TraceEvent);
   // Snapshot retained events; acknowledge only after storage commits.
@@ -194,6 +195,8 @@ message AttachRequest {
   // field is retired and must never be reused.
   reserved 2;
   reserved "application_modules";
+  uint64 expected_process_start_time = 3; // Zero selects by PID alone.
+  string expected_executable = 4; // Exact /proc/PID/exe path, when selected locally.
 }
 message JitRuntimeProfile {
   string agent_build_id = 1; // GNU build ID of the loaded agent, in hex.
@@ -225,6 +228,7 @@ message Session {
       6; // Automatically discovered, pinned paths.
   uint64 process_start_time = 7; // Linux /proc start time in clock ticks.
   JitRuntimeProfile jit_runtime = 8;
+  string executable = 9;
 }
 message AddProbeRequest {
   string session_id = 1;
@@ -291,23 +295,52 @@ message RemoveProbeRequest {
 message DetachRequest { string session_id = 1; }
 message ListSessionsRequest {}
 message ListSessionsResponse { repeated Session sessions = 1; }
-message ListModulesRequest { string session_id = 1; }
-message ListModulesResponse { repeated string modules = 1; }
+message ListModulesRequest {
+  string session_id = 1;
+  bool include_mappings = 2;
+}
+message ModuleMapping {
+  string path = 1;
+  uint64 begin_address = 2;
+  uint64 end_address = 3; // Exclusive.
+  uint64 file_offset = 4;
+  string device = 5;
+  uint64 inode = 6;
+  string build_id = 7; // GNU build ID when the mapped backing file is verified.
+}
+message ListModulesResponse {
+  repeated string modules = 1;
+  repeated ModuleMapping mappings = 2;
+  string mapping_token = 3;
+}
+message ListThreadsRequest { string session_id = 1; }
+message TargetThread {
+  uint32 tid = 1;
+  string name = 2;
+  uint64 start_time = 3;
+}
+message ListThreadsResponse { repeated TargetThread threads = 1; }
 message ListSymbolsRequest {
   string session_id = 1;
   string query = 2; // Case-sensitive substring of selector or linkage name.
   string module = 3; // Case-sensitive substring of mapped ELF module path.
   uint32 page_size = 4; // Zero returns all matches; positive values opt into pagination.
   string page_token = 5; // Opaque continuation token from the previous page.
+  uint64 address = 6; // Nonzero PC for reverse lookup.
+  string mapping_token = 7; // Required for reverse lookup.
+  bool include_addresses = 8;
 }
 message FunctionSymbol {
   string selector = 1; // Full canonical C++ function or method signature.
   string linkage_symbol = 2;
   string module_path = 3;
+  uint64 runtime_address = 4; // Zero when no unique live entry can be proven.
+  uint64 elf_address = 5;
 }
 message ListSymbolsResponse {
   repeated FunctionSymbol symbols = 1;
   string next_page_token = 2;
+  string mapping_token = 3;
 }
 message ListSymbolsPageToken {
   string session_id = 1;

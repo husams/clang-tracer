@@ -26,37 +26,13 @@
 
 #include "agent_runtime_profile.hpp"
 #include "injector.hpp"
+#include "proc_identity.hpp"
 #include "tracer/compat.hpp"
 
 namespace tracer {
 namespace {
 
 std::atomic<std::uint64_t> validation_sequence{1};
-
-std::uint64_t read_process_start(std::uint32_t pid) {
-  std::ifstream input("/proc/" + std::to_string(pid) + "/stat");
-  std::string line;
-  if (!std::getline(input, line)) {
-    throw std::runtime_error("target process is no longer available");
-  }
-  const auto close = line.rfind(')');
-  if (close == std::string::npos || close + 2 >= line.size()) {
-    throw std::runtime_error("cannot read target process identity");
-  }
-  std::istringstream fields(line.substr(close + 2));
-  std::string field;
-  // The first token is field 3 (state); starttime is field 22.
-  for (unsigned number = 3; number <= 22; ++number) {
-    if (!(fields >> field)) {
-      throw std::runtime_error("cannot read target process identity");
-    }
-  }
-  try {
-    return std::stoull(field);
-  } catch (...) {
-    throw std::runtime_error("cannot read target process identity");
-  }
-}
 
 template <std::size_t N>
 void copy_field(char (&target)[N], const std::string &value,
@@ -191,7 +167,7 @@ Session::Session(std::string id, std::uint32_t pid, std::uint64_t process_start,
       operation_timeout_(operation_timeout) {}
 
 std::uint64_t Session::ProcessStartTime(std::uint32_t pid) {
-  return read_process_start(pid);
+  return proc::start_time(proc::directory(pid) / "stat");
 }
 
 void Session::attach_process(injector::Process &process,
@@ -220,7 +196,7 @@ void Session::attach_process(injector::Process &process,
 
 void Session::check_identity_locked() {
   try {
-    if (read_process_start(pid_) != process_start_) {
+    if (ProcessStartTime(pid_) != process_start_) {
       state_ = clangtracer::v1::Session::EXITED;
       application_modules_.clear();
       error_ = "target process exited; PID was reused";
@@ -241,7 +217,7 @@ void Session::set_failed_locked(const std::string &message) {
   error_ = message;
 }
 
-void Session::attach() {
+void Session::attach(const std::string &expected_executable) {
   std::lock_guard lock(mutex_);
   check_identity_locked();
   if (state_ != clangtracer::v1::Session::ATTACHED) {
@@ -260,6 +236,15 @@ void Session::attach() {
     attach_process(process, deadline);
   } catch (const injector::IdlePointUnavailable &error) {
     throw injector::InitialAdmissionUnavailable(error.what());
+  }
+  std::error_code executable_error;
+  executable_ = std::filesystem::read_symlink(proc::directory(pid_) / "exe",
+                                             executable_error).string();
+  if (executable_error ||
+      (!expected_executable.empty() && executable_ != expected_executable)) {
+    process.detach();
+    throw injector::InitialAdmissionUnavailable(
+        "target executable changed or became unavailable; refresh process selection");
   }
   std::uintptr_t scratch = 0;
   // Each synchronous loader call has finished using its string before the
@@ -1196,6 +1181,7 @@ clangtracer::v1::Session Session::snapshot() const {
   result.set_id(id_);
   result.set_pid(pid_);
   result.set_process_start_time(process_start_);
+  result.set_executable(executable_);
   if (jit_runtime_)
     result.mutable_jit_runtime()->CopyFrom(*jit_runtime_);
   result.set_state(state_);

@@ -49,7 +49,8 @@ enum class CommandKind {
   complete,
   type,
   help,
-  quit
+  quit,
+  threads
 };
 
 struct Command {
@@ -66,5 +67,6 @@ struct Command {
 Command parse_command(const std::string &input);
 std::uint64_t unsigned_number(const std::string &text, const std::string &name,
                               std::uint64_t maximum = UINT64_MAX);
+std::uint64_t address_number(const std::string &text);
 const std::vector<std::string> &command_names();
 } // namespace tracer_repl

@@ -85,7 +85,10 @@ locally.
 
 With an owned local Linux server, `--process NAME` matches executable paths.
 `%attach` without a PID opens the process picker; multiple matches require
-choosing a displayed PID. `%processes --filter TEXT` lists local candidates.
+choosing a displayed PID. The picker shows each candidate's executable and Linux
+start time and checks the selected identity at attach. `%processes --filter TEXT`
+lists the same local candidates. In scripts, use `%attach PID --start-time TICKS`
+to attach only when the PID still has the displayed start time.
 Remote process enumeration is not in the service API, so remote attach uses an
 explicit PID.
 
@@ -95,6 +98,28 @@ session IDs, blocks automatic retries for that PID, and reconciles again on
 `%status` and exit. Inspect `%sessions` and explicitly `%detach SESSION` when
 appropriate. Candidates are never assumed to belong to this console on an
 external server; recovery information is retained until explicitly resolved.
+
+## Browse a local C++ target
+
+```text
+%threads
+%modules --details
+%symbols --filter Calculator --addresses
+%symbols --address 0xADDRESS --mapping TOKEN
+```
+
+`%threads` shows thread IDs, names and start times for the selected process.
+`%modules` lists application module paths. Add `--details` for file-backed
+executable address ranges, file offsets, device and inode, and the ELF build
+ID when the backing file can be verified.
+
+`%symbols --addresses` shows runtime and ELF entries for supported C++ callables
+when there is a unique verified mapping. For reverse lookup, copy a runtime
+address and the `mapping=` token from the same session. Addresses inside a
+supported callable also work. If the mappings or backing files change, take a
+new snapshot before using an address. The token checks observed mapping
+identity. An unload and reload of the same image at the same address between
+snapshots can produce identical observations.
 
 ## Interceptor upload
 

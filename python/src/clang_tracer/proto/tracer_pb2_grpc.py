@@ -75,6 +75,11 @@ class TracerStub(object):
                 request_serializer=tracer__pb2.ListModulesRequest.SerializeToString,
                 response_deserializer=tracer__pb2.ListModulesResponse.FromString,
                 _registered_method=True)
+        self.ListThreads = channel.unary_unary(
+                '/clangtracer.v1.Tracer/ListThreads',
+                request_serializer=tracer__pb2.ListThreadsRequest.SerializeToString,
+                response_deserializer=tracer__pb2.ListThreadsResponse.FromString,
+                _registered_method=True)
         self.ListSymbols = channel.unary_unary(
                 '/clangtracer.v1.Tracer/ListSymbols',
                 request_serializer=tracer__pb2.ListSymbolsRequest.SerializeToString,
@@ -150,6 +155,12 @@ class TracerServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ListThreads(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ListSymbols(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -217,6 +228,11 @@ def add_TracerServicer_to_server(servicer, server):
                     servicer.ListModules,
                     request_deserializer=tracer__pb2.ListModulesRequest.FromString,
                     response_serializer=tracer__pb2.ListModulesResponse.SerializeToString,
+            ),
+            'ListThreads': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListThreads,
+                    request_deserializer=tracer__pb2.ListThreadsRequest.FromString,
+                    response_serializer=tracer__pb2.ListThreadsResponse.SerializeToString,
             ),
             'ListSymbols': grpc.unary_unary_rpc_method_handler(
                     servicer.ListSymbols,
@@ -456,6 +472,33 @@ class Tracer(object):
             '/clangtracer.v1.Tracer/ListModules',
             tracer__pb2.ListModulesRequest.SerializeToString,
             tracer__pb2.ListModulesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListThreads(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/ListThreads',
+            tracer__pb2.ListThreadsRequest.SerializeToString,
+            tracer__pb2.ListThreadsResponse.FromString,
             options,
             channel_credentials,
             insecure,

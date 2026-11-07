@@ -330,10 +330,14 @@ class ProbeSpec(_message.Message):
     def __init__(self, symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., callback_source: _Optional[str] = ..., receiver: _Optional[_Union[ReceiverContext, _Mapping]] = ..., receiver_unavailable_reason: _Optional[str] = ..., debug_info: _Optional[_Union[DebugInfo, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., stack_depth: _Optional[int] = ..., include_internal_stack_frames: bool = ..., print_arguments: bool = ..., print_result: bool = ..., callback_package_path: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ...) -> None: ...
 
 class AttachRequest(_message.Message):
-    __slots__ = ("pid",)
+    __slots__ = ("pid", "expected_process_start_time", "expected_executable")
     PID_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_PROCESS_START_TIME_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_EXECUTABLE_FIELD_NUMBER: _ClassVar[int]
     pid: int
-    def __init__(self, pid: _Optional[int] = ...) -> None: ...
+    expected_process_start_time: int
+    expected_executable: str
+    def __init__(self, pid: _Optional[int] = ..., expected_process_start_time: _Optional[int] = ..., expected_executable: _Optional[str] = ...) -> None: ...
 
 class JitRuntimeProfile(_message.Message):
     __slots__ = ("agent_build_id", "bootstrap_protocol", "target_abi", "clang_version", "llvm_version", "glibc_version", "cxx_runtime_path", "libstdcxx_header_release", "libstdcxx_default_cxx11_abi")
@@ -358,7 +362,7 @@ class JitRuntimeProfile(_message.Message):
     def __init__(self, agent_build_id: _Optional[str] = ..., bootstrap_protocol: _Optional[int] = ..., target_abi: _Optional[str] = ..., clang_version: _Optional[str] = ..., llvm_version: _Optional[str] = ..., glibc_version: _Optional[str] = ..., cxx_runtime_path: _Optional[str] = ..., libstdcxx_header_release: _Optional[int] = ..., libstdcxx_default_cxx11_abi: bool = ...) -> None: ...
 
 class Session(_message.Message):
-    __slots__ = ("id", "pid", "state", "probes", "error", "application_modules", "process_start_time", "jit_runtime")
+    __slots__ = ("id", "pid", "state", "probes", "error", "application_modules", "process_start_time", "jit_runtime", "executable")
     class State(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         STATE_UNSPECIFIED: _ClassVar[Session.State]
@@ -379,6 +383,7 @@ class Session(_message.Message):
     APPLICATION_MODULES_FIELD_NUMBER: _ClassVar[int]
     PROCESS_START_TIME_FIELD_NUMBER: _ClassVar[int]
     JIT_RUNTIME_FIELD_NUMBER: _ClassVar[int]
+    EXECUTABLE_FIELD_NUMBER: _ClassVar[int]
     id: str
     pid: int
     state: Session.State
@@ -387,7 +392,8 @@ class Session(_message.Message):
     application_modules: _containers.RepeatedScalarFieldContainer[str]
     process_start_time: int
     jit_runtime: JitRuntimeProfile
-    def __init__(self, id: _Optional[str] = ..., pid: _Optional[int] = ..., state: _Optional[_Union[Session.State, str]] = ..., probes: _Optional[_Iterable[_Union[Probe, _Mapping]]] = ..., error: _Optional[str] = ..., application_modules: _Optional[_Iterable[str]] = ..., process_start_time: _Optional[int] = ..., jit_runtime: _Optional[_Union[JitRuntimeProfile, _Mapping]] = ...) -> None: ...
+    executable: str
+    def __init__(self, id: _Optional[str] = ..., pid: _Optional[int] = ..., state: _Optional[_Union[Session.State, str]] = ..., probes: _Optional[_Iterable[_Union[Probe, _Mapping]]] = ..., error: _Optional[str] = ..., application_modules: _Optional[_Iterable[str]] = ..., process_start_time: _Optional[int] = ..., jit_runtime: _Optional[_Union[JitRuntimeProfile, _Mapping]] = ..., executable: _Optional[str] = ...) -> None: ...
 
 class AddProbeRequest(_message.Message):
     __slots__ = ("session_id", "spec")
@@ -534,48 +540,106 @@ class ListSessionsResponse(_message.Message):
     def __init__(self, sessions: _Optional[_Iterable[_Union[Session, _Mapping]]] = ...) -> None: ...
 
 class ListModulesRequest(_message.Message):
+    __slots__ = ("session_id", "include_mappings")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    INCLUDE_MAPPINGS_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    include_mappings: bool
+    def __init__(self, session_id: _Optional[str] = ..., include_mappings: bool = ...) -> None: ...
+
+class ModuleMapping(_message.Message):
+    __slots__ = ("path", "begin_address", "end_address", "file_offset", "device", "inode", "build_id")
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    BEGIN_ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    END_ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    FILE_OFFSET_FIELD_NUMBER: _ClassVar[int]
+    DEVICE_FIELD_NUMBER: _ClassVar[int]
+    INODE_FIELD_NUMBER: _ClassVar[int]
+    BUILD_ID_FIELD_NUMBER: _ClassVar[int]
+    path: str
+    begin_address: int
+    end_address: int
+    file_offset: int
+    device: str
+    inode: int
+    build_id: str
+    def __init__(self, path: _Optional[str] = ..., begin_address: _Optional[int] = ..., end_address: _Optional[int] = ..., file_offset: _Optional[int] = ..., device: _Optional[str] = ..., inode: _Optional[int] = ..., build_id: _Optional[str] = ...) -> None: ...
+
+class ListModulesResponse(_message.Message):
+    __slots__ = ("modules", "mappings", "mapping_token")
+    MODULES_FIELD_NUMBER: _ClassVar[int]
+    MAPPINGS_FIELD_NUMBER: _ClassVar[int]
+    MAPPING_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    modules: _containers.RepeatedScalarFieldContainer[str]
+    mappings: _containers.RepeatedCompositeFieldContainer[ModuleMapping]
+    mapping_token: str
+    def __init__(self, modules: _Optional[_Iterable[str]] = ..., mappings: _Optional[_Iterable[_Union[ModuleMapping, _Mapping]]] = ..., mapping_token: _Optional[str] = ...) -> None: ...
+
+class ListThreadsRequest(_message.Message):
     __slots__ = ("session_id",)
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     session_id: str
     def __init__(self, session_id: _Optional[str] = ...) -> None: ...
 
-class ListModulesResponse(_message.Message):
-    __slots__ = ("modules",)
-    MODULES_FIELD_NUMBER: _ClassVar[int]
-    modules: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, modules: _Optional[_Iterable[str]] = ...) -> None: ...
+class TargetThread(_message.Message):
+    __slots__ = ("tid", "name", "start_time")
+    TID_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    START_TIME_FIELD_NUMBER: _ClassVar[int]
+    tid: int
+    name: str
+    start_time: int
+    def __init__(self, tid: _Optional[int] = ..., name: _Optional[str] = ..., start_time: _Optional[int] = ...) -> None: ...
+
+class ListThreadsResponse(_message.Message):
+    __slots__ = ("threads",)
+    THREADS_FIELD_NUMBER: _ClassVar[int]
+    threads: _containers.RepeatedCompositeFieldContainer[TargetThread]
+    def __init__(self, threads: _Optional[_Iterable[_Union[TargetThread, _Mapping]]] = ...) -> None: ...
 
 class ListSymbolsRequest(_message.Message):
-    __slots__ = ("session_id", "query", "module", "page_size", "page_token")
+    __slots__ = ("session_id", "query", "module", "page_size", "page_token", "address", "mapping_token", "include_addresses")
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     QUERY_FIELD_NUMBER: _ClassVar[int]
     MODULE_FIELD_NUMBER: _ClassVar[int]
     PAGE_SIZE_FIELD_NUMBER: _ClassVar[int]
     PAGE_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    MAPPING_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    INCLUDE_ADDRESSES_FIELD_NUMBER: _ClassVar[int]
     session_id: str
     query: str
     module: str
     page_size: int
     page_token: str
-    def __init__(self, session_id: _Optional[str] = ..., query: _Optional[str] = ..., module: _Optional[str] = ..., page_size: _Optional[int] = ..., page_token: _Optional[str] = ...) -> None: ...
+    address: int
+    mapping_token: str
+    include_addresses: bool
+    def __init__(self, session_id: _Optional[str] = ..., query: _Optional[str] = ..., module: _Optional[str] = ..., page_size: _Optional[int] = ..., page_token: _Optional[str] = ..., address: _Optional[int] = ..., mapping_token: _Optional[str] = ..., include_addresses: bool = ...) -> None: ...
 
 class FunctionSymbol(_message.Message):
-    __slots__ = ("selector", "linkage_symbol", "module_path")
+    __slots__ = ("selector", "linkage_symbol", "module_path", "runtime_address", "elf_address")
     SELECTOR_FIELD_NUMBER: _ClassVar[int]
     LINKAGE_SYMBOL_FIELD_NUMBER: _ClassVar[int]
     MODULE_PATH_FIELD_NUMBER: _ClassVar[int]
+    RUNTIME_ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    ELF_ADDRESS_FIELD_NUMBER: _ClassVar[int]
     selector: str
     linkage_symbol: str
     module_path: str
-    def __init__(self, selector: _Optional[str] = ..., linkage_symbol: _Optional[str] = ..., module_path: _Optional[str] = ...) -> None: ...
+    runtime_address: int
+    elf_address: int
+    def __init__(self, selector: _Optional[str] = ..., linkage_symbol: _Optional[str] = ..., module_path: _Optional[str] = ..., runtime_address: _Optional[int] = ..., elf_address: _Optional[int] = ...) -> None: ...
 
 class ListSymbolsResponse(_message.Message):
-    __slots__ = ("symbols", "next_page_token")
+    __slots__ = ("symbols", "next_page_token", "mapping_token")
     SYMBOLS_FIELD_NUMBER: _ClassVar[int]
     NEXT_PAGE_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    MAPPING_TOKEN_FIELD_NUMBER: _ClassVar[int]
     symbols: _containers.RepeatedCompositeFieldContainer[FunctionSymbol]
     next_page_token: str
-    def __init__(self, symbols: _Optional[_Iterable[_Union[FunctionSymbol, _Mapping]]] = ..., next_page_token: _Optional[str] = ...) -> None: ...
+    mapping_token: str
+    def __init__(self, symbols: _Optional[_Iterable[_Union[FunctionSymbol, _Mapping]]] = ..., next_page_token: _Optional[str] = ..., mapping_token: _Optional[str] = ...) -> None: ...
 
 class ListSymbolsPageToken(_message.Message):
     __slots__ = ("session_id", "pid", "process_start_time", "query", "module", "page_size", "mapping_fingerprint", "last_selector", "last_linkage_symbol", "last_module_path")

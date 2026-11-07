@@ -25,18 +25,20 @@ public:
     T__62 = 63, T__63 = 64, T__64 = 65, T__65 = 66, T__66 = 67, T__67 = 68,
     T__68 = 69, T__69 = 70, T__70 = 71, T__71 = 72, T__72 = 73, T__73 = 74,
     T__74 = 75, T__75 = 76, T__76 = 77, T__77 = 78, T__78 = 79, T__79 = 80,
-    T__80 = 81, UINT = 82, STRING = 83, SHELL = 84, METADATA_ONLY = 85,
-    WORD = 86, WS = 87
+    T__80 = 81, T__81 = 82, T__82 = 83, T__83 = 84, T__84 = 85, T__85 = 86,
+    T__86 = 87, UINT = 88, STRING = 89, SHELL = 90, METADATA_ONLY = 91,
+    WORD = 92, WS = 93
   };
 
   enum {
     RuleLine = 0, RuleCommand = 1, RuleServer = 2, RuleServerOption = 3,
     RuleAttach = 4, RuleProcesses = 5, RuleSessions = 6, RuleUse = 7, RuleStatus = 8,
-    RuleDetach = 9, RuleModules = 10, RuleSymbols = 11, RuleSymbolOption = 12,
-    RuleProbe = 13, RulePrepareOption = 14, RuleResolveOption = 15, RuleDeployOption = 16,
-    RuleInterceptor = 17, RuleEvents = 18, RuleCollect = 19, RuleRecord = 20,
-    RuleStreamOption = 21, RuleCpp = 22, RuleShell = 23, RuleComplete = 24,
-    RuleType = 25, RuleHelp = 26, RuleQuit = 27, RuleValue = 28, RuleKeyword = 29
+    RuleDetach = 9, RuleModules = 10, RuleThreads = 11, RuleSymbols = 12,
+    RuleSymbolOption = 13, RuleProbe = 14, RulePrepareOption = 15, RuleResolveOption = 16,
+    RuleDeployOption = 17, RuleInterceptor = 18, RuleEvents = 19, RuleCollect = 20,
+    RuleRecord = 21, RuleStreamOption = 22, RuleCpp = 23, RuleShell = 24,
+    RuleComplete = 25, RuleType = 26, RuleHelp = 27, RuleQuit = 28, RuleValue = 29,
+    RuleKeyword = 30
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -67,6 +69,7 @@ public:
   class StatusContext;
   class DetachContext;
   class ModulesContext;
+  class ThreadsContext;
   class SymbolsContext;
   class SymbolOptionContext;
   class ProbeContext;
@@ -113,6 +116,7 @@ public:
     StatusContext *status();
     DetachContext *detach();
     ModulesContext *modules();
+    ThreadsContext *threads();
     SymbolsContext *symbols();
     ProbeContext *probe();
     InterceptorContext *interceptor();
@@ -165,7 +169,8 @@ public:
   public:
     AttachContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
-    antlr4::tree::TerminalNode *UINT();
+    std::vector<antlr4::tree::TerminalNode *> UINT();
+    antlr4::tree::TerminalNode* UINT(size_t i);
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -248,6 +253,18 @@ public:
   };
 
   ModulesContext* modules();
+
+  class  ThreadsContext : public antlr4::ParserRuleContext {
+  public:
+    ThreadsContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  ThreadsContext* threads();
 
   class  SymbolsContext : public antlr4::ParserRuleContext {
   public:

@@ -33,7 +33,7 @@ public:
           std::string context_endpoint, std::string context_durable_directory,
           std::chrono::seconds operation_timeout);
 
-  void attach();
+  void attach(const std::string &expected_executable);
   clangtracer::v1::Probe add_probe(const clangtracer::v1::ProbeSpec &spec,
                                    const std::string &source_directory,
                                    std::uint64_t probe_id,
@@ -90,6 +90,7 @@ private:
   std::mutex operation_mutex_;
   clangtracer::v1::Session::State state_ = clangtracer::v1::Session::ATTACHED;
   std::string error_;
+  std::string executable_;
   std::optional<clangtracer::v1::JitRuntimeProfile> jit_runtime_;
   bool unsafe_target_ = false;
   std::uintptr_t start_address_ = 0;

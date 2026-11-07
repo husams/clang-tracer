@@ -1,10 +1,12 @@
 #include "server.hpp"
 #include "prepared_contract.hpp"
+#include "proc_identity.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -1167,6 +1169,13 @@ public:
     } catch (const std::exception &error) {
       return {grpc::StatusCode::NOT_FOUND, error.what()};
     }
+    if (request->expected_executable().size() > 4096 ||
+        request->expected_executable().find('\0') != std::string::npos)
+      return {grpc::StatusCode::INVALID_ARGUMENT, "invalid expected executable path"};
+    if (request->expected_process_start_time() != 0 &&
+        request->expected_process_start_time() != process_start)
+      return {grpc::StatusCode::FAILED_PRECONDITION,
+              "target process start time changed; refresh process selection"};
     const auto id = make_id();
     std::shared_ptr<Session> prior_session;
     {
@@ -1221,7 +1230,7 @@ public:
         std::move(context_endpoint), std::move(producer_journal_directory),
         timeout_);
     try {
-      session->attach();
+      session->attach(request->expected_executable());
       std::lock_guard lock(mutex_);
       pending_pids_.erase(pid);
       sessions_.emplace(id, session);
@@ -1504,8 +1513,74 @@ public:
     if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED)
       return {grpc::StatusCode::FAILED_PRECONDITION, "session is not attached"};
     try {
-      for (const auto &path : client::list_debug_modules(session->pid()))
-        response->add_modules(path);
+      if (request->include_mappings()) {
+        *response = client::list_debug_module_mappings(session->pid());
+        response->set_mapping_token(session->id() + ":" + response->mapping_token());
+      } else {
+        for (const auto &path : client::list_debug_modules(session->pid()))
+          response->add_modules(path);
+      }
+      session->refresh_process_state();
+      if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED)
+        return {grpc::StatusCode::FAILED_PRECONDITION,
+                "target process exited during module discovery"};
+      return grpc::Status::OK;
+    } catch (const std::invalid_argument &error) {
+      return {grpc::StatusCode::ABORTED, error.what()};
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
+  }
+
+  grpc::Status ListThreads(
+      grpc::ServerContext *context, const clangtracer::v1::ListThreadsRequest *request,
+      clangtracer::v1::ListThreadsResponse *response) override {
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    session->refresh_process_state();
+    if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "session is not attached"};
+    try {
+      std::map<std::uint32_t, clangtracer::v1::TargetThread> threads;
+      const auto tasks = proc::directory(session->pid()) / "task";
+      for (const auto &entry : std::filesystem::directory_iterator(tasks)) {
+        if (context->IsCancelled())
+          return {grpc::StatusCode::CANCELLED, "thread discovery cancelled"};
+        const auto name = entry.path().filename().string();
+        std::uint32_t tid = 0;
+        const auto end = name.data() + name.size();
+        const auto parsed = std::from_chars(name.data(), end, tid);
+        if (parsed.ec != std::errc{} || parsed.ptr != end || !tid)
+          continue;
+        try {
+          const auto start = proc::start_time(entry.path() / "stat");
+          std::ifstream comm(entry.path() / "comm");
+          std::string thread_name;
+          if (!std::getline(comm, thread_name, '\0') ||
+              proc::start_time(entry.path() / "stat") != start)
+            continue;
+          if (!thread_name.empty() && thread_name.back() == '\n')
+            thread_name.pop_back();
+          auto &thread = threads[tid];
+          thread.set_tid(tid);
+          thread.set_name(std::move(thread_name));
+          thread.set_start_time(start);
+        } catch (const std::runtime_error &) {
+          // A thread can exit or be replaced while its row is being read.
+        }
+        if (threads.size() > 4096)
+          return {grpc::StatusCode::RESOURCE_EXHAUSTED, "thread listing limit exceeded"};
+      }
+      session->refresh_process_state();
+      if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED)
+        return {grpc::StatusCode::FAILED_PRECONDITION,
+                "target process exited during thread discovery"};
+      for (auto &[tid, thread] : threads) {
+        (void)tid;
+        response->add_threads()->Swap(&thread);
+      }
       return grpc::Status::OK;
     } catch (const std::exception &error) {
       return status_for(error);
@@ -1524,6 +1599,10 @@ public:
       return {grpc::StatusCode::INVALID_ARGUMENT, "invalid symbol listing request"};
     }
     const std::size_t page_size = request->page_size();
+    if (request->address() &&
+        (request->mapping_token().empty() || page_size || !request->page_token().empty()))
+      return {grpc::StatusCode::INVALID_ARGUMENT,
+              "address lookup requires a mapping token and does not support paging"};
     auto session = find_session(request->session_id());
     if (!session)
       return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
@@ -1558,13 +1637,28 @@ public:
                 "invalid or mismatched symbol page token"};
       }
     }
+    auto expected_mapping = continuation.mapping_fingerprint();
+    if (!request->mapping_token().empty()) {
+      const auto prefix = session->id() + ":";
+      const auto &token = request->mapping_token();
+      if (token.compare(0, prefix.size(), prefix) != 0 ||
+          token.size() != prefix.size() + 64)
+        return {grpc::StatusCode::INVALID_ARGUMENT,
+                "mapping token does not identify this session"};
+      const auto fingerprint = token.substr(prefix.size());
+      if (!expected_mapping.empty() && expected_mapping != fingerprint)
+        return {grpc::StatusCode::INVALID_ARGUMENT,
+                "mapping token does not match the symbol page"};
+      expected_mapping = fingerprint;
+    }
 
     try {
       const auto page = client::list_debug_symbols(
           session->pid(), request->query(), request->module(), page_size,
           continuation.last_selector(), continuation.last_linkage_symbol(),
-          continuation.last_module_path(), continuation.mapping_fingerprint(),
-          [&] { return context->IsCancelled(); });
+          continuation.last_module_path(), expected_mapping,
+          [&] { return context->IsCancelled(); }, request->include_addresses(),
+          request->address());
       if (page.cancelled || context->IsCancelled())
         return {grpc::StatusCode::CANCELLED, "symbol discovery cancelled"};
       session->refresh_process_state();
@@ -1587,7 +1681,11 @@ public:
         symbol->set_selector(item.selector);
         symbol->set_linkage_symbol(item.linkage_symbol);
         symbol->set_module_path(item.module_path);
+        symbol->set_runtime_address(item.runtime_address);
+        symbol->set_elf_address(item.elf_address);
       }
+      if (request->include_addresses() || request->address())
+        response->set_mapping_token(session->id() + ":" + page.mapping_fingerprint);
       if (page.has_more && !page.symbols.empty()) {
         continuation.set_session_id(request->session_id());
         continuation.set_pid(session->pid());

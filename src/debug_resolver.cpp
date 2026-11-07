@@ -17,6 +17,7 @@
 #include <tuple>
 
 #include <llvm/BinaryFormat/Dwarf.h>
+#include <llvm/ADT/StringExtras.h>
 #include <llvm/DebugInfo/DWARF/DWARFContext.h>
 #include <llvm/DebugInfo/DWARF/DWARFDie.h>
 #include <llvm/Demangle/Demangle.h>
@@ -30,6 +31,7 @@
 #include <llvm/Support/SHA256.h>
 #include <llvm/TargetParser/Triple.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 
 #include "tracer/compat.hpp"
 #include "linux_syscalls.hpp"
@@ -301,6 +303,16 @@ struct ExecutableMapping {
   std::uint64_t begin = 0;
   std::uint64_t end = 0;
   std::uint64_t offset = 0;
+  std::uint64_t inode = 0;
+  unsigned device_major = 0;
+  unsigned device_minor = 0;
+  std::string device;
+
+  bool matches(const struct stat &file) const {
+    return inode != 0 && inode == file.st_ino &&
+           device_major == major(file.st_dev) &&
+           device_minor == minor(file.st_dev);
+  }
 };
 
 std::vector<ExecutableMapping> read_executable_mappings(
@@ -336,6 +348,10 @@ std::vector<ExecutableMapping> read_executable_mappings(
       mapping.begin = std::stoull(range.substr(0, dash), nullptr, 16);
       mapping.end = std::stoull(range.substr(dash + 1), nullptr, 16);
       mapping.offset = std::stoull(offset, nullptr, 16);
+      mapping.inode = std::stoull(inode);
+      mapping.device_major = std::stoul(device.substr(0, colon), nullptr, 16);
+      mapping.device_minor = std::stoul(device.substr(colon + 1), nullptr, 16);
+      mapping.device = device;
       if (mapping.end > mapping.begin) {
         result.push_back(std::move(mapping));
       }
@@ -358,9 +374,12 @@ std::string mapping_fingerprint(
     if (::stat(path.c_str(), &st) != 0) {
       throw std::runtime_error("cannot stat mapped debug image");
     }
-    std::string identity = path;
-    identity.push_back('\0');
-    hash.update(identity);
+    std::ostringstream identity;
+    identity << path << '\0' << st.st_dev << ':' << st.st_ino << ':'
+             << st.st_size << ':' << st.st_mtim.tv_sec << ':'
+             << st.st_mtim.tv_nsec << ':' << st.st_ctim.tv_sec << ':'
+             << st.st_ctim.tv_nsec << '\0';
+    hash.update(identity.str());
   }
 
   for (const auto& mapping : executable_mappings) {
@@ -407,6 +426,7 @@ std::vector<ExecutableSegment> executable_segments(
 struct MappedExecutableRange {
   std::uint64_t begin = 0;
   std::uint64_t end = 0;
+  std::uint64_t runtime_begin = 0;
 };
 
 std::vector<MappedExecutableRange> mapped_executable_ranges(
@@ -442,7 +462,7 @@ std::vector<MappedExecutableRange> mapped_executable_ranges(
         continue;
       }
       result.push_back(
-          {virtual_begin, virtual_begin + (file_end - file_begin)});
+          {virtual_begin, virtual_begin + (file_end - file_begin), runtime_begin});
     }
   }
   return result;
@@ -1083,6 +1103,51 @@ std::vector<std::string> list_debug_modules(std::uint32_t pid) {
   return modules(pid);
 }
 
+api::ListModulesResponse list_debug_module_mappings(std::uint32_t pid) {
+  const auto paths = modules(pid);
+  const auto mappings = read_executable_mappings(pid, paths);
+  const auto fingerprint = mapping_fingerprint(paths, mappings);
+  api::ListModulesResponse result;
+  std::map<std::string, std::string> build_ids;
+  for (const auto &path : paths) {
+    result.add_modules(path);
+    struct stat file{};
+    if (::stat(path.c_str(), &file) != 0 ||
+        std::none_of(mappings.begin(), mappings.end(), [&](const auto &entry) {
+          return entry.path == path && entry.matches(file);
+        }))
+      continue;
+    auto binary = llvm::object::createBinary(path);
+    if (!binary) {
+      llvm::consumeError(binary.takeError());
+      continue;
+    }
+    if (const auto *elf = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(
+            binary->getBinary()))
+      build_ids.emplace(path, llvm::toHex(llvm::object::getBuildID(elf), true));
+  }
+  for (const auto &mapping : mappings) {
+    auto &entry = *result.add_mappings();
+    entry.set_path(mapping.path);
+    entry.set_begin_address(mapping.begin);
+    entry.set_end_address(mapping.end);
+    entry.set_file_offset(mapping.offset);
+    entry.set_device(mapping.device);
+    entry.set_inode(mapping.inode);
+    const auto id = build_ids.find(mapping.path);
+    struct stat file{};
+    if (id != build_ids.end() && ::stat(mapping.path.c_str(), &file) == 0 &&
+        mapping.matches(file))
+      entry.set_build_id(id->second);
+  }
+  const auto current = modules(pid);
+  if (mapping_fingerprint(current, read_executable_mappings(pid, current)) !=
+      fingerprint)
+    throw std::invalid_argument("mapped images changed during discovery; restart listing");
+  result.set_mapping_token(fingerprint);
+  return result;
+}
+
 ResolvedCallable bind_prepared_callable(std::uint32_t pid,
                                         const api::PreparedInjector &prepared,
                                         const DebugLookupOptions &options,
@@ -1521,7 +1586,8 @@ DebugSymbolPage list_debug_symbols(
     std::size_t page_size, const std::string& after_selector,
     const std::string& after_linkage_symbol, const std::string& after_module_path,
     const std::string& expected_mapping_fingerprint,
-    const std::function<bool()>& is_cancelled) {
+    const std::function<bool()>& is_cancelled,
+    bool include_addresses, std::uint64_t address) {
   const auto image_paths = modules(pid);
   const auto mappings = read_executable_mappings(pid, image_paths);
   const auto current_fingerprint = mapping_fingerprint(image_paths, mappings);
@@ -1542,6 +1608,12 @@ DebugSymbolPage list_debug_symbols(
     if (!module.empty() && path.find(module) == std::string::npos) {
       continue;
     }
+    if (address && std::none_of(mappings.begin(), mappings.end(),
+                               [&](const auto &mapping) {
+           return mapping.path == path && address >= mapping.begin &&
+                  address < mapping.end;
+         }))
+      continue;
     auto binary = llvm::object::createBinary(path);
     if (!binary) {
       llvm::consumeError(binary.takeError());
@@ -1560,6 +1632,18 @@ DebugSymbolPage list_debug_symbols(
                  [&](const auto& mapping) { return mapping.path == path; });
     const auto mapped_ranges =
         mapped_executable_ranges(*object, module_identity, segments, module_mappings);
+    std::vector<MappedExecutableRange> verified_ranges;
+    if (include_addresses || address) {
+      struct stat file{};
+      if (::stat(path.c_str(), &file) == 0) {
+        module_mappings.erase(
+            std::remove_if(module_mappings.begin(), module_mappings.end(),
+                           [&](const auto &mapping) { return !mapping.matches(file); }),
+            module_mappings.end());
+        verified_ranges = mapped_executable_ranges(
+            *object, module_identity, segments, module_mappings);
+      }
+    }
     std::optional<llvm::object::OwningBinary<llvm::object::Binary>>
         separate_debug_binary;
     const llvm::object::ELF64LEObjectFile *dwarf_object = object;
@@ -1612,10 +1696,28 @@ DebugSymbolPage list_debug_symbols(
           }
           if (selector.find(query) != std::string::npos ||
               linkage_symbol.find(query) != std::string::npos) {
+            std::set<std::uint64_t> runtime_entries;
+            for (const auto &range : verified_ranges) {
+              if (low < range.begin || high > range.end)
+                continue;
+              const auto entry = range.runtime_begin + (low - range.begin);
+              if (!address || (address >= entry && address - entry < high - low))
+                runtime_entries.insert(entry);
+            }
+            if (address && runtime_entries.empty())
+              return;
             const Key key{selector, linkage_symbol, path};
             if (key > after) {
-              candidates.try_emplace(
-                  key, DebugSymbol{selector, linkage_symbol, path});
+              DebugSymbol item{selector, linkage_symbol, path};
+              if (runtime_entries.size() == 1) {
+                item.runtime_address = *runtime_entries.begin();
+                item.elf_address = low;
+              }
+              auto [existing, added] = candidates.try_emplace(key, std::move(item));
+              if (!added && existing->second.runtime_address != item.runtime_address) {
+                existing->second.runtime_address = 0;
+                existing->second.elf_address = 0;
+              }
               if (page_size != 0 && candidates.size() > page_size &&
                   candidates.size() - page_size > 1) {
                 candidates.erase(std::prev(candidates.end()));

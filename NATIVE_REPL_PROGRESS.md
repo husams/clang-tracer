@@ -143,3 +143,21 @@ The staged-install interceptor test passed with its target fixtures rebuilt
 with DWARF in the isolated validation directory. It covered original exception
 propagation, replacement and concurrent detach. The ordinary GCC 8.5 SDK
 profile was used throughout.
+
+## Local C++ browsing P1
+
+T1 adds identity-checked local process selection, thread listings, executable
+module mappings and bidirectional C++ symbol lookup. Process selections carry
+the PID start time and executable path into attach. Module snapshots carry the
+session ID, live executable ranges and backing-file identity. Reverse lookup
+requires a current token from that session. Loader notifications and import,
+export and section views remain follow-up slices.
+
+The browser fixture selects one of two same-name C++ targets, rejects an
+incorrect start time for the other, lists both threads of the selected target,
+round-trips a C++ symbol through an interior runtime address, and rejects the
+old token both after unload and after loading a different ELF identity at the
+same path.
+
+The GCC 8.5 Linux x86-64 build passed four focused CTests and the native
+Python symbol-pagination regression. All 198 portable Python tests passed.

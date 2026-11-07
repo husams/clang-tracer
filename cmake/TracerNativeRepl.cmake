@@ -217,6 +217,14 @@ function(tracer_add_native_repl)
         $<TARGET_FILE:clang-tracer-repl>)
     set_tests_properties(native_repl_header_reuse PROPERTIES TIMEOUT 240)
     if(NOT TRACER_REPL_ONLY)
+      add_executable(repl-browser-target tests/fixtures/repl_browser.cpp)
+      target_link_libraries(repl-browser-target PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+      target_compile_options(repl-browser-target PRIVATE -g -O0 -fno-omit-frame-pointer)
+      add_test(NAME native_repl_browser_integration
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_browser_integration.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:repl-browser-target> $<TARGET_FILE:call-stacks-calculator>)
+      set_tests_properties(native_repl_browser_integration PROPERTIES TIMEOUT 100)
       add_test(NAME native_repl_prepared_integration
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_prepared_integration.py"
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>

@@ -59,6 +59,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitThreads(TracerCommandsParser::ThreadsContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitSymbols(TracerCommandsParser::SymbolsContext *ctx) override {
     return visitChildren(ctx);
   }

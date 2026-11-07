@@ -2,19 +2,21 @@ grammar TracerCommands;
 
 line : '%' command EOF;
 command : server | attach | processes | sessions | use | status | detach
-        | modules | symbols | probe | interceptor | events | collect | record
+        | modules | threads | symbols | probe | interceptor | events | collect | record
         | cpp | shell | complete | type | help | quit;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
 serverOption : ('--executable' | '--agent') value;
-attach : 'attach' UINT?;
+attach : 'attach' (UINT ('--start-time' UINT)?)?;
 processes : 'processes' ('--filter' value)?;
 sessions : 'sessions';
 use : 'use' value;
 status : 'status';
 detach : 'detach' value?;
-modules : 'modules';
+modules : 'modules' '--details'?;
+threads : 'threads';
 symbols : 'symbols' symbolOption*;
-symbolOption : ('--filter' | '--module' | '--page') value | '--limit' UINT;
+symbolOption : ('--filter' | '--module' | '--page' | '--address' | '--mapping') value
+             | '--limit' UINT | '--addresses';
 probe : 'probe' ('prepare' value prepareOption+
       | 'resolve' value resolveOption*
       | 'inject' value '--callback' value deployOption*
@@ -50,7 +52,7 @@ help : 'help' ('%'? value+)?;
 quit : 'quit' | 'exit';
 value : STRING | WORD | UINT | keyword;
 keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
-        | 'processes' | 'sessions' | 'use' | 'detach' | 'modules' | 'symbols'
+        | 'processes' | 'sessions' | 'use' | 'detach' | 'modules' | 'threads' | 'symbols'
         | 'probe' | 'prepare' | 'resolve' | 'inject' | 'validate' | 'remove' | 'probes'
         | 'interceptor' | 'load' | 'edit' | 'show' | 'upload' | 'events'
         | 'list' | 'calls' | 'stats' | 'clear' | 'open' | 'export' | 'json'

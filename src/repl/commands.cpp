@@ -58,6 +58,7 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"status", K::status},
                                         {"detach", K::detach},
                                         {"modules", K::modules},
+                                        {"threads", K::threads},
                                         {"symbols", K::symbols},
                                         {"probe prepare", K::prepare},
                                         {"probe resolve", K::resolve},
@@ -117,8 +118,9 @@ public:
         result.arguments.push_back(decode(ts[i]->getText()));
       return {};
     }
-    const std::set<std::string> flags = {"--all", "--metadata-only", "--print-arguments",
-                                         "--print-result"};
+    const std::set<std::string> flags = {
+        "--all", "--metadata-only", "--print-arguments", "--print-result",
+        "--details", "--addresses"};
     const std::set<std::string> repeated = {"--include", "--compile-option",
                                             "--name", "--type"};
     for (; i + 1 < ts.size(); ++i) {
@@ -170,6 +172,18 @@ std::uint64_t Command::number(const std::string &name,
   return has(name) ? unsigned_number(option(name), name) : fallback;
 }
 
+std::uint64_t address_number(const std::string &text) {
+  const bool hex = text.size() >= 2 && text[0] == '0' &&
+                   (text[1] == 'x' || text[1] == 'X');
+  const auto begin = text.data() + (hex ? 2 : 0);
+  const auto end = text.data() + text.size();
+  std::uint64_t address = 0;
+  const auto parsed = std::from_chars(begin, end, address, hex ? 16 : 10);
+  if (parsed.ec != std::errc{} || parsed.ptr != end || !address)
+    throw std::invalid_argument("invalid nonzero address: " + text);
+  return address;
+}
+
 Command parse_command(const std::string &input) {
   if (input.size() > 65536 || input.find('\0') != std::string::npos) {
     throw std::invalid_argument("command is too large or contains a null byte");
@@ -216,6 +230,17 @@ Command parse_command(const std::string &input) {
     if (!unsigned_number(command.arguments[0], "PID", INT32_MAX)) {
       throw std::invalid_argument("PID must be positive");
     }
+    if (command.has("--start-time") && !command.number("--start-time", 0))
+      throw std::invalid_argument("--start-time must be positive");
+  }
+  if (command.has("--address")) {
+    address_number(command.option("--address"));
+    if (command.option("--mapping").empty() || command.has("--page") ||
+        command.number("--limit", 0))
+      throw std::invalid_argument("--address requires --mapping and does not support paging");
+  }
+  if (command.has("--mapping") && command.option("--mapping").empty()) {
+    throw std::invalid_argument("--mapping requires a snapshot token");
   }
   if (command.kind == K::remove &&
       !unsigned_number(command.arguments[0], "probe ID")) {

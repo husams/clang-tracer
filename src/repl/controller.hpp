@@ -60,6 +60,13 @@ class Controller {
   void watch(const Command &command, bool display,
              const std::string &record_path = {});
   const EventBuffer &buffer(const std::string &name) const;
+  struct ProcessChoice {
+    std::uint32_t pid;
+    std::uint64_t start_time;
+    std::string executable;
+    std::string command;
+  };
+  std::vector<ProcessChoice> processes(const std::string &filter) const;
 
 public:
   explicit Controller(Settings settings, std::ostream &out);
@@ -72,7 +79,8 @@ public:
   std::string prompt() const;
   void prepare(const std::string &selector, const Command &options);
   std::vector<std::string> take_pending_imports();
-  SessionHandle attach(std::uint32_t pid);
+  SessionHandle attach(std::uint32_t pid, std::uint64_t expected_start_time = 0,
+                       const std::string &expected_executable = {});
   void detach(const SessionHandle &session);
   void require_session(const SessionHandle &session);
   std::uint64_t inject(const SessionHandle &session,
@@ -86,8 +94,6 @@ public:
   void draft(const std::string &name, std::string source);
   void print(const Event &event) const;
   void print(const Collection &collection) const;
-  std::vector<std::pair<unsigned, std::string>>
-  processes(const std::string &filter) const;
   void
   select_process(const std::string &filter,
                  const std::function<std::string(const std::string &)> &read);

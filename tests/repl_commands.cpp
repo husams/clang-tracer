@@ -109,5 +109,16 @@ int main() {
   bad("%events --probe 0");
   bad("%events --after 999999999999999999999999999999999");
   bad("%symbols --limit 4294967296");
+  require(parse_command("%threads").kind == CommandKind::threads);
+  require(parse_command("%modules --details").has("--details"));
+  require(parse_command("%attach 42 --start-time 100").number("--start-time", 0) == 100);
+  require(parse_command("%symbols --filter demo --addresses").has("--addresses"));
+  require(address_number(parse_command("%symbols --address 0x100a --mapping s:token")
+                             .option("--address")) == 0x100a);
+  bad("%attach 42 --start-time 0");
+  bad("%symbols --address 0x100a");
+  bad("%symbols --address 0x100a --mapping token --page other");
+  bad("%symbols --address 0xzz --mapping token");
+  bad("%symbols --address 18446744073709551616 --mapping token");
   std::cout << "native REPL grammar checks passed\n";
 }

@@ -197,6 +197,13 @@ class Client:
         )
         return list(response.modules)
 
+    def list_threads(self, session_id: str) -> list[pb.TargetThread]:
+        """List thread IDs, names and start times for an attached target."""
+        response = self.stub.ListThreads(
+            pb.ListThreadsRequest(session_id=session_id), timeout=self.timeout
+        )
+        return list(response.threads)
+
     def list_symbols(
         self,
         session_id: str,
