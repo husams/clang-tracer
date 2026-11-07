@@ -21,6 +21,8 @@ struct Handler final : Prefix, Interface, virtual VirtualState {
   int factor = 7;
   int route(int value) const override;
   template<class T> T convert(T value) const { return value + factor; }
+  static int scale(int value);
+  template<class T> static T shift(T value) { return value + 2; }
 };
 
 template<> double Handler::convert<double>(double value) const;

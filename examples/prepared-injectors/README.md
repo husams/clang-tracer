@@ -157,6 +157,11 @@ The preparer resolves the concrete declaration without building the target.
 Injection requires the instance to have an executable symbol and a safe patch
 window in the target.
 
+The concrete demo also prepares `Handler::scale(int)` and
+`Handler::shift<int>(int)` with the `prepared_concrete::` qualifier. The
+`native_repl_prepared_concrete` test injects both static methods after removing
+the application header and checks that they return 12 and 6 for input 4.
+
 For records with application-defined copy, move, or destruction code, the
 standalone adapter preserves the lifetime declarations and lets the target
 perform those operations. Reference and by-value snapshots can capture fields

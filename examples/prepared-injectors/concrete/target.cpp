@@ -11,7 +11,9 @@ int main() {
         prepared_concrete::twice<double>(4.0) != 4.5 ||
         handler.convert<int>(4) != 11 ||
         handler.convert<double>(4.0) != 11.5 ||
-        box.apply(4) != 15)
+        box.apply(4) != 15 ||
+        prepared_concrete::Handler::scale(4) != 12 ||
+        prepared_concrete::Handler::shift<int>(4) != 6)
       return 1;
     ::usleep(100000);
   }
