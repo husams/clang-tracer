@@ -29,15 +29,21 @@ def main():
         default_compdb = root / "compile_commands.json"
         local_header = root / "headers" / "calculator.hpp"
         local_header.parent.mkdir()
+        sysroot = root / "sdk"
+        sdk_include = sysroot / "usr" / "include"
+        sdk_include.mkdir(parents=True)
+        (sdk_include / "prepared_sdk.h").write_text("#define PREPARED_SDK_HEADER 1\n")
         local_header.write_text(
             '#ifndef FIRST_DIRECTORY_ENTRY\n#error wrong compile command\n#endif\n'
+            '#include <prepared_sdk.h>\n'
+            '#if PREPARED_SDK_HEADER != 1\n#error wrong sysroot\n#endif\n'
             f'#include "{header}"\n')
         default_compdb.write_text(json.dumps([
             {"directory": str(root), "file": source,
              "arguments": ["clang++", "-std=c++17", *flags, "-c", source]}
             for source, flags in (
                 ("foreign.cpp", []),
-                ("headers/z_first.cpp", ["-DFIRST_DIRECTORY_ENTRY"]),
+                ("headers/z_first.cpp", ["-DFIRST_DIRECTORY_ENTRY", f"--sysroot={sysroot}"]),
                 ("headers/a_second.cpp", []),
             )
         ]))
@@ -47,6 +53,11 @@ def main():
         changed = None
         console = None
         try:
+            def prepare(include, output):
+                command = f'%probe prepare {selector} --include "{include}" --output "{output}"'
+                return subprocess.run([args.repl, "--fail-fast"], input=command + "\n%quit\n",
+                                      text=True, capture_output=True, cwd=root, env=env, timeout=30)
+
             def launch(pid):
                 return [str(args.repl), "--server", str(args.server), "--agent", str(args.agent),
                         "--attach", str(pid), "--timeout", "60", "--fail-fast"]
@@ -76,11 +87,37 @@ def main():
                 console = None
                 return text
 
-            preparation = f'%probe prepare {selector} --include "{local_header}" --output "{package}"'
-            offline = subprocess.run([args.repl, "--fail-fast"], input=preparation + "\n%quit\n",
-                                     text=True, capture_output=True, cwd=root, env=env, timeout=30)
+            offline = prepare(local_header, package)
             assert offline.returncode == 0 and "prepared directory=" in offline.stdout, (
                 offline.stdout + offline.stderr)
+
+            cl_header = root / "headers" / "cl.hpp"
+            cl_header.write_text(
+                '#if !defined(_MT) || !defined(PREPARE_CL_MODE)\n#error expected clang-cl mode\n#endif\n'
+                '#if __cplusplus < 202002L\n#error expected C++20 from the compile command\n#endif\n'
+                '#include <prepared_sdk.h>\n'
+                f'#include "{header}"\n')
+            source = "headers/cl.cpp"
+            cl_flags = ["/TP", "/c", "/Foignored.obj", "/std:c++20", "/DPREPARE_CL_MODE", source]
+            for name, arguments in (
+                ("cl_linux", ["clang-cl", "--target=x86_64-unknown-linux-gnu",
+                              f"--sysroot={sysroot}", *cl_flags]),
+                ("cl_windows", ["clang-cl", *cl_flags]),
+                ("gnu_x32", ["clang++", "-mx32", "-c", source]),
+            ):
+                default_compdb.write_text(json.dumps([
+                    {"directory": str(root), "file": source, "arguments": arguments},
+                ]))
+                output = root / name
+                result = prepare(cl_header, output)
+                text = result.stdout + result.stderr
+                if name == "cl_linux":
+                    assert result.returncode == 0 and (output / "prepared.pb").is_file(), text
+                    assert not (root / "ignored.obj").exists()
+                else:
+                    assert result.returncode != 0, text
+                    assert "compilation database ABI does not match the trace target" in text, text
+                    assert not (output / "prepared.pb").exists()
 
             target = subprocess.Popen([args.target], stdout=target_log, stderr=subprocess.STDOUT)
             prepared = f'--prepared "{package}" --prepared-mode require'
@@ -137,8 +174,9 @@ auto hook = tracer.inject(session, {selector}, "{callback}");
                     assert result.returncode == 0 and 'symbol: "_ZN13prepared_demo7computeEi"' in text, text
                     assert ("falling back to DWARF" in text) == (mode != "off"), text
             assert callback.read_bytes() == original_callback, "generation changed the user callback"
-            print("Native prepared integration passed: offline generation, ABI-compatible rebuild reuse, "
-                  "pinned-image rejection, C++ API, typed results, restoration, and prefer/off.")
+            print("Native prepared integration passed: compile database driver and sysroot, ABI rejection, "
+                  "offline generation, ABI-compatible rebuild reuse, pinned-image rejection, "
+                  "C++ API, typed results, restoration, and prefer/off.")
         finally:
             if console is not None and console.poll() is None:
                 console.terminate()

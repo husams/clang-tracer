@@ -7,6 +7,8 @@
 
 namespace tracer::client {
 
+struct PreparedHeaderCommand;
+
 struct ResolvedCallable {
   clangtracer::v1::ProbeSpec spec;
   std::string declaration;
@@ -16,6 +18,7 @@ struct ResolvedCallable {
 
 ResolvedCallable resolve_header_callable(const std::string& selector,
                                          const clangtracer::v1::ProbeSpec& header_context,
+                                         const PreparedHeaderCommand& command,
                                          bool pointer_layouts);
 
 void verify_prepared_adapter(const std::string &selector,

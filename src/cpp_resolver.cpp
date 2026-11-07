@@ -1,4 +1,5 @@
 #include "cpp_resolver.hpp"
+#include "header_context.hpp"
 #include "prepared_types.hpp"
 #include "prepared_adapter.hpp"
 #include "prepared_contract.hpp"
@@ -492,6 +493,7 @@ public:
           auto adapter = tracer::prepared::AdapterEmitter(*context_).emit(
               *declaration, invocation_.prepared_headers, invocation_.pointer_layouts);
           auto &package = *candidate.spec.mutable_prepared();
+          package.set_target_triple(context_->getTargetInfo().getTriple().str());
           package.set_adapter_declarations(std::move(adapter.source));
           for (const auto &header : adapter.standard_headers)
             package.add_adapter_standard_headers(header);
@@ -640,8 +642,13 @@ public:
     const auto& target = compiler.getTarget();
     const auto& triple = target.getTriple();
     if (triple.getArch() != llvm::Triple::x86_64 || !triple.isOSLinux() ||
-        target.getPointerWidth(clang::LangAS::Default) != 64 || target.getLongWidth() != 64) {
-      target_error_ = "compilation database must target Linux x86_64 (found " + triple.str() + ")";
+        target.getPointerWidth(clang::LangAS::Default) != 64 || target.getLongWidth() != 64 ||
+        (prepared_ && (!triple.isOSBinFormatELF() || !target.isLittleEndian() ||
+                       !target.getCXXABI().isItaniumFamily()))) {
+      target_error_ = prepared_
+          ? "compilation database ABI does not match the trace target (expected Linux x86_64 "
+            "ELF LP64 with the Itanium C++ ABI, found " + triple.str() + ")"
+          : "compilation database must target Linux x86_64 (found " + triple.str() + ")";
       return false;
     }
     return true;
@@ -973,19 +980,26 @@ ResolvedCallable resolve_cpp_callable(const std::string& name,
 
 ResolvedCallable resolve_header_callable(const std::string& name,
                                          const api::ProbeSpec& headers,
+                                         const PreparedHeaderCommand& command,
                                          bool pointer_layouts) {
   const auto selector = parse_selector(name);
-  if (!selector.has_parameters || headers.include_headers().empty() ||
-      !headers.has_header_context())
+  if (!selector.has_parameters || headers.include_headers().empty())
     throw std::runtime_error("prepared generation requires an explicit selector and header context");
-  // Parse with the same implicit SDK defaults used for the live wrapper.
-  std::vector<std::string> arguments(runtime::jit_flags.begin(), runtime::jit_flags.end());
-  arguments.insert(arguments.end(), headers.header_context().compiler_arguments().begin(),
-                   headers.header_context().compiler_arguments().end());
+  // Use the SDK fallback unless the database names a different installed
+  // compiler by path or explicitly selects a toolchain.
+  std::vector<std::string> arguments{"--no-default-config"};
+  std::error_code path_error;
+  const bool alternate_driver = fs::path(command.driver).is_absolute() &&
+      fs::is_regular_file(command.driver, path_error) &&
+      !fs::equivalent(command.driver, TRACER_PREPARE_BUILD_CXX, path_error) && !path_error;
+  if (command.use_default_toolchain && !alternate_driver) {
+    for (const auto* flag : runtime::jit_flags)
+      arguments.push_back(command.clang_cl ? std::string("/clang:") + flag : flag);
+  }
+  arguments.insert(arguments.end(), command.arguments.begin(), command.arguments.end());
   arguments.push_back("-resource-dir=" + std::string(TRACER_CLANG_RESOURCE_DIR));
   arguments.insert(arguments.end(), {"-x", "c++"});
-  const auto source = (fs::path(headers.header_context().working_directory()) /
-                       "clang-tracer-prepared-headers.cc").string();
+  const auto source = (fs::path(command.directory) / "clang-tracer-prepared-headers.cc").string();
   std::string code;
   for (const auto& header : headers.include_headers())
     code += "#include \"" + header + "\"\n";
@@ -1014,10 +1028,9 @@ ResolvedCallable resolve_header_callable(const std::string& name,
       code += "template<class R> void select(R (*)" + type + ");\n";
     code += "template<class R, class C> void select(R (C::*)" + member + ");\n"
             "using Selected = decltype(select(&" + qualified + "));\n}\n";
-    arguments.push_back("-fno-access-control");
+    arguments.push_back(command.clang_cl ? "/clang:-fno-access-control" : "-fno-access-control");
   }
-  clang::tooling::FixedCompilationDatabase database(
-      headers.header_context().working_directory(), arguments);
+  clang::tooling::FixedCompilationDatabase database(command.directory, arguments);
   clang::tooling::ClangTool tool(database, {source});
   tool.mapVirtualFile(source, code);
   std::vector<Candidate> candidates;
@@ -1030,8 +1043,9 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   tool.appendArgumentsAdjuster([&](const clang::tooling::CommandLineArguments& args,
                                    llvm::StringRef filename) {
     invocation.arguments = args;
+    invocation.arguments.front() = command.driver;
     invocation.source_argument = filename.str();
-    return args;
+    return invocation.arguments;
   });
   ActionFactory factory(candidates, target_error, selector.qualified_name, invocation,
                         invocation_error, true);

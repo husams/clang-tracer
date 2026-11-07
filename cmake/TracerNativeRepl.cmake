@@ -99,7 +99,8 @@ function(tracer_add_native_repl)
   target_include_directories(clang-tracer-prepare-injectors-native SYSTEM PRIVATE
     ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
   target_compile_definitions(clang-tracer-prepare-injectors-native PRIVATE
-    TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
+    TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}"
+    TRACER_PREPARE_BUILD_CXX="${CMAKE_CXX_COMPILER}")
   target_link_libraries(clang-tracer-prepare-injectors-native PRIVATE
     tracer_repl_rpc clang-cpp LLVM)
   if(NOT TRACER_REPL_FILESYSTEM_LINKS)

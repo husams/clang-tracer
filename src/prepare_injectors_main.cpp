@@ -103,17 +103,15 @@ int main(int argc, char **argv) {
       digest = image_digest(module);
     }
     const auto unit = options.find("--translation-unit");
-    tracer::client::resolve_header_context(
-        context, options.at("--compdb"),
-        unit == options.end() ? std::string{} : unit->second,
-        tracer::client::HeaderCommandSelection::first_in_header_directory);
+    const auto command = tracer::client::resolve_prepared_header_command(
+        headers.front(), options.at("--compdb"),
+        unit == options.end() ? std::string{} : unit->second);
     const auto resolve_adapter = [&](bool pointer_layouts) {
       auto callable = tracer::client::resolve_header_callable(
-          options.at("--selector"), context, pointer_layouts);
+          options.at("--selector"), context, command, pointer_layouts);
       auto &adapter = *callable.spec.mutable_prepared();
-      for (const auto &option : context.header_context().compiler_arguments())
-        if (tracer::prepared::abi_option(option))
-          adapter.add_adapter_abi_options(option);
+      for (const auto &option : command.adapter_abi_options)
+        adapter.add_adapter_abi_options(option);
       tracer::client::verify_prepared_adapter(options.at("--selector"), adapter,
                                               callable, pointer_layouts);
       return callable;
@@ -167,7 +165,6 @@ int main(int argc, char **argv) {
     prepared.set_symbol(resolved.spec.symbol());
     *prepared.mutable_signature() = resolved.spec.signature();
     *prepared.mutable_argument_names() = resolved.spec.argument_names();
-    prepared.set_target_triple("x86_64-unknown-linux-gnu");
     if (!module.empty() && image_digest(module) != digest)
       throw std::runtime_error("module changed during preparation");
     if (prepared.ByteSizeLong() > 64 * 1024)
