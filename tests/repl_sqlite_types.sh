@@ -29,7 +29,7 @@ timeout 10 bash -c 'until test -S tracer.sock; do sleep 0.1; done'
 
 selector='prepared_demo::Account::apply(const std::string &, std::vector<int>, prepared_demo::Adjustment, std::unique_ptr<int>, const std::shared_ptr<int> &, const std::weak_ptr<int> &, Choice)'
 {
-  printf '%%probe prepare "%s" --include account.hpp --include reading.hpp --output prepared --metadata-only\n' "$selector"
+  printf 'tracer.prepare("%s", {"account.hpp", "reading.hpp"}, "prepared");\n' "$selector"
   printf '%s\n' '%shell "unlink account.hpp && unlink reading.hpp && unlink compile_commands.json"'
   printf '%%probe inject "%s" --callback state_interceptor.cpp --prepared-mode require\n' "$selector"
   printf '%s\n' '%record capture.db --sqlite --name account.adjusted --count 12 --timeout 8'

@@ -205,8 +205,10 @@ auto state = e.state_as<app::State>();)",
     {"attach", "Attach to a target PID and return its session handle.", "auto target = tracer.attach(12345);"},
     {"selected_session", "Get the currently selected attachment.", "auto target = tracer.selected_session();"},
     {"prepare", "Generate a reusable probe package from local headers.",
-     R"example(tracer.prepare("demo::compute(int)", "demo.hpp", "prepared");)example",
-     "The output directory must be new. See %help probe prepare for compilation database and module options."},
+     R"example(tracer.prepare("demo::compute(int)", {"demo.hpp", "state.hpp"}, "prepared");)example",
+     "Pass one header, a braced list, or a vector of header paths. Order the probe's declaration header first, "
+     "followed by additional types used by the callback. The output directory must be new. "
+     "See %help probe prepare for compilation database and module options."},
     {"inject", "Install a callback from a local file and return the probe ID.",
      R"example(auto probe = tracer.inject(session, "demo::compute(int)", "hook.cpp");)example",
      "Pass a prepared package directory as the fourth argument to require prepared injection."},

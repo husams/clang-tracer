@@ -522,6 +522,14 @@ An explicit `%cpp reset` clears C++ variables and unlocks configuration while
 retaining tracing sessions. Local options do not change remote probe settings:
 `--include`, `--compile-option` and `--compdb` still refer to the server.
 
+Use `tracer.prepare` with a header path, a braced list, or a
+`std::vector<std::string>`. Put the probed function's declaration header
+first, followed by headers for types used by the callback.
+
+```cpp
+tracer.prepare("demo::compute(int)", {"demo.hpp", "state.hpp"}, "prepared");
+```
+
 Successful injection with a typed package prepared in the same REPL imports
 eligible mappings from its standalone adapter. For `tracer.inject(...)`,
 the mappings become available at the next input after the call. The import
