@@ -63,9 +63,11 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'import'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
         | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview' | 'apply'
-        | 'memory' | 'maps' | 'read';
+        | 'memory' | 'maps' | 'read' | 'scan';
 memory : 'memory' ('maps' | 'read' value '--mapping' value
-                 ('--count' UINT | '--type' value));
+                 ('--count' UINT | '--type' value)
+                 | 'scan' value '--mapping' value '--count' UINT
+                   '--pattern' value ('--limit' UINT)?);
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';

@@ -236,3 +236,20 @@ mapped file's EOF, and token invalidation after permission changes, remapping
 and reattaching. Eight focused CTests passed with the GCC 8.5 SDK and Clang
 21.1.8. The memory fixture also passed on OverlayFS. All 198 portable Python
 tests passed.
+
+### I1 Bounded masked-pattern memory scans
+
+`%memory scan` uses the same session and mapping token as `%memory read`.
+It searches a readable span of up to 1 MiB for a pattern of up to 256
+bytes. The REPL accepts wildcard bytes, wildcard nibbles and an explicit
+bit mask. Results include overlaps in ascending address order and report
+whether further matches exceeded the limit. The scanner uses the existing
+deadline, cancellation and snapshot checks and returns no matches when
+the requested span cannot be verified and read in full.
+
+The Linux x86-64 memory fixture verified cross-page and cross-mapping
+matches, a 128 KiB scan, overlapping and truncated results, invalid
+inputs, unmapped or protected memory, a mapped file fault, and stale
+tokens after permission changes, remapping and reattach.
+Eight focused CTests passed with the GCC 8.5 SDK and Clang 21.1.8. The
+memory fixture also passed on OverlayFS. All 198 portable Python tests passed.

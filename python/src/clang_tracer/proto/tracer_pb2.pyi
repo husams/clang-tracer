@@ -629,6 +629,32 @@ class ReadMemoryResponse(_message.Message):
     data: bytes
     def __init__(self, address: _Optional[int] = ..., data: _Optional[bytes] = ...) -> None: ...
 
+class ScanMemoryRequest(_message.Message):
+    __slots__ = ("session_id", "mapping_token", "address", "size", "pattern", "mask", "max_matches")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    MAPPING_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    SIZE_FIELD_NUMBER: _ClassVar[int]
+    PATTERN_FIELD_NUMBER: _ClassVar[int]
+    MASK_FIELD_NUMBER: _ClassVar[int]
+    MAX_MATCHES_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    mapping_token: str
+    address: int
+    size: int
+    pattern: bytes
+    mask: bytes
+    max_matches: int
+    def __init__(self, session_id: _Optional[str] = ..., mapping_token: _Optional[str] = ..., address: _Optional[int] = ..., size: _Optional[int] = ..., pattern: _Optional[bytes] = ..., mask: _Optional[bytes] = ..., max_matches: _Optional[int] = ...) -> None: ...
+
+class ScanMemoryResponse(_message.Message):
+    __slots__ = ("addresses", "truncated")
+    ADDRESSES_FIELD_NUMBER: _ClassVar[int]
+    TRUNCATED_FIELD_NUMBER: _ClassVar[int]
+    addresses: _containers.RepeatedScalarFieldContainer[int]
+    truncated: bool
+    def __init__(self, addresses: _Optional[_Iterable[int]] = ..., truncated: bool = ...) -> None: ...
+
 class ListThreadsRequest(_message.Message):
     __slots__ = ("session_id",)
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]

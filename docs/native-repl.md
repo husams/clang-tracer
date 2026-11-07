@@ -173,12 +173,13 @@ command. Removal is repeatable for a retained batch in its original session.
 Removal and rollback restore entry bytes. The agent still retains compiled
 slots until the target exits.
 
-## Read mapped memory
+## Read and scan mapped memory
 
 ```text
 %memory maps
 %memory read 0xADDRESS --mapping TOKEN --count 32
 %memory read 0xADDRESS --mapping TOKEN --type i64
+%memory scan 0xADDRESS --mapping TOKEN --count 4096 --pattern "48 8? ?? ff" --limit 16
 ```
 
 Run these commands after attaching to a local Linux x86-64 target. Copy the
@@ -194,10 +195,23 @@ entire span is readable. A gap, inaccessible page, or short kernel read
 fails the request at the first affected address and returns no bytes.
 
 The server checks the mapping snapshot and target identity around each
-read. Run `%memory maps` again after any mapping or permission change.
+read or scan. Run `%memory maps` again after any mapping or permission change.
 The target keeps running during inspection, so bytes can change while
 they are copied. An unmap and remap with identical visible metadata between
 checks can produce the same snapshot.
+
+Scans accept 1 to 1048576 bytes and patterns of 1 to 256 bytes. Separate hex
+bytes with spaces. Use `??` for an entire wildcard byte, or `8?` or `?f`
+for a wildcard nibble. To choose individual bits, append a colon and a
+same-length hex mask, as in `"13 37 : 1f ff"`. A bit participates only
+if the explicit mask enables it and the bit belongs to a non-wildcard nibble.
+
+Matches are reported in ascending address order and can overlap or cross
+adjacent readable mappings. The default match limit is 64 and the maximum
+is 1024. `truncated=true` means the scan found at least one more match.
+A scan fails without returning matches if any part of its requested range
+is unreadable or the snapshot changes during inspection. The scan uses the
+configured operation timeout and supports Ctrl+C.
 
 ## Interceptor upload
 

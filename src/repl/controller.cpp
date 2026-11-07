@@ -115,6 +115,47 @@ void print_memory_dump(std::ostream &out, std::uint64_t address, std::string_vie
   out << dump.str();
 }
 
+std::pair<std::string, std::string> parse_memory_pattern(std::string_view text) {
+  const auto parse_bytes = [](std::string_view source, bool wildcards) {
+    std::istringstream input{std::string(source)};
+    std::string token, bytes, mask;
+    while (input >> token) {
+      if (token.size() != 2)
+        throw std::invalid_argument("memory pattern needs two hex digits or wildcards per byte");
+      if (bytes.size() == 256)
+        throw std::invalid_argument("memory pattern must be at most 256 bytes");
+      unsigned value = 0, bits = 0;
+      for (const unsigned char ch : token) {
+        value <<= 4;
+        bits <<= 4;
+        if (wildcards && ch == '?')
+          continue;
+        const auto nibble = std::string_view("0123456789abcdef").find(
+            static_cast<char>(std::tolower(ch)));
+        if (nibble == std::string_view::npos)
+          throw std::invalid_argument("invalid hex digit in memory pattern or mask");
+        value |= static_cast<unsigned>(nibble);
+        bits |= 0xf;
+      }
+      bytes.push_back(static_cast<char>(value));
+      mask.push_back(static_cast<char>(bits));
+    }
+    if (bytes.empty())
+      throw std::invalid_argument("memory pattern and explicit mask must be nonempty");
+    return std::make_pair(std::move(bytes), std::move(mask));
+  };
+  const auto colon = text.find(':');
+  auto [pattern, mask] = parse_bytes(text.substr(0, colon), true);
+  if (colon != std::string_view::npos) {
+    const auto explicit_mask = parse_bytes(text.substr(colon + 1), false).first;
+    if (explicit_mask.size() != pattern.size())
+      throw std::invalid_argument("memory pattern and explicit mask must have the same length");
+    for (std::size_t i = 0; i < mask.size(); ++i)
+      mask[i] = static_cast<char>(mask[i] & explicit_mask[i]);
+  }
+  return {std::move(pattern), std::move(mask)};
+}
+
 void save_bulk_manifest(const std::string &path, const api::BulkTraceRules &rules) {
   const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   if (fd < 0)
@@ -1279,6 +1320,35 @@ bool Controller::execute(const Command &command) {
       print_memory_scalar(out_, request.address(), response.data(), type);
     else
       print_memory_dump(out_, request.address(), response.data());
+    return true;
+  }
+  case K::memory_scan: {
+    require_session(selected_);
+    api::ScanMemoryRequest request;
+    request.set_session_id(selected_.id);
+    request.set_mapping_token(command.option("--mapping"));
+    request.set_address(address_number(args.at(0)));
+    request.set_size(static_cast<std::uint32_t>(
+        unsigned_number(command.option("--count"), "memory scan size", 1048576)));
+    auto [pattern, mask] = parse_memory_pattern(command.option("--pattern"));
+    request.set_pattern(std::move(pattern));
+    request.set_mask(std::move(mask));
+    if (command.has("--limit")) {
+      const auto limit = unsigned_number(command.option("--limit"), "memory scan match limit", 1024);
+      if (!limit)
+        throw std::invalid_argument("memory scan match limit must be positive");
+      request.set_max_matches(static_cast<std::uint32_t>(limit));
+    }
+    const auto response = unary<api::ScanMemoryResponse>(
+        [&](auto &c, auto &r) {
+          Cancellation cancellation(c);
+          return stub_->ScanMemory(&c, request, &r);
+        },
+        settings_.timeout_seconds);
+    for (const auto address : response.addresses())
+      out_ << "match=0x" << std::hex << address << std::dec << '\n';
+    out_ << "memory scan matches=" << response.addresses_size()
+         << " truncated=" << (response.truncated() ? "true" : "false") << '\n';
     return true;
   }
   case K::threads: {

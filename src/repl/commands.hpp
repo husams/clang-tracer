@@ -21,6 +21,7 @@ enum class CommandKind {
   symbols,
   memory_maps,
   memory_read,
+  memory_scan,
   prepare,
   resolve,
   inject,

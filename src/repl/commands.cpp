@@ -62,6 +62,7 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"symbols", K::symbols},
                                         {"memory maps", K::memory_maps},
                                         {"memory read", K::memory_read},
+                                        {"memory scan", K::memory_scan},
                                         {"trace preview", K::bulk_preview},
                                         {"trace apply", K::bulk_apply},
                                         {"trace remove", K::bulk_remove},
@@ -262,7 +263,7 @@ Command parse_command(const std::string &input) {
   if (command.has("--mapping") && command.option("--mapping").empty()) {
     throw std::invalid_argument("--mapping requires a snapshot token");
   }
-  if (command.kind == K::memory_read)
+  if (command.kind == K::memory_read || command.kind == K::memory_scan)
     address_number(command.arguments.at(0));
   if (command.kind == K::remove &&
       !unsigned_number(command.arguments[0], "probe ID")) {

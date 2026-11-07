@@ -16,6 +16,7 @@ service Tracer {
   rpc ListModules(ListModulesRequest) returns (ListModulesResponse);
   rpc ListMemoryMappings(ListMemoryMappingsRequest) returns (ListMemoryMappingsResponse);
   rpc ReadMemory(ReadMemoryRequest) returns (ReadMemoryResponse);
+  rpc ScanMemory(ScanMemoryRequest) returns (ScanMemoryResponse);
   rpc ListThreads(ListThreadsRequest) returns (ListThreadsResponse);
   rpc ListSymbols(ListSymbolsRequest) returns (ListSymbolsResponse);
   rpc PreviewBulkTrace(PreviewBulkTraceRequest) returns (PreviewBulkTraceResponse);
@@ -342,6 +343,19 @@ message ReadMemoryRequest {
 message ReadMemoryResponse {
   uint64 address = 1;
   bytes data = 2; // On success, exactly size bytes owned by the response.
+}
+message ScanMemoryRequest {
+  string session_id = 1;
+  string mapping_token = 2;
+  uint64 address = 3;
+  uint32 size = 4; // 1..1048576 bytes.
+  bytes pattern = 5; // 1..256 bytes.
+  bytes mask = 6; // Same length as pattern. Set bits participate in comparison.
+  uint32 max_matches = 7; // Zero defaults to 64. At most 1024.
+}
+message ScanMemoryResponse {
+  repeated uint64 addresses = 1; // Ascending match starts, including overlaps.
+  bool truncated = 2; // At least one additional match was found.
 }
 message ListThreadsRequest { string session_id = 1; }
 message TargetThread {

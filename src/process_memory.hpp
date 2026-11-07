@@ -15,5 +15,9 @@ grpc::Status read(grpc::ServerContext &context, Session &session,
                   std::chrono::seconds timeout,
                   const clangtracer::v1::ReadMemoryRequest &request,
                   clangtracer::v1::ReadMemoryResponse &response);
+grpc::Status scan(grpc::ServerContext &context, Session &session,
+                  std::chrono::seconds timeout,
+                  const clangtracer::v1::ScanMemoryRequest &request,
+                  clangtracer::v1::ScanMemoryResponse &response);
 } // namespace memory
 } // namespace tracer

@@ -15,6 +15,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include <fcntl.h>
 #include <llvm/ADT/StringExtras.h>
@@ -27,6 +28,10 @@ using Code = grpc::StatusCode;
 namespace {
 constexpr std::size_t max_maps_bytes = 1024 * 1024;
 constexpr std::size_t max_read_bytes = 64 * 1024;
+constexpr std::size_t max_scan_bytes = 1024 * 1024;
+constexpr std::size_t max_pattern_bytes = 256;
+constexpr int default_match_limit = 64;
+constexpr int max_match_limit = 1024;
 
 class MemoryError final : public std::runtime_error {
 public:
@@ -248,6 +253,67 @@ grpc::Status inspect(grpc::ServerContext &context, Session &session,
     return {Code::INTERNAL, error.what()};
   }
 }
+
+template <typename Operation>
+grpc::Status inspect_range(grpc::ServerContext &context, Session &session,
+                           std::chrono::seconds timeout, const std::string &token,
+                           std::uint64_t address, std::uint32_t size, Operation operation) {
+  if (!address || size > std::numeric_limits<std::uint64_t>::max() - address)
+    return {Code::INVALID_ARGUMENT, "invalid or overflowing memory address range"};
+  const auto prefix = token_prefix(session);
+  if (token.compare(0, prefix.size(), prefix) != 0 || token.size() != prefix.size() + 64 ||
+      token.find_first_not_of("0123456789abcdef", prefix.size()) != std::string::npos)
+    return {Code::INVALID_ARGUMENT, "memory mapping token does not identify this session"};
+  return inspect(context, session, timeout, [&](const Target &target) {
+    const auto maps = target.maps();
+    if (mapping_token(session, maps) != token)
+      throw MemoryError(Code::ABORTED, "memory mapping snapshot is stale; run %memory maps again");
+    require_readable(parse_mappings(maps, target), address, address + size);
+    operation(target, target.read_bytes(address, size));
+    if (maps != target.maps())
+      throw MemoryError(Code::ABORTED, "target mappings changed during inspection; run %memory maps again");
+    target.verify_live();
+  });
+}
+
+void find_matches(const Target &target, std::string_view bytes, std::uint64_t address,
+                  std::string_view pattern, std::string_view mask, int limit,
+                  api::ScanMemoryResponse &result) {
+  if (pattern.size() > bytes.size())
+    return;
+  struct Check {
+    std::size_t offset;
+    unsigned char mask;
+    unsigned char expected;
+  };
+  std::vector<Check> checks;
+  checks.reserve(pattern.size());
+  for (std::size_t i = 0; i < pattern.size(); ++i) {
+    const auto bits = static_cast<unsigned char>(mask[i]);
+    const auto value = static_cast<unsigned char>(pattern[i]);
+    if (bits)
+      checks.push_back({i, bits, static_cast<unsigned char>(value & bits)});
+  }
+  // Test exact bytes first, even when the pattern starts with wildcards.
+  std::stable_partition(checks.begin(), checks.end(), [](const Check &check) {
+    return check.mask == 0xff;
+  });
+  const auto last = bytes.size() - pattern.size();
+  for (std::size_t start = 0; start <= last; ++start) {
+    if (start % 4096 == 0)
+      target.checkpoint();
+    if (!std::all_of(checks.begin(), checks.end(), [&](const Check &check) {
+          return (static_cast<unsigned char>(bytes[start + check.offset]) & check.mask)
+                 == check.expected;
+        }))
+      continue;
+    if (result.addresses_size() == limit) {
+      result.set_truncated(true);
+      break;
+    }
+    result.add_addresses(address + start);
+  }
+}
 } // namespace
 
 grpc::Status list_mappings(grpc::ServerContext &context, Session &session,
@@ -271,24 +337,38 @@ grpc::Status read(grpc::ServerContext &context, Session &session,
   const auto size = request.size();
   if (!size || size > max_read_bytes)
     return {Code::INVALID_ARGUMENT, "memory read size must be between 1 and 65536 bytes"};
-  if (!address || size > std::numeric_limits<std::uint64_t>::max() - address)
-    return {Code::INVALID_ARGUMENT, "invalid or overflowing memory address range"};
-  const auto prefix = token_prefix(session);
-  const auto &token = request.mapping_token();
-  if (token.compare(0, prefix.size(), prefix) != 0 || token.size() != prefix.size() + 64 ||
-      token.find_first_not_of("0123456789abcdef", prefix.size()) != std::string::npos)
-    return {Code::INVALID_ARGUMENT, "memory mapping token does not identify this session"};
-  return inspect(context, session, timeout, [&](const Target &target) {
-    const auto maps = target.maps();
-    if (mapping_token(session, maps) != token)
-      throw MemoryError(Code::ABORTED, "memory mapping snapshot is stale; run %memory maps again");
-    require_readable(parse_mappings(maps, target), address, address + size);
-    auto bytes = target.read_bytes(address, size);
-    if (maps != target.maps())
-      throw MemoryError(Code::ABORTED, "target mappings changed during read; run %memory maps again");
-    target.verify_live();
-    response.set_address(address);
-    response.set_data(std::move(bytes));
+  api::ReadMemoryResponse result;
+  const auto status = inspect_range(context, session, timeout, request.mapping_token(),
+                                    address, size, [&](const Target &, std::string bytes) {
+    result.set_address(address);
+    result.set_data(std::move(bytes));
   });
+  if (status.ok())
+    response.Swap(&result);
+  return status;
+}
+
+grpc::Status scan(grpc::ServerContext &context, Session &session,
+                  std::chrono::seconds timeout, const api::ScanMemoryRequest &request,
+                  api::ScanMemoryResponse &response) {
+  if (!request.size() || request.size() > max_scan_bytes)
+    return {Code::INVALID_ARGUMENT, "memory scan size must be between 1 and 1048576 bytes"};
+  const auto &pattern = request.pattern();
+  const auto &mask = request.mask();
+  if (pattern.empty() || pattern.size() > max_pattern_bytes || mask.size() != pattern.size())
+    return {Code::INVALID_ARGUMENT, "memory scan pattern and mask must have the same length of 1 to 256 bytes"};
+  if (request.max_matches() > max_match_limit)
+    return {Code::INVALID_ARGUMENT, "memory scan match limit must be at most 1024"};
+  const int limit = request.max_matches() ? static_cast<int>(request.max_matches())
+                                          : default_match_limit;
+  api::ScanMemoryResponse result;
+  const auto status = inspect_range(context, session, timeout, request.mapping_token(),
+                                    request.address(), request.size(),
+                                    [&](const Target &target, const std::string &bytes) {
+    find_matches(target, bytes, request.address(), pattern, mask, limit, result);
+  });
+  if (status.ok())
+    response.Swap(&result);
+  return status;
 }
 } // namespace tracer::memory

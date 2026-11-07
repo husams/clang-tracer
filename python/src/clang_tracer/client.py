@@ -225,6 +225,20 @@ class Client:
         )
         return response.data
 
+    def scan_memory(
+        self, session_id: str, address: int, size: int, *,
+        mapping_token: str, pattern: bytes, mask: bytes, max_matches: int = 0,
+    ) -> pb.ScanMemoryResponse:
+        """Find masked matches in a current mapping snapshot."""
+        return self.stub.ScanMemory(
+            pb.ScanMemoryRequest(
+                session_id=session_id, address=address, size=size,
+                mapping_token=mapping_token, pattern=pattern, mask=mask,
+                max_matches=max_matches,
+            ),
+            timeout=self.timeout,
+        )
+
     def list_threads(self, session_id: str) -> list[pb.TargetThread]:
         """List thread IDs, names and start times for an attached target."""
         response = self.stub.ListThreads(

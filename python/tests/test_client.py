@@ -179,6 +179,7 @@ def test_all_public_rpcs_have_client_methods():
         "ListModules": "list_modules",
         "ListMemoryMappings": "list_memory_mappings",
         "ReadMemory": "read_memory",
+        "ScanMemory": "scan_memory",
         "ListThreads": "list_threads",
         "PreviewBulkTrace": "preview_bulk_trace",
         "ApplyBulkTrace": "apply_bulk_trace",

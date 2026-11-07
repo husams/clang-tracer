@@ -8,6 +8,7 @@
 
 namespace {
 volatile std::sig_atomic_t change_requested = 0;
+unsigned char large_range[128 * 1024]{};
 
 void request_change(int) { change_requested = 1; }
 } // namespace
@@ -25,6 +26,9 @@ int main(int argc, char **argv) {
     return 3;
   const unsigned char across[] = {0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0};
   std::memcpy(base + page - 4, across, sizeof(across));
+  volatile unsigned char *tail = large_range + sizeof(large_range) - sizeof(across);
+  for (std::size_t i = 0; i < sizeof(across); ++i)
+    tail[i] = across[i];
   const float floating = -1.5f;
   std::memcpy(base + 8, &floating, sizeof(floating));
   if (::mprotect(base + page, page, PROT_READ) != 0 ||
@@ -32,7 +36,8 @@ int main(int argc, char **argv) {
              MAP_FIXED | MAP_PRIVATE, backing, 0) == MAP_FAILED)
     return 4;
   std::signal(SIGUSR1, request_change);
-  std::printf("memory base=%p page=%ld\n", static_cast<void *>(base), page);
+  std::printf("memory base=%p page=%ld large=%p\n",
+              static_cast<void *>(base), page, static_cast<void *>(large_range));
   std::fflush(stdout);
   unsigned stage = 0;
   for (;;) {

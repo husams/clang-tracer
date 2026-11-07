@@ -1507,6 +1507,14 @@ public:
     return memory::read(*context, *session, timeout_, *request, *response);
   }
 
+  grpc::Status ScanMemory(grpc::ServerContext *context, const api::ScanMemoryRequest *request,
+                          api::ScanMemoryResponse *response) override {
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    return memory::scan(*context, *session, timeout_, *request, *response);
+  }
+
   grpc::Status ListThreads(
       grpc::ServerContext *context, const clangtracer::v1::ListThreadsRequest *request,
       clangtracer::v1::ListThreadsResponse *response) override {
