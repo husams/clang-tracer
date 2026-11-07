@@ -1498,6 +1498,28 @@ bool Controller::execute(const Command &command) {
     }
     return true;
   }
+  case K::probe_reload: {
+    require_session(selected_);
+    api::ReloadProbeRequest request;
+    request.set_session_id(selected_.id);
+    request.set_probe_id(unsigned_number(args.at(0), "probe ID"));
+    request.set_callback_source(read_source(command.option("--callback")));
+    const auto response = unary<api::ReloadProbeResponse>(
+        [&](auto &c, auto &r) {
+          Cancellation cancellation(c);
+          return stub_->ReloadProbe(&c, request, &r);
+        },
+        settings_.timeout_seconds);
+    out_ << "reloaded probe=" << response.probe().id()
+         << " replaces=" << response.probe().replaces_probe_id()
+         << " retained_limit=" << response.retained_limit();
+    if (response.has_agent_retained())
+      out_ << " agent_retained=" << response.agent_retained();
+    else
+      out_ << " agent_retained=unknown";
+    out_ << '\n';
+    return true;
+  }
   case K::remove: {
     require_session(selected_);
     api::RemoveProbeRequest request;
@@ -1508,7 +1530,7 @@ bool Controller::execute(const Command &command) {
         settings_.timeout_seconds);
     out_ << "removed probe=" << response.id() << " restored="
          << (response.original_bytes_restored() ? "true" : "false") << '\n';
-    if (!response.original_bytes_restored()) {
+    if (!response.original_bytes_restored() && !response.superseded_by_probe_id()) {
       throw std::runtime_error("probe restoration incomplete");
     }
     return true;

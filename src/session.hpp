@@ -3,6 +3,7 @@
 #include <chrono>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -38,7 +39,10 @@ public:
                                    const std::string &source_directory,
                                    std::uint64_t probe_id,
                                    const std::array<std::uint8_t, 16> &lineage,
-                                   const std::string &bulk_batch_id = {});
+                                   const std::string &bulk_batch_id = {},
+                                   std::uint64_t reload_probe_id = 0,
+                                   const std::function<bool()> &cancelled = {});
+  clangtracer::v1::ProbeSpec reload_spec(std::uint64_t probe_id, std::string source);
   clangtracer::v1::ValidationReport
   validate_probe(const clangtracer::v1::ProbeSpec &spec,
                  const std::string &source_directory,
@@ -72,6 +76,7 @@ private:
 
   struct ProbeRecord {
     clangtracer::v1::Probe value;
+    clangtracer::v1::ProbeSpec reload_spec;
     std::uintptr_t remote_request = 0;
     std::string source_file;
     bool patch_committed = false;

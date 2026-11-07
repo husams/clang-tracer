@@ -275,12 +275,28 @@ build defaults. Probe-specific flags and target signature ABI checks still apply
 Successful installs report resolve, target JIT compile and patch durations
 in nanoseconds when the server supports them.
 
-The probe ID identifies one installed observer generation. If a replacement
-fails to compile, the previous observer stays active. Removal restores the
-original entry, closes callback admission, and drains in-flight calls.
-The agent retains native wrappers for safe late arrivals. Borrow target
-pointers and references only during the callback. Use owned snapshots for REPL
-inspection and replay.
+### Reload an observer
+
+```text
+%probe reload PROBE_ID --callback observer-v2.cpp
+```
+
+Use the ID of the active probe. Reload keeps its target binding, ABI and
+deployment options. The agent prepares the new observer before switching the
+entry. A rejected callback or a switch that rolls back leaves the existing
+observer in place. Cancellation is checked up to the entry switch. Use
+`%probes` to identify the current generation if the reply is interrupted.
+
+The entry switches directly to the new wrapper. Calls that already entered
+the previous wrapper finish there, with both PRE and POST tagged by the
+previous probe ID. A successful reload reports the new ID and retained
+capacity. The 32-slot process limit includes retired wrappers, which stay
+resident for safe late arrivals. Remove the active generation to restore the
+original entry. Removing a superseded generation drains it while leaving the
+successor in place. Detach drains all generations.
+
+Borrow target pointers and references only during the callback. Use owned
+snapshots for REPL inspection and replay.
 
 ## Collect and inspect
 

@@ -407,6 +407,17 @@ class Client:
         )
         return response
 
+    def reload_probe(
+        self, session_id: str, probe_id: int, callback_source: str
+    ) -> pb.ReloadProbeResponse:
+        """Switch an active probe to a new observer generation."""
+        return self.stub.ReloadProbe(
+            pb.ReloadProbeRequest(
+                session_id=session_id, probe_id=probe_id, callback_source=callback_source
+            ),
+            timeout=self.timeout,
+        )
+
     def inject(
         self,
         session_id: str,

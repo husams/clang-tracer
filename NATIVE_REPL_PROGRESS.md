@@ -269,3 +269,27 @@ preservation during preview, refused prologues, and rejection of stale
 mapping tokens and changed entry bytes.
 Nine focused CTests passed with the GCC 8.5 SDK and Clang 21.1.8. The entry
 fixture also passed on OverlayFS. All 198 portable Python tests passed.
+
+### I3 Safe observer reload
+
+`%probe reload ID --callback FILE` reuses the active probe's binding and
+deployment options. The agent prepares a separate Clang JIT wrapper, then
+the server switches the installed detour directly while peer threads are
+stopped. In-flight invocations and queued events retain the original probe
+ID. Compilation rejection and a recoverable switch rollback preserve the
+existing detour.
+
+Reload reports the new generation ID and the 32-slot retained-probe
+budget. Superseded wrappers stay resident for late arrivals. Removal
+drains admitted calls before closing callback delivery, and detach drains
+all retained generations.
+
+The Linux x86-64 fixture held an original call open across a failed compile
+and a successful cutover. New calls emitted the replacement's events, and
+the held call emitted its POST on the original ID. The fixture filled the
+retained budget, verified rejection preserved the active observer, and
+checked original entry bytes after detach.
+
+Eight focused CTests passed with the GCC 8.5 SDK and Clang 21.1.8,
+including staged CLI replacement across a collector restart. All 198
+portable Python tests passed.

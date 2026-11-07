@@ -488,7 +488,7 @@ class ValidationReport(_message.Message):
     def __init__(self, success: bool = ..., level: _Optional[_Union[ValidateProbeRequest.Level, str]] = ..., effective_options: _Optional[_Iterable[str]] = ..., diagnostics: _Optional[_Iterable[_Union[ValidationDiagnostic, _Mapping]]] = ..., prepared_used: bool = ...) -> None: ...
 
 class Probe(_message.Message):
-    __slots__ = ("id", "session_id", "symbol", "signature", "active", "callback_address", "entry_address", "original_bytes_restored", "agent_dropped_events", "callback_errors", "jit_compile_ns", "patch_install_ns", "bulk_batch_id")
+    __slots__ = ("id", "session_id", "symbol", "signature", "active", "callback_address", "entry_address", "original_bytes_restored", "agent_dropped_events", "callback_errors", "jit_compile_ns", "patch_install_ns", "bulk_batch_id", "replaces_probe_id", "superseded_by_probe_id", "draining")
     ID_FIELD_NUMBER: _ClassVar[int]
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     SYMBOL_FIELD_NUMBER: _ClassVar[int]
@@ -502,6 +502,9 @@ class Probe(_message.Message):
     JIT_COMPILE_NS_FIELD_NUMBER: _ClassVar[int]
     PATCH_INSTALL_NS_FIELD_NUMBER: _ClassVar[int]
     BULK_BATCH_ID_FIELD_NUMBER: _ClassVar[int]
+    REPLACES_PROBE_ID_FIELD_NUMBER: _ClassVar[int]
+    SUPERSEDED_BY_PROBE_ID_FIELD_NUMBER: _ClassVar[int]
+    DRAINING_FIELD_NUMBER: _ClassVar[int]
     id: int
     session_id: str
     symbol: str
@@ -515,7 +518,30 @@ class Probe(_message.Message):
     jit_compile_ns: int
     patch_install_ns: int
     bulk_batch_id: str
-    def __init__(self, id: _Optional[int] = ..., session_id: _Optional[str] = ..., symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., active: bool = ..., callback_address: _Optional[int] = ..., entry_address: _Optional[int] = ..., original_bytes_restored: bool = ..., agent_dropped_events: _Optional[int] = ..., callback_errors: _Optional[int] = ..., jit_compile_ns: _Optional[int] = ..., patch_install_ns: _Optional[int] = ..., bulk_batch_id: _Optional[str] = ...) -> None: ...
+    replaces_probe_id: int
+    superseded_by_probe_id: int
+    draining: bool
+    def __init__(self, id: _Optional[int] = ..., session_id: _Optional[str] = ..., symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., active: bool = ..., callback_address: _Optional[int] = ..., entry_address: _Optional[int] = ..., original_bytes_restored: bool = ..., agent_dropped_events: _Optional[int] = ..., callback_errors: _Optional[int] = ..., jit_compile_ns: _Optional[int] = ..., patch_install_ns: _Optional[int] = ..., bulk_batch_id: _Optional[str] = ..., replaces_probe_id: _Optional[int] = ..., superseded_by_probe_id: _Optional[int] = ..., draining: bool = ...) -> None: ...
+
+class ReloadProbeRequest(_message.Message):
+    __slots__ = ("session_id", "probe_id", "callback_source")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    PROBE_ID_FIELD_NUMBER: _ClassVar[int]
+    CALLBACK_SOURCE_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    probe_id: int
+    callback_source: str
+    def __init__(self, session_id: _Optional[str] = ..., probe_id: _Optional[int] = ..., callback_source: _Optional[str] = ...) -> None: ...
+
+class ReloadProbeResponse(_message.Message):
+    __slots__ = ("probe", "retained_limit", "agent_retained")
+    PROBE_FIELD_NUMBER: _ClassVar[int]
+    RETAINED_LIMIT_FIELD_NUMBER: _ClassVar[int]
+    AGENT_RETAINED_FIELD_NUMBER: _ClassVar[int]
+    probe: Probe
+    retained_limit: int
+    agent_retained: int
+    def __init__(self, probe: _Optional[_Union[Probe, _Mapping]] = ..., retained_limit: _Optional[int] = ..., agent_retained: _Optional[int] = ...) -> None: ...
 
 class RemoveProbeRequest(_message.Message):
     __slots__ = ("session_id", "probe_id")

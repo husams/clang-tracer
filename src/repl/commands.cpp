@@ -68,6 +68,7 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"trace remove", K::bulk_remove},
                                         {"probe prepare", K::prepare},
                                         {"probe entry", K::probe_entry},
+                                        {"probe reload", K::probe_reload},
                                         {"probe resolve", K::resolve},
                                         {"probe inject", K::inject},
                                         {"probe validate", K::validate},
@@ -266,7 +267,7 @@ Command parse_command(const std::string &input) {
   }
   if (command.kind == K::memory_read || command.kind == K::memory_scan)
     address_number(command.arguments.at(0));
-  if (command.kind == K::remove &&
+  if ((command.kind == K::remove || command.kind == K::probe_reload) &&
       !unsigned_number(command.arguments[0], "probe ID")) {
     throw std::invalid_argument("probe ID must be positive");
   }

@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -394,7 +395,8 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
                    const std::string &source_directory,
                    std::uint64_t probe_id,
                    const std::array<std::uint8_t, 16> &lineage,
-                   const std::string &bulk_batch_id) {
+                   const std::string &bulk_batch_id, std::uint64_t reload_probe_id,
+                   const std::function<bool()> &cancelled) {
   std::lock_guard lock(mutex_);
   check_identity_locked();
   if (state_ != clangtracer::v1::Session::ATTACHED) {
@@ -406,6 +408,10 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
   if (probe_id == 0 || probes_.count(probe_id) != 0) {
     throw std::invalid_argument("probe id is invalid or already used");
   }
+  if (cancelled && cancelled())
+    throw std::runtime_error("reload cancelled before preparing the replacement");
+  const auto batch_id = reload_probe_id ? find_probe_locked(reload_probe_id).value.bulk_batch_id()
+                                        : bulk_batch_id;
   const auto source_file =
       source_directory + "/" + id_ + "-" + std::to_string(probe_id) + ".pb";
   write_file_0600(source_file, spec.SerializeAsString());
@@ -413,12 +419,55 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
   const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
   std::uintptr_t remote_request = 0;
   bool prepared = false;
+  bool cleanup_attempted = false;
+  const auto discard_prepared = [&] {
+    // The prepared wrapper is unreachable. Deactivate it before releasing
+    // the request record and resuming the process.
+    cleanup_attempted = true;
+    if (!process.attached())
+      attach_process(process, std::chrono::steady_clock::now() + operation_timeout_);
+    constexpr unsigned cleanup_attempts = 12;
+    for (unsigned attempt = 0; attempt < cleanup_attempts; ++attempt) {
+      std::int32_t cleanup_status = 0;
+      try {
+        cleanup_status = static_cast<std::int32_t>(
+            process.remote_call(stop_address_, {remote_request}, 1));
+      } catch (const std::exception &error) {
+        process.mark_unsafe();
+        unsafe_target_ = true;
+        set_failed_locked(std::string("prepared probe cleanup outcome is "
+                                      "uncertain; target remains stopped: ") +
+                          error.what());
+        throw std::runtime_error(error_);
+      } catch (...) {
+        process.mark_unsafe();
+        unsafe_target_ = true;
+        set_failed_locked("prepared probe cleanup outcome is uncertain; "
+                          "target remains stopped");
+        throw std::runtime_error(error_);
+      }
+      if (cleanup_status == 0)
+        break;
+      if (cleanup_status != 1 || attempt + 1 == cleanup_attempts) {
+        process.mark_unsafe();
+        unsafe_target_ = true;
+        set_failed_locked("could not deactivate prepared probe; target "
+                          "remains stopped");
+        throw std::runtime_error(error_);
+      }
+    }
+    process.remote_free(remote_request, sizeof(Request));
+    remote_request = 0;
+    probes_.erase(probe_id);
+    prepared = false;
+  };
   try {
     attach_process(process, deadline);
     remote_request = process.remote_allocate(sizeof(Request));
     Request request{};
     request.probe_id = probe_id;
-    request.reject_replacement = !bulk_batch_id.empty();
+    request.reject_replacement = !reload_probe_id && !batch_id.empty();
+    request.expected_replaced_probe_id = reload_probe_id;
     copy_field(request.session_id, id_, "session id");
     request.context_native_pid = pid_;
     request.context_process_start_time = process_start_;
@@ -453,8 +502,10 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     record.value.set_id(probe_id);
     record.value.set_session_id(id_);
     record.value.set_symbol(spec.symbol());
-    record.value.set_bulk_batch_id(bulk_batch_id);
+    record.value.set_bulk_batch_id(batch_id);
     record.value.mutable_signature()->CopyFrom(spec.signature());
+    record.reload_spec.CopyFrom(spec);
+    record.reload_spec.clear_callback_source();
     auto [it, inserted] = probes_.emplace(probe_id, std::move(record));
     if (!inserted)
       throw std::invalid_argument("probe id is already in use");
@@ -587,33 +638,41 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
           "shared-context activation requires a proven pthread_create detour");
     }
 
+    ProbeRecord *previous = nullptr;
+    Request previous_patch{};
+    if (reload_probe_id && response.replaced_probe_id != reload_probe_id)
+      throw std::runtime_error("agent returned the wrong reload generation");
     if (response.replaced_probe_id) {
       if (request.reject_replacement)
         throw std::runtime_error("bulk installation cannot replace an existing probe");
-      auto &previous = find_probe_locked(response.replaced_probe_id);
-      if (!previous.value.active() || !previous.patch_committed ||
-          previous.value.entry_address() != response.original_entry)
+      previous = &find_probe_locked(response.replaced_probe_id);
+      if (!previous->value.active() || !previous->patch_committed ||
+          previous->value.entry_address() != response.original_entry)
         throw std::runtime_error("agent returned an invalid replacement probe");
-      // Preparation succeeded while the previous callback stayed live. Restore
-      // and drain it through the normal removal path before installing the new
-      // detour; never chain one wrapper through another.
-      process.detach();
-      stop_probe_locked(previous, false);
-      attach_process(process, deadline);
+      process.remote_read(previous->remote_request, &previous_patch, sizeof(previous_patch));
+      if (previous_patch.probe_id != previous->value.id() ||
+          previous_patch.original_entry != response.original_entry ||
+          previous_patch.patch_size != response.patch_size ||
+          std::memcmp(previous_patch.original, response.original, response.patch_size) != 0)
+        throw std::runtime_error("agent returned inconsistent replacement patch metadata");
     }
 
     const auto patch_started = std::chrono::steady_clock::now();
     constexpr unsigned kPatchAttempts = 12;
     bool committed = false;
     unsigned patch_attempts = 0;
+    std::exception_ptr switch_error;
     for (unsigned attempt = 0; attempt < kPatchAttempts; ++attempt) {
+      if (cancelled && cancelled())
+        throw std::runtime_error("reload cancelled before switching the active observer");
       if (std::chrono::steady_clock::now() >= deadline)
         break;
       ++patch_attempts;
       bool patch_applied = false;
       try {
         const injector::CodePatch target_patch{
-            response.original_entry, response.original, response.installed,
+            response.original_entry, previous ? previous_patch.installed : response.original,
+            response.installed,
             response.patch_size};
         if (scheduler_patch && !pthread_create_patch_committed_) {
           const injector::CodePatch task_patch{
@@ -627,6 +686,10 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
               ::tracer::compat::span<const injector::CodePatch>(&target_patch, 1));
         }
       } catch (const std::exception &error) {
+        if (previous && !process.unsafe()) {
+          switch_error = std::current_exception();
+          break;
+        }
         // A failed peer release can report an error after the bytes changed.
         // Preserve enough state to identify the probe and leave recovery to a
         // caller that can inspect the parked process.
@@ -643,6 +706,10 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
                           error.what());
         throw std::runtime_error(error_);
       } catch (...) {
+        if (previous && !process.unsafe()) {
+          switch_error = std::current_exception();
+          break;
+        }
         it->second.patch_committed = true;
         it->second.value.set_active(true);
         if (scheduler_patch && !pthread_create_patch_committed_) {
@@ -664,49 +731,24 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
       attach_process(process, deadline);
     }
     if (!committed) {
-      // The prepared wrapper is unreachable. Deactivate it before releasing
-      // the request record and resuming the process.
-      for (unsigned attempt = 0; attempt < kPatchAttempts; ++attempt) {
-        std::int32_t cleanup_status = 0;
-        try {
-          cleanup_status = static_cast<std::int32_t>(
-              process.remote_call(stop_address_, {remote_request}, 1));
-        } catch (const std::exception &error) {
-          it->second.value.set_active(true);
-          process.mark_unsafe();
-          unsafe_target_ = true;
-          set_failed_locked(std::string("prepared probe cleanup outcome is "
-                                        "uncertain; target remains stopped: ") +
-                            error.what());
-          throw std::runtime_error(error_);
-        } catch (...) {
-          it->second.value.set_active(true);
-          process.mark_unsafe();
-          unsafe_target_ = true;
-          set_failed_locked("prepared probe cleanup outcome is uncertain; "
-                            "target remains stopped");
-          throw std::runtime_error(error_);
-        }
-        if (cleanup_status == 0)
-          break;
-        if (cleanup_status != 1 || attempt + 1 == kPatchAttempts) {
-          process.mark_unsafe();
-          unsafe_target_ = true;
-          set_failed_locked("could not deactivate prepared probe; target "
-                            "remains stopped");
-          throw std::runtime_error(error_);
-        }
-      }
-      process.remote_free(remote_request, sizeof(Request));
-      remote_request = 0;
-      probes_.erase(it);
-      prepared = false;
+      discard_prepared();
       process.detach();
+      if (switch_error)
+        std::rethrow_exception(switch_error);
       if (!patch_attempts)
         throw std::runtime_error("operation deadline expired before the first entry patch attempt; increase --timeout");
       throw std::runtime_error("entry remained busy; probe was not committed");
     }
     it->second.patch_committed = true;
+    if (previous) {
+      // The entry now admits only the new wrapper. Calls already routed
+      // through the old wrapper keep its callbacks and event transport.
+      previous->patch_committed = false;
+      previous->value.set_active(false);
+      previous->value.set_draining(true);
+      previous->value.set_superseded_by_probe_id(probe_id);
+      it->second.value.set_replaces_probe_id(previous->value.id());
+    }
     it->second.value.set_jit_compile_ns(response.jit_compile_ns);
     it->second.value.set_patch_install_ns(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -734,6 +776,14 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
       unsafe_target_ = true;
       set_failed_locked("probe preparation recovery is uncertain; target "
                         "remains stopped");
+    }
+    if (reload_probe_id && prepared && !cleanup_attempted && !unsafe_target_ &&
+        !find_probe_locked(probe_id).patch_committed) {
+      try {
+        discard_prepared();
+      } catch (...) {
+        // Leave the retained request available for recovery.
+      }
     }
     const auto found = probes_.find(probe_id);
     if (found != probes_.end() && !prepared && !unsafe_target_) {
@@ -773,10 +823,21 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
   }
 }
 
+clangtracer::v1::ProbeSpec Session::reload_spec(std::uint64_t probe_id, std::string source) {
+  std::lock_guard lock(mutex_);
+  const auto &probe = find_probe_locked(probe_id);
+  if (state_ != clangtracer::v1::Session::ATTACHED || !probe.value.active() ||
+      !probe.patch_committed)
+    throw std::runtime_error("reload requires the active probe that owns the entry");
+  auto spec = probe.reload_spec;
+  spec.set_callback_source(std::move(source));
+  return spec;
+}
+
 bool Session::stop_probe_locked(
     ProbeRecord &probe, bool shutdown_mode,
     std::chrono::steady_clock::time_point shutdown_deadline) {
-  if (!probe.value.active()) {
+  if (!probe.value.active() && !probe.value.draining()) {
     return true;
   }
   const auto operation_deadline =
@@ -784,7 +845,8 @@ bool Session::stop_probe_locked(
   const auto deadline = std::min(operation_deadline, shutdown_deadline);
   const bool last_active_probe = std::none_of(
       probes_.begin(), probes_.end(), [&](const auto &entry) {
-        return entry.first != probe.value.id() && entry.second.value.active();
+        return entry.first != probe.value.id() &&
+               (entry.second.value.active() || entry.second.value.draining());
       });
   for (;;) {
     if (std::chrono::steady_clock::now() >= deadline) {
@@ -994,27 +1056,29 @@ bool Session::stop_probe_locked(
                         "target remains stopped");
       throw std::runtime_error(error_);
     }
-    std::array<std::uint8_t, kMaxPatchBytes> bytes{};
-    try {
-      process.remote_read(response.original_entry, bytes.data(),
-                          response.patch_size);
-    } catch (const std::exception &error) {
-      process.mark_unsafe();
-      unsafe_target_ = true;
-      set_failed_locked(std::string("could not verify restored bytes: ") +
-                        error.what());
-      throw std::runtime_error(error_);
-    }
-    if (std::memcmp(bytes.data(), response.original, response.patch_size) !=
-        0) {
-      process.mark_unsafe();
-      unsafe_target_ = true;
-      set_failed_locked("original function bytes changed during removal");
-      throw std::runtime_error(error_);
+    if (!probe.value.draining()) {
+      std::array<std::uint8_t, kMaxPatchBytes> bytes{};
+      try {
+        process.remote_read(response.original_entry, bytes.data(),
+                            response.patch_size);
+      } catch (const std::exception &error) {
+        process.mark_unsafe();
+        unsafe_target_ = true;
+        set_failed_locked(std::string("could not verify restored bytes: ") +
+                          error.what());
+        throw std::runtime_error(error_);
+      }
+      if (std::memcmp(bytes.data(), response.original, response.patch_size) != 0) {
+        process.mark_unsafe();
+        unsafe_target_ = true;
+        set_failed_locked("original function bytes changed during removal");
+        throw std::runtime_error(error_);
+      }
+      probe.value.set_original_bytes_restored(true);
     }
     probe.events_sent = response.events_sent;
     probe.value.set_active(false);
-    probe.value.set_original_bytes_restored(true);
+    probe.value.set_draining(false);
     probe.value.set_callback_address(response.callback_address);
     probe.value.set_entry_address(response.original_entry);
     probe.value.set_agent_dropped_events(response.event_drops);
@@ -1100,7 +1164,7 @@ clangtracer::v1::Probe Session::remove_probe(std::uint64_t probe_id) {
   }
   check_identity_locked();
   auto &probe = find_probe_locked(probe_id);
-  if (probe.value.active())
+  if (probe.value.active() || probe.value.draining())
     stop_probe_locked(probe, false);
   else
     release_request_locked(probe, std::chrono::steady_clock::now() + operation_timeout_);
@@ -1119,7 +1183,7 @@ void Session::detach() {
   check_identity_locked();
   for (auto &[id, probe] : probes_) {
     (void)id;
-    if (probe.value.active())
+    if (probe.value.active() || probe.value.draining())
       stop_probe_locked(probe, false);
     else
       release_request_locked(probe, std::chrono::steady_clock::now() +
@@ -1141,10 +1205,10 @@ void Session::shutdown() noexcept {
       std::chrono::steady_clock::now() + operation_timeout_;
   for (auto &[id, probe] : probes_) {
     (void)id;
-    if (!probe.value.active() && !probe.remote_request)
+    if (!probe.value.active() && !probe.value.draining() && !probe.remote_request)
       continue;
     try {
-      if (probe.value.active())
+      if (probe.value.active() || probe.value.draining())
         stop_probe_locked(probe, true, shutdown_deadline);
       else
         release_request_locked(probe, shutdown_deadline);
@@ -1157,7 +1221,9 @@ void Session::shutdown() noexcept {
   }
   const bool any_active =
       std::any_of(probes_.begin(), probes_.end(),
-                  [](const auto &item) { return item.second.value.active(); });
+                  [](const auto &item) {
+                    return item.second.value.active() || item.second.value.draining();
+                  });
   if (state_ == clangtracer::v1::Session::EXITED)
     return;
   if (!any_active && first_error.empty()) {
@@ -1227,7 +1293,8 @@ bool Session::accepts_event(std::uint64_t probe_id, std::uint32_t pid) const {
   if (pid != pid_ || state_ != clangtracer::v1::Session::ATTACHED)
     return false;
   const auto found = probes_.find(probe_id);
-  return found != probes_.end() && found->second.value.active();
+  return found != probes_.end() &&
+         (found->second.value.active() || found->second.value.draining());
 }
 
 } // namespace tracer

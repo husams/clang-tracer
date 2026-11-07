@@ -89,6 +89,8 @@ public:
 
     virtual std::any visitProbeEntry(TracerCommandsParser::ProbeEntryContext *context) = 0;
 
+    virtual std::any visitProbeReload(TracerCommandsParser::ProbeReloadContext *context) = 0;
+
 
 };
 

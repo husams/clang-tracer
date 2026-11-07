@@ -28,8 +28,8 @@ public:
     T__80 = 81, T__81 = 82, T__82 = 83, T__83 = 84, T__84 = 85, T__85 = 86,
     T__86 = 87, T__87 = 88, T__88 = 89, T__89 = 90, T__90 = 91, T__91 = 92,
     T__92 = 93, T__93 = 94, T__94 = 95, T__95 = 96, T__96 = 97, T__97 = 98,
-    T__98 = 99, T__99 = 100, T__100 = 101, T__101 = 102, UINT = 103, STRING = 104,
-    SHELL = 105, METADATA_ONLY = 106, WORD = 107, WS = 108
+    T__98 = 99, T__99 = 100, T__100 = 101, T__101 = 102, T__102 = 103, UINT = 104,
+    STRING = 105, SHELL = 106, METADATA_ONLY = 107, WORD = 108, WS = 109
   };
 
   enum {
@@ -41,7 +41,7 @@ public:
     RuleRecord = 21, RuleStreamOption = 22, RuleCpp = 23, RuleShell = 24,
     RuleComplete = 25, RuleType = 26, RuleHelp = 27, RuleQuit = 28, RuleBulkTrace = 29,
     RuleBulkTraceOption = 30, RuleValue = 31, RuleKeyword = 32, RuleMemory = 33,
-    RuleProbeEntry = 34
+    RuleProbeEntry = 34, RuleProbeReload = 35
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -96,6 +96,7 @@ public:
   class KeywordContext;
   class MemoryContext;
   class ProbeEntryContext;
+  class ProbeReloadContext;
 
   class  LineContext : public antlr4::ParserRuleContext {
   public:
@@ -139,6 +140,7 @@ public:
     BulkTraceContext *bulkTrace();
     MemoryContext *memory();
     ProbeEntryContext *probeEntry();
+    ProbeReloadContext *probeReload();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -611,6 +613,20 @@ public:
   };
 
   ProbeEntryContext* probeEntry();
+
+  class  ProbeReloadContext : public antlr4::ParserRuleContext {
+  public:
+    ProbeReloadContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    antlr4::tree::TerminalNode *UINT();
+    ValueContext *value();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  ProbeReloadContext* probeReload();
 
 
   // By default the static state used to implement the parser is lazily initialized during the first

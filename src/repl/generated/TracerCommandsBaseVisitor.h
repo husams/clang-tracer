@@ -155,6 +155,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitProbeReload(TracerCommandsParser::ProbeReloadContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
 
 };
 

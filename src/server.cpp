@@ -1396,6 +1396,39 @@ public:
     return install_probe(session, request->spec(), {}, probe_id, response);
   }
 
+  grpc::Status ReloadProbe(grpc::ServerContext *context,
+                            const api::ReloadProbeRequest *request,
+                            api::ReloadProbeResponse *response) override {
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    try {
+      auto spec = session->reload_spec(request->probe_id(), request->callback_source());
+      const auto validation = validate_probe(spec);
+      if (!validation.ok())
+        return validation;
+      const auto retained = session->agent_retained_count();
+      if (retained == kMaxProbes || session->snapshot().probes_size() >= kMaxProbes)
+        return {grpc::StatusCode::RESOURCE_EXHAUSTED, "reload reached the 32 retained-probe limit"};
+      std::uint64_t pending_id = 0;
+      const auto status = install_probe(session, spec, {}, pending_id, response->mutable_probe(),
+                                        request->probe_id(), [&] {
+        return context->IsCancelled() || std::chrono::system_clock::now() >= context->deadline();
+      });
+      if (!status.ok())
+        return status;
+      response->set_retained_limit(kMaxProbes);
+      if (const auto used = session->agent_retained_count())
+        response->set_agent_retained(*used);
+      return grpc::Status::OK;
+    } catch (const std::invalid_argument &error) {
+      return {grpc::StatusCode::NOT_FOUND, error.what()};
+    } catch (const std::exception &error) {
+      return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
+    }
+  }
+
   grpc::Status RemoveProbe(grpc::ServerContext *,
                            const clangtracer::v1::RemoveProbeRequest *request,
                            clangtracer::v1::Probe *response) override {
@@ -1961,7 +1994,7 @@ public:
                   << snapshot.error() << '\n';
       }
       for (const auto &probe : snapshot.probes()) {
-        if (!probe.active() &&
+        if (!probe.active() && !probe.draining() &&
             !events_.retire_probe(
                 probe.session_id(), probe.id(),
                 session->events_sent(probe.id()),
@@ -2039,7 +2072,9 @@ private:
   // The caller holds the session operation lock throughout these operations.
   grpc::Status install_probe(const std::shared_ptr<Session> &session,
                              const api::ProbeSpec &spec, const std::string &batch_id,
-                             std::uint64_t &pending_probe_id, api::Probe *response) {
+                             std::uint64_t &pending_probe_id, api::Probe *response,
+                             std::uint64_t reload_probe_id = 0,
+                             const std::function<bool()> &cancelled = {}) {
     pending_probe_id = 0;
     try {
       pending_probe_id = next_probe_id_.fetch_add(1);
@@ -2059,7 +2094,7 @@ private:
                   << lineage.diagnostic.substr(0, 240) << '\n';
       }
       auto probe = session->add_probe(spec, source_directory_, pending_probe_id,
-                                      lineage.id, batch_id);
+                                      lineage.id, batch_id, reload_probe_id, cancelled);
       sync_event_probes(session);
       response->CopyFrom(probe);
       return grpc::Status::OK;
@@ -2155,7 +2190,7 @@ private:
             [&](const auto &probe) { return probe.id() == pending_probe_id; }))
       events_.set_probe(session->id(), pending_probe_id, session->pid(), {}, false);
     for (const auto &probe : snapshot.probes()) {
-      if (probe.active())
+      if (probe.active() || probe.draining())
         events_.set_probe(probe.session_id(), probe.id(), session->pid(),
                           probe.symbol(), true);
       else
