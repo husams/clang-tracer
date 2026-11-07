@@ -1661,6 +1661,15 @@ bool Controller::execute(const Command &command) {
     print(b.at(command.number("--index", 0)));
     return true;
   }
+  case K::event_stack: {
+    const auto &events = buffer(args.at(0)).events();
+    const auto index = command.number("--index", 0);
+    if (index >= events.size())
+      throw std::out_of_range("event index is outside the retained collection");
+    print_event_stack(events[index]->message, out_);
+    out_ << std::flush;
+    return true;
+  }
   case K::event_calls:
   case K::event_stats:
     event_statistics(buffer(args.at(0)), out_, command.kind == K::event_calls);

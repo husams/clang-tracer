@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <filesystem>
 #include <fstream>
@@ -668,14 +669,40 @@ int main(int argc, char **argv) {
     require(::mkdtemp(directory), "recording directory");
     const auto path = std::string(directory) + "/events.pb";
     const int fd = create_recording(path);
-    for (const auto &e : limited.events()) {
-      write_record(fd, e->message);
-    }
+    auto with_stack = limited.events().front()->message;
+    with_stack.set_function_name("event_summary_marker");
+    auto *stack = with_stack.mutable_stack();
+    stack->set_status(api::StackTrace::PARTIAL);
+    stack->set_detail("unwind stopped");
+    stack->set_hidden_frames(2);
+    for (int i = 0; i < 1025; ++i)
+      stack->add_frames()->set_pc(0x1000 + i);
+    auto *last = stack->mutable_frames(1024);
+    last->set_function("last_frame()");
+    last->set_module("/app");
+    last->set_module_offset(0x40);
+    last->set_file("/app/main.cpp");
+    last->set_line(42);
+    write_record(fd, with_stack);
+    write_record(fd, limited.events().back()->message);
     ::close(fd);
-    auto loaded = open_recording(path, 20, 4096);
+    auto loaded = open_recording(path, 20, 512 * 1024);
     require(loaded.events().size() == 2 && loaded.complete, "recording replay");
     Controller offline(settings, out);
     offline.execute(parse_command("%events open \"" + path + "\" --as saved"));
+    out.str("");
+    offline.execute(parse_command("%events stack saved --index 0"));
+    const auto printed_stack = out.str();
+    require(printed_stack.find("stack PARTIAL frames=1025 hidden=2") == 0 &&
+                std::count(printed_stack.begin(), printed_stack.end(), '\n') == 1026 &&
+                printed_stack.find("#1024 0x1400 NATIVE function=\"last_frame()\" "
+                                   "module=\"/app\"+0x40 file=\"/app/main.cpp\":42") !=
+                    std::string::npos &&
+                printed_stack.find("event_summary_marker") == std::string::npos,
+            "stack view prints every retained frame and stack status");
+    out.str("");
+    offline.execute(parse_command("%events stack saved --index 1"));
+    require(out.str() == "no stack captured\n", "missing stack has a clear response");
     try {
       create_recording(path);
       throw std::logic_error("overwrote recording");

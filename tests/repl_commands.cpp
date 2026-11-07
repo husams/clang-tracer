@@ -97,6 +97,13 @@ int main() {
   bad("%cpp import `cat flags.txt`");
   require(parse_command("%events show batch --index 0").kind ==
           CommandKind::event_show);
+  const auto stack_view = parse_command("%events stack fullstack --index 3");
+  require(stack_view.kind == CommandKind::event_stack &&
+          stack_view.arguments.at(0) == "fullstack" &&
+          stack_view.number("--index", 0) == 3);
+  require(parse_command("%events stack stack --index 0").arguments.at(0) == "stack");
+  bad("%events stack fullstack");
+  bad("%events stack fullstack --index -1");
   const auto draft_check = parse_command(
       "%interceptor validate hook --target \"demo::compute(int)\" "
       "--prepared-mode require");
