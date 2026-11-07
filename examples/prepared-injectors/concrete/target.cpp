@@ -13,7 +13,9 @@ int main() {
         handler.convert<double>(4.0) != 11.5 ||
         box.apply(4) != 15 ||
         prepared_concrete::Handler::scale(4) != 12 ||
-        prepared_concrete::Handler::shift<int>(4) != 6)
+        prepared_concrete::Handler::shift<int>(4) != 6 ||
+        prepared_concrete::Handler::Nested::adjust(4) != 13 ||
+        prepared_concrete::Handler::Nested::adjust<int>(4) != 14)
       return 1;
     ::usleep(100000);
   }

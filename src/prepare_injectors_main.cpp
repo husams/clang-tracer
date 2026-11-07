@@ -145,7 +145,7 @@ int main(int argc, char **argv) {
       default: return false;
       }
     };
-    bool typed = resolved.template_instance || signature.kind() == api::METHOD ||
+    bool typed = resolved.requires_typed_adapter || signature.kind() == api::METHOD ||
                  !legacy(signature.result(), types.result_cpp_type());
     for (int i = 0; i < signature.arguments_size(); ++i)
       typed |= !legacy(signature.arguments(i), types.arguments(i).cpp_type());

@@ -18,6 +18,11 @@ struct Interface {
 struct VirtualState { int shared = 9; };
 
 struct Handler final : Prefix, Interface, virtual VirtualState {
+  struct Nested {
+    static int adjust(int value);
+    template<class T> static T adjust(T value) { return value + 10; }
+  };
+
   int factor = 7;
   int route(int value) const override;
   template<class T> T convert(T value) const { return value + factor; }

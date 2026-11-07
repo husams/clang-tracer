@@ -26,9 +26,11 @@ selectors=(
   'prepared_concrete::Box<int, 5>::apply(int) const'
   'prepared_concrete::Handler::scale(int)'
   'prepared_concrete::Handler::shift<int>(int)'
+  'prepared_concrete::Handler::Nested::adjust(int)'
+  'prepared_concrete::Handler::Nested::adjust<int>(int)'
 )
-types=(int int double int double int int int)
-results=(23 8 4.5 11 11.5 15 12 6)
+types=(int int double int double int int int int int)
+results=(23 8 4.5 11 11.5 15 12 6 13 14)
 
 for i in "${!selectors[@]}"; do
   printf '%%probe prepare "%s" --include application/types.hpp --compdb application/compile_commands.json --output package-%s --metadata-only\n' \
