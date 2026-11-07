@@ -59,6 +59,8 @@ class Controller {
                                         const Command &command);
   void watch(const Command &command, bool display,
              const std::string &record_path = {});
+  EventBuffer read_recording(const std::string &path,
+                             const EventQuery &query) const;
   const EventBuffer &buffer(const std::string &name) const;
 
 public:
@@ -82,6 +84,7 @@ public:
                      unsigned timeout);
   EventRange events(const SessionHandle& session, std::uint64_t count, unsigned timeout);
   EventRange events_async(const SessionHandle& session, std::uint64_t count, unsigned timeout);
+  Collection replay(const std::string &path, const EventQuery &query) const;
   Collection batch(const std::string &name) const;
   void draft(const std::string &name, std::string source);
   void print(const Event &event) const;

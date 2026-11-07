@@ -19,6 +19,7 @@
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/util/json_util.h>
 #include <google/protobuf/wire_format_lite.h>
+#include <sqlite3.h>
 #include <unistd.h>
 
 namespace tracer_repl {
@@ -933,19 +934,120 @@ void write_record(int fd, const api::TraceEvent &event) {
   write_all(fd, bytes.data(), bytes.size());
 }
 
+namespace {
+void read_sqlite_recording(const std::string &path, const EventQuery &query,
+                           api::TracePhase phase, EventBuffer &buffer) {
+  // Prefix relative paths so they are literal filenames even in SQLite builds
+  // that enable URI interpretation globally.
+  const auto filename = path.front() == '/' ? path : "./" + path;
+  sqlite3 *handle = nullptr;
+  const auto open = sqlite3_open_v2(filename.c_str(), &handle,
+                                    SQLITE_OPEN_READONLY, nullptr);
+  const std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db(handle, sqlite3_close);
+  const auto failure = [&] {
+    return std::runtime_error("cannot read SQLite recording: " + path + ": " +
+                              (db ? sqlite3_errmsg(db.get()) : "allocation failed"));
+  };
+  if (open != SQLITE_OK)
+    throw failure();
+  if (sqlite3_busy_timeout(db.get(), 5000) != SQLITE_OK)
+    throw failure();
+
+  std::string sql = "SELECT payload FROM trace_events WHERE 1";
+  if (query.pid)
+    sql += " AND pid = ?1";
+  if (!query.session_id.empty())
+    sql += " AND session_id = ?2";
+  if (!query.phase.empty())
+    sql += " AND phase = ?3";
+  if (!query.names.empty()) {
+    std::string names = "(?4";
+    for (std::size_t i = 1; i < query.names.size(); ++i)
+      names += ",?" + std::to_string(i + 4);
+    names += ')';
+    sql += " AND (function_name IN " + names + " OR event_name IN " + names + ")";
+  }
+  sql += " ORDER BY rowid";
+
+  sqlite3_stmt *statement = nullptr;
+  const auto prepare = sqlite3_prepare_v2(db.get(), sql.c_str(), -1, &statement, nullptr);
+  const std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> rows(statement,
+                                                                     sqlite3_finalize);
+  if (prepare != SQLITE_OK)
+    throw failure();
+  const auto check = [&](int result) {
+    if (result != SQLITE_OK)
+      throw failure();
+  };
+  const auto bind_text = [&](int index, const std::string &value) {
+    check(sqlite3_bind_text64(rows.get(), index, value.data(), value.size(),
+                             SQLITE_STATIC, SQLITE_UTF8));
+  };
+  if (query.pid)
+    check(sqlite3_bind_int64(rows.get(), 1, query.pid));
+  if (!query.session_id.empty())
+    bind_text(2, query.session_id);
+  if (!query.phase.empty())
+    check(sqlite3_bind_int(rows.get(), 3, phase));
+  for (std::size_t i = 0; i < query.names.size(); ++i)
+    bind_text(static_cast<int>(i) + 4, query.names[i]);
+
+  while (!query.count || buffer.received < query.count) {
+    const auto status = sqlite3_step(rows.get());
+    if (status == SQLITE_DONE)
+      break;
+    if (status != SQLITE_ROW)
+      throw failure();
+    const auto size = sqlite3_column_type(rows.get(), 0) == SQLITE_BLOB
+                          ? sqlite3_column_bytes(rows.get(), 0)
+                          : 0;
+    api::TraceEvent event;
+    if (size <= 0 || size > static_cast<int>(max_frame) ||
+        !event.ParseFromArray(sqlite3_column_blob(rows.get(), 0), size))
+      throw std::runtime_error("invalid event payload in SQLite recording: " + path);
+    buffer.push(event);
+  }
+}
+} // namespace
+
 EventBuffer open_recording(const std::string &path, std::size_t max_events,
-                           std::size_t max_bytes) {
+                           std::size_t max_bytes, const EventQuery &query) {
+  api::TracePhase phase = api::TRACE_PHASE_UNSPECIFIED;
+  if (!query.phase.empty() && !api::TracePhase_Parse(query.phase, &phase))
+    throw std::invalid_argument("unknown event phase: " + query.phase);
+  const auto invalid_name = [](const std::string &name) {
+    return name.empty() || name.find('\0') != std::string::npos;
+  };
+  if (query.names.size() > 64 ||
+      std::any_of(query.names.begin(), query.names.end(), invalid_name))
+    throw std::invalid_argument("replay accepts up to 64 nonempty event names");
+  if (path.empty() || path.find('\0') != std::string::npos)
+    throw std::invalid_argument("replay requires a recording path");
+  if (query.session_id.find('\0') != std::string::npos)
+    throw std::invalid_argument("replay session ID contains a null byte");
   std::ifstream input(path, std::ios::binary);
   if (!input) {
     throw std::runtime_error("cannot open recording: " + path);
   }
   EventBuffer buffer(max_events, max_bytes);
   unsigned char prefix[4];
-  while (input.read(reinterpret_cast<char *>(prefix), sizeof(prefix)) ||
-         input.gcount()) {
+  bool first_frame = true;
+  while ((!query.count || buffer.received < query.count) &&
+         (input.read(reinterpret_cast<char *>(prefix), sizeof(prefix)) ||
+          input.gcount())) {
     if (input.gcount() != 4) {
       throw std::runtime_error("truncated recording header");
     }
+    // The SQLite signature cannot be a valid Protobuf frame length.
+    if (first_frame && std::memcmp(prefix, "SQLi", sizeof(prefix)) == 0) {
+      char rest[12];
+      if (!input.read(rest, sizeof(rest)) ||
+          std::memcmp(rest, "te format 3", sizeof(rest)) != 0)
+        throw std::runtime_error("invalid SQLite recording header: " + path);
+      read_sqlite_recording(path, query, phase, buffer);
+      break;
+    }
+    first_frame = false;
     std::uint32_t size = 0;
     for (unsigned i = 0; i < 4; ++i) {
       size |= static_cast<std::uint32_t>(prefix[i]) << (8 * i);
@@ -961,6 +1063,14 @@ EventBuffer open_recording(const std::string &path, std::size_t max_events,
     if (!event.ParseFromString(bytes)) {
       throw std::runtime_error("invalid event in recording");
     }
+    if ((query.pid && event.pid() != query.pid) ||
+        (!query.session_id.empty() && event.session_id() != query.session_id) ||
+        (!query.phase.empty() && event.phase() != phase) ||
+        (!query.names.empty() &&
+         std::none_of(query.names.begin(), query.names.end(), [&](const auto &name) {
+           return name == event.function_name() || name == event.context().event().name();
+         })))
+      continue;
     buffer.push(event);
   }
   if (input.bad()) {
