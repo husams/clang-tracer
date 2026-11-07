@@ -32,6 +32,7 @@ public:
 
 std::string value_text(const clangtracer::v1::Value &value);
 std::string event_summary(const clangtracer::v1::TraceEvent &event);
+void print_event_stack(const clangtracer::v1::TraceEvent &event, std::ostream &out);
 void event_statistics(const EventBuffer &buffer, std::ostream &out, bool calls);
 void write_record(int fd, const clangtracer::v1::TraceEvent &event);
 int create_recording(const std::string &path);

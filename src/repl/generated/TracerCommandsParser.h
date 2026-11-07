@@ -30,7 +30,7 @@ public:
     T__92 = 93, T__93 = 94, T__94 = 95, T__95 = 96, T__96 = 97, T__97 = 98,
     T__98 = 99, T__99 = 100, T__100 = 101, T__101 = 102, T__102 = 103, T__103 = 104,
     T__104 = 105, T__105 = 106, UINT = 107, STRING = 108, SHELL = 109, METADATA_ONLY = 110,
-    SQLITE = 111, WORD = 112, WS = 113
+    SQLITE = 111, STACK = 112, WORD = 113, WS = 114
   };
 
   enum {
@@ -399,6 +399,7 @@ public:
     std::vector<ValueContext *> value();
     ValueContext* value(size_t i);
     antlr4::tree::TerminalNode *UINT();
+    antlr4::tree::TerminalNode *STACK();
     std::vector<StreamOptionContext *> streamOption();
     StreamOptionContext* streamOption(size_t i);
 
@@ -584,6 +585,7 @@ public:
   public:
     KeywordContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
+    antlr4::tree::TerminalNode *STACK();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;

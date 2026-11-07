@@ -34,6 +34,7 @@ interceptor : 'interceptor' ('load' value '--as' value | 'edit' value | 'show' v
 events : 'events' (streamOption*
        | 'list' value ('--limit' UINT)?
        | 'show' value '--index' UINT
+       | STACK value '--index' UINT
        | 'calls' value | 'stats' value | 'clear' value
        | 'open' value '--as' value
        | 'export' value '--format' 'json' '--output' value);
@@ -64,7 +65,7 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'import'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
         | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview' | 'apply'
-        | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload';
+        | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | STACK;
 memory : 'memory' ('maps' | 'read' value '--mapping' value
                  ('--count' UINT | '--type' value)
                  | 'scan' value '--mapping' value '--count' UINT
@@ -80,5 +81,6 @@ STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
 SHELL : '`' ~[`\r\n]+ '`';
 METADATA_ONLY : '--metadata-only';
 SQLITE : '--sqlite';
+STACK : 'stack';
 WORD : ~[ \t\r\n"'\\%`]+;
 WS : [ \t\r\n]+ -> skip;

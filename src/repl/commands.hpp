@@ -38,6 +38,7 @@ enum class CommandKind {
   events,
   event_list,
   event_show,
+  event_stack,
   event_calls,
   event_stats,
   event_clear,

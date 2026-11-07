@@ -987,6 +987,40 @@ void print_function_stats(std::ostream &out, const TargetKey &key,
 }
 } // namespace
 
+void print_event_stack(const api::TraceEvent &event, std::ostream &out) {
+  if (!event.has_stack()) {
+    out << "no stack captured\n";
+    return;
+  }
+  const auto flags = out.flags();
+  const auto &stack = event.stack();
+  out << std::dec << "stack " << api::StackTrace::Status_Name(stack.status())
+      << " frames=" << stack.frames_size();
+  if (stack.hidden_frames())
+    out << " hidden=" << stack.hidden_frames();
+  if (!stack.detail().empty())
+    out << " detail=" << std::quoted(printable_stat_text(stack.detail()));
+  out << '\n';
+  int index = 0;
+  for (const auto &frame : stack.frames()) {
+    out << '#' << index++ << " 0x" << std::hex << frame.pc() << std::dec
+        << ' ' << api::StackFrame::Kind_Name(frame.kind());
+    if (!frame.function().empty())
+      out << " function=" << std::quoted(printable_stat_text(frame.function()));
+    if (!frame.module().empty()) {
+      out << " module=" << std::quoted(printable_stat_text(frame.module()))
+          << "+0x" << std::hex << frame.module_offset() << std::dec;
+    }
+    if (!frame.file().empty()) {
+      out << " file=" << std::quoted(printable_stat_text(frame.file()));
+      if (frame.line())
+        out << ':' << frame.line();
+    }
+    out << '\n';
+  }
+  out.flags(flags);
+}
+
 void event_statistics(const EventBuffer &buffer, std::ostream &out,
                       bool calls) {
   std::map<CallKey, CallPair> pairs;

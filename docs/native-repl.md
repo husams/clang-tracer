@@ -431,6 +431,7 @@ can include `event_ranges.hpp` and use the `tracer_repl` namespace explicitly.
 %collect --count 100 --timeout 10 --as batch
 %events list batch --limit 20
 %events show batch --index 0
+%events stack batch --index 0
 %events calls batch
 %events stats batch
 %record capture.pb --count 1000
@@ -464,8 +465,10 @@ new events. Offline replay requires an unused name or an explicit `%events clear
 first, so a corrupt recording cannot overwrite an existing capture.
 
 Detail inspection shows typed arguments/results, receiver fields, stack frames,
-and raw metadata. Shared-state payloads are decoded with their attached schema
-when available. Native PRE/POST pairing includes server lifetime, session,
+and raw metadata. `%events stack NAME --index N` prints the capture status and
+each retained stack frame directly, including frames from replayed events.
+Shared-state payloads are decoded with their attached schema when available.
+Native PRE/POST pairing includes server lifetime, session,
 probe, thread and call identity, and marks missing halves. Shared-context
 invocation/task identities remain available in event details.
 Loss statistics sum the latest observed cumulative agent counter per probe and
