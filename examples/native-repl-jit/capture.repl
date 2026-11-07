@@ -1,0 +1,15 @@
+%threads
+%symbols --filter add --addresses --limit 5
+%trace preview --exact "add(int, int)" --save trace.textproto
+%trace apply --manifest trace.textproto --callback observer.cpp
+%collect --name "add(int, int)" --count 8 --timeout 15 --as live
+if (tracer.batch("live").size() != 8) throw std::runtime_error("incomplete live capture");
+%events stats live
+tracer_repl::RecordOptions options;
+options.names = {"add(int, int)"};
+options.count = 12;
+options.timeout_seconds = 15;
+auto recording = tracer.record("capture.db", options);
+if (!recording.complete || recording.received != 12) throw std::runtime_error("incomplete SQLite recording");
+%detach
+%quit

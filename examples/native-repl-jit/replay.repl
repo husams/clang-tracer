@@ -1,0 +1,11 @@
+%events open capture.db --as saved
+%events stats saved
+tracer_repl::EventQuery query;
+query.names = {"add(int, int)"};
+query.phase = "POST";
+query.count = 3;
+auto results = tracer.replay("capture.db", query);
+if (results.size() != 3) throw std::runtime_error("expected three POST events");
+for (const auto &event : results) { if (event.result_as<int>() != event.argument_as<int>(0) + event.argument_as<int>(1)) throw std::runtime_error("unexpected add result"); }
+std::cout << "JIT_EXAMPLE_PASSED=" << results.size() << std::endl;
+%quit
