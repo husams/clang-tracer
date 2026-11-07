@@ -111,6 +111,20 @@ tracer.print(empty)
                 assert expected in discovery.stdout, (expected, discovery.stdout, discovery.stderr)
             assert "\x1b[" not in discovery.stdout
             assert "Collection {" not in discovery.stdout
+            adaptors = ("filter", "take", "drop", "take_while", "drop_while", "transform",
+                        "stride", "enumerate", "reverse", "first", "to_vector")
+            topics = subprocess.run(
+                [console, "--fail-fast"],
+                input="".join(f"%help api {name}\n" for name in adaptors) + "%quit\n",
+                text=True, capture_output=True, timeout=10)
+            assert topics.returncode == 0, (topics.stdout, topics.stderr)
+            pages = topics.stdout.split("\nExample\n")
+            assert len(pages) == len(adaptors) + 1, topics.stdout
+            for name, page in zip(adaptors, pages):
+                assert name in page.splitlines(), (name, page)
+            drop_page = pages[adaptors.index("drop") + 1]
+            assert "| drop(5) | take(10)" in drop_page, drop_page
+            assert "std::invalid_argument" in drop_page and "empty view" in drop_page, drop_page
             for command, message in [("%help missing", "Use %help for commands"),
                                      ("%help api Missing", "Use %help api to list topics")]:
                 unknown = subprocess.run([console, "--fail-fast"], input=command + "\n",

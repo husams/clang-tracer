@@ -100,6 +100,8 @@ def main():
         until(rb"auto order = e.argument_snapshot\(0\);.*elements\(\) const;.*tracer\[7\]> ")
         assert b'\x1b[1;36mauto\x1b[0m order' in transcript
         assert b'\x1b[32m"id"\x1b[0m' in transcript
+        send("%help api drop_w\t\r")
+        until(rb"(?m)^drop_while\n.*first false result.*tracer\[7\]> ")
         send("%help probe inj\t\r")
         until(rb"Deployment options.*tracer\[7\]> ")
         assert b'\x1b[33m--callback\x1b[0m' in transcript

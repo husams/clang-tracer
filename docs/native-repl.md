@@ -180,6 +180,9 @@ named collection commands retain their behavior.
 
 ### C++17 collection adaptors
 
+Use `%help api adaptors` for an overview, or look up an individual operation
+with `%help api drop`, `%help api filter`, or any other adaptor name.
+
 `take`, `drop`, `filter`, `take_while`, `drop_while`, `transform`, `stride`,
 `enumerate`, `reverse`, `to_vector`, and `first` are available directly in
 the REPL. They also work with `Collection` values from `collect`, `batch`, and

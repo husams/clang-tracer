@@ -233,8 +233,82 @@ if (first_post) tracer.print(*first_post);
 auto ids = data | take(10) | transform([](const auto& e) {
   return e.sequence();
 }) | to_vector();)",
-     "Available adaptors are filter, take, drop, take_while, drop_while, transform, stride, "
-     "enumerate, reverse, first, and to_vector. first() returns an optional value."},
+     "Use %help api NAME for each adaptor's inputs, behavior, and example. Try %help api drop.\n"
+     "Topics: filter, take, drop, take_while, drop_while, transform, stride, "
+     "enumerate, reverse, first, to_vector.\n"
+     "Views over live ranges inspect a fresh snapshot each time a loop starts. "
+     "They leave the background capture running."},
+    {"filter", "Keep every item that satisfies a predicate.",
+     R"(auto is_post = [](const auto& e) { return e.phase() == "POST"; };
+auto post = tracer.batch("results") | filter(is_post);
+for (const auto& e : post) tracer.print(e);)",
+     "filter(predicate) returns a lazy view in input order. The predicate takes one item "
+     "and returns a truth value. Put filter before take to count matches, or after take "
+     "to test only a prefix of the input."},
+    {"take", "Keep up to the first count items.",
+     R"(auto preview = tracer.batch("results") | take(5);
+for (const auto& e : preview) tracer.print(e);)",
+     "take(count) returns a lazy view and stops when the count or input is exhausted. "
+     "Zero yields an empty view without evaluating upstream predicates. "
+     "A negative count throws std::invalid_argument. On a live range, take limits the "
+     "snapshot being inspected. Use the count argument to events_async to limit capture."},
+    {"drop", "Skip a fixed number of items at the start and keep the rest in input order.",
+     R"(auto page = tracer.batch("results") | drop(5) | take(10);
+for (const auto& e : page) tracer.print(e);)",
+     "drop(count) returns a lazy view and skips the prefix when iteration starts. "
+     "Zero skips nothing. A count at least as large as the input yields an empty view. "
+     "A negative count throws std::invalid_argument. The source collection is preserved. "
+     "Put drop after filter to skip matching items."},
+    {"take_while", "Keep the leading items that satisfy a predicate.",
+     R"(auto early = [](const auto& e) { return e.sequence() < 50; };
+auto prefix = tracer.batch("results") | take_while(early);
+for (const auto& e : prefix) tracer.print(e);)",
+     "take_while(predicate) returns a lazy view and stops at the first false result. "
+     "A false result on the first item yields an empty view. Use filter to keep matches "
+     "that occur later in the input."},
+    {"drop_while", "Skip the leading items that satisfy a predicate.",
+     R"(auto early = [](const auto& e) { return e.sequence() < 50; };
+auto tail = tracer.batch("results") | drop_while(early);
+for (const auto& e : tail) tracer.print(e);)",
+     "drop_while(predicate) returns a lazy view starting at the first false result. "
+     "It keeps that item and every item after it. If all items match, the view is empty."},
+    {"transform", "Convert each item into a new value.",
+     R"(auto name = [](const auto& e) { return e.function_name(); };
+auto names = tracer.batch("results") | transform(name) | to_vector();)",
+     "transform(function) returns a lazy view that calls the function when an item is read. "
+     "The function takes one item and returns the value to emit, such as a string or sequence number. "
+     "Use to_vector to evaluate and store the results."},
+    {"stride", "Select items at a fixed interval, starting with the first.",
+     R"(auto sampled = tracer.batch("results") | stride(3);
+for (const auto& e : sampled) tracer.print(e);)",
+     "stride(step) returns a lazy view. A step of 3 selects positions 0, 3, 6, and so on. "
+     "A step of 1 keeps every item. Zero and negative steps throw std::invalid_argument."},
+    {"enumerate", "Pair each item with its zero-based index in the current pipeline.",
+     R"(auto numbered = tracer.batch("results") | drop(5) | enumerate();
+for (const auto& [index, e] : numbered) {
+  std::cout << index << ' ' << e.function_name() << '\n';
+})",
+     "enumerate() returns a lazy view of std::pair values. Read the pair with a structured "
+     "binding or its first and second members. After drop(5), the sixth input item gets index 0. "
+     "Enumerate before filtering to preserve the original positions."},
+    {"reverse", "Materialize the input in reverse iteration order.",
+     R"(auto backwards = tracer.batch("results") | reverse();
+if (!backwards.empty()) tracer.print(backwards.front());)",
+     "reverse() evaluates the entire input immediately and returns an owned std::vector. "
+     "It preserves the source order in the original collection. Put take before reverse "
+     "to reverse only a prefix and bound the number of items stored."},
+    {"first", "Return the first available item as an owned optional value.",
+     R"(auto is_post = [](const auto& e) { return e.phase() == "POST"; };
+auto event = tracer.batch("results") | filter(is_post) | first();
+if (event) tracer.print(*event);)",
+     "first() evaluates enough of the input to find one item. It returns std::optional<T>, "
+     "where T is the type produced by the pipeline. The optional is empty if the input yields no items."},
+    {"to_vector", "Evaluate the pipeline and store its items in an owned vector.",
+     R"(auto sequence = [](const auto& e) { return e.sequence(); };
+auto ids = tracer.batch("results") | take(10) | transform(sequence) | to_vector();)",
+     "to_vector() returns a std::vector<T> in iteration order. It reads the entire input "
+     "immediately and returns an empty vector for empty input. Put take before to_vector "
+     "to cap the number of stored items."},
 };
 
 constexpr string_view reset = "\033[0m";
