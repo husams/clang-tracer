@@ -234,6 +234,28 @@ void verify_context_delivery() {
   }
   std::filesystem::remove_all(segment_dir);
 
+  const auto large_dir = dir.string() + "-large";
+  std::filesystem::remove_all(large_dir);
+  {
+    ContextJournal journal(large_dir, {4096, 1024, {}});
+    assert(journal.begin_create("recording-large", "sink-large"));
+    assert(journal.confirm_create("recording-large", 0));
+    ContextFrame large;
+    large.mutable_event()->set_name(std::string(256, 'x'));
+    std::uint64_t position = 0;
+    assert(journal.append(large, position) && position == 1);
+  }
+  {
+    ContextJournal smaller(large_dir, {4096, 128, {}});
+    assert(!smaller.healthy());
+  }
+  {
+    ContextJournal restored(large_dir, {4096, 1024, {}});
+    assert(restored.healthy());
+    assert(restored.read_after(0, 1, 1024).size() == 1);
+  }
+  std::filesystem::remove_all(large_dir);
+
   const auto fault_dir = dir.string() + "-fault";
   std::filesystem::remove_all(fault_dir);
 

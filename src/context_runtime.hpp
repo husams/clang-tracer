@@ -34,6 +34,7 @@ struct EventMetadata final {
   std::uint64_t recording_position = 0;
   std::uint64_t epoch_schema_id = 1;
   std::uint32_t capture_hook_id = 0;
+  std::uint32_t capture_event_bytes = tracer::kDefaultContextEventBytes;
   bool print_arguments = false;
   bool print_result = false;
 };

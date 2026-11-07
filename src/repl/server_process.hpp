@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 
 namespace tracer_repl {
@@ -12,7 +13,9 @@ class ServerProcess {
 public:
   ~ServerProcess();
   void start(const std::string &executable, const std::string &agent,
-             unsigned timeout_seconds = 30);
+             unsigned timeout_seconds = 30,
+             std::uint32_t context_event_bytes = 0,
+             std::uint64_t context_transport_memory_bytes = 0);
   void stop(unsigned timeout_seconds = 30);
   bool running();
 

@@ -38,6 +38,7 @@
 #include <llvm/Support/SHA256.h>
 #include <poll.h>
 #include <sys/file.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -47,6 +48,7 @@
 #include "context_journal.hpp"
 #include "context_package.hpp"
 #include "debug_resolver.hpp"
+#include "event_transport.hpp"
 #include "header_context.hpp"
 #include "injector.hpp"
 #include "session.hpp"
@@ -59,7 +61,6 @@ namespace api = clangtracer::v1;
 
 constexpr std::size_t kSessionLimit = 64;
 constexpr std::size_t kMaxCallbackSource = 64 * 1024;
-constexpr std::size_t kMaxEventBytes = 64 * 1024;
 
 template <class Headers, class Options>
 grpc::Status validate_resolution_inputs(std::string_view selector,
@@ -156,8 +157,8 @@ public:
 
 class DurableStoreCatalog final {
 public:
-  explicit DurableStoreCatalog(std::filesystem::path root)
-      : root_(std::move(root)) {}
+  DurableStoreCatalog(std::filesystem::path root, context_delivery::JournalLimits limits)
+      : root_(std::move(root)), limits_(std::move(limits)) {}
 
   std::shared_ptr<context_delivery::ContextCollectorStore>
   acquire(std::string_view recording_id, std::string_view sink_id) {
@@ -194,7 +195,7 @@ public:
     if (error)
       return {};
     auto store = std::make_shared<context_delivery::ContextCollectorStore>(
-        directory);
+        directory, limits_);
     stores_.emplace(std::move(key), store);
     return store;
   }
@@ -217,6 +218,7 @@ private:
   }
 
   const std::filesystem::path root_;
+  const context_delivery::JournalLimits limits_;
   std::mutex mutex_;
   std::unordered_map<
       std::string,
@@ -577,8 +579,8 @@ public:
     };
     const auto copy_stack = [](const clangtracer::context::v1::ContextStackTrace &in,
                                clangtracer::v1::StackTrace *out) {
-      if (in.requested_depth() < 1 || in.requested_depth() > kMaxStackDepth ||
-          in.frames_size() > static_cast<int>(in.requested_depth()) ||
+      if (!in.requested_depth() ||
+          static_cast<unsigned>(in.frames_size()) > in.requested_depth() ||
           in.captured_depth() > in.requested_depth() ||
           in.hidden_frames() > in.captured_depth() ||
           (in.captured_depth() == 0
@@ -979,9 +981,16 @@ private:
   }
 
   void receive_loop() {
-    std::array<char, kMaxEventBytes> bytes{};
+    std::array<char, EventTransport::kInlineEventBytes> bytes{};
     while (!stopping_.load()) {
-      const auto count = ::recv(fd_, bytes.data(), bytes.size(), 0);
+      iovec data{bytes.data(), bytes.size()};
+      alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))]{};
+      msghdr message{};
+      message.msg_iov = &data;
+      message.msg_iovlen = 1;
+      message.msg_control = control;
+      message.msg_controllen = sizeof(control);
+      const auto count = ::recvmsg(fd_, &message, MSG_CMSG_CLOEXEC);
       if (count < 0) {
         if (errno == EINTR)
           continue;
@@ -997,8 +1006,58 @@ private:
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         continue;
       }
+      struct File {
+        int fd = -1;
+        ~File() { if (fd >= 0) ::close(fd); }
+      } file;
+      bool extra_descriptor = false;
+      for (auto *header = CMSG_FIRSTHDR(&message); header;
+           header = CMSG_NXTHDR(&message, header)) {
+        if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS)
+          continue;
+        const auto descriptors = (header->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        for (std::size_t i = 0; i < descriptors; ++i) {
+          int fd;
+          std::memcpy(&fd, CMSG_DATA(header) + i * sizeof(fd), sizeof(fd));
+          if (file.fd < 0) {
+            file.fd = fd;
+          } else {
+            ::close(fd);
+            extra_descriptor = true;
+          }
+        }
+      }
+      if (extra_descriptor || (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)))
+        continue;
       clangtracer::v1::TraceEvent event;
-      if (!event.ParseFromArray(bytes.data(), static_cast<int>(count)) ||
+      bool parsed = false;
+      if (file.fd >= 0) {
+        struct stat info{};
+        const int seals = ::fcntl(file.fd, EventTransport::kGetSeals);
+        if (count != 1 || bytes[0] != EventTransport::kExternalEventMarker ||
+            seals < 0 || (seals & EventTransport::kReadOnlySeals) != EventTransport::kReadOnlySeals ||
+            ::fstat(file.fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+            info.st_size <= static_cast<off_t>(bytes.size()) ||
+            info.st_size > std::numeric_limits<int>::max())
+          continue;
+        const auto size = static_cast<std::size_t>(info.st_size);
+        auto *mapped = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, file.fd, 0);
+        if (mapped == MAP_FAILED)
+          continue;
+        struct Mapping {
+          void *address;
+          std::size_t size;
+          ~Mapping() { ::munmap(address, size); }
+        } payload{mapped, size};
+        try {
+          parsed = event.ParseFromArray(payload.address, static_cast<int>(size));
+        } catch (const std::bad_alloc &) {
+          continue;
+        }
+      } else {
+        parsed = event.ParseFromArray(bytes.data(), static_cast<int>(count));
+      }
+      if (!parsed ||
           event.protocol_version() != kProtocolVersion ||
           event.session_id().empty() || event.probe_id() == 0 ||
           event.pid() == 0 || event.tid() == 0 ||
@@ -1087,9 +1146,8 @@ private:
       if (event.has_stack()) {
         const auto &stack = event.stack();
         bool valid_stack = stack.requested_depth() >= 1 &&
-            stack.requested_depth() <= kMaxStackDepth &&
             (stack.application_only() || stack.frames_size() >= 1) &&
-            stack.frames_size() <= static_cast<int>(stack.requested_depth()) &&
+            static_cast<unsigned>(stack.frames_size()) <= stack.requested_depth() &&
             stack.captured_depth() <= stack.requested_depth() &&
             stack.hidden_frames() <= stack.captured_depth() &&
             (stack.captured_depth() == 0 ? !stack.application_only() :
@@ -1174,11 +1232,12 @@ public:
                 std::string source_directory, std::chrono::seconds timeout,
                 std::string context_endpoint,
                 std::string context_durable_directory,
-                EventHistoryLimits limits)
+                EventHistoryLimits limits, ContextTransportBudget context_budget)
       : agent_path_(std::move(agent_path)), event_path_(std::move(event_path)),
         source_directory_(std::move(source_directory)), timeout_(timeout),
         context_endpoint_(std::move(context_endpoint)),
         context_durable_directory_(std::move(context_durable_directory)),
+        context_budget_(context_budget),
         events_(event_path_, limits), next_probe_id_(random_probe_seed()) {}
 
   void set_context_endpoint(std::string endpoint) {
@@ -1271,7 +1330,7 @@ public:
     auto session = std::make_shared<Session>(
         id, pid, process_start, agent_path_, event_path_,
         std::move(context_endpoint), std::move(producer_journal_directory),
-        timeout_);
+        timeout_, context_budget_);
     try {
       session->attach(request->expected_executable());
       std::lock_guard lock(mutex_);
@@ -2060,6 +2119,7 @@ private:
   std::chrono::seconds timeout_;
   std::string context_endpoint_;
   std::string context_durable_directory_;
+  ContextTransportBudget context_budget_;
   std::condition_variable context_endpoint_cv_;
   bool context_endpoint_ready_ = false;
   EventHub events_;
@@ -2247,8 +2307,6 @@ private:
     if (spec.prepared().format_version() == tracer::prepared::typed_version &&
         (spec.has_header_context() || !spec.include_headers().empty()))
       return {grpc::StatusCode::INVALID_ARGUMENT, "standalone prepared injection does not accept application headers"};
-    if (spec.stack_depth() > tracer::kMaxStackDepth)
-      return {grpc::StatusCode::INVALID_ARGUMENT, "stack depth must be between 0 and 64"};
     if (spec.ByteSizeLong() > 256 * 1024) {
       return {grpc::StatusCode::INVALID_ARGUMENT,
               "probe specification exceeds 256 KiB"};
@@ -2477,7 +2535,18 @@ private:
 int RunServer(const std::string &agent_path, const std::string &listen_uri,
               std::chrono::seconds operation_timeout,
               const std::string &context_durable_directory,
-              EventHistoryLimits history_limits) {
+              EventHistoryLimits history_limits, ContextTransportBudget context_budget) {
+  const auto stream_limits = context_delivery::stream_limits_for_context(context_budget);
+  if (!history_limits.context_bytes) {
+    history_limits.context_bytes = 16 * 1024 * 1024;
+    if (context_budget.event_bytes > kDefaultContextEventBytes) {
+      // The retained TraceEvent has the original event and projected fields.
+      const auto envelope_bytes = 2ull * context_budget.event_bytes +
+                                  stream_limits.max_epoch_schema_bytes + 4096;
+      history_limits.context_bytes =
+          std::max<std::size_t>(history_limits.context_bytes, envelope_bytes);
+    }
+  }
   if (history_limits.events == 0 || history_limits.context_events == 0 ||
       history_limits.context_bytes == 0 ||
       history_limits.context_bytes >
@@ -2514,14 +2583,16 @@ int RunServer(const std::string &agent_path, const std::string &listen_uri,
     std::filesystem::create_directories(context_durable_directory);
     durable_root = std::filesystem::canonical(context_durable_directory).string();
     durable_catalog = std::make_shared<DurableStoreCatalog>(
-        std::filesystem::path(durable_root) / "collector");
+        std::filesystem::path(durable_root) / "collector",
+        context_delivery::journal_limits_for_packet(stream_limits.max_packet_bytes,
+                                                   stream_limits.max_epoch_schema_bytes));
   }
   TracerService service(canonical_agent, event_path, directory.path(),
                         operation_timeout, endpoint, durable_root,
-                        history_limits);
+                        history_limits, context_budget);
   LiveContextCapture live_context;
   context_delivery::ContextCollector context_collector(
-      {}, {},
+      {}, stream_limits,
       [&service, &live_context](const auto &open, const auto &envelope, auto decoded) {
         return service.publish_context(open, envelope) &&
                live_context.accept(open, envelope, std::move(decoded));

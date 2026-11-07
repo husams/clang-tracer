@@ -200,6 +200,12 @@ target_link_libraries(call-stacks-filter-target PRIVATE call-stacks-calculator T
 target_compile_options(call-stacks-filter-target PRIVATE -g -O1 -fno-inline -fomit-frame-pointer
   -fno-optimize-sibling-calls -fasynchronous-unwind-tables -fcf-protection=none)
 
+if(BUILD_TESTING)
+  add_executable(deep-stack-target tests/fixtures/deep_stack.cpp)
+  target_compile_options(deep-stack-target PRIVATE -g -O1 -fomit-frame-pointer
+    -fno-optimize-sibling-calls -fasynchronous-unwind-tables -fcf-protection=none)
+endif()
+
 add_executable(trace-threaded-target tests/fixtures/threaded/target.cpp)
 add_library(trace-stack-b SHARED tests/fixtures/threaded/shared_stack_b.cpp)
 add_library(trace-stack-a SHARED tests/fixtures/threaded/shared_stack_a.cpp)

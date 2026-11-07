@@ -21,7 +21,11 @@ struct EventDelivery {
 class EventTransport {
 public:
   static constexpr std::size_t kCapacity = 4096;
-  static constexpr std::size_t kMaxEventBytes = 64 * 1024;
+  static constexpr std::size_t kInlineEventBytes = 64 * 1024;
+  static constexpr char kExternalEventMarker = '\0';
+  // Linux UAPI values, including when building with an older SDK.
+  static constexpr int kAddSeals = 1033, kGetSeals = 1034;
+  static constexpr int kReadOnlySeals = 0x02 | 0x04 | 0x08;
   struct Packet {
     std::atomic<std::size_t> turn{0};
     std::size_t position = 0;

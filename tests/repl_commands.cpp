@@ -44,6 +44,18 @@ int main() {
   require(p.arguments.at(0) == "Calculator::multiply(int, int) const");
   require(p.option("--callback") == "my callback.cpp");
   require(p.number("--stack-depth", 0) == 16);
+  const auto full_stack = parse_command(
+      "%interceptor upload hook --target compute --stack-depth full "
+      "--stack-application-only false");
+  require(full_stack.number("--stack-depth", 0) == UINT32_MAX);
+  require(full_stack.option("--stack-application-only") == "false");
+  require(parse_command("%server start --context-event-bytes 4194304")
+              .number("--context-event-bytes", 0) == 4194304);
+  bad("%server start --context-event-bytes 0");
+  require(parse_command("%server start --context-event-bytes 25165824 "
+                        "--context-transport-memory-bytes 234881024")
+              .number("--context-transport-memory-bytes", 0) == 234881024);
+  bad("%server start --context-transport-memory-bytes 0");
   require(!parse_command("%events").has("--count"));
   require(!parse_command("%collect --as live").has("--count"));
   require(parse_command("%collect --as cpp").option("--as") == "cpp");

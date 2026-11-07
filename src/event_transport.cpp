@@ -3,6 +3,8 @@
 #include "context_diagnostic_format.hpp"
 
 #include <cerrno>
+#include <cstring>
+#include <fcntl.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -11,6 +13,7 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -129,10 +132,52 @@ void EventTransport::begin_drain(EventDelivery &delivery) noexcept {
 
 bool EventTransport::send(EventDelivery &delivery, const void *bytes,
                           std::size_t size) noexcept {
+  struct File {
+    int fd = -1;
+    ~File() { if (fd >= 0) ::close(fd); }
+  } file;
+  char marker = kExternalEventMarker;
+  iovec data{const_cast<void *>(bytes), size};
+  msghdr message{};
+  message.msg_iov = &data;
+  message.msg_iovlen = 1;
+  alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))]{};
+  if (size > kInlineEventBytes) {
+    // Transfer large stacks by descriptor, outside the intercepted thread
+    // and without splitting them across a sequence of lossy datagrams.
+    constexpr long memfd_create = 319; // Linux x86-64 UAPI.
+    constexpr unsigned cloexec_allow_sealing = 0x01 | 0x02;
+    file.fd = static_cast<int>(
+        ::syscall(memfd_create, "clang-tracer-event", cloexec_allow_sealing));
+    if (file.fd < 0)
+      return false;
+    std::size_t written = 0;
+    while (written < size) {
+      const auto count = ::write(file.fd, static_cast<const char *>(bytes) + written,
+                                 size - written);
+      if (count < 0 && errno == EINTR)
+        continue;
+      if (count <= 0)
+        return false;
+      written += static_cast<std::size_t>(count);
+    }
+    if (::fcntl(file.fd, kAddSeals, kReadOnlySeals) < 0)
+      return false;
+    data = {&marker, sizeof(marker)};
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+    auto *descriptor = CMSG_FIRSTHDR(&message);
+    descriptor->cmsg_level = SOL_SOCKET;
+    descriptor->cmsg_type = SCM_RIGHTS;
+    descriptor->cmsg_len = CMSG_LEN(sizeof(int));
+    std::memcpy(CMSG_DATA(descriptor), &file.fd, sizeof(file.fd));
+  }
   while (!stopping_.load(std::memory_order_acquire)) {
-    const auto count =
-        ::send(delivery.socket_fd, bytes, size, MSG_DONTWAIT | MSG_NOSIGNAL);
-    if (count == static_cast<ssize_t>(size))
+    constexpr int flags = MSG_DONTWAIT | MSG_NOSIGNAL;
+    const auto count = file.fd >= 0
+        ? ::sendmsg(delivery.socket_fd, &message, flags)
+        : ::send(delivery.socket_fd, bytes, size, flags);
+    if (count == static_cast<ssize_t>(data.iov_len))
       return true;
     if (count >= 0 ||
         (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
@@ -158,8 +203,10 @@ void EventTransport::run() noexcept {
       auto &delivery = *packet.delivery;
       if (packet.valid) {
         const bool delivered =
-            !packet.bytes.empty() && packet.bytes.size() <= kMaxEventBytes &&
+            !packet.bytes.empty() &&
             send(delivery, packet.bytes.data(), packet.bytes.size());
+        if (packet.bytes.size() > kInlineEventBytes)
+          std::string().swap(packet.bytes);
         if (delivered)
           delivery.sent.fetch_add(1, std::memory_order_relaxed);
         else

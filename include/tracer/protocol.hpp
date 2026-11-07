@@ -12,11 +12,20 @@ inline constexpr std::uint32_t kProtocolVersion = 2;
 // Version 20 adds capture-time owned value snapshots to TraceValue.
 // Version 21 verifies header-prepared scalar contracts without rescanning DWARF.
 // Version 23 reports target-side JIT compile time for prepared probes.
-inline constexpr std::uint32_t kBootstrapVersion = 25;
+// Version 26 replaces the inline callback stack array with an invocation view.
+// Version 27 configures the shared-context event budget in the bootstrap.
+// Version 28 also carries the shared transport memory budget.
+inline constexpr std::uint32_t kBootstrapVersion = 28;
+inline constexpr std::uint32_t kDefaultContextEventBytes = 256 * 1024;
+inline constexpr std::uint64_t kDefaultContextTransportMemoryBytes = 64ull * 1024 * 1024;
+struct ContextTransportBudget {
+  std::uint32_t event_bytes = kDefaultContextEventBytes;
+  std::uint64_t memory_bytes = kDefaultContextTransportMemoryBytes;
+};
 inline constexpr unsigned kMaxPatchBytes = 64;
 inline constexpr unsigned kMaxArguments = 8;
 inline constexpr unsigned kMaxProbes = 32;
-inline constexpr unsigned kMaxStackDepth = 64;
+inline constexpr std::uint32_t kUnlimitedStackDepth = UINT32_MAX;
 
 enum class StackStatus : std::uint32_t {
   Disabled = 0,
@@ -52,7 +61,7 @@ struct StackTrace {
   std::uint32_t captured_depth =
       0; // Before filtering; depth/status cover this unwind.
   char detail[160]{};
-  StackFrame frames[kMaxStackDepth]{};
+  const StackFrame *frames = nullptr;
 };
 
 // Numeric values match proto/tracer.proto; this is the native bootstrap ABI.
@@ -110,6 +119,8 @@ struct CallbackPrintOptions {
   bool result = false;
 };
 
+struct NativeStackStorage;
+
 struct TraceContext {
   std::uint64_t probe_id = 0;
   std::uint64_t object_address = 0;
@@ -144,6 +155,8 @@ struct TraceContext {
   void (*stack_capture)(const TraceContext *, unsigned,
                         bool) noexcept = nullptr;
   mutable StackTrace stack{};
+  // Agent-owned storage backing this invocation's stack view.
+  mutable NativeStackStorage *stack_storage = nullptr;
 };
 
 struct Request {
@@ -195,6 +208,7 @@ struct Request {
   std::uint64_t jit_compile_ns = 0;
   bool reject_replacement = false;
   std::uint64_t expected_replaced_probe_id = 0;
+  ContextTransportBudget context_budget{};
 };
 
 // Side-effect-free callback preparation request. The agent reads a serialized

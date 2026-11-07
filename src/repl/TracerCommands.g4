@@ -5,7 +5,7 @@ command : server | attach | processes | sessions | use | status | detach
         | modules | threads | symbols | probe | interceptor | events | collect | record
         | cpp | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
-serverOption : ('--executable' | '--agent') value;
+serverOption : ('--executable' | '--agent') value | contextEventBytes;
 attach : 'attach' (UINT ('--start-time' UINT)?)?;
 processes : 'processes' ('--filter' value)?;
 sessions : 'sessions';
@@ -26,7 +26,8 @@ prepareOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | 
               | METADATA_ONLY;
 resolveOption : ('--include' | '--compdb' | '--module' | '--compile-option'
                 | '--prepared' | '--prepared-mode') value;
-deployOption : resolveOption | '--stack-depth' UINT | '--print-arguments' | '--print-result';
+deployOption : resolveOption | '--stack-depth' (UINT | WORD)
+             | '--print-arguments' | '--print-result' | stackFilter;
 interceptor : 'interceptor' ('load' value '--as' value | 'edit' value | 'show' value
       | 'validate' value '--target' value resolveOption*
             | 'upload' value '--target' value deployOption*);
@@ -71,6 +72,8 @@ memory : 'memory' ('maps' | 'read' value '--mapping' value
 probeEntry : 'probe' 'entry' (value '--mapping' value ('--module' value)?
            | '--module' value '--elf-address' value '--abi' value '--mapping' value);
 probeReload : 'probe' 'reload' UINT '--callback' value;
+stackFilter : '--stack-application-only' value;
+contextEventBytes : ('--context-event-bytes' | '--context-transport-memory-bytes') UINT;
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';

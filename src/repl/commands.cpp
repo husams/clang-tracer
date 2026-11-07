@@ -179,7 +179,12 @@ std::uint64_t unsigned_number(const std::string &text, const std::string &name,
 
 std::uint64_t Command::number(const std::string &name,
                               std::uint64_t fallback) const {
-  return has(name) ? unsigned_number(option(name), name) : fallback;
+  if (!has(name))
+    return fallback;
+  const auto value = option(name);
+  if (name == "--stack-depth" && value == "full")
+    return UINT32_MAX;
+  return unsigned_number(value, name);
 }
 
 std::uint64_t address_number(const std::string &text) {
@@ -246,6 +251,16 @@ Command parse_command(const std::string &input) {
       command.number(key, 0);
     }
   }
+  if (command.has("--context-event-bytes")) {
+    const auto bytes = command.number("--context-event-bytes", 0);
+    if (!bytes || bytes > UINT32_MAX)
+      throw std::invalid_argument("--context-event-bytes must be a positive 32-bit byte count");
+  }
+  if (command.has("--context-transport-memory-bytes")) {
+    const auto bytes = command.number("--context-transport-memory-bytes", 0);
+    if (!bytes || bytes > INT64_MAX)
+      throw std::invalid_argument("--context-transport-memory-bytes must be a positive byte count");
+  }
   if (command.number("--limit", 0) > UINT32_MAX) {
     throw std::invalid_argument("--limit must fit a 32-bit page size");
   }
@@ -279,8 +294,12 @@ Command parse_command(const std::string &input) {
   if (command.number("--timeout", 0) > 86400) {
     throw std::invalid_argument("--timeout must be at most 86400 seconds");
   }
-  if (command.number("--stack-depth", 0) > 64) {
-    throw std::invalid_argument("--stack-depth must be at most 64");
+  const auto application_only = command.option("--stack-application-only", "true");
+  if (application_only != "true" && application_only != "false") {
+    throw std::invalid_argument("--stack-application-only must be true or false");
+  }
+  if (command.number("--stack-depth", 0) > UINT32_MAX) {
+    throw std::invalid_argument("--stack-depth must fit a 32-bit depth");
   }
   if (command.has("--probe") && !command.number("--probe", 0)) {
     throw std::invalid_argument("probe ID must be positive");

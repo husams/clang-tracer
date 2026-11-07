@@ -109,10 +109,12 @@ remain available for custom callbacks. See `stack-capture-results/2026-10-30-opt
 
 ## Native call stacks
 
-Add `--stack 24` to an ordinary `trace` command to capture the calling thread's
-entry stack, with a depth from 1 to 64. Capture is optional. An interceptor may
-also call `call.capture_stack(24)` without that flag; `call.stack()` reads the
-automatic snapshot. Both PRE and POST refer to the invocation's entry stack.
+Add `--stack full` to a `trace` command to unwind the calling thread's entry
+stack to its root. Use `--stack N` to choose a frame limit, or omit it to
+disable automatic capture. The native REPL uses `--stack-depth full` or
+`--stack-depth N`. An interceptor can request a snapshot with
+`call.capture_stack(tracer::kUnlimitedStackDepth)` or `call.capture_stack(N)`.
+`call.stack()` reads the automatic snapshot. Both PRE and POST refer to the invocation's entry stack.
 Stacks are application-only by default in both callbacks and CLI output.
 `--stack-application-only false` restores all native, JIT and runtime frames;
 `true` explicitly selects the default. Callback-requested capture inherits this
@@ -124,14 +126,22 @@ Application functions taking `std::` arguments remain visible. ELF ownership,
 SONAME and LLVM declaration context drive classification, not a substring match
 on parameter types.
 
-Filtering happens after the bounded native unwind: requested depth includes
+Filtering happens after the native unwind, so requested depth includes
 hidden frames, and COMPLETE/PARTIAL/TRUNCATED continues to describe that unwind.
 `stack.captured_depth` records raw depth and `stack.hidden_frames` records the
 omissions; the CLI prints both. Filtering never turns a truncated unwind into
 a complete one. A fully hidden snapshot may contain zero visible frames.
 The corresponding Protobuf fields preserve the same callback/CLI view.
+Shared events include the stack in their payload. Start the server with
+`--context-event-bytes 4194304` to allow 4 MiB per shared event. The default
+is 256 KiB. For larger events, set both `--context-event-bytes 25165824`
+and `--context-transport-memory-bytes 234881024` for a 24 MiB event budget and
+224 MiB of transport memory. The transport default is 64 MiB. It accounts for
+staging copies, so it needs roughly eight times the event budget plus overhead.
+The server grows the default context history budget to retain a large event
+and still honors an explicit `--context-history-bytes` setting.
 
-Callbacks can inspect the bounded frame array (`pc`, `stack_pointer`, `kind`,
+Callbacks can inspect the invocation’s frames (`pc`, `stack_pointer`, `kind`,
 `function`, `module`, `file`, `line`, `module_offset`, `application_frame`), frame count, requested
 depth, status and stop reason. LLVM resolves metadata before PRE/POST can read
 it; events reuse the exact same snapshot. `function`, `module`, and `file` are

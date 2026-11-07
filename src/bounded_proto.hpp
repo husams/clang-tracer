@@ -42,6 +42,12 @@ public:
   BoundedProtoWriter &operator=(BoundedProtoWriter &&) = delete;
   CaptureStatus status() const noexcept { return status_; }
 
+  // Fixed-format metadata has no generated codec traversal. Each field
+  // consumes a byte, so the remaining storage also bounds its field visits.
+  void bound_remaining_visits_by_bytes() noexcept {
+    limits_.visits = visits_ + (storage_.size() - used_);
+  }
+
   ::tracer::compat::span<const std::byte> finish() noexcept;
   bool u64(std::uint32_t field, std::uint64_t) noexcept;
   bool s64(std::uint32_t field, std::int64_t) noexcept;
@@ -66,7 +72,7 @@ private:
   };
 
   const ::tracer::compat::span<std::byte> storage_;
-  const CaptureLimits limits_;
+  CaptureLimits limits_;
   CaptureStatus status_ = CaptureStatus::ok;
   std::size_t used_ = 0, visits_ = 0, items_ = 0, depth_ = 0, work_ = 0;
   std::array<Message, 32> messages_{};

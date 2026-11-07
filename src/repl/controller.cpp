@@ -356,7 +356,7 @@ Controller::~Controller() {
 
 void Controller::connect(const std::string &endpoint) {
   grpc::ChannelArguments arguments;
-  arguments.SetMaxReceiveMessageSize(32 * 1024 * 1024);
+  arguments.SetMaxReceiveMessageSize(-1);
   arguments.SetMaxSendMessageSize(32 * 1024 * 1024);
   auto next = api::Tracer::NewStub(grpc::CreateCustomChannel(
       endpoint, grpc::InsecureChannelCredentials(), arguments));
@@ -383,7 +383,11 @@ void Controller::start_server(const Command &command) {
   }
   server_.start(command.option("--executable", settings_.server),
                 command.option("--agent", settings_.agent),
-                settings_.timeout_seconds);
+                settings_.timeout_seconds,
+                static_cast<std::uint32_t>(command.number(
+                    "--context-event-bytes", settings_.context_event_bytes)),
+                command.number("--context-transport-memory-bytes",
+                               settings_.context_transport_memory_bytes));
   connect(server_.endpoint());
   out_ << "server ready endpoint=" << endpoint_
        << " ownership=this-console pid=" << server_.pid() << '\n';
@@ -694,6 +698,8 @@ std::uint64_t Controller::inject(const SessionHandle &session,
   spec.set_callback_source(source);
   spec.set_stack_depth(
       static_cast<unsigned>(options.number("--stack-depth", 0)));
+  spec.set_include_internal_stack_frames(
+      options.option("--stack-application-only", "true") == "false");
   spec.set_print_arguments(options.has("--print-arguments"));
   spec.set_print_result(options.has("--print-result"));
   api::AddProbeRequest request;

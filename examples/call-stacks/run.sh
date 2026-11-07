@@ -24,7 +24,7 @@ case "$mode" in
   complete) ;;
   partial) target_args+=(--partial) ;;
   truncated) stack_args=(--stack 2); function_callback=${STACK_FUNCTION_CALLBACK:-examples/call-stacks/automatic.cpp} ;;
-  maximum) stack_args=(--stack 64); function_callback=${STACK_FUNCTION_CALLBACK:-examples/call-stacks/automatic.cpp} ;;
+  maximum) stack_args=(--stack full); function_callback=${STACK_FUNCTION_CALLBACK:-examples/call-stacks/automatic.cpp} ;;
   bridge-limit) stack_args=(--stack 3); function_callback=${STACK_FUNCTION_CALLBACK:-examples/call-stacks/automatic.cpp} ;;
   disabled) stack_args=(); function_callback=${STACK_FUNCTION_CALLBACK:-examples/call-stacks/automatic.cpp} ;;
   *) echo "Unknown mode: $mode" >&2; exit 2 ;;
@@ -100,8 +100,8 @@ attached=$target_pid
 ./build/clang-tracer trace "$target_pid" 'stack_add(int, int)' \
   --callback "$function_callback" "${function_stack_args[@]}" "${filter_args[@]}" "${print_args[@]}"
 if ./build/clang-tracer trace "$target_pid" 'stack_add(int, int)' \
-    --callback "$function_callback" --stack 65 > "$run_dir/invalid-depth.log" 2>&1; then
-  echo 'Unexpected acceptance of depth 65'; exit 1
+    --callback "$function_callback" --stack 4294967296 > "$run_dir/invalid-depth.log" 2>&1; then
+  echo 'Unexpected acceptance of depth outside uint32 range'; exit 1
 fi
 cat "$run_dir/invalid-depth.log"
 kill -USR1 "$target_pid"

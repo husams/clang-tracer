@@ -238,10 +238,13 @@ def test_console_reaches_sqlite_record_and_drain(storage_peer):
 def test_limit_options_parse():
     command = parse_command(
         "server start --event-history-limit 1000 "
-        "--context-history-limit 10 --context-history-bytes 4096"
+        "--context-history-limit 10 --context-history-bytes 4096 "
+        "--context-event-bytes 524288 --context-transport-memory-bytes 134217728"
     )
     assert command.options == {
         "event_history_limit": 1000,
         "context_history_limit": 10,
         "context_history_bytes": 4096,
+        "context_event_bytes": 524288,
+        "context_transport_memory_bytes": 134217728,
     }

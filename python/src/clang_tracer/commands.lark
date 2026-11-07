@@ -30,9 +30,11 @@
               | "--event-history-limit" INT             -> event_history_limit
               | "--context-history-limit" INT           -> context_history_limit
               | "--context-history-bytes" INT           -> context_history_bytes
+              | "--context-event-bytes" INT             -> context_event_bytes
+              | "--context-transport-memory-bytes" INT  -> context_transport_memory_bytes
               | timeout_option
 ?injection_option: "--callback" value                    -> callback
-                 | "--stack" INT                        -> stack_depth
+                 | "--stack" (INT | FULL_STACK)         -> stack_depth
                  | "--internal-frames"                  -> internal_frames
                  | "--print-arguments"                  -> print_arguments
                  | "--print-result"                     -> print_result
@@ -67,6 +69,7 @@ SHELL_COMMAND.10: /![ \t][^\n]*/
 ?value: STRING | BARE
 STRING.3: /"(?:[^"\\]|\\.)*"/ | /'(?:[^'\\]|\\.)*'/
 BARE.-1: /[^\s'"#]+/
+FULL_STACK: "full"
 INT.1: /[0-9]+/
 NUMBER.2: /[0-9]+(?:\.[0-9]+)?/
 %import common.WS

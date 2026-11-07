@@ -624,8 +624,8 @@ void *SharedSourceRuntime::native_hook_begin(
   // Reserve all bounded event buffers before any payload mutex wait.
   if (all_visible)
     for (auto &capture : hook.captures) {
-      capture =
-          runtime.capture_pool_.try_reserve(runtime.metadata_.capture_hook_id);
+      capture = runtime.capture_pool_.try_reserve(
+          runtime.metadata_.capture_hook_id, runtime.metadata_.capture_event_bytes);
       if (!capture) {
         if (runtime.capture_pool_.outstanding(
                 runtime.metadata_.capture_hook_id) >=

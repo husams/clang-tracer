@@ -254,7 +254,15 @@ no installation or writes.
 
 `load` reads the file on the console machine. `upload` sends its source by value
 through ResolveProbe/AddProbe and reports success only for an active probe.
-The draft remains available after deployment errors. The short equivalent is:
+The draft remains available after deployment errors. Use
+`--stack-depth full --stack-application-only false` to capture through the
+thread root and include runtime and JIT frames. A numeric depth caps the
+unwind at that many frames before filtering. For large shared events, pass
+`--context-event-bytes 25165824 --context-transport-memory-bytes 234881024`
+to the REPL at launch or to `%server start` for 24 MiB events. Pass the same
+options to `clang-tracer-server` when starting an external server. For REPL collections,
+`--buffer-bytes` controls how much space is available for the retained event
+and its projected stack. The short equivalent is:
 
 ```text
 %probe inject "Calculator::multiply(int, int) const" --callback method.cpp

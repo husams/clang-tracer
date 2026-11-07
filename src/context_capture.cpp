@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -13,9 +14,24 @@
 
 namespace tracer::context_engine {
 struct CaptureArena {
-  explicit CaptureArena(std::size_t bytes) : storage(bytes) {}
+  explicit CaptureArena(std::size_t event_bytes)
+      : block_bytes(event_bytes <= kCapturePoolBytes
+                        ? kCaptureEventBytes
+                        : (event_bytes - 1) / (kCaptureSlots / 2) + 1) {
+    if (block_bytes > storage.max_size() / kCaptureSlots)
+      throw std::length_error("shared capture arena exceeds addressable storage");
+    storage.resize(block_bytes * kCaptureSlots);
+  }
+  const std::size_t block_bytes;
   std::vector<std::byte> storage;
   std::array<std::atomic<std::uint8_t>, kCaptureHooks> hook_outstanding{};
+  std::array<std::atomic<bool>, kCaptureSlots> occupied{};
+
+  void release_blocks(std::size_t start, std::size_t count) noexcept {
+    // Release the first block last, as it identifies the lease metadata.
+    while (count)
+      occupied[start + --count].store(false, std::memory_order_release);
+  }
 
   void release(CaptureSlotState &, std::uint32_t) noexcept;
 };
@@ -56,7 +72,10 @@ struct CaptureSlotState {
 
   std::shared_ptr<CaptureArena> arena;
   std::atomic<bool> active{false};
-  std::size_t slot = 0;
+  std::size_t slot = 0, event_capacity = 0, blocks = 0;
+  ::tracer::compat::span<std::byte> buffer() const noexcept {
+    return {arena->storage.data() + slot * arena->block_bytes, event_capacity};
+  }
   CaptureSchemaSetLease schema_set;
 };
 
@@ -222,9 +241,6 @@ bool write_trace_context(BoundedProtoWriter &writer,
   const auto &stack = context.stack;
   if (stack.requested_depth == 0 && stack.count == 0)
     return true;
-  if (stack.requested_depth > tracer::kMaxStackDepth ||
-      stack.count > tracer::kMaxStackDepth)
-    return false;
   const auto bounded_text = [](const char *text, std::size_t capacity) {
     if (!text)
       return std::string_view{};
@@ -234,6 +250,7 @@ bool write_trace_context(BoundedProtoWriter &writer,
       ++length;
     return std::string_view(text, length);
   };
+  writer.bound_remaining_visits_by_bytes();
   if (!writer.begin_message(21) ||
       !writer.u64(1, static_cast<std::uint32_t>(stack.status)) ||
       !writer.u64(2, stack.requested_depth))
@@ -277,29 +294,33 @@ CaptureStatus budget_status(const EncodeBudget &budget) noexcept {
 }
 } // namespace
 
-ContextCapturePool::ContextCapturePool()
-    : arena_(std::make_shared<CaptureArena>(kCapturePoolBytes)) {
+ContextCapturePool::ContextCapturePool(std::size_t event_bytes)
+    : arena_(std::make_shared<CaptureArena>(event_bytes)) {
   for (std::size_t i = 0; i < slots_.size(); ++i)
     slots_[i] = std::make_shared<CaptureSlotState>(arena_, i);
 }
 
 ContextCapturePool::~ContextCapturePool() = default;
 
+std::size_t ContextCapturePool::capacity() const noexcept {
+  return arena_->storage.size();
+}
+
 ContextCapturePool::Lease::Lease(std::shared_ptr<CaptureSlotState> slot_state,
-                                 std::size_t slot, std::uint32_t hook) noexcept
+                                 std::uint32_t hook) noexcept
     : slot_state_(std::move(slot_state)),
       schema_token_(
           slot_state_ ? std::shared_ptr<const void>(
                             slot_state_,
                             static_cast<const void *>(&slot_state_->schema_set))
                       : std::shared_ptr<const void>{}),
-      slot_(slot), hook_(hook) {}
+      hook_(hook) {}
 
 ContextCapturePool::Lease::~Lease() noexcept { reset(); }
 
 ContextCapturePool::Lease::Lease(Lease &&other) noexcept
     : slot_state_(std::move(other.slot_state_)),
-      schema_token_(std::move(other.schema_token_)), slot_(other.slot_),
+      schema_token_(std::move(other.schema_token_)),
       hook_(other.hook_), bytes_(other.bytes_), captured_(other.captured_),
       published_(other.published_) {
   other.published_ = false;
@@ -311,7 +332,6 @@ ContextCapturePool::Lease::operator=(Lease &&other) noexcept {
     reset();
     slot_state_ = std::move(other.slot_state_);
     schema_token_ = std::move(other.schema_token_);
-    slot_ = other.slot_;
     hook_ = other.hook_;
     bytes_ = other.bytes_;
     captured_ = other.captured_;
@@ -396,14 +416,15 @@ ContextCapturePool::Lease::capture(const CaptureEventMetadata& event,
   }
 
   CaptureLimits limits;
-  limits.bytes = kCaptureEventBytes;
+  limits.bytes = slot_state_->event_capacity;
+  // The writer charges encoded bytes and enclosing-message compaction.
+  // State traversal keeps its separate existing work allowance below.
+  limits.byte_work = std::max(limits.byte_work, limits.bytes * 8);
   limits.string_bytes = 64 * 1024;
   limits.visits = 8192; // The codec budget accounts for the other 8192.
   limits.items = 4096;
   limits.depth = 32;
-  const ::tracer::compat::span<std::byte> event_storage(
-      slot_state_->arena->storage.data() + slot_ * kCaptureEventBytes, kCaptureEventBytes);
-  BoundedProtoWriter writer(event_storage, limits);
+  BoundedProtoWriter writer(slot_state_->buffer(), limits);
   if (!writer.string(1, event.event_id) || !writer.string(2, event.source_id) ||
       !writer.u64(3, event.source_sequence) ||
       !writer.string(4, event.task_id) ||
@@ -414,6 +435,7 @@ ContextCapturePool::Lease::capture(const CaptureEventMetadata& event,
   budget.max_items = event.effective_max_items;
   budget.limits = limits;
   budget.limits.visits = 8192;
+  budget.limits.byte_work = CaptureLimits{}.byte_work;
   TruncationLog truncations;
   budget.truncation = record_truncation;
   budget.truncation_context = &truncations;
@@ -508,13 +530,13 @@ ContextCapturePool::Lease::schema_lease_token() const noexcept {
 ::tracer::compat::span<const std::byte> ContextCapturePool::Lease::bytes() const noexcept {
   if (!slot_state_ || !captured_)
     return {};
-  return {slot_state_->arena->storage.data() + slot_ * kCaptureEventBytes,
-          bytes_};
+  return slot_state_->buffer().first(bytes_);
 }
 
 ContextCapturePool::Lease
-ContextCapturePool::try_reserve(std::uint32_t hook_id) noexcept {
-  if (hook_id >= kCaptureHooks)
+ContextCapturePool::try_reserve(std::uint32_t hook_id,
+                                std::size_t event_bytes) noexcept {
+  if (hook_id >= kCaptureHooks || !event_bytes || event_bytes > capacity())
     return {};
   auto &outstanding = arena_->hook_outstanding[hook_id];
   auto count = outstanding.load(std::memory_order_relaxed);
@@ -524,11 +546,24 @@ ContextCapturePool::try_reserve(std::uint32_t hook_id) noexcept {
   } while (!outstanding.compare_exchange_weak(
       count, static_cast<std::uint8_t>(count + 1), std::memory_order_acq_rel,
       std::memory_order_relaxed));
-  for (std::size_t i = 0; i < slots_.size(); ++i) {
-    bool free = false;
-    if (slots_[i]->active.compare_exchange_strong(
-            free, true, std::memory_order_acq_rel, std::memory_order_relaxed))
-      return Lease(slots_[i], i, hook_id);
+  const auto blocks = (event_bytes - 1) / arena_->block_bytes + 1;
+  for (std::size_t i = 0; i <= slots_.size() - blocks;) {
+    std::size_t reserved = 0;
+    for (; reserved < blocks; ++reserved) {
+      bool free = false;
+      if (!arena_->occupied[i + reserved].compare_exchange_strong(
+              free, true, std::memory_order_acq_rel, std::memory_order_relaxed))
+        break;
+    }
+    if (reserved == blocks) {
+      auto &slot = *slots_[i];
+      slot.blocks = blocks;
+      slot.event_capacity = event_bytes;
+      slot.active.store(true, std::memory_order_release);
+      return Lease(slots_[i], hook_id);
+    }
+    arena_->release_blocks(i, reserved);
+    i += reserved + 1;
   }
   outstanding.fetch_sub(1, std::memory_order_release);
   return {};
@@ -554,6 +589,7 @@ void CaptureArena::release(CaptureSlotState &slot,
   schema_set.epoch_schema_ids_.fill(0);
   if (!slot.active.exchange(false, std::memory_order_acq_rel))
     return;
+  release_blocks(slot.slot, slot.blocks);
   hook_outstanding[hook].fetch_sub(1, std::memory_order_release);
 }
 
@@ -568,10 +604,9 @@ CaptureSchemaSetLease::record(std::size_t index) const noexcept {
 }
 
 ::tracer::compat::span<const std::byte> CaptureSchemaSetLease::event_bytes() const noexcept {
-  if (!arena_ || !event_bytes_size_ || event_bytes_size_ > kCaptureEventBytes)
+  if (!owner_ || !event_bytes_size_ || event_bytes_size_ > owner_->event_capacity)
     return {};
-  return {arena_->storage.data() + slot_ * kCaptureEventBytes,
-          event_bytes_size_};
+  return owner_->buffer().first(event_bytes_size_);
 }
 
 const CaptureSchemaSetLease *
