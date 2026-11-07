@@ -371,8 +371,15 @@ The standalone pilot compares Frida Gum Stalker 17.26.1 with native ptrace
 single-step on one owned fixture thread and address range. Both matched the
 instruction oracle, preserved SIGUSR1 delivery, reported truncation and
 stopped cleanly. Gum's median was 1.200 ms versus 23.664 ms for native
-stepping in the 1,929-instruction GCC 8.5 SDK run. The recommendation is to
-hold a maintained backend pending live-target integration and distribution
-verification. See `benchmarks/instruction-trace/README.md` for the comparison.
+stepping in the 1,929-instruction GCC 8.5 SDK run.
 Four focused native REPL regression CTests passed. The native-only pilot,
 normal completion, cap teardown, and five-second watchdog reaping passed.
+
+The live follow-up attached to an existing C++ worker with an active Clang
+JIT observer. The stripped plugin passed three runs on glibc 2.23 and one
+on 2.34 with matching loader profiles. Each matched the instruction oracle,
+reported truncation at the cap, preserved six native PRE and POST pairs,
+and unloaded before native detach restored the original code. Three focused
+REPL regression CTests passed. Keep Gum experimental while loader routing,
+the private glibc import and distribution notices are resolved. See
+`benchmarks/instruction-trace/README.md` for reproduction and the loader matrix.

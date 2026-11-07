@@ -15,7 +15,13 @@ read -r -a link_flags <<< "${PILOT_LDFLAGS:-}"
 "${CXX:-c++}" -std=c++17 -O2 -g -Wall -Wextra -Wpedantic -fPIE -pie \
   "$src/pilot.cpp" "$src/workload.S" -ldl "${link_flags[@]}" -o "$out/pilot"
 if [[ "$gum" != - ]]; then
+  "${CXX:-c++}" -std=c++17 -O0 -g -Wall -Wextra -Wpedantic -fPIE -pie \
+    -fno-omit-frame-pointer -fcf-protection=none \
+    "$src/live_target.cpp" "$src/workload.S" -pthread \
+    -Wl,--no-as-needed -ldl -Wl,--as-needed "${link_flags[@]}" -o "$out/live-target"
   "${CC:-cc}" -std=c11 -O2 -fPIC -shared -fvisibility=hidden -Wall -Wextra \
-    -Wl,--exclude-libs,ALL,-z,defs -I "$gum" "$src/gum_backend.c" \
+    -Wl,--exclude-libs,ALL,-z,defs,-z,relro,-z,now,-z,noexecstack,--build-id=sha1 \
+    -Xlinker --version-script -Xlinker "$src/gum.exports" \
+    -Xlinker -Map -Xlinker "$out/gum-backend.map" -I "$gum" "$src/gum_backend.c" \
     "$gum/libfrida-gum.a" -ldl -lpthread -lresolv -lm -o "$out/gum-backend.so"
 fi

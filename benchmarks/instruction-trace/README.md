@@ -1,11 +1,10 @@
 # Bounded instruction tracing pilot
 
-**Decision for P4 A2:** Hold a maintained instruction-tracing backend. Keep
-Gum Stalker as the candidate for an integration experiment and native
-single-step as a fixture reference. Gum was faster on the measured workload.
-The pilot covers an owned, cooperative fixture. A maintained backend would
-also need live attachment and coexistence with the existing injector and
-observers, broader signal and fault cases, and a redistribution inventory.
+**Decision for P4 A2.** Keep Gum Stalker as an experimental backend. It was
+faster on the standalone fixture and passed live attachment with an existing
+native observer. A maintained backend still needs loader and packaging work,
+broader signal and fault coverage, and validation of concurrent probe changes.
+Native single-step remains the fixture reference.
 
 ## Reproduce
 
@@ -85,19 +84,88 @@ The SDK-interpreter build passed all nine timed trials. A separate
 direct-loader run of that SDK-interpreter build passed 20 trials.
 These are distinct launch configurations. [Gum libc discovery](https://github.com/frida/frida-gum/blob/00a05282d1074c0e043b285c70a4412d784c573d/gum/backend-linux/gumprocess-linux.c#L1316)
 
+## Live attachment with a native probe
+
+Build the pilot as above with Gum, and supply the paths to a built native
+REPL, server, and agent. Keep debug symbols on `live-target` so the REPL can
+resolve the fixture's C++ function signatures. The pilot also verifies the
+ELF metadata of a stripped plugin after moving it to a staging directory.
+
+```sh
+mkdir -p /tmp/instruction-stage
+strip --strip-unneeded -o /tmp/instruction-stage/gum-backend.so \
+  /tmp/instruction-pilot/gum-backend.so
+python3 benchmarks/instruction-trace/live_compare.py \
+  "$REPL" "$SERVER" "$AGENT" /tmp/instruction-pilot/live-target \
+  /tmp/instruction-stage/gum-backend.so
+```
+
+The runner starts a C++ target and waits for its worker to come up. It then
+attaches with `clang-tracer-repl --attach`, installs a Clang JIT PRE and POST
+observer, and installs a temporary control observer. The control observer
+loads the plugin through `dlopen` and follows the existing worker. The
+instruction range is the same 65-byte leaf used by the standalone pilot,
+reached through the actively probed caller on that worker.
+
+Three runs on SDK glibc 2.23 and one on Rocky Linux 9.8 glibc 2.34 each
+matched 56 instruction PCs and a seven-PC prefix with explicit truncation.
+Each verified six native PRE and POST pairs before, during, and after Gum,
+including typed arguments and unchanged return values. The native detour
+bytes remained intact through both Gum unloads. The plugin disappeared
+from `/proc/PID/maps` after each capture, and REPL detach restored the
+original entry bytes. The standalone comparison smoke cases and three
+focused native REPL CTests passed in the same SDK environment.
+
+The default Gum trust threshold captured the expected PCs but could time
+out waiting for the worker to unfollow. The live pilot sets the threshold
+to `-1` so already translated blocks continue checking for unfollow at
+dispatch boundaries. On timeout, the pilot keeps the plugin and capture
+storage resident. Gum temporarily authorizes its own tracing helper on
+Linux, so the control hook restores this fixture's explicit authorization
+after start and stop. The host had `kernel.yama.ptrace_scope=0`.
+[Pinned x86 source](https://github.com/frida/frida-gum/blob/00a05282d1074c0e043b285c70a4412d784c573d/gum/backend-x86/gumstalker-x86.c),
+[Pinned Linux source](https://github.com/frida/frida-gum/blob/00a05282d1074c0e043b285c70a4412d784c573d/gum/backend-linux/gumprocess-linux.c#L792)
+
+The SDK run used the executable's linked SDK interpreter and matching
+server and agent libraries. For the host run, build `live-target` with the
+host interpreter. Run the server through a wrapper executing
+`/lib64/ld-linux-x86-64.so.2 --library-path /lib64:$SDK/lib.llvm` with the
+absolute server executable path and its arguments. Pass
+`--target-library-path "/lib64:$SDK/lib.llvm"` to the runner so the SDK-built
+agent resolves host glibc libraries in the target. The same relocated
+SDK-built plugin worked in both runs.
+
+Using the SDK server's default libraries against the host target failed
+before Gum loaded because the injector could not translate its `dlopen`
+address to the target. After switching the server to host libraries,
+the SDK-built agent also needed host library precedence to avoid an
+`__libc_vfork@GLIBC_PRIVATE` loader failure. Invoking the target through an
+explicit loader failed native attach admission because `/proc/PID/exe`
+identified the loader itself.
+
 ## Packaging and distribution
 
 The native-only fixture added no third-party library. The Gum devkit download
 was 12,791,284 bytes and its static archive was 87,510,768 bytes. The SDK-linked
 Gum module was 23,109,304 bytes before stripping and 10,319,976 bytes after
-stripping. The native executable was 27,248 bytes after stripping. The module
-required glibc symbols through `GLIBC_2.17`. The SDK GNU linker 2.30 emitted
+stripping. The native executable was 27,248 bytes after stripping.
+The SDK GNU linker 2.30 emitted
 564 unsupported GNU property warnings while reading the devkit objects.
 The tested runtime still passed the fixture.
+
+The live SDK module was 10,322,360 bytes after stripping. It exposed five
+pilot symbols and had full RELRO, immediate binding and a nonexecutable
+stack. Its dynamic section had no search path or text relocations. Its
+runtime dependencies were libc, libdl, libgcc_s, libm, libpthread and
+libresolv. The newest public glibc symbol version was `GLIBC_2.17`. The
+devkit's `gum.c.o` also introduced a weak
+`__libc_dlopen_mode@GLIBC_PRIVATE` import, which prevents inferring a
+supported glibc minimum from the public symbol versions alone.
 
 Gum's wxWindows Library Licence 3.1 includes an exception permitting binary
 distribution of works based on the library under the distributor's own terms.
 The devkit also bundles third-party code and contained no separate license
 inventory in its file list. Shipping the module requires checking the exact
 bundled dependencies and carrying their applicable notices and terms.
+Resolve the private ABI import and linker warnings before distribution.
 [Gum COPYING](https://github.com/frida/frida-gum/blob/00a05282d1074c0e043b285c70a4412d784c573d/COPYING)

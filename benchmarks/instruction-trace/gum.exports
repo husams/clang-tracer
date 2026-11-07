@@ -1,0 +1,9 @@
+{
+  global:
+    pilot_gum_init;
+    pilot_gum_run;
+    pilot_gum_live_start;
+    pilot_gum_live_stop;
+    pilot_gum_shutdown;
+  local: *;
+};

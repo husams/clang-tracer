@@ -28,7 +28,7 @@ extern char pilot_work_end[], pilot_native_trap[], pilot_native_done[];
 }
 
 namespace {
-constexpr unsigned max_events = 8192;
+constexpr unsigned max_events = PILOT_MAX_RECORDS;
 constexpr int trap_unknown = 5; // Linux TRAP_UNK, absent in the GCC 8.5 SDK headers.
 using Offsets = std::array<std::uint32_t, max_events>;
 enum class Mode : unsigned { baseline, native, gum, post };
