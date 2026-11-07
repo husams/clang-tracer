@@ -99,6 +99,8 @@ public:
 
     virtual std::any visitTargetCall(TracerCommandsParser::TargetCallContext *context) = 0;
 
+    virtual std::any visitLocalPerf(TracerCommandsParser::LocalPerfContext *context) = 0;
+
 
 };
 

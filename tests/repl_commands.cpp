@@ -32,6 +32,10 @@ int main() {
   require(call.kind == CommandKind::target_call && call.arguments[0] == "app::sum" &&
           call.options.at("--arg") == std::vector<std::string>{"-3", "1.25"});
   require(parse_command("%call-result --timeout 2").kind == CommandKind::target_call_result);
+  require(parse_command("%syscalls --count 64").kind == CommandKind::syscalls);
+  require(parse_command("%sample cpu --timeout 1").kind == CommandKind::sample_cpu);
+  bad("%sample cpu --timeout 61");
+  bad("%syscalls --count 8193");
   const auto overrides = parse_command("%probe inject f --callback hook.cpp --allow-arg-overrides --allow-result-override");
   require(overrides.has("--allow-arg-overrides") && overrides.has("--allow-result-override"));
   require(parse_command("%probe validate f --callback hook.cpp --allow-result-override")

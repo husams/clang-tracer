@@ -67,7 +67,7 @@ function(tracer_add_native_repl)
     "${_generated}/tracer.grpc.pb.cc" "${_generated}/context_transport.pb.cc")
   target_include_directories(tracer_repl_rpc PUBLIC "${_generated}")
   target_link_libraries(tracer_repl_rpc PUBLIC gRPC::grpc++ protobuf::libprotobuf)
-  add_library(tracer_repl_client STATIC "${_repl}/controller.cpp" "${_repl}/server_process.cpp" "${_repl}/owned_target.cpp" "${_repl}/events.cpp" "${_repl}/background_events.cpp")
+  add_library(tracer_repl_client STATIC "${_repl}/controller.cpp" "${_repl}/server_process.cpp" "${_repl}/owned_target.cpp" "${_repl}/local_perf.cpp" "${_repl}/events.cpp" "${_repl}/background_events.cpp")
   target_include_directories(tracer_repl_client PUBLIC "${_repl}")
   target_link_libraries(tracer_repl_client PUBLIC tracer_repl_rpc tracer_repl_commands Threads::Threads
     PRIVATE SQLite::SQLite3)
@@ -230,6 +230,16 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:repl-launch-target>)
       set_tests_properties(native_repl_launch_integration PROPERTIES TIMEOUT 120)
+      add_executable(repl-local-perf-target tests/fixtures/repl_local_perf.cpp)
+      target_include_directories(repl-local-perf-target PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+      target_link_libraries(repl-local-perf-target PRIVATE Threads::Threads)
+      foreach(mode cpu syscalls)
+        add_test(NAME native_repl_local_perf_${mode}
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_local_perf_integration.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:repl-local-perf-target> ${mode})
+        set_tests_properties(native_repl_local_perf_${mode} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+      endforeach()
       if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         add_executable(repl-overrides-target tests/fixtures/repl_overrides.cpp)
         target_include_directories(repl-overrides-target PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")

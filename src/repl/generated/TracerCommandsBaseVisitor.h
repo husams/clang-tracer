@@ -175,6 +175,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitLocalPerf(TracerCommandsParser::LocalPerfContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
 
 };
 

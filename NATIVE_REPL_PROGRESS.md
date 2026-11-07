@@ -348,3 +348,19 @@ hook rollback, target exceptions, errno preservation, and restoration on
 detach. Fourteen focused Linux x86-64 CTests passed with the GCC 8.5 SDK
 and Clang 21.1.8. The override fixture also passed on OverlayFS, and 198
 portable Python tests passed with the regenerated bindings.
+
+### A1 Local syscall and CPU capture
+
+`%syscalls` uses task-scoped perf tracepoints for syscall entry and exit.
+`%sample cpu` uses user-space task-clock samples. Both verify the selected
+process and its thread snapshot, report monotonic timestamps and kernel
+loss, and close all event descriptors before displaying results. Permission
+failures identify the unavailable backend. Both modes leave target threads
+running throughout collection.
+
+The Linux x86-64 fixture correlated samples with a worker's hot-loop address
+range and syscall entries and exits with its thread and parent process.
+It verified forced loss reporting, timeout, interruption, target exit, and
+descriptor cleanup. Fifteen focused CTests passed unprivileged on the GCC
+8.5 SDK with Clang 21.1.8. The syscall test reported the tracefs permission
+denial and passed on an elevated run with the same binaries.

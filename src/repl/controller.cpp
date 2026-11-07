@@ -1,4 +1,5 @@
 #include "controller.hpp"
+#include "local_perf.hpp"
 #include "../prepared_contract.hpp"
 #include "../proc_identity.hpp"
 #include "../sqlite_events.hpp"
@@ -451,7 +452,7 @@ std::string Controller::prompt() const {
              : "tracer[" + std::to_string(selected_.pid) + "]> ";
 }
 
-void Controller::require_session(const SessionHandle &session, bool scalar_overrides) {
+std::uint64_t Controller::require_session(const SessionHandle &session, bool scalar_overrides) {
   if (!stub_ || session.id.empty() || session.connection != connection_) {
     throw std::runtime_error(
         "no valid selected session; use %attach PID or %use SESSION");
@@ -465,7 +466,7 @@ void Controller::require_session(const SessionHandle &session, bool scalar_overr
     if (entry.id() == session.id && entry.state() == api::Session::ATTACHED) {
       if (scalar_overrides && !entry.jit_runtime().scalar_overrides_supported())
         throw std::runtime_error("the server and agent do not support scalar overrides");
-      return;
+      return entry.process_start_time();
     }
   }
   throw std::runtime_error("session is no longer attached: " + session.id);
@@ -1452,6 +1453,16 @@ bool Controller::execute(const Command &command) {
   case K::target_call_result:
     call_target(command);
     return true;
+  case K::syscalls:
+  case K::sample_cpu: {
+    if (!server_.running() || endpoint_ != server_.endpoint())
+      throw std::runtime_error("local perf capture requires the REPL's owned local server");
+    const auto start = require_session(selected_);
+    const auto mode = command.kind == K::syscalls ? LocalPerfMode::syscalls : LocalPerfMode::cpu;
+    capture_local_perf(mode, selected_.pid, start, command.number("--timeout", 2),
+                       command.number("--count", 256), interrupted, out_);
+    return true;
+  }
   case K::bulk_preview:
     preview_bulk_trace(command);
     return true;

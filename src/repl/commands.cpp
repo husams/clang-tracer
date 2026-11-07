@@ -1,4 +1,5 @@
 #include "commands.hpp"
+#include "local_perf.hpp"
 
 #include <charconv>
 #include <limits>
@@ -57,6 +58,8 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"terminate", K::terminate},
                                         {"call", K::target_call},
                                         {"call-result", K::target_call_result},
+                                        {"syscalls", K::syscalls},
+                                        {"sample cpu", K::sample_cpu},
                                         {"processes", K::processes},
                                         {"sessions", K::sessions},
                                         {"use", K::use},
@@ -291,6 +294,12 @@ Command parse_command(const std::string &input) {
   }
   if (command.number("--timeout", 0) > 86400) {
     throw std::invalid_argument("--timeout must be at most 86400 seconds");
+  }
+  if (command.kind == K::syscalls || command.kind == K::sample_cpu) {
+    if (command.number("--timeout", 0) > max_local_perf_seconds)
+      throw std::invalid_argument("local perf capture timeout is capped at 60 seconds");
+    if (command.number("--count", 0) > max_local_perf_events)
+      throw std::invalid_argument("local perf capture is capped at 8192 events");
   }
   if (command.number("--stack-depth", 0) > 64) {
     throw std::invalid_argument("--stack-depth must be at most 64");

@@ -101,7 +101,7 @@ public:
   SessionHandle attach(std::uint32_t pid, std::uint64_t expected_start_time = 0,
                        const std::string &expected_executable = {});
   void detach(const SessionHandle &session);
-  void require_session(const SessionHandle &session, bool scalar_overrides = false);
+  std::uint64_t require_session(const SessionHandle &session, bool scalar_overrides = false);
   std::uint64_t inject(const SessionHandle &session,
                        const std::string &selector, const std::string &source,
                        const Command &options);

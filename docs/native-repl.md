@@ -213,6 +213,49 @@ new snapshot before using an address. The token checks observed mapping
 identity. An unload and reload of the same image at the same address between
 snapshots can produce identical observations.
 
+## Capture local syscalls or CPU samples
+
+Attach to a running Linux x86-64 target using the REPL's own local server,
+then choose a capture:
+
+```text
+%syscalls --timeout 2 --count 256
+%sample cpu --timeout 2 --count 256
+```
+
+`%syscalls` reports separate entry and exit records with the syscall number
+and the raw kernel return value on exit. `%sample cpu` reports user-space
+instruction addresses at roughly one sample per 10 ms of scheduled CPU time.
+Each record carries the process ID, thread ID, and a monotonic nanosecond
+timestamp on the same clock as probe events. Use a current mapping snapshot
+and `%symbols --address` to look up a sample address.
+
+Each capture snapshots and verifies up to 64 existing target threads.
+Threads created after that snapshot and child processes are outside the
+capture. The command releases its kernel resources before printing records
+in timestamp order. It stops on timeout, the record limit, Ctrl+C, or the
+exit of all monitored threads. The defaults are two seconds and 256 records,
+with ceilings of 60 seconds and 8192 records.
+
+The summary reports kernel loss, throttle notifications, and samples
+discarded at the requested limit separately. Kernels with a perf loss counter
+include loss still pending at shutdown. On older kernels, `loss_accounting=records`
+counts loss notifications the kernel wrote to the ring. Collection boundaries,
+loss, and the record limit can leave individual syscall entries or exits
+without a partner. These pilot records are printed by their capture command.
+
+Syscall capture reads the raw syscall tracepoint IDs and formats from tracefs
+and opens the events through perf for each target thread. It needs tracefs
+read access and permission to open those events. CPU sampling uses a user-space
+perf task-clock event and can work under a policy that denies syscall tracing.
+Both modes report permission failures directly. Perf events allow the target
+threads to continue running. A syscall-stop backend based on ptrace would stop
+them at each syscall boundary and compete with the injector for ptrace ownership.
+[Linux event tracing](https://docs.kernel.org/trace/events.html) ·
+[Perf permissions](https://docs.kernel.org/admin-guide/perf-security.html) ·
+[perf_event_open](https://man7.org/linux/man-pages/man2/perf_event_open.2.html) ·
+[ptrace](https://man7.org/linux/man-pages/man2/ptrace.2.html)
+
 ## Preview a bulk trace
 
 ```text
