@@ -173,6 +173,32 @@ command. Removal is repeatable for a retained batch in its original session.
 Removal and rollback restore entry bytes. The agent still retains compiled
 slots until the target exits.
 
+## Read mapped memory
+
+```text
+%memory maps
+%memory read 0xADDRESS --mapping TOKEN --count 32
+%memory read 0xADDRESS --mapping TOKEN --type i64
+```
+
+Run these commands after attaching to a local Linux x86-64 target. Copy the
+token after `memory mapping=` and use an address from one of the listed
+ranges. Ranges include anonymous and file-backed mappings, with permissions
+shown as reported by Linux. The memory token is specific to the attached
+session and its memory map.
+
+Use `--count` for a hex and ASCII dump of 1 to 65536 bytes. Use `--type`
+for one little-endian `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64`,
+`f32` or `f64` value. Reads can cross page and mapping boundaries when the
+entire span is readable. A gap, inaccessible page, or short kernel read
+fails the request at the first affected address and returns no bytes.
+
+The server checks the mapping snapshot and target identity around each
+read. Run `%memory maps` again after any mapping or permission change.
+The target keeps running during inspection, so bytes can change while
+they are copied. An unmap and remap with identical visible metadata between
+checks can produce the same snapshot.
+
 ## Interceptor upload
 
 ```text

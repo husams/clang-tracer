@@ -19,6 +19,8 @@ enum class CommandKind {
   detach,
   modules,
   symbols,
+  memory_maps,
+  memory_read,
   prepare,
   resolve,
   inject,

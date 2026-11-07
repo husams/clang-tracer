@@ -225,6 +225,12 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:repl-browser-target> $<TARGET_FILE:call-stacks-calculator>)
       set_tests_properties(native_repl_browser_integration PROPERTIES TIMEOUT 100)
+      add_executable(repl-memory-target tests/fixtures/repl_memory.cpp)
+      add_test(NAME native_repl_memory_integration
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_memory_integration.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:repl-memory-target>)
+      set_tests_properties(native_repl_memory_integration PROPERTIES TIMEOUT 100)
       add_executable(repl-bulk-concrete-target
         examples/prepared-injectors/concrete/target.cpp
         examples/prepared-injectors/concrete/virtual.cpp)

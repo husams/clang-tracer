@@ -14,6 +14,8 @@ service Tracer {
   rpc Detach(DetachRequest) returns (Session);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc ListModules(ListModulesRequest) returns (ListModulesResponse);
+  rpc ListMemoryMappings(ListMemoryMappingsRequest) returns (ListMemoryMappingsResponse);
+  rpc ReadMemory(ReadMemoryRequest) returns (ReadMemoryResponse);
   rpc ListThreads(ListThreadsRequest) returns (ListThreadsResponse);
   rpc ListSymbols(ListSymbolsRequest) returns (ListSymbolsResponse);
   rpc PreviewBulkTrace(PreviewBulkTraceRequest) returns (PreviewBulkTraceResponse);
@@ -316,6 +318,30 @@ message ListModulesResponse {
   repeated string modules = 1;
   repeated ModuleMapping mappings = 2;
   string mapping_token = 3;
+}
+message ListMemoryMappingsRequest { string session_id = 1; }
+message MemoryMapping {
+  uint64 begin_address = 1;
+  uint64 end_address = 2; // Exclusive.
+  string permissions = 3; // Linux maps permissions such as r--p.
+  uint64 file_offset = 4;
+  string device = 5;
+  uint64 inode = 6;
+  bytes path = 7; // Path or label as reported by procfs.
+}
+message ListMemoryMappingsResponse {
+  repeated MemoryMapping mappings = 1;
+  string mapping_token = 2; // Bound to the selected session and mapping snapshot.
+}
+message ReadMemoryRequest {
+  string session_id = 1;
+  string mapping_token = 2;
+  uint64 address = 3;
+  uint32 size = 4; // 1..65536 bytes.
+}
+message ReadMemoryResponse {
+  uint64 address = 1;
+  bytes data = 2; // On success, exactly size bytes owned by the response.
 }
 message ListThreadsRequest { string session_id = 1; }
 message TargetThread {

@@ -217,3 +217,22 @@ histogram boundaries and caller evidence from filtered or partial stacks.
 
 A bulk observer captured 32 timed calls across both fixture overloads and
 reported `main` as the caller for both.
+
+## Read-only inspection P2
+
+### I1 Mapping-aware memory reads
+
+`%memory maps` lists live ranges and permissions and issues a token bound to
+the selected session. `%memory read` uses that token to read up to 64 KiB or
+decode a little-endian scalar. The server checks process identity and mapping
+metadata around the read, validates the entire readable span, and only
+returns owned bytes for a complete read. Kernel read failures report the
+first affected address. Identical mapping metadata can hide a remap between
+checks.
+
+The Linux x86-64 fixture verified cross-page reads across adjacent mappings,
+scalar decoding, protected and unmapped ranges, a kernel fault beyond a
+mapped file's EOF, and token invalidation after permission changes, remapping
+and reattaching. Eight focused CTests passed with the GCC 8.5 SDK and Clang
+21.1.8. The memory fixture also passed on OverlayFS. All 198 portable Python
+tests passed.

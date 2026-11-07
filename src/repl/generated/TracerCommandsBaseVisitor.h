@@ -147,6 +147,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitMemory(TracerCommandsParser::MemoryContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
 
 };
 

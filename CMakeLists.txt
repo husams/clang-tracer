@@ -106,7 +106,7 @@ add_custom_command(TARGET clang_tracer_agent POST_BUILD
   VERBATIM)
 
 add_executable(clang-tracer-server src/main.cpp src/server.cpp src/session.cpp src/injector.cpp src/admission.cpp
-  src/debug_resolver.cpp src/header_context.cpp)
+  src/debug_resolver.cpp src/header_context.cpp src/process_memory.cpp)
 target_include_directories(clang-tracer-server PRIVATE include ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_compile_definitions(clang-tracer-server PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
 target_link_libraries(clang-tracer-server PRIVATE tracer_grpc tracer_context_collector

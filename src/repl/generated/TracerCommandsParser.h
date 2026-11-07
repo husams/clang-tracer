@@ -27,8 +27,8 @@ public:
     T__74 = 75, T__75 = 76, T__76 = 77, T__77 = 78, T__78 = 79, T__79 = 80,
     T__80 = 81, T__81 = 82, T__82 = 83, T__83 = 84, T__84 = 85, T__85 = 86,
     T__86 = 87, T__87 = 88, T__88 = 89, T__89 = 90, T__90 = 91, T__91 = 92,
-    T__92 = 93, T__93 = 94, UINT = 95, STRING = 96, SHELL = 97, METADATA_ONLY = 98,
-    WORD = 99, WS = 100
+    T__92 = 93, T__93 = 94, T__94 = 95, T__95 = 96, T__96 = 97, UINT = 98,
+    STRING = 99, SHELL = 100, METADATA_ONLY = 101, WORD = 102, WS = 103
   };
 
   enum {
@@ -39,7 +39,7 @@ public:
     RuleDeployOption = 17, RuleInterceptor = 18, RuleEvents = 19, RuleCollect = 20,
     RuleRecord = 21, RuleStreamOption = 22, RuleCpp = 23, RuleShell = 24,
     RuleComplete = 25, RuleType = 26, RuleHelp = 27, RuleQuit = 28, RuleBulkTrace = 29,
-    RuleBulkTraceOption = 30, RuleValue = 31, RuleKeyword = 32
+    RuleBulkTraceOption = 30, RuleValue = 31, RuleKeyword = 32, RuleMemory = 33
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -92,6 +92,7 @@ public:
   class BulkTraceOptionContext;
   class ValueContext;
   class KeywordContext;
+  class MemoryContext;
 
   class  LineContext : public antlr4::ParserRuleContext {
   public:
@@ -133,6 +134,7 @@ public:
     HelpContext *help();
     QuitContext *quit();
     BulkTraceContext *bulkTrace();
+    MemoryContext *memory();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -575,6 +577,21 @@ public:
   };
 
   KeywordContext* keyword();
+
+  class  MemoryContext : public antlr4::ParserRuleContext {
+  public:
+    MemoryContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    std::vector<ValueContext *> value();
+    ValueContext* value(size_t i);
+    antlr4::tree::TerminalNode *UINT();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  MemoryContext* memory();
 
 
   // By default the static state used to implement the parser is lazily initialized during the first

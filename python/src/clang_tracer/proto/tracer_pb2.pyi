@@ -577,6 +577,58 @@ class ListModulesResponse(_message.Message):
     mapping_token: str
     def __init__(self, modules: _Optional[_Iterable[str]] = ..., mappings: _Optional[_Iterable[_Union[ModuleMapping, _Mapping]]] = ..., mapping_token: _Optional[str] = ...) -> None: ...
 
+class ListMemoryMappingsRequest(_message.Message):
+    __slots__ = ("session_id",)
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    def __init__(self, session_id: _Optional[str] = ...) -> None: ...
+
+class MemoryMapping(_message.Message):
+    __slots__ = ("begin_address", "end_address", "permissions", "file_offset", "device", "inode", "path")
+    BEGIN_ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    END_ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    PERMISSIONS_FIELD_NUMBER: _ClassVar[int]
+    FILE_OFFSET_FIELD_NUMBER: _ClassVar[int]
+    DEVICE_FIELD_NUMBER: _ClassVar[int]
+    INODE_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    begin_address: int
+    end_address: int
+    permissions: str
+    file_offset: int
+    device: str
+    inode: int
+    path: bytes
+    def __init__(self, begin_address: _Optional[int] = ..., end_address: _Optional[int] = ..., permissions: _Optional[str] = ..., file_offset: _Optional[int] = ..., device: _Optional[str] = ..., inode: _Optional[int] = ..., path: _Optional[bytes] = ...) -> None: ...
+
+class ListMemoryMappingsResponse(_message.Message):
+    __slots__ = ("mappings", "mapping_token")
+    MAPPINGS_FIELD_NUMBER: _ClassVar[int]
+    MAPPING_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    mappings: _containers.RepeatedCompositeFieldContainer[MemoryMapping]
+    mapping_token: str
+    def __init__(self, mappings: _Optional[_Iterable[_Union[MemoryMapping, _Mapping]]] = ..., mapping_token: _Optional[str] = ...) -> None: ...
+
+class ReadMemoryRequest(_message.Message):
+    __slots__ = ("session_id", "mapping_token", "address", "size")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    MAPPING_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    SIZE_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    mapping_token: str
+    address: int
+    size: int
+    def __init__(self, session_id: _Optional[str] = ..., mapping_token: _Optional[str] = ..., address: _Optional[int] = ..., size: _Optional[int] = ...) -> None: ...
+
+class ReadMemoryResponse(_message.Message):
+    __slots__ = ("address", "data")
+    ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    address: int
+    data: bytes
+    def __init__(self, address: _Optional[int] = ..., data: _Optional[bytes] = ...) -> None: ...
+
 class ListThreadsRequest(_message.Message):
     __slots__ = ("session_id",)
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]

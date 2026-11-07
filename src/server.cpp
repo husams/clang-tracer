@@ -1,6 +1,7 @@
 #include "server.hpp"
 #include "prepared_contract.hpp"
 #include "proc_identity.hpp"
+#include "process_memory.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1487,6 +1488,23 @@ public:
     } catch (const std::exception &error) {
       return status_for(error);
     }
+  }
+
+  grpc::Status ListMemoryMappings(
+      grpc::ServerContext *context, const api::ListMemoryMappingsRequest *request,
+      api::ListMemoryMappingsResponse *response) override {
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    return memory::list_mappings(*context, *session, timeout_, *response);
+  }
+
+  grpc::Status ReadMemory(grpc::ServerContext *context, const api::ReadMemoryRequest *request,
+                          api::ReadMemoryResponse *response) override {
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    return memory::read(*context, *session, timeout_, *request, *response);
   }
 
   grpc::Status ListThreads(

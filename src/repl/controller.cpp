@@ -6,6 +6,7 @@
 #include <utility>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -14,6 +15,7 @@
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <cctype>
 #include <cstdlib>
@@ -46,6 +48,71 @@ std::string printable_proc_text(std::string value) {
       ch = '?';
   }
   return value;
+}
+
+std::size_t memory_scalar_size(std::string_view type) {
+  if (type == "u8" || type == "i8")
+    return 1;
+  if (type == "u16" || type == "i16")
+    return 2;
+  if (type == "u32" || type == "i32" || type == "f32")
+    return 4;
+  if (type == "u64" || type == "i64" || type == "f64")
+    return 8;
+  throw std::invalid_argument("expected u8/u16/u32/u64, i8/i16/i32/i64, f32 or f64");
+}
+
+template <typename Float, typename Bits>
+void print_memory_float(std::ostream &out, Bits bits) {
+  static_assert(sizeof(Float) == sizeof(Bits) && std::numeric_limits<Float>::is_iec559);
+  Float value;
+  std::memcpy(&value, &bits, sizeof(value));
+  out << std::setprecision(std::numeric_limits<Float>::max_digits10) << value;
+}
+
+void print_memory_scalar(std::ostream &out, std::uint64_t address,
+                         std::string_view bytes, std::string_view type) {
+  std::uint64_t bits = 0;
+  for (std::size_t i = 0; i < bytes.size(); ++i)
+    bits |= static_cast<std::uint64_t>(static_cast<unsigned char>(bytes[i])) << (8 * i);
+  std::ostringstream result;
+  result << "0x" << std::hex << address << std::dec << ' ' << type << '=';
+  if (type == "f32") {
+    print_memory_float<float>(result, static_cast<std::uint32_t>(bits));
+  } else if (type == "f64") {
+    print_memory_float<double>(result, bits);
+  } else if (type.front() == 'i') {
+    const auto width = bytes.size() * 8;
+    const auto mask = UINT64_MAX >> (64 - width);
+    const auto sign = std::uint64_t{1} << (width - 1);
+    const auto value = bits & sign ? -1 - static_cast<std::int64_t>(mask ^ bits)
+                                   : static_cast<std::int64_t>(bits);
+    result << value;
+  } else {
+    result << bits;
+  }
+  out << result.str() << '\n';
+}
+
+void print_memory_dump(std::ostream &out, std::uint64_t address, std::string_view bytes) {
+  constexpr std::size_t row_width = 16;
+  std::ostringstream dump;
+  dump << std::hex << std::setfill('0');
+  for (std::size_t offset = 0; offset < bytes.size(); offset += row_width) {
+    const auto row = bytes.substr(offset, row_width);
+    dump << "0x" << address + offset << "  ";
+    for (std::size_t i = 0; i < row_width; ++i) {
+      if (i < row.size())
+        dump << std::setw(2) << static_cast<unsigned>(static_cast<unsigned char>(row[i])) << ' ';
+      else
+        dump << "   ";
+    }
+    dump << " |";
+    for (const unsigned char ch : row)
+      dump << (ch >= 32 && ch <= 126 ? static_cast<char>(ch) : '.');
+    dump << "|\n";
+  }
+  out << dump.str();
 }
 
 void save_bulk_manifest(const std::string &path, const api::BulkTraceRules &rules) {
@@ -1172,6 +1239,46 @@ bool Controller::execute(const Command &command) {
              << " " << std::quoted(printable_proc_text(entry.path())) << '\n';
       }
     }
+    return true;
+  }
+  case K::memory_maps: {
+    require_session(selected_);
+    api::ListMemoryMappingsRequest request;
+    request.set_session_id(selected_.id);
+    const auto response = unary<api::ListMemoryMappingsResponse>(
+        [&](auto &c, auto &r) { return stub_->ListMemoryMappings(&c, request, &r); },
+        settings_.timeout_seconds);
+    out_ << "memory mapping=" << response.mapping_token() << '\n';
+    for (const auto &entry : response.mappings()) {
+      out_ << "0x" << std::hex << entry.begin_address() << "-0x"
+           << entry.end_address() << ' ' << entry.permissions()
+           << " offset=0x" << entry.file_offset() << std::dec
+           << " device=" << entry.device() << " inode=" << entry.inode()
+           << ' ' << std::quoted(printable_proc_text(entry.path())) << '\n';
+    }
+    out_ << "memory mappings=" << response.mappings_size() << '\n';
+    return true;
+  }
+  case K::memory_read: {
+    require_session(selected_);
+    api::ReadMemoryRequest request;
+    request.set_session_id(selected_.id);
+    request.set_mapping_token(command.option("--mapping"));
+    request.set_address(address_number(args.at(0)));
+    const auto type = command.option("--type");
+    const auto size = command.has("--type")
+        ? memory_scalar_size(type)
+        : unsigned_number(command.option("--count"), "memory read size", 65536);
+    request.set_size(static_cast<std::uint32_t>(size));
+    const auto response = unary<api::ReadMemoryResponse>(
+        [&](auto &c, auto &r) { return stub_->ReadMemory(&c, request, &r); },
+        settings_.timeout_seconds);
+    if (response.address() != request.address() || response.data().size() != size)
+      throw std::runtime_error("invalid memory read response");
+    if (command.has("--type"))
+      print_memory_scalar(out_, request.address(), response.data(), type);
+    else
+      print_memory_dump(out_, request.address(), response.data());
     return true;
   }
   case K::threads: {

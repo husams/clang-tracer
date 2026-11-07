@@ -85,6 +85,8 @@ public:
 
     virtual std::any visitKeyword(TracerCommandsParser::KeywordContext *context) = 0;
 
+    virtual std::any visitMemory(TracerCommandsParser::MemoryContext *context) = 0;
+
 
 };
 

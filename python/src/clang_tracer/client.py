@@ -207,6 +207,24 @@ class Client:
         )
         return response
 
+    def list_memory_mappings(self, session_id: str) -> pb.ListMemoryMappingsResponse:
+        """Snapshot the mapped ranges and permissions for an attached target."""
+        return self.stub.ListMemoryMappings(
+            pb.ListMemoryMappingsRequest(session_id=session_id), timeout=self.timeout
+        )
+
+    def read_memory(
+        self, session_id: str, address: int, size: int, *, mapping_token: str
+    ) -> bytes:
+        """Return a complete, owned copy of a readable range in a current snapshot."""
+        response = self.stub.ReadMemory(
+            pb.ReadMemoryRequest(
+                session_id=session_id, address=address, size=size, mapping_token=mapping_token
+            ),
+            timeout=self.timeout,
+        )
+        return response.data
+
     def list_threads(self, session_id: str) -> list[pb.TargetThread]:
         """List thread IDs, names and start times for an attached target."""
         response = self.stub.ListThreads(

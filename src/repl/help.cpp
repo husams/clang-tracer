@@ -43,6 +43,12 @@ const CommandTopic commands[] = {
      "  [--addresses] [--mapping TOKEN] [--address PC]",
      "Find supported C++ callables. Use --addresses for verified entries or --address with the mapping token to look up a PC.",
      "%symbols --filter Calculator --limit 20 --addresses"},
+    {"memory", "", "List mapped memory or read bytes from a mapped range."},
+    {"memory maps", "%memory maps",
+     "List all mapped ranges and permissions in the selected session and issue a memory snapshot token."},
+    {"memory read", "%memory read ADDRESS --mapping TOKEN (--count BYTES | --type TYPE)",
+     "Read up to 65536 bytes as a hex dump, or decode one little-endian u8/u16/u32/u64, "
+     "i8/i16/i32/i64, f32 or f64 value."},
 
     {"trace", "", "Preview, apply, or remove a bulk C++ trace."},
     {"trace preview", "%trace preview [--module GLOB] [--include GLOB] [--exclude GLOB] [--exact SIGNATURE]\n"

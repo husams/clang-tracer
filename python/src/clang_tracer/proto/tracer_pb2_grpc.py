@@ -75,6 +75,16 @@ class TracerStub(object):
                 request_serializer=tracer__pb2.ListModulesRequest.SerializeToString,
                 response_deserializer=tracer__pb2.ListModulesResponse.FromString,
                 _registered_method=True)
+        self.ListMemoryMappings = channel.unary_unary(
+                '/clangtracer.v1.Tracer/ListMemoryMappings',
+                request_serializer=tracer__pb2.ListMemoryMappingsRequest.SerializeToString,
+                response_deserializer=tracer__pb2.ListMemoryMappingsResponse.FromString,
+                _registered_method=True)
+        self.ReadMemory = channel.unary_unary(
+                '/clangtracer.v1.Tracer/ReadMemory',
+                request_serializer=tracer__pb2.ReadMemoryRequest.SerializeToString,
+                response_deserializer=tracer__pb2.ReadMemoryResponse.FromString,
+                _registered_method=True)
         self.ListThreads = channel.unary_unary(
                 '/clangtracer.v1.Tracer/ListThreads',
                 request_serializer=tracer__pb2.ListThreadsRequest.SerializeToString,
@@ -165,6 +175,18 @@ class TracerServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def ListModules(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListMemoryMappings(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReadMemory(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -261,6 +283,16 @@ def add_TracerServicer_to_server(servicer, server):
                     servicer.ListModules,
                     request_deserializer=tracer__pb2.ListModulesRequest.FromString,
                     response_serializer=tracer__pb2.ListModulesResponse.SerializeToString,
+            ),
+            'ListMemoryMappings': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListMemoryMappings,
+                    request_deserializer=tracer__pb2.ListMemoryMappingsRequest.FromString,
+                    response_serializer=tracer__pb2.ListMemoryMappingsResponse.SerializeToString,
+            ),
+            'ReadMemory': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReadMemory,
+                    request_deserializer=tracer__pb2.ReadMemoryRequest.FromString,
+                    response_serializer=tracer__pb2.ReadMemoryResponse.SerializeToString,
             ),
             'ListThreads': grpc.unary_unary_rpc_method_handler(
                     servicer.ListThreads,
@@ -520,6 +552,60 @@ class Tracer(object):
             '/clangtracer.v1.Tracer/ListModules',
             tracer__pb2.ListModulesRequest.SerializeToString,
             tracer__pb2.ListModulesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListMemoryMappings(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/ListMemoryMappings',
+            tracer__pb2.ListMemoryMappingsRequest.SerializeToString,
+            tracer__pb2.ListMemoryMappingsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReadMemory(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/ReadMemory',
+            tracer__pb2.ReadMemoryRequest.SerializeToString,
+            tracer__pb2.ReadMemoryResponse.FromString,
             options,
             channel_credentials,
             insecure,
