@@ -21,6 +21,7 @@
 
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/DeclTemplate.h>
+#include <clang/AST/Attr.h>
 #include <clang/AST/Expr.h>
 #include <clang/AST/PrettyPrinter.h>
 #include <llvm/Config/llvm-config.h>
@@ -699,6 +700,84 @@ std::string reflect_cpp_header(const std::vector<std::string> &arguments,
   return generated.source.substr(0, generated.source.find('\n') + 1) +
          "#pragma once\n" + manifest.str() + resolved_includes +
          generated.source.substr(generated.source.find('\n') + 1);
+}
+
+void validate_replay_types(const std::vector<std::string> &arguments,
+                           const std::string &prelude, const std::string &source) {
+  if (source.find("_Pragma") != std::string::npos ||
+      source.find("__pragma") != std::string::npos ||
+      source.find("??") != std::string::npos)
+    throw std::runtime_error("preprocessor directives are not replay declarations");
+  auto ci = compiler_for(arguments);
+  ci->getDiagnostics().setSuppressAllDiagnostics(false);
+  ci->getDiagnostics().setClient(new CheckDiagnostics(ci->getDiagnosticOpts()));
+  ci->getFrontendOpts().ProgramAction = clang::frontend::ParseSyntaxOnly;
+  bool missing = false;
+  llvm::Error error = llvm::Error::success();
+  auto interpreter = std::make_unique<CheckInterpreter>(std::move(ci), error, missing);
+  if (error)
+    throw std::runtime_error(llvm::toString(std::move(error)));
+  const auto parse = [&](const std::string &text) -> clang::PartialTranslationUnit & {
+    auto unit = interpreter->Parse(text);
+    if (!unit)
+      throw std::runtime_error(llvm::toString(unit.takeError()));
+    return *unit;
+  };
+  if (!prelude.empty())
+    parse(prelude);
+  const auto &unit = parse(source);
+  const auto validate = [&](const auto &self, const clang::Decl &decl) -> void {
+    if (decl.isImplicit())
+      return;
+    const auto reject = [&] {
+      throw std::runtime_error(std::string("unsupported replay declaration: ") +
+                               decl.getDeclKindName());
+    };
+    for (const auto *scope = decl.getDeclContext(); scope; scope = scope->getParent()) {
+      if (const auto *ns = llvm::dyn_cast<clang::NamespaceDecl>(scope);
+          ns && (ns->isStdNamespace() ||
+                 (ns->getParent()->isTranslationUnit() && ns->getName() == "tracer_repl")))
+        reject();
+    }
+    for (const auto *attr : decl.attrs()) {
+      if (attr->isImplicit() ||
+          llvm::isa<clang::AlignedAttr, clang::PackedAttr, clang::FinalAttr,
+                    clang::NoUniqueAddressAttr>(attr))
+        continue;
+      if (const auto *label = llvm::dyn_cast<clang::AsmLabelAttr>(attr);
+          label && llvm::isa<clang::FunctionDecl>(decl) &&
+          label->getLabel().starts_with("_Z") &&
+          label->getLabel().find_first_not_of("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_") ==
+              llvm::StringRef::npos)
+        continue;
+      reject();
+    }
+    if (const auto *function = llvm::dyn_cast<clang::FunctionDecl>(&decl)) {
+      if ((function->doesThisDeclarationHaveABody() &&
+           !function->isExplicitlyDefaulted() && !function->isDeletedAsWritten()) ||
+          llvm::any_of(function->parameters(), [](const auto *parameter) {
+            return parameter->hasDefaultArg() || parameter->hasAttrs();
+          }))
+        reject();
+    } else if (const auto *field = llvm::dyn_cast<clang::FieldDecl>(&decl)) {
+      if (field->hasInClassInitializer())
+        reject();
+    } else if (const auto *primary = llvm::dyn_cast<clang::ClassTemplateDecl>(&decl)) {
+      if (primary->getTemplatedDecl()->isCompleteDefinition())
+        reject();
+      self(self, *primary->getTemplatedDecl());
+    } else if (llvm::isa<clang::NamespaceDecl, clang::LinkageSpecDecl,
+                         clang::CXXRecordDecl, clang::EnumDecl>(decl)) {
+      const auto *scope = clang::Decl::castToDeclContext(&decl);
+      for (const auto *member : scope->decls())
+        self(self, *member);
+    } else if (!llvm::isa<clang::EnumConstantDecl, clang::TypedefNameDecl,
+                          clang::AccessSpecDecl, clang::EmptyDecl>(decl)) {
+      reject();
+    }
+  };
+  for (const auto *decl : unit.TUPart->decls())
+    validate(validate, *decl);
 }
 
 bool incomplete_cpp(const std::string &source) {

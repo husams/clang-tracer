@@ -424,6 +424,7 @@ class EventHub final {
   struct ProbeIdentity {
     std::uint32_t pid = 0;
     std::string function_name;
+    std::shared_ptr<const clangtracer::v1::PreparedInjector> replay_types;
   };
 
 public:
@@ -454,18 +455,31 @@ public:
   const std::string &path() const { return path_; }
 
   void set_probe(const std::string &session_id, std::uint64_t probe_id,
-                 std::uint32_t pid, std::string function_name, bool active) {
+                 std::uint32_t pid, std::string function_name, bool active,
+                 const clangtracer::v1::PreparedInjector *prepared = nullptr) {
+    std::shared_ptr<const clangtracer::v1::PreparedInjector> replay_types;
+    if (prepared && prepared->format_version() == tracer::prepared::typed_version &&
+        !prepared->adapter_declarations().empty() &&
+        prepared->ByteSizeLong() <= tracer::prepared::max_replay_type_bytes) {
+      auto types = std::make_shared<clangtracer::v1::PreparedInjector>();
+      types->set_format_version(prepared->format_version());
+      types->set_adapter_declarations(prepared->adapter_declarations());
+      *types->mutable_adapter_standard_headers() = prepared->adapter_standard_headers();
+      replay_types = std::move(types);
+    }
     std::lock_guard lock(mutex_);
     const auto key = std::make_pair(session_id, probe_id);
     if (active) {
       const auto existing = active_probes_.find(key);
       if (existing != active_probes_.end()) {
         function_name = existing->second.function_name;
+        replay_types = existing->second.replay_types;
       } else if (const auto known = known_probes_.find(key);
                  known != known_probes_.end()) {
         function_name = known->second.function_name;
+        replay_types = known->second.replay_types;
       }
-      ProbeIdentity identity{pid, std::move(function_name)};
+      ProbeIdentity identity{pid, std::move(function_name), std::move(replay_types)};
       active_probes_[key] = identity;
       constexpr std::size_t kKnownProbeLimit = 4096;
       bool retain_probe_identity = true;
@@ -767,6 +781,7 @@ public:
     for (;;) {
       std::vector<clangtracer::v1::TraceEvent> batch;
       std::size_t batch_bytes = 0;
+      std::set<std::uint64_t> included_types;
       {
         std::unique_lock lock(mutex_);
         if (context->IsCancelled())
@@ -789,10 +804,15 @@ public:
                         event.context().event().name() == name);
               });
           if (session_matches && pid_matches && name_matches) {
-            const auto bytes = event.ByteSizeLong();
+            const auto *types = request->include_replay_types()
+                                    ? recording_types(event, included_types) : nullptr;
+            const auto bytes = event.ByteSizeLong() +
+                               (types ? types->ByteSizeLong() + 8 : 0);
             if (!batch.empty() && batch_bytes + bytes > 32 * 1024 * 1024)
               break;
             batch.push_back(event);
+            if (types)
+              *batch.back().mutable_replay_types() = *types;
             batch_bytes += bytes;
           }
           cursor = event.sequence();
@@ -839,6 +859,7 @@ public:
     const auto &filter = request.filter();
     const auto limit = request.limit() == 0 ? 256 : request.limit();
     std::size_t bytes = 0;
+    std::set<std::uint64_t> included_types;
     for (const auto &event : history_) {
       if (event.sequence() > through) {
         break;
@@ -858,7 +879,10 @@ public:
                         }))) {
         continue;
       }
-      const auto charge = event.ByteSizeLong() + 16;
+      const auto *types = filter.include_replay_types()
+                              ? recording_types(event, included_types) : nullptr;
+      const auto charge = event.ByteSizeLong() + 16 +
+                          (types ? types->ByteSizeLong() + 8 : 0);
       if (charge > 31 * 1024 * 1024) {
         return {grpc::StatusCode::RESOURCE_EXHAUSTED,
                 "event exceeds drain response budget"};
@@ -866,7 +890,10 @@ public:
       if (bytes + charge > 31 * 1024 * 1024) {
         break;
       }
-      response.add_events()->CopyFrom(event);
+      auto *copy = response.add_events();
+      copy->CopyFrom(event);
+      if (types)
+        *copy->mutable_replay_types() = *types;
       bytes += charge;
       if (response.events_size() >= static_cast<int>(limit)) {
         break;
@@ -933,6 +960,19 @@ private:
   std::size_t context_event_count_ = 0;
   std::uint64_t next_sequence_ = 1;
   std::uint64_t dropped_ = 0;
+
+  const clangtracer::v1::PreparedInjector *
+  recording_types(const clangtracer::v1::TraceEvent &event,
+                  std::set<std::uint64_t> &included) const {
+    if (event.context().event().states().empty() || !included.insert(event.probe_id()).second)
+      return nullptr;
+    const auto key = std::make_pair(event.session_id(), event.probe_id());
+    const auto active = active_probes_.find(key);
+    if (active != active_probes_.end())
+      return active->second.replay_types.get();
+    const auto known = known_probes_.find(key);
+    return known == known_probes_.end() ? nullptr : known->second.replay_types.get();
+  }
 
   void receive_loop() {
     std::array<char, kMaxEventBytes> bytes{};
@@ -1102,6 +1142,7 @@ private:
         continue;
       // Function identity comes from the registered probe, not the agent packet.
       event.clear_function_name();
+      event.clear_replay_types();
       event.set_function_name(active->second.function_name);
       ++received_[active->first];
       event.set_sequence(next_sequence_++);
@@ -1390,7 +1431,7 @@ public:
               ? selector
               : spec.symbol();
       events_.set_probe(session->id(), pending_probe_id, session->pid(),
-                        function_name, true);
+                        function_name, true, &spec.prepared());
       const auto lineage = admit_probe_package(request->spec());
       if (!lineage.retained) {
         std::cerr << "clang-tracer: shared-context source lineage isolated: "

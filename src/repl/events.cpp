@@ -1,4 +1,5 @@
 #include "events.hpp"
+#include "../prepared_contract.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -935,6 +936,61 @@ void write_record(int fd, const api::TraceEvent &event) {
 }
 
 namespace {
+void read_recorded_types(sqlite3 *db, EventBuffer &buffer) {
+  const auto statement = [&](const char *sql) {
+    sqlite3_stmt *raw = nullptr;
+    const auto status = sqlite3_prepare_v2(db, sql, -1, &raw, nullptr);
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> rows(raw, sqlite3_finalize);
+    if (status != SQLITE_OK)
+      throw std::runtime_error(std::string("cannot read recorded types: ") + sqlite3_errmsg(db));
+    return rows;
+  };
+  const auto step = [&](sqlite3_stmt *rows) {
+    const auto status = sqlite3_step(rows);
+    if (status != SQLITE_ROW && status != SQLITE_DONE)
+      throw std::runtime_error(std::string("cannot read recorded types: ") + sqlite3_errmsg(db));
+    return status == SQLITE_ROW;
+  };
+  if (std::none_of(buffer.events().begin(), buffer.events().end(), [](const auto &event) {
+        return !event->message.context().event().states().empty();
+      }))
+    return;
+  const auto table = statement("SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                               "AND name = 'trace_event_types'");
+  if (!step(table.get()))
+    return; // Recordings made before portable types remain readable.
+  const auto types = statement("SELECT adapter FROM trace_event_types "
+                               "WHERE server_instance_id = ? AND session_id = ? AND probe_id = ?");
+  std::set<std::tuple<std::string, std::string, std::uint64_t>> seen_probes;
+  std::set<std::string> seen_adapters;
+  for (const auto &data : buffer.events()) {
+    const auto &event = data->message;
+    if (event.context().event().states().empty() ||
+        !seen_probes.emplace(event.server_instance_id(), event.session_id(), event.probe_id()).second)
+      continue;
+    sqlite3_reset(types.get());
+    const auto bind = [&](int index, const std::string &value) {
+      if (sqlite3_bind_text64(types.get(), index, value.data(), value.size(),
+                              SQLITE_TRANSIENT, SQLITE_UTF8) != SQLITE_OK)
+        throw std::runtime_error(std::string("cannot bind recorded types: ") + sqlite3_errmsg(db));
+    };
+    bind(1, event.server_instance_id());
+    bind(2, event.session_id());
+    bind(3, std::to_string(event.probe_id()));
+    if (!step(types.get()) || sqlite3_column_type(types.get(), 0) != SQLITE_BLOB)
+      continue;
+    const auto size = sqlite3_column_bytes(types.get(), 0);
+    if (size <= 0 || size > static_cast<int>(tracer::prepared::max_replay_type_bytes))
+      continue;
+    const auto *bytes = static_cast<const char *>(sqlite3_column_blob(types.get(), 0));
+    if (!bytes || !seen_adapters.emplace(bytes, size).second)
+      continue;
+    api::PreparedInjector adapter;
+    if (adapter.ParseFromArray(bytes, size))
+      buffer.replay_types.push_back(std::move(adapter));
+  }
+}
+
 void read_sqlite_recording(const std::string &path, const EventQuery &query,
                            api::TracePhase phase, EventBuffer &buffer) {
   // Prefix relative paths so they are literal filenames even in SQLite builds
@@ -1007,6 +1063,7 @@ void read_sqlite_recording(const std::string &path, const EventQuery &query,
       throw std::runtime_error("invalid event payload in SQLite recording: " + path);
     buffer.push(event);
   }
+  read_recorded_types(db.get(), buffer);
 }
 } // namespace
 

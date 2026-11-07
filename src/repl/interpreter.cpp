@@ -2,6 +2,7 @@
 #include "check_process.hpp"
 #include "completion.hpp"
 #include "mapping_cache.hpp"
+#include "../prepared_contract.hpp"
 
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/Decl.h>
@@ -28,6 +29,7 @@
 #endif
 #include <cstdlib>
 #include <filesystem>
+#include <set>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -124,6 +126,7 @@ struct CppEngine::Impl {
   using Stamp = std::pair<std::uintmax_t, std::filesystem::file_time_type>;
   std::map<std::filesystem::path, Stamp> headers;
   std::map<std::pair<std::string, std::filesystem::path>, std::string> mappings;
+  std::set<std::string> imported_adapters;
   bool synchronized = true;
   bool user_cells = false;
   void verify_inputs() const {
@@ -305,9 +308,32 @@ std::string CppEngine::import_headers(const std::vector<std::string> &headers,
 
 std::string CppEngine::import_prepared_adapter(const std::string &source) {
   const auto key = mapping_digest(source);
+  if (impl_ && impl_->imported_adapters.count(key))
+    return {};
   const auto path = mapping_cache_directory() / ("prepared-" + key + ".hpp");
   save_mapping_header(path, key, "#pragma once\n" + source);
-  return import_headers({path.string()});
+  auto imported = import_headers({path.string()});
+  impl_->imported_adapters.insert(key);
+  return imported;
+}
+
+std::string CppEngine::import_recorded_types(const clangtracer::v1::PreparedInjector &types) {
+  if (types.format_version() != tracer::prepared::typed_version ||
+      types.ByteSizeLong() > tracer::prepared::max_replay_type_bytes)
+    throw std::invalid_argument("unsupported recorded type bundle");
+  const auto source = tracer::prepared::adapter_source(types);
+  if (impl_ && impl_->imported_adapters.count(mapping_digest(source)))
+    return {};
+  const auto &declarations = types.adapter_declarations();
+  const auto helper = std::filesystem::path(executable_path()).parent_path() /
+                      "clang-tracer-repl-check";
+  const auto checked = run_cpp_analysis(
+      helper.string(), "replay-types", profile_arguments(arguments_),
+      source.substr(0, source.size() - declarations.size()), declarations);
+  if (checked.status != 0)
+    throw std::runtime_error("recorded adapter must contain declarations only\n" +
+                             checked.output);
+  return import_prepared_adapter(source);
 }
 
 void CppEngine::initialize() {

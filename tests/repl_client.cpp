@@ -178,7 +178,8 @@ public:
 
 int main(int argc, char **argv) {
   try {
-    if (argc == 3 && std::string(argv[1]) == "--write-replay-db") {
+    const bool unsafe_replay = argc == 3 && std::string(argv[1]) == "--write-unsafe-replay-db";
+    if (argc == 3 && (std::string(argv[1]) == "--write-replay-db" || unsafe_replay)) {
       api::TraceEvent event;
       event.set_server_instance_id("server");
       event.set_session_id("s1");
@@ -218,6 +219,12 @@ int main(int argc, char **argv) {
       auto *state = context->mutable_event()->add_states();
       state->set_epoch_schema_id(1);
       state->set_payload("\x0a\x05" "saved");
+      if (unsafe_replay) {
+        auto *adapter = event.mutable_replay_types();
+        adapter->set_format_version(4);
+        adapter->set_adapter_declarations(
+            "namespace replay_test { int init = *reinterpret_cast<volatile int *>(1); }");
+      }
       events.push_back(event);
       tracer::client::SQLiteEvents(argv[2]).write(events);
       return 0;

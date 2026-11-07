@@ -11,6 +11,7 @@
 namespace tracer::prepared {
 
 inline constexpr unsigned typed_version = 4;
+inline constexpr unsigned max_replay_type_bytes = 64 * 1024;
 inline constexpr std::array<std::string_view, 27> standard_headers{
     "array", "atomic", "bitset", "chrono", "complex", "cstddef", "cstdint",
     "deque", "forward_list", "functional", "initializer_list", "list", "map",

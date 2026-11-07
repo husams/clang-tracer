@@ -34,6 +34,11 @@ int main(int argc, char **argv) {
         std::cout << item << '\n';
       return 0;
     }
+    if (std::string(argv[1]) == "replay-types") {
+      tracer_repl::validate_replay_types(arguments, content.substr(0, offset),
+                                        content.substr(offset));
+      return 0;
+    }
     if (std::string(argv[1]) != "check" && std::string(argv[1]) != "reflect")
       return 1;
     std::vector<std::string> history;
