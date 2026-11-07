@@ -233,6 +233,12 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:prepared-concrete-target>
           "${CMAKE_CURRENT_SOURCE_DIR}/examples/prepared-injectors/concrete/types.hpp")
       set_tests_properties(native_repl_prepared_concrete PROPERTIES TIMEOUT 240)
+      add_test(NAME native_repl_prepared_history
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_prepared_history.sh"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:prepared-history-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/examples/prepared-injectors/concrete/history.hpp")
+      set_tests_properties(native_repl_prepared_history PROPERTIES TIMEOUT 240)
       foreach(_example methods state)
         add_test(NAME native_repl_prepared_${_example}
           COMMAND "${CMAKE_COMMAND}" -E env

@@ -4313,7 +4313,7 @@ bool validate_prepared_types(clang::ASTUnit &unit,
     ProbeSpec actual;
     actual.mutable_signature()->set_kind(method && !method->isStatic() ? METHOD : FUNCTION);
     tracer::prepared::describe_prepared_callable(ast, *decl, method, actual,
-                                                unit.hasSema() ? &unit.getSema() : nullptr);
+        unit.hasSema() ? &unit.getSema() : nullptr, &spec.prepared().header_types());
     if (actual.debug_info().SerializeAsString() != spec.prepared().header_types().SerializeAsString() ||
         actual.signature().SerializeAsString() != spec.signature().SerializeAsString())
       throw std::runtime_error("prepared types or record layout changed; prepare again");
