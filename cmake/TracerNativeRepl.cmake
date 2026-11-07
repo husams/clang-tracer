@@ -230,6 +230,16 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:repl-launch-target>)
       set_tests_properties(native_repl_launch_integration PROPERTIES TIMEOUT 120)
+      if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        add_executable(repl-overrides-target tests/fixtures/repl_overrides.cpp)
+        target_include_directories(repl-overrides-target PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_compile_options(repl-overrides-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
+        add_test(NAME native_repl_overrides_integration
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_overrides_integration.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:repl-overrides-target>)
+        set_tests_properties(native_repl_overrides_integration PROPERTIES TIMEOUT 150)
+      endif()
       add_executable(repl-browser-target tests/fixtures/repl_browser.cpp)
       target_link_libraries(repl-browser-target PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
       target_compile_options(repl-browser-target PRIVATE -g -O0 -fno-omit-frame-pointer)

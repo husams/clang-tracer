@@ -21,15 +21,16 @@ symbolOption : ('--filter' | '--module' | '--page' | '--address' | '--mapping') 
 probe : 'probe' ('prepare' value prepareOption+
       | 'resolve' value resolveOption*
       | 'inject' value '--callback' value deployOption*
-      | 'validate' value '--callback' value resolveOption*
+      | 'validate' value '--callback' value validateOption*
       | 'remove' UINT) | 'probes';
 prepareOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--output') value
               | METADATA_ONLY;
 resolveOption : ('--include' | '--compdb' | '--module' | '--compile-option'
                 | '--prepared' | '--prepared-mode') value;
-deployOption : resolveOption | '--stack-depth' UINT | '--print-arguments' | '--print-result';
+validateOption : resolveOption | '--allow-arg-overrides' | '--allow-result-override';
+deployOption : validateOption | '--stack-depth' UINT | '--print-arguments' | '--print-result';
 interceptor : 'interceptor' ('load' value '--as' value | 'edit' value | 'show' value
-      | 'validate' value '--target' value resolveOption*
+      | 'validate' value '--target' value validateOption*
             | 'upload' value '--target' value deployOption*);
 events : 'events' (streamOption*
        | 'list' value ('--limit' UINT)?

@@ -88,10 +88,12 @@ const CommandTopic commands[] = {
     {"probe resolve", "%probe resolve SELECTOR [RESOLUTION OPTIONS]",
      "Resolve a selector in the selected target and show the available metadata.",
      R"(%probe resolve "Calculator::multiply(int, int) const")"},
-    {"probe validate", "%probe validate SELECTOR --callback FILE [RESOLUTION OPTIONS]",
+    {"probe validate", "%probe validate SELECTOR --callback FILE [RESOLUTION OPTIONS]\n"
+     "  [--allow-arg-overrides] [--allow-result-override]",
      "Check whether the callback can be deployed for the selected function."},
-    {"probe inject", "%probe inject SELECTOR --callback FILE [RESOLUTION OPTIONS] [DEPLOYMENT OPTIONS]",
-     "Read a local callback file and install it on the selected target.",
+    {"probe inject", "%probe inject SELECTOR --callback FILE [RESOLUTION OPTIONS] [DEPLOYMENT OPTIONS]\n"
+     "  [--allow-arg-overrides] [--allow-result-override]",
+     "Install a callback. The two override flags separately enable scalar writes in pre() and post().",
      R"example(%probe inject "demo::compute(int)" --callback hook.cpp --prepared prepared)example"},
     {"probe remove", "%probe remove ID", "Remove a probe from the selected session and restore the original code."},
     {"probe reload", "%probe reload ID --callback FILE",

@@ -196,6 +196,8 @@ message ProbeSpec {
   reserved 16;
   repeated string compile_options = 17;
   PreparedInjector prepared = 18;
+  bool allow_argument_overrides = 19;
+  bool allow_result_override = 20;
 }
 message AttachRequest {
   uint32 pid = 1;
@@ -218,6 +220,7 @@ message JitRuntimeProfile {
   // The agent build default. Probe-specific flags and target signatures are
   // checked independently. Presence distinguishes the old ABI from unknown.
   optional bool libstdcxx_default_cxx11_abi = 9;
+  bool scalar_overrides_supported = 10;
 }
 message Session {
   string id = 1;
@@ -266,6 +269,8 @@ message ValidateProbeRequest {
   uint64 debug_max_entries = 9;
   uint32 debug_max_depth = 10;
   PreparedInjector prepared = 11;
+  bool allow_argument_overrides = 12;
+  bool allow_result_override = 13;
 }
 message ValidationDiagnostic {
   string stage = 1;
@@ -299,6 +304,8 @@ message Probe {
   uint64 replaces_probe_id = 14;
   uint64 superseded_by_probe_id = 15;
   bool draining = 16; // Superseded entry, still accepting events from its invocations.
+  bool allow_argument_overrides = 17;
+  bool allow_result_override = 18;
 }
 message ReloadProbeRequest {
   string session_id = 1;

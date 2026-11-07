@@ -32,6 +32,11 @@ int main() {
   require(call.kind == CommandKind::target_call && call.arguments[0] == "app::sum" &&
           call.options.at("--arg") == std::vector<std::string>{"-3", "1.25"});
   require(parse_command("%call-result --timeout 2").kind == CommandKind::target_call_result);
+  const auto overrides = parse_command("%probe inject f --callback hook.cpp --allow-arg-overrides --allow-result-override");
+  require(overrides.has("--allow-arg-overrides") && overrides.has("--allow-result-override"));
+  require(parse_command("%probe validate f --callback hook.cpp --allow-result-override")
+              .has("--allow-result-override"));
+  bad("%probe inject f --callback hook.cpp --allow-arg-overrides --allow-arg-overrides");
   bad("%call");
   bad("%call-result --arg 1");
   bad("%launch app --cwd here --cwd there");

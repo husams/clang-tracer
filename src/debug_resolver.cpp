@@ -37,6 +37,7 @@
 #include <fnmatch.h>
 
 #include "tracer/compat.hpp"
+#include "tracer/override_target.hpp"
 #include "linux_syscalls.hpp"
 #include "mapped_path.hpp"
 #include "prepared_contract.hpp"
@@ -938,6 +939,22 @@ std::pair<std::uint64_t, std::uint64_t> callable_code_range(DWARFDie die) {
   return {low, high};
 }
 
+bool in_override_section(const llvm::object::ELF64LEObjectFile &object,
+                         std::uint64_t low, std::uint64_t high) {
+  for (const auto &section : object.sections()) {
+    auto name = section.getName();
+    if (!name) {
+      llvm::consumeError(name.takeError());
+      continue;
+    }
+    const auto start = section.getAddress();
+    if (*name == CLANG_TRACER_OVERRIDE_SECTION && section.isText() &&
+        low >= start && high - start <= section.getSize())
+      return true;
+  }
+  return false;
+}
+
 void resolve_method_symbols(const llvm::object::ELF64LEObjectFile &object,
                             std::uint32_t pid,
                             const api::DebugInfo &module_identity,
@@ -1771,6 +1788,22 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
             if (paren != std::string::npos && compact(shape.selector) != selected) {
               return;
             }
+            if (options.require_override_abi) {
+              const auto producer = die.getDwarfUnit()->getUnitDIE().find(dw::DW_AT_producer);
+              auto text = producer ? producer->getAsCString() : llvm::Expected<const char *>(nullptr);
+              if (!text) {
+                llvm::consumeError(text.takeError());
+                throw std::runtime_error("scalar overrides require Clang DWARF calling-convention evidence");
+              }
+              const auto scope = decl.getParent().getTag();
+              if (!*text || !llvm::StringRef(*text).contains("clang version ") ||
+                  (scope != dw::DW_TAG_compile_unit && scope != dw::DW_TAG_namespace) ||
+                  number(die, dw::DW_AT_calling_convention, dw::DW_CC_normal) != dw::DW_CC_normal)
+                throw std::runtime_error("scalar overrides require Clang DWARF for a SysV free function");
+              for (const auto child : die.children())
+                if (child.getTag() == dw::DW_TAG_unspecified_parameters)
+                  throw std::runtime_error("variadic functions cannot use scalar overrides");
+            }
             found.spec.mutable_signature()->CopyFrom(shape.signature);
             for (const auto& argument_name : shape.argument_names) {
               found.spec.add_argument_names(argument_name);
@@ -1778,6 +1811,8 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
             auto* info = found.spec.mutable_debug_info();
             *info = before;
             const auto [low, high] = callable_code_range(die);
+            if (options.require_override_abi && !in_override_section(*object, low, high))
+              throw std::runtime_error("scalar overrides require TRACER_SCALAR_OVERRIDE_TARGET on the function definition");
             info->set_entry_virtual_address(low);
             info->set_entry_size(high - low);
             info->set_runtime_entry(runtime_entry(pid, *object, *info, low, high));

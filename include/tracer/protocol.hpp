@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace tracer {
 inline constexpr std::uint32_t kProtocolVersion = 2;
@@ -12,7 +13,8 @@ inline constexpr std::uint32_t kProtocolVersion = 2;
 // Version 20 adds capture-time owned value snapshots to TraceValue.
 // Version 21 verifies header-prepared scalar contracts without rescanning DWARF.
 // Version 23 reports target-side JIT compile time for prepared probes.
-inline constexpr std::uint32_t kBootstrapVersion = 25;
+// Version 26 adds invocation-local scalar override storage to TraceContext.
+inline constexpr std::uint32_t kBootstrapVersion = 26;
 inline constexpr unsigned kMaxPatchBytes = 64;
 inline constexpr unsigned kMaxArguments = 8;
 inline constexpr unsigned kMaxProbes = 32;
@@ -110,6 +112,29 @@ struct CallbackPrintOptions {
   bool result = false;
 };
 
+struct ScalarOverrides {
+  bool allow_arguments = false;
+  bool allow_result = false;
+  std::uint32_t argument_mask = 0;
+  bool result_set = false;
+  std::uint64_t arguments[kMaxArguments]{};
+  std::uint64_t result = 0;
+
+  template <class T> static std::uint64_t pack(T value) noexcept {
+    static_assert(sizeof(T) <= sizeof(std::uint64_t));
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(T));
+    return bits;
+  }
+
+  template <class T> static T unpack(std::uint64_t bits) noexcept {
+    static_assert(sizeof(T) <= sizeof(std::uint64_t));
+    T value;
+    std::memcpy(&value, &bits, sizeof(T));
+    return value;
+  }
+};
+
 struct TraceContext {
   std::uint64_t probe_id = 0;
   std::uint64_t object_address = 0;
@@ -144,6 +169,8 @@ struct TraceContext {
   void (*stack_capture)(const TraceContext *, unsigned,
                         bool) noexcept = nullptr;
   mutable StackTrace stack{};
+  // Wrapper-owned storage. Callbacks receive private staging storage.
+  ScalarOverrides *scalar_overrides = nullptr;
 };
 
 struct Request {

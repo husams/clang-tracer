@@ -133,7 +133,7 @@ public:
     }
     const std::set<std::string> flags = {
         "--all", "--metadata-only", "--print-arguments", "--print-result",
-        "--details", "--addresses", "--sqlite"};
+        "--details", "--addresses", "--sqlite", "--allow-arg-overrides", "--allow-result-override"};
     const std::set<std::string> repeated = {"--include", "--compile-option",
                                            "--name", "--type", "--arg", "--env"};
     const std::set<std::string> bulk_repeated = {"--module", "--exclude", "--exact"};

@@ -53,6 +53,8 @@ public:
 
     virtual std::any visitResolveOption(TracerCommandsParser::ResolveOptionContext *context) = 0;
 
+    virtual std::any visitValidateOption(TracerCommandsParser::ValidateOptionContext *context) = 0;
+
     virtual std::any visitDeployOption(TracerCommandsParser::DeployOptionContext *context) = 0;
 
     virtual std::any visitInterceptor(TracerCommandsParser::InterceptorContext *context) = 0;

@@ -93,6 +93,7 @@
 #include "tracer/compat.hpp"
 #include "tracer/compiler_options.hpp"
 #include "tracer/protocol.hpp"
+#include "scalar_overrides.hpp"
 #include "tracer/receiver_abi.hpp"
 
 #if !defined(__linux__) || !defined(__x86_64__)
@@ -1495,9 +1496,12 @@ std::string missing_recovered_record_declarations(
 }
 
 std::uint64_t validate_debug_entry(const clangtracer::v1::ProbeSpec &spec) {
+  if (const auto *error = tracer::scalar_override_error(spec))
+    throw std::invalid_argument(error);
   const auto &info = spec.debug_info();
   tracer::client::DebugLookupOptions lookup;
   lookup.module = info.module();
+  lookup.require_override_abi = tracer::has_scalar_overrides(spec);
   const auto live_patch = [](std::uint64_t address) -> tracer::client::PreparedCodePatch {
     const auto *current = agent.load(std::memory_order_acquire);
     if (current) {
@@ -2344,6 +2348,9 @@ std::string make_wrapper(const tracer::Request &r,
                          bool result_sret = false,
                          const tracer::ValueSnapshotCode *snapshots = nullptr) {
   const bool typed = spec && spec->prepared().format_version() == tracer::prepared::typed_version;
+  const bool override_arguments = spec && spec->allow_argument_overrides();
+  const bool override_result = spec && spec->allow_result_override();
+  const bool overrides = override_arguments || override_result;
   const auto indirect_argument = [&](unsigned i) {
     return typed && r.arguments[i] == tracer::ValueType::Object &&
            spec->debug_info().arguments(i).object_type().record_pass_by_reference();
@@ -2403,7 +2410,7 @@ std::string make_wrapper(const tracer::Request &r,
   if (result_sret)
     code += result_type() + "* (*) (" + result_type() + "*";
   else
-    code += result_type() + " (*) (";
+    code += result_type() + (overrides ? " (__attribute__((sysv_abi)) *) (" : " (*) (");
   bool comma = false;
   if (result_sret)
     comma = true;
@@ -2424,6 +2431,8 @@ std::string make_wrapper(const tracer::Request &r,
     code += "void";
   }
   code += ");\nextern \"C\" ";
+  if (overrides)
+    code += "__attribute__((sysv_abi)) ";
   code += result_sret ? result_type() + "* clangtracer_wrapper(" + result_type() +
                             "* result_slot"
                       : result_type() + " clangtracer_wrapper(";
@@ -2456,6 +2465,13 @@ std::string make_wrapper(const tracer::Request &r,
           std::to_string(r.probe_id) +
           "ULL); ctx.argument_count=" + std::to_string(r.argument_count) +
           "; ctx.phase=tracer::TracePhase::Pre;\n";
+  if (overrides) {
+    code += "tracer::ScalarOverrides overrides{}; ctx.scalar_overrides=&overrides;\n";
+    if (override_arguments)
+      code += "overrides.allow_arguments=true;\n";
+    if (override_result)
+      code += "overrides.allow_result=true;\n";
+  }
   code += "ctx.target_entry=" + std::to_string(r.original_entry) +
           "ULL; ctx.bridge_begin=reinterpret_cast<uintptr_t>(&&original_begin);"
           "ctx.bridge_end=reinterpret_cast<uintptr_t>(&&original_end);"
@@ -2496,6 +2512,17 @@ std::string make_wrapper(const tracer::Request &r,
     else
       code += "(void)tracer_callback_dispatch(" + std::to_string(r.probe_id) +
               "ULL,&ctx," + instance + ");\n";
+  }
+  if (override_arguments) {
+    for (unsigned i = 0; i < r.argument_count; ++i) {
+      const auto index = std::to_string(i);
+      const auto argument = "a" + index;
+      code += "if (overrides.argument_mask & (1u<<" + index + ")) { " +
+              argument + "=tracer::ScalarOverrides::unpack<decltype(" + argument +
+              ")>(overrides.arguments[" + index + "]);\n";
+      fill_value(code, i, r.arguments[i], false);
+      code += "}\n";
+    }
   }
   code += "auto original=reinterpret_cast<Original>(" +
           std::to_string(original_trampoline) + "ULL);\n";
@@ -2596,6 +2623,9 @@ std::string make_wrapper(const tracer::Request &r,
               "(void)tracer_callback_dispatch(" +
               std::to_string(r.probe_id) + "ULL,&ctx," + instance + ");\n";
   }
+  if (override_result)
+    code += "if (overrides.result_set) result="
+            "tracer::ScalarOverrides::unpack<decltype(result)>(overrides.result);\n";
   if (shared_mode)
     code += "tracer_shared_leave(shared_guard.token); "
             "tracer_shared_resume(shared_guard.token); "
@@ -4209,6 +4239,11 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
                    bool syntax_only = false,
                    clangtracer::v1::ValidationReport *report = nullptr,
                    const VerifiedDebugEntry *verified_entry = nullptr) {
+  if (const auto *invalid = tracer::scalar_override_error(specification)) {
+    error = invalid;
+    return false;
+  }
+  const bool overrides = tracer::has_scalar_overrides(specification);
   const auto validate_options = [&error](const auto &first, const auto &last,
                                          const char *source,
                                          bool allow_toolchain = false) {
@@ -4517,6 +4552,10 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
     const auto context_declarations =
         tracer::analyze_context_declarations(user_ast->getASTContext());
     if (context_declarations.requires_context) {
+      if (overrides) {
+        error = "scalar overrides require an invocation-scoped Interceptor";
+        return false;
+      }
       std::string signature_assert;
       if (!interceptor_template_prelude(source).empty()) {
         shape_valid = inspect_callback_shape(user_ast->getASTContext(), shape,
@@ -4553,6 +4592,13 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   bool baseline_preflight_succeeded = false;
   DiagnosticCapture complete_capture(nullptr);
   if (shape_valid) {
+    if (overrides &&
+        (!shape.class_mode ||
+         (specification.allow_argument_overrides() && !shape.has_pre) ||
+         (specification.allow_result_override() && !shape.has_post))) {
+      error = "scalar overrides require an Interceptor with pre() for arguments and post() for results";
+      return false;
+    }
     if (!validate_specialized_signature(user_ast->getASTContext(), shape,
                                         specification, error))
       return false;
@@ -4879,6 +4925,13 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
   long long value = 0;
   bool succeeded = false;
   tracer::TraceContext invocation = *ctx;
+  std::optional<tracer::ScalarOverrides> staged;
+  if (ctx->scalar_overrides) {
+    staged.emplace();
+    staged->allow_arguments = ctx->scalar_overrides->allow_arguments;
+    staged->allow_result = ctx->scalar_overrides->allow_result;
+    invocation.scalar_overrides = &*staged;
+  }
   invocation.named_count = 0;
   for (unsigned i = 0;
        i < invocation.argument_count && i < tracer::kMaxArguments; ++i)
@@ -4896,6 +4949,8 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
   }
   --callback_depth;
   if (succeeded) {
+    if (staged)
+      *ctx->scalar_overrides = *staged;
     tracer_event_dispatch(id, &invocation, value);
   }
   errno = saved_errno;
@@ -5160,6 +5215,10 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     clangtracer::v1::ProbeSpec specification;
     if (!read_probe_spec(p->request, specification, error)) {
       set_error(request, error.c_str());
+      return -1;
+    }
+    if (const auto *invalid = tracer::scalar_override_error(specification)) {
+      set_error(request, invalid);
       return -1;
     }
     // Named tracing uses the target's own independently re-read DWARF and ELF

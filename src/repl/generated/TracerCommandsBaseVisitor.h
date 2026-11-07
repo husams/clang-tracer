@@ -83,6 +83,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitValidateOption(TracerCommandsParser::ValidateOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitDeployOption(TracerCommandsParser::DeployOptionContext *ctx) override {
     return visitChildren(ctx);
   }

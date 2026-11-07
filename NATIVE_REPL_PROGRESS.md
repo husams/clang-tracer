@@ -331,3 +331,20 @@ long double, variadics, member pointers and the Microsoft x64 calling convention
 Eleven focused CTests passed with the GCC 8.5 SDK and Clang 21.1.8. The
 shell profile test timed out in the parallel run and passed on its isolated
 rerun.
+
+### L3 Opt-in scalar overrides
+
+A Clang-built target marks a free function with
+`TRACER_SCALAR_OVERRIDE_TARGET`. The agent verifies its mapped ELF section
+and DWARF signature before installing an ordinary SysV wrapper. Argument
+and result overrides have independent deployment flags and are available
+only on the local Unix control socket. Each successful hook commits its
+own staged changes. Failed hooks discard them, and exceptions from the
+original function propagate without running the POST hook.
+
+The live fixture covered independent opt-ins, a stack-passed argument,
+floating-point and 64-bit integer return registers, per-call recursion,
+hook rollback, target exceptions, errno preservation, and restoration on
+detach. Fourteen focused Linux x86-64 CTests passed with the GCC 8.5 SDK
+and Clang 21.1.8. The override fixture also passed on OverlayFS, and 198
+portable Python tests passed with the regenerated bindings.

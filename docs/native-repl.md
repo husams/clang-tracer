@@ -390,6 +390,57 @@ successor in place. Detach drains all generations.
 Borrow target pointers and references only during the callback. Use owned
 snapshots for REPL inspection and replay.
 
+### Opt in to scalar overrides
+
+Mark an eligible free-function definition in the application and build it with
+Clang and DWARF. The marker declares the ordinary Linux x86-64 SysV ABI.
+Use it on functions that follow the standard register preservation rules.
+The agent verifies the marked ELF section, mapped entry, calling convention,
+and complete scalar signature before installing a detour.
+
+```cpp
+#include <tracer/override_target.hpp>
+
+TRACER_SCALAR_OVERRIDE_TARGET int compute(int input) { return input * 2; }
+```
+
+In the callback, request an argument change in `pre()` or a return change in
+`post()`. Indexes start at zero.
+
+```cpp
+struct Interceptor {
+  void pre(const Call &call) {
+    if (call.arg<int>(0) == 10)
+      call.override_argument(0, 12);
+  }
+  void post(const Call &call) {
+    if (call.result<int>() == 24)
+      call.override_result(25);
+  }
+};
+```
+
+```text
+%probe validate "compute(int)" --callback override.cpp --allow-arg-overrides --allow-result-override
+%probe inject "compute(int)" --callback override.cpp --allow-arg-overrides --allow-result-override
+```
+
+Each flag enables only its corresponding hook operation. Overrides require a
+local Unix control socket and a DWARF binding. Use `--prepared-mode off` if a
+prepared package would otherwise be selected. Supported values are `bool`,
+signed 32- and 64-bit integers, unsigned 64-bit integers, `float`, and
+`double`. Match the slot's type and width exactly. A `void` function can use
+argument overrides.
+
+The original function runs with the committed arguments. An escaping hook
+exception discards its staged writes. An exception from the original function
+propagates to its caller without running `post()`. Overrides apply per call,
+including recursion, and preserve the original function's `errno` behavior.
+PRE events show the incoming arguments. POST events show the arguments used
+by the function and its original return value. Reload retains the permissions
+of the active generation. Removing the probe or detaching restores the
+function entry.
+
 ## Collect and inspect
 
 Missing semicolons inside loops or conditionals are syntax errors. They are

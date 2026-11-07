@@ -294,7 +294,7 @@ class PreparedInjector(_message.Message):
     def __init__(self, format_version: _Optional[int] = ..., module_sha256: _Optional[bytes] = ..., module_name: _Optional[str] = ..., selector: _Optional[str] = ..., symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., target_triple: _Optional[str] = ..., header_types: _Optional[_Union[DebugInfo, _Mapping]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., adapter_declarations: _Optional[str] = ..., adapter_standard_headers: _Optional[_Iterable[str]] = ..., adapter_abi_options: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class ProbeSpec(_message.Message):
-    __slots__ = ("symbol", "signature", "callback_source", "receiver", "receiver_unavailable_reason", "debug_info", "argument_names", "include_headers", "header_context", "stack_depth", "include_internal_stack_frames", "print_arguments", "print_result", "callback_package_path", "compile_options", "prepared")
+    __slots__ = ("symbol", "signature", "callback_source", "receiver", "receiver_unavailable_reason", "debug_info", "argument_names", "include_headers", "header_context", "stack_depth", "include_internal_stack_frames", "print_arguments", "print_result", "callback_package_path", "compile_options", "prepared", "allow_argument_overrides", "allow_result_override")
     SYMBOL_FIELD_NUMBER: _ClassVar[int]
     SIGNATURE_FIELD_NUMBER: _ClassVar[int]
     CALLBACK_SOURCE_FIELD_NUMBER: _ClassVar[int]
@@ -311,6 +311,8 @@ class ProbeSpec(_message.Message):
     CALLBACK_PACKAGE_PATH_FIELD_NUMBER: _ClassVar[int]
     COMPILE_OPTIONS_FIELD_NUMBER: _ClassVar[int]
     PREPARED_FIELD_NUMBER: _ClassVar[int]
+    ALLOW_ARGUMENT_OVERRIDES_FIELD_NUMBER: _ClassVar[int]
+    ALLOW_RESULT_OVERRIDE_FIELD_NUMBER: _ClassVar[int]
     symbol: str
     signature: Signature
     callback_source: str
@@ -327,7 +329,9 @@ class ProbeSpec(_message.Message):
     callback_package_path: str
     compile_options: _containers.RepeatedScalarFieldContainer[str]
     prepared: PreparedInjector
-    def __init__(self, symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., callback_source: _Optional[str] = ..., receiver: _Optional[_Union[ReceiverContext, _Mapping]] = ..., receiver_unavailable_reason: _Optional[str] = ..., debug_info: _Optional[_Union[DebugInfo, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., stack_depth: _Optional[int] = ..., include_internal_stack_frames: bool = ..., print_arguments: bool = ..., print_result: bool = ..., callback_package_path: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ...) -> None: ...
+    allow_argument_overrides: bool
+    allow_result_override: bool
+    def __init__(self, symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., callback_source: _Optional[str] = ..., receiver: _Optional[_Union[ReceiverContext, _Mapping]] = ..., receiver_unavailable_reason: _Optional[str] = ..., debug_info: _Optional[_Union[DebugInfo, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., stack_depth: _Optional[int] = ..., include_internal_stack_frames: bool = ..., print_arguments: bool = ..., print_result: bool = ..., callback_package_path: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ..., allow_argument_overrides: bool = ..., allow_result_override: bool = ...) -> None: ...
 
 class AttachRequest(_message.Message):
     __slots__ = ("pid", "expected_process_start_time", "expected_executable")
@@ -340,7 +344,7 @@ class AttachRequest(_message.Message):
     def __init__(self, pid: _Optional[int] = ..., expected_process_start_time: _Optional[int] = ..., expected_executable: _Optional[str] = ...) -> None: ...
 
 class JitRuntimeProfile(_message.Message):
-    __slots__ = ("agent_build_id", "bootstrap_protocol", "target_abi", "clang_version", "llvm_version", "glibc_version", "cxx_runtime_path", "libstdcxx_header_release", "libstdcxx_default_cxx11_abi")
+    __slots__ = ("agent_build_id", "bootstrap_protocol", "target_abi", "clang_version", "llvm_version", "glibc_version", "cxx_runtime_path", "libstdcxx_header_release", "libstdcxx_default_cxx11_abi", "scalar_overrides_supported")
     AGENT_BUILD_ID_FIELD_NUMBER: _ClassVar[int]
     BOOTSTRAP_PROTOCOL_FIELD_NUMBER: _ClassVar[int]
     TARGET_ABI_FIELD_NUMBER: _ClassVar[int]
@@ -350,6 +354,7 @@ class JitRuntimeProfile(_message.Message):
     CXX_RUNTIME_PATH_FIELD_NUMBER: _ClassVar[int]
     LIBSTDCXX_HEADER_RELEASE_FIELD_NUMBER: _ClassVar[int]
     LIBSTDCXX_DEFAULT_CXX11_ABI_FIELD_NUMBER: _ClassVar[int]
+    SCALAR_OVERRIDES_SUPPORTED_FIELD_NUMBER: _ClassVar[int]
     agent_build_id: str
     bootstrap_protocol: int
     target_abi: str
@@ -359,7 +364,8 @@ class JitRuntimeProfile(_message.Message):
     cxx_runtime_path: str
     libstdcxx_header_release: int
     libstdcxx_default_cxx11_abi: bool
-    def __init__(self, agent_build_id: _Optional[str] = ..., bootstrap_protocol: _Optional[int] = ..., target_abi: _Optional[str] = ..., clang_version: _Optional[str] = ..., llvm_version: _Optional[str] = ..., glibc_version: _Optional[str] = ..., cxx_runtime_path: _Optional[str] = ..., libstdcxx_header_release: _Optional[int] = ..., libstdcxx_default_cxx11_abi: bool = ...) -> None: ...
+    scalar_overrides_supported: bool
+    def __init__(self, agent_build_id: _Optional[str] = ..., bootstrap_protocol: _Optional[int] = ..., target_abi: _Optional[str] = ..., clang_version: _Optional[str] = ..., llvm_version: _Optional[str] = ..., glibc_version: _Optional[str] = ..., cxx_runtime_path: _Optional[str] = ..., libstdcxx_header_release: _Optional[int] = ..., libstdcxx_default_cxx11_abi: bool = ..., scalar_overrides_supported: bool = ...) -> None: ...
 
 class Session(_message.Message):
     __slots__ = ("id", "pid", "state", "probes", "error", "application_modules", "process_start_time", "jit_runtime", "executable")
@@ -426,7 +432,7 @@ class ResolveProbeRequest(_message.Message):
     def __init__(self, session_id: _Optional[str] = ..., selector: _Optional[str] = ..., include_headers: _Optional[_Iterable[str]] = ..., compilation_database: _Optional[str] = ..., module: _Optional[str] = ..., debug_max_entries: _Optional[int] = ..., debug_max_depth: _Optional[int] = ..., compile_options: _Optional[_Iterable[str]] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ...) -> None: ...
 
 class ValidateProbeRequest(_message.Message):
-    __slots__ = ("session_id", "selector", "callback_source", "include_headers", "compilation_database", "compile_options", "level", "module", "debug_max_entries", "debug_max_depth", "prepared")
+    __slots__ = ("session_id", "selector", "callback_source", "include_headers", "compilation_database", "compile_options", "level", "module", "debug_max_entries", "debug_max_depth", "prepared", "allow_argument_overrides", "allow_result_override")
     class Level(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         COMPILE: _ClassVar[ValidateProbeRequest.Level]
@@ -444,6 +450,8 @@ class ValidateProbeRequest(_message.Message):
     DEBUG_MAX_ENTRIES_FIELD_NUMBER: _ClassVar[int]
     DEBUG_MAX_DEPTH_FIELD_NUMBER: _ClassVar[int]
     PREPARED_FIELD_NUMBER: _ClassVar[int]
+    ALLOW_ARGUMENT_OVERRIDES_FIELD_NUMBER: _ClassVar[int]
+    ALLOW_RESULT_OVERRIDE_FIELD_NUMBER: _ClassVar[int]
     session_id: str
     selector: str
     callback_source: str
@@ -455,7 +463,9 @@ class ValidateProbeRequest(_message.Message):
     debug_max_entries: int
     debug_max_depth: int
     prepared: PreparedInjector
-    def __init__(self, session_id: _Optional[str] = ..., selector: _Optional[str] = ..., callback_source: _Optional[str] = ..., include_headers: _Optional[_Iterable[str]] = ..., compilation_database: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ..., level: _Optional[_Union[ValidateProbeRequest.Level, str]] = ..., module: _Optional[str] = ..., debug_max_entries: _Optional[int] = ..., debug_max_depth: _Optional[int] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ...) -> None: ...
+    allow_argument_overrides: bool
+    allow_result_override: bool
+    def __init__(self, session_id: _Optional[str] = ..., selector: _Optional[str] = ..., callback_source: _Optional[str] = ..., include_headers: _Optional[_Iterable[str]] = ..., compilation_database: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ..., level: _Optional[_Union[ValidateProbeRequest.Level, str]] = ..., module: _Optional[str] = ..., debug_max_entries: _Optional[int] = ..., debug_max_depth: _Optional[int] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ..., allow_argument_overrides: bool = ..., allow_result_override: bool = ...) -> None: ...
 
 class ValidationDiagnostic(_message.Message):
     __slots__ = ("stage", "severity", "file", "line", "column", "message")
@@ -488,7 +498,7 @@ class ValidationReport(_message.Message):
     def __init__(self, success: bool = ..., level: _Optional[_Union[ValidateProbeRequest.Level, str]] = ..., effective_options: _Optional[_Iterable[str]] = ..., diagnostics: _Optional[_Iterable[_Union[ValidationDiagnostic, _Mapping]]] = ..., prepared_used: bool = ...) -> None: ...
 
 class Probe(_message.Message):
-    __slots__ = ("id", "session_id", "symbol", "signature", "active", "callback_address", "entry_address", "original_bytes_restored", "agent_dropped_events", "callback_errors", "jit_compile_ns", "patch_install_ns", "bulk_batch_id", "replaces_probe_id", "superseded_by_probe_id", "draining")
+    __slots__ = ("id", "session_id", "symbol", "signature", "active", "callback_address", "entry_address", "original_bytes_restored", "agent_dropped_events", "callback_errors", "jit_compile_ns", "patch_install_ns", "bulk_batch_id", "replaces_probe_id", "superseded_by_probe_id", "draining", "allow_argument_overrides", "allow_result_override")
     ID_FIELD_NUMBER: _ClassVar[int]
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     SYMBOL_FIELD_NUMBER: _ClassVar[int]
@@ -505,6 +515,8 @@ class Probe(_message.Message):
     REPLACES_PROBE_ID_FIELD_NUMBER: _ClassVar[int]
     SUPERSEDED_BY_PROBE_ID_FIELD_NUMBER: _ClassVar[int]
     DRAINING_FIELD_NUMBER: _ClassVar[int]
+    ALLOW_ARGUMENT_OVERRIDES_FIELD_NUMBER: _ClassVar[int]
+    ALLOW_RESULT_OVERRIDE_FIELD_NUMBER: _ClassVar[int]
     id: int
     session_id: str
     symbol: str
@@ -521,7 +533,9 @@ class Probe(_message.Message):
     replaces_probe_id: int
     superseded_by_probe_id: int
     draining: bool
-    def __init__(self, id: _Optional[int] = ..., session_id: _Optional[str] = ..., symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., active: bool = ..., callback_address: _Optional[int] = ..., entry_address: _Optional[int] = ..., original_bytes_restored: bool = ..., agent_dropped_events: _Optional[int] = ..., callback_errors: _Optional[int] = ..., jit_compile_ns: _Optional[int] = ..., patch_install_ns: _Optional[int] = ..., bulk_batch_id: _Optional[str] = ..., replaces_probe_id: _Optional[int] = ..., superseded_by_probe_id: _Optional[int] = ..., draining: bool = ...) -> None: ...
+    allow_argument_overrides: bool
+    allow_result_override: bool
+    def __init__(self, id: _Optional[int] = ..., session_id: _Optional[str] = ..., symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., active: bool = ..., callback_address: _Optional[int] = ..., entry_address: _Optional[int] = ..., original_bytes_restored: bool = ..., agent_dropped_events: _Optional[int] = ..., callback_errors: _Optional[int] = ..., jit_compile_ns: _Optional[int] = ..., patch_install_ns: _Optional[int] = ..., bulk_batch_id: _Optional[str] = ..., replaces_probe_id: _Optional[int] = ..., superseded_by_probe_id: _Optional[int] = ..., draining: bool = ..., allow_argument_overrides: bool = ..., allow_result_override: bool = ...) -> None: ...
 
 class ReloadProbeRequest(_message.Message):
     __slots__ = ("session_id", "probe_id", "callback_source")

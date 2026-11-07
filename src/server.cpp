@@ -50,6 +50,7 @@
 #include "header_context.hpp"
 #include "injector.hpp"
 #include "session.hpp"
+#include "scalar_overrides.hpp"
 #include "tracer/compat.hpp"
 #include "tracer/compiler_options.hpp"
 
@@ -1174,12 +1175,13 @@ public:
                 std::string source_directory, std::chrono::seconds timeout,
                 std::string context_endpoint,
                 std::string context_durable_directory,
-                EventHistoryLimits limits)
+                EventHistoryLimits limits, bool local_control)
       : agent_path_(std::move(agent_path)), event_path_(std::move(event_path)),
         source_directory_(std::move(source_directory)), timeout_(timeout),
         context_endpoint_(std::move(context_endpoint)),
         context_durable_directory_(std::move(context_durable_directory)),
-        events_(event_path_, limits), next_probe_id_(random_probe_seed()) {}
+        local_control_(local_control), events_(event_path_, limits),
+        next_probe_id_(random_probe_seed()) {}
 
   void set_context_endpoint(std::string endpoint) {
     std::lock_guard lock(mutex_);
@@ -1400,6 +1402,8 @@ public:
       if (!resolved.spec.has_header_context())
         client::resolve_header_context(resolved.spec, request->compilation_database());
       resolved.spec.set_callback_source(request->callback_source());
+      resolved.spec.set_allow_argument_overrides(request->allow_argument_overrides());
+      resolved.spec.set_allow_result_override(request->allow_result_override());
       const auto input_valid = validate_probe(resolved.spec);
       if (!input_valid.ok())
         return input_valid;
@@ -2063,6 +2067,7 @@ private:
   std::string context_durable_directory_;
   std::condition_variable context_endpoint_cv_;
   bool context_endpoint_ready_ = false;
+  const bool local_control_;
   EventHub events_;
   std::atomic<std::uint64_t> next_probe_id_;
   std::mutex mutex_;
@@ -2243,6 +2248,10 @@ private:
   }
 
   grpc::Status validate_probe(const clangtracer::v1::ProbeSpec &spec) const {
+    if (has_scalar_overrides(spec) && !local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "scalar overrides require a local Unix control socket"};
+    if (const auto *error = scalar_override_error(spec))
+      return {grpc::StatusCode::INVALID_ARGUMENT, error};
     if (spec.has_prepared() && !spec.has_debug_info())
       return {grpc::StatusCode::INVALID_ARGUMENT, "prepared probe requires a live binding"};
     if (spec.prepared().format_version() == tracer::prepared::typed_version &&
@@ -2519,7 +2528,7 @@ int RunServer(const std::string &agent_path, const std::string &listen_uri,
   }
   TracerService service(canonical_agent, event_path, directory.path(),
                         operation_timeout, endpoint, durable_root,
-                        history_limits);
+                        history_limits, !socket_path.empty());
   LiveContextCapture live_context;
   context_delivery::ContextCollector context_collector(
       {}, {},

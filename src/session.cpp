@@ -146,6 +146,7 @@ clangtracer::v1::JitRuntimeProfile read_agent_profile(
   result.set_target_abi("linux-x86-64-sysv");
   result.set_clang_version(profile_text(profile.clang_version));
   result.set_llvm_version(profile_text(profile.llvm_version));
+  result.set_scalar_overrides_supported(true);
   result.set_glibc_version(profile_text(profile.glibc_version));
   result.set_cxx_runtime_path(profile_text(profile.cxx_runtime_path));
   result.set_libstdcxx_header_release(profile.libstdcxx_header_release);
@@ -504,6 +505,8 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     record.value.set_symbol(spec.symbol());
     record.value.set_bulk_batch_id(batch_id);
     record.value.mutable_signature()->CopyFrom(spec.signature());
+    record.value.set_allow_argument_overrides(spec.allow_argument_overrides());
+    record.value.set_allow_result_override(spec.allow_result_override());
     record.reload_spec.CopyFrom(spec);
     record.reload_spec.clear_callback_source();
     auto [it, inserted] = probes_.emplace(probe_id, std::move(record));

@@ -451,16 +451,20 @@ std::string Controller::prompt() const {
              : "tracer[" + std::to_string(selected_.pid) + "]> ";
 }
 
-void Controller::require_session(const SessionHandle &session) {
+void Controller::require_session(const SessionHandle &session, bool scalar_overrides) {
   if (!stub_ || session.id.empty() || session.connection != connection_) {
     throw std::runtime_error(
         "no valid selected session; use %attach PID or %use SESSION");
   }
+  if (scalar_overrides && endpoint_.rfind("unix:", 0) != 0)
+    throw std::runtime_error("scalar overrides require a local Unix control socket");
   api::ListSessionsRequest request;
   auto response = unary<api::ListSessionsResponse>(
       [&](auto &c, auto &r) { return stub_->ListSessions(&c, request, &r); });
   for (const auto &entry : response.sessions()) {
     if (entry.id() == session.id && entry.state() == api::Session::ATTACHED) {
+      if (scalar_overrides && !entry.jit_runtime().scalar_overrides_supported())
+        throw std::runtime_error("the server and agent do not support scalar overrides");
       return;
     }
   }
@@ -818,7 +822,9 @@ std::uint64_t Controller::inject(const SessionHandle &session,
                                  const std::string &source,
                                  const Command &options) {
   require_idle_target(session);
-  require_session(session);
+  const bool override_arguments = options.has("--allow-arg-overrides");
+  const bool override_result = options.has("--allow-result-override");
+  require_session(session, override_arguments || override_result);
   const auto resolve_started = std::chrono::steady_clock::now();
   auto spec = resolve_for(session, selector, options);
   const auto resolve_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -828,6 +834,8 @@ std::uint64_t Controller::inject(const SessionHandle &session,
       static_cast<unsigned>(options.number("--stack-depth", 0)));
   spec.set_print_arguments(options.has("--print-arguments"));
   spec.set_print_result(options.has("--print-result"));
+  spec.set_allow_argument_overrides(override_arguments);
+  spec.set_allow_result_override(override_result);
   api::AddProbeRequest request;
   request.set_session_id(session.id);
   *request.mutable_spec() = std::move(spec);
@@ -1699,7 +1707,9 @@ bool Controller::execute(const Command &command) {
   case K::validate:
   case K::draft_validate: {
     require_idle_target(selected_);
-    require_session(selected_);
+    const bool override_arguments = command.has("--allow-arg-overrides");
+    const bool override_result = command.has("--allow-result-override");
+    require_session(selected_, override_arguments || override_result);
     const bool named = command.kind == K::draft_validate;
     const auto selector = named ? command.option("--target") : args.at(0);
     api::ResolveProbeRequest resolution;
@@ -1707,6 +1717,8 @@ bool Controller::execute(const Command &command) {
     api::ValidateProbeRequest request;
     request.set_session_id(selected_.id);
     request.set_selector(selector);
+    request.set_allow_argument_overrides(override_arguments);
+    request.set_allow_result_override(override_result);
     request.set_callback_source(named ? drafts_.at(args.at(0))
                                       : read_source(command.option("--callback")));
     *request.mutable_include_headers() = resolution.include_headers();

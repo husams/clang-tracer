@@ -31,8 +31,8 @@ public:
     T__98 = 99, T__99 = 100, T__100 = 101, T__101 = 102, T__102 = 103, T__103 = 104,
     T__104 = 105, T__105 = 106, T__106 = 107, T__107 = 108, T__108 = 109,
     T__109 = 110, T__110 = 111, T__111 = 112, T__112 = 113, T__113 = 114,
-    UINT = 115, STRING = 116, SHELL = 117, METADATA_ONLY = 118, SQLITE = 119,
-    WORD = 120, WS = 121
+    T__114 = 115, T__115 = 116, UINT = 117, STRING = 118, SHELL = 119, METADATA_ONLY = 120,
+    SQLITE = 121, WORD = 122, WS = 123
   };
 
   enum {
@@ -40,12 +40,12 @@ public:
     RuleAttach = 4, RuleProcesses = 5, RuleSessions = 6, RuleUse = 7, RuleStatus = 8,
     RuleDetach = 9, RuleModules = 10, RuleThreads = 11, RuleSymbols = 12,
     RuleSymbolOption = 13, RuleProbe = 14, RulePrepareOption = 15, RuleResolveOption = 16,
-    RuleDeployOption = 17, RuleInterceptor = 18, RuleEvents = 19, RuleCollect = 20,
-    RuleRecord = 21, RuleStreamOption = 22, RuleCpp = 23, RuleShell = 24,
-    RuleComplete = 25, RuleType = 26, RuleHelp = 27, RuleQuit = 28, RuleBulkTrace = 29,
-    RuleBulkTraceOption = 30, RuleValue = 31, RuleKeyword = 32, RuleMemory = 33,
-    RuleProbeEntry = 34, RuleProbeReload = 35, RuleTargetLaunch = 36, RuleLaunchOption = 37,
-    RuleTargetCall = 38
+    RuleValidateOption = 17, RuleDeployOption = 18, RuleInterceptor = 19,
+    RuleEvents = 20, RuleCollect = 21, RuleRecord = 22, RuleStreamOption = 23,
+    RuleCpp = 24, RuleShell = 25, RuleComplete = 26, RuleType = 27, RuleHelp = 28,
+    RuleQuit = 29, RuleBulkTrace = 30, RuleBulkTraceOption = 31, RuleValue = 32,
+    RuleKeyword = 33, RuleMemory = 34, RuleProbeEntry = 35, RuleProbeReload = 36,
+    RuleTargetLaunch = 37, RuleLaunchOption = 38, RuleTargetCall = 39
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -82,6 +82,7 @@ public:
   class ProbeContext;
   class PrepareOptionContext;
   class ResolveOptionContext;
+  class ValidateOptionContext;
   class DeployOptionContext;
   class InterceptorContext;
   class EventsContext;
@@ -328,6 +329,8 @@ public:
     ResolveOptionContext* resolveOption(size_t i);
     std::vector<DeployOptionContext *> deployOption();
     DeployOptionContext* deployOption(size_t i);
+    std::vector<ValidateOptionContext *> validateOption();
+    ValidateOptionContext* validateOption(size_t i);
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -363,11 +366,24 @@ public:
 
   ResolveOptionContext* resolveOption();
 
+  class  ValidateOptionContext : public antlr4::ParserRuleContext {
+  public:
+    ValidateOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ResolveOptionContext *resolveOption();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  ValidateOptionContext* validateOption();
+
   class  DeployOptionContext : public antlr4::ParserRuleContext {
   public:
     DeployOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
-    ResolveOptionContext *resolveOption();
+    ValidateOptionContext *validateOption();
     antlr4::tree::TerminalNode *UINT();
 
 
@@ -383,8 +399,8 @@ public:
     virtual size_t getRuleIndex() const override;
     std::vector<ValueContext *> value();
     ValueContext* value(size_t i);
-    std::vector<ResolveOptionContext *> resolveOption();
-    ResolveOptionContext* resolveOption(size_t i);
+    std::vector<ValidateOptionContext *> validateOption();
+    ValidateOptionContext* validateOption(size_t i);
     std::vector<DeployOptionContext *> deployOption();
     DeployOptionContext* deployOption(size_t i);
 

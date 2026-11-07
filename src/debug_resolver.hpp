@@ -15,6 +15,7 @@ struct DebugLookupOptions {
   std::uint64_t max_entries = 0; // Zero is unlimited.
   std::uint32_t max_depth = 0; // Zero is unlimited.
   std::function<bool()> is_cancelled = [] { return false; };
+  bool require_override_abi = false;
 };
 
 class DebugLookupLimit : public std::runtime_error {
