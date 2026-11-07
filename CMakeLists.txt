@@ -85,7 +85,7 @@ target_link_libraries(tracer_proto PUBLIC protobuf::libprotobuf tracer_context_t
 add_library(tracer_grpc STATIC ${TRACER_PROTO_DIR}/tracer.grpc.pb.cc)
 target_link_libraries(tracer_grpc PUBLIC tracer_proto gRPC::grpc++)
 
-add_library(clang_tracer_agent SHARED src/agent.cpp src/value_snapshot_codegen.cpp src/value_snapshot_storage.cpp src/callback_pch.cpp src/debug_resolver.cpp src/native_stack.cpp
+add_library(clang_tracer_agent SHARED src/agent.cpp src/value_snapshot_codegen.cpp src/value_snapshot_storage.cpp src/callback_pch.cpp src/debug_resolver.cpp src/native_stack.cpp src/native_entry.cpp
   src/event_transport.cpp src/context_agent_delivery.cpp src/agent_runtime_profile.cpp)
 target_include_directories(clang_tracer_agent PRIVATE include ${TRACER_PROTO_DIR} ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_compile_definitions(clang_tracer_agent PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
@@ -106,7 +106,7 @@ add_custom_command(TARGET clang_tracer_agent POST_BUILD
   VERBATIM)
 
 add_executable(clang-tracer-server src/main.cpp src/server.cpp src/session.cpp src/injector.cpp src/admission.cpp
-  src/debug_resolver.cpp src/header_context.cpp src/process_memory.cpp)
+  src/debug_resolver.cpp src/header_context.cpp src/process_memory.cpp src/native_entry.cpp)
 target_include_directories(clang-tracer-server PRIVATE include ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_compile_definitions(clang-tracer-server PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
 target_link_libraries(clang-tracer-server PRIVATE tracer_grpc tracer_context_collector

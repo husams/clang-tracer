@@ -87,6 +87,8 @@ public:
 
     virtual std::any visitMemory(TracerCommandsParser::MemoryContext *context) = 0;
 
+    virtual std::any visitProbeEntry(TracerCommandsParser::ProbeEntryContext *context) = 0;
+
 
 };
 

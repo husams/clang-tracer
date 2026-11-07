@@ -90,6 +90,11 @@ class TracerStub(object):
                 request_serializer=tracer__pb2.ScanMemoryRequest.SerializeToString,
                 response_deserializer=tracer__pb2.ScanMemoryResponse.FromString,
                 _registered_method=True)
+        self.PreviewFunctionEntry = channel.unary_unary(
+                '/clangtracer.v1.Tracer/PreviewFunctionEntry',
+                request_serializer=tracer__pb2.PreviewFunctionEntryRequest.SerializeToString,
+                response_deserializer=tracer__pb2.PreviewFunctionEntryResponse.FromString,
+                _registered_method=True)
         self.ListThreads = channel.unary_unary(
                 '/clangtracer.v1.Tracer/ListThreads',
                 request_serializer=tracer__pb2.ListThreadsRequest.SerializeToString,
@@ -203,6 +208,12 @@ class TracerServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def PreviewFunctionEntry(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ListThreads(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -309,6 +320,11 @@ def add_TracerServicer_to_server(servicer, server):
                     servicer.ScanMemory,
                     request_deserializer=tracer__pb2.ScanMemoryRequest.FromString,
                     response_serializer=tracer__pb2.ScanMemoryResponse.SerializeToString,
+            ),
+            'PreviewFunctionEntry': grpc.unary_unary_rpc_method_handler(
+                    servicer.PreviewFunctionEntry,
+                    request_deserializer=tracer__pb2.PreviewFunctionEntryRequest.FromString,
+                    response_serializer=tracer__pb2.PreviewFunctionEntryResponse.SerializeToString,
             ),
             'ListThreads': grpc.unary_unary_rpc_method_handler(
                     servicer.ListThreads,
@@ -649,6 +665,33 @@ class Tracer(object):
             '/clangtracer.v1.Tracer/ScanMemory',
             tracer__pb2.ScanMemoryRequest.SerializeToString,
             tracer__pb2.ScanMemoryResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PreviewFunctionEntry(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/PreviewFunctionEntry',
+            tracer__pb2.PreviewFunctionEntryRequest.SerializeToString,
+            tracer__pb2.PreviewFunctionEntryResponse.FromString,
             options,
             channel_credentials,
             insecure,

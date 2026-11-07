@@ -180,6 +180,7 @@ def test_all_public_rpcs_have_client_methods():
         "ListMemoryMappings": "list_memory_mappings",
         "ReadMemory": "read_memory",
         "ScanMemory": "scan_memory",
+        "PreviewFunctionEntry": "preview_function_entry",
         "ListThreads": "list_threads",
         "PreviewBulkTrace": "preview_bulk_trace",
         "ApplyBulkTrace": "apply_bulk_trace",

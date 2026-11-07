@@ -22,6 +22,7 @@ enum class CommandKind {
   memory_maps,
   memory_read,
   memory_scan,
+  probe_entry,
   prepare,
   resolve,
   inject,

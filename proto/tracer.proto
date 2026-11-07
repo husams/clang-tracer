@@ -17,6 +17,7 @@ service Tracer {
   rpc ListMemoryMappings(ListMemoryMappingsRequest) returns (ListMemoryMappingsResponse);
   rpc ReadMemory(ReadMemoryRequest) returns (ReadMemoryResponse);
   rpc ScanMemory(ScanMemoryRequest) returns (ScanMemoryResponse);
+  rpc PreviewFunctionEntry(PreviewFunctionEntryRequest) returns (PreviewFunctionEntryResponse);
   rpc ListThreads(ListThreadsRequest) returns (ListThreadsResponse);
   rpc ListSymbols(ListSymbolsRequest) returns (ListSymbolsResponse);
   rpc PreviewBulkTrace(PreviewBulkTraceRequest) returns (PreviewBulkTraceResponse);
@@ -356,6 +357,50 @@ message ScanMemoryRequest {
 message ScanMemoryResponse {
   repeated uint64 addresses = 1; // Ascending match starts, including overlaps.
   bool truncated = 2; // At least one additional match was found.
+}
+message PreviewFunctionEntryRequest {
+  string session_id = 1;
+  string mapping_token = 2;
+  oneof entry {
+    string selector = 3; // C++ selector resolved through live DWARF.
+    uint64 elf_address = 4; // Link-time ELF virtual address, not a file offset.
+  }
+  string module = 5; // Exact absolute mapping path for an ELF address.
+  string abi = 6; // Required for an ELF address. Currently linux-x86-64-sysv.
+}
+message EntryInstruction {
+  enum Flow {
+    ORDINARY = 0;
+    BRANCH = 1;
+    CALL = 2;
+    RETURN = 3;
+  }
+  uint64 address = 1;
+  bytes encoding = 2;
+  string assembly = 3;
+  Flow flow = 4;
+  optional uint64 target_address = 5; // Absent for an unresolved transfer.
+  bool falls_through = 6;
+}
+message PreviewFunctionEntryResponse {
+  enum Boundary {
+    BOUNDARY_UNSPECIFIED = 0;
+    DWARF = 1;
+    ELF_SYMBOL = 2;
+    EH_FRAME = 3;
+  }
+  string module = 1;
+  string selector = 2;
+  string abi = 3;
+  uint64 elf_address = 4;
+  uint64 runtime_address = 5;
+  uint64 function_size = 6;
+  Boundary boundary = 7;
+  bytes entry_bytes = 8; // Verified against the mapped ELF and re-read live.
+  uint32 patch_size = 9; // Zero if the current copy-only detour policy rejects it.
+  string patch_diagnostic = 10;
+  repeated EntryInstruction instructions = 11;
+  bool decode_failed = 12; // A reachable instruction could not be decoded in bounds.
 }
 message ListThreadsRequest { string session_id = 1; }
 message TargetThread {

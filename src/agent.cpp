@@ -57,21 +57,10 @@
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
-#include <llvm/MC/MCAsmInfo.h>
-#include <llvm/MC/MCContext.h>
-#include <llvm/MC/MCDisassembler/MCDisassembler.h>
-#include <llvm/MC/MCInst.h>
-#include <llvm/MC/MCInstrInfo.h>
-#include <llvm/MC/MCRegisterInfo.h>
-#include <llvm/MC/MCSubtargetInfo.h>
-#include <llvm/MC/MCTargetOptions.h>
-#include <llvm/MC/TargetRegistry.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/MemoryBuffer.h>
-#include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/VirtualFileSystem.h>
 #include <llvm/Support/raw_ostream.h>
-#include <llvm/TargetParser/Host.h>
 #include <llvm/TargetParser/Triple.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -95,6 +84,7 @@
 #include "context_stdlib.hpp"
 #include "debug_resolver.hpp"
 #include "event_transport.hpp"
+#include "native_entry.hpp"
 #include "native_stack.hpp"
 #include "runtime_identity.hpp"
 #include "runtime_paths.hpp"
@@ -109,8 +99,7 @@
 #endif
 
 namespace {
-constexpr std::size_t kJumpBytes = 14;
-constexpr std::size_t kMaxDecodedBytes = tracer::kMaxPatchBytes - kJumpBytes;
+constexpr auto kJumpBytes = tracer::native_entry::jump_bytes;
 thread_local unsigned callback_depth = 0;
 
 struct DebugRecord {
@@ -2108,150 +2097,21 @@ bool mapping(const void *address, std::uintptr_t &begin, std::uintptr_t &end,
   return false;
 }
 
-bool initialize_llvm(std::string &error) {
-  static std::once_flag once;
-  static std::string init_error;
-  std::call_once(once, [] {
-    if (llvm::InitializeNativeTarget() ||
-        llvm::InitializeNativeTargetAsmPrinter() ||
-        llvm::InitializeNativeTargetDisassembler()) {
-      init_error = "LLVM native target initialization failed";
-    }
-  });
-  if (!init_error.empty()) {
-    error = init_error;
-    return false;
-  }
-  return true;
-}
-
-struct Decoder {
-  std::unique_ptr<llvm::MCRegisterInfo> regs;
-  std::unique_ptr<llvm::MCAsmInfo> asm_info;
-  std::unique_ptr<llvm::MCSubtargetInfo> sub;
-  std::unique_ptr<llvm::MCInstrInfo> ins;
-  std::unique_ptr<llvm::MCContext> context;
-  std::unique_ptr<llvm::MCDisassembler> dis;
-};
-
-bool make_decoder(Decoder &d, std::string &error) {
-  if (!initialize_llvm(error)) {
-    return false;
-  }
-  auto triple = llvm::sys::getDefaultTargetTriple();
-  std::string lookup_error;
-  auto *target = llvm::TargetRegistry::lookupTarget(triple, lookup_error);
-  if (!target) {
-    error = "LLVM target lookup failed: " + lookup_error;
-    return false;
-  }
-  llvm::MCTargetOptions options;
-  llvm::Triple parsed(triple);
-  d.regs.reset(target->createMCRegInfo(triple));
-  d.ins.reset(target->createMCInstrInfo());
-  d.sub.reset(target->createMCSubtargetInfo(triple, "generic", ""));
-  if (!d.regs || !d.ins || !d.sub) {
-    error = "LLVM MC metadata unavailable";
-    return false;
-  }
-  d.asm_info.reset(target->createMCAsmInfo(*d.regs, triple, options));
-  if (!d.asm_info) {
-    error = "LLVM MC assembly metadata unavailable";
-    return false;
-  }
-  d.context = std::make_unique<llvm::MCContext>(parsed, d.asm_info.get(),
-                                                d.regs.get(), d.sub.get());
-  d.dis.reset(target->createMCDisassembler(*d.sub, *d.context));
-  if (!d.dis) {
-    error = "LLVM MC disassembler unavailable";
-    return false;
-  }
-  return true;
-}
-
-bool safe_instruction(const llvm::MCInst &inst, const llvm::MCInstrInfo &ins,
-                      const llvm::MCRegisterInfo &regs) {
-  const auto &desc = ins.get(inst.getOpcode());
-  if (desc.isBranch() || desc.isCall() || desc.isReturn() ||
-      desc.isIndirectBranch()) {
-    return false;
-  }
-  const std::string name = ins.getName(inst.getOpcode()).str();
-  static constexpr std::string_view allowed[] = {
-      "PUSH64r",   "POP64r",    "MOV64rr",    "MOV32rr",   "MOV16rr",
-      "MOV8rr",    "MOV32ri",   "MOV64rm",    "MOV32rm",   "MOV16rm",
-      "MOV8rm",    "MOV64mr",   "MOV32mr",    "MOV16mr",   "MOV8mr",
-      "MOVSS",     "MOVSD",     "MOVAPS",     "MOVUPS",    "LEA64r",
-      "LEA32r",    "SUB64ri8",  "SUB64ri32",  "ADD64ri8",  "ADD64ri32",
-      "ADD32ri8",  "ADD32ri",   "IMUL32rri8", "IMUL32rri", "IMUL32rmi8",
-      "IMUL32rmi", "XOR64rr",   "XOR32rr",    "TEST64rr",  "TEST32rr",
-      "CMP64rr",   "CMP32rr",   "AND8i8",     "AND8ri",    "AND64ri8",
-      "AND64ri32", "XOR8i8",    "XOR8ri",     "NOP",
-      "NOOP",      "MOV64mi32", "MOV32mi",    "MOV16mi",   "MOV8mi"};
-  bool known = false;
-  for (auto p : allowed) {
-    if (name == p || (name.size() > p.size() && ::tracer::compat::starts_with(name, p))) {
-      known = true;
-      break;
-    }
-  }
-  if (!known) {
-    return false;
-  }
-  for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
-    if (inst.getOperand(i).isReg()) {
-      auto r = inst.getOperand(i).getReg();
-      const char *n = r ? regs.getName(r) : nullptr;
-      if (n && (!std::strcmp(n, "RIP") || !std::strcmp(n, "EIP"))) {
-        return false;
-      }
-    }
-  }
-  return true;
-}
-
 bool decode_patch(const std::uint8_t *entry, tracer::Request &req,
                   std::string &error) {
+  const auto address = reinterpret_cast<std::uintptr_t>(entry);
   std::uintptr_t lo = 0, hi = 0;
   int prot = 0;
-  if (!mapping(entry, lo, hi, prot) ||
-      hi - reinterpret_cast<std::uintptr_t>(entry) < kJumpBytes) {
+  if (!mapping(entry, lo, hi, prot) || hi - address < kJumpBytes) {
     error = "target entry has insufficient mapped bytes";
     return false;
   }
-  if (entry[0] == 0xf3 && entry[1] == 0x0f && entry[2] == 0x1e &&
-      entry[3] == 0xfa) {
-    error = "target entry has an ENDBR64 CET landing instruction";
+  const auto size = tracer::native_entry::patch_window(
+      address, {reinterpret_cast<const char *>(entry), hi - address}, error);
+  if (!size)
     return false;
-  }
-  Decoder d;
-  if (!make_decoder(d, error)) {
-    return false;
-  }
-  const auto address = reinterpret_cast<std::uintptr_t>(entry);
-  std::size_t used = 0;
-  while (used < kJumpBytes) {
-    llvm::MCInst inst;
-    std::uint64_t size = 0;
-    auto status = d.dis->getInstruction(
-        inst, size,
-        llvm::ArrayRef<std::uint8_t>(
-            entry + used, std::min<std::size_t>(kMaxDecodedBytes - used,
-                                                hi - address - used)),
-        address + used, llvm::nulls());
-    if (status != llvm::MCDisassembler::Success || !size ||
-        !safe_instruction(inst, *d.ins, *d.regs)) {
-      error = "target entry contains an unsupported or PC-relative instruction";
-      return false;
-    }
-    used += size;
-    if (used > kMaxDecodedBytes) {
-      error = "target entry exceeds safe patch window";
-      return false;
-    }
-  }
-  req.patch_size = static_cast<std::uint32_t>(used);
-  std::memcpy(req.original, entry, used);
+  req.patch_size = static_cast<std::uint32_t>(size);
+  std::memcpy(req.original, entry, size);
   return true;
 }
 
@@ -4462,7 +4322,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
       !determine_object_result_sret(specification, p.debug_records,
                                     result_sret, error))
     return false;
-  if (!initialize_llvm(error)) {
+  if (!tracer::native_entry::initialize_llvm(error)) {
     return false;
   }
   const std::string resource_dir_argument =

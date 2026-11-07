@@ -655,6 +655,86 @@ class ScanMemoryResponse(_message.Message):
     truncated: bool
     def __init__(self, addresses: _Optional[_Iterable[int]] = ..., truncated: bool = ...) -> None: ...
 
+class PreviewFunctionEntryRequest(_message.Message):
+    __slots__ = ("session_id", "mapping_token", "selector", "elf_address", "module", "abi")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    MAPPING_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    SELECTOR_FIELD_NUMBER: _ClassVar[int]
+    ELF_ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    MODULE_FIELD_NUMBER: _ClassVar[int]
+    ABI_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    mapping_token: str
+    selector: str
+    elf_address: int
+    module: str
+    abi: str
+    def __init__(self, session_id: _Optional[str] = ..., mapping_token: _Optional[str] = ..., selector: _Optional[str] = ..., elf_address: _Optional[int] = ..., module: _Optional[str] = ..., abi: _Optional[str] = ...) -> None: ...
+
+class EntryInstruction(_message.Message):
+    __slots__ = ("address", "encoding", "assembly", "flow", "target_address", "falls_through")
+    class Flow(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = ()
+        ORDINARY: _ClassVar[EntryInstruction.Flow]
+        BRANCH: _ClassVar[EntryInstruction.Flow]
+        CALL: _ClassVar[EntryInstruction.Flow]
+        RETURN: _ClassVar[EntryInstruction.Flow]
+    ORDINARY: EntryInstruction.Flow
+    BRANCH: EntryInstruction.Flow
+    CALL: EntryInstruction.Flow
+    RETURN: EntryInstruction.Flow
+    ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    ENCODING_FIELD_NUMBER: _ClassVar[int]
+    ASSEMBLY_FIELD_NUMBER: _ClassVar[int]
+    FLOW_FIELD_NUMBER: _ClassVar[int]
+    TARGET_ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    FALLS_THROUGH_FIELD_NUMBER: _ClassVar[int]
+    address: int
+    encoding: bytes
+    assembly: str
+    flow: EntryInstruction.Flow
+    target_address: int
+    falls_through: bool
+    def __init__(self, address: _Optional[int] = ..., encoding: _Optional[bytes] = ..., assembly: _Optional[str] = ..., flow: _Optional[_Union[EntryInstruction.Flow, str]] = ..., target_address: _Optional[int] = ..., falls_through: bool = ...) -> None: ...
+
+class PreviewFunctionEntryResponse(_message.Message):
+    __slots__ = ("module", "selector", "abi", "elf_address", "runtime_address", "function_size", "boundary", "entry_bytes", "patch_size", "patch_diagnostic", "instructions", "decode_failed")
+    class Boundary(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = ()
+        BOUNDARY_UNSPECIFIED: _ClassVar[PreviewFunctionEntryResponse.Boundary]
+        DWARF: _ClassVar[PreviewFunctionEntryResponse.Boundary]
+        ELF_SYMBOL: _ClassVar[PreviewFunctionEntryResponse.Boundary]
+        EH_FRAME: _ClassVar[PreviewFunctionEntryResponse.Boundary]
+    BOUNDARY_UNSPECIFIED: PreviewFunctionEntryResponse.Boundary
+    DWARF: PreviewFunctionEntryResponse.Boundary
+    ELF_SYMBOL: PreviewFunctionEntryResponse.Boundary
+    EH_FRAME: PreviewFunctionEntryResponse.Boundary
+    MODULE_FIELD_NUMBER: _ClassVar[int]
+    SELECTOR_FIELD_NUMBER: _ClassVar[int]
+    ABI_FIELD_NUMBER: _ClassVar[int]
+    ELF_ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    RUNTIME_ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    FUNCTION_SIZE_FIELD_NUMBER: _ClassVar[int]
+    BOUNDARY_FIELD_NUMBER: _ClassVar[int]
+    ENTRY_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PATCH_SIZE_FIELD_NUMBER: _ClassVar[int]
+    PATCH_DIAGNOSTIC_FIELD_NUMBER: _ClassVar[int]
+    INSTRUCTIONS_FIELD_NUMBER: _ClassVar[int]
+    DECODE_FAILED_FIELD_NUMBER: _ClassVar[int]
+    module: str
+    selector: str
+    abi: str
+    elf_address: int
+    runtime_address: int
+    function_size: int
+    boundary: PreviewFunctionEntryResponse.Boundary
+    entry_bytes: bytes
+    patch_size: int
+    patch_diagnostic: str
+    instructions: _containers.RepeatedCompositeFieldContainer[EntryInstruction]
+    decode_failed: bool
+    def __init__(self, module: _Optional[str] = ..., selector: _Optional[str] = ..., abi: _Optional[str] = ..., elf_address: _Optional[int] = ..., runtime_address: _Optional[int] = ..., function_size: _Optional[int] = ..., boundary: _Optional[_Union[PreviewFunctionEntryResponse.Boundary, str]] = ..., entry_bytes: _Optional[bytes] = ..., patch_size: _Optional[int] = ..., patch_diagnostic: _Optional[str] = ..., instructions: _Optional[_Iterable[_Union[EntryInstruction, _Mapping]]] = ..., decode_failed: bool = ...) -> None: ...
+
 class ListThreadsRequest(_message.Message):
     __slots__ = ("session_id",)
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]

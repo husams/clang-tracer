@@ -253,3 +253,19 @@ inputs, unmapped or protected memory, a mapped file fault, and stale
 tokens after permission changes, remapping and reattach.
 Eight focused CTests passed with the GCC 8.5 SDK and Clang 21.1.8. The
 memory fixture also passed on OverlayFS. All 198 portable Python tests passed.
+
+### I2 Verified function-entry previews
+
+`%probe entry` accepts a C++ selector or an exact module path and ELF
+virtual address with a Linux x86-64 SysV ABI label. It reuses the memory
+mapping token and verifies the live entry against the file-backed executable
+mapping. The explicit address requires an exact ELF function symbol or
+`.eh_frame` range start. The preview disassembles up to 64 bytes, explores
+in-window direct branch targets, and reports unresolved indirect targets.
+
+The agent and preview share the copy-only detour window check. The Linux
+fixture checked DWARF, ELF symbol and stripped PIE entries, byte-for-byte
+preservation during preview, refused prologues, and rejection of stale
+mapping tokens and changed entry bytes.
+Nine focused CTests passed with the GCC 8.5 SDK and Clang 21.1.8. The entry
+fixture also passed on OverlayFS. All 198 portable Python tests passed.

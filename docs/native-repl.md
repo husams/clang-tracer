@@ -213,6 +213,29 @@ A scan fails without returning matches if any part of its requested range
 is unreadable or the snapshot changes during inspection. The scan uses the
 configured operation timeout and supports Ctrl+C.
 
+## Preview a verified function entry
+
+```text
+%memory maps
+%probe entry "Calculator::multiply(int, int) const" --mapping TOKEN
+%probe entry --module /absolute/path/to/app --elf-address 0xELF_VA --abi linux-x86-64-sysv --mapping TOKEN
+```
+
+Use the token from the attached session's memory snapshot. A named entry
+uses DWARF. The explicit form requires the exact mapped module path and a
+link-time ELF virtual address. It accepts an exact function symbol start
+or an exact `.eh_frame` range start in a stripped image. The ABI label in
+that form is supplied by the caller. The preview verifies executable
+mapping identity and compares the live bytes with the ELF file, which
+must be a readable regular file of at most 128 MiB.
+
+The preview disassembles up to 64 verified entry bytes and follows direct
+branches within that window. Call targets are reported without following
+them. Indirect targets are shown as unresolved. `patch_size` shows the
+instruction-aligned window accepted by the current copy-only detour policy.
+If the policy rejects the entry, the preview shows the reason. It performs
+no installation or writes.
+
 ## Interceptor upload
 
 ```text

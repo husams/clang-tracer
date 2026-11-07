@@ -239,6 +239,23 @@ class Client:
             timeout=self.timeout,
         )
 
+    def preview_function_entry(
+        self, session_id: str, *, mapping_token: str, selector: str | None = None,
+        elf_address: int | None = None, module: str = "", abi: str = "",
+    ) -> pb.PreviewFunctionEntryResponse:
+        """Verify and disassemble a live entry without installing a probe."""
+        if (selector is None) == (elf_address is None):
+            raise ValueError("provide exactly one selector or ELF address")
+        request = pb.PreviewFunctionEntryRequest(
+            session_id=session_id, mapping_token=mapping_token, module=module, abi=abi
+        )
+        if selector is not None:
+            request.selector = selector
+        else:
+            assert elf_address is not None
+            request.elf_address = elf_address
+        return self.stub.PreviewFunctionEntry(request, timeout=self.timeout)
+
     def list_threads(self, session_id: str) -> list[pb.TargetThread]:
         """List thread IDs, names and start times for an attached target."""
         response = self.stub.ListThreads(

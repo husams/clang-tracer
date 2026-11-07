@@ -1515,6 +1515,15 @@ public:
     return memory::scan(*context, *session, timeout_, *request, *response);
   }
 
+  grpc::Status PreviewFunctionEntry(grpc::ServerContext *context,
+                                   const api::PreviewFunctionEntryRequest *request,
+                                   api::PreviewFunctionEntryResponse *response) override {
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    return memory::preview_entry(*context, *session, timeout_, *request, *response);
+  }
+
   grpc::Status ListThreads(
       grpc::ServerContext *context, const clangtracer::v1::ListThreadsRequest *request,
       clangtracer::v1::ListThreadsResponse *response) override {

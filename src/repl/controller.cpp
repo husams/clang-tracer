@@ -1351,6 +1351,59 @@ bool Controller::execute(const Command &command) {
          << " truncated=" << (response.truncated() ? "true" : "false") << '\n';
     return true;
   }
+  case K::probe_entry: {
+    require_session(selected_);
+    api::PreviewFunctionEntryRequest request;
+    request.set_session_id(selected_.id);
+    request.set_mapping_token(command.option("--mapping"));
+    request.set_module(command.option("--module"));
+    if (command.has("--elf-address")) {
+      request.set_elf_address(address_number(command.option("--elf-address")));
+      request.set_abi(command.option("--abi"));
+    } else {
+      request.set_selector(args.at(0));
+    }
+    const auto response = unary<api::PreviewFunctionEntryResponse>(
+        [&](auto &c, auto &r) {
+          Cancellation cancellation(c);
+          return stub_->PreviewFunctionEntry(&c, request, &r);
+        },
+        settings_.timeout_seconds);
+    out_ << "entry=0x" << std::hex << response.runtime_address()
+         << " elf=0x" << response.elf_address() << std::dec
+         << " module=" << std::quoted(printable_proc_text(response.module()))
+         << " boundary=" << api::PreviewFunctionEntryResponse::Boundary_Name(response.boundary())
+         << " abi=" << response.abi() << " function_size=" << response.function_size()
+         << " verified_bytes=" << response.entry_bytes().size();
+    if (!response.selector().empty())
+      out_ << " selector=" << std::quoted(printable_proc_text(response.selector()));
+    out_ << '\n';
+    for (const auto &instruction : response.instructions()) {
+      std::ostringstream line;
+      line << "0x" << std::hex << instruction.address() << "  ";
+      for (const unsigned char byte : instruction.encoding())
+        line << std::setfill('0') << std::setw(2) << static_cast<unsigned>(byte) << ' ';
+      line << std::dec << ' ' << instruction.assembly();
+      if (instruction.flow() != api::EntryInstruction::ORDINARY) {
+        line << " flow=" << api::EntryInstruction::Flow_Name(instruction.flow());
+        if (instruction.has_target_address())
+          line << " target=0x" << std::hex << instruction.target_address() << std::dec;
+        else
+          line << " target=unresolved";
+      }
+      if (instruction.falls_through())
+        line << " next=0x" << std::hex << instruction.address() + instruction.encoding().size();
+      out_ << line.str() << '\n';
+    }
+    if (response.decode_failed())
+      out_ << "disassembly incomplete within verified window\n";
+    if (response.patch_size())
+      out_ << "patch_size=" << response.patch_size() << " relocation=copy\n";
+    else
+      out_ << "patch_size=0 reason="
+           << std::quoted(printable_proc_text(response.patch_diagnostic())) << '\n';
+    return true;
+  }
   case K::threads: {
     require_session(selected_);
     api::ListThreadsRequest request;

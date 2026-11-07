@@ -65,6 +65,9 @@ const CommandTopic commands[] = {
     {"trace remove", "%trace remove BATCH_ID",
      "Remove or retry restoration of the probes owned by a batch in the selected session."},
     {"probe", "", "Prepare, resolve, validate, install, or remove a probe."},
+    {"probe entry", "%probe entry SELECTOR --mapping TOKEN [--module MODULE]\n"
+     "  or %probe entry --module PATH --elf-address ADDRESS --abi linux-x86-64-sysv --mapping TOKEN",
+     "Verify and disassemble a function entry and show the copy-only detour window and bounded control flow."},
     {"probe prepare",
      "%probe prepare SELECTOR --include HEADER --output NEW_DIRECTORY\n"
      "  [--compdb PATH] [--translation-unit FILE] [--module ELF] [--metadata-only]",
