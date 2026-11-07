@@ -25,8 +25,9 @@ cmake --build build-repl -j2
 ctest --test-dir build-repl --output-on-failure
 ```
 
-Supply a matching LLVM/Clang 21 or 22 development installation and gRPC/Protobuf
-development packages and compiler plugin. The implementation has separate
+Supply a matching LLVM/Clang 21 or 22 development installation, the gRPC and
+Protobuf development packages and compiler plugin, and the SQLite development
+package. The implementation has separate
 embedding paths for LLVM 21.1.8 and 22.1.8. Set `CMAKE_PREFIX_PATH` for dependencies
 outside the system search path. The existing full Linux build includes the REPL
 by default; `-DTRACER_BUILD_REPL=OFF` keeps the prior backend-only build.
@@ -254,6 +255,7 @@ can include `event_ranges.hpp` and use the `tracer_repl` namespace explicitly.
 %events stats batch
 %record capture.pb --count 1000
 %events open capture.pb --as saved
+%events open capture.db --as stored
 %events export saved --format json --output events.json
 %events clear saved
 ```
@@ -293,6 +295,38 @@ TraceEvent framing, with a 32 MiB per-frame limit. Recording and export create
 new files exclusively. Replay rejects truncated headers/bodies and invalid
 messages. A failed recording keeps its partial file; offline loading retains
 only the configured bounded window. Use recording for long captures.
+
+### Query a recording offline
+
+Open the native console without attaching to a process. To browse a SQLite
+recording from `clang-tracer drain --sqlite`, use the same commands as for
+a framed Protobuf recording.
+
+```text
+%events open capture.db --as saved
+%events list saved --limit 10
+%events show saved --index 0
+```
+
+Use `tracer.replay` to filter the recording before loading a collection.
+
+```cpp
+tracer_repl::EventQuery query;
+query.names = {"demo::compute(int)"};
+query.phase = "POST";
+query.count = 20;
+auto matches = tracer.replay("capture.db", query);
+for (const auto& event : matches) std::cout << event.result_as<int>() << '\n';
+```
+
+Set `pid` or `session_id` to narrow a capture that contains multiple processes
+or sessions. Names match exact function selectors or custom event names. A
+list of names matches any of them, and the other filters are combined. A
+positive count reads up to that many matches in recording order. Zero reads
+all matches and retains the latest events that fit the memory budget.
+`received` and `evicted` show how much of the query was retained. Replay opens
+SQLite read-only and works after the target and tracing server have exited.
+The results support the same typed accessors and C++ adaptors as live events.
 
 ## Analyze in C++
 

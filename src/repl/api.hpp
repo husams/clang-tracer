@@ -89,6 +89,16 @@ struct Collection {
   auto end() const { return events.end(); }
 };
 
+struct EventQuery {
+  // Match any exact function selector or custom event name.
+  std::vector<std::string> names;
+  std::string phase;
+  std::uint32_t pid = 0;
+  std::string session_id;
+  // Zero reads all matches, subject to the collection's retention limits.
+  std::uint64_t count = 0;
+};
+
 // Iteration visits a stable snapshot of the events retained at begin().
 // It never waits for new events; collection continues independently.
 class EventRange {
@@ -155,6 +165,7 @@ public:
                     unsigned timeout_seconds = 30);
   EventRange events_async(const SessionHandle& session, std::uint64_t count = 0,
                           unsigned timeout_seconds = 0);
+  Collection replay(const std::string &path, const EventQuery &query = {}) const;
   Collection batch(const std::string &name) const;
   void print(const Event &event) const;
   void print(const Collection &collection) const;

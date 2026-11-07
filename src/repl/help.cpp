@@ -77,8 +77,8 @@ const CommandTopic commands[] = {
     {"events calls", "%events calls NAME", "Pair PRE and POST events and show call durations and missing halves."},
     {"events stats", "%events stats NAME", "Summarize events, calls, loss, and capture status."},
     {"events clear", "%events clear NAME", "Remove a named collection and release its buffer space."},
-    {"events open", "%events open FILE.pb --as NAME", "Read a recording into a bounded collection for offline analysis.",
-     "%events open capture.pb --as saved"},
+    {"events open", "%events open FILE --as NAME", "Read a Protobuf or SQLite recording into a bounded collection for offline analysis.",
+     "%events open capture.db --as saved"},
     {"events export", "%events export NAME --format json --output NEW_FILE.json",
      "Write the retained events to a new JSON file."},
     {"collect", "%collect [STREAM OPTIONS] [--as NAME]", "Capture events into a bounded collection named batch by default.",
@@ -219,6 +219,14 @@ auto state = e.state_as<app::State>();)",
      "auto live = tracer.events_async(session, 10, 15);\nauto data = live.snapshot();\nlive.stop();",
      "The optional count and timeout default to zero, which leaves the corresponding limit open. "
      "Check running() and error() as capture proceeds."},
+    {"replay", "Query a Protobuf or SQLite recording offline and return a Collection.",
+     R"(tracer_repl::EventQuery query;
+query.names = {"account.adjusted"};
+query.count = 20;
+auto data = tracer.replay("capture.db", query);
+if (data.size()) tracer.print(data.at(0));)",
+     "Set names, phase, pid, session_id, or count to narrow the read. Names match exact function "
+     "selectors or custom event names. Count zero reads all matches within the retention budget."},
     {"batch", "Get a Collection from a named capture or replay.",
      R"(auto data = tracer.batch("results");
 if (data.size()) tracer.print(data.at(0));)",

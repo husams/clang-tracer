@@ -35,6 +35,6 @@ void event_statistics(const EventBuffer &buffer, std::ostream &out, bool calls);
 void write_record(int fd, const clangtracer::v1::TraceEvent &event);
 int create_recording(const std::string &path);
 EventBuffer open_recording(const std::string &path, std::size_t max_events,
-                           std::size_t max_bytes);
+                           std::size_t max_bytes, const EventQuery &query = {});
 void export_json(const EventBuffer &buffer, const std::string &path);
 } // namespace tracer_repl

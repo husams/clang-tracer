@@ -699,6 +699,26 @@ std::pair<std::size_t, std::size_t> Controller::background_storage() const {
   return used;
 }
 
+EventBuffer Controller::read_recording(const std::string &path,
+                                       const EventQuery &query) const {
+  auto [events, bytes] = background_storage();
+  for (const auto &entry : batches_) {
+    bytes += entry.second.bytes();
+    events += entry.second.events().size();
+  }
+  if (bytes >= settings_.max_bytes || events >= settings_.max_events) {
+    throw std::runtime_error(
+        "clear collections or release event ranges before loading a recording");
+  }
+  return open_recording(path, settings_.max_events - events,
+                        settings_.max_bytes - bytes, query);
+}
+
+Collection Controller::replay(const std::string &path,
+                              const EventQuery &query) const {
+  return read_recording(path, query).snapshot();
+}
+
 void Controller::stop_background(const std::string& session_id) {
   for (auto it = background_.begin(); it != background_.end();) {
     if (auto state = it->lock()) {
@@ -1062,24 +1082,11 @@ bool Controller::execute(const Command &command) {
       throw std::runtime_error("collection already exists: " + name +
                                "; choose a new name or use %events clear NAME");
     }
-    const auto reserved = background_storage();
-    std::size_t events = reserved.first, bytes = reserved.second;
-    for (const auto &b : batches_) {
-      if (b.first != command.option("--as")) {
-        bytes += b.second.bytes();
-        events += b.second.events().size();
-      }
-    }
-    if (bytes >= settings_.max_bytes || events >= settings_.max_events) {
-      throw std::runtime_error(
-          "clear collections before loading another recording");
-    }
-    auto loaded = open_recording(args.at(0), settings_.max_events - events,
-                                 settings_.max_bytes - bytes);
+    auto loaded = read_recording(args.at(0), {});
     out_ << "opened events=" << loaded.received
          << " retained=" << loaded.events().size()
          << " evicted=" << loaded.evicted << '\n';
-    batches_.insert_or_assign(command.option("--as"), std::move(loaded));
+    batches_.emplace(name, std::move(loaded));
     return true;
   }
   case K::event_export:
@@ -1184,6 +1191,10 @@ EventRange Facade::events(const SessionHandle& session, std::uint64_t count, uns
 EventRange Facade::events_async(const SessionHandle& session, std::uint64_t count,
                                 unsigned timeout) {
   return controller_->events_async(session, count, timeout);
+}
+
+Collection Facade::replay(const std::string &path, const EventQuery &query) const {
+  return controller_->replay(path, query);
 }
 
 Collection Facade::batch(const std::string &name) const {
