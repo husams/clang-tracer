@@ -426,6 +426,60 @@ struct Interceptor {
                 target.wait()
 
 
+@pytest.mark.parametrize("durable", [False, True])
+def test_configured_shared_event_bytes_preserve_large_stack(tmp_path, durable):
+    configured = os.getenv("CLANG_TRACER_NATIVE_BUILD")
+    if not configured or platform.system() != "Linux":
+        pytest.skip("set CLANG_TRACER_NATIVE_BUILD to a Linux native build directory")
+    build = Path(configured).resolve()
+    depth = 22000
+    event_bytes = 5 * 1024 * 1024
+    source = """
+struct Interceptor {
+  void pre(const Call &call) {
+    call.capture_stack(tracer::kUnlimitedStackDepth, false);
+    call.context().event("deep.shared");
+  }
+};
+"""
+    with subprocess.Popen(
+        [build / "deep-stack-target", str(depth)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    ) as target:
+        try:
+            assert target.stdin is not None and target.stdout is not None
+            assert target.stdout.readline() == b"READY\n"
+            with Client(f"unix://{tmp_path}/control.sock", timeout=60) as client:
+                client.start_server(
+                    str(build / "clang-tracer-server"),
+                    agent=str(build / "libclang_tracer_agent.so"),
+                    context_event_bytes=event_bytes,
+                    durable_directory=str(tmp_path / "journal") if durable else None,
+                )
+                session = client.attach(target.pid)
+                probe = client.inject(session.id, "traced_deep_leaf(int)", source)
+                target.stdin.write(b"x")
+                target.stdin.flush()
+                (event,) = client.collect_traces(
+                    1, session_ids=[session.id], names=["deep.shared"], timeout=25,
+                )
+                assert event.probe_id == probe.id
+                assert 2 * 1024 * 1024 < event.context.event.ByteSize() <= event_bytes
+                assert event.stack.status == pb.StackTrace.COMPLETE, event.stack.detail
+                assert len(event.stack.frames) > depth
+                assert any(frame.function == "main" for frame in event.stack.frames)
+                client.detach(session.id)
+        finally:
+            if target.stdin is not None:
+                target.stdin.close()
+            try:
+                target.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                target.kill()
+                target.wait()
+
+
 def test_real_native_api_resolution_injection_and_shutdown_restore(native):
     build, target, temporary = native
     with Client(f"unix://{temporary}/control.sock", timeout=30) as client:

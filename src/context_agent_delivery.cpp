@@ -98,9 +98,10 @@ ContextAgentDelivery::ContextAgentDelivery(const Request &request) {
     open.set_sink_id(sink);
   }
 
+  const auto limits = stream_limits_for_event_bytes(request.context_event_bytes);
   grpc::ChannelArguments arguments;
   arguments.SetInt(GRPC_ARG_ENABLE_RETRIES, 0);
-  arguments.SetMaxSendMessageSize(static_cast<int>(StreamLimits{}.max_packet_bytes));
+  arguments.SetMaxSendMessageSize(static_cast<int>(limits.max_packet_bytes));
   arguments.SetMaxReceiveMessageSize(4 * 1024);
   auto channel = grpc::CreateCustomChannel(
       endpoint, grpc::InsecureChannelCredentials(), arguments);
@@ -108,7 +109,7 @@ ContextAgentDelivery::ContextAgentDelivery(const Request &request) {
     return true;
   };
   client_ = std::make_unique<ContextExportClient>(
-      std::move(channel), std::move(open), StreamLimits{},
+      std::move(channel), std::move(open), limits,
       durable ? ContextExportClient::DurableConfirmation(confirmation)
               : ContextExportClient::DurableConfirmation{},
       journal_);

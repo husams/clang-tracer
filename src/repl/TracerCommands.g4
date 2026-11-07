@@ -5,7 +5,7 @@ command : server | attach | processes | sessions | use | status | detach
         | modules | threads | symbols | probe | interceptor | events | collect | record
         | cpp | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
-serverOption : ('--executable' | '--agent') value;
+serverOption : ('--executable' | '--agent') value | contextEventBytes;
 attach : 'attach' (UINT ('--start-time' UINT)?)?;
 processes : 'processes' ('--filter' value)?;
 sessions : 'sessions';
@@ -73,6 +73,7 @@ probeEntry : 'probe' 'entry' (value '--mapping' value ('--module' value)?
            | '--module' value '--elf-address' value '--abi' value '--mapping' value);
 probeReload : 'probe' 'reload' UINT '--callback' value;
 stackFilter : '--stack-application-only' value;
+contextEventBytes : '--context-event-bytes' UINT;
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';

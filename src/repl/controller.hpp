@@ -19,6 +19,7 @@ extern std::atomic<bool> interrupted;
 struct Settings {
   std::string endpoint, server, agent;
   unsigned timeout_seconds = 30;
+  std::uint32_t context_event_bytes = 0;
   std::size_t max_events = 4096, max_bytes = 64 * 1024 * 1024;
 };
 

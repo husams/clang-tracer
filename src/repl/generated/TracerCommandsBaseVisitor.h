@@ -163,6 +163,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitContextEventBytes(TracerCommandsParser::ContextEventBytesContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
 
 };
 

@@ -77,6 +77,25 @@ void report_export_failure(const char *label, std::uint64_t code = 0) noexcept {
 }
 }
 
+std::size_t ContextHookRing::max_capture_event_bytes() noexcept {
+  const auto metadata = StreamLimits{}.queued_packets * sizeof(Entry);
+  const auto packet_overhead = kStagingPerPacket * (kCaptureSchemasPerEvent + 1);
+  return (kStagingCreditBudgetBytes - metadata - packet_overhead) / kStagingMultiplier;
+}
+
+StreamLimits stream_limits_for_event_bytes(std::uint32_t event_bytes) {
+  const auto maximum = ContextHookRing::max_capture_event_bytes();
+  if (!event_bytes || event_bytes > maximum)
+    throw std::invalid_argument("--context-event-bytes must be between 1 and " +
+                                std::to_string(maximum) +
+                                " bytes for the shared transport memory budget");
+  StreamLimits limits;
+  limits.max_event_bytes = event_bytes;
+  // The producer packet wraps the EventRecord in a ContextFrame.
+  limits.max_packet_bytes = std::max(limits.max_packet_bytes, event_bytes + 64);
+  return limits;
+}
+
 HookPacket::StorageCharge::~StorageCharge() noexcept {
   reset();
 }
@@ -240,8 +259,6 @@ bool ContextHookRing::try_publish_batch(
     entry.allocation_size = bytes.size();
     entry.queue_charge = bytes.size();
     entry.reservation = next_reservation_++;
-    entry.schema_records = nullptr;
-    entry.schema_count = 0;
     entry.capture_event = false;
     std::memcpy(entry.storage, bytes.data(), bytes.size());
     entry.lease = packet.lease;
@@ -264,6 +281,11 @@ bool ContextHookRing::try_publish_capture(
   std::unique_lock lock(mutex_, std::try_to_lock);
   if (!lock.owns_lock() || event_record.empty() ||
       event_record.size() > capture_event_bytes_ || item_count_ == packet_limit_) {
+    dropped_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  const auto captured = schema_set->event_bytes();
+  if (event_record.data() != captured.data() || event_record.size() != captured.size()) {
     dropped_.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
@@ -295,23 +317,7 @@ bool ContextHookRing::try_publish_capture(
   const auto staging_bytes = (schema_bytes + event_record.size()) *
                                  kStagingMultiplier +
                              kStagingPerPacket * (schema_count + 1);
-  const auto remainder = event_record.size() % alignof(const tracer::context_engine::SchemaRecord *);
-  const auto padding = remainder == 0 ? 0 :
-      alignof(const tracer::context_engine::SchemaRecord *) - remainder;
-  if (schema_count > (std::numeric_limits<std::size_t>::max() -
-                      event_record.size() - padding) /
-                         sizeof(const tracer::context_engine::SchemaRecord *)) {
-    dropped_.fetch_add(1, std::memory_order_relaxed);
-    return false;
-  }
-  const auto allocation_bytes = event_record.size() + padding +
-      schema_count * sizeof(const tracer::context_engine::SchemaRecord *);
-  const auto queue_charge = event_record.size() + padding +
-      schema_count * sizeof(const tracer::context_engine::SchemaRecord *);
-  if (staging_bytes > std::numeric_limits<std::size_t>::max() - queue_charge) {
-    dropped_.fetch_add(1, std::memory_order_relaxed);
-    return false;
-  }
+  const auto queue_charge = event_record.size();
   if (queue_charge > capacity_ - queued_bytes_) {
     dropped_.fetch_add(1, std::memory_order_relaxed);
     return false;
@@ -330,36 +336,13 @@ bool ContextHookRing::try_publish_capture(
   } while (!g_live_packets.compare_exchange_weak(
       global_packets, global_packets + 1, std::memory_order_acq_rel,
       std::memory_order_relaxed));
-  const auto allocation = storage_->allocate(domain_, allocation_bytes);
-  if (allocation.status != tracer::context_engine::StorageStatus::ok) {
-    release_staging_credit(staging_bytes);
-    g_live_packets.fetch_sub(1, std::memory_order_release);
-    dropped_.fetch_add(1, std::memory_order_relaxed);
-    return false;
-  }
-  auto *base = static_cast<std::byte *>(allocation.pointer);
-  std::memcpy(base, event_record.data(), event_record.size());
-  auto *schema_records = reinterpret_cast<const tracer::context_engine::SchemaRecord **>(
-      base + event_record.size() + padding);
-  for (std::size_t i = 0; i < schema_count; ++i) {
-    schema_records[i] = schema_set->record(i);
-    if (!schema_records[i]) {
-      storage_->release(domain_, allocation.pointer, allocation_bytes);
-      release_staging_credit(staging_bytes);
-      g_live_packets.fetch_sub(1, std::memory_order_release);
-      dropped_.fetch_add(1, std::memory_order_relaxed);
-      return false;
-    }
-  }
+  // The lease already pins this buffer and its schemas. Keep it in the
+  // capture arena until the consumer has copied the packet outside the hook.
   Entry &entry = entries_[item_tail_];
-  entry.storage = allocation.pointer;
   entry.length = event_record.size();
   entry.staging_bytes = staging_bytes;
-  entry.allocation_size = allocation_bytes;
   entry.queue_charge = queue_charge;
   entry.reservation = next_reservation_++;
-  entry.schema_records = schema_records;
-  entry.schema_count = schema_count;
   entry.capture_event = true;
   entry.lease = schema_lease;
   queued_bytes_ += queue_charge;
@@ -373,12 +356,18 @@ bool ContextHookRing::try_take(HookPacket &packet) noexcept {
   if (in_flight_ || item_count_ == 0) return false;
   Entry &entry = entries_[item_head_];
   try {
-    packet.serialized_frame.assign(reinterpret_cast<const char *>(entry.storage), entry.length);
-    if (entry.schema_count)
-      packet.schema_records.assign(entry.schema_records,
-                                   entry.schema_records + entry.schema_count);
-    else
-      packet.schema_records.clear();
+    packet.schema_records.clear();
+    if (entry.capture_event) {
+      const auto *set = tracer::context_engine::capture_schema_set(entry.lease);
+      const auto bytes = set->event_bytes();
+      packet.serialized_frame.assign(reinterpret_cast<const char *>(bytes.data()),
+                                     bytes.size());
+      for (std::size_t i = 0; i < set->size(); ++i)
+        packet.schema_records.push_back(set->record(i));
+    } else {
+      packet.serialized_frame.assign(reinterpret_cast<const char *>(entry.storage),
+                                     entry.length);
+    }
   } catch (...) { return false; }
   packet.storage_charge.take(entry.staging_bytes);
   entry.staging_bytes = 0;
@@ -415,8 +404,6 @@ void ContextHookRing::complete(std::uint64_t reservation) noexcept {
   entry.allocation_size = 0;
   entry.queue_charge = 0;
   entry.reservation = 0;
-  entry.schema_records = nullptr;
-  entry.schema_count = 0;
   entry.capture_event = false;
   item_head_ = (item_head_ + 1) % packet_limit_;
   --item_count_;

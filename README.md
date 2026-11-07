@@ -132,7 +132,10 @@ hidden frames, and COMPLETE/PARTIAL/TRUNCATED continues to describe that unwind.
 omissions; the CLI prints both. Filtering never turns a truncated unwind into
 a complete one. A fully hidden snapshot may contain zero visible frames.
 The corresponding Protobuf fields preserve the same callback/CLI view.
-Shared-context events include the stack within their 256 KiB payload budget.
+Shared events include the stack in their payload. Start the server with
+`--context-event-bytes 4194304` to allow 4 MiB per shared event. The default
+is 256 KiB. This setting sizes capture and delivery together. Startup rejects
+values that exceed the shared transport memory budget.
 
 Callbacks can inspect the invocation’s frames (`pc`, `stack_pointer`, `kind`,
 `function`, `module`, `file`, `line`, `module_offset`, `application_frame`), frame count, requested

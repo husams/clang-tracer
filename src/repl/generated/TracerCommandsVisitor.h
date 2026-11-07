@@ -93,6 +93,8 @@ public:
 
     virtual std::any visitStackFilter(TracerCommandsParser::StackFilterContext *context) = 0;
 
+    virtual std::any visitContextEventBytes(TracerCommandsParser::ContextEventBytesContext *context) = 0;
+
 
 };
 

@@ -169,6 +169,7 @@ int main(int argc, char **argv) {
                      "FILTER] [--endpoint ENDPOINT]\n"
                      "  --server PATH --agent PATH --timeout SECONDS "
                      "--buffer-events N --buffer-bytes N\n"
+                     "  --context-event-bytes N (managed server)\n"
                      "  --cpp-arg ARG (repeatable) --startup FILE --fail-fast\n"
                      "C++17; replxx 0.0.4; ANTLR generator/runtime 4.13.2; "
                      "LLVM 21 or 22.\n"
@@ -205,6 +206,11 @@ int main(int argc, char **argv) {
       } else if (option == "--timeout") {
         settings.timeout_seconds =
             static_cast<unsigned>(tr::unsigned_number(value, "timeout", 300));
+      } else if (option == "--context-event-bytes") {
+        settings.context_event_bytes = static_cast<std::uint32_t>(
+            tr::unsigned_number(value, option, UINT32_MAX));
+        if (!settings.context_event_bytes)
+          throw std::invalid_argument(option + " must be positive");
       } else if (option == "--buffer-events") {
         settings.max_events =
             tr::unsigned_number(value, "buffer events", 1000000);

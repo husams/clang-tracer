@@ -69,15 +69,18 @@ def test_launch_with_history_limits(child):
         event_history_limit=1000,
         context_history_limit=10,
         context_history_bytes=4096,
+        context_event_bytes=4194304,
     )
     arguments = spawn.call_args.args[0]
-    assert arguments[-6:] == [
+    assert arguments[-8:] == [
         "--event-history-limit",
         "1000",
         "--context-history-limit",
         "10",
         "--context-history-bytes",
         "4096",
+        "--context-event-bytes",
+        "4194304",
     ]
     manager.shutdown()
 

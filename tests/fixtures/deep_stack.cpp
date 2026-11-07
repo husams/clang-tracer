@@ -1,5 +1,6 @@
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <fcntl.h>
 
 #include <unistd.h>
@@ -18,7 +19,8 @@ int traced_deep_leaf(int value) {
   return value + 1;
 }
 
-int main() {
+int main(int argc, char **argv) {
+  const int depth = argc > 1 ? std::atoi(argv[1]) : 1200;
   if (::fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK) < 0)
     return 1;
   std::puts("READY");
@@ -29,7 +31,7 @@ int main() {
     if (count == 0)
       return 0;
     if (count > 0) {
-      if (recursive_entry(1200) != 1201)
+      if (recursive_entry(depth) != depth + 1)
         return 1;
     } else if (errno == EAGAIN || errno == EINTR) {
       ::usleep(10000);

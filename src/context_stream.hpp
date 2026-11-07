@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "context_transport.grpc.pb.h"
+#include "tracer/protocol.hpp"
 #include "engine_storage.hpp"
 #include "tracer/compat.hpp"
 
@@ -42,10 +43,12 @@ struct StreamLimits {
   std::size_t queued_packets = 4096;
   std::size_t queued_bytes = 64ull * 1024 * 1024;
   std::uint32_t max_packet_bytes = 2 * 1024 * 1024;
-  std::uint32_t max_event_bytes = 256 * 1024;
+  std::uint32_t max_event_bytes = tracer::kDefaultContextEventBytes;
   std::uint32_t max_epoch_schemas = 256;
   std::uint64_t max_epoch_schema_bytes = 16ull * 1024 * 1024;
 };
+
+StreamLimits stream_limits_for_event_bytes(std::uint32_t event_bytes);
 
 struct ExportCounters {
   std::uint64_t capture_failed = 0, queue_dropped = 0;
@@ -92,7 +95,8 @@ public:
   explicit ContextHookRing(std::size_t byte_capacity = 64ull * 1024 * 1024,
                            std::size_t packet_limit = 4096,
                            std::size_t packet_bytes = 2 * 1024 * 1024,
-                           std::size_t capture_event_bytes = 256 * 1024);
+                           std::size_t capture_event_bytes = tracer::kDefaultContextEventBytes);
+  static std::size_t max_capture_event_bytes() noexcept;
   ~ContextHookRing();
   ContextHookRing(const ContextHookRing &) = delete;
   ContextHookRing &operator=(const ContextHookRing &) = delete;
@@ -115,8 +119,6 @@ private:
     std::size_t queue_charge = 0;
     std::uint64_t reservation = 0;
     std::shared_ptr<const void> lease;
-    const tracer::context_engine::SchemaRecord **schema_records = nullptr;
-    std::size_t schema_count = 0;
     bool capture_event = false;
   };
   const std::size_t capacity_, packet_limit_, packet_bytes_, capture_event_bytes_;

@@ -251,6 +251,11 @@ Command parse_command(const std::string &input) {
       command.number(key, 0);
     }
   }
+  if (command.has("--context-event-bytes")) {
+    const auto bytes = command.number("--context-event-bytes", 0);
+    if (!bytes || bytes > UINT32_MAX)
+      throw std::invalid_argument("--context-event-bytes must be a positive 32-bit byte count");
+  }
   if (command.number("--limit", 0) > UINT32_MAX) {
     throw std::invalid_argument("--limit must fit a 32-bit page size");
   }

@@ -784,6 +784,7 @@ class Client:
         event_history_limit: int | None = None,
         context_history_limit: int | None = None,
         context_history_bytes: int | None = None,
+        context_event_bytes: int | None = None,
     ) -> ServerStatus:
         """Start a local child and confirm both managed and client readiness.
 
@@ -810,6 +811,7 @@ class Client:
             event_history_limit=event_history_limit,
             context_history_limit=context_history_limit,
             context_history_bytes=context_history_bytes,
+            context_event_bytes=context_event_bytes,
         )
         # A channel used before a restart may still be reconnecting after a
         # failed status check; wait until this client's channel is usable too.

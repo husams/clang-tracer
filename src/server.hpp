@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <string>
 
+#include "tracer/protocol.hpp"
+
 namespace tracer {
 
 struct EventHistoryLimits {
@@ -16,6 +18,7 @@ struct EventHistoryLimits {
 int RunServer(const std::string &agent_path, const std::string &listen_uri,
               std::chrono::seconds operation_timeout,
               const std::string &context_durable_directory = {},
-              EventHistoryLimits history_limits = {});
+              EventHistoryLimits history_limits = {},
+              std::uint32_t context_event_bytes = kDefaultContextEventBytes);
 
 } // namespace tracer

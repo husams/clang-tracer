@@ -161,12 +161,14 @@ Session::Session(std::string id, std::uint32_t pid, std::uint64_t process_start,
                  std::string agent_path, std::string event_path,
                  std::string context_endpoint,
                  std::string context_durable_directory,
-                 std::chrono::seconds operation_timeout)
+                 std::chrono::seconds operation_timeout,
+                 std::uint32_t context_event_bytes)
     : id_(std::move(id)), pid_(pid), process_start_(process_start),
       agent_path_(std::move(agent_path)), event_path_(std::move(event_path)),
       context_endpoint_(std::move(context_endpoint)),
       context_durable_directory_(std::move(context_durable_directory)),
-      operation_timeout_(operation_timeout) {}
+      operation_timeout_(operation_timeout),
+      context_event_bytes_(context_event_bytes) {}
 
 std::uint64_t Session::ProcessStartTime(std::uint32_t pid) {
   return proc::start_time(proc::directory(pid) / "stat");
@@ -470,6 +472,7 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     request.expected_replaced_probe_id = reload_probe_id;
     copy_field(request.session_id, id_, "session id");
     request.context_native_pid = pid_;
+    request.context_event_bytes = context_event_bytes_;
     request.context_process_start_time = process_start_;
     copy_field(request.symbol, spec.symbol(), "symbol");
     copy_field(request.source_path, source_file, "callback source path");

@@ -61,16 +61,18 @@ class ServerProcess:
         event_history_limit: int | None = None,
         context_history_limit: int | None = None,
         context_history_bytes: int | None = None,
+        context_event_bytes: int | None = None,
     ) -> Self:
         positive_timeout(timeout)
         limits = {
             "--event-history-limit": event_history_limit,
             "--context-history-limit": context_history_limit,
             "--context-history-bytes": context_history_bytes,
+            "--context-event-bytes": context_event_bytes,
         }
         for option, value in limits.items():
             if value is not None:
-                uint(value, 63, option, 1)
+                uint(value, 32 if option == "--context-event-bytes" else 63, option, 1)
         if isinstance(operation_timeout, bool) or not isinstance(
             operation_timeout, int
         ):

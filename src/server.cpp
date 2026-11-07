@@ -1231,11 +1231,12 @@ public:
                 std::string source_directory, std::chrono::seconds timeout,
                 std::string context_endpoint,
                 std::string context_durable_directory,
-                EventHistoryLimits limits)
+                EventHistoryLimits limits, std::uint32_t context_event_bytes)
       : agent_path_(std::move(agent_path)), event_path_(std::move(event_path)),
         source_directory_(std::move(source_directory)), timeout_(timeout),
         context_endpoint_(std::move(context_endpoint)),
         context_durable_directory_(std::move(context_durable_directory)),
+        context_event_bytes_(context_event_bytes),
         events_(event_path_, limits), next_probe_id_(random_probe_seed()) {}
 
   void set_context_endpoint(std::string endpoint) {
@@ -1328,7 +1329,7 @@ public:
     auto session = std::make_shared<Session>(
         id, pid, process_start, agent_path_, event_path_,
         std::move(context_endpoint), std::move(producer_journal_directory),
-        timeout_);
+        timeout_, context_event_bytes_);
     try {
       session->attach(request->expected_executable());
       std::lock_guard lock(mutex_);
@@ -2117,6 +2118,7 @@ private:
   std::chrono::seconds timeout_;
   std::string context_endpoint_;
   std::string context_durable_directory_;
+  std::uint32_t context_event_bytes_;
   std::condition_variable context_endpoint_cv_;
   bool context_endpoint_ready_ = false;
   EventHub events_;
@@ -2532,7 +2534,8 @@ private:
 int RunServer(const std::string &agent_path, const std::string &listen_uri,
               std::chrono::seconds operation_timeout,
               const std::string &context_durable_directory,
-              EventHistoryLimits history_limits) {
+              EventHistoryLimits history_limits, std::uint32_t context_event_bytes) {
+  const auto stream_limits = context_delivery::stream_limits_for_event_bytes(context_event_bytes);
   if (history_limits.events == 0 || history_limits.context_events == 0 ||
       history_limits.context_bytes == 0 ||
       history_limits.context_bytes >
@@ -2573,10 +2576,10 @@ int RunServer(const std::string &agent_path, const std::string &listen_uri,
   }
   TracerService service(canonical_agent, event_path, directory.path(),
                         operation_timeout, endpoint, durable_root,
-                        history_limits);
+                        history_limits, context_event_bytes);
   LiveContextCapture live_context;
   context_delivery::ContextCollector context_collector(
-      {}, {},
+      {}, stream_limits,
       [&service, &live_context](const auto &open, const auto &envelope, auto decoded) {
         return service.publish_context(open, envelope) &&
                live_context.accept(open, envelope, std::move(decoded));

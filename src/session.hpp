@@ -32,7 +32,8 @@ public:
   Session(std::string id, std::uint32_t pid, std::uint64_t process_start,
           std::string agent_path, std::string event_path,
           std::string context_endpoint, std::string context_durable_directory,
-          std::chrono::seconds operation_timeout);
+          std::chrono::seconds operation_timeout,
+          std::uint32_t context_event_bytes = kDefaultContextEventBytes);
 
   void attach(const std::string &expected_executable);
   clangtracer::v1::Probe add_probe(const clangtracer::v1::ProbeSpec &spec,
@@ -91,6 +92,7 @@ private:
   std::string context_endpoint_;
   std::string context_durable_directory_;
   std::chrono::seconds operation_timeout_;
+  std::uint32_t context_event_bytes_;
   std::vector<std::string> discovered_module_paths_;
   std::vector<injector::ApplicationModule> application_modules_;
   mutable std::mutex mutex_;

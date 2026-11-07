@@ -257,7 +257,10 @@ through ResolveProbe/AddProbe and reports success only for an active probe.
 The draft remains available after deployment errors. Use
 `--stack-depth full --stack-application-only false` to capture through the
 thread root and include runtime and JIT frames. A numeric depth caps the
-unwind at that many frames before filtering. The short equivalent is:
+unwind at that many frames before filtering. For large shared events, pass
+`--context-event-bytes 4194304` to the REPL at launch or to `%server start`
+when starting its managed server. For an external server, pass the option
+when starting `clang-tracer-server`. The short equivalent is:
 
 ```text
 %probe inject "Calculator::multiply(int, int) const" --callback method.cpp

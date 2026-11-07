@@ -4014,6 +4014,7 @@ bool compile_shared_probe(Probe &p,
     metadata.print_arguments = specification.print_arguments();
     metadata.print_result = specification.print_result();
     metadata.capture_hook_id = owner->next_context_hook++;
+    metadata.capture_event_bytes = p.request.context_event_bytes;
     p.shared_runtime = std::make_shared<tracer::context_runtime::SharedSourceRuntime>(
         generation.generation->scopes(), *owner->context_capture, std::move(metadata),
         [](void* opaque, ::tracer::compat::span<const std::byte> bytes,
