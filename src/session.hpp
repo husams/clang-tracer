@@ -49,6 +49,7 @@ public:
   void refresh_process_state() noexcept;
 
   [[nodiscard]] clangtracer::v1::Session snapshot() const;
+  [[nodiscard]] std::optional<unsigned> agent_retained_count() const;
   [[nodiscard]] std::uint64_t events_sent(std::uint64_t probe_id) const;
   [[nodiscard]] bool accepts_event(std::uint64_t probe_id,
                                    std::uint32_t pid) const;
@@ -96,6 +97,7 @@ private:
   std::uintptr_t start_address_ = 0;
   std::uintptr_t stop_address_ = 0;
   std::uintptr_t validate_address_ = 0;
+  std::uintptr_t capacity_address_ = 0;
   std::uintptr_t pthread_detour_address_ = 0;
   std::map<std::uint64_t, ProbeRecord> probes_;
   std::optional<PthreadCreatePatch> pthread_create_patch_;

@@ -16,8 +16,10 @@ void sleep_briefly() { std::this_thread::sleep_for(std::chrono::milliseconds(10)
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 2)
+  if (argc < 2 || argc > 3)
     return 1;
+  if (argc == 3 && !::dlopen(argv[2], RTLD_NOW | RTLD_LOCAL))
+    return 3;
   std::signal(SIGUSR1, request_toggle);
   std::thread([] {
     for (;;)

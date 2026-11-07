@@ -665,6 +665,66 @@ class ListSymbolsPageToken(_message.Message):
     last_module_path: str
     def __init__(self, session_id: _Optional[str] = ..., pid: _Optional[int] = ..., process_start_time: _Optional[int] = ..., query: _Optional[str] = ..., module: _Optional[str] = ..., page_size: _Optional[int] = ..., mapping_fingerprint: _Optional[str] = ..., last_selector: _Optional[str] = ..., last_linkage_symbol: _Optional[str] = ..., last_module_path: _Optional[str] = ...) -> None: ...
 
+class BulkTraceRules(_message.Message):
+    __slots__ = ("version", "module_globs", "include_globs", "exclude_globs", "exact_selectors")
+    VERSION_FIELD_NUMBER: _ClassVar[int]
+    MODULE_GLOBS_FIELD_NUMBER: _ClassVar[int]
+    INCLUDE_GLOBS_FIELD_NUMBER: _ClassVar[int]
+    EXCLUDE_GLOBS_FIELD_NUMBER: _ClassVar[int]
+    EXACT_SELECTORS_FIELD_NUMBER: _ClassVar[int]
+    version: int
+    module_globs: _containers.RepeatedScalarFieldContainer[str]
+    include_globs: _containers.RepeatedScalarFieldContainer[str]
+    exclude_globs: _containers.RepeatedScalarFieldContainer[str]
+    exact_selectors: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, version: _Optional[int] = ..., module_globs: _Optional[_Iterable[str]] = ..., include_globs: _Optional[_Iterable[str]] = ..., exclude_globs: _Optional[_Iterable[str]] = ..., exact_selectors: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class PreviewBulkTraceRequest(_message.Message):
+    __slots__ = ("session_id", "rules")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    RULES_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    rules: BulkTraceRules
+    def __init__(self, session_id: _Optional[str] = ..., rules: _Optional[_Union[BulkTraceRules, _Mapping]] = ...) -> None: ...
+
+class BulkTraceCandidate(_message.Message):
+    __slots__ = ("function", "abi_status", "diagnostic")
+    class AbiStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = ()
+        ABI_STATUS_UNSPECIFIED: _ClassVar[BulkTraceCandidate.AbiStatus]
+        DWARF_SUPPORTED: _ClassVar[BulkTraceCandidate.AbiStatus]
+        PREPARED_REQUIRED: _ClassVar[BulkTraceCandidate.AbiStatus]
+        UNSUPPORTED: _ClassVar[BulkTraceCandidate.AbiStatus]
+        AMBIGUOUS: _ClassVar[BulkTraceCandidate.AbiStatus]
+    ABI_STATUS_UNSPECIFIED: BulkTraceCandidate.AbiStatus
+    DWARF_SUPPORTED: BulkTraceCandidate.AbiStatus
+    PREPARED_REQUIRED: BulkTraceCandidate.AbiStatus
+    UNSUPPORTED: BulkTraceCandidate.AbiStatus
+    AMBIGUOUS: BulkTraceCandidate.AbiStatus
+    FUNCTION_FIELD_NUMBER: _ClassVar[int]
+    ABI_STATUS_FIELD_NUMBER: _ClassVar[int]
+    DIAGNOSTIC_FIELD_NUMBER: _ClassVar[int]
+    function: FunctionSymbol
+    abi_status: BulkTraceCandidate.AbiStatus
+    diagnostic: str
+    def __init__(self, function: _Optional[_Union[FunctionSymbol, _Mapping]] = ..., abi_status: _Optional[_Union[BulkTraceCandidate.AbiStatus, str]] = ..., diagnostic: _Optional[str] = ...) -> None: ...
+
+class PreviewBulkTraceResponse(_message.Message):
+    __slots__ = ("candidates", "unmatched_exact_selectors", "retained_limit", "session_retained", "agent_retained", "available_slots")
+    CANDIDATES_FIELD_NUMBER: _ClassVar[int]
+    UNMATCHED_EXACT_SELECTORS_FIELD_NUMBER: _ClassVar[int]
+    RETAINED_LIMIT_FIELD_NUMBER: _ClassVar[int]
+    SESSION_RETAINED_FIELD_NUMBER: _ClassVar[int]
+    AGENT_RETAINED_FIELD_NUMBER: _ClassVar[int]
+    AVAILABLE_SLOTS_FIELD_NUMBER: _ClassVar[int]
+    candidates: _containers.RepeatedCompositeFieldContainer[BulkTraceCandidate]
+    unmatched_exact_selectors: _containers.RepeatedScalarFieldContainer[str]
+    retained_limit: int
+    session_retained: int
+    agent_retained: int
+    available_slots: int
+    def __init__(self, candidates: _Optional[_Iterable[_Union[BulkTraceCandidate, _Mapping]]] = ..., unmatched_exact_selectors: _Optional[_Iterable[str]] = ..., retained_limit: _Optional[int] = ..., session_retained: _Optional[int] = ..., agent_retained: _Optional[int] = ..., available_slots: _Optional[int] = ...) -> None: ...
+
 class WatchEventsRequest(_message.Message):
     __slots__ = ("session_ids", "after_sequence", "pid", "names")
     SESSION_IDS_FIELD_NUMBER: _ClassVar[int]

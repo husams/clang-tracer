@@ -85,6 +85,11 @@ class TracerStub(object):
                 request_serializer=tracer__pb2.ListSymbolsRequest.SerializeToString,
                 response_deserializer=tracer__pb2.ListSymbolsResponse.FromString,
                 _registered_method=True)
+        self.PreviewBulkTrace = channel.unary_unary(
+                '/clangtracer.v1.Tracer/PreviewBulkTrace',
+                request_serializer=tracer__pb2.PreviewBulkTraceRequest.SerializeToString,
+                response_deserializer=tracer__pb2.PreviewBulkTraceResponse.FromString,
+                _registered_method=True)
         self.WatchEvents = channel.unary_stream(
                 '/clangtracer.v1.Tracer/WatchEvents',
                 request_serializer=tracer__pb2.WatchEventsRequest.SerializeToString,
@@ -167,6 +172,12 @@ class TracerServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def PreviewBulkTrace(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def WatchEvents(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -238,6 +249,11 @@ def add_TracerServicer_to_server(servicer, server):
                     servicer.ListSymbols,
                     request_deserializer=tracer__pb2.ListSymbolsRequest.FromString,
                     response_serializer=tracer__pb2.ListSymbolsResponse.SerializeToString,
+            ),
+            'PreviewBulkTrace': grpc.unary_unary_rpc_method_handler(
+                    servicer.PreviewBulkTrace,
+                    request_deserializer=tracer__pb2.PreviewBulkTraceRequest.FromString,
+                    response_serializer=tracer__pb2.PreviewBulkTraceResponse.SerializeToString,
             ),
             'WatchEvents': grpc.unary_stream_rpc_method_handler(
                     servicer.WatchEvents,
@@ -526,6 +542,33 @@ class Tracer(object):
             '/clangtracer.v1.Tracer/ListSymbols',
             tracer__pb2.ListSymbolsRequest.SerializeToString,
             tracer__pb2.ListSymbolsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PreviewBulkTrace(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/PreviewBulkTrace',
+            tracer__pb2.PreviewBulkTraceRequest.SerializeToString,
+            tracer__pb2.PreviewBulkTraceResponse.FromString,
             options,
             channel_credentials,
             insecure,

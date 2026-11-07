@@ -1711,6 +1711,64 @@ public:
     }
   }
 
+  grpc::Status PreviewBulkTrace(
+      grpc::ServerContext *context, const clangtracer::v1::PreviewBulkTraceRequest *request,
+      clangtracer::v1::PreviewBulkTraceResponse *response) override {
+    const auto &rules = request->rules();
+    if (rules.version() != 1)
+      return {grpc::StatusCode::INVALID_ARGUMENT, "unsupported bulk manifest version"};
+    if (rules.include_globs().empty() && rules.exact_selectors().empty())
+      return {grpc::StatusCode::INVALID_ARGUMENT, "bulk preview requires an include glob or exact signature"};
+    std::size_t count = 0;
+    for (const auto *group : {&rules.module_globs(), &rules.include_globs(),
+                              &rules.exclude_globs(), &rules.exact_selectors()}) {
+      count += group->size();
+      if (count > 128)
+        return {grpc::StatusCode::INVALID_ARGUMENT, "bulk preview allows at most 128 rules"};
+      for (const auto &rule : *group)
+        if (rule.empty() || rule.size() > 4096 || rule.find('\0') != std::string::npos)
+          return {grpc::StatusCode::INVALID_ARGUMENT, "bulk rules must contain 1 to 4096 bytes without NUL"};
+    }
+    for (const auto &selector : rules.exact_selectors())
+      if (selector.find('(') == std::string::npos || selector.find(')') == std::string::npos)
+        return {grpc::StatusCode::INVALID_ARGUMENT, "exact selection requires a full C++ signature"};
+
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    session->refresh_process_state();
+    if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "session is not attached"};
+    try {
+      auto preview = client::preview_bulk_trace(
+          session->pid(), rules, [&] { return context->IsCancelled(); });
+      const auto agent_retained = session->agent_retained_count();
+      session->refresh_process_state();
+      const auto snapshot = session->snapshot();
+      if (snapshot.state() != clangtracer::v1::Session::ATTACHED)
+        return {grpc::StatusCode::FAILED_PRECONDITION,
+                "target process exited during bulk preview"};
+      preview.set_retained_limit(kMaxProbes);
+      preview.set_session_retained(snapshot.probes_size());
+      if (agent_retained) {
+        preview.set_agent_retained(*agent_retained);
+        const auto retained = std::max(*agent_retained, preview.session_retained());
+        preview.set_available_slots(kMaxProbes - std::min(kMaxProbes, retained));
+      }
+      response->Swap(&preview);
+      return grpc::Status::OK;
+    } catch (const client::DebugLookupLimit &error) {
+      return {grpc::StatusCode::RESOURCE_EXHAUSTED, error.what()};
+    } catch (const std::invalid_argument &error) {
+      return {grpc::StatusCode::ABORTED, error.what()};
+    } catch (const std::exception &error) {
+      if (context->IsCancelled())
+        return {grpc::StatusCode::CANCELLED, "bulk trace preview cancelled"};
+      return status_for(error);
+    }
+  }
+
   grpc::Status WatchEvents(
       grpc::ServerContext *context,
       const clangtracer::v1::WatchEventsRequest *request,

@@ -225,6 +225,17 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:repl-browser-target> $<TARGET_FILE:call-stacks-calculator>)
       set_tests_properties(native_repl_browser_integration PROPERTIES TIMEOUT 100)
+      add_executable(repl-bulk-concrete-target
+        examples/prepared-injectors/concrete/target.cpp
+        examples/prepared-injectors/concrete/virtual.cpp)
+      target_compile_options(repl-bulk-concrete-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
+      add_test(NAME native_repl_bulk_preview
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_bulk_preview.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:cpp-name-fixture> $<TARGET_FILE:repl-bulk-concrete-target>
+          $<TARGET_FILE:repl-browser-target> $<TARGET_FILE:call-stacks-calculator>
+          "${CMAKE_OBJCOPY}")
+      set_tests_properties(native_repl_bulk_preview PROPERTIES TIMEOUT 120)
       add_test(NAME native_repl_prepared_integration
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_prepared_integration.py"
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>

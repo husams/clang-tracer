@@ -121,6 +121,35 @@ new snapshot before using an address. The token checks observed mapping
 identity. An unload and reload of the same image at the same address between
 snapshots can produce identical observations.
 
+## Preview a bulk trace
+
+```text
+%trace preview --module 'libapp*' --include 'app::*' --exclude 'app::detail::*' --save trace.textproto
+%trace preview --exact "Calculator::multiply(int, int) const"
+%trace preview --manifest trace.textproto
+```
+
+Run the preview after attaching to a local Linux x86-64 C++ application.
+Repeat `--module` to match any executable module by basename or path.
+`--include` and `--exact` combine their selections, then `--exclude` removes
+matches. Globs are case-sensitive and support `*`, `?` and bracket patterns.
+They match either qualified names or full signatures. Use `--exact` to choose
+an overload by its full C++ signature. Quote patterns at the REPL.
+
+The dry run reads executable mappings, ELF symbols and DWARF, including matching
+separate debug files. It reports a live entry when one can be verified.
+`DWARF_SUPPORTED` means the entry passed static ABI checks. Callback compilation
+and installation checks run separately. `PREPARED_REQUIRED` identifies a
+concrete virtual implementation that needs a compatible prepared package.
+Unsupported entries and ambiguous selections show a reason. Narrow a
+duplicate signature with `--module`.
+
+The capacity line shows retained slots and whether the DWARF-supported
+selection fits. It is a snapshot and reserves no slots. The preview runs
+without installing probes, stopping target threads or executing code inside
+the target. `--save` creates a new versioned text-protobuf file with selection
+rules. Reusing it resolves against the current session and mappings.
+
 ## Interceptor upload
 
 ```text

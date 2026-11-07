@@ -77,6 +77,10 @@ public:
 
     virtual std::any visitQuit(TracerCommandsParser::QuitContext *context) = 0;
 
+    virtual std::any visitBulkTrace(TracerCommandsParser::BulkTraceContext *context) = 0;
+
+    virtual std::any visitBulkTraceOption(TracerCommandsParser::BulkTraceOptionContext *context) = 0;
+
     virtual std::any visitValue(TracerCommandsParser::ValueContext *context) = 0;
 
     virtual std::any visitKeyword(TracerCommandsParser::KeywordContext *context) = 0;

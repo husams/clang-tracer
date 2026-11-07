@@ -26,8 +26,9 @@ public:
     T__68 = 69, T__69 = 70, T__70 = 71, T__71 = 72, T__72 = 73, T__73 = 74,
     T__74 = 75, T__75 = 76, T__76 = 77, T__77 = 78, T__78 = 79, T__79 = 80,
     T__80 = 81, T__81 = 82, T__82 = 83, T__83 = 84, T__84 = 85, T__85 = 86,
-    T__86 = 87, UINT = 88, STRING = 89, SHELL = 90, METADATA_ONLY = 91,
-    WORD = 92, WS = 93
+    T__86 = 87, T__87 = 88, T__88 = 89, T__89 = 90, T__90 = 91, T__91 = 92,
+    T__92 = 93, UINT = 94, STRING = 95, SHELL = 96, METADATA_ONLY = 97,
+    WORD = 98, WS = 99
   };
 
   enum {
@@ -37,8 +38,8 @@ public:
     RuleSymbolOption = 13, RuleProbe = 14, RulePrepareOption = 15, RuleResolveOption = 16,
     RuleDeployOption = 17, RuleInterceptor = 18, RuleEvents = 19, RuleCollect = 20,
     RuleRecord = 21, RuleStreamOption = 22, RuleCpp = 23, RuleShell = 24,
-    RuleComplete = 25, RuleType = 26, RuleHelp = 27, RuleQuit = 28, RuleValue = 29,
-    RuleKeyword = 30
+    RuleComplete = 25, RuleType = 26, RuleHelp = 27, RuleQuit = 28, RuleBulkTrace = 29,
+    RuleBulkTraceOption = 30, RuleValue = 31, RuleKeyword = 32
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -87,6 +88,8 @@ public:
   class TypeContext;
   class HelpContext;
   class QuitContext;
+  class BulkTraceContext;
+  class BulkTraceOptionContext;
   class ValueContext;
   class KeywordContext;
 
@@ -129,6 +132,7 @@ public:
     TypeContext *type();
     HelpContext *help();
     QuitContext *quit();
+    BulkTraceContext *bulkTrace();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -514,6 +518,33 @@ public:
   };
 
   QuitContext* quit();
+
+  class  BulkTraceContext : public antlr4::ParserRuleContext {
+  public:
+    BulkTraceContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    std::vector<BulkTraceOptionContext *> bulkTraceOption();
+    BulkTraceOptionContext* bulkTraceOption(size_t i);
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  BulkTraceContext* bulkTrace();
+
+  class  BulkTraceOptionContext : public antlr4::ParserRuleContext {
+  public:
+    BulkTraceOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  BulkTraceOptionContext* bulkTraceOption();
 
   class  ValueContext : public antlr4::ParserRuleContext {
   public:

@@ -26,8 +26,9 @@ public:
     T__68 = 69, T__69 = 70, T__70 = 71, T__71 = 72, T__72 = 73, T__73 = 74,
     T__74 = 75, T__75 = 76, T__76 = 77, T__77 = 78, T__78 = 79, T__79 = 80,
     T__80 = 81, T__81 = 82, T__82 = 83, T__83 = 84, T__84 = 85, T__85 = 86,
-    T__86 = 87, UINT = 88, STRING = 89, SHELL = 90, METADATA_ONLY = 91,
-    WORD = 92, WS = 93
+    T__86 = 87, T__87 = 88, T__88 = 89, T__89 = 90, T__90 = 91, T__91 = 92,
+    T__92 = 93, UINT = 94, STRING = 95, SHELL = 96, METADATA_ONLY = 97,
+    WORD = 98, WS = 99
   };
 
   explicit TracerCommandsLexer(antlr4::CharStream *input);

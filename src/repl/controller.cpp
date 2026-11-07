@@ -22,6 +22,9 @@
 #include <system_error>
 
 #include <grpcpp/grpcpp.h>
+#include <google/protobuf/io/zero_copy_stream_impl.h>
+#include <google/protobuf/text_format.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include "background_events.hpp"
@@ -42,6 +45,22 @@ std::string printable_proc_text(std::string value) {
       ch = '?';
   }
   return value;
+}
+
+void save_bulk_manifest(const std::string &path, const api::BulkTraceRules &rules) {
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (fd < 0)
+    throw std::system_error(errno, std::generic_category(),
+                            "cannot create new bulk trace manifest " + path);
+  google::protobuf::io::FileOutputStream stream(fd);
+  stream.SetCloseOnDelete(true);
+  const bool printed = google::protobuf::TextFormat::Print(rules, &stream);
+  stream.SetCloseOnDelete(false);
+  const bool closed = stream.Close();
+  if (!printed || !closed) {
+    ::unlink(path.c_str());
+    throw std::runtime_error("cannot write bulk trace manifest: " + path);
+  }
 }
 
 template <class Response, class Call>
@@ -863,6 +882,74 @@ void Controller::select_process(
   attach(selected->pid, selected->start_time, selected->executable);
 }
 
+void Controller::preview_bulk_trace(const Command &command) {
+  require_session(selected_);
+  api::PreviewBulkTraceRequest request;
+  request.set_session_id(selected_.id);
+  auto &rules = *request.mutable_rules();
+  if (command.has("--manifest")) {
+    const auto path = command.option("--manifest");
+    if (!google::protobuf::TextFormat::ParseFromString(read_source(path), &rules))
+      throw std::invalid_argument("invalid bulk trace manifest: " + path);
+  } else {
+    rules.set_version(1);
+    const auto copy = [&](const char *option, auto *field) {
+      const auto values = command.options.find(option);
+      if (values != command.options.end())
+        for (const auto &value : values->second)
+          *field->Add() = value;
+    };
+    copy("--module", rules.mutable_module_globs());
+    copy("--include", rules.mutable_include_globs());
+    copy("--exclude", rules.mutable_exclude_globs());
+    copy("--exact", rules.mutable_exact_selectors());
+  }
+  grpc::ClientContext context;
+  context.set_deadline(std::chrono::system_clock::now() +
+                       std::chrono::seconds(settings_.timeout_seconds));
+  Cancellation cancellation(context);
+  api::PreviewBulkTraceResponse response;
+  const auto status = stub_->PreviewBulkTrace(&context, request, &response);
+  if (!status.ok())
+    throw std::runtime_error("bulk trace preview: " + status.error_message());
+
+  unsigned supported = 0;
+  for (const auto &candidate : response.candidates()) {
+    const auto &function = candidate.function();
+    out_ << api::BulkTraceCandidate::AbiStatus_Name(candidate.abi_status()) << " ";
+    if (function.runtime_address())
+      out_ << "address=0x" << std::hex << function.runtime_address() << std::dec;
+    else
+      out_ << "address=unavailable";
+    out_ << " " << std::quoted(printable_proc_text(function.selector()))
+         << " module=" << std::quoted(printable_proc_text(function.module_path()));
+    if (!candidate.diagnostic().empty())
+      out_ << " reason=" << std::quoted(printable_proc_text(candidate.diagnostic()));
+    out_ << '\n';
+    if (candidate.abi_status() == api::BulkTraceCandidate::DWARF_SUPPORTED)
+      ++supported;
+  }
+  for (const auto &selector : response.unmatched_exact_selectors())
+    out_ << "UNMATCHED " << std::quoted(printable_proc_text(selector))
+         << " reason=\"no matching concrete entry after module and exclusion rules\"\n";
+  out_ << "dry-run matched=" << response.candidates_size()
+       << " dwarf_supported=" << supported
+       << " limit=" << response.retained_limit()
+       << " session_retained=" << response.session_retained();
+  if (response.has_available_slots())
+    out_ << " agent_retained=" << response.agent_retained()
+         << " available=" << response.available_slots()
+         << " fits=" << (supported <= response.available_slots() ? "yes" : "no");
+  else
+    out_ << " available=unknown fits=unknown";
+  out_ << '\n';
+  if (command.has("--save")) {
+    const auto path = command.option("--save");
+    save_bulk_manifest(path, rules);
+    out_ << "manifest=" << std::quoted(printable_proc_text(path)) << '\n';
+  }
+}
+
 bool Controller::execute(const Command &command) {
   const auto &args = command.arguments;
   using K = CommandKind;
@@ -922,6 +1009,9 @@ bool Controller::execute(const Command &command) {
   case K::attach:
     attach(static_cast<unsigned>(unsigned_number(args.at(0), "PID", INT32_MAX)),
            command.number("--start-time", 0));
+    return true;
+  case K::bulk_preview:
+    preview_bulk_trace(command);
     return true;
   case K::sessions:
   case K::use:

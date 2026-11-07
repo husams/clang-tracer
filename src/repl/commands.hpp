@@ -50,7 +50,8 @@ enum class CommandKind {
   type,
   help,
   quit,
-  threads
+  threads,
+  bulk_preview
 };
 
 struct Command {

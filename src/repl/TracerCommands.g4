@@ -3,7 +3,7 @@ grammar TracerCommands;
 line : '%' command EOF;
 command : server | attach | processes | sessions | use | status | detach
         | modules | threads | symbols | probe | interceptor | events | collect | record
-        | cpp | shell | complete | type | help | quit;
+        | cpp | shell | complete | type | help | quit | bulkTrace;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
 serverOption : ('--executable' | '--agent') value;
 attach : 'attach' (UINT ('--start-time' UINT)?)?;
@@ -50,6 +50,8 @@ complete : 'complete' value;
 type : 'type' value;
 help : 'help' ('%'? value+)?;
 quit : 'quit' | 'exit';
+bulkTrace : 'trace' 'preview' bulkTraceOption+;
+bulkTraceOption : ('--module' | '--include' | '--exclude' | '--exact' | '--manifest' | '--save') value;
 value : STRING | WORD | UINT | keyword;
 keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'processes' | 'sessions' | 'use' | 'detach' | 'modules' | 'threads' | 'symbols'
@@ -58,7 +60,7 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'list' | 'calls' | 'stats' | 'clear' | 'open' | 'export' | 'json'
         | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'import'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
-        | 'complete' | 'type' | 'help' | 'quit' | 'exit';
+        | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview';
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';

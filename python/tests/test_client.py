@@ -178,6 +178,7 @@ def test_all_public_rpcs_have_client_methods():
         "ListSymbols": "list_symbols",
         "ListModules": "list_modules",
         "ListThreads": "list_threads",
+        "PreviewBulkTrace": "preview_bulk_trace",
         "WatchEvents": "watch_events",
         "ResolveProbe": "resolve_probe",
         "ValidateProbe": "validate_probe",

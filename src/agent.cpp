@@ -82,6 +82,7 @@
 #include <unistd.h>
 
 #include "callback_bridge.hpp"
+#include "agent_runtime_profile.hpp"
 #include "callback_pch.hpp"
 #include "callback_source.hpp"
 #include "context_activation.hpp"
@@ -5233,6 +5234,13 @@ bool validate_request(const tracer::Request &r, std::string &error) {
 }
 } // namespace
 
+extern "C" {
+// The server reads this word without stopping or executing code in the target.
+static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+static_assert(sizeof(std::atomic<std::uint64_t>) == sizeof(std::uint64_t));
+std::atomic<std::uint64_t> tracer_agent_capacity_v1{tracer::kAgentCapacityTag};
+}
+
 extern "C" int tracer_agent_start(tracer::Request *request) {
   try {
     tracer::context_scheduler::ScopedPthreadBypass compiler_threads;
@@ -5435,6 +5443,8 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     Probe *installed_probe = a.probes[slot].get();
     a.probe_slots[slot].store(installed_probe, std::memory_order_release);
     ++a.retained;
+    tracer_agent_capacity_v1.store(tracer::kAgentCapacityTag | a.retained,
+                                  std::memory_order_relaxed);
     *request = installed_probe->request;
     return 0;
   } catch (const std::exception &e) {

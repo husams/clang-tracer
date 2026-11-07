@@ -4,6 +4,8 @@
 
 namespace tracer {
 
+inline constexpr std::uint64_t kAgentCapacityTag = 0x4354433100000000ULL;
+
 // Fixed layout for tracer_agent_runtime_profile_v1. Evolve it by exporting
 // another version, independently of the probe request protocol.
 struct AgentRuntimeProfile {

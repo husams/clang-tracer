@@ -131,6 +131,14 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitBulkTrace(TracerCommandsParser::BulkTraceContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitBulkTraceOption(TracerCommandsParser::BulkTraceOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitValue(TracerCommandsParser::ValueContext *ctx) override {
     return visitChildren(ctx);
   }

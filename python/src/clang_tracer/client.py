@@ -197,6 +197,16 @@ class Client:
         )
         return list(response.modules)
 
+    def preview_bulk_trace(
+        self, session_id: str, rules: pb.BulkTraceRules
+    ) -> pb.PreviewBulkTraceResponse:
+        """Resolve bulk trace rules and report capacity without installing probes."""
+        response: pb.PreviewBulkTraceResponse = self.stub.PreviewBulkTrace(
+            pb.PreviewBulkTraceRequest(session_id=session_id, rules=rules),
+            timeout=self.timeout,
+        )
+        return response
+
     def list_threads(self, session_id: str) -> list[pb.TargetThread]:
         """List thread IDs, names and start times for an attached target."""
         response = self.stub.ListThreads(

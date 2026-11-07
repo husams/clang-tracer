@@ -26,6 +26,7 @@
 
 #include "agent_runtime_profile.hpp"
 #include "injector.hpp"
+#include "linux_syscalls.hpp"
 #include "proc_identity.hpp"
 #include "tracer/compat.hpp"
 
@@ -281,6 +282,7 @@ void Session::attach(const std::string &expected_executable) {
     const auto start = agent_symbol("tracer_agent_start");
     const auto stop = agent_symbol("tracer_agent_stop");
     const auto validate = agent_symbol("tracer_agent_validate");
+    const auto capacity = agent_symbol("tracer_agent_capacity_v1");
     const auto pthread_detour =
         agent_symbol("tracer_context_pthread_create_detour");
     if (!start || !stop) {
@@ -293,6 +295,7 @@ void Session::attach(const std::string &expected_executable) {
     start_address_ = start;
     stop_address_ = stop;
     validate_address_ = validate;
+    capacity_address_ = capacity;
     pthread_detour_address_ = pthread_detour;
   } catch (...) {
     if (process.unsafe()) {
@@ -1173,6 +1176,21 @@ void Session::refresh_process_state() noexcept {
     check_identity_locked();
   } catch (...) {
   }
+}
+
+std::optional<unsigned> Session::agent_retained_count() const {
+  std::lock_guard lock(mutex_);
+  if (state_ != clangtracer::v1::Session::ATTACHED || !capacity_address_)
+    return std::nullopt;
+  std::uint64_t word = 0;
+  iovec local{&word, sizeof(word)};
+  iovec remote{reinterpret_cast<void *>(capacity_address_), sizeof(word)};
+  if (linux_api::process_vm_readv(pid_, &local, 1, &remote, 1, 0) !=
+          static_cast<ssize_t>(sizeof(word)) ||
+      (word & 0xffffffff00000000ULL) != kAgentCapacityTag ||
+      (word & 0xffffffffULL) > kMaxProbes)
+    return std::nullopt;
+  return static_cast<unsigned>(word & 0xffffffffULL);
 }
 
 clangtracer::v1::Session Session::snapshot() const {

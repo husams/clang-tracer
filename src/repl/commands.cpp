@@ -60,6 +60,7 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"modules", K::modules},
                                         {"threads", K::threads},
                                         {"symbols", K::symbols},
+                                        {"trace preview", K::bulk_preview},
                                         {"probe prepare", K::prepare},
                                         {"probe resolve", K::resolve},
                                         {"probe inject", K::inject},
@@ -122,14 +123,16 @@ public:
         "--all", "--metadata-only", "--print-arguments", "--print-result",
         "--details", "--addresses"};
     const std::set<std::string> repeated = {"--include", "--compile-option",
-                                            "--name", "--type"};
+                                           "--name", "--type"};
+    const std::set<std::string> bulk_repeated = {"--module", "--exclude", "--exact"};
     for (; i + 1 < ts.size(); ++i) {
       const auto text = ts[i]->getText();
       const bool profile_add = result.kind == K::cpp_options &&
                                !result.arguments.empty() && result.arguments.front() == "add";
       if (!profile_add && ts[i]->getType() != TracerCommandsLexer::STRING &&
           text.rfind("--", 0) == 0) {
-        if (result.has(text) && !repeated.count(text)) {
+        const bool bulk_repeat = result.kind == K::bulk_preview && bulk_repeated.count(text);
+        if (result.has(text) && !repeated.count(text) && !bulk_repeat) {
           throw std::invalid_argument("duplicate option: " + text);
         }
         result.options[text].push_back(
@@ -204,6 +207,19 @@ Command parse_command(const std::string &input) {
   Builder visitor(tokens);
   visitor.visit(tree);
   auto command = std::move(visitor.result);
+  if (command.kind == K::bulk_preview) {
+    const bool has_rules = command.has("--include") || command.has("--exact");
+    if (command.has("--manifest")) {
+      if (has_rules || command.has("--module") || command.has("--exclude"))
+        throw std::invalid_argument("--manifest cannot be combined with selection rules");
+    } else if (!has_rules) {
+      throw std::invalid_argument("%trace preview requires --include, --exact or --manifest");
+    }
+    for (const auto &[option, values] : command.options)
+      for (const auto &value : values)
+        if (value.empty())
+          throw std::invalid_argument(option + " requires a nonempty value");
+  }
   if (command.kind == K::prepare) {
     for (const auto* option : {"--include", "--output"})
       if (!command.has(option) || command.option(option).empty())

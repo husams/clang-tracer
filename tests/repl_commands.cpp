@@ -120,5 +120,14 @@ int main() {
   bad("%symbols --address 0x100a --mapping token --page other");
   bad("%symbols --address 0xzz --mapping token");
   bad("%symbols --address 18446744073709551616 --mapping token");
+  const auto bulk = parse_command(
+      "%trace preview --module 'lib*.so' --module target --include 'app::*' "
+      "--exclude 'app::detail::*' --exact 'app::run(int)' --save rules.textproto");
+  require(bulk.kind == CommandKind::bulk_preview && bulk.options.at("--module").size() == 2);
+  require(parse_command("%trace preview --manifest rules.textproto").has("--manifest"));
+  bad("%trace preview --exclude 'app::*'");
+  bad("%trace preview --manifest rules --exact 'app::run(int)'");
+  bad("%trace preview --include ''");
+  bad("%trace preview --include app --save one --save two");
   std::cout << "native REPL grammar checks passed\n";
 }

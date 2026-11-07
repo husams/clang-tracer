@@ -161,3 +161,20 @@ same path.
 
 The GCC 8.5 Linux x86-64 build passed four focused CTests and the native
 Python symbol-pagination regression. All 198 portable Python tests passed.
+
+### T2 Bulk trace dry run
+
+`%trace preview` expands qualified-name and module globs, applies exclusions,
+and resolves exact overloads in one pass per mapped image. It reports verified
+runtime entries, static ABI status, and the target agent's retained probe
+capacity when readable. The versioned manifest stores selection rules for
+another run against the current mappings.
+
+The GCC 8.5 Linux x86-64 fixture passed split DWARF, ASLR address translation,
+overload exclusion, exact signatures, concrete templates, virtual
+implementations, duplicate modules, and manifest round-trip. The fixture
+compared the same target entry bytes before and after preview and confirmed
+that reattaching after removal still reports the retired agent slot.
+
+Seven focused Linux CTests, the REPL help smoke check and all 198 portable
+Python tests passed.

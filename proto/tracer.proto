@@ -16,6 +16,7 @@ service Tracer {
   rpc ListModules(ListModulesRequest) returns (ListModulesResponse);
   rpc ListThreads(ListThreadsRequest) returns (ListThreadsResponse);
   rpc ListSymbols(ListSymbolsRequest) returns (ListSymbolsResponse);
+  rpc PreviewBulkTrace(PreviewBulkTraceRequest) returns (PreviewBulkTraceResponse);
   rpc WatchEvents(WatchEventsRequest) returns (stream TraceEvent);
   // Snapshot retained events; acknowledge only after storage commits.
   rpc ReadEvents(ReadEventsRequest) returns (ReadEventsResponse);
@@ -353,6 +354,39 @@ message ListSymbolsPageToken {
   string last_selector = 8;
   string last_linkage_symbol = 9;
   string last_module_path = 10;
+}
+// Versioned, reusable selection rules. A saved manifest contains no addresses
+// or session IDs and is resolved again against the selected target.
+message BulkTraceRules {
+  uint32 version = 1;
+  repeated string module_globs = 2;
+  repeated string include_globs = 3;
+  repeated string exclude_globs = 4;
+  repeated string exact_selectors = 5;
+}
+message PreviewBulkTraceRequest {
+  string session_id = 1;
+  BulkTraceRules rules = 2;
+}
+message BulkTraceCandidate {
+  enum AbiStatus {
+    ABI_STATUS_UNSPECIFIED = 0;
+    DWARF_SUPPORTED = 1;
+    PREPARED_REQUIRED = 2;
+    UNSUPPORTED = 3;
+    AMBIGUOUS = 4;
+  }
+  FunctionSymbol function = 1;
+  AbiStatus abi_status = 2;
+  string diagnostic = 3;
+}
+message PreviewBulkTraceResponse {
+  repeated BulkTraceCandidate candidates = 1;
+  repeated string unmatched_exact_selectors = 2;
+  uint32 retained_limit = 3;
+  uint32 session_retained = 4;
+  optional uint32 agent_retained = 5;
+  optional uint32 available_slots = 6;
 }
 message WatchEventsRequest {
   repeated string session_ids = 1; // Empty subscribes to all sessions.
