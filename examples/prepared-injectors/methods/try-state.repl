@@ -1,0 +1,4 @@
+std::cout << reading.label << std::endl;
+reading.parts.at(1)
+reading.adjustment.delta
+reading.adjustment.limit.value()
