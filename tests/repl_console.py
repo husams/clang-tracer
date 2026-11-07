@@ -121,6 +121,17 @@ if (tracer.replay("{database}", query).size()) throw std::runtime_error("replay 
             assert "opened events=4 retained=4 evicted=0" in replay.stdout, replay.stdout
             assert "Query a Protobuf or SQLite recording offline" in replay.stdout, replay.stdout
             assert database.read_bytes() == before_replay
+            unsafe = root / "unsafe.db"
+            subprocess.run([fixture, "--write-unsafe-replay-db", str(unsafe)], check=True, timeout=10)
+            rejected = subprocess.run(
+                [console, "--fail-fast"],
+                input=f'''%events open "{unsafe}" --as saved
+auto saved = tracer.batch("saved");
+if (saved.at(3).state_snapshot().field("label").as<std::string>() != "saved") throw std::runtime_error("snapshot lost");
+%quit
+''', text=True, capture_output=True, timeout=30)
+            assert rejected.returncode == 0, (rejected.stdout, rejected.stderr)
+            assert "recorded adapter must contain declarations only" in rejected.stderr, rejected.stderr
             printed = run.stdout.split("event-print-start\n", 1)[1].split("event-print-end", 1)[0]
             assert "phase: POST" in printed and "signed_value: 42" in printed, printed
             printed = run.stdout.split("exact-print-start\n", 1)[1].split("exact-print-end", 1)[0]

@@ -328,6 +328,26 @@ all matches and retains the latest events that fit the memory budget.
 SQLite read-only and works after the target and tracing server have exited.
 The results support the same typed accessors and C++ adaptors as live events.
 
+The native SQLite recorder (`clang-tracer events --sqlite` or
+`clang-tracer drain --sqlite`) saves the standalone C++ type bundle for
+prepared probes with custom state. Opening the database or calling
+`tracer.replay` makes those types and their generated mappings available at
+the next prompt. A fresh REPL can reconstruct the recorded C++ value without
+access to the application headers:
+
+```text
+tracer_repl::EventQuery query;
+query.names = {"account.adjusted"};
+query.count = 1;
+auto matches = tracer.replay("capture.db", query);
+auto reading = matches.at(0).state_as<prepared_demo::Reading>();
+```
+
+Earlier recordings and recordings without a standalone type bundle still
+support `state_snapshot()` and explicit C++ imports. Replay checks the saved
+declarations before loading them. If a declaration is unsupported or conflicts
+with a type already loaded in the REPL, the recorded fields remain inspectable.
+
 ## Analyze in C++
 
 Discover the API from the prompt before writing analysis:

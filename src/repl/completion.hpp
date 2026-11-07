@@ -19,6 +19,8 @@ void serve_cpp_checks(const std::vector<std::string> &arguments);
 std::string reflect_cpp_header(const std::vector<std::string> &arguments,
                                const std::vector<std::string> &history,
                                const std::string &request);
+void validate_replay_types(const std::vector<std::string> &arguments,
+                           const std::string &prelude, const std::string &source);
 bool incomplete_cpp(const std::string &source);
 std::string describe_cpp_api(clang::CompilerInstance &parent,
                              const std::string &topic);

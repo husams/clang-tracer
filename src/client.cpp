@@ -1127,6 +1127,7 @@ int run_drain(const Options &o, api::Tracer::Stub &stub) {
   while (!interrupted.load(std::memory_order_relaxed) &&
          std::chrono::system_clock::now() < deadline) {
     api::ReadEventsRequest request;
+    request.mutable_filter()->set_include_replay_types(true);
     request.mutable_filter()->set_pid(static_cast<std::uint32_t>(o.pid));
     request.mutable_filter()->set_after_sequence(o.after);
     request.set_limit(static_cast<std::uint32_t>(
@@ -1494,6 +1495,7 @@ int run_direct(const Options &o, api::Tracer::Stub &stub) {
     req.set_pid(static_cast<std::uint32_t>(o.pid));
   }
   req.set_after_sequence(o.after);
+  req.set_include_replay_types(static_cast<bool>(storage));
   grpc::ClientContext ctx;
   if (o.timeout_set) {
     ctx.set_deadline(std::chrono::system_clock::now() +

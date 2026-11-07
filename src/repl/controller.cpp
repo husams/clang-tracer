@@ -480,6 +480,10 @@ std::vector<std::string> Controller::take_pending_imports() {
   return std::exchange(pending_imports_, {});
 }
 
+std::vector<api::PreparedInjector> Controller::take_pending_replay_types() {
+  return std::exchange(pending_replay_types_, {});
+}
+
 std::uint64_t Controller::inject(const SessionHandle &session,
                                  const std::string &selector,
                                  const std::string &source,
@@ -710,8 +714,12 @@ EventBuffer Controller::read_recording(const std::string &path,
     throw std::runtime_error(
         "clear collections or release event ranges before loading a recording");
   }
-  return open_recording(path, settings_.max_events - events,
-                        settings_.max_bytes - bytes, query);
+  auto recording = open_recording(path, settings_.max_events - events,
+                                 settings_.max_bytes - bytes, query);
+  for (auto &types : recording.replay_types)
+    pending_replay_types_.push_back(std::move(types));
+  recording.replay_types.clear();
+  return recording;
 }
 
 Collection Controller::replay(const std::string &path,

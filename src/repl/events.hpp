@@ -18,6 +18,7 @@ class EventBuffer {
 public:
   std::uint64_t received = 0, evicted = 0;
   bool complete = false, cancelled = false, timed_out = false;
+  std::vector<clangtracer::v1::PreparedInjector> replay_types;
   explicit EventBuffer(std::size_t max_events = 4096,
                        std::size_t max_bytes = 64 * 1024 * 1024);
   void push(const clangtracer::v1::TraceEvent &event);

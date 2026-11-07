@@ -309,6 +309,7 @@ message WatchEventsRequest {
   uint64 after_sequence = 2;       // Resume cursor in bounded server history.
   uint32 pid = 3;                  // Optional process filter; survives session loss.
   repeated string names = 4;       // Exact function or emitted context event names; ORed.
+  bool include_replay_types = 5;    // Include standalone types for SQLite recording.
 }
 message ReadEventsRequest {
   WatchEventsRequest filter = 1;
@@ -392,4 +393,5 @@ message TraceEvent {
   string function_name = 21; // Bounded registered selector or linkage fallback; server-assigned.
   string server_instance_id = 22; // Unique server lifetime; sequence alone is not durable identity.
   clangtracer.context.v1.ValueSnapshot receiver_snapshot = 23;
+  PreparedInjector replay_types = 24; // Server-supplied declarations and standard headers only.
 }
