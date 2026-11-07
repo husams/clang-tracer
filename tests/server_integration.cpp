@@ -637,18 +637,21 @@ void run(const std::filesystem::path &server_path,
                                       output_dir, "pointer-a");
   const auto void_spec = make_spec("traced_void", api::FUNCTION, api::VOID,
                                    {api::INT32}, callback);
-  const auto void_a =
+  auto void_a =
       add_probe_ok(*stub, session_a.id(), void_spec, output_dir, "void-a");
 
-  api::Probe duplicate_probe;
-  const auto duplicate_probe_status =
-      add_probe(*stub, session_a.id(), free_spec, &duplicate_probe);
-  require(duplicate_probe_status.ok(),
-          "replacement probe failed: " + duplicate_probe_status.error_message());
-  require(duplicate_probe.active() && duplicate_probe.id() != free_a.id() &&
-              duplicate_probe.entry_address() == free_a.entry_address(),
-          "replacement did not activate a new probe at the same entry");
-  free_a = duplicate_probe;
+  const auto replace_probe = [&](const api::ProbeSpec &spec, api::Probe &probe) {
+    api::Probe replacement;
+    const auto status = add_probe(*stub, session_a.id(), spec, &replacement);
+    require(status.ok(), "replacement probe failed: " + status.error_message());
+    require(replacement.active() && replacement.id() != probe.id() &&
+                replacement.entry_address() == probe.entry_address(),
+            "replacement did not activate a new probe at the same entry");
+    probe = replacement;
+  };
+  replace_probe(free_spec, free_a);
+  // The PIE fixture needs relocation again when replacing this probe.
+  replace_probe(void_spec, void_a);
   report(report_file, "same-session probe replaced with a new version");
 
   api::ProbeSpec missing = free_spec;

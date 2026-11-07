@@ -57,21 +57,10 @@
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
-#include <llvm/MC/MCAsmInfo.h>
-#include <llvm/MC/MCContext.h>
-#include <llvm/MC/MCDisassembler/MCDisassembler.h>
-#include <llvm/MC/MCInst.h>
-#include <llvm/MC/MCInstrInfo.h>
-#include <llvm/MC/MCRegisterInfo.h>
-#include <llvm/MC/MCSubtargetInfo.h>
-#include <llvm/MC/MCTargetOptions.h>
-#include <llvm/MC/TargetRegistry.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/MemoryBuffer.h>
-#include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/VirtualFileSystem.h>
 #include <llvm/Support/raw_ostream.h>
-#include <llvm/TargetParser/Host.h>
 #include <llvm/TargetParser/Triple.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -94,6 +83,7 @@
 #include "context_stdlib.hpp"
 #include "debug_resolver.hpp"
 #include "event_transport.hpp"
+#include "native_detour.hpp"
 #include "native_stack.hpp"
 #include "runtime_identity.hpp"
 #include "runtime_paths.hpp"
@@ -108,8 +98,8 @@
 #endif
 
 namespace {
-constexpr std::size_t kJumpBytes = 14;
-constexpr std::size_t kMaxDecodedBytes = tracer::kMaxPatchBytes - kJumpBytes;
+constexpr std::size_t kJumpBytes = tracer::native_detour::kJumpBytes;
+using tracer::native_detour::initialize_llvm;
 thread_local unsigned callback_depth = 0;
 
 struct DebugRecord {
@@ -2107,150 +2097,23 @@ bool mapping(const void *address, std::uintptr_t &begin, std::uintptr_t &end,
   return false;
 }
 
-bool initialize_llvm(std::string &error) {
-  static std::once_flag once;
-  static std::string init_error;
-  std::call_once(once, [] {
-    if (llvm::InitializeNativeTarget() ||
-        llvm::InitializeNativeTargetAsmPrinter() ||
-        llvm::InitializeNativeTargetDisassembler()) {
-      init_error = "LLVM native target initialization failed";
-    }
-  });
-  if (!init_error.empty()) {
-    error = init_error;
-    return false;
-  }
-  return true;
-}
-
-struct Decoder {
-  std::unique_ptr<llvm::MCRegisterInfo> regs;
-  std::unique_ptr<llvm::MCAsmInfo> asm_info;
-  std::unique_ptr<llvm::MCSubtargetInfo> sub;
-  std::unique_ptr<llvm::MCInstrInfo> ins;
-  std::unique_ptr<llvm::MCContext> context;
-  std::unique_ptr<llvm::MCDisassembler> dis;
-};
-
-bool make_decoder(Decoder &d, std::string &error) {
-  if (!initialize_llvm(error)) {
-    return false;
-  }
-  auto triple = llvm::sys::getDefaultTargetTriple();
-  std::string lookup_error;
-  auto *target = llvm::TargetRegistry::lookupTarget(triple, lookup_error);
-  if (!target) {
-    error = "LLVM target lookup failed: " + lookup_error;
-    return false;
-  }
-  llvm::MCTargetOptions options;
-  llvm::Triple parsed(triple);
-  d.regs.reset(target->createMCRegInfo(triple));
-  d.ins.reset(target->createMCInstrInfo());
-  d.sub.reset(target->createMCSubtargetInfo(triple, "generic", ""));
-  if (!d.regs || !d.ins || !d.sub) {
-    error = "LLVM MC metadata unavailable";
-    return false;
-  }
-  d.asm_info.reset(target->createMCAsmInfo(*d.regs, triple, options));
-  if (!d.asm_info) {
-    error = "LLVM MC assembly metadata unavailable";
-    return false;
-  }
-  d.context = std::make_unique<llvm::MCContext>(parsed, d.asm_info.get(),
-                                                d.regs.get(), d.sub.get());
-  d.dis.reset(target->createMCDisassembler(*d.sub, *d.context));
-  if (!d.dis) {
-    error = "LLVM MC disassembler unavailable";
-    return false;
-  }
-  return true;
-}
-
-bool safe_instruction(const llvm::MCInst &inst, const llvm::MCInstrInfo &ins,
-                      const llvm::MCRegisterInfo &regs) {
-  const auto &desc = ins.get(inst.getOpcode());
-  if (desc.isBranch() || desc.isCall() || desc.isReturn() ||
-      desc.isIndirectBranch()) {
-    return false;
-  }
-  const std::string name = ins.getName(inst.getOpcode()).str();
-  static constexpr std::string_view allowed[] = {
-      "PUSH64r",   "POP64r",    "MOV64rr",    "MOV32rr",   "MOV16rr",
-      "MOV8rr",    "MOV32ri",   "MOV64rm",    "MOV32rm",   "MOV16rm",
-      "MOV8rm",    "MOV64mr",   "MOV32mr",    "MOV16mr",   "MOV8mr",
-      "MOVSS",     "MOVSD",     "MOVAPS",     "MOVUPS",    "LEA64r",
-      "LEA32r",    "SUB64ri8",  "SUB64ri32",  "ADD64ri8",  "ADD64ri32",
-      "ADD32ri8",  "ADD32ri",   "IMUL32rri8", "IMUL32rri", "IMUL32rmi8",
-      "IMUL32rmi", "XOR64rr",   "XOR32rr",    "TEST64rr",  "TEST32rr",
-      "CMP64rr",   "CMP32rr",   "AND8i8",     "AND8ri",    "AND64ri8",
-      "AND64ri32", "XOR8i8",    "XOR8ri",     "NOP",
-      "NOOP",      "MOV64mi32", "MOV32mi",    "MOV16mi",   "MOV8mi"};
-  bool known = false;
-  for (auto p : allowed) {
-    if (name == p || (name.size() > p.size() && ::tracer::compat::starts_with(name, p))) {
-      known = true;
-      break;
-    }
-  }
-  if (!known) {
-    return false;
-  }
-  for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
-    if (inst.getOperand(i).isReg()) {
-      auto r = inst.getOperand(i).getReg();
-      const char *n = r ? regs.getName(r) : nullptr;
-      if (n && (!std::strcmp(n, "RIP") || !std::strcmp(n, "EIP"))) {
-        return false;
-      }
-    }
-  }
-  return true;
-}
-
 bool decode_patch(const std::uint8_t *entry, tracer::Request &req,
-                  std::string &error) {
+                  tracer::native_detour::Patch &patch, std::string &error) {
   std::uintptr_t lo = 0, hi = 0;
   int prot = 0;
-  if (!mapping(entry, lo, hi, prot) ||
-      hi - reinterpret_cast<std::uintptr_t>(entry) < kJumpBytes) {
-    error = "target entry has insufficient mapped bytes";
+  if (!mapping(entry, lo, hi, prot) || (prot & PROT_READ) == 0) {
+    error = "target entry is not in a readable mapping";
     return false;
   }
-  if (entry[0] == 0xf3 && entry[1] == 0x0f && entry[2] == 0x1e &&
-      entry[3] == 0xfa) {
-    error = "target entry has an ENDBR64 CET landing instruction";
+  const auto available = std::min<std::size_t>(
+      tracer::native_detour::kMaxDecodedBytes,
+      hi - reinterpret_cast<std::uintptr_t>(entry));
+  if (!tracer::native_detour::decode(
+          {entry, available}, reinterpret_cast<std::uintptr_t>(entry), patch,
+          error))
     return false;
-  }
-  Decoder d;
-  if (!make_decoder(d, error)) {
-    return false;
-  }
-  const auto address = reinterpret_cast<std::uintptr_t>(entry);
-  std::size_t used = 0;
-  while (used < kJumpBytes) {
-    llvm::MCInst inst;
-    std::uint64_t size = 0;
-    auto status = d.dis->getInstruction(
-        inst, size,
-        llvm::ArrayRef<std::uint8_t>(
-            entry + used, std::min<std::size_t>(kMaxDecodedBytes - used,
-                                                hi - address - used)),
-        address + used, llvm::nulls());
-    if (status != llvm::MCDisassembler::Success || !size ||
-        !safe_instruction(inst, *d.ins, *d.regs)) {
-      error = "target entry contains an unsupported or PC-relative instruction";
-      return false;
-    }
-    used += size;
-    if (used > kMaxDecodedBytes) {
-      error = "target entry exceeds safe patch window";
-      return false;
-    }
-  }
-  req.patch_size = static_cast<std::uint32_t>(used);
-  std::memcpy(req.original, entry, used);
+  req.patch_size = static_cast<std::uint32_t>(patch.size);
+  std::memcpy(req.original, patch.original.data(), patch.size);
   return true;
 }
 
@@ -2392,7 +2255,8 @@ bool prepare_context_pthread(Agent &owner, Probe &probe, std::string &error) {
     patch_entry += 4;
   }
   patch.pthread_create_entry = reinterpret_cast<std::uintptr_t>(patch_entry);
-  if (!decode_patch(patch_entry, patch, error))
+  tracer::native_detour::Patch scheduler_patch;
+  if (!decode_patch(patch_entry, patch, scheduler_patch, error))
     return false;
   patch.pthread_create_patch_size = patch.patch_size;
   std::memcpy(patch.pthread_create_original, patch.original, patch.patch_size);
@@ -2416,26 +2280,11 @@ bool prepare_context_pthread(Agent &owner, Probe &probe, std::string &error) {
     }
   }
 
-  const long page_size = ::sysconf(_SC_PAGESIZE);
-  if (page_size <= 0) {
-    error = "cannot determine page size for pthread_create trampoline";
+  std::size_t trampoline_size = 0;
+  void *trampoline = MAP_FAILED;
+  if (!tracer::native_detour::create_trampoline(
+          scheduler_patch, trampoline, trampoline_size, error))
     return false;
-  }
-  const auto trampoline_size = static_cast<std::size_t>(page_size);
-  void *trampoline = ::mmap(nullptr, trampoline_size, PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (trampoline == MAP_FAILED) {
-    error = "cannot allocate pthread_create trampoline";
-    return false;
-  }
-  std::memcpy(trampoline, patch.pthread_create_original, patch.patch_size);
-  add_jump(static_cast<std::uint8_t *>(trampoline) + patch.patch_size,
-           patch_entry + patch.patch_size);
-  if (::mprotect(trampoline, trampoline_size, PROT_READ | PROT_EXEC) != 0) {
-    ::munmap(trampoline, trampoline_size);
-    error = "cannot make pthread_create trampoline executable";
-    return false;
-  }
 
   patch.pthread_create_trampoline =
       reinterpret_cast<std::uintptr_t>(trampoline);
@@ -5328,15 +5177,22 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
         replaced = other;
       }
     }
+    tracer::native_detour::Patch target_patch;
     if (replaced) {
-      // Compile the new callback before touching the live hook. Decode neither
-      // its detour nor its wrapper: the trampoline needs the original prologue.
+      // The live entry contains our jump. Decode the saved prologue at its
+      // original address so RIP-relative operands keep their original targets.
       p->request.replaced_probe_id = replaced->request.probe_id;
       p->request.patch_size = replaced->request.patch_size;
       std::memcpy(p->request.original, replaced->request.original,
                   p->request.patch_size);
+      if (!tracer::native_detour::decode(
+              {p->request.original, p->request.patch_size},
+              p->request.original_entry, target_patch, error)) {
+        set_error(request, error.c_str());
+        return -1;
+      }
     } else if (!decode_patch(static_cast<const std::uint8_t *>(entry), p->request,
-                             error)) {
+                             target_patch, error)) {
       set_error(request, error.c_str());
       return -1;
     }
@@ -5359,23 +5215,9 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
         return -1;
       }
     }
-    long page_size = ::sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) {
-      set_error(request, "could not determine page size");
-      return -1;
-    }
-    p->mapping_size = static_cast<std::size_t>(page_size);
-    p->trampoline = ::mmap(nullptr, p->mapping_size, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p->trampoline == MAP_FAILED) {
-      set_error(request, "could not allocate trampoline");
-      return -1;
-    }
-    std::memcpy(p->trampoline, p->request.original, p->request.patch_size);
-    add_jump(static_cast<std::uint8_t *>(p->trampoline) + p->request.patch_size,
-             static_cast<std::uint8_t *>(entry) + p->request.patch_size);
-    if (::mprotect(p->trampoline, p->mapping_size, PROT_READ | PROT_EXEC)) {
-      set_error(request, "could not make trampoline executable");
+    if (!tracer::native_detour::create_trampoline(
+            target_patch, p->trampoline, p->mapping_size, error)) {
+      set_error(request, error.c_str());
       return -1;
     }
     if (!compile_probe(
