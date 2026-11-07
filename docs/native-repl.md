@@ -331,7 +331,7 @@ all matches and retains the latest events that fit the memory budget.
 SQLite read-only and works after the target and tracing server have exited.
 The results support the same typed accessors and C++ adaptors as live events.
 
-The native SQLite recorders (`%record FILE --sqlite`, `clang-tracer events
+The native SQLite recorders (`%record FILE --sqlite`, `tracer.record()`, `clang-tracer events
 --sqlite`, and `clang-tracer drain --sqlite`) save the standalone C++ type bundle for
 prepared probes with custom state. Opening the database or calling
 `tracer.replay` makes those types and their generated mappings available at
@@ -350,6 +350,24 @@ Earlier recordings and recordings without a standalone type bundle still
 support `state_snapshot()` and explicit C++ imports. Replay checks the saved
 declarations before loading them. If a declaration is unsupported or conflicts
 with a type already loaded in the REPL, the recorded fields remain inspectable.
+
+To record from C++, call `tracer.record` while attached.
+
+```cpp
+tracer_repl::RecordOptions options;
+options.names = {"account.adjusted"};
+options.count = 12;
+options.timeout_seconds = 15;
+auto saved = tracer.record("capture.db", options);
+```
+
+This creates or appends to the SQLite recording. By default it uses the
+selected session. Set `options.session` to another session handle or
+`options.all_sessions` to record from all sessions. The filters also include
+`phase`, `probe_id`, and `after_sequence`. `saved.complete` reports whether
+the requested count was reached. Use `saved.received`, `saved.cursor`,
+`saved.cancelled`, and `saved.timed_out` to inspect the outcome. See
+`%help api tracer.record` for the native REPL topic.
 
 ## Analyze in C++
 

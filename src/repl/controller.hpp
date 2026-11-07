@@ -58,8 +58,8 @@ class Controller {
   clangtracer::v1::ProbeSpec resolve_for(const SessionHandle &session,
                                         const std::string &selector,
                                         const Command &command);
-  void watch(const Command &command, bool display,
-             const std::string &record_path = {});
+  RecordResult watch(const Command &command, bool display,
+                     const std::string &record_path = {});
   EventBuffer read_recording(const std::string &path,
                              const EventQuery &query) const;
   const EventBuffer &buffer(const std::string &name) const;
@@ -86,6 +86,7 @@ public:
                      unsigned timeout);
   EventRange events(const SessionHandle& session, std::uint64_t count, unsigned timeout);
   EventRange events_async(const SessionHandle& session, std::uint64_t count, unsigned timeout);
+  RecordResult record(const std::string &path, const RecordOptions &options);
   Collection replay(const std::string &path, const EventQuery &query) const;
   Collection batch(const std::string &name) const;
   void draft(const std::string &name, std::string source);
