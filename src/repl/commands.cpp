@@ -108,6 +108,13 @@ public:
       name += " " + ts[i++]->getText();
     }
     result.kind = kinds.at(name);
+    if (result.kind == K::help) {
+      if (ts[i]->getText() == "%")
+        ++i;
+      for (; i + 1 < ts.size(); ++i)
+        result.arguments.push_back(decode(ts[i]->getText()));
+      return {};
+    }
     const std::set<std::string> flags = {"--all", "--metadata-only", "--print-arguments",
                                          "--print-result"};
     const std::set<std::string> repeated = {"--include", "--compile-option",
@@ -243,10 +250,6 @@ const std::vector<std::string> &command_names() {
     std::vector<std::string> result;
     for (const auto &entry : kinds) {
       result.push_back("%" + entry.first);
-    }
-    for (const auto& topic : {"api", "tracer", "Event", "Collection", "SessionHandle",
-                              "ScalarValue", "EventValue", "EventRange", "cpp"}) {
-      result.push_back(std::string("%help ") + topic);
     }
     return result;
   }();

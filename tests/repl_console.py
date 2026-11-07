@@ -90,7 +90,11 @@ tracer.detach(session)
             assert "phase: POST" in printed and "signed_value: 42" in printed, printed
             printed = run.stdout.split("exact-print-start\n", 1)[1].split("exact-print-end", 1)[0]
             assert "phase: PRE" in printed and "signed_value: 21" in printed, printed
-            discovery = subprocess.run([console, "--fail-fast"], input='''%help api
+            discovery = subprocess.run([console, "--fail-fast"], input='''%help
+%help %probe inject
+%help api
+%help api tracer_repl::Event
+%help api tracer.events_async
 %help Event
 %complete "tracer.pr"
 tracer_repl::Collection empty;
@@ -100,8 +104,18 @@ tracer.print(empty)
 %quit
 ''', text=True, capture_output=True, timeout=20)
             assert discovery.returncode == 0, (discovery.stdout, discovery.stderr)
-            for expected in ("T result_as() const", "std::uint64_t received", "  print", "  received", "Collection retained=0", "ready=unconnected"):
+            for expected in ("Connection and targets", "Capture and replay", "Resolution options",
+                             "Types and objects", "tracer methods", "One captured event", "Example",
+                             "T result_as() const", "auto live = tracer.events_async(session, 10, 15);",
+                             "  print", "  received", "Collection retained=0", "ready=unconnected"):
                 assert expected in discovery.stdout, (expected, discovery.stdout, discovery.stderr)
+            assert "\x1b[" not in discovery.stdout
+            assert "Collection {" not in discovery.stdout
+            for command, message in [("%help missing", "Use %help for commands"),
+                                     ("%help api Missing", "Use %help api to list topics")]:
+                unknown = subprocess.run([console, "--fail-fast"], input=command + "\n",
+                                         text=True, capture_output=True, timeout=10)
+                assert unknown.returncode == 1 and message in unknown.stderr, unknown.stderr
             temporary = subprocess.run([console, "--fail-fast"], input='''tracer_repl::Collection{}.size()
 std::cout << "temporary-collection-ok" << std::endl;
 %quit

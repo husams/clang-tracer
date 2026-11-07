@@ -64,6 +64,7 @@ def main():
         assert server.stdout.readline().strip() == "ready"
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 160, 0, 0))
         env = dict(os.environ, TERM="xterm-256color")
+        env.pop("NO_COLOR", None)
         child = subprocess.Popen([console, "--endpoint", endpoint],
                                  stdin=slave, stdout=slave, stderr=slave,
                                  env=env, start_new_session=True)
@@ -89,14 +90,19 @@ def main():
         until(rb"data\.received")
         send("\x15data.at(0).desc\t")
         until(rb"data\.at\(0\)\.describe")
-        send("\x15%help a\t")
+        send("\x15%help ap\t")
         until(rb"%help api")
         send("\r")
-        until(rb"template <class T> T result_as\(\) const;.*tracer\[7\]> ")
+        until(rb"Range pipelines.*tracer\[7\]> ")
         send("data.at(0).argument_snapshot(0).cpp_t\t")
         until(rb"argument_snapshot\(0\)\.cpp_type")
-        send("\x15%help EventV\t\r")
-        until(rb"EventValue \{.*elements\(\) const;.*tracer\[7\]> ")
+        send("\x15%help api EventV\t\r")
+        until(rb"auto order = e.argument_snapshot\(0\);.*elements\(\) const;.*tracer\[7\]> ")
+        assert b'\x1b[1;36mauto\x1b[0m order' in transcript
+        assert b'\x1b[32m"id"\x1b[0m' in transcript
+        send("%help probe inj\t\r")
+        until(rb"Deployment options.*tracer\[7\]> ")
+        assert b'\x1b[33m--callback\x1b[0m' in transcript
         # Enter must keep an unfinished block in the editor; Ctrl+C discards it.
         send("for (const auto& e : data.events) {\r")
         send("tracer.print(e);\r")

@@ -48,6 +48,11 @@ int main() {
   require(!parse_command("%collect --as live").has("--count"));
   require(parse_command("%collect --as cpp").option("--as") == "cpp");
   require(parse_command("%help Event").arguments.at(0) == "Event");
+  require(parse_command("%help api tracer_repl::Event").arguments ==
+          std::vector<std::string>{"api", "tracer_repl::Event"});
+  require(parse_command("%help %probe inject").arguments ==
+          std::vector<std::string>{"probe", "inject"});
+  bad("%help %");
   require(parse_command("%complete \"data.at(0).\"").kind ==
           CommandKind::complete);
   bad("%complete");

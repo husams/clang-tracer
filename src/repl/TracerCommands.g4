@@ -44,7 +44,7 @@ cpp : 'cpp' ('load' value | 'reset'
                         | 'compdb' value '--file' value)?);
 shell : 'shell' value;
 complete : 'complete' value;
-help : 'help' value?;
+help : 'help' ('%'? value+)?;
 quit : 'quit' | 'exit';
 value : STRING | WORD | UINT | keyword;
 keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
