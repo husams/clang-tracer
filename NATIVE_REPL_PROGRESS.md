@@ -178,3 +178,25 @@ that reattaching after removal still reports the retired agent slot.
 
 Seven focused Linux CTests, the REPL help smoke check and all 198 portable
 Python tests passed.
+
+### T3 Bulk trace apply and removal
+
+`%trace apply --manifest FILE` resolves the saved selection in the live
+session and installs typed Clang JIT observers. An optional callback file
+is compiled for each selected function. Preflight checks selection blockers,
+existing hooks and available retained slots. Bulk installs cannot replace
+active probes. The server serializes installs and removals within the session.
+
+Each retained probe records its batch ID. After an installation failure, the
+server restores attempted probes from that batch in reverse order and reports
+the result per entry. `%trace remove BATCH_ID` removes only probes owned by
+that batch and can retry incomplete restoration. Bulk apply currently
+accepts DWARF-supported bindings. Prepared-only entries block the batch.
+
+The Linux x86-64 regression forced a type mismatch on the second overload
+after the first was installed. It verified original bytes after rollback,
+successful typed observation on both overloads in a later batch, repeatable
+removal, and an unrelated probe emitting events through both operations.
+
+Eight focused CTests passed on Linux x86-64 with the GCC 8.5 SDK and
+Clang 21.1.8. All 198 portable Python tests passed.

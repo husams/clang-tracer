@@ -150,6 +150,29 @@ without installing probes, stopping target threads or executing code inside
 the target. `--save` creates a new versioned text-protobuf file with selection
 rules. Reusing it resolves against the current session and mappings.
 
+## Apply and remove a bulk trace
+
+```text
+%trace apply --manifest trace.textproto
+%trace apply --manifest trace.textproto --callback observer.cpp
+%trace remove BATCH_ID
+```
+
+Apply re-resolves the manifest against the selected session. The default
+Clang JIT observer records typed PRE and POST events. With `--callback`, the
+same C++ source is compiled for each matched function. Every match must be
+DWARF-supported and fit in the available retained slots. Ambiguous or
+unmatched selections, entries requiring prepared packages, and entries with
+active probes block installation.
+
+The REPL prints the batch ID before applying and reports the status of each
+entry. If an install fails, the server restores this batch's probes in
+reverse order. Use the same batch ID with `%trace remove` to retry entries
+reported as `RESTORE_PENDING` or to check a batch after an interrupted
+command. Removal is repeatable for a retained batch in its original session.
+Removal and rollback restore entry bytes. The agent still retains compiled
+slots until the target exits.
+
 ## Interceptor upload
 
 ```text

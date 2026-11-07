@@ -17,6 +17,8 @@ service Tracer {
   rpc ListThreads(ListThreadsRequest) returns (ListThreadsResponse);
   rpc ListSymbols(ListSymbolsRequest) returns (ListSymbolsResponse);
   rpc PreviewBulkTrace(PreviewBulkTraceRequest) returns (PreviewBulkTraceResponse);
+  rpc ApplyBulkTrace(ApplyBulkTraceRequest) returns (BulkTraceReport);
+  rpc RemoveBulkTrace(RemoveBulkTraceRequest) returns (BulkTraceReport);
   rpc WatchEvents(WatchEventsRequest) returns (stream TraceEvent);
   // Snapshot retained events; acknowledge only after storage commits.
   rpc ReadEvents(ReadEventsRequest) returns (ReadEventsResponse);
@@ -288,6 +290,7 @@ message Probe {
   uint64 callback_errors = 10;
   uint64 jit_compile_ns = 11; // Target-side compilation and materialization.
   uint64 patch_install_ns = 12; // Code patch attempts, including retries.
+  string bulk_batch_id = 13; // Set only for probes owned by a bulk apply.
 }
 message RemoveProbeRequest {
   string session_id = 1;
@@ -387,6 +390,41 @@ message PreviewBulkTraceResponse {
   uint32 session_retained = 4;
   optional uint32 agent_retained = 5;
   optional uint32 available_slots = 6;
+}
+message ApplyBulkTraceRequest {
+  string session_id = 1;
+  BulkTraceRules rules = 2;
+  // Caller-generated 32 lowercase hexadecimal digits. Keep for removal even
+  // when the RPC result is lost. Unique among retained batches in the session.
+  string batch_id = 3;
+  optional string callback_source = 4; // Omit for the typed PRE/POST observer.
+}
+message RemoveBulkTraceRequest {
+  string session_id = 1;
+  string batch_id = 2;
+}
+message BulkTraceEntry {
+  enum Status {
+    NOT_ATTEMPTED = 0;
+    BLOCKED = 1;
+    INSTALLED = 2;
+    INSTALL_FAILED = 3;
+    ROLLED_BACK = 4;
+    REMOVED = 5;
+    RESTORE_PENDING = 6;
+  }
+  FunctionSymbol function = 1;
+  Status status = 2;
+  Probe probe = 3; // Present for a retained probe, including after restoration.
+  string diagnostic = 4;
+}
+message BulkTraceReport {
+  string batch_id = 1;
+  repeated BulkTraceEntry entries = 2;
+  repeated string unmatched_exact_selectors = 3;
+  optional uint32 available_slots = 4; // Capacity before apply.
+  string diagnostic = 5;
+  bool complete = 6; // Every selected entry was installed or removed as requested.
 }
 message WatchEventsRequest {
   repeated string session_ids = 1; // Empty subscribes to all sessions.

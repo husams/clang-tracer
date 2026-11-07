@@ -11,6 +11,7 @@
 #include <iostream>
 #include <iomanip>
 #include <limits>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -61,6 +62,47 @@ void save_bulk_manifest(const std::string &path, const api::BulkTraceRules &rule
     ::unlink(path.c_str());
     throw std::runtime_error("cannot write bulk trace manifest: " + path);
   }
+}
+
+api::BulkTraceRules read_bulk_manifest(const std::string &path) {
+  api::BulkTraceRules rules;
+  if (!google::protobuf::TextFormat::ParseFromString(read_source(path), &rules))
+    throw std::invalid_argument("invalid bulk trace manifest: " + path);
+  return rules;
+}
+
+std::string new_bulk_batch_id() {
+  std::random_device random;
+  std::uniform_int_distribution<unsigned> nibble(0, 15);
+  std::string id(32, '0');
+  for (auto &ch : id)
+    ch = "0123456789abcdef"[nibble(random)];
+  return id;
+}
+
+void print_bulk_report(std::ostream &out, const char *operation,
+                       const api::BulkTraceReport &report) {
+  for (const auto &row : report.entries()) {
+    const auto &function = row.function();
+    out << api::BulkTraceEntry::Status_Name(row.status()) << ' '
+        << std::quoted(printable_proc_text(function.selector().empty()
+                           ? function.linkage_symbol() : function.selector()));
+    if (!function.module_path().empty())
+      out << " module=" << std::quoted(printable_proc_text(function.module_path()));
+    if (row.has_probe())
+      out << " probe=" << row.probe().id()
+          << " restored=" << (row.probe().original_bytes_restored() ? "true" : "false");
+    if (!row.diagnostic().empty())
+      out << " reason=" << std::quoted(printable_proc_text(row.diagnostic()));
+    out << '\n';
+  }
+  for (const auto &selector : report.unmatched_exact_selectors())
+    out << "UNMATCHED " << std::quoted(printable_proc_text(selector)) << '\n';
+  out << "bulk " << operation << " batch=" << report.batch_id()
+      << " complete=" << (report.complete() ? "true" : "false");
+  if (report.has_available_slots())
+    out << " available=" << report.available_slots();
+  out << '\n';
 }
 
 template <class Response, class Call>
@@ -888,9 +930,7 @@ void Controller::preview_bulk_trace(const Command &command) {
   request.set_session_id(selected_.id);
   auto &rules = *request.mutable_rules();
   if (command.has("--manifest")) {
-    const auto path = command.option("--manifest");
-    if (!google::protobuf::TextFormat::ParseFromString(read_source(path), &rules))
-      throw std::invalid_argument("invalid bulk trace manifest: " + path);
+    rules = read_bulk_manifest(command.option("--manifest"));
   } else {
     rules.set_version(1);
     const auto copy = [&](const char *option, auto *field) {
@@ -948,6 +988,56 @@ void Controller::preview_bulk_trace(const Command &command) {
     save_bulk_manifest(path, rules);
     out_ << "manifest=" << std::quoted(printable_proc_text(path)) << '\n';
   }
+}
+
+void Controller::apply_bulk_trace(const Command &command) {
+  require_session(selected_);
+  api::ApplyBulkTraceRequest request;
+  request.set_session_id(selected_.id);
+  *request.mutable_rules() = read_bulk_manifest(command.option("--manifest"));
+  if (command.has("--callback"))
+    request.set_callback_source(read_source(command.option("--callback")));
+  request.set_batch_id(new_bulk_batch_id());
+  out_ << "bulk apply starting batch=" << request.batch_id() << std::endl;
+
+  grpc::ClientContext context;
+  context.set_deadline(std::chrono::system_clock::now() +
+                       std::chrono::seconds(settings_.timeout_seconds));
+  Cancellation cancellation(context);
+  api::BulkTraceReport report;
+  const auto status = stub_->ApplyBulkTrace(&context, request, &report);
+  if (!status.ok()) {
+    auto message = "bulk trace apply: " + status.error_message();
+    if (status.error_code() == grpc::StatusCode::CANCELLED ||
+        status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED ||
+        status.error_code() == grpc::StatusCode::UNAVAILABLE ||
+        status.error_code() == grpc::StatusCode::UNKNOWN ||
+        status.error_code() == grpc::StatusCode::INTERNAL)
+      message += " | check or restore with %trace remove " + request.batch_id();
+    throw std::runtime_error(message);
+  }
+  print_bulk_report(out_, "apply", report);
+  if (!report.complete()) {
+    auto message = report.diagnostic();
+    if (std::any_of(report.entries().begin(), report.entries().end(), [](const auto &row) {
+          return row.status() == api::BulkTraceEntry::RESTORE_PENDING;
+        }))
+      message += " | retry with %trace remove " + request.batch_id();
+    throw std::runtime_error(message);
+  }
+}
+
+void Controller::remove_bulk_trace(const std::string &batch_id) {
+  require_session(selected_);
+  api::RemoveBulkTraceRequest request;
+  request.set_session_id(selected_.id);
+  request.set_batch_id(batch_id);
+  const auto report = unary<api::BulkTraceReport>(
+      [&](auto &context, auto &response) { return stub_->RemoveBulkTrace(&context, request, &response); },
+      settings_.timeout_seconds);
+  print_bulk_report(out_, "remove", report);
+  if (!report.complete())
+    throw std::runtime_error(report.diagnostic() + " | retry with %trace remove " + batch_id);
 }
 
 bool Controller::execute(const Command &command) {
@@ -1012,6 +1102,12 @@ bool Controller::execute(const Command &command) {
     return true;
   case K::bulk_preview:
     preview_bulk_trace(command);
+    return true;
+  case K::bulk_apply:
+    apply_bulk_trace(command);
+    return true;
+  case K::bulk_remove:
+    remove_bulk_trace(args.at(0));
     return true;
   case K::sessions:
   case K::use:

@@ -61,6 +61,8 @@ class Controller {
              const std::string &record_path = {});
   const EventBuffer &buffer(const std::string &name) const;
   void preview_bulk_trace(const Command &command);
+  void apply_bulk_trace(const Command &command);
+  void remove_bulk_trace(const std::string &batch_id);
   struct ProcessChoice {
     std::uint32_t pid;
     std::uint64_t start_time;

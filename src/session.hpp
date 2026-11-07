@@ -37,7 +37,8 @@ public:
   clangtracer::v1::Probe add_probe(const clangtracer::v1::ProbeSpec &spec,
                                    const std::string &source_directory,
                                    std::uint64_t probe_id,
-                                   const std::array<std::uint8_t, 16> &lineage);
+                                   const std::array<std::uint8_t, 16> &lineage,
+                                   const std::string &bulk_batch_id = {});
   clangtracer::v1::ValidationReport
   validate_probe(const clangtracer::v1::ProbeSpec &spec,
                  const std::string &source_directory,

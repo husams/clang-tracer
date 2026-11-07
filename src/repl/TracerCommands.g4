@@ -50,7 +50,9 @@ complete : 'complete' value;
 type : 'type' value;
 help : 'help' ('%'? value+)?;
 quit : 'quit' | 'exit';
-bulkTrace : 'trace' 'preview' bulkTraceOption+;
+bulkTrace : 'trace' ('preview' bulkTraceOption+
+          | 'apply' '--manifest' value ('--callback' value)?
+          | 'remove' value);
 bulkTraceOption : ('--module' | '--include' | '--exclude' | '--exact' | '--manifest' | '--save') value;
 value : STRING | WORD | UINT | keyword;
 keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
@@ -60,7 +62,7 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'list' | 'calls' | 'stats' | 'clear' | 'open' | 'export' | 'json'
         | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'import'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
-        | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview';
+        | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview' | 'apply';
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';

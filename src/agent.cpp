@@ -5326,7 +5326,8 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       auto *other = a.probes[i].get();
       if (other && other->active.load() &&
           other->request.original_entry == p->request.original_entry) {
-        if (other->session_id != request->session_id || replaced ||
+        if (request->reject_replacement ||
+            other->session_id != request->session_id || replaced ||
             std::memcmp(entry, other->request.installed,
                         other->request.patch_size) != 0) {
           set_error(request,

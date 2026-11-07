@@ -12,7 +12,7 @@ inline constexpr std::uint32_t kProtocolVersion = 2;
 // Version 20 adds capture-time owned value snapshots to TraceValue.
 // Version 21 verifies header-prepared scalar contracts without rescanning DWARF.
 // Version 23 reports target-side JIT compile time for prepared probes.
-inline constexpr std::uint32_t kBootstrapVersion = 23;
+inline constexpr std::uint32_t kBootstrapVersion = 24;
 inline constexpr unsigned kMaxPatchBytes = 64;
 inline constexpr unsigned kMaxArguments = 8;
 inline constexpr unsigned kMaxProbes = 32;
@@ -193,6 +193,7 @@ struct Request {
   // Agent-selected same-session probe to drain after replacement preparation.
   std::uint64_t replaced_probe_id = 0;
   std::uint64_t jit_compile_ns = 0;
+  bool reject_replacement = false;
 };
 
 // Side-effect-free callback preparation request. The agent reads a serialized

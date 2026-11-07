@@ -393,7 +393,8 @@ clangtracer::v1::Probe
 Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
                    const std::string &source_directory,
                    std::uint64_t probe_id,
-                   const std::array<std::uint8_t, 16> &lineage) {
+                   const std::array<std::uint8_t, 16> &lineage,
+                   const std::string &bulk_batch_id) {
   std::lock_guard lock(mutex_);
   check_identity_locked();
   if (state_ != clangtracer::v1::Session::ATTACHED) {
@@ -417,6 +418,7 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     remote_request = process.remote_allocate(sizeof(Request));
     Request request{};
     request.probe_id = probe_id;
+    request.reject_replacement = !bulk_batch_id.empty();
     copy_field(request.session_id, id_, "session id");
     request.context_native_pid = pid_;
     request.context_process_start_time = process_start_;
@@ -451,6 +453,7 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     record.value.set_id(probe_id);
     record.value.set_session_id(id_);
     record.value.set_symbol(spec.symbol());
+    record.value.set_bulk_batch_id(bulk_batch_id);
     record.value.mutable_signature()->CopyFrom(spec.signature());
     auto [it, inserted] = probes_.emplace(probe_id, std::move(record));
     if (!inserted)
@@ -585,6 +588,8 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     }
 
     if (response.replaced_probe_id) {
+      if (request.reject_replacement)
+        throw std::runtime_error("bulk installation cannot replace an existing probe");
       auto &previous = find_probe_locked(response.replaced_probe_id);
       if (!previous.value.active() || !previous.patch_committed ||
           previous.value.entry_address() != response.original_entry)
@@ -1095,7 +1100,10 @@ clangtracer::v1::Probe Session::remove_probe(std::uint64_t probe_id) {
   }
   check_identity_locked();
   auto &probe = find_probe_locked(probe_id);
-  stop_probe_locked(probe, false);
+  if (probe.value.active())
+    stop_probe_locked(probe, false);
+  else
+    release_request_locked(probe, std::chrono::steady_clock::now() + operation_timeout_);
   return probe.value;
 }
 

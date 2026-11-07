@@ -488,7 +488,7 @@ class ValidationReport(_message.Message):
     def __init__(self, success: bool = ..., level: _Optional[_Union[ValidateProbeRequest.Level, str]] = ..., effective_options: _Optional[_Iterable[str]] = ..., diagnostics: _Optional[_Iterable[_Union[ValidationDiagnostic, _Mapping]]] = ..., prepared_used: bool = ...) -> None: ...
 
 class Probe(_message.Message):
-    __slots__ = ("id", "session_id", "symbol", "signature", "active", "callback_address", "entry_address", "original_bytes_restored", "agent_dropped_events", "callback_errors", "jit_compile_ns", "patch_install_ns")
+    __slots__ = ("id", "session_id", "symbol", "signature", "active", "callback_address", "entry_address", "original_bytes_restored", "agent_dropped_events", "callback_errors", "jit_compile_ns", "patch_install_ns", "bulk_batch_id")
     ID_FIELD_NUMBER: _ClassVar[int]
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     SYMBOL_FIELD_NUMBER: _ClassVar[int]
@@ -501,6 +501,7 @@ class Probe(_message.Message):
     CALLBACK_ERRORS_FIELD_NUMBER: _ClassVar[int]
     JIT_COMPILE_NS_FIELD_NUMBER: _ClassVar[int]
     PATCH_INSTALL_NS_FIELD_NUMBER: _ClassVar[int]
+    BULK_BATCH_ID_FIELD_NUMBER: _ClassVar[int]
     id: int
     session_id: str
     symbol: str
@@ -513,7 +514,8 @@ class Probe(_message.Message):
     callback_errors: int
     jit_compile_ns: int
     patch_install_ns: int
-    def __init__(self, id: _Optional[int] = ..., session_id: _Optional[str] = ..., symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., active: bool = ..., callback_address: _Optional[int] = ..., entry_address: _Optional[int] = ..., original_bytes_restored: bool = ..., agent_dropped_events: _Optional[int] = ..., callback_errors: _Optional[int] = ..., jit_compile_ns: _Optional[int] = ..., patch_install_ns: _Optional[int] = ...) -> None: ...
+    bulk_batch_id: str
+    def __init__(self, id: _Optional[int] = ..., session_id: _Optional[str] = ..., symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., active: bool = ..., callback_address: _Optional[int] = ..., entry_address: _Optional[int] = ..., original_bytes_restored: bool = ..., agent_dropped_events: _Optional[int] = ..., callback_errors: _Optional[int] = ..., jit_compile_ns: _Optional[int] = ..., patch_install_ns: _Optional[int] = ..., bulk_batch_id: _Optional[str] = ...) -> None: ...
 
 class RemoveProbeRequest(_message.Message):
     __slots__ = ("session_id", "probe_id")
@@ -724,6 +726,70 @@ class PreviewBulkTraceResponse(_message.Message):
     agent_retained: int
     available_slots: int
     def __init__(self, candidates: _Optional[_Iterable[_Union[BulkTraceCandidate, _Mapping]]] = ..., unmatched_exact_selectors: _Optional[_Iterable[str]] = ..., retained_limit: _Optional[int] = ..., session_retained: _Optional[int] = ..., agent_retained: _Optional[int] = ..., available_slots: _Optional[int] = ...) -> None: ...
+
+class ApplyBulkTraceRequest(_message.Message):
+    __slots__ = ("session_id", "rules", "batch_id", "callback_source")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    RULES_FIELD_NUMBER: _ClassVar[int]
+    BATCH_ID_FIELD_NUMBER: _ClassVar[int]
+    CALLBACK_SOURCE_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    rules: BulkTraceRules
+    batch_id: str
+    callback_source: str
+    def __init__(self, session_id: _Optional[str] = ..., rules: _Optional[_Union[BulkTraceRules, _Mapping]] = ..., batch_id: _Optional[str] = ..., callback_source: _Optional[str] = ...) -> None: ...
+
+class RemoveBulkTraceRequest(_message.Message):
+    __slots__ = ("session_id", "batch_id")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    BATCH_ID_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    batch_id: str
+    def __init__(self, session_id: _Optional[str] = ..., batch_id: _Optional[str] = ...) -> None: ...
+
+class BulkTraceEntry(_message.Message):
+    __slots__ = ("function", "status", "probe", "diagnostic")
+    class Status(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = ()
+        NOT_ATTEMPTED: _ClassVar[BulkTraceEntry.Status]
+        BLOCKED: _ClassVar[BulkTraceEntry.Status]
+        INSTALLED: _ClassVar[BulkTraceEntry.Status]
+        INSTALL_FAILED: _ClassVar[BulkTraceEntry.Status]
+        ROLLED_BACK: _ClassVar[BulkTraceEntry.Status]
+        REMOVED: _ClassVar[BulkTraceEntry.Status]
+        RESTORE_PENDING: _ClassVar[BulkTraceEntry.Status]
+    NOT_ATTEMPTED: BulkTraceEntry.Status
+    BLOCKED: BulkTraceEntry.Status
+    INSTALLED: BulkTraceEntry.Status
+    INSTALL_FAILED: BulkTraceEntry.Status
+    ROLLED_BACK: BulkTraceEntry.Status
+    REMOVED: BulkTraceEntry.Status
+    RESTORE_PENDING: BulkTraceEntry.Status
+    FUNCTION_FIELD_NUMBER: _ClassVar[int]
+    STATUS_FIELD_NUMBER: _ClassVar[int]
+    PROBE_FIELD_NUMBER: _ClassVar[int]
+    DIAGNOSTIC_FIELD_NUMBER: _ClassVar[int]
+    function: FunctionSymbol
+    status: BulkTraceEntry.Status
+    probe: Probe
+    diagnostic: str
+    def __init__(self, function: _Optional[_Union[FunctionSymbol, _Mapping]] = ..., status: _Optional[_Union[BulkTraceEntry.Status, str]] = ..., probe: _Optional[_Union[Probe, _Mapping]] = ..., diagnostic: _Optional[str] = ...) -> None: ...
+
+class BulkTraceReport(_message.Message):
+    __slots__ = ("batch_id", "entries", "unmatched_exact_selectors", "available_slots", "diagnostic", "complete")
+    BATCH_ID_FIELD_NUMBER: _ClassVar[int]
+    ENTRIES_FIELD_NUMBER: _ClassVar[int]
+    UNMATCHED_EXACT_SELECTORS_FIELD_NUMBER: _ClassVar[int]
+    AVAILABLE_SLOTS_FIELD_NUMBER: _ClassVar[int]
+    DIAGNOSTIC_FIELD_NUMBER: _ClassVar[int]
+    COMPLETE_FIELD_NUMBER: _ClassVar[int]
+    batch_id: str
+    entries: _containers.RepeatedCompositeFieldContainer[BulkTraceEntry]
+    unmatched_exact_selectors: _containers.RepeatedScalarFieldContainer[str]
+    available_slots: int
+    diagnostic: str
+    complete: bool
+    def __init__(self, batch_id: _Optional[str] = ..., entries: _Optional[_Iterable[_Union[BulkTraceEntry, _Mapping]]] = ..., unmatched_exact_selectors: _Optional[_Iterable[str]] = ..., available_slots: _Optional[int] = ..., diagnostic: _Optional[str] = ..., complete: bool = ...) -> None: ...
 
 class WatchEventsRequest(_message.Message):
     __slots__ = ("session_ids", "after_sequence", "pid", "names")

@@ -54,6 +54,7 @@
 
 namespace tracer {
 namespace {
+namespace api = clangtracer::v1;
 
 constexpr std::size_t kSessionLimit = 64;
 constexpr std::size_t kMaxCallbackSource = 64 * 1024;
@@ -1390,37 +1391,8 @@ public:
     if (!session)
       return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
     std::lock_guard operation_lock(session->operation_mutex());
-    std::uint64_t pending_probe_id = 0;
-    try {
-      pending_probe_id = next_probe_id_.fetch_add(1);
-      if (pending_probe_id == 0)
-        pending_probe_id = next_probe_id_.fetch_add(1);
-      const auto &spec = request->spec();
-      const auto &selector = spec.debug_info().selector();
-      const auto function_name =
-          spec.has_debug_info() && !selector.empty() && selector.size() <= 4096 &&
-                  selector.find('\0') == std::string::npos
-              ? selector
-              : spec.symbol();
-      events_.set_probe(session->id(), pending_probe_id, session->pid(),
-                        function_name, true);
-      const auto lineage = admit_probe_package(request->spec());
-      if (!lineage.retained) {
-        std::cerr << "clang-tracer: shared-context source lineage isolated: "
-                  << lineage.diagnostic.substr(0, 240) << '\n';
-      }
-      auto probe = session->add_probe(request->spec(), source_directory_,
-                                      pending_probe_id, lineage.id);
-      sync_event_probes(session);
-      response->CopyFrom(probe);
-      return grpc::Status::OK;
-    } catch (const std::invalid_argument &error) {
-      sync_event_probes(session, pending_probe_id);
-      return {grpc::StatusCode::INVALID_ARGUMENT, error.what()};
-    } catch (const std::exception &error) {
-      sync_event_probes(session, pending_probe_id);
-      return status_for(error);
-    }
+    std::uint64_t probe_id = 0;
+    return install_probe(session, request->spec(), {}, probe_id, response);
   }
 
   grpc::Status RemoveProbe(grpc::ServerContext *,
@@ -1430,22 +1402,7 @@ public:
     if (!session)
       return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
     std::lock_guard operation_lock(session->operation_mutex());
-    try {
-      auto probe = session->remove_probe(request->probe_id());
-      if (!events_.retire_probe(
-              probe.session_id(), probe.id(), session->events_sent(probe.id()),
-              std::chrono::duration_cast<std::chrono::milliseconds>(timeout_)))
-        throw std::runtime_error("timed out waiting for emitted probe events");
-      response->CopyFrom(probe);
-      erase_active_pid_if_inactive(session);
-      return grpc::Status::OK;
-    } catch (const std::invalid_argument &error) {
-      sync_event_probes(session);
-      return {grpc::StatusCode::NOT_FOUND, error.what()};
-    } catch (const std::exception &error) {
-      sync_event_probes(session);
-      return status_for(error);
-    }
+    return remove_probe(session, request->probe_id(), response);
   }
 
   grpc::Status Detach(grpc::ServerContext *,
@@ -1714,59 +1671,175 @@ public:
   grpc::Status PreviewBulkTrace(
       grpc::ServerContext *context, const clangtracer::v1::PreviewBulkTraceRequest *request,
       clangtracer::v1::PreviewBulkTraceResponse *response) override {
-    const auto &rules = request->rules();
-    if (rules.version() != 1)
-      return {grpc::StatusCode::INVALID_ARGUMENT, "unsupported bulk manifest version"};
-    if (rules.include_globs().empty() && rules.exact_selectors().empty())
-      return {grpc::StatusCode::INVALID_ARGUMENT, "bulk preview requires an include glob or exact signature"};
-    std::size_t count = 0;
-    for (const auto *group : {&rules.module_globs(), &rules.include_globs(),
-                              &rules.exclude_globs(), &rules.exact_selectors()}) {
-      count += group->size();
-      if (count > 128)
-        return {grpc::StatusCode::INVALID_ARGUMENT, "bulk preview allows at most 128 rules"};
-      for (const auto &rule : *group)
-        if (rule.empty() || rule.size() > 4096 || rule.find('\0') != std::string::npos)
-          return {grpc::StatusCode::INVALID_ARGUMENT, "bulk rules must contain 1 to 4096 bytes without NUL"};
-    }
-    for (const auto &selector : rules.exact_selectors())
-      if (selector.find('(') == std::string::npos || selector.find(')') == std::string::npos)
-        return {grpc::StatusCode::INVALID_ARGUMENT, "exact selection requires a full C++ signature"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    return preview_bulk_trace(context, session, request->rules(), response);
+  }
+
+  grpc::Status ApplyBulkTrace(grpc::ServerContext *context,
+                              const api::ApplyBulkTraceRequest *request,
+                              api::BulkTraceReport *response) override {
+    using Entry = api::BulkTraceEntry;
+    const auto &batch_id = request->batch_id();
+    if (!valid_batch_id(batch_id))
+      return {grpc::StatusCode::INVALID_ARGUMENT, "invalid bulk trace batch ID"};
+    const std::string callback = request->has_callback_source()
+        ? request->callback_source()
+        : "struct Interceptor { void pre(const Call&) {} void post(const Call&) {} };";
+    if (callback.empty() || callback.size() > kMaxCallbackSource ||
+        callback.find('\0') != std::string::npos)
+      return {grpc::StatusCode::INVALID_ARGUMENT,
+              "callback source must be 1 to 65536 bytes without NUL"};
 
     auto session = find_session(request->session_id());
     if (!session)
       return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
     std::lock_guard operation_lock(session->operation_mutex());
-    session->refresh_process_state();
-    if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED)
-      return {grpc::StatusCode::FAILED_PRECONDITION, "session is not attached"};
-    try {
-      auto preview = client::preview_bulk_trace(
-          session->pid(), rules, [&] { return context->IsCancelled(); });
-      const auto agent_retained = session->agent_retained_count();
-      session->refresh_process_state();
-      const auto snapshot = session->snapshot();
-      if (snapshot.state() != clangtracer::v1::Session::ATTACHED)
-        return {grpc::StatusCode::FAILED_PRECONDITION,
-                "target process exited during bulk preview"};
-      preview.set_retained_limit(kMaxProbes);
-      preview.set_session_retained(snapshot.probes_size());
-      if (agent_retained) {
-        preview.set_agent_retained(*agent_retained);
-        const auto retained = std::max(*agent_retained, preview.session_retained());
-        preview.set_available_slots(kMaxProbes - std::min(kMaxProbes, retained));
+    const auto snapshot = session->snapshot();
+    if (std::any_of(snapshot.probes().begin(), snapshot.probes().end(),
+                    [&](const auto &probe) { return probe.bulk_batch_id() == batch_id; }))
+      return {grpc::StatusCode::ALREADY_EXISTS, "bulk trace batch ID is already retained"};
+
+    api::PreviewBulkTraceResponse preview;
+    const auto status = preview_bulk_trace(context, session, request->rules(), &preview);
+    if (!status.ok())
+      return status;
+    response->set_batch_id(batch_id);
+    *response->mutable_unmatched_exact_selectors() = preview.unmatched_exact_selectors();
+    if (preview.has_available_slots())
+      response->set_available_slots(preview.available_slots());
+
+    bool blocked = !preview.unmatched_exact_selectors().empty();
+    std::set<std::uint64_t> entries;
+    for (const auto &candidate : preview.candidates()) {
+      auto &row = *response->add_entries();
+      const auto &function = candidate.function();
+      *row.mutable_function() = function;
+      if (candidate.abi_status() != api::BulkTraceCandidate::DWARF_SUPPORTED) {
+        row.set_status(Entry::BLOCKED);
+        row.set_diagnostic(api::BulkTraceCandidate::AbiStatus_Name(candidate.abi_status()) +
+                           ": " + candidate.diagnostic());
+      } else if (!entries.insert(function.runtime_address()).second) {
+        row.set_status(Entry::BLOCKED);
+        row.set_diagnostic("multiple selections refer to the same runtime entry");
+      } else if (std::any_of(snapshot.probes().begin(), snapshot.probes().end(),
+                            [&](const auto &probe) {
+        return probe.active() && probe.entry_address() == function.runtime_address();
+      })) {
+        row.set_status(Entry::BLOCKED);
+        row.set_diagnostic("entry is already hooked");
       }
-      response->Swap(&preview);
-      return grpc::Status::OK;
-    } catch (const client::DebugLookupLimit &error) {
-      return {grpc::StatusCode::RESOURCE_EXHAUSTED, error.what()};
-    } catch (const std::invalid_argument &error) {
-      return {grpc::StatusCode::ABORTED, error.what()};
-    } catch (const std::exception &error) {
-      if (context->IsCancelled())
-        return {grpc::StatusCode::CANCELLED, "bulk trace preview cancelled"};
-      return status_for(error);
+      blocked |= row.status() == Entry::BLOCKED;
     }
+    if (blocked)
+      response->set_diagnostic("selection contains blocked or unmatched entries");
+    else if (response->entries().empty())
+      response->set_diagnostic("selection matched no entries");
+    else if (!preview.has_available_slots())
+      response->set_diagnostic("agent capacity could not be verified");
+    else if (static_cast<unsigned>(response->entries_size()) > preview.available_slots())
+      response->set_diagnostic("selection exceeds available retained probe slots");
+    if (!response->diagnostic().empty())
+      return grpc::Status::OK;
+
+    // Resolve all exact bindings before changing target code. The agent checks
+    // the binding again at installation, including the mapped image identity.
+    std::vector<api::ProbeSpec> specs;
+    specs.reserve(response->entries_size());
+    client::DebugLookupOptions lookup;
+    lookup.is_cancelled = [&] { return context->IsCancelled(); };
+    for (auto &row : *response->mutable_entries()) {
+      const auto &function = row.function();
+      lookup.module = function.module_path();
+      try {
+        auto spec = client::resolve_debug_callable(session->pid(), function.selector(), lookup).spec;
+        const auto &info = spec.debug_info();
+        if (info.module() != function.module_path() || spec.symbol() != function.linkage_symbol() ||
+            info.runtime_entry() != function.runtime_address() ||
+            info.entry_virtual_address() != function.elf_address())
+          throw std::runtime_error("function binding changed since preview");
+        spec.set_callback_source(callback);
+        const auto validation = validate_probe(spec);
+        if (!validation.ok())
+          throw std::runtime_error(validation.error_message());
+        specs.push_back(std::move(spec));
+      } catch (const std::exception &error) {
+        if (context->IsCancelled())
+          return {grpc::StatusCode::CANCELLED, "bulk trace apply cancelled during preflight"};
+        row.set_status(Entry::BLOCKED);
+        row.set_diagnostic(error.what());
+        blocked = true;
+      }
+    }
+    if (blocked) {
+      response->set_diagnostic("one or more function bindings could not be validated");
+      return grpc::Status::OK;
+    }
+
+    // Keep the attempted IDs even when installation throws after preparing
+    // or writing an entry. Only IDs retained by this batch can be restored.
+    std::vector<std::uint64_t> attempted(specs.size());
+    for (std::size_t i = 0; i < specs.size() && !context->IsCancelled(); ++i) {
+      auto &row = *response->mutable_entries(i);
+      api::Probe probe;
+      const auto result = install_probe(session, specs[i], batch_id, attempted[i], &probe);
+      if (!result.ok()) {
+        row.set_status(Entry::INSTALL_FAILED);
+        row.set_diagnostic(result.error_message());
+        response->set_diagnostic("bulk installation failed");
+        break;
+      }
+      *row.mutable_probe() = std::move(probe);
+      row.set_status(Entry::INSTALLED);
+    }
+    if (context->IsCancelled() && response->diagnostic().empty())
+      response->set_diagnostic("bulk trace apply cancelled");
+    if (response->diagnostic().empty()) {
+      response->set_complete(true);
+      return grpc::Status::OK;
+    }
+    const auto retained = session->snapshot();
+    for (int i = response->entries_size() - 1; i >= 0; --i) {
+      const auto probe = std::find_if(retained.probes().begin(), retained.probes().end(),
+                                     [&](const auto &item) {
+        return item.id() == attempted[i] && item.bulk_batch_id() == batch_id;
+      });
+      if (probe != retained.probes().end())
+        restore_bulk_entry(session, *probe, Entry::ROLLED_BACK, response->mutable_entries(i));
+    }
+    return grpc::Status::OK;
+  }
+
+  grpc::Status RemoveBulkTrace(grpc::ServerContext *,
+                               const api::RemoveBulkTraceRequest *request,
+                               api::BulkTraceReport *response) override {
+    using Entry = api::BulkTraceEntry;
+    if (!valid_batch_id(request->batch_id()))
+      return {grpc::StatusCode::INVALID_ARGUMENT, "invalid bulk trace batch ID"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    response->set_batch_id(request->batch_id());
+    const auto snapshot = session->snapshot();
+    bool complete = true;
+    for (auto it = snapshot.probes().rbegin(); it != snapshot.probes().rend(); ++it) {
+      if (it->bulk_batch_id() != request->batch_id())
+        continue;
+      auto *row = response->add_entries();
+      row->mutable_function()->set_linkage_symbol(it->symbol());
+      row->mutable_function()->set_runtime_address(it->entry_address());
+      restore_bulk_entry(session, *it, Entry::REMOVED, row);
+      complete &= row->status() == Entry::REMOVED;
+    }
+    if (response->entries().empty())
+      return {grpc::StatusCode::NOT_FOUND, "bulk trace batch has no retained probes in this session"};
+    response->set_complete(complete);
+    if (!complete)
+      response->set_diagnostic("bulk trace removal is incomplete");
+    return grpc::Status::OK;
   }
 
   grpc::Status WatchEvents(
@@ -1902,6 +1975,139 @@ private:
     const auto found = active_by_pid_.find(session->pid());
     if (found != active_by_pid_.end() && found->second == session->id()) {
       active_by_pid_.erase(found);
+    }
+  }
+
+  static bool valid_batch_id(const std::string &id) {
+    return id.size() == 32 && id.find_first_not_of("0123456789abcdef") == std::string::npos;
+  }
+
+  void restore_bulk_entry(const std::shared_ptr<Session> &session, const api::Probe &probe,
+                          api::BulkTraceEntry::Status success, api::BulkTraceEntry *row) {
+    auto *result = row->mutable_probe();
+    *result = probe;
+    const auto status = remove_probe(session, probe.id(), result);
+    if (status.ok()) {
+      row->set_status(success);
+      return;
+    }
+    const auto snapshot = session->snapshot();
+    for (const auto &current : snapshot.probes())
+      if (current.id() == probe.id())
+        *result = current;
+    row->set_status(api::BulkTraceEntry::RESTORE_PENDING);
+    const auto previous = row->diagnostic();
+    row->set_diagnostic((previous.empty() ? "" : previous + " | ") +
+                        "restore: " + status.error_message());
+  }
+
+  // The caller holds the session operation lock throughout these operations.
+  grpc::Status install_probe(const std::shared_ptr<Session> &session,
+                             const api::ProbeSpec &spec, const std::string &batch_id,
+                             std::uint64_t &pending_probe_id, api::Probe *response) {
+    pending_probe_id = 0;
+    try {
+      pending_probe_id = next_probe_id_.fetch_add(1);
+      if (pending_probe_id == 0)
+        pending_probe_id = next_probe_id_.fetch_add(1);
+      const auto &selector = spec.debug_info().selector();
+      const auto function_name =
+          spec.has_debug_info() && !selector.empty() && selector.size() <= 4096 &&
+                  selector.find('\0') == std::string::npos
+              ? selector
+              : spec.symbol();
+      events_.set_probe(session->id(), pending_probe_id, session->pid(),
+                        function_name, true);
+      const auto lineage = admit_probe_package(spec);
+      if (!lineage.retained) {
+        std::cerr << "clang-tracer: shared-context source lineage isolated: "
+                  << lineage.diagnostic.substr(0, 240) << '\n';
+      }
+      auto probe = session->add_probe(spec, source_directory_, pending_probe_id,
+                                      lineage.id, batch_id);
+      sync_event_probes(session);
+      response->CopyFrom(probe);
+      return grpc::Status::OK;
+    } catch (const std::invalid_argument &error) {
+      sync_event_probes(session, pending_probe_id);
+      return {grpc::StatusCode::INVALID_ARGUMENT, error.what()};
+    } catch (const std::exception &error) {
+      sync_event_probes(session, pending_probe_id);
+      return status_for(error);
+    }
+  }
+
+  grpc::Status remove_probe(const std::shared_ptr<Session> &session,
+                            std::uint64_t probe_id, api::Probe *response) {
+    try {
+      auto probe = session->remove_probe(probe_id);
+      if (!events_.retire_probe(
+              probe.session_id(), probe.id(), session->events_sent(probe.id()),
+              std::chrono::duration_cast<std::chrono::milliseconds>(timeout_)))
+        throw std::runtime_error("timed out waiting for emitted probe events");
+      response->CopyFrom(probe);
+      erase_active_pid_if_inactive(session);
+      return grpc::Status::OK;
+    } catch (const std::invalid_argument &error) {
+      sync_event_probes(session);
+      return {grpc::StatusCode::NOT_FOUND, error.what()};
+    } catch (const std::exception &error) {
+      sync_event_probes(session);
+      return status_for(error);
+    }
+  }
+
+  grpc::Status preview_bulk_trace(grpc::ServerContext *context,
+                                  const std::shared_ptr<Session> &session,
+                                  const api::BulkTraceRules &rules,
+                                  api::PreviewBulkTraceResponse *response) {
+    if (rules.version() != 1)
+      return {grpc::StatusCode::INVALID_ARGUMENT, "unsupported bulk manifest version"};
+    if (rules.include_globs().empty() && rules.exact_selectors().empty())
+      return {grpc::StatusCode::INVALID_ARGUMENT, "bulk preview requires an include glob or exact signature"};
+    std::size_t count = 0;
+    for (const auto *group : {&rules.module_globs(), &rules.include_globs(),
+                              &rules.exclude_globs(), &rules.exact_selectors()}) {
+      count += group->size();
+      if (count > 128)
+        return {grpc::StatusCode::INVALID_ARGUMENT, "bulk preview allows at most 128 rules"};
+      for (const auto &rule : *group)
+        if (rule.empty() || rule.size() > 4096 || rule.find('\0') != std::string::npos)
+          return {grpc::StatusCode::INVALID_ARGUMENT, "bulk rules must contain 1 to 4096 bytes without NUL"};
+    }
+    for (const auto &selector : rules.exact_selectors())
+      if (selector.find('(') == std::string::npos || selector.find(')') == std::string::npos)
+        return {grpc::StatusCode::INVALID_ARGUMENT, "exact selection requires a full C++ signature"};
+
+    session->refresh_process_state();
+    if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "session is not attached"};
+    try {
+      auto preview = client::preview_bulk_trace(
+          session->pid(), rules, [&] { return context->IsCancelled(); });
+      const auto agent_retained = session->agent_retained_count();
+      session->refresh_process_state();
+      const auto snapshot = session->snapshot();
+      if (snapshot.state() != clangtracer::v1::Session::ATTACHED)
+        return {grpc::StatusCode::FAILED_PRECONDITION,
+                "target process exited during bulk preview"};
+      preview.set_retained_limit(kMaxProbes);
+      preview.set_session_retained(snapshot.probes_size());
+      if (agent_retained) {
+        preview.set_agent_retained(*agent_retained);
+        const auto retained = std::max(*agent_retained, preview.session_retained());
+        preview.set_available_slots(kMaxProbes - std::min(kMaxProbes, retained));
+      }
+      response->Swap(&preview);
+      return grpc::Status::OK;
+    } catch (const client::DebugLookupLimit &error) {
+      return {grpc::StatusCode::RESOURCE_EXHAUSTED, error.what()};
+    } catch (const std::invalid_argument &error) {
+      return {grpc::StatusCode::ABORTED, error.what()};
+    } catch (const std::exception &error) {
+      if (context->IsCancelled())
+        return {grpc::StatusCode::CANCELLED, "bulk trace preview cancelled"};
+      return status_for(error);
     }
   }
 

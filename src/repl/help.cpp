@@ -44,11 +44,16 @@ const CommandTopic commands[] = {
      "Find supported C++ callables. Use --addresses for verified entries or --address with the mapping token to look up a PC.",
      "%symbols --filter Calculator --limit 20 --addresses"},
 
-    {"trace", "", "Preview a bulk C++ trace selection."},
+    {"trace", "", "Preview, apply, or remove a bulk C++ trace."},
     {"trace preview", "%trace preview [--module GLOB] [--include GLOB] [--exclude GLOB] [--exact SIGNATURE]\n"
      "  or %trace preview --manifest FILE\n  [--save NEW_FILE]",
      "Preview bulk C++ matches, ABI status and retained probe capacity without installing probes.",
      R"example(%trace preview --module "libapp*" --include "app::*" --exclude "app::detail::*")example"},
+    {"trace apply", "%trace apply --manifest FILE [--callback FILE]",
+     "Install a typed observer for each eligible manifest match. Restore newly installed probes on partial failure.",
+     "%trace apply --manifest trace.textproto"},
+    {"trace remove", "%trace remove BATCH_ID",
+     "Remove or retry restoration of the probes owned by a batch in the selected session."},
     {"probe", "", "Prepare, resolve, validate, install, or remove a probe."},
     {"probe prepare",
      "%probe prepare SELECTOR --include HEADER --output NEW_DIRECTORY\n"

@@ -214,6 +214,25 @@ class Client:
         )
         return list(response.threads)
 
+    def apply_bulk_trace(
+        self, session_id: str, rules: pb.BulkTraceRules, batch_id: str,
+        *, callback_source: str | None = None,
+    ) -> pb.BulkTraceReport:
+        """Apply rules with a caller-owned batch ID, such as uuid.uuid4().hex."""
+        request = pb.ApplyBulkTraceRequest(
+            session_id=session_id, rules=rules, batch_id=batch_id
+        )
+        if callback_source is not None:
+            request.callback_source = callback_source
+        return self.stub.ApplyBulkTrace(request, timeout=self.timeout)
+
+    def remove_bulk_trace(self, session_id: str, batch_id: str) -> pb.BulkTraceReport:
+        """Restore the probes owned by a retained batch in this session."""
+        return self.stub.RemoveBulkTrace(
+            pb.RemoveBulkTraceRequest(session_id=session_id, batch_id=batch_id),
+            timeout=self.timeout,
+        )
+
     def list_symbols(
         self,
         session_id: str,

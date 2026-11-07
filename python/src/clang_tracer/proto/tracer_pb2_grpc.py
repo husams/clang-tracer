@@ -90,6 +90,16 @@ class TracerStub(object):
                 request_serializer=tracer__pb2.PreviewBulkTraceRequest.SerializeToString,
                 response_deserializer=tracer__pb2.PreviewBulkTraceResponse.FromString,
                 _registered_method=True)
+        self.ApplyBulkTrace = channel.unary_unary(
+                '/clangtracer.v1.Tracer/ApplyBulkTrace',
+                request_serializer=tracer__pb2.ApplyBulkTraceRequest.SerializeToString,
+                response_deserializer=tracer__pb2.BulkTraceReport.FromString,
+                _registered_method=True)
+        self.RemoveBulkTrace = channel.unary_unary(
+                '/clangtracer.v1.Tracer/RemoveBulkTrace',
+                request_serializer=tracer__pb2.RemoveBulkTraceRequest.SerializeToString,
+                response_deserializer=tracer__pb2.BulkTraceReport.FromString,
+                _registered_method=True)
         self.WatchEvents = channel.unary_stream(
                 '/clangtracer.v1.Tracer/WatchEvents',
                 request_serializer=tracer__pb2.WatchEventsRequest.SerializeToString,
@@ -178,6 +188,18 @@ class TracerServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ApplyBulkTrace(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RemoveBulkTrace(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def WatchEvents(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -254,6 +276,16 @@ def add_TracerServicer_to_server(servicer, server):
                     servicer.PreviewBulkTrace,
                     request_deserializer=tracer__pb2.PreviewBulkTraceRequest.FromString,
                     response_serializer=tracer__pb2.PreviewBulkTraceResponse.SerializeToString,
+            ),
+            'ApplyBulkTrace': grpc.unary_unary_rpc_method_handler(
+                    servicer.ApplyBulkTrace,
+                    request_deserializer=tracer__pb2.ApplyBulkTraceRequest.FromString,
+                    response_serializer=tracer__pb2.BulkTraceReport.SerializeToString,
+            ),
+            'RemoveBulkTrace': grpc.unary_unary_rpc_method_handler(
+                    servicer.RemoveBulkTrace,
+                    request_deserializer=tracer__pb2.RemoveBulkTraceRequest.FromString,
+                    response_serializer=tracer__pb2.BulkTraceReport.SerializeToString,
             ),
             'WatchEvents': grpc.unary_stream_rpc_method_handler(
                     servicer.WatchEvents,
@@ -569,6 +601,60 @@ class Tracer(object):
             '/clangtracer.v1.Tracer/PreviewBulkTrace',
             tracer__pb2.PreviewBulkTraceRequest.SerializeToString,
             tracer__pb2.PreviewBulkTraceResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ApplyBulkTrace(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/ApplyBulkTrace',
+            tracer__pb2.ApplyBulkTraceRequest.SerializeToString,
+            tracer__pb2.BulkTraceReport.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RemoveBulkTrace(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/RemoveBulkTrace',
+            tracer__pb2.RemoveBulkTraceRequest.SerializeToString,
+            tracer__pb2.BulkTraceReport.FromString,
             options,
             channel_credentials,
             insecure,

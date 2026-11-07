@@ -236,6 +236,11 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:repl-browser-target> $<TARGET_FILE:call-stacks-calculator>
           "${CMAKE_OBJCOPY}")
       set_tests_properties(native_repl_bulk_preview PROPERTIES TIMEOUT 120)
+      add_test(NAME native_repl_bulk_apply
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_bulk_apply.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:cpp-name-fixture>)
+      set_tests_properties(native_repl_bulk_apply PROPERTIES TIMEOUT 120)
       add_test(NAME native_repl_prepared_integration
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_prepared_integration.py"
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
