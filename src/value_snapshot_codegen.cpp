@@ -194,7 +194,7 @@ make_value_snapshot_code(clang::ASTContext &ast,
     std::string error;
   };
   std::vector<Entry> entries;
-  const auto access = spec.prepared().format_version() == tracer::prepared::typed_version
+  const auto access = tracer::prepared::is_typed_version(spec.prepared().format_version())
       ? context_engine::CodecAccess::snapshot_members
       : context_engine::CodecAccess::public_members;
   const auto add = [&](unsigned index, Role role, clang::QualType type) {

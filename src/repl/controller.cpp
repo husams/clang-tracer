@@ -320,7 +320,7 @@ PreparedMode prepared_options(Request &request, const Command &options,
       throw std::runtime_error("invalid prepared contract");
     if (prepared.format_version() == 3)
       throw std::runtime_error("legacy typed prepared package requires regeneration");
-    const bool typed = prepared.format_version() == tracer::prepared::typed_version;
+    const bool typed = tracer::prepared::is_typed_version(prepared.format_version());
     const bool pinned = (prepared.format_version() == 1 || typed) &&
                         prepared.module_sha256().size() == 32 && !prepared.module_name().empty();
     const bool source_only = (prepared.format_version() == 2 || typed) &&
@@ -715,7 +715,7 @@ std::uint64_t Controller::inject(const SessionHandle &session,
   // intact by resolution.
   const auto &artifact = request.spec().prepared();
   const auto package = prepared_packages_.find(compact_selector(selector));
-  if (artifact.format_version() == tracer::prepared::typed_version &&
+  if (tracer::prepared::is_typed_version(artifact.format_version()) &&
       package != prepared_packages_.end() &&
       artifact.SerializeAsString() == package->second.artifact.SerializeAsString())
     pending_imports_.push_back(tracer::prepared::adapter_source(package->second.artifact));

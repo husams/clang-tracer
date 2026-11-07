@@ -110,8 +110,6 @@ int main(int argc, char **argv) {
       auto callable = tracer::client::resolve_header_callable(
           options.at("--selector"), context, command, pointer_layouts);
       auto &adapter = *callable.spec.mutable_prepared();
-      for (const auto &option : command.adapter_abi_options)
-        adapter.add_adapter_abi_options(option);
       tracer::client::verify_prepared_adapter(options.at("--selector"), adapter,
                                               callable, pointer_layouts);
       return callable;
@@ -156,6 +154,8 @@ int main(int argc, char **argv) {
       prepared.clear_adapter_declarations();
       prepared.clear_adapter_standard_headers();
       prepared.clear_adapter_abi_options();
+      prepared.clear_adapter_toolchain_options();
+      prepared.clear_adapter_uses_default_toolchain();
     }
     if (!module.empty()) {
       prepared.set_module_sha256(digest);

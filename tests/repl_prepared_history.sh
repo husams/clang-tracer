@@ -23,6 +23,7 @@ cat >prepare.repl <<'REPL'
 %probe prepare "prepared_history::via_value(prepared_history::HistoryItem, int)" --include application/history.hpp --output value
 %probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include application/history.hpp --output opaque
 %probe prepare "HFW::HfwManager::createItem()" --include application/history.hpp --include application/payload.hpp --output manager-item --metadata-only
+%probe prepare "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --include application/payload.hpp --compdb compile_commands.json --output toolchain-headers
 REPL
 "$repl" --fail-fast <prepare.repl
 cat >unsupported.repl <<'REPL'
@@ -34,6 +35,8 @@ if "$repl" --fail-fast <unsupported.repl >unsupported.log 2>&1; then
 fi
 grep -F "cannot prepare standalone type 'HFW::HfwManager::ItemBox<int>'" unsupported.log
 test ! -e manager-box
+grep -Fx '#include <system_error>' toolchain-headers/generated/adapter.hpp
+grep -Ex '#include <(time\.h|ctime)>' toolchain-headers/generated/adapter.hpp
 unlink application/history.hpp
 unlink application/payload.hpp
 unlink compile_commands.json
@@ -104,6 +107,9 @@ auto manager_item = tracer.batch("manager-item").at(0);
 auto returned_item = manager_item.result_snapshot();
 if (returned_item.field("id").as<int>() != 73 || returned_item.field("kind").as<int>() != 3 || returned_item.field("details").field("quantity").as<int>() != 5) throw std::runtime_error("wrong nested manager item fields");
 if (manager_item.receiver_snapshot().field("seed").as<int>() != 71) throw std::runtime_error("wrong manager receiver fields");
+%probe inject "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --callback snapshot.cpp --prepared toolchain-headers --prepared-mode require
+%collect --name "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --phase POST --count 1 --timeout 15 --as toolchain-headers
+if (tracer.batch("toolchain-headers").at(0).result_as<int>() != 1) throw std::runtime_error("toolchain-header callable returned wrong result");
 std::cout << "PREPARED_HISTORY_FIELDS=1" << std::endl;
 %quit
 REPL
@@ -113,7 +119,7 @@ pid=$!
 trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
 "$repl" --server "$server" --agent "$agent" --attach "$pid" --timeout 60 \
   --fail-fast <verify.repl | tee smoke.log
-test "$(grep -c '^installed probe=' smoke.log)" -eq 5
+test "$(grep -c '^installed probe=' smoke.log)" -eq 6
 grep -qx 'prepared_used: true' smoke.log
 grep -qx PREPARED_HISTORY_FIELDS=1 smoke.log
 kill -0 "$pid"

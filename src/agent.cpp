@@ -26,6 +26,7 @@
 #include "context_paths.hpp"
 #include "prepared_types.hpp"
 #include "prepared_contract.hpp"
+#include "prepared_header_search.hpp"
 
 #include <clang/AST/ASTImporter.h>
 #include <clang/AST/DeclCXX.h>
@@ -43,6 +44,7 @@
 #include <clang/Frontend/FrontendActions.h>
 #include <clang/Interpreter/Interpreter.h>
 #include <clang/Lex/Lexer.h>
+#include <clang/Lex/Preprocessor.h>
 #include <clang/Parse/ParseAST.h>
 #include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/Tooling.h>
@@ -2349,7 +2351,8 @@ std::string make_wrapper(const tracer::Request &r,
                          bool class_mode = false, bool shared_mode = false,
                          bool result_sret = false,
                          const tracer::ValueSnapshotCode *snapshots = nullptr) {
-  const bool typed = spec && spec->prepared().format_version() == tracer::prepared::typed_version;
+  const bool typed = spec && tracer::prepared::is_typed_version(
+                                  spec->prepared().format_version());
   const auto indirect_argument = [&](unsigned i) {
     return typed && r.arguments[i] == tracer::ValueType::Object &&
            spec->debug_info().arguments(i).object_type().record_pass_by_reference();
@@ -2941,7 +2944,7 @@ bool validate_specialized_signature(
   }
   // Prepared aliases retain the exact Clang type. The generated
   // static_assert compares the complete signature in the same TU.
-  if (spec.prepared().format_version() == tracer::prepared::typed_version)
+  if (tracer::prepared::is_typed_version(spec.prepared().format_version()))
     return true;
   const auto &info = spec.debug_info();
   if (function->getNumParams() != info.arguments_size()) {
@@ -3526,7 +3529,8 @@ std::string argument_aliases(const clangtracer::v1::ProbeSpec &spec) {
   std::string code =
       "namespace tracer { template<unsigned long> struct ArgumentType; "
       "template<unsigned long> struct ResultType;\n";
-  const bool typed = spec.prepared().format_version() == tracer::prepared::typed_version;
+  const bool typed = tracer::prepared::is_typed_version(
+      spec.prepared().format_version());
   if (typed)
     code += "template<unsigned> struct PreparedArgument;\n"
             "template<unsigned N> using ResolvedArgument = typename PreparedArgument<N>::type;\n";
@@ -3904,7 +3908,8 @@ bool compile_shared_probe(Probe &p,
   tracer::ContextActivationRequest activation;
   const auto [callback_includes, callback_body] =
       split_callback_includes(specification.callback_source());
-  const bool typed_prepared = specification.prepared().format_version() == tracer::prepared::typed_version;
+  const bool typed_prepared = tracer::prepared::is_typed_version(
+      specification.prepared().format_version());
   std::string requested_header_source = typed_prepared
       ? tracer::prepared::adapter_source(specification.prepared()) : std::string();
   for (const auto &header : specification.include_headers())
@@ -4254,7 +4259,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
             "receiver context", true)))) {
     return false;
   }
-  const bool typed_prepared = specification.prepared().format_version() == tracer::prepared::typed_version;
+  const bool typed_prepared = tracer::prepared::is_typed_version(
+      specification.prepared().format_version());
   if (typed_prepared &&
       (specification.has_header_context() || specification.include_headers_size())) {
     error = "standalone prepared injection does not accept application headers";
@@ -4342,9 +4348,48 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   const std::string resource_dir_argument =
       std::string("-resource-dir=") + tracer::runtime::clang_resource_dir();
   auto compiler_arguments = tracer::runtime::jit_arguments();
+  if (typed_prepared) {
+    try {
+      compiler_arguments = tracer::prepared::toolchain_arguments(
+          specification.prepared(), std::move(compiler_arguments));
+    } catch (const std::exception &exception) {
+      error = exception.what();
+      return false;
+    }
+  }
   compiler_arguments.insert(
       compiler_arguments.end(),
       {"-std=c++20", "-x", "c++", "-fPIC", "-O0", resource_dir_argument});
+  if (typed_prepared) {
+    auto header_check_arguments = compiler_arguments;
+    header_check_arguments.push_back("-fsyntax-only");
+    DiagnosticCapture capture(nullptr);
+    auto toolchain_ast = clang::tooling::buildASTFromCodeWithArgs(
+        "", header_check_arguments, "clang-tracer-toolchain-headers.cc",
+        "clang-tracer", std::make_shared<clang::PCHContainerOperations>(),
+        clang::tooling::getClangStripOutputAdjuster(), {}, &capture);
+    if (!toolchain_ast || capture.had_error()) {
+      error = capture.message().empty()
+                  ? "cannot initialize the selected toolchain header search"
+                  : capture.message();
+      return false;
+    }
+    try {
+      const auto &target = toolchain_ast->getASTContext().getTargetInfo();
+      const auto &triple = target.getTriple();
+      if (triple.getArch() != llvm::Triple::x86_64 || !triple.isOSLinux() ||
+          !triple.isOSBinFormatELF() || !target.isLittleEndian() ||
+          target.getPointerWidth(clang::LangAS::Default) != 64 || target.getLongWidth() != 64 ||
+          !target.getCXXABI().isItaniumFamily())
+        throw std::invalid_argument("prepared toolchain ABI does not match the trace target");
+      tracer::prepared::check_toolchain_headers(
+          toolchain_ast->getPreprocessor().getHeaderSearchInfo(),
+          specification.prepared());
+    } catch (const std::exception &exception) {
+      error = exception.what();
+      return false;
+    }
+  }
   const auto &snapshot_debug = specification.debug_info();
   const bool needs_snapshot_headers =
       (typed_prepared && specification.signature().kind() == clangtracer::v1::METHOD) ||

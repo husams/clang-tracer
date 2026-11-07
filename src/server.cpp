@@ -464,7 +464,7 @@ public:
                  std::uint32_t pid, std::string function_name, bool active,
                  const clangtracer::v1::PreparedInjector *prepared = nullptr) {
     std::shared_ptr<const clangtracer::v1::PreparedInjector> replay_types;
-    if (prepared && prepared->format_version() == tracer::prepared::typed_version &&
+    if (prepared && tracer::prepared::is_typed_version(prepared->format_version()) &&
         !prepared->adapter_declarations().empty() &&
         prepared->ByteSizeLong() <= tracer::prepared::max_replay_type_bytes) {
       auto types = std::make_shared<clangtracer::v1::PreparedInjector>();
@@ -1382,7 +1382,7 @@ public:
       lookup.is_cancelled = [&] { return context->IsCancelled(); };
       if (request->has_prepared() && request->prepared().selector() != request->selector())
         return {grpc::StatusCode::INVALID_ARGUMENT, "prepared selector mismatch"};
-      if (request->prepared().format_version() == tracer::prepared::typed_version &&
+      if (tracer::prepared::is_typed_version(request->prepared().format_version()) &&
           !request->include_headers().empty())
         return {grpc::StatusCode::INVALID_ARGUMENT, "standalone prepared injection does not accept application headers"};
       auto resolved = request->has_prepared()
@@ -1446,7 +1446,7 @@ public:
       lookup.is_cancelled = [&] { return context->IsCancelled(); };
       if (request->has_prepared() && request->prepared().selector() != request->selector())
         return {grpc::StatusCode::INVALID_ARGUMENT, "prepared selector mismatch"};
-      if (request->prepared().format_version() == tracer::prepared::typed_version &&
+      if (tracer::prepared::is_typed_version(request->prepared().format_version()) &&
           !request->include_headers().empty())
         return {grpc::StatusCode::INVALID_ARGUMENT, "standalone prepared injection does not accept application headers"};
       auto resolved = request->has_prepared()
@@ -2304,7 +2304,7 @@ private:
   grpc::Status validate_probe(const clangtracer::v1::ProbeSpec &spec) const {
     if (spec.has_prepared() && !spec.has_debug_info())
       return {grpc::StatusCode::INVALID_ARGUMENT, "prepared probe requires a live binding"};
-    if (spec.prepared().format_version() == tracer::prepared::typed_version &&
+    if (tracer::prepared::is_typed_version(spec.prepared().format_version()) &&
         (spec.has_header_context() || !spec.include_headers().empty()))
       return {grpc::StatusCode::INVALID_ARGUMENT, "standalone prepared injection does not accept application headers"};
     if (spec.ByteSizeLong() > 256 * 1024) {

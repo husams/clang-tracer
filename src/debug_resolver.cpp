@@ -1436,7 +1436,7 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
   const auto version = prepared.format_version();
   if (version == 3)
     throw std::invalid_argument("legacy typed prepared package requires regeneration");
-  const bool typed = version == tracer::prepared::typed_version;
+  const bool typed = tracer::prepared::is_typed_version(version);
   const bool pinned = (version == 1 || typed) &&
                       prepared.module_sha256().size() == 32 && !prepared.module_name().empty();
   const bool source_only = (version == 2 || typed) &&
@@ -1500,7 +1500,8 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
         throw std::invalid_argument("invalid prepared C++ type");
     };
     (void)tracer::prepared::adapter_source(prepared);
-    if (prepared.has_header_context() || prepared.include_headers_size() != 0 ||
+    if ((version == tracer::prepared::typed_version && prepared.adapter_toolchain_options().empty()) ||
+        prepared.has_header_context() || prepared.include_headers_size() != 0 ||
         source.arguments_size() != signature.arguments_size() ||
         source.record_name().empty() == (signature.kind() == api::METHOD))
       throw std::invalid_argument("invalid prepared header metadata");
@@ -1535,7 +1536,8 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
       throw std::invalid_argument("prepared metadata contains unexpected fields");
   } else if (prepared.has_header_types() || prepared.has_header_context() ||
              !prepared.include_headers().empty() || !prepared.adapter_declarations().empty() ||
-             !prepared.adapter_standard_headers().empty() || !prepared.adapter_abi_options().empty()) {
+             !prepared.adapter_standard_headers().empty() || !prepared.adapter_abi_options().empty() ||
+             !prepared.adapter_toolchain_options().empty() || prepared.adapter_uses_default_toolchain()) {
     throw std::invalid_argument("unexpected header metadata in scalar package");
   }
   std::vector<ResolvedCallable> matches;

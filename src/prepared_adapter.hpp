@@ -1,6 +1,7 @@
 #pragma once
 
 #include "prepared_types.hpp"
+#include "prepared_header_discovery.hpp"
 
 #include <clang/AST/DeclCXX.h>
 #include <clang/Basic/SourceManager.h>
@@ -26,7 +27,10 @@ struct AdapterDeclarations {
 
 class AdapterEmitter {
 public:
-  explicit AdapterEmitter(clang::ASTContext &ast) : ast_(ast), policy_(ast.getLangOpts()) {
+  explicit AdapterEmitter(clang::ASTContext &ast,
+                          const clang::HeaderSearch &toolchain_search)
+      : ast_(ast), policy_(ast.getLangOpts()),
+        header_discovery_(ast, toolchain_search) {
     policy_.SuppressTagKeyword = true;
     policy_.FullyQualifiedName = true;
   }
@@ -43,6 +47,7 @@ public:
       register_nested_type(parameter->getType(), pointer_layouts);
     // Additional inputs can provide callback-only payload declarations.
     extra_headers_.insert(std::next(headers.begin()), headers.end());
+    excluded_headers_.insert(headers.begin(), headers.end());
     emit_extra(*ast_.getTranslationUnitDecl());
     if (selected_method_ && !linkage_alias) {
       emit_record(*selected_method_->getParent());
@@ -232,6 +237,12 @@ private:
   }
 
   void emit_enum(const clang::EnumDecl &enumeration) {
+    if (const auto header = header_discovery_.headerFor(enumeration, excluded_headers_)) {
+      standard_headers_.insert(*header);
+      return;
+    }
+    if (enumeration.isInStdNamespace())
+      unsupported(enumeration, "cannot resolve a public toolchain header");
     const auto *decl = enumeration.getDefinition();
     if (!decl || !decl->getIdentifier())
       unsupported(enumeration, "enumeration requires a named definition");
@@ -276,35 +287,18 @@ private:
       unsupported(dependency, "nested type owner has no complete definition");
   }
 
-  void standard_record(const clang::CXXRecordDecl &record) {
-    const auto *special = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(&record);
-    const auto name = special ? special->getSpecializedTemplate()->getName() : record.getName();
-    static constexpr std::pair<std::string_view, std::string_view> headers[]{
-        {"array", "array"}, {"atomic", "atomic"}, {"basic_ostream", "ostream"},
-        {"basic_ostringstream", "sstream"}, {"basic_string", "string"},
-        {"basic_string_view", "string_view"}, {"bitset", "bitset"}, {"char_traits", "string"},
-        {"complex", "complex"}, {"deque", "deque"}, {"duration", "chrono"},
-        {"time_point", "chrono"}, {"forward_list", "forward_list"}, {"function", "functional"},
-        {"greater", "functional"}, {"less", "functional"}, {"equal_to", "functional"},
-        {"hash", "functional"}, {"initializer_list", "initializer_list"}, {"list", "list"},
-        {"map", "map"}, {"multimap", "map"}, {"allocator", "memory"},
-        {"default_delete", "memory"}, {"shared_ptr", "memory"}, {"weak_ptr", "memory"},
-        {"unique_ptr", "memory"}, {"optional", "optional"}, {"queue", "queue"},
-        {"priority_queue", "queue"}, {"set", "set"}, {"multiset", "set"}, {"stack", "stack"},
-        {"tuple", "tuple"}, {"unordered_map", "unordered_map"},
-        {"unordered_multimap", "unordered_map"}, {"unordered_set", "unordered_set"},
-        {"unordered_multiset", "unordered_set"}, {"pair", "utility"}, {"ratio", "chrono"},
-        {"monostate", "variant"}, {"variant", "variant"}, {"vector", "vector"}};
-    for (const auto &[type, header] : headers) {
-      if (name == llvm::StringRef(type.data(), type.size())) {
-        standard_headers_.emplace(header);
-        if (special)
-          for (const auto &argument : special->getTemplateArgs().asArray())
-            visit_template_arg(argument);
-        return;
-      }
+  bool include_toolchain_record(const clang::CXXRecordDecl &record) {
+    const auto header = header_discovery_.headerFor(record, excluded_headers_);
+    if (!header) {
+      if (record.isInStdNamespace())
+        unsupported(record, "cannot resolve a public toolchain header");
+      return false;
     }
-    unsupported(record, "unsupported standard library type");
+    standard_headers_.emplace(*header);
+    if (const auto *special = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(&record))
+      for (const auto &argument : special->getTemplateArgs().asArray())
+        visit_template_arg(argument);
+    return true;
   }
 
   void visit_template_arg(const clang::TemplateArgument &arg) {
@@ -331,9 +325,9 @@ private:
       for (auto parameter : function->param_types())
         visit(parameter, false);
     } else if (const auto *record = type->getAsCXXRecordDecl()) {
-      if (record->isInStdNamespace())
-        standard_record(*record);
-      else if (complete && record->getDefinition())
+      if (include_toolchain_record(*record))
+        return;
+      if (complete && record->getDefinition())
         emit_record(*record->getDefinition());
       else
         forward(*record);
@@ -408,10 +402,8 @@ private:
   }
 
   void emit_record(const clang::CXXRecordDecl &record) {
-    if (record.isInStdNamespace()) {
-      standard_record(record);
+    if (include_toolchain_record(record))
       return;
-    }
     const auto *identity = record.getCanonicalDecl();
     if (emitted_.count(identity) || defer_to_owner(record))
       return;
@@ -531,8 +523,10 @@ private:
 
   clang::ASTContext &ast_;
   clang::PrintingPolicy policy_;
+  HeaderDiscovery header_discovery_;
   const clang::CXXMethodDecl *selected_method_ = nullptr;
   std::set<std::string> extra_headers_;
+  std::set<std::string> excluded_headers_;
   std::set<std::string> standard_headers_;
   std::unordered_set<const clang::Decl *> emitted_;
   std::unordered_set<const clang::Decl *> forwarded_;

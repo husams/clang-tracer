@@ -43,6 +43,10 @@ const OpaqueItem *via_opaque(const OpaqueItem *item, int tag) {
   return item;
 }
 
+int uses_toolchain_headers(const std::error_code *error, const struct tm *time) {
+  return error && time ? 1 : 0;
+}
+
 } // namespace prepared_history
 
 HFW::HfwManager::Item HFW::HfwManager::createItem() {
@@ -58,6 +62,8 @@ int main() {
   const HistoryItem item;
   const OpaqueItem opaque{3};
   HFW::HfwManager manager;
+  const std::error_code toolchain_error;
+  const struct tm toolchain_time{};
   for (;;) {
     copies = moves = destructions = 0;
     if (via_pointer(nullptr, 1) || via_pointer(&item, 1) != &item ||
@@ -77,6 +83,8 @@ int main() {
     const auto box = manager.createBox();
     if (box.value != 17)
       return 5;
+    if (uses_toolchain_headers(&toolchain_error, &toolchain_time) != 1)
+      return 6;
     ::usleep(100000);
   }
 }

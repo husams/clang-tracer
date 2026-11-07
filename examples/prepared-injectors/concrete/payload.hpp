@@ -2,6 +2,15 @@
 
 #include <ostream>
 #include <sstream>
+#include <system_error>
+
+#include <time.h>
+
+namespace prepared_history {
+
+int uses_toolchain_headers(const std::error_code *error, const struct tm *time);
+
+} // namespace prepared_history
 
 namespace HFW {
 

@@ -3,6 +3,7 @@
 #include "completion.hpp"
 #include "mapping_cache.hpp"
 #include "../prepared_contract.hpp"
+#include "../prepared_header_search.hpp"
 
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/Decl.h>
@@ -11,6 +12,8 @@
 #include <clang/Interpreter/Interpreter.h>
 #include <clang/Interpreter/PartialTranslationUnit.h>
 #include <clang/Interpreter/Value.h>
+#include <clang/Lex/Preprocessor.h>
+#include <clang/Tooling/Tooling.h>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/IR/Instructions.h>
@@ -318,12 +321,20 @@ std::string CppEngine::import_prepared_adapter(const std::string &source) {
 }
 
 std::string CppEngine::import_recorded_types(const clangtracer::v1::PreparedInjector &types) {
-  if (types.format_version() != tracer::prepared::typed_version ||
+  if (!tracer::prepared::is_typed_version(types.format_version()) ||
+      !types.adapter_toolchain_options().empty() || types.adapter_uses_default_toolchain() ||
       types.ByteSizeLong() > tracer::prepared::max_replay_type_bytes)
     throw std::invalid_argument("unsupported recorded type bundle");
   const auto source = tracer::prepared::adapter_source(types);
   if (impl_ && impl_->imported_adapters.count(mapping_digest(source)))
     return {};
+  if (!types.adapter_standard_headers().empty()) {
+    auto unit = clang::tooling::buildASTFromCodeWithArgs("", profile_arguments({}),
+                                                       "recorded-toolchain.cc");
+    if (!unit || unit->getDiagnostics().hasErrorOccurred())
+      throw std::runtime_error("cannot resolve the local toolchain for recorded types");
+    tracer::prepared::check_toolchain_headers(unit->getPreprocessor().getHeaderSearchInfo(), types);
+  }
   const auto &declarations = types.adapter_declarations();
   const auto helper = std::filesystem::path(executable_path()).parent_path() /
                       "clang-tracer-repl-check";

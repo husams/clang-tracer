@@ -3,6 +3,7 @@
 #include "prepared_types.hpp"
 #include "prepared_adapter.hpp"
 #include "prepared_contract.hpp"
+#include "prepared_header_search.hpp"
 #include "tracer_runtime_config.hpp"
 
 #include "../include/tracer/receiver_abi.hpp"
@@ -37,6 +38,7 @@
 #include <clang/Basic/TargetInfo.h>
 #include <clang/Basic/Version.h>
 #include <clang/Frontend/CompilerInstance.h>
+#include <clang/Lex/Preprocessor.h>
 #include <clang/Frontend/FrontendActions.h>
 #include <clang/Frontend/TextDiagnosticPrinter.h>
 #include <clang/Tooling/ArgumentsAdjusters.h>
@@ -249,6 +251,7 @@ struct FrozenInvocation {
   std::string source_argument;
   std::vector<std::string> arguments;
   std::vector<std::string> prepared_headers;
+  api::PreparedInjector prepared_profile;
   std::string adapter_symbol;
   bool select_template = false;
   bool pointer_layouts = true;
@@ -510,9 +513,10 @@ public:
         tracer::prepared::describe_prepared_callable(*context_, *declaration, method,
             candidate.spec, sema_, nullptr, invocation_.pointer_layouts);
         if (!invocation_.prepared_headers.empty()) {
-          auto adapter = tracer::prepared::AdapterEmitter(*context_).emit(
+          auto adapter = tracer::prepared::AdapterEmitter(*context_, *header_search_).emit(
               *declaration, invocation_.prepared_headers, invocation_.pointer_layouts);
           auto &package = *candidate.spec.mutable_prepared();
+          package = invocation_.prepared_profile;
           package.set_target_triple(context_->getTargetInfo().getTriple().str());
           package.set_adapter_declarations(std::move(adapter.source));
           for (const auto &header : adapter.standard_headers)
@@ -533,9 +537,32 @@ public:
     return true;
   }
 
-  void set_context(clang::ASTContext& context, clang::Sema *sema) {
+  void set_context(clang::ASTContext& context, clang::Sema *sema,
+                   const clang::HeaderSearch *header_search = nullptr) {
     context_ = &context;
     sema_ = sema;
+    header_search_ = header_search;
+  }
+
+  void collect_translation_unit(clang::ASTContext &context, clang::Sema *sema) {
+    clang::DiagnosticOptions diagnostic_options;
+    PrepareDiagnostics diagnostics(diagnostic_options);
+    std::unique_ptr<clang::ASTUnit> toolchain;
+    if (!invocation_.prepared_headers.empty()) {
+      auto arguments = tracer::prepared::toolchain_arguments(invocation_.prepared_profile,
+          {runtime::jit_flags.begin(), runtime::jit_flags.end()});
+      arguments.insert(arguments.end(), {"-std=c++20", "-x", "c++",
+          "-resource-dir=" + std::string(TRACER_CLANG_RESOURCE_DIR)});
+      const auto &abi_options = invocation_.prepared_profile.adapter_abi_options();
+      arguments.insert(arguments.end(), abi_options.begin(), abi_options.end());
+      toolchain = clang::tooling::buildASTFromCodeWithArgs("", arguments,
+          "prepared-toolchain.cc", "clang-tool", std::make_shared<clang::PCHContainerOperations>(),
+          clang::tooling::getClangStripDependencyFileAdjuster(), {}, &diagnostics);
+      if (!toolchain || diagnostics.had_error() || toolchain->getDiagnostics().hasErrorOccurred())
+        throw std::invalid_argument("Clang could not resolve the prepared toolchain headers");
+    }
+    set_context(context, sema, toolchain ? &toolchain->getPreprocessor().getHeaderSearchInfo() : nullptr);
+    TraverseDecl(context.getTranslationUnitDecl());
   }
 
 private:
@@ -645,6 +672,7 @@ private:
   std::string translation_unit_;
   std::string target_triple_;
   clang::Sema *sema_;
+  const clang::HeaderSearch *header_search_ = nullptr;
 };
 
 class Action : public clang::ASTFrontendAction {
@@ -690,13 +718,12 @@ class Consumer : public clang::ASTConsumer {
 public:
   Consumer(std::vector<Candidate>& candidates, const std::string& qualified_name,
            FrozenInvocation invocation, std::string translation_unit, std::string target_triple,
-            clang::CompilerInstance *compiler)
+           clang::CompilerInstance *compiler)
       : visitor_(candidates, qualified_name, std::move(invocation), std::move(translation_unit),
                  std::move(target_triple), nullptr), compiler_(compiler) {}
 
   void HandleTranslationUnit(clang::ASTContext& context) override {
-    visitor_.set_context(context, compiler_ ? &compiler_->getSema() : nullptr);
-    visitor_.TraverseDecl(context.getTranslationUnitDecl());
+    visitor_.collect_translation_unit(context, compiler_ ? &compiler_->getSema() : nullptr);
   }
 
 private:
@@ -756,7 +783,8 @@ std::unique_ptr<clang::ASTConsumer> Action::CreateASTConsumer(clang::CompilerIns
   }
   invocation.arguments = std::move(normalized_arguments);
   return std::make_unique<Consumer>(candidates_, qualified_name_, std::move(invocation),
-                                    absolute_input, compiler.getTarget().getTriple().str(), prepared_ ? &compiler : nullptr);
+                                    absolute_input, compiler.getTarget().getTriple().str(),
+                                    prepared_ ? &compiler : nullptr);
 }
 
 class ActionFactory : public clang::tooling::FrontendActionFactory {
@@ -1012,9 +1040,54 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   const bool alternate_driver = fs::path(command.driver).is_absolute() &&
       fs::is_regular_file(command.driver, path_error) &&
       !fs::equivalent(command.driver, TRACER_PREPARE_BUILD_CXX, path_error) && !path_error;
+  FrozenInvocation invocation;
+  auto &profile = invocation.prepared_profile;
+  profile.set_format_version(tracer::prepared::typed_version);
+  profile.add_adapter_toolchain_options("--no-default-config");
+  for (const auto &option : command.adapter_abi_options)
+    profile.add_adapter_abi_options(option);
   if (command.use_default_toolchain && !alternate_driver) {
-    for (const auto* flag : runtime::jit_flags)
+    profile.set_adapter_uses_default_toolchain(true);
+    for (const auto* flag : runtime::jit_flags) {
       arguments.push_back(command.clang_cl ? std::string("/clang:") + flag : flag);
+    }
+  }
+  if (alternate_driver) {
+    profile.add_adapter_toolchain_options("-ccc-install-dir");
+    profile.add_adapter_toolchain_options(fs::path(command.driver).parent_path().string());
+  }
+  const auto absolute_option_path = [&](llvm::StringRef path) {
+    return (fs::path(command.directory) / fs::path(path.str())).lexically_normal().string();
+  };
+  // Carry driver toolchain selection, without the donor's application include
+  // paths, forced headers, defines or other unrelated compiler switches.
+  for (std::size_t index = 0; index < command.arguments.size(); ++index) {
+    llvm::StringRef option(command.arguments[index]);
+    option.consume_front("/clang:");
+    const auto prefix = tracer::prepared::toolchain_path_option(
+        std::string_view(option.data(), option.size()));
+    if (option == "-isysroot" || option == "-ccc-install-dir") {
+      if (++index == command.arguments.size())
+        throw std::invalid_argument("missing prepared toolchain path");
+      llvm::StringRef path(command.arguments[index]);
+      path.consume_front("/clang:");
+      if (option == "-ccc-install-dir") {
+        profile.add_adapter_toolchain_options("-ccc-install-dir");
+        profile.add_adapter_toolchain_options(absolute_option_path(path));
+      } else {
+        profile.add_adapter_toolchain_options("-isysroot" + absolute_option_path(path));
+      }
+    } else if (!prefix.empty()) {
+      auto path = option.drop_front(prefix.size());
+      if (prefix == "-isysroot")
+        path.consume_front("=");
+      if (!path.empty())
+        profile.add_adapter_toolchain_options(std::string(prefix) + absolute_option_path(path));
+    } else if (option.consume_front("--target=")) {
+      profile.add_adapter_toolchain_options("--target=" + llvm::Triple::normalize(option));
+    } else if (tracer::prepared::toolchain_switch(std::string_view(option.data(), option.size()))) {
+      profile.add_adapter_toolchain_options(option.str());
+    }
   }
   arguments.insert(arguments.end(), command.arguments.begin(), command.arguments.end());
   arguments.push_back("-resource-dir=" + std::string(TRACER_CLANG_RESOURCE_DIR));
@@ -1059,7 +1132,6 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   tool.mapVirtualFile(source, code);
   std::vector<Candidate> candidates;
   std::string target_error, invocation_error;
-  FrozenInvocation invocation;
   invocation.select_template = select_template;
   invocation.pointer_layouts = pointer_layouts;
   invocation.prepared_headers.assign(headers.include_headers().begin(),
@@ -1084,7 +1156,8 @@ ResolvedCallable resolve_header_callable(const std::string& name,
 void verify_prepared_adapter(const std::string &name, const api::PreparedInjector &adapter,
                              const ResolvedCallable &original, bool pointer_layouts) {
   const auto selector = parse_selector(name);
-  std::vector<std::string> arguments(runtime::jit_flags.begin(), runtime::jit_flags.end());
+  auto arguments = tracer::prepared::toolchain_arguments(adapter,
+      {runtime::jit_flags.begin(), runtime::jit_flags.end()});
   arguments.insert(arguments.end(), {"-std=c++20", "-x", "c++",
       "-resource-dir=" + std::string(TRACER_CLANG_RESOURCE_DIR)});
   arguments.insert(arguments.end(), adapter.adapter_abi_options().begin(),
@@ -1100,6 +1173,7 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
     throw std::invalid_argument("Clang reported an error while compiling the prepared adapter");
   if (!unit)
     throw std::runtime_error("generated prepared adapter does not compile independently");
+  tracer::prepared::check_toolchain_headers(unit->getPreprocessor().getHeaderSearchInfo(), adapter);
   std::vector<Candidate> candidates;
   FrozenInvocation invocation;
   invocation.adapter_symbol = original.spec.symbol();
