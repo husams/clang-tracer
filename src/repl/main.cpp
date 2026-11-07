@@ -8,12 +8,14 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include <replxx.hxx>
 #include <unistd.h>
 
 #include "completion.hpp"
 #include "controller.hpp"
+#include "help.hpp"
 #include "interpreter.hpp"
 #include "compiler_profile.hpp"
 #include "shell.hpp"
@@ -64,7 +66,7 @@ public:
           if (entered.front() == '%') {
             // Command completions never perform RPCs on the editor's input
             // thread.
-            for (const auto &name : tr::command_names()) {
+            for (const auto &name : tr::command_completions()) {
               if (name.rfind(entered, 0) == 0) {
                 completions.emplace_back(name);
               }
@@ -227,8 +229,12 @@ int main(int argc, char **argv) {
     }
     if (input.terminal()) {
       std::cout << "Clang Tracer native C++17 REPL. %help lists commands; "
-                   "%help api describes C++ APIs; Tab completes members.\n";
+                   "%help api lists C++ APIs. Tab completes help topics and members.\n";
     }
+    const auto* term = std::getenv("TERM");
+    const auto* no_color = std::getenv("NO_COLOR");
+    const bool color_help = ::isatty(STDOUT_FILENO) && term && *term &&
+                            std::string_view(term) != "dumb" && !(no_color && *no_color);
     bool failed = false;
     while (true) {
       // tracer.inject() can execute inside a JIT cell. Import after the cell
@@ -272,28 +278,8 @@ int main(int argc, char **argv) {
           continue;
         }
         const auto command = tr::parse_command(*line);
-        const bool api_help =
-            command.kind == tr::CommandKind::help &&
-            !command.arguments.empty() &&
-            std::find(tr::command_names().begin(), tr::command_names().end(),
-                      "%help " + command.arguments[0]) !=
-                tr::command_names().end();
-        if (command.kind == tr::CommandKind::help && !command.arguments.empty() &&
-            command.arguments[0] == "cpp") {
-          std::cout << "%cpp options lists the local C++ compiler arguments.\n"
-                       "%cpp options add \"-I/path/to/application/include\" \"-DFEATURE=1\"\n"
-                       "Configure options before C++ input; --cpp-arg ARG also works at startup.\n"
-                       "%cpp import \"application/types.hpp\" caches and loads EventRecord mappings.\n"
-                       "%cpp generate HEADER [--output FILE] generates the entire include using only its AST.\n"
-                       "Saved headers can be reused with #include or %cpp load; generation never links or runs application code.\n"
-                       "%cpp options compdb DATABASE --file FILE uses an exact entry, then same-directory C++ source.\n"
-                       "%shell \"COMMAND\" captures output; %cpp options add `COMMAND` adds stdout flags.\n"
-                       "Use --type QualifiedType (repeatable) to select records; nested dependencies are automatic.\n"
-                       "Existing EventRecord/EventCodec mappings are retained. Public supported fields and\n"
-                       "accessible default construction are required; incompatible types are reported.\n"
-                       "Import errors keep earlier variables. Changing compiler options after C++ input\n"
-                       "requires an explicit %cpp reset, which clears C++ variables and retains tracing sessions.\n"
-                       "Probe compiler options remain separate: --include/--compile-option refer to the server.\n";
+        if (command.kind == tr::CommandKind::help) {
+          tr::print_help(std::cout, command.arguments, cpp, color_help);
         } else if (command.kind == tr::CommandKind::cpp_options) {
           if (!command.arguments.empty()) cpp.require_compiler_options_mutable();
           if (command.arguments.empty()) {
@@ -333,32 +319,6 @@ int main(int argc, char **argv) {
           std::cout << reply.output;
           std::cerr << reply.error;
           if (reply.status) throw std::runtime_error("shell returned " + std::to_string(reply.status));
-        } else if (api_help) {
-          std::cout
-              << "C++ APIs from the loaded header (namespace tracer_repl; "
-                 "tracer is a Facade).\n"
-                 "After collecting: auto data = tracer.batch(\"batch\"); "
-                 "tracer.print(data);\n"
-                 "Print one event: tracer.print(data.at(0)); — a trailing "
-                 "semicolon is optional.\n"
-                 "Typed access: event.argument_as<int>(0), "
-                 "event.result_as<bool>(); types must match.\n"
-                 "Typed values support scalars, std::string, containers, and "
-                 "class/struct snapshots. Strings preserve NUL/binary bytes.\n"
-                 "Inspect objects: "
-                 "event.argument_snapshot(0).field(\"name\").as<std::string>()."
-                 "\n"
-                 "Use %cpp import HEADER to generate mappings for argument_as<MyType>(). "
-                 "For manual mappings, specialize EventRecord<MyType>: "
-                 "type_name plus fields() returning a tuple of "
-                 "event_member(\"name\", &MyType::member).\n"
-                 "Use EventCodec<T>::decode(const EventValue&) for "
-                 "constructor/factory mapping. "
-                 "All converted values own their data; missing/over-budget "
-                 "captures throw.\n"
-                 "Use event.has_result() before reading a result (normally "
-                 "POST); private implementation members are hidden.\n"
-              << cpp.describe_api(command.arguments[0]) << std::flush;
         } else if (command.kind == tr::CommandKind::complete) {
           const auto candidates = cpp.complete(command.arguments.at(0));
           std::cout << "C++ completions (prefix=\"" << candidates.prefix

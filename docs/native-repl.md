@@ -175,10 +175,13 @@ and join its worker. Workers never execute user C++ or print into the prompt.
 The controller/facade remains a foreground API; use these range handles rather
 than calling the facade from user-created threads.
 
-Use `%help EventRange` for the range API. Existing `tracer.collect(...)` and
+Use `%help api EventRange` for the range API. Existing `tracer.collect(...)` and
 named collection commands retain their behavior.
 
 ### C++17 collection adaptors
+
+Use `%help api adaptors` for an overview, or look up an individual operation
+with `%help api drop`, `%help api filter`, or any other adaptor name.
 
 `take`, `drop`, `filter`, `take_while`, `drop_while`, `transform`, `stride`,
 `enumerate`, `reverse`, `to_vector`, and `first` are available directly in
@@ -296,15 +299,23 @@ only the configured bounded window. Use recording for long captures.
 Discover the API from the prompt before writing analysis:
 
 ```text
+%help
+%help probe inject
 %help api
-%help tracer
-%help Event
-%help Collection
+%help api tracer
+%help api Event
+%help api tracer.events_async
 %complete "tracer."
 ```
 
-Help prints public fields, method signatures, templates and defaults from the
-loaded facade declarations. Tab completes C++ names and members, including
+The command index groups commands by task. Look up a command or subcommand for
+its usage, options, and examples. The C++ API index lists types and operations.
+Individual API topics explain when to use them and show C++ examples. Type topics
+also show the public signatures from the loaded declarations. Shortcuts such
+as `%help Event` still work. Help uses syntax highlighting on color terminals
+and plain text for redirected output or when `NO_COLOR` is set.
+
+Tab completes help topics and C++ names and members, including
 `tracer.`, `data.`, and `data.at(0).`, using Clang's semantic analysis and the
 session's semantically accepted inputs. `%complete "data.at(0)."` prints the same candidates
 when `data` has been declared. Completion parses code without executing it or
@@ -555,7 +566,7 @@ contents. The old scalar variant/text APIs remain available.
 
 Snapshots survive detach, target exit, collection clearing and recording replay.
 Both native and shared-context event envelopes carry the same owned data.
-Use `%help EventValue` for the loaded inspection API and Tab on
+Use `%help api EventValue` for the loaded inspection API and Tab on
 `event.argument_snapshot(0).` for its methods. Backend/agent bootstrap version
 20 is required for new captures; install the server and agent together.
 

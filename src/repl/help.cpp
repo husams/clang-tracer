@@ -1,0 +1,548 @@
+#include "help.hpp"
+
+#include "commands.hpp"
+#include "interpreter.hpp"
+
+#include <algorithm>
+#include <iomanip>
+#include <ostream>
+#include <regex>
+#include <stdexcept>
+#include <string_view>
+
+namespace tracer_repl {
+namespace {
+using std::string_view;
+
+struct CommandTopic {
+  string_view name;
+  string_view usage;
+  string_view summary;
+  string_view example{};
+};
+
+const CommandTopic commands[] = {
+    {"server", "", "Start, connect to, inspect, or stop a tracing server."},
+    {"server start", "%server start [--executable PATH] [--agent PATH]",
+     "Start a private local server and connect to it."},
+    {"server connect", "%server connect ENDPOINT",
+     "Connect to an existing server after detaching and stopping any server you own.",
+     "%server connect localhost:50051"},
+    {"server status", "%server status", "Show the endpoint, ownership, and readiness."},
+    {"server stop", "%server stop", "Stop the server started by this REPL and restore its targets."},
+    {"attach", "%attach [PID]", "Attach to a target and select its session. Omit PID for the local process picker.",
+     "%attach 12345"},
+    {"processes", "%processes [--filter TEXT]", "List local target processes that match the filter."},
+    {"sessions", "%sessions", "List sessions known to the connected server."},
+    {"use", "%use SESSION", "Select an attached session for subsequent commands.", "%use s1"},
+    {"status", "%status", "Show connection details, the selected session, and retained collections."},
+    {"detach", "%detach [SESSION]", "Detach the selected or named session and remove its probes."},
+    {"modules", "%modules", "List the loaded modules in the selected target."},
+    {"symbols", "%symbols [--filter TEXT] [--module TEXT] [--limit N] [--page TOKEN]",
+     "Find function selectors. Use the printed next-page token to continue the listing.",
+     "%symbols --filter Calculator --limit 20"},
+
+    {"probe", "", "Prepare, resolve, validate, install, or remove a probe."},
+    {"probe prepare",
+     "%probe prepare SELECTOR --include HEADER --output NEW_DIRECTORY\n"
+     "  [--compdb PATH] [--translation-unit FILE] [--module ELF] [--metadata-only]",
+     "Build a reusable probe package from local source. Repeat --include for extra headers. "
+     "By default, preparation uses compile_commands.json in the current directory and a source "
+     "beside the first header. Use --module to pin the package to a specific build. "
+     "Use --metadata-only to skip the separate C++ adapter files.",
+     R"example(%probe prepare "demo::compute(int)" --include demo.hpp --output prepared)example"},
+    {"probe resolve", "%probe resolve SELECTOR [RESOLUTION OPTIONS]",
+     "Resolve a selector in the selected target and show the available metadata.",
+     R"(%probe resolve "Calculator::multiply(int, int) const")"},
+    {"probe validate", "%probe validate SELECTOR --callback FILE [RESOLUTION OPTIONS]",
+     "Check whether the callback can be deployed for the selected function."},
+    {"probe inject", "%probe inject SELECTOR --callback FILE [RESOLUTION OPTIONS] [DEPLOYMENT OPTIONS]",
+     "Read a local callback file and install it on the selected target.",
+     R"example(%probe inject "demo::compute(int)" --callback hook.cpp --prepared prepared)example"},
+    {"probe remove", "%probe remove ID", "Remove a probe from the selected session and restore the original code."},
+    {"probes", "%probes", "List the probes in the selected session."},
+    {"interceptor", "", "Manage named C++ callback drafts."},
+    {"interceptor load", "%interceptor load FILE --as NAME", "Load a local C++ file into a named draft."},
+    {"interceptor edit", "%interceptor edit NAME", "Enter C++ source interactively. Use .end to save or .cancel to discard."},
+    {"interceptor show", "%interceptor show NAME", "Print the source of a named draft."},
+    {"interceptor upload", "%interceptor upload NAME --target SELECTOR [RESOLUTION OPTIONS] [DEPLOYMENT OPTIONS]",
+     "Install the named draft on the selected target.",
+     R"example(%interceptor upload hook --target "demo::compute(int)")example"},
+
+    {"events", "%events [STREAM OPTIONS] [--as NAME]",
+     "Print live events and keep a bounded collection named live by default.",
+     "%events --count 5 --phase POST"},
+    {"events list", "%events list NAME [--limit N]", "List retained events with their zero-based indexes. The default limit is 20."},
+    {"events show", "%events show NAME --index N", "Print one retained event and its captured values.", "%events show batch --index 0"},
+    {"events calls", "%events calls NAME", "Pair PRE and POST events and show call durations and missing halves."},
+    {"events stats", "%events stats NAME", "Summarize events, calls, loss, and capture status."},
+    {"events clear", "%events clear NAME", "Remove a named collection and release its buffer space."},
+    {"events open", "%events open FILE.pb --as NAME", "Read a recording into a bounded collection for offline analysis.",
+     "%events open capture.pb --as saved"},
+    {"events export", "%events export NAME --format json --output NEW_FILE.json",
+     "Write the retained events to a new JSON file."},
+    {"collect", "%collect [STREAM OPTIONS] [--as NAME]", "Capture events into a bounded collection named batch by default.",
+     "%collect --count 10 --timeout 15 --phase POST --as results"},
+    {"record", "%record NEW_FILE.pb [STREAM OPTIONS]", "Write events to a new recording file for later replay.",
+     "%record capture.pb --count 10"},
+
+    {"cpp", "", "Load C++, configure the local compiler, or generate mappings for captured values."},
+    {"cpp load", "%cpp load FILE", "Evaluate a local C++ source file in the current interpreter."},
+    {"cpp reset", "%cpp reset", "Clear C++ variables, declarations, and background range handles. Tracing sessions stay attached."},
+    {"cpp import", "%cpp import HEADER [--type TYPE] [--output FILE]",
+     "Generate, cache, and load mappings for typed event decoding. Repeat --type to select several records. "
+     "Nested dependencies are included automatically. Import failures preserve earlier variables.",
+     "%cpp import application/types.hpp --type app::Order"},
+    {"cpp generate", "%cpp generate HEADER [--type TYPE] [--output FILE]",
+     "Generate mappings from the header's AST. Use --output to save a header for #include or %cpp load. "
+     "Automatic mappings require supported public fields and accessible default construction.",
+     "%cpp generate application/types.hpp --output mappings.hpp"},
+    {"cpp options", "%cpp options", "List the effective local compiler arguments in order. "
+     "Use --cpp-arg ARG at startup. Probe compilation uses separate options on the server."},
+    {"cpp options add", "%cpp options add ARG...", "Add compiler arguments before the first C++ input. "
+     "Quote flags with spaces. Backticks run a shell command and add flags from its output.",
+     R"(%cpp options add "-I/path/to/include" "-DFEATURE=1")"},
+    {"cpp options clear", "%cpp options clear", "Clear custom local compiler arguments. Use %cpp reset first after C++ input."},
+    {"cpp options compdb", "%cpp options compdb DATABASE --file FILE",
+     "Load flags from an exact compilation database entry or a C++ source in the same directory.",
+     "%cpp options compdb build/compile_commands.json --file src/target.cpp"},
+    {"shell", "%shell \"COMMAND\"", "Run a local shell command and print its output.", R"(%shell "pwd")"},
+    {"complete", "%complete \"C++ PREFIX\"", "List semantic C++ completions without evaluating the expression.",
+     R"(%complete "tracer.")"},
+    {"help", "%help [COMMAND | api [NAME]]", "Browse commands and C++ APIs or look up a specific topic.",
+     "%help probe inject\n%help api Event"},
+    {"quit", "%quit | %exit", "Exit, detach sessions owned by this REPL, and stop its private server."},
+};
+
+struct ApiTopic {
+  string_view name;
+  string_view summary;
+  string_view usage;
+  string_view notes{};
+  const char* declarations = nullptr;
+};
+
+const ApiTopic apis[] = {
+    {"tracer", "The session and capture API exposed as tracer, an instance of tracer_repl::Facade.",
+     R"(auto target = tracer.selected_session();
+auto data = tracer.batch("results");
+tracer.print(data);)",
+     "Use the built-in session handle after %attach. For live capture, see events and events_async.", "tracer"},
+    {"SessionHandle", "Identifies an attachment on the current server connection.",
+     R"(auto target = tracer.selected_session();
+std::cout << target.id << ' ' << target.pid << '\n';)",
+     "Get a handle from the built-in session variable or tracer.attach(pid). Use a fresh handle after reconnecting.", "SessionHandle"},
+    {"Event", "One captured event with its function, phase, arguments, result, receiver, or custom state.",
+     R"(auto data = tracer.batch("results");
+for (const auto& e : data) tracer.print(e);
+if (data.size()) {
+  auto e = data.at(0);
+  std::cout << e.phase() << ' ' << e.function_name() << '\n';
+})",
+     "Use argument_as<T>(index) or result_as<T>() when T matches the captured type. "
+     "has_result() includes void returns. Use argument_snapshot(), receiver_snapshot(), or state_snapshot() "
+     "to inspect captured fields without rebuilding an application type.", "Event"},
+    {"Collection", "A retained set of events with capture counters and status.",
+     R"(auto data = tracer.batch("results");
+std::cout << data.received << " received, " << data.evicted << " evicted\n";
+if (data.size()) tracer.print(data.at(0));)",
+     "Use size() for the retained count and at() for checked indexing. "
+     "complete, cancelled, and timed_out describe how the capture ended.", "Collection"},
+    {"EventRange", "A synchronous or background capture handle that can be iterated in C++17.",
+     R"(auto live = tracer.events_async(session, 10, 30);
+auto data = live.snapshot();
+for (const auto& e : data) tracer.print(e);
+if (live.running()) live.stop();
+std::cout << live.error() << '\n';)",
+     "Iteration reads a stable snapshot of currently retained events. Later snapshots may include new arrivals. "
+     "stop() preserves retained events. Release all copies of the range to free its capture reservation.", "EventRange"},
+    {"EventValue", "An owned snapshot of a scalar, string, object, or container from a captured event.",
+     R"(auto e = tracer.batch("results").at(0);
+auto order = e.argument_snapshot(0);
+auto id = order.field("id").as<int>();
+std::cout << order.cpp_type() << ' ' << id << '\n';)",
+     "Use fields() for object members and elements() or at() for array entries. "
+     "Missing fields and incompatible types throw. For conversion to an application type, see EventRecord.", "EventValue"},
+    {"ScalarValue", "The variant returned by argument_value() and result_value() for captured numeric or boolean values.",
+     R"(auto e = tracer.batch("results").at(0);
+auto value = e.argument_value(0);
+std::visit([](auto v) { std::cout << v << '\n'; }, value);)",
+     "Use argument_snapshot() or result_snapshot() for strings, objects, and containers.", "ScalarValue"},
+    {"EventRecord", "Maps an owned event snapshot to a default-constructible C++ record with supported fields.",
+     R"(// After %cpp import application/types.hpp --type app::Order
+auto e = tracer.batch("results").at(0);
+auto order = e.argument_as<app::Order>(0);)",
+     "For a manual mapping, specialize tracer_repl::EventRecord<T> with type_name and fields(). "
+     "Return a tuple of event_member(\"field\", &T::member) entries from fields(). For factory-based decoding, see EventCodec."},
+    {"EventCodec", "Customizes decoding when an application type needs a constructor or factory.",
+     R"(template <> struct tracer_repl::EventCodec<Order> {
+  static Order decode(const tracer_repl::EventValue& value) {
+    return Order(value.field("id").as<int>());
+  }
+};)",
+     "Define Order first. The specialization is used by EventValue::as<Order>() and typed event accessors."},
+    {"Event::argument_as", "Decode the argument at a zero-based index as an owned C++ value.",
+     R"(auto e = tracer.batch("results").at(0);
+auto input = e.argument_as<int>(0);)",
+     "Use the captured C++ type. Use argument_snapshot(index) to inspect fields without a type mapping."},
+    {"Event::result_as", "Decode a captured return value as an owned C++ value.",
+     R"(auto e = tracer.batch("results").at(0);
+if (e.phase() == "POST" && e.has_result()) {
+  auto result = e.result_as<int>();
+  std::cout << result << '\n';
+})",
+     "This example assumes the probed function returns int. has_result() can also be true for void returns."},
+    {"Event::state_as", "Decode the payload at a zero-based index in a named custom event.",
+     R"(// After importing the declaration of app::State
+auto e = tracer.batch("results").at(0);
+auto state = e.state_as<app::State>();)",
+     "The index defaults to zero. Use state_snapshot(index) to inspect fields without a type mapping."},
+    {"attach", "Attach to a target PID and return its session handle.", "auto target = tracer.attach(12345);"},
+    {"selected_session", "Get the currently selected attachment.", "auto target = tracer.selected_session();"},
+    {"prepare", "Generate a reusable probe package from local headers.",
+     R"example(tracer.prepare("demo::compute(int)", "demo.hpp", "prepared");)example",
+     "The output directory must be new. See %help probe prepare for compilation database and module options."},
+    {"inject", "Install a callback from a local file and return the probe ID.",
+     R"example(auto probe = tracer.inject(session, "demo::compute(int)", "hook.cpp");)example",
+     "Pass a prepared package directory as the fourth argument to require prepared injection."},
+    {"detach", "Detach the given session and remove its probes.", "tracer.detach(session);"},
+    {"collect", "Wait for a bounded capture and return a Collection.",
+     "auto data = tracer.collect(session, 10, 15);\ntracer.print(data);",
+     "Pass the event count and optionally a timeout in seconds. The default timeout is 30 seconds."},
+    {"events", "Wait for a synchronous event capture and return an EventRange.",
+     "auto captured = tracer.events(session, 10, 15);\nfor (const auto& e : captured) tracer.print(e);",
+     "Pass a positive count and timeout in seconds. The default timeout is 30 seconds. "
+     "Check captured.error() for stream failures and captured.snapshot() for partial results."},
+    {"events_async", "Start a background event capture and return an EventRange immediately.",
+     "auto live = tracer.events_async(session, 10, 15);\nauto data = live.snapshot();\nlive.stop();",
+     "The optional count and timeout default to zero, which leaves the corresponding limit open. "
+     "Check running() and error() as capture proceeds."},
+    {"batch", "Get a Collection from a named capture or replay.",
+     R"(auto data = tracer.batch("results");
+if (data.size()) tracer.print(data.at(0));)",
+     "First create the collection with %collect, %events, or %events open."},
+    {"print", "Print a captured Event or an entire Collection.",
+     R"(auto data = tracer.batch("results");
+tracer.print(data);
+if (data.size()) tracer.print(data.at(0));)"},
+    {"adaptors", "Filter, slice, and transform Collection and EventRange values with C++17 pipelines.",
+     R"(auto data = tracer.batch("results");
+auto is_post = [](const auto& e) { return e.phase() == "POST"; };
+auto first_post = data | filter(is_post) | first();
+if (first_post) tracer.print(*first_post);
+auto ids = data | take(10) | transform([](const auto& e) {
+  return e.sequence();
+}) | to_vector();)",
+     "Use %help api NAME for each adaptor's inputs, behavior, and example. Try %help api drop.\n"
+     "Topics: filter, take, drop, take_while, drop_while, transform, stride, "
+     "enumerate, reverse, first, to_vector.\n"
+     "Views over live ranges inspect a fresh snapshot each time a loop starts. "
+     "They leave the background capture running."},
+    {"filter", "Keep every item that satisfies a predicate.",
+     R"(auto is_post = [](const auto& e) { return e.phase() == "POST"; };
+auto post = tracer.batch("results") | filter(is_post);
+for (const auto& e : post) tracer.print(e);)",
+     "filter(predicate) returns a lazy view in input order. The predicate takes one item "
+     "and returns a truth value. Put filter before take to count matches, or after take "
+     "to test only a prefix of the input."},
+    {"take", "Keep up to the first count items.",
+     R"(auto preview = tracer.batch("results") | take(5);
+for (const auto& e : preview) tracer.print(e);)",
+     "take(count) returns a lazy view and stops when the count or input is exhausted. "
+     "Zero yields an empty view without evaluating upstream predicates. "
+     "A negative count throws std::invalid_argument. On a live range, take limits the "
+     "snapshot being inspected. Use the count argument to events_async to limit capture."},
+    {"drop", "Skip a fixed number of items at the start and keep the rest in input order.",
+     R"(auto page = tracer.batch("results") | drop(5) | take(10);
+for (const auto& e : page) tracer.print(e);)",
+     "drop(count) returns a lazy view and skips the prefix when iteration starts. "
+     "Zero skips nothing. A count at least as large as the input yields an empty view. "
+     "A negative count throws std::invalid_argument. The source collection is preserved. "
+     "Put drop after filter to skip matching items."},
+    {"take_while", "Keep the leading items that satisfy a predicate.",
+     R"(auto early = [](const auto& e) { return e.sequence() < 50; };
+auto prefix = tracer.batch("results") | take_while(early);
+for (const auto& e : prefix) tracer.print(e);)",
+     "take_while(predicate) returns a lazy view and stops at the first false result. "
+     "A false result on the first item yields an empty view. Use filter to keep matches "
+     "that occur later in the input."},
+    {"drop_while", "Skip the leading items that satisfy a predicate.",
+     R"(auto early = [](const auto& e) { return e.sequence() < 50; };
+auto tail = tracer.batch("results") | drop_while(early);
+for (const auto& e : tail) tracer.print(e);)",
+     "drop_while(predicate) returns a lazy view starting at the first false result. "
+     "It keeps that item and every item after it. If all items match, the view is empty."},
+    {"transform", "Convert each item into a new value.",
+     R"(auto name = [](const auto& e) { return e.function_name(); };
+auto names = tracer.batch("results") | transform(name) | to_vector();)",
+     "transform(function) returns a lazy view that calls the function when an item is read. "
+     "The function takes one item and returns the value to emit, such as a string or sequence number. "
+     "Use to_vector to evaluate and store the results."},
+    {"stride", "Select items at a fixed interval, starting with the first.",
+     R"(auto sampled = tracer.batch("results") | stride(3);
+for (const auto& e : sampled) tracer.print(e);)",
+     "stride(step) returns a lazy view. A step of 3 selects positions 0, 3, 6, and so on. "
+     "A step of 1 keeps every item. Zero and negative steps throw std::invalid_argument."},
+    {"enumerate", "Pair each item with its zero-based index in the current pipeline.",
+     R"(auto numbered = tracer.batch("results") | drop(5) | enumerate();
+for (const auto& [index, e] : numbered) {
+  std::cout << index << ' ' << e.function_name() << '\n';
+})",
+     "enumerate() returns a lazy view of std::pair values. Read the pair with a structured "
+     "binding or its first and second members. After drop(5), the sixth input item gets index 0. "
+     "Enumerate before filtering to preserve the original positions."},
+    {"reverse", "Materialize the input in reverse iteration order.",
+     R"(auto backwards = tracer.batch("results") | reverse();
+if (!backwards.empty()) tracer.print(backwards.front());)",
+     "reverse() evaluates the entire input immediately and returns an owned std::vector. "
+     "It preserves the source order in the original collection. Put take before reverse "
+     "to reverse only a prefix and bound the number of items stored."},
+    {"first", "Return the first available item as an owned optional value.",
+     R"(auto is_post = [](const auto& e) { return e.phase() == "POST"; };
+auto event = tracer.batch("results") | filter(is_post) | first();
+if (event) tracer.print(*event);)",
+     "first() evaluates enough of the input to find one item. It returns std::optional<T>, "
+     "where T is the type produced by the pipeline. The optional is empty if the input yields no items."},
+    {"to_vector", "Evaluate the pipeline and store its items in an owned vector.",
+     R"(auto sequence = [](const auto& e) { return e.sequence(); };
+auto ids = tracer.batch("results") | take(10) | transform(sequence) | to_vector();)",
+     "to_vector() returns a std::vector<T> in iteration order. It reads the entire input "
+     "immediately and returns an empty vector for empty input. Put take before to_vector "
+     "to cap the number of stored items."},
+};
+
+constexpr string_view reset = "\033[0m";
+constexpr string_view bold = "\033[1m";
+constexpr string_view cyan = "\033[1;36m";
+constexpr string_view yellow = "\033[33m";
+constexpr string_view green = "\033[32m";
+constexpr string_view magenta = "\033[35m";
+
+void styled(std::ostream& out, string_view text, string_view style, bool color) {
+  if (color) out << style;
+  out << text;
+  if (color) out << reset;
+}
+
+enum class Syntax { command, cpp };
+
+void code(std::ostream& out, string_view text, Syntax syntax, bool color) {
+  if (!color) {
+    out << text;
+    return;
+  }
+  static const std::regex command_tokens(
+      R"re(("[^"]*"|'[^']*'|`[^`]*`)|(%[a-z][a-z-]*(?: [a-z][a-z-]*)*)|(--[a-z][a-z-]*)|\b([A-Z][A-Z0-9_]*|[0-9]+)\b)re");
+  static const std::regex cpp_tokens(
+      R"re(("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|//[^\n]*)|\b(auto|bool|char|class|const|double|else|for|if|int|return|static|struct|template|typename|unsigned|using|void)\b|\b([0-9]+|false|true|nullptr)\b)re");
+  const auto& tokens = syntax == Syntax::command ? command_tokens : cpp_tokens;
+  auto pos = text.begin();
+  for (std::cregex_iterator it(text.begin(), text.end(), tokens), end; it != end; ++it) {
+    const auto& match = *it;
+    out << string_view(pos, match[0].first - pos);
+    const auto style = match[1].matched ? green : match[2].matched ? cyan :
+                       match[3].matched ? yellow : magenta;
+    styled(out, string_view(match[0].first, match.length()), style, true);
+    pos = match[0].second;
+  }
+  out << string_view(pos, text.end() - pos);
+}
+
+void block(std::ostream& out, string_view text, Syntax syntax, bool color) {
+  while (!text.empty()) {
+    const auto newline = text.find('\n');
+    out << "  ";
+    code(out, text.substr(0, newline), syntax, color);
+    out << '\n';
+    if (newline == string_view::npos) break;
+    text.remove_prefix(newline + 1);
+  }
+}
+
+void heading(std::ostream& out, string_view title, bool color) {
+  styled(out, title, bold, color);
+  out << '\n';
+}
+
+bool child_topic(string_view name, string_view parent) {
+  return name.size() > parent.size() && name.substr(0, parent.size()) == parent &&
+         name[parent.size()] == ' ';
+}
+
+const ApiTopic* find_api(string_view name) {
+  for (const string_view prefix : {"tracer_repl::", "tracer.", "Facade::"}) {
+    if (name.substr(0, prefix.size()) == prefix)
+      name.remove_prefix(prefix.size());
+  }
+  if (name == "Facade") name = "tracer";
+  for (const auto& entry : apis) {
+    if (entry.name == name) return &entry;
+  }
+  return nullptr;
+}
+
+void command_index(std::ostream& out, bool color) {
+  heading(out, "Clang Tracer commands", color);
+  out << "Use %help COMMAND for usage, %help api for the C++ API index,\n"
+         "or %help api NAME for an API example. Tab completes help topics.\n";
+  for (const auto& entry : commands) {
+    if (entry.name.find(' ') != string_view::npos) continue;
+    if (entry.name == "server" || entry.name == "probe" ||
+        entry.name == "events" || entry.name == "cpp") {
+      out << '\n';
+      heading(out, entry.name == "server" ? "Connection and targets" :
+                   entry.name == "probe" ? "Probes and interceptors" :
+                   entry.name == "events" ? "Capture and replay" : "C++ and utilities", color);
+    }
+    out << "  ";
+    const auto name = "%" + std::string(entry.name);
+    styled(out, name, cyan, color);
+    out << std::setw(std::max(1, 16 - static_cast<int>(name.size()))) << ' '
+        << entry.summary << '\n';
+  }
+}
+
+void api_index(std::ostream& out, bool color) {
+  heading(out, "C++ API", color);
+  out << "Use %help api NAME for examples and details.\n"
+         "The examples that use a collection named results start with\n";
+  block(out, "%collect --count 10 --as results\n"
+             "%events open capture.pb --as results",
+        Syntax::command, color);
+  out << "Capture live events with the first command or open a recording with the second.\n";
+  for (const auto& entry : apis) {
+    if (entry.name == "tracer" || entry.name == "Event::argument_as" ||
+        entry.name == "attach" || entry.name == "adaptors") {
+      out << '\n';
+      heading(out, entry.name == "tracer" ? "Types and objects" :
+                   entry.name == "Event::argument_as" ? "Typed event access" :
+                   entry.name == "attach" ? "tracer methods" : "Range pipelines", color);
+    }
+    out << "  ";
+    styled(out, entry.name, cyan, color);
+    out << std::setw(std::max(1, 21 - static_cast<int>(entry.name.size()))) << ' '
+        << entry.summary << '\n';
+  }
+}
+
+void command_details(std::ostream& out, const CommandTopic& entry, bool color) {
+  heading(out, "%" + std::string(entry.name), color);
+  out << entry.summary << '\n';
+  if (!entry.usage.empty()) {
+    out << '\n';
+    heading(out, "Usage", color);
+    block(out, entry.usage, Syntax::command, color);
+  }
+  if (std::any_of(std::begin(commands), std::end(commands),
+                  [&](const auto& sub) { return child_topic(sub.name, entry.name); })) {
+    out << '\n';
+    heading(out, "Subcommands", color);
+    for (const auto& sub : commands) {
+      if (child_topic(sub.name, entry.name)) {
+        out << "  ";
+        styled(out, "%" + std::string(sub.name), cyan, color);
+        out << '\n' << "    " << sub.summary << '\n';
+      }
+    }
+  }
+  if (entry.usage.find("STREAM OPTIONS") != string_view::npos) {
+    out << '\n';
+    heading(out, "Stream options", color);
+    block(out, "--count N --timeout SECONDS --after CURSOR --probe ID\n"
+               "--phase PRE|POST --name SELECTOR --session ID | --all",
+          Syntax::command, color);
+    out << "The selected session is the default. Without a count or timeout, press Ctrl+C to stop.\n";
+  }
+  if (entry.usage.find("RESOLUTION OPTIONS") != string_view::npos) {
+    out << '\n';
+    heading(out, "Resolution options", color);
+    block(out, "--include SERVER_HEADER --compdb SERVER_PATH --module TEXT --compile-option FLAG\n"
+               "--prepared DIRECTORY --prepared-mode off|prefer|require",
+          Syntax::command, color);
+    out << "The default mode, prefer, uses an available prepared package and falls back to DWARF.\n";
+  }
+  if (entry.usage.find("DEPLOYMENT OPTIONS") != string_view::npos) {
+    out << '\n';
+    heading(out, "Deployment options", color);
+    block(out, "--stack-depth 0..64 --print-arguments --print-result", Syntax::command, color);
+  }
+  if (!entry.example.empty()) {
+    out << '\n';
+    heading(out, "Example", color);
+    block(out, entry.example, Syntax::command, color);
+  }
+}
+
+void api_details(std::ostream& out, const ApiTopic& entry, CppEngine& cpp, bool color) {
+  heading(out, entry.name, color);
+  out << entry.summary << "\n\n";
+  heading(out, "Example", color);
+  block(out, entry.usage, Syntax::cpp, color);
+  if (!entry.notes.empty()) out << '\n' << entry.notes << '\n';
+  if (entry.declarations) {
+    out << '\n';
+    heading(out, "Public signatures", color);
+    const auto signatures = cpp.describe_api(entry.declarations);
+    const auto first = signatures.find_first_not_of('\n');
+    if (first != std::string::npos)
+      block(out, string_view(signatures).substr(first), Syntax::cpp, color);
+  }
+}
+} // namespace
+
+const std::vector<std::string>& command_completions() {
+  static const auto names = [] {
+    auto result = command_names();
+    for (const auto& entry : commands)
+      result.push_back("%help " + std::string(entry.name));
+    result.emplace_back("%help exit");
+    result.emplace_back("%help api");
+    result.emplace_back("%help api Facade");
+    for (const auto& entry : apis) {
+      result.push_back("%help api " + std::string(entry.name));
+      if (entry.declarations)
+        result.push_back("%help " + std::string(entry.name));
+    }
+    return result;
+  }();
+  return names;
+}
+
+void print_help(std::ostream& out, const std::vector<std::string>& arguments,
+                CppEngine& cpp, bool color) {
+  if (arguments.empty()) {
+    command_index(out, color);
+    return;
+  }
+  if (arguments.front() == "api") {
+    if (arguments.size() == 1) {
+      api_index(out, color);
+      return;
+    }
+    if (arguments.size() == 2) {
+      if (const auto* entry = find_api(arguments[1])) {
+        api_details(out, *entry, cpp, color);
+        return;
+      }
+    }
+    throw std::invalid_argument("unknown C++ API topic. Use %help api to list topics.");
+  }
+
+  std::string name = arguments.front();
+  for (std::size_t i = 1; i < arguments.size(); ++i)
+    name += " " + arguments[i];
+  if (!name.empty() && name.front() == '%') name.erase(0, 1);
+  if (name == "exit") name = "quit";
+  for (const auto& entry : commands) {
+    if (entry.name == name) {
+      command_details(out, entry, color);
+      return;
+    }
+  }
+  if (const auto* entry = find_api(name)) {
+    api_details(out, *entry, cpp, color);
+    return;
+  }
+  throw std::invalid_argument("unknown help topic. Use %help for commands or %help api for C++ APIs.");
+}
+} // namespace tracer_repl

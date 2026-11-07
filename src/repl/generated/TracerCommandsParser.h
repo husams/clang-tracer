@@ -458,7 +458,8 @@ public:
   public:
     HelpContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
-    ValueContext *value();
+    std::vector<ValueContext *> value();
+    ValueContext* value(size_t i);
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
