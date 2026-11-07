@@ -23,6 +23,7 @@ def main():
             callback = root / "client only callback.cpp"
             callback.write_text("// client-only interceptor\n")
             capture = root / "capture.pb"
+            filtered = root / "filtered.db"
             export = root / "events.json"
             commands = f'''%attach 7
 %interceptor load "{callback}" --as hook
@@ -78,6 +79,12 @@ if (numbered != 2) throw std::runtime_error("stride failed");
 %events open "{capture}" --as saved
 %events export saved --format json --output "{export}"
 %events stats saved
+%record "{filtered}" --sqlite --phase POST --count 2
+%record "{filtered}" --sqlite --phase POST --count 2
+auto filtered_recording = tracer.replay("{filtered}");
+if (filtered_recording.size() != 2 || filtered_recording.at(0).sequence() != 2 || filtered_recording.at(1).sequence() != 4) throw std::runtime_error("wrong recorded phases");
+ReplayMarker replay_marker{{42}};
+if (replay_marker.value != 42) throw std::runtime_error("filtered adapter was lost");
 tracer.detach(session)
 %quit
 '''

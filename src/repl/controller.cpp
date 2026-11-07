@@ -1,7 +1,9 @@
 #include "controller.hpp"
 #include "../prepared_contract.hpp"
+#include "../sqlite_events.hpp"
 
 #include <algorithm>
+#include <array>
 #include <utility>
 #include <atomic>
 #include <chrono>
@@ -563,6 +565,8 @@ void Controller::watch(const Command &command, bool display,
     request.add_session_ids(selected_.id);
   }
   request.set_after_sequence(command.number("--after", 0));
+  const bool record_sqlite = command.has("--sqlite");
+  request.set_include_replay_types(record_sqlite);
   auto names = command.options.find("--name");
   if (names != command.options.end()) {
     for (const auto &name : names->second) {
@@ -600,7 +604,10 @@ void Controller::watch(const Command &command, bool display,
     }
   } output;
 
-  if (!record_path.empty()) {
+  std::unique_ptr<tracer::client::SQLiteEvents> sqlite;
+  if (record_sqlite) {
+    sqlite = std::make_unique<tracer::client::SQLiteEvents>(record_path);
+  } else if (!record_path.empty()) {
     output.fd = create_recording(record_path);
   }
   grpc::ClientContext context;
@@ -615,6 +622,7 @@ void Controller::watch(const Command &command, bool display,
     batches_.erase(collection_name);
   auto reader = stub_->WatchEvents(&context, request);
   Cancellation cancellation(context);
+  std::map<std::uint64_t, api::PreparedInjector> pending_types;
   api::TraceEvent event;
   std::uint64_t accepted = 0, cursor = request.after_sequence();
   while ((!count || accepted < count) && reader->Read(&event)) {
@@ -625,9 +633,19 @@ void Controller::watch(const Command &command, bool display,
     }
     if (command.has("--phase") &&
         api::TracePhase_Name(event.phase()) != command.option("--phase")) {
+      // The server can send the adapter once for a batch. Keep it if the
+      // event carrying it is filtered out before the next stored event.
+      if (sqlite && event.has_replay_types())
+        pending_types.insert_or_assign(event.probe_id(),
+                                       std::move(*event.mutable_replay_types()));
       continue;
     }
-    if (output.fd >= 0) {
+    if (sqlite) {
+      auto types = pending_types.extract(event.probe_id());
+      if (!types.empty() && !event.has_replay_types())
+        *event.mutable_replay_types() = std::move(types.mapped());
+      sqlite->write(std::array{event});
+    } else if (output.fd >= 0) {
       write_record(output.fd, event);
     } else {
       next.push(event);

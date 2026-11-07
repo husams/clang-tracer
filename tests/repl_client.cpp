@@ -162,6 +162,15 @@ public:
         e.mutable_result()->set_type(api::INT32);
         e.mutable_result()->set_signed_value(42);
       }
+      if (q->include_replay_types()) {
+        e.set_server_instance_id("fixture");
+        e.mutable_context()->mutable_event()->add_states();
+        if (i == 1) {
+          auto *types = e.mutable_replay_types();
+          types->set_format_version(4);
+          types->set_adapter_declarations("struct ReplayMarker { int value; };");
+        }
+      }
       if (!writer->Write(e)) {
         break;
       }
