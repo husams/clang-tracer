@@ -27,6 +27,10 @@ if(BUILD_TESTING AND TRACER_BUILD_REPL)
   target_compile_features(prepared-concrete-target PRIVATE cxx_std_17)
   target_compile_options(prepared-concrete-target PRIVATE
     -g0 -O0 -fno-omit-frame-pointer -fcf-protection=none)
+  add_executable(prepared-history-target concrete/history.cpp)
+  target_compile_features(prepared-history-target PRIVATE cxx_std_17)
+  target_compile_options(prepared-history-target PRIVATE
+    -g0 -O0 -fno-omit-frame-pointer -fcf-protection=none)
   # Exercise prepared binding both with and without a loaded ELF build ID.
   target_link_options(prepared-injectors-target PRIVATE -Wl,--build-id=none)
   # Give the ABI-compatible rebuild its own compile command. The original

@@ -2,8 +2,10 @@
 #include "check_process.hpp"
 #include "completion.hpp"
 #include "mapping_cache.hpp"
+#include "../prepared_contract.hpp"
 
 #include <clang/AST/ASTContext.h>
+#include <clang/AST/Decl.h>
 #include <clang/Basic/SourceManager.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Interpreter/Interpreter.h>
@@ -11,6 +13,7 @@
 #include <clang/Interpreter/Value.h>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Support/DynamicLibrary.h>
 #include <llvm/Support/Error.h>
@@ -26,6 +29,7 @@
 #endif
 #include <cstdlib>
 #include <filesystem>
+#include <set>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -69,6 +73,48 @@ std::string api_header() {
     throw std::runtime_error("unsupported character in facade header path");
   return path;
 }
+
+bool is_single_initializer(const clang::TranslationUnitDecl &unit,
+                           const std::string &source) {
+  // Clang Undo retracts the whole input and does not undo preprocessor
+  // directives. Limit this recovery to a single new variable definition.
+  if (source.find('#') != std::string::npos)
+    return false;
+  const clang::VarDecl *variable = nullptr;
+  for (const auto *decl : unit.decls()) {
+    if (llvm::isa<clang::EmptyDecl>(decl))
+      continue;
+    const auto *candidate = llvm::dyn_cast<clang::VarDecl>(decl);
+    if (variable || !candidate || !candidate->getIdentifier() ||
+        candidate->getPreviousDecl() || !candidate->hasInit())
+      return false;
+    variable = candidate;
+  }
+  return variable != nullptr;
+}
+
+bool can_unload_initializer(const llvm::Module &module) {
+  // Undo unmaps the module, but ORC keeps registered destructors until the
+  // interpreter shuts down. A function-local static can register one even
+  // when the top-level initializer eventually throws.
+  if (module.getNamedGlobal("llvm.global_dtors"))
+    return false;
+  for (const auto *name : {"atexit", "__cxa_thread_atexit",
+                           "__cxa_thread_atexit_impl", "_tlregdtor"})
+    if (const auto *function = module.getFunction(name);
+        function && !function->use_empty())
+      return false;
+  const auto *registration = module.getFunction("__cxa_atexit");
+  if (!registration || registration->use_empty())
+    return true;
+  if (!registration->hasOneUse())
+    return false;
+  const auto *call = llvm::dyn_cast<llvm::CallInst>(*registration->user_begin());
+  // A single registration at the end of the global initializer is reached
+  // only once that variable and its initializer temporaries have succeeded.
+  return call && call->getFunction()->getName().starts_with("__cxx_global_var_init") &&
+         llvm::isa_and_nonnull<llvm::ReturnInst>(call->getNextNode());
+}
 } // namespace
 struct CppEngine::Impl {
   CppCheckSession checker;
@@ -80,6 +126,7 @@ struct CppEngine::Impl {
   using Stamp = std::pair<std::uintmax_t, std::filesystem::file_time_type>;
   std::map<std::filesystem::path, Stamp> headers;
   std::map<std::pair<std::string, std::filesystem::path>, std::string> mappings;
+  std::set<std::string> imported_adapters;
   bool synchronized = true;
   bool user_cells = false;
   void verify_inputs() const {
@@ -261,9 +308,32 @@ std::string CppEngine::import_headers(const std::vector<std::string> &headers,
 
 std::string CppEngine::import_prepared_adapter(const std::string &source) {
   const auto key = mapping_digest(source);
+  if (impl_ && impl_->imported_adapters.count(key))
+    return {};
   const auto path = mapping_cache_directory() / ("prepared-" + key + ".hpp");
   save_mapping_header(path, key, "#pragma once\n" + source);
-  return import_headers({path.string()});
+  auto imported = import_headers({path.string()});
+  impl_->imported_adapters.insert(key);
+  return imported;
+}
+
+std::string CppEngine::import_recorded_types(const clangtracer::v1::PreparedInjector &types) {
+  if (types.format_version() != tracer::prepared::typed_version ||
+      types.ByteSizeLong() > tracer::prepared::max_replay_type_bytes)
+    throw std::invalid_argument("unsupported recorded type bundle");
+  const auto source = tracer::prepared::adapter_source(types);
+  if (impl_ && impl_->imported_adapters.count(mapping_digest(source)))
+    return {};
+  const auto &declarations = types.adapter_declarations();
+  const auto helper = std::filesystem::path(executable_path()).parent_path() /
+                      "clang-tracer-repl-check";
+  const auto checked = run_cpp_analysis(
+      helper.string(), "replay-types", profile_arguments(arguments_),
+      source.substr(0, source.size() - declarations.size()), declarations);
+  if (checked.status != 0)
+    throw std::runtime_error("recorded adapter must contain declarations only\n" +
+                             checked.output);
+  return import_prepared_adapter(source);
 }
 
 void CppEngine::initialize() {
@@ -418,19 +488,53 @@ bool CppEngine::evaluate(const std::string &source) {
     llvm::logAllUnhandledErrors(std::move(error), llvm::errs(), "C++ input: ");
     return false;
   };
-  auto parsed = impl_->interpreter->Parse(terminate ? source + "\n;" : source);
+  const auto input = terminate ? source + "\n;" : source;
+  auto parsed = impl_->interpreter->Parse(input);
   if (!parsed) {
     impl_->synchronized = false;
     return report(parsed.takeError());
   }
-  // Declarations remain in Clang even if execution later throws. Keep discovery
-  // synchronized at the parse/execute boundary, without replaying side effects.
   impl_->user_cells = true;
+  const auto history_size = impl_->history.size();
+  const auto check_history_size = impl_->check_history.size();
   impl_->history += "\n#line 1\n" + source + "\n;\n";
-  impl_->remember(terminate ? source + "\n;" : source);
-  if (parsed->TheModule)
-    if (auto error = impl_->interpreter->Execute(*parsed))
+  impl_->remember(input);
+  if (parsed->TheModule) {
+    const bool initializer = is_single_initializer(*parsed->TUPart, input);
+    const bool unload = initializer && can_unload_initializer(*parsed->TheModule);
+    const auto rollback_initializer = [&] {
+      if (!initializer)
+        return;
+      if (!unload) {
+        impl_->synchronized = false;
+        llvm::errs() << "C++ initializer may have registered cleanup; "
+                        "use %cpp reset to recover\n";
+        return;
+      }
+      if (auto error = impl_->interpreter->Undo()) {
+        impl_->synchronized = false;
+        llvm::logAllUnhandledErrors(std::move(error), llvm::errs(),
+                                    "C++ input rollback: ");
+        return;
+      }
+      impl_->history.resize(history_size);
+      impl_->check_history.resize(check_history_size);
+      // Undo removes the declaration, but Clang still advances the input
+      // number. Replay a blank cell in the syntax-only checker.
+      impl_->remember("");
+    };
+    llvm::Error error = llvm::Error::success();
+    try {
+      error = impl_->interpreter->Execute(*parsed);
+    } catch (...) {
+      rollback_initializer();
+      throw;
+    }
+    if (error) {
+      rollback_initializer();
       return report(std::move(error));
+    }
+  }
   // The public ParseAndExecute interface transfers Clang's pending captured
   // value. An empty input retrieves it without executing the user's cell again.
   clang::Value value;

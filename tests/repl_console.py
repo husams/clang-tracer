@@ -23,6 +23,8 @@ def main():
             callback = root / "client only callback.cpp"
             callback.write_text("// client-only interceptor\n")
             capture = root / "capture.pb"
+            filtered = root / "filtered.db"
+            timed_recording = root / "timed.db"
             export = root / "events.json"
             commands = f'''%attach 7
 %interceptor load "{callback}" --as hook
@@ -78,6 +80,21 @@ if (numbered != 2) throw std::runtime_error("stride failed");
 %events open "{capture}" --as saved
 %events export saved --format json --output "{export}"
 %events stats saved
+%record "{filtered}" --sqlite --phase POST --count 2
+tracer_repl::RecordOptions options;
+options.phase = "POST";
+options.count = 2;
+auto recorded = tracer.record("{filtered}", options);
+if (recorded.received != 2 || recorded.cursor != 4 || !recorded.complete) throw std::runtime_error("wrong recording result");
+auto filtered_recording = tracer.replay("{filtered}");
+if (filtered_recording.size() != 2 || filtered_recording.at(0).sequence() != 2 || filtered_recording.at(1).sequence() != 4) throw std::runtime_error("wrong recorded phases");
+ReplayMarker replay_marker{{42}};
+if (replay_marker.value != 42) throw std::runtime_error("filtered adapter was lost");
+options.after_sequence = 900;
+options.timeout_seconds = 1;
+auto timed_recording = tracer.record("{timed_recording}", options);
+if (timed_recording.received || timed_recording.cursor != 900 || timed_recording.complete || !timed_recording.timed_out || timed_recording.cancelled) throw std::runtime_error("wrong recording timeout result");
+%help api tracer.record
 tracer.detach(session)
 %quit
 '''
@@ -86,6 +103,53 @@ tracer.detach(session)
             for expected in ["installed probe=5", "cpp-size=4 result=42", "typed-sum=63", "typed-mismatch-rejected", "collected-cpp=4", "retained-session=7", "duration_ns=10", "paired=2", "detached session=s1", "background-prompt-ready", "sync-range-count=4", "EventRange", "adaptors=1:2"]:
                 assert expected in run.stdout, (expected, run.stdout, run.stderr)
             assert len(json.loads(export.read_text())) == 4
+            assert "Record events and available prepared C++ types to SQLite." in run.stdout
+            database = root / "capture with spaces.db"
+            subprocess.run([fixture, "--write-replay-db", str(database)], check=True, timeout=10)
+            before_replay = database.read_bytes()
+            replay = subprocess.run(
+                [console, "--fail-fast"],
+                input=f'''%events open "{database}" --as saved
+%events stats saved
+auto all_saved = tracer.batch("saved");
+if (all_saved.size() != 4 || all_saved.at(2).sequence() != 10) throw std::runtime_error("wrong replay order");
+tracer_repl::EventQuery query;
+query.names = {{"missing.event", "multiply(int, int)"}};
+query.phase = "POST";
+query.count = 1;
+auto earliest = tracer.replay("{database}", query);
+if (earliest.size() != 1 || earliest.received != 1 || earliest.at(0).sequence() != 2) throw std::runtime_error("wrong replay count");
+query.pid = 7;
+query.session_id = "s1";
+auto matches = tracer.replay("{database}", query);
+if (matches.size() != 1 || matches.at(0).sequence() != 2 || matches.at(0).result_as<int>() != 42) throw std::runtime_error("wrong filtered result");
+auto framed = tracer.replay("{capture}", query);
+if (framed.size() != 1 || framed.at(0).sequence() != 2) throw std::runtime_error("wrong framed result");
+query.names = {{"custom.event"}};
+query.pid = 8;
+query.session_id = "s2";
+auto custom = tracer.replay("{database}", query);
+if (custom.size() != 1 || custom.at(0).sequence() != 11 || custom.at(0).state_snapshot().field("label").as<std::string>() != "saved") throw std::runtime_error("wrong custom event state");
+query.session_id = "s1";
+if (tracer.replay("{database}", query).size()) throw std::runtime_error("replay filter ignored session");
+%help api tracer.replay
+%quit
+''', text=True, capture_output=True, timeout=30)
+            assert replay.returncode == 0, (replay.stdout, replay.stderr)
+            assert "opened events=4 retained=4 evicted=0" in replay.stdout, replay.stdout
+            assert "Query a Protobuf or SQLite recording offline" in replay.stdout, replay.stdout
+            assert database.read_bytes() == before_replay
+            unsafe = root / "unsafe.db"
+            subprocess.run([fixture, "--write-unsafe-replay-db", str(unsafe)], check=True, timeout=10)
+            rejected = subprocess.run(
+                [console, "--fail-fast"],
+                input=f'''%events open "{unsafe}" --as saved
+auto saved = tracer.batch("saved");
+if (saved.at(3).state_snapshot().field("label").as<std::string>() != "saved") throw std::runtime_error("snapshot lost");
+%quit
+''', text=True, capture_output=True, timeout=30)
+            assert rejected.returncode == 0, (rejected.stdout, rejected.stderr)
+            assert "recorded adapter must contain declarations only" in rejected.stderr, rejected.stderr
             printed = run.stdout.split("event-print-start\n", 1)[1].split("event-print-end", 1)[0]
             assert "phase: POST" in printed and "signed_value: 42" in printed, printed
             printed = run.stdout.split("exact-print-start\n", 1)[1].split("exact-print-end", 1)[0]

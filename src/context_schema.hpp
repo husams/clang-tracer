@@ -23,8 +23,16 @@ namespace tracer::context_engine {
 struct StateFamilyKey {
   std::array<std::uint8_t, 16> source_lineage_id{};
   std::string cpp_state_type, cpp_scope_type;
-  friend bool operator==(const StateFamilyKey &,
-                         const StateFamilyKey &) = default;
+  friend bool operator==(const StateFamilyKey &left,
+                         const StateFamilyKey &right) noexcept {
+    return left.source_lineage_id == right.source_lineage_id &&
+           left.cpp_state_type == right.cpp_state_type &&
+           left.cpp_scope_type == right.cpp_scope_type;
+  }
+  friend bool operator!=(const StateFamilyKey &left,
+                         const StateFamilyKey &right) noexcept {
+    return !(left == right);
+  }
 };
 
 enum class SchemaKind : std::uint8_t {

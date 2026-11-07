@@ -105,14 +105,16 @@ const CommandTopic commands[] = {
     {"events stats", "%events stats NAME",
      "Summarize live or replayed calls per probe, with duration histograms, caller edges and loss."},
     {"events clear", "%events clear NAME", "Remove a named collection and release its buffer space."},
-    {"events open", "%events open FILE.pb --as NAME", "Read a recording into a bounded collection for offline analysis.",
-     "%events open capture.pb --as saved"},
+    {"events open", "%events open FILE --as NAME",
+     "Open a Protobuf or SQLite recording offline as a bounded, named collection. Compatible C++ types stored in SQLite load automatically.",
+     "%events open capture.db --as saved"},
     {"events export", "%events export NAME --format json --output NEW_FILE.json",
      "Write the retained events to a new JSON file."},
     {"collect", "%collect [STREAM OPTIONS] [--as NAME]", "Capture events into a bounded collection named batch by default.",
      "%collect --count 10 --timeout 15 --phase POST --as results"},
-    {"record", "%record NEW_FILE.pb [STREAM OPTIONS]", "Write events to a new recording file for later replay.",
-     "%record capture.pb --count 10"},
+    {"record", "%record FILE [--sqlite] [STREAM OPTIONS]",
+     "Record framed Protobuf by default. With --sqlite, create or append to a SQLite recording and save available prepared C++ types for replay.",
+     "%record capture.db --sqlite --name account.adjusted --count 12"},
 
     {"cpp", "", "Load C++, configure the local compiler, or generate mappings for captured values."},
     {"cpp load", "%cpp load FILE", "Evaluate a local C++ source file in the current interpreter."},
@@ -223,15 +225,18 @@ if (e.phase() == "POST" && e.has_result()) {
 })",
      "This example assumes the probed function returns int. has_result() can also be true for void returns."},
     {"Event::state_as", "Decode the payload at a zero-based index in a named custom event.",
-     R"(// After importing the declaration of app::State
+     R"(// After opening a recording with the app::State type
 auto e = tracer.batch("results").at(0);
 auto state = e.state_as<app::State>();)",
-     "The index defaults to zero. Use state_snapshot(index) to inspect fields without a type mapping."},
+     "The index defaults to zero. SQLite replay generates mappings for compatible recorded C++ types. "
+     "Use state_snapshot(index) to inspect fields without a mapping, or %cpp import for a local type definition."},
     {"attach", "Attach to a target PID and return its session handle.", "auto target = tracer.attach(12345);"},
     {"selected_session", "Get the currently selected attachment.", "auto target = tracer.selected_session();"},
     {"prepare", "Generate a reusable probe package from local headers.",
-     R"example(tracer.prepare("demo::compute(int)", "demo.hpp", "prepared");)example",
-     "The output directory must be new. See %help probe prepare for compilation database and module options."},
+     R"example(tracer.prepare("demo::compute(int)", {"demo.hpp", "state.hpp"}, "prepared");)example",
+     "Pass one header, a braced list, or a vector of header paths. Order the probe's declaration header first, "
+     "followed by additional types used by the callback. The output directory must be new. "
+     "See %help probe prepare for compilation database and module options."},
     {"inject", "Install a callback from a local file and return the probe ID.",
      R"example(auto probe = tracer.inject(session, "demo::compute(int)", "hook.cpp");)example",
      "Pass a prepared package directory as the fourth argument to require prepared injection."},
@@ -247,6 +252,26 @@ auto state = e.state_as<app::State>();)",
      "auto live = tracer.events_async(session, 10, 15);\nauto data = live.snapshot();\nlive.stop();",
      "The optional count and timeout default to zero, which leaves the corresponding limit open. "
      "Check running() and error() as capture proceeds."},
+    {"record", "Record events and available prepared C++ types to SQLite.",
+     R"(tracer_repl::RecordOptions options;
+options.names = {"account.adjusted"};
+options.count = 12;
+options.timeout_seconds = 15;
+auto saved = tracer.record("capture.db", options);
+std::cout << saved.received << ' ' << saved.complete << '\n';)",
+     "Use the selected session, set options.session for another attachment, or set all_sessions. "
+     "Filter with names, phase, probe_id, and after_sequence. Zero count streams until cancelled or timed out. "
+     "Zero timeout uses the console default for counted recordings. Committed events remain available "
+     "after cancellation or timeout. The result reports received, cursor, complete, cancelled, and timed_out."},
+    {"replay", "Query a Protobuf or SQLite recording offline and return a Collection.",
+     R"(tracer_repl::EventQuery query;
+query.names = {"account.adjusted"};
+query.count = 20;
+auto data = tracer.replay("capture.db", query);
+if (data.size()) tracer.print(data.at(0));)",
+     "Set names, phase, pid, session_id, or count to narrow the read. Names match exact function "
+     "selectors or custom event names. Count zero reads all matches and retains the latest that fit. "
+     "SQLite replay loads compatible recorded C++ types and generates their mappings before the next input."},
     {"batch", "Get a Collection from a named capture or replay.",
      R"(auto data = tracer.batch("results");
 if (data.size()) tracer.print(data.at(0));)",

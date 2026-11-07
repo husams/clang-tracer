@@ -37,7 +37,7 @@ events : 'events' (streamOption*
        | 'open' value '--as' value
        | 'export' value '--format' 'json' '--output' value);
 collect : 'collect' streamOption*;
-record : 'record' value streamOption*;
+record : 'record' value (streamOption | SQLITE)*;
 streamOption : ('--count' | '--timeout' | '--after' | '--probe') UINT
              | '--phase' ('PRE' | 'POST')
              | ('--as' | '--name' | '--session') value | '--all';
@@ -75,5 +75,6 @@ STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';
 SHELL : '`' ~[`\r\n]+ '`';
 METADATA_ONLY : '--metadata-only';
+SQLITE : '--sqlite';
 WORD : ~[ \t\r\n"'\\%`]+;
 WS : [ \t\r\n]+ -> skip;

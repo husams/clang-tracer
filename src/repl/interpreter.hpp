@@ -5,6 +5,10 @@
 
 #include "api.hpp"
 
+namespace clangtracer::v1 {
+class PreparedInjector;
+}
+
 namespace tracer_repl {
 struct CppCompletions {
   std::string prefix;
@@ -47,6 +51,7 @@ public:
                              const std::vector<std::string> &types = {},
                              const std::string &output = {});
   std::string import_prepared_adapter(const std::string &source);
+  std::string import_recorded_types(const clangtracer::v1::PreparedInjector &types);
   std::string generate_header(const std::string &header,
                               const std::vector<std::string> &types = {},
                               const std::string &output = {});

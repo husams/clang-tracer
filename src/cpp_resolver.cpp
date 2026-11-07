@@ -248,6 +248,7 @@ struct FrozenInvocation {
   std::vector<std::string> prepared_headers;
   std::string adapter_symbol;
   bool select_template = false;
+  bool pointer_layouts = true;
 };
 
 bool is_receiver_field_type(clang::QualType type) {
@@ -485,10 +486,10 @@ public:
                                                                                  : api::FUNCTION);
       if (sema_) {
         tracer::prepared::describe_prepared_callable(*context_, *declaration, method,
-                                                    candidate.spec, sema_);
+            candidate.spec, sema_, nullptr, invocation_.pointer_layouts);
         if (!invocation_.prepared_headers.empty()) {
           auto adapter = tracer::prepared::AdapterEmitter(*context_).emit(
-              *declaration, invocation_.prepared_headers);
+              *declaration, invocation_.prepared_headers, invocation_.pointer_layouts);
           auto &package = *candidate.spec.mutable_prepared();
           package.set_adapter_declarations(std::move(adapter.source));
           for (const auto &header : adapter.standard_headers)
@@ -970,7 +971,8 @@ ResolvedCallable resolve_cpp_callable(const std::string& name,
 }
 
 ResolvedCallable resolve_header_callable(const std::string& name,
-                                         const api::ProbeSpec& headers) {
+                                         const api::ProbeSpec& headers,
+                                         bool pointer_layouts) {
   const auto selector = parse_selector(name);
   if (!selector.has_parameters || headers.include_headers().empty() ||
       !headers.has_header_context())
@@ -1021,6 +1023,7 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   std::string target_error, invocation_error;
   FrozenInvocation invocation;
   invocation.select_template = select_template;
+  invocation.pointer_layouts = pointer_layouts;
   invocation.prepared_headers.assign(headers.include_headers().begin(),
                                      headers.include_headers().end());
   tool.appendArgumentsAdjuster([&](const clang::tooling::CommandLineArguments& args,
@@ -1038,7 +1041,7 @@ ResolvedCallable resolve_header_callable(const std::string& name,
 }
 
 void verify_prepared_adapter(const std::string &name, const api::PreparedInjector &adapter,
-                             const ResolvedCallable &original) {
+                             const ResolvedCallable &original, bool pointer_layouts) {
   const auto selector = parse_selector(name);
   std::vector<std::string> arguments(runtime::jit_flags.begin(), runtime::jit_flags.end());
   arguments.insert(arguments.end(), {"-std=c++20", "-x", "c++",
@@ -1052,6 +1055,7 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
   std::vector<Candidate> candidates;
   FrozenInvocation invocation;
   invocation.adapter_symbol = original.spec.symbol();
+  invocation.pointer_layouts = pointer_layouts;
   Collector visitor(candidates, selector.qualified_name, std::move(invocation), "", "",
                     &unit->getSema());
   visitor.set_context(unit->getASTContext(), &unit->getSema());

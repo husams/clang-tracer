@@ -1496,7 +1496,7 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
       if (spelling.empty() || spelling.size() > 4096 ||
           spelling.find('\0') != std::string::npos ||
           object != (wire == api::OBJECT) || (object && (!record || reference)) ||
-          (reference && wire != api::POINTER) || (record && !object && !reference))
+          ((reference || (record && !object)) && wire != api::POINTER))
         throw std::invalid_argument("invalid prepared C++ type");
     };
     (void)tracer::prepared::adapter_source(prepared);
@@ -1516,7 +1516,8 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
     types.set_result_is_object_value(source.result_is_object_value());
     if (source.has_result_object_type()) {
       copy_record(source.result_object_type(), *types.mutable_result_object_type());
-      types.set_result_pass_by_reference(source.result_object_type().record_pass_by_reference());
+      if (source.result_is_reference() || source.result_is_object_value())
+        types.set_result_pass_by_reference(source.result_object_type().record_pass_by_reference());
     }
     for (int i = 0; i < source.arguments_size(); ++i) {
       const auto &from = source.arguments(i);

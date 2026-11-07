@@ -178,7 +178,7 @@ if [[ $ACTUAL_GRPC_COMMIT != "$GRPC_COMMIT" ]]; then
   exit 1
 fi
 PROTOBUF_INSTALL_CMAKE="$GRPC_SOURCE/third_party/protobuf/cmake/install.cmake"
-check_grpc_source_tree() {
+prepare_grpc_source_tree() {
 python3 - "$GRPC_SOURCE" "$PROTOBUF_INSTALL_CMAKE" "$1" <<'PY'
 from pathlib import Path
 import subprocess
@@ -202,6 +202,20 @@ def git_bytes(repo, *args):
 grpc_root = Path(sys.argv[1]).resolve()
 protobuf_file = Path(sys.argv[2]).resolve()
 allow_uninitialized = sys.argv[3] == "allow-uninitialized"
+cpu_source = "src/core/lib/gpr/cpu_linux.cc"
+cpu_file = grpc_root / cpu_source
+cpu_pristine = git_bytes(grpc_root, "show", f"HEAD:{cpu_source}")
+cpu_diagnostic = b'    gpr_log(GPR_ERROR, "Error determining current CPU: %s\\n", strerror(errno));\n'
+if cpu_pristine.count(cpu_diagnostic) != 2:
+    raise SystemExit("pinned gRPC CPU source lacks the expected diagnostics")
+# Keep both gRPC fallbacks intact. ENOSYS is expected when the legacy SDK's
+# sched_getcpu cannot query the host. Other CPU errors still need diagnostics.
+cpu_patched = cpu_pristine.replace(
+    cpu_diagnostic, b"    if (errno != ENOSYS) {\n  " + cpu_diagnostic + b"    }\n"
+)
+cpu_current = cpu_file.read_bytes()
+if cpu_current not in (cpu_pristine, cpu_patched):
+    raise SystemExit("gRPC CPU source differs from its pinned source and approved ENOSYS patch")
 protobuf_repo = protobuf_file.parents[1]
 zlib_repo = (grpc_root / "third_party/zlib").resolve()
 protobuf_initialized = (protobuf_repo / ".git").exists()
@@ -277,6 +291,8 @@ for repo in repositories:
                  "--ignore-submodules=none")
     for line in result.stdout.splitlines():
         status, path = line[:2], line[3:]
+        if repo == grpc_root and status == " M" and path == cpu_source:
+            continue
         if repo == protobuf_repo and status == " M" and path == "cmake/install.cmake":
             continue
         if repo == grpc_root and status == " M" and path == allowed_submodule:
@@ -288,17 +304,19 @@ for repo in repositories:
         dirty.append(f"{repo}: {line}")
 if dirty:
     raise SystemExit("refusing dirty pinned gRPC source tree; only the exact "
-                     "protobuf RPATH patch and zlib header rename are allowed:\n" +
+                     "gRPC ENOSYS patch, protobuf RPATH patch and zlib header rename are allowed:\n" +
                      "\n".join(dirty))
+if not allow_uninitialized and cpu_current != cpu_patched:
+    cpu_file.write_bytes(cpu_patched)
 PY
 }
 
 # Check existing checkouts before submodule update can change their revisions.
-check_grpc_source_tree allow-uninitialized
+prepare_grpc_source_tree allow-uninitialized
 git -C "$GRPC_SOURCE" submodule update --init --recursive --depth 1 \
   2>&1 | tee "$LOGS/grpc-submodules.log"
-# Then require every recursive submodule at its pinned revision and clean.
-check_grpc_source_tree require-initialized
+# Then verify every recursive submodule before applying the gRPC CPU patch.
+prepare_grpc_source_tree require-initialized
 {
   printf 'grpc %s %s\n' "$GRPC_TAG" "$ACTUAL_GRPC_COMMIT"
   git -C "$GRPC_SOURCE" submodule status --recursive

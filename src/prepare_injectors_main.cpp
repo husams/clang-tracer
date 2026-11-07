@@ -2,6 +2,7 @@
 #include "header_context.hpp"
 #include "prepared_contract.hpp"
 
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -106,8 +107,31 @@ int main(int argc, char **argv) {
         context, options.at("--compdb"),
         unit == options.end() ? std::string{} : unit->second,
         tracer::client::HeaderCommandSelection::first_in_header_directory);
-    const auto resolved = tracer::client::resolve_header_callable(
-        options.at("--selector"), context);
+    const auto resolve_adapter = [&](bool pointer_layouts) {
+      auto callable = tracer::client::resolve_header_callable(
+          options.at("--selector"), context, pointer_layouts);
+      auto &adapter = *callable.spec.mutable_prepared();
+      for (const auto &option : context.header_context().compiler_arguments())
+        if (tracer::prepared::abi_option(option))
+          adapter.add_adapter_abi_options(option);
+      tracer::client::verify_prepared_adapter(options.at("--selector"), adapter,
+                                              callable, pointer_layouts);
+      return callable;
+    };
+    const auto resolved = [&] {
+      try {
+        return resolve_adapter(true);
+      } catch (const std::runtime_error &error) {
+        const auto original = std::current_exception();
+        try {
+          auto callable = resolve_adapter(false);
+          std::cerr << "prepare: retaining address-only pointers: " << error.what() << '\n';
+          return callable;
+        } catch (const std::runtime_error &) {
+          std::rethrow_exception(original);
+        }
+      }
+    }();
     const auto &signature = resolved.spec.signature();
     const auto &types = resolved.spec.debug_info();
     const auto legacy = [](api::ValueType type, const std::string &spelling) {
@@ -126,10 +150,6 @@ int main(int argc, char **argv) {
     for (int i = 0; i < signature.arguments_size(); ++i)
       typed |= !legacy(signature.arguments(i), types.arguments(i).cpp_type());
     auto prepared = resolved.spec.prepared();
-    for (const auto &option : context.header_context().compiler_arguments())
-      if (tracer::prepared::abi_option(option))
-        prepared.add_adapter_abi_options(option);
-    tracer::client::verify_prepared_adapter(options.at("--selector"), prepared, resolved);
     const auto adapter = tracer::prepared::adapter_source(prepared);
     prepared.set_format_version(typed ? tracer::prepared::typed_version : module.empty() ? 2 : 1);
     if (typed) {

@@ -8,12 +8,7 @@
 #include <vector>
 
 namespace tracer::native_entry {
-inline constexpr std::size_t jump_bytes = 14;
 inline constexpr std::size_t preview_bytes = 64;
-
-bool initialize_llvm(std::string &error);
-std::size_t patch_window(std::uint64_t address, std::string_view bytes,
-                         std::string &error);
 
 enum class Flow { ordinary, branch, call, returns };
 

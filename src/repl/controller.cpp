@@ -1,8 +1,10 @@
 #include "controller.hpp"
 #include "../prepared_contract.hpp"
 #include "../proc_identity.hpp"
+#include "../sqlite_events.hpp"
 
 #include <algorithm>
+#include <array>
 #include <utility>
 #include <atomic>
 #include <chrono>
@@ -676,6 +678,10 @@ std::vector<std::string> Controller::take_pending_imports() {
   return std::exchange(pending_imports_, {});
 }
 
+std::vector<api::PreparedInjector> Controller::take_pending_replay_types() {
+  return std::exchange(pending_replay_types_, {});
+}
+
 std::uint64_t Controller::inject(const SessionHandle &session,
                                  const std::string &selector,
                                  const std::string &source,
@@ -752,8 +758,8 @@ void Controller::print(const Collection &collection) const {
   out_ << std::flush;
 }
 
-void Controller::watch(const Command &command, bool display,
-                       const std::string &record_path) {
+RecordResult Controller::watch(const Command &command, bool display,
+                               const std::string &record_path) {
   ensure_connected();
   api::WatchEventsRequest request;
   if (command.has("--session")) {
@@ -763,6 +769,8 @@ void Controller::watch(const Command &command, bool display,
     request.add_session_ids(selected_.id);
   }
   request.set_after_sequence(command.number("--after", 0));
+  const bool record_sqlite = command.has("--sqlite");
+  request.set_include_replay_types(record_sqlite);
   auto names = command.options.find("--name");
   if (names != command.options.end()) {
     for (const auto &name : names->second) {
@@ -800,7 +808,10 @@ void Controller::watch(const Command &command, bool display,
     }
   } output;
 
-  if (!record_path.empty()) {
+  std::unique_ptr<tracer::client::SQLiteEvents> sqlite;
+  if (record_sqlite) {
+    sqlite = std::make_unique<tracer::client::SQLiteEvents>(record_path);
+  } else if (!record_path.empty()) {
     output.fd = create_recording(record_path);
   }
   grpc::ClientContext context;
@@ -815,6 +826,7 @@ void Controller::watch(const Command &command, bool display,
     batches_.erase(collection_name);
   auto reader = stub_->WatchEvents(&context, request);
   Cancellation cancellation(context);
+  std::map<std::uint64_t, api::PreparedInjector> pending_types;
   api::TraceEvent event;
   std::uint64_t accepted = 0, cursor = request.after_sequence();
   while ((!count || accepted < count) && reader->Read(&event)) {
@@ -825,9 +837,19 @@ void Controller::watch(const Command &command, bool display,
     }
     if (command.has("--phase") &&
         api::TracePhase_Name(event.phase()) != command.option("--phase")) {
+      // The server can send the adapter once for a batch. Keep it if the
+      // event carrying it is filtered out before the next stored event.
+      if (sqlite && event.has_replay_types())
+        pending_types.insert_or_assign(event.probe_id(),
+                                       std::move(*event.mutable_replay_types()));
       continue;
     }
-    if (output.fd >= 0) {
+    if (sqlite) {
+      auto types = pending_types.extract(event.probe_id());
+      if (!types.empty() && !event.has_replay_types())
+        *event.mutable_replay_types() = std::move(types.mapped());
+      sqlite->write(std::array{event});
+    } else if (output.fd >= 0) {
       write_record(output.fd, event);
     } else {
       next.push(event);
@@ -849,14 +871,16 @@ void Controller::watch(const Command &command, bool display,
       throw std::runtime_error("recording close failed; partial file retained");
     }
   }
-  next.complete = complete;
-  next.cancelled = interrupted != 0;
-  next.timed_out = status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED;
-  out_ << "received=" << accepted << " cursor=" << cursor
-       << " complete=" << (complete ? "true" : "false")
-       << " cancelled=" << (next.cancelled ? "true" : "false")
-       << " timed_out=" << (next.timed_out ? "true" : "false");
+  const RecordResult result{accepted, cursor, complete, interrupted != 0,
+                            status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED};
+  out_ << "received=" << result.received << " cursor=" << result.cursor
+       << " complete=" << (result.complete ? "true" : "false")
+       << " cancelled=" << (result.cancelled ? "true" : "false")
+       << " timed_out=" << (result.timed_out ? "true" : "false");
   if (record_path.empty()) {
+    next.complete = result.complete;
+    next.cancelled = result.cancelled;
+    next.timed_out = result.timed_out;
     out_ << " collection=" << collection_name
          << " retained=" << next.events().size() << " evicted=" << next.evicted;
     batches_.insert_or_assign(collection_name, std::move(next));
@@ -874,6 +898,7 @@ void Controller::watch(const Command &command, bool display,
     throw std::runtime_error(
         "event stream ended early; partial results retained");
   }
+  return result;
 }
 
 Collection Controller::collect(const SessionHandle &session,
@@ -892,6 +917,40 @@ Collection Controller::collect(const SessionHandle &session,
   return batch("cpp");
 }
 
+RecordResult Controller::record(const std::string &path,
+                                const RecordOptions &options) {
+  if (path.empty() || path == ":memory:" || path.find('\0') != std::string::npos)
+    throw std::invalid_argument("SQLite recording requires a persistent file path");
+  if (options.session && options.all_sessions)
+    throw std::invalid_argument("recording session conflicts with all_sessions");
+  if (!options.phase.empty() && options.phase != "PRE" && options.phase != "POST")
+    throw std::invalid_argument("recording phase must be PRE or POST");
+  if (options.timeout_seconds > 86400)
+    throw std::invalid_argument("recording timeout must be at most 86400 seconds");
+
+  Command command;
+  command.options["--sqlite"] = {"true"};
+  if (options.session) {
+    require_session(*options.session);
+    command.options["--session"] = {options.session->id};
+  }
+  if (options.all_sessions)
+    command.options["--all"] = {"true"};
+  if (!options.names.empty())
+    command.options["--name"] = options.names;
+  if (!options.phase.empty())
+    command.options["--phase"] = {options.phase};
+  if (options.probe_id)
+    command.options["--probe"] = {std::to_string(options.probe_id)};
+  if (options.after_sequence)
+    command.options["--after"] = {std::to_string(options.after_sequence)};
+  if (options.count)
+    command.options["--count"] = {std::to_string(options.count)};
+  if (options.timeout_seconds)
+    command.options["--timeout"] = {std::to_string(options.timeout_seconds)};
+  return watch(command, false, path);
+}
+
 std::pair<std::size_t, std::size_t> Controller::background_storage() const {
   std::pair<std::size_t, std::size_t> used{};
   for (const auto& weak : background_) {
@@ -901,6 +960,30 @@ std::pair<std::size_t, std::size_t> Controller::background_storage() const {
     }
   }
   return used;
+}
+
+EventBuffer Controller::read_recording(const std::string &path,
+                                       const EventQuery &query) const {
+  auto [events, bytes] = background_storage();
+  for (const auto &entry : batches_) {
+    bytes += entry.second.bytes();
+    events += entry.second.events().size();
+  }
+  if (bytes >= settings_.max_bytes || events >= settings_.max_events) {
+    throw std::runtime_error(
+        "clear collections or release event ranges before loading a recording");
+  }
+  auto recording = open_recording(path, settings_.max_events - events,
+                                 settings_.max_bytes - bytes, query);
+  for (auto &types : recording.replay_types)
+    pending_replay_types_.push_back(std::move(types));
+  recording.replay_types.clear();
+  return recording;
+}
+
+Collection Controller::replay(const std::string &path,
+                              const EventQuery &query) const {
+  return read_recording(path, query).snapshot();
 }
 
 void Controller::stop_background(const std::string& session_id) {
@@ -1565,24 +1648,11 @@ bool Controller::execute(const Command &command) {
       throw std::runtime_error("collection already exists: " + name +
                                "; choose a new name or use %events clear NAME");
     }
-    const auto reserved = background_storage();
-    std::size_t events = reserved.first, bytes = reserved.second;
-    for (const auto &b : batches_) {
-      if (b.first != command.option("--as")) {
-        bytes += b.second.bytes();
-        events += b.second.events().size();
-      }
-    }
-    if (bytes >= settings_.max_bytes || events >= settings_.max_events) {
-      throw std::runtime_error(
-          "clear collections before loading another recording");
-    }
-    auto loaded = open_recording(args.at(0), settings_.max_events - events,
-                                 settings_.max_bytes - bytes);
+    auto loaded = read_recording(args.at(0), {});
     out_ << "opened events=" << loaded.received
          << " retained=" << loaded.events().size()
          << " evicted=" << loaded.evicted << '\n';
-    batches_.insert_or_assign(command.option("--as"), std::move(loaded));
+    batches_.emplace(name, std::move(loaded));
     return true;
   }
   case K::event_export:
@@ -1659,12 +1729,48 @@ void Facade::prepare(const std::string &selector, const std::string &header,
 void Facade::prepare(const std::string &selector, const std::string &header,
                      const std::string &compdb, const std::string &translation_unit,
                      const std::string &module, const std::string &output) {
+  prepare(selector, std::vector<std::string>{header}, compdb, translation_unit,
+          module, output);
+}
+
+void Facade::prepare(const std::string &selector,
+                     const std::vector<std::string> &headers,
+                     const std::string &output, const std::string &compdb,
+                     const std::string &translation_unit) {
+  prepare(selector, headers, compdb, translation_unit, {}, output);
+}
+
+void Facade::prepare(const std::string &selector,
+                     const std::vector<std::string> &headers,
+                     const std::string &compdb, const std::string &translation_unit,
+                     const std::string &module, const std::string &output) {
+  if (headers.empty() ||
+      std::any_of(headers.begin(), headers.end(), [](const auto &header) {
+        return header.empty() || header.find('\0') != std::string::npos;
+      }))
+    throw std::invalid_argument("preparation requires nonempty header paths");
   Command options;
-  options.options = {{"--include", {header}}, {"--output", {output}}};
+  options.options = {{"--include", headers}, {"--output", {output}}};
   if (!compdb.empty()) options.options["--compdb"] = {compdb};
   if (!translation_unit.empty()) options.options["--translation-unit"] = {translation_unit};
   if (!module.empty()) options.options["--module"] = {module};
   controller_->prepare(selector, options);
+}
+
+void Facade::prepare(const std::string &selector,
+                     std::initializer_list<std::string> headers,
+                     const std::string &output, const std::string &compdb,
+                     const std::string &translation_unit) {
+  prepare(selector, std::vector<std::string>(headers), output, compdb,
+          translation_unit);
+}
+
+void Facade::prepare(const std::string &selector,
+                     std::initializer_list<std::string> headers,
+                     const std::string &compdb, const std::string &translation_unit,
+                     const std::string &module, const std::string &output) {
+  prepare(selector, std::vector<std::string>(headers), compdb, translation_unit,
+          module, output);
 }
 
 void Facade::detach(const SessionHandle &session) {
@@ -1689,6 +1795,14 @@ EventRange Facade::events(const SessionHandle& session, std::uint64_t count, uns
 EventRange Facade::events_async(const SessionHandle& session, std::uint64_t count,
                                 unsigned timeout) {
   return controller_->events_async(session, count, timeout);
+}
+
+RecordResult Facade::record(const std::string &path, const RecordOptions &options) {
+  return controller_->record(path, options);
+}
+
+Collection Facade::replay(const std::string &path, const EventQuery &query) const {
+  return controller_->replay(path, query);
 }
 
 Collection Facade::batch(const std::string &name) const {

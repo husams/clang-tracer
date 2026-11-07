@@ -2,8 +2,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -89,6 +91,39 @@ struct Collection {
   auto end() const { return events.end(); }
 };
 
+struct EventQuery {
+  // Match any exact function selector or custom event name.
+  std::vector<std::string> names;
+  std::string phase;
+  std::uint32_t pid = 0;
+  std::string session_id;
+  // Zero reads all matches, subject to the collection's retention limits.
+  std::uint64_t count = 0;
+};
+
+struct RecordOptions {
+  // An omitted session uses the selected attachment.
+  std::optional<SessionHandle> session;
+  bool all_sessions = false;
+  // Match any exact function selector or custom event name.
+  std::vector<std::string> names;
+  std::string phase;
+  std::uint64_t probe_id = 0;
+  std::uint64_t after_sequence = 0;
+  // Zero count streams until cancelled or timed out.
+  std::uint64_t count = 0;
+  // Zero uses the console timeout for counted recordings.
+  unsigned timeout_seconds = 0;
+};
+
+struct RecordResult {
+  std::uint64_t received = 0;
+  std::uint64_t cursor = 0;
+  bool complete = false;
+  bool cancelled = false;
+  bool timed_out = false;
+};
+
 // Iteration visits a stable snapshot of the events retained at begin().
 // It never waits for new events; collection continues independently.
 class EventRange {
@@ -140,6 +175,22 @@ public:
   void prepare(const std::string &selector, const std::string &header,
                const std::string &compdb, const std::string &translation_unit,
                const std::string &module, const std::string &output);
+  void prepare(const std::string &selector,
+               const std::vector<std::string> &headers,
+               const std::string &output, const std::string &compdb = {},
+               const std::string &translation_unit = {});
+  void prepare(const std::string &selector,
+               const std::vector<std::string> &headers,
+               const std::string &compdb, const std::string &translation_unit,
+               const std::string &module, const std::string &output);
+  void prepare(const std::string &selector,
+               std::initializer_list<std::string> headers,
+               const std::string &output, const std::string &compdb = {},
+               const std::string &translation_unit = {});
+  void prepare(const std::string &selector,
+               std::initializer_list<std::string> headers,
+               const std::string &compdb, const std::string &translation_unit,
+               const std::string &module, const std::string &output);
   void detach(const SessionHandle &session);
   std::uint64_t inject(const SessionHandle &session,
                        const std::string &selector,
@@ -155,6 +206,8 @@ public:
                     unsigned timeout_seconds = 30);
   EventRange events_async(const SessionHandle& session, std::uint64_t count = 0,
                           unsigned timeout_seconds = 0);
+  RecordResult record(const std::string &path, const RecordOptions &options = {});
+  Collection replay(const std::string &path, const EventQuery &query = {}) const;
   Collection batch(const std::string &name) const;
   void print(const Event &event) const;
   void print(const Collection &collection) const;

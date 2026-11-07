@@ -84,7 +84,7 @@
 #include "context_stdlib.hpp"
 #include "debug_resolver.hpp"
 #include "event_transport.hpp"
-#include "native_entry.hpp"
+#include "native_detour.hpp"
 #include "native_stack.hpp"
 #include "runtime_identity.hpp"
 #include "runtime_paths.hpp"
@@ -99,7 +99,8 @@
 #endif
 
 namespace {
-constexpr auto kJumpBytes = tracer::native_entry::jump_bytes;
+constexpr std::size_t kJumpBytes = tracer::native_detour::kJumpBytes;
+using tracer::native_detour::initialize_llvm;
 thread_local unsigned callback_depth = 0;
 
 struct DebugRecord {
@@ -2098,20 +2099,22 @@ bool mapping(const void *address, std::uintptr_t &begin, std::uintptr_t &end,
 }
 
 bool decode_patch(const std::uint8_t *entry, tracer::Request &req,
-                  std::string &error) {
-  const auto address = reinterpret_cast<std::uintptr_t>(entry);
+                  tracer::native_detour::Patch &patch, std::string &error) {
   std::uintptr_t lo = 0, hi = 0;
   int prot = 0;
-  if (!mapping(entry, lo, hi, prot) || hi - address < kJumpBytes) {
-    error = "target entry has insufficient mapped bytes";
+  if (!mapping(entry, lo, hi, prot) || (prot & PROT_READ) == 0) {
+    error = "target entry is not in a readable mapping";
     return false;
   }
-  const auto size = tracer::native_entry::patch_window(
-      address, {reinterpret_cast<const char *>(entry), hi - address}, error);
-  if (!size)
+  const auto available = std::min<std::size_t>(
+      tracer::native_detour::kMaxDecodedBytes,
+      hi - reinterpret_cast<std::uintptr_t>(entry));
+  if (!tracer::native_detour::decode(
+          {entry, available}, reinterpret_cast<std::uintptr_t>(entry), patch,
+          error))
     return false;
-  req.patch_size = static_cast<std::uint32_t>(size);
-  std::memcpy(req.original, entry, size);
+  req.patch_size = static_cast<std::uint32_t>(patch.size);
+  std::memcpy(req.original, patch.original.data(), patch.size);
   return true;
 }
 
@@ -2253,7 +2256,8 @@ bool prepare_context_pthread(Agent &owner, Probe &probe, std::string &error) {
     patch_entry += 4;
   }
   patch.pthread_create_entry = reinterpret_cast<std::uintptr_t>(patch_entry);
-  if (!decode_patch(patch_entry, patch, error))
+  tracer::native_detour::Patch scheduler_patch;
+  if (!decode_patch(patch_entry, patch, scheduler_patch, error))
     return false;
   patch.pthread_create_patch_size = patch.patch_size;
   std::memcpy(patch.pthread_create_original, patch.original, patch.patch_size);
@@ -2277,26 +2281,11 @@ bool prepare_context_pthread(Agent &owner, Probe &probe, std::string &error) {
     }
   }
 
-  const long page_size = ::sysconf(_SC_PAGESIZE);
-  if (page_size <= 0) {
-    error = "cannot determine page size for pthread_create trampoline";
+  std::size_t trampoline_size = 0;
+  void *trampoline = MAP_FAILED;
+  if (!tracer::native_detour::create_trampoline(
+          scheduler_patch, trampoline, trampoline_size, error))
     return false;
-  }
-  const auto trampoline_size = static_cast<std::size_t>(page_size);
-  void *trampoline = ::mmap(nullptr, trampoline_size, PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (trampoline == MAP_FAILED) {
-    error = "cannot allocate pthread_create trampoline";
-    return false;
-  }
-  std::memcpy(trampoline, patch.pthread_create_original, patch.patch_size);
-  add_jump(static_cast<std::uint8_t *>(trampoline) + patch.patch_size,
-           patch_entry + patch.patch_size);
-  if (::mprotect(trampoline, trampoline_size, PROT_READ | PROT_EXEC) != 0) {
-    ::munmap(trampoline, trampoline_size);
-    error = "cannot make pthread_create trampoline executable";
-    return false;
-  }
 
   patch.pthread_create_trampoline =
       reinterpret_cast<std::uintptr_t>(trampoline);
@@ -4174,7 +4163,7 @@ bool validate_prepared_types(clang::ASTUnit &unit,
     ProbeSpec actual;
     actual.mutable_signature()->set_kind(method && !method->isStatic() ? METHOD : FUNCTION);
     tracer::prepared::describe_prepared_callable(ast, *decl, method, actual,
-                                                unit.hasSema() ? &unit.getSema() : nullptr);
+        unit.hasSema() ? &unit.getSema() : nullptr, &spec.prepared().header_types());
     if (actual.debug_info().SerializeAsString() != spec.prepared().header_types().SerializeAsString() ||
         actual.signature().SerializeAsString() != spec.signature().SerializeAsString())
       throw std::runtime_error("prepared types or record layout changed; prepare again");
@@ -4322,7 +4311,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
       !determine_object_result_sret(specification, p.debug_records,
                                     result_sret, error))
     return false;
-  if (!tracer::native_entry::initialize_llvm(error)) {
+  if (!initialize_llvm(error)) {
     return false;
   }
   const std::string resource_dir_argument =
@@ -5197,15 +5186,22 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
         replaced = other;
       }
     }
+    tracer::native_detour::Patch target_patch;
     if (replaced) {
-      // Compile the new callback before touching the live hook. Decode neither
-      // its detour nor its wrapper: the trampoline needs the original prologue.
+      // The live entry contains our jump. Decode the saved prologue at its
+      // original address so RIP-relative operands keep their original targets.
       p->request.replaced_probe_id = replaced->request.probe_id;
       p->request.patch_size = replaced->request.patch_size;
       std::memcpy(p->request.original, replaced->request.original,
                   p->request.patch_size);
+      if (!tracer::native_detour::decode(
+              {p->request.original, p->request.patch_size},
+              p->request.original_entry, target_patch, error)) {
+        set_error(request, error.c_str());
+        return -1;
+      }
     } else if (!decode_patch(static_cast<const std::uint8_t *>(entry), p->request,
-                             error)) {
+                             target_patch, error)) {
       set_error(request, error.c_str());
       return -1;
     }
@@ -5228,23 +5224,9 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
         return -1;
       }
     }
-    long page_size = ::sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) {
-      set_error(request, "could not determine page size");
-      return -1;
-    }
-    p->mapping_size = static_cast<std::size_t>(page_size);
-    p->trampoline = ::mmap(nullptr, p->mapping_size, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p->trampoline == MAP_FAILED) {
-      set_error(request, "could not allocate trampoline");
-      return -1;
-    }
-    std::memcpy(p->trampoline, p->request.original, p->request.patch_size);
-    add_jump(static_cast<std::uint8_t *>(p->trampoline) + p->request.patch_size,
-             static_cast<std::uint8_t *>(entry) + p->request.patch_size);
-    if (::mprotect(p->trampoline, p->mapping_size, PROT_READ | PROT_EXEC)) {
-      set_error(request, "could not make trampoline executable");
+    if (!tracer::native_detour::create_trampoline(
+            target_patch, p->trampoline, p->mapping_size, error)) {
+      set_error(request, error.c_str());
       return -1;
     }
     const auto compile_started = std::chrono::steady_clock::now();

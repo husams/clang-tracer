@@ -42,6 +42,7 @@ class Controller {
   };
   std::map<std::string, PreparedPackage> prepared_packages_;
   std::vector<std::string> pending_imports_;
+  mutable std::vector<clangtracer::v1::PreparedInjector> pending_replay_types_;
   std::map<std::string, EventBuffer> batches_;
   std::vector<std::weak_ptr<BackgroundEvents>> background_;
   void stop_background(const std::string& session_id = {});
@@ -57,8 +58,10 @@ class Controller {
   clangtracer::v1::ProbeSpec resolve_for(const SessionHandle &session,
                                         const std::string &selector,
                                         const Command &command);
-  void watch(const Command &command, bool display,
-             const std::string &record_path = {});
+  RecordResult watch(const Command &command, bool display,
+                     const std::string &record_path = {});
+  EventBuffer read_recording(const std::string &path,
+                             const EventQuery &query) const;
   const EventBuffer &buffer(const std::string &name) const;
   void preview_bulk_trace(const Command &command);
   void apply_bulk_trace(const Command &command);
@@ -82,6 +85,7 @@ public:
   std::string prompt() const;
   void prepare(const std::string &selector, const Command &options);
   std::vector<std::string> take_pending_imports();
+  std::vector<clangtracer::v1::PreparedInjector> take_pending_replay_types();
   SessionHandle attach(std::uint32_t pid, std::uint64_t expected_start_time = 0,
                        const std::string &expected_executable = {});
   void detach(const SessionHandle &session);
@@ -93,6 +97,8 @@ public:
                      unsigned timeout);
   EventRange events(const SessionHandle& session, std::uint64_t count, unsigned timeout);
   EventRange events_async(const SessionHandle& session, std::uint64_t count, unsigned timeout);
+  RecordResult record(const std::string &path, const RecordOptions &options);
+  Collection replay(const std::string &path, const EventQuery &query) const;
   Collection batch(const std::string &name) const;
   void draft(const std::string &name, std::string source);
   void print(const Event &event) const;

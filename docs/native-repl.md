@@ -25,8 +25,9 @@ cmake --build build-repl -j2
 ctest --test-dir build-repl --output-on-failure
 ```
 
-Supply a matching LLVM/Clang 21 or 22 development installation and gRPC/Protobuf
-development packages and compiler plugin. The implementation has separate
+Supply a matching LLVM/Clang 21 or 22 development installation, the gRPC and
+Protobuf development packages and compiler plugin, and the SQLite development
+package. The implementation has separate
 embedding paths for LLVM 21.1.8 and 22.1.8. Set `CMAKE_PREFIX_PATH` for dependencies
 outside the system search path. The existing full Linux build includes the REPL
 by default; `-DTRACER_BUILD_REPL=OFF` keeps the prior backend-only build.
@@ -409,7 +410,9 @@ can include `event_ranges.hpp` and use the `tracer_repl` namespace explicitly.
 %events calls batch
 %events stats batch
 %record capture.pb --count 1000
+%record capture.db --sqlite --count 1000
 %events open capture.pb --as saved
+%events open capture.db --as stored
 %events stats saved
 %events export saved --format json --output events.json
 %events clear saved
@@ -472,11 +475,83 @@ struct Interceptor {
 Agent and server loss counters are cumulative samples from retained events.
 They and local buffer evictions are reported separately from incomplete calls.
 
-Recordings use the Python client's four-byte little-endian length plus Protobuf
-TraceEvent framing, with a 32 MiB per-frame limit. Recording and export create
-new files exclusively. Replay rejects truncated headers/bodies and invalid
-messages. A failed recording keeps its partial file; offline loading retains
-only the configured bounded window. Use recording for long captures.
+By default, `%record` uses four-byte little-endian lengths and Protobuf
+TraceEvent frames, with a 32 MiB per-frame limit. Framed recording and export
+create new files exclusively. `%record FILE --sqlite` creates or appends to a
+SQLite recording and deduplicates events by server instance and sequence.
+Replay rejects truncated headers/bodies and invalid messages. A failed
+recording keeps its partial file. Offline loading retains the configured
+bounded window.
+
+### Query a recording offline
+
+Open the native console without attaching to a process. To browse a SQLite
+recording from `clang-tracer drain --sqlite`, use the same commands as for
+a framed Protobuf recording.
+
+```text
+%events open capture.db --as saved
+%events list saved --limit 10
+%events show saved --index 0
+```
+
+Use `tracer.replay` to filter the recording before loading a collection.
+
+```cpp
+tracer_repl::EventQuery query;
+query.names = {"demo::compute(int)"};
+query.phase = "POST";
+query.count = 20;
+auto matches = tracer.replay("capture.db", query);
+for (const auto& event : matches) std::cout << event.result_as<int>() << '\n';
+```
+
+Set `pid` or `session_id` to narrow a capture that contains multiple processes
+or sessions. Names match exact function selectors or custom event names. A
+list of names matches any of them, and the other filters are combined. A
+positive count reads up to that many matches in recording order. Zero reads
+all matches and retains the latest events that fit the memory budget.
+`received` and `evicted` show how much of the query was retained. Replay opens
+SQLite read-only and works after the target and tracing server have exited.
+The results support the same typed accessors and C++ adaptors as live events.
+
+The native SQLite recorders (`%record FILE --sqlite`, `tracer.record()`, `clang-tracer events
+--sqlite`, and `clang-tracer drain --sqlite`) save the standalone C++ type bundle for
+prepared probes with custom state. Opening the database or calling
+`tracer.replay` makes those types and their generated mappings available at
+the next prompt. A fresh REPL can reconstruct the recorded C++ value without
+access to the application headers:
+
+```text
+tracer_repl::EventQuery query;
+query.names = {"account.adjusted"};
+query.count = 1;
+auto matches = tracer.replay("capture.db", query);
+auto reading = matches.at(0).state_as<prepared_demo::Reading>();
+```
+
+Earlier recordings and recordings without a standalone type bundle still
+support `state_snapshot()` and explicit C++ imports. Replay checks the saved
+declarations before loading them. If a declaration is unsupported or conflicts
+with a type already loaded in the REPL, the recorded fields remain inspectable.
+
+To record from C++, call `tracer.record` while attached.
+
+```cpp
+tracer_repl::RecordOptions options;
+options.names = {"account.adjusted"};
+options.count = 12;
+options.timeout_seconds = 15;
+auto saved = tracer.record("capture.db", options);
+```
+
+This creates or appends to the SQLite recording. By default it uses the
+selected session. Set `options.session` to another session handle or
+`options.all_sessions` to record from all sessions. The filters also include
+`phase`, `probe_id`, and `after_sequence`. `saved.complete` reports whether
+the requested count was reached. Use `saved.received`, `saved.cursor`,
+`saved.cancelled`, and `saved.timed_out` to inspect the outcome. See
+`%help api tracer.record` for the native REPL topic.
 
 ## Analyze in C++
 
@@ -630,6 +705,14 @@ After C++ input, changing options is rejected without dropping variables.
 An explicit `%cpp reset` clears C++ variables and unlocks configuration while
 retaining tracing sessions. Local options do not change remote probe settings:
 `--include`, `--compile-option` and `--compdb` still refer to the server.
+
+Use `tracer.prepare` with a header path, a braced list, or a
+`std::vector<std::string>`. Put the probed function's declaration header
+first, followed by headers for types used by the callback.
+
+```cpp
+tracer.prepare("demo::compute(int)", {"demo.hpp", "state.hpp"}, "prepared");
+```
 
 Successful injection with a typed package prepared in the same REPL imports
 eligible mappings from its standalone adapter. For `tracer.inject(...)`,

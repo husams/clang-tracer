@@ -34,7 +34,13 @@ clang-tracer drain --sqlite capture.db
 clang-tracer drain 12345 --sqlite capture.db --listen --timeout 60
 ```
 
-Console commands:
+In the native REPL, save without consuming retained history:
+
+```text
+%record capture.db --sqlite --name account.adjusted --count 12
+```
+
+Python console commands:
 
 ```text
 record capture.db 100 --sqlite --timeout 30
@@ -75,14 +81,10 @@ until storage is full. WAL uses FULL synchronous commits.
 The database path must name a persistent file; empty paths and `:memory:` are
 rejected. Both writers create a missing database and append to an existing one.
 
-```sql
-SELECT pid, function_name, phase, count(*) FROM trace_events
-GROUP BY pid, function_name, phase;
-```
-
-To replay, parse each `payload` BLOB with `messages.TraceEvent.FromString(blob)`.
-Sort sequences numerically using `ORDER BY length(sequence), sequence` within
-one `server_instance_id`, since unsigned 64-bit IDs are stored as decimal text.
+Open the recording from the native REPL with `%events open capture.db --as saved`.
+Use `tracer.replay("capture.db", query)` to select events by function or custom
+event name, phase, process, or session before reading them. See
+[Query a recording offline](native-repl.md#query-a-recording-offline) for examples.
 
 ## Verification
 

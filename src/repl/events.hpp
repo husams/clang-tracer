@@ -18,6 +18,7 @@ class EventBuffer {
 public:
   std::uint64_t received = 0, evicted = 0;
   bool complete = false, cancelled = false, timed_out = false;
+  std::vector<clangtracer::v1::PreparedInjector> replay_types;
   explicit EventBuffer(std::size_t max_events = 4096,
                        std::size_t max_bytes = 64 * 1024 * 1024);
   void push(const clangtracer::v1::TraceEvent &event);
@@ -35,6 +36,6 @@ void event_statistics(const EventBuffer &buffer, std::ostream &out, bool calls);
 void write_record(int fd, const clangtracer::v1::TraceEvent &event);
 int create_recording(const std::string &path);
 EventBuffer open_recording(const std::string &path, std::size_t max_events,
-                           std::size_t max_bytes);
+                           std::size_t max_bytes, const EventQuery &query = {});
 void export_json(const EventBuffer &buffer, const std::string &path);
 } // namespace tracer_repl

@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "controller.hpp"
+#include "../src/sqlite_events.hpp"
 
 using namespace tracer_repl;
 namespace api = clangtracer::v1;
@@ -257,6 +258,15 @@ public:
         e.mutable_result()->set_type(api::INT32);
         e.mutable_result()->set_signed_value(42);
       }
+      if (q->include_replay_types()) {
+        e.set_server_instance_id("fixture");
+        e.mutable_context()->mutable_event()->add_states();
+        if (i == 1) {
+          auto *types = e.mutable_replay_types();
+          types->set_format_version(4);
+          types->set_adapter_declarations("struct ReplayMarker { int value; };");
+        }
+      }
       if (!writer->Write(e)) {
         break;
       }
@@ -273,6 +283,57 @@ public:
 
 int main(int argc, char **argv) {
   try {
+    const bool unsafe_replay = argc == 3 && std::string(argv[1]) == "--write-unsafe-replay-db";
+    if (argc == 3 && (std::string(argv[1]) == "--write-replay-db" || unsafe_replay)) {
+      api::TraceEvent event;
+      event.set_server_instance_id("server");
+      event.set_session_id("s1");
+      event.set_pid(7);
+      event.set_sequence(1);
+      event.set_function_name("multiply(int, int)");
+      event.set_phase(api::PRE);
+      std::vector<api::TraceEvent> events{event};
+      event.set_sequence(2);
+      event.set_phase(api::POST);
+      event.mutable_result()->set_type(api::INT32);
+      event.mutable_result()->set_signed_value(42);
+      events.push_back(event);
+      event.set_sequence(10);
+      event.set_session_id("s2");
+      event.set_pid(8);
+      events.push_back(event);
+      event.set_sequence(11);
+      auto *context = event.mutable_context();
+      context->mutable_event()->set_name("custom.event");
+      google::protobuf::FileDescriptorSet descriptors;
+      auto *file = descriptors.add_file();
+      file->set_name("replay_state.proto");
+      file->set_package("tracer.generated.state");
+      auto *record = file->add_message_type();
+      record->set_name("M_8b906fc299f87a61"); // Canonical name for ReplayState.
+      auto *field = record->add_field();
+      field->set_name("label");
+      field->set_number(1);
+      field->set_type(google::protobuf::FieldDescriptorProto::TYPE_STRING);
+      field->set_label(google::protobuf::FieldDescriptorProto::LABEL_OPTIONAL);
+      auto *schema = context->add_schemas();
+      schema->set_epoch_schema_id(1);
+      schema->set_cpp_state_type("ReplayState");
+      schema->set_root_type("tracer.generated.state." + record->name());
+      schema->set_serialized_file_descriptor_set(descriptors.SerializeAsString());
+      auto *state = context->mutable_event()->add_states();
+      state->set_epoch_schema_id(1);
+      state->set_payload("\x0a\x05" "saved");
+      if (unsafe_replay) {
+        auto *adapter = event.mutable_replay_types();
+        adapter->set_format_version(4);
+        adapter->set_adapter_declarations(
+            "namespace replay_test { int init = *reinterpret_cast<volatile int *>(1); }");
+      }
+      events.push_back(event);
+      tracer::client::SQLiteEvents(argv[2]).write(events);
+      return 0;
+    }
     Service service;
     if (argc == 3 &&
         (std::string(argv[1]) == "--listen" || std::string(argv[1]) == "--listen-live")) {

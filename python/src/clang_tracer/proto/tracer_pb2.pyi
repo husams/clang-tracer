@@ -950,16 +950,18 @@ class BulkTraceReport(_message.Message):
     def __init__(self, batch_id: _Optional[str] = ..., entries: _Optional[_Iterable[_Union[BulkTraceEntry, _Mapping]]] = ..., unmatched_exact_selectors: _Optional[_Iterable[str]] = ..., available_slots: _Optional[int] = ..., diagnostic: _Optional[str] = ..., complete: bool = ...) -> None: ...
 
 class WatchEventsRequest(_message.Message):
-    __slots__ = ("session_ids", "after_sequence", "pid", "names")
+    __slots__ = ("session_ids", "after_sequence", "pid", "names", "include_replay_types")
     SESSION_IDS_FIELD_NUMBER: _ClassVar[int]
     AFTER_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
     PID_FIELD_NUMBER: _ClassVar[int]
     NAMES_FIELD_NUMBER: _ClassVar[int]
+    INCLUDE_REPLAY_TYPES_FIELD_NUMBER: _ClassVar[int]
     session_ids: _containers.RepeatedScalarFieldContainer[str]
     after_sequence: int
     pid: int
     names: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, session_ids: _Optional[_Iterable[str]] = ..., after_sequence: _Optional[int] = ..., pid: _Optional[int] = ..., names: _Optional[_Iterable[str]] = ...) -> None: ...
+    include_replay_types: bool
+    def __init__(self, session_ids: _Optional[_Iterable[str]] = ..., after_sequence: _Optional[int] = ..., pid: _Optional[int] = ..., names: _Optional[_Iterable[str]] = ..., include_replay_types: bool = ...) -> None: ...
 
 class ReadEventsRequest(_message.Message):
     __slots__ = ("filter", "limit", "through_sequence", "server_instance_id")
@@ -1082,7 +1084,7 @@ class StackTrace(_message.Message):
     def __init__(self, status: _Optional[_Union[StackTrace.Status, str]] = ..., requested_depth: _Optional[int] = ..., frames: _Optional[_Iterable[_Union[StackFrame, _Mapping]]] = ..., detail: _Optional[str] = ..., application_only: bool = ..., hidden_frames: _Optional[int] = ..., captured_depth: _Optional[int] = ...) -> None: ...
 
 class TraceEvent(_message.Message):
-    __slots__ = ("protocol_version", "session_id", "probe_id", "pid", "tid", "sequence", "probe_sequence", "monotonic_time_ns", "object_address", "arguments", "callback_value", "agent_dropped_events", "server_dropped_events", "phase", "call_id", "result", "named_arguments", "object_fields", "stack", "context", "function_name", "server_instance_id", "receiver_snapshot")
+    __slots__ = ("protocol_version", "session_id", "probe_id", "pid", "tid", "sequence", "probe_sequence", "monotonic_time_ns", "object_address", "arguments", "callback_value", "agent_dropped_events", "server_dropped_events", "phase", "call_id", "result", "named_arguments", "object_fields", "stack", "context", "function_name", "server_instance_id", "receiver_snapshot", "replay_types")
     PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     PROBE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -1106,6 +1108,7 @@ class TraceEvent(_message.Message):
     FUNCTION_NAME_FIELD_NUMBER: _ClassVar[int]
     SERVER_INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
     RECEIVER_SNAPSHOT_FIELD_NUMBER: _ClassVar[int]
+    REPLAY_TYPES_FIELD_NUMBER: _ClassVar[int]
     protocol_version: int
     session_id: str
     probe_id: int
@@ -1129,4 +1132,5 @@ class TraceEvent(_message.Message):
     function_name: str
     server_instance_id: str
     receiver_snapshot: _context_transport_pb2.ValueSnapshot
-    def __init__(self, protocol_version: _Optional[int] = ..., session_id: _Optional[str] = ..., probe_id: _Optional[int] = ..., pid: _Optional[int] = ..., tid: _Optional[int] = ..., sequence: _Optional[int] = ..., probe_sequence: _Optional[int] = ..., monotonic_time_ns: _Optional[int] = ..., object_address: _Optional[int] = ..., arguments: _Optional[_Iterable[_Union[Value, _Mapping]]] = ..., callback_value: _Optional[int] = ..., agent_dropped_events: _Optional[int] = ..., server_dropped_events: _Optional[int] = ..., phase: _Optional[_Union[TracePhase, str]] = ..., call_id: _Optional[int] = ..., result: _Optional[_Union[Value, _Mapping]] = ..., named_arguments: _Optional[_Iterable[_Union[NamedValue, _Mapping]]] = ..., object_fields: _Optional[_Iterable[_Union[NamedValue, _Mapping]]] = ..., stack: _Optional[_Union[StackTrace, _Mapping]] = ..., context: _Optional[_Union[_context_transport_pb2.ContextEventEnvelope, _Mapping]] = ..., function_name: _Optional[str] = ..., server_instance_id: _Optional[str] = ..., receiver_snapshot: _Optional[_Union[_context_transport_pb2.ValueSnapshot, _Mapping]] = ...) -> None: ...
+    replay_types: PreparedInjector
+    def __init__(self, protocol_version: _Optional[int] = ..., session_id: _Optional[str] = ..., probe_id: _Optional[int] = ..., pid: _Optional[int] = ..., tid: _Optional[int] = ..., sequence: _Optional[int] = ..., probe_sequence: _Optional[int] = ..., monotonic_time_ns: _Optional[int] = ..., object_address: _Optional[int] = ..., arguments: _Optional[_Iterable[_Union[Value, _Mapping]]] = ..., callback_value: _Optional[int] = ..., agent_dropped_events: _Optional[int] = ..., server_dropped_events: _Optional[int] = ..., phase: _Optional[_Union[TracePhase, str]] = ..., call_id: _Optional[int] = ..., result: _Optional[_Union[Value, _Mapping]] = ..., named_arguments: _Optional[_Iterable[_Union[NamedValue, _Mapping]]] = ..., object_fields: _Optional[_Iterable[_Union[NamedValue, _Mapping]]] = ..., stack: _Optional[_Union[StackTrace, _Mapping]] = ..., context: _Optional[_Union[_context_transport_pb2.ContextEventEnvelope, _Mapping]] = ..., function_name: _Optional[str] = ..., server_instance_id: _Optional[str] = ..., receiver_snapshot: _Optional[_Union[_context_transport_pb2.ValueSnapshot, _Mapping]] = ..., replay_types: _Optional[_Union[PreparedInjector, _Mapping]] = ...) -> None: ...

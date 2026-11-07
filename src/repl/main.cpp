@@ -259,9 +259,20 @@ int main(int argc, char **argv) {
       // returns so the live interpreter is never re-entered.
       for (const auto &adapter : controller.take_pending_imports()) {
         try {
-          std::cout << cpp.import_prepared_adapter(adapter) << '\n';
+          const auto imported = cpp.import_prepared_adapter(adapter);
+          if (!imported.empty())
+            std::cout << imported << '\n';
         } catch (const std::exception &error) {
           std::cerr << "prepared C++ import skipped: " << error.what() << '\n';
+        }
+      }
+      for (const auto &types : controller.take_pending_replay_types()) {
+        try {
+          const auto imported = cpp.import_recorded_types(types);
+          if (!imported.empty())
+            std::cout << imported << '\n';
+        } catch (const std::exception &error) {
+          std::cerr << "recorded C++ types skipped: " << error.what() << '\n';
         }
       }
       const auto line = [&]() -> std::optional<std::string> {

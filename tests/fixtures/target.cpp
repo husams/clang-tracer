@@ -57,10 +57,7 @@ traced_pointer(void *value) {
 
 extern "C" __attribute__((visibility("default"), noinline)) void
 traced_void(int value) {
-  // Keep this positive fixture patchable with either compiler PIE default.
-  // Production entry relocation restrictions are unchanged.
-  volatile int saved = value;
-  last_void_argument = saved;
+  last_void_argument = value;
 }
 
 namespace fixture {

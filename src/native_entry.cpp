@@ -26,6 +26,9 @@
 #include "tracer/protocol.hpp"
 
 namespace tracer::native_entry {
+namespace {
+constexpr std::size_t jump_bytes = 14;
+
 bool initialize_llvm(std::string &error) {
   static std::once_flag once;
   static std::string init_error;
@@ -43,7 +46,6 @@ bool initialize_llvm(std::string &error) {
   return true;
 }
 
-namespace {
 constexpr auto max_decoded_bytes = kMaxPatchBytes - jump_bytes;
 
 struct Decoder {
@@ -57,7 +59,7 @@ struct Decoder {
   std::unique_ptr<llvm::MCInstrAnalysis> analysis;
 };
 
-bool make_decoder(Decoder &d, std::string &error, bool for_preview = false) {
+bool make_decoder(Decoder &d, std::string &error) {
   if (!initialize_llvm(error)) {
     return false;
   }
@@ -89,16 +91,14 @@ bool make_decoder(Decoder &d, std::string &error, bool for_preview = false) {
     error = "LLVM MC disassembler unavailable";
     return false;
   }
-  if (for_preview) {
-    d.printer.reset(target->createMCInstPrinter(parsed, d.asm_info->getAssemblerDialect(),
-                                               *d.asm_info, *d.ins, *d.regs));
-    d.analysis.reset(target->createMCInstrAnalysis(d.ins.get()));
-    if (!d.printer || !d.analysis) {
-      error = "LLVM MC instruction formatting or analysis unavailable";
-      return false;
-    }
-    d.printer->setPrintBranchImmAsAddress(true);
+  d.printer.reset(target->createMCInstPrinter(parsed, d.asm_info->getAssemblerDialect(),
+                                             *d.asm_info, *d.ins, *d.regs));
+  d.analysis.reset(target->createMCInstrAnalysis(d.ins.get()));
+  if (!d.printer || !d.analysis) {
+    error = "LLVM MC instruction formatting or analysis unavailable";
+    return false;
   }
+  d.printer->setPrintBranchImmAsAddress(true);
   return true;
 }
 
@@ -178,16 +178,10 @@ std::size_t patch_window(const Decoder &decoder, std::uint64_t address,
 }
 } // namespace
 
-std::size_t patch_window(std::uint64_t address, std::string_view bytes,
-                         std::string &error) {
-  Decoder decoder;
-  return make_decoder(decoder, error) ? patch_window(decoder, address, bytes, error) : 0;
-}
-
 Preview preview(std::uint64_t address, std::string_view bytes) {
   Preview result;
   Decoder decoder;
-  if (!make_decoder(decoder, result.diagnostic, true))
+  if (!make_decoder(decoder, result.diagnostic))
     return result;
   bytes = bytes.substr(0, preview_bytes);
   result.patch_size = patch_window(decoder, address, bytes, result.diagnostic);

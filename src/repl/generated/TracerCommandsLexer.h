@@ -29,7 +29,7 @@ public:
     T__86 = 87, T__87 = 88, T__88 = 89, T__89 = 90, T__90 = 91, T__91 = 92,
     T__92 = 93, T__93 = 94, T__94 = 95, T__95 = 96, T__96 = 97, T__97 = 98,
     T__98 = 99, T__99 = 100, T__100 = 101, T__101 = 102, UINT = 103, STRING = 104,
-    SHELL = 105, METADATA_ONLY = 106, WORD = 107, WS = 108
+    SHELL = 105, METADATA_ONLY = 106, SQLITE = 107, WORD = 108, WS = 109
   };
 
   explicit TracerCommandsLexer(antlr4::CharStream *input);

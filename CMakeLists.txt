@@ -85,8 +85,10 @@ target_link_libraries(tracer_proto PUBLIC protobuf::libprotobuf tracer_context_t
 add_library(tracer_grpc STATIC ${TRACER_PROTO_DIR}/tracer.grpc.pb.cc)
 target_link_libraries(tracer_grpc PUBLIC tracer_proto gRPC::grpc++)
 
-add_library(clang_tracer_agent SHARED src/agent.cpp src/value_snapshot_codegen.cpp src/value_snapshot_storage.cpp src/callback_pch.cpp src/debug_resolver.cpp src/native_stack.cpp src/native_entry.cpp
-  src/event_transport.cpp src/context_agent_delivery.cpp src/agent_runtime_profile.cpp)
+add_library(clang_tracer_agent SHARED src/agent.cpp src/native_detour.cpp
+  src/value_snapshot_codegen.cpp src/value_snapshot_storage.cpp src/callback_pch.cpp
+  src/debug_resolver.cpp src/native_stack.cpp src/event_transport.cpp
+  src/context_agent_delivery.cpp src/agent_runtime_profile.cpp)
 target_include_directories(clang_tracer_agent PRIVATE include ${TRACER_PROTO_DIR} ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_compile_definitions(clang_tracer_agent PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
 target_link_libraries(clang_tracer_agent PRIVATE tracer_context_engine tracer_context_analysis tracer_proto clang-cpp LLVM ${CMAKE_DL_LIBS} Threads::Threads)
@@ -215,6 +217,21 @@ if(BUILD_TESTING)
   add_test(NAME callback_pch_unavailable
     COMMAND callback-pch-tests "${_tracer_resource_dir}" --unavailable-cache)
   set_tests_properties(callback_pch_reuse callback_pch_unavailable PROPERTIES TIMEOUT 60)
+  add_executable(native-detour-tests tests/native_detour_tests.cpp src/native_detour.cpp)
+  target_include_directories(native-detour-tests PRIVATE include src ${LLVM_INCLUDE_DIRS})
+  target_link_libraries(native-detour-tests PRIVATE LLVM tracer_compat)
+  target_compile_options(native-detour-tests PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME native_detour_relocation COMMAND native-detour-tests)
+  set_tests_properties(native_detour_relocation PROPERTIES TIMEOUT 30)
+
+  # Exercise the unchanged fixture with PIE regardless of the driver default.
+  add_executable(trace-target-pie tests/fixtures/target.cpp)
+  set_target_properties(trace-target-pie PROPERTIES ENABLE_EXPORTS ON)
+  target_link_libraries(trace-target-pie PRIVATE Threads::Threads)
+  target_compile_options(trace-target-pie PRIVATE -g -O0 -fPIE
+    -fno-omit-frame-pointer -fcf-protection=none)
+  target_link_options(trace-target-pie PRIVATE -pie)
+
   add_test(NAME agent_symbol_isolation
     COMMAND ${CMAKE_COMMAND} -DAGENT=$<TARGET_FILE:clang_tracer_agent>
       -DNM=${CMAKE_NM} -DREADELF=${CMAKE_READELF}
@@ -301,6 +318,15 @@ if(BUILD_TESTING)
   add_test(NAME native_module_cfi_cache_integration COMMAND module-identity-integration
     --module $<TARGET_FILE:trace-stack-b> --cfi-cache-only)
   set_tests_properties(native_module_cfi_cache_integration PROPERTIES TIMEOUT 30)
+  add_executable(remote-call-signal-integration tests/remote_call_signal_integration.cpp
+    src/injector.cpp src/admission.cpp src/runtime_identity.cpp)
+  target_include_directories(remote-call-signal-integration PRIVATE src ${LLVM_INCLUDE_DIRS})
+  target_link_libraries(remote-call-signal-integration PRIVATE tracer_compat LLVM
+    ${CMAKE_DL_LIBS} Threads::Threads)
+  target_link_options(remote-call-signal-integration PRIVATE "LINKER:--wrap=ptrace")
+  target_compile_options(remote-call-signal-integration PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME native_remote_call_signal_recovery COMMAND remote-call-signal-integration)
+  set_tests_properties(native_remote_call_signal_recovery PROPERTIES TIMEOUT 60)
   add_executable(server-integration tests/server_integration.cpp)
   target_link_libraries(server-integration PRIVATE tracer_grpc Threads::Threads)
   target_compile_options(server-integration PRIVATE -Wall -Wextra -Wpedantic)
@@ -311,6 +337,13 @@ if(BUILD_TESTING)
       --target $<TARGET_FILE:trace-target>
       --output-dir ${CMAKE_CURRENT_BINARY_DIR}/test-results)
   set_tests_properties(grpc_native_integration PROPERTIES TIMEOUT 120)
+  add_test(NAME grpc_native_pie_integration
+    COMMAND server-integration
+      --server $<TARGET_FILE:clang-tracer-server>
+      --agent $<TARGET_FILE:clang_tracer_agent>
+      --target $<TARGET_FILE:trace-target-pie>
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/pie-test-results)
+  set_tests_properties(grpc_native_pie_integration PROPERTIES TIMEOUT 120)
   add_test(NAME grpc_client_integration
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/client_integration.py
       --server $<TARGET_FILE:clang-tracer-server>
