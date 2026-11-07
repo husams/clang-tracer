@@ -2,8 +2,9 @@
 
 **Decision for P4 A2.** Keep Gum Stalker as an experimental backend. It was
 faster on the standalone fixture and passed live attachment with an existing
-native observer. A maintained backend still needs loader and packaging work,
-broader signal and fault coverage, and validation of concurrent probe changes.
+native observer. A maintained backend still needs loader routing, a release
+package that addresses the audited licenses, broader signal and fault
+coverage, and validation of concurrent probe changes.
 Native single-step remains the fixture reference.
 
 ## Reproduce
@@ -107,8 +108,9 @@ loads the plugin through `dlopen` and follows the existing worker. The
 instruction range is the same 65-byte leaf used by the standalone pilot,
 reached through the actively probed caller on that worker.
 
-Three runs on SDK glibc 2.23 and one on Rocky Linux 9.8 glibc 2.34 each
-matched 56 instruction PCs and a seven-PC prefix with explicit truncation.
+After replacing the private glibc import, three runs on SDK glibc 2.23 and
+four on Rocky Linux 9.8 glibc 2.34 each matched 56 instruction PCs and a
+seven-PC prefix with explicit truncation.
 Each verified six native PRE and POST pairs before, during, and after Gum,
 including typed arguments and unchanged return values. The native detour
 bytes remained intact through both Gum unloads. The plugin disappeared
@@ -128,7 +130,8 @@ after start and stop. The host had `kernel.yama.ptrace_scope=0`.
 
 The SDK run used the executable's linked SDK interpreter and matching
 server and agent libraries. For the host run, build `live-target` with the
-host interpreter. Run the server through a wrapper executing
+same SDK Clang and omit `PILOT_LDFLAGS` to use the host interpreter. Run the
+server through a wrapper executing
 `/lib64/ld-linux-x86-64.so.2 --library-path /lib64:$SDK/lib.llvm` with the
 absolute server executable path and its arguments. Pass
 `--target-library-path "/lib64:$SDK/lib.llvm"` to the runner so the SDK-built
@@ -142,6 +145,9 @@ the SDK-built agent also needed host library precedence to avoid an
 `__libc_vfork@GLIBC_PRIVATE` loader failure. Invoking the target through an
 explicit loader failed native attach admission because `/proc/PID/exe`
 identified the loader itself.
+The stock GCC 11.5 debug build attached and ran the native observer, then
+failed to resolve the control observer's signature. A fresh host-linked
+Clang 21.1.8 build passed the same live run.
 
 ## Packaging and distribution
 
@@ -153,19 +159,20 @@ The SDK GNU linker 2.30 emitted
 564 unsupported GNU property warnings while reading the devkit objects.
 The tested runtime still passed the fixture.
 
-The live SDK module was 10,322,360 bytes after stripping. It exposed five
+The updated live SDK module was 10,322,360 bytes after stripping. It exposed five
 pilot symbols and had full RELRO, immediate binding and a nonexecutable
 stack. Its dynamic section had no search path or text relocations. Its
 runtime dependencies were libc, libdl, libgcc_s, libm, libpthread and
 libresolv. The newest public glibc symbol version was `GLIBC_2.17`. The
-devkit's `gum.c.o` also introduced a weak
-`__libc_dlopen_mode@GLIBC_PRIVATE` import, which prevents inferring a
-supported glibc minimum from the public symbol versions alone.
+devkit's `gum.c.o` originally introduced a weak
+`__libc_dlopen_mode@GLIBC_PRIVATE` import. The pilot links that reference to
+a hidden wrapper that pins libdl through public `dlopen` and balances its
+reference during Gum shutdown. Both the build and live runner reject
+`GLIBC_PRIVATE` in the plugin's ELF versions. The updated staged plugin
+passed that check and the previous plugin failed it.
+[Pinned Gum initialization](https://github.com/frida/frida-gum/blob/00a05282d1074c0e043b285c70a4412d784c573d/gum/gum.c#L538)
 
-Gum's wxWindows Library Licence 3.1 includes an exception permitting binary
-distribution of works based on the library under the distributor's own terms.
-The devkit also bundles third-party code and contained no separate license
-inventory in its file list. Shipping the module requires checking the exact
-bundled dependencies and carrying their applicable notices and terms.
-Resolve the private ABI import and linker warnings before distribution.
-[Gum COPYING](https://github.com/frida/frida-gum/blob/00a05282d1074c0e043b285c70a4412d784c573d/COPYING)
+The [license audit](GUM_LICENSE_AUDIT.md) identifies 819 archive members
+and 282 members linked into the pilot, including LGPL GLib code. A release
+still needs notices and a way to satisfy the LGPL source and relinking
+requirements. The SDK linker warnings remain open.

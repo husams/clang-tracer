@@ -30,14 +30,14 @@ def inspect_plugin(plugin):
     assert "libc.so.6" in needed and set(needed) <= allowed, needed
     assert "(BIND_NOW)" in dynamic or re.search(r"Flags:.*\bNOW\b", dynamic)
     assert not re.search(r"\((?:TEXTREL|RPATH|RUNPATH)\)", dynamic)
-    symbols = subprocess.check_output(["readelf", "-W", "--dyn-syms", plugin], text=True)
-    private = sorted(re.findall(r"\bUND\s+(\S+@GLIBC_PRIVATE)\b", symbols))
+    if re.search(r"\bGLIBC_PRIVATE\b", versions):
+        raise ValueError(f"{plugin} requires private glibc symbols")
     stack = next(line.split() for line in segments.splitlines() if "GNU_STACK" in line)
     assert "RW" in stack and "GNU_RELRO" in segments
     glibc = max(re.findall(r"\bGLIBC_([0-9.]+)", versions),
                 key=lambda version: tuple(map(int, version.split("."))))
     return {"bytes": plugin.stat().st_size, "needed": needed, "max_glibc": glibc,
-            "private_glibc_imports": private,
+            "private_glibc_imports": [],
             "exports": sorted(names), "relro": "full", "executable_stack": False}
 
 

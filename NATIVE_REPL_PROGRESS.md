@@ -376,10 +376,12 @@ Four focused native REPL regression CTests passed. The native-only pilot,
 normal completion, cap teardown, and five-second watchdog reaping passed.
 
 The live follow-up attached to an existing C++ worker with an active Clang
-JIT observer. The stripped plugin passed three runs on glibc 2.23 and one
-on 2.34 with matching loader profiles. Each matched the instruction oracle,
+JIT observer. The stripped plugin passed three runs on glibc 2.23 and
+four on 2.34 with matching loader profiles. Each matched the instruction oracle,
 reported truncation at the cap, preserved six native PRE and POST pairs,
 and unloaded before native detach restored the original code. Three focused
-REPL regression CTests passed. Keep Gum experimental while loader routing,
-the private glibc import and distribution notices are resolved. See
-`benchmarks/instruction-trace/README.md` for reproduction and the loader matrix.
+REPL regression CTests passed. The plugin uses public `dlopen` in place
+of Gum's private import and the build rejects private glibc symbol
+versions. The license audit identified statically linked LGPL code.
+Keep Gum experimental while loader routing and release packaging are
+resolved. See `benchmarks/instruction-trace/README.md` for reproduction.

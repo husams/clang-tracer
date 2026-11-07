@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "pilot.h"
 #include <frida-gum.h>
+#include <dlfcn.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -21,6 +22,18 @@ typedef struct {
 static Capture live;
 static GumStalkerTransformer *live_transformer;
 static uint32_t live_offsets[PILOT_MAX_RECORDS];
+
+static void *libdl_pin;
+
+/* Gum 17.26.1 uses the private glibc entry point only to keep libdl
+ * resident. Use public loader flags and release our reference at shutdown.
+ * RTLD_NODELETE keeps the library resident after that reference is released. */
+void *__wrap___libc_dlopen_mode(const char *name, int flags) {
+  (void)flags;
+  if (!libdl_pin)
+    libdl_pin = dlopen(name, RTLD_LAZY | RTLD_LOCAL | RTLD_NODELETE);
+  return libdl_pin;
+}
 
 static uint64_t now_ns(void) {
   struct timespec t;
@@ -138,4 +151,8 @@ __attribute__((visibility("default"))) int pilot_gum_init(void) {
 
 __attribute__((visibility("default"))) void pilot_gum_shutdown(void) {
   gum_deinit_embedded();
+  if (libdl_pin) {
+    dlclose(libdl_pin);
+    libdl_pin = NULL;
+  }
 }
