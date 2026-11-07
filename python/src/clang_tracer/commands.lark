@@ -31,6 +31,7 @@
               | "--context-history-limit" INT           -> context_history_limit
               | "--context-history-bytes" INT           -> context_history_bytes
               | "--context-event-bytes" INT             -> context_event_bytes
+              | "--context-transport-memory-bytes" INT  -> context_transport_memory_bytes
               | timeout_option
 ?injection_option: "--callback" value                    -> callback
                  | "--stack" (INT | FULL_STACK)         -> stack_depth

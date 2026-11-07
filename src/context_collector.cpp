@@ -28,9 +28,9 @@ public:
     schema_bytes_ -= std::min(schema_bytes_, bytes);
     schemas_ -= std::min(schemas_, count);
   }
-  bool reserve_envelope(std::size_t bytes) noexcept {
+  bool reserve_envelope(std::size_t bytes, std::size_t budget) noexcept {
     std::lock_guard lock(mutex_);
-    if (bytes > 32 * 1024 * 1024 - envelope_bytes_)
+    if (envelope_bytes_ > budget || bytes > budget - envelope_bytes_)
       return false;
     envelope_bytes_ += bytes;
     return true;
@@ -103,7 +103,12 @@ public:
         envelope_charge += schema->second.ByteSizeLong() + 16;
       }
       envelope_charge += 64;
-      if (!envelope_ledger_->reserve_envelope(envelope_charge))
+      const auto envelope_budget = stream_limits_.transport_memory_bytes / 2;
+      if (envelope_charge > envelope_budget) {
+        error = "event envelope exceeds the collector transport memory budget";
+        return false;
+      }
+      if (!envelope_ledger_->reserve_envelope(envelope_charge, envelope_budget))
         return false;
       struct EnvelopeReservation {
         std::shared_ptr<EnvelopeMemoryLedger> ledger;

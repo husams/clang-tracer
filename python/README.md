@@ -309,9 +309,9 @@ with Client() as tracer:
     tracer.shutdown_server(timeout=30)
 ```
 
-Set `context_event_bytes=5242880` in `start_server()` to allow shared events
-up to 5 MiB. The console equivalent is
-`server start --context-event-bytes 5242880`.
+Set `context_event_bytes=25165824` and `context_transport_memory_bytes=234881024`
+in `start_server()` for 24 MiB shared events. The console equivalent is
+`server start --context-event-bytes 25165824 --context-transport-memory-bytes 234881024`.
 
 `ServerProcess` is also exported for standalone process management. Startup
 checks that the endpoint is unused, launches without a shell, and waits for a

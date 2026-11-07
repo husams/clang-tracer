@@ -14,8 +14,14 @@ inline constexpr std::uint32_t kProtocolVersion = 2;
 // Version 23 reports target-side JIT compile time for prepared probes.
 // Version 26 replaces the inline callback stack array with an invocation view.
 // Version 27 configures the shared-context event budget in the bootstrap.
-inline constexpr std::uint32_t kBootstrapVersion = 27;
+// Version 28 also carries the shared transport memory budget.
+inline constexpr std::uint32_t kBootstrapVersion = 28;
 inline constexpr std::uint32_t kDefaultContextEventBytes = 256 * 1024;
+inline constexpr std::uint64_t kDefaultContextTransportMemoryBytes = 64ull * 1024 * 1024;
+struct ContextTransportBudget {
+  std::uint32_t event_bytes = kDefaultContextEventBytes;
+  std::uint64_t memory_bytes = kDefaultContextTransportMemoryBytes;
+};
 inline constexpr unsigned kMaxPatchBytes = 64;
 inline constexpr unsigned kMaxArguments = 8;
 inline constexpr unsigned kMaxProbes = 32;
@@ -202,7 +208,7 @@ struct Request {
   std::uint64_t jit_compile_ns = 0;
   bool reject_replacement = false;
   std::uint64_t expected_replaced_probe_id = 0;
-  std::uint32_t context_event_bytes = kDefaultContextEventBytes;
+  ContextTransportBudget context_budget{};
 };
 
 // Side-effect-free callback preparation request. The agent reads a serialized

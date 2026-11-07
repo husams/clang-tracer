@@ -27,18 +27,20 @@ constexpr std::size_t kGlobalPacketLimit = 4096;
 constexpr std::size_t kGlobalRingLimit = 64;
 constexpr std::size_t kCaptureSchemasPerEvent = 64;
 constexpr std::size_t kRingStorageBudgetBytes = 8ull * 1024 * 1024;
-constexpr std::size_t kStagingCreditBudgetBytes =
-    tracer::context_engine::kCaptureQueueBudgetBytes - kRingStorageBudgetBytes;
+std::size_t staging_budget(std::size_t transport_memory_bytes) noexcept {
+  return transport_memory_bytes > kRingStorageBudgetBytes
+             ? transport_memory_bytes - kRingStorageBudgetBytes : 0;
+}
 constexpr std::size_t kStagingMultiplier = 8;
 constexpr std::size_t kStagingPerPacket = 4096;
 std::atomic<std::size_t> g_live_rings{0};
 std::atomic<std::size_t> g_live_packets{0};
 std::atomic<std::size_t> g_staging_credits_used{0};
 std::atomic<std::uint64_t> g_next_storage_domain{1};
-bool reserve_staging_credit(std::size_t bytes) noexcept {
+bool reserve_staging_credit(std::size_t bytes, std::size_t budget) noexcept {
   auto used = g_staging_credits_used.load(std::memory_order_relaxed);
   do {
-    if (bytes > kStagingCreditBudgetBytes - used) return false;
+    if (used > budget || bytes > budget - used) return false;
   } while (!g_staging_credits_used.compare_exchange_weak(
       used, used + bytes, std::memory_order_acq_rel,
       std::memory_order_relaxed));
@@ -77,22 +79,36 @@ void report_export_failure(const char *label, std::uint64_t code = 0) noexcept {
 }
 }
 
-std::size_t ContextHookRing::max_capture_event_bytes() noexcept {
-  const auto metadata = StreamLimits{}.queued_packets * sizeof(Entry);
-  const auto packet_overhead = kStagingPerPacket * (kCaptureSchemasPerEvent + 1);
-  return (kStagingCreditBudgetBytes - metadata - packet_overhead) / kStagingMultiplier;
+std::size_t ContextHookRing::max_capture_event_bytes(
+    std::size_t transport_memory_bytes) noexcept {
+  const auto overhead = StreamLimits{}.queued_packets * sizeof(Entry) +
+                        kStagingPerPacket * (kCaptureSchemasPerEvent + 1);
+  const auto staging = staging_budget(transport_memory_bytes);
+  return staging > overhead ? (staging - overhead) / kStagingMultiplier : 0;
 }
 
-StreamLimits stream_limits_for_event_bytes(std::uint32_t event_bytes) {
-  const auto maximum = ContextHookRing::max_capture_event_bytes();
-  if (!event_bytes || event_bytes > maximum)
-    throw std::invalid_argument("--context-event-bytes must be between 1 and " +
-                                std::to_string(maximum) +
-                                " bytes for the shared transport memory budget");
+StreamLimits stream_limits_for_context(ContextTransportBudget budget) {
   StreamLimits limits;
-  limits.max_event_bytes = event_bytes;
-  // The producer packet wraps the EventRecord in a ContextFrame.
-  limits.max_packet_bytes = std::max(limits.max_packet_bytes, event_bytes + 64);
+  if (budget.memory_bytes > std::numeric_limits<std::size_t>::max())
+    throw std::invalid_argument("--context-transport-memory-bytes exceeds size_t");
+  limits.transport_memory_bytes = static_cast<std::size_t>(budget.memory_bytes);
+  // TraceEvent includes both the original event and its projected trace fields.
+  // Leave room for the schema envelope and protobuf framing within its signed
+  // message length.
+  const auto wire_maximum = (std::numeric_limits<int>::max() -
+                             limits.max_epoch_schema_bytes - 4096) / 2;
+  if (!budget.event_bytes || budget.event_bytes > wire_maximum)
+    throw std::invalid_argument("--context-event-bytes must be between 1 and " +
+                                std::to_string(wire_maximum) +
+                                " bytes for the protobuf message format");
+  const auto maximum = ContextHookRing::max_capture_event_bytes(limits.transport_memory_bytes);
+  if (budget.event_bytes > maximum)
+    throw std::invalid_argument("--context-transport-memory-bytes is too small for "
+                                "--context-event-bytes (maximum " +
+                                std::to_string(maximum) + " event bytes at this budget)");
+  limits.max_event_bytes = budget.event_bytes;
+  limits.max_packet_bytes = std::max(limits.max_packet_bytes, budget.event_bytes + 64);
+  limits.queued_bytes = limits.transport_memory_bytes;
   return limits;
 }
 
@@ -122,9 +138,11 @@ void HookPacket::StorageCharge::take(
 
 ContextHookRing::ContextHookRing(std::size_t byte_capacity, std::size_t packet_limit,
                                  std::size_t packet_bytes,
-                                 std::size_t capture_event_bytes)
+                                 std::size_t capture_event_bytes,
+                                 std::size_t transport_memory_bytes)
     : capacity_(byte_capacity), packet_limit_(packet_limit), packet_bytes_(packet_bytes),
       capture_event_bytes_(std::min(capture_event_bytes, packet_bytes)),
+      staging_budget_(staging_budget(transport_memory_bytes)),
       storage_(&shared_hook_storage()), domain_(g_next_storage_domain.fetch_add(1)) {
   if (capacity_ == 0 || packet_limit_ == 0 || packet_limit_ > kGlobalPacketLimit ||
       packet_bytes_ == 0 || packet_bytes_ > capacity_ ||
@@ -140,7 +158,7 @@ ContextHookRing::ContextHookRing(std::size_t byte_capacity, std::size_t packet_l
     throw std::invalid_argument("hook ring metadata size overflow");
   }
   entries_bytes_ = packet_limit_ * sizeof(Entry);
-  if (!reserve_staging_credit(entries_bytes_)) {
+  if (!reserve_staging_credit(entries_bytes_, staging_budget_)) {
     g_live_rings.fetch_sub(1, std::memory_order_relaxed);
     throw std::bad_alloc();
   }
@@ -229,7 +247,7 @@ bool ContextHookRing::try_publish_batch(
     }
     staging_total += staging;
   }
-  if (!reserve_staging_credit(staging_total)) {
+  if (!reserve_staging_credit(staging_total, staging_budget_)) {
     g_live_packets.fetch_sub(packets.size(), std::memory_order_release);
     dropped_.fetch_add(1, std::memory_order_relaxed);
     return false;
@@ -322,7 +340,7 @@ bool ContextHookRing::try_publish_capture(
     dropped_.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
-  if (!reserve_staging_credit(staging_bytes)) {
+  if (!reserve_staging_credit(staging_bytes, staging_budget_)) {
     dropped_.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
@@ -382,7 +400,7 @@ bool ContextHookRing::try_take(HookPacket &packet) noexcept {
 bool ContextHookRing::reserve_worker_staging(
     std::size_t bytes, HookPacket::StorageCharge &charge) noexcept {
   if (bytes == 0) return true;
-  if (!reserve_staging_credit(bytes)) return false;
+  if (!reserve_staging_credit(bytes, staging_budget_)) return false;
   charge.take(bytes);
   return true;
 }
@@ -426,7 +444,8 @@ ContextExportClient::ContextExportClient(std::shared_ptr<grpc::Channel> channel,
               limits.max_packet_bytes > 16 ? limits.max_packet_bytes - 16 : 0),
           std::min<std::size_t>(limits.max_event_bytes,
               open.max_event_bytes() ? open.max_event_bytes()
-                                     : limits.max_event_bytes)),
+                                     : limits.max_event_bytes),
+          limits.transport_memory_bytes),
       open_(std::move(open)),
       stub_(clangtracer::context::v1::ContextTransport::NewStub(std::move(channel))),
       durable_confirmation_(std::move(durable_confirmation)), journal_(std::move(journal)) {

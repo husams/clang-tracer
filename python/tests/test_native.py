@@ -432,8 +432,9 @@ def test_configured_shared_event_bytes_preserve_large_stack(tmp_path, durable):
     if not configured or platform.system() != "Linux":
         pytest.skip("set CLANG_TRACER_NATIVE_BUILD to a Linux native build directory")
     build = Path(configured).resolve()
-    depth = 22000
-    event_bytes = 5 * 1024 * 1024
+    depth = 100_000
+    event_bytes = 24 * 1024 * 1024
+    transport_bytes = 224 * 1024 * 1024
     source = """
 struct Interceptor {
   void pre(const Call &call) {
@@ -455,6 +456,7 @@ struct Interceptor {
                     str(build / "clang-tracer-server"),
                     agent=str(build / "libclang_tracer_agent.so"),
                     context_event_bytes=event_bytes,
+                    context_transport_memory_bytes=transport_bytes,
                     durable_directory=str(tmp_path / "journal") if durable else None,
                 )
                 session = client.attach(target.pid)
@@ -462,10 +464,10 @@ struct Interceptor {
                 target.stdin.write(b"x")
                 target.stdin.flush()
                 (event,) = client.collect_traces(
-                    1, session_ids=[session.id], names=["deep.shared"], timeout=25,
+                    1, session_ids=[session.id], names=["deep.shared"], timeout=60,
                 )
                 assert event.probe_id == probe.id
-                assert 2 * 1024 * 1024 < event.context.event.ByteSize() <= event_bytes
+                assert 7269888 < event.context.event.ByteSize() <= event_bytes
                 assert event.stack.status == pb.StackTrace.COMPLETE, event.stack.detail
                 assert len(event.stack.frames) > depth
                 assert any(frame.function == "main" for frame in event.stack.frames)

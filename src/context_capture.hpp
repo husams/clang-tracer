@@ -24,12 +24,12 @@ struct TraceContext;
 
 namespace tracer::context_engine {
 
-// The event arena, its fixed slot tables, 64MiB queued attachments, and 16MiB
-// native workspace fit within the 128MiB process capture-storage budget.
+// The default event arena, queued attachments, and native workspace fit
+// within the default process capture-storage budget.
 // Allocation quantum and default event size. Larger events reserve adjacent blocks.
 inline constexpr std::size_t kCaptureEventBytes = tracer::kDefaultContextEventBytes;
 inline constexpr std::size_t kCaptureGlobalBudgetBytes = 128ull * 1024 * 1024;
-inline constexpr std::size_t kCaptureQueueBudgetBytes = 64ull * 1024 * 1024;
+inline constexpr std::size_t kCaptureQueueBudgetBytes = tracer::kDefaultContextTransportMemoryBytes;
 inline constexpr std::size_t kCaptureInvocationWorkspaceBytes =
     7ull * 1024 * 1024;
 inline constexpr std::size_t kCaptureRuntimeWorkspaceBytes = 4ull * 1024 * 1024;
@@ -189,7 +189,8 @@ public:
     bool published_ = false;
   };
 
-  ContextCapturePool();
+  explicit ContextCapturePool(std::size_t event_bytes = kCaptureEventBytes);
+  std::size_t capacity() const noexcept;
   ~ContextCapturePool();
   ContextCapturePool(const ContextCapturePool &) = delete;
   ContextCapturePool &operator=(const ContextCapturePool &) = delete;

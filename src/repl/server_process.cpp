@@ -131,12 +131,14 @@ bool ServerProcess::running() {
 
 void ServerProcess::start(const std::string &executable,
                           const std::string &agent, unsigned timeout_seconds,
-                          std::uint32_t context_event_bytes) {
+                          std::uint32_t context_event_bytes,
+                          std::uint64_t context_transport_memory_bytes) {
 #ifndef __linux__
   (void)executable;
   (void)agent;
   (void)timeout_seconds;
   (void)context_event_bytes;
+  (void)context_transport_memory_bytes;
   throw std::runtime_error(
       "local server startup requires Linux x86_64; use --endpoint to connect");
 #else
@@ -168,6 +170,10 @@ void ServerProcess::start(const std::string &executable,
   if (context_event_bytes) {
     args.push_back("--context-event-bytes");
     args.push_back(std::to_string(context_event_bytes));
+  }
+  if (context_transport_memory_bytes) {
+    args.push_back("--context-transport-memory-bytes");
+    args.push_back(std::to_string(context_transport_memory_bytes));
   }
   std::vector<char *> argv;
   for (auto &arg : args) {

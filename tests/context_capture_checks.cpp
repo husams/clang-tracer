@@ -192,6 +192,19 @@ void verify_context_capture() {
     entry = {};
   pool.reset();
 
+  {
+    const auto event_bytes = kCapturePoolBytes + 1;
+    ContextCapturePool expanded(event_bytes);
+    auto first = expanded.try_reserve(3, event_bytes);
+    auto second = expanded.try_reserve(4, event_bytes);
+    require(bool(first) && bool(second),
+            "expanded arena cannot reserve two events above the default arena size");
+    require(!expanded.try_reserve(5, event_bytes), "expanded arena overlapped reservations");
+    first = {};
+    require(bool(expanded.try_reserve(5, event_bytes)),
+            "expanded arena did not reuse released blocks");
+  }
+
   auto short_lived_pool = std::make_unique<ContextCapturePool>();
   auto detached = short_lived_pool->try_reserve(9);
   const std::string detached_descriptor(300 * 1024, 'X');

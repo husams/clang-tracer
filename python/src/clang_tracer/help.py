@@ -80,6 +80,7 @@ HELP_TOPICS = {
             ("start --context-history-limit N", "Context event count; default 128."),
             ("start --context-history-bytes N", "Serialized context-byte budget."),
             ("start --context-event-bytes N", "Maximum bytes per shared event."),
+            ("start --context-transport-memory-bytes N", "Shared transport memory budget."),
             ("stop --timeout SECONDS", "Graceful shutdown wait; default 30 seconds."),
         ),
         examples=("server start", "server status", "server stop --timeout 45"),
@@ -115,6 +116,7 @@ HELP_TOPICS = {
             (
                 "--context-history-bytes N",
                 "--context-event-bytes N",
+                "--context-transport-memory-bytes N",
                 "Serialized context bytes; default 16777216.",
             ),
         ),

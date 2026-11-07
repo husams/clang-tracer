@@ -157,8 +157,8 @@ public:
 
 class DurableStoreCatalog final {
 public:
-  explicit DurableStoreCatalog(std::filesystem::path root)
-      : root_(std::move(root)) {}
+  DurableStoreCatalog(std::filesystem::path root, context_delivery::JournalLimits limits)
+      : root_(std::move(root)), limits_(std::move(limits)) {}
 
   std::shared_ptr<context_delivery::ContextCollectorStore>
   acquire(std::string_view recording_id, std::string_view sink_id) {
@@ -195,7 +195,7 @@ public:
     if (error)
       return {};
     auto store = std::make_shared<context_delivery::ContextCollectorStore>(
-        directory);
+        directory, limits_);
     stores_.emplace(std::move(key), store);
     return store;
   }
@@ -218,6 +218,7 @@ private:
   }
 
   const std::filesystem::path root_;
+  const context_delivery::JournalLimits limits_;
   std::mutex mutex_;
   std::unordered_map<
       std::string,
@@ -1231,12 +1232,12 @@ public:
                 std::string source_directory, std::chrono::seconds timeout,
                 std::string context_endpoint,
                 std::string context_durable_directory,
-                EventHistoryLimits limits, std::uint32_t context_event_bytes)
+                EventHistoryLimits limits, ContextTransportBudget context_budget)
       : agent_path_(std::move(agent_path)), event_path_(std::move(event_path)),
         source_directory_(std::move(source_directory)), timeout_(timeout),
         context_endpoint_(std::move(context_endpoint)),
         context_durable_directory_(std::move(context_durable_directory)),
-        context_event_bytes_(context_event_bytes),
+        context_budget_(context_budget),
         events_(event_path_, limits), next_probe_id_(random_probe_seed()) {}
 
   void set_context_endpoint(std::string endpoint) {
@@ -1329,7 +1330,7 @@ public:
     auto session = std::make_shared<Session>(
         id, pid, process_start, agent_path_, event_path_,
         std::move(context_endpoint), std::move(producer_journal_directory),
-        timeout_, context_event_bytes_);
+        timeout_, context_budget_);
     try {
       session->attach(request->expected_executable());
       std::lock_guard lock(mutex_);
@@ -2118,7 +2119,7 @@ private:
   std::chrono::seconds timeout_;
   std::string context_endpoint_;
   std::string context_durable_directory_;
-  std::uint32_t context_event_bytes_;
+  ContextTransportBudget context_budget_;
   std::condition_variable context_endpoint_cv_;
   bool context_endpoint_ready_ = false;
   EventHub events_;
@@ -2534,8 +2535,18 @@ private:
 int RunServer(const std::string &agent_path, const std::string &listen_uri,
               std::chrono::seconds operation_timeout,
               const std::string &context_durable_directory,
-              EventHistoryLimits history_limits, std::uint32_t context_event_bytes) {
-  const auto stream_limits = context_delivery::stream_limits_for_event_bytes(context_event_bytes);
+              EventHistoryLimits history_limits, ContextTransportBudget context_budget) {
+  const auto stream_limits = context_delivery::stream_limits_for_context(context_budget);
+  if (!history_limits.context_bytes) {
+    history_limits.context_bytes = 16 * 1024 * 1024;
+    if (context_budget.event_bytes > kDefaultContextEventBytes) {
+      // The retained TraceEvent has the original event and projected fields.
+      const auto envelope_bytes = 2ull * context_budget.event_bytes +
+                                  stream_limits.max_epoch_schema_bytes + 4096;
+      history_limits.context_bytes =
+          std::max<std::size_t>(history_limits.context_bytes, envelope_bytes);
+    }
+  }
   if (history_limits.events == 0 || history_limits.context_events == 0 ||
       history_limits.context_bytes == 0 ||
       history_limits.context_bytes >
@@ -2572,11 +2583,13 @@ int RunServer(const std::string &agent_path, const std::string &listen_uri,
     std::filesystem::create_directories(context_durable_directory);
     durable_root = std::filesystem::canonical(context_durable_directory).string();
     durable_catalog = std::make_shared<DurableStoreCatalog>(
-        std::filesystem::path(durable_root) / "collector");
+        std::filesystem::path(durable_root) / "collector",
+        context_delivery::journal_limits_for_packet(stream_limits.max_packet_bytes,
+                                                   stream_limits.max_epoch_schema_bytes));
   }
   TracerService service(canonical_agent, event_path, directory.path(),
                         operation_timeout, endpoint, durable_root,
-                        history_limits, context_event_bytes);
+                        history_limits, context_budget);
   LiveContextCapture live_context;
   context_delivery::ContextCollector context_collector(
       {}, stream_limits,

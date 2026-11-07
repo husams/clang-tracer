@@ -256,6 +256,11 @@ Command parse_command(const std::string &input) {
     if (!bytes || bytes > UINT32_MAX)
       throw std::invalid_argument("--context-event-bytes must be a positive 32-bit byte count");
   }
+  if (command.has("--context-transport-memory-bytes")) {
+    const auto bytes = command.number("--context-transport-memory-bytes", 0);
+    if (!bytes || bytes > INT64_MAX)
+      throw std::invalid_argument("--context-transport-memory-bytes must be a positive byte count");
+  }
   if (command.number("--limit", 0) > UINT32_MAX) {
     throw std::invalid_argument("--limit must fit a 32-bit page size");
   }

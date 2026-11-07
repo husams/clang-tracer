@@ -134,8 +134,12 @@ a complete one. A fully hidden snapshot may contain zero visible frames.
 The corresponding Protobuf fields preserve the same callback/CLI view.
 Shared events include the stack in their payload. Start the server with
 `--context-event-bytes 4194304` to allow 4 MiB per shared event. The default
-is 256 KiB. This setting sizes capture and delivery together. Startup rejects
-values that exceed the shared transport memory budget.
+is 256 KiB. For larger events, set both `--context-event-bytes 25165824`
+and `--context-transport-memory-bytes 234881024` for a 24 MiB event budget and
+224 MiB of transport memory. The transport default is 64 MiB. It accounts for
+staging copies, so it needs roughly eight times the event budget plus overhead.
+The server grows the default context history budget to retain a large event
+and still honors an explicit `--context-history-bytes` setting.
 
 Callbacks can inspect the invocation’s frames (`pc`, `stack_pointer`, `kind`,
 `function`, `module`, `file`, `line`, `module_offset`, `application_frame`), frame count, requested

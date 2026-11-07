@@ -23,7 +23,8 @@ struct CommandTopic {
 
 const CommandTopic commands[] = {
     {"server", "", "Start, connect to, inspect, or stop a tracing server."},
-    {"server start", "%server start [--executable PATH] [--agent PATH] [--context-event-bytes N]",
+    {"server start", "%server start [--executable PATH] [--agent PATH] [--context-event-bytes N] "
+                     "[--context-transport-memory-bytes N]",
      "Start a private local server and connect to it."},
     {"server connect", "%server connect ENDPOINT",
      "Connect to an existing server after detaching and stopping any server you own.",

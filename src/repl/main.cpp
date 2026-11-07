@@ -169,7 +169,7 @@ int main(int argc, char **argv) {
                      "FILTER] [--endpoint ENDPOINT]\n"
                      "  --server PATH --agent PATH --timeout SECONDS "
                      "--buffer-events N --buffer-bytes N\n"
-                     "  --context-event-bytes N (managed server)\n"
+                     "  --context-event-bytes N --context-transport-memory-bytes N (managed server)\n"
                      "  --cpp-arg ARG (repeatable) --startup FILE --fail-fast\n"
                      "C++17; replxx 0.0.4; ANTLR generator/runtime 4.13.2; "
                      "LLVM 21 or 22.\n"
@@ -210,6 +210,11 @@ int main(int argc, char **argv) {
         settings.context_event_bytes = static_cast<std::uint32_t>(
             tr::unsigned_number(value, option, UINT32_MAX));
         if (!settings.context_event_bytes)
+          throw std::invalid_argument(option + " must be positive");
+      } else if (option == "--context-transport-memory-bytes") {
+        settings.context_transport_memory_bytes =
+            tr::unsigned_number(value, option, INT64_MAX);
+        if (!settings.context_transport_memory_bytes)
           throw std::invalid_argument(option + " must be positive");
       } else if (option == "--buffer-events") {
         settings.max_events =

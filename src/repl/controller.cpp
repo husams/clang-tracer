@@ -385,7 +385,9 @@ void Controller::start_server(const Command &command) {
                 command.option("--agent", settings_.agent),
                 settings_.timeout_seconds,
                 static_cast<std::uint32_t>(command.number(
-                    "--context-event-bytes", settings_.context_event_bytes)));
+                    "--context-event-bytes", settings_.context_event_bytes)),
+                command.number("--context-transport-memory-bytes",
+                               settings_.context_transport_memory_bytes));
   connect(server_.endpoint());
   out_ << "server ready endpoint=" << endpoint_
        << " ownership=this-console pid=" << server_.pid() << '\n';

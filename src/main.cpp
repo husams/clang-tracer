@@ -34,6 +34,7 @@ int usage() {
          "  --context-history-limit N (default 128)\n"
          "  --context-history-bytes N (default 16777216; serialized bytes)\n"
          "  --context-event-bytes N (default 262144; bytes per shared event)\n"
+         "  --context-transport-memory-bytes N (default 67108864)\n"
          "Starts the native multi-process tracing gRPC server. Default "
          "endpoint is a "
          "private Unix socket; Linux x86_64 only.\n"
@@ -53,7 +54,7 @@ int main(int argc, char **argv) {
     std::string context_durable_directory;
     unsigned timeout = 10;
     tracer::EventHistoryLimits history_limits;
-    auto context_event_bytes = tracer::kDefaultContextEventBytes;
+    tracer::ContextTransportBudget context_budget;
     for (int i = 1; i < argc; ++i) {
       const std::string option = argv[i];
       if (option == "--help")
@@ -62,7 +63,8 @@ int main(int argc, char **argv) {
           option != "--timeout" && option != "--context-durable-dir" &&
           option != "--event-history-limit" &&
           option != "--context-history-limit" &&
-          option != "--context-history-bytes" && option != "--context-event-bytes") {
+          option != "--context-history-bytes" && option != "--context-event-bytes" &&
+          option != "--context-transport-memory-bytes") {
         throw std::invalid_argument("unknown option: " + option);
       }
       if (++i == argc)
@@ -92,7 +94,9 @@ int main(int argc, char **argv) {
         } else if (option == "--context-event-bytes") {
           if (limit > std::numeric_limits<std::uint32_t>::max())
             throw std::invalid_argument("invalid value for " + option);
-          context_event_bytes = static_cast<std::uint32_t>(limit);
+          context_budget.event_bytes = static_cast<std::uint32_t>(limit);
+        } else if (option == "--context-transport-memory-bytes") {
+          context_budget.memory_bytes = limit;
         } else {
           history_limits.context_bytes = static_cast<std::size_t>(limit);
         }
@@ -101,7 +105,7 @@ int main(int argc, char **argv) {
     if (agent.empty())
       agent = tracer::runtime::default_agent_path();
     return tracer::RunServer(agent, listen, std::chrono::seconds(timeout),
-                             context_durable_directory, history_limits, context_event_bytes);
+                             context_durable_directory, history_limits, context_budget);
   } catch (const std::exception &error) {
     std::cerr << "clang-tracer: " << error.what() << '\n';
     return 1;

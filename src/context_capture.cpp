@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -13,7 +14,15 @@
 
 namespace tracer::context_engine {
 struct CaptureArena {
-  explicit CaptureArena(std::size_t bytes) : storage(bytes) {}
+  explicit CaptureArena(std::size_t event_bytes)
+      : block_bytes(event_bytes <= kCapturePoolBytes
+                        ? kCaptureEventBytes
+                        : (event_bytes - 1) / (kCaptureSlots / 2) + 1) {
+    if (block_bytes > storage.max_size() / kCaptureSlots)
+      throw std::length_error("shared capture arena exceeds addressable storage");
+    storage.resize(block_bytes * kCaptureSlots);
+  }
+  const std::size_t block_bytes;
   std::vector<std::byte> storage;
   std::array<std::atomic<std::uint8_t>, kCaptureHooks> hook_outstanding{};
   std::array<std::atomic<bool>, kCaptureSlots> occupied{};
@@ -65,7 +74,7 @@ struct CaptureSlotState {
   std::atomic<bool> active{false};
   std::size_t slot = 0, event_capacity = 0, blocks = 0;
   ::tracer::compat::span<std::byte> buffer() const noexcept {
-    return {arena->storage.data() + slot * kCaptureEventBytes, event_capacity};
+    return {arena->storage.data() + slot * arena->block_bytes, event_capacity};
   }
   CaptureSchemaSetLease schema_set;
 };
@@ -285,13 +294,17 @@ CaptureStatus budget_status(const EncodeBudget &budget) noexcept {
 }
 } // namespace
 
-ContextCapturePool::ContextCapturePool()
-    : arena_(std::make_shared<CaptureArena>(kCapturePoolBytes)) {
+ContextCapturePool::ContextCapturePool(std::size_t event_bytes)
+    : arena_(std::make_shared<CaptureArena>(event_bytes)) {
   for (std::size_t i = 0; i < slots_.size(); ++i)
     slots_[i] = std::make_shared<CaptureSlotState>(arena_, i);
 }
 
 ContextCapturePool::~ContextCapturePool() = default;
+
+std::size_t ContextCapturePool::capacity() const noexcept {
+  return arena_->storage.size();
+}
 
 ContextCapturePool::Lease::Lease(std::shared_ptr<CaptureSlotState> slot_state,
                                  std::uint32_t hook) noexcept
@@ -523,7 +536,7 @@ ContextCapturePool::Lease::schema_lease_token() const noexcept {
 ContextCapturePool::Lease
 ContextCapturePool::try_reserve(std::uint32_t hook_id,
                                 std::size_t event_bytes) noexcept {
-  if (hook_id >= kCaptureHooks || !event_bytes || event_bytes > kCapturePoolBytes)
+  if (hook_id >= kCaptureHooks || !event_bytes || event_bytes > capacity())
     return {};
   auto &outstanding = arena_->hook_outstanding[hook_id];
   auto count = outstanding.load(std::memory_order_relaxed);
@@ -533,7 +546,7 @@ ContextCapturePool::try_reserve(std::uint32_t hook_id,
   } while (!outstanding.compare_exchange_weak(
       count, static_cast<std::uint8_t>(count + 1), std::memory_order_acq_rel,
       std::memory_order_relaxed));
-  const auto blocks = (event_bytes + kCaptureEventBytes - 1) / kCaptureEventBytes;
+  const auto blocks = (event_bytes - 1) / arena_->block_bytes + 1;
   for (std::size_t i = 0; i <= slots_.size() - blocks;) {
     std::size_t reserved = 0;
     for (; reserved < blocks; ++reserved) {

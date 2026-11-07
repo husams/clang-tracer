@@ -62,6 +62,7 @@ class ServerProcess:
         context_history_limit: int | None = None,
         context_history_bytes: int | None = None,
         context_event_bytes: int | None = None,
+        context_transport_memory_bytes: int | None = None,
     ) -> Self:
         positive_timeout(timeout)
         limits = {
@@ -69,6 +70,7 @@ class ServerProcess:
             "--context-history-limit": context_history_limit,
             "--context-history-bytes": context_history_bytes,
             "--context-event-bytes": context_event_bytes,
+            "--context-transport-memory-bytes": context_transport_memory_bytes,
         }
         for option, value in limits.items():
             if value is not None:

@@ -156,6 +156,7 @@ struct Probe {
   void *wrapper = nullptr;
   std::vector<std::string> external_link_candidates;
   std::shared_ptr<const tracer::ContextActivationGeneration> shared_generation;
+  std::shared_ptr<tracer::context_engine::ContextCapturePool> capture_pool;
   std::shared_ptr<tracer::context_runtime::SharedSourceRuntime> shared_runtime;
   std::shared_ptr<tracer::context_delivery::ContextAgentDelivery>
       context_delivery;
@@ -176,7 +177,7 @@ struct Agent {
   std::size_t retained = 0;
   pid_t pid = 0;
   tracer::ContextRegistry context_registry;
-  std::unique_ptr<tracer::context_engine::ContextCapturePool> context_capture;
+  std::shared_ptr<tracer::context_engine::ContextCapturePool> context_capture;
   unsigned next_context_hook = 0;
   tracer::EventTransport transport{[] { ++callback_depth; }};
   std::shared_ptr<tracer::context_engine::PropagationLedger> propagation_ledger;
@@ -3998,11 +3999,13 @@ bool compile_shared_probe(Probe &p,
     return false;
   }
   try {
-    if (!owner->context_capture)
-      owner->context_capture =
-          std::make_unique<tracer::context_engine::ContextCapturePool>();
     p.context_delivery =
         tracer::context_delivery::ContextAgentDelivery::acquire(p.request);
+    const auto event_bytes = p.request.context_budget.event_bytes;
+    if (!owner->context_capture || event_bytes > owner->context_capture->capacity())
+      owner->context_capture =
+          std::make_shared<tracer::context_engine::ContextCapturePool>(event_bytes);
+    p.capture_pool = owner->context_capture;
     tracer::context_runtime::EventMetadata metadata;
     metadata.source_id.assign(
         reinterpret_cast<const char *>(activation.source_lineage_id.data()),
@@ -4014,9 +4017,9 @@ bool compile_shared_probe(Probe &p,
     metadata.print_arguments = specification.print_arguments();
     metadata.print_result = specification.print_result();
     metadata.capture_hook_id = owner->next_context_hook++;
-    metadata.capture_event_bytes = p.request.context_event_bytes;
+    metadata.capture_event_bytes = event_bytes;
     p.shared_runtime = std::make_shared<tracer::context_runtime::SharedSourceRuntime>(
-        generation.generation->scopes(), *owner->context_capture, std::move(metadata),
+        generation.generation->scopes(), *p.capture_pool, std::move(metadata),
         [](void* opaque, ::tracer::compat::span<const std::byte> bytes,
            const std::shared_ptr<const void>& schema_lease) noexcept {
           return static_cast<tracer::context_delivery::ContextAgentDelivery *>(
