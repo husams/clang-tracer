@@ -33,10 +33,12 @@
 #include <clang/AST/Mangle.h>
 #include <clang/AST/RecordLayout.h>
 #include <clang/AST/RecursiveASTVisitor.h>
+#include <clang/Basic/DiagnosticOptions.h>
 #include <clang/Basic/TargetInfo.h>
 #include <clang/Basic/Version.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendActions.h>
+#include <clang/Frontend/TextDiagnosticPrinter.h>
 #include <clang/Tooling/ArgumentsAdjusters.h>
 #include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/JSONCompilationDatabase.h>
@@ -250,6 +252,24 @@ struct FrozenInvocation {
   std::string adapter_symbol;
   bool select_template = false;
   bool pointer_layouts = true;
+};
+
+class PrepareDiagnostics final : public clang::TextDiagnosticPrinter {
+public:
+  explicit PrepareDiagnostics(clang::DiagnosticOptions& options)
+      : clang::TextDiagnosticPrinter(llvm::errs(), options) {}
+
+  void HandleDiagnostic(clang::DiagnosticsEngine::Level level,
+                        const clang::Diagnostic& diagnostic) override {
+    had_error_ |= level >= clang::DiagnosticsEngine::Error;
+    clang::TextDiagnosticPrinter::HandleDiagnostic(level, diagnostic);
+  }
+
+  // A ToolInvocation can continue into the frontend after a driver error.
+  bool had_error() const { return had_error_; }
+
+private:
+  bool had_error_ = false;
 };
 
 bool is_receiver_field_type(clang::QualType type) {
@@ -998,7 +1018,7 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   }
   arguments.insert(arguments.end(), command.arguments.begin(), command.arguments.end());
   arguments.push_back("-resource-dir=" + std::string(TRACER_CLANG_RESOURCE_DIR));
-  arguments.insert(arguments.end(), {"-x", "c++"});
+  arguments.insert(arguments.end(), {"-fsyntax-only", "-x", "c++"});
   const auto source = (fs::path(command.directory) / "clang-tracer-prepared-headers.cc").string();
   std::string code;
   for (const auto& header : headers.include_headers())
@@ -1031,7 +1051,11 @@ ResolvedCallable resolve_header_callable(const std::string& name,
     arguments.push_back(command.clang_cl ? "/clang:-fno-access-control" : "-fno-access-control");
   }
   clang::tooling::FixedCompilationDatabase database(command.directory, arguments);
+  clang::DiagnosticOptions diagnostic_options;
+  PrepareDiagnostics diagnostics(diagnostic_options);
   clang::tooling::ClangTool tool(database, {source});
+  tool.clearArgumentsAdjusters();
+  tool.setDiagnosticConsumer(&diagnostics);
   tool.mapVirtualFile(source, code);
   std::vector<Candidate> candidates;
   std::string target_error, invocation_error;
@@ -1050,6 +1074,8 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   ActionFactory factory(candidates, target_error, selector.qualified_name, invocation,
                         invocation_error, true);
   const auto result = tool.run(&factory);
+  if (diagnostics.had_error())
+    throw std::invalid_argument("Clang reported an error while parsing prepared headers");
   if (!target_error.empty() || !invocation_error.empty() || result != 0)
     throw std::runtime_error("cannot parse prepared headers: " + target_error + invocation_error);
   return select_cpp_candidate(std::move(candidates), selector, name);
@@ -1063,9 +1089,16 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
       "-resource-dir=" + std::string(TRACER_CLANG_RESOURCE_DIR)});
   arguments.insert(arguments.end(), adapter.adapter_abi_options().begin(),
                    adapter.adapter_abi_options().end());
+  clang::DiagnosticOptions diagnostic_options;
+  PrepareDiagnostics diagnostics(diagnostic_options);
   auto unit = clang::tooling::buildASTFromCodeWithArgs(
-      tracer::prepared::adapter_source(adapter), arguments, "prepared-adapter.cc");
-  if (!unit || unit->getDiagnostics().hasErrorOccurred())
+      tracer::prepared::adapter_source(adapter), arguments, "prepared-adapter.cc",
+      "clang-tool", std::make_shared<clang::PCHContainerOperations>(),
+      clang::tooling::getClangStripDependencyFileAdjuster(), {}, &diagnostics);
+  // A compiler error must bypass the address-only pointer retry.
+  if (diagnostics.had_error() || (unit && unit->getDiagnostics().hasErrorOccurred()))
+    throw std::invalid_argument("Clang reported an error while compiling the prepared adapter");
+  if (!unit)
     throw std::runtime_error("generated prepared adapter does not compile independently");
   std::vector<Candidate> candidates;
   FrozenInvocation invocation;
@@ -1075,6 +1108,8 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
                     &unit->getSema());
   visitor.set_context(unit->getASTContext(), &unit->getSema());
   visitor.TraverseDecl(unit->getASTContext().getTranslationUnitDecl());
+  if (diagnostics.had_error())
+    throw std::invalid_argument("Clang reported an error while compiling the prepared adapter");
   // Match by linkage because the adapter writes canonical parameter types.
   const auto candidate = std::find_if(candidates.begin(), candidates.end(), [&](const auto &item) {
     return item.symbol == original.spec.symbol() && item.unsupported_reason.empty();

@@ -1,8 +1,8 @@
 #include "header_context.hpp"
-#include "prepared_contract.hpp"
 
 #include <algorithm>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -10,10 +10,19 @@
 #include <utility>
 
 #include <clang/Driver/Driver.h>
+
+#include "prepared_contract.hpp"
+#if __has_include(<clang/Options/Options.h>)
+#include <clang/Options/Options.h>
+#define TRACER_CLANG_OPTIONS_V22 1
+#else
+#include <clang/Driver/Options.h>
+#endif
 #include <clang/Tooling/ArgumentsAdjusters.h>
 #include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/JSONCompilationDatabase.h>
 #include <llvm/ADT/Twine.h>
+#include <llvm/Option/ArgList.h>
 #if __has_include(<llvm/TargetParser/Triple.h>)
 #include <llvm/TargetParser/Triple.h>
 #else
@@ -24,6 +33,7 @@
 #else
 #include <llvm/Support/Host.h>
 #endif
+#include <llvm/Option/Arg.h>
 #include <llvm/Support/VirtualFileSystem.h>
 
 #include "tracer/compiler_options.hpp"
@@ -35,15 +45,13 @@ namespace tooling = clang::tooling;
 
 bool same_engine_target(const std::string& target) {
   const llvm::Triple requested(llvm::Triple::normalize(target));
-  const llvm::Triple engine(
-      llvm::Triple::normalize(llvm::sys::getDefaultTargetTriple()));
-  return requested.getArch() == engine.getArch() &&
-         requested.getOS() == engine.getOS() &&
+  const llvm::Triple engine(llvm::Triple::normalize(llvm::sys::getDefaultTargetTriple()));
+  return requested.getArch() == engine.getArch() && requested.getOS() == engine.getOS() &&
          requested.getEnvironment() == engine.getEnvironment();
 }
 
-std::unique_ptr<tooling::CompilationDatabase>
-load_database(const std::string& header, const std::string& database_path) {
+std::unique_ptr<tooling::CompilationDatabase> load_database(const std::string& header,
+                                                            const std::string& database_path) {
   std::string error;
   std::unique_ptr<tooling::CompilationDatabase> database;
   if (database_path.empty()) {
@@ -69,13 +77,14 @@ load_database(const std::string& header, const std::string& database_path) {
 }
 
 tooling::CompileCommand select_prepared_command(tooling::CompilationDatabase& database,
-                                               const std::string& header,
-                                               const std::string& translation_unit) {
+                                                const std::string& header,
+                                                const std::string& translation_unit) {
   if (!translation_unit.empty()) {
-    auto commands = database.getCompileCommands(
-        fs::absolute(translation_unit).lexically_normal().string());
-    if (commands.size() != 1)
+    auto commands =
+        database.getCompileCommands(fs::absolute(translation_unit).lexically_normal().string());
+    if (commands.size() != 1) {
       throw std::runtime_error("--translation-unit must have exactly one compile command");
+    }
     return std::move(commands.front());
   }
   const auto directory = fs::canonical(header).parent_path();
@@ -86,32 +95,68 @@ tooling::CompileCommand select_prepared_command(tooling::CompilationDatabase& da
     const auto source_directory = fs::weakly_canonical(source.parent_path(), path_error);
     return !path_error && source_directory == directory;
   });
-  if (match == commands.end())
+  if (match == commands.end()) {
     throw std::runtime_error("no compile command for a source in " + directory.string() +
                              ". Pass --translation-unit FILE.");
+  }
   return std::move(*match);
 }
 
 bool selects_toolchain(llvm::StringRef argument) {
-  return argument.starts_with("--sysroot=") ||
-         argument.starts_with("-isysroot") ||
-         argument.starts_with("--gcc-toolchain=") ||
-         argument.starts_with("--gcc-install-dir=") || argument.starts_with("-stdlib=") ||
-         argument == "-nostdinc" || argument == "-nostdinc++";
+  return argument.starts_with("--sysroot=") || argument.starts_with("-isysroot") ||
+         argument.starts_with("--gcc-toolchain=") || argument.starts_with("--gcc-install-dir=") ||
+         argument.starts_with("-stdlib=") || argument == "-nostdinc" || argument == "-nostdinc++";
 }
 
-bool prepared_driver_option(llvm::StringRef argument, bool clang_cl) {
-  return argument.starts_with("--target=") ||
-         argument.starts_with("--gcc-install-dir=") || argument.starts_with("-stdlib=") ||
-         argument == "-nostdinc" || argument == "-nostdinc++" ||
+bool starts_with_any(llvm::StringRef value, std::initializer_list<llvm::StringRef> prefixes) {
+  return std::any_of(prefixes.begin(), prefixes.end(),
+                     [&](llvm::StringRef prefix) { return value.starts_with(prefix); });
+}
+
+bool unsafe_prepared_option(const llvm::opt::Option& option) {
+  const auto name = option.getUnaliasedOption().getName();
+  // These options cross the compiler-driver boundary, load code, or write
+  // files/caches as a side effect even for a syntax-only invocation.
+  return starts_with_any(name, {
+      "X", "cc1", "mllvm", "Wp,", "Wa,", "Wl,", "fplugin", "fpass-plugin",
+      "fmodule", "fimplicit-module", "fprebuilt-", "fcxx-modules", "include-pch",
+      "include-pth", "Yc", "Yu", "Fp", "ivfsoverlay", "vfsoverlay", "config",
+      "fconfig", "fprofile", "fcoverage", "ftime-trace", "serialize-diagnostics",
+      "diagnostic-log-file", "serialize-diagnostic-file", "verify",
+      "dependency-dot", "module-dependency-dir", "header-include-file",
+      "fproc-stat-report", "fcrash-diagnostics-dir", "fdiagnostics-file",
+      "fdiagnostics-serialization-file", "foptimization-record-file",
+      "save-temps", "save-stats", "dump", "rewrite", "analyze", "emit-",
+      "print-", "gen-reproducer", "gen-cdb-fragment-path", "offload", "###", "dry-run"});
+}
+
+bool safe_clang_cl_forwarded_option(llvm::StringRef argument) {
+  return safe_preflight_compiler_argument(argument.str()) ||
+         selects_toolchain(argument) || argument.starts_with("--target=") ||
          argument == "-m32" || argument == "-m64" || argument == "-mx32" ||
-         argument == "-fshort-enums" || argument == "-fshort-wchar" ||
-         (clang_cl && (argument == "/nologo" || argument == "/TP" || argument == "/EHsc" ||
-                       argument == "/GR" || argument == "/GR-" ||
-                       argument == "/MD" || argument == "/MDd" ||
-                       argument == "/MT" || argument == "/MTd" ||
-                       argument == "/W0" || argument == "/W1" || argument == "/W2" ||
-                       argument == "/W3" || argument == "/W4" || argument == "/WX"));
+         argument == "-fshort-enums" || argument == "-fshort-wchar";
+}
+
+bool forwarded_option_takes_operand(llvm::StringRef argument) {
+  return argument == "-I" || argument == "-isystem" || argument == "-iquote" ||
+         argument == "-idirafter" || argument == "-include" || argument == "-D" ||
+         argument == "-U" || argument == "-std" || argument == "-isysroot" ||
+         argument == "--sysroot" || argument == "--gcc-toolchain";
+}
+
+bool removable_prepared_action(const llvm::opt::Option& option) {
+  const auto name = option.getUnaliasedOption().getName();
+  return name == "c" || name == "S" || name == "E" || name == "fsyntax-only" || name == "o" ||
+         name == "MF" || name == "MT" || name == "MQ" || name == "MJ" || name == "MD" ||
+         name == "MMD" || name == "MM" || name == "MG" || name == "MP" || name == "M" ||
+         name == "dependency-file" || name == "Fo" || name == "Fe" || name == "Fd" ||
+         name == "Fa" || name == "Fi" || name == "FR" ||
+         name == "sourceDependencies" || name == "Zs";
+}
+
+bool same_source_argument(llvm::StringRef argument, const tooling::CompileCommand& command) {
+  return (fs::path(command.Directory) / fs::path(argument.str())).lexically_normal() ==
+         (fs::path(command.Directory) / command.Filename).lexically_normal();
 }
 
 std::vector<std::string> normalize_driver_options(const std::vector<std::string>& command) {
@@ -125,123 +170,284 @@ std::vector<std::string> normalize_driver_options(const std::vector<std::string>
     if (argument == "-target" || argument == "--target" || argument == "--driver-mode" ||
         argument == "--sysroot" || argument == "--gcc-toolchain" ||
         argument == "--gcc-install-dir") {
-      if (++i == command.size() || command[i].empty() || command[i].front() == '-')
-        throw std::invalid_argument("compilation database option is missing its value: " + argument);
+      if (++i == command.size() || command[i].empty() || command[i].front() == '-') {
+        throw std::invalid_argument("compilation database option is missing its value: " +
+                                    argument);
+      }
       result.push_back((argument == "-target" ? "--target" : argument) + "=" + command[i]);
     } else {
       result.push_back(argument);
     }
-    if (result.back() == "--driver-mode=c++")
+    if (result.back() == "--driver-mode=c++") {
       result.back() = "--driver-mode=g++";
+    }
   }
   return result;
 }
 
-std::string preflight_spelling(llvm::StringRef argument, bool clang_cl) {
-  if (clang_cl) {
-    for (const auto& [prefix, replacement] : {
-             std::pair{"/external:I", "-isystem"}, {"/imsvc", "-isystem"},
-             {"/FI", "-include"}, {"/I", "-I"}, {"/D", "-D"}, {"/U", "-U"}}) {
-      auto value = argument;
-      if (value.consume_front(prefix))
-        return (llvm::Twine(replacement) + value).str();
-    }
-  }
-  return argument.str();
+bool is_input_option(const llvm::opt::Option& option) {
+#if defined(TRACER_CLANG_OPTIONS_V22)
+  return option.matches(clang::options::OPT_INPUT);
+#else
+  return option.matches(clang::driver::options::OPT_INPUT);
+#endif
+}
+
+const llvm::opt::OptTable& prepared_driver_opt_table() {
+#if defined(TRACER_CLANG_OPTIONS_V22)
+  return clang::getDriverOptTable();
+#else
+  return clang::driver::getDriverOptTable();
+#endif
+}
+
+unsigned prepared_driver_visibility(bool clang_cl) {
+#if defined(TRACER_CLANG_OPTIONS_V22)
+  return clang_cl ? clang::options::CLOption : clang::options::ClangOption;
+#else
+  return clang_cl ? clang::driver::options::CLOption : clang::driver::options::ClangOption;
+#endif
 }
 
 } // namespace
 
-PreparedHeaderCommand resolve_prepared_header_command(
-    const std::string& header, const std::string& database_path,
-    const std::string& translation_unit) {
+PreparedHeaderCommand resolve_prepared_header_command(const std::string& header,
+                                                      const std::string& database_path,
+                                                      const std::string& translation_unit) {
   auto database = load_database(header, database_path);
-  if (!database)
+  if (!database) {
     throw std::runtime_error("compilation database was not found");
+  }
   auto donor = select_prepared_command(*database, header, translation_unit);
-  if (donor.CommandLine.empty() || donor.CommandLine.front().empty())
+  if (donor.CommandLine.empty() || donor.CommandLine.front().empty() ||
+      donor.CommandLine.front().find('\0') != std::string::npos) {
     throw std::runtime_error("compilation database has no compiler executable");
+  }
+  for (const auto& argument : donor.CommandLine) {
+    if (argument.find('\0') != std::string::npos) {
+      throw std::invalid_argument("header compilation command contains a NUL byte");
+    }
+  }
   donor.CommandLine = normalize_driver_options(donor.CommandLine);
   std::vector<const char*> argv;
-  for (const auto& argument : donor.CommandLine)
+  for (const auto& argument : donor.CommandLine) {
     argv.push_back(argument.c_str());
+  }
   const auto mode = clang::driver::getDriverMode(argv.front(), llvm::ArrayRef(argv).drop_front());
-  if (mode == "cpp")
+  if (mode == "cpp") {
     throw std::invalid_argument("compilation database driver mode cpp only preprocesses input");
+  }
   const bool clang_cl = clang::driver::IsClangCL(mode);
   if (clang_cl) {
     for (std::size_t i = 1; i < donor.CommandLine.size(); ++i) {
       auto& argument = donor.CommandLine[i];
-      if (argument == "--")
+      if (argument == "--") {
         break;
+      }
       auto standard = llvm::StringRef(argument);
       if (standard.consume_front("/std:")) {
-        if (standard == "c++latest")
+        if (standard == "c++latest") {
           standard = "c++2c";
-        if (standard == "c++23preview")
+        }
+        if (standard == "c++23preview") {
           standard = "c++23";
+        }
         argument = ("/clang:-std=" + standard).str();
-      } else if (selects_toolchain(argument) ||
-                 argument == "-fshort-enums" || argument == "-fshort-wchar") {
-        if (argument == "-isysroot" && i + 1 < donor.CommandLine.size())
+      } else if (selects_toolchain(argument) || argument == "-fshort-enums" ||
+                 argument == "-fshort-wchar") {
+        if (argument == "-isysroot" && i + 1 < donor.CommandLine.size()) {
           donor.CommandLine[i + 1].insert(0, "/clang:");
+        }
         argument.insert(0, "/clang:");
       }
     }
   }
-  auto command = tooling::transferCompileCommand(std::move(donor), "clang-tracer-prepared-headers.cc");
-  auto arguments = tooling::getClangStripDependencyFileAdjuster()(command.CommandLine,
-                                                                  command.Filename);
-  const auto directory = fs::absolute(command.Directory).lexically_normal();
-  const fs::path driver = arguments.front();
+  const auto directory = fs::absolute(donor.Directory).lexically_normal();
+  const fs::path driver = donor.CommandLine.front();
   PreparedHeaderCommand result{directory.string(), driver.string(), {}, {}, clang_cl};
-  if (driver.is_relative() && driver.has_parent_path())
+  if (driver.is_relative() && driver.has_parent_path()) {
     result.driver = (directory / driver).lexically_normal().string();
-  std::vector<std::string> preflight;
-  std::size_t bytes = 0;
-  for (std::size_t i = 1; i + 2 < arguments.size(); ++i) {
-    auto argument = llvm::StringRef(arguments[i]);
-    const bool forwarded = clang_cl && argument.consume_front("/clang:");
-    bytes += arguments[i].size();
-    if (argument.empty() || argument.contains('\0') || bytes > 65536 || i > 512)
-      throw std::invalid_argument("header compilation command exceeds limits or has an empty option");
-    if (!forwarded && (argument == "-c" || argument == "-S" || argument == "-E" ||
-                       argument == "-fsyntax-only" ||
-                       (clang_cl && (argument == "/c" || argument == "/Zs"))))
-      continue;
-    if (selects_toolchain(argument))
-      result.use_default_toolchain = false;
-    auto spelling = preflight_spelling(argument, clang_cl && !forwarded);
-    auto abi_option = spelling;
-    if (abi_option == "-D" && i + 3 < arguments.size()) {
-      auto value = llvm::StringRef(arguments[i + 1]);
-      if (forwarded)
-        value.consume_front("/clang:");
-      abi_option += value.str();
-    }
-    if (tracer::prepared::abi_option(abi_option))
-      result.adapter_abi_options.push_back(std::move(abi_option));
-    if ((!forwarded && (argument == "--driver-mode=cl" || argument == "--driver-mode=g++" ||
-                        argument == "--driver-mode=gcc" || argument == "--driver-mode=cpp")) ||
-        prepared_driver_option(argument, clang_cl && !forwarded)) {
-      result.arguments.push_back(arguments[i]);
-      continue;
-    }
-    if (argument == "-isysroot") {
-      preflight.emplace_back("--sysroot");
-    } else if (argument.starts_with("-isysroot")) {
-      preflight.push_back(("--sysroot=" + argument.drop_front(9)).str());
-    } else if (clang_cl && !forwarded && argument.starts_with("/FI") && argument.size() > 3) {
-      preflight.emplace_back("-include");
-      preflight.push_back(argument.drop_front(3).str());
-    } else {
-      preflight.push_back(std::move(spelling));
-    }
-    result.arguments.push_back(arguments[i]);
   }
-  std::string unsupported;
-  if (!safe_preflight_compiler_arguments(preflight.begin(), preflight.end(), true, &unsupported))
-    throw std::invalid_argument("header compiler command contains unsupported option: " + unsupported);
+  std::vector<const char*> option_argv;
+  option_argv.reserve(donor.CommandLine.size() - 1);
+  std::size_t raw_bytes = 0;
+  bool clang_cl_forwarded_operand = false;
+  for (std::size_t i = 1; i < donor.CommandLine.size(); ++i) {
+    const llvm::StringRef raw(donor.CommandLine[i]);
+    if (raw.empty() || raw.front() == '@') {
+      throw std::invalid_argument(
+          "header compilation command contains unsupported option: @response-file");
+    }
+    raw_bytes += raw.size();
+    if (raw_bytes > 65536 || i > 512) {
+      throw std::invalid_argument("header compilation command exceeds limits");
+    }
+    if (raw == "--") {
+      if (i + 2 != donor.CommandLine.size() ||
+          !same_source_argument(donor.CommandLine[i + 1], donor)) {
+        throw std::invalid_argument("header compilation command contains unsupported option: --");
+      }
+      ++i;
+      continue;
+    }
+    if (raw.starts_with_insensitive("/link") || raw.starts_with_insensitive("-link") ||
+        raw.starts_with_insensitive("-clang:") || raw.starts_with("-X") ||
+        raw.starts_with("-mllvm") || raw.starts_with("-Wp,") || raw.starts_with("-Wa,") ||
+        raw.starts_with("-Wl,")) {
+      throw std::invalid_argument("header compilation command contains unsupported option: " +
+                                  raw.str());
+    }
+    if (raw.starts_with_insensitive("/clang:")) {
+      const auto forwarded = raw.drop_front(7);
+      const bool safe = clang_cl_forwarded_operand
+          ? !forwarded.empty() && forwarded.front() != '-' && forwarded.front() != '@'
+          : safe_clang_cl_forwarded_option(forwarded);
+      if (!clang_cl || !raw.starts_with("/clang:") || !safe) {
+        throw std::invalid_argument(
+            "header compilation command contains unsupported option: /clang:");
+      }
+      clang_cl_forwarded_operand = !clang_cl_forwarded_operand &&
+                                   forwarded_option_takes_operand(forwarded);
+    }
+    option_argv.push_back(donor.CommandLine[i].c_str());
+  }
+  if (clang_cl_forwarded_operand)
+    throw std::invalid_argument("header compilation command option is missing a /clang: operand");
+  unsigned missing_index = 0;
+  unsigned missing_count = 0;
+  const auto all_visibility = prepared_driver_opt_table().ParseArgs(
+      llvm::ArrayRef<const char*>(option_argv), missing_index, missing_count);
+  if (missing_count != 0) {
+    const auto index = std::min<std::size_t>(missing_index, option_argv.size() - 1);
+    throw std::invalid_argument("header compilation command option is missing a value: " +
+                                std::string(option_argv[index]));
+  }
+  for (const auto* argument : all_visibility) {
+    if (unsafe_prepared_option(argument->getOption()) &&
+        !removable_prepared_action(argument->getOption())) {
+      throw std::invalid_argument("header compilation command contains unsupported option: " +
+                                  argument->getSpelling().str());
+    }
+  }
+  missing_index = 0;
+  missing_count = 0;
+  const auto parsed = prepared_driver_opt_table().ParseArgs(
+      llvm::ArrayRef<const char*>(option_argv), missing_index, missing_count,
+      llvm::opt::Visibility(prepared_driver_visibility(clang_cl)));
+  if (missing_count != 0) {
+    const auto index = std::min<std::size_t>(missing_index, option_argv.size() - 1);
+    throw std::invalid_argument("header compilation command option is missing a value: " +
+                                std::string(option_argv[index]));
+  }
+  std::vector<bool> remove(option_argv.size(), false);
+  std::vector<const llvm::opt::Arg*> parsed_arguments;
+  for (const auto* argument : parsed) {
+    parsed_arguments.push_back(argument);
+  }
+  for (std::size_t parsed_index = 0; parsed_index < parsed_arguments.size(); ++parsed_index) {
+    const auto* argument = parsed_arguments[parsed_index];
+    const auto& option = argument->getOption();
+    if (unsafe_prepared_option(option) && !removable_prepared_action(option)) {
+      throw std::invalid_argument("header compilation command contains unsupported option: " +
+                                  argument->getSpelling().str());
+    }
+    const auto index = argument->getIndex();
+    if (index >= remove.size()) {
+      continue;
+    }
+    if (removable_prepared_action(option)) {
+      const auto end =
+          parsed_index + 1 < parsed_arguments.size()
+              ? std::min(remove.size(),
+                         static_cast<std::size_t>(parsed_arguments[parsed_index + 1]->getIndex()))
+              : remove.size();
+      std::fill(remove.begin() + index, remove.begin() + end, true);
+    } else if (is_input_option(option) && argument->getNumValues() > 0 &&
+               same_source_argument(argument->getValue(), donor)) {
+      remove[index] = true;
+    }
+  }
+
+  for (std::size_t i = 0; i < option_argv.size(); ++i) {
+    if (remove[i]) {
+      continue;
+    }
+    auto argument = llvm::StringRef(option_argv[i]);
+    if (clang_cl)
+      argument.consume_front("/clang:");
+    if (selects_toolchain(argument)) {
+      result.use_default_toolchain = false;
+    }
+    // Preserve every remaining original token, including unknown GCC flags,
+    // so Clang can issue the authoritative driver/parser diagnostic.
+    result.arguments.emplace_back(option_argv[i]);
+  }
+  for (const auto* argument : parsed) {
+    const auto& option = argument->getOption();
+    const auto name = option.getUnaliasedOption().getName();
+    if (name.starts_with("std=") && argument->getNumValues() == 1 &&
+        argument->getIndex() < option_argv.size() &&
+        (llvm::StringRef(option_argv[argument->getIndex()]).starts_with("-std=") ||
+         llvm::StringRef(option_argv[argument->getIndex()]).starts_with("--std="))) {
+      auto value = llvm::StringRef(argument->getValue());
+      if (value == "gnu++2a") {
+        value = "gnu++20";
+      }
+      if (value == "c++2a") {
+        value = "c++20";
+      }
+      if (value == "gnu++2b") {
+        value = "gnu++23";
+      }
+      if (value == "c++2b") {
+        value = "c++23";
+      }
+      const auto normalized = (llvm::Twine("-std=") + value).str();
+      if (tracer::prepared::abi_option(normalized)) {
+        result.adapter_abi_options.push_back(normalized);
+      }
+    } else if ((name == "D" || name == "D_" || name == "D__" || argument->getSpelling() == "-D") &&
+               argument->getNumValues() == 1) {
+      const auto definition = (llvm::Twine("-D") + argument->getValue()).str();
+      if (tracer::prepared::abi_option(definition)) {
+        result.adapter_abi_options.push_back(definition);
+      }
+    } else if ((name == "fshort-enums" || name == "fshort-wchar") &&
+               tracer::prepared::abi_option(argument->getSpelling().str())) {
+      result.adapter_abi_options.push_back(argument->getSpelling().str());
+    }
+  }
+  for (const auto& raw : donor.CommandLine) {
+    llvm::StringRef value(raw);
+    if (value.consume_front("/clang:-std=")) {
+      if (value == "gnu++2a") {
+        value = "gnu++20";
+      }
+      if (value == "c++2a") {
+        value = "c++20";
+      }
+      if (value == "gnu++2b") {
+        value = "gnu++23";
+      }
+      if (value == "c++2b") {
+        value = "c++23";
+      }
+      const auto normalized = (llvm::Twine("-std=") + value).str();
+      if (tracer::prepared::abi_option(normalized)) {
+        result.adapter_abi_options.push_back(normalized);
+      }
+    } else if (value.consume_front("/clang:-D")) {
+      const auto definition = (llvm::Twine("-D") + value).str();
+      if (tracer::prepared::abi_option(definition)) {
+        result.adapter_abi_options.push_back(definition);
+      }
+    } else if (value == "/clang:-fshort-enums" || value == "/clang:-fshort-wchar") {
+      const auto option = value.drop_front(7).str();
+      if (tracer::prepared::abi_option(option)) {
+        result.adapter_abi_options.push_back(option);
+      }
+    }
+  }
   return result;
 }
 

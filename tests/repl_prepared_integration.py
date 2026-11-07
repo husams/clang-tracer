@@ -119,6 +119,44 @@ def main():
                     assert "compilation database ABI does not match the trace target" in text, text
                     assert not (output / "prepared.pb").exists()
 
+            gcc_header = root / "headers" / "gcc.hpp"
+            gcc_header.write_text(
+                '#ifdef PREPARE_TEST_GCC_FLAGS\n'
+                '#ifndef __CHAR_UNSIGNED__\n#error expected -funsigned-char\n#endif\n'
+                '#warning prepare test warning\n#endif\n'
+                f'#include "{header}"\n')
+            bad_header = root / "headers" / "bad.hpp"
+            bad_header.write_text(f'#error prepare test parser error\n#include "{header}"\n')
+            source = "headers/gcc.cpp"
+            gcc_flags = ["-oignored.o", "-DPREPARE_TEST_GCC_FLAGS", "-MFignored.d", "-funsigned-char"]
+            for name, include, flags, diagnostic in (
+                ("gcc_flags", gcc_header, gcc_flags, None),
+                ("driver_error", gcc_header, ["-fclang-tracer-invalid-test-flag"], "error: unknown argument"),
+                ("invalid_standard", gcc_header, ["-std=tracer-invalid-standard"], "error: invalid value"),
+                ("parser_error", bad_header, [], "error: prepare test parser error"),
+                ("unsafe_flag", gcc_header, ["-Xclang", "-load", "-Xclang", "unused.so"],
+                 "header compilation command contains unsupported option: -Xclang"),
+                ("unsafe_log", gcc_header, ["-diagnostic-log-file", "ignored.log"],
+                 "header compilation command contains unsupported option: -diagnostic-log-file"),
+            ):
+                default_compdb.write_text(json.dumps([{
+                    "directory": str(root), "file": source,
+                    "arguments": ["g++", *flags, "-MMD", "-MF", "ignored.d", "-c", source,
+                                  "-o", "ignored.o"],
+                }]))
+                output = root / name
+                result = prepare(include, output)
+                text = result.stdout + result.stderr
+                if diagnostic is None:
+                    assert result.returncode == 0 and (output / "prepared.pb").is_file(), text
+                    assert "warning: prepare test warning" in text, text
+                else:
+                    assert result.returncode != 0 and diagnostic in text, text
+                    assert not output.exists(), text
+                assert not (root / "ignored.d").exists()
+                assert not (root / "ignored.o").exists()
+                assert not (root / "ignored.log").exists()
+
             target = subprocess.Popen([args.target], stdout=target_log, stderr=subprocess.STDOUT)
             prepared = f'--prepared "{package}" --prepared-mode require'
             validate = f'%probe validate {selector} --callback "{callback}" {prepared}\n'
@@ -174,8 +212,8 @@ auto hook = tracer.inject(session, {selector}, "{callback}");
                     assert result.returncode == 0 and 'symbol: "_ZN13prepared_demo7computeEi"' in text, text
                     assert ("falling back to DWARF" in text) == (mode != "off"), text
             assert callback.read_bytes() == original_callback, "generation changed the user callback"
-            print("Native prepared integration passed: compile database driver and sysroot, ABI rejection, "
-                  "offline generation, ABI-compatible rebuild reuse, pinned-image rejection, "
+            print("Native prepared integration passed: compile database driver, sysroot, and Clang diagnostics, "
+                  "ABI rejection, offline generation, ABI-compatible rebuild reuse, pinned-image rejection, "
                   "C++ API, typed results, restoration, and prefer/off.")
         finally:
             if console is not None and console.poll() is None:
