@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -10,6 +11,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -17,6 +19,7 @@
 #include <tuple>
 
 #include <llvm/BinaryFormat/Dwarf.h>
+#include <llvm/ADT/StringExtras.h>
 #include <llvm/DebugInfo/DWARF/DWARFContext.h>
 #include <llvm/DebugInfo/DWARF/DWARFDie.h>
 #include <llvm/Demangle/Demangle.h>
@@ -30,6 +33,8 @@
 #include <llvm/Support/SHA256.h>
 #include <llvm/TargetParser/Triple.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <fnmatch.h>
 
 #include "tracer/compat.hpp"
 #include "linux_syscalls.hpp"
@@ -301,6 +306,16 @@ struct ExecutableMapping {
   std::uint64_t begin = 0;
   std::uint64_t end = 0;
   std::uint64_t offset = 0;
+  std::uint64_t inode = 0;
+  unsigned device_major = 0;
+  unsigned device_minor = 0;
+  std::string device;
+
+  bool matches(const struct stat &file) const {
+    return inode != 0 && inode == file.st_ino &&
+           device_major == major(file.st_dev) &&
+           device_minor == minor(file.st_dev);
+  }
 };
 
 std::vector<ExecutableMapping> read_executable_mappings(
@@ -336,6 +351,10 @@ std::vector<ExecutableMapping> read_executable_mappings(
       mapping.begin = std::stoull(range.substr(0, dash), nullptr, 16);
       mapping.end = std::stoull(range.substr(dash + 1), nullptr, 16);
       mapping.offset = std::stoull(offset, nullptr, 16);
+      mapping.inode = std::stoull(inode);
+      mapping.device_major = std::stoul(device.substr(0, colon), nullptr, 16);
+      mapping.device_minor = std::stoul(device.substr(colon + 1), nullptr, 16);
+      mapping.device = device;
       if (mapping.end > mapping.begin) {
         result.push_back(std::move(mapping));
       }
@@ -358,9 +377,12 @@ std::string mapping_fingerprint(
     if (::stat(path.c_str(), &st) != 0) {
       throw std::runtime_error("cannot stat mapped debug image");
     }
-    std::string identity = path;
-    identity.push_back('\0');
-    hash.update(identity);
+    std::ostringstream identity;
+    identity << path << '\0' << st.st_dev << ':' << st.st_ino << ':'
+             << st.st_size << ':' << st.st_mtim.tv_sec << ':'
+             << st.st_mtim.tv_nsec << ':' << st.st_ctim.tv_sec << ':'
+             << st.st_ctim.tv_nsec << '\0';
+    hash.update(identity.str());
   }
 
   for (const auto& mapping : executable_mappings) {
@@ -407,6 +429,7 @@ std::vector<ExecutableSegment> executable_segments(
 struct MappedExecutableRange {
   std::uint64_t begin = 0;
   std::uint64_t end = 0;
+  std::uint64_t runtime_begin = 0;
 };
 
 std::vector<MappedExecutableRange> mapped_executable_ranges(
@@ -442,7 +465,7 @@ std::vector<MappedExecutableRange> mapped_executable_ranges(
         continue;
       }
       result.push_back(
-          {virtual_begin, virtual_begin + (file_end - file_begin)});
+          {virtual_begin, virtual_begin + (file_end - file_begin), runtime_begin});
     }
   }
   return result;
@@ -1083,6 +1106,322 @@ std::vector<std::string> list_debug_modules(std::uint32_t pid) {
   return modules(pid);
 }
 
+api::ListModulesResponse list_debug_module_mappings(std::uint32_t pid) {
+  const auto paths = modules(pid);
+  const auto mappings = read_executable_mappings(pid, paths);
+  const auto fingerprint = mapping_fingerprint(paths, mappings);
+  api::ListModulesResponse result;
+  std::map<std::string, std::string> build_ids;
+  for (const auto &path : paths) {
+    result.add_modules(path);
+    struct stat file{};
+    if (::stat(path.c_str(), &file) != 0 ||
+        std::none_of(mappings.begin(), mappings.end(), [&](const auto &entry) {
+          return entry.path == path && entry.matches(file);
+        }))
+      continue;
+    auto binary = llvm::object::createBinary(path);
+    if (!binary) {
+      llvm::consumeError(binary.takeError());
+      continue;
+    }
+    if (const auto *elf = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(
+            binary->getBinary()))
+      build_ids.emplace(path, llvm::toHex(llvm::object::getBuildID(elf), true));
+  }
+  for (const auto &mapping : mappings) {
+    auto &entry = *result.add_mappings();
+    entry.set_path(mapping.path);
+    entry.set_begin_address(mapping.begin);
+    entry.set_end_address(mapping.end);
+    entry.set_file_offset(mapping.offset);
+    entry.set_device(mapping.device);
+    entry.set_inode(mapping.inode);
+    const auto id = build_ids.find(mapping.path);
+    struct stat file{};
+    if (id != build_ids.end() && ::stat(mapping.path.c_str(), &file) == 0 &&
+        mapping.matches(file))
+      entry.set_build_id(id->second);
+  }
+  const auto current = modules(pid);
+  if (mapping_fingerprint(current, read_executable_mappings(pid, current)) !=
+      fingerprint)
+    throw std::invalid_argument("mapped images changed during discovery; restart listing");
+  result.set_mapping_token(fingerprint);
+  return result;
+}
+
+namespace {
+
+using PreviewCandidate = api::BulkTraceCandidate;
+
+bool glob_matches(const std::string &pattern, const std::string &value) {
+  return ::fnmatch(pattern.c_str(), value.c_str(), FNM_NOESCAPE) == 0;
+}
+
+struct PreviewName {
+  std::string qualified;
+  std::string selector;
+};
+
+PreviewName preview_name(const std::string &linkage, std::string fallback) {
+  llvm::ItaniumPartialDemangler demangler;
+  if (demangler.partialDemangle(linkage.c_str()) || !demangler.isFunction() ||
+      demangler.isSpecialName())
+    return {fallback, fallback};
+  using Text = std::unique_ptr<char, decltype(&std::free)>;
+  std::size_t size = 0;
+  const Text name(demangler.getFunctionName(nullptr, &size), &std::free);
+  const Text params(demangler.getFunctionParameters(nullptr, &size), &std::free);
+  const Text full(demangler.finishDemangle(nullptr, &size), &std::free);
+  if (!name || !params || !full)
+    return {fallback, fallback};
+  std::string selector = std::string(name.get()) + params.get();
+  const std::string pretty = full.get();
+  const auto begin = pretty.find(selector);
+  if (begin != std::string::npos)
+    selector = pretty.substr(begin);
+  return {name.get(), std::move(selector)};
+}
+
+std::optional<llvm::object::OwningBinary<llvm::object::Binary>>
+open_debug_companion(const std::string &path,
+                     const llvm::object::ELF64LEObjectFile &object) {
+  const auto debug_path = separate_debug_file(path, object);
+  if (!debug_path)
+    return std::nullopt;
+  auto binary = llvm::object::createBinary(*debug_path);
+  if (!binary) {
+    llvm::consumeError(binary.takeError());
+    return std::nullopt;
+  }
+  const auto *elf = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(binary->getBinary());
+  if (!elf || elf->getArch() != llvm::Triple::x86_64)
+    return std::nullopt;
+  return std::move(*binary);
+}
+
+} // namespace
+
+api::PreviewBulkTraceResponse preview_bulk_trace(
+    std::uint32_t pid, const api::BulkTraceRules &rules,
+    const std::function<bool()> &is_cancelled) {
+  const auto paths = modules(pid);
+  const auto mappings = read_executable_mappings(pid, paths);
+  const auto fingerprint = mapping_fingerprint(paths, mappings);
+  std::map<std::string, std::string> exacts;
+  for (const auto &selector : rules.exact_selectors())
+    exacts.try_emplace(compact(selector), selector);
+  std::set<std::string> matched_exacts;
+  using Key = std::tuple<std::string, std::string, std::uint64_t, std::string>;
+  std::map<Key, PreviewCandidate> candidates;
+  const auto check_cancelled = [&] {
+    if (is_cancelled())
+      throw std::runtime_error("bulk trace preview cancelled");
+  };
+  const auto glob_any = [](const auto &patterns, const PreviewName &name,
+                           const std::string &canonical) {
+    return std::any_of(patterns.begin(), patterns.end(), [&](const auto &pattern) {
+      return glob_matches(pattern, name.qualified) ||
+             glob_matches(pattern, name.selector) ||
+             (canonical != name.selector && glob_matches(pattern, canonical));
+    });
+  };
+  for (const auto &path : paths) {
+    check_cancelled();
+    const auto basename = std::filesystem::path(path).filename().string();
+    if (!rules.module_globs().empty() &&
+        std::none_of(rules.module_globs().begin(), rules.module_globs().end(),
+                     [&](const auto &pattern) {
+                       return glob_matches(pattern, path) || glob_matches(pattern, basename);
+                     }))
+      continue;
+    auto binary = llvm::object::createBinary(path);
+    if (!binary) {
+      llvm::consumeError(binary.takeError());
+      continue;
+    }
+    const auto *object = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(binary->getBinary());
+    if (!object || object->getArch() != llvm::Triple::x86_64)
+      continue;
+    api::DebugInfo image;
+    identity(image, path);
+    struct stat file{};
+    if (::stat(path.c_str(), &file) != 0)
+      throw std::invalid_argument("mapped images changed during preview; retry");
+    std::vector<ExecutableMapping> verified;
+    std::copy_if(mappings.begin(), mappings.end(), std::back_inserter(verified),
+                 [&](const auto &m) { return m.path == path && m.matches(file); });
+    const auto ranges = mapped_executable_ranges(*object, image,
+                                                  executable_segments(*object), verified);
+    const auto emit = [&](const PreviewName &name, const std::string &canonical,
+                          const std::string &linkage, std::uint64_t low,
+                          std::uint64_t high, PreviewCandidate::AbiStatus status,
+                          std::string diagnostic) {
+      const auto exact = exacts.find(compact(canonical));
+      const auto alternate = exacts.find(compact(name.selector));
+      if ((exact == exacts.end() && alternate == exacts.end() &&
+           !glob_any(rules.include_globs(), name, canonical)) ||
+          glob_any(rules.exclude_globs(), name, canonical))
+        return;
+      if (exact != exacts.end())
+        matched_exacts.insert(exact->first);
+      if (alternate != exacts.end())
+        matched_exacts.insert(alternate->first);
+      std::set<std::uint64_t> addresses;
+      for (const auto &range : ranges)
+        if (low >= range.begin && high <= range.end)
+          addresses.insert(range.runtime_begin + (low - range.begin));
+      if (addresses.empty()) {
+        status = PreviewCandidate::UNSUPPORTED;
+        diagnostic = "no verified mapped executable entry" +
+                     (diagnostic.empty() ? std::string{} : "; " + diagnostic);
+      } else if (addresses.size() != 1) {
+        status = PreviewCandidate::AMBIGUOUS;
+        diagnostic = "ELF entry maps to multiple runtime addresses";
+      }
+      const Key key{compact(canonical), path, low, linkage};
+      auto [entry, added] = candidates.try_emplace(key);
+      auto &candidate = entry->second;
+      if (!added && (candidate.abi_status() == PreviewCandidate::DWARF_SUPPORTED ||
+                     status != PreviewCandidate::DWARF_SUPPORTED))
+        return;
+      if (candidates.size() > 4096)
+        throw DebugLookupLimit("bulk preview exceeds 4096 matches; narrow the selection");
+      auto &symbol = *candidate.mutable_function();
+      symbol.set_selector(canonical);
+      symbol.set_module_path(path);
+      symbol.set_linkage_symbol(linkage);
+      symbol.set_elf_address(low);
+      if (addresses.size() == 1)
+        symbol.set_runtime_address(*addresses.begin());
+      candidate.set_abi_status(status);
+      candidate.set_diagnostic(std::move(diagnostic));
+    };
+    std::set<std::pair<std::string, std::uint64_t>> described;
+    auto companion = open_debug_companion(path, *object);
+    const auto *debug_object = companion
+        ? llvm::cast<llvm::object::ELF64LEObjectFile>(companion->getBinary())
+        : object;
+    auto dwarf = llvm::DWARFContext::create(*debug_object);
+    std::size_t visited = 0;
+    for (const auto &unit : dwarf->compile_units()) {
+      std::vector<DWARFDie> pending{unit->getUnitDIE(false)};
+      while (!pending.empty()) {
+        if ((visited++ % 128) == 0)
+          check_cancelled();
+        const auto die = pending.back();
+        pending.pop_back();
+        if (!die)
+          continue;
+        for (auto child : die.children())
+          pending.push_back(child);
+        if (die.getTag() != dw::DW_TAG_subprogram)
+          continue;
+        std::uint64_t low = 0, high = 0, section = 0;
+        if (!die.getLowAndHighPC(low, high, section) || high <= low)
+          continue;
+        const auto decl = declaration(die);
+        const auto qname = qualified(decl);
+        if (qname.empty())
+          continue;
+        const auto *mangled = die.getName(llvm::DINameKind::LinkageName);
+        const auto linkage = mangled ? std::string(mangled) : name(decl);
+        auto display = preview_name(linkage, qname);
+        const auto potential = [&](const auto &entry) {
+          return ::tracer::compat::starts_with(entry.first, compact(qname) + "(") ||
+                 ::tracer::compat::starts_with(entry.first, compact(display.qualified) + "(");
+        };
+        if (!glob_any(rules.include_globs(), display, qname) &&
+            std::none_of(exacts.begin(), exacts.end(), potential) &&
+            std::none_of(rules.include_globs().begin(), rules.include_globs().end(),
+                         [](const auto &glob) { return glob.find('(') != std::string::npos; }))
+          continue;
+        described.emplace(linkage, low);
+        auto selector = display.selector;
+        auto status = PreviewCandidate::DWARF_SUPPORTED;
+        std::string diagnostic;
+        try {
+          callable_code_range(die);
+          if (number(decl, dw::DW_AT_virtuality)) {
+            status = PreviewCandidate::PREPARED_REQUIRED;
+            diagnostic = "virtual implementation requires a compatible prepared package";
+          } else {
+            const auto shape = describe_callable(die, decl);
+            if (shape.receiver) {
+              api::DebugInfo record;
+              describe_record(shape.receiver, record);
+            }
+            const auto result_type = read_type(type_of(decl));
+            if (result_type.record) {
+              api::DebugInfo record;
+              describe_record(result_type.record, record);
+            }
+            selector = shape.selector;
+          }
+        } catch (const std::exception &error) {
+          status = PreviewCandidate::UNSUPPORTED;
+          diagnostic = error.what();
+        }
+        emit(display, selector, linkage, low, high, status, std::move(diagnostic));
+      }
+    }
+    const auto visit_elf = [&](const llvm::object::SymbolRef &symbol) {
+      if ((visited++ % 128) == 0)
+        check_cancelled();
+      const llvm::object::ELFSymbolRef elf(symbol);
+      if (elf.getELFType() != llvm::ELF::STT_FUNC || !elf.getSize())
+        return;
+      auto address = symbol.getAddress();
+      auto linkage = symbol.getName();
+      if (!address || !linkage) {
+        if (!address) llvm::consumeError(address.takeError());
+        if (!linkage) llvm::consumeError(linkage.takeError());
+        return;
+      }
+      if (!*address || elf.getSize() > UINT64_MAX - *address ||
+          described.count({linkage->str(), *address}))
+        return;
+      const auto display = preview_name(linkage->str(), linkage->str());
+      emit(display, display.selector, linkage->str(), *address, *address + elf.getSize(),
+           PreviewCandidate::UNSUPPORTED, "ELF symbol has no matching concrete DWARF ABI");
+    };
+    for (const auto &symbol : object->symbols())
+      visit_elf(symbol);
+    for (const auto &symbol : object->getDynamicSymbolIterators())
+      visit_elf(symbol);
+  }
+  check_cancelled();
+  const auto current = modules(pid);
+  if (mapping_fingerprint(current, read_executable_mappings(pid, current)) != fingerprint)
+    throw std::invalid_argument("mapped images changed during preview; retry");
+
+  std::map<std::string, std::set<std::pair<std::string, std::uint64_t>>> selector_entries;
+  std::map<std::uint64_t, unsigned> address_counts;
+  for (const auto &[key, candidate] : candidates) {
+    const auto &function = candidate.function();
+    selector_entries[std::get<0>(key)].emplace(function.module_path(), function.elf_address());
+    if (function.runtime_address())
+      ++address_counts[function.runtime_address()];
+  }
+  api::PreviewBulkTraceResponse result;
+  for (auto &[key, candidate] : candidates) {
+    if (selector_entries.at(std::get<0>(key)).size() > 1) {
+      candidate.set_abi_status(PreviewCandidate::AMBIGUOUS);
+      candidate.set_diagnostic("selector identifies multiple entries; narrow the module selection");
+    } else if (candidate.function().runtime_address() &&
+               address_counts.at(candidate.function().runtime_address()) > 1) {
+      candidate.set_abi_status(PreviewCandidate::AMBIGUOUS);
+      candidate.set_diagnostic("multiple selected symbols share this runtime entry");
+    }
+    result.add_candidates()->Swap(&candidate);
+  }
+  for (const auto &[key, selector] : exacts)
+    if (!matched_exacts.count(key))
+      result.add_unmatched_exact_selectors(selector);
+  return result;
+}
+
 ResolvedCallable bind_prepared_callable(std::uint32_t pid,
                                         const api::PreparedInjector &prepared,
                                         const DebugLookupOptions &options,
@@ -1522,7 +1861,8 @@ DebugSymbolPage list_debug_symbols(
     std::size_t page_size, const std::string& after_selector,
     const std::string& after_linkage_symbol, const std::string& after_module_path,
     const std::string& expected_mapping_fingerprint,
-    const std::function<bool()>& is_cancelled) {
+    const std::function<bool()>& is_cancelled,
+    bool include_addresses, std::uint64_t address) {
   const auto image_paths = modules(pid);
   const auto mappings = read_executable_mappings(pid, image_paths);
   const auto current_fingerprint = mapping_fingerprint(image_paths, mappings);
@@ -1543,6 +1883,12 @@ DebugSymbolPage list_debug_symbols(
     if (!module.empty() && path.find(module) == std::string::npos) {
       continue;
     }
+    if (address && std::none_of(mappings.begin(), mappings.end(),
+                               [&](const auto &mapping) {
+           return mapping.path == path && address >= mapping.begin &&
+                  address < mapping.end;
+         }))
+      continue;
     auto binary = llvm::object::createBinary(path);
     if (!binary) {
       llvm::consumeError(binary.takeError());
@@ -1561,6 +1907,18 @@ DebugSymbolPage list_debug_symbols(
                  [&](const auto& mapping) { return mapping.path == path; });
     const auto mapped_ranges =
         mapped_executable_ranges(*object, module_identity, segments, module_mappings);
+    std::vector<MappedExecutableRange> verified_ranges;
+    if (include_addresses || address) {
+      struct stat file{};
+      if (::stat(path.c_str(), &file) == 0) {
+        module_mappings.erase(
+            std::remove_if(module_mappings.begin(), module_mappings.end(),
+                           [&](const auto &mapping) { return !mapping.matches(file); }),
+            module_mappings.end());
+        verified_ranges = mapped_executable_ranges(
+            *object, module_identity, segments, module_mappings);
+      }
+    }
     std::optional<llvm::object::OwningBinary<llvm::object::Binary>>
         separate_debug_binary;
     const llvm::object::ELF64LEObjectFile *dwarf_object = object;
@@ -1613,10 +1971,28 @@ DebugSymbolPage list_debug_symbols(
           }
           if (selector.find(query) != std::string::npos ||
               linkage_symbol.find(query) != std::string::npos) {
+            std::set<std::uint64_t> runtime_entries;
+            for (const auto &range : verified_ranges) {
+              if (low < range.begin || high > range.end)
+                continue;
+              const auto entry = range.runtime_begin + (low - range.begin);
+              if (!address || (address >= entry && address - entry < high - low))
+                runtime_entries.insert(entry);
+            }
+            if (address && runtime_entries.empty())
+              return;
             const Key key{selector, linkage_symbol, path};
             if (key > after) {
-              candidates.try_emplace(
-                  key, DebugSymbol{selector, linkage_symbol, path});
+              DebugSymbol item{selector, linkage_symbol, path};
+              if (runtime_entries.size() == 1) {
+                item.runtime_address = *runtime_entries.begin();
+                item.elf_address = low;
+              }
+              auto [existing, added] = candidates.try_emplace(key, std::move(item));
+              if (!added && existing->second.runtime_address != item.runtime_address) {
+                existing->second.runtime_address = 0;
+                existing->second.elf_address = 0;
+              }
               if (page_size != 0 && candidates.size() > page_size &&
                   candidates.size() - page_size > 1) {
                 candidates.erase(std::prev(candidates.end()));

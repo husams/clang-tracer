@@ -86,7 +86,10 @@ locally.
 
 With an owned local Linux server, `--process NAME` matches executable paths.
 `%attach` without a PID opens the process picker; multiple matches require
-choosing a displayed PID. `%processes --filter TEXT` lists local candidates.
+choosing a displayed PID. The picker shows each candidate's executable and Linux
+start time and checks the selected identity at attach. `%processes --filter TEXT`
+lists the same local candidates. In scripts, use `%attach PID --start-time TICKS`
+to attach only when the PID still has the displayed start time.
 Remote process enumeration is not in the service API, so remote attach uses an
 explicit PID.
 
@@ -96,6 +99,143 @@ session IDs, blocks automatic retries for that PID, and reconciles again on
 `%status` and exit. Inspect `%sessions` and explicitly `%detach SESSION` when
 appropriate. Candidates are never assumed to belong to this console on an
 external server; recovery information is retained until explicitly resolved.
+
+## Browse a local C++ target
+
+```text
+%threads
+%modules --details
+%symbols --filter Calculator --addresses
+%symbols --address 0xADDRESS --mapping TOKEN
+```
+
+`%threads` shows thread IDs, names and start times for the selected process.
+`%modules` lists application module paths. Add `--details` for file-backed
+executable address ranges, file offsets, device and inode, and the ELF build
+ID when the backing file can be verified.
+
+`%symbols --addresses` shows runtime and ELF entries for supported C++ callables
+when there is a unique verified mapping. For reverse lookup, copy a runtime
+address and the `mapping=` token from the same session. Addresses inside a
+supported callable also work. If the mappings or backing files change, take a
+new snapshot before using an address. The token checks observed mapping
+identity. An unload and reload of the same image at the same address between
+snapshots can produce identical observations.
+
+## Preview a bulk trace
+
+```text
+%trace preview --module 'libapp*' --include 'app::*' --exclude 'app::detail::*' --save trace.textproto
+%trace preview --exact "Calculator::multiply(int, int) const"
+%trace preview --manifest trace.textproto
+```
+
+Run the preview after attaching to a local Linux x86-64 C++ application.
+Repeat `--module` to match any executable module by basename or path.
+`--include` and `--exact` combine their selections, then `--exclude` removes
+matches. Globs are case-sensitive and support `*`, `?` and bracket patterns.
+They match either qualified names or full signatures. Use `--exact` to choose
+an overload by its full C++ signature. Quote patterns at the REPL.
+
+The dry run reads executable mappings, ELF symbols and DWARF, including matching
+separate debug files. It reports a live entry when one can be verified.
+`DWARF_SUPPORTED` means the entry passed static ABI checks. Callback compilation
+and installation checks run separately. `PREPARED_REQUIRED` identifies a
+concrete virtual implementation that needs a compatible prepared package.
+Unsupported entries and ambiguous selections show a reason. Narrow a
+duplicate signature with `--module`.
+
+The capacity line shows retained slots and whether the DWARF-supported
+selection fits. It is a snapshot and reserves no slots. The preview runs
+without installing probes, stopping target threads or executing code inside
+the target. `--save` creates a new versioned text-protobuf file with selection
+rules. Reusing it resolves against the current session and mappings.
+
+## Apply and remove a bulk trace
+
+```text
+%trace apply --manifest trace.textproto
+%trace apply --manifest trace.textproto --callback observer.cpp
+%trace remove BATCH_ID
+```
+
+Apply re-resolves the manifest against the selected session. The default
+Clang JIT observer records typed PRE and POST events. With `--callback`, the
+same C++ source is compiled for each matched function. Every match must be
+DWARF-supported and fit in the available retained slots. Ambiguous or
+unmatched selections, entries requiring prepared packages, and entries with
+active probes block installation.
+
+The REPL prints the batch ID before applying and reports the status of each
+entry. If an install fails, the server restores this batch's probes in
+reverse order. Use the same batch ID with `%trace remove` to retry entries
+reported as `RESTORE_PENDING` or to check a batch after an interrupted
+command. Removal is repeatable for a retained batch in its original session.
+Removal and rollback restore entry bytes. The agent still retains compiled
+slots until the target exits.
+
+## Read and scan mapped memory
+
+```text
+%memory maps
+%memory read 0xADDRESS --mapping TOKEN --count 32
+%memory read 0xADDRESS --mapping TOKEN --type i64
+%memory scan 0xADDRESS --mapping TOKEN --count 4096 --pattern "48 8? ?? ff" --limit 16
+```
+
+Run these commands after attaching to a local Linux x86-64 target. Copy the
+token after `memory mapping=` and use an address from one of the listed
+ranges. Ranges include anonymous and file-backed mappings, with permissions
+shown as reported by Linux. The memory token is specific to the attached
+session and its memory map.
+
+Use `--count` for a hex and ASCII dump of 1 to 65536 bytes. Use `--type`
+for one little-endian `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64`,
+`f32` or `f64` value. Reads can cross page and mapping boundaries when the
+entire span is readable. A gap, inaccessible page, or short kernel read
+fails the request at the first affected address and returns no bytes.
+
+The server checks the mapping snapshot and target identity around each
+read or scan. Run `%memory maps` again after any mapping or permission change.
+The target keeps running during inspection, so bytes can change while
+they are copied. An unmap and remap with identical visible metadata between
+checks can produce the same snapshot.
+
+Scans accept 1 to 1048576 bytes and patterns of 1 to 256 bytes. Separate hex
+bytes with spaces. Use `??` for an entire wildcard byte, or `8?` or `?f`
+for a wildcard nibble. To choose individual bits, append a colon and a
+same-length hex mask, as in `"13 37 : 1f ff"`. A bit participates only
+if the explicit mask enables it and the bit belongs to a non-wildcard nibble.
+
+Matches are reported in ascending address order and can overlap or cross
+adjacent readable mappings. The default match limit is 64 and the maximum
+is 1024. `truncated=true` means the scan found at least one more match.
+A scan fails without returning matches if any part of its requested range
+is unreadable or the snapshot changes during inspection. The scan uses the
+configured operation timeout and supports Ctrl+C.
+
+## Preview a verified function entry
+
+```text
+%memory maps
+%probe entry "Calculator::multiply(int, int) const" --mapping TOKEN
+%probe entry --module /absolute/path/to/app --elf-address 0xELF_VA --abi linux-x86-64-sysv --mapping TOKEN
+```
+
+Use the token from the attached session's memory snapshot. A named entry
+uses DWARF. The explicit form requires the exact mapped module path and a
+link-time ELF virtual address. It accepts an exact function symbol start
+or an exact `.eh_frame` range start in a stripped image. The ABI label in
+that form is supplied by the caller. The preview verifies executable
+mapping identity and compares the live bytes with the ELF file, which
+must be a readable regular file of at most 128 MiB.
+
+The preview disassembles up to 64 verified entry bytes and follows direct
+branches within that window. Call targets are reported without following
+them. Indirect targets are shown as unresolved. `patch_size` shows the
+instruction-aligned window accepted by the current copy-only detour policy.
+If the policy rejects the entry, the preview shows the reason. It performs
+no installation or writes.
 
 ## Interceptor upload
 
@@ -107,6 +247,7 @@ external server; recovery information is retained until explicitly resolved.
 %probe resolve "Calculator::multiply(int, int) const"
 %interceptor load method.cpp --as multiply_hook
 %interceptor show multiply_hook
+%interceptor validate multiply_hook --target "Calculator::multiply(int, int) const"
 %interceptor upload multiply_hook --target "Calculator::multiply(int, int) const" --stack-depth 16
 %probes
 ```
@@ -126,6 +267,37 @@ repeatable `--compile-option`. Headers and compilation-database paths refer to
 the server host. Source files are limited to 4 MiB. Uploaded interceptors are
 compiled by the server/agent; local REPL variables, pointers and lambdas are not
 implicitly transferred into the target.
+
+Attach checks the loaded agent's bootstrap protocol and ELF build ID against
+the server and its configured agent file before accepting the session. Use
+`%sessions` to see the process start time and target JIT runtime profile.
+The reported libstdc++ header release and C++11 ABI flag describe the agent
+build defaults. Probe-specific flags and target signature ABI checks still apply.
+Successful installs report resolve, target JIT compile and patch durations
+in nanoseconds when the server supports them.
+
+### Reload an observer
+
+```text
+%probe reload PROBE_ID --callback observer-v2.cpp
+```
+
+Use the ID of the active probe. Reload keeps its target binding, ABI and
+deployment options. The agent prepares the new observer before switching the
+entry. A rejected callback or a switch that rolls back leaves the existing
+observer in place. Cancellation is checked up to the entry switch. Use
+`%probes` to identify the current generation if the reply is interrupted.
+
+The entry switches directly to the new wrapper. Calls that already entered
+the previous wrapper finish there, with both PRE and POST tagged by the
+previous probe ID. A successful reload reports the new ID and retained
+capacity. The 32-slot process limit includes retired wrappers, which stay
+resident for safe late arrivals. Remove the active generation to restore the
+original entry. Removing a superseded generation drains it while leaving the
+successor in place. Detach drains all generations.
+
+Borrow target pointers and references only during the callback. Use owned
+snapshots for REPL inspection and replay.
 
 ## Collect and inspect
 
@@ -257,6 +429,7 @@ can include `event_ranges.hpp` and use the `tracer_repl` namespace explicitly.
 %record capture.db --sqlite --count 1000
 %events open capture.pb --as saved
 %events open capture.db --as stored
+%events stats saved
 %events export saved --format json --output events.json
 %events clear saved
 ```
@@ -290,6 +463,33 @@ invocation/task identities remain available in event details.
 Loss statistics sum the latest observed cumulative agent counter per probe and
 server counter per server lifetime, without counting repeated samples twice.
 Unknown native phases remain inspectable and are counted outside PRE/POST pairs.
+
+`%events stats NAME` uses the same summary for captured and replayed collections.
+Each function row counts distinct observed calls for a probe in its process and
+session. A call with just one phase contributes to `missing_pre` or
+`missing_post`. Only a pair with one unambiguous timestamp per phase and a
+nonnegative interval contributes to `timed` and the histogram. Histogram
+labels are inclusive nanosecond ranges, with empty buckets omitted and a final
+bucket for one second or longer. Durations measure the elapsed interval between
+the two trace timestamps, including tracing overhead.
+
+Caller edges count calls with evidence of the direct native caller in either
+phase's entry stack. Caller labels use the function and module when available,
+then the module offset or native PC. `caller_unknown` counts calls whose stack
+does not establish that edge. Enable stack capture with `--stack-depth 8` when
+installing a single probe. For a bulk manifest, pass this observer with
+`%trace apply --manifest trace.textproto --callback observer.cpp` to capture
+the stack on PRE and retain both phases for timing.
+
+```cpp
+struct Interceptor {
+  void pre(const Call& call) { call.capture_stack(8, false); }
+  void post(const Call&) {}
+};
+```
+
+Agent and server loss counters are cumulative samples from retained events.
+They and local buffer evictions are reported separately from incomplete calls.
 
 By default, `%record` uses four-byte little-endian lengths and Protobuf
 TraceEvent frames, with a 32 MiB per-frame limit. Framed recording and export
@@ -660,8 +860,8 @@ contents. The old scalar variant/text APIs remain available.
 Snapshots survive detach, target exit, collection clearing and recording replay.
 Both native and shared-context event envelopes carry the same owned data.
 Use `%help api EventValue` for the loaded inspection API and Tab on
-`event.argument_snapshot(0).` for its methods. Backend/agent bootstrap version
-20 is required for new captures; install the server and agent together.
+`event.argument_snapshot(0).` for its methods. Install the server and agent
+together so their bootstrap protocols match.
 
 The prelude provides `tracer` and a selected-session reference named `session`.
 Copying `session` makes a handle that retains that server/session identity;

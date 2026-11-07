@@ -19,6 +19,11 @@ enum class CommandKind {
   detach,
   modules,
   symbols,
+  memory_maps,
+  memory_read,
+  memory_scan,
+  probe_entry,
+  probe_reload,
   prepare,
   resolve,
   inject,
@@ -28,6 +33,7 @@ enum class CommandKind {
   draft_load,
   draft_edit,
   draft_show,
+  draft_validate,
   draft_upload,
   events,
   event_list,
@@ -48,7 +54,11 @@ enum class CommandKind {
   complete,
   type,
   help,
-  quit
+  quit,
+  threads,
+  bulk_preview,
+  bulk_apply,
+  bulk_remove
 };
 
 struct Command {
@@ -65,5 +75,6 @@ struct Command {
 Command parse_command(const std::string &input);
 std::uint64_t unsigned_number(const std::string &text, const std::string &name,
                               std::uint64_t maximum = UINT64_MAX);
+std::uint64_t address_number(const std::string &text);
 const std::vector<std::string> &command_names();
 } // namespace tracer_repl

@@ -197,6 +197,91 @@ class Client:
         )
         return list(response.modules)
 
+    def preview_bulk_trace(
+        self, session_id: str, rules: pb.BulkTraceRules
+    ) -> pb.PreviewBulkTraceResponse:
+        """Resolve bulk trace rules and report capacity without installing probes."""
+        response: pb.PreviewBulkTraceResponse = self.stub.PreviewBulkTrace(
+            pb.PreviewBulkTraceRequest(session_id=session_id, rules=rules),
+            timeout=self.timeout,
+        )
+        return response
+
+    def list_memory_mappings(self, session_id: str) -> pb.ListMemoryMappingsResponse:
+        """Snapshot the mapped ranges and permissions for an attached target."""
+        return self.stub.ListMemoryMappings(
+            pb.ListMemoryMappingsRequest(session_id=session_id), timeout=self.timeout
+        )
+
+    def read_memory(
+        self, session_id: str, address: int, size: int, *, mapping_token: str
+    ) -> bytes:
+        """Return a complete, owned copy of a readable range in a current snapshot."""
+        response = self.stub.ReadMemory(
+            pb.ReadMemoryRequest(
+                session_id=session_id, address=address, size=size, mapping_token=mapping_token
+            ),
+            timeout=self.timeout,
+        )
+        return response.data
+
+    def scan_memory(
+        self, session_id: str, address: int, size: int, *,
+        mapping_token: str, pattern: bytes, mask: bytes, max_matches: int = 0,
+    ) -> pb.ScanMemoryResponse:
+        """Find masked matches in a current mapping snapshot."""
+        return self.stub.ScanMemory(
+            pb.ScanMemoryRequest(
+                session_id=session_id, address=address, size=size,
+                mapping_token=mapping_token, pattern=pattern, mask=mask,
+                max_matches=max_matches,
+            ),
+            timeout=self.timeout,
+        )
+
+    def preview_function_entry(
+        self, session_id: str, *, mapping_token: str, selector: str | None = None,
+        elf_address: int | None = None, module: str = "", abi: str = "",
+    ) -> pb.PreviewFunctionEntryResponse:
+        """Verify and disassemble a live entry without installing a probe."""
+        if (selector is None) == (elf_address is None):
+            raise ValueError("provide exactly one selector or ELF address")
+        request = pb.PreviewFunctionEntryRequest(
+            session_id=session_id, mapping_token=mapping_token, module=module, abi=abi
+        )
+        if selector is not None:
+            request.selector = selector
+        else:
+            assert elf_address is not None
+            request.elf_address = elf_address
+        return self.stub.PreviewFunctionEntry(request, timeout=self.timeout)
+
+    def list_threads(self, session_id: str) -> list[pb.TargetThread]:
+        """List thread IDs, names and start times for an attached target."""
+        response = self.stub.ListThreads(
+            pb.ListThreadsRequest(session_id=session_id), timeout=self.timeout
+        )
+        return list(response.threads)
+
+    def apply_bulk_trace(
+        self, session_id: str, rules: pb.BulkTraceRules, batch_id: str,
+        *, callback_source: str | None = None,
+    ) -> pb.BulkTraceReport:
+        """Apply rules with a caller-owned batch ID, such as uuid.uuid4().hex."""
+        request = pb.ApplyBulkTraceRequest(
+            session_id=session_id, rules=rules, batch_id=batch_id
+        )
+        if callback_source is not None:
+            request.callback_source = callback_source
+        return self.stub.ApplyBulkTrace(request, timeout=self.timeout)
+
+    def remove_bulk_trace(self, session_id: str, batch_id: str) -> pb.BulkTraceReport:
+        """Restore the probes owned by a retained batch in this session."""
+        return self.stub.RemoveBulkTrace(
+            pb.RemoveBulkTraceRequest(session_id=session_id, batch_id=batch_id),
+            timeout=self.timeout,
+        )
+
     def list_symbols(
         self,
         session_id: str,
@@ -321,6 +406,17 @@ class Client:
             timeout=self.timeout,
         )
         return response
+
+    def reload_probe(
+        self, session_id: str, probe_id: int, callback_source: str
+    ) -> pb.ReloadProbeResponse:
+        """Switch an active probe to a new observer generation."""
+        return self.stub.ReloadProbe(
+            pb.ReloadProbeRequest(
+                session_id=session_id, probe_id=probe_id, callback_source=callback_source
+            ),
+            timeout=self.timeout,
+        )
 
     def inject(
         self,

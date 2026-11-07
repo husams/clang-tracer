@@ -2,12 +2,14 @@
 #include "../prepared_contract.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -829,86 +831,255 @@ Collection EventBuffer::snapshot() const {
 
 Collection::~Collection() = default;
 
+namespace {
+using ProbeKey = std::tuple<std::string_view, std::string_view, std::uint64_t>;
+using TargetKey = std::pair<ProbeKey, std::uint32_t>;
+using CallKey = std::tuple<TargetKey, std::uint32_t, std::uint64_t>;
+
+struct CallPair {
+  const api::TraceEvent *pre = nullptr, *post = nullptr;
+  bool ambiguous = false;
+
+  void add(const api::TraceEvent &event) {
+    auto &half = event.phase() == api::PRE ? pre : post;
+    if (!half)
+      half = &event;
+    else if (!event.sequence() || event.sequence() != half->sequence())
+      ambiguous = true;
+  }
+
+  std::optional<std::uint64_t> duration() const {
+    if (ambiguous || !pre || !post || !pre->monotonic_time_ns() ||
+        post->monotonic_time_ns() < pre->monotonic_time_ns())
+      return std::nullopt;
+    return post->monotonic_time_ns() - pre->monotonic_time_ns();
+  }
+};
+
+struct CallCounts {
+  std::size_t paired = 0, missing_pre = 0, missing_post = 0, timed = 0;
+  std::size_t ambiguous = 0;
+
+  void add(const CallPair &pair, bool has_duration) {
+    paired += pair.pre && pair.post;
+    missing_pre += !pair.pre;
+    missing_post += !pair.post;
+    timed += has_duration;
+    ambiguous += pair.ambiguous;
+  }
+
+  std::size_t incomplete() const { return missing_pre + missing_post; }
+};
+
+// Upper-exclusive duration buckets, in nanoseconds.
+constexpr std::array<std::uint64_t, 8> duration_bounds{
+    100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000};
+
+using CallerKey = std::tuple<std::string_view, std::string_view, std::uint64_t,
+                             std::uint64_t>;
+
+struct FunctionStats {
+  std::string_view name;
+  CallCounts counts;
+  std::array<std::size_t, duration_bounds.size() + 1> histogram{};
+  std::map<CallerKey, std::size_t> callers;
+  std::size_t caller_unknown = 0;
+};
+
+std::string_view target_name(const api::TraceEvent *event) {
+  if (!event)
+    return {};
+  if (!event->function_name().empty())
+    return event->function_name();
+  if (event->stack().frames_size() &&
+      event->stack().frames(0).kind() == api::StackFrame::TARGET_ENTRY)
+    return event->stack().frames(0).function();
+  return {};
+}
+
+std::optional<CallerKey> direct_caller(const api::TraceEvent *event) {
+  if (!event)
+    return std::nullopt;
+  const auto &stack = event->stack();
+  if (stack.frames_size() < 2 ||
+      (stack.status() != api::StackTrace::COMPLETE &&
+       stack.status() != api::StackTrace::TRUNCATED &&
+       stack.status() != api::StackTrace::PARTIAL))
+    return std::nullopt;
+  const auto &entry = stack.frames(0);
+  const auto &caller = stack.frames(1);
+  if (entry.kind() != api::StackFrame::TARGET_ENTRY || !entry.pc() ||
+      caller.kind() != api::StackFrame::NATIVE || !caller.pc())
+    return std::nullopt;
+  // A filtered stack can hide the real caller. The entry frame and its
+  // immediate caller are one x86-64 return-address slot apart on the stack.
+  constexpr std::uint64_t return_address_size = 8;
+  if (stack.application_only() && stack.hidden_frames() &&
+      (!entry.stack_pointer() || caller.stack_pointer() <= entry.stack_pointer() ||
+       caller.stack_pointer() - entry.stack_pointer() != return_address_size))
+    return std::nullopt;
+  if (!caller.function().empty())
+    return CallerKey{caller.module(), caller.function(), 0, 0};
+  if (!caller.module().empty())
+    return CallerKey{caller.module(), {}, caller.module_offset(), 0};
+  return CallerKey{{}, {}, 0, caller.pc()};
+}
+
+std::string printable_stat_text(std::string_view text) {
+  std::string result(text);
+  for (char &ch : result) {
+    const auto byte = static_cast<unsigned char>(ch);
+    if (byte < 32 || byte == 127)
+      ch = '?';
+  }
+  return result;
+}
+
+void print_target(std::ostream &out, const TargetKey &key, std::string_view name) {
+  const auto &[probe_key, pid] = key;
+  const auto &[server, session, probe] = probe_key;
+  out << "function=" << std::quoted(printable_stat_text(name))
+      << " server=" << std::quoted(printable_stat_text(server))
+      << " session=" << std::quoted(printable_stat_text(session))
+      << " pid=" << pid << " probe=" << probe;
+}
+
+void print_function_stats(std::ostream &out, const TargetKey &key,
+                          const FunctionStats &stats) {
+  print_target(out, key, stats.name);
+  const auto &counts = stats.counts;
+  out << " calls=" << counts.paired + counts.incomplete()
+      << " paired=" << counts.paired << " timed=" << counts.timed
+      << " missing_pre=" << counts.missing_pre
+      << " missing_post=" << counts.missing_post
+      << " untimed_pairs=" << counts.paired - counts.timed
+      << " ambiguous=" << counts.ambiguous
+      << " caller_unknown=" << stats.caller_unknown << " histogram_ns=[";
+  bool first = true;
+  for (std::size_t i = 0; i < stats.histogram.size(); ++i) {
+    if (!stats.histogram[i])
+      continue;
+    if (!first)
+      out << ',';
+    first = false;
+    out << (i ? duration_bounds[i - 1] : 0);
+    if (i < duration_bounds.size())
+      out << ".." << duration_bounds[i] - 1;
+    else
+      out << '+';
+    out << ':' << stats.histogram[i];
+  }
+  out << "]\n";
+  for (const auto &[caller, count] : stats.callers) {
+    const auto &[module, function, offset, pc] = caller;
+    out << "edge ";
+    print_target(out, key, stats.name);
+    if (!module.empty())
+      out << " caller_module=" << std::quoted(printable_stat_text(module));
+    if (!function.empty())
+      out << " caller=" << std::quoted(printable_stat_text(function));
+    else if (!module.empty())
+      out << " caller_offset=0x" << std::hex << offset << std::dec;
+    else
+      out << " caller_pc=0x" << std::hex << pc << std::dec;
+    out << " calls=" << count << '\n';
+  }
+}
+} // namespace
+
 void event_statistics(const EventBuffer &buffer, std::ostream &out,
                       bool calls) {
-  using Key = std::tuple<std::string, std::string, std::uint64_t, std::uint32_t,
-                         std::uint64_t>;
-
-  struct Pair {
-    const api::TraceEvent *pre = nullptr, *post = nullptr;
-  };
-
-  std::map<Key, Pair> pairs;
-  using ProbeKey = std::tuple<std::string, std::string, std::uint64_t>;
+  std::map<CallKey, CallPair> pairs;
   std::map<ProbeKey, std::uint64_t> agent_losses;
-  std::map<std::string, std::uint64_t> server_losses;
-  std::uint64_t pre = 0, post = 0, other = 0, agent = 0, server = 0;
+  std::map<std::string_view, std::uint64_t> server_losses;
+  std::uint64_t pre = 0, post = 0, other = 0, unidentified = 0;
   for (const auto &item : buffer.events()) {
     const auto &e = item->message;
-    auto &probe_loss =
-        agent_losses[{e.server_instance_id(), e.session_id(), e.probe_id()}];
+    const ProbeKey probe{e.server_instance_id(), e.session_id(), e.probe_id()};
+    auto &probe_loss = agent_losses[probe];
     probe_loss = std::max(probe_loss, e.agent_dropped_events());
     auto &server_loss = server_losses[e.server_instance_id()];
     server_loss = std::max(server_loss, e.server_dropped_events());
-    if (!e.has_context() && (e.phase() == api::PRE || e.phase() == api::POST)) {
-      auto &pair = pairs[{e.server_instance_id(), e.session_id(), e.probe_id(),
-                          e.tid(), e.call_id()}];
-      if (e.phase() == api::PRE) {
-        pair.pre = &e;
-      }
-      if (e.phase() == api::POST) {
-        pair.post = &e;
-      }
+    pre += e.phase() == api::PRE;
+    post += e.phase() == api::POST;
+    other += e.phase() != api::PRE && e.phase() != api::POST;
+    if (e.has_context() || (e.phase() != api::PRE && e.phase() != api::POST))
+      continue;
+    if (e.session_id().empty() || !e.probe_id() || !e.tid() || !e.call_id()) {
+      ++unidentified;
+      continue;
     }
-    if (e.phase() == api::PRE) {
-      ++pre;
-    }
-    if (e.phase() == api::POST) {
-      ++post;
-    }
-    if (e.phase() != api::PRE && e.phase() != api::POST)
-      ++other;
+    pairs[{{probe, e.pid()}, e.tid(), e.call_id()}].add(e);
   }
-  const auto add_loss = [](std::uint64_t &total, std::uint64_t value) {
-    total = value > std::numeric_limits<std::uint64_t>::max() - total
-                ? std::numeric_limits<std::uint64_t>::max()
-                : total + value;
-  };
-  for (const auto &entry : agent_losses)
-    add_loss(agent, entry.second);
-  for (const auto &entry : server_losses)
-    add_loss(server, entry.second);
-  std::size_t matched = 0;
-  for (const auto &entry : pairs) {
-    const auto &pair = entry.second;
-    if (pair.pre && pair.post) {
-      ++matched;
+  const auto sum_losses = [](const auto &losses) {
+    std::uint64_t total = 0;
+    for (const auto &entry : losses) {
+      const auto remaining = std::numeric_limits<std::uint64_t>::max() - total;
+      total += std::min(remaining, entry.second);
     }
+    return total;
+  };
+
+  CallCounts counts;
+  std::map<TargetKey, FunctionStats> functions;
+  for (const auto &[key, pair] : pairs) {
+    const auto duration = pair.duration();
+    counts.add(pair, duration.has_value());
     if (calls) {
       const auto *e = pair.pre ? pair.pre : pair.post;
-      out << "session=" << e->session_id() << " probe=" << e->probe_id()
+      out << "session=" << printable_stat_text(e->session_id())
+          << " probe=" << e->probe_id()
           << " tid=" << e->tid() << " call=" << e->call_id()
           << " PRE=" << (pair.pre ? "present" : "missing")
           << " POST=" << (pair.post ? "present" : "missing");
-      if (pair.pre && pair.post && pair.pre->monotonic_time_ns() &&
-          pair.post->monotonic_time_ns() >= pair.pre->monotonic_time_ns()) {
-        out << " duration_ns="
-            << pair.post->monotonic_time_ns() - pair.pre->monotonic_time_ns();
-      }
+      if (duration)
+        out << " duration_ns=" << *duration;
+      if (pair.ambiguous)
+        out << " duplicate_phase=true";
       out << '\n';
+      continue;
     }
+    auto &function = functions[std::get<0>(key)];
+    if (function.name.empty()) {
+      function.name = target_name(pair.pre);
+      if (function.name.empty())
+        function.name = target_name(pair.post);
+    }
+    function.counts.add(pair, duration.has_value());
+    if (duration) {
+      const auto bucket = std::upper_bound(duration_bounds.begin(),
+                                           duration_bounds.end(), *duration);
+      ++function.histogram[bucket - duration_bounds.begin()];
+    }
+    // Both phases carry entry-stack evidence. A single phase can prove an edge.
+    auto caller = pair.ambiguous ? std::nullopt : direct_caller(pair.pre);
+    if (!caller && !pair.ambiguous)
+      caller = direct_caller(pair.post);
+    if (caller)
+      ++function.callers[*caller];
+    else
+      ++function.caller_unknown;
   }
   out << "received=" << buffer.received
       << " retained=" << buffer.events().size() << " bytes=" << buffer.bytes()
       << " evicted=" << buffer.evicted << " PRE=" << pre << " POST=" << post
-      << " other_phases=" << other << " paired=" << matched
-      << " incomplete=" << pairs.size() - matched << " lost(agent=" << agent
-      << ",server=" << server << ")\n";
+      << " other_phases=" << other << " paired=" << counts.paired
+      << " incomplete=" << counts.incomplete()
+      << " lost(agent=" << sum_losses(agent_losses)
+      << ",server=" << sum_losses(server_losses) << ')'
+      << " calls=" << counts.paired + counts.incomplete()
+      << " timed=" << counts.timed << " missing_pre=" << counts.missing_pre
+      << " missing_post=" << counts.missing_post
+      << " untimed_pairs=" << counts.paired - counts.timed
+      << " ambiguous=" << counts.ambiguous
+      << " unidentified_events=" << unidentified << '\n';
   if (calls) {
     out << "shared-context events retain invocation/task identities in event "
            "details; they are not "
            "paired by native thread/call fields\n";
   }
+  for (const auto &[key, stats] : functions)
+    print_function_stats(out, key, stats);
 }
 
 int create_recording(const std::string &path) {

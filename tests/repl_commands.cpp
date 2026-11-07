@@ -85,6 +85,15 @@ int main() {
   bad("%cpp import `cat flags.txt`");
   require(parse_command("%events show batch --index 0").kind ==
           CommandKind::event_show);
+  const auto draft_check = parse_command(
+      "%interceptor validate hook --target \"demo::compute(int)\" "
+      "--prepared-mode require");
+  require(draft_check.kind == CommandKind::draft_validate &&
+          draft_check.arguments.at(0) == "hook" &&
+          draft_check.option("--target") == "demo::compute(int)" &&
+          draft_check.option("--prepared-mode") == "require");
+  bad("%interceptor validate hook");
+  bad("%interceptor validate hook --target compute --stack-depth 4");
   bad("%attach 12345 trailing");
   bad("%probe inject \"unfinished --callback f.cpp");
   bad("%collect --count 3 --count 4");
@@ -106,5 +115,25 @@ int main() {
   bad("%events --probe 0");
   bad("%events --after 999999999999999999999999999999999");
   bad("%symbols --limit 4294967296");
+  require(parse_command("%threads").kind == CommandKind::threads);
+  require(parse_command("%modules --details").has("--details"));
+  require(parse_command("%attach 42 --start-time 100").number("--start-time", 0) == 100);
+  require(parse_command("%symbols --filter demo --addresses").has("--addresses"));
+  require(address_number(parse_command("%symbols --address 0x100a --mapping s:token")
+                             .option("--address")) == 0x100a);
+  bad("%attach 42 --start-time 0");
+  bad("%symbols --address 0x100a");
+  bad("%symbols --address 0x100a --mapping token --page other");
+  bad("%symbols --address 0xzz --mapping token");
+  bad("%symbols --address 18446744073709551616 --mapping token");
+  const auto bulk = parse_command(
+      "%trace preview --module 'lib*.so' --module target --include 'app::*' "
+      "--exclude 'app::detail::*' --exact 'app::run(int)' --save rules.textproto");
+  require(bulk.kind == CommandKind::bulk_preview && bulk.options.at("--module").size() == 2);
+  require(parse_command("%trace preview --manifest rules.textproto").has("--manifest"));
+  bad("%trace preview --exclude 'app::*'");
+  bad("%trace preview --manifest rules --exact 'app::run(int)'");
+  bad("%trace preview --include ''");
+  bad("%trace preview --include app --save one --save two");
   std::cout << "native REPL grammar checks passed\n";
 }

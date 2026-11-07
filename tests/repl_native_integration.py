@@ -1,5 +1,6 @@
 """Real Linux attach/deploy/collect/restore path for the native C++17 console."""
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -57,6 +58,7 @@ def main():
     for name in ("repl", "server", "target", "callback"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--bool-target")
+    parser.add_argument("--incompatible-agent")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="tracer-native-repl-") as directory:
         root = Path(directory)
@@ -67,7 +69,37 @@ def main():
             orphan_server_pid = None
             try:
                 source = root / "local callback.cpp"
-                source.write_text(Path(args.callback).read_text())
+                marker = root / "jit-initialized"
+                prelude = f'''#include <cstdio>
+#include <vector>
+#include <unistd.h>
+int observer_initialized = [] {{
+  if (auto* file = std::fopen({json.dumps(str(marker))}, "w"))
+    std::fclose(file);
+  return 1;
+}}();
+template <class T> T observe_lifetime(T value) {{
+  T destroyed = 0;
+  {{
+    struct Counter {{
+      T& output;
+      ~Counter() {{ ++output; }}
+    }} counter{{destroyed}};
+    std::vector<T> values{{value}};
+    if (values.at(0) != value) return 0;
+  }}
+  return destroyed;
+}}
+'''
+                body = Path(args.callback).read_text().replace(
+                    "void pre(const Call &call) {",
+                    """void pre(const Call &call) {
+    call.field("jit_target_pid", static_cast<int>(::getpid()));
+    call.field("jit_raii", observe_lifetime(call.arg<int>(0)));
+""",
+                    1,
+                )
+                source.write_text(prelude + body)
                 console = subprocess.Popen(
                     [args.repl, "--server", args.server, "--attach", str(target.pid), "--fail-fast"],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -85,18 +117,33 @@ def main():
                             return match
 
                 until(r"attached session=")
+                profile = until(r'target JIT runtime agent_build_id: "([0-9a-f]{40})"')
+                assert 'target_abi: "linux-x86-64-sysv"' in profile.string, profile.string
+                assert 'clang_version:' in profile.string and 'llvm_version:' in profile.string, profile.string
                 console.stdin.write(f'''%server status
 %symbols --filter Calculator --limit 10
 %interceptor load "{source}" --as hook
-%interceptor upload hook --target "Calculator::multiply(int, int) const" --stack-depth 8
+%interceptor validate hook --target "Calculator::multiply(int, int) const"
 ''')
                 console.stdin.flush()
-                probe = until(r"installed probe=(\d+)").group(1)
+                until(r"^success: true")
+                assert not marker.exists(), "validation ran the observer initializer"
+                console.stdin.write(
+                    '%interceptor upload hook --target "Calculator::multiply(int, int) const" --stack-depth 8\n'
+                )
+                console.stdin.flush()
+                install = until(
+                    r"installed probe=(\d+).*resolve_ns=([1-9]\d*) "
+                    r"jit_compile_ns=([1-9]\d*) patch_install_ns=([1-9]\d*)"
+                )
+                probe = install.group(1)
+                assert marker.exists(), "activation did not run the observer initializer"
                 recording = root / "capture.pb"
                 console.stdin.write(f'''%collect --count 6 --timeout 10 --as batch
 %events list batch --limit 2
 %events show batch --index 1
 %events calls batch
+%events stats batch
 auto captured = tracer.batch("batch");
 std::cout << "native-bare-print-start" << std::endl;
 tracer.print(captured.at(0))
@@ -129,9 +176,39 @@ try {{ tracer.detach(saved_session); std::cout << "stale-detach-accepted" << std
                     assert expected in text, (text, stderr)
                 bare_print = text.split("native-bare-print-start\n", 1)[1].split("native-bare-print-end", 1)[0]
                 assert "phase: PRE" in bare_print and "object_fields {" in bare_print, bare_print
+                assert re.search(rf'name: "jit_target_pid"\s+value \{{\s+type: INT32\s+signed_value: {target.pid}\b', bare_print), bare_print
+                assert re.search(r'name: "jit_raii"\s+value \{\s+type: INT32\s+signed_value: 1\b', bare_print), bare_print
                 assert "T result_as() const" in text and "  result_as\n" in text, text
                 assert target.poll() is None, "tracing terminated the application"
                 assert recording.stat().st_size > 0
+                live_cursor = re.search(r"^received=6 cursor=(\d+).*collection=batch ", text, re.M)
+                saved_cursor = re.search(r"^received=6 cursor=(\d+).*recording=", text, re.M)
+                assert live_cursor and saved_cursor and live_cursor[1] == saved_cursor[1], text
+                rows = [line for line in text.splitlines()
+                        if line.startswith(('function="', 'edge function="'))]
+                assert len(rows) == 4 and rows[:2] == rows[2:], rows
+                assert "calls=3 paired=3 timed=3 missing_pre=0 missing_post=0" in rows[0], rows
+                assert "caller_unknown=0 histogram_ns=[" in rows[0], rows
+                assert re.search(r'caller="main" calls=3$', rows[1]), rows
+                buckets = rows[0].split("histogram_ns=[", 1)[1].rstrip("]")
+                assert sum(int(bucket.split(":")[1]) for bucket in buckets.split(",")) == 3, rows
+                offline = subprocess.run(
+                    [args.repl, "--fail-fast"],
+                    input=f'%events open "{recording}" --as replay\n%events stats replay\n%quit\n',
+                    text=True, capture_output=True, timeout=15)
+                assert offline.returncode == 0, (offline.stdout, offline.stderr)
+                assert [line for line in offline.stdout.splitlines()
+                        if line.startswith(('function="', 'edge function="'))] == rows[:2], offline.stdout
+                if args.incompatible_agent:
+                    incompatible = subprocess.run(
+                        [args.repl, "--server", args.server, "--agent",
+                         args.incompatible_agent, "--attach", str(target.pid), "--fail-fast"],
+                        input="%quit\n", text=True, capture_output=True, timeout=45)
+                    assert incompatible.returncode != 0, incompatible.stdout
+                    assert "loaded agent has no JIT runtime profile handshake" in incompatible.stderr, (
+                        incompatible.stdout, incompatible.stderr)
+                    status = Path(f"/proc/{target.pid}/status").read_text()
+                    assert re.search(r"^TracerPid:\s+0$", status, re.MULTILINE), status
                 # Name attach exercises the integrated process lookup and quit cleanup.
                 selected = subprocess.run(
                     [args.repl, "--server", args.server, "--process", os.path.realpath(args.target), "--fail-fast"],

@@ -219,6 +219,52 @@ function(tracer_add_native_repl)
         $<TARGET_FILE:clang-tracer-repl>)
     set_tests_properties(native_repl_header_reuse PROPERTIES TIMEOUT 240)
     if(NOT TRACER_REPL_ONLY)
+      add_executable(repl-browser-target tests/fixtures/repl_browser.cpp)
+      target_link_libraries(repl-browser-target PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+      target_compile_options(repl-browser-target PRIVATE -g -O0 -fno-omit-frame-pointer)
+      add_test(NAME native_repl_browser_integration
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_browser_integration.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:repl-browser-target> $<TARGET_FILE:call-stacks-calculator>)
+      set_tests_properties(native_repl_browser_integration PROPERTIES TIMEOUT 100)
+      add_executable(repl-memory-target tests/fixtures/repl_memory.cpp)
+      add_test(NAME native_repl_memory_integration
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_memory_integration.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:repl-memory-target>)
+      set_tests_properties(native_repl_memory_integration PROPERTIES TIMEOUT 100)
+      add_executable(repl-entry-target tests/fixtures/repl_entry.cpp)
+      target_compile_options(repl-entry-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none -fPIE)
+      target_link_options(repl-entry-target PRIVATE -pie "LINKER:--build-id=sha1")
+      add_test(NAME native_repl_entry_integration
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_entry_integration.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:repl-entry-target> "${CMAKE_OBJCOPY}" "${CMAKE_NM}")
+      set_tests_properties(native_repl_entry_integration PROPERTIES TIMEOUT 100)
+      add_executable(repl-reload-target tests/fixtures/repl_reload.cpp)
+      target_compile_options(repl-reload-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
+      target_link_libraries(repl-reload-target PRIVATE Threads::Threads)
+      add_test(NAME native_repl_reload_integration
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_reload_integration.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:repl-reload-target>)
+      set_tests_properties(native_repl_reload_integration PROPERTIES TIMEOUT 240)
+      add_executable(repl-bulk-concrete-target
+        examples/prepared-injectors/concrete/target.cpp
+        examples/prepared-injectors/concrete/virtual.cpp)
+      target_compile_options(repl-bulk-concrete-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
+      add_test(NAME native_repl_bulk_preview
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_bulk_preview.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:cpp-name-fixture> $<TARGET_FILE:repl-bulk-concrete-target>
+          $<TARGET_FILE:repl-browser-target> $<TARGET_FILE:call-stacks-calculator>
+          "${CMAKE_OBJCOPY}")
+      set_tests_properties(native_repl_bulk_preview PROPERTIES TIMEOUT 120)
+      add_test(NAME native_repl_bulk_apply
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_bulk_apply.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:cpp-name-fixture>)
+      set_tests_properties(native_repl_bulk_apply PROPERTIES TIMEOUT 120)
       add_test(NAME native_repl_prepared_integration
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_prepared_integration.py"
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
@@ -265,6 +311,7 @@ function(tracer_add_native_repl)
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
           --target $<TARGET_FILE:cpp-interceptors-target>
           --bool-target $<TARGET_FILE:signature-interceptor-fixture>
+          --incompatible-agent $<TARGET_FILE:call-stacks-calculator>
           --callback "${CMAKE_CURRENT_SOURCE_DIR}/examples/cpp-interceptors/method.cpp")
       set_tests_properties(native_repl_integration PROPERTIES TIMEOUT 240)
       add_test(NAME native_repl_complex_integration

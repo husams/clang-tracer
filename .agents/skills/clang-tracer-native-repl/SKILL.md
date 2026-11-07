@@ -1,6 +1,6 @@
 ---
 name: clang-tracer-native-repl
-description: Use clang-tracer-repl for native C++ tracing, prepared probes, typed event inspection, SQLite recording and offline replay, and reusable .repl scripts. Use for native tracing and replay unless the user requests the Python client.
+description: Use clang-tracer-repl for native C++ tracing, prepared probes, bulk tracing, observer reload, read-only target inspection, typed SQLite recording and offline replay, and reusable .repl scripts. Use for native tracing and replay unless the user requests the Python client.
 ---
 
 # Clang Tracer native REPL
@@ -62,6 +62,68 @@ When verifying a run, check that injection reports an installed probe and
 that collection received the expected events before indexing it. Report the
 actual working directory and generated paths printed for that run. `%quit` or
 EOF detaches sessions owned by this REPL and stops its owned server.
+
+## Browse, inspect, and trace a local target
+
+Use a matching REPL, server, and agent on Linux x86-64. Use `%processes --filter TEXT`
+to identify the target, `%attach PID --start-time TICKS` to guard against PID
+reuse, and `%sessions` to check the target's JIT runtime profile. Browse the
+selected target with:
+
+```text
+%threads
+%modules --details
+%symbols --filter Calculator --addresses
+%symbols --address 0xADDRESS --mapping TOKEN
+```
+
+Use the runtime address and mapping token from the same session. Refresh the
+lookup after the target's mappings change. To compile and link a named draft
+before installing a probe, use `%interceptor load observer.cpp --as observer`
+then `%interceptor validate observer --target "Calculator::multiply(int, int) const"`.
+
+Preview bulk selections and check the reported match status and retained slots
+before applying the manifest:
+
+```text
+%trace preview --module "libapp*" --include "app::*" --exclude "app::detail::*" --save trace.textproto
+%trace apply --manifest trace.textproto
+%trace remove BATCH_ID
+```
+
+Use `--exact "full C++ signature"` to select a specific overload. Apply resolves
+the manifest again and installs typed PRE/POST observers. Every match must be
+DWARF-supported and available for a new probe. Use `--callback FILE` to compile
+a custom observer for each match. Keep the reported batch ID to remove its probes
+or retry any incomplete restoration.
+
+Use `%probe reload PROBE_ID --callback observer-v2.cpp` to update an active
+observer while keeping its binding and deployment options. A rejected callback
+leaves the existing observer active. Calls already in flight finish under the
+old ID. Use the new ID for subsequent filtering or removal, and check `%probes`
+if the reload reply was interrupted. Retired generations still count toward
+the target's retained-probe limit.
+
+Use `%events stats NAME` on live or replayed collections for per-probe counts,
+duration histograms, and caller edges. Caller edges require captured entry stacks.
+
+For read-only inspection, get a memory snapshot token from `%memory maps`:
+
+```text
+%memory maps
+%memory read 0xADDRESS --mapping TOKEN --count 32
+%memory scan 0xADDRESS --mapping TOKEN --count 4096 --pattern "48 8? ?? ff" --limit 16
+%probe entry "Calculator::multiply(int, int) const" --mapping TOKEN
+```
+
+Use addresses from readable ranges for reads and scans. Reads support up to
+64 KiB or one little-endian scalar via `--type`. Scans support up to 1 MiB and
+wildcard nibbles. Refresh the snapshot after a mapping or permission change.
+An entry preview verifies live bytes against the mapped ELF, disassembles up
+to 64 bytes, and reports the copy-only patch window. For an explicit entry,
+pass the exact module path, a link-time ELF virtual address with `--elf-address`,
+and `--abi linux-x86-64-sysv`. See `%help memory scan` or `%help probe entry`
+for the installed syntax.
 
 ## Choose the capture path
 

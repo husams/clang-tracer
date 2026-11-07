@@ -59,6 +59,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitThreads(TracerCommandsParser::ThreadsContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitSymbols(TracerCommandsParser::SymbolsContext *ctx) override {
     return visitChildren(ctx);
   }
@@ -127,11 +131,31 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitBulkTrace(TracerCommandsParser::BulkTraceContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitBulkTraceOption(TracerCommandsParser::BulkTraceOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitValue(TracerCommandsParser::ValueContext *ctx) override {
     return visitChildren(ctx);
   }
 
   virtual std::any visitKeyword(TracerCommandsParser::KeywordContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitMemory(TracerCommandsParser::MemoryContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitProbeEntry(TracerCommandsParser::ProbeEntryContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitProbeReload(TracerCommandsParser::ProbeReloadContext *ctx) override {
     return visitChildren(ctx);
   }
 

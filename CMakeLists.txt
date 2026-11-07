@@ -87,8 +87,8 @@ target_link_libraries(tracer_grpc PUBLIC tracer_proto gRPC::grpc++)
 
 add_library(clang_tracer_agent SHARED src/agent.cpp src/native_detour.cpp
   src/value_snapshot_codegen.cpp src/value_snapshot_storage.cpp src/callback_pch.cpp
-  src/debug_resolver.cpp src/native_stack.cpp
-  src/event_transport.cpp src/context_agent_delivery.cpp)
+  src/debug_resolver.cpp src/native_stack.cpp src/event_transport.cpp
+  src/context_agent_delivery.cpp src/agent_runtime_profile.cpp)
 target_include_directories(clang_tracer_agent PRIVATE include ${TRACER_PROTO_DIR} ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_compile_definitions(clang_tracer_agent PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
 target_link_libraries(clang_tracer_agent PRIVATE tracer_context_engine tracer_context_analysis tracer_proto clang-cpp LLVM ${CMAKE_DL_LIBS} Threads::Threads)
@@ -97,7 +97,7 @@ target_compile_options(clang_tracer_agent PRIVATE -Wall -Wextra -Wpedantic)
 # --exclude-libs,ALL would also hide the required pthread detour entry point
 # from tracer_context_engine; the version script preserves that exact export.
 target_link_options(clang_tracer_agent PRIVATE
-  "LINKER:--no-undefined,-Bsymbolic,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/agent_exports.map")
+  "LINKER:--no-undefined,-Bsymbolic,--build-id=sha1,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/agent_exports.map")
 set_property(TARGET clang_tracer_agent APPEND PROPERTY LINK_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/agent_exports.map
   ${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckAgentSymbols.cmake)
@@ -108,7 +108,7 @@ add_custom_command(TARGET clang_tracer_agent POST_BUILD
   VERBATIM)
 
 add_executable(clang-tracer-server src/main.cpp src/server.cpp src/session.cpp src/injector.cpp src/admission.cpp
-  src/debug_resolver.cpp src/header_context.cpp)
+  src/debug_resolver.cpp src/header_context.cpp src/process_memory.cpp src/native_entry.cpp)
 target_include_directories(clang-tracer-server PRIVATE include ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_compile_definitions(clang-tracer-server PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
 target_link_libraries(clang-tracer-server PRIVATE tracer_grpc tracer_context_collector
@@ -166,6 +166,10 @@ add_executable(order-arguments-target examples/order-arguments/target.cpp)
 target_compile_options(order-arguments-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
 
 add_library(call-stacks-calculator SHARED examples/call-stacks/calculator.cpp)
+if(BUILD_TESTING)
+  # Also use this as a valid ELF without the agent handshake in the REPL test.
+  target_link_options(call-stacks-calculator PRIVATE "LINKER:--build-id=sha1")
+endif()
 target_compile_options(call-stacks-calculator PRIVATE -g -O0 -fomit-frame-pointer
   -fno-optimize-sibling-calls -fasynchronous-unwind-tables -fcf-protection=none)
 add_library(call-stacks-no-cfi OBJECT examples/call-stacks/no_cfi.cpp)

@@ -1,5 +1,6 @@
 #include "controller.hpp"
 #include "../prepared_contract.hpp"
+#include "../proc_identity.hpp"
 #include "../sqlite_events.hpp"
 
 #include <algorithm>
@@ -7,12 +8,16 @@
 #include <utility>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <limits>
+#include <random>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <cctype>
 #include <cstdlib>
@@ -22,6 +27,9 @@
 #include <system_error>
 
 #include <grpcpp/grpcpp.h>
+#include <google/protobuf/io/zero_copy_stream_impl.h>
+#include <google/protobuf/text_format.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include "background_events.hpp"
@@ -35,6 +43,178 @@ static_assert(std::atomic<bool>::is_always_lock_free,
 std::atomic<bool> interrupted{false};
 
 namespace {
+std::string printable_proc_text(std::string value) {
+  for (char &ch : value) {
+    const auto byte = static_cast<unsigned char>(ch);
+    if (byte < 32 || byte == 127)
+      ch = '?';
+  }
+  return value;
+}
+
+std::size_t memory_scalar_size(std::string_view type) {
+  if (type == "u8" || type == "i8")
+    return 1;
+  if (type == "u16" || type == "i16")
+    return 2;
+  if (type == "u32" || type == "i32" || type == "f32")
+    return 4;
+  if (type == "u64" || type == "i64" || type == "f64")
+    return 8;
+  throw std::invalid_argument("expected u8/u16/u32/u64, i8/i16/i32/i64, f32 or f64");
+}
+
+template <typename Float, typename Bits>
+void print_memory_float(std::ostream &out, Bits bits) {
+  static_assert(sizeof(Float) == sizeof(Bits) && std::numeric_limits<Float>::is_iec559);
+  Float value;
+  std::memcpy(&value, &bits, sizeof(value));
+  out << std::setprecision(std::numeric_limits<Float>::max_digits10) << value;
+}
+
+void print_memory_scalar(std::ostream &out, std::uint64_t address,
+                         std::string_view bytes, std::string_view type) {
+  std::uint64_t bits = 0;
+  for (std::size_t i = 0; i < bytes.size(); ++i)
+    bits |= static_cast<std::uint64_t>(static_cast<unsigned char>(bytes[i])) << (8 * i);
+  std::ostringstream result;
+  result << "0x" << std::hex << address << std::dec << ' ' << type << '=';
+  if (type == "f32") {
+    print_memory_float<float>(result, static_cast<std::uint32_t>(bits));
+  } else if (type == "f64") {
+    print_memory_float<double>(result, bits);
+  } else if (type.front() == 'i') {
+    const auto width = bytes.size() * 8;
+    const auto mask = UINT64_MAX >> (64 - width);
+    const auto sign = std::uint64_t{1} << (width - 1);
+    const auto value = bits & sign ? -1 - static_cast<std::int64_t>(mask ^ bits)
+                                   : static_cast<std::int64_t>(bits);
+    result << value;
+  } else {
+    result << bits;
+  }
+  out << result.str() << '\n';
+}
+
+void print_memory_dump(std::ostream &out, std::uint64_t address, std::string_view bytes) {
+  constexpr std::size_t row_width = 16;
+  std::ostringstream dump;
+  dump << std::hex << std::setfill('0');
+  for (std::size_t offset = 0; offset < bytes.size(); offset += row_width) {
+    const auto row = bytes.substr(offset, row_width);
+    dump << "0x" << address + offset << "  ";
+    for (std::size_t i = 0; i < row_width; ++i) {
+      if (i < row.size())
+        dump << std::setw(2) << static_cast<unsigned>(static_cast<unsigned char>(row[i])) << ' ';
+      else
+        dump << "   ";
+    }
+    dump << " |";
+    for (const unsigned char ch : row)
+      dump << (ch >= 32 && ch <= 126 ? static_cast<char>(ch) : '.');
+    dump << "|\n";
+  }
+  out << dump.str();
+}
+
+std::pair<std::string, std::string> parse_memory_pattern(std::string_view text) {
+  const auto parse_bytes = [](std::string_view source, bool wildcards) {
+    std::istringstream input{std::string(source)};
+    std::string token, bytes, mask;
+    while (input >> token) {
+      if (token.size() != 2)
+        throw std::invalid_argument("memory pattern needs two hex digits or wildcards per byte");
+      if (bytes.size() == 256)
+        throw std::invalid_argument("memory pattern must be at most 256 bytes");
+      unsigned value = 0, bits = 0;
+      for (const unsigned char ch : token) {
+        value <<= 4;
+        bits <<= 4;
+        if (wildcards && ch == '?')
+          continue;
+        const auto nibble = std::string_view("0123456789abcdef").find(
+            static_cast<char>(std::tolower(ch)));
+        if (nibble == std::string_view::npos)
+          throw std::invalid_argument("invalid hex digit in memory pattern or mask");
+        value |= static_cast<unsigned>(nibble);
+        bits |= 0xf;
+      }
+      bytes.push_back(static_cast<char>(value));
+      mask.push_back(static_cast<char>(bits));
+    }
+    if (bytes.empty())
+      throw std::invalid_argument("memory pattern and explicit mask must be nonempty");
+    return std::make_pair(std::move(bytes), std::move(mask));
+  };
+  const auto colon = text.find(':');
+  auto [pattern, mask] = parse_bytes(text.substr(0, colon), true);
+  if (colon != std::string_view::npos) {
+    const auto explicit_mask = parse_bytes(text.substr(colon + 1), false).first;
+    if (explicit_mask.size() != pattern.size())
+      throw std::invalid_argument("memory pattern and explicit mask must have the same length");
+    for (std::size_t i = 0; i < mask.size(); ++i)
+      mask[i] = static_cast<char>(mask[i] & explicit_mask[i]);
+  }
+  return {std::move(pattern), std::move(mask)};
+}
+
+void save_bulk_manifest(const std::string &path, const api::BulkTraceRules &rules) {
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (fd < 0)
+    throw std::system_error(errno, std::generic_category(),
+                            "cannot create new bulk trace manifest " + path);
+  google::protobuf::io::FileOutputStream stream(fd);
+  stream.SetCloseOnDelete(true);
+  const bool printed = google::protobuf::TextFormat::Print(rules, &stream);
+  stream.SetCloseOnDelete(false);
+  const bool closed = stream.Close();
+  if (!printed || !closed) {
+    ::unlink(path.c_str());
+    throw std::runtime_error("cannot write bulk trace manifest: " + path);
+  }
+}
+
+api::BulkTraceRules read_bulk_manifest(const std::string &path) {
+  api::BulkTraceRules rules;
+  if (!google::protobuf::TextFormat::ParseFromString(read_source(path), &rules))
+    throw std::invalid_argument("invalid bulk trace manifest: " + path);
+  return rules;
+}
+
+std::string new_bulk_batch_id() {
+  std::random_device random;
+  std::uniform_int_distribution<unsigned> nibble(0, 15);
+  std::string id(32, '0');
+  for (auto &ch : id)
+    ch = "0123456789abcdef"[nibble(random)];
+  return id;
+}
+
+void print_bulk_report(std::ostream &out, const char *operation,
+                       const api::BulkTraceReport &report) {
+  for (const auto &row : report.entries()) {
+    const auto &function = row.function();
+    out << api::BulkTraceEntry::Status_Name(row.status()) << ' '
+        << std::quoted(printable_proc_text(function.selector().empty()
+                           ? function.linkage_symbol() : function.selector()));
+    if (!function.module_path().empty())
+      out << " module=" << std::quoted(printable_proc_text(function.module_path()));
+    if (row.has_probe())
+      out << " probe=" << row.probe().id()
+          << " restored=" << (row.probe().original_bytes_restored() ? "true" : "false");
+    if (!row.diagnostic().empty())
+      out << " reason=" << std::quoted(printable_proc_text(row.diagnostic()));
+    out << '\n';
+  }
+  for (const auto &selector : report.unmatched_exact_selectors())
+    out << "UNMATCHED " << std::quoted(printable_proc_text(selector)) << '\n';
+  out << "bulk " << operation << " batch=" << report.batch_id()
+      << " complete=" << (report.complete() ? "true" : "false");
+  if (report.has_available_slots())
+    out << " available=" << report.available_slots();
+  out << '\n';
+}
+
 template <class Response, class Call>
 Response unary(Call call, unsigned timeout = 30) {
   grpc::ClientContext context;
@@ -286,7 +466,9 @@ void Controller::require_session(const SessionHandle &session) {
   throw std::runtime_error("session is no longer attached: " + session.id);
 }
 
-SessionHandle Controller::attach(std::uint32_t pid) {
+SessionHandle Controller::attach(std::uint32_t pid,
+                                 std::uint64_t expected_start_time,
+                                 const std::string &expected_executable) {
   if (!pid || pid > INT32_MAX) {
     throw std::invalid_argument("PID must be positive and fit a native PID");
   }
@@ -301,6 +483,9 @@ SessionHandle Controller::attach(std::uint32_t pid) {
       [&](auto &c, auto &r) { return stub_->ListSessions(&c, list, &r); });
   for (const auto &s : before.sessions()) {
     if (s.pid() == pid && s.state() == api::Session::ATTACHED) {
+      if ((expected_start_time && s.process_start_time() != expected_start_time) ||
+          (!expected_executable.empty() && s.executable() != expected_executable))
+        throw std::runtime_error("target identity changed; refresh process selection");
       selected_ = {s.id(), s.pid(), connection_};
       out_ << "selected existing session=" << s.id() << " pid=" << pid << '\n';
       return selected_;
@@ -308,6 +493,8 @@ SessionHandle Controller::attach(std::uint32_t pid) {
   }
   api::AttachRequest request;
   request.set_pid(pid);
+  request.set_expected_process_start_time(expected_start_time);
+  request.set_expected_executable(expected_executable);
   out_ << "attaching pid=" << pid << " endpoint=" << endpoint_ << " ...\n"
        << std::flush;
   grpc::ClientContext context;
@@ -344,9 +531,18 @@ SessionHandle Controller::attach(std::uint32_t pid) {
     throw std::runtime_error("attach did not complete; session=" +
                              response.id() + " " + response.error());
   }
+  if ((expected_start_time && response.process_start_time() != expected_start_time) ||
+      (!expected_executable.empty() && response.executable() != expected_executable)) {
+    detach({response.id(), response.pid(), connection_});
+    throw std::runtime_error("server did not confirm the selected target identity");
+  }
   selected_ = {response.id(), response.pid(), connection_};
   out_ << "attached session=" << selected_.id << " pid=" << selected_.pid
        << '\n';
+  if (response.has_jit_runtime()) {
+    out_ << "target JIT runtime " << response.jit_runtime().ShortDebugString()
+         << '\n';
+  }
   return selected_;
 }
 
@@ -491,7 +687,10 @@ std::uint64_t Controller::inject(const SessionHandle &session,
                                  const std::string &source,
                                  const Command &options) {
   require_session(session);
+  const auto resolve_started = std::chrono::steady_clock::now();
   auto spec = resolve_for(session, selector, options);
+  const auto resolve_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - resolve_started).count();
   spec.set_callback_source(source);
   spec.set_stack_depth(
       static_cast<unsigned>(options.number("--stack-depth", 0)));
@@ -515,7 +714,12 @@ std::uint64_t Controller::inject(const SessionHandle &session,
       artifact.SerializeAsString() == package->second.artifact.SerializeAsString())
     pending_imports_.push_back(tracer::prepared::adapter_source(package->second.artifact));
   out_ << "installed probe=" << result.id()
-       << " session=" << result.session_id() << '\n';
+       << " session=" << result.session_id();
+  if (result.jit_compile_ns() && result.patch_install_ns())
+    out_ << " resolve_ns=" << resolve_ns
+         << " jit_compile_ns=" << result.jit_compile_ns()
+         << " patch_install_ns=" << result.patch_install_ns();
+  out_ << '\n';
   return result.id();
 }
 
@@ -833,14 +1037,14 @@ EventRange Controller::events_async(const SessionHandle& session, std::uint64_t 
   return EventRange(std::move(state));
 }
 
-std::vector<std::pair<unsigned, std::string>>
+std::vector<Controller::ProcessChoice>
 Controller::processes(const std::string &filter) const {
 #ifdef __linux__
   if (server_.pid() < 0) {
     throw std::runtime_error("process listing is local-owned-server only; "
                              "remote attach requires an explicit PID");
   }
-  std::vector<std::pair<unsigned, std::string>> result;
+  std::vector<ProcessChoice> result;
   for (const auto &entry : std::filesystem::directory_iterator("/proc")) {
     const auto name = entry.path().filename().string();
     if (name.empty() ||
@@ -853,22 +1057,26 @@ Controller::processes(const std::string &filter) const {
         pid == static_cast<unsigned>(server_.pid())) {
       continue;
     }
-    std::error_code error;
-    const auto executable =
-        std::filesystem::read_symlink(entry.path() / "exe", error).string();
-    if (error ||
-        (!filter.empty() && executable.find(filter) == std::string::npos)) {
-      continue;
-    }
-    std::ifstream input(entry.path() / "cmdline", std::ios::binary);
-    std::string command;
-    std::getline(input, command);
-    std::replace(command.begin(), command.end(), '\0', ' ');
-    if (!command.empty()) {
-      result.emplace_back(pid, std::move(command));
+    try {
+      const auto start = tracer::proc::start_time(entry.path() / "stat");
+      std::error_code error;
+      auto executable =
+          std::filesystem::read_symlink(entry.path() / "exe", error).string();
+      if (error || executable.find(filter) == std::string::npos)
+        continue;
+      std::ifstream input(entry.path() / "cmdline", std::ios::binary);
+      std::string command(4096, '\0');
+      input.read(command.data(), command.size());
+      command.resize(input.gcount());
+      std::replace(command.begin(), command.end(), '\0', ' ');
+      if (tracer::proc::start_time(entry.path() / "stat") == start)
+        result.push_back({pid, start, std::move(executable), std::move(command)});
+    } catch (const std::runtime_error &) {
+      // A process may exit or become inaccessible while reading /proc.
     }
   }
-  std::sort(result.begin(), result.end());
+  std::sort(result.begin(), result.end(),
+            [](const auto &left, const auto &right) { return left.pid < right.pid; });
   return result;
 #else
   (void)filter;
@@ -885,23 +1093,142 @@ void Controller::select_process(
   if (choices.empty()) {
     throw std::runtime_error("no matching processes");
   }
-  if (choices.size() == 1) {
-    attach(choices[0].first);
-    return;
+  auto selected = choices.begin();
+  if (choices.size() > 1) {
+    for (const auto &choice : choices)
+      out_ << choice.pid << " start=" << choice.start_time << " exe="
+           << std::quoted(printable_proc_text(choice.executable)) << " "
+           << printable_proc_text(choice.command) << '\n';
+    const auto choice = read("Attach PID (empty cancels)> ");
+    if (choice.empty())
+      return;
+    const auto pid = unsigned_number(choice, "PID", INT32_MAX);
+    selected = std::find_if(choices.begin(), choices.end(),
+                            [&](const auto &p) { return p.pid == pid; });
+    if (selected == choices.end())
+      throw std::invalid_argument("PID was not in the displayed process list");
   }
-  for (const auto &choice : choices) {
-    out_ << choice.first << "  " << choice.second << '\n';
+  const auto proc = tracer::proc::directory(selected->pid);
+  if (tracer::proc::start_time(proc / "stat") != selected->start_time ||
+      std::filesystem::read_symlink(proc / "exe") != selected->executable)
+    throw std::runtime_error("target identity changed; refresh process selection");
+  attach(selected->pid, selected->start_time, selected->executable);
+}
+
+void Controller::preview_bulk_trace(const Command &command) {
+  require_session(selected_);
+  api::PreviewBulkTraceRequest request;
+  request.set_session_id(selected_.id);
+  auto &rules = *request.mutable_rules();
+  if (command.has("--manifest")) {
+    rules = read_bulk_manifest(command.option("--manifest"));
+  } else {
+    rules.set_version(1);
+    const auto copy = [&](const char *option, auto *field) {
+      const auto values = command.options.find(option);
+      if (values != command.options.end())
+        for (const auto &value : values->second)
+          *field->Add() = value;
+    };
+    copy("--module", rules.mutable_module_globs());
+    copy("--include", rules.mutable_include_globs());
+    copy("--exclude", rules.mutable_exclude_globs());
+    copy("--exact", rules.mutable_exact_selectors());
   }
-  const auto choice = read("Attach PID (empty cancels)> ");
-  if (choice.empty()) {
-    return;
+  grpc::ClientContext context;
+  context.set_deadline(std::chrono::system_clock::now() +
+                       std::chrono::seconds(settings_.timeout_seconds));
+  Cancellation cancellation(context);
+  api::PreviewBulkTraceResponse response;
+  const auto status = stub_->PreviewBulkTrace(&context, request, &response);
+  if (!status.ok())
+    throw std::runtime_error("bulk trace preview: " + status.error_message());
+
+  unsigned supported = 0;
+  for (const auto &candidate : response.candidates()) {
+    const auto &function = candidate.function();
+    out_ << api::BulkTraceCandidate::AbiStatus_Name(candidate.abi_status()) << " ";
+    if (function.runtime_address())
+      out_ << "address=0x" << std::hex << function.runtime_address() << std::dec;
+    else
+      out_ << "address=unavailable";
+    out_ << " " << std::quoted(printable_proc_text(function.selector()))
+         << " module=" << std::quoted(printable_proc_text(function.module_path()));
+    if (!candidate.diagnostic().empty())
+      out_ << " reason=" << std::quoted(printable_proc_text(candidate.diagnostic()));
+    out_ << '\n';
+    if (candidate.abi_status() == api::BulkTraceCandidate::DWARF_SUPPORTED)
+      ++supported;
   }
-  const auto pid = unsigned_number(choice, "PID", INT32_MAX);
-  if (std::none_of(choices.begin(), choices.end(),
-                   [&](const auto &p) { return p.first == pid; })) {
-    throw std::invalid_argument("PID was not in the displayed process list");
+  for (const auto &selector : response.unmatched_exact_selectors())
+    out_ << "UNMATCHED " << std::quoted(printable_proc_text(selector))
+         << " reason=\"no matching concrete entry after module and exclusion rules\"\n";
+  out_ << "dry-run matched=" << response.candidates_size()
+       << " dwarf_supported=" << supported
+       << " limit=" << response.retained_limit()
+       << " session_retained=" << response.session_retained();
+  if (response.has_available_slots())
+    out_ << " agent_retained=" << response.agent_retained()
+         << " available=" << response.available_slots()
+         << " fits=" << (supported <= response.available_slots() ? "yes" : "no");
+  else
+    out_ << " available=unknown fits=unknown";
+  out_ << '\n';
+  if (command.has("--save")) {
+    const auto path = command.option("--save");
+    save_bulk_manifest(path, rules);
+    out_ << "manifest=" << std::quoted(printable_proc_text(path)) << '\n';
   }
-  attach(static_cast<unsigned>(pid));
+}
+
+void Controller::apply_bulk_trace(const Command &command) {
+  require_session(selected_);
+  api::ApplyBulkTraceRequest request;
+  request.set_session_id(selected_.id);
+  *request.mutable_rules() = read_bulk_manifest(command.option("--manifest"));
+  if (command.has("--callback"))
+    request.set_callback_source(read_source(command.option("--callback")));
+  request.set_batch_id(new_bulk_batch_id());
+  out_ << "bulk apply starting batch=" << request.batch_id() << std::endl;
+
+  grpc::ClientContext context;
+  context.set_deadline(std::chrono::system_clock::now() +
+                       std::chrono::seconds(settings_.timeout_seconds));
+  Cancellation cancellation(context);
+  api::BulkTraceReport report;
+  const auto status = stub_->ApplyBulkTrace(&context, request, &report);
+  if (!status.ok()) {
+    auto message = "bulk trace apply: " + status.error_message();
+    if (status.error_code() == grpc::StatusCode::CANCELLED ||
+        status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED ||
+        status.error_code() == grpc::StatusCode::UNAVAILABLE ||
+        status.error_code() == grpc::StatusCode::UNKNOWN ||
+        status.error_code() == grpc::StatusCode::INTERNAL)
+      message += " | check or restore with %trace remove " + request.batch_id();
+    throw std::runtime_error(message);
+  }
+  print_bulk_report(out_, "apply", report);
+  if (!report.complete()) {
+    auto message = report.diagnostic();
+    if (std::any_of(report.entries().begin(), report.entries().end(), [](const auto &row) {
+          return row.status() == api::BulkTraceEntry::RESTORE_PENDING;
+        }))
+      message += " | retry with %trace remove " + request.batch_id();
+    throw std::runtime_error(message);
+  }
+}
+
+void Controller::remove_bulk_trace(const std::string &batch_id) {
+  require_session(selected_);
+  api::RemoveBulkTraceRequest request;
+  request.set_session_id(selected_.id);
+  request.set_batch_id(batch_id);
+  const auto report = unary<api::BulkTraceReport>(
+      [&](auto &context, auto &response) { return stub_->RemoveBulkTrace(&context, request, &response); },
+      settings_.timeout_seconds);
+  print_bulk_report(out_, "remove", report);
+  if (!report.complete())
+    throw std::runtime_error(report.diagnostic() + " | retry with %trace remove " + batch_id);
 }
 
 bool Controller::execute(const Command &command) {
@@ -961,8 +1288,17 @@ bool Controller::execute(const Command &command) {
     return true;
   }
   case K::attach:
-    attach(
-        static_cast<unsigned>(unsigned_number(args.at(0), "PID", INT32_MAX)));
+    attach(static_cast<unsigned>(unsigned_number(args.at(0), "PID", INT32_MAX)),
+           command.number("--start-time", 0));
+    return true;
+  case K::bulk_preview:
+    preview_bulk_trace(command);
+    return true;
+  case K::bulk_apply:
+    apply_bulk_trace(command);
+    return true;
+  case K::bulk_remove:
+    remove_bulk_trace(args.at(0));
     return true;
   case K::sessions:
   case K::use:
@@ -1008,11 +1344,158 @@ bool Controller::execute(const Command &command) {
     require_session(selected_);
     api::ListModulesRequest request;
     request.set_session_id(selected_.id);
+    request.set_include_mappings(command.has("--details"));
     const auto response = unary<api::ListModulesResponse>(
         [&](auto &c, auto &r) { return stub_->ListModules(&c, request, &r); });
-    for (const auto &module : response.modules()) {
-      out_ << module << '\n';
+    if (!command.has("--details")) {
+      for (const auto &module : response.modules())
+        out_ << module << '\n';
+    } else {
+      if (response.mapping_token().empty())
+        throw std::runtime_error("server does not support mapped module details");
+      out_ << "mapping=" << response.mapping_token() << '\n';
+      for (const auto &entry : response.mappings()) {
+        out_ << "0x" << std::hex << entry.begin_address() << "-0x"
+             << entry.end_address() << " offset=0x" << entry.file_offset()
+             << std::dec << " device=" << entry.device() << " inode="
+             << entry.inode() << " build_id="
+             << (entry.build_id().empty() ? "unavailable" : entry.build_id())
+             << " " << std::quoted(printable_proc_text(entry.path())) << '\n';
+      }
     }
+    return true;
+  }
+  case K::memory_maps: {
+    require_session(selected_);
+    api::ListMemoryMappingsRequest request;
+    request.set_session_id(selected_.id);
+    const auto response = unary<api::ListMemoryMappingsResponse>(
+        [&](auto &c, auto &r) { return stub_->ListMemoryMappings(&c, request, &r); },
+        settings_.timeout_seconds);
+    out_ << "memory mapping=" << response.mapping_token() << '\n';
+    for (const auto &entry : response.mappings()) {
+      out_ << "0x" << std::hex << entry.begin_address() << "-0x"
+           << entry.end_address() << ' ' << entry.permissions()
+           << " offset=0x" << entry.file_offset() << std::dec
+           << " device=" << entry.device() << " inode=" << entry.inode()
+           << ' ' << std::quoted(printable_proc_text(entry.path())) << '\n';
+    }
+    out_ << "memory mappings=" << response.mappings_size() << '\n';
+    return true;
+  }
+  case K::memory_read: {
+    require_session(selected_);
+    api::ReadMemoryRequest request;
+    request.set_session_id(selected_.id);
+    request.set_mapping_token(command.option("--mapping"));
+    request.set_address(address_number(args.at(0)));
+    const auto type = command.option("--type");
+    const auto size = command.has("--type")
+        ? memory_scalar_size(type)
+        : unsigned_number(command.option("--count"), "memory read size", 65536);
+    request.set_size(static_cast<std::uint32_t>(size));
+    const auto response = unary<api::ReadMemoryResponse>(
+        [&](auto &c, auto &r) { return stub_->ReadMemory(&c, request, &r); },
+        settings_.timeout_seconds);
+    if (response.address() != request.address() || response.data().size() != size)
+      throw std::runtime_error("invalid memory read response");
+    if (command.has("--type"))
+      print_memory_scalar(out_, request.address(), response.data(), type);
+    else
+      print_memory_dump(out_, request.address(), response.data());
+    return true;
+  }
+  case K::memory_scan: {
+    require_session(selected_);
+    api::ScanMemoryRequest request;
+    request.set_session_id(selected_.id);
+    request.set_mapping_token(command.option("--mapping"));
+    request.set_address(address_number(args.at(0)));
+    request.set_size(static_cast<std::uint32_t>(
+        unsigned_number(command.option("--count"), "memory scan size", 1048576)));
+    auto [pattern, mask] = parse_memory_pattern(command.option("--pattern"));
+    request.set_pattern(std::move(pattern));
+    request.set_mask(std::move(mask));
+    if (command.has("--limit")) {
+      const auto limit = unsigned_number(command.option("--limit"), "memory scan match limit", 1024);
+      if (!limit)
+        throw std::invalid_argument("memory scan match limit must be positive");
+      request.set_max_matches(static_cast<std::uint32_t>(limit));
+    }
+    const auto response = unary<api::ScanMemoryResponse>(
+        [&](auto &c, auto &r) {
+          Cancellation cancellation(c);
+          return stub_->ScanMemory(&c, request, &r);
+        },
+        settings_.timeout_seconds);
+    for (const auto address : response.addresses())
+      out_ << "match=0x" << std::hex << address << std::dec << '\n';
+    out_ << "memory scan matches=" << response.addresses_size()
+         << " truncated=" << (response.truncated() ? "true" : "false") << '\n';
+    return true;
+  }
+  case K::probe_entry: {
+    require_session(selected_);
+    api::PreviewFunctionEntryRequest request;
+    request.set_session_id(selected_.id);
+    request.set_mapping_token(command.option("--mapping"));
+    request.set_module(command.option("--module"));
+    if (command.has("--elf-address")) {
+      request.set_elf_address(address_number(command.option("--elf-address")));
+      request.set_abi(command.option("--abi"));
+    } else {
+      request.set_selector(args.at(0));
+    }
+    const auto response = unary<api::PreviewFunctionEntryResponse>(
+        [&](auto &c, auto &r) {
+          Cancellation cancellation(c);
+          return stub_->PreviewFunctionEntry(&c, request, &r);
+        },
+        settings_.timeout_seconds);
+    out_ << "entry=0x" << std::hex << response.runtime_address()
+         << " elf=0x" << response.elf_address() << std::dec
+         << " module=" << std::quoted(printable_proc_text(response.module()))
+         << " boundary=" << api::PreviewFunctionEntryResponse::Boundary_Name(response.boundary())
+         << " abi=" << response.abi() << " function_size=" << response.function_size()
+         << " verified_bytes=" << response.entry_bytes().size();
+    if (!response.selector().empty())
+      out_ << " selector=" << std::quoted(printable_proc_text(response.selector()));
+    out_ << '\n';
+    for (const auto &instruction : response.instructions()) {
+      std::ostringstream line;
+      line << "0x" << std::hex << instruction.address() << "  ";
+      for (const unsigned char byte : instruction.encoding())
+        line << std::setfill('0') << std::setw(2) << static_cast<unsigned>(byte) << ' ';
+      line << std::dec << ' ' << instruction.assembly();
+      if (instruction.flow() != api::EntryInstruction::ORDINARY) {
+        line << " flow=" << api::EntryInstruction::Flow_Name(instruction.flow());
+        if (instruction.has_target_address())
+          line << " target=0x" << std::hex << instruction.target_address() << std::dec;
+        else
+          line << " target=unresolved";
+      }
+      if (instruction.falls_through())
+        line << " next=0x" << std::hex << instruction.address() + instruction.encoding().size();
+      out_ << line.str() << '\n';
+    }
+    if (response.decode_failed())
+      out_ << "disassembly incomplete within verified window\n";
+    if (response.patch_size())
+      out_ << "patch_size=" << response.patch_size() << " relocation=copy\n";
+    else
+      out_ << "patch_size=0 reason="
+           << std::quoted(printable_proc_text(response.patch_diagnostic())) << '\n';
+    return true;
+  }
+  case K::threads: {
+    require_session(selected_);
+    api::ListThreadsRequest request;
+    request.set_session_id(selected_.id);
+    const auto response = unary<api::ListThreadsResponse>(
+        [&](auto &c, auto &r) { return stub_->ListThreads(&c, request, &r); });
+    for (const auto &thread : response.threads())
+      out_ << "tid=" << thread.tid() << " start=" << thread.start_time()
+           << " name=" << std::quoted(printable_proc_text(thread.name())) << '\n';
     return true;
   }
   case K::symbols: {
@@ -1024,10 +1507,26 @@ bool Controller::execute(const Command &command) {
     request.set_page_size(static_cast<unsigned>(
         unsigned_number(command.option("--limit", "0"), "limit", UINT32_MAX)));
     request.set_page_token(command.option("--page"));
+    request.set_mapping_token(command.option("--mapping"));
+    request.set_include_addresses(command.has("--addresses"));
+    if (command.has("--address"))
+      request.set_address(address_number(command.option("--address")));
     const auto response = unary<api::ListSymbolsResponse>(
         [&](auto &c, auto &r) { return stub_->ListSymbols(&c, request, &r); });
+    const bool addresses = request.include_addresses() || request.address();
+    if (addresses) {
+      if (response.mapping_token().empty())
+        throw std::runtime_error("server does not support symbol address lookup");
+      out_ << "mapping=" << response.mapping_token() << '\n';
+    }
     for (const auto &symbol : response.symbols()) {
-      out_ << symbol.selector() << " [" << symbol.module_path() << "]\n";
+      out_ << symbol.selector() << " [" << symbol.module_path() << "]";
+      if (symbol.runtime_address())
+        out_ << " address=0x" << std::hex << symbol.runtime_address()
+             << " elf=0x" << symbol.elf_address() << std::dec;
+      else if (addresses)
+        out_ << " address=unavailable";
+      out_ << '\n';
     }
     if (!response.next_page_token().empty()) {
       out_ << "next_page=" << response.next_page_token() << '\n';
@@ -1044,14 +1543,18 @@ bool Controller::execute(const Command &command) {
     inject(selected_, args.at(0), read_source(command.option("--callback")),
            command);
     return true;
-  case K::validate: {
+  case K::validate:
+  case K::draft_validate: {
     require_session(selected_);
+    const bool named = command.kind == K::draft_validate;
+    const auto selector = named ? command.option("--target") : args.at(0);
     api::ResolveProbeRequest resolution;
     resolution_options(resolution, command);
     api::ValidateProbeRequest request;
     request.set_session_id(selected_.id);
-    request.set_selector(args.at(0));
-    request.set_callback_source(read_source(command.option("--callback")));
+    request.set_selector(selector);
+    request.set_callback_source(named ? drafts_.at(args.at(0))
+                                      : read_source(command.option("--callback")));
     *request.mutable_include_headers() = resolution.include_headers();
     *request.mutable_compile_options() = resolution.compile_options();
     request.set_module(resolution.module());
@@ -1069,13 +1572,35 @@ bool Controller::execute(const Command &command) {
       if (prepared != PreparedMode::prefer) throw;
       out_ << "prepared validation rejected; falling back to DWARF: " << error.what() << '\n';
       request.clear_prepared();
-      request.set_selector(args.at(0));
+      request.set_selector(selector);
       response = validate();
     }
     out_ << response.DebugString();
     if (!response.success()) {
       throw std::runtime_error("interceptor validation failed");
     }
+    return true;
+  }
+  case K::probe_reload: {
+    require_session(selected_);
+    api::ReloadProbeRequest request;
+    request.set_session_id(selected_.id);
+    request.set_probe_id(unsigned_number(args.at(0), "probe ID"));
+    request.set_callback_source(read_source(command.option("--callback")));
+    const auto response = unary<api::ReloadProbeResponse>(
+        [&](auto &c, auto &r) {
+          Cancellation cancellation(c);
+          return stub_->ReloadProbe(&c, request, &r);
+        },
+        settings_.timeout_seconds);
+    out_ << "reloaded probe=" << response.probe().id()
+         << " replaces=" << response.probe().replaces_probe_id()
+         << " retained_limit=" << response.retained_limit();
+    if (response.has_agent_retained())
+      out_ << " agent_retained=" << response.agent_retained();
+    else
+      out_ << " agent_retained=unknown";
+    out_ << '\n';
     return true;
   }
   case K::remove: {
@@ -1088,7 +1613,7 @@ bool Controller::execute(const Command &command) {
         settings_.timeout_seconds);
     out_ << "removed probe=" << response.id() << " restored="
          << (response.original_bytes_restored() ? "true" : "false") << '\n';
-    if (!response.original_bytes_restored()) {
+    if (!response.original_bytes_restored() && !response.superseded_by_probe_id()) {
       throw std::runtime_error("probe restoration incomplete");
     }
     return true;
@@ -1158,7 +1683,9 @@ bool Controller::execute(const Command &command) {
   case K::processes:
     ensure_connected();
     for (const auto &p : processes(command.option("--filter"))) {
-      out_ << p.first << " " << p.second << '\n';
+      out_ << p.pid << " start=" << p.start_time << " exe="
+           << std::quoted(printable_proc_text(p.executable)) << " "
+           << printable_proc_text(p.command) << '\n';
     }
     return true;
   case K::help:

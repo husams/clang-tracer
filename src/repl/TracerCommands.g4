@@ -2,19 +2,21 @@ grammar TracerCommands;
 
 line : '%' command EOF;
 command : server | attach | processes | sessions | use | status | detach
-        | modules | symbols | probe | interceptor | events | collect | record
-        | cpp | shell | complete | type | help | quit;
+        | modules | threads | symbols | probe | interceptor | events | collect | record
+        | cpp | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
 serverOption : ('--executable' | '--agent') value;
-attach : 'attach' UINT?;
+attach : 'attach' (UINT ('--start-time' UINT)?)?;
 processes : 'processes' ('--filter' value)?;
 sessions : 'sessions';
 use : 'use' value;
 status : 'status';
 detach : 'detach' value?;
-modules : 'modules';
+modules : 'modules' '--details'?;
+threads : 'threads';
 symbols : 'symbols' symbolOption*;
-symbolOption : ('--filter' | '--module' | '--page') value | '--limit' UINT;
+symbolOption : ('--filter' | '--module' | '--page' | '--address' | '--mapping') value
+             | '--limit' UINT | '--addresses';
 probe : 'probe' ('prepare' value prepareOption+
       | 'resolve' value resolveOption*
       | 'inject' value '--callback' value deployOption*
@@ -26,6 +28,7 @@ resolveOption : ('--include' | '--compdb' | '--module' | '--compile-option'
                 | '--prepared' | '--prepared-mode') value;
 deployOption : resolveOption | '--stack-depth' UINT | '--print-arguments' | '--print-result';
 interceptor : 'interceptor' ('load' value '--as' value | 'edit' value | 'show' value
+      | 'validate' value '--target' value resolveOption*
             | 'upload' value '--target' value deployOption*);
 events : 'events' (streamOption*
        | 'list' value ('--limit' UINT)?
@@ -47,15 +50,27 @@ complete : 'complete' value;
 type : 'type' value;
 help : 'help' ('%'? value+)?;
 quit : 'quit' | 'exit';
+bulkTrace : 'trace' ('preview' bulkTraceOption+
+          | 'apply' '--manifest' value ('--callback' value)?
+          | 'remove' value);
+bulkTraceOption : ('--module' | '--include' | '--exclude' | '--exact' | '--manifest' | '--save') value;
 value : STRING | WORD | UINT | keyword;
 keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
-        | 'processes' | 'sessions' | 'use' | 'detach' | 'modules' | 'symbols'
+        | 'processes' | 'sessions' | 'use' | 'detach' | 'modules' | 'threads' | 'symbols'
         | 'probe' | 'prepare' | 'resolve' | 'inject' | 'validate' | 'remove' | 'probes'
         | 'interceptor' | 'load' | 'edit' | 'show' | 'upload' | 'events'
         | 'list' | 'calls' | 'stats' | 'clear' | 'open' | 'export' | 'json'
         | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'import'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
-        | 'complete' | 'type' | 'help' | 'quit' | 'exit';
+        | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview' | 'apply'
+        | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload';
+memory : 'memory' ('maps' | 'read' value '--mapping' value
+                 ('--count' UINT | '--type' value)
+                 | 'scan' value '--mapping' value '--count' UINT
+                   '--pattern' value ('--limit' UINT)?);
+probeEntry : 'probe' 'entry' (value '--mapping' value ('--module' value)?
+           | '--module' value '--elf-address' value '--abi' value '--mapping' value);
+probeReload : 'probe' 'reload' UINT '--callback' value;
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';

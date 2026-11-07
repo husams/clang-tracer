@@ -58,8 +58,17 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"status", K::status},
                                         {"detach", K::detach},
                                         {"modules", K::modules},
+                                        {"threads", K::threads},
                                         {"symbols", K::symbols},
+                                        {"memory maps", K::memory_maps},
+                                        {"memory read", K::memory_read},
+                                        {"memory scan", K::memory_scan},
+                                        {"trace preview", K::bulk_preview},
+                                        {"trace apply", K::bulk_apply},
+                                        {"trace remove", K::bulk_remove},
                                         {"probe prepare", K::prepare},
+                                        {"probe entry", K::probe_entry},
+                                        {"probe reload", K::probe_reload},
                                         {"probe resolve", K::resolve},
                                         {"probe inject", K::inject},
                                         {"probe validate", K::validate},
@@ -68,6 +77,7 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"interceptor load", K::draft_load},
                                         {"interceptor edit", K::draft_edit},
                                         {"interceptor show", K::draft_show},
+                                        {"interceptor validate", K::draft_validate},
                                         {"interceptor upload", K::draft_upload},
                                         {"events", K::events},
                                         {"events list", K::event_list},
@@ -116,17 +126,20 @@ public:
         result.arguments.push_back(decode(ts[i]->getText()));
       return {};
     }
-    const std::set<std::string> flags = {"--all", "--metadata-only", "--print-arguments",
-                                         "--print-result", "--sqlite"};
+    const std::set<std::string> flags = {
+        "--all", "--metadata-only", "--print-arguments", "--print-result",
+        "--details", "--addresses", "--sqlite"};
     const std::set<std::string> repeated = {"--include", "--compile-option",
-                                            "--name", "--type"};
+                                           "--name", "--type"};
+    const std::set<std::string> bulk_repeated = {"--module", "--exclude", "--exact"};
     for (; i + 1 < ts.size(); ++i) {
       const auto text = ts[i]->getText();
       const bool profile_add = result.kind == K::cpp_options &&
                                !result.arguments.empty() && result.arguments.front() == "add";
       if (!profile_add && ts[i]->getType() != TracerCommandsLexer::STRING &&
           text.rfind("--", 0) == 0) {
-        if (result.has(text) && !repeated.count(text)) {
+        const bool bulk_repeat = result.kind == K::bulk_preview && bulk_repeated.count(text);
+        if (result.has(text) && !repeated.count(text) && !bulk_repeat) {
           throw std::invalid_argument("duplicate option: " + text);
         }
         result.options[text].push_back(
@@ -169,6 +182,18 @@ std::uint64_t Command::number(const std::string &name,
   return has(name) ? unsigned_number(option(name), name) : fallback;
 }
 
+std::uint64_t address_number(const std::string &text) {
+  const bool hex = text.size() >= 2 && text[0] == '0' &&
+                   (text[1] == 'x' || text[1] == 'X');
+  const auto begin = text.data() + (hex ? 2 : 0);
+  const auto end = text.data() + text.size();
+  std::uint64_t address = 0;
+  const auto parsed = std::from_chars(begin, end, address, hex ? 16 : 10);
+  if (parsed.ec != std::errc{} || parsed.ptr != end || !address)
+    throw std::invalid_argument("invalid nonzero address: " + text);
+  return address;
+}
+
 Command parse_command(const std::string &input) {
   if (input.size() > 65536 || input.find('\0') != std::string::npos) {
     throw std::invalid_argument("command is too large or contains a null byte");
@@ -189,6 +214,19 @@ Command parse_command(const std::string &input) {
   Builder visitor(tokens);
   visitor.visit(tree);
   auto command = std::move(visitor.result);
+  if (command.kind == K::bulk_preview) {
+    const bool has_rules = command.has("--include") || command.has("--exact");
+    if (command.has("--manifest")) {
+      if (has_rules || command.has("--module") || command.has("--exclude"))
+        throw std::invalid_argument("--manifest cannot be combined with selection rules");
+    } else if (!has_rules) {
+      throw std::invalid_argument("%trace preview requires --include, --exact or --manifest");
+    }
+    for (const auto &[option, values] : command.options)
+      for (const auto &value : values)
+        if (value.empty())
+          throw std::invalid_argument(option + " requires a nonempty value");
+  }
   if (command.kind == K::prepare) {
     for (const auto* option : {"--include", "--output"})
       if (!command.has(option) || command.option(option).empty())
@@ -215,8 +253,21 @@ Command parse_command(const std::string &input) {
     if (!unsigned_number(command.arguments[0], "PID", INT32_MAX)) {
       throw std::invalid_argument("PID must be positive");
     }
+    if (command.has("--start-time") && !command.number("--start-time", 0))
+      throw std::invalid_argument("--start-time must be positive");
   }
-  if (command.kind == K::remove &&
+  if (command.has("--address")) {
+    address_number(command.option("--address"));
+    if (command.option("--mapping").empty() || command.has("--page") ||
+        command.number("--limit", 0))
+      throw std::invalid_argument("--address requires --mapping and does not support paging");
+  }
+  if (command.has("--mapping") && command.option("--mapping").empty()) {
+    throw std::invalid_argument("--mapping requires a snapshot token");
+  }
+  if (command.kind == K::memory_read || command.kind == K::memory_scan)
+    address_number(command.arguments.at(0));
+  if ((command.kind == K::remove || command.kind == K::probe_reload) &&
       !unsigned_number(command.arguments[0], "probe ID")) {
     throw std::invalid_argument("probe ID must be positive");
   }

@@ -41,6 +41,8 @@ public:
 
     virtual std::any visitModules(TracerCommandsParser::ModulesContext *context) = 0;
 
+    virtual std::any visitThreads(TracerCommandsParser::ThreadsContext *context) = 0;
+
     virtual std::any visitSymbols(TracerCommandsParser::SymbolsContext *context) = 0;
 
     virtual std::any visitSymbolOption(TracerCommandsParser::SymbolOptionContext *context) = 0;
@@ -75,9 +77,19 @@ public:
 
     virtual std::any visitQuit(TracerCommandsParser::QuitContext *context) = 0;
 
+    virtual std::any visitBulkTrace(TracerCommandsParser::BulkTraceContext *context) = 0;
+
+    virtual std::any visitBulkTraceOption(TracerCommandsParser::BulkTraceOptionContext *context) = 0;
+
     virtual std::any visitValue(TracerCommandsParser::ValueContext *context) = 0;
 
     virtual std::any visitKeyword(TracerCommandsParser::KeywordContext *context) = 0;
+
+    virtual std::any visitMemory(TracerCommandsParser::MemoryContext *context) = 0;
+
+    virtual std::any visitProbeEntry(TracerCommandsParser::ProbeEntryContext *context) = 0;
+
+    virtual std::any visitProbeReload(TracerCommandsParser::ProbeReloadContext *context) = 0;
 
 
 };

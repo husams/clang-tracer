@@ -115,3 +115,181 @@ targeting `c++17`; merging and live installation are separate operations.
   logical line 1, and rejects ambiguous state after parse errors with explicit
   recovery guidance. Pending values are transferred through the public
   interpreter API without repeating the user cell.
+
+## Local C++ JIT P0
+
+Base: `04e503b` on `c++17`. Isolated branch: `codex/local-cpp-jit-p0`.
+Scope: local Linux x86-64 C++ targets.
+
+| Story | Implementation |
+| --- | --- |
+| J1 Runtime identity | Compare the loaded agent's GNU build ID and bootstrap version before accepting attach. Report the runtime profile and measure resolution, target JIT compilation and patch installation separately. Recheck PID start time on both sides of ptrace admission. |
+| J2 Named observer validation | Validate the exact in-memory C++ draft before upload, through the existing Clang interpreter and non-activating validation path. The native fixture distinguishes validation from activation and checks target-side STL, templates and RAII. |
+| J3 Observer lifetime | Use the existing probe ID as the observer generation. Keep the established replacement and drain paths, which retain native wrappers for late arrivals. Document the callback-scoped borrow contract. |
+
+The named-observer fixture ran with Clang/LLVM 21.1.8, glibc 2.23 and the GCC
+8.5 SDK. One install measured 1.60 ms to resolve, 1,685.74 ms in the target
+JIT and 5.13 ms to patch. The callback reported the target PID and its RAII
+destructor count. The REPL inspected and replayed the owned events.
+
+The stale-agent check replaced the configured ELF on disk while the original
+remained mapped. Attach rejected the build ID mismatch and released ptrace.
+Native Python checks covered invalid syntax, signature mismatch, unresolved
+symbols, initializer-free validation and failed replacement preserving the
+old observer. All 198 portable Python tests passed.
+
+Nine focused CTests and five native Python tests passed on Linux x86-64.
+The staged-install interceptor test passed with its target fixtures rebuilt
+with DWARF in the isolated validation directory. It covered original exception
+propagation, replacement and concurrent detach. The ordinary GCC 8.5 SDK
+profile was used throughout.
+
+## Local C++ browsing P1
+
+T1 adds identity-checked local process selection, thread listings, executable
+module mappings and bidirectional C++ symbol lookup. Process selections carry
+the PID start time and executable path into attach. Module snapshots carry the
+session ID, live executable ranges and backing-file identity. Reverse lookup
+requires a current token from that session. Loader notifications and import,
+export and section views remain follow-up slices.
+
+The browser fixture selects one of two same-name C++ targets, rejects an
+incorrect start time for the other, lists both threads of the selected target,
+round-trips a C++ symbol through an interior runtime address, and rejects the
+old token both after unload and after loading a different ELF identity at the
+same path.
+
+The GCC 8.5 Linux x86-64 build passed four focused CTests and the native
+Python symbol-pagination regression. All 198 portable Python tests passed.
+
+### T2 Bulk trace dry run
+
+`%trace preview` expands qualified-name and module globs, applies exclusions,
+and resolves exact overloads in one pass per mapped image. It reports verified
+runtime entries, static ABI status, and the target agent's retained probe
+capacity when readable. The versioned manifest stores selection rules for
+another run against the current mappings.
+
+The GCC 8.5 Linux x86-64 fixture passed split DWARF, ASLR address translation,
+overload exclusion, exact signatures, concrete templates, virtual
+implementations, duplicate modules, and manifest round-trip. The fixture
+compared the same target entry bytes before and after preview and confirmed
+that reattaching after removal still reports the retired agent slot.
+
+Seven focused Linux CTests, the REPL help smoke check and all 198 portable
+Python tests passed.
+
+### T3 Bulk trace apply and removal
+
+`%trace apply --manifest FILE` resolves the saved selection in the live
+session and installs typed Clang JIT observers. An optional callback file
+is compiled for each selected function. Preflight checks selection blockers,
+existing hooks and available retained slots. Bulk installs cannot replace
+active probes. The server serializes installs and removals within the session.
+
+Each retained probe records its batch ID. After an installation failure, the
+server restores attempted probes from that batch in reverse order and reports
+the result per entry. `%trace remove BATCH_ID` removes only probes owned by
+that batch and can retry incomplete restoration. Bulk apply currently
+accepts DWARF-supported bindings. Prepared-only entries block the batch.
+
+The Linux x86-64 regression forced a type mismatch on the second overload
+after the first was installed. It verified original bytes after rollback,
+successful typed observation on both overloads in a later batch, repeatable
+removal, and an unrelated probe emitting events through both operations.
+
+Eight focused CTests passed on Linux x86-64 with the GCC 8.5 SDK and
+Clang 21.1.8. All 198 portable Python tests passed.
+
+### T4 Live and replay trace summaries
+
+`%events stats NAME` reports observed call counts per probe, fixed duration
+histograms, and direct caller edges from entry stacks. PRE and POST are
+paired by server lifetime, session, process, probe, thread and call ID.
+Missing phases and ambiguous or invalid timestamps are reported separately
+from timed calls, cumulative loss counters and local evictions.
+
+Eight focused CTests passed on Linux x86-64 with the GCC 8.5 SDK and Clang
+21.1.8. The native fixture verified the same event window produced matching
+live and offline summaries, including the symbolized caller. Unit coverage
+checks incomplete pairs, replayed copies, duplicate phases, invalid timing,
+histogram boundaries and caller evidence from filtered or partial stacks.
+
+A bulk observer captured 32 timed calls across both fixture overloads and
+reported `main` as the caller for both.
+
+## Read-only inspection P2
+
+### I1 Mapping-aware memory reads
+
+`%memory maps` lists live ranges and permissions and issues a token bound to
+the selected session. `%memory read` uses that token to read up to 64 KiB or
+decode a little-endian scalar. The server checks process identity and mapping
+metadata around the read, validates the entire readable span, and only
+returns owned bytes for a complete read. Kernel read failures report the
+first affected address. Identical mapping metadata can hide a remap between
+checks.
+
+The Linux x86-64 fixture verified cross-page reads across adjacent mappings,
+scalar decoding, protected and unmapped ranges, a kernel fault beyond a
+mapped file's EOF, and token invalidation after permission changes, remapping
+and reattaching. Eight focused CTests passed with the GCC 8.5 SDK and Clang
+21.1.8. The memory fixture also passed on OverlayFS. All 198 portable Python
+tests passed.
+
+### I1 Bounded masked-pattern memory scans
+
+`%memory scan` uses the same session and mapping token as `%memory read`.
+It searches a readable span of up to 1 MiB for a pattern of up to 256
+bytes. The REPL accepts wildcard bytes, wildcard nibbles and an explicit
+bit mask. Results include overlaps in ascending address order and report
+whether further matches exceeded the limit. The scanner uses the existing
+deadline, cancellation and snapshot checks and returns no matches when
+the requested span cannot be verified and read in full.
+
+The Linux x86-64 memory fixture verified cross-page and cross-mapping
+matches, a 128 KiB scan, overlapping and truncated results, invalid
+inputs, unmapped or protected memory, a mapped file fault, and stale
+tokens after permission changes, remapping and reattach.
+Eight focused CTests passed with the GCC 8.5 SDK and Clang 21.1.8. The
+memory fixture also passed on OverlayFS. All 198 portable Python tests passed.
+
+### I2 Verified function-entry previews
+
+`%probe entry` accepts a C++ selector or an exact module path and ELF
+virtual address with a Linux x86-64 SysV ABI label. It reuses the memory
+mapping token and verifies the live entry against the file-backed executable
+mapping. The explicit address requires an exact ELF function symbol or
+`.eh_frame` range start. The preview disassembles up to 64 bytes, explores
+in-window direct branch targets, and reports unresolved indirect targets.
+
+The agent and preview share the copy-only detour window check. The Linux
+fixture checked DWARF, ELF symbol and stripped PIE entries, byte-for-byte
+preservation during preview, refused prologues, and rejection of stale
+mapping tokens and changed entry bytes.
+Nine focused CTests passed with the GCC 8.5 SDK and Clang 21.1.8. The entry
+fixture also passed on OverlayFS. All 198 portable Python tests passed.
+
+### I3 Safe observer reload
+
+`%probe reload ID --callback FILE` reuses the active probe's binding and
+deployment options. The agent prepares a separate Clang JIT wrapper, then
+the server switches the installed detour directly while peer threads are
+stopped. In-flight invocations and queued events retain the original probe
+ID. Compilation rejection and a recoverable switch rollback preserve the
+existing detour.
+
+Reload reports the new generation ID and the 32-slot retained-probe
+budget. Superseded wrappers stay resident for late arrivals. Removal
+drains admitted calls before closing callback delivery, and detach drains
+all retained generations.
+
+The Linux x86-64 fixture held an original call open across a failed compile
+and a successful cutover. New calls emitted the replacement's events, and
+the held call emitted its POST on the original ID. The fixture filled the
+retained budget, verified rejection preserved the active observer, and
+checked original entry bytes after detach.
+
+Eight focused CTests passed with the GCC 8.5 SDK and Clang 21.1.8,
+including staged CLI replacement across a collector restart. All 198
+portable Python tests passed.
