@@ -364,3 +364,15 @@ It verified forced loss reporting, timeout, interruption, target exit, and
 descriptor cleanup. Fifteen focused CTests passed unprivileged on the GCC
 8.5 SDK with Clang 21.1.8. The syscall test reported the tracefs permission
 denial and passed on an elevated run with the same binaries.
+
+### A2 Bounded instruction tracing pilot
+
+The standalone pilot compares Frida Gum Stalker 17.26.1 with native ptrace
+single-step on one owned fixture thread and address range. Both matched the
+instruction oracle, preserved SIGUSR1 delivery, reported truncation and
+stopped cleanly. Gum's median was 1.200 ms versus 23.664 ms for native
+stepping in the 1,929-instruction GCC 8.5 SDK run. The recommendation is to
+hold a maintained backend pending live-target integration and distribution
+verification. See `benchmarks/instruction-trace/README.md` for the comparison.
+Four focused native REPL regression CTests passed. The native-only pilot,
+normal completion, cap teardown, and five-second watchdog reaping passed.
