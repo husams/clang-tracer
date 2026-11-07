@@ -75,6 +75,22 @@ def main():
         until(rb"attached session=s1.*tracer\[7\]> ")
         send("%collect --count 4 --as batch\r")
         until(rb"received=4.*tracer\[7\]> ")
+        start = len(transcript)
+        send("%symbols --limit 9")
+        until(rb"%symbols --limit 9")
+        command = bytes(transcript[start:])
+        assert b"\x1b[0;96m%symbols" in command, command
+        assert b"\x1b[0;22;33m--limit" in command, command
+        assert b"\x1b[0;22;32m9" in command, command
+        start = len(transcript)
+        send('\x15const auto shade = "café";')
+        until(rb'const auto shade = "caf\xc3\xa9";')
+        code = bytes(transcript[start:])
+        assert b"\x1b[0;96mconst" in code, code
+        assert b"\x1b[0;22;35m=" in code, code
+        assert b'\x1b[0;22;32m"caf\xc3\xa9"' in code, code
+        send("\x15%type session.pid\r")
+        until(rb"(?m)^.* pid;\n.*tracer\[7\]> ")
         send('auto data = tracer.batch("batch"); std::cout << "terminal-ready" << std::endl;\r')
         until(rb"(?m)^terminal-ready\n.*tracer\[7\]> ")
         # This is the exact user-reported spelling, with no trailing semicolon.

@@ -327,6 +327,16 @@ expressions; tracing commands, API help and statements terminated with `;`
 remain available. Ambiguous bare input reports recovery guidance instead of
 silently dropping a call.
 
+Use `%type SYMBOL` to inspect a declaration in the current C++ session.
+The command accepts simple names, qualified names such as `ns::function`,
+and members such as `tracer.events_async`. It lists function overloads and
+shows readable types such as `std::string` and `std::map<std::string, int>`.
+It looks up declarations without evaluating C++ expressions.
+
+Color terminals highlight C++ keywords and percent commands in cyan, literals
+in green, operators in magenta, command options in yellow, and comments in
+gray. The prompt, help examples, and `%type` output share the palette.
+
 Ordinary C++ checks retain accepted syntax in a separate, syntax-only compiler
 process. Each new input is checked in a disposable fork, so rejected declarations
 and macros cannot corrupt the retained state or execute initializers. Later inputs

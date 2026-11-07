@@ -44,6 +44,7 @@
 #include <llvm/ADT/SmallString.h>
 #include <llvm/Support/VirtualFileSystem.h>
 #include <clang/Sema/CodeCompleteConsumer.h>
+#include <clang/Sema/Lookup.h>
 #include <clang/Sema/Sema.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/Support/MemoryBuffer.h>
@@ -312,6 +313,74 @@ void print_function(llvm::raw_ostream &out, const clang::FunctionDecl &function,
     if (method->isConst())
       out << " const";
   out << ";\n";
+}
+
+clang::DeclContext* symbol_scope(clang::NamedDecl* declaration,
+                                clang::tok::TokenKind separator) {
+  clang::QualType type;
+  if (separator == clang::tok::coloncolon) {
+    if (auto* alias = llvm::dyn_cast<clang::NamespaceAliasDecl>(declaration))
+      return alias->getNamespace();
+    if (auto* record = llvm::dyn_cast<clang::CXXRecordDecl>(declaration))
+      return record->getDefinition();
+    if (auto* record = llvm::dyn_cast<clang::ClassTemplateDecl>(declaration))
+      return record->getTemplatedDecl()->getDefinition();
+    if (auto* scope = llvm::dyn_cast<clang::NamespaceDecl>(declaration))
+      return scope;
+    if (auto* scope = llvm::dyn_cast<clang::EnumDecl>(declaration))
+      return scope->getDefinition();
+    if (const auto* alias = llvm::dyn_cast<clang::TypedefNameDecl>(declaration))
+      type = alias->getUnderlyingType();
+  } else if (const auto* value = llvm::dyn_cast<clang::ValueDecl>(declaration)) {
+    type = value->getType().getNonReferenceType();
+    if (separator == clang::tok::arrow) type = type->getPointeeType();
+  }
+  if (!type.isNull())
+    if (auto* record = type->getAsCXXRecordDecl())
+      return record->getDefinition();
+  return nullptr;
+}
+
+clang::PrintingPolicy readable_policy(const clang::CompilerInstance& compiler) {
+  clang::PrintingPolicy policy(compiler.getLangOpts());
+  policy.SuppressTagKeyword = true;
+  policy.SuppressUnwrittenScope = true;
+  policy.SuppressInlineNamespace =
+      static_cast<unsigned>(clang::PrintingPolicy::SuppressInlineNamespaceMode::All);
+  return policy;
+}
+
+// Some standard libraries omit preferred_name on basic_string. Apply the
+// standard aliases to exact default specializations, including nested types.
+std::string preferred_string_names(std::string text, const clang::LangOptions& language) {
+  if (text.find("std::basic_string<") == std::string::npos) return text;
+  constexpr std::pair<llvm::StringLiteral, llvm::StringLiteral> aliases[] = {
+      {"std::basic_string<char>", "std::string"},
+      {"std::basic_string<wchar_t>", "std::wstring"},
+      {"std::basic_string<char16_t>", "std::u16string"},
+      {"std::basic_string<char32_t>", "std::u32string"}};
+  clang::Lexer lexer({}, language, text.data(), text.data(), text.data() + text.size());
+  std::string result;
+  std::size_t position = 0;
+  clang::Token token;
+  for (;;) {
+    lexer.LexFromRawLexer(token);
+    if (token.is(clang::tok::eof)) break;
+    if (token.isNot(clang::tok::raw_identifier) || token.getRawIdentifier() != "std")
+      continue;
+    const auto begin = token.getLocation().getRawEncoding();
+    if (begin < position || (begin && text[begin - 1] == ':')) continue;
+    const auto suffix = llvm::StringRef(text).substr(begin);
+    for (const auto& alias : aliases) {
+      if (!suffix.starts_with(alias.first)) continue;
+      result.append(text, position, begin - position);
+      result += alias.second.str();
+      position = begin + alias.first.size();
+      break;
+    }
+  }
+  result.append(text, position);
+  return result;
 }
 } // namespace
 
@@ -738,6 +807,76 @@ CppCompletions complete_cpp(const std::vector<std::string> &arguments,
                       results.items.end());
   return results;
 }
+std::string describe_cpp_symbol(clang::CompilerInstance& compiler,
+                                const std::string& symbol) {
+  constexpr auto usage = "%type expects a C++ symbol such as name, ns::name, or object.member";
+  auto& sema = compiler.getSema();
+  clang::DeclContext* context = compiler.getASTContext().getTranslationUnitDecl();
+  clang::Lexer lexer({}, compiler.getLangOpts(), symbol.data(), symbol.data(),
+                     symbol.data() + symbol.size());
+  clang::Token token;
+  lexer.LexFromRawLexer(token);
+  bool unqualified = token.isNot(clang::tok::coloncolon);
+  if (!unqualified) lexer.LexFromRawLexer(token);
+  auto policy = readable_policy(compiler);
+  policy.TerseOutput = true;
+  policy.PolishForDeclaration = true;
+  policy.FullyQualifiedName = true;
+
+  for (;;) {
+    if (token.isNot(clang::tok::raw_identifier))
+      throw std::invalid_argument(usage);
+    const auto name = token.getRawIdentifier();
+    lexer.LexFromRawLexer(token);
+    const auto separator = token.getKind();
+    if (separator != clang::tok::eof && separator != clang::tok::coloncolon &&
+        separator != clang::tok::period && separator != clang::tok::arrow)
+      throw std::invalid_argument(usage);
+    auto& id = compiler.getPreprocessor().getIdentifierTable().get(name);
+    clang::LookupResult lookup(sema, &id, {}, clang::Sema::LookupOrdinaryName);
+    lookup.suppressDiagnostics();
+    if (unqualified && sema.TUScope)
+      sema.LookupName(lookup, sema.TUScope);
+    else
+      sema.LookupQualifiedName(lookup, context);
+    if (lookup.empty())
+      throw std::invalid_argument("unknown C++ symbol: " + symbol);
+    if (lookup.isAmbiguous())
+      throw std::invalid_argument("ambiguous C++ symbol: " + symbol);
+    if (separator == clang::tok::eof) {
+      std::string output;
+      llvm::raw_string_ostream out(output);
+      std::set<const clang::Decl*> seen;
+      for (auto* candidate : lookup) {
+        const auto* declaration = candidate->getUnderlyingDecl();
+        if (!seen.insert(declaration->getCanonicalDecl()).second) continue;
+        if (const auto* value = llvm::dyn_cast<clang::ValueDecl>(declaration);
+            value && !llvm::isa<clang::FunctionDecl>(value)) {
+          auto type = value->getType();
+          if (const auto* deduced = llvm::dyn_cast<clang::DecltypeType>(type.getTypePtr()))
+            type = compiler.getASTContext().getQualifiedType(deduced->getUnderlyingType(),
+                                                              type.getLocalQualifiers());
+          type.print(out, policy, value->getNameAsString());
+        } else if (declaration->getDeclContext()->isStdNamespace() &&
+                   llvm::isa<clang::TypeDecl, clang::ClassTemplateDecl,
+                             clang::TypeAliasTemplateDecl>(declaration)) {
+          declaration->printQualifiedName(out, policy);
+        } else {
+          declaration->print(out, policy);
+        }
+        if (!output.empty() && output.back() != ';') out << ';';
+        out << '\n';
+      }
+      return preferred_string_names(std::move(output), compiler.getLangOpts());
+    }
+    if (!lookup.isSingleResult() ||
+        !(context = symbol_scope(lookup.getFoundDecl()->getUnderlyingDecl(), separator)))
+      throw std::invalid_argument("C++ symbol has no member scope: " + name.str());
+    unqualified = false;
+    lexer.LexFromRawLexer(token);
+  }
+}
+
 std::string describe_cpp_api(clang::CompilerInstance &parent,
                              const std::string &requested) {
   const auto topic = requested == "tracer" ? "Facade" : requested;
@@ -749,8 +888,7 @@ std::string describe_cpp_api(clang::CompilerInstance &parent,
                                 "SessionHandle, ScalarValue, EventRange");
   std::string text;
   llvm::raw_string_ostream out(text);
-  clang::PrintingPolicy policy(parent.getLangOpts());
-  policy.SuppressTagKeyword = true;
+  const auto policy = readable_policy(parent);
   std::set<const clang::Decl *> seen;
   for (auto *tu = parent.getASTContext().getTranslationUnitDecl(); tu;
        tu = tu->getPreviousDecl()) {

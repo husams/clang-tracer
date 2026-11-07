@@ -1099,6 +1099,7 @@ bool Controller::execute(const Command &command) {
   case K::cpp_generate:
   case K::shell:
   case K::complete:
+  case K::type:
   case K::draft_edit:
     throw std::logic_error("command requires the interactive driver");
   }

@@ -56,6 +56,10 @@ int main() {
   require(parse_command("%complete \"data.at(0).\"").kind ==
           CommandKind::complete);
   bad("%complete");
+  require(parse_command("%type tracer.events_async").kind == CommandKind::type);
+  require(parse_command("%type std::string").arguments.at(0) == "std::string");
+  bad("%type");
+  bad("%type name another");
   require(
       parse_command(
           "%cpp import \"app/types.hpp\" --type app::Order --type app::Address")

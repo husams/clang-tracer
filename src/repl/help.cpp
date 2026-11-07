@@ -2,11 +2,11 @@
 
 #include "commands.hpp"
 #include "interpreter.hpp"
+#include "syntax.hpp"
 
 #include <algorithm>
 #include <iomanip>
 #include <ostream>
-#include <regex>
 #include <stdexcept>
 #include <string_view>
 
@@ -109,6 +109,8 @@ const CommandTopic commands[] = {
     {"shell", "%shell \"COMMAND\"", "Run a local shell command and print its output.", R"(%shell "pwd")"},
     {"complete", "%complete \"C++ PREFIX\"", "List semantic C++ completions without evaluating the expression.",
      R"(%complete "tracer.")"},
+    {"type", "%type SYMBOL", "Show the type or signatures of a symbol in the current C++ session.",
+     "%type tracer.events_async"},
     {"help", "%help [COMMAND | api [NAME]]", "Browse commands and C++ APIs or look up a specific topic.",
      "%help probe inject\n%help api Event"},
     {"quit", "%quit | %exit", "Exit, detach sessions owned by this REPL, and stop its private server."},
@@ -314,9 +316,6 @@ auto ids = tracer.batch("results") | take(10) | transform(sequence) | to_vector(
 constexpr string_view reset = "\033[0m";
 constexpr string_view bold = "\033[1m";
 constexpr string_view cyan = "\033[1;36m";
-constexpr string_view yellow = "\033[33m";
-constexpr string_view green = "\033[32m";
-constexpr string_view magenta = "\033[35m";
 
 void styled(std::ostream& out, string_view text, string_view style, bool color) {
   if (color) out << style;
@@ -324,35 +323,11 @@ void styled(std::ostream& out, string_view text, string_view style, bool color) 
   if (color) out << reset;
 }
 
-enum class Syntax { command, cpp };
-
-void code(std::ostream& out, string_view text, Syntax syntax, bool color) {
-  if (!color) {
-    out << text;
-    return;
-  }
-  static const std::regex command_tokens(
-      R"re(("[^"]*"|'[^']*'|`[^`]*`)|(%[a-z][a-z-]*(?: [a-z][a-z-]*)*)|(--[a-z][a-z-]*)|\b([A-Z][A-Z0-9_]*|[0-9]+)\b)re");
-  static const std::regex cpp_tokens(
-      R"re(("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|//[^\n]*)|\b(auto|bool|char|class|const|double|else|for|if|int|return|static|struct|template|typename|unsigned|using|void)\b|\b([0-9]+|false|true|nullptr)\b)re");
-  const auto& tokens = syntax == Syntax::command ? command_tokens : cpp_tokens;
-  auto pos = text.begin();
-  for (std::cregex_iterator it(text.begin(), text.end(), tokens), end; it != end; ++it) {
-    const auto& match = *it;
-    out << string_view(pos, match[0].first - pos);
-    const auto style = match[1].matched ? green : match[2].matched ? cyan :
-                       match[3].matched ? yellow : magenta;
-    styled(out, string_view(match[0].first, match.length()), style, true);
-    pos = match[0].second;
-  }
-  out << string_view(pos, text.end() - pos);
-}
-
 void block(std::ostream& out, string_view text, Syntax syntax, bool color) {
   while (!text.empty()) {
     const auto newline = text.find('\n');
     out << "  ";
-    code(out, text.substr(0, newline), syntax, color);
+    print_code(out, text.substr(0, newline), syntax, color);
     out << '\n';
     if (newline == string_view::npos) break;
     text.remove_prefix(newline + 1);

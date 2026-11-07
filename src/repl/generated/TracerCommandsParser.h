@@ -25,7 +25,8 @@ public:
     T__62 = 63, T__63 = 64, T__64 = 65, T__65 = 66, T__66 = 67, T__67 = 68,
     T__68 = 69, T__69 = 70, T__70 = 71, T__71 = 72, T__72 = 73, T__73 = 74,
     T__74 = 75, T__75 = 76, T__76 = 77, T__77 = 78, T__78 = 79, T__79 = 80,
-    UINT = 81, STRING = 82, SHELL = 83, METADATA_ONLY = 84, WORD = 85, WS = 86
+    T__80 = 81, UINT = 82, STRING = 83, SHELL = 84, METADATA_ONLY = 85,
+    WORD = 86, WS = 87
   };
 
   enum {
@@ -35,7 +36,7 @@ public:
     RuleProbe = 13, RulePrepareOption = 14, RuleResolveOption = 15, RuleDeployOption = 16,
     RuleInterceptor = 17, RuleEvents = 18, RuleCollect = 19, RuleRecord = 20,
     RuleStreamOption = 21, RuleCpp = 22, RuleShell = 23, RuleComplete = 24,
-    RuleHelp = 25, RuleQuit = 26, RuleValue = 27, RuleKeyword = 28
+    RuleType = 25, RuleHelp = 26, RuleQuit = 27, RuleValue = 28, RuleKeyword = 29
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -80,6 +81,7 @@ public:
   class CppContext;
   class ShellContext;
   class CompleteContext;
+  class TypeContext;
   class HelpContext;
   class QuitContext;
   class ValueContext;
@@ -120,6 +122,7 @@ public:
     CppContext *cpp();
     ShellContext *shell();
     CompleteContext *complete();
+    TypeContext *type();
     HelpContext *help();
     QuitContext *quit();
 
@@ -453,6 +456,19 @@ public:
   };
 
   CompleteContext* complete();
+
+  class  TypeContext : public antlr4::ParserRuleContext {
+  public:
+    TypeContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  TypeContext* type();
 
   class  HelpContext : public antlr4::ParserRuleContext {
   public:

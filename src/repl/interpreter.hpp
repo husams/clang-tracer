@@ -33,6 +33,7 @@ public:
   bool evaluate(const std::string &source);
   CppCompletions complete(const std::string &source);
   std::string describe_api(const std::string &topic = "api");
+  std::string describe_symbol(const std::string &symbol);
   const std::vector<std::string> &compiler_options() const {
     return arguments_;
   }

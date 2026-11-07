@@ -3,7 +3,7 @@ grammar TracerCommands;
 line : '%' command EOF;
 command : server | attach | processes | sessions | use | status | detach
         | modules | symbols | probe | interceptor | events | collect | record
-        | cpp | shell | complete | help | quit;
+        | cpp | shell | complete | type | help | quit;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
 serverOption : ('--executable' | '--agent') value;
 attach : 'attach' UINT?;
@@ -44,6 +44,7 @@ cpp : 'cpp' ('load' value | 'reset'
                         | 'compdb' value '--file' value)?);
 shell : 'shell' value;
 complete : 'complete' value;
+type : 'type' value;
 help : 'help' ('%'? value+)?;
 quit : 'quit' | 'exit';
 value : STRING | WORD | UINT | keyword;
@@ -54,7 +55,7 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'list' | 'calls' | 'stats' | 'clear' | 'open' | 'export' | 'json'
         | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'import'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
-        | 'complete' | 'help' | 'quit' | 'exit';
+        | 'complete' | 'type' | 'help' | 'quit' | 'exit';
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';
