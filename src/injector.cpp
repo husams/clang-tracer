@@ -301,6 +301,73 @@ std::uintptr_t register_ip(const user_regs_struct &registers) {
   return static_cast<std::uintptr_t>(registers.rip);
 }
 
+bool confirmed_injected_fault(const siginfo_t &info,
+                              const user_regs_struct &registers,
+                              pid_t process_id, pid_t tid) {
+  // A signal-specific synchronous fault was raised while this thread was
+  // executing the injected code. Generic SI_KERNEL and async codes do not
+  // establish that, even when their value is positive.
+  switch (info.si_signo) {
+  case SIGSEGV:
+    return info.si_code == SEGV_MAPERR || info.si_code == SEGV_ACCERR;
+  case SIGBUS:
+    return info.si_code == BUS_ADRALN || info.si_code == BUS_ADRERR ||
+           info.si_code == BUS_OBJERR;
+  case SIGILL:
+    return info.si_code >= ILL_ILLOPC && info.si_code <= ILL_BADSTK;
+  case SIGFPE:
+    return info.si_code >= FPE_INTDIV && info.si_code <= FPE_FLTSUB;
+  case SIGABRT:
+    // si_pid is shared by peer threads. Confirm that the stopped thread
+    // itself issued a successful thread-directed abort to its own TID.
+    return info.si_code == SI_TKILL && info.si_pid == process_id &&
+           registers.rax == 0 &&
+           ((registers.orig_rax == SYS_tgkill &&
+             registers.rdi == static_cast<unsigned long long>(process_id) &&
+             registers.rsi == static_cast<unsigned long long>(tid) &&
+             registers.rdx == SIGABRT) ||
+            (registers.orig_rax == SYS_tkill &&
+             registers.rdi == static_cast<unsigned long long>(tid) &&
+             registers.rsi == SIGABRT));
+  default:
+    return false;
+  }
+}
+
+enum class InjectedStopKind { unexpected, completion, confirmed_fault };
+
+struct InjectedStop {
+  user_regs_struct registers{};
+  int signal;
+  InjectedStopKind kind = InjectedStopKind::unexpected;
+};
+
+InjectedStop inspect_injected_stop(pid_t process_id, pid_t tid, int status,
+                                   std::uintptr_t completion_ip,
+                                   int &pending_signal) {
+  InjectedStop stop{{}, WSTOPSIG(status)};
+  const bool signal_stop = (static_cast<unsigned int>(status) >> 16) == 0;
+  const int earlier_signal = pending_signal;
+  // Record the signal first so a failed attribution or register read leaves
+  // it available to the normal recovery path.
+  if (signal_stop)
+    pending_signal = stop.signal;
+  ptrace_checked(PTRACE_GETREGS, tid, nullptr, &stop.registers,
+                 "read injected stop registers");
+  siginfo_t info{};
+  if (!signal_stop || ::ptrace(PTRACE_GETSIGINFO, tid, nullptr, &info) != 0 ||
+      info.si_signo != stop.signal)
+    return stop;
+  if (stop.signal == SIGTRAP && stop.registers.rip == completion_ip &&
+      (info.si_code == TRAP_BRKPT || info.si_code == SI_KERNEL))
+    stop.kind = InjectedStopKind::completion;
+  else if (confirmed_injected_fault(info, stop.registers, process_id, tid))
+    stop.kind = InjectedStopKind::confirmed_fault;
+  if (stop.kind != InjectedStopKind::unexpected)
+    pending_signal = earlier_signal;
+  return stop;
+}
+
 std::vector<unsigned char> read_remote(pid_t tid, std::uintptr_t address,
                                        std::size_t size) {
   std::vector<unsigned char> result(size);
@@ -1345,20 +1412,16 @@ Process::remote_syscall(long number,
     }
     tracee_stopped = true;
     tracee_stopped_ = true;
-    if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
-      if (WIFSTOPPED(status) &&
-          (static_cast<unsigned int>(status) >> 16) == 0) {
-        pending_signal_ = WSTOPSIG(status);
-      }
-      throw std::runtime_error("native syscall ended at an unexpected stop; "
-                               "tracee stopped for recovery");
+    const auto stop = inspect_injected_stop(process_id_, tid_, status,
+                                           ip + stub.size(), pending_signal_);
+    if (stop.kind != InjectedStopKind::completion) {
+      throw std::runtime_error(
+          "native syscall stopped on signal " + std::to_string(stop.signal) +
+          (stop.kind == InjectedStopKind::confirmed_fault
+               ? " (confirmed injected fault; signal delivery suppressed)"
+               : ""));
     }
-    const auto after = read_registers(tid_);
-    if (after.general.rip != ip + stub.size()) {
-      throw std::runtime_error("native syscall stub stopped at an unexpected "
-                               "instruction; state restored");
-    }
-    result = after.general.rax;
+    result = stop.registers.rax;
     if (static_cast<long long>(result) < 0 &&
         static_cast<long long>(result) >= -4095) {
       throw std::runtime_error("remote syscall failed with errno " +
@@ -1540,24 +1603,18 @@ Process::remote_call_raw(std::uintptr_t function,
     }
     tracee_stopped = true;
     tracee_stopped_ = true;
-    if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
-      if (WIFSTOPPED(status) &&
-          (static_cast<unsigned int>(status) >> 16) == 0) {
-        pending_signal_ = WSTOPSIG(status);
-      }
+    const auto stop = inspect_injected_stop(process_id_, tid_, status,
+                                           call_page_ + 3, pending_signal_);
+    if (stop.kind != InjectedStopKind::completion) {
       throw std::runtime_error(
-          "remote call stopped on signal " +
-          std::to_string(WIFSTOPPED(status) ? WSTOPSIG(status) : 0) +
-          " at PC " + std::to_string(read_registers(tid_).general.rip) +
-          " before its completion; the callee "
-          "may have side effects");
+          "remote call stopped on signal " + std::to_string(stop.signal) +
+          " at PC " + std::to_string(stop.registers.rip) +
+          " before its completion; the callee may have side effects" +
+          (stop.kind == InjectedStopKind::confirmed_fault
+               ? "; confirmed injected fault, signal delivery suppressed"
+               : ""));
     }
-    const auto after = read_registers(tid_);
-    if (after.general.rip != call_page_ + 3) {
-      throw std::runtime_error(
-          "remote call stopped at an unexpected instruction");
-    }
-    result = after.general.rax;
+    result = stop.registers.rax;
   } catch (...) {
     failure = std::current_exception();
     if (execution_started && !tracee_stopped) {

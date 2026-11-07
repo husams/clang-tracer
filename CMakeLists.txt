@@ -314,6 +314,15 @@ if(BUILD_TESTING)
   add_test(NAME native_module_cfi_cache_integration COMMAND module-identity-integration
     --module $<TARGET_FILE:trace-stack-b> --cfi-cache-only)
   set_tests_properties(native_module_cfi_cache_integration PROPERTIES TIMEOUT 30)
+  add_executable(remote-call-signal-integration tests/remote_call_signal_integration.cpp
+    src/injector.cpp src/admission.cpp src/runtime_identity.cpp)
+  target_include_directories(remote-call-signal-integration PRIVATE src ${LLVM_INCLUDE_DIRS})
+  target_link_libraries(remote-call-signal-integration PRIVATE tracer_compat LLVM
+    ${CMAKE_DL_LIBS} Threads::Threads)
+  target_link_options(remote-call-signal-integration PRIVATE "LINKER:--wrap=ptrace")
+  target_compile_options(remote-call-signal-integration PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME native_remote_call_signal_recovery COMMAND remote-call-signal-integration)
+  set_tests_properties(native_remote_call_signal_recovery PROPERTIES TIMEOUT 60)
   add_executable(server-integration tests/server_integration.cpp)
   target_link_libraries(server-integration PRIVATE tracer_grpc Threads::Threads)
   target_compile_options(server-integration PRIVATE -Wall -Wextra -Wpedantic)
