@@ -11,6 +11,7 @@
 #include "check_process.hpp"
 #include "completion.hpp"
 #include "controller.hpp"
+#include "events.hpp"
 #include "interpreter.hpp"
 
 using namespace tracer_repl;
@@ -148,6 +149,46 @@ int main(int argc, char **argv) {
     require(contains(cpp.complete("data.at(0).argument_snapshot(0).cpp_t"), "cpp_type") &&
                 contains(cpp.complete("data.at(0).argument_snapshot(0).ele"), "elements"),
             "completion follows the owned complex-value API");
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+      bool threw = false;
+      try {
+        cpp.evaluate("auto e = data.at(0);");
+      } catch (const std::out_of_range &) {
+        threw = true;
+      }
+      require(threw, "each empty-collection initializer throws at runtime");
+    }
+    require(!contains(cpp.complete("e"), "e") && !cpp.evaluate("tracer.print(e)"),
+            "a failed initializer leaves no inspectable Event");
+    Collection populated;
+    auto recovered_event = std::make_shared<EventData>();
+    recovered_event->message.set_function_name("recovered_event");
+    populated.events.emplace_back(recovered_event);
+    const auto populated_address =
+        std::to_string(reinterpret_cast<std::uintptr_t>(&populated));
+    require(cpp.evaluate("auto e = reinterpret_cast<const tracer_repl::Collection*>(" +
+                         populated_address + "ULL)->at(0);"),
+            "a valid event can reuse the failed declaration's name");
+    require(cpp.evaluate("tracer.print(e)") &&
+                output.str().find("recovered_event") != std::string::npos,
+            "printing the redeclared event keeps the REPL usable");
+    {
+      int destroyed = 0;
+      CppEngine cleanup(facade, {});
+      require(cleanup.evaluate(
+                  "template<class T> int fail_after_static() { struct Live { "
+                  "~Live() { ++*reinterpret_cast<int*>(" +
+                  std::to_string(reinterpret_cast<std::uintptr_t>(&destroyed)) +
+                  "ULL); } }; static Live object; throw std::out_of_range(\"test\"); }"),
+              "declare a throwing initializer with a static local");
+      try {
+        cleanup.evaluate("auto failed = fail_after_static<int>();");
+        throw std::logic_error("initializer did not throw");
+      } catch (const std::out_of_range &) {
+      }
+      cleanup.reset();
+      require(destroyed == 1, "reset runs registered JIT cleanup safely");
+    }
     require(
         cpp.evaluate(
             "int effects = 0; struct Thing { int count; bool ready() const { "
