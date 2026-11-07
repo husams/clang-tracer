@@ -8,8 +8,11 @@ int Prefix::unused() const { return prefix; }
 
 int Handler::route(int value) const { return value + factor + base + shared; }
 
-// GCC 8.5 emits a register-to-register ADD within the patch window.
-int Handler::scale(int value) { return value * 3; }
+int Handler::scale(int value) {
+  // GCC 8.5 emits a register ADD. Keep the body long enough to patch on Clang.
+  const volatile int result = value * 3;
+  return result;
+}
 
 int Handler::Nested::adjust(int value) { return value + 9; }
 
