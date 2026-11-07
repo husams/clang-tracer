@@ -280,7 +280,8 @@ private:
     const auto *special = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(&record);
     const auto name = special ? special->getSpecializedTemplate()->getName() : record.getName();
     static constexpr std::pair<std::string_view, std::string_view> headers[]{
-        {"array", "array"}, {"atomic", "atomic"}, {"basic_string", "string"},
+        {"array", "array"}, {"atomic", "atomic"}, {"basic_ostream", "ostream"},
+        {"basic_ostringstream", "sstream"}, {"basic_string", "string"},
         {"basic_string_view", "string_view"}, {"bitset", "bitset"}, {"char_traits", "string"},
         {"complex", "complex"}, {"deque", "deque"}, {"duration", "chrono"},
         {"time_point", "chrono"}, {"forward_list", "forward_list"}, {"function", "functional"},
