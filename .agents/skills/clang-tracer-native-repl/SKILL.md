@@ -1,6 +1,6 @@
 ---
 name: clang-tracer-native-repl
-description: Use clang-tracer-repl for native C++ tracing, prepared probes, bulk tracing, read-only target inspection, typed SQLite recording and offline replay, and reusable .repl scripts. Use for native tracing and replay unless the user requests the Python client.
+description: Use clang-tracer-repl for native C++ tracing, prepared probes, bulk tracing, observer reload, read-only target inspection, typed SQLite recording and offline replay, and reusable .repl scripts. Use for native tracing and replay unless the user requests the Python client.
 ---
 
 # Clang Tracer native REPL
@@ -95,9 +95,17 @@ Use `--exact "full C++ signature"` to select a specific overload. Apply resolves
 the manifest again and installs typed PRE/POST observers. Every match must be
 DWARF-supported and available for a new probe. Use `--callback FILE` to compile
 a custom observer for each match. Keep the reported batch ID to remove its probes
-or retry any incomplete restoration. Use `%events stats NAME` on live or replayed
-collections for per-probe counts, duration histograms, and caller edges. Caller
-edges require captured entry stacks.
+or retry any incomplete restoration.
+
+Use `%probe reload PROBE_ID --callback observer-v2.cpp` to update an active
+observer while keeping its binding and deployment options. A rejected callback
+leaves the existing observer active. Calls already in flight finish under the
+old ID. Use the new ID for subsequent filtering or removal, and check `%probes`
+if the reload reply was interrupted. Retired generations still count toward
+the target's retained-probe limit.
+
+Use `%events stats NAME` on live or replayed collections for per-probe counts,
+duration histograms, and caller edges. Caller edges require captured entry stacks.
 
 For read-only inspection, get a memory snapshot token from `%memory maps`:
 
