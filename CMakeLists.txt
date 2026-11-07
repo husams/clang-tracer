@@ -138,16 +138,27 @@ target_compile_options(trace-target PRIVATE -O0 -fno-omit-frame-pointer -fcf-pro
 add_executable(cpp-interceptors-target examples/cpp-interceptors/target.cpp)
 target_compile_options(cpp-interceptors-target PRIVATE -g -O0 -fno-omit-frame-pointer
   -fcf-protection=none)
+if(TRACER_BUILD_REPL)
+  # Keep DWARF in the demo fixture even when the runtime is installed stripped.
+  install(PROGRAMS "$<TARGET_FILE:cpp-interceptors-target>"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer/examples/native-repl-jit"
+    RENAME target COMPONENT Development)
+endif()
 
 add_executable(signature-interceptor-fixture tests/signature_interceptor_fixture.cpp)
 add_executable(repl-complex-fixture tests/repl_complex_fixture.cpp)
-if(BUILD_TESTING)
+if(BUILD_TESTING OR TRACER_BUILD_REPL)
   add_executable(repl-values-example-target examples/native-repl-values/target.cpp)
   target_link_libraries(repl-values-example-target PRIVATE Threads::Threads)
   set_target_properties(repl-values-example-target PROPERTIES ENABLE_EXPORTS ON
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
   target_compile_options(repl-values-example-target PRIVATE -g -O0
     -fno-omit-frame-pointer -fcf-protection=none)
+  if(TRACER_BUILD_REPL)
+    install(PROGRAMS "$<TARGET_FILE:repl-values-example-target>"
+      DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer/examples/native-repl-values"
+      RENAME target COMPONENT Development)
+  endif()
 endif()
 target_link_libraries(repl-complex-fixture PRIVATE Threads::Threads)
 set_target_properties(repl-complex-fixture PROPERTIES ENABLE_EXPORTS ON CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)

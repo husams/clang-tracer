@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-example_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 category=${1:-all}
 interactive=${2:-}
 case "$category" in
@@ -18,9 +17,19 @@ if [[ $(uname -s) != Linux || $(uname -m) != x86_64 ]]; then
   printf 'Run this native attach example on Linux x86-64.\n' >&2
   exit 1
 fi
+script=$(readlink -f -- "${BASH_SOURCE[0]}")
+example_dir=$(dirname -- "$script")
 compiler=${CXX:-clang++-21}
-repl=$(command -v "${CLANG_TRACER_REPL:-clang-tracer-repl}")
-server=$(command -v "${CLANG_TRACER_SERVER:-clang-tracer-server}")
+prefix=$(cd -- "$example_dir/../../../.." && pwd)
+if [[ -x $prefix/bin/clang-tracer-repl && -x $prefix/bin/clang-tracer-server ]]; then
+  repl_default=$prefix/bin/clang-tracer-repl
+  server_default=$prefix/bin/clang-tracer-server
+else
+  repl_default=clang-tracer-repl
+  server_default=clang-tracer-server
+fi
+repl=$(command -v "${CLANG_TRACER_REPL:-$repl_default}")
+server=$(command -v "${CLANG_TRACER_SERVER:-$server_default}")
 run_dir=$(mktemp -d "${TMPDIR:-/tmp}/tracer-values.XXXXXX")
 demo_pid=
 cleanup() {
@@ -36,6 +45,9 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 target_executable=${CLANG_TRACER_VALUES_TARGET:-}
+if [[ -z $target_executable && -z ${CXX:-} && -x $example_dir/target ]]; then
+  target_executable=$example_dir/target
+fi
 if [[ -z "$target_executable" ]]; then
   target_executable=$run_dir/target
   "$compiler" -std=c++17 -g -O0 -fno-omit-frame-pointer -fcf-protection=none \
