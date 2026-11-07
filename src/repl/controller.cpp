@@ -377,6 +377,7 @@ void Controller::start_server(const Command &command) {
   if (server_.running()) {
     throw std::runtime_error("this console already owns a running server");
   }
+  require_no_owned_targets();
   if (!owned_sessions_.empty() || !pending_attaches_.empty()) {
     throw std::runtime_error(
         "resolve console-created or uncertain sessions before changing server");
@@ -546,9 +547,112 @@ SessionHandle Controller::attach(std::uint32_t pid,
   return selected_;
 }
 
+void Controller::prune_owned_targets() {
+  for (auto it = owned_targets_.begin(); it != owned_targets_.end();) {
+    if (it->second.process->running())
+      ++it;
+    else
+      it = owned_targets_.erase(it);
+  }
+}
+
+void Controller::require_no_owned_targets() {
+  prune_owned_targets();
+  if (!owned_targets_.empty())
+    throw std::runtime_error("terminate owned targets before changing server");
+}
+
+void Controller::launch(const Command &command) {
+  prune_owned_targets();
+  if (owned_targets_.size() >= 16)
+    throw std::runtime_error("owned target limit reached");
+  ensure_connected();
+  if (!server_.running() || endpoint_ != server_.endpoint())
+    throw std::runtime_error("%launch requires a private local server owned by this REPL");
+
+  LaunchOptions options;
+  options.executable = command.arguments.at(0);
+  options.cwd = command.option("--cwd");
+  options.input = command.option("--stdin");
+  options.output = command.option("--stdout");
+  options.error = command.option("--stderr");
+  if (command.has("--arg"))
+    options.arguments = command.options.at("--arg");
+  if (command.has("--env"))
+    options.environment = command.options.at("--env");
+
+  auto target = OwnedTarget::start(options, server_.pid());
+  const auto pid = target->pid();
+  auto &owned = owned_targets_.emplace(pid, OwnedLaunch{std::move(target), {}}).first->second;
+  auto &process = *owned.process;
+  try {
+    out_ << "launching pid=" << pid
+         << " stdout=" << std::quoted(printable_proc_text(process.output_path()))
+         << " stderr=" << std::quoted(printable_proc_text(process.error_path()))
+         << '\n' << std::flush;
+    process.wait_ready(command.number("--timeout", settings_.timeout_seconds), interrupted);
+    const auto start = tracer::proc::start_time(tracer::proc::directory(pid) / "stat");
+    if (!start)
+      throw std::runtime_error("cannot verify owned target identity");
+    owned.session = attach(pid, start, process.executable());
+    if (interrupted.load())
+      throw std::runtime_error("target launch cancelled");
+  } catch (const std::exception &error) {
+    try {
+      process.terminate();
+    } catch (const std::exception &cleanup) {
+      throw std::runtime_error(std::string(error.what()) + "; " + cleanup.what() +
+                               "; retry with %terminate " + std::to_string(pid));
+    }
+    const auto session = std::move(owned.session);
+    owned_targets_.erase(pid);
+    pending_attaches_.erase(pid);
+    if (!session.id.empty()) {
+      try {
+        detach(session);
+      } catch (const std::exception &cleanup) {
+        throw std::runtime_error(std::string(error.what()) +
+                                 "; target reaped, session cleanup failed: " + cleanup.what());
+      }
+    }
+    throw;
+  }
+  out_ << "launched pid=" << pid << " session=" << owned.session.id
+       << " paused=true\n";
+}
+
+void Controller::control_target(const Command &command) {
+  const auto pid = command.arguments.empty()
+                       ? selected_.pid
+                       : static_cast<std::uint32_t>(unsigned_number(command.arguments[0], "PID", INT32_MAX));
+  const auto found = owned_targets_.find(pid);
+  if (found == owned_targets_.end())
+    throw std::runtime_error("specify a PID launched by this REPL or select its session");
+  auto &owned = found->second;
+  if (command.kind == CommandKind::resume) {
+    require_session(owned.session);
+    owned.process->resume();
+    out_ << "resumed pid=" << pid << '\n';
+    return;
+  }
+  owned.process->terminate();
+  const auto session = std::move(owned.session);
+  owned_targets_.erase(found);
+  pending_attaches_.erase(pid);
+  out_ << "terminated pid=" << pid << '\n';
+  if (owned_sessions_.count(session.id))
+    detach(session);
+}
+
 void Controller::detach(const SessionHandle &session) {
   if (!stub_ || session.id.empty() || session.connection != connection_) {
     throw std::runtime_error("invalid session handle");
+  }
+  for (const auto &entry : owned_targets_) {
+    auto &target = entry.second;
+    if (target.session.id == session.id && target.process->paused() &&
+        target.process->running())
+      throw std::runtime_error("resume or terminate the paused target before detaching");
   }
   stop_background(session.id);
   api::DetachRequest request;
@@ -1241,6 +1345,7 @@ bool Controller::execute(const Command &command) {
     start_server(command);
     return true;
   case K::server_connect:
+    require_no_owned_targets();
     if (server_.running() || !owned_sessions_.empty() ||
         !pending_attaches_.empty()) {
       throw std::runtime_error(
@@ -1251,6 +1356,7 @@ bool Controller::execute(const Command &command) {
     out_ << "connected endpoint=" << endpoint_ << " ownership=external\n";
     return true;
   case K::server_stop:
+    require_no_owned_targets();
     if (server_.pid() < 0) {
       throw std::runtime_error("this console does not own a server");
     }
@@ -1262,6 +1368,7 @@ bool Controller::execute(const Command &command) {
     return true;
   case K::server_status:
   case K::status: {
+    prune_owned_targets();
     const bool owned = server_.running();
     out_ << "endpoint=" << (endpoint_.empty() ? settings_.endpoint : endpoint_)
          << " ownership="
@@ -1281,6 +1388,9 @@ bool Controller::execute(const Command &command) {
     }
     if (!pending_attaches_.empty())
       out_ << reconcile_attaches() << '\n';
+    for (const auto &target : owned_targets_)
+      out_ << "owned_target pid=" << target.first
+           << " paused=" << (target.second.process->paused() ? "true" : "false") << '\n';
     for (const auto &b : batches_) {
       out_ << "collection=" << b.first << " events=" << b.second.events().size()
            << " bytes=" << b.second.bytes() << '\n';
@@ -1290,6 +1400,13 @@ bool Controller::execute(const Command &command) {
   case K::attach:
     attach(static_cast<unsigned>(unsigned_number(args.at(0), "PID", INT32_MAX)),
            command.number("--start-time", 0));
+    return true;
+  case K::launch:
+    launch(command);
+    return true;
+  case K::resume:
+  case K::terminate:
+    control_target(command);
     return true;
   case K::bulk_preview:
     preview_bulk_trace(command);
@@ -1706,6 +1823,16 @@ bool Controller::execute(const Command &command) {
 void Controller::shutdown() {
   stop_background();
   std::string failures;
+  for (auto it = owned_targets_.begin(); it != owned_targets_.end();) {
+    try {
+      it->second.process->terminate();
+      pending_attaches_.erase(it->first);
+      it = owned_targets_.erase(it);
+    } catch (const std::exception &e) {
+      failures += "pid=" + std::to_string(it->first) + ": " + e.what() + "\n";
+      ++it;
+    }
+  }
   for (const auto &id : std::vector<std::string>(owned_sessions_.begin(),
                                                  owned_sessions_.end())) {
     try {

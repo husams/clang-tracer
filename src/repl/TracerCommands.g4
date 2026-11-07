@@ -3,7 +3,8 @@ grammar TracerCommands;
 line : '%' command EOF;
 command : server | attach | processes | sessions | use | status | detach
         | modules | threads | symbols | probe | interceptor | events | collect | record
-        | cpp | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload;
+        | cpp | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload
+        | targetLaunch;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
 serverOption : ('--executable' | '--agent') value;
 attach : 'attach' (UINT ('--start-time' UINT)?)?;
@@ -63,7 +64,7 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'import'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
         | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview' | 'apply'
-        | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload';
+        | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | 'launch' | 'resume' | 'terminate';
 memory : 'memory' ('maps' | 'read' value '--mapping' value
                  ('--count' UINT | '--type' value)
                  | 'scan' value '--mapping' value '--count' UINT
@@ -71,6 +72,9 @@ memory : 'memory' ('maps' | 'read' value '--mapping' value
 probeEntry : 'probe' 'entry' (value '--mapping' value ('--module' value)?
            | '--module' value '--elf-address' value '--abi' value '--mapping' value);
 probeReload : 'probe' 'reload' UINT '--callback' value;
+targetLaunch : 'launch' value launchOption* | ('resume' | 'terminate') UINT?;
+launchOption : ('--arg' | '--cwd' | '--env' | '--stdin' | '--stdout' | '--stderr') value
+             | '--timeout' UINT;
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';

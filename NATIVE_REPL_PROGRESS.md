@@ -293,3 +293,22 @@ checked original entry bytes after detach.
 Eight focused CTests passed with the GCC 8.5 SDK and Clang 21.1.8,
 including staged CLI replacement across a collector restart. All 198
 portable Python tests passed.
+
+### L1 Owned local launch
+
+`%launch` starts a local Linux x86-64 application with explicit arguments,
+working directory, environment overrides, file-based stdio, and a readiness
+deadline. It attaches at the C++ application's opt-in startup checkpoint and
+keeps application work paused while probes are installed. `%resume [PID]`
+releases the checkpoint. `%terminate [PID]` kills and reaps a child owned by
+the REPL. Failed launches and REPL exit clean up the owned child.
+
+The Linux fixture captures the first call after the checkpoint and checks
+its result, arguments, environment, working directory and stdio. It also
+covers ordinary launch, paused termination, rejected detach while paused,
+readiness timeout, early exit, exec and attach failures, natural exit after
+resume, and REPL exit with a paused child.
+
+Twelve focused native REPL CTests passed on Linux x86-64 with the GCC 8.5
+SDK and Clang 21.1.8. The launch fixture also passed with its executable,
+working directory, and output files on OverlayFS.

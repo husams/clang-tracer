@@ -93,6 +93,51 @@ to attach only when the PID still has the displayed start time.
 Remote process enumeration is not in the service API, so remote attach uses an
 explicit PID.
 
+### Launch a local application
+
+Build the application with the installed C++17 `<tracer/launch.hpp>` header and add
+a checkpoint at the start of `main`, before starting threads or calling the
+code you want to trace. It returns immediately on an ordinary run. Treat a
+failed checkpoint as a startup failure.
+
+```cpp
+#include <tracer/launch.hpp>
+
+int main() {
+  if (!tracer::launch::wait_for_resume())
+    return 125;
+  return run_application();
+}
+```
+
+Use these commands in the native REPL with its private Linux x86-64 server.
+`%launch` selects the attached session and holds the application at the
+checkpoint while you install probes.
+
+```text
+%launch ./app --arg "example input" --env MODE=test --cwd ./work --stdin ./input.txt --timeout 5
+%probe inject "app::start()" --callback observer.cpp
+%resume
+%terminate
+```
+
+The earliest traceable work is the first eligible call after the checkpoint.
+The loader, global constructors, and any earlier application code have already
+run. Repeat `--arg` for arguments and `--env NAME=VALUE` for overrides to the
+inherited environment. Relative paths are resolved from the REPL's working
+directory. Standard input defaults to `/dev/null`. Use `--stdout NEW_FILE`
+and `--stderr NEW_FILE` to choose output files. The REPL reports the paths and
+otherwise creates private log files. Existing files are protected from overwrite.
+
+`--timeout` bounds the wait for the checkpoint in seconds. It defaults to
+the REPL timeout, which also applies separately to attach. Setup or attach
+failure and readiness timeout terminate and reap the child. `%resume [PID]`
+and `%terminate [PID]` use the selected target when PID is omitted.
+`%terminate` kills and reaps the launched child whether paused or resumed.
+The REPL retains ownership after detach and terminates any remaining owned
+children on exit. Use `%status` to list owned targets and reap any that have
+already exited. Only the launched process is managed.
+
 If an attach reply fails or times out, the operation may still finish on the
 server. The console reports the endpoint, PID and newly observed candidate
 session IDs, blocks automatic retries for that PID, and reconciles again on

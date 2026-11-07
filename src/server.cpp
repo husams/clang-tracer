@@ -1488,6 +1488,7 @@ public:
       return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
     std::lock_guard operation_lock(session->operation_mutex());
     try {
+      session->refresh_process_state();
       session->detach();
       const auto snapshot = session->snapshot();
       for (const auto &probe : snapshot.probes()) {

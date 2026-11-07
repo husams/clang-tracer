@@ -28,9 +28,10 @@ public:
     T__80 = 81, T__81 = 82, T__82 = 83, T__83 = 84, T__84 = 85, T__85 = 86,
     T__86 = 87, T__87 = 88, T__88 = 89, T__89 = 90, T__90 = 91, T__91 = 92,
     T__92 = 93, T__93 = 94, T__94 = 95, T__95 = 96, T__96 = 97, T__97 = 98,
-    T__98 = 99, T__99 = 100, T__100 = 101, T__101 = 102, T__102 = 103, UINT = 104,
-    STRING = 105, SHELL = 106, METADATA_ONLY = 107, SQLITE = 108, WORD = 109,
-    WS = 110
+    T__98 = 99, T__99 = 100, T__100 = 101, T__101 = 102, T__102 = 103, T__103 = 104,
+    T__104 = 105, T__105 = 106, T__106 = 107, T__107 = 108, T__108 = 109,
+    T__109 = 110, T__110 = 111, T__111 = 112, UINT = 113, STRING = 114,
+    SHELL = 115, METADATA_ONLY = 116, SQLITE = 117, WORD = 118, WS = 119
   };
 
   enum {
@@ -42,7 +43,7 @@ public:
     RuleRecord = 21, RuleStreamOption = 22, RuleCpp = 23, RuleShell = 24,
     RuleComplete = 25, RuleType = 26, RuleHelp = 27, RuleQuit = 28, RuleBulkTrace = 29,
     RuleBulkTraceOption = 30, RuleValue = 31, RuleKeyword = 32, RuleMemory = 33,
-    RuleProbeEntry = 34, RuleProbeReload = 35
+    RuleProbeEntry = 34, RuleProbeReload = 35, RuleTargetLaunch = 36, RuleLaunchOption = 37
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -98,6 +99,8 @@ public:
   class MemoryContext;
   class ProbeEntryContext;
   class ProbeReloadContext;
+  class TargetLaunchContext;
+  class LaunchOptionContext;
 
   class  LineContext : public antlr4::ParserRuleContext {
   public:
@@ -142,6 +145,7 @@ public:
     MemoryContext *memory();
     ProbeEntryContext *probeEntry();
     ProbeReloadContext *probeReload();
+    TargetLaunchContext *targetLaunch();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -630,6 +634,36 @@ public:
   };
 
   ProbeReloadContext* probeReload();
+
+  class  TargetLaunchContext : public antlr4::ParserRuleContext {
+  public:
+    TargetLaunchContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+    std::vector<LaunchOptionContext *> launchOption();
+    LaunchOptionContext* launchOption(size_t i);
+    antlr4::tree::TerminalNode *UINT();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  TargetLaunchContext* targetLaunch();
+
+  class  LaunchOptionContext : public antlr4::ParserRuleContext {
+  public:
+    LaunchOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+    antlr4::tree::TerminalNode *UINT();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  LaunchOptionContext* launchOption();
 
 
   // By default the static state used to implement the parser is lazily initialized during the first

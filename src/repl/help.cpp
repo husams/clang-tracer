@@ -32,6 +32,11 @@ const CommandTopic commands[] = {
     {"server stop", "%server stop", "Stop the server started by this REPL and restore its targets."},
     {"attach", "%attach [PID [--start-time TICKS]]", "Attach to a target. Omit PID for the local picker, or supply the observed start time with a PID.",
      "%attach 12345"},
+    {"launch", "%launch EXECUTABLE [--arg VALUE] [--env NAME=VALUE] [--cwd DIR]\n"
+     "  [--stdin FILE] [--stdout NEW_FILE] [--stderr NEW_FILE] [--timeout SECONDS]",
+     "Launch a local C++ application and attach at its startup checkpoint. Repeat --arg and --env."},
+    {"resume", "%resume [PID]", "Release the startup checkpoint of an attached target launched by this REPL."},
+    {"terminate", "%terminate [PID]", "Kill and reap a target launched by this REPL."},
     {"processes", "%processes [--filter TEXT]", "List local target processes that match the filter."},
     {"sessions", "%sessions", "List sessions known to the connected server."},
     {"use", "%use SESSION", "Select an attached session for subsequent commands.", "%use s1"},

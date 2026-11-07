@@ -159,6 +159,14 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitTargetLaunch(TracerCommandsParser::TargetLaunchContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitLaunchOption(TracerCommandsParser::LaunchOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
 
 };
 

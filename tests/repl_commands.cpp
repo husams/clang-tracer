@@ -20,6 +20,18 @@ int main() {
     throw std::runtime_error("accepted malformed command: " + s);
   };
   require(parse_command("%attach 12345").kind == CommandKind::attach);
+  const auto launch = parse_command(
+      "%launch ./app --arg \"--first\" --arg \"\" --env VAR=1 --env \"VAR=two words\" --timeout 5");
+  require(launch.kind == CommandKind::launch && launch.arguments.at(0) == "./app" &&
+          launch.options.at("--arg") == std::vector<std::string>{"--first", ""} &&
+          launch.options.at("--env") == std::vector<std::string>{"VAR=1", "VAR=two words"} &&
+          launch.number("--timeout", 0) == 5);
+  require(parse_command("%resume").arguments.empty());
+  require(parse_command("%terminate 123").kind == CommandKind::terminate);
+  bad("%launch app --cwd here --cwd there");
+  bad("%launch app --timeout 0");
+  bad("%resume 0");
+  bad("%terminate 2147483648");
   require(parse_command("%probe prepare \"demo::compute(int)\" --include api.hpp "
       "--compdb build --translation-unit src/api.cpp --module app --output prepared").kind
           == CommandKind::prepare);

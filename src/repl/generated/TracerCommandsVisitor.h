@@ -91,6 +91,10 @@ public:
 
     virtual std::any visitProbeReload(TracerCommandsParser::ProbeReloadContext *context) = 0;
 
+    virtual std::any visitTargetLaunch(TracerCommandsParser::TargetLaunchContext *context) = 0;
+
+    virtual std::any visitLaunchOption(TracerCommandsParser::LaunchOptionContext *context) = 0;
+
 
 };
 

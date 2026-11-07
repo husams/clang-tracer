@@ -52,6 +52,9 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"server status", K::server_status},
                                         {"server stop", K::server_stop},
                                         {"attach", K::attach},
+                                        {"launch", K::launch},
+                                        {"resume", K::resume},
+                                        {"terminate", K::terminate},
                                         {"processes", K::processes},
                                         {"sessions", K::sessions},
                                         {"use", K::use},
@@ -130,7 +133,7 @@ public:
         "--all", "--metadata-only", "--print-arguments", "--print-result",
         "--details", "--addresses", "--sqlite"};
     const std::set<std::string> repeated = {"--include", "--compile-option",
-                                           "--name", "--type"};
+                                           "--name", "--type", "--arg", "--env"};
     const std::set<std::string> bulk_repeated = {"--module", "--exclude", "--exact"};
     for (; i + 1 < ts.size(); ++i) {
       const auto text = ts[i]->getText();
@@ -249,7 +252,15 @@ Command parse_command(const std::string &input) {
   if (command.number("--limit", 0) > UINT32_MAX) {
     throw std::invalid_argument("--limit must fit a 32-bit page size");
   }
-  if (command.kind == K::attach && !command.arguments.empty()) {
+  if (command.kind == K::launch) {
+    if (command.arguments[0].empty())
+      throw std::invalid_argument("%launch requires an executable path");
+    for (const auto *key : {"--cwd", "--stdin", "--stdout", "--stderr"})
+      if (command.has(key) && command.option(key).empty())
+        throw std::invalid_argument(std::string(key) + " requires a path");
+  }
+  if ((command.kind == K::attach || command.kind == K::resume ||
+       command.kind == K::terminate) && !command.arguments.empty()) {
     if (!unsigned_number(command.arguments[0], "PID", INT32_MAX)) {
       throw std::invalid_argument("PID must be positive");
     }
