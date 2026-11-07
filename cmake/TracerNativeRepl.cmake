@@ -250,6 +250,7 @@ function(tracer_add_native_repl)
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
           --target $<TARGET_FILE:cpp-interceptors-target>
           --bool-target $<TARGET_FILE:signature-interceptor-fixture>
+          --incompatible-agent $<TARGET_FILE:call-stacks-calculator>
           --callback "${CMAKE_CURRENT_SOURCE_DIR}/examples/cpp-interceptors/method.cpp")
       set_tests_properties(native_repl_integration PROPERTIES TIMEOUT 240)
       add_test(NAME native_repl_complex_integration

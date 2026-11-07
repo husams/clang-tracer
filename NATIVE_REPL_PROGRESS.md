@@ -115,3 +115,31 @@ targeting `c++17`; merging and live installation are separate operations.
   logical line 1, and rejects ambiguous state after parse errors with explicit
   recovery guidance. Pending values are transferred through the public
   interpreter API without repeating the user cell.
+
+## Local C++ JIT P0
+
+Base: `04e503b` on `c++17`. Isolated branch: `codex/local-cpp-jit-p0`.
+Scope: local Linux x86-64 C++ targets.
+
+| Story | Implementation |
+| --- | --- |
+| J1 Runtime identity | Compare the loaded agent's GNU build ID and bootstrap version before accepting attach. Report the runtime profile and measure resolution, target JIT compilation and patch installation separately. Recheck PID start time on both sides of ptrace admission. |
+| J2 Named observer validation | Validate the exact in-memory C++ draft before upload, through the existing Clang interpreter and non-activating validation path. The native fixture distinguishes validation from activation and checks target-side STL, templates and RAII. |
+| J3 Observer lifetime | Use the existing probe ID as the observer generation. Keep the established replacement and drain paths, which retain native wrappers for late arrivals. Document the callback-scoped borrow contract. |
+
+The named-observer fixture ran with Clang/LLVM 21.1.8, glibc 2.23 and the GCC
+8.5 SDK. One install measured 1.60 ms to resolve, 1,685.74 ms in the target
+JIT and 5.13 ms to patch. The callback reported the target PID and its RAII
+destructor count. The REPL inspected and replayed the owned events.
+
+The stale-agent check replaced the configured ELF on disk while the original
+remained mapped. Attach rejected the build ID mismatch and released ptrace.
+Native Python checks covered invalid syntax, signature mismatch, unresolved
+symbols, initializer-free validation and failed replacement preserving the
+old observer. All 198 portable Python tests passed.
+
+Nine focused CTests and five native Python tests passed on Linux x86-64.
+The staged-install interceptor test passed with its target fixtures rebuilt
+with DWARF in the isolated validation directory. It covered original exception
+propagation, replacement and concurrent detach. The ordinary GCC 8.5 SDK
+profile was used throughout.

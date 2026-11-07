@@ -26,6 +26,7 @@ resolveOption : ('--include' | '--compdb' | '--module' | '--compile-option'
                 | '--prepared' | '--prepared-mode') value;
 deployOption : resolveOption | '--stack-depth' UINT | '--print-arguments' | '--print-result';
 interceptor : 'interceptor' ('load' value '--as' value | 'edit' value | 'show' value
+      | 'validate' value '--target' value resolveOption*
             | 'upload' value '--target' value deployOption*);
 events : 'events' (streamOption*
        | 'list' value ('--limit' UINT)?

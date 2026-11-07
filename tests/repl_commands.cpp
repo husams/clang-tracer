@@ -85,6 +85,15 @@ int main() {
   bad("%cpp import `cat flags.txt`");
   require(parse_command("%events show batch --index 0").kind ==
           CommandKind::event_show);
+  const auto draft_check = parse_command(
+      "%interceptor validate hook --target \"demo::compute(int)\" "
+      "--prepared-mode require");
+  require(draft_check.kind == CommandKind::draft_validate &&
+          draft_check.arguments.at(0) == "hook" &&
+          draft_check.option("--target") == "demo::compute(int)" &&
+          draft_check.option("--prepared-mode") == "require");
+  bad("%interceptor validate hook");
+  bad("%interceptor validate hook --target compute --stack-depth 4");
   bad("%attach 12345 trailing");
   bad("%probe inject \"unfinished --callback f.cpp");
   bad("%collect --count 3 --count 4");

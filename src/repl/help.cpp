@@ -65,6 +65,8 @@ const CommandTopic commands[] = {
     {"interceptor load", "%interceptor load FILE --as NAME", "Load a local C++ file into a named draft."},
     {"interceptor edit", "%interceptor edit NAME", "Enter C++ source interactively. Use .end to save or .cancel to discard."},
     {"interceptor show", "%interceptor show NAME", "Print the source of a named draft."},
+    {"interceptor validate", "%interceptor validate NAME --target SELECTOR [RESOLUTION OPTIONS]",
+     "Compile and link the named draft for the selected target without activating a probe."},
     {"interceptor upload", "%interceptor upload NAME --target SELECTOR [RESOLUTION OPTIONS] [DEPLOYMENT OPTIONS]",
      "Install the named draft on the selected target.",
      R"example(%interceptor upload hook --target "demo::compute(int)")example"},

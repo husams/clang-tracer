@@ -28,6 +28,7 @@ enum class CommandKind {
   draft_load,
   draft_edit,
   draft_show,
+  draft_validate,
   draft_upload,
   events,
   event_list,

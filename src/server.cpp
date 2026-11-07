@@ -1233,6 +1233,10 @@ public:
       std::lock_guard lock(mutex_);
       pending_pids_.erase(pid);
       return status_for(error);
+    } catch (const AgentRuntimeIncompatible &error) {
+      std::lock_guard lock(mutex_);
+      pending_pids_.erase(pid);
+      return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
     } catch (const std::exception &error) {
       session->record_failure(error.what());
       std::lock_guard lock(mutex_);

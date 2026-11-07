@@ -19,6 +19,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <llvm/ADT/StringExtras.h>
+#include <llvm/Object/BuildID.h>
+#include <llvm/Object/ObjectFile.h>
+#include <llvm/Support/Error.h>
+
+#include "agent_runtime_profile.hpp"
 #include "injector.hpp"
 #include "tracer/compat.hpp"
 
@@ -105,6 +111,72 @@ void copy_signature(const clangtracer::v1::Signature &signature,
   }
 }
 
+std::string configured_agent_build_id(const std::string &path) {
+  auto binary = llvm::object::createBinary(path);
+  if (!binary)
+    throw AgentRuntimeIncompatible("cannot read configured agent ELF: " +
+                                   llvm::toString(binary.takeError()));
+  const auto *object =
+      llvm::dyn_cast<llvm::object::ObjectFile>(binary->getBinary());
+  const auto id = object ? llvm::object::getBuildID(object)
+                         : llvm::ArrayRef<std::uint8_t>{};
+  if (id.empty())
+    throw AgentRuntimeIncompatible("configured agent has no ELF build ID");
+  return llvm::toHex(id, /*LowerCase=*/true);
+}
+
+template <std::size_t N> std::string profile_text(const char (&value)[N]) {
+  const auto *end = std::find(value, value + N, '\0');
+  if (end == value + N)
+    throw AgentRuntimeIncompatible(
+        "loaded agent returned invalid runtime profile text");
+  return {value, end};
+}
+
+clangtracer::v1::JitRuntimeProfile read_agent_profile(
+    injector::Process &process, std::uintptr_t profile_entry,
+    std::uintptr_t scratch, const std::string &expected_id) {
+  if (!profile_entry)
+    throw AgentRuntimeIncompatible(
+        "loaded agent has no JIT runtime profile handshake; use a matching agent or restart the target");
+  AgentRuntimeProfile profile{};
+  if (process.remote_call(profile_entry, {scratch, sizeof(profile)}, 2) != 0)
+    throw AgentRuntimeIncompatible(
+        "loaded agent could not report its JIT runtime profile");
+  process.remote_read(scratch, &profile, sizeof(profile));
+  if (profile.bootstrap_protocol != kBootstrapVersion)
+    throw AgentRuntimeIncompatible(
+        "loaded agent bootstrap protocol " +
+        std::to_string(profile.bootstrap_protocol) +
+        " differs from server protocol " + std::to_string(kBootstrapVersion) +
+        "; use a matching agent or restart the target");
+  const auto build_id = llvm::toHex(llvm::ArrayRef(profile.build_id),
+                                    /*LowerCase=*/true);
+  if (build_id != expected_id)
+    throw AgentRuntimeIncompatible(
+        "loaded agent build " + build_id +
+        " differs from configured agent build " +
+        expected_id + "; restart the target to load the configured agent");
+  if (profile.pointer_bytes != 8 || profile.libstdcxx_default_cxx11_abi < -1 ||
+      profile.libstdcxx_default_cxx11_abi > 1)
+    throw AgentRuntimeIncompatible(
+        "loaded agent returned an invalid x86-64 runtime profile");
+
+  clangtracer::v1::JitRuntimeProfile result;
+  result.set_agent_build_id(build_id);
+  result.set_bootstrap_protocol(profile.bootstrap_protocol);
+  result.set_target_abi("linux-x86-64-sysv");
+  result.set_clang_version(profile_text(profile.clang_version));
+  result.set_llvm_version(profile_text(profile.llvm_version));
+  result.set_glibc_version(profile_text(profile.glibc_version));
+  result.set_cxx_runtime_path(profile_text(profile.cxx_runtime_path));
+  result.set_libstdcxx_header_release(profile.libstdcxx_header_release);
+  if (profile.libstdcxx_default_cxx11_abi >= 0)
+    result.set_libstdcxx_default_cxx11_abi(
+        profile.libstdcxx_default_cxx11_abi == 1);
+  return result;
+}
+
 } // namespace
 
 Session::Session(std::string id, std::uint32_t pid, std::uint64_t process_start,
@@ -125,8 +197,10 @@ std::uint64_t Session::ProcessStartTime(std::uint32_t pid) {
 void Session::attach_process(injector::Process &process,
                              std::chrono::steady_clock::time_point deadline) {
   for (;;) {
+    check_identity_locked();
     try {
       process.attach(static_cast<pid_t>(pid_), application_modules_);
+      check_identity_locked();
       return;
     } catch (const injector::IdlePointUnavailable &) {
       if (std::chrono::steady_clock::now() >= deadline) {
@@ -173,6 +247,7 @@ void Session::attach() {
   if (state_ != clangtracer::v1::Session::ATTACHED) {
     throw std::runtime_error("session is not attachable");
   }
+  const auto expected_agent_id = configured_agent_build_id(agent_path_);
   injector::Process process;
   const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
   try {
@@ -187,38 +262,42 @@ void Session::attach() {
     throw injector::InitialAdmissionUnavailable(error.what());
   }
   std::uintptr_t scratch = 0;
-  const auto start_offset = agent_path_.size() + 16;
-  const auto stop_offset = start_offset + 32;
-  const auto detour_offset = stop_offset + 32;
-  const auto scratch_size = detour_offset + 96;
+  // Each synchronous loader call has finished using its string before the
+  // scratch buffer is reused for another symbol name or the profile.
+  const auto scratch_size =
+      std::max(agent_path_.size() + 1, sizeof(AgentRuntimeProfile));
   try {
     scratch = process.remote_allocate(scratch_size);
-    auto put = [&](std::uintptr_t offset, const std::string &text) {
-      process.remote_write(scratch + offset, text.c_str(), text.size() + 1);
-      return scratch + offset;
-    };
-    const auto library_path = put(0, agent_path_);
+    process.remote_write(scratch, agent_path_.c_str(), agent_path_.size() + 1);
     const auto dlopen_address = process.resolve_remote_symbol("dlopen");
     const auto dlsym_address = process.resolve_remote_symbol("dlsym");
     const auto handle = process.remote_call(
-        dlopen_address, {library_path, RTLD_NOW | RTLD_GLOBAL}, 2);
+        dlopen_address, {scratch, RTLD_NOW | RTLD_GLOBAL}, 2);
     if (!handle) {
       throw std::runtime_error(
           "target dlopen failed to load the agent and its dependencies");
     }
-    const auto start_name = put(start_offset, "tracer_agent_start");
-    const auto stop_name = put(stop_offset, "tracer_agent_stop");
-    const auto detour_name = put(detour_offset,
-                                 "tracer_context_pthread_create_detour");
-    const auto start =
-        process.remote_call(dlsym_address, {handle, start_name}, 2);
-    const auto stop =
-        process.remote_call(dlsym_address, {handle, stop_name}, 2);
-    const auto validate_name = put(detour_offset + 48, "tracer_agent_validate");
-    const auto validate =
-        process.remote_call(dlsym_address, {handle, validate_name}, 2);
+    const auto agent_symbol = [&](const char *name) {
+      process.remote_write(scratch, name, std::strlen(name) + 1);
+      return process.remote_call(dlsym_address, {handle, scratch}, 2);
+    };
+    const auto profile_entry = agent_symbol("tracer_agent_runtime_profile_v1");
+    try {
+      jit_runtime_ =
+          read_agent_profile(process, profile_entry, scratch, expected_agent_id);
+    } catch (const AgentRuntimeIncompatible &) {
+      // The handshake does not install hooks. Return a definitive failure
+      // only after scratch memory and ptrace ownership have been released.
+      process.remote_free(scratch, scratch_size);
+      scratch = 0;
+      process.detach();
+      throw;
+    }
+    const auto start = agent_symbol("tracer_agent_start");
+    const auto stop = agent_symbol("tracer_agent_stop");
+    const auto validate = agent_symbol("tracer_agent_validate");
     const auto pthread_detour =
-        process.remote_call(dlsym_address, {handle, detour_name}, 2);
+        agent_symbol("tracer_context_pthread_create_detour");
     if (!start || !stop) {
       throw std::runtime_error(
           "native agent start/stop exports were not found");
@@ -530,6 +609,7 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
       attach_process(process, deadline);
     }
 
+    const auto patch_started = std::chrono::steady_clock::now();
     constexpr unsigned kPatchAttempts = 12;
     bool committed = false;
     unsigned patch_attempts = 0;
@@ -634,6 +714,10 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
       throw std::runtime_error("entry remained busy; probe was not committed");
     }
     it->second.patch_committed = true;
+    it->second.value.set_jit_compile_ns(response.jit_compile_ns);
+    it->second.value.set_patch_install_ns(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - patch_started).count());
     if (scheduler_patch && !pthread_create_patch_committed_) {
       pthread_create_patch_ = scheduler_patch;
       pthread_create_patch_committed_ = true;
@@ -671,6 +755,7 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     if (!prepared)
       ::unlink(source_file.c_str());
     else if (found != probes_.end() && !unsafe_target_ &&
+             state_ != clangtracer::v1::Session::EXITED &&
              !found->second.patch_committed) {
       // Metadata or commit failed after preparation. Leave the immutable
       // retained probe discoverable for a later safe remove.
@@ -1110,6 +1195,9 @@ clangtracer::v1::Session Session::snapshot() const {
   clangtracer::v1::Session result;
   result.set_id(id_);
   result.set_pid(pid_);
+  result.set_process_start_time(process_start_);
+  if (jit_runtime_)
+    result.mutable_jit_runtime()->CopyFrom(*jit_runtime_);
   result.set_state(state_);
   result.set_error(error_);
   for (const auto &path : discovered_module_paths_) {

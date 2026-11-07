@@ -5378,12 +5378,16 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, "could not make trampoline executable");
       return -1;
     }
+    const auto compile_started = std::chrono::steady_clock::now();
     if (!compile_probe(
             *p, specification, error, true, false, nullptr,
             verified_debug_entry ? &*verified_debug_entry : nullptr)) {
       set_error(request, error.c_str());
       return -1;
     }
+    p->request.jit_compile_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - compile_started).count();
     if (p->request.context_required && !prepare_context_pthread(a, *p, error)) {
       set_error(request, error.c_str());
       return -1;

@@ -106,6 +106,7 @@ external server; recovery information is retained until explicitly resolved.
 %probe resolve "Calculator::multiply(int, int) const"
 %interceptor load method.cpp --as multiply_hook
 %interceptor show multiply_hook
+%interceptor validate multiply_hook --target "Calculator::multiply(int, int) const"
 %interceptor upload multiply_hook --target "Calculator::multiply(int, int) const" --stack-depth 16
 %probes
 ```
@@ -125,6 +126,21 @@ repeatable `--compile-option`. Headers and compilation-database paths refer to
 the server host. Source files are limited to 4 MiB. Uploaded interceptors are
 compiled by the server/agent; local REPL variables, pointers and lambdas are not
 implicitly transferred into the target.
+
+Attach checks the loaded agent's bootstrap protocol and ELF build ID against
+the server and its configured agent file before accepting the session. Use
+`%sessions` to see the process start time and target JIT runtime profile.
+The reported libstdc++ header release and C++11 ABI flag describe the agent
+build defaults. Probe-specific flags and target signature ABI checks still apply.
+Successful installs report resolve, target JIT compile and patch durations
+in nanoseconds when the server supports them.
+
+The probe ID identifies one installed observer generation. If a replacement
+fails to compile, the previous observer stays active. Removal restores the
+original entry, closes callback admission, and drains in-flight calls.
+The agent retains native wrappers for safe late arrivals. Borrow target
+pointers and references only during the callback. Use owned snapshots for REPL
+inspection and replay.
 
 ## Collect and inspect
 
@@ -577,8 +593,8 @@ contents. The old scalar variant/text APIs remain available.
 Snapshots survive detach, target exit, collection clearing and recording replay.
 Both native and shared-context event envelopes carry the same owned data.
 Use `%help api EventValue` for the loaded inspection API and Tab on
-`event.argument_snapshot(0).` for its methods. Backend/agent bootstrap version
-20 is required for new captures; install the server and agent together.
+`event.argument_snapshot(0).` for its methods. Install the server and agent
+together so their bootstrap protocols match.
 
 The prelude provides `tracer` and a selected-session reference named `session`.
 Copying `session` makes a handle that retains that server/session identity;

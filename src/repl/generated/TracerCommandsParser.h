@@ -345,6 +345,8 @@ public:
     virtual size_t getRuleIndex() const override;
     std::vector<ValueContext *> value();
     ValueContext* value(size_t i);
+    std::vector<ResolveOptionContext *> resolveOption();
+    ResolveOptionContext* resolveOption(size_t i);
     std::vector<DeployOptionContext *> deployOption();
     DeployOptionContext* deployOption(size_t i);
 

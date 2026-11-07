@@ -345,6 +345,10 @@ SessionHandle Controller::attach(std::uint32_t pid) {
   selected_ = {response.id(), response.pid(), connection_};
   out_ << "attached session=" << selected_.id << " pid=" << selected_.pid
        << '\n';
+  if (response.has_jit_runtime()) {
+    out_ << "target JIT runtime " << response.jit_runtime().ShortDebugString()
+         << '\n';
+  }
   return selected_;
 }
 
@@ -485,7 +489,10 @@ std::uint64_t Controller::inject(const SessionHandle &session,
                                  const std::string &source,
                                  const Command &options) {
   require_session(session);
+  const auto resolve_started = std::chrono::steady_clock::now();
   auto spec = resolve_for(session, selector, options);
+  const auto resolve_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - resolve_started).count();
   spec.set_callback_source(source);
   spec.set_stack_depth(
       static_cast<unsigned>(options.number("--stack-depth", 0)));
@@ -509,7 +516,12 @@ std::uint64_t Controller::inject(const SessionHandle &session,
       artifact.SerializeAsString() == package->second.artifact.SerializeAsString())
     pending_imports_.push_back(tracer::prepared::adapter_source(package->second.artifact));
   out_ << "installed probe=" << result.id()
-       << " session=" << result.session_id() << '\n';
+       << " session=" << result.session_id();
+  if (result.jit_compile_ns() && result.patch_install_ns())
+    out_ << " resolve_ns=" << resolve_ns
+         << " jit_compile_ns=" << result.jit_compile_ns()
+         << " patch_install_ns=" << result.patch_install_ns();
+  out_ << '\n';
   return result.id();
 }
 
@@ -961,14 +973,18 @@ bool Controller::execute(const Command &command) {
     inject(selected_, args.at(0), read_source(command.option("--callback")),
            command);
     return true;
-  case K::validate: {
+  case K::validate:
+  case K::draft_validate: {
     require_session(selected_);
+    const bool named = command.kind == K::draft_validate;
+    const auto selector = named ? command.option("--target") : args.at(0);
     api::ResolveProbeRequest resolution;
     resolution_options(resolution, command);
     api::ValidateProbeRequest request;
     request.set_session_id(selected_.id);
-    request.set_selector(args.at(0));
-    request.set_callback_source(read_source(command.option("--callback")));
+    request.set_selector(selector);
+    request.set_callback_source(named ? drafts_.at(args.at(0))
+                                      : read_source(command.option("--callback")));
     *request.mutable_include_headers() = resolution.include_headers();
     *request.mutable_compile_options() = resolution.compile_options();
     request.set_module(resolution.module());
@@ -986,7 +1002,7 @@ bool Controller::execute(const Command &command) {
       if (prepared != PreparedMode::prefer) throw;
       out_ << "prepared validation rejected; falling back to DWARF: " << error.what() << '\n';
       request.clear_prepared();
-      request.set_selector(args.at(0));
+      request.set_selector(selector);
       response = validate();
     }
     out_ << response.DebugString();

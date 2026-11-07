@@ -235,16 +235,50 @@ class ContextEventEnvelope(_message.Message):
     def __init__(self, producer_session_id: _Optional[bytes] = ..., epoch_id: _Optional[int] = ..., schemas: _Optional[_Iterable[_Union[SchemaRecord, _Mapping]]] = ..., event: _Optional[_Union[EventRecord, _Mapping]] = ...) -> None: ...
 
 class TypedTraceValue(_message.Message):
-    __slots__ = ("value_type", "signed_value", "unsigned_value", "real_value")
+    __slots__ = ("value_type", "signed_value", "unsigned_value", "real_value", "snapshot")
     VALUE_TYPE_FIELD_NUMBER: _ClassVar[int]
     SIGNED_VALUE_FIELD_NUMBER: _ClassVar[int]
     UNSIGNED_VALUE_FIELD_NUMBER: _ClassVar[int]
     REAL_VALUE_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_FIELD_NUMBER: _ClassVar[int]
     value_type: int
     signed_value: int
     unsigned_value: int
     real_value: float
-    def __init__(self, value_type: _Optional[int] = ..., signed_value: _Optional[int] = ..., unsigned_value: _Optional[int] = ..., real_value: _Optional[float] = ...) -> None: ...
+    snapshot: ValueSnapshot
+    def __init__(self, value_type: _Optional[int] = ..., signed_value: _Optional[int] = ..., unsigned_value: _Optional[int] = ..., real_value: _Optional[float] = ..., snapshot: _Optional[_Union[ValueSnapshot, _Mapping]] = ...) -> None: ...
+
+class ValueSnapshot(_message.Message):
+    __slots__ = ("cpp_type", "root_type", "descriptor_set", "payload", "status", "detail", "container_roles", "record_types")
+    class Status(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = ()
+        UNSPECIFIED: _ClassVar[ValueSnapshot.Status]
+        COMPLETE: _ClassVar[ValueSnapshot.Status]
+        UNSUPPORTED: _ClassVar[ValueSnapshot.Status]
+        LIMIT_EXCEEDED: _ClassVar[ValueSnapshot.Status]
+        FAILED: _ClassVar[ValueSnapshot.Status]
+    UNSPECIFIED: ValueSnapshot.Status
+    COMPLETE: ValueSnapshot.Status
+    UNSUPPORTED: ValueSnapshot.Status
+    LIMIT_EXCEEDED: ValueSnapshot.Status
+    FAILED: ValueSnapshot.Status
+    CPP_TYPE_FIELD_NUMBER: _ClassVar[int]
+    ROOT_TYPE_FIELD_NUMBER: _ClassVar[int]
+    DESCRIPTOR_SET_FIELD_NUMBER: _ClassVar[int]
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    STATUS_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    CONTAINER_ROLES_FIELD_NUMBER: _ClassVar[int]
+    RECORD_TYPES_FIELD_NUMBER: _ClassVar[int]
+    cpp_type: str
+    root_type: str
+    descriptor_set: bytes
+    payload: bytes
+    status: ValueSnapshot.Status
+    detail: str
+    container_roles: _containers.RepeatedScalarFieldContainer[str]
+    record_types: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, cpp_type: _Optional[str] = ..., root_type: _Optional[str] = ..., descriptor_set: _Optional[bytes] = ..., payload: _Optional[bytes] = ..., status: _Optional[_Union[ValueSnapshot.Status, str]] = ..., detail: _Optional[str] = ..., container_roles: _Optional[_Iterable[str]] = ..., record_types: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class TraceArgument(_message.Message):
     __slots__ = ("index", "name", "value")

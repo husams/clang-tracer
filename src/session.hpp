@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,11 @@ namespace tracer {
 namespace injector {
 class Process;
 }
+
+class AgentRuntimeIncompatible final : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
 
 class Session final {
 public:
@@ -84,6 +90,7 @@ private:
   std::mutex operation_mutex_;
   clangtracer::v1::Session::State state_ = clangtracer::v1::Session::ATTACHED;
   std::string error_;
+  std::optional<clangtracer::v1::JitRuntimeProfile> jit_runtime_;
   bool unsafe_target_ = false;
   std::uintptr_t start_address_ = 0;
   std::uintptr_t stop_address_ = 0;

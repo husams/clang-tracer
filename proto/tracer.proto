@@ -195,6 +195,19 @@ message AttachRequest {
   reserved 2;
   reserved "application_modules";
 }
+message JitRuntimeProfile {
+  string agent_build_id = 1; // GNU build ID of the loaded agent, in hex.
+  uint32 bootstrap_protocol = 2;
+  string target_abi = 3;
+  string clang_version = 4;
+  string llvm_version = 5;
+  string glibc_version = 6;
+  string cxx_runtime_path = 7; // Loaded provider of __cxa_throw, if known.
+  uint32 libstdcxx_header_release = 8; // Agent build headers, if known.
+  // The agent build default. Probe-specific flags and target signatures are
+  // checked independently. Presence distinguishes the old ABI from unknown.
+  optional bool libstdcxx_default_cxx11_abi = 9;
+}
 message Session {
   string id = 1;
   uint32 pid = 2;
@@ -210,6 +223,8 @@ message Session {
   string error = 5;
   repeated string application_modules =
       6; // Automatically discovered, pinned paths.
+  uint64 process_start_time = 7; // Linux /proc start time in clock ticks.
+  JitRuntimeProfile jit_runtime = 8;
 }
 message AddProbeRequest {
   string session_id = 1;
@@ -266,6 +281,8 @@ message Probe {
   bool original_bytes_restored = 8;
   uint64 agent_dropped_events = 9;
   uint64 callback_errors = 10;
+  uint64 jit_compile_ns = 11; // Target-side compilation and materialization.
+  uint64 patch_install_ns = 12; // Code patch attempts, including retries.
 }
 message RemoveProbeRequest {
   string session_id = 1;
