@@ -26,4 +26,13 @@ const HistoryItem *via_pointer(const HistoryItem *item, int enabled);
 const HistoryItem &via_reference(const HistoryItem &item, int tag);
 HistoryItem via_value(HistoryItem item, int tag);
 
+struct OpaqueItem {
+  union {
+    int integer;
+    double real;
+  };
+};
+
+const OpaqueItem *via_opaque(const OpaqueItem *item, int tag);
+
 } // namespace prepared_history

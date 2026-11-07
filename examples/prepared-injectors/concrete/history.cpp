@@ -36,15 +36,22 @@ HistoryItem via_value(HistoryItem item, int tag) {
   return item;
 }
 
+const OpaqueItem *via_opaque(const OpaqueItem *item, int tag) {
+  const volatile int observed = tag;
+  (void)observed;
+  return item;
+}
+
 } // namespace prepared_history
 
 int main() {
   using namespace prepared_history;
   const HistoryItem item;
+  const OpaqueItem opaque{3};
   for (;;) {
     copies = moves = destructions = 0;
     if (via_pointer(nullptr, 1) || via_pointer(&item, 1) != &item ||
-        &via_reference(item, 4) != &item)
+        &via_reference(item, 4) != &item || via_opaque(&opaque, 4) != &opaque)
       return 1;
     {
       const auto value = via_value(item, 4);

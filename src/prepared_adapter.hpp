@@ -29,7 +29,8 @@ public:
   }
 
   AdapterDeclarations emit(const clang::FunctionDecl &function,
-                           const std::vector<std::string> &headers) {
+                           const std::vector<std::string> &headers,
+                           bool pointer_layouts) {
     selected_method_ = llvm::dyn_cast<clang::CXXMethodDecl>(&function);
     // Additional inputs can provide callback-only payload declarations.
     extra_headers_.insert(std::next(headers.begin()), headers.end());
@@ -42,11 +43,13 @@ public:
     }
     // Emit pointees after the callable's own records. They may contain the
     // receiver by value, while its method only needs a forward declaration.
-    if (const auto *record = prepared_pointer_record(function.getReturnType()))
-      emit_record(*record);
-    for (const auto *parameter : function.parameters())
-      if (const auto *record = prepared_pointer_record(parameter->getType()))
+    if (pointer_layouts) {
+      if (const auto *record = prepared_pointer_record(function.getReturnType()))
         emit_record(*record);
+      for (const auto *parameter : function.parameters())
+        if (const auto *record = prepared_pointer_record(parameter->getType()))
+          emit_record(*record);
+    }
     return {forwards_ + declarations_, std::move(standard_headers_)};
   }
 

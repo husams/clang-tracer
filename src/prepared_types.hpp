@@ -172,7 +172,8 @@ inline void describe_prepared_callable(clang::ASTContext &ast,
                                const clang::CXXMethodDecl *method,
                                clangtracer::v1::ProbeSpec &spec,
                                clang::Sema *sema = nullptr,
-                               const clangtracer::v1::DebugInfo *expected = nullptr) {
+                               const clangtracer::v1::DebugInfo *expected = nullptr,
+                               bool pointer_layouts = true) {
   auto &signature = *spec.mutable_signature();
   auto &info = *spec.mutable_debug_info();
   if (method && !method->isStatic()) {
@@ -184,7 +185,7 @@ inline void describe_prepared_callable(clang::ASTContext &ast,
     if (sema && referent->isRecordType() && referent->isIncompleteType())
       (void)sema->isCompleteType(declaration.getLocation(), referent);
     auto description = prepared_type(ast, type, is_result);
-    if (pointer_layout && description.wire == clangtracer::v1::POINTER)
+    if (pointer_layouts && pointer_layout && description.wire == clangtracer::v1::POINTER)
       if (const auto *pointee = prepared_pointer_record(type))
         description.record = pointee;
     return description;

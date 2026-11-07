@@ -20,6 +20,7 @@ cat >prepare.repl <<'REPL'
 %probe prepare "prepared_history::via_pointer(const prepared_history::HistoryItem*, int)" --include application/history.hpp --output pointer
 %probe prepare "prepared_history::via_reference(const prepared_history::HistoryItem&, int)" --include application/history.hpp --output reference
 %probe prepare "prepared_history::via_value(prepared_history::HistoryItem, int)" --include application/history.hpp --output value
+%probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include application/history.hpp --output opaque
 REPL
 "$repl" --fail-fast <prepare.repl
 unlink application/history.hpp
@@ -70,6 +71,9 @@ if (ref.argument_snapshot(0).field("code").as<int>() != 42 || ref.argument_snaps
 %collect --name "prepared_history::via_value(prepared_history::HistoryItem, int)" --phase POST --count 1 --timeout 15 --as value
 auto value = tracer.batch("value").at(0);
 if (value.argument_snapshot(0).field("label").as<std::string>() != "entry" || value.result_snapshot().field("label").as<std::string>() != "entry4" || value.result_snapshot().field("code").as<int>() != 42) throw std::runtime_error("wrong by-value fields");
+%probe inject "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --callback snapshot.cpp --prepared opaque --prepared-mode require
+%collect --name "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --phase POST --count 1 --timeout 15 --as opaque
+if (tracer.batch("opaque").size() != 1) throw std::runtime_error("missing address-only pointer event");
 std::cout << "PREPARED_HISTORY_FIELDS=1" << std::endl;
 %quit
 REPL
@@ -79,7 +83,7 @@ pid=$!
 trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
 "$repl" --server "$server" --agent "$agent" --attach "$pid" --timeout 60 \
   --fail-fast <verify.repl | tee smoke.log
-test "$(grep -c '^installed probe=' smoke.log)" -eq 3
+test "$(grep -c '^installed probe=' smoke.log)" -eq 4
 grep -qx 'prepared_used: true' smoke.log
 grep -qx PREPARED_HISTORY_FIELDS=1 smoke.log
 kill -0 "$pid"
