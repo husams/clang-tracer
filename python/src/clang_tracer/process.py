@@ -9,7 +9,7 @@ from typing import BinaryIO, Self
 
 import grpc
 
-from .client import Client, ServerStatus, positive_timeout
+from .client import Client, ServerStatus, positive_timeout, uint
 
 
 class ServerProcessError(RuntimeError):
@@ -58,8 +58,19 @@ class ServerProcess:
         timeout: float = 30,
         operation_timeout: int = 10,
         durable_directory: str | None = None,
+        event_history_limit: int | None = None,
+        context_history_limit: int | None = None,
+        context_history_bytes: int | None = None,
     ) -> Self:
         positive_timeout(timeout)
+        limits = {
+            "--event-history-limit": event_history_limit,
+            "--context-history-limit": context_history_limit,
+            "--context-history-bytes": context_history_bytes,
+        }
+        for option, value in limits.items():
+            if value is not None:
+                uint(value, 63, option, 1)
         if isinstance(operation_timeout, bool) or not isinstance(
             operation_timeout, int
         ):
@@ -97,6 +108,9 @@ class ServerProcess:
             command.extend(["--agent", agent])
         if durable_directory:
             command.extend(["--context-durable-dir", durable_directory])
+        for option, value in limits.items():
+            if value is not None:
+                command.extend([option, str(value)])
         if self._log is not None:
             self._log.close()
         self._log = tempfile.TemporaryFile()

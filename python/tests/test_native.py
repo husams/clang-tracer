@@ -2,6 +2,8 @@
 
 import os
 import platform
+import signal
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
@@ -16,6 +18,236 @@ from clang_tracer.command import parse_command
 from clang_tracer.console import Console
 
 pytestmark = pytest.mark.native
+
+
+def test_native_retention_snapshot_ack_and_cli_storage(native):
+    build, target, temporary = native
+    with Client(f"unix://{temporary}/control.sock") as client:
+        client.start_server(
+            str(build / "clang-tracer-server"),
+            agent=str(build / "libclang_tracer_agent.so"),
+            event_history_limit=3,
+        )
+        session = client.attach(target.pid)
+        probe = client.inject(session.id, "add(int, int)", INTERCEPTOR)
+        client.collect_traces(12, session_ids=[session.id], timeout=10)
+        client.remove_probe(session.id, probe.id)
+        batch = client.read_events()
+        assert len(batch.events) == 3
+        assert batch.server_dropped_events >= 9
+        with pytest.raises(grpc.RpcError) as raised:
+            client.read_events(
+                through_sequence=2**64 - 1,
+                server_instance_id=batch.server_instance_id,
+            )
+        assert raised.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert all(
+            e.server_instance_id == batch.server_instance_id for e in batch.events
+        )
+        with pytest.raises(grpc.RpcError) as raised:
+            client.acknowledge_events("previous-server", [batch.events[0].sequence])
+        assert raised.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+        assert client.read_events() == batch
+        # Saving through Python leaves retained history available to the native writer.
+        path = temporary / "capture.db"
+        assert client.record_sqlite(path, 3, timeout=5) == 3
+        assert len(client.read_events().events) == 3
+        with sqlite3.connect(path) as db:
+            db.execute(
+                "CREATE TRIGGER reject_capture BEFORE INSERT ON trace_events "
+                "BEGIN SELECT RAISE(ABORT, 'native storage failure'); END"
+            )
+        result = subprocess.run(
+            [
+                build / "clang-tracer",
+                "--endpoint",
+                client.endpoint,
+                "drain",
+                "--sqlite",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode != 0
+        assert "native storage failure" in result.stderr
+        assert len(client.read_events().events) == 3
+        with sqlite3.connect(path) as db:
+            db.execute("DROP TRIGGER reject_capture")
+        result = subprocess.run(
+            [
+                build / "clang-tracer",
+                "--endpoint",
+                client.endpoint,
+                "drain",
+                "--sqlite",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "drained 3 events" in result.stdout
+        assert not client.read_events().events
+        with sqlite3.connect(path) as db:
+            rows = db.execute("SELECT payload FROM trace_events").fetchall()
+        assert (
+            len(rows) == 3
+        )  # Both writers use the same identity/deduplication format.
+        assert {pb.TraceEvent.FromString(r[0]).sequence for r in rows} == {
+            e.sequence for e in batch.events
+        }
+        assert (
+            client.acknowledge_events(
+                batch.server_instance_id, [batch.events[0].sequence]
+            )
+            == 0
+        )
+        with client.watch_events(
+            after_sequence=batch.events[0].sequence, timeout=1
+        ) as stream:
+            with pytest.raises(grpc.RpcError) as raised:
+                next(stream)
+        assert raised.value.code() == grpc.StatusCode.OUT_OF_RANGE
+        # An interrupted live drain leaves the independently managed server up.
+        child = subprocess.Popen(
+            [
+                build / "clang-tracer",
+                "--endpoint",
+                client.endpoint,
+                "drain",
+                "--sqlite",
+                path,
+                "--listen",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            time.sleep(0.2)
+            child.send_signal(signal.SIGINT)
+            _output, error = child.communicate(timeout=5)
+            assert child.returncode == 0, error
+            assert client.status().running
+        finally:
+            if child.poll() is None:
+                child.terminate()
+                child.wait(timeout=5)
+        client.detach(session.id)
+
+
+def test_native_cli_live_storage_and_console_drain(native):
+    build, target, temporary = native
+    with Client(f"unix://{temporary}/control.sock") as client:
+        client.start_server(
+            str(build / "clang-tracer-server"),
+            agent=str(build / "libclang_tracer_agent.so"),
+        )
+        session = client.attach(target.pid)
+        probe = client.inject(session.id, "add(int, int)", INTERCEPTOR)
+        path = temporary / "live.db"
+        result = subprocess.run(
+            [
+                build / "clang-tracer",
+                "--endpoint",
+                client.endpoint,
+                "drain",
+                str(target.pid),
+                "--sqlite",
+                path,
+                "--listen",
+                "--count",
+                "6",
+                "--timeout",
+                "10",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "drained 6 events" in result.stdout
+        watch_path = temporary / "watch.db"
+        result = subprocess.run(
+            [
+                build / "clang-tracer",
+                "--endpoint",
+                client.endpoint,
+                "events",
+                str(target.pid),
+                "--sqlite",
+                watch_path,
+                "--count",
+                "3",
+                "--timeout",
+                "10",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, result.stderr
+        client.remove_probe(session.id, probe.id)
+        console = Console(client, output=DummyOutput())
+        console.session_id = session.id
+        console.execute(parse_command(f'drain "{path}"'))
+        assert not client.read_events().events
+        for database, minimum in [(path, 6), (watch_path, 3)]:
+            with sqlite3.connect(database) as db:
+                assert (
+                    db.execute("SELECT count(*) FROM trace_events").fetchone()[0]
+                    >= minimum
+                )
+        client.detach(session.id)
+
+
+@pytest.mark.parametrize("context_bytes, expected", [(16777216, True), (1, False)])
+def test_native_context_history_limits(native, context_bytes, expected):
+    build, target, temporary = native
+    with Client(f"unix://{temporary}/control.sock") as client:
+        client.start_server(
+            str(build / "clang-tracer-server"),
+            agent=str(build / "libclang_tracer_agent.so"),
+            context_history_limit=2,
+            context_history_bytes=context_bytes,
+        )
+        session = client.attach(target.pid)
+        probe = client.inject(session.id, "add(int, int)", CONTEXT_INTERCEPTOR)
+        if expected:
+            client.collect_traces(16, session_ids=[session.id], timeout=10)
+        else:
+            # Context probes publish via the context transport, so a one-byte
+            # budget can reject every event, including PRE/POST notifications.
+            deadline = time.monotonic() + 10
+            while client.read_events().server_dropped_events < 16:
+                assert time.monotonic() < deadline
+                assert target.poll() is None
+                time.sleep(0.05)
+        client.remove_probe(session.id, probe.id)
+        batch = client.read_events()
+        contexts = [event for event in batch.events if event.HasField("context")]
+        assert len(contexts) <= 2
+        assert bool(contexts) is expected
+        assert sum(e.ByteSize() for e in contexts) <= context_bytes
+        assert batch.server_dropped_events > 0
+        client.detach(session.id)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "18446744073709551615", "1x"])
+def test_native_invalid_retention_limit(native, value):
+    build, _target, _temporary = native
+    result = subprocess.run(
+        [build / "clang-tracer-server", "--event-history-limit", value],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode != 0
+    assert "invalid value" in result.stderr
+
 
 INTERCEPTOR = """class Interceptor {
 public:

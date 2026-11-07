@@ -201,22 +201,32 @@ shows the supported state shapes.
 ## Build and run
 
 Use Linux x86-64, C++20, matching LLVM/Clang development packages (21 or 22),
-Protobuf with `protoc`, gRPC C++ with `grpc_cpp_plugin`, CMake, and Ninja.
+Protobuf with `protoc`, gRPC C++ with `grpc_cpp_plugin`, SQLite development
+headers, CMake, and Ninja. Supply PIC static Protobuf/gRPC and their transport
+dependencies to isolate the injected agent from the application's libraries.
 
 ```sh
 cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
   -DLLVM_DIR=/usr/lib64/llvm21/lib64/cmake/llvm \
-  -DClang_DIR=/usr/lib64/cmake/clang
+  -DClang_DIR=/usr/lib64/cmake/clang \
+  -DCMAKE_PREFIX_PATH=/path/to/static-dependencies \
+  -DProtobuf_USE_STATIC_LIBS=ON
 cmake --build build -j4
 ctest --test-dir build --output-on-failure
 ```
 
 Adjust package paths for your installation. CMake generates the C++ message and
-service bindings from `proto/tracer.proto`; the agent links Protobuf without the
-gRPC client/server library. The integration test uses real target processes and
-real generated gRPC clients.
+service bindings from `proto/tracer.proto`. The agent's Protobuf and shared-context
+gRPC transport are linked privately; its build rejects dependency symbol exports
+and shared transport dependencies. The integration tests use real target processes
+and generated gRPC clients, including a target with incompatible dependency symbols.
+
+To run the suite from OverlayFS, use
+`tests/overlay_integration.sh "$(realpath build)"`. This optional regression
+runner needs user and mount namespaces plus OverlayFS support; it overlays
+only its private build view and leaves the host build directory unchanged.
 
 For RHEL-compatible systems, see [build, toolchain and deployment instructions](docs/build-rhel.md).
 `build-rhel.sh` accepts custom compiler/LLVM paths or a CMake toolchain file;
@@ -299,7 +309,25 @@ available for status inspection. Session history is bounded to 64 entries per
 server lifetime; the agent retains at most 32 prepared probe generations per
 process lifetime.
 
-The event history holds 4,096 messages. Each event has a server cursor, a per-probe
+The event history holds 4,096 messages by default; configure it with server
+`--event-history-limit N`. Shared-context history additionally defaults to 128
+events and 16 MiB of serialized bytes, configured with `--context-history-limit N`
+and `--context-history-bytes N`. These are positive startup settings, not a cap on
+total process RAM. Old events are evicted when limits are reached.
+
+Save events on the client host with `clang-tracer events PID --sqlite capture.db`.
+To save and consume retained events, use `clang-tracer drain --sqlite capture.db`;
+add an optional PID filter and `--listen` to keep draining generated events.
+For example, `clang-tracer drain 12345 --sqlite capture.db --listen --timeout 60`.
+The console equivalents are `record capture.db 100 --sqlite` and
+`drain capture.db --listen`. Both writers append complete Protobuf payloads to
+SQLite and deduplicate by server lifetime and event sequence. Drain acknowledges
+exact events only after their SQLite transaction commits, so failed writes do
+not consume history. Existing transport and overflow losses remain possible.
+See [event storage](docs/event-storage.md) for snapshot, retry and shared-reader
+semantics. SQLite development headers are required to build the native CLI.
+
+Each event has a server cursor, a per-probe
 sequence, PID/TID, monotonic timestamp, probe/session IDs, typed arguments, a
 method object address, callback value, phase, per-probe call ID, and loss counters.
 POST events include the typed original result. A nonzero resume cursor
@@ -319,10 +347,11 @@ Trace a running process by C++ signature using its mapped ELF debug information:
 No target source, compilation database, copied class, or handwritten symbol is
 required. LLVM DWARF APIs discover the code entry/range, scalar ABI, parameter names,
 receiver size, member offsets/types, and access. The agent independently rereads
-its mapped debug images and checks image identity and metadata before constructing
+its mapped debug images and checks mapped paths, entries and metadata before constructing
 Clang AST declarations. Clang verifies receiver size and every member offset and
-size; mismatches fail before patching. Image identity includes device, inode,
-size, modification and change times, and is checked before and after resolution.
+size; mismatches fail before patching. Binaries and debug files are fixed for each
+session; rebuilding or replacing them requires a new session. Device/inode
+equality and live file-timestamp checks are not required.
 Native patchability, admission, stopped-thread patching, and detach safeguards
 remain in force. Inlined or optimized-away calls are not traceable entries. Class arguments are described below.
 
@@ -336,7 +365,7 @@ The target and debug data must be Linux x86-64 LP64 with supported scalar ABI.
 Named tracing requires no exported symbol or ELF symbol-table entry. LLVM reads
 the concrete function's DWARF low/high PC range, then relocates its entry through
 the image's executable ELF PT_LOAD segment and the target's executable mapping.
-Device/inode and full debug-image identity must match; PIE, fixed-address
+Canonical mapped paths and ELF offsets/ranges must match; PIE, fixed-address
 executables and shared libraries use the same translation. The agent independently
 re-resolves the exact entry, range and callable metadata inside the target before
 decoding or preparing a hook. A patch cannot extend beyond the selected function.
@@ -579,14 +608,30 @@ the server and attempts to restore active hooks.
 
 The native backend supports Linux x86-64 processes with concurrent application
 threads, including a CPU-busy leader inside nested C++ functions and methods.
+Attachment prefers the leader and can select an eligible existing worker when
+the leader is blocked in futex, epoll, pipe reads, or another unsupported syscall.
+The process PID remains the session identity; the selected TID runs native
+control operations. Tasks in `nanosleep` or `clock_nanosleep` retain the existing
+sleep admission policy. Other blocked syscalls are left intact, and external
+job-control stops are preserved.
+
 Admission no longer requires an instruction in `main`, a `main` symbol, or an
 immediate return into libc. LLVM parses `.eh_frame` and unwinds each application
 frame through executable segments of the main ELF image or a DSO in the session's
-discovered snapshot, selecting the matching image and pinned load bias at each
+discovered snapshot, selecting the matching image and captured load bias at each
 frame. Executable and library symbols may be stripped; unwind metadata must
 remain. The walk ends at libc's
-identified `__libc_start_call_main` → `__libc_start_main` startup chain, whose
-symbols are still required.
+identified `__libc_start_call_main` → `__libc_start_main` startup chain, or, for
+a directly started pthread worker, exact `start_thread` → `__clone`/`__clone3`
+functions. The relevant startup symbols are required. Additional runtime wrapper
+frames, including unproven C++ thread-library wrappers, remain unsupported for
+userspace admission; such workers can still qualify through the sleep policy.
+
+If no task qualifies before the operation deadline, the server returns
+`FAILED_PRECONDITION` with per-TID syscall numbers, known names and rejection reasons.
+Diagnostics list up to 32 rejected tasks and report the number omitted.
+Fully released admission failures create no failed session to clean up during
+shutdown. Failures after bootstrap retain their normal recovery state.
 
 The complete chain is bounded to 128 frames including startup. Each recovered
 stack pointer must advance within the original readable stack mapping, and saved
@@ -596,14 +641,14 @@ signal frames, callbacks that unwind through protected runtimes, undiscovered
 library frames, and incomplete or excessively deep chains are rejected and
 retried within the operation deadline.
 
-The session snapshot retains file handles and pins device/inode, size,
-modification and change timestamps, and load bias. Every control attachment
-revalidates each pinned path, open file, and target mapping before native
-execution, including the sleep admission path. Replacement, modification,
-unmapping, or rebasing invalidates the snapshot instead of approving a new image.
-Module handles are released after logical detach or target exit; discovered-path
-history remains visible. Concurrent module unloading and modification during an
-operation remain outside the lifecycle contract.
+The session snapshots canonical mapped paths and load biases without retaining
+binary file handles or policing file timestamps. Control attachments validate
+the paths and executable ELF mapping ranges, including the sleep admission path.
+Unmapping or rebasing invalidates that snapshot. Rebuilding or replacing binary
+contents requires a new session. Native stack caches refresh after prior probes
+drain; reconnecting a durable collector keeps active probe metadata alive.
+Discovered-path history remains visible after detach. Concurrent module unloading
+or binary modification during an operation remains outside the lifecycle contract.
 
 This is a restricted application rendezvous, not arbitrary-PC injection. The
 bounded startup-chain check does not prove arbitrary runtime or application lock
@@ -614,6 +659,11 @@ session takes a fresh snapshot for libraries loaded later; it does not make
 unsupported CFI or runtime behavior safe.
 The existing `nanosleep`/`clock_nanosleep` admission path remains available outside
 critical sections, with its prior interrupted-sleep timing/restart limitation.
+The CLI regression covers sleeping-worker attachment with a leader blocked in
+`futex`, `epoll_wait`, `poll`, `read`, `accept`, `pause`, or `sigwait`. After
+detach, it verifies that the leader remains in its original blocking operation, workers
+remain alive, and every task is untraced. It also verifies the all-blocked
+diagnostic and clean server shutdown after a failed admission.
 Native calls preserve general registers, extended floating-point state, the
 thread's signal mask, and its `errno` value. Signals are blocked during injected
 execution and the saved mask is restored before normal execution resumes.
@@ -662,6 +712,22 @@ signal-handler probes, and control threads holding application/runtime locks are
 outside the current lifecycle contract.
 
 ## Validation and sources
+
+The reconciled worker-admission changes passed **25/25 CTests in 419.70 seconds**
+on `linux-dev` on 2 November 2026; both regression sets also passed from
+OverlayFS (**7/7 in 44.09 seconds**). Main retains C++20. The original overlapping
+local implementation is preserved in the merge's second-parent snapshot.
+
+Blocked-main worker selection was verified on 2 November 2026 on `linux-dev`:
+**24/24 CTests passed in 411.09 seconds**, and the six new regression cases
+passed from OverlayFS in 35.26 seconds. The supplied condition-variable/sleeping
+worker reproduction also attached, detached and shut down successfully.
+
+The session-path backport was verified on 2 November 2026 with the normal
+C++20 build on `linux-dev`: **18/18 CTests passed natively in 373.84 seconds**
+and **18/18 passed from OverlayFS in 378.11 seconds**. The build configuration,
+dependencies and standard C++20 APIs remain unchanged; this backport includes
+no GCC 8.5 compatibility profile or library fallbacks.
 
 Class-instance arguments verified on 30 October 2026 through the normal CLI,
 with Order target source and compilation database temporarily unavailable.
@@ -769,9 +835,9 @@ fixtures. Four application frames crossed the two discovered DSOs. Empty and
 partial internal snapshots rejected that stack; these are negative admission
 tests, not caller configuration. Loader callbacks in executable and DSO code,
 signal handlers, and excessive depth were rejected, and every child progressed
-after detach. Separate identity tests discovered 17 distinct loaded fixture
-copies, excluded unmapped files and libc/loader aliases, and rejected changed
-paths or metadata for pinned identities.
+after detach. Module snapshot tests discover loaded fixture copies, exclude
+unmapped files and libc/loader aliases, and reject invalid ELF offsets and
+ambiguous mappings. Metadata-only timestamp changes are accepted.
 
 The complete suite also covers multiple processes, C++ overloads and const/static
 methods, scalar signatures, binary Protobuf CLI responses and events, concurrent

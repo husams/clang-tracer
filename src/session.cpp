@@ -169,15 +169,19 @@ void Session::attach() {
   if (state_ != clangtracer::v1::Session::ATTACHED) {
     throw std::runtime_error("session is not attachable");
   }
-  application_modules_ =
-      injector::discover_application_modules(static_cast<pid_t>(pid_));
-  discovered_module_paths_.clear();
-  for (const auto &module : application_modules_)
-    discovered_module_paths_.push_back(module.path());
-  check_identity_locked();
   injector::Process process;
   const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
-  attach_process(process, deadline);
+  try {
+    application_modules_ =
+        injector::discover_application_modules(static_cast<pid_t>(pid_));
+    discovered_module_paths_.clear();
+    for (const auto &module : application_modules_)
+      discovered_module_paths_.push_back(module.path());
+    check_identity_locked();
+    attach_process(process, deadline);
+  } catch (const injector::IdlePointUnavailable &error) {
+    throw injector::InitialAdmissionUnavailable(error.what());
+  }
   std::uintptr_t scratch = 0;
   const auto start_offset = agent_path_.size() + 16;
   const auto stop_offset = start_offset + 32;
@@ -398,7 +402,14 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
                   candidate.original.begin());
       std::copy_n(response.pthread_create_installed, candidate.size,
                   candidate.installed.begin());
-      const auto proven_entry = process.resolve_remote_symbol("pthread_create");
+      injector::CodePatch owned_scheduler_patch{};
+      if (pthread_create_patch_committed_ && pthread_create_patch_) {
+        const auto &owned = *pthread_create_patch_;
+        owned_scheduler_patch = {owned.entry, owned.original.data(),
+                                 owned.installed.data(), owned.size};
+      }
+      const auto proven_entry = process.resolve_remote_symbol(
+          "pthread_create", owned_scheduler_patch.size ? &owned_scheduler_patch : nullptr);
       bool proven_patch_entry = candidate.entry == proven_entry;
       if (!proven_patch_entry &&
           proven_entry <= std::numeric_limits<std::uintptr_t>::max() - 4 &&

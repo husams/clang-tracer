@@ -63,6 +63,33 @@ def test_launch_status_and_graceful_shutdown(child):
     manager.shutdown()
 
 
+def test_launch_with_history_limits(child):
+    _process, spawn = child
+    manager = ServerProcess().start(
+        event_history_limit=1000,
+        context_history_limit=10,
+        context_history_bytes=4096,
+    )
+    arguments = spawn.call_args.args[0]
+    assert arguments[-6:] == [
+        "--event-history-limit",
+        "1000",
+        "--context-history-limit",
+        "10",
+        "--context-history-bytes",
+        "4096",
+    ]
+    manager.shutdown()
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, 2**63])
+def test_invalid_history_limit_does_not_launch(child, value):
+    _process, spawn = child
+    with pytest.raises(ValueError):
+        ServerProcess().start(event_history_limit=value)
+    spawn.assert_not_called()
+
+
 def test_rejects_existing_endpoint(child, monkeypatch):
     process, spawn = child
     monkeypatch.setattr(

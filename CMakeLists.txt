@@ -30,6 +30,7 @@ include(cmake/TracerContextAnalysis.cmake)
 find_package(Threads REQUIRED)
 find_package(Protobuf REQUIRED)
 find_package(gRPC REQUIRED CONFIG)
+find_package(SQLite3 REQUIRED)
 
 set(TRACER_PROTO_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 file(MAKE_DIRECTORY ${TRACER_PROTO_DIR})
@@ -69,6 +70,19 @@ target_include_directories(clang_tracer_agent PRIVATE include ${TRACER_PROTO_DIR
 target_compile_definitions(clang_tracer_agent PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
 target_link_libraries(clang_tracer_agent PRIVATE tracer_context_engine tracer_context_analysis tracer_proto clang-cpp LLVM ${CMAKE_DL_LIBS} Threads::Threads)
 target_compile_options(clang_tracer_agent PRIVATE -Wall -Wextra -Wpedantic)
+# Localize archive definitions as well as symbols emitted by agent sources.
+# --exclude-libs,ALL would also hide the required pthread detour entry point
+# from tracer_context_engine; the version script preserves that exact export.
+target_link_options(clang_tracer_agent PRIVATE
+  "LINKER:--no-undefined,-Bsymbolic,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/agent_exports.map")
+set_property(TARGET clang_tracer_agent APPEND PROPERTY LINK_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/agent_exports.map
+  ${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckAgentSymbols.cmake)
+add_custom_command(TARGET clang_tracer_agent POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -DAGENT=$<TARGET_FILE:clang_tracer_agent>
+    -DNM=${CMAKE_NM} -DREADELF=${CMAKE_READELF}
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckAgentSymbols.cmake
+  VERBATIM)
 
 add_executable(clang-tracer-server src/main.cpp src/server.cpp src/session.cpp src/injector.cpp src/admission.cpp
   src/debug_resolver.cpp src/header_context.cpp)
@@ -81,7 +95,7 @@ target_compile_options(clang-tracer-server PRIVATE -Wall -Wextra -Wpedantic)
 add_executable(clang-tracer src/client.cpp src/debug_resolver.cpp src/header_context.cpp)
 target_include_directories(clang-tracer PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_compile_definitions(clang-tracer PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
-target_link_libraries(clang-tracer PRIVATE tracer_grpc tracer_context_analysis clang-cpp LLVM Threads::Threads)
+target_link_libraries(clang-tracer PRIVATE tracer_grpc tracer_context_analysis clang-cpp LLVM Threads::Threads SQLite::SQLite3)
 target_compile_options(clang-tracer PRIVATE -Wall -Wextra -Wpedantic)
 
 include(cmake/TracerInstall.cmake)
@@ -155,6 +169,39 @@ if(BUILD_TESTING)
   target_compile_options(trace-target-pie PRIVATE -g -O0 -fPIE
     -fno-omit-frame-pointer -fcf-protection=none)
   target_link_options(trace-target-pie PRIVATE -pie)
+
+  add_test(NAME agent_symbol_isolation
+    COMMAND ${CMAKE_COMMAND} -DAGENT=$<TARGET_FILE:clang_tracer_agent>
+      -DNM=${CMAKE_NM} -DREADELF=${CMAKE_READELF}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckAgentSymbols.cmake)
+  add_executable(trace-collision-target tests/fixtures/target.cpp
+    tests/fixtures/dependency_collision.cpp)
+  set_target_properties(trace-collision-target PROPERTIES ENABLE_EXPORTS ON)
+  target_link_libraries(trace-collision-target PRIVATE Threads::Threads)
+  target_compile_options(trace-collision-target PRIVATE -O0 -fno-omit-frame-pointer
+    -fcf-protection=none)
+  add_test(NAME grpc_agent_dependency_collision
+    COMMAND server-integration
+      --server $<TARGET_FILE:clang-tracer-server>
+      --agent $<TARGET_FILE:clang_tracer_agent>
+      --target $<TARGET_FILE:trace-collision-target>
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/collision-test-results)
+  set_tests_properties(agent_symbol_isolation PROPERTIES TIMEOUT 30)
+  set_tests_properties(grpc_agent_dependency_collision PROPERTIES TIMEOUT 120)
+  add_test(NAME grpc_agent_shared_dependency_collision
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/class_interceptor_integration.py
+      --server $<TARGET_FILE:clang-tracer-server>
+      --client $<TARGET_FILE:clang-tracer>
+      --agent $<TARGET_FILE:clang_tracer_agent>
+      --target $<TARGET_FILE:trace-collision-target>
+      --threaded-target $<TARGET_FILE:trace-threaded-target>
+      --protoc $<TARGET_FILE:protobuf::protoc>
+      --proto ${CMAKE_CURRENT_SOURCE_DIR}/proto/tracer.proto
+      --compdb ${CMAKE_CURRENT_BINARY_DIR}
+      --source ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/target.cpp
+      --threaded-source ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/threaded/target.cpp
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/collision-class-results)
+  set_tests_properties(grpc_agent_shared_dependency_collision PROPERTIES TIMEOUT 360)
   add_library(admission-leaf OBJECT tests/admission_leaf.cpp)
   target_compile_options(admission-leaf PRIVATE -O2 -fomit-frame-pointer -momit-leaf-frame-pointer
     -fasynchronous-unwind-tables -Wall -Wextra -Wpedantic)
@@ -284,6 +331,19 @@ if(BUILD_TESTING)
       --callback ${CMAKE_CURRENT_SOURCE_DIR}/examples/cpp-interceptors/method.cpp
       --output-dir ${CMAKE_CURRENT_BINARY_DIR}/typed-this-results)
   set_tests_properties(grpc_typed_this_integration PROPERTIES TIMEOUT 180)
+  add_executable(blocked-main-fixture tests/fixtures/blocked_main.cpp)
+  target_link_libraries(blocked-main-fixture PRIVATE Threads::Threads)
+  set_target_properties(blocked-main-fixture PROPERTIES ENABLE_EXPORTS ON)
+  target_compile_options(blocked-main-fixture PRIVATE -g -O0 -fno-omit-frame-pointer
+    -fcf-protection=none)
+  add_test(NAME grpc_blocked_main_integration
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/blocked_main_integration.py
+      --server $<TARGET_FILE:clang-tracer-server>
+      --client $<TARGET_FILE:clang-tracer>
+      --agent $<TARGET_FILE:clang_tracer_agent>
+      --target $<TARGET_FILE:blocked-main-fixture>
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/blocked-main-test-results)
+  set_tests_properties(grpc_blocked_main_integration PROPERTIES TIMEOUT 180)
   add_executable(threaded-integration tests/threaded_integration.cpp)
   target_link_libraries(threaded-integration PRIVATE tracer_grpc Threads::Threads)
   target_compile_options(threaded-integration PRIVATE -Wall -Wextra -Wpedantic)
@@ -326,4 +386,44 @@ if(BUILD_TESTING)
       --expected-module $<TARGET_FILE:trace-stack-b>
       --output-dir ${CMAKE_CURRENT_BINARY_DIR}/auto-test-results)
   set_tests_properties(grpc_shared_main_integration PROPERTIES TIMEOUT 180)
+  add_executable(blocked-main-target tests/blocked_main_target.cpp)
+  set_target_properties(blocked-main-target PROPERTIES ENABLE_EXPORTS ON)
+  target_compile_options(blocked-main-target PRIVATE -g -O0 -fno-omit-frame-pointer
+    -fcf-protection=none -Wall -Wextra -Wpedantic)
+  target_link_libraries(blocked-main-target PRIVATE Threads::Threads)
+  add_executable(blocked-main-integration tests/blocked_main_integration.cpp)
+  target_link_libraries(blocked-main-integration PRIVATE tracer_grpc Threads::Threads)
+  target_compile_options(blocked-main-integration PRIVATE -Wall -Wextra -Wpedantic)
+  foreach(blocked_mode IN ITEMS positive-hot positive-sleeping all-blocked)
+    string(REPLACE "-" "_" blocked_test_suffix "${blocked_mode}")
+    add_test(NAME grpc_blocked_main_${blocked_test_suffix}
+      COMMAND blocked-main-integration
+        --server $<TARGET_FILE:clang-tracer-server>
+        --agent $<TARGET_FILE:clang_tracer_agent>
+        --target $<TARGET_FILE:blocked-main-target>
+        --output-dir ${CMAKE_CURRENT_BINARY_DIR}/blocked-main-${blocked_test_suffix}
+        --mode ${blocked_mode}
+        --leader futex)
+    set_tests_properties(grpc_blocked_main_${blocked_test_suffix} PROPERTIES TIMEOUT 90)
+  endforeach()
+  foreach(leader_mode IN ITEMS epoll read)
+    add_test(NAME grpc_blocked_main_sleeping_${leader_mode}
+      COMMAND blocked-main-integration
+        --server $<TARGET_FILE:clang-tracer-server>
+        --agent $<TARGET_FILE:clang_tracer_agent>
+        --target $<TARGET_FILE:blocked-main-target>
+        --output-dir ${CMAKE_CURRENT_BINARY_DIR}/blocked-main-sleeping-${leader_mode}
+        --mode positive-sleeping
+        --leader ${leader_mode})
+    set_tests_properties(grpc_blocked_main_sleeping_${leader_mode} PROPERTIES TIMEOUT 90)
+  endforeach()
+  add_test(NAME grpc_blocked_main_external_job_stop
+    COMMAND blocked-main-integration
+      --server $<TARGET_FILE:clang-tracer-server>
+      --agent $<TARGET_FILE:clang_tracer_agent>
+      --target $<TARGET_FILE:blocked-main-target>
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/blocked-main-external-job-stop
+      --mode job-stopped
+      --leader futex)
+  set_tests_properties(grpc_blocked_main_external_job_stop PROPERTIES TIMEOUT 90)
 endif()

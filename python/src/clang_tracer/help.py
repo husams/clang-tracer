@@ -27,6 +27,7 @@ HELP_TOPICS = {
             "symbols [OPTIONS]",
             "probe resolve|inject|add|remove ...",
             "events [OPTIONS] | collect COUNT [OPTIONS] | record FILE COUNT [OPTIONS]",
+            "drain DATABASE [--listen] [--count N] [STREAM_OPTIONS]",
             "help [TOPIC] | ! SHELL_COMMAND | exit",
         ),
         options=(
@@ -75,6 +76,9 @@ HELP_TOPICS = {
                 "start --durable-directory PATH",
                 "Enable durable shared-context recording.",
             ),
+            ("start --event-history-limit N", "Retained event count; default 4096."),
+            ("start --context-history-limit N", "Context event count; default 128."),
+            ("start --context-history-bytes N", "Serialized context-byte budget."),
             ("stop --timeout SECONDS", "Graceful shutdown wait; default 30 seconds."),
         ),
         examples=("server start", "server status", "server stop --timeout 45"),
@@ -105,6 +109,12 @@ HELP_TOPICS = {
                 "Native operation timeout from 1 to 300; default 10.",
             ),
             ("--durable-directory PATH", "Enable durable context recording."),
+            ("--event-history-limit N", "Retained event count; default 4096."),
+            ("--context-history-limit N", "Retained context count; default 128."),
+            (
+                "--context-history-bytes N",
+                "Serialized context bytes; default 16777216.",
+            ),
         ),
         examples=("server start --timeout 45",),
     ),
@@ -313,10 +323,11 @@ HELP_TOPICS = {
     ),
     "record": HelpTopic(
         "record",
-        "Stream events to an exclusive-create binary Protobuf recording.",
-        usage=("record FILE COUNT [STREAM_OPTIONS]",),
+        "Save events as binary Protobuf or append them to SQLite.",
+        usage=("record FILE COUNT [--sqlite] [STREAM_OPTIONS]",),
         options=(
-            ("FILE", "New output file; existing files are never overwritten."),
+            ("FILE", "New Protobuf file, or a new/existing SQLite database."),
+            ("--sqlite", "Append complete events to SQLite with deduplication."),
             ("COUNT", "Required positive event count."),
             (
                 "--session ID",
@@ -336,6 +347,27 @@ HELP_TOPICS = {
         notes=(
             "File framing is uint32 little-endian length followed by "
             "serialized TraceEvent bytes.",
+        ),
+    ),
+    "drain": HelpTopic(
+        "drain",
+        "Commit retained events to SQLite, then consume them from shared history.",
+        usage=("drain DATABASE [--listen] [--count N] [STREAM_OPTIONS]",),
+        options=(
+            ("DATABASE", "SQLite file on this host; appends and deduplicates."),
+            ("--listen", "Continue collecting generated events until Ctrl-C."),
+            ("--count N", "Stop after at most N events."),
+            ("--timeout SECONDS", "Stop after this duration; default no deadline."),
+            ("--session ID", "Filter; defaults to selected session or all."),
+            ("--pid PID", "Filter by process ID."),
+            ("--name NAME", "Repeatable exact function/context event name filter."),
+            ("--after CURSOR", "Only consume events after this sequence."),
+        ),
+        examples=("drain capture.db", "drain capture.db --listen --timeout 60"),
+        notes=(
+            "Without --listen, drains only the snapshot present at the first read.",
+            "Storage errors leave events unacknowledged; retry the same database.",
+            "Consumption affects all readers. Overflow can still lose events.",
         ),
     ),
     "help": HelpTopic(

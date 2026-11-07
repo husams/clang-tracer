@@ -96,6 +96,8 @@ def test_all_public_rpcs_have_client_methods():
         "ListSymbols": "list_symbols",
         "WatchEvents": "watch_events",
         "ResolveProbe": "resolve_probe",
+        "ReadEvents": "read_events",
+        "AcknowledgeEvents": "acknowledge_events",
     }
     assert set(methods) == {
         m.name for m in pb.DESCRIPTOR.services_by_name["Tracer"].methods

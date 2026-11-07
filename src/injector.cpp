@@ -12,7 +12,7 @@
 #include <cstring>
 #include <exception>
 #include <fstream>
-#include <iomanip>
+#include <istream>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -32,13 +32,13 @@
 #include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
-#include <sys/sysmacros.h>
 #include <sys/uio.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "admission.hpp"
+#include "mapped_path.hpp"
 
 #ifndef NT_X86_XSTATE
 #define NT_X86_XSTATE 0x202
@@ -132,12 +132,7 @@ bool thread_exists(pid_t process_id, pid_t tid) {
   return ::stat(path.c_str(), &status) == 0;
 }
 
-long stopped_syscall(pid_t tid) {
-  std::ifstream input("/proc/" + std::to_string(tid) + "/syscall");
-  if (!input) {
-    throw std::runtime_error(
-        "cannot inspect /proc/<pid>/syscall; refusing an unknown stop");
-  }
+long parse_syscall_number(std::istream &input) {
   std::string first;
   input >> first;
   if (first.empty() || first == "running") {
@@ -149,6 +144,55 @@ long stopped_syscall(pid_t tid) {
   return parsed.ec == std::errc{} && parsed.ptr == first.data() + first.size()
              ? number
              : -1;
+}
+
+long stopped_syscall(pid_t tid) {
+  std::ifstream input("/proc/" + std::to_string(tid) + "/syscall");
+  if (!input) {
+    throw std::runtime_error(
+        "cannot inspect /proc/<pid>/syscall; refusing an unknown stop");
+  }
+  return parse_syscall_number(input);
+}
+
+std::string join_rejections(const std::vector<std::string> &rejections) {
+  constexpr std::size_t kMaxListed = 32;
+  std::string joined;
+  const std::size_t listed = std::min(rejections.size(), kMaxListed);
+  for (std::size_t i = 0; i < listed; ++i) {
+    if (i != 0) {
+      joined += "; ";
+    }
+    joined += rejections[i];
+  }
+  if (rejections.size() > listed) {
+    joined += "; and " + std::to_string(rejections.size() - listed) +
+              " more";
+  }
+  return joined;
+}
+
+std::string_view syscall_name(long number) {
+  switch (number) {
+  case SYS_futex:
+    return "futex";
+  case SYS_epoll_wait:
+    return "epoll_wait";
+  case SYS_poll:
+    return "poll";
+  case SYS_read:
+    return "read";
+  case SYS_accept:
+    return "accept";
+  case SYS_accept4:
+    return "accept4";
+  case SYS_nanosleep:
+    return "nanosleep";
+  case SYS_clock_nanosleep:
+    return "clock_nanosleep";
+  default:
+    return "unknown";
+  }
 }
 
 void verify_target_executable(pid_t process_id) {
@@ -298,10 +342,8 @@ struct MapEntry {
   std::uintptr_t start = 0;
   std::uintptr_t end = 0;
   std::uintptr_t offset = 0;
-  unsigned int device_major = 0;
-  unsigned int device_minor = 0;
-  std::uint64_t inode = 0;
-  std::string path;
+  std::string module_path;
+  bool readable = false, executable = false;
 };
 
 std::vector<MapEntry> read_maps(pid_t process_id) {
@@ -329,29 +371,26 @@ std::vector<MapEntry> read_maps(pid_t process_id) {
     if (colon == std::string::npos) {
       continue;
     }
-    entry.device_major = static_cast<unsigned int>(
-        std::stoul(device.substr(0, colon), nullptr, 16));
-    entry.device_minor = static_cast<unsigned int>(
-        std::stoul(device.substr(colon + 1), nullptr, 16));
-    entry.inode = std::stoull(inode);
-    std::getline(row >> std::ws, entry.path);
+    std::string path;
+    std::getline(row >> std::ws, path);
+    entry.module_path = tracer::detail::canonical_mapped_path(path);
+    entry.readable = !permissions.empty() && permissions[0] == 'r';
+    entry.executable = permissions.size() >= 3 && permissions[2] == 'x';
     maps.push_back(std::move(entry));
   }
   return maps;
 }
 
-bool same_file(const MapEntry &map, const struct stat &status) {
-  return map.inode == static_cast<std::uint64_t>(status.st_ino) &&
-         map.device_major == static_cast<unsigned int>(major(status.st_dev)) &&
-         map.device_minor == static_cast<unsigned int>(minor(status.st_dev));
+bool same_module_path(const MapEntry &map, const std::string &path) {
+  return !path.empty() && map.module_path == path;
 }
 
 std::uintptr_t map_load_bias(const std::vector<MapEntry> &maps,
-                             const struct stat &status) {
+                             const std::string &path) {
   std::uintptr_t bias = 0;
   bool found = false;
   for (const auto &map : maps) {
-    if (!same_file(map, status)) {
+    if (!same_module_path(map, path)) {
       continue;
     }
     const auto candidate = map.start - map.offset;
@@ -365,79 +404,6 @@ std::uintptr_t map_load_bias(const std::vector<MapEntry> &maps,
         "module backing file is not mapped in the target process");
   }
   return bias;
-}
-
-std::string elf_build_id(const char *path) {
-  std::ifstream file(path, std::ios::binary);
-  if (!file) {
-    throw std::runtime_error(
-        "cannot read local ELF module to verify its build id");
-  }
-  Elf64_Ehdr header{};
-  file.read(reinterpret_cast<char *>(&header), sizeof(header));
-  if (!file || std::memcmp(header.e_ident, ELFMAG, SELFMAG) != 0 ||
-      header.e_ident[EI_CLASS] != ELFCLASS64 ||
-      header.e_ident[EI_DATA] != ELFDATA2LSB || header.e_machine != EM_X86_64 ||
-      header.e_phentsize != sizeof(Elf64_Phdr)) {
-    throw std::runtime_error(
-        "local symbol module is not a compatible ELF64 x86_64 image");
-  }
-  if (header.e_phnum == 0 || header.e_phnum > 4096) {
-    throw std::runtime_error(
-        "local ELF module has an invalid program-header table");
-  }
-  file.seekg(static_cast<std::streamoff>(header.e_phoff));
-  std::vector<Elf64_Phdr> programs(header.e_phnum);
-  file.read(reinterpret_cast<char *>(programs.data()),
-            static_cast<std::streamsize>(programs.size() * sizeof(Elf64_Phdr)));
-  if (!file) {
-    throw std::runtime_error("cannot read local ELF program headers");
-  }
-  for (const auto &program : programs) {
-    if (program.p_type != PT_NOTE || program.p_filesz == 0 ||
-        program.p_filesz > 1024 * 1024) {
-      continue;
-    }
-    std::vector<unsigned char> notes(
-        static_cast<std::size_t>(program.p_filesz));
-    file.seekg(static_cast<std::streamoff>(program.p_offset));
-    file.read(reinterpret_cast<char *>(notes.data()),
-              static_cast<std::streamsize>(notes.size()));
-    if (!file) {
-      throw std::runtime_error("cannot read local ELF note segment");
-    }
-    std::size_t offset = 0;
-    while (offset + sizeof(Elf64_Nhdr) <= notes.size()) {
-      Elf64_Nhdr note{};
-      std::memcpy(&note, notes.data() + offset, sizeof(note));
-      offset += sizeof(note);
-      const auto name_size = static_cast<std::size_t>(note.n_namesz);
-      const auto description_size = static_cast<std::size_t>(note.n_descsz);
-      const auto padded_name = (name_size + 3) & ~std::size_t{3};
-      const auto padded_description = (description_size + 3) & ~std::size_t{3};
-      if (padded_name > notes.size() - offset) {
-        break;
-      }
-      const auto *name = notes.data() + offset;
-      offset += padded_name;
-      if (padded_description > notes.size() - offset) {
-        break;
-      }
-      const auto *description = notes.data() + offset;
-      offset += padded_description;
-      if (note.n_type == NT_GNU_BUILD_ID && name_size >= 3 &&
-          std::memcmp(name, "GNU", 3) == 0 && description_size != 0) {
-        std::ostringstream encoded;
-        encoded << std::hex << std::setfill('0');
-        for (std::size_t i = 0; i < description_size; ++i) {
-          encoded << std::setw(2) << static_cast<unsigned int>(description[i]);
-        }
-        return encoded.str();
-      }
-    }
-  }
-  throw std::runtime_error("local symbol module has no GNU ELF build id; "
-                           "refusing address translation");
 }
 
 } // namespace
@@ -461,7 +427,7 @@ struct Process::PeerFreeze {
     try {
       for (;;) {
         bool added = false;
-        for (const pid_t tid : thread_ids(process.tid_)) {
+        for (const pid_t tid : thread_ids(process.process_id_)) {
           if (tid == process.tid_ || find(tid) != peers.end()) {
             continue;
           }
@@ -474,7 +440,7 @@ struct Process::PeerFreeze {
               // process) between enumeration and SEIZE. Only a confirmed
               // missing task is safe to discard; permissions or an existing
               // tracer on a surviving task must still reject the freeze.
-              const std::string path = "/proc/" + std::to_string(process.tid_) +
+              const std::string path = "/proc/" + std::to_string(process.process_id_) +
                                        "/task/" + std::to_string(tid);
               struct stat task_status{};
               if (::stat(path.c_str(), &task_status) != 0 && errno == ENOENT)
@@ -482,7 +448,7 @@ struct Process::PeerFreeze {
               errno = seize_error;
             }
             if (errno == ESRCH || errno == ECHILD) {
-              if (thread_exists(process.tid_, tid)) {
+              if (thread_exists(process.process_id_, tid)) {
                 throw std::runtime_error(
                     "PTRACE_SEIZE reported a missing peer that remains in "
                     "/proc; refusing an incomplete freeze");
@@ -497,7 +463,7 @@ struct Process::PeerFreeze {
           added = true;
           if (::ptrace(PTRACE_INTERRUPT, tid, nullptr, nullptr) == -1) {
             if (errno == ESRCH || errno == ECHILD) {
-              if (thread_exists(process.tid_, tid)) {
+              if (thread_exists(process.process_id_, tid)) {
                 throw std::runtime_error(
                     "PTRACE_INTERRUPT reported a missing peer that remains in "
                     "/proc; refusing an incomplete freeze");
@@ -509,7 +475,7 @@ struct Process::PeerFreeze {
             throw_errno("PTRACE_INTERRUPT peer thread");
           }
           try {
-            wait_peer(peers.back(), deadline, process.tid_);
+            wait_peer(peers.back(), deadline, process.process_id_);
           } catch (...) {
             update_signal(tid, peers.back().pending_signal);
             throw;
@@ -522,7 +488,7 @@ struct Process::PeerFreeze {
 
         // Threads may be created while the current snapshot is being stopped.
         // Repeat until a full enumeration adds no peer.
-        const auto current = thread_ids(process.tid_);
+        const auto current = thread_ids(process.process_id_);
         const bool missing =
             std::any_of(current.begin(), current.end(), [&](pid_t tid) {
               return tid != process.tid_ && find(tid) == peers.end();
@@ -559,6 +525,23 @@ struct Process::PeerFreeze {
     return leader_ip > address && leader_ip < end;
   }
 
+  void promote(pid_t tid) {
+    const auto selected = find(tid);
+    if (selected == peers.end() || !selected->stopped) {
+      throw std::logic_error("selected injection thread is not stopped");
+    }
+    const int selected_signal = selected->pending_signal;
+    ptrace_checked(PTRACE_DETACH, process.tid_, nullptr,
+                   reinterpret_cast<void *>(static_cast<std::uintptr_t>(
+                       process.pending_signal_)),
+                   "detach original injection thread after worker selection");
+    process.tid_ = tid;
+    process.pending_signal_ = selected_signal;
+    process.tracee_stopped_ = true;
+    selected->seized = false;
+    forget(tid);
+  }
+
   void release() {
     if (released) {
       return;
@@ -570,9 +553,11 @@ struct Process::PeerFreeze {
       }
       if (process.poisoned_ && it->pending_signal != 0 &&
           it->pending_signal != SIGSTOP &&
-          ::syscall(SYS_tgkill, process.tid_, it->tid, it->pending_signal) !=
+          ::syscall(SYS_tgkill, process.process_id_, it->tid,
+                    it->pending_signal) !=
               0 &&
-          !(errno == ESRCH && !thread_exists(process.tid_, it->tid))) {
+          !(errno == ESRCH &&
+            !thread_exists(process.process_id_, it->tid))) {
         if (!failure) {
           try {
             throw_errno("preserve peer signal before poisoned detach");
@@ -589,7 +574,7 @@ struct Process::PeerFreeze {
                    reinterpret_cast<void *>(
                        static_cast<std::uintptr_t>(detach_signal))) == -1) {
         if (errno == ESRCH || errno == ECHILD) {
-          if (!thread_exists(process.tid_, it->tid)) {
+          if (!thread_exists(process.process_id_, it->tid)) {
             it->seized = false;
             forget(it->tid);
             continue;
@@ -603,7 +588,7 @@ struct Process::PeerFreeze {
               ::ptrace(PTRACE_INTERRUPT, it->tid, nullptr, nullptr) == 0) {
             try {
               wait_peer(*it, std::chrono::steady_clock::now() + kStopTimeout,
-                        process.tid_);
+                        process.process_id_);
             } catch (...) {
             }
             update_signal(it->tid, it->pending_signal);
@@ -616,7 +601,7 @@ struct Process::PeerFreeze {
             it->seized = false;
             forget(it->tid);
           } else if ((errno == ESRCH || errno == ECHILD) &&
-                     !thread_exists(process.tid_, it->tid)) {
+                     !thread_exists(process.process_id_, it->tid)) {
             it->seized = false;
             forget(it->tid);
           } else {
@@ -686,7 +671,7 @@ private:
         }
         if (event == PTRACE_EVENT_STOP) {
           peer.pending_signal = signal;
-          throw std::runtime_error(
+          throw IdlePointUnavailable(
               "peer thread is in a job-control group stop; refusing to thaw "
               "or inject through an unsupported stop");
         }
@@ -734,7 +719,7 @@ private:
 Process::~Process() {
   if (attached()) {
     if (poisoned_) {
-      const pid_t unsafe_pid = tid_;
+      const pid_t unsafe_pid = process_id_;
       try {
         preserve_poisoned_stop();
       } catch (const std::exception &error) {
@@ -757,7 +742,8 @@ Process::~Process() {
 }
 
 Process::Process(Process &&other) noexcept
-    : tid_(std::exchange(other.tid_, -1)),
+    : process_id_(std::exchange(other.process_id_, -1)),
+      tid_(std::exchange(other.tid_, -1)),
       traced_peers_(std::move(other.traced_peers_)),
       pending_signal_(std::exchange(other.pending_signal_, 0)),
       scratch_stack_(std::exchange(other.scratch_stack_, 0)),
@@ -776,7 +762,7 @@ Process &Process::operator=(Process &&other) noexcept {
       std::fprintf(stderr,
                    "injector: refusing move assignment over poisoned PID %d; "
                    "it remains ptrace-stopped\n",
-                   static_cast<int>(tid_));
+                   static_cast<int>(process_id_));
       return *this;
     }
     try {
@@ -785,16 +771,17 @@ Process &Process::operator=(Process &&other) noexcept {
       std::fprintf(
           stderr,
           "injector: cannot release PID %d during move assignment: %s\n",
-          static_cast<int>(tid_), error.what());
+          static_cast<int>(process_id_), error.what());
       return *this;
     } catch (...) {
       std::fprintf(stderr,
                    "injector: cannot release PID %d during move assignment; "
                    "ownership retained\n",
-                   static_cast<int>(tid_));
+                   static_cast<int>(process_id_));
       return *this;
     }
   }
+  process_id_ = std::exchange(other.process_id_, -1);
   tid_ = std::exchange(other.tid_, -1);
   traced_peers_ = std::move(other.traced_peers_);
   pending_signal_ = std::exchange(other.pending_signal_, 0);
@@ -823,10 +810,10 @@ void Process::ensure_usable() const {
 
 void Process::poison_process() noexcept {
   poisoned_ = true;
-  if (tid_ > 0 && ::kill(tid_, SIGSTOP) != 0 && errno != ESRCH) {
+  if (process_id_ > 0 && ::kill(process_id_, SIGSTOP) != 0 && errno != ESRCH) {
     std::fprintf(stderr,
                  "injector: could not request SIGSTOP for unsafe PID %d: %s\n",
-                 static_cast<int>(tid_), std::strerror(errno));
+                 static_cast<int>(process_id_), std::strerror(errno));
   }
 }
 
@@ -848,6 +835,7 @@ void Process::attach(pid_t process_id,
   if (::ptrace(PTRACE_SEIZE, process_id, nullptr, nullptr) == -1) {
     throw_errno("PTRACE_SEIZE (check ptrace permissions and target ownership)");
   }
+  process_id_ = process_id;
   tid_ = process_id;
   bool stopped = false;
   try {
@@ -866,26 +854,80 @@ void Process::attach(pid_t process_id,
     const unsigned int event = static_cast<unsigned int>(status) >> 16;
     if (event == PTRACE_EVENT_STOP && WSTOPSIG(status) != SIGTRAP) {
       pending_signal_ = WSTOPSIG(status);
-      throw std::runtime_error(
+      throw IdlePointUnavailable(
           "target leader is in a job-control group stop; refusing injection");
     }
     if (event != PTRACE_EVENT_STOP) {
       // Preserve a genuine signal-delivery stop if one raced with interrupt.
       pending_signal_ = WSTOPSIG(status);
     }
-    validate_application_modules(tid_, application_modules);
-    const long syscall_number = stopped_syscall(tid_);
-    if (syscall_number != SYS_nanosleep &&
-        syscall_number != SYS_clock_nanosleep) {
-      if (syscall_number >= 0) {
-        throw IdlePointUnavailable(
-            "busy-main admission requires a userspace stop");
+    validate_application_modules(process_id_, application_modules);
+    struct Rejection {
+      pid_t tid;
+      long syscall_number;
+      std::string reason;
+    };
+    std::vector<Rejection> rejected;
+    auto eligible = [&](pid_t candidate_tid) {
+      const long syscall_number = stopped_syscall(candidate_tid);
+      const auto registers = read_registers(candidate_tid).general;
+      if (candidate_tid != process_id_ && registers.fs_base == 0) {
+        rejected.push_back({candidate_tid, syscall_number,
+                            "worker has no thread pointer for dlopen"});
+        return false;
       }
-      (void)require_application_rendezvous(tid_, read_registers(tid_).general,
-                                           application_modules);
+      if (syscall_number == SYS_nanosleep ||
+          syscall_number == SYS_clock_nanosleep) {
+        return true;
+      }
+      if (syscall_number >= 0) {
+        rejected.push_back({candidate_tid, syscall_number,
+                            "syscall is outside the approved sleep policy"});
+        return false;
+      }
+      try {
+        (void)require_application_rendezvous(
+            process_id_, registers, application_modules);
+        return true;
+      } catch (const IdlePointUnavailable &error) {
+        rejected.push_back({candidate_tid, syscall_number, error.what()});
+        return false;
+      }
+    };
+
+    if (!eligible(tid_)) {
+      PeerFreeze freeze(*this);
+      pid_t selected_tid = -1;
+      for (const auto &peer : freeze.peers) {
+        if (peer.stopped && eligible(peer.tid)) {
+          selected_tid = peer.tid;
+          break;
+        }
+      }
+      if (selected_tid < 0) {
+        std::ostringstream message;
+        message << "no eligible injection thread; blocked TIDs/syscalls:";
+        std::vector<std::string> rejection_lines;
+        rejection_lines.reserve(rejected.size());
+        for (const auto &rejection : rejected) {
+          std::ostringstream line;
+          line << "tid=" << rejection.tid << " syscall="
+               << rejection.syscall_number << "(";
+          if (rejection.syscall_number < 0) {
+            line << "userspace";
+          } else {
+            line << syscall_name(rejection.syscall_number);
+          }
+          line << ") reason=" << rejection.reason;
+          rejection_lines.push_back(line.str());
+        }
+        message << " " << join_rejections(rejection_lines);
+        freeze.release();
+        throw IdlePointUnavailable(message.str());
+      }
+      freeze.promote(selected_tid);
+      freeze.release();
     }
-    (void)read_registers(
-        tid_); // Fail early if complete register preservation is unavailable.
   } catch (...) {
     const auto original_failure = std::current_exception();
     if (!stopped) {
@@ -902,6 +944,12 @@ void Process::attach(pid_t process_id,
                       WSTOPSIG(recovery_status) != SIGTRAP)) {
         pending_signal_ = WSTOPSIG(recovery_status);
       }
+    }
+    if (poisoned_ || !traced_peers_.empty()) {
+      poison_process();
+      throw std::runtime_error(
+          "attach failed and peer cleanup is uncertain; injector retains "
+          "ptrace ownership");
     }
     if (!stopped) {
       poison_process();
@@ -922,6 +970,7 @@ void Process::attach(pid_t process_id,
           error.what() + "; injector retains ptrace ownership");
     }
     tid_ = -1;
+    process_id_ = -1;
     pending_signal_ = 0;
     tracee_stopped_ = false;
     std::rethrow_exception(original_failure);
@@ -947,6 +996,7 @@ void Process::detach() {
       reinterpret_cast<void *>(static_cast<std::uintptr_t>(pending_signal_)),
       "PTRACE_DETACH");
   tid_ = -1;
+  process_id_ = -1;
   pending_signal_ = 0;
   tracee_stopped_ = false;
   scratch_stack_ = 0;
@@ -957,11 +1007,12 @@ void Process::detach() {
 
 void Process::preserve_poisoned_stop() {
   ensure_attached();
-  const pid_t unsafe_pid = tid_;
+  const pid_t unsafe_pid = process_id_;
+  const pid_t unsafe_tid = tid_;
   if (!tracee_stopped_) {
-    ptrace_checked(PTRACE_INTERRUPT, unsafe_pid, nullptr, nullptr,
+    ptrace_checked(PTRACE_INTERRUPT, unsafe_tid, nullptr, nullptr,
                    "interrupt unsafe tracee before preserving stop");
-    wait_stopped_or_throw(unsafe_pid,
+    wait_stopped_or_throw(unsafe_tid,
                           std::chrono::steady_clock::now() + kStopTimeout,
                           "stop unsafe tracee before detach");
     tracee_stopped_ = true;
@@ -1004,13 +1055,14 @@ void Process::preserve_poisoned_stop() {
   }
   traced_peers_.clear();
   if (pending_signal_ != 0 && pending_signal_ != SIGSTOP &&
-      ::syscall(SYS_tgkill, unsafe_pid, unsafe_pid, pending_signal_) != 0) {
+      ::syscall(SYS_tgkill, unsafe_pid, unsafe_tid, pending_signal_) != 0) {
     throw_errno("preserve leader signal during poisoned stop");
   }
-  ptrace_checked(PTRACE_DETACH, unsafe_pid, nullptr,
+  ptrace_checked(PTRACE_DETACH, unsafe_tid, nullptr,
                  reinterpret_cast<void *>(static_cast<std::uintptr_t>(SIGSTOP)),
                  "detach poisoned tracee while delivering SIGSTOP");
   tid_ = -1;
+  process_id_ = -1;
   pending_signal_ = 0;
   tracee_stopped_ = false;
   scratch_stack_ = 0;
@@ -1542,7 +1594,7 @@ Process::remote_call_raw(std::uintptr_t function,
   return result;
 }
 
-std::uintptr_t Process::resolve_remote_symbol(std::string_view name) {
+std::uintptr_t Process::resolve_remote_symbol(std::string_view name, const CodePatch *owned_patch) {
   ensure_usable();
   if (name.empty() || name.find('\0') != std::string_view::npos) {
     throw std::invalid_argument(
@@ -1565,36 +1617,61 @@ std::uintptr_t Process::resolve_remote_symbol(std::string_view name) {
     throw std::runtime_error("dladdr could not identify the local module for " +
                              symbol_name);
   }
-  struct stat module_status{};
-  if (::stat(info.dli_fname, &module_status) != 0) {
-    throw_errno("stat local symbol module");
+  const auto module_path = tracer::detail::canonical_mapped_path(info.dli_fname);
+  if (module_path.empty()) {
+    throw std::runtime_error("cannot resolve local symbol module path");
   }
-  const std::string build_id = elf_build_id(info.dli_fname);
-
   const auto local_maps = read_maps(::getpid());
-  const auto remote_maps = read_maps(tid_);
-  const auto local_bias = map_load_bias(local_maps, module_status);
-  const auto remote_bias = map_load_bias(remote_maps, module_status);
+  const auto remote_maps = read_maps(process_id_);
+  const auto local_bias = map_load_bias(local_maps, module_path);
+  const auto remote_bias = map_load_bias(remote_maps, module_path);
   const auto actual_local_base =
       reinterpret_cast<std::uintptr_t>(info.dli_fbase);
   if (local_bias != actual_local_base) {
-    throw std::runtime_error(
-        "local module mapping identity/base is inconsistent for " +
-        symbol_name);
-  }
-  // Requiring a build id plus matching device/inode on both hosts binds the
-  // translated offset to the exact local ELF image, rather than a same-named
-  // library from a different runtime installation.
-  if (build_id.empty()) {
-    throw std::runtime_error("local module build id is empty for " +
-                             symbol_name);
+    throw std::runtime_error("local module mapping base is inconsistent for " + symbol_name);
   }
   const auto symbol = reinterpret_cast<std::uintptr_t>(local_address);
-  if (symbol < local_bias) {
-    throw std::runtime_error(
-        "local symbol address precedes its module load base");
+  if (symbol < local_bias ||
+      symbol - local_bias > std::numeric_limits<std::uintptr_t>::max() - remote_bias) {
+    throw std::runtime_error("runtime symbol address translation overflows");
   }
-  return remote_bias + (symbol - local_bias);
+  const auto remote_symbol = remote_bias + (symbol - local_bias);
+
+  // Runtime files remain fixed for the session. Check the actual instructions
+  // used for runtime calls without comparing filesystem identities or times.
+  constexpr std::size_t bytes = 32;
+  const auto contains_entry = [&](const auto &maps, std::uintptr_t address) {
+    return std::any_of(maps.begin(), maps.end(), [&](const MapEntry &entry) {
+      return same_module_path(entry, module_path) && entry.readable && entry.executable &&
+             address >= entry.start && address < entry.end && bytes <= entry.end - address;
+    });
+  };
+  if (!contains_entry(local_maps, symbol) || !contains_entry(remote_maps, remote_symbol)) {
+    throw std::runtime_error("runtime entry is outside its executable mapping");
+  }
+  std::array<std::uint8_t, bytes> remote_entry{};
+  remote_read(remote_symbol, remote_entry.data(), remote_entry.size());
+  if (owned_patch) {
+    // Additional shared probes see the session's installed pthread adapter.
+    // Verify its live bytes, then compare its original entry to the local code.
+    if (name != "pthread_create" || !owned_patch->expected || !owned_patch->replacement ||
+        owned_patch->address < remote_symbol || owned_patch->address - remote_symbol > 4 ||
+        !owned_patch->size ||
+        owned_patch->size > bytes - (owned_patch->address - remote_symbol)) {
+      throw std::runtime_error("invalid owned runtime patch");
+    }
+    std::array<std::uint8_t, bytes> installed{};
+    remote_read(owned_patch->address, installed.data(), owned_patch->size);
+    if (std::memcmp(installed.data(), owned_patch->replacement, owned_patch->size) != 0) {
+      throw std::runtime_error("owned runtime patch bytes changed");
+    }
+    std::memcpy(remote_entry.data() + (owned_patch->address - remote_symbol),
+                owned_patch->expected, owned_patch->size);
+  }
+  if (std::memcmp(local_address, remote_entry.data(), bytes) != 0) {
+    throw std::runtime_error("runtime entry instructions do not match");
+  }
+  return remote_symbol;
 }
 
 } // namespace tracer::injector

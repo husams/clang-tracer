@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -129,6 +130,7 @@ def build_completer() -> NestedCompleter:
                         "events",
                         "collect",
                         "record",
+                        "drain",
                         "colors",
                         "!",
                         "help",
@@ -147,6 +149,7 @@ def build_completer() -> NestedCompleter:
                     "events",
                     "collect",
                     "record",
+                    "drain",
                     "exit",
                     "quit",
                 ]
@@ -272,16 +275,22 @@ class Console:
             self.emit(self.client.add_probe(selected, spec))
         elif name == "remove":
             self.emit(self.client.remove_probe(self.selected(), int(arguments[0])))
-        elif name in {"events", "collect", "record"}:
+        elif name in {"events", "collect", "record", "drain"}:
             if "session_ids" not in options and self.session_id is not None:
                 options["session_ids"] = [self.session_id]
-            if name == "collect":
+            if name == "drain":
+                count = self.client.drain_traces(str(arguments[0]), **options)
+                self.emit(f"drained {count} events to SQLite")
+            elif name == "collect":
                 for event in self.client.collect_traces(int(arguments[0]), **options):
                     self.emit(event)
             elif name == "record":
-                count = self.client.record_traces(
-                    str(arguments[0]), int(arguments[1]), **options
+                record = (
+                    self.client.record_sqlite
+                    if options.pop("sqlite", False)
+                    else self.client.record_traces
                 )
+                count = record(str(arguments[0]), int(arguments[1]), **options)
                 self.emit(f"recorded {count} events")
             else:
                 count = options.pop("count", None)
@@ -330,6 +339,7 @@ class Console:
                     ValueError,
                     OSError,
                     RuntimeError,
+                    sqlite3.Error,
                     text_format.ParseError,
                 ) as error:
                     self.emit(error, error=True)

@@ -75,6 +75,16 @@ class TracerStub(object):
                 request_serializer=tracer__pb2.WatchEventsRequest.SerializeToString,
                 response_deserializer=tracer__pb2.TraceEvent.FromString,
                 _registered_method=True)
+        self.ReadEvents = channel.unary_unary(
+                '/clangtracer.v1.Tracer/ReadEvents',
+                request_serializer=tracer__pb2.ReadEventsRequest.SerializeToString,
+                response_deserializer=tracer__pb2.ReadEventsResponse.FromString,
+                _registered_method=True)
+        self.AcknowledgeEvents = channel.unary_unary(
+                '/clangtracer.v1.Tracer/AcknowledgeEvents',
+                request_serializer=tracer__pb2.AcknowledgeEventsRequest.SerializeToString,
+                response_deserializer=tracer__pb2.AcknowledgeEventsResponse.FromString,
+                _registered_method=True)
 
 
 class TracerServicer(object):
@@ -130,6 +140,19 @@ class TracerServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ReadEvents(self, request, context):
+        """Snapshot retained events; acknowledge only after storage commits.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AcknowledgeEvents(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_TracerServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -172,6 +195,16 @@ def add_TracerServicer_to_server(servicer, server):
                     servicer.WatchEvents,
                     request_deserializer=tracer__pb2.WatchEventsRequest.FromString,
                     response_serializer=tracer__pb2.TraceEvent.SerializeToString,
+            ),
+            'ReadEvents': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReadEvents,
+                    request_deserializer=tracer__pb2.ReadEventsRequest.FromString,
+                    response_serializer=tracer__pb2.ReadEventsResponse.SerializeToString,
+            ),
+            'AcknowledgeEvents': grpc.unary_unary_rpc_method_handler(
+                    servicer.AcknowledgeEvents,
+                    request_deserializer=tracer__pb2.AcknowledgeEventsRequest.FromString,
+                    response_serializer=tracer__pb2.AcknowledgeEventsResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -391,6 +424,60 @@ class Tracer(object):
             '/clangtracer.v1.Tracer/WatchEvents',
             tracer__pb2.WatchEventsRequest.SerializeToString,
             tracer__pb2.TraceEvent.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReadEvents(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/ReadEvents',
+            tracer__pb2.ReadEventsRequest.SerializeToString,
+            tracer__pb2.ReadEventsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AcknowledgeEvents(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/AcknowledgeEvents',
+            tracer__pb2.AcknowledgeEventsRequest.SerializeToString,
+            tracer__pb2.AcknowledgeEventsResponse.FromString,
             options,
             channel_credentials,
             insecure,

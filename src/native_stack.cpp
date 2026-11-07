@@ -28,7 +28,6 @@
 #include <llvm/Object/ObjectFile.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <sys/stat.h>
-#include <sys/sysmacros.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -40,8 +39,7 @@ thread_local tracer::TraceContext *current_context = nullptr;
 
 struct Image;
 struct Mapping {
-  std::uint64_t begin{}, end{}, offset{}, inode{};
-  unsigned device_major{}, device_minor{};
+  std::uint64_t begin{}, end{}, offset{};
   bool readable{}, executable{};
   std::string path;
   // Verified only for this fresh /proc snapshot, never retained across
@@ -198,12 +196,14 @@ std::vector<Mapping> mappings(std::uint64_t stack_pointer = 0,
     number(m.offset, 16);
     separator(' ');
     spaces();
-    number(m.device_major, 16);
+    std::uint64_t ignored_device_component = 0;
+    number(ignored_device_component, 16);
     separator(':');
-    number(m.device_minor, 16);
+    number(ignored_device_component, 16);
     separator(' ');
     spaces();
-    number(m.inode, 10);
+    std::uint64_t ignored_inode = 0;
+    number(ignored_inode, 10);
     if (cursor != end && *cursor != ' ' && *cursor != '\t')
       stop("invalid native mapping");
     spaces();
@@ -252,14 +252,6 @@ std::vector<Mapping> mappings(std::uint64_t stack_pointer = 0,
     }
   }
   return result;
-}
-
-bool same_identity(const struct stat &a, const struct stat &b) {
-  return a.st_dev == b.st_dev && a.st_ino == b.st_ino &&
-         a.st_size == b.st_size && a.st_mtim.tv_sec == b.st_mtim.tv_sec &&
-         a.st_mtim.tv_nsec == b.st_mtim.tv_nsec &&
-         a.st_ctim.tv_sec == b.st_ctim.tv_sec &&
-         a.st_ctim.tv_nsec == b.st_ctim.tv_nsec;
 }
 
 bool runtime_module(std::string_view path) {
@@ -357,7 +349,6 @@ struct UnwindPlan {
 };
 
 struct Image {
-  struct stat identity{};
   std::unique_ptr<llvm::MemoryBuffer> bytes;
   std::unique_ptr<llvm::object::ObjectFile> object;
   std::unique_ptr<llvm::DWARFContext> dwarf;
@@ -380,32 +371,23 @@ struct Image {
 struct Cache {
   std::mutex mutex;
   std::unordered_map<std::string, std::unique_ptr<Image>> images;
+  std::string session_id;
   std::size_t bytes = 0;
   std::size_t row_count = 0;
   std::size_t plan_count = 0;
   std::size_t symbolized_frames = 0;
 
   Image &image(const Mapping &m) {
-    struct stat identity{};
-    if (m.path.empty() || m.path.front() != '/' ||
-        ::stat(m.path.c_str(), &identity) || identity.st_ino != m.inode ||
-        major(identity.st_dev) != m.device_major ||
-        minor(identity.st_dev) != m.device_minor)
-      stop("native ELF identity is unavailable or changed");
+    if (m.path.empty() || m.path.front() != '/')
+      stop("native ELF mapped path is unavailable");
     const auto existing = images.find(m.path);
-    if (existing != images.end()) {
-      if (!same_identity(existing->second->identity, identity))
-        stop("cached native ELF identity changed");
+    if (existing != images.end())
       return *existing->second;
-    }
-    if (identity.st_size < static_cast<off_t>(sizeof(Elf64_Ehdr)) ||
-        identity.st_size > 256 * 1024 * 1024 || images.size() >= 64 ||
-        static_cast<std::uint64_t>(identity.st_size) >
-            512 * 1024 * 1024 - bytes)
-      stop("native ELF cache bound exceeded");
-    auto result = std::make_unique<Image>();
-    result->identity = identity;
-    // Open first, then revalidate both descriptor and pathname after reading.
+
+    // A trace session treats the mapped binary as immutable. Procfs device
+    // and inode values can differ from stat() for OverlayFS mappings, so the
+    // mapped path selects the session cache and ELF load offsets/ranges below
+    // validate each PC against the live mapping.
     const int fd = ::open(m.path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0)
       stop("cannot open native ELF");
@@ -414,13 +396,18 @@ struct Cache {
       ~Fd() { ::close(fd); }
     } owner{fd};
     struct stat opened{};
-    if (::fstat(fd, &opened) || !same_identity(identity, opened))
-      stop("native ELF changed during open");
+    if (::fstat(fd, &opened) || !S_ISREG(opened.st_mode) ||
+        opened.st_size < static_cast<off_t>(sizeof(Elf64_Ehdr)) ||
+        opened.st_size > 256 * 1024 * 1024 || images.size() >= 64 ||
+        static_cast<std::uint64_t>(opened.st_size) >
+            512 * 1024 * 1024 - bytes)
+      stop("native ELF cache bound exceeded");
+    auto result = std::make_unique<Image>();
     // Never retain file-backed ELF mmaps in the target: an extra offset-zero
     // mapping would make the admission resolver correctly reject ambiguous
     // load biases. A private byte copy leaves the loaded-image topology alone.
     auto buffer = llvm::WritableMemoryBuffer::getNewUninitMemBuffer(
-        identity.st_size, m.path);
+        opened.st_size, m.path);
     if (!buffer)
       stop("cannot allocate native ELF byte copy");
     std::size_t got = 0;
@@ -432,10 +419,6 @@ struct Cache {
       got += static_cast<std::size_t>(amount);
     }
     result->bytes = std::move(buffer);
-    struct stat after{}, path_after{};
-    if (::fstat(fd, &after) || ::stat(m.path.c_str(), &path_after) ||
-        !same_identity(identity, after) || !same_identity(identity, path_after))
-      stop("native ELF changed during read");
     const auto contents = result->bytes->getBuffer();
     Elf64_Ehdr header{};
     std::memcpy(&header, contents.data(), sizeof(header));
@@ -756,7 +739,7 @@ const UnwindPlan &plan_for(Location loc, UnwindPlan &fallback) {
     }
     // Unsupported registers have no instruction or preservation bit.
   }
-  // Node references survive rehash; plans belong to identity-checked images.
+  // Node references survive rehash; plans belong to path-keyed session images.
   // At the bound, execute this capture's temporary plan without retaining it.
   if (cache.plan_count < 16384) {
     const auto inserted = loc.image->plans.emplace(loc.pc, fallback);
@@ -920,6 +903,18 @@ extern "C" void tracer_stack_leave(tracer::TraceContext *ctx) noexcept {
 }
 
 namespace tracer {
+void begin_native_stack_session(std::string_view session_id) {
+  std::lock_guard lock(cache.mutex);
+  if (cache.session_id == session_id)
+    return;
+  cache.images.clear();
+  cache.bytes = 0;
+  cache.row_count = 0;
+  cache.plan_count = 0;
+  cache.symbolized_frames = 0;
+  cache.session_id.assign(session_id);
+}
+
 void capture_native_stack(const TraceContext &ctx, unsigned depth,
                           bool application_only) noexcept {
   const int saved_errno = errno;

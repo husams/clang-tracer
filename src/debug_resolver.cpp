@@ -24,9 +24,8 @@
 #include <llvm/Support/SHA256.h>
 #include <llvm/TargetParser/Triple.h>
 #include <sys/stat.h>
-#if defined(__linux__)
-#include <sys/sysmacros.h>
-#endif
+
+#include "mapped_path.hpp"
 
 namespace tracer::client {
 namespace {
@@ -240,7 +239,11 @@ DWARFDie declaration(DWARFDie d) {
 std::vector<std::string> modules(std::uint32_t pid, bool include_runtime = false) {
   std::set<std::string> paths;
   const auto proc = "/proc/" + std::to_string(pid);
-  paths.insert(std::filesystem::read_symlink(proc + "/exe").string());
+  const auto executable = tracer::detail::canonical_mapped_path(proc + "/exe");
+  if (executable.empty()) {
+    throw std::runtime_error("cannot resolve target executable path");
+  }
+  paths.insert(executable);
   std::ifstream maps(proc + "/maps");
   std::string line;
   while (std::getline(maps, line)) {
@@ -248,8 +251,11 @@ std::vector<std::string> modules(std::uint32_t pid, bool include_runtime = false
     std::string range, perms, offset, dev, inode, path;
     in >> range >> perms >> offset >> dev >> inode;
     std::getline(in >> std::ws, path);
-    if (perms.find('x') == std::string::npos || path.empty() || path[0] != '/' ||
-        path.ends_with(" (deleted)")) {
+    if (perms.find('x') == std::string::npos || path.empty() || path[0] != '/') {
+      continue;
+    }
+    path = tracer::detail::canonical_mapped_path(path);
+    if (path.empty()) {
       continue;
     }
     const auto base = std::filesystem::path(path).filename().string();
@@ -276,17 +282,8 @@ void identity(api::DebugInfo& info, const std::string& path) {
   if (::stat(path.c_str(), &st) != 0) {
     throw std::runtime_error("cannot stat debug image: " + path);
   }
-  info.set_module(path);
-  info.set_device(st.st_dev);
-  info.set_inode(st.st_ino);
+  info.set_module(tracer::detail::canonical_mapped_path(path));
   info.set_file_size(st.st_size);
-#if defined(__APPLE__)
-  info.set_modification_ns(st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec);
-  info.set_change_ns(st.st_ctimespec.tv_sec * 1000000000LL + st.st_ctimespec.tv_nsec);
-#else
-  info.set_modification_ns(st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec);
-  info.set_change_ns(st.st_ctim.tv_sec * 1000000000LL + st.st_ctim.tv_nsec);
-#endif
 }
 
 struct ExecutableMapping {
@@ -295,9 +292,6 @@ struct ExecutableMapping {
   std::uint64_t begin = 0;
   std::uint64_t end = 0;
   std::uint64_t offset = 0;
-  std::uint64_t device_major = 0;
-  std::uint64_t device_minor = 0;
-  std::uint64_t inode = 0;
 };
 
 std::vector<ExecutableMapping> read_executable_mappings(
@@ -317,6 +311,7 @@ std::vector<ExecutableMapping> read_executable_mappings(
       continue;
     }
     std::getline(in >> std::ws, path);
+    path = tracer::detail::canonical_mapped_path(path);
     if (!path_set.contains(path)) {
       continue;
     }
@@ -332,9 +327,6 @@ std::vector<ExecutableMapping> read_executable_mappings(
       mapping.begin = std::stoull(range.substr(0, dash), nullptr, 16);
       mapping.end = std::stoull(range.substr(dash + 1), nullptr, 16);
       mapping.offset = std::stoull(offset, nullptr, 16);
-      mapping.device_major = std::stoull(device.substr(0, colon), nullptr, 16);
-      mapping.device_minor = std::stoull(device.substr(colon + 1), nullptr, 16);
-      mapping.inode = std::stoull(inode);
       if (mapping.end > mapping.begin) {
         result.push_back(std::move(mapping));
       }
@@ -368,20 +360,6 @@ std::string mapping_fingerprint(
     }
     image_bytes += file_size;
     std::string identity = path;
-    identity.push_back('\0');
-    identity += std::to_string(st.st_dev) + ":" + std::to_string(st.st_ino) + ":" +
-                std::to_string(st.st_size) + ":";
-#if defined(__APPLE__)
-    identity += std::to_string(st.st_mtimespec.tv_sec) + ":" +
-                std::to_string(st.st_mtimespec.tv_nsec) + ":" +
-                std::to_string(st.st_ctimespec.tv_sec) + ":" +
-                std::to_string(st.st_ctimespec.tv_nsec);
-#else
-    identity += std::to_string(st.st_mtim.tv_sec) + ":" +
-                std::to_string(st.st_mtim.tv_nsec) + ":" +
-                std::to_string(st.st_ctim.tv_sec) + ":" +
-                std::to_string(st.st_ctim.tv_nsec);
-#endif
     identity.push_back('\0');
     hash.update(identity);
   }
@@ -445,17 +423,9 @@ std::vector<MappedExecutableRange> mapped_executable_ranges(
   for (const auto& segment : segments) {
     const auto segment_end = segment.file_offset + segment.file_size;
     for (const auto& mapping : mappings) {
-      if (mapping.path != info.module() || mapping.inode != info.inode()) {
+      if (mapping.path != info.module()) {
         continue;
       }
-#if defined(__linux__)
-      if (mapping.device_major != major(static_cast<dev_t>(info.device())) ||
-          mapping.device_minor != minor(static_cast<dev_t>(info.device()))) {
-        continue;
-      }
-#else
-      continue;
-#endif
       const auto mapping_size = mapping.end - mapping.begin;
       if (mapping.offset > std::numeric_limits<std::uint64_t>::max() - mapping_size) {
         continue;
@@ -526,7 +496,12 @@ std::uint64_t runtime_entry(std::uint32_t pid, const llvm::object::ELF64LEObject
     std::istringstream in(line);
     std::string range, permissions, offset, device, inode;
     if (!(in >> range >> permissions >> offset >> device >> inode) || permissions.size() < 3 ||
-        permissions[2] != 'x' || std::stoull(inode) != info.inode()) {
+        permissions[2] != 'x') {
+      continue;
+    }
+    std::string path;
+    std::getline(in >> std::ws, path);
+    if (tracer::detail::canonical_mapped_path(path) != info.module()) {
       continue;
     }
     const auto colon = device.find(':');
@@ -534,16 +509,6 @@ std::uint64_t runtime_entry(std::uint32_t pid, const llvm::object::ELF64LEObject
     if (colon == std::string::npos || dash == std::string::npos) {
       throw std::runtime_error("invalid target mapping identity");
     }
-#if defined(__linux__)
-    if (std::stoull(device.substr(0, colon), nullptr, 16) !=
-            major(static_cast<dev_t>(info.device())) ||
-        std::stoull(device.substr(colon + 1), nullptr, 16) !=
-            minor(static_cast<dev_t>(info.device()))) {
-      continue;
-    }
-#else
-    throw std::runtime_error("DWARF entry relocation requires Linux");
-#endif
     const auto begin = std::stoull(range.substr(0, dash), nullptr, 16);
     const auto end = std::stoull(range.substr(dash + 1), nullptr, 16);
     const auto mapped_offset = std::stoull(offset, nullptr, 16);
@@ -562,7 +527,7 @@ std::uint64_t runtime_entry(std::uint32_t pid, const llvm::object::ELF64LEObject
     }
   }
   if (entries.size() != 1) {
-    throw std::runtime_error("DWARF entry has no unique identity-matched executable mapping");
+    throw std::runtime_error("DWARF entry has no unique path-matched executable mapping");
   }
   return *entries.begin();
 }
@@ -834,14 +799,6 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
             found.spec.set_symbol(symbol);
             found.declaration = shape.result_spelling + " " + shape.selector;
             found.source = path;
-            api::DebugInfo after;
-            identity(after, path);
-            if (after.device() != info->device() || after.inode() != info->inode() ||
-                after.file_size() != info->file_size() ||
-                after.modification_ns() != info->modification_ns() ||
-                after.change_ns() != info->change_ns()) {
-              throw std::runtime_error("debug image changed while resolving");
-            }
             const auto key = path + ":" + std::to_string(low);
             matches[key] = std::move(found);
           } catch (const std::exception& e) {

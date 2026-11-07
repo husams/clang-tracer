@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -24,30 +25,18 @@
 #include <llvm/Support/Error.h>
 #include <llvm/TargetParser/Triple.h>
 #include <sys/stat.h>
-#include <sys/sysmacros.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
 #include "injector.hpp"
+#include "mapped_path.hpp"
 
 namespace tracer::injector {
 
 namespace detail {
 struct ApprovedModuleIdentity {
   std::string path;
-  int fd = -1;
-  dev_t device = 0;
-  ino_t inode = 0;
-  off_t size = 0;
   std::uint64_t load_bias = 0;
-  timespec mtime{};
-  timespec ctime{};
-
-  ~ApprovedModuleIdentity() {
-    if (fd >= 0) {
-      ::close(fd);
-    }
-  }
 };
 } // namespace detail
 
@@ -75,12 +64,10 @@ struct Mapping {
   std::uint64_t begin = 0;
   std::uint64_t end = 0;
   std::uint64_t offset = 0;
-  unsigned major_no = 0;
-  unsigned minor_no = 0;
-  std::uint64_t inode = 0;
   bool readable = false;
   bool executable = false;
   std::string path;
+  std::string canonical_path;
 };
 
 std::vector<Mapping> read_mappings(pid_t pid) {
@@ -90,26 +77,24 @@ std::vector<Mapping> read_mappings(pid_t pid) {
   }
   std::vector<Mapping> out;
   std::string line;
+  std::unordered_map<std::string, std::string> canonical_paths;
   while (std::getline(input, line)) {
     std::istringstream row(line);
-    std::string addresses, permissions, device;
+    std::string addresses, permissions, device, inode;
     Mapping m;
     if (!(row >> addresses >> permissions >> std::hex >> m.offset >> device >>
-          std::dec >> m.inode)) {
+          std::dec >> inode)) {
       continue;
     }
     m.readable = permissions.size() >= 1 && permissions[0] == 'r';
     m.executable = permissions.size() >= 3 && permissions[2] == 'x';
     const auto dash = addresses.find('-');
-    const auto colon = device.find(':');
-    if (dash == std::string::npos || colon == std::string::npos) {
+    if (dash == std::string::npos) {
       continue;
     }
     try {
       m.begin = std::stoull(addresses.substr(0, dash), nullptr, 16);
       m.end = std::stoull(addresses.substr(dash + 1), nullptr, 16);
-      m.major_no = std::stoul(device.substr(0, colon), nullptr, 16);
-      m.minor_no = std::stoul(device.substr(colon + 1), nullptr, 16);
     } catch (...) {
       continue;
     }
@@ -118,6 +103,15 @@ std::vector<Mapping> read_mappings(pid_t pid) {
     if (first != std::string::npos) {
       m.path.erase(0, first);
     }
+    if (!m.path.empty() && m.path.front() == '/') {
+      const auto found = canonical_paths.find(m.path);
+      if (found != canonical_paths.end()) {
+        m.canonical_path = found->second;
+      } else {
+        m.canonical_path = ::tracer::detail::canonical_mapped_path(m.path);
+        canonical_paths.emplace(m.path, m.canonical_path);
+      }
+    }
     out.push_back(std::move(m));
   }
   return out;
@@ -125,8 +119,6 @@ std::vector<Mapping> read_mappings(pid_t pid) {
 
 struct FileImage {
   std::string path;
-  dev_t device = 0;
-  ino_t inode = 0;
   std::uint16_t elf_type = 0;
   std::string soname;
   std::string interpreter;
@@ -183,9 +175,7 @@ struct FileImage {
       }
       const bool mapped =
           std::any_of(maps.begin(), maps.end(), [&](const Mapping &m) {
-            if (!m.executable || m.inode != static_cast<std::uint64_t>(inode) ||
-                m.major_no != static_cast<unsigned>(major(device)) ||
-                m.minor_no != static_cast<unsigned>(minor(device)) ||
+            if (!m.executable || m.canonical_path != path ||
                 pc < m.begin || pc >= m.end) {
               return false;
             }
@@ -203,17 +193,13 @@ struct FileImage {
 };
 
 FileImage load_image_fd(const std::string &path, int fd,
-                        const std::vector<Mapping> &maps,
-                        const struct stat &identity) {
+                        const std::vector<Mapping> &maps) {
   FileImage image;
   image.path = path;
   struct stat st{};
-  if (::fstat(fd, &st) != 0 || st.st_dev != identity.st_dev ||
-      st.st_ino != identity.st_ino) {
-    unavailable("mapped ELF identity changed during admission");
+  if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    unavailable("mapped ELF path is not a readable regular file");
   }
-  image.device = st.st_dev;
-  image.inode = st.st_ino;
   if (st.st_size < static_cast<off_t>(sizeof(Elf64_Ehdr)) ||
       static_cast<std::uint64_t>(st.st_size) > 512ULL * 1024 * 1024) {
     unavailable("mapped ELF has an unsupported size");
@@ -279,23 +265,110 @@ FileImage load_image_fd(const std::string &path, int fd,
   }
   const auto page = static_cast<std::uint64_t>(page_size);
   const auto same_file = [&](const Mapping &m) {
-    return m.inode == static_cast<std::uint64_t>(identity.st_ino) &&
-           m.major_no == static_cast<unsigned>(major(identity.st_dev)) &&
-           m.minor_no == static_cast<unsigned>(minor(identity.st_dev));
+    return !m.canonical_path.empty() && m.canonical_path == path;
+  };
+  const auto file_page_range = [&](const Elf64_Phdr &segment,
+                                   std::uint64_t &file_begin,
+                                   std::uint64_t &virtual_begin,
+                                   std::uint64_t &length) {
+    if (segment.p_filesz == 0 || segment.p_offset % page !=
+                                    segment.p_vaddr % page) {
+      return false;
+    }
+    const auto file_end = segment.p_offset + segment.p_filesz;
+    const auto virtual_end = segment.p_vaddr + segment.p_filesz;
+    if (file_end > std::numeric_limits<std::uint64_t>::max() - (page - 1) ||
+        virtual_end > std::numeric_limits<std::uint64_t>::max() - (page - 1)) {
+      return false;
+    }
+    file_begin = (segment.p_offset / page) * page;
+    virtual_begin = (segment.p_vaddr / page) * page;
+    const auto file_page_end = ((file_end + page - 1) / page) * page;
+    const auto virtual_page_end = ((virtual_end + page - 1) / page) * page;
+    if (file_page_end < file_begin || virtual_page_end < virtual_begin ||
+        file_page_end - file_begin != virtual_page_end - virtual_begin) {
+      return false;
+    }
+    length = file_page_end - file_begin;
+    return length != 0;
+  };
+  const auto mapping_covers_range = [&](std::uint64_t load_bias,
+                                       const Elf64_Phdr &segment) {
+    std::uint64_t file_begin = 0, virtual_begin = 0, length = 0;
+    if (!file_page_range(segment, file_begin, virtual_begin, length) ||
+        virtual_begin >
+            std::numeric_limits<std::uint64_t>::max() - load_bias) {
+      return false;
+    }
+    const auto address_begin = load_bias + virtual_begin;
+    if (length > std::numeric_limits<std::uint64_t>::max() - address_begin) {
+      return false;
+    }
+    const auto address_end = address_begin + length;
+    auto cursor = address_begin;
+    while (cursor < address_end) {
+      auto covered_until = cursor;
+      for (const auto &mapping : maps) {
+        if (!same_file(mapping) ||
+            ((segment.p_flags & PF_X) != 0 && !mapping.executable) ||
+            cursor < mapping.begin || cursor >= mapping.end) {
+          continue;
+        }
+        const auto address_delta = cursor - address_begin;
+        const auto mapping_delta = cursor - mapping.begin;
+        if (address_delta >
+                std::numeric_limits<std::uint64_t>::max() - file_begin ||
+            mapping_delta >
+                std::numeric_limits<std::uint64_t>::max() - mapping.offset ||
+            file_begin + address_delta != mapping.offset + mapping_delta) {
+          continue;
+        }
+        covered_until = std::max(covered_until,
+                                 std::min(address_end, mapping.end));
+      }
+      if (covered_until == cursor) {
+        return false;
+      }
+      cursor = covered_until;
+    }
+    return true;
   };
   bool bias_found = false;
+  bool header_identity_found = false;
   for (const auto &p : image.loads) {
     if (p.p_offset != 0 || p.p_filesz == 0) {
       continue;
     }
-    const auto expected_offset = (p.p_offset / page) * page;
-    const auto expected_vaddr = (p.p_vaddr / page) * page;
+    std::uint64_t expected_offset = 0, expected_vaddr = 0, range_length = 0;
+    if (!file_page_range(p, expected_offset, expected_vaddr, range_length)) {
+      unavailable("ELF header load segment has invalid page alignment for " +
+                  path);
+    }
     for (const auto &m : maps) {
-      if (!same_file(m) || m.offset != expected_offset ||
-          m.begin < expected_vaddr) {
+      if (!same_file(m) || m.offset > expected_offset) {
         continue;
       }
-      const auto candidate = m.begin - expected_vaddr;
+      const auto file_delta = expected_offset - m.offset;
+      if (file_delta >= m.end - m.begin ||
+          file_delta > std::numeric_limits<std::uint64_t>::max() - m.begin) {
+        continue;
+      }
+      const auto header_address = m.begin + file_delta;
+      if (header_address < expected_vaddr) {
+        continue;
+      }
+      header_identity_found = true;
+      const auto candidate = header_address - expected_vaddr;
+      // A VMA may cover several adjacent PT_LOAD ranges after the kernel
+      // coalesces mappings with matching protections and file offsets. Check
+      // byte-page coverage and file-offset correspondence across the range.
+      const bool complete =
+          std::all_of(image.loads.begin(), image.loads.end(), [&](const auto &load) {
+            return load.p_filesz == 0 || mapping_covers_range(candidate, load);
+          });
+      if (!complete) {
+        continue;
+      }
       if (bias_found && candidate != image.bias) {
         unavailable("ELF header mappings imply inconsistent load biases");
       }
@@ -304,27 +377,13 @@ FileImage load_image_fd(const std::string &path, int fd,
     }
   }
   if (!bias_found) {
-    unavailable("no target ELF header mapping matches the file identity");
-  }
-  for (const auto &p : image.loads) {
-    if (p.p_filesz == 0) {
-      continue;
+    if (!header_identity_found) {
+      unavailable("no target ELF header mapping matches canonical path " +
+                  path);
     }
-    const auto expected_offset = (p.p_offset / page) * page;
-    const auto segment_page = (p.p_vaddr / page) * page;
-    if (segment_page > std::numeric_limits<std::uint64_t>::max() - image.bias) {
-      unavailable("ELF segment address overflows the target address space");
-    }
-    const auto expected_begin = image.bias + segment_page;
-    const bool mapped =
-        std::any_of(maps.begin(), maps.end(), [&](const Mapping &m) {
-          return same_file(m) && m.offset == expected_offset &&
-                 m.begin == expected_begin &&
-                 ((p.p_flags & PF_X) == 0 || m.executable);
-        });
-    if (!mapped) {
-      unavailable("ELF program headers do not match target file mappings");
-    }
+    unavailable("target ELF header identity found but PT_LOAD file coverage "
+                "is incomplete for " +
+                path);
   }
   if (eh->e_type == ET_EXEC && image.bias != 0) {
     unavailable("unexpected load bias for fixed-address ELF");
@@ -428,15 +487,14 @@ FileImage load_image_fd(const std::string &path, int fd,
   return image;
 }
 
-FileImage load_image(const std::string &path, const std::vector<Mapping> &maps,
-                     const struct stat &identity) {
+FileImage load_image(const std::string &path, const std::vector<Mapping> &maps) {
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     unavailable("cannot open mapped ELF image");
   }
   FileImage image;
   try {
-    image = load_image_fd(path, fd, maps, identity);
+    image = load_image_fd(path, fd, maps);
   } catch (...) {
     ::close(fd);
     throw;
@@ -447,149 +505,85 @@ FileImage load_image(const std::string &path, const std::vector<Mapping> &maps,
 
 FileImage load_executable(pid_t pid, const std::vector<Mapping> &maps) {
   const std::string proc_path = "/proc/" + std::to_string(pid) + "/exe";
-  struct stat st{};
-  if (::stat(proc_path.c_str(), &st) != 0) {
+  const auto path = ::tracer::detail::canonical_mapped_path(proc_path);
+  if (path.empty()) {
     unavailable("cannot identify the target executable");
   }
-  return load_image(proc_path, maps, st);
+  return load_image(path, maps);
 }
 
 FileImage load_libc(const std::vector<Mapping> &maps) {
   for (const auto &m : maps) {
-    if (m.inode == 0 || m.path.find("libc.so") == std::string::npos) {
+    const auto basename = m.path.substr(m.path.find_last_of('/') + 1);
+    const bool candidate =
+        basename == "libc.so.6" || (basename.starts_with("libc-") &&
+                                    basename.ends_with(".so"));
+    if (m.canonical_path.empty() || !candidate) {
       continue;
     }
-    std::string path = m.path;
-    const auto deleted = path.find(" (deleted)");
-    if (deleted != std::string::npos) {
-      path.resize(deleted);
+    const auto &path = m.canonical_path;
+    auto image = load_image(path, maps);
+    if (image.soname == "libc.so.6") {
+      return image;
     }
-    struct stat st{};
-    if (::stat(path.c_str(), &st) != 0 ||
-        static_cast<std::uint64_t>(st.st_ino) != m.inode ||
-        static_cast<unsigned>(major(st.st_dev)) != m.major_no ||
-        static_cast<unsigned>(minor(st.st_dev)) != m.minor_no) {
-      continue;
-    }
-    return load_image(path, maps, st);
   }
   unavailable("cannot identify the mapped libc ELF image");
 }
 
-struct FileKey {
-  dev_t device;
-  ino_t inode;
-
-  bool operator==(const FileKey &other) const noexcept {
-    return device == other.device && inode == other.inode;
-  }
-};
-
 using ExecutableMapRecord =
-    std::tuple<unsigned, unsigned, std::uint64_t, std::uint64_t, std::uint64_t,
-               std::uint64_t, std::string>;
+    std::tuple<std::uint64_t, std::uint64_t, std::uint64_t, std::string>;
 
 std::vector<ExecutableMapRecord>
 executable_map_snapshot(const std::vector<Mapping> &maps) {
   std::vector<ExecutableMapRecord> result;
   for (const auto &m : maps) {
-    if (m.executable && m.inode != 0) {
-      result.emplace_back(m.major_no, m.minor_no, m.inode, m.begin, m.end,
-                          m.offset, m.path);
+    if (m.executable && !m.canonical_path.empty()) {
+      result.emplace_back(m.begin, m.end, m.offset, m.canonical_path);
     }
   }
   std::sort(result.begin(), result.end());
   return result;
 }
 
-bool same_timespec(const timespec &a, const timespec &b) {
-  return a.tv_sec == b.tv_sec && a.tv_nsec == b.tv_nsec;
-}
-
-bool same_file_snapshot(const struct stat &a, const struct stat &b) {
-  return a.st_dev == b.st_dev && a.st_ino == b.st_ino &&
-         a.st_size == b.st_size && same_timespec(a.st_mtim, b.st_mtim) &&
-         same_timespec(a.st_ctim, b.st_ctim);
-}
-
-bool path_and_fd_unchanged(int fd, const std::string &path,
-                           const struct stat &initial) {
-  struct stat fd_after{}, path_after{};
-  return ::fstat(fd, &fd_after) == 0 &&
-         ::stat(path.c_str(), &path_after) == 0 &&
-         same_file_snapshot(fd_after, initial) &&
-         same_file_snapshot(path_after, initial);
-}
-
-bool matches_identity(const struct stat &st,
-                      const detail::ApprovedModuleIdentity &identity) {
-  return st.st_dev == identity.device && st.st_ino == identity.inode &&
-         st.st_size == identity.size &&
-         same_timespec(st.st_mtim, identity.mtime) &&
-         same_timespec(st.st_ctim, identity.ctime);
-}
-
-FileKey key_for(const struct stat &st) { return {st.st_dev, st.st_ino}; }
-
-FileKey key_for(const FileImage &image) { return {image.device, image.inode}; }
-
-bool has_mapping(const std::vector<Mapping> &maps, FileKey key) {
-  return std::any_of(maps.begin(), maps.end(), [&](const Mapping &m) {
-    return m.inode == static_cast<std::uint64_t>(key.inode) &&
-           m.major_no == static_cast<unsigned>(major(key.device)) &&
-           m.minor_no == static_cast<unsigned>(minor(key.device));
-  });
-}
-
 bool forbidden_soname(std::string soname);
 
-std::vector<FileKey>
+std::vector<std::string>
 protected_runtime_identities(const std::vector<Mapping> &maps,
-                             const FileImage &libc, FileKey loader) {
-  std::vector<FileKey> protected_files{key_for(libc), loader};
+                             const FileImage &libc, std::string loader) {
+  std::vector<std::string> protected_files{libc.path, std::move(loader)};
   for (const auto &mapping : maps) {
-    if (mapping.inode == 0 || mapping.path.empty() ||
-        mapping.path.front() != '/') {
+    if (mapping.canonical_path.empty()) {
       continue;
     }
-    std::string path = mapping.path;
-    const auto deleted = path.find(" (deleted)");
-    if (deleted != std::string::npos) {
-      path.resize(deleted);
-    }
+    const auto &path = mapping.canonical_path;
     const auto slash = path.find_last_of('/');
     const auto basename =
         path.substr(slash == std::string::npos ? 0 : slash + 1);
     if (!forbidden_soname(basename)) {
       continue;
     }
-    struct stat st{};
-    if (::stat(path.c_str(), &st) != 0 ||
-        static_cast<std::uint64_t>(st.st_ino) != mapping.inode ||
-        static_cast<unsigned>(major(st.st_dev)) != mapping.major_no ||
-        static_cast<unsigned>(minor(st.st_dev)) != mapping.minor_no) {
-      continue;
-    }
-    const auto key = key_for(st);
-    if (std::find(protected_files.begin(), protected_files.end(), key) ==
+    if (std::find(protected_files.begin(), protected_files.end(), path) ==
         protected_files.end()) {
-      protected_files.push_back(key);
+      protected_files.push_back(path);
     }
   }
   return protected_files;
 }
 
-FileKey loader_identity(const FileImage &executable,
-                        const std::vector<Mapping> &maps) {
+std::string loader_identity(const FileImage &executable,
+                            const std::vector<Mapping> &maps) {
   if (executable.interpreter.empty()) {
     unavailable("executable does not declare a dynamic loader");
   }
-  struct stat st{};
-  if (::stat(executable.interpreter.c_str(), &st) != 0 ||
-      !has_mapping(maps, key_for(st))) {
+  const auto path =
+      ::tracer::detail::canonical_mapped_path(executable.interpreter);
+  if (path.empty() ||
+      std::none_of(maps.begin(), maps.end(), [&](const Mapping &mapping) {
+        return mapping.canonical_path == path;
+      })) {
     unavailable("ELF PT_INTERP identity is not present in target mappings");
   }
-  return key_for(st);
+  return path;
 }
 
 bool forbidden_soname(std::string soname) {
@@ -672,13 +666,13 @@ std::vector<FileImage> revalidate_modules(
     const std::vector<std::shared_ptr<const detail::ApprovedModuleIdentity>>
         &modules,
     const std::vector<Mapping> &maps,
-    const std::vector<FileKey> &protected_files) {
+    const std::vector<std::string> &protected_files) {
   if (modules.size() > 256) {
     throw std::invalid_argument(
         "at most 256 discovered application modules are supported");
   }
   std::vector<FileImage> images;
-  std::vector<FileKey> seen;
+  std::vector<std::string> seen;
   images.reserve(modules.size());
   seen.reserve(modules.size());
   for (const auto &module : modules) {
@@ -686,28 +680,26 @@ std::vector<FileImage> revalidate_modules(
       throw std::invalid_argument("application module handle is empty");
     }
     const auto &identity = *module;
-    struct stat fd_stat{}, path_stat{};
-    if (identity.fd < 0 || ::fstat(identity.fd, &fd_stat) != 0 ||
-        ::stat(identity.path.c_str(), &path_stat) != 0 ||
-        !matches_identity(fd_stat, identity) ||
-        !matches_identity(path_stat, identity)) {
+    const auto current_path =
+        ::tracer::detail::canonical_mapped_path(identity.path);
+    if (current_path.empty() || current_path != identity.path) {
       throw std::runtime_error(
-          "approved application module identity changed: " + identity.path);
+          "approved application module path is no longer canonical: " +
+          identity.path);
     }
-    const auto key = key_for(fd_stat);
-    if (std::find(seen.begin(), seen.end(), key) != seen.end()) {
+    if (std::find(seen.begin(), seen.end(), identity.path) != seen.end()) {
       throw std::invalid_argument(
-          "application module handles contain duplicate file identities");
+          "application module handles contain duplicate canonical paths");
     }
-    seen.push_back(key);
-    if (std::find(protected_files.begin(), protected_files.end(), key) !=
+    seen.push_back(identity.path);
+    if (std::find(protected_files.begin(), protected_files.end(), identity.path) !=
         protected_files.end()) {
       throw std::runtime_error(
-          "approved application module aliases a protected runtime image");
+          "approved application module path aliases a protected runtime image");
     }
     FileImage image;
     try {
-      image = load_image_fd(identity.path, identity.fd, maps, fd_stat);
+      image = load_image(identity.path, maps);
       require_usable_module(image);
       if (image.bias != identity.load_bias) {
         throw std::runtime_error(
@@ -717,15 +709,6 @@ std::vector<FileImage> revalidate_modules(
       throw std::runtime_error(
           "approved application module is no longer valid: " + identity.path +
           ": " + error.what());
-    }
-    struct stat fd_after{}, path_after{};
-    if (::fstat(identity.fd, &fd_after) != 0 ||
-        ::stat(identity.path.c_str(), &path_after) != 0 ||
-        !matches_identity(fd_after, identity) ||
-        !matches_identity(path_after, identity)) {
-      throw std::runtime_error(
-          "approved application module changed during validation: " +
-          identity.path);
     }
     images.push_back(std::move(image));
   }
@@ -1027,41 +1010,33 @@ std::vector<ApplicationModule> discover_application_modules(pid_t pid) {
   const auto libc = load_libc(maps);
   const auto loader = loader_identity(executable, maps);
   const auto protected_files = protected_runtime_identities(maps, libc, loader);
-  const auto main_key = key_for(executable);
 
   struct Candidate {
-    FileKey key;
     std::string path;
   };
 
   std::vector<Candidate> candidates;
   for (const auto &mapping : maps) {
-    if (!mapping.executable || mapping.inode == 0 || mapping.path.empty() ||
-        mapping.path.front() != '/' || mapping.path.ends_with(" (deleted)")) {
+    if (!mapping.executable || mapping.canonical_path.empty()) {
       continue;
     }
-    const FileKey key{
-        static_cast<dev_t>(makedev(mapping.major_no, mapping.minor_no)),
-        static_cast<ino_t>(mapping.inode)};
-    if (key == main_key ||
-        std::find(protected_files.begin(), protected_files.end(), key) !=
+    const auto &path = mapping.canonical_path;
+    if (path == executable.path ||
+        std::find(protected_files.begin(), protected_files.end(), path) !=
             protected_files.end()) {
       continue;
     }
     auto found = std::find_if(
         candidates.begin(), candidates.end(),
-        [&](const Candidate &candidate) { return candidate.key == key; });
+        [&](const Candidate &candidate) { return candidate.path == path; });
     if (found == candidates.end()) {
-      candidates.push_back({key, mapping.path});
-    } else if (mapping.path < found->path) {
-      found->path = mapping.path;
+      candidates.push_back({path});
     }
   }
 
   std::sort(candidates.begin(), candidates.end(),
             [](const Candidate &a, const Candidate &b) {
-              return std::tie(a.path, a.key.device, a.key.inode) <
-                     std::tie(b.path, b.key.device, b.key.inode);
+              return a.path < b.path;
             });
   if (candidates.size() > 256) {
     throw std::runtime_error(
@@ -1072,78 +1047,36 @@ std::vector<ApplicationModule> discover_application_modules(pid_t pid) {
   std::vector<ApplicationModule> result;
   result.reserve(candidates.size());
   for (const auto &candidate : candidates) {
-    struct stat path_stat{};
-    if (::stat(candidate.path.c_str(), &path_stat) != 0) {
-      continue; // Unreadable or unlinked candidates are unsupported.
-    }
-    if (!(key_for(path_stat) == candidate.key)) {
-      throw std::runtime_error(
-          "mapped application identity raced path discovery: " +
-          candidate.path);
-    }
     const int fd = ::open(candidate.path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
       continue;
     }
-    struct stat st{};
-    if (::fstat(fd, &st) != 0) {
-      ::close(fd);
-      continue;
-    }
-    if (!(key_for(st) == candidate.key) || st.st_dev != path_stat.st_dev ||
-        st.st_ino != path_stat.st_ino) {
-      ::close(fd);
-      throw std::runtime_error(
-          "mapped application identity changed while opening: " +
-          candidate.path);
-    }
 
     FileImage image;
     try {
-      image = load_image_fd(candidate.path, fd, maps, st);
+      image = load_image_fd(candidate.path, fd, maps);
       if (image.elf_type != ET_DYN ||
           std::find(protected_files.begin(), protected_files.end(),
-                    candidate.key) != protected_files.end()) {
+                    candidate.path) != protected_files.end()) {
         ::close(fd);
         continue;
       }
       require_usable_module(image);
     } catch (const IdlePointUnavailable &) {
-      const bool stable = path_and_fd_unchanged(fd, candidate.path, st);
       ::close(fd);
-      if (!stable) {
-        throw std::runtime_error(
-            "application module identity raced discovery: " + candidate.path);
-      }
       continue; // Non-ELF, unreadable metadata, or unsupported mapping.
     } catch (const std::invalid_argument &) {
-      const bool stable = path_and_fd_unchanged(fd, candidate.path, st);
       ::close(fd);
-      if (!stable) {
-        throw std::runtime_error(
-            "application module identity raced discovery: " + candidate.path);
-      }
       continue; // Known runtime and modules without supported CFI are excluded.
     } catch (const std::exception &) {
       ::close(fd);
       throw;
     }
 
-    if (!path_and_fd_unchanged(fd, candidate.path, st)) {
-      ::close(fd);
-      throw std::runtime_error("application module changed during discovery: " +
-                               candidate.path);
-    }
-
     auto identity = std::make_shared<detail::ApprovedModuleIdentity>();
     identity->path = candidate.path;
-    identity->fd = fd;
-    identity->device = st.st_dev;
-    identity->inode = st.st_ino;
-    identity->size = st.st_size;
     identity->load_bias = image.bias;
-    identity->mtime = st.st_mtim;
-    identity->ctime = st.st_ctim;
+    ::close(fd);
     result.emplace_back(ApplicationModule(std::move(identity)));
   }
 
@@ -1198,9 +1131,9 @@ require_application_rendezvous(pid_t pid, const user_regs_struct &regs,
   auto approved = revalidate_modules(identities, maps, protected_files);
   const auto *start_call_main = libc.named("__libc_start_call_main");
   const auto *start_main = libc.named("__libc_start_main");
-  if (!start_call_main || !start_main) {
-    unavailable("required exact startup function symbols are unavailable");
-  }
+  const auto *thread_start = libc.named("start_thread");
+  const auto *clone = libc.named("__clone");
+  const auto *clone3 = libc.named("__clone3");
   const FileImage *current_image =
       application_image_for(regs.rip, executable, approved, maps);
   if (!current_image) {
@@ -1243,28 +1176,43 @@ require_application_rendezvous(pid_t pid, const user_regs_struct &regs,
       pc_is_return_address = true;
       continue;
     }
-    if (caller_pc < libc.runtime(*start_call_main) ||
-        caller_pc - libc.runtime(*start_call_main) >= start_call_main->size ||
-        !libc.executable_pc(caller_pc, maps)) {
-      unavailable(
-          "application unwind leaves the executable outside libc startup");
+    const auto within = [&](const FileImage::Function *function,
+                            std::uint64_t address) {
+      return function && address >= libc.runtime(*function) &&
+             address - libc.runtime(*function) < function->size &&
+             libc.executable_pc(address, maps);
+    };
+    if (within(start_call_main, caller_pc)) {
+      if (!start_main || traversed_frames + 2 > 128) {
+        unavailable("required exact main startup symbols are unavailable");
+      }
+      ++traversed_frames;
+      auto startup_caller =
+          unwind_one(pid, libc, return_pc, caller, known, stack, true);
+      const auto startup_return_pc = startup_caller.rip;
+      if (startup_return_pc == 0 ||
+          !within(start_main, startup_return_pc - 1)) {
+        unavailable(
+            "libc startup caller chain does not reach __libc_start_main");
+      }
+      return application_frames;
     }
-    if (traversed_frames + 2 > 128) {
-      unavailable("startup unwind exceeds the 128-frame admission bound");
+    if (!within(thread_start, caller_pc) || traversed_frames + 2 > 128) {
+      unavailable(
+          "application unwind leaves the executable outside a validated "
+          "libc startup chain");
     }
 
     ++traversed_frames;
-    auto startup_caller =
+    auto thread_caller =
         unwind_one(pid, libc, return_pc, caller, known, stack, true);
-    const auto startup_return_pc = startup_caller.rip;
-    if (startup_return_pc == 0) {
-      unavailable("libc startup CFI produced an invalid return address");
-    }
-    const auto startup_pc = startup_return_pc - 1;
-    if (startup_pc < libc.runtime(*start_main) ||
-        startup_pc - libc.runtime(*start_main) >= start_main->size ||
-        !libc.executable_pc(startup_pc, maps)) {
-      unavailable("libc startup caller chain does not reach __libc_start_main");
+    const auto thread_return_pc = thread_caller.rip;
+    const auto clone_pc = thread_return_pc == 0 ? 0 : thread_return_pc - 1;
+    if (thread_return_pc == 0 ||
+        (!within(clone, clone_pc) && !within(clone3, clone_pc))) {
+      unavailable(
+          "pthread startup caller chain does not reach exact __clone or "
+          "__clone3");
     }
     return application_frames;
   }

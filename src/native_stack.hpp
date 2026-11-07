@@ -1,8 +1,11 @@
 #pragma once
+#include <string_view>
+
 #include "tracer.pb.h"
 #include "tracer/protocol.hpp"
 
 namespace tracer {
+void begin_native_stack_session(std::string_view session_id);
 void capture_native_stack(const TraceContext &context, unsigned depth,
                           bool application_only) noexcept;
 void serialize_native_stack(const StackTrace &stack,

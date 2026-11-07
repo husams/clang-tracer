@@ -1,5 +1,23 @@
 # Clang Tracer Python client
 
+The console supports `drain capture.db` to save and consume retained history,
+or `drain capture.db --listen` to keep collecting generated events until Ctrl-C.
+Use `--count N` or `--timeout SECONDS` to bound it. Existing stream filters apply;
+the default is the selected session, or all sessions when none is selected.
+`record capture.db 100 --sqlite` saves without consuming server history.
+
+For larger history, launch with `server start --event-history-limit 16384
+--context-history-limit 512 --context-history-bytes 67108864` on one line. Defaults
+remain 4096 events, 128 context events, and 16 MiB of serialized context data.
+
+The API equivalents are `Client.drain_traces(path, listen=True, timeout=60)` and
+`Client.record_sqlite(path, count=100)`. `read_events()` snapshots a bounded batch;
+`acknowledge_events(server_instance_id, sequences)` consumes exact stored IDs.
+SQLite appends and deduplicates full Protobuf payloads. Writes commit before
+drain acknowledgement; retry a failed drain into the same database. Consumption
+affects all readers, and overflow can still lose events before storage. See
+[event storage](../docs/event-storage.md) for the schema and failure semantics.
+
 The Python API covers every public `Tracer` gRPC operation. The interactive
 console uses that same API, a Lark LALR command grammar, and prompt-toolkit for
 live command highlighting, completion, history and input validation. All network

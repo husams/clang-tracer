@@ -61,7 +61,6 @@
 #include <llvm/MC/MCSubtargetInfo.h>
 #include <llvm/MC/MCTargetOptions.h>
 #include <llvm/MC/TargetRegistry.h>
-#include <llvm/Support/DynamicLibrary.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/TargetSelect.h>
@@ -1026,8 +1025,8 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
                           DebugRecords &records) {
   try {
     const auto &info = spec.debug_info();
-    // Re-read mapped debug information in the target and compare the complete
-    // image identity, signature and type metadata before constructing any AST.
+    // Match the mapped entry, signature and type metadata before constructing
+    // any AST. Binary contents remain fixed for the tracing session.
     validate_debug_entry(spec);
     bool has_record = !info.record_name().empty();
     for (const auto &argument : info.arguments())
@@ -2642,6 +2641,49 @@ bool compile_shared_probe(Probe &p,
   return true;
 }
 
+bool bind_probe_symbols(clang::Interpreter &interpreter, std::string &error) {
+  auto jit = interpreter.getExecutionEngine();
+  if (!jit) {
+    error = llvm::toString(jit.takeError());
+    return false;
+  }
+  // Clang's process-symbol generator uses dlsym, which cannot see our hidden
+  // ELF helpers. Define their addresses in this interpreter's own JITDylib.
+  llvm::orc::SymbolMap symbols;
+  auto bind = [&](llvm::StringRef name, auto *address) {
+    symbols[jit->mangleAndIntern(name)] = llvm::orc::ExecutorSymbolDef(
+        llvm::orc::ExecutorAddr::fromPtr(address),
+        llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
+  };
+  bind("tracer_callback_dispatch", &tracer_callback_dispatch);
+  bind("tracer_context_check_entry", &tracer_context_check_entry);
+  bind("tracer_shared_enter", &tracer_shared_enter);
+  bind("tracer_shared_leave", &tracer_shared_leave);
+  bind("tracer_shared_release", &tracer_shared_release);
+  bind("tracer_shared_resume", &tracer_shared_resume);
+  bind("tracer_shared_dispatch", &tracer_shared_dispatch);
+  bind("tracer_shared_original_enter", &tracer_shared_original_enter);
+  bind("tracer_shared_original_leave", &tracer_shared_original_leave);
+  bind("tracer_callback_lifecycle_enter", &tracer_callback_lifecycle_enter);
+  bind("tracer_callback_cleanup_enter", &tracer_callback_cleanup_enter);
+  bind("tracer_callback_lifecycle_leave", &tracer_callback_lifecycle_leave);
+  bind("tracer_callback_failure", &tracer_callback_failure);
+  bind("tracer_event_dispatch", &tracer_event_dispatch);
+  bind("tracer_probe_enter", &tracer_probe_enter);
+  bind("tracer_probe_leave", &tracer_probe_leave);
+  bind("tracer_next_call_id", &tracer_next_call_id);
+  bind("tracer_stack_enter", &tracer_stack_enter);
+  bind("tracer_stack_leave", &tracer_stack_leave);
+  bind("tracer_capture_stack", &tracer_capture_stack);
+  bind("tracer_capture_entry_stack", &tracer_capture_entry_stack);
+  if (auto failure = jit->getMainJITDylib().define(
+          llvm::orc::absoluteSymbols(std::move(symbols)))) {
+    error = llvm::toString(std::move(failure));
+    return false;
+  }
+  return true;
+}
+
 bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
                    std::string &error) {
   const std::string &source = specification.callback_source();
@@ -2653,60 +2695,6 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
                                        p.debug_records)) {
     return false;
   }
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_callback_dispatch",
-      reinterpret_cast<void *>(&tracer_callback_dispatch));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_context_check_entry",
-      reinterpret_cast<void *>(&tracer_context_check_entry));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_shared_enter", reinterpret_cast<void *>(&tracer_shared_enter));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_shared_leave", reinterpret_cast<void *>(&tracer_shared_leave));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_shared_release",
-      reinterpret_cast<void *>(&tracer_shared_release));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_shared_resume", reinterpret_cast<void *>(&tracer_shared_resume));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_shared_dispatch",
-      reinterpret_cast<void *>(&tracer_shared_dispatch));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_shared_original_enter",
-      reinterpret_cast<void *>(&tracer_shared_original_enter));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_shared_original_leave",
-      reinterpret_cast<void *>(&tracer_shared_original_leave));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_callback_lifecycle_enter",
-      reinterpret_cast<void *>(&tracer_callback_lifecycle_enter));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_callback_cleanup_enter",
-      reinterpret_cast<void *>(&tracer_callback_cleanup_enter));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_callback_lifecycle_leave",
-      reinterpret_cast<void *>(&tracer_callback_lifecycle_leave));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_callback_failure",
-      reinterpret_cast<void *>(&tracer_callback_failure));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_event_dispatch",
-      reinterpret_cast<void *>(&tracer_event_dispatch));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_probe_enter", reinterpret_cast<void *>(&tracer_probe_enter));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_probe_leave", reinterpret_cast<void *>(&tracer_probe_leave));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_next_call_id", reinterpret_cast<void *>(&tracer_next_call_id));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_stack_enter", reinterpret_cast<void *>(&tracer_stack_enter));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_stack_leave", reinterpret_cast<void *>(&tracer_stack_leave));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_capture_stack", reinterpret_cast<void *>(&tracer_capture_stack));
-  llvm::sys::DynamicLibrary::AddSymbol(
-      "tracer_capture_entry_stack",
-      reinterpret_cast<void *>(&tracer_capture_entry_stack));
   if (!initialize_llvm(error)) {
     return false;
   }
@@ -2732,6 +2720,9 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
     return false;
   }
   p.interpreter = std::move(*created);
+  if (!bind_probe_symbols(*p.interpreter, error)) {
+    return false;
+  }
   const std::string prelude =
       std::string(tracer::kEmbeddedProtocolHeader) +
       "\nusing int32_t=std::int32_t; using int64_t=std::int64_t; "
@@ -3259,6 +3250,23 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, "the process has reached its 32 retained-probe limit");
       return -1;
     }
+    // A durable collector can reconnect while old probes are still active.
+    // Keep their shared metadata alive; refresh a new session only after the
+    // previous callback cohort has drained.
+    bool native_cache_quiescent = true;
+    for (std::size_t i = 0; i < a.retained; ++i) {
+      const auto *prior = a.probes[i].get();
+      if (prior &&
+          (prior->active.load(std::memory_order_seq_cst) ||
+           prior->in_flight.load(std::memory_order_seq_cst) ||
+           prior->delivery.pending.load(std::memory_order_acquire) ||
+           prior->transport_active)) {
+        native_cache_quiescent = false;
+        break;
+      }
+    }
+    if (native_cache_quiescent)
+      tracer::begin_native_stack_session(request->session_id);
     auto p = std::make_unique<Probe>();
     p->request = *request;
     clangtracer::v1::ProbeSpec specification;
