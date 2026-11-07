@@ -200,3 +200,20 @@ removal, and an unrelated probe emitting events through both operations.
 
 Eight focused CTests passed on Linux x86-64 with the GCC 8.5 SDK and
 Clang 21.1.8. All 198 portable Python tests passed.
+
+### T4 Live and replay trace summaries
+
+`%events stats NAME` reports observed call counts per probe, fixed duration
+histograms, and direct caller edges from entry stacks. PRE and POST are
+paired by server lifetime, session, process, probe, thread and call ID.
+Missing phases and ambiguous or invalid timestamps are reported separately
+from timed calls, cumulative loss counters and local evictions.
+
+Eight focused CTests passed on Linux x86-64 with the GCC 8.5 SDK and Clang
+21.1.8. The native fixture verified the same event window produced matching
+live and offline summaries, including the symbolized caller. Unit coverage
+checks incomplete pairs, replayed copies, duplicate phases, invalid timing,
+histogram boundaries and caller evidence from filtered or partial stacks.
+
+A bulk observer captured 32 timed calls across both fixture overloads and
+reported `main` as the caller for both.

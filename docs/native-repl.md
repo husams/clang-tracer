@@ -347,6 +347,7 @@ can include `event_ranges.hpp` and use the `tracer_repl` namespace explicitly.
 %events stats batch
 %record capture.pb --count 1000
 %events open capture.pb --as saved
+%events stats saved
 %events export saved --format json --output events.json
 %events clear saved
 ```
@@ -380,6 +381,33 @@ invocation/task identities remain available in event details.
 Loss statistics sum the latest observed cumulative agent counter per probe and
 server counter per server lifetime, without counting repeated samples twice.
 Unknown native phases remain inspectable and are counted outside PRE/POST pairs.
+
+`%events stats NAME` uses the same summary for captured and replayed collections.
+Each function row counts distinct observed calls for a probe in its process and
+session. A call with just one phase contributes to `missing_pre` or
+`missing_post`. Only a pair with one unambiguous timestamp per phase and a
+nonnegative interval contributes to `timed` and the histogram. Histogram
+labels are inclusive nanosecond ranges, with empty buckets omitted and a final
+bucket for one second or longer. Durations measure the elapsed interval between
+the two trace timestamps, including tracing overhead.
+
+Caller edges count calls with evidence of the direct native caller in either
+phase's entry stack. Caller labels use the function and module when available,
+then the module offset or native PC. `caller_unknown` counts calls whose stack
+does not establish that edge. Enable stack capture with `--stack-depth 8` when
+installing a single probe. For a bulk manifest, pass this observer with
+`%trace apply --manifest trace.textproto --callback observer.cpp` to capture
+the stack on PRE and retain both phases for timing.
+
+```cpp
+struct Interceptor {
+  void pre(const Call& call) { call.capture_stack(8, false); }
+  void post(const Call&) {}
+};
+```
+
+Agent and server loss counters are cumulative samples from retained events.
+They and local buffer evictions are reported separately from incomplete calls.
 
 Recordings use the Python client's four-byte little-endian length plus Protobuf
 TraceEvent framing, with a 32 MiB per-frame limit. Recording and export create

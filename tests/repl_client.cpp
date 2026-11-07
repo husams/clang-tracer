@@ -23,6 +23,102 @@ void require(bool ok, const std::string &why) {
   }
 }
 
+void check_trace_statistics() {
+  EventBuffer buffer(20, 65536);
+  const auto event = [](std::uint64_t call, api::TracePhase phase,
+                        std::uint64_t time, std::uint64_t cursor) {
+    api::TraceEvent value;
+    value.set_server_instance_id("server");
+    value.set_session_id("session");
+    value.set_pid(7);
+    value.set_probe_id(5);
+    value.set_tid(9);
+    value.set_call_id(call);
+    value.set_phase(phase);
+    value.set_monotonic_time_ns(time);
+    value.set_sequence(cursor);
+    value.set_function_name("callee(int)");
+    return value;
+  };
+  const auto stack = [](api::TraceEvent &value, std::uint64_t caller_sp) {
+    auto *trace = value.mutable_stack();
+    trace->set_status(api::StackTrace::PARTIAL);
+    auto *entry = trace->add_frames();
+    entry->set_kind(api::StackFrame::TARGET_ENTRY);
+    entry->set_pc(0x1010);
+    entry->set_stack_pointer(0x1000);
+    auto *caller = trace->add_frames();
+    caller->set_pc(0x2030);
+    caller->set_stack_pointer(caller_sp);
+    return caller;
+  };
+  buffer.push(event(1, api::POST, 200, 2));
+  auto pre = event(1, api::PRE, 100, 1);
+  auto *caller = stack(pre, 0x1008);
+  caller->set_function("parent()");
+  caller->set_module("/app");
+  pre.mutable_stack()->set_application_only(true);
+  pre.mutable_stack()->set_hidden_frames(1);
+  buffer.push(pre);
+  buffer.push(pre); // The same server cursor is a replayed copy.
+  auto no_post = event(2, api::PRE, 200, 3);
+  stack(no_post, 0x1020)->set_function("hidden_caller_was_skipped()");
+  no_post.mutable_stack()->set_application_only(true);
+  no_post.mutable_stack()->set_hidden_frames(1);
+  buffer.push(no_post);
+  auto no_pre = event(3, api::POST, 300, 4);
+  stack(no_pre, 0x1008);
+  buffer.push(no_pre);
+  buffer.push(event(4, api::PRE, 400, 5));
+  buffer.push(event(4, api::POST, 390, 6));
+  buffer.push(event(5, api::PRE, 500, 7));
+  buffer.push(event(5, api::PRE, 510, 8));
+  buffer.push(event(5, api::POST, 600, 9));
+  buffer.push(event(6, api::PRE, 700, 10));
+  buffer.push(event(6, api::POST, 700, 11));
+  auto contextual = event(2, api::POST, 250, 12);
+  contextual.mutable_context();
+  buffer.push(contextual);
+  buffer.push(event(0, api::PRE, 800, 13));
+  auto other_server = event(2, api::POST, 900, 14);
+  other_server.set_server_instance_id("new-server");
+  buffer.push(other_server);
+  auto other_probe = event(1, api::PRE, 1, 15);
+  other_probe.set_probe_id(6);
+  other_probe.set_function_name("other()");
+  auto *offset = stack(other_probe, 0x1008);
+  offset->set_module("/other");
+  offset->set_module_offset(0x30);
+  buffer.push(other_probe);
+  other_probe.set_phase(api::POST);
+  other_probe.set_sequence(16);
+  other_probe.set_monotonic_time_ns(2000000001);
+  buffer.push(other_probe);
+
+  std::ostringstream output;
+  event_statistics(buffer, output, false);
+  const auto report = output.str();
+  require(report.find("server=\"server\" session=\"session\" pid=7 probe=5 calls=6 "
+                      "paired=4 timed=2 missing_pre=1 missing_post=1 untimed_pairs=2 "
+                      "ambiguous=1 caller_unknown=4 histogram_ns=[0..99:1,100..999:1]") !=
+              std::string::npos,
+          "duration boundaries, incomplete pairs and ambiguous phases: " + report);
+  require(report.find("server=\"new-server\" session=\"session\" pid=7 probe=5 calls=1 "
+                      "paired=0 timed=0 missing_pre=1 missing_post=0") != std::string::npos &&
+              report.find("unidentified_events=1") != std::string::npos,
+          "separate server identities and missing call IDs: " + report);
+  require(report.find("caller_module=\"/app\" caller=\"parent()\" calls=1") != std::string::npos &&
+              report.find("caller_pc=0x2030 calls=1") != std::string::npos &&
+              report.find("hidden_caller_was_skipped") == std::string::npos,
+          "caller edges with symbol, raw PC and filtered stack evidence: " + report);
+  require(report.find("pid=7 probe=6 calls=1 paired=1 timed=1 missing_pre=0 "
+                      "missing_post=0 untimed_pairs=0 ambiguous=0 caller_unknown=0 "
+                      "histogram_ns=[1000000000+:1]") != std::string::npos &&
+              report.find("caller_module=\"/other\" caller_offset=0x30 calls=1") !=
+                  std::string::npos,
+          "separate probe identity, final bucket and module offset: " + report);
+}
+
 class Service final : public api::Tracer::Service {
 public:
   std::atomic<bool> attached{false};
@@ -473,6 +569,7 @@ int main(int argc, char **argv) {
     require(
         loss_summary.str().find("lost(agent=10,server=7)") != std::string::npos,
         "per-probe losses are summed without counting repeated samples twice");
+    check_trace_statistics();
     EventBuffer too_small(2, 1);
     api::TraceEvent large_event;
     large_event.set_sequence(1);

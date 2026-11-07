@@ -143,6 +143,7 @@ template <class T> T observe_lifetime(T value) {{
 %events list batch --limit 2
 %events show batch --index 1
 %events calls batch
+%events stats batch
 auto captured = tracer.batch("batch");
 std::cout << "native-bare-print-start" << std::endl;
 tracer.print(captured.at(0))
@@ -180,6 +181,24 @@ try {{ tracer.detach(saved_session); std::cout << "stale-detach-accepted" << std
                 assert "T result_as() const" in text and "  result_as\n" in text, text
                 assert target.poll() is None, "tracing terminated the application"
                 assert recording.stat().st_size > 0
+                live_cursor = re.search(r"^received=6 cursor=(\d+).*collection=batch ", text, re.M)
+                saved_cursor = re.search(r"^received=6 cursor=(\d+).*recording=", text, re.M)
+                assert live_cursor and saved_cursor and live_cursor[1] == saved_cursor[1], text
+                rows = [line for line in text.splitlines()
+                        if line.startswith(('function="', 'edge function="'))]
+                assert len(rows) == 4 and rows[:2] == rows[2:], rows
+                assert "calls=3 paired=3 timed=3 missing_pre=0 missing_post=0" in rows[0], rows
+                assert "caller_unknown=0 histogram_ns=[" in rows[0], rows
+                assert re.search(r'caller="main" calls=3$', rows[1]), rows
+                buckets = rows[0].split("histogram_ns=[", 1)[1].rstrip("]")
+                assert sum(int(bucket.split(":")[1]) for bucket in buckets.split(",")) == 3, rows
+                offline = subprocess.run(
+                    [args.repl, "--fail-fast"],
+                    input=f'%events open "{recording}" --as replay\n%events stats replay\n%quit\n',
+                    text=True, capture_output=True, timeout=15)
+                assert offline.returncode == 0, (offline.stdout, offline.stderr)
+                assert [line for line in offline.stdout.splitlines()
+                        if line.startswith(('function="', 'edge function="'))] == rows[:2], offline.stdout
                 if args.incompatible_agent:
                     incompatible = subprocess.run(
                         [args.repl, "--server", args.server, "--agent",
