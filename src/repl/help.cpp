@@ -77,14 +77,16 @@ const CommandTopic commands[] = {
     {"events calls", "%events calls NAME", "Pair PRE and POST events and show call durations and missing halves."},
     {"events stats", "%events stats NAME", "Summarize events, calls, loss, and capture status."},
     {"events clear", "%events clear NAME", "Remove a named collection and release its buffer space."},
-    {"events open", "%events open FILE --as NAME", "Read a Protobuf or SQLite recording into a bounded collection for offline analysis.",
+    {"events open", "%events open FILE --as NAME",
+     "Open a Protobuf or SQLite recording offline as a bounded, named collection. Compatible C++ types stored in SQLite load automatically.",
      "%events open capture.db --as saved"},
     {"events export", "%events export NAME --format json --output NEW_FILE.json",
      "Write the retained events to a new JSON file."},
     {"collect", "%collect [STREAM OPTIONS] [--as NAME]", "Capture events into a bounded collection named batch by default.",
      "%collect --count 10 --timeout 15 --phase POST --as results"},
-    {"record", "%record FILE [--sqlite] [STREAM OPTIONS]", "Save events for replay. Use --sqlite to create or append to a SQLite recording with available prepared C++ types.",
-     "%record capture.db --sqlite --count 10"},
+    {"record", "%record FILE [--sqlite] [STREAM OPTIONS]",
+     "Record framed Protobuf by default. With --sqlite, create or append to a SQLite recording and save available prepared C++ types for replay.",
+     "%record capture.db --sqlite --name account.adjusted --count 12"},
 
     {"cpp", "", "Load C++, configure the local compiler, or generate mappings for captured values."},
     {"cpp load", "%cpp load FILE", "Evaluate a local C++ source file in the current interpreter."},
@@ -195,10 +197,11 @@ if (e.phase() == "POST" && e.has_result()) {
 })",
      "This example assumes the probed function returns int. has_result() can also be true for void returns."},
     {"Event::state_as", "Decode the payload at a zero-based index in a named custom event.",
-     R"(// After importing the declaration of app::State
+     R"(// After opening a recording with the app::State type
 auto e = tracer.batch("results").at(0);
 auto state = e.state_as<app::State>();)",
-     "The index defaults to zero. Use state_snapshot(index) to inspect fields without a type mapping."},
+     "The index defaults to zero. SQLite replay generates mappings for compatible recorded C++ types. "
+     "Use state_snapshot(index) to inspect fields without a mapping, or %cpp import for a local type definition."},
     {"attach", "Attach to a target PID and return its session handle.", "auto target = tracer.attach(12345);"},
     {"selected_session", "Get the currently selected attachment.", "auto target = tracer.selected_session();"},
     {"prepare", "Generate a reusable probe package from local headers.",
@@ -226,7 +229,8 @@ query.count = 20;
 auto data = tracer.replay("capture.db", query);
 if (data.size()) tracer.print(data.at(0));)",
      "Set names, phase, pid, session_id, or count to narrow the read. Names match exact function "
-     "selectors or custom event names. Count zero reads all matches within the retention budget."},
+     "selectors or custom event names. Count zero reads all matches and retains the latest that fit. "
+     "SQLite replay loads compatible recorded C++ types and generates their mappings before the next input."},
     {"batch", "Get a Collection from a named capture or replay.",
      R"(auto data = tracer.batch("results");
 if (data.size()) tracer.print(data.at(0));)",
