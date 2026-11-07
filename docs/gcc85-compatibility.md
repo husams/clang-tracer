@@ -51,8 +51,10 @@ filesystem to satisfy file identity checks.
 
 The script preserves the scratch tree and refuses to replace an existing gRPC
 checkout if it does not match the pin. It rejects dirty root and recursive
-submodule sources, allowing only its exact protobuf RPATH patch and the pinned
-zlib CMake configuration's exact `zconf.h` to `zconf.h.included` rename.
+submodule sources, allowing only its exact gRPC CPU fallback and protobuf
+RPATH patches and the pinned zlib CMake configuration's exact `zconf.h` to
+`zconf.h.included` rename. The gRPC patch keeps the CPU fallback quiet when
+`sched_getcpu()` returns `ENOSYS`.
 Its dependency pins are gRPC tag
 `v1.46.7` at
 `02384e39185f109bd299eb8482306229967dc970`, with recursive shallow submodules
