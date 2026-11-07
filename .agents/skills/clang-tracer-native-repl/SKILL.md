@@ -240,6 +240,28 @@ SQLite without changing it and works after the target and server have exited.
 
 ## Reuse the runnable examples
 
+### Run the deployed JIT demo on linux-dev
+
+Run the automated capture and offline replay, or open an attached prompt
+from a terminal for the interactive walkthrough.
+
+```sh
+ssh linux-dev clang-tracer-jit-demo
+ssh -t linux-dev clang-tracer-jit-demo --interactive
+```
+
+The launcher uses its bundled target, REPL, server, and agent. The automated
+run prints `JIT_EXAMPLE_PASSED=3` and the path to `capture.db`. In interactive
+mode, use the walkthrough to copy the current mapping token, entry address,
+probe ID, and batch ID from the prompt. Use `%quit` to end the demo.
+
+- [JIT walkthrough for bulk tracing, memory inspection, and reload](../../../examples/native-repl-jit/README.md)
+- [Capture script](../../../examples/native-repl-jit/capture.repl) and [offline replay script](../../../examples/native-repl-jit/replay.repl)
+- Run the typed-value demos with `ssh linux-dev clang-tracer-values-demo all`.
+  [Typed-value walkthrough](../../../examples/native-repl-values/README.md)
+
+### Run the prepared injector demos
+
 From the repository root on Linux x86-64 with the native demo targets built,
 `./examples/prepared-injectors/run-native.sh` opens the free-function demo.
 Add `--methods` for typed arguments and inherited fields, or `--state` for
