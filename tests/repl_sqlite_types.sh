@@ -33,12 +33,22 @@ selector='prepared_demo::Account::apply(const std::string &, std::vector<int>, p
   printf '%s\n' '%shell "unlink account.hpp && unlink reading.hpp && unlink compile_commands.json"'
   printf '%%probe inject "%s" --callback state_interceptor.cpp --prepared-mode require\n' "$selector"
   printf '%s\n' '%record capture.db --sqlite --name account.adjusted --count 12 --timeout 8'
+  cat <<'REPL'
+tracer_repl::RecordOptions options;
+options.session = session;
+options.names = {"account.adjusted"};
+options.count = 12;
+options.timeout_seconds = 8;
+auto saved = tracer.record("api.db", options);
+if (!saved.complete || saved.received != 12 || !saved.cursor || saved.cancelled || saved.timed_out) throw std::runtime_error("C++ recording did not complete");
+REPL
   printf '%%shell "\047%s\047 events %s --sqlite streamed.db --count 12 --timeout 8"\n' "$client" "$target_pid"
   printf '%%shell "\047%s\047 drain %s --sqlite drained.db --count 12 --timeout 8"\n' "$client" "$target_pid"
   printf '%s\n' '%quit'
 } | "$repl" --attach "$target_pid" --timeout 60 --fail-fast | tee capture.log
 grep -q '^installed probe=' capture.log
 grep -q '^received=12 .*complete=true .*recording=capture.db$' capture.log
+grep -q '^received=12 .*complete=true .*recording=api.db$' capture.log
 grep -q '^drained 12 events' capture.log
 test ! -e account.hpp
 test ! -e reading.hpp
@@ -48,9 +58,9 @@ trap - EXIT
 unset CLANG_TRACER_ENDPOINT
 
 mkdir offline
-mv capture.db streamed.db drained.db offline/
+mv capture.db api.db streamed.db drained.db offline/
 cd offline
-for recording in capture streamed drained; do
+for recording in capture api streamed drained; do
   export XDG_CACHE_HOME="$run/offline-$recording-cache"
   {
     if [[ "$recording" != drained ]]; then

@@ -554,8 +554,8 @@ void Controller::print(const Collection &collection) const {
   out_ << std::flush;
 }
 
-void Controller::watch(const Command &command, bool display,
-                       const std::string &record_path) {
+RecordResult Controller::watch(const Command &command, bool display,
+                               const std::string &record_path) {
   ensure_connected();
   api::WatchEventsRequest request;
   if (command.has("--session")) {
@@ -667,14 +667,16 @@ void Controller::watch(const Command &command, bool display,
       throw std::runtime_error("recording close failed; partial file retained");
     }
   }
-  next.complete = complete;
-  next.cancelled = interrupted != 0;
-  next.timed_out = status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED;
-  out_ << "received=" << accepted << " cursor=" << cursor
-       << " complete=" << (complete ? "true" : "false")
-       << " cancelled=" << (next.cancelled ? "true" : "false")
-       << " timed_out=" << (next.timed_out ? "true" : "false");
+  const RecordResult result{accepted, cursor, complete, interrupted != 0,
+                            status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED};
+  out_ << "received=" << result.received << " cursor=" << result.cursor
+       << " complete=" << (result.complete ? "true" : "false")
+       << " cancelled=" << (result.cancelled ? "true" : "false")
+       << " timed_out=" << (result.timed_out ? "true" : "false");
   if (record_path.empty()) {
+    next.complete = result.complete;
+    next.cancelled = result.cancelled;
+    next.timed_out = result.timed_out;
     out_ << " collection=" << collection_name
          << " retained=" << next.events().size() << " evicted=" << next.evicted;
     batches_.insert_or_assign(collection_name, std::move(next));
@@ -692,6 +694,7 @@ void Controller::watch(const Command &command, bool display,
     throw std::runtime_error(
         "event stream ended early; partial results retained");
   }
+  return result;
 }
 
 Collection Controller::collect(const SessionHandle &session,
@@ -708,6 +711,40 @@ Collection Controller::collect(const SessionHandle &session,
                      {"--as", {"cpp"}}};
   watch(command, false);
   return batch("cpp");
+}
+
+RecordResult Controller::record(const std::string &path,
+                                const RecordOptions &options) {
+  if (path.empty() || path == ":memory:" || path.find('\0') != std::string::npos)
+    throw std::invalid_argument("SQLite recording requires a persistent file path");
+  if (options.session && options.all_sessions)
+    throw std::invalid_argument("recording session conflicts with all_sessions");
+  if (!options.phase.empty() && options.phase != "PRE" && options.phase != "POST")
+    throw std::invalid_argument("recording phase must be PRE or POST");
+  if (options.timeout_seconds > 86400)
+    throw std::invalid_argument("recording timeout must be at most 86400 seconds");
+
+  Command command;
+  command.options["--sqlite"] = {"true"};
+  if (options.session) {
+    require_session(*options.session);
+    command.options["--session"] = {options.session->id};
+  }
+  if (options.all_sessions)
+    command.options["--all"] = {"true"};
+  if (!options.names.empty())
+    command.options["--name"] = options.names;
+  if (!options.phase.empty())
+    command.options["--phase"] = {options.phase};
+  if (options.probe_id)
+    command.options["--probe"] = {std::to_string(options.probe_id)};
+  if (options.after_sequence)
+    command.options["--after"] = {std::to_string(options.after_sequence)};
+  if (options.count)
+    command.options["--count"] = {std::to_string(options.count)};
+  if (options.timeout_seconds)
+    command.options["--timeout"] = {std::to_string(options.timeout_seconds)};
+  return watch(command, false, path);
 }
 
 std::pair<std::size_t, std::size_t> Controller::background_storage() const {
@@ -1217,6 +1254,10 @@ EventRange Facade::events(const SessionHandle& session, std::uint64_t count, uns
 EventRange Facade::events_async(const SessionHandle& session, std::uint64_t count,
                                 unsigned timeout) {
   return controller_->events_async(session, count, timeout);
+}
+
+RecordResult Facade::record(const std::string &path, const RecordOptions &options) {
+  return controller_->record(path, options);
 }
 
 Collection Facade::replay(const std::string &path, const EventQuery &query) const {

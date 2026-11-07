@@ -222,6 +222,17 @@ auto state = e.state_as<app::State>();)",
      "auto live = tracer.events_async(session, 10, 15);\nauto data = live.snapshot();\nlive.stop();",
      "The optional count and timeout default to zero, which leaves the corresponding limit open. "
      "Check running() and error() as capture proceeds."},
+    {"record", "Record events and available prepared C++ types to SQLite.",
+     R"(tracer_repl::RecordOptions options;
+options.names = {"account.adjusted"};
+options.count = 12;
+options.timeout_seconds = 15;
+auto saved = tracer.record("capture.db", options);
+std::cout << saved.received << ' ' << saved.complete << '\n';)",
+     "Use the selected session, set options.session for another attachment, or set all_sessions. "
+     "Filter with names, phase, probe_id, and after_sequence. Zero count streams until cancelled or timed out. "
+     "Zero timeout uses the console default for counted recordings. Committed events remain available "
+     "after cancellation or timeout. The result reports received, cursor, complete, cancelled, and timed_out."},
     {"replay", "Query a Protobuf or SQLite recording offline and return a Collection.",
      R"(tracer_repl::EventQuery query;
 query.names = {"account.adjusted"};
