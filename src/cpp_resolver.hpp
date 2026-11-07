@@ -15,11 +15,13 @@ struct ResolvedCallable {
 };
 
 ResolvedCallable resolve_header_callable(const std::string& selector,
-                                         const clangtracer::v1::ProbeSpec& header_context);
+                                         const clangtracer::v1::ProbeSpec& header_context,
+                                         bool pointer_layouts);
 
 void verify_prepared_adapter(const std::string &selector,
                              const clangtracer::v1::PreparedInjector &adapter,
-                             const ResolvedCallable &original);
+                             const ResolvedCallable &original,
+                             bool pointer_layouts);
 
 // Resolves a C++ callable using the project's compilation database. The
 // selector may include an explicit parameter list and member qualifiers.

@@ -36,6 +36,7 @@ inline bool safe_preflight_compiler_argument(std::string_view argument) {
       argument == "-g0" || argument == "-g1" || argument == "-g2" ||
       argument == "-g3" || argument.rfind("-ggdb", 0) == 0 ||
       argument == "-gline-tables-only" || argument == "-fno-elide-constructors" ||
+      argument == "-fno-access-control" ||
       argument == "-fno-omit-frame-pointer" ||
       argument == "-fomit-frame-pointer" || argument == "-fPIC" ||
       argument == "-fpic" || argument == "-fno-PIC" ||

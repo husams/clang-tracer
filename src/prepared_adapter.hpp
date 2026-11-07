@@ -29,7 +29,8 @@ public:
   }
 
   AdapterDeclarations emit(const clang::FunctionDecl &function,
-                           const std::vector<std::string> &headers) {
+                           const std::vector<std::string> &headers,
+                           bool pointer_layouts) {
     selected_method_ = llvm::dyn_cast<clang::CXXMethodDecl>(&function);
     // Additional inputs can provide callback-only payload declarations.
     extra_headers_.insert(std::next(headers.begin()), headers.end());
@@ -39,6 +40,15 @@ public:
     } else {
       visit_signature(function);
       declarations_ += in_namespace(*function.getDeclContext(), callable(function));
+    }
+    // Emit pointees after the callable's own records. They may contain the
+    // receiver by value, while its method only needs a forward declaration.
+    if (pointer_layouts) {
+      if (const auto *record = prepared_pointer_record(function.getReturnType()))
+        emit_record(*record);
+      for (const auto *parameter : function.parameters())
+        if (const auto *record = prepared_pointer_record(parameter->getType()))
+          emit_record(*record);
     }
     return {forwards_ + declarations_, std::move(standard_headers_)};
   }
@@ -74,6 +84,14 @@ private:
 
   static std::string access(clang::AccessSpecifier access) {
     return clang::getAccessSpelling(access).str();
+  }
+
+  static bool custom_lifetime(const clang::CXXMethodDecl &method) {
+    if (!method.isUserProvided())
+      return false;
+    if (const auto *ctor = llvm::dyn_cast<clang::CXXConstructorDecl>(&method))
+      return ctor->isCopyOrMoveConstructor();
+    return llvm::isa<clang::CXXDestructorDecl>(method) && !method.isVirtual();
   }
 
   void visit_signature(const clang::FunctionDecl &decl, bool complete = true) {
@@ -302,13 +320,6 @@ private:
       return;
     if (record.isUnion())
       unsupported(record, "union layout requires an explicit adapter");
-    for (const auto *method : record.methods()) {
-      const auto *ctor = llvm::dyn_cast<clang::CXXConstructorDecl>(method);
-      if (method->isUserProvided() &&
-          ((llvm::isa<clang::CXXDestructorDecl>(method) && !method->isVirtual()) ||
-           (ctor && ctor->isCopyOrMoveConstructor())))
-        unsupported(record, "user-defined copy, move or destruction requires an explicit adapter");
-    }
     const auto alignment = ast_.getASTRecordLayout(&record).getAlignment().getQuantity();
     std::string source = specialization_prefix(record) + std::string(record.getKindName()) + " alignas(" +
                          std::to_string(alignment) + ") ";
@@ -356,19 +367,33 @@ private:
       }
       const auto *ctor = llvm::dyn_cast<clang::CXXConstructorDecl>(method);
       const bool destructor = llvm::isa<clang::CXXDestructorDecl>(method);
+      const bool custom = custom_lifetime(*method);
       if ((!ctor && !destructor) ||
-          (!method->isExplicitlyDefaulted() && !method->isDeletedAsWritten()))
+          (!custom && !method->isExplicitlyDefaulted() && !method->isDeletedAsWritten()))
         continue;
       source += access(method->getAccess()) + ": ";
       if (destructor)
         source += "~";
       source += record.getNameAsString() + "(";
-      for (unsigned i = 0; i < method->getNumParams(); ++i) {
+      // A copy or move constructor can have trailing default arguments.
+      // Only its first parameter is needed to retain its special-member role.
+      const auto parameters = custom && ctor ? 1U : method->getNumParams();
+      for (unsigned i = 0; i < parameters; ++i) {
         if (i)
           source += ", ";
         source += spelling(method->getParamDecl(i)->getType());
       }
-      source += method->isDeletedAsWritten() ? ") = delete;\n" : ") = default;\n";
+      source += ")";
+      if (custom) {
+        // Keep the call ABI without compiling application lifetime code.
+        const auto *prototype = method->getType()->castAs<clang::FunctionProtoType>();
+        if (!clang::isUnresolvedExceptionSpec(prototype->getExceptionSpecType()) &&
+            prototype->isNothrow())
+          source += " noexcept";
+      } else {
+        source += method->isDeletedAsWritten() ? " = delete" : " = default";
+      }
+      source += ";\n";
     }
     if (!emitted_selected && selected_method_ && selected_method_->getParent()->getCanonicalDecl() ==
                                 record.getCanonicalDecl()) {

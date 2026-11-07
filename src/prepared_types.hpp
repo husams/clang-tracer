@@ -115,6 +115,15 @@ struct PreparedType {
   bool reference;
 };
 
+inline const clang::CXXRecordDecl *prepared_pointer_record(clang::QualType type) {
+  if (!type->isPointerType())
+    return nullptr;
+  const auto *record = type->getPointeeType()->getAsCXXRecordDecl();
+  if (record)
+    record = record->getDefinition();
+  return record && !record->isUnion() && !record->isInStdNamespace() ? record : nullptr;
+}
+
 inline PreparedType prepared_type(clang::ASTContext &ast, clang::QualType type,
                            bool result) {
   type = type.getCanonicalType().getUnqualifiedType();
@@ -162,20 +171,29 @@ inline void describe_prepared_callable(clang::ASTContext &ast,
                                const clang::FunctionDecl &declaration,
                                const clang::CXXMethodDecl *method,
                                clangtracer::v1::ProbeSpec &spec,
-                               clang::Sema *sema = nullptr) {
+                               clang::Sema *sema = nullptr,
+                               const clangtracer::v1::DebugInfo *expected = nullptr,
+                               bool pointer_layouts = true) {
   auto &signature = *spec.mutable_signature();
   auto &info = *spec.mutable_debug_info();
   if (method && !method->isStatic()) {
     describe_record(ast, *method->getParent(), info);
     info.set_receiver_volatile(method->isVolatile());
   }
-  const auto inspect = [&](clang::QualType type, bool is_result) {
+  const auto inspect = [&](clang::QualType type, bool is_result, bool pointer_layout) {
     const auto referent = type.getNonReferenceType();
     if (sema && referent->isRecordType() && referent->isIncompleteType())
       (void)sema->isCompleteType(declaration.getLocation(), referent);
-    return prepared_type(ast, type, is_result);
+    auto description = prepared_type(ast, type, is_result);
+    if (pointer_layouts && pointer_layout && description.wire == clangtracer::v1::POINTER)
+      if (const auto *pointee = prepared_pointer_record(type))
+        description.record = pointee;
+    return description;
   };
-  const auto result = inspect(declaration.getReturnType(), true);
+  // Earlier standalone packages could declare a pointee without recording
+  // its layout. Verify only the pointer layouts promised by a loaded package.
+  const auto result = inspect(declaration.getReturnType(), true,
+                              !expected || expected->has_result_object_type());
   signature.set_result(result.wire);
   info.set_result_cpp_type(result.spelling);
   info.set_result_is_reference(result.reference);
@@ -183,10 +201,13 @@ inline void describe_prepared_callable(clang::ASTContext &ast,
   if (result.record) {
     describe_record(ast, *result.record,
                                      *info.mutable_result_object_type());
-    info.set_result_pass_by_reference(!result.record->canPassInRegisters());
+    if (result.reference || result.wire == clangtracer::v1::OBJECT)
+      info.set_result_pass_by_reference(!result.record->canPassInRegisters());
   }
   for (const auto *parameter : declaration.parameters()) {
-    const auto type = inspect(parameter->getType(), false);
+    const auto index = info.arguments_size();
+    const auto type = inspect(parameter->getType(), false, !expected ||
+        (index < expected->arguments_size() && expected->arguments(index).has_object_type()));
     signature.add_arguments(type.wire);
     auto &argument = *info.add_arguments();
     argument.set_index(info.arguments_size() - 1);

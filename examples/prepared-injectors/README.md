@@ -157,6 +157,16 @@ The preparer resolves the concrete declaration without building the target.
 Injection requires the instance to have an executable symbol and a safe patch
 window in the target.
 
+For records with application-defined copy, move, or destruction code, the
+standalone adapter preserves the lifetime declarations and lets the target
+perform those operations. Reference and by-value snapshots can capture fields
+from those records. For a raw pointer, the callback decides when to read the
+pointee and can publish an owned field payload. Use
+`--compile-option "-fno-access-control"` on injection if the callback itself
+names protected or private fields. Automatic snapshots already include those
+fields. If the adapter cannot reproduce a pointee layout, the probe can still
+capture the pointer address.
+
 To run the same workflow automatically through the native REPL:
 
 ```bash
