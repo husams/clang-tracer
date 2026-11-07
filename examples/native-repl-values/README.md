@@ -2,8 +2,9 @@
 
 These examples attach to a real process, upload an interceptor, collect POST
 events, and read arguments and results as C++ values. Run them on Linux x86-64
-with `clang-tracer-repl` and `clang-tracer-server` installed on `PATH`, plus
-Clang 21 (`clang++-21`). The target and REPL examples use C++17.
+with a matching native REPL and server. For a source checkout, use Clang 21
+(`clang++-21`) or set `CXX` to a compiler targeting the server's runtime.
+The target and REPL examples use C++17.
 The existing Linux process-attach/ptrace permission requirements also apply.
 
 From this directory:
@@ -19,8 +20,9 @@ any directory:
 bash /usr/local/share/clang-tracer/examples/native-repl-values/run.sh all
 ```
 
-The runner compiles a small target with debug information, starts it, and runs
-seven demonstrations. Each prints the actual values and `example passed: NAME`
+The runner starts a small target with debug information and runs seven
+demonstrations. The installed example includes a target built against the
+matching runtime. From a source checkout, the runner compiles the target. Each prints the actual values and `example passed: NAME`
 after checking them. It detaches and stops its own server after each case,
 then stops its target on exit. It uses a temporary build directory, so the
 installed examples directory can be read-only. It needs no Python.

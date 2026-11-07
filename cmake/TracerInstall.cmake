@@ -54,11 +54,13 @@ install(FILES python/README.md DESTINATION "${CMAKE_INSTALL_DOCDIR}/python" COMP
 install(DIRECTORY docs DESTINATION "${CMAKE_INSTALL_DOCDIR}" COMPONENT Runtime)
 install(DIRECTORY examples DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer"
   COMPONENT Development FILES_MATCHING
-  PATTERN "*.cpp" PATTERN "*.hpp" PATTERN "*.md" PATTERN "*.py"
+  PATTERN "*.cpp" PATTERN "*.hpp" PATTERN "*.md" PATTERN "*.py" PATTERN "*.repl"
   PATTERN "__pycache__" EXCLUDE)
-install(PROGRAMS examples/native-repl-values/run.sh
-  DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer/examples/native-repl-values"
-  COMPONENT Development)
+foreach(_example native-repl-values native-repl-jit)
+  install(PROGRAMS examples/${_example}/run.sh
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer/examples/${_example}"
+    COMPONENT Development)
+endforeach()
 install(FILES LICENSES/LLVM.txt DESTINATION "${CMAKE_INSTALL_DOCDIR}/licenses" COMPONENT Runtime)
 if(TRACER_BUNDLE_CLANG_HEADERS)
   install(DIRECTORY "${_tracer_resource_dir}/include"
