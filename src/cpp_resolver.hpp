@@ -11,6 +11,7 @@ struct ResolvedCallable {
   clangtracer::v1::ProbeSpec spec;
   std::string declaration;
   std::string source;
+  bool template_instance = false;
 };
 
 ResolvedCallable resolve_header_callable(const std::string& selector,

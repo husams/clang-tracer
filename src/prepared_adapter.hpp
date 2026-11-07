@@ -76,27 +76,38 @@ private:
     return clang::getAccessSpelling(access).str();
   }
 
-  void visit_signature(const clang::FunctionDecl &decl) {
-    visit(decl.getReturnType());
+  void visit_signature(const clang::FunctionDecl &decl, bool complete = true) {
+    visit(decl.getReturnType(), complete);
     for (const auto *parameter : decl.parameters())
-      visit(parameter->getType());
+      visit(parameter->getType(), complete);
   }
 
-  std::string callable(const clang::FunctionDecl &decl) {
+  std::string callable(const clang::FunctionDecl &decl, bool selected = true) {
     std::string source;
     if (decl.isExternC())
       source += "extern \"C\" ";
-    if (const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(&decl);
-        method && method->isStatic())
+    const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(&decl);
+    if (method && method->isStatic())
       source += "static ";
-    std::string name = decl.getNameAsString() + "(";
+    if (method && method->isVirtual())
+      source += "virtual ";
+    const bool destructor = llvm::isa<clang::CXXDestructorDecl>(decl);
+    const auto *conversion = llvm::dyn_cast<clang::CXXConversionDecl>(&decl);
+    std::string name;
+    if (destructor)
+      name = "~" + method->getParent()->getNameAsString();
+    else if (conversion)
+      name = "operator " + spelling(conversion->getConversionType());
+    else
+      name = decl.getNameAsString();
+    name += "(";
     for (unsigned i = 0; i < decl.getNumParams(); ++i) {
       if (i)
         name += ", ";
       name += spelling(decl.getParamDecl(i)->getType());
     }
     name += ")";
-    if (const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(&decl)) {
+    if (method) {
       if (method->isConst()) name += " const";
       if (method->isVolatile()) name += " volatile";
       if (method->getRefQualifier() == clang::RQ_LValue) name += " &";
@@ -104,7 +115,16 @@ private:
     }
     if (decl.getType()->castAs<clang::FunctionProtoType>()->isNothrow())
       name += " noexcept";
-    return source + spelling(decl.getReturnType(), name) + ";\n";
+    source += (destructor || conversion) ? name : spelling(decl.getReturnType(), name);
+    // A concrete template instance needs its original linkage spelling, but
+    // its adapter needs only the substituted C++ signature.
+    if (selected && template_instance(decl))
+      source += " __asm__(\"" + mangle(&decl, ast_) + "\")";
+    if (decl.isPureVirtual())
+      source += " = 0";
+    else if (decl.isDeletedAsWritten())
+      source += " = delete";
+    return source + ";\n";
   }
 
   void emit_extra(const clang::DeclContext &scope) {
@@ -196,8 +216,9 @@ private:
   }
 
   void visit(clang::QualType type, bool complete = true) {
-    if (const auto *alias = type->getAs<clang::TypedefType>())
-      emit_alias(*alias->getDecl());
+    if (complete)
+      if (const auto *alias = type->getAs<clang::TypedefType>())
+        emit_alias(*alias->getDecl());
     type = type.getCanonicalType();
     if (const auto *array = ast_.getAsArrayType(type)) {
       visit(array->getElementType(), complete);
@@ -222,12 +243,53 @@ private:
   }
 
   void forward(const clang::CXXRecordDecl &record) {
-    if (!record.getIdentifier() || record.isDependentType() ||
-        llvm::isa<clang::ClassTemplateSpecializationDecl>(record))
-      unsupported(record, "requires a named non-template declaration");
-    if (forwarded_.insert(record.getCanonicalDecl()).second)
-      forwards_ += in_namespace(*record.getDeclContext(),
-          std::string(record.getKindName()) + " " + record.getNameAsString() + ";\n");
+    if (!record.getIdentifier() || record.isDependentType())
+      unsupported(record, "requires a named concrete declaration");
+    if (!forwarded_.insert(record.getCanonicalDecl()).second)
+      return;
+    if (const auto *special = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(&record)) {
+      const auto *primary = special->getSpecializedTemplate();
+      if (forwarded_.insert(primary->getCanonicalDecl()).second) {
+        std::string declaration = "template<";
+        bool first = true;
+        for (const auto *parameter : *primary->getTemplateParameters()) {
+          if (!first)
+            declaration += ", ";
+          first = false;
+          if (const auto *type = llvm::dyn_cast<clang::TemplateTypeParmDecl>(parameter)) {
+            declaration += type->isParameterPack() ? "class..." : "class";
+          } else if (const auto *value = llvm::dyn_cast<clang::NonTypeTemplateParmDecl>(parameter);
+                     value && !value->getType()->isDependentType()) {
+            visit(value->getType());
+            declaration += spelling(value->getType(), value->isParameterPack() ? "..." : "");
+          } else {
+            unsupported(record, "cannot extract the primary template parameters");
+          }
+        }
+        forwards_ += in_namespace(*record.getDeclContext(), declaration + "> " +
+            std::string(record.getKindName()) + " " + record.getNameAsString() + ";\n");
+      }
+      for (const auto &argument : special->getTemplateArgs().asArray())
+        visit_template_arg(argument);
+    }
+    forwards_ += in_namespace(*record.getDeclContext(),
+        specialization_prefix(record) + std::string(record.getKindName()) + " " +
+        record_name(record) + ";\n");
+  }
+
+  static std::string specialization_prefix(const clang::CXXRecordDecl &record) {
+    return llvm::isa<clang::ClassTemplateSpecializationDecl>(record) ? "template<> " : "";
+  }
+
+  std::string record_name(const clang::CXXRecordDecl &record) {
+    if (!llvm::isa<clang::ClassTemplateSpecializationDecl>(record))
+      return record.getNameAsString();
+    auto policy = policy_;
+    policy.SuppressDefaultTemplateArgs = false;
+    std::string result;
+    llvm::raw_string_ostream out(result);
+    record.getNameForDiagnostic(out, policy, false);
+    return result;
   }
 
   void emit_record(const clang::CXXRecordDecl &record) {
@@ -238,25 +300,29 @@ private:
     forward(record);
     if (!emitted_.insert(record.getCanonicalDecl()).second)
       return;
-    if (record.isDynamicClass() || record.isUnion())
-      unsupported(record, "polymorphic, virtual-base and union layouts require an explicit adapter");
+    if (record.isUnion())
+      unsupported(record, "union layout requires an explicit adapter");
     for (const auto *method : record.methods()) {
       const auto *ctor = llvm::dyn_cast<clang::CXXConstructorDecl>(method);
       if (method->isUserProvided() &&
-          (llvm::isa<clang::CXXDestructorDecl>(method) || (ctor && ctor->isCopyOrMoveConstructor())))
+          ((llvm::isa<clang::CXXDestructorDecl>(method) && !method->isVirtual()) ||
+           (ctor && ctor->isCopyOrMoveConstructor())))
         unsupported(record, "user-defined copy, move or destruction requires an explicit adapter");
     }
     const auto alignment = ast_.getASTRecordLayout(&record).getAlignment().getQuantity();
-    std::string source = std::string(record.getKindName()) + " alignas(" +
+    std::string source = specialization_prefix(record) + std::string(record.getKindName()) + " alignas(" +
                          std::to_string(alignment) + ") ";
     if (record.hasAttr<clang::PackedAttr>())
       source += "__attribute__((packed)) ";
-    source += record.getNameAsString();
+    source += record_name(record);
+    if (record.hasAttr<clang::FinalAttr>())
+      source += " final";
     bool first = true;
     for (const auto &base : record.bases()) {
       visit(base.getType());
       source += first ? " : " : ", ";
-      source += access(base.getAccessSpecifier()) + " " + spelling(base.getType());
+      source += access(base.getAccessSpecifier()) + (base.isVirtual() ? " virtual " : " ") +
+                spelling(base.getType());
       first = false;
     }
     source += " {\n";
@@ -276,9 +342,18 @@ private:
         source += " : " + std::to_string(field->getBitWidthValue());
       source += ";\n";
     }
+    bool emitted_selected = false;
     for (const auto *method : record.methods()) {
       if (method->isImplicit())
         continue;
+      if (method->isVirtual()) {
+        const bool selected = selected_method_ &&
+            method->getCanonicalDecl() == selected_method_->getCanonicalDecl();
+        visit_signature(*method, selected);
+        source += access(method->getAccess()) + ": " + callable(*method, selected);
+        emitted_selected |= selected;
+        continue;
+      }
       const auto *ctor = llvm::dyn_cast<clang::CXXConstructorDecl>(method);
       const bool destructor = llvm::isa<clang::CXXDestructorDecl>(method);
       if ((!ctor && !destructor) ||
@@ -295,7 +370,7 @@ private:
       }
       source += method->isDeletedAsWritten() ? ") = delete;\n" : ") = default;\n";
     }
-    if (selected_method_ && selected_method_->getParent()->getCanonicalDecl() ==
+    if (!emitted_selected && selected_method_ && selected_method_->getParent()->getCanonicalDecl() ==
                                 record.getCanonicalDecl()) {
       visit_signature(*selected_method_);
       source += "public: " + callable(*selected_method_);

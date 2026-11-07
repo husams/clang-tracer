@@ -28,6 +28,7 @@
 #include <clang/AST/Attr.h>
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/DeclTemplate.h>
+#include <clang/AST/Expr.h>
 #include <clang/AST/Mangle.h>
 #include <clang/AST/RecordLayout.h>
 #include <clang/AST/RecursiveASTVisitor.h>
@@ -152,7 +153,26 @@ std::vector<std::string> split_parameters(std::string_view text) {
 
 Selector parse_selector(const std::string& text) {
   Selector selector;
-  const auto open = text.find('(');
+  auto open = std::string::npos;
+  unsigned angles = 0, parentheses = 0;
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    const char ch = text[i];
+    if (ch == '(') {
+      if (!angles) {
+        open = i;
+        break;
+      }
+      ++parentheses;
+    } else if (ch == ')' && parentheses) {
+      --parentheses;
+    } else if (!parentheses && ch == '<') {
+      ++angles;
+    } else if (!parentheses && ch == '>' && angles) {
+      --angles;
+    }
+  }
+  if (open == std::string::npos)
+    open = text.find('('); // Preserve legacy parsing for operator spellings.
   if (open == std::string::npos) {
     selector.qualified_name = trim(text);
     if (selector.qualified_name.empty()) {
@@ -217,6 +237,8 @@ struct Candidate {
   clang::RefQualifierKind ref_qualifier = clang::RQ_None;
   api::ProbeSpec spec;
   std::string unsupported_reason;
+  bool selected_by_type = false;
+  bool template_instance = false;
 };
 
 struct FrozenInvocation {
@@ -224,6 +246,8 @@ struct FrozenInvocation {
   std::string source_argument;
   std::vector<std::string> arguments;
   std::vector<std::string> prepared_headers;
+  std::string adapter_symbol;
+  bool select_template = false;
 };
 
 bool is_receiver_field_type(clang::QualType type) {
@@ -322,10 +346,34 @@ public:
       , target_triple_(std::move(target_triple)), sema_(sema) {}
 
   bool VisitFunctionDecl(clang::FunctionDecl* declaration) {
-    if (declaration->getQualifiedNameAsString() != qualified_name_) {
+    if (invocation_.select_template)
+      return true;
+    if (!invocation_.adapter_symbol.empty()) {
+      if (!tracer::prepared::adapter_callable(*declaration, *context_, qualified_name_,
+                                             invocation_.adapter_symbol))
+        return true;
+    } else if (declaration->getQualifiedNameAsString() != qualified_name_) {
       return true;
     }
+    return collect(declaration, false);
+  }
 
+  bool VisitTypeAliasDecl(clang::TypeAliasDecl *alias) {
+    if (!invocation_.select_template ||
+        alias->getQualifiedNameAsString() != "tracer_prepared_selection::Selected")
+      return true;
+    const auto *type = llvm::dyn_cast<clang::DecltypeType>(alias->getUnderlyingType().getTypePtr());
+    const auto *call = type ? llvm::dyn_cast<clang::CallExpr>(
+        type->getUnderlyingExpr()->IgnoreParenImpCasts()) : nullptr;
+    const auto *address = call && call->getNumArgs() == 1
+        ? llvm::dyn_cast<clang::UnaryOperator>(call->getArg(0)->IgnoreParenImpCasts()) : nullptr;
+    const auto *reference = address && address->getOpcode() == clang::UO_AddrOf
+        ? llvm::dyn_cast<clang::DeclRefExpr>(address->getSubExpr()->IgnoreParenImpCasts()) : nullptr;
+    auto *function = reference ? llvm::dyn_cast<clang::FunctionDecl>(reference->getDecl()) : nullptr;
+    return function ? collect(function, true) : true;
+  }
+
+  bool collect(const clang::FunctionDecl *declaration, bool selected_by_type) {
     auto* prototype = declaration->getType()->getAs<clang::FunctionProtoType>();
     if (!prototype) {
       return true;
@@ -333,7 +381,9 @@ public:
     const auto* method = llvm::dyn_cast<clang::CXXMethodDecl>(declaration);
 
     Candidate candidate;
-    candidate.name = declaration->getQualifiedNameAsString();
+    candidate.name = selected_by_type ? qualified_name_ : declaration->getQualifiedNameAsString();
+    candidate.selected_by_type = selected_by_type;
+    candidate.template_instance = tracer::prepared::template_instance(*declaration);
     candidate.is_const = method && method->isConst();
     candidate.is_volatile = method && method->isVolatile();
     candidate.ref_qualifier = method ? method->getRefQualifier() : clang::RQ_None;
@@ -392,7 +442,7 @@ public:
           declaration->getType()->isDependentType()) {
         throw std::runtime_error("dependent callable types are unsupported");
       }
-      if (method && method->isVirtual()) {
+      if (!sema_ && method && method->isVirtual()) {
         throw std::runtime_error("virtual methods and their possible thunks are unsupported");
       }
       if (llvm::isa<clang::CXXConstructorDecl>(declaration) ||
@@ -410,7 +460,7 @@ public:
           function_info.getNoCallerSavedRegs() || function_info.getCmseNSCall()) {
         throw std::runtime_error("ABI-changing function attributes are unsupported");
       }
-      if (declaration->hasAttr<clang::AsmLabelAttr>()) {
+      if (invocation_.adapter_symbol.empty() && declaration->hasAttr<clang::AsmLabelAttr>()) {
         throw std::runtime_error("asm-labelled declarations are unsupported");
       }
       if (prototype->isVariadic()) {
@@ -429,7 +479,8 @@ public:
       if (method && !method->isStatic() && !method->getParent()->isCompleteDefinition()) {
         throw std::runtime_error("incomplete class method is unsupported");
       }
-      candidate.spec.set_symbol(tracer::prepared::mangle(declaration, *context_));
+      candidate.spec.set_symbol(invocation_.adapter_symbol.empty()
+          ? tracer::prepared::mangle(declaration, *context_) : invocation_.adapter_symbol);
       candidate.spec.mutable_signature()->set_kind(method && !method->isStatic() ? api::METHOD
                                                                                  : api::FUNCTION);
       if (sema_) {
@@ -759,7 +810,7 @@ bool matches(const Candidate& candidate, const Selector& selector) {
   if (candidate.name != selector.qualified_name) {
     return false;
   }
-  if (!selector.has_parameters) {
+  if (!selector.has_parameters || candidate.selected_by_type) {
     return true;
   }
   if (candidate.parameter_spellings.size() != selector.parameters.size() ||
@@ -814,6 +865,7 @@ static ResolvedCallable select_cpp_candidate(std::vector<Candidate> candidates,
   resolved.spec = std::move(candidate.spec);
   resolved.declaration = std::move(candidate.declaration);
   resolved.source = std::move(candidate.source);
+  resolved.template_instance = candidate.template_instance;
   return resolved;
 }
 
@@ -934,6 +986,33 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   std::string code;
   for (const auto& header : headers.include_headers())
     code += "#include \"" + header + "\"\n";
+  const auto angle = selector.qualified_name.find('<');
+  const bool select_template = angle != std::string::npos &&
+      selector.qualified_name.find('>', angle) != std::string::npos;
+  if (select_template) {
+    if (name.find_first_of("#;{}\\\r\n") != std::string::npos)
+      throw std::invalid_argument("invalid character in prepared template selector");
+    std::string parameters;
+    for (const auto &parameter : selector.parameters) {
+      if (!parameters.empty())
+        parameters += ", ";
+      parameters += parameter;
+    }
+    const auto type = "(" + parameters + ")";
+    std::string member = type;
+    if (selector.is_const) member += " const";
+    if (selector.is_volatile) member += " volatile";
+    if (selector.ref_qualifier == clang::RQ_LValue) member += " &";
+    if (selector.ref_qualifier == clang::RQ_RValue) member += " &&";
+    const auto qualified = selector.qualified_name.rfind("::", 0) == 0
+        ? selector.qualified_name : "::" + selector.qualified_name;
+    code += "\nnamespace tracer_prepared_selection {\n";
+    if (member == type)
+      code += "template<class R> void select(R (*)" + type + ");\n";
+    code += "template<class R, class C> void select(R (C::*)" + member + ");\n"
+            "using Selected = decltype(select(&" + qualified + "));\n}\n";
+    arguments.push_back("-fno-access-control");
+  }
   clang::tooling::FixedCompilationDatabase database(
       headers.header_context().working_directory(), arguments);
   clang::tooling::ClangTool tool(database, {source});
@@ -941,6 +1020,7 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   std::vector<Candidate> candidates;
   std::string target_error, invocation_error;
   FrozenInvocation invocation;
+  invocation.select_template = select_template;
   invocation.prepared_headers.assign(headers.include_headers().begin(),
                                      headers.include_headers().end());
   tool.appendArgumentsAdjuster([&](const clang::tooling::CommandLineArguments& args,
@@ -970,7 +1050,10 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
   if (!unit || unit->getDiagnostics().hasErrorOccurred())
     throw std::runtime_error("generated prepared adapter does not compile independently");
   std::vector<Candidate> candidates;
-  Collector visitor(candidates, selector.qualified_name, {}, "", "", &unit->getSema());
+  FrozenInvocation invocation;
+  invocation.adapter_symbol = original.spec.symbol();
+  Collector visitor(candidates, selector.qualified_name, std::move(invocation), "", "",
+                    &unit->getSema());
   visitor.set_context(unit->getASTContext(), &unit->getSema());
   visitor.TraverseDecl(unit->getASTContext().getTranslationUnitDecl());
   // Match by linkage because the adapter writes canonical parameter types.
