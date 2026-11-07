@@ -1224,12 +1224,48 @@ void Facade::prepare(const std::string &selector, const std::string &header,
 void Facade::prepare(const std::string &selector, const std::string &header,
                      const std::string &compdb, const std::string &translation_unit,
                      const std::string &module, const std::string &output) {
+  prepare(selector, std::vector<std::string>{header}, compdb, translation_unit,
+          module, output);
+}
+
+void Facade::prepare(const std::string &selector,
+                     const std::vector<std::string> &headers,
+                     const std::string &output, const std::string &compdb,
+                     const std::string &translation_unit) {
+  prepare(selector, headers, compdb, translation_unit, {}, output);
+}
+
+void Facade::prepare(const std::string &selector,
+                     const std::vector<std::string> &headers,
+                     const std::string &compdb, const std::string &translation_unit,
+                     const std::string &module, const std::string &output) {
+  if (headers.empty() ||
+      std::any_of(headers.begin(), headers.end(), [](const auto &header) {
+        return header.empty() || header.find('\0') != std::string::npos;
+      }))
+    throw std::invalid_argument("preparation requires nonempty header paths");
   Command options;
-  options.options = {{"--include", {header}}, {"--output", {output}}};
+  options.options = {{"--include", headers}, {"--output", {output}}};
   if (!compdb.empty()) options.options["--compdb"] = {compdb};
   if (!translation_unit.empty()) options.options["--translation-unit"] = {translation_unit};
   if (!module.empty()) options.options["--module"] = {module};
   controller_->prepare(selector, options);
+}
+
+void Facade::prepare(const std::string &selector,
+                     std::initializer_list<std::string> headers,
+                     const std::string &output, const std::string &compdb,
+                     const std::string &translation_unit) {
+  prepare(selector, std::vector<std::string>(headers), output, compdb,
+          translation_unit);
+}
+
+void Facade::prepare(const std::string &selector,
+                     std::initializer_list<std::string> headers,
+                     const std::string &compdb, const std::string &translation_unit,
+                     const std::string &module, const std::string &output) {
+  prepare(selector, std::vector<std::string>(headers), compdb, translation_unit,
+          module, output);
 }
 
 void Facade::detach(const SessionHandle &session) {

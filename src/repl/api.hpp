@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -172,6 +173,22 @@ public:
                const std::string &output, const std::string &compdb = {},
                const std::string &translation_unit = {});
   void prepare(const std::string &selector, const std::string &header,
+               const std::string &compdb, const std::string &translation_unit,
+               const std::string &module, const std::string &output);
+  void prepare(const std::string &selector,
+               const std::vector<std::string> &headers,
+               const std::string &output, const std::string &compdb = {},
+               const std::string &translation_unit = {});
+  void prepare(const std::string &selector,
+               const std::vector<std::string> &headers,
+               const std::string &compdb, const std::string &translation_unit,
+               const std::string &module, const std::string &output);
+  void prepare(const std::string &selector,
+               std::initializer_list<std::string> headers,
+               const std::string &output, const std::string &compdb = {},
+               const std::string &translation_unit = {});
+  void prepare(const std::string &selector,
+               std::initializer_list<std::string> headers,
                const std::string &compdb, const std::string &translation_unit,
                const std::string &module, const std::string &output);
   void detach(const SessionHandle &session);
