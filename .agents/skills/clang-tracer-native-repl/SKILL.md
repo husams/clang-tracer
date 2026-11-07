@@ -98,8 +98,8 @@ EOF detaches sessions owned by this REPL and stops its owned server.
   `call.context().event("name")`. Collect the event with
   `%collect --name name --count 1 --timeout 15 --as captured`. Then read
   `state_snapshot()` for fields or `state_as<Payload>()` for a supported
-  C++ value. Supply the payload declaration through a repeated `--include`
-  during preparation. Injection in the same REPL attempts to import mappings
+  C++ value. Supply the payload declaration as an additional header during
+  preparation. Injection in the same REPL attempts to import mappings
   from its generated adapter. If a mapping is unavailable, inspect the import
   diagnostic and use `state_snapshot()` or `%cpp import` as appropriate.
 - **Live capture.** Use `tracer.events(session, count, seconds)` for
@@ -107,6 +107,23 @@ EOF detaches sessions owned by this REPL and stops its owned server.
   background range. Inspect `snapshot()` and `error()` and call `stop()` when
   done. For named collections, use `%events stats NAME` to check for loss and
   incomplete captures.
+
+### Prepare with multiple headers in C++
+
+On builds with the multi-header overload, pass a braced list or a
+`std::vector<std::string>` as the second argument to `tracer.prepare()`.
+Put the function's declaration header first, followed by headers for callback
+types. Use a new output directory.
+
+```cpp
+tracer.prepare("demo::compute(int)", {"demo.hpp", "state.hpp"}, "prepared");
+```
+
+For the equivalent `%probe prepare` command, repeat `--include` for each header
+in the same order. To override the compile flags in C++, pass the compilation
+database and translation unit after the output directory. Use
+`%help api tracer.prepare` for an example and `%type tracer.prepare` for the
+installed overloads.
 
 ## Record and replay events
 
