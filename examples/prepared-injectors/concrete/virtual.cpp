@@ -8,6 +8,14 @@ int Prefix::unused() const { return prefix; }
 
 int Handler::route(int value) const { return value + factor + base + shared; }
 
+int Handler::scale(int value) {
+  // GCC 8.5 emits a register ADD. Keep the body long enough to patch on Clang.
+  const volatile int result = value * 3;
+  return result;
+}
+
+int Handler::Nested::adjust(int value) { return value + 9; }
+
 int through_base(const Interface *object, int value) {
   return object->route(value);
 }

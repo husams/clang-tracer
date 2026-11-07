@@ -4,6 +4,7 @@
 
 #include <clang/AST/DeclCXX.h>
 #include <clang/Basic/SourceManager.h>
+#include <llvm/ADT/StringExtras.h>
 
 #include <iterator>
 #include <set>
@@ -35,11 +36,18 @@ public:
     // Additional inputs can provide callback-only payload declarations.
     extra_headers_.insert(std::next(headers.begin()), headers.end());
     emit_extra(*ast_.getTranslationUnitDecl());
-    if (selected_method_) {
+    const bool linkage_alias = nested_static_method(selected_method_);
+    if (selected_method_ && !linkage_alias) {
       emit_record(*selected_method_->getParent());
     } else {
       visit_signature(function);
-      declarations_ += in_namespace(*function.getDeclContext(), callable(function));
+      if (linkage_alias) {
+        // A static method needs only its signature and original ELF symbol.
+        declarations_ += "namespace tracer_prepared_detail {\n" +
+                         callable(function) + "}\n";
+      } else {
+        declarations_ += in_namespace(*function.getDeclContext(), callable(function));
+      }
     }
     // Emit pointees after the callable's own records. They may contain the
     // receiver by value, while its method only needs a forward declaration.
@@ -105,14 +113,19 @@ private:
     if (decl.isExternC())
       source += "extern \"C\" ";
     const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(&decl);
-    if (method && method->isStatic())
+    const bool linkage_alias = selected && nested_static_method(method);
+    const auto symbol = linkage_alias || (selected && template_instance(decl))
+                            ? mangle(&decl, ast_) : std::string();
+    if (method && method->isStatic() && !linkage_alias)
       source += "static ";
     if (method && method->isVirtual())
       source += "virtual ";
     const bool destructor = llvm::isa<clang::CXXDestructorDecl>(decl);
     const auto *conversion = llvm::dyn_cast<clang::CXXConversionDecl>(&decl);
     std::string name;
-    if (destructor)
+    if (linkage_alias)
+      name = "target_" + llvm::toHex(symbol, true);
+    else if (destructor)
       name = "~" + method->getParent()->getNameAsString();
     else if (conversion)
       name = "operator " + spelling(conversion->getConversionType());
@@ -134,10 +147,8 @@ private:
     if (decl.getType()->castAs<clang::FunctionProtoType>()->isNothrow())
       name += " noexcept";
     source += (destructor || conversion) ? name : spelling(decl.getReturnType(), name);
-    // A concrete template instance needs its original linkage spelling, but
-    // its adapter needs only the substituted C++ signature.
-    if (selected && template_instance(decl))
-      source += " __asm__(\"" + mangle(&decl, ast_) + "\")";
+    if (!symbol.empty())
+      source += " __asm__(\"" + symbol + "\")";
     if (decl.isPureVirtual())
       source += " = 0";
     else if (decl.isDeletedAsWritten())

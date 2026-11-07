@@ -243,6 +243,11 @@ inline bool template_instance(const clang::FunctionDecl &declaration) {
   return false;
 }
 
+inline bool nested_static_method(const clang::CXXMethodDecl *method) {
+  return method && method->isStatic() &&
+         llvm::isa<clang::CXXRecordDecl>(method->getParent()->getDeclContext());
+}
+
 inline bool adapter_callable(const clang::FunctionDecl &declaration,
                              clang::ASTContext &ast, const std::string &name,
                              const std::string &symbol) {

@@ -157,6 +157,14 @@ The preparer resolves the concrete declaration without building the target.
 Injection requires the instance to have an executable symbol and a safe patch
 window in the target.
 
+The concrete demo prepares `Handler::scale(int)`, `Handler::shift<int>(int)`,
+`Handler::Nested::adjust(int)`, and `Handler::Nested::adjust<int>(int)` with the
+`prepared_concrete::` qualifier. The `native_repl_prepared_concrete` test
+injects all four static methods after removing the application header and
+checks that they return 12, 6, 13, and 14 for input 4. For nested static methods,
+the package preserves the original symbol and callable signature. Argument
+and result types follow the same adapter rules as other prepared probes.
+
 For records with application-defined copy, move, or destruction code, the
 standalone adapter preserves the lifetime declarations and lets the target
 perform those operations. Reference and by-value snapshots can capture fields

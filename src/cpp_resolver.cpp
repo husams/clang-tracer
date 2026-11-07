@@ -238,7 +238,7 @@ struct Candidate {
   api::ProbeSpec spec;
   std::string unsupported_reason;
   bool selected_by_type = false;
-  bool template_instance = false;
+  bool requires_typed_adapter = false;
 };
 
 struct FrozenInvocation {
@@ -384,7 +384,8 @@ public:
     Candidate candidate;
     candidate.name = selected_by_type ? qualified_name_ : declaration->getQualifiedNameAsString();
     candidate.selected_by_type = selected_by_type;
-    candidate.template_instance = tracer::prepared::template_instance(*declaration);
+    candidate.requires_typed_adapter = tracer::prepared::template_instance(*declaration) ||
+                                       tracer::prepared::nested_static_method(method);
     candidate.is_const = method && method->isConst();
     candidate.is_volatile = method && method->isVolatile();
     candidate.ref_qualifier = method ? method->getRefQualifier() : clang::RQ_None;
@@ -866,7 +867,7 @@ static ResolvedCallable select_cpp_candidate(std::vector<Candidate> candidates,
   resolved.spec = std::move(candidate.spec);
   resolved.declaration = std::move(candidate.declaration);
   resolved.source = std::move(candidate.source);
-  resolved.template_instance = candidate.template_instance;
+  resolved.requires_typed_adapter = candidate.requires_typed_adapter;
   return resolved;
 }
 
