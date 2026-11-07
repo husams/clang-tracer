@@ -86,6 +86,7 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"cpp options", K::cpp_options},
                                         {"shell", K::shell},
                                         {"complete", K::complete},
+                                        {"type", K::type},
                                         {"help", K::help},
                                         {"quit", K::quit},
                                         {"exit", K::quit}};
@@ -108,7 +109,7 @@ public:
       name += " " + ts[i++]->getText();
     }
     result.kind = kinds.at(name);
-    if (result.kind == K::help) {
+    if (result.kind == K::help || result.kind == K::type) {
       if (ts[i]->getText() == "%")
         ++i;
       for (; i + 1 < ts.size(); ++i)

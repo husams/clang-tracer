@@ -22,4 +22,6 @@ std::string reflect_cpp_header(const std::vector<std::string> &arguments,
 bool incomplete_cpp(const std::string &source);
 std::string describe_cpp_api(clang::CompilerInstance &parent,
                              const std::string &topic);
+std::string describe_cpp_symbol(clang::CompilerInstance &compiler,
+                                const std::string &symbol);
 } // namespace tracer_repl

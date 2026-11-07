@@ -46,6 +46,7 @@ enum class CommandKind {
   cpp_options,
   shell,
   complete,
+  type,
   help,
   quit
 };

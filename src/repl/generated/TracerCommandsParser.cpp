@@ -56,7 +56,7 @@ void tracercommandsParserInitialize() {
       "sessions", "use", "status", "detach", "modules", "symbols", "symbolOption",
       "probe", "prepareOption", "resolveOption", "deployOption", "interceptor",
       "events", "collect", "record", "streamOption", "cpp", "shell", "complete",
-      "help", "quit", "value", "keyword"
+      "type", "help", "quit", "value", "keyword"
     },
     std::vector<std::string>{
       "", "'%'", "'server'", "'start'", "'connect'", "'status'", "'stop'",
@@ -73,138 +73,140 @@ void tracercommandsParserInitialize() {
       "'--probe'", "'--phase'", "'PRE'", "'POST'", "'--name'", "'--session'",
       "'--all'", "'cpp'", "'reset'", "'import'", "'generate'", "'--type'",
       "'options'", "'add'", "'compdb'", "'--file'", "'shell'", "'complete'",
-      "'help'", "'quit'", "'exit'", "", "", "", "'--metadata-only'"
+      "'type'", "'help'", "'quit'", "'exit'", "", "", "", "'--metadata-only'"
     },
     std::vector<std::string>{
       "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
       "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
       "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
       "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
-      "", "", "", "", "", "", "", "", "", "", "", "", "", "UINT", "STRING",
+      "", "", "", "", "", "", "", "", "", "", "", "", "", "", "UINT", "STRING",
       "SHELL", "METADATA_ONLY", "WORD", "WS"
     }
   );
   static const int32_t serializedATNSegment[] = {
-    4,1,86,336,2,0,7,0,2,1,7,1,2,2,7,2,2,3,7,3,2,4,7,4,2,5,7,5,2,6,7,6,2,
+    4,1,87,342,2,0,7,0,2,1,7,1,2,2,7,2,2,3,7,3,2,4,7,4,2,5,7,5,2,6,7,6,2,
     7,7,7,2,8,7,8,2,9,7,9,2,10,7,10,2,11,7,11,2,12,7,12,2,13,7,13,2,14,7,
     14,2,15,7,15,2,16,7,16,2,17,7,17,2,18,7,18,2,19,7,19,2,20,7,20,2,21,7,
     21,2,22,7,22,2,23,7,23,2,24,7,24,2,25,7,25,2,26,7,26,2,27,7,27,2,28,7,
-    28,1,0,1,0,1,0,1,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-    1,1,1,1,1,1,1,1,1,1,1,1,1,3,1,82,8,1,1,2,1,2,1,2,5,2,87,8,2,10,2,12,2,
-    90,9,2,1,2,1,2,1,2,1,2,3,2,96,8,2,1,3,1,3,1,3,1,4,1,4,3,4,103,8,4,1,5,
-    1,5,1,5,3,5,108,8,5,1,6,1,6,1,7,1,7,1,7,1,8,1,8,1,9,1,9,3,9,119,8,9,1,
-    10,1,10,1,11,1,11,5,11,125,8,11,10,11,12,11,128,9,11,1,12,1,12,1,12,1,
-    12,3,12,134,8,12,1,13,1,13,1,13,1,13,4,13,140,8,13,11,13,12,13,141,1,
-    13,1,13,1,13,5,13,147,8,13,10,13,12,13,150,9,13,1,13,1,13,1,13,1,13,1,
-    13,5,13,157,8,13,10,13,12,13,160,9,13,1,13,1,13,1,13,1,13,1,13,5,13,167,
-    8,13,10,13,12,13,170,9,13,1,13,1,13,3,13,174,8,13,1,13,3,13,177,8,13,
-    1,14,1,14,1,14,3,14,182,8,14,1,15,1,15,1,15,1,16,1,16,1,16,1,16,1,16,
-    3,16,192,8,16,1,17,1,17,1,17,1,17,1,17,1,17,1,17,1,17,1,17,1,17,1,17,
-    1,17,1,17,1,17,1,17,5,17,209,8,17,10,17,12,17,212,9,17,3,17,214,8,17,
-    1,18,1,18,5,18,218,8,18,10,18,12,18,221,9,18,1,18,1,18,1,18,1,18,3,18,
-    227,8,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,
-    1,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,3,18,252,8,18,
-    1,19,1,19,5,19,256,8,19,10,19,12,19,259,9,19,1,20,1,20,1,20,5,20,264,
-    8,20,10,20,12,20,267,9,20,1,21,1,21,1,21,1,21,1,21,1,21,1,21,3,21,276,
-    8,21,1,22,1,22,1,22,1,22,1,22,1,22,1,22,1,22,5,22,286,8,22,10,22,12,22,
-    289,9,22,1,22,1,22,1,22,1,22,4,22,295,8,22,11,22,12,22,296,1,22,1,22,
-    1,22,1,22,1,22,1,22,3,22,305,8,22,3,22,307,8,22,1,23,1,23,1,23,1,24,1,
-    24,1,24,1,25,1,25,3,25,317,8,25,1,25,4,25,320,8,25,11,25,12,25,321,3,
-    25,324,8,25,1,26,1,26,1,27,1,27,1,27,1,27,3,27,332,8,27,1,28,1,28,1,28,
-    0,0,29,0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,
-    46,48,50,52,54,56,0,11,1,0,7,8,2,0,11,11,17,18,2,0,17,17,28,31,3,0,17,
-    17,28,29,32,34,1,0,57,60,1,0,62,63,2,0,40,40,64,65,1,0,69,70,2,0,31,31,
-    71,71,1,0,79,80,14,0,2,6,9,10,12,16,20,23,25,27,38,39,41,43,45,46,48,
-    52,54,56,62,63,67,70,72,74,76,80,379,0,58,1,0,0,0,2,81,1,0,0,0,4,83,1,
-    0,0,0,6,97,1,0,0,0,8,100,1,0,0,0,10,104,1,0,0,0,12,109,1,0,0,0,14,111,
-    1,0,0,0,16,114,1,0,0,0,18,116,1,0,0,0,20,120,1,0,0,0,22,122,1,0,0,0,24,
-    133,1,0,0,0,26,176,1,0,0,0,28,181,1,0,0,0,30,183,1,0,0,0,32,191,1,0,0,
-    0,34,193,1,0,0,0,36,215,1,0,0,0,38,253,1,0,0,0,40,260,1,0,0,0,42,275,
-    1,0,0,0,44,277,1,0,0,0,46,308,1,0,0,0,48,311,1,0,0,0,50,314,1,0,0,0,52,
-    325,1,0,0,0,54,331,1,0,0,0,56,333,1,0,0,0,58,59,5,1,0,0,59,60,3,2,1,0,
-    60,61,5,0,0,1,61,1,1,0,0,0,62,82,3,4,2,0,63,82,3,8,4,0,64,82,3,10,5,0,
-    65,82,3,12,6,0,66,82,3,14,7,0,67,82,3,16,8,0,68,82,3,18,9,0,69,82,3,20,
-    10,0,70,82,3,22,11,0,71,82,3,26,13,0,72,82,3,34,17,0,73,82,3,36,18,0,
-    74,82,3,38,19,0,75,82,3,40,20,0,76,82,3,44,22,0,77,82,3,46,23,0,78,82,
-    3,48,24,0,79,82,3,50,25,0,80,82,3,52,26,0,81,62,1,0,0,0,81,63,1,0,0,0,
-    81,64,1,0,0,0,81,65,1,0,0,0,81,66,1,0,0,0,81,67,1,0,0,0,81,68,1,0,0,0,
-    81,69,1,0,0,0,81,70,1,0,0,0,81,71,1,0,0,0,81,72,1,0,0,0,81,73,1,0,0,0,
-    81,74,1,0,0,0,81,75,1,0,0,0,81,76,1,0,0,0,81,77,1,0,0,0,81,78,1,0,0,0,
-    81,79,1,0,0,0,81,80,1,0,0,0,82,3,1,0,0,0,83,95,5,2,0,0,84,88,5,3,0,0,
-    85,87,3,6,3,0,86,85,1,0,0,0,87,90,1,0,0,0,88,86,1,0,0,0,88,89,1,0,0,0,
-    89,96,1,0,0,0,90,88,1,0,0,0,91,92,5,4,0,0,92,96,3,54,27,0,93,96,5,5,0,
-    0,94,96,5,6,0,0,95,84,1,0,0,0,95,91,1,0,0,0,95,93,1,0,0,0,95,94,1,0,0,
-    0,96,5,1,0,0,0,97,98,7,0,0,0,98,99,3,54,27,0,99,7,1,0,0,0,100,102,5,9,
-    0,0,101,103,5,81,0,0,102,101,1,0,0,0,102,103,1,0,0,0,103,9,1,0,0,0,104,
-    107,5,10,0,0,105,106,5,11,0,0,106,108,3,54,27,0,107,105,1,0,0,0,107,108,
-    1,0,0,0,108,11,1,0,0,0,109,110,5,12,0,0,110,13,1,0,0,0,111,112,5,13,0,
-    0,112,113,3,54,27,0,113,15,1,0,0,0,114,115,5,5,0,0,115,17,1,0,0,0,116,
-    118,5,14,0,0,117,119,3,54,27,0,118,117,1,0,0,0,118,119,1,0,0,0,119,19,
-    1,0,0,0,120,121,5,15,0,0,121,21,1,0,0,0,122,126,5,16,0,0,123,125,3,24,
-    12,0,124,123,1,0,0,0,125,128,1,0,0,0,126,124,1,0,0,0,126,127,1,0,0,0,
-    127,23,1,0,0,0,128,126,1,0,0,0,129,130,7,1,0,0,130,134,3,54,27,0,131,
-    132,5,19,0,0,132,134,5,81,0,0,133,129,1,0,0,0,133,131,1,0,0,0,134,25,
-    1,0,0,0,135,173,5,20,0,0,136,137,5,21,0,0,137,139,3,54,27,0,138,140,3,
-    28,14,0,139,138,1,0,0,0,140,141,1,0,0,0,141,139,1,0,0,0,141,142,1,0,0,
-    0,142,174,1,0,0,0,143,144,5,22,0,0,144,148,3,54,27,0,145,147,3,30,15,
-    0,146,145,1,0,0,0,147,150,1,0,0,0,148,146,1,0,0,0,148,149,1,0,0,0,149,
-    174,1,0,0,0,150,148,1,0,0,0,151,152,5,23,0,0,152,153,3,54,27,0,153,154,
-    5,24,0,0,154,158,3,54,27,0,155,157,3,32,16,0,156,155,1,0,0,0,157,160,
-    1,0,0,0,158,156,1,0,0,0,158,159,1,0,0,0,159,174,1,0,0,0,160,158,1,0,0,
-    0,161,162,5,25,0,0,162,163,3,54,27,0,163,164,5,24,0,0,164,168,3,54,27,
-    0,165,167,3,30,15,0,166,165,1,0,0,0,167,170,1,0,0,0,168,166,1,0,0,0,168,
-    169,1,0,0,0,169,174,1,0,0,0,170,168,1,0,0,0,171,172,5,26,0,0,172,174,
-    5,81,0,0,173,136,1,0,0,0,173,143,1,0,0,0,173,151,1,0,0,0,173,161,1,0,
-    0,0,173,171,1,0,0,0,174,177,1,0,0,0,175,177,5,27,0,0,176,135,1,0,0,0,
-    176,175,1,0,0,0,177,27,1,0,0,0,178,179,7,2,0,0,179,182,3,54,27,0,180,
-    182,5,84,0,0,181,178,1,0,0,0,181,180,1,0,0,0,182,29,1,0,0,0,183,184,7,
-    3,0,0,184,185,3,54,27,0,185,31,1,0,0,0,186,192,3,30,15,0,187,188,5,35,
-    0,0,188,192,5,81,0,0,189,192,5,36,0,0,190,192,5,37,0,0,191,186,1,0,0,
-    0,191,187,1,0,0,0,191,189,1,0,0,0,191,190,1,0,0,0,192,33,1,0,0,0,193,
-    213,5,38,0,0,194,195,5,39,0,0,195,196,3,54,27,0,196,197,5,40,0,0,197,
-    198,3,54,27,0,198,214,1,0,0,0,199,200,5,41,0,0,200,214,3,54,27,0,201,
-    202,5,42,0,0,202,214,3,54,27,0,203,204,5,43,0,0,204,205,3,54,27,0,205,
-    206,5,44,0,0,206,210,3,54,27,0,207,209,3,32,16,0,208,207,1,0,0,0,209,
-    212,1,0,0,0,210,208,1,0,0,0,210,211,1,0,0,0,211,214,1,0,0,0,212,210,1,
-    0,0,0,213,194,1,0,0,0,213,199,1,0,0,0,213,201,1,0,0,0,213,203,1,0,0,0,
-    214,35,1,0,0,0,215,251,5,45,0,0,216,218,3,42,21,0,217,216,1,0,0,0,218,
-    221,1,0,0,0,219,217,1,0,0,0,219,220,1,0,0,0,220,252,1,0,0,0,221,219,1,
-    0,0,0,222,223,5,46,0,0,223,226,3,54,27,0,224,225,5,19,0,0,225,227,5,81,
-    0,0,226,224,1,0,0,0,226,227,1,0,0,0,227,252,1,0,0,0,228,229,5,42,0,0,
-    229,230,3,54,27,0,230,231,5,47,0,0,231,232,5,81,0,0,232,252,1,0,0,0,233,
-    234,5,48,0,0,234,252,3,54,27,0,235,236,5,49,0,0,236,252,3,54,27,0,237,
-    238,5,50,0,0,238,252,3,54,27,0,239,240,5,51,0,0,240,241,3,54,27,0,241,
-    242,5,40,0,0,242,243,3,54,27,0,243,252,1,0,0,0,244,245,5,52,0,0,245,246,
-    3,54,27,0,246,247,5,53,0,0,247,248,5,54,0,0,248,249,5,31,0,0,249,250,
-    3,54,27,0,250,252,1,0,0,0,251,219,1,0,0,0,251,222,1,0,0,0,251,228,1,0,
-    0,0,251,233,1,0,0,0,251,235,1,0,0,0,251,237,1,0,0,0,251,239,1,0,0,0,251,
-    244,1,0,0,0,252,37,1,0,0,0,253,257,5,55,0,0,254,256,3,42,21,0,255,254,
-    1,0,0,0,256,259,1,0,0,0,257,255,1,0,0,0,257,258,1,0,0,0,258,39,1,0,0,
-    0,259,257,1,0,0,0,260,261,5,56,0,0,261,265,3,54,27,0,262,264,3,42,21,
-    0,263,262,1,0,0,0,264,267,1,0,0,0,265,263,1,0,0,0,265,266,1,0,0,0,266,
-    41,1,0,0,0,267,265,1,0,0,0,268,269,7,4,0,0,269,276,5,81,0,0,270,271,5,
-    61,0,0,271,276,7,5,0,0,272,273,7,6,0,0,273,276,3,54,27,0,274,276,5,66,
-    0,0,275,268,1,0,0,0,275,270,1,0,0,0,275,272,1,0,0,0,275,274,1,0,0,0,276,
-    43,1,0,0,0,277,306,5,67,0,0,278,279,5,39,0,0,279,307,3,54,27,0,280,307,
-    5,68,0,0,281,282,7,7,0,0,282,287,3,54,27,0,283,284,7,8,0,0,284,286,3,
-    54,27,0,285,283,1,0,0,0,286,289,1,0,0,0,287,285,1,0,0,0,287,288,1,0,0,
-    0,288,307,1,0,0,0,289,287,1,0,0,0,290,304,5,72,0,0,291,294,5,73,0,0,292,
-    295,3,54,27,0,293,295,5,83,0,0,294,292,1,0,0,0,294,293,1,0,0,0,295,296,
-    1,0,0,0,296,294,1,0,0,0,296,297,1,0,0,0,297,305,1,0,0,0,298,305,5,50,
-    0,0,299,300,5,74,0,0,300,301,3,54,27,0,301,302,5,75,0,0,302,303,3,54,
-    27,0,303,305,1,0,0,0,304,291,1,0,0,0,304,298,1,0,0,0,304,299,1,0,0,0,
-    304,305,1,0,0,0,305,307,1,0,0,0,306,278,1,0,0,0,306,280,1,0,0,0,306,281,
-    1,0,0,0,306,290,1,0,0,0,307,45,1,0,0,0,308,309,5,76,0,0,309,310,3,54,
-    27,0,310,47,1,0,0,0,311,312,5,77,0,0,312,313,3,54,27,0,313,49,1,0,0,0,
-    314,323,5,78,0,0,315,317,5,1,0,0,316,315,1,0,0,0,316,317,1,0,0,0,317,
-    319,1,0,0,0,318,320,3,54,27,0,319,318,1,0,0,0,320,321,1,0,0,0,321,319,
-    1,0,0,0,321,322,1,0,0,0,322,324,1,0,0,0,323,316,1,0,0,0,323,324,1,0,0,
-    0,324,51,1,0,0,0,325,326,7,9,0,0,326,53,1,0,0,0,327,332,5,82,0,0,328,
-    332,5,85,0,0,329,332,5,81,0,0,330,332,3,56,28,0,331,327,1,0,0,0,331,328,
-    1,0,0,0,331,329,1,0,0,0,331,330,1,0,0,0,332,55,1,0,0,0,333,334,7,10,0,
-    0,334,57,1,0,0,0,33,81,88,95,102,107,118,126,133,141,148,158,168,173,
-    176,181,191,210,213,219,226,251,257,265,275,287,294,296,304,306,316,321,
-    323,331
+    28,2,29,7,29,1,0,1,0,1,0,1,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,3,1,85,8,1,1,2,1,2,1,2,5,2,90,
+    8,2,10,2,12,2,93,9,2,1,2,1,2,1,2,1,2,3,2,99,8,2,1,3,1,3,1,3,1,4,1,4,3,
+    4,106,8,4,1,5,1,5,1,5,3,5,111,8,5,1,6,1,6,1,7,1,7,1,7,1,8,1,8,1,9,1,9,
+    3,9,122,8,9,1,10,1,10,1,11,1,11,5,11,128,8,11,10,11,12,11,131,9,11,1,
+    12,1,12,1,12,1,12,3,12,137,8,12,1,13,1,13,1,13,1,13,4,13,143,8,13,11,
+    13,12,13,144,1,13,1,13,1,13,5,13,150,8,13,10,13,12,13,153,9,13,1,13,1,
+    13,1,13,1,13,1,13,5,13,160,8,13,10,13,12,13,163,9,13,1,13,1,13,1,13,1,
+    13,1,13,5,13,170,8,13,10,13,12,13,173,9,13,1,13,1,13,3,13,177,8,13,1,
+    13,3,13,180,8,13,1,14,1,14,1,14,3,14,185,8,14,1,15,1,15,1,15,1,16,1,16,
+    1,16,1,16,1,16,3,16,195,8,16,1,17,1,17,1,17,1,17,1,17,1,17,1,17,1,17,
+    1,17,1,17,1,17,1,17,1,17,1,17,1,17,5,17,212,8,17,10,17,12,17,215,9,17,
+    3,17,217,8,17,1,18,1,18,5,18,221,8,18,10,18,12,18,224,9,18,1,18,1,18,
+    1,18,1,18,3,18,230,8,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,
+    1,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,1,18,
+    3,18,255,8,18,1,19,1,19,5,19,259,8,19,10,19,12,19,262,9,19,1,20,1,20,
+    1,20,5,20,267,8,20,10,20,12,20,270,9,20,1,21,1,21,1,21,1,21,1,21,1,21,
+    1,21,3,21,279,8,21,1,22,1,22,1,22,1,22,1,22,1,22,1,22,1,22,5,22,289,8,
+    22,10,22,12,22,292,9,22,1,22,1,22,1,22,1,22,4,22,298,8,22,11,22,12,22,
+    299,1,22,1,22,1,22,1,22,1,22,1,22,3,22,308,8,22,3,22,310,8,22,1,23,1,
+    23,1,23,1,24,1,24,1,24,1,25,1,25,1,25,1,26,1,26,3,26,323,8,26,1,26,4,
+    26,326,8,26,11,26,12,26,327,3,26,330,8,26,1,27,1,27,1,28,1,28,1,28,1,
+    28,3,28,338,8,28,1,29,1,29,1,29,0,0,30,0,2,4,6,8,10,12,14,16,18,20,22,
+    24,26,28,30,32,34,36,38,40,42,44,46,48,50,52,54,56,58,0,11,1,0,7,8,2,
+    0,11,11,17,18,2,0,17,17,28,31,3,0,17,17,28,29,32,34,1,0,57,60,1,0,62,
+    63,2,0,40,40,64,65,1,0,69,70,2,0,31,31,71,71,1,0,80,81,14,0,2,6,9,10,
+    12,16,20,23,25,27,38,39,41,43,45,46,48,52,54,56,62,63,67,70,72,74,76,
+    81,385,0,60,1,0,0,0,2,84,1,0,0,0,4,86,1,0,0,0,6,100,1,0,0,0,8,103,1,0,
+    0,0,10,107,1,0,0,0,12,112,1,0,0,0,14,114,1,0,0,0,16,117,1,0,0,0,18,119,
+    1,0,0,0,20,123,1,0,0,0,22,125,1,0,0,0,24,136,1,0,0,0,26,179,1,0,0,0,28,
+    184,1,0,0,0,30,186,1,0,0,0,32,194,1,0,0,0,34,196,1,0,0,0,36,218,1,0,0,
+    0,38,256,1,0,0,0,40,263,1,0,0,0,42,278,1,0,0,0,44,280,1,0,0,0,46,311,
+    1,0,0,0,48,314,1,0,0,0,50,317,1,0,0,0,52,320,1,0,0,0,54,331,1,0,0,0,56,
+    337,1,0,0,0,58,339,1,0,0,0,60,61,5,1,0,0,61,62,3,2,1,0,62,63,5,0,0,1,
+    63,1,1,0,0,0,64,85,3,4,2,0,65,85,3,8,4,0,66,85,3,10,5,0,67,85,3,12,6,
+    0,68,85,3,14,7,0,69,85,3,16,8,0,70,85,3,18,9,0,71,85,3,20,10,0,72,85,
+    3,22,11,0,73,85,3,26,13,0,74,85,3,34,17,0,75,85,3,36,18,0,76,85,3,38,
+    19,0,77,85,3,40,20,0,78,85,3,44,22,0,79,85,3,46,23,0,80,85,3,48,24,0,
+    81,85,3,50,25,0,82,85,3,52,26,0,83,85,3,54,27,0,84,64,1,0,0,0,84,65,1,
+    0,0,0,84,66,1,0,0,0,84,67,1,0,0,0,84,68,1,0,0,0,84,69,1,0,0,0,84,70,1,
+    0,0,0,84,71,1,0,0,0,84,72,1,0,0,0,84,73,1,0,0,0,84,74,1,0,0,0,84,75,1,
+    0,0,0,84,76,1,0,0,0,84,77,1,0,0,0,84,78,1,0,0,0,84,79,1,0,0,0,84,80,1,
+    0,0,0,84,81,1,0,0,0,84,82,1,0,0,0,84,83,1,0,0,0,85,3,1,0,0,0,86,98,5,
+    2,0,0,87,91,5,3,0,0,88,90,3,6,3,0,89,88,1,0,0,0,90,93,1,0,0,0,91,89,1,
+    0,0,0,91,92,1,0,0,0,92,99,1,0,0,0,93,91,1,0,0,0,94,95,5,4,0,0,95,99,3,
+    56,28,0,96,99,5,5,0,0,97,99,5,6,0,0,98,87,1,0,0,0,98,94,1,0,0,0,98,96,
+    1,0,0,0,98,97,1,0,0,0,99,5,1,0,0,0,100,101,7,0,0,0,101,102,3,56,28,0,
+    102,7,1,0,0,0,103,105,5,9,0,0,104,106,5,82,0,0,105,104,1,0,0,0,105,106,
+    1,0,0,0,106,9,1,0,0,0,107,110,5,10,0,0,108,109,5,11,0,0,109,111,3,56,
+    28,0,110,108,1,0,0,0,110,111,1,0,0,0,111,11,1,0,0,0,112,113,5,12,0,0,
+    113,13,1,0,0,0,114,115,5,13,0,0,115,116,3,56,28,0,116,15,1,0,0,0,117,
+    118,5,5,0,0,118,17,1,0,0,0,119,121,5,14,0,0,120,122,3,56,28,0,121,120,
+    1,0,0,0,121,122,1,0,0,0,122,19,1,0,0,0,123,124,5,15,0,0,124,21,1,0,0,
+    0,125,129,5,16,0,0,126,128,3,24,12,0,127,126,1,0,0,0,128,131,1,0,0,0,
+    129,127,1,0,0,0,129,130,1,0,0,0,130,23,1,0,0,0,131,129,1,0,0,0,132,133,
+    7,1,0,0,133,137,3,56,28,0,134,135,5,19,0,0,135,137,5,82,0,0,136,132,1,
+    0,0,0,136,134,1,0,0,0,137,25,1,0,0,0,138,176,5,20,0,0,139,140,5,21,0,
+    0,140,142,3,56,28,0,141,143,3,28,14,0,142,141,1,0,0,0,143,144,1,0,0,0,
+    144,142,1,0,0,0,144,145,1,0,0,0,145,177,1,0,0,0,146,147,5,22,0,0,147,
+    151,3,56,28,0,148,150,3,30,15,0,149,148,1,0,0,0,150,153,1,0,0,0,151,149,
+    1,0,0,0,151,152,1,0,0,0,152,177,1,0,0,0,153,151,1,0,0,0,154,155,5,23,
+    0,0,155,156,3,56,28,0,156,157,5,24,0,0,157,161,3,56,28,0,158,160,3,32,
+    16,0,159,158,1,0,0,0,160,163,1,0,0,0,161,159,1,0,0,0,161,162,1,0,0,0,
+    162,177,1,0,0,0,163,161,1,0,0,0,164,165,5,25,0,0,165,166,3,56,28,0,166,
+    167,5,24,0,0,167,171,3,56,28,0,168,170,3,30,15,0,169,168,1,0,0,0,170,
+    173,1,0,0,0,171,169,1,0,0,0,171,172,1,0,0,0,172,177,1,0,0,0,173,171,1,
+    0,0,0,174,175,5,26,0,0,175,177,5,82,0,0,176,139,1,0,0,0,176,146,1,0,0,
+    0,176,154,1,0,0,0,176,164,1,0,0,0,176,174,1,0,0,0,177,180,1,0,0,0,178,
+    180,5,27,0,0,179,138,1,0,0,0,179,178,1,0,0,0,180,27,1,0,0,0,181,182,7,
+    2,0,0,182,185,3,56,28,0,183,185,5,85,0,0,184,181,1,0,0,0,184,183,1,0,
+    0,0,185,29,1,0,0,0,186,187,7,3,0,0,187,188,3,56,28,0,188,31,1,0,0,0,189,
+    195,3,30,15,0,190,191,5,35,0,0,191,195,5,82,0,0,192,195,5,36,0,0,193,
+    195,5,37,0,0,194,189,1,0,0,0,194,190,1,0,0,0,194,192,1,0,0,0,194,193,
+    1,0,0,0,195,33,1,0,0,0,196,216,5,38,0,0,197,198,5,39,0,0,198,199,3,56,
+    28,0,199,200,5,40,0,0,200,201,3,56,28,0,201,217,1,0,0,0,202,203,5,41,
+    0,0,203,217,3,56,28,0,204,205,5,42,0,0,205,217,3,56,28,0,206,207,5,43,
+    0,0,207,208,3,56,28,0,208,209,5,44,0,0,209,213,3,56,28,0,210,212,3,32,
+    16,0,211,210,1,0,0,0,212,215,1,0,0,0,213,211,1,0,0,0,213,214,1,0,0,0,
+    214,217,1,0,0,0,215,213,1,0,0,0,216,197,1,0,0,0,216,202,1,0,0,0,216,204,
+    1,0,0,0,216,206,1,0,0,0,217,35,1,0,0,0,218,254,5,45,0,0,219,221,3,42,
+    21,0,220,219,1,0,0,0,221,224,1,0,0,0,222,220,1,0,0,0,222,223,1,0,0,0,
+    223,255,1,0,0,0,224,222,1,0,0,0,225,226,5,46,0,0,226,229,3,56,28,0,227,
+    228,5,19,0,0,228,230,5,82,0,0,229,227,1,0,0,0,229,230,1,0,0,0,230,255,
+    1,0,0,0,231,232,5,42,0,0,232,233,3,56,28,0,233,234,5,47,0,0,234,235,5,
+    82,0,0,235,255,1,0,0,0,236,237,5,48,0,0,237,255,3,56,28,0,238,239,5,49,
+    0,0,239,255,3,56,28,0,240,241,5,50,0,0,241,255,3,56,28,0,242,243,5,51,
+    0,0,243,244,3,56,28,0,244,245,5,40,0,0,245,246,3,56,28,0,246,255,1,0,
+    0,0,247,248,5,52,0,0,248,249,3,56,28,0,249,250,5,53,0,0,250,251,5,54,
+    0,0,251,252,5,31,0,0,252,253,3,56,28,0,253,255,1,0,0,0,254,222,1,0,0,
+    0,254,225,1,0,0,0,254,231,1,0,0,0,254,236,1,0,0,0,254,238,1,0,0,0,254,
+    240,1,0,0,0,254,242,1,0,0,0,254,247,1,0,0,0,255,37,1,0,0,0,256,260,5,
+    55,0,0,257,259,3,42,21,0,258,257,1,0,0,0,259,262,1,0,0,0,260,258,1,0,
+    0,0,260,261,1,0,0,0,261,39,1,0,0,0,262,260,1,0,0,0,263,264,5,56,0,0,264,
+    268,3,56,28,0,265,267,3,42,21,0,266,265,1,0,0,0,267,270,1,0,0,0,268,266,
+    1,0,0,0,268,269,1,0,0,0,269,41,1,0,0,0,270,268,1,0,0,0,271,272,7,4,0,
+    0,272,279,5,82,0,0,273,274,5,61,0,0,274,279,7,5,0,0,275,276,7,6,0,0,276,
+    279,3,56,28,0,277,279,5,66,0,0,278,271,1,0,0,0,278,273,1,0,0,0,278,275,
+    1,0,0,0,278,277,1,0,0,0,279,43,1,0,0,0,280,309,5,67,0,0,281,282,5,39,
+    0,0,282,310,3,56,28,0,283,310,5,68,0,0,284,285,7,7,0,0,285,290,3,56,28,
+    0,286,287,7,8,0,0,287,289,3,56,28,0,288,286,1,0,0,0,289,292,1,0,0,0,290,
+    288,1,0,0,0,290,291,1,0,0,0,291,310,1,0,0,0,292,290,1,0,0,0,293,307,5,
+    72,0,0,294,297,5,73,0,0,295,298,3,56,28,0,296,298,5,84,0,0,297,295,1,
+    0,0,0,297,296,1,0,0,0,298,299,1,0,0,0,299,297,1,0,0,0,299,300,1,0,0,0,
+    300,308,1,0,0,0,301,308,5,50,0,0,302,303,5,74,0,0,303,304,3,56,28,0,304,
+    305,5,75,0,0,305,306,3,56,28,0,306,308,1,0,0,0,307,294,1,0,0,0,307,301,
+    1,0,0,0,307,302,1,0,0,0,307,308,1,0,0,0,308,310,1,0,0,0,309,281,1,0,0,
+    0,309,283,1,0,0,0,309,284,1,0,0,0,309,293,1,0,0,0,310,45,1,0,0,0,311,
+    312,5,76,0,0,312,313,3,56,28,0,313,47,1,0,0,0,314,315,5,77,0,0,315,316,
+    3,56,28,0,316,49,1,0,0,0,317,318,5,78,0,0,318,319,3,56,28,0,319,51,1,
+    0,0,0,320,329,5,79,0,0,321,323,5,1,0,0,322,321,1,0,0,0,322,323,1,0,0,
+    0,323,325,1,0,0,0,324,326,3,56,28,0,325,324,1,0,0,0,326,327,1,0,0,0,327,
+    325,1,0,0,0,327,328,1,0,0,0,328,330,1,0,0,0,329,322,1,0,0,0,329,330,1,
+    0,0,0,330,53,1,0,0,0,331,332,7,9,0,0,332,55,1,0,0,0,333,338,5,83,0,0,
+    334,338,5,86,0,0,335,338,5,82,0,0,336,338,3,58,29,0,337,333,1,0,0,0,337,
+    334,1,0,0,0,337,335,1,0,0,0,337,336,1,0,0,0,338,57,1,0,0,0,339,340,7,
+    10,0,0,340,59,1,0,0,0,33,84,91,98,105,110,121,129,136,144,151,161,171,
+    176,179,184,194,213,216,222,229,254,260,268,278,290,297,299,307,309,322,
+    327,329,337
   };
   staticData->serializedATN = antlr4::atn::SerializedATNView(serializedATNSegment, sizeof(serializedATNSegment) / sizeof(serializedATNSegment[0]));
 
@@ -293,11 +295,11 @@ TracerCommandsParser::LineContext* TracerCommandsParser::line() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(58);
-    match(TracerCommandsParser::T__0);
-    setState(59);
-    command();
     setState(60);
+    match(TracerCommandsParser::T__0);
+    setState(61);
+    command();
+    setState(62);
     match(TracerCommandsParser::EOF);
 
   }
@@ -384,6 +386,10 @@ TracerCommandsParser::CompleteContext* TracerCommandsParser::CommandContext::com
   return getRuleContext<TracerCommandsParser::CompleteContext>(0);
 }
 
+TracerCommandsParser::TypeContext* TracerCommandsParser::CommandContext::type() {
+  return getRuleContext<TracerCommandsParser::TypeContext>(0);
+}
+
 TracerCommandsParser::HelpContext* TracerCommandsParser::CommandContext::help() {
   return getRuleContext<TracerCommandsParser::HelpContext>(0);
 }
@@ -417,68 +423,68 @@ TracerCommandsParser::CommandContext* TracerCommandsParser::command() {
     exitRule();
   });
   try {
-    setState(81);
+    setState(84);
     _errHandler->sync(this);
     switch (_input->LA(1)) {
       case TracerCommandsParser::T__1: {
         enterOuterAlt(_localctx, 1);
-        setState(62);
+        setState(64);
         server();
         break;
       }
 
       case TracerCommandsParser::T__8: {
         enterOuterAlt(_localctx, 2);
-        setState(63);
+        setState(65);
         attach();
         break;
       }
 
       case TracerCommandsParser::T__9: {
         enterOuterAlt(_localctx, 3);
-        setState(64);
+        setState(66);
         processes();
         break;
       }
 
       case TracerCommandsParser::T__11: {
         enterOuterAlt(_localctx, 4);
-        setState(65);
+        setState(67);
         sessions();
         break;
       }
 
       case TracerCommandsParser::T__12: {
         enterOuterAlt(_localctx, 5);
-        setState(66);
+        setState(68);
         use();
         break;
       }
 
       case TracerCommandsParser::T__4: {
         enterOuterAlt(_localctx, 6);
-        setState(67);
+        setState(69);
         status();
         break;
       }
 
       case TracerCommandsParser::T__13: {
         enterOuterAlt(_localctx, 7);
-        setState(68);
+        setState(70);
         detach();
         break;
       }
 
       case TracerCommandsParser::T__14: {
         enterOuterAlt(_localctx, 8);
-        setState(69);
+        setState(71);
         modules();
         break;
       }
 
       case TracerCommandsParser::T__15: {
         enterOuterAlt(_localctx, 9);
-        setState(70);
+        setState(72);
         symbols();
         break;
       }
@@ -486,71 +492,78 @@ TracerCommandsParser::CommandContext* TracerCommandsParser::command() {
       case TracerCommandsParser::T__19:
       case TracerCommandsParser::T__26: {
         enterOuterAlt(_localctx, 10);
-        setState(71);
+        setState(73);
         probe();
         break;
       }
 
       case TracerCommandsParser::T__37: {
         enterOuterAlt(_localctx, 11);
-        setState(72);
+        setState(74);
         interceptor();
         break;
       }
 
       case TracerCommandsParser::T__44: {
         enterOuterAlt(_localctx, 12);
-        setState(73);
+        setState(75);
         events();
         break;
       }
 
       case TracerCommandsParser::T__54: {
         enterOuterAlt(_localctx, 13);
-        setState(74);
+        setState(76);
         collect();
         break;
       }
 
       case TracerCommandsParser::T__55: {
         enterOuterAlt(_localctx, 14);
-        setState(75);
+        setState(77);
         record();
         break;
       }
 
       case TracerCommandsParser::T__66: {
         enterOuterAlt(_localctx, 15);
-        setState(76);
+        setState(78);
         cpp();
         break;
       }
 
       case TracerCommandsParser::T__75: {
         enterOuterAlt(_localctx, 16);
-        setState(77);
+        setState(79);
         shell();
         break;
       }
 
       case TracerCommandsParser::T__76: {
         enterOuterAlt(_localctx, 17);
-        setState(78);
+        setState(80);
         complete();
         break;
       }
 
       case TracerCommandsParser::T__77: {
         enterOuterAlt(_localctx, 18);
-        setState(79);
+        setState(81);
+        type();
+        break;
+      }
+
+      case TracerCommandsParser::T__78: {
+        enterOuterAlt(_localctx, 19);
+        setState(82);
         help();
         break;
       }
 
-      case TracerCommandsParser::T__78:
-      case TracerCommandsParser::T__79: {
-        enterOuterAlt(_localctx, 19);
-        setState(80);
+      case TracerCommandsParser::T__79:
+      case TracerCommandsParser::T__80: {
+        enterOuterAlt(_localctx, 20);
+        setState(83);
         quit();
         break;
       }
@@ -614,23 +627,23 @@ TracerCommandsParser::ServerContext* TracerCommandsParser::server() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(83);
+    setState(86);
     match(TracerCommandsParser::T__1);
-    setState(95);
+    setState(98);
     _errHandler->sync(this);
     switch (_input->LA(1)) {
       case TracerCommandsParser::T__2: {
-        setState(84);
+        setState(87);
         match(TracerCommandsParser::T__2);
-        setState(88);
+        setState(91);
         _errHandler->sync(this);
         _la = _input->LA(1);
         while (_la == TracerCommandsParser::T__6
 
         || _la == TracerCommandsParser::T__7) {
-          setState(85);
+          setState(88);
           serverOption();
-          setState(90);
+          setState(93);
           _errHandler->sync(this);
           _la = _input->LA(1);
         }
@@ -638,21 +651,21 @@ TracerCommandsParser::ServerContext* TracerCommandsParser::server() {
       }
 
       case TracerCommandsParser::T__3: {
-        setState(91);
+        setState(94);
         match(TracerCommandsParser::T__3);
-        setState(92);
+        setState(95);
         value();
         break;
       }
 
       case TracerCommandsParser::T__4: {
-        setState(93);
+        setState(96);
         match(TracerCommandsParser::T__4);
         break;
       }
 
       case TracerCommandsParser::T__5: {
-        setState(94);
+        setState(97);
         match(TracerCommandsParser::T__5);
         break;
       }
@@ -708,7 +721,7 @@ TracerCommandsParser::ServerOptionContext* TracerCommandsParser::serverOption() 
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(97);
+    setState(100);
     _la = _input->LA(1);
     if (!(_la == TracerCommandsParser::T__6
 
@@ -719,7 +732,7 @@ TracerCommandsParser::ServerOptionContext* TracerCommandsParser::serverOption() 
       _errHandler->reportMatch(this);
       consume();
     }
-    setState(98);
+    setState(101);
     value();
 
   }
@@ -769,14 +782,14 @@ TracerCommandsParser::AttachContext* TracerCommandsParser::attach() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(100);
+    setState(103);
     match(TracerCommandsParser::T__8);
-    setState(102);
+    setState(105);
     _errHandler->sync(this);
 
     _la = _input->LA(1);
     if (_la == TracerCommandsParser::UINT) {
-      setState(101);
+      setState(104);
       match(TracerCommandsParser::UINT);
     }
 
@@ -827,16 +840,16 @@ TracerCommandsParser::ProcessesContext* TracerCommandsParser::processes() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(104);
-    match(TracerCommandsParser::T__9);
     setState(107);
+    match(TracerCommandsParser::T__9);
+    setState(110);
     _errHandler->sync(this);
 
     _la = _input->LA(1);
     if (_la == TracerCommandsParser::T__10) {
-      setState(105);
+      setState(108);
       match(TracerCommandsParser::T__10);
-      setState(106);
+      setState(109);
       value();
     }
 
@@ -882,7 +895,7 @@ TracerCommandsParser::SessionsContext* TracerCommandsParser::sessions() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(109);
+    setState(112);
     match(TracerCommandsParser::T__11);
 
   }
@@ -931,9 +944,9 @@ TracerCommandsParser::UseContext* TracerCommandsParser::use() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(111);
+    setState(114);
     match(TracerCommandsParser::T__12);
-    setState(112);
+    setState(115);
     value();
 
   }
@@ -978,7 +991,7 @@ TracerCommandsParser::StatusContext* TracerCommandsParser::status() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(114);
+    setState(117);
     match(TracerCommandsParser::T__4);
 
   }
@@ -1028,16 +1041,16 @@ TracerCommandsParser::DetachContext* TracerCommandsParser::detach() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(116);
+    setState(119);
     match(TracerCommandsParser::T__13);
-    setState(118);
+    setState(121);
     _errHandler->sync(this);
 
     _la = _input->LA(1);
     if ((((_la & ~ 0x3fULL) == 0) &&
       ((1ULL << _la) & -4476737733419469188) != 0) || ((((_la - 67) & ~ 0x3fULL) == 0) &&
-      ((1ULL << (_la - 67)) & 327407) != 0)) {
-      setState(117);
+      ((1ULL << (_la - 67)) & 655087) != 0)) {
+      setState(120);
       value();
     }
 
@@ -1083,7 +1096,7 @@ TracerCommandsParser::ModulesContext* TracerCommandsParser::modules() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(120);
+    setState(123);
     match(TracerCommandsParser::T__14);
 
   }
@@ -1137,16 +1150,16 @@ TracerCommandsParser::SymbolsContext* TracerCommandsParser::symbols() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(122);
+    setState(125);
     match(TracerCommandsParser::T__15);
-    setState(126);
+    setState(129);
     _errHandler->sync(this);
     _la = _input->LA(1);
     while ((((_la & ~ 0x3fULL) == 0) &&
       ((1ULL << _la) & 919552) != 0)) {
-      setState(123);
+      setState(126);
       symbolOption();
-      setState(128);
+      setState(131);
       _errHandler->sync(this);
       _la = _input->LA(1);
     }
@@ -1201,14 +1214,14 @@ TracerCommandsParser::SymbolOptionContext* TracerCommandsParser::symbolOption() 
     exitRule();
   });
   try {
-    setState(133);
+    setState(136);
     _errHandler->sync(this);
     switch (_input->LA(1)) {
       case TracerCommandsParser::T__10:
       case TracerCommandsParser::T__16:
       case TracerCommandsParser::T__17: {
         enterOuterAlt(_localctx, 1);
-        setState(129);
+        setState(132);
         _la = _input->LA(1);
         if (!((((_la & ~ 0x3fULL) == 0) &&
           ((1ULL << _la) & 395264) != 0))) {
@@ -1218,16 +1231,16 @@ TracerCommandsParser::SymbolOptionContext* TracerCommandsParser::symbolOption() 
           _errHandler->reportMatch(this);
           consume();
         }
-        setState(130);
+        setState(133);
         value();
         break;
       }
 
       case TracerCommandsParser::T__18: {
         enterOuterAlt(_localctx, 2);
-        setState(131);
+        setState(134);
         match(TracerCommandsParser::T__18);
-        setState(132);
+        setState(135);
         match(TracerCommandsParser::UINT);
         break;
       }
@@ -1314,28 +1327,28 @@ TracerCommandsParser::ProbeContext* TracerCommandsParser::probe() {
     exitRule();
   });
   try {
-    setState(176);
+    setState(179);
     _errHandler->sync(this);
     switch (_input->LA(1)) {
       case TracerCommandsParser::T__19: {
         enterOuterAlt(_localctx, 1);
-        setState(135);
+        setState(138);
         match(TracerCommandsParser::T__19);
-        setState(173);
+        setState(176);
         _errHandler->sync(this);
         switch (_input->LA(1)) {
           case TracerCommandsParser::T__20: {
-            setState(136);
-            match(TracerCommandsParser::T__20);
-            setState(137);
-            value();
             setState(139);
+            match(TracerCommandsParser::T__20);
+            setState(140);
+            value();
+            setState(142);
             _errHandler->sync(this);
             _la = _input->LA(1);
             do {
-              setState(138);
-              prepareOption();
               setState(141);
+              prepareOption();
+              setState(144);
               _errHandler->sync(this);
               _la = _input->LA(1);
             } while ((((_la & ~ 0x3fULL) == 0) &&
@@ -1344,18 +1357,18 @@ TracerCommandsParser::ProbeContext* TracerCommandsParser::probe() {
           }
 
           case TracerCommandsParser::T__21: {
-            setState(143);
+            setState(146);
             match(TracerCommandsParser::T__21);
-            setState(144);
+            setState(147);
             value();
-            setState(148);
+            setState(151);
             _errHandler->sync(this);
             _la = _input->LA(1);
             while ((((_la & ~ 0x3fULL) == 0) &&
               ((1ULL << _la) & 30870208512) != 0)) {
-              setState(145);
+              setState(148);
               resolveOption();
-              setState(150);
+              setState(153);
               _errHandler->sync(this);
               _la = _input->LA(1);
             }
@@ -1363,22 +1376,22 @@ TracerCommandsParser::ProbeContext* TracerCommandsParser::probe() {
           }
 
           case TracerCommandsParser::T__22: {
-            setState(151);
-            match(TracerCommandsParser::T__22);
-            setState(152);
-            value();
-            setState(153);
-            match(TracerCommandsParser::T__23);
             setState(154);
+            match(TracerCommandsParser::T__22);
+            setState(155);
             value();
-            setState(158);
+            setState(156);
+            match(TracerCommandsParser::T__23);
+            setState(157);
+            value();
+            setState(161);
             _errHandler->sync(this);
             _la = _input->LA(1);
             while ((((_la & ~ 0x3fULL) == 0) &&
               ((1ULL << _la) & 271388377088) != 0)) {
-              setState(155);
+              setState(158);
               deployOption();
-              setState(160);
+              setState(163);
               _errHandler->sync(this);
               _la = _input->LA(1);
             }
@@ -1386,22 +1399,22 @@ TracerCommandsParser::ProbeContext* TracerCommandsParser::probe() {
           }
 
           case TracerCommandsParser::T__24: {
-            setState(161);
-            match(TracerCommandsParser::T__24);
-            setState(162);
-            value();
-            setState(163);
-            match(TracerCommandsParser::T__23);
             setState(164);
+            match(TracerCommandsParser::T__24);
+            setState(165);
             value();
-            setState(168);
+            setState(166);
+            match(TracerCommandsParser::T__23);
+            setState(167);
+            value();
+            setState(171);
             _errHandler->sync(this);
             _la = _input->LA(1);
             while ((((_la & ~ 0x3fULL) == 0) &&
               ((1ULL << _la) & 30870208512) != 0)) {
-              setState(165);
+              setState(168);
               resolveOption();
-              setState(170);
+              setState(173);
               _errHandler->sync(this);
               _la = _input->LA(1);
             }
@@ -1409,9 +1422,9 @@ TracerCommandsParser::ProbeContext* TracerCommandsParser::probe() {
           }
 
           case TracerCommandsParser::T__25: {
-            setState(171);
+            setState(174);
             match(TracerCommandsParser::T__25);
-            setState(172);
+            setState(175);
             match(TracerCommandsParser::UINT);
             break;
           }
@@ -1424,7 +1437,7 @@ TracerCommandsParser::ProbeContext* TracerCommandsParser::probe() {
 
       case TracerCommandsParser::T__26: {
         enterOuterAlt(_localctx, 2);
-        setState(175);
+        setState(178);
         match(TracerCommandsParser::T__26);
         break;
       }
@@ -1483,7 +1496,7 @@ TracerCommandsParser::PrepareOptionContext* TracerCommandsParser::prepareOption(
     exitRule();
   });
   try {
-    setState(181);
+    setState(184);
     _errHandler->sync(this);
     switch (_input->LA(1)) {
       case TracerCommandsParser::T__16:
@@ -1492,7 +1505,7 @@ TracerCommandsParser::PrepareOptionContext* TracerCommandsParser::prepareOption(
       case TracerCommandsParser::T__29:
       case TracerCommandsParser::T__30: {
         enterOuterAlt(_localctx, 1);
-        setState(178);
+        setState(181);
         _la = _input->LA(1);
         if (!((((_la & ~ 0x3fULL) == 0) &&
           ((1ULL << _la) & 4026662912) != 0))) {
@@ -1502,14 +1515,14 @@ TracerCommandsParser::PrepareOptionContext* TracerCommandsParser::prepareOption(
           _errHandler->reportMatch(this);
           consume();
         }
-        setState(179);
+        setState(182);
         value();
         break;
       }
 
       case TracerCommandsParser::METADATA_ONLY: {
         enterOuterAlt(_localctx, 2);
-        setState(180);
+        setState(183);
         match(TracerCommandsParser::METADATA_ONLY);
         break;
       }
@@ -1565,7 +1578,7 @@ TracerCommandsParser::ResolveOptionContext* TracerCommandsParser::resolveOption(
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(183);
+    setState(186);
     _la = _input->LA(1);
     if (!((((_la & ~ 0x3fULL) == 0) &&
       ((1ULL << _la) & 30870208512) != 0))) {
@@ -1575,7 +1588,7 @@ TracerCommandsParser::ResolveOptionContext* TracerCommandsParser::resolveOption(
       _errHandler->reportMatch(this);
       consume();
     }
-    setState(184);
+    setState(187);
     value();
 
   }
@@ -1627,7 +1640,7 @@ TracerCommandsParser::DeployOptionContext* TracerCommandsParser::deployOption() 
     exitRule();
   });
   try {
-    setState(191);
+    setState(194);
     _errHandler->sync(this);
     switch (_input->LA(1)) {
       case TracerCommandsParser::T__16:
@@ -1637,30 +1650,30 @@ TracerCommandsParser::DeployOptionContext* TracerCommandsParser::deployOption() 
       case TracerCommandsParser::T__32:
       case TracerCommandsParser::T__33: {
         enterOuterAlt(_localctx, 1);
-        setState(186);
+        setState(189);
         resolveOption();
         break;
       }
 
       case TracerCommandsParser::T__34: {
         enterOuterAlt(_localctx, 2);
-        setState(187);
+        setState(190);
         match(TracerCommandsParser::T__34);
-        setState(188);
+        setState(191);
         match(TracerCommandsParser::UINT);
         break;
       }
 
       case TracerCommandsParser::T__35: {
         enterOuterAlt(_localctx, 3);
-        setState(189);
+        setState(192);
         match(TracerCommandsParser::T__35);
         break;
       }
 
       case TracerCommandsParser::T__36: {
         enterOuterAlt(_localctx, 4);
-        setState(190);
+        setState(193);
         match(TracerCommandsParser::T__36);
         break;
       }
@@ -1728,56 +1741,56 @@ TracerCommandsParser::InterceptorContext* TracerCommandsParser::interceptor() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(193);
+    setState(196);
     match(TracerCommandsParser::T__37);
-    setState(213);
+    setState(216);
     _errHandler->sync(this);
     switch (_input->LA(1)) {
       case TracerCommandsParser::T__38: {
-        setState(194);
-        match(TracerCommandsParser::T__38);
-        setState(195);
-        value();
-        setState(196);
-        match(TracerCommandsParser::T__39);
         setState(197);
+        match(TracerCommandsParser::T__38);
+        setState(198);
         value();
-        break;
-      }
-
-      case TracerCommandsParser::T__40: {
         setState(199);
-        match(TracerCommandsParser::T__40);
+        match(TracerCommandsParser::T__39);
         setState(200);
         value();
         break;
       }
 
-      case TracerCommandsParser::T__41: {
-        setState(201);
-        match(TracerCommandsParser::T__41);
+      case TracerCommandsParser::T__40: {
         setState(202);
+        match(TracerCommandsParser::T__40);
+        setState(203);
+        value();
+        break;
+      }
+
+      case TracerCommandsParser::T__41: {
+        setState(204);
+        match(TracerCommandsParser::T__41);
+        setState(205);
         value();
         break;
       }
 
       case TracerCommandsParser::T__42: {
-        setState(203);
-        match(TracerCommandsParser::T__42);
-        setState(204);
-        value();
-        setState(205);
-        match(TracerCommandsParser::T__43);
         setState(206);
+        match(TracerCommandsParser::T__42);
+        setState(207);
         value();
-        setState(210);
+        setState(208);
+        match(TracerCommandsParser::T__43);
+        setState(209);
+        value();
+        setState(213);
         _errHandler->sync(this);
         _la = _input->LA(1);
         while ((((_la & ~ 0x3fULL) == 0) &&
           ((1ULL << _la) & 271388377088) != 0)) {
-          setState(207);
+          setState(210);
           deployOption();
-          setState(212);
+          setState(215);
           _errHandler->sync(this);
           _la = _input->LA(1);
         }
@@ -1851,9 +1864,9 @@ TracerCommandsParser::EventsContext* TracerCommandsParser::events() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(215);
+    setState(218);
     match(TracerCommandsParser::T__44);
-    setState(251);
+    setState(254);
     _errHandler->sync(this);
     switch (_input->LA(1)) {
       case TracerCommandsParser::EOF:
@@ -1866,14 +1879,14 @@ TracerCommandsParser::EventsContext* TracerCommandsParser::events() {
       case TracerCommandsParser::T__63:
       case TracerCommandsParser::T__64:
       case TracerCommandsParser::T__65: {
-        setState(219);
+        setState(222);
         _errHandler->sync(this);
         _la = _input->LA(1);
         while (((((_la - 40) & ~ 0x3fULL) == 0) &&
           ((1ULL << (_la - 40)) & 121503745) != 0)) {
-          setState(216);
+          setState(219);
           streamOption();
-          setState(221);
+          setState(224);
           _errHandler->sync(this);
           _la = _input->LA(1);
         }
@@ -1881,83 +1894,83 @@ TracerCommandsParser::EventsContext* TracerCommandsParser::events() {
       }
 
       case TracerCommandsParser::T__45: {
-        setState(222);
+        setState(225);
         match(TracerCommandsParser::T__45);
-        setState(223);
-        value();
         setState(226);
+        value();
+        setState(229);
         _errHandler->sync(this);
 
         _la = _input->LA(1);
         if (_la == TracerCommandsParser::T__18) {
-          setState(224);
+          setState(227);
           match(TracerCommandsParser::T__18);
-          setState(225);
+          setState(228);
           match(TracerCommandsParser::UINT);
         }
         break;
       }
 
       case TracerCommandsParser::T__41: {
-        setState(228);
-        match(TracerCommandsParser::T__41);
-        setState(229);
-        value();
-        setState(230);
-        match(TracerCommandsParser::T__46);
         setState(231);
+        match(TracerCommandsParser::T__41);
+        setState(232);
+        value();
+        setState(233);
+        match(TracerCommandsParser::T__46);
+        setState(234);
         match(TracerCommandsParser::UINT);
         break;
       }
 
       case TracerCommandsParser::T__47: {
-        setState(233);
+        setState(236);
         match(TracerCommandsParser::T__47);
-        setState(234);
+        setState(237);
         value();
         break;
       }
 
       case TracerCommandsParser::T__48: {
-        setState(235);
+        setState(238);
         match(TracerCommandsParser::T__48);
-        setState(236);
+        setState(239);
         value();
         break;
       }
 
       case TracerCommandsParser::T__49: {
-        setState(237);
+        setState(240);
         match(TracerCommandsParser::T__49);
-        setState(238);
+        setState(241);
         value();
         break;
       }
 
       case TracerCommandsParser::T__50: {
-        setState(239);
-        match(TracerCommandsParser::T__50);
-        setState(240);
-        value();
-        setState(241);
-        match(TracerCommandsParser::T__39);
         setState(242);
+        match(TracerCommandsParser::T__50);
+        setState(243);
+        value();
+        setState(244);
+        match(TracerCommandsParser::T__39);
+        setState(245);
         value();
         break;
       }
 
       case TracerCommandsParser::T__51: {
-        setState(244);
-        match(TracerCommandsParser::T__51);
-        setState(245);
-        value();
-        setState(246);
-        match(TracerCommandsParser::T__52);
         setState(247);
-        match(TracerCommandsParser::T__53);
+        match(TracerCommandsParser::T__51);
         setState(248);
-        match(TracerCommandsParser::T__30);
+        value();
         setState(249);
+        match(TracerCommandsParser::T__52);
+        setState(250);
+        match(TracerCommandsParser::T__53);
+        setState(251);
+        match(TracerCommandsParser::T__30);
+        setState(252);
         value();
         break;
       }
@@ -2017,16 +2030,16 @@ TracerCommandsParser::CollectContext* TracerCommandsParser::collect() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(253);
+    setState(256);
     match(TracerCommandsParser::T__54);
-    setState(257);
+    setState(260);
     _errHandler->sync(this);
     _la = _input->LA(1);
     while (((((_la - 40) & ~ 0x3fULL) == 0) &&
       ((1ULL << (_la - 40)) & 121503745) != 0)) {
-      setState(254);
+      setState(257);
       streamOption();
-      setState(259);
+      setState(262);
       _errHandler->sync(this);
       _la = _input->LA(1);
     }
@@ -2086,18 +2099,18 @@ TracerCommandsParser::RecordContext* TracerCommandsParser::record() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(260);
+    setState(263);
     match(TracerCommandsParser::T__55);
-    setState(261);
+    setState(264);
     value();
-    setState(265);
+    setState(268);
     _errHandler->sync(this);
     _la = _input->LA(1);
     while (((((_la - 40) & ~ 0x3fULL) == 0) &&
       ((1ULL << (_la - 40)) & 121503745) != 0)) {
-      setState(262);
+      setState(265);
       streamOption();
-      setState(267);
+      setState(270);
       _errHandler->sync(this);
       _la = _input->LA(1);
     }
@@ -2152,7 +2165,7 @@ TracerCommandsParser::StreamOptionContext* TracerCommandsParser::streamOption() 
     exitRule();
   });
   try {
-    setState(275);
+    setState(278);
     _errHandler->sync(this);
     switch (_input->LA(1)) {
       case TracerCommandsParser::T__56:
@@ -2160,7 +2173,7 @@ TracerCommandsParser::StreamOptionContext* TracerCommandsParser::streamOption() 
       case TracerCommandsParser::T__58:
       case TracerCommandsParser::T__59: {
         enterOuterAlt(_localctx, 1);
-        setState(268);
+        setState(271);
         _la = _input->LA(1);
         if (!((((_la & ~ 0x3fULL) == 0) &&
           ((1ULL << _la) & 2161727821137838080) != 0))) {
@@ -2170,16 +2183,16 @@ TracerCommandsParser::StreamOptionContext* TracerCommandsParser::streamOption() 
           _errHandler->reportMatch(this);
           consume();
         }
-        setState(269);
+        setState(272);
         match(TracerCommandsParser::UINT);
         break;
       }
 
       case TracerCommandsParser::T__60: {
         enterOuterAlt(_localctx, 2);
-        setState(270);
+        setState(273);
         match(TracerCommandsParser::T__60);
-        setState(271);
+        setState(274);
         _la = _input->LA(1);
         if (!(_la == TracerCommandsParser::T__61
 
@@ -2197,7 +2210,7 @@ TracerCommandsParser::StreamOptionContext* TracerCommandsParser::streamOption() 
       case TracerCommandsParser::T__63:
       case TracerCommandsParser::T__64: {
         enterOuterAlt(_localctx, 3);
-        setState(272);
+        setState(275);
         _la = _input->LA(1);
         if (!(((((_la - 40) & ~ 0x3fULL) == 0) &&
           ((1ULL << (_la - 40)) & 50331649) != 0))) {
@@ -2207,14 +2220,14 @@ TracerCommandsParser::StreamOptionContext* TracerCommandsParser::streamOption() 
           _errHandler->reportMatch(this);
           consume();
         }
-        setState(273);
+        setState(276);
         value();
         break;
       }
 
       case TracerCommandsParser::T__65: {
         enterOuterAlt(_localctx, 4);
-        setState(274);
+        setState(277);
         match(TracerCommandsParser::T__65);
         break;
       }
@@ -2282,28 +2295,28 @@ TracerCommandsParser::CppContext* TracerCommandsParser::cpp() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(277);
+    setState(280);
     match(TracerCommandsParser::T__66);
-    setState(306);
+    setState(309);
     _errHandler->sync(this);
     switch (_input->LA(1)) {
       case TracerCommandsParser::T__38: {
-        setState(278);
+        setState(281);
         match(TracerCommandsParser::T__38);
-        setState(279);
+        setState(282);
         value();
         break;
       }
 
       case TracerCommandsParser::T__67: {
-        setState(280);
+        setState(283);
         match(TracerCommandsParser::T__67);
         break;
       }
 
       case TracerCommandsParser::T__68:
       case TracerCommandsParser::T__69: {
-        setState(281);
+        setState(284);
         _la = _input->LA(1);
         if (!(_la == TracerCommandsParser::T__68
 
@@ -2314,15 +2327,15 @@ TracerCommandsParser::CppContext* TracerCommandsParser::cpp() {
           _errHandler->reportMatch(this);
           consume();
         }
-        setState(282);
+        setState(285);
         value();
-        setState(287);
+        setState(290);
         _errHandler->sync(this);
         _la = _input->LA(1);
         while (_la == TracerCommandsParser::T__30
 
         || _la == TracerCommandsParser::T__70) {
-          setState(283);
+          setState(286);
           _la = _input->LA(1);
           if (!(_la == TracerCommandsParser::T__30
 
@@ -2333,9 +2346,9 @@ TracerCommandsParser::CppContext* TracerCommandsParser::cpp() {
             _errHandler->reportMatch(this);
             consume();
           }
-          setState(284);
+          setState(287);
           value();
-          setState(289);
+          setState(292);
           _errHandler->sync(this);
           _la = _input->LA(1);
         }
@@ -2343,19 +2356,19 @@ TracerCommandsParser::CppContext* TracerCommandsParser::cpp() {
       }
 
       case TracerCommandsParser::T__71: {
-        setState(290);
+        setState(293);
         match(TracerCommandsParser::T__71);
-        setState(304);
+        setState(307);
         _errHandler->sync(this);
         switch (_input->LA(1)) {
           case TracerCommandsParser::T__72: {
-            setState(291);
-            match(TracerCommandsParser::T__72);
             setState(294);
+            match(TracerCommandsParser::T__72);
+            setState(297);
             _errHandler->sync(this);
             _la = _input->LA(1);
             do {
-              setState(294);
+              setState(297);
               _errHandler->sync(this);
               switch (_input->LA(1)) {
                 case TracerCommandsParser::T__1:
@@ -2406,16 +2419,17 @@ TracerCommandsParser::CppContext* TracerCommandsParser::cpp() {
                 case TracerCommandsParser::T__77:
                 case TracerCommandsParser::T__78:
                 case TracerCommandsParser::T__79:
+                case TracerCommandsParser::T__80:
                 case TracerCommandsParser::UINT:
                 case TracerCommandsParser::STRING:
                 case TracerCommandsParser::WORD: {
-                  setState(292);
+                  setState(295);
                   value();
                   break;
                 }
 
                 case TracerCommandsParser::SHELL: {
-                  setState(293);
+                  setState(296);
                   match(TracerCommandsParser::SHELL);
                   break;
                 }
@@ -2423,29 +2437,29 @@ TracerCommandsParser::CppContext* TracerCommandsParser::cpp() {
               default:
                 throw NoViableAltException(this);
               }
-              setState(296);
+              setState(299);
               _errHandler->sync(this);
               _la = _input->LA(1);
             } while ((((_la & ~ 0x3fULL) == 0) &&
               ((1ULL << _la) & -4476737733419469188) != 0) || ((((_la - 67) & ~ 0x3fULL) == 0) &&
-              ((1ULL << (_la - 67)) & 392943) != 0));
+              ((1ULL << (_la - 67)) & 786159) != 0));
             break;
           }
 
           case TracerCommandsParser::T__49: {
-            setState(298);
+            setState(301);
             match(TracerCommandsParser::T__49);
             break;
           }
 
           case TracerCommandsParser::T__73: {
-            setState(299);
-            match(TracerCommandsParser::T__73);
-            setState(300);
-            value();
-            setState(301);
-            match(TracerCommandsParser::T__74);
             setState(302);
+            match(TracerCommandsParser::T__73);
+            setState(303);
+            value();
+            setState(304);
+            match(TracerCommandsParser::T__74);
+            setState(305);
             value();
             break;
           }
@@ -2510,9 +2524,9 @@ TracerCommandsParser::ShellContext* TracerCommandsParser::shell() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(308);
+    setState(311);
     match(TracerCommandsParser::T__75);
-    setState(309);
+    setState(312);
     value();
 
   }
@@ -2561,9 +2575,60 @@ TracerCommandsParser::CompleteContext* TracerCommandsParser::complete() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(311);
+    setState(314);
     match(TracerCommandsParser::T__76);
-    setState(312);
+    setState(315);
+    value();
+
+  }
+  catch (RecognitionException &e) {
+    _errHandler->reportError(this, e);
+    _localctx->exception = std::current_exception();
+    _errHandler->recover(this, _localctx->exception);
+  }
+
+  return _localctx;
+}
+
+//----------------- TypeContext ------------------------------------------------------------------
+
+TracerCommandsParser::TypeContext::TypeContext(ParserRuleContext *parent, size_t invokingState)
+  : ParserRuleContext(parent, invokingState) {
+}
+
+TracerCommandsParser::ValueContext* TracerCommandsParser::TypeContext::value() {
+  return getRuleContext<TracerCommandsParser::ValueContext>(0);
+}
+
+
+size_t TracerCommandsParser::TypeContext::getRuleIndex() const {
+  return TracerCommandsParser::RuleType;
+}
+
+
+std::any TracerCommandsParser::TypeContext::accept(tree::ParseTreeVisitor *visitor) {
+  if (auto parserVisitor = dynamic_cast<TracerCommandsVisitor*>(visitor))
+    return parserVisitor->visitType(this);
+  else
+    return visitor->visitChildren(this);
+}
+
+TracerCommandsParser::TypeContext* TracerCommandsParser::type() {
+  TypeContext *_localctx = _tracker.createInstance<TypeContext>(_ctx, getState());
+  enterRule(_localctx, 50, TracerCommandsParser::RuleType);
+
+#if __cplusplus > 201703L
+  auto onExit = finally([=, this] {
+#else
+  auto onExit = finally([=] {
+#endif
+    exitRule();
+  });
+  try {
+    enterOuterAlt(_localctx, 1);
+    setState(317);
+    match(TracerCommandsParser::T__77);
+    setState(318);
     value();
 
   }
@@ -2605,7 +2670,7 @@ std::any TracerCommandsParser::HelpContext::accept(tree::ParseTreeVisitor *visit
 
 TracerCommandsParser::HelpContext* TracerCommandsParser::help() {
   HelpContext *_localctx = _tracker.createInstance<HelpContext>(_ctx, getState());
-  enterRule(_localctx, 50, TracerCommandsParser::RuleHelp);
+  enterRule(_localctx, 52, TracerCommandsParser::RuleHelp);
   size_t _la = 0;
 
 #if __cplusplus > 201703L
@@ -2617,35 +2682,35 @@ TracerCommandsParser::HelpContext* TracerCommandsParser::help() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(314);
-    match(TracerCommandsParser::T__77);
-    setState(323);
+    setState(320);
+    match(TracerCommandsParser::T__78);
+    setState(329);
     _errHandler->sync(this);
 
     _la = _input->LA(1);
     if ((((_la & ~ 0x3fULL) == 0) &&
       ((1ULL << _la) & -4476737733419469186) != 0) || ((((_la - 67) & ~ 0x3fULL) == 0) &&
-      ((1ULL << (_la - 67)) & 327407) != 0)) {
-      setState(316);
+      ((1ULL << (_la - 67)) & 655087) != 0)) {
+      setState(322);
       _errHandler->sync(this);
 
       _la = _input->LA(1);
       if (_la == TracerCommandsParser::T__0) {
-        setState(315);
+        setState(321);
         match(TracerCommandsParser::T__0);
       }
-      setState(319);
+      setState(325);
       _errHandler->sync(this);
       _la = _input->LA(1);
       do {
-        setState(318);
+        setState(324);
         value();
-        setState(321);
+        setState(327);
         _errHandler->sync(this);
         _la = _input->LA(1);
       } while ((((_la & ~ 0x3fULL) == 0) &&
         ((1ULL << _la) & -4476737733419469188) != 0) || ((((_la - 67) & ~ 0x3fULL) == 0) &&
-        ((1ULL << (_la - 67)) & 327407) != 0));
+        ((1ULL << (_la - 67)) & 655087) != 0));
     }
 
   }
@@ -2679,7 +2744,7 @@ std::any TracerCommandsParser::QuitContext::accept(tree::ParseTreeVisitor *visit
 
 TracerCommandsParser::QuitContext* TracerCommandsParser::quit() {
   QuitContext *_localctx = _tracker.createInstance<QuitContext>(_ctx, getState());
-  enterRule(_localctx, 52, TracerCommandsParser::RuleQuit);
+  enterRule(_localctx, 54, TracerCommandsParser::RuleQuit);
   size_t _la = 0;
 
 #if __cplusplus > 201703L
@@ -2691,11 +2756,11 @@ TracerCommandsParser::QuitContext* TracerCommandsParser::quit() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(325);
+    setState(331);
     _la = _input->LA(1);
-    if (!(_la == TracerCommandsParser::T__78
+    if (!(_la == TracerCommandsParser::T__79
 
-    || _la == TracerCommandsParser::T__79)) {
+    || _la == TracerCommandsParser::T__80)) {
     _errHandler->recoverInline(this);
     }
     else {
@@ -2750,7 +2815,7 @@ std::any TracerCommandsParser::ValueContext::accept(tree::ParseTreeVisitor *visi
 
 TracerCommandsParser::ValueContext* TracerCommandsParser::value() {
   ValueContext *_localctx = _tracker.createInstance<ValueContext>(_ctx, getState());
-  enterRule(_localctx, 54, TracerCommandsParser::RuleValue);
+  enterRule(_localctx, 56, TracerCommandsParser::RuleValue);
 
 #if __cplusplus > 201703L
   auto onExit = finally([=, this] {
@@ -2760,26 +2825,26 @@ TracerCommandsParser::ValueContext* TracerCommandsParser::value() {
     exitRule();
   });
   try {
-    setState(331);
+    setState(337);
     _errHandler->sync(this);
     switch (_input->LA(1)) {
       case TracerCommandsParser::STRING: {
         enterOuterAlt(_localctx, 1);
-        setState(327);
+        setState(333);
         match(TracerCommandsParser::STRING);
         break;
       }
 
       case TracerCommandsParser::WORD: {
         enterOuterAlt(_localctx, 2);
-        setState(328);
+        setState(334);
         match(TracerCommandsParser::WORD);
         break;
       }
 
       case TracerCommandsParser::UINT: {
         enterOuterAlt(_localctx, 3);
-        setState(329);
+        setState(335);
         match(TracerCommandsParser::UINT);
         break;
       }
@@ -2831,9 +2896,10 @@ TracerCommandsParser::ValueContext* TracerCommandsParser::value() {
       case TracerCommandsParser::T__76:
       case TracerCommandsParser::T__77:
       case TracerCommandsParser::T__78:
-      case TracerCommandsParser::T__79: {
+      case TracerCommandsParser::T__79:
+      case TracerCommandsParser::T__80: {
         enterOuterAlt(_localctx, 4);
-        setState(330);
+        setState(336);
         keyword();
         break;
       }
@@ -2873,7 +2939,7 @@ std::any TracerCommandsParser::KeywordContext::accept(tree::ParseTreeVisitor *vi
 
 TracerCommandsParser::KeywordContext* TracerCommandsParser::keyword() {
   KeywordContext *_localctx = _tracker.createInstance<KeywordContext>(_ctx, getState());
-  enterRule(_localctx, 56, TracerCommandsParser::RuleKeyword);
+  enterRule(_localctx, 58, TracerCommandsParser::RuleKeyword);
   size_t _la = 0;
 
 #if __cplusplus > 201703L
@@ -2885,11 +2951,11 @@ TracerCommandsParser::KeywordContext* TracerCommandsParser::keyword() {
   });
   try {
     enterOuterAlt(_localctx, 1);
-    setState(333);
+    setState(339);
     _la = _input->LA(1);
     if (!((((_la & ~ 0x3fULL) == 0) &&
       ((1ULL << _la) & -4476737733419469188) != 0) || ((((_la - 67) & ~ 0x3fULL) == 0) &&
-      ((1ULL << (_la - 67)) & 16111) != 0))) {
+      ((1ULL << (_la - 67)) & 32495) != 0))) {
     _errHandler->recoverInline(this);
     }
     else {

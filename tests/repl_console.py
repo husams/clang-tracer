@@ -111,6 +111,45 @@ tracer.print(empty)
                 assert expected in discovery.stdout, (expected, discovery.stdout, discovery.stderr)
             assert "\x1b[" not in discovery.stdout
             assert "Collection {" not in discovery.stdout
+            types = subprocess.run([console, "--fail-fast"], input='''std::string text = "hello";
+auto title = text;
+std::basic_string<char> basic;
+std::map<std::string, int> counts;
+std::map<int, int, std::greater<int>> descending;
+std::vector<std::basic_string<char>> nested;
+decltype(text) same_type;
+const decltype(text) immutable = text;
+namespace sample { int choose(int value); }
+namespace sample { double choose(double value); }
+using sample::choose;
+%type text
+%type title
+%type basic
+%type counts
+%type descending
+%type nested
+%type same_type
+%type immutable
+%type std::string
+%type std::map
+%type sample::choose
+%type choose
+%type tracer.events_async
+%type session.pid
+%quit
+''', text=True, capture_output=True, timeout=20)
+            assert types.returncode == 0, (types.stdout, types.stderr)
+            for expected in ("std::string text;", "std::string title;", "std::string basic;",
+                             "std::map<std::string, int> counts;",
+                             "std::map<int, int, std::greater<int>> descending;",
+                             "std::vector<std::string> nested;", "std::string same_type;",
+                             "const std::string immutable;",
+                             "\nstd::string;\n", "\nstd::map;\n",
+                             "events_async(", "pid;"):
+                assert expected in types.stdout, (expected, types.stdout)
+            assert types.stdout.count("choose(int value)") == 2, types.stdout
+            assert types.stdout.count("choose(double value)") == 2, types.stdout
+            assert "\x1b[" not in types.stdout and "__cxx11" not in types.stdout, types.stdout
             adaptors = ("filter", "take", "drop", "take_while", "drop_while", "transform",
                         "stride", "enumerate", "reverse", "first", "to_vector")
             topics = subprocess.run(
@@ -126,7 +165,9 @@ tracer.print(empty)
             assert "| drop(5) | take(10)" in drop_page, drop_page
             assert "std::invalid_argument" in drop_page and "empty view" in drop_page, drop_page
             for command, message in [("%help missing", "Use %help for commands"),
-                                     ("%help api Missing", "Use %help api to list topics")]:
+                                     ("%help api Missing", "Use %help api to list topics"),
+                                     ("%type missing", "unknown C++ symbol"),
+                                     ("%type tracer.events_async()", "expects a C++ symbol")]:
                 unknown = subprocess.run([console, "--fail-fast"], input=command + "\n",
                                          text=True, capture_output=True, timeout=10)
                 assert unknown.returncode == 1 and message in unknown.stderr, unknown.stderr

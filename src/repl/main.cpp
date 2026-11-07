@@ -19,11 +19,19 @@
 #include "interpreter.hpp"
 #include "compiler_profile.hpp"
 #include "shell.hpp"
+#include "syntax.hpp"
 
 namespace tr = tracer_repl;
 
 namespace {
 void interrupt(int) { tr::interrupted.store(true, std::memory_order_relaxed); }
+
+bool color_output() {
+  const auto* term = std::getenv("TERM");
+  const auto* no_color = std::getenv("NO_COLOR");
+  return ::isatty(STDOUT_FILENO) && term && *term &&
+         std::string_view(term) != "dumb" && !(no_color && *no_color);
+}
 
 struct Signals {
   struct sigaction old{};
@@ -44,7 +52,8 @@ class Input {
   tr::CppEngine *cpp_ = nullptr;
 
 public:
-  Input() {
+  explicit Input(bool color) {
+    editor_.set_no_color(!color);
     editor_.set_max_history_size(1000);
     editor_.set_double_tab_completion(false);
     editor_.bind_key(replxx::Replxx::KEY::ENTER, [this](char32_t key) {
@@ -90,11 +99,23 @@ public:
           }
           return completions;
         });
-    editor_.set_highlighter_callback(
-        [](const std::string &input, auto &colors) {
-          if (!input.empty() && input.front() == '%') {
-            std::fill(colors.begin(), colors.end(),
-                      replxx::Replxx::Color::BRIGHTCYAN);
+    if (color) editor_.set_highlighter_callback(
+        [](const std::string& input, auto& colors) {
+          using Color = replxx::Replxx::Color;
+          constexpr Color palette[] = {
+              Color::BRIGHTCYAN, Color::GREEN, Color::MAGENTA, Color::BROWN, Color::GRAY};
+          const auto first = input.find_first_not_of(" \t\r\n");
+          if (first == std::string::npos) return;
+          const auto syntax = input[first] == '%' ? tr::Syntax::command : tr::Syntax::cpp;
+          std::size_t byte = 0, character = 0;
+          for (const auto& span : tr::highlight(input, syntax)) {
+            for (; byte < span.end; ++byte) {
+              if ((static_cast<unsigned char>(input[byte]) & 0xc0) == 0x80) continue;
+              if (character == colors.size()) return;
+              if (byte >= span.begin)
+                colors[character] = palette[static_cast<std::size_t>(span.style)];
+              ++character;
+            }
           }
         });
   }
@@ -214,7 +235,8 @@ int main(int argc, char **argv) {
         throw std::runtime_error("cannot open REPL startup file: " + startup_path);
     }
     Signals signals;
-    Input input;
+    const bool color = color_output();
+    Input input(color);
     tr::Controller controller(settings, std::cout);
     tr::Facade facade(controller);
     tr::CppEngine cpp(facade, std::move(cpp_args));
@@ -231,10 +253,6 @@ int main(int argc, char **argv) {
       std::cout << "Clang Tracer native C++17 REPL. %help lists commands; "
                    "%help api lists C++ APIs. Tab completes help topics and members.\n";
     }
-    const auto* term = std::getenv("TERM");
-    const auto* no_color = std::getenv("NO_COLOR");
-    const bool color_help = ::isatty(STDOUT_FILENO) && term && *term &&
-                            std::string_view(term) != "dumb" && !(no_color && *no_color);
     bool failed = false;
     while (true) {
       // tracer.inject() can execute inside a JIT cell. Import after the cell
@@ -279,7 +297,10 @@ int main(int argc, char **argv) {
         }
         const auto command = tr::parse_command(*line);
         if (command.kind == tr::CommandKind::help) {
-          tr::print_help(std::cout, command.arguments, cpp, color_help);
+          tr::print_help(std::cout, command.arguments, cpp, color);
+        } else if (command.kind == tr::CommandKind::type) {
+          tr::print_code(std::cout, cpp.describe_symbol(command.arguments.at(0)),
+                         tr::Syntax::cpp, color);
         } else if (command.kind == tr::CommandKind::cpp_options) {
           if (!command.arguments.empty()) cpp.require_compiler_options_mutable();
           if (command.arguments.empty()) {

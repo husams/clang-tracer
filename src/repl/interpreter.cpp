@@ -387,6 +387,14 @@ std::string CppEngine::describe_api(const std::string &topic) {
   return describe_cpp_api(*impl_->interpreter->getCompilerInstance(), topic);
 }
 
+std::string CppEngine::describe_symbol(const std::string &symbol) {
+  initialize();
+  impl_->verify_inputs();
+  if (!impl_->synchronized)
+    throw std::runtime_error("%type requires %cpp reset to restore C++ analysis");
+  return describe_cpp_symbol(*impl_->interpreter->getCompilerInstance(), symbol);
+}
+
 bool CppEngine::evaluate(const std::string &source) {
   initialize();
   impl_->verify_inputs();
