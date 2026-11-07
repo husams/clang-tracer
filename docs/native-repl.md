@@ -254,7 +254,10 @@ no installation or writes.
 
 `load` reads the file on the console machine. `upload` sends its source by value
 through ResolveProbe/AddProbe and reports success only for an active probe.
-The draft remains available after deployment errors. The short equivalent is:
+The draft remains available after deployment errors. Use
+`--stack-depth full --stack-application-only false` to capture through the
+thread root and include runtime and JIT frames. A numeric depth caps the
+unwind at that many frames before filtering. The short equivalent is:
 
 ```text
 %probe inject "Calculator::multiply(int, int) const" --callback method.cpp

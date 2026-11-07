@@ -316,7 +316,7 @@ extern "C" void tracer_event_dispatch(unsigned long long,
                                       long long) noexcept;
 extern "C" void tracer_context_check_entry();
 extern "C" void *tracer_shared_enter(unsigned long long,
-                                     const tracer::TraceContext *);
+                                     const tracer::TraceContext *, unsigned);
 extern "C" void tracer_shared_leave(void *) noexcept;
 extern "C" void tracer_shared_release(void *) noexcept;
 extern "C" void tracer_shared_dispatch(void *, const tracer::TraceContext *);
@@ -345,7 +345,8 @@ Probe *find_probe(std::uint64_t id) noexcept {
 struct SharedInvocationToken {
   Probe *probe = nullptr;
   tracer::TraceContext raw{};
-  tracer::StackTrace entry_stack{};
+  tracer::TraceContext entry_context{};
+  std::vector<tracer::StackFrame> filtered_frames;
   tracer::Call call{raw};
   std::optional<tracer::ContextStdlibImage::Frame> support;
   std::optional<tracer::context_runtime::SharedSourceRuntime::Invocation>
@@ -379,41 +380,32 @@ void copy_shared_value(T &destination, const T &source) noexcept {
 // from the immutable invocation-entry snapshot prepared before scope access.
 void shared_capture_stack(const tracer::TraceContext *context, unsigned depth,
                           bool application_only) noexcept {
-  for (const auto &token : shared_invocations) {
+  for (auto &token : shared_invocations) {
     if (&token.raw != context ||
         !token.occupied.load(std::memory_order_acquire))
       continue;
-    copy_shared_value(context->stack, token.entry_stack);
+    const auto &entry = token.entry_context.stack;
     auto &stack = context->stack;
-    const auto count = std::min<unsigned>(depth, token.entry_stack.count);
+    copy_shared_value(stack, entry);
+    const auto count = std::min(depth, entry.count);
     stack.requested_depth = depth;
     stack.application_only = application_only;
     stack.captured_depth = count;
-    stack.hidden_frames = 0;
-    stack.count = 0;
-    if (count < token.entry_stack.count) {
+    if (count < entry.count) {
       stack.status = tracer::StackStatus::Truncated;
       constexpr char detail[] = "entry stack exceeds requested depth";
       for (std::size_t i = 0; i < sizeof(detail); ++i)
         stack.detail[i] = detail[i];
     }
-    for (unsigned i = 0; i < count; ++i) {
-      if (application_only && !token.entry_stack.frames[i].application_frame) {
-        ++stack.hidden_frames;
-        continue;
+    stack.count = count;
+    if (application_only) {
+      stack.count = 0;
+      for (unsigned i = 0; i < count; ++i) {
+        if (entry.frames[i].application_frame)
+          copy_shared_value(token.filtered_frames[stack.count++], entry.frames[i]);
       }
-      auto *frame = reinterpret_cast<volatile unsigned char *>(
-          &stack.frames[stack.count++]);
-      const auto *source = reinterpret_cast<const volatile unsigned char *>(
-          &token.entry_stack.frames[i]);
-      for (std::size_t j = 0; j < sizeof(tracer::StackFrame); ++j)
-        frame[j] = source[j];
-    }
-    for (unsigned i = stack.count; i < tracer::kMaxStackDepth; ++i) {
-      auto *frame =
-          reinterpret_cast<volatile unsigned char *>(&stack.frames[i]);
-      for (std::size_t j = 0; j < sizeof(tracer::StackFrame); ++j)
-        frame[j] = 0;
+      stack.hidden_frames = count - stack.count;
+      stack.frames = token.filtered_frames.data();
     }
     return;
   }
@@ -462,7 +454,8 @@ extern "C" void tracer_context_check_entry() {
 }
 
 extern "C" void *tracer_shared_enter(unsigned long long id,
-                                     const tracer::TraceContext *raw) {
+                                     const tracer::TraceContext *raw,
+                                     unsigned stack_depth) {
   auto *probe = find_probe(id);
   if (!probe || !raw || callback_depth || !probe->shared_runtime ||
       !probe->callbacks_active() ||
@@ -513,13 +506,23 @@ extern "C" void *tracer_shared_enter(unsigned long long id,
   ::pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &token->cancel_state);
   token->cancel_disabled = true;
   ++callback_depth;
-  if (probe->shared_generation->requires_stack()) {
-    tracer::capture_native_stack(token->raw, tracer::kMaxStackDepth, false);
-    copy_shared_value(token->entry_stack, token->raw.stack);
-    copy_shared_value(token->raw.stack, raw->stack);
-  }
   token->raw.stack_capture = &shared_capture_stack;
   try {
+    if (probe->shared_generation->requires_stack()) {
+      // The callback can choose its depth while a shared scope is active.
+      // Capture once before entering that scope and reuse it for automatic
+      // entry capture and for any callback-requested views.
+      copy_shared_value(token->entry_context, *raw);
+      token->entry_context.stack_storage = nullptr;
+      tracer::capture_native_stack(token->entry_context,
+                                   tracer::kUnlimitedStackDepth, false);
+      token->filtered_frames.resize(token->entry_context.stack.count);
+      if (stack_depth)
+        shared_capture_stack(&token->raw, stack_depth, raw->stack_application_only);
+    } else if (stack_depth) {
+      tracer::capture_native_stack(*raw, stack_depth, raw->stack_application_only);
+      copy_shared_value(token->raw.stack, raw->stack);
+    }
     const auto &code = probe->shared_generation->callback_code();
     // Reserve the teardown lane before constructing any generated frame. It
     // stays pinned through the original call and final owner destruction.
@@ -647,8 +650,14 @@ extern "C" void tracer_shared_leave(void *opaque) noexcept {
 
 extern "C" void tracer_shared_release(void *opaque) noexcept {
   auto *token = static_cast<SharedInvocationToken *>(opaque);
-  if (token && token->finished)
+  if (token && token->finished) {
+    const int saved_errno = errno;
+    tracer::release_native_stack(token->entry_context);
+    token->entry_context.stack = {};
+    std::vector<tracer::StackFrame>().swap(token->filtered_frames);
     token->occupied.store(false, std::memory_order_release);
+    errno = saved_errno;
+  }
 }
 
 std::uint64_t address_value(auto address) {
@@ -709,10 +718,6 @@ bool read_probe_spec(const tracer::Request &request,
   }
   if (spec.callback_source().size() > kMaxCallbackSource) {
     error = "callback source exceeds 64 KiB";
-    return false;
-  }
-  if (spec.stack_depth() > tracer::kMaxStackDepth) {
-    error = "stack depth must be between 0 and 64";
     return false;
   }
   if (spec.has_receiver()) {
@@ -2391,7 +2396,7 @@ std::string make_wrapper(const tracer::Request &r,
   if (shared_mode)
     code += "#include <bits/cxxabi_forced.h>\n"
             "extern \"C\" void* tracer_shared_enter(unsigned long long,const "
-            "tracer::TraceContext*);\n"
+            "tracer::TraceContext*,unsigned);\n"
             "extern \"C\" void tracer_shared_leave(void*) noexcept;\n"
             "extern \"C\" void tracer_shared_release(void*) noexcept;\n"
             "extern \"C\" void tracer_shared_resume(void*);\n"
@@ -2477,7 +2482,7 @@ std::string make_wrapper(const tracer::Request &r,
     fill_value(code, i, r.arguments[i], indirect_argument(i));
   }
   if (snapshots) code += snapshots->arguments;
-  if (spec && spec->stack_depth())
+  if (!shared_mode && spec && spec->stack_depth())
     code += "tracer_capture_entry_stack(&ctx," +
             std::to_string(spec->stack_depth()) + ");\n";
   if (shared_mode) {
@@ -2485,8 +2490,9 @@ std::string make_wrapper(const tracer::Request &r,
             "{ if(token){tracer_shared_leave(token); tracer_shared_release(token);} } } "
             "shared_guard;\n"
             "shared_guard.token=tracer_shared_enter(" +
-            std::to_string(r.probe_id) +
-            "ULL,&ctx);\ntry { tracer_shared_resume(shared_guard.token);\n";
+            std::to_string(r.probe_id) + "ULL,&ctx," +
+            std::to_string(spec ? spec->stack_depth() : 0) +
+            "U);\ntry { tracer_shared_resume(shared_guard.token);\n";
   } else if (class_mode)
     code += "tracer_invocation_instance tracer_invocation(ctx);\n";
   const std::string instance = class_mode ? "&tracer_invocation" : "nullptr";
@@ -4879,6 +4885,7 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
   long long value = 0;
   bool succeeded = false;
   tracer::TraceContext invocation = *ctx;
+  invocation.stack_storage = nullptr;
   invocation.named_count = 0;
   for (unsigned i = 0;
        i < invocation.argument_count && i < tracer::kMaxArguments; ++i)
@@ -4898,6 +4905,7 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
   if (succeeded) {
     tracer_event_dispatch(id, &invocation, value);
   }
+  tracer::release_native_stack(invocation);
   errno = saved_errno;
   return value;
 }
@@ -4921,7 +4929,10 @@ extern "C" void tracer_callback_failure(unsigned long long id) noexcept {
 extern "C" void tracer_capture_stack(const tracer::TraceContext *ctx,
                                      unsigned depth,
                                      bool application_only) noexcept {
-  if (!ctx)
+  if (!ctx || (ctx->stack.requested_depth == depth &&
+               ctx->stack.application_only == application_only &&
+               (ctx->stack.status == tracer::StackStatus::Complete ||
+                ctx->stack.status == tracer::StackStatus::Truncated)))
     return;
   const int saved_errno = errno;
   ++callback_depth;
@@ -5014,8 +5025,6 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
       }
     }
     event.set_callback_value(cb);
-    if (ctx->stack.status != tracer::StackStatus::Disabled)
-      tracer::serialize_native_stack(ctx->stack, *event.mutable_stack());
     if (ctx->phase == tracer::TracePhase::Post) {
       *event.mutable_result() = to_proto_value(ctx->result);
     }
@@ -5028,19 +5037,22 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
       snapshot->set_status(clangtracer::context::v1::ValueSnapshot::LIMIT_EXCEEDED);
       snapshot->set_detail("snapshot exceeds native event packet budget");
     };
-    for (int i = 0; i < event.arguments_size() && event.ByteSizeLong() > tracer::EventTransport::kMaxEventBytes; ++i) {
+    for (int i = 0; i < event.arguments_size() && event.ByteSizeLong() > tracer::EventTransport::kInlineEventBytes; ++i) {
       auto &value = *event.mutable_arguments(i);
       if (!value.has_snapshot()) continue;
       discard_snapshot(value.mutable_snapshot());
       for (auto &named : *event.mutable_named_arguments())
         if (named.argument_index() == static_cast<unsigned>(i)) *named.mutable_value() = value;
     }
-    if (event.ByteSizeLong() > tracer::EventTransport::kMaxEventBytes && event.has_result() && event.result().has_snapshot())
+    if (event.ByteSizeLong() > tracer::EventTransport::kInlineEventBytes && event.has_result() && event.result().has_snapshot())
       discard_snapshot(event.mutable_result()->mutable_snapshot());
-    if (event.ByteSizeLong() > tracer::EventTransport::kMaxEventBytes && event.has_receiver_snapshot())
+    if (event.ByteSizeLong() > tracer::EventTransport::kInlineEventBytes && event.has_receiver_snapshot())
       discard_snapshot(event.mutable_receiver_snapshot());
+    const bool base_fits = event.ByteSizeLong() <= tracer::EventTransport::kInlineEventBytes;
+    if (ctx->stack.status != tracer::StackStatus::Disabled)
+      tracer::serialize_native_stack(ctx->stack, *event.mutable_stack());
     const auto size = event.ByteSizeLong();
-    if (size <= tracer::EventTransport::kMaxEventBytes) {
+    if (base_fits && size <= static_cast<std::size_t>(std::numeric_limits<int>::max())) {
       packet->bytes.resize(size);
       valid =
           event.SerializeToArray(packet->bytes.data(), static_cast<int>(size));

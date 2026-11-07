@@ -189,8 +189,8 @@ public:
     return capture_stack(depth, context_.stack_application_only);
   }
   const StackTrace &capture_stack(unsigned depth, bool application_only) const {
-    if (!depth || depth > kMaxStackDepth)
-      throw std::out_of_range("stack depth must be between 1 and 64");
+    if (!depth)
+      throw std::out_of_range("stack depth must be positive");
     if (!context_.stack_capture)
       throw std::logic_error("native stack capture is unavailable");
     context_.stack_capture(&context_, depth, application_only);

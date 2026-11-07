@@ -354,6 +354,78 @@ def native(tmp_path):
             target.wait(timeout=5)
 
 
+def test_deep_native_stacks_keep_all_frames_and_honor_requested_depth(tmp_path):
+    configured = os.getenv("CLANG_TRACER_NATIVE_BUILD")
+    if not configured or platform.system() != "Linux":
+        pytest.skip("set CLANG_TRACER_NATIVE_BUILD to a Linux native build directory")
+    build = Path(configured).resolve()
+    with subprocess.Popen(
+        [build / "deep-stack-target"], stdin=subprocess.PIPE, stdout=subprocess.PIPE
+    ) as target:
+        try:
+            assert target.stdout is not None and target.stdin is not None
+            assert target.stdout.readline() == b"READY\n"
+            with Client(f"unix://{tmp_path}/control.sock", timeout=60) as client:
+                client.start_server(
+                    str(build / "clang-tracer-server"),
+                    agent=str(build / "libclang_tracer_agent.so"),
+                )
+                session = client.attach(target.pid)
+                cursor = 0
+                for depth, status in (
+                    (128, pb.StackTrace.TRUNCATED), ("full", pb.StackTrace.COMPLETE)
+                ):
+                    probe = client.inject(
+                        session.id, "traced_deep_leaf(int)", INTERCEPTOR,
+                        stack_depth=depth, include_internal_stack_frames=True,
+                    )
+                    target.stdin.write(b"x")
+                    target.stdin.flush()
+                    events = client.collect_traces(
+                        2, session_ids=[session.id], after_sequence=cursor, timeout=15
+                    )
+                    for event in events:
+                        assert event.probe_id == probe.id
+                        stack = event.stack
+                        assert stack.status == status, stack.detail
+                        assert stack.frames[0].function == "traced_deep_leaf(int)"
+                        if depth == "full":
+                            assert len(stack.frames) > 1200
+                            assert any(frame.function == "main" for frame in stack.frames)
+                            assert event.ByteSize() > 64 * 1024
+                        else:
+                            assert len(stack.frames) == depth
+                    client.remove_probe(session.id, probe.id)
+                    cursor = client.read_events().through_sequence
+                context_source = """
+struct Interceptor {
+  void pre(const Call &call) {
+    call.capture_stack(tracer::kUnlimitedStackDepth, false);
+    call.context().event("deep.stack");
+  }
+};
+"""
+                probe = client.inject(session.id, "traced_deep_leaf(int)", context_source)
+                target.stdin.write(b"x")
+                target.stdin.flush()
+                event, = client.collect_traces(
+                    1, session_ids=[session.id], after_sequence=cursor,
+                    names=["deep.stack"], timeout=15,
+                )
+                assert event.probe_id == probe.id
+                assert event.stack.status == pb.StackTrace.COMPLETE, event.stack.detail
+                assert len(event.stack.frames) > 1200
+                client.remove_probe(session.id, probe.id)
+                client.detach(session.id)
+        finally:
+            target.terminate()
+            try:
+                target.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                target.kill()
+                target.wait()
+
+
 def test_real_native_api_resolution_injection_and_shutdown_restore(native):
     build, target, temporary = native
     with Client(f"unix://{temporary}/control.sock", timeout=30) as client:

@@ -222,9 +222,6 @@ bool write_trace_context(BoundedProtoWriter &writer,
   const auto &stack = context.stack;
   if (stack.requested_depth == 0 && stack.count == 0)
     return true;
-  if (stack.requested_depth > tracer::kMaxStackDepth ||
-      stack.count > tracer::kMaxStackDepth)
-    return false;
   const auto bounded_text = [](const char *text, std::size_t capacity) {
     if (!text)
       return std::string_view{};
@@ -234,6 +231,7 @@ bool write_trace_context(BoundedProtoWriter &writer,
       ++length;
     return std::string_view(text, length);
   };
+  writer.bound_remaining_visits_by_bytes();
   if (!writer.begin_message(21) ||
       !writer.u64(1, static_cast<std::uint32_t>(stack.status)) ||
       !writer.u64(2, stack.requested_depth))

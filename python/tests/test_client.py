@@ -409,7 +409,14 @@ def test_invalid_pid_is_rejected_before_rpc(peer, pid):
     assert not service.requests
 
 
-@pytest.mark.parametrize("depth", [-1, 65, True])
+@pytest.mark.parametrize("depth, wire_depth", [(128, 128), ("full", (1 << 32) - 1)])
+def test_extended_stack_depth_is_sent_to_server(peer, depth, wire_depth):
+    client, service = peer
+    client.inject("s1", "add(int,int)", "struct Interceptor {};", stack_depth=depth)
+    assert service.requests[-1].spec.stack_depth == wire_depth
+
+
+@pytest.mark.parametrize("depth", [-1, 1 << 32, True])
 def test_invalid_stack_depth_is_rejected_before_resolution(peer, depth):
     client, service = peer
     with pytest.raises(ValueError):

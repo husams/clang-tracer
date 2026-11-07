@@ -494,7 +494,9 @@ void command_details(std::ostream& out, const CommandTopic& entry, bool color) {
   if (entry.usage.find("DEPLOYMENT OPTIONS") != string_view::npos) {
     out << '\n';
     heading(out, "Deployment options", color);
-    block(out, "--stack-depth 0..64 --print-arguments --print-result", Syntax::command, color);
+    block(out, "--stack-depth N|full --stack-application-only true|false",
+          Syntax::command, color);
+    block(out, "--print-arguments --print-result", Syntax::command, color);
   }
   if (!entry.example.empty()) {
     out << '\n';

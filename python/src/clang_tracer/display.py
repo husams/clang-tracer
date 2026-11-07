@@ -165,9 +165,10 @@ def _probe_spec(lines: _Lines, spec: pb.ProbeSpec) -> None:
             f"entry={_hex(spec.debug_info.runtime_entry)}",
             indent=1,
         )
+    depth = "full" if spec.stack_depth == (1 << 32) - 1 else spec.stack_depth
     lines.add(
         "options",
-        f"stack_depth={spec.stack_depth} "
+        f"stack_depth={depth} "
         f"internal_frames={spec.include_internal_stack_frames} "
         f"print_arguments={spec.print_arguments} print_result={spec.print_result}",
         indent=1,
@@ -182,9 +183,10 @@ def _probe_spec(lines: _Lines, spec: pb.ProbeSpec) -> None:
 
 def _stack(lines: _Lines, stack: pb.StackTrace, *, indent: int) -> None:
     status = _enum(pb.StackTrace.Status, stack.status)
+    depth = "full" if stack.requested_depth == (1 << 32) - 1 else stack.requested_depth
     lines.add(
         "stack",
-        f"{status} captured={stack.captured_depth}/{stack.requested_depth} "
+        f"{status} captured={stack.captured_depth}/{depth} "
         f"hidden={stack.hidden_frames} application_only={stack.application_only}",
         indent=indent,
         style="class:warning"

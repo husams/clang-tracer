@@ -91,6 +91,8 @@ public:
 
     virtual std::any visitProbeReload(TracerCommandsParser::ProbeReloadContext *context) = 0;
 
+    virtual std::any visitStackFilter(TracerCommandsParser::StackFilterContext *context) = 0;
+
 
 };
 

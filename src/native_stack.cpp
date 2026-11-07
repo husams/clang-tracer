@@ -12,6 +12,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -47,7 +48,7 @@ struct Mapping {
   std::string path;
   // Verified only for this fresh /proc snapshot, never retained across
   // captures.
-  mutable Image *verified_image = nullptr;
+  mutable std::shared_ptr<Image> verified_image;
 };
 
 // Trivial per-thread scratch stays valid for late callbacks without allocating
@@ -160,10 +161,7 @@ std::vector<Mapping> mappings(std::uint64_t stack_pointer = 0,
     stop("cannot read native mappings");
   std::vector<Mapping> result;
   result.reserve(32);
-  unsigned seen = 0;
   const auto parse = [&](std::string_view line) {
-    if (++seen > 16384)
-      stop("native mapping bound exceeded");
     Mapping m;
     const char *cursor = line.data(), *end = cursor + line.size();
     const auto spaces = [&] {
@@ -190,7 +188,7 @@ std::vector<Mapping> mappings(std::uint64_t stack_pointer = 0,
     m.readable = cursor[0] == 'r';
     m.executable = cursor[2] == 'x';
     // Unwinding needs executable owners and this invocation's stack VMA only.
-    // Still count every VMA and refresh the complete input on every capture.
+    // Refresh the input on every capture so the ranges match the live process.
     if (!m.executable &&
         !(m.readable && m.begin <= stack_pointer && stack_pointer < m.end))
       return;
@@ -311,17 +309,22 @@ bool standard_symbol(const char *linkage_name) {
 }
 
 bool standard_die(llvm::DWARFDie die) {
-  for (unsigned depth = 0; die && depth < 32; ++depth) {
-    auto origin =
-        die.getAttributeValueAsReferencedDie(llvm::dwarf::DW_AT_specification);
-    if (!origin)
-      origin = die.getAttributeValueAsReferencedDie(
-          llvm::dwarf::DW_AT_abstract_origin);
-    if (!origin)
-      break;
+  const auto declaration = [](llvm::DWARFDie current) {
+    if (!current)
+      return current;
+    const auto specification = current.getAttributeValueAsReferencedDie(
+        llvm::dwarf::DW_AT_specification);
+    return specification ? specification : current.getAttributeValueAsReferencedDie(
+        llvm::dwarf::DW_AT_abstract_origin);
+  };
+  auto fast = die;
+  while (auto origin = declaration(die)) {
     die = origin;
+    fast = declaration(declaration(fast));
+    if (die == fast)
+      break; // Malformed DWARF can contain a reference cycle.
   }
-  for (unsigned depth = 0; die && depth < 64; ++depth, die = die.getParent())
+  for (; die; die = die.getParent())
     if (die.getTag() == llvm::dwarf::DW_TAG_namespace)
       if (const char *name = die.getName(llvm::DINameKind::ShortName))
         if (standard_namespace(name))
@@ -332,6 +335,7 @@ bool standard_die(llvm::DWARFDie die) {
 struct FrameSymbols {
   std::string function, module, file;
   std::uint32_t line = 0;
+  std::uint64_t module_offset = 0;
   bool application = false;
 };
 
@@ -357,16 +361,11 @@ struct Image {
   std::unique_ptr<llvm::object::ObjectFile> object;
   std::unique_ptr<llvm::DWARFContext> dwarf;
   std::vector<Elf64_Phdr> loads;
-  bool application = false;
-  struct Function {
-    std::uint64_t address, size;
-    std::string name;
-    bool standard = false;
-  };
-  std::vector<Function> functions;
+  std::optional<bool> application;
+  bool retained = false;
   std::unordered_map<std::uint64_t, std::vector<llvm::dwarf::UnwindRow>> rows;
   std::unordered_map<std::uint64_t, UnwindPlan> plans;
-  std::unordered_map<std::uint64_t, std::unique_ptr<const FrameSymbols>>
+  std::unordered_map<std::uint64_t, std::shared_ptr<const FrameSymbols>>
       symbols;
 };
 
@@ -374,19 +373,19 @@ struct Image {
 // Cache storage is bounded and remains valid while late wrapper entrants drain.
 struct Cache {
   std::mutex mutex;
-  std::unordered_map<std::string, std::unique_ptr<Image>> images;
+  std::unordered_map<std::string, std::shared_ptr<Image>> images;
   std::string session_id;
   std::size_t bytes = 0;
   std::size_t row_count = 0;
   std::size_t plan_count = 0;
   std::size_t symbolized_frames = 0;
 
-  Image &image(const Mapping &m) {
+  std::shared_ptr<Image> image(const Mapping &m) {
     if (m.path.empty() || m.path.front() != '/')
       stop("native ELF mapped path is unavailable");
     const auto existing = images.find(m.path);
     if (existing != images.end())
-      return *existing->second;
+      return existing->second;
 
     // A trace session treats the mapped binary as immutable. Procfs device
     // and inode values can differ from stat() for OverlayFS mappings, so the
@@ -401,15 +400,11 @@ struct Cache {
     } owner{fd};
     struct stat opened{};
     if (::fstat(fd, &opened) || !S_ISREG(opened.st_mode) ||
-        opened.st_size < static_cast<off_t>(sizeof(Elf64_Ehdr)) ||
-        opened.st_size > 256 * 1024 * 1024 || images.size() >= 64 ||
-        static_cast<std::uint64_t>(opened.st_size) >
-            512 * 1024 * 1024 - bytes)
-      stop("native ELF cache bound exceeded");
-    auto result = std::make_unique<Image>();
-    // Never retain file-backed ELF mmaps in the target: an extra offset-zero
-    // mapping would make the admission resolver correctly reject ambiguous
-    // load biases. A private byte copy leaves the loaded-image topology alone.
+        opened.st_size < static_cast<off_t>(sizeof(Elf64_Ehdr)))
+      stop("invalid native ELF file");
+    auto result = std::make_shared<Image>();
+    // LLVM uses a contiguous buffer. Copy the ELF so a file truncated after
+    // attach cannot fault the target through a file mapping.
     auto buffer = llvm::WritableMemoryBuffer::getNewUninitMemBuffer(
         opened.st_size, m.path);
     if (!buffer)
@@ -418,6 +413,8 @@ struct Cache {
     while (got < buffer->getBufferSize()) {
       const auto amount = ::pread(fd, buffer->getBufferStart() + got,
                                   buffer->getBufferSize() - got, got);
+      if (amount < 0 && errno == EINTR)
+        continue;
       if (amount <= 0)
         stop("cannot read native ELF");
       got += static_cast<std::size_t>(amount);
@@ -456,92 +453,15 @@ struct Cache {
       stop("LLVM rejected native ELF");
     }
     result->object = std::move(*object);
-    result->application = !runtime_module(m.path);
-    const auto &elf =
-        llvm::cast<llvm::object::ELF64LEObjectFile>(*result->object)
-            .getELFFile();
-    auto dynamic = elf.dynamicEntries();
-    if (!dynamic) {
-      llvm::consumeError(dynamic.takeError());
-      result->application = false; // An unclassified owner is not asserted to
-                                   // be application code.
-    } else {
-      std::uint64_t strings = 0, string_size = 0, soname_offset = 0;
-      bool has_soname = false;
-      unsigned scanned = 0;
-      for (const auto &entry : *dynamic) {
-        if (++scanned > 65536)
-          stop("native dynamic-table bound exceeded");
-        if (entry.d_tag == DT_NULL)
-          break;
-        if (entry.d_tag == DT_STRTAB)
-          strings = entry.d_un.d_ptr;
-        if (entry.d_tag == DT_STRSZ)
-          string_size = entry.d_un.d_val;
-        if (entry.d_tag == DT_SONAME) {
-          has_soname = true;
-          soname_offset = entry.d_un.d_val;
-        }
-      }
-      if (has_soname) {
-        auto table = elf.toMappedAddr(strings);
-        if (!table) {
-          llvm::consumeError(table.takeError());
-          result->application = false;
-        } else {
-          const auto *begin = reinterpret_cast<const char *>(*table);
-          if (begin < contents.begin() || begin > contents.end() ||
-              string_size >
-                  static_cast<std::uint64_t>(contents.end() - begin) ||
-              soname_offset >= string_size)
-            stop("invalid native SONAME string table");
-          const auto *name = begin + soname_offset;
-          const auto length = ::strnlen(
-              name, std::min<std::uint64_t>(string_size - soname_offset, 4097));
-          if (length > 4096 || length == string_size - soname_offset)
-            stop("invalid native SONAME");
-          result->application &=
-              !runtime_module(std::string_view(name, length));
-        }
-      }
-    }
-    const auto add_symbol = [&](const llvm::object::SymbolRef &symbol) {
-      if (result->functions.size() >= 262144)
-        stop("native symbol bound exceeded");
-      auto type = symbol.getType();
-      if (!type) {
-        llvm::consumeError(type.takeError());
-        return;
-      }
-      if (*type != llvm::object::SymbolRef::ST_Function)
-        return;
-      auto address = symbol.getAddress();
-      if (!address) {
-        llvm::consumeError(address.takeError());
-        return;
-      }
-      auto name = symbol.getName();
-      if (!name) {
-        llvm::consumeError(name.takeError());
-        return;
-      }
-      const auto size = llvm::object::ELFSymbolRef(symbol).getSize();
-      if (size && !name->empty())
-        result->functions.push_back({*address, size,
-                                     llvm::demangle(*name).substr(0, 256),
-                                     standard_symbol(name->str().c_str())});
-    };
-    for (const auto &symbol : result->object->symbols())
-      add_symbol(symbol);
-    if (const auto *elf = llvm::dyn_cast<llvm::object::ELFObjectFileBase>(
-            result->object.get()))
-      for (const auto &symbol : elf->getDynamicSymbolIterators())
-        add_symbol(symbol);
     result->dwarf = llvm::DWARFContext::create(*result->object);
-    bytes += contents.size();
-    auto *address = result.get();
-    images.emplace(m.path, std::move(result));
-    return *address;
+    // Retention is optional. Captures keep oversized or uncached images alive
+    // in their mapping snapshot and apply the same unwind and lookup rules.
+    if (images.size() < 64 && contents.size() <= 512 * 1024 * 1024 - bytes) {
+      images.emplace(m.path, result);
+      result->retained = true;
+      bytes += contents.size();
+    }
+    return result;
   }
 };
 // Retained like the probe registry: a late entrant or a target atexit callback
@@ -558,7 +478,7 @@ Location locate(const std::vector<Mapping> &maps, std::uint64_t pc) {
     if (!m.executable || pc < m.begin || pc >= m.end)
       continue;
     if (!m.verified_image)
-      m.verified_image = &cache.image(m);
+      m.verified_image = cache.image(m);
     auto &image = *m.verified_image;
     const auto file_offset = m.offset + (pc - m.begin);
     for (const auto &load : image.loads)
@@ -570,7 +490,8 @@ Location locate(const std::vector<Mapping> &maps, std::uint64_t pc) {
   stop("native PC is outside mapped executable ELF code");
 }
 
-const std::vector<llvm::dwarf::UnwindRow> &rows_for(Location loc) {
+const std::vector<llvm::dwarf::UnwindRow> &
+rows_for(Location loc, std::vector<llvm::dwarf::UnwindRow> &scratch) {
   auto frame = loc.image->dwarf->getEHFrame();
   if (!frame) {
     llvm::consumeError(frame.takeError());
@@ -578,10 +499,7 @@ const std::vector<llvm::dwarf::UnwindRow> &rows_for(Location loc) {
   }
   if (!*frame)
     stop("native .eh_frame is unavailable");
-  unsigned count = 0;
   for (const auto &entry : (*frame)->entries()) {
-    if (++count > 1000000)
-      stop("native CFI search bound exceeded");
     const auto *fde = llvm::dyn_cast<llvm::dwarf::FDE>(&entry);
     if (!fde || loc.pc < fde->getInitialLocation() ||
         loc.pc - fde->getInitialLocation() >= fde->getAddressRange())
@@ -595,20 +513,19 @@ const std::vector<llvm::dwarf::UnwindRow> &rows_for(Location loc) {
     if (const auto found = cached.find(fde->getInitialLocation());
         found != cached.end())
       return found->second;
-    if (cached.size() >= 4096)
-      stop("native CFI row cache bound exceeded");
     auto table = llvm::dwarf::createUnwindTable(fde);
     if (!table) {
       llvm::consumeError(table.takeError());
       stop("unsupported native CFI program");
     }
-    if (table->size() > 65536 - cache.row_count)
-      stop("native CFI program exceeds row bound");
-    cache.row_count += table->size();
-    return cached
-        .emplace(fde->getInitialLocation(), std::vector<llvm::dwarf::UnwindRow>(
-                                                table->begin(), table->end()))
-        .first->second;
+    scratch.assign(table->begin(), table->end());
+    if (loc.image->retained &&
+        (cached.size() >= 4096 || scratch.size() > 65536 - cache.row_count))
+      return scratch;
+    const auto result = cached.emplace(fde->getInitialLocation(), std::move(scratch));
+    if (loc.image->retained)
+      cache.row_count += result.first->second.size();
+    return result.first->second;
   }
   stop("no native CFI covers this caller");
 }
@@ -707,7 +624,8 @@ const UnwindPlan &plan_for(Location loc, UnwindPlan &fallback) {
       found != loc.image->plans.end())
     return found->second;
   const llvm::dwarf::UnwindRow *row = nullptr;
-  for (const auto &candidate : rows_for(loc))
+  std::vector<llvm::dwarf::UnwindRow> scratch;
+  for (const auto &candidate : rows_for(loc, scratch))
     if (candidate.hasAddress() && candidate.getAddress() <= loc.pc &&
         (!row || candidate.getAddress() > row->getAddress()))
       row = &candidate;
@@ -746,9 +664,9 @@ const UnwindPlan &plan_for(Location loc, UnwindPlan &fallback) {
   }
   // Node references survive rehash; plans belong to path-keyed session images.
   // At the bound, execute this capture's temporary plan without retaining it.
-  if (cache.plan_count < 16384) {
+  if (!loc.image->retained || cache.plan_count < 16384) {
     const auto inserted = loc.image->plans.emplace(loc.pc, fallback);
-    if (inserted.second)
+    if (inserted.second && loc.image->retained)
       ++cache.plan_count;
     return inserted.first->second;
   }
@@ -811,72 +729,162 @@ std::string readable_text(std::string value) {
   return value;
 }
 
-void symbolize_stack(tracer::StackTrace &stack,
-                     std::vector<Mapping> &maps) noexcept {
+bool application_image(Image &image, std::string_view path) {
+  if (image.application)
+    return *image.application;
+  image.application = false;
+  if (runtime_module(path))
+    return false;
+  const auto &elf =
+      llvm::cast<llvm::object::ELF64LEObjectFile>(*image.object).getELFFile();
+  auto dynamic = elf.dynamicEntries();
+  if (!dynamic) {
+    llvm::consumeError(dynamic.takeError());
+    return false;
+  }
+  std::uint64_t strings = 0, string_size = 0;
+  std::optional<std::uint64_t> soname_offset;
+  for (const auto &entry : *dynamic) {
+    if (entry.d_tag == DT_NULL)
+      break;
+    if (entry.d_tag == DT_STRTAB)
+      strings = entry.d_un.d_ptr;
+    if (entry.d_tag == DT_STRSZ)
+      string_size = entry.d_un.d_val;
+    if (entry.d_tag == DT_SONAME)
+      soname_offset = entry.d_un.d_val;
+  }
+  if (soname_offset) {
+    auto table = elf.toMappedAddr(strings);
+    if (!table) {
+      llvm::consumeError(table.takeError());
+      return false;
+    }
+    const auto contents = image.bytes->getBuffer();
+    const auto *begin = reinterpret_cast<const char *>(*table);
+    if (begin < contents.begin() || begin > contents.end() ||
+        string_size > static_cast<std::uint64_t>(contents.end() - begin) ||
+        *soname_offset >= string_size)
+      return false;
+    const auto *name = begin + *soname_offset;
+    const auto available = string_size - *soname_offset;
+    const auto length = ::strnlen(name, available);
+    if (length == available || runtime_module(std::string_view(name, length)))
+      return false;
+  }
+  image.application = true;
+  return true;
+}
+
+// ELF symbol tables need not be ordered by address. Consult them only when
+// DWARF lacks a name, and read and demangle only a symbol covering this PC.
+template <typename Symbols>
+bool find_symbol(Symbols symbols, std::uint64_t pc, FrameSymbols &metadata) {
+  for (const auto &symbol : symbols) {
+    auto address = symbol.getAddress();
+    if (!address) {
+      llvm::consumeError(address.takeError());
+      continue;
+    }
+    if (pc < *address || pc - *address >= llvm::object::ELFSymbolRef(symbol).getSize())
+      continue;
+    auto type = symbol.getType();
+    if (!type) {
+      llvm::consumeError(type.takeError());
+      continue;
+    }
+    if (*type != llvm::object::SymbolRef::ST_Function)
+      continue;
+    auto name = symbol.getName();
+    if (!name) {
+      llvm::consumeError(name.takeError());
+      continue;
+    }
+    if (name->empty())
+      continue;
+    metadata.function = readable_text(llvm::demangle(*name));
+    metadata.application &= !standard_symbol(name->str().c_str());
+    return true;
+  }
+  return false;
+}
+
+std::shared_ptr<const FrameSymbols> symbols_for(Location loc) {
+  auto &symbols = loc.image->symbols;
+  if (const auto found = symbols.find(loc.pc); found != symbols.end())
+    return found->second;
+
+  auto metadata = std::make_shared<FrameSymbols>();
+  metadata->module = readable_text(loc.mapping->path);
+  metadata->module_offset = loc.pc;
+  metadata->application = application_image(*loc.image, loc.mapping->path);
+  try {
+    const llvm::DILineInfoSpecifier spec(
+        llvm::DILineInfoSpecifier::FileLineInfoKind::AbsoluteFilePath,
+        llvm::DINameKind::LinkageName);
+    const auto info = loc.image->dwarf->getLineInfoForAddress(
+        {loc.pc, llvm::object::SectionedAddress::UndefSection}, spec);
+    if (info) {
+      metadata->application &= !standard_symbol(info->FunctionName.c_str());
+      if (info->FunctionName != llvm::DILineInfo::BadString)
+        metadata->function = readable_text(llvm::demangle(info->FunctionName));
+      if (info->FileName != llvm::DILineInfo::BadString)
+        metadata->file = readable_text(info->FileName);
+      metadata->line = info->Line;
+    }
+    metadata->application &= !standard_die(
+        loc.image->dwarf->getDIEsForAddress(loc.pc).FunctionDIE);
+  } catch (...) {
+    // Keep module identity even if debug-name lookup fails.
+  }
+  if (metadata->function.empty() &&
+      !find_symbol(loc.image->object->symbols(), loc.pc, *metadata)) {
+    const auto &elf =
+        llvm::cast<llvm::object::ELF64LEObjectFile>(*loc.image->object);
+    find_symbol(elf.getDynamicSymbolIterators(), loc.pc, *metadata);
+  }
+  if (loc.image->retained && cache.symbolized_frames < 16384) {
+    symbols.emplace(loc.pc, metadata);
+    ++cache.symbolized_frames;
+  }
+  return metadata;
+}
+} // namespace
+
+struct tracer::NativeStackStorage {
+  std::vector<StackFrame> frames;
+  std::unordered_map<std::uint64_t, std::shared_ptr<const FrameSymbols>> symbols;
+};
+
+namespace {
+void symbolize_stack(tracer::NativeStackStorage &storage,
+                     std::vector<Mapping> &maps, bool application_only) noexcept {
   try {
     std::lock_guard lock(cache.mutex);
     if (maps.empty())
       maps = mappings();
-    for (unsigned i = 0; i < stack.count && i < tracer::kMaxStackDepth; ++i) {
-      auto &frame = stack.frames[i];
+    for (auto &frame : storage.frames) {
       if (frame.kind == tracer::FrameKind::JitBridge) {
         frame.function = "clangtracer_wrapper (verified bridge)";
         continue;
       }
       try {
-        const auto loc = locate(
-            maps, frame.kind == tracer::FrameKind::TargetEntry ? frame.pc
-                                                               : frame.pc - 1);
-        frame.module_offset = loc.pc;
-        auto &symbols = loc.image->symbols;
-        auto found = symbols.find(loc.pc);
-        if (found == symbols.end()) {
-          // Stable, immutable ownership keeps callback pointers valid across
-          // cache rehashes, concurrent captures, and late wrapper entrants.
-          if (cache.symbolized_frames >= 16384)
+        const auto pc = frame.kind == tracer::FrameKind::TargetEntry
+                            ? frame.pc : frame.pc - 1;
+        auto found = storage.symbols.find(pc);
+        if (found == storage.symbols.end()) {
+          const auto loc = locate(maps, pc);
+          if (application_only && !application_image(*loc.image, loc.mapping->path))
             continue;
-          auto metadata = std::make_unique<FrameSymbols>();
-          metadata->module = readable_text(loc.mapping->path);
-          metadata->application = loc.image->application;
-          try {
-            const llvm::DILineInfoSpecifier spec(
-                llvm::DILineInfoSpecifier::FileLineInfoKind::AbsoluteFilePath,
-                llvm::DINameKind::LinkageName);
-            const auto info = loc.image->dwarf->getLineInfoForAddress(
-                {loc.pc, llvm::object::SectionedAddress::UndefSection}, spec);
-            if (info) {
-              metadata->application &=
-                  !standard_symbol(info->FunctionName.c_str());
-              if (info->FunctionName != llvm::DILineInfo::BadString)
-                metadata->function =
-                    readable_text(llvm::demangle(info->FunctionName));
-              if (info->FileName != llvm::DILineInfo::BadString)
-                metadata->file = readable_text(info->FileName);
-              metadata->line = info->Line;
-            }
-            metadata->application &= !standard_die(
-                loc.image->dwarf->getDIEsForAddress(loc.pc).FunctionDIE);
-          } catch (...) {
-            // Keep module identity even if debug-name lookup fails.
-          }
-          if (metadata->function.empty()) {
-            for (const auto &symbol : loc.image->functions)
-              if (loc.pc >= symbol.address &&
-                  loc.pc - symbol.address < symbol.size) {
-                metadata->function = readable_text(symbol.name);
-                metadata->application &= !symbol.standard;
-                break;
-              }
-          }
-          found = symbols.emplace(loc.pc, std::move(metadata)).first;
-          ++cache.symbolized_frames;
+          auto metadata = symbols_for(loc);
+          found = storage.symbols.emplace(pc, std::move(metadata)).first;
         }
-        const auto &metadata = *found->second;
-        frame.function = metadata.function.c_str();
-        frame.module = metadata.module.c_str();
-        frame.file = metadata.file.c_str();
-        frame.line = metadata.line;
-        frame.application_frame = metadata.application;
+        const auto &metadata = found->second;
+        frame.module_offset = metadata->module_offset;
+        frame.function = metadata->function.c_str();
+        frame.module = metadata->module.c_str();
+        frame.file = metadata->file.c_str();
+        frame.application_frame = metadata->application;
       } catch (...) {
         // Unknown names do not invalidate recovered native frames.
       }
@@ -905,6 +913,9 @@ extern "C" void tracer_stack_enter(tracer::TraceContext *ctx,
 extern "C" void tracer_stack_leave(tracer::TraceContext *ctx) noexcept {
   if (current_context == ctx)
     current_context = const_cast<tracer::TraceContext *>(ctx->stack_previous);
+  const int saved_errno = errno;
+  tracer::release_native_stack(*ctx);
+  errno = saved_errno;
 }
 
 namespace tracer {
@@ -920,21 +931,31 @@ void begin_native_stack_session(std::string_view session_id) {
   cache.session_id.assign(session_id);
 }
 
+void release_native_stack(const TraceContext &ctx) noexcept {
+  delete ctx.stack_storage;
+  ctx.stack_storage = nullptr;
+}
+
 void capture_native_stack(const TraceContext &ctx, unsigned depth,
                           bool application_only) noexcept {
   const int saved_errno = errno;
   auto &out = ctx.stack;
   out = {};
+  if (ctx.stack_storage)
+    ctx.stack_storage->frames.clear();
   out.requested_depth = depth;
   out.application_only = application_only;
   out.status = StackStatus::Partial;
   std::vector<Mapping> maps;
   try {
-    if (!depth || depth > kMaxStackDepth)
-      stop("stack depth must be between 1 and 64");
-    out.frames[out.count++] = {ctx.target_entry,
-                               ctx.caller_sp >= 8 ? ctx.caller_sp - 8 : 0,
-                               FrameKind::TargetEntry};
+    if (!depth)
+      stop("stack depth must be positive");
+    if (!ctx.stack_storage)
+      ctx.stack_storage = std::make_unique<NativeStackStorage>().release();
+    auto &frames = ctx.stack_storage->frames;
+    frames.push_back({ctx.target_entry,
+                      ctx.caller_sp >= 8 ? ctx.caller_sp - 8 : 0,
+                      FrameKind::TargetEntry});
     if (!ctx.caller_pc || !ctx.caller_sp)
       stop("Clang wrapper caller state is unavailable");
     // Procfs I/O and parsing use private scratch; do not serialize captures
@@ -954,7 +975,7 @@ void capture_native_stack(const TraceContext &ctx, unsigned depth,
     auto regs = seed(ctx);
     auto *outer = ctx.stack_previous;
     while (regs.values[16]) {
-      if (out.count == depth) {
+      if (frames.size() == depth) {
         out.status = StackStatus::Truncated;
         std::snprintf(out.detail, sizeof(out.detail),
                       "entry stack exceeds requested depth");
@@ -966,14 +987,14 @@ void capture_native_stack(const TraceContext &ctx, unsigned depth,
       if (outer && regs.has(6) && regs.values[6] == outer->wrapper_frame &&
           pc >= outer->bridge_begin && pc <= outer->bridge_end &&
           outer->bridge_end > outer->bridge_begin) {
-        out.frames[out.count++] = {pc, regs.values[7], FrameKind::JitBridge};
+        frames.push_back({pc, regs.values[7], FrameKind::JitBridge});
         if (outer->caller_sp <= regs.values[7] || outer->caller_sp > stack->end)
           stop("JIT bridge does not advance within the original stack");
         regs = seed(*outer);
         outer = outer->stack_previous;
         continue;
       }
-      out.frames[out.count++] = {pc, regs.values[7], FrameKind::Native};
+      frames.push_back({pc, regs.values[7], FrameKind::Native});
       regs = unwind(regs, locate(maps, pc - 1), *stack, memory);
     }
     if (!regs.values[16]) {
@@ -989,17 +1010,19 @@ void capture_native_stack(const TraceContext &ctx, unsigned depth,
   }
   // Resolve before the C++ hook runs, for complete, partial and truncated
   // unwinds alike. This runs after the unwind lock has been released.
-  symbolize_stack(out, maps);
-  out.captured_depth = out.count;
-  if (application_only) {
-    unsigned visible = 0;
-    for (unsigned i = 0; i < out.captured_depth; ++i)
-      if (out.frames[i].application_frame)
-        out.frames[visible++] = out.frames[i];
-    out.hidden_frames = out.captured_depth - visible;
-    std::fill(out.frames + visible, out.frames + out.captured_depth,
-              StackFrame{});
-    out.count = visible;
+  if (ctx.stack_storage) {
+    auto &storage = *ctx.stack_storage;
+    symbolize_stack(storage, maps, application_only);
+    auto &frames = storage.frames;
+    out.captured_depth = static_cast<unsigned>(frames.size());
+    if (application_only) {
+      frames.erase(std::remove_if(frames.begin(), frames.end(),
+                                  [](const auto &f) { return !f.application_frame; }),
+                   frames.end());
+      out.hidden_frames = out.captured_depth - frames.size();
+    }
+    out.count = static_cast<unsigned>(frames.size());
+    out.frames = frames.data();
   }
   errno = saved_errno;
 }
@@ -1014,7 +1037,7 @@ void serialize_native_stack(const StackTrace &stack,
   output.set_captured_depth(stack.captured_depth);
   output.set_detail(stack.detail,
                     ::strnlen(stack.detail, sizeof(stack.detail)));
-  for (unsigned i = 0; i < stack.count && i < kMaxStackDepth; ++i) {
+  for (unsigned i = 0; i < stack.count; ++i) {
     const auto &frame = stack.frames[i];
     auto *out = output.add_frames();
     out->set_pc(frame.pc);

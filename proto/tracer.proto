@@ -184,7 +184,7 @@ message ProbeSpec {
   repeated string argument_names = 7;
   repeated string include_headers = 8; // Optional headers; no target source required.
   HeaderContext header_context = 9; // Optional compilation database flags.
-  uint32 stack_depth = 10; // Zero disables automatic entry capture; otherwise 1..64.
+  uint32 stack_depth = 10; // Zero disables automatic entry capture. UINT32_MAX captures to the root.
   bool include_internal_stack_frames = 11; // False defaults to application-only, including old clients.
   bool print_arguments = 12; // Optional callback PRE rendering; defaults off.
   bool print_result = 13; // Optional callback POST rendering; defaults off.

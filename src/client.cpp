@@ -128,7 +128,7 @@ Options parse_options(int argc, char **argv) {
              "  attach PID\n"
              "  trace PID 'C++ declaration' --callback FILE "
              "[--include HEADER ...] [--compdb FILE|DIR] "
-             "[--compile-option ARG ...] [--stack DEPTH]\n"
+             "[--compile-option ARG ...] [--stack DEPTH|full]\n"
              "  resolve PID 'C++ selector' [--module PATH] "
              "[--debug-max-entries N] [--debug-max-depth N] "
              "[--compile-option ARG ...]\n"
@@ -210,7 +210,8 @@ Options parse_options(int argc, char **argv) {
       } else if (a == "--callback") {
         o.callback = v;
       } else if (a == "--stack") {
-        o.stack_depth = static_cast<unsigned>(parse_number(v, a, 64));
+        o.stack_depth = v == "full" ? UINT32_MAX
+                                    : static_cast<unsigned>(parse_number(v, a, UINT32_MAX));
       } else if (a == "--stack-application-only") {
         if (v != "true" && v != "false")
           throw std::runtime_error("--stack-application-only must be true or false");
@@ -1037,7 +1038,9 @@ void print_event(TextWriter &out, const api::TraceEvent &e,
   if (e.has_stack()) {
     const auto &stack = e.stack();
     out.line("  entry-stack ", api::StackTrace::Status_Name(stack.status()),
-             " depth=", stack.frames_size(), "/", stack.requested_depth(),
+             " depth=", stack.frames_size(), "/",
+             stack.requested_depth() == UINT32_MAX
+                 ? "full" : std::to_string(stack.requested_depth()),
              " application-only=", stack.application_only() ? "true" : "false",
              " captured=", stack.captured_depth(), " hidden=", stack.hidden_frames(),
              " (", stack.detail(), ")");

@@ -12,11 +12,12 @@ inline constexpr std::uint32_t kProtocolVersion = 2;
 // Version 20 adds capture-time owned value snapshots to TraceValue.
 // Version 21 verifies header-prepared scalar contracts without rescanning DWARF.
 // Version 23 reports target-side JIT compile time for prepared probes.
-inline constexpr std::uint32_t kBootstrapVersion = 25;
+// Version 26 replaces the inline callback stack array with an invocation view.
+inline constexpr std::uint32_t kBootstrapVersion = 26;
 inline constexpr unsigned kMaxPatchBytes = 64;
 inline constexpr unsigned kMaxArguments = 8;
 inline constexpr unsigned kMaxProbes = 32;
-inline constexpr unsigned kMaxStackDepth = 64;
+inline constexpr std::uint32_t kUnlimitedStackDepth = UINT32_MAX;
 
 enum class StackStatus : std::uint32_t {
   Disabled = 0,
@@ -52,7 +53,7 @@ struct StackTrace {
   std::uint32_t captured_depth =
       0; // Before filtering; depth/status cover this unwind.
   char detail[160]{};
-  StackFrame frames[kMaxStackDepth]{};
+  const StackFrame *frames = nullptr;
 };
 
 // Numeric values match proto/tracer.proto; this is the native bootstrap ABI.
@@ -110,6 +111,8 @@ struct CallbackPrintOptions {
   bool result = false;
 };
 
+struct NativeStackStorage;
+
 struct TraceContext {
   std::uint64_t probe_id = 0;
   std::uint64_t object_address = 0;
@@ -144,6 +147,8 @@ struct TraceContext {
   void (*stack_capture)(const TraceContext *, unsigned,
                         bool) noexcept = nullptr;
   mutable StackTrace stack{};
+  // Agent-owned storage backing this invocation's stack view.
+  mutable NativeStackStorage *stack_storage = nullptr;
 };
 
 struct Request {

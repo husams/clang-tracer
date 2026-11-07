@@ -159,6 +159,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitStackFilter(TracerCommandsParser::StackFilterContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
 
 };
 

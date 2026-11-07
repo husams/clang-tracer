@@ -229,7 +229,7 @@ HELP_TOPICS = {
                 "--callback FILE",
                 "Required C++ Interceptor source, read on the console host.",
             ),
-            ("--stack 0..64", "Capture entry stacks; default 0 disables capture."),
+            ("--stack N|full", "Capture entry stacks. Zero disables capture."),
             (
                 "--internal-frames",
                 "Include tracer/JIT/runtime frames; default filters them.",

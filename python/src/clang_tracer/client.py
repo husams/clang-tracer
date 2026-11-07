@@ -8,7 +8,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Literal, Self
 
 import grpc
 
@@ -426,7 +426,7 @@ class Client:
         *,
         include_headers: Iterable[str] = (),
         compilation_database: str = "",
-        stack_depth: int = 0,
+        stack_depth: int | Literal["full"] = 0,
         include_internal_stack_frames: bool = False,
         print_arguments: bool = False,
         print_result: bool = False,
@@ -445,9 +445,9 @@ class Client:
             raise ValueError("callback source must be nonempty and contain no NUL")
         if len(callback_source.encode()) > 64 * 1024:
             raise ValueError("callback source exceeds 64 KiB")
-        uint(stack_depth, 32, "stack_depth")
-        if stack_depth > 64:
-            raise ValueError("stack_depth must be between 0 and 64")
+        depth = (
+            (1 << 32) - 1 if stack_depth == "full" else uint(stack_depth, 32, "stack_depth")
+        )
         options = _compiler_options(compile_options)
         spec = self.resolve_probe(
             session_id,
@@ -461,7 +461,7 @@ class Client:
         )
         spec.compile_options[:] = options
         spec.callback_source = callback_source
-        spec.stack_depth = stack_depth
+        spec.stack_depth = depth
         spec.include_internal_stack_frames = include_internal_stack_frames
         spec.print_arguments = print_arguments
         spec.print_result = print_result
