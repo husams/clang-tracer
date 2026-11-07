@@ -383,5 +383,7 @@ and unloaded before native detach restored the original code. Three focused
 REPL regression CTests passed. The plugin uses public `dlopen` in place
 of Gum's private import and the build rejects private glibc symbol
 versions. The license audit identified statically linked LGPL code.
-Keep Gum experimental while loader routing and release packaging are
-resolved. See `benchmarks/instruction-trace/README.md` for reproduction.
+The pilot now builds a bundle with notices, pinned source, and the objects
+and scripts needed to relink against modified GLib. Keep Gum experimental
+while loader routing and broader tracing cases are validated. See
+`benchmarks/instruction-trace/README.md` for reproduction.

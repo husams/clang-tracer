@@ -2,9 +2,9 @@
 
 **Decision for P4 A2.** Keep Gum Stalker as an experimental backend. It was
 faster on the standalone fixture and passed live attachment with an existing
-native observer. A maintained backend still needs loader routing, a release
-package that addresses the audited licenses, broader signal and fault
-coverage, and validation of concurrent probe changes.
+native observer. The pilot has a source and relinking bundle. A maintained
+backend still needs loader routing, broader signal and fault coverage, and
+validation of concurrent probe changes.
 Native single-step remains the fixture reference.
 
 ## Reproduce
@@ -173,6 +173,20 @@ passed that check and the previous plugin failed it.
 [Pinned Gum initialization](https://github.com/frida/frida-gum/blob/00a05282d1074c0e043b285c70a4412d784c573d/gum/gum.c#L538)
 
 The [license audit](GUM_LICENSE_AUDIT.md) identifies 819 archive members
-and 282 members linked into the pilot, including LGPL GLib code. A release
-still needs notices and a way to satisfy the LGPL source and relinking
-requirements. The SDK linker warnings remain open.
+and 282 members linked into the original pilot, including LGPL GLib code.
+The relinking bundle contains the license texts, original source notices,
+pinned source trees, and 149 retained Gum, Capstone and liblzma objects.
+It builds the plugin from replacement GLib, GObject, libffi and PCRE2
+libraries. The SDK linker warnings remain open.
+
+From the repository root on Linux x86-64, use the verified SDK compiler
+and Meson to assemble the bundle and produce an archive.
+
+```sh
+CC="$SDK/bin/clang" CXX="$SDK/bin/clang++" \
+  benchmarks/instruction-trace/package-relink.sh "$GUM_DEVKIT_TARBALL" \
+  gum-stalker-pilot-linux-x86_64
+tar -cJf gum-stalker-pilot-linux-x86_64.tar.xz gum-stalker-pilot-linux-x86_64
+```
+
+See [Relink the Gum Stalker pilot](RELINK.md) for recipient instructions.

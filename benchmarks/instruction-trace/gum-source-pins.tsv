@@ -1,0 +1,9 @@
+glib	https://codeload.github.com/frida-forks/glib/tar.gz/f11db6352345ad21deb5f5783bb988bfca2a3d85
+glib/subprojects/gvdb	https://gitlab.gnome.org/GNOME/gvdb/-/archive/2b42fc75f09dbe1cd1057580b5782b08f2dcb400/gvdb-2b42fc75f09dbe1cd1057580b5782b08f2dcb400.tar.gz
+libffi	https://codeload.github.com/frida-forks/libffi/tar.gz/5cca756802a5d27988e7f9973e1299f684cfeff7
+pcre2	https://codeload.github.com/frida-forks/pcre2/tar.gz/683059230e4894342bb19f2776f0e50c757fde17
+pcre2/deps/sljit	https://codeload.github.com/zherczeg/sljit/tar.gz/39c508d1b8fbae332d60c7450db20236913089da
+zlib	https://codeload.github.com/frida-forks/zlib/tar.gz/b910f805561e24a7a25521de438c82942cd7885b
+frida-gum	https://codeload.github.com/frida/frida-gum/tar.gz/00a05282d1074c0e043b285c70a4412d784c573d
+capstone	https://codeload.github.com/frida-forks/capstone/tar.gz/f919a03a5417e1c7ea3af7035225073437030ef2
+xz	https://codeload.github.com/frida-forks/xz/tar.gz/68289232393af1ff1756bcf05164cedfd792df59
