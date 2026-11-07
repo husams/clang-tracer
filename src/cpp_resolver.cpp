@@ -1114,10 +1114,33 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
   const auto candidate = std::find_if(candidates.begin(), candidates.end(), [&](const auto &item) {
     return item.symbol == original.spec.symbol() && item.unsupported_reason.empty();
   });
-  if (candidate == candidates.end() ||
-      candidate->spec.signature().SerializeAsString() != original.spec.signature().SerializeAsString() ||
-      candidate->spec.debug_info().SerializeAsString() != original.spec.debug_info().SerializeAsString())
-    throw std::runtime_error("generated prepared adapter does not reproduce the target ABI and layout");
+  const std::string failure = "generated prepared adapter does not reproduce the target ABI and layout";
+  if (candidate == candidates.end())
+    throw std::runtime_error(failure + " for '" + name + "'");
+  const auto &expected = original.spec.debug_info();
+  const auto &actual = candidate->spec.debug_info();
+  const auto &expected_signature = original.spec.signature();
+  const auto &actual_signature = candidate->spec.signature();
+  if (actual_signature.SerializeAsString() == expected_signature.SerializeAsString() &&
+      actual.SerializeAsString() == expected.SerializeAsString())
+    return;
+
+  if (actual_signature.result() != expected_signature.result() ||
+      actual.result_cpp_type() != expected.result_cpp_type() ||
+      actual.result_is_reference() != expected.result_is_reference() ||
+      actual.result_pass_by_reference() != expected.result_pass_by_reference() ||
+      actual.result_object_type().SerializeAsString() !=
+          expected.result_object_type().SerializeAsString())
+    throw std::runtime_error(failure + " for result type '" + expected.result_cpp_type() + "'");
+  for (int i = 0; i < std::min(expected.arguments_size(), actual.arguments_size()); ++i) {
+    if (actual.arguments(i).SerializeAsString() != expected.arguments(i).SerializeAsString())
+      throw std::runtime_error(failure + " for argument type '" +
+                               expected.arguments(i).cpp_type() + "'");
+  }
+  if (!expected.record_name().empty() &&
+      actual.prepared_layout_sha256() != expected.prepared_layout_sha256())
+    throw std::runtime_error(failure + " for receiver type '" + expected.record_name() + "'");
+  throw std::runtime_error(failure + " for '" + name + "'");
 }
 
 } // namespace tracer::client

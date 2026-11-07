@@ -11,8 +11,10 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace tracer::prepared {
@@ -33,10 +35,15 @@ public:
                            const std::vector<std::string> &headers,
                            bool pointer_layouts) {
     selected_method_ = llvm::dyn_cast<clang::CXXMethodDecl>(&function);
+    const bool linkage_alias = nested_static_method(selected_method_);
+    if (selected_method_ && !linkage_alias)
+      register_nested(*selected_method_->getParent());
+    register_nested_type(function.getReturnType(), pointer_layouts);
+    for (const auto *parameter : function.parameters())
+      register_nested_type(parameter->getType(), pointer_layouts);
     // Additional inputs can provide callback-only payload declarations.
     extra_headers_.insert(std::next(headers.begin()), headers.end());
     emit_extra(*ast_.getTranslationUnitDecl());
-    const bool linkage_alias = nested_static_method(selected_method_);
     if (selected_method_ && !linkage_alias) {
       emit_record(*selected_method_->getParent());
     } else {
@@ -46,40 +53,43 @@ public:
         declarations_ += "namespace tracer_prepared_detail {\n" +
                          callable(function) + "}\n";
       } else {
-        declarations_ += in_namespace(*function.getDeclContext(), callable(function));
+        declarations_ += in_namespace(function, callable(function));
       }
     }
-    // Emit pointees after the callable's own records. They may contain the
-    // receiver by value, while its method only needs a forward declaration.
+    // Preserve the previous ordering for ordinary namespace-scope pointees.
     if (pointer_layouts) {
       if (const auto *record = prepared_pointer_record(function.getReturnType()))
-        emit_record(*record);
+        if (!llvm::isa<clang::CXXRecordDecl>(record->getDeclContext()))
+          emit_record(*record);
       for (const auto *parameter : function.parameters())
         if (const auto *record = prepared_pointer_record(parameter->getType()))
-          emit_record(*record);
+          if (!llvm::isa<clang::CXXRecordDecl>(record->getDeclContext()))
+            emit_record(*record);
     }
     return {forwards_ + declarations_, std::move(standard_headers_)};
   }
 
 private:
   [[noreturn]] static void unsupported(const clang::NamedDecl &decl, const char *reason) {
-    throw std::runtime_error("cannot prepare standalone type '" +
-                             decl.getQualifiedNameAsString() + "': " + reason);
+    std::string name;
+    llvm::raw_string_ostream out(name);
+    auto policy = decl.getASTContext().getPrintingPolicy();
+    policy.FullyQualifiedName = true;
+    decl.getNameForDiagnostic(out, policy, true);
+    throw std::runtime_error("cannot prepare standalone type '" + name + "': " + reason);
   }
 
-  std::string in_namespace(const clang::DeclContext &context, std::string source) {
-    const auto *scope = &context;
-    while (const auto *ns = llvm::dyn_cast<clang::NamespaceDecl>(scope)) {
-      if (ns->isAnonymousNamespace())
-        unsupported(*ns, "anonymous namespace");
+  std::string in_namespace(const clang::NamedDecl &decl, std::string source) {
+    for (const auto *scope = decl.getDeclContext(); !scope->isTranslationUnit();
+         scope = scope->getParent()) {
+      if (llvm::isa<clang::LinkageSpecDecl>(scope))
+        continue;
+      const auto *ns = llvm::dyn_cast<clang::NamespaceDecl>(scope);
+      if (!ns || ns->isAnonymousNamespace())
+        unsupported(decl, "cannot declare the type in its original scope");
       source = std::string(ns->isInline() ? "inline namespace " : "namespace ") +
                ns->getNameAsString() + " {\n" + source + "}\n";
-      scope = ns->getParent();
     }
-    if (const auto *linkage = llvm::dyn_cast<clang::LinkageSpecDecl>(scope))
-      return in_namespace(*linkage->getParent(), std::move(source));
-    if (!scope->isTranslationUnit())
-      throw std::runtime_error("standalone preparation requires namespace-scope types");
     return source;
   }
 
@@ -106,6 +116,35 @@ private:
     visit(decl.getReturnType(), complete);
     for (const auto *parameter : decl.parameters())
       visit(parameter->getType(), complete);
+  }
+
+  // Reserve direct signature dependencies before additional headers or another
+  // signature type can cause their owning record to be emitted.
+  void register_nested(const clang::NamedDecl &decl) {
+    const auto *owner = llvm::dyn_cast<clang::CXXRecordDecl>(decl.getDeclContext());
+    if (!owner)
+      return;
+    nested_declarations_[owner->getCanonicalDecl()].push_back(&decl);
+    if (const auto *definition = owner->getDefinition())
+      register_nested(*definition);
+  }
+
+  void register_nested_type(clang::QualType type, bool pointer_layouts) {
+    if (const auto *alias = type->getAs<clang::TypedefType>())
+      register_nested(*alias->getDecl());
+    if (type->isPointerType()) {
+      if (pointer_layouts)
+        if (const auto *pointee = prepared_pointer_record(type))
+          register_nested(*pointee);
+      return;
+    }
+    type = type.getNonReferenceType().getCanonicalType();
+    if (const auto *record = type->getAsCXXRecordDecl()) {
+      if (const auto *definition = record->getDefinition())
+        register_nested(*definition);
+    } else if (const auto *enumeration = type->getAs<clang::EnumType>()) {
+      register_nested(*enumeration->getDecl());
+    }
   }
 
   std::string callable(const clang::FunctionDecl &decl, bool selected = true) {
@@ -183,19 +222,22 @@ private:
 
   void emit_alias(const clang::TypedefNameDecl &alias) {
     if (alias.isInStdNamespace() || ast_.getSourceManager().isInSystemHeader(alias.getLocation()) ||
-        !emitted_.insert(alias.getCanonicalDecl()).second)
+        emitted_.count(alias.getCanonicalDecl()) || defer_to_owner(alias))
       return;
+    emitted_.insert(alias.getCanonicalDecl());
     visit(alias.getUnderlyingType());
-    declarations_ += in_namespace(*alias.getDeclContext(), "using " + alias.getNameAsString() +
-                                  " = " + spelling(alias.getUnderlyingType()) + ";\n");
+    const auto declaration = "using " + alias.getNameAsString() + " = " +
+                             spelling(alias.getUnderlyingType()) + ";\n";
+    place_declaration(alias, declaration);
   }
 
   void emit_enum(const clang::EnumDecl &enumeration) {
     const auto *decl = enumeration.getDefinition();
     if (!decl || !decl->getIdentifier())
       unsupported(enumeration, "enumeration requires a named definition");
-    if (!emitted_.insert(decl->getCanonicalDecl()).second)
+    if (emitted_.count(decl->getCanonicalDecl()) || defer_to_owner(*decl))
       return;
+    emitted_.insert(decl->getCanonicalDecl());
     std::string source = decl->isScoped() ? "enum class " : "enum ";
     source += decl->getNameAsString() + " : " + spelling(decl->getIntegerType()) + " {\n";
     for (const auto *value : decl->enumerators()) {
@@ -203,7 +245,35 @@ private:
       value->getInitVal().toString(number, 10);
       source += value->getNameAsString() + " = " + number.str().str() + ",\n";
     }
-    declarations_ += in_namespace(*decl->getDeclContext(), source + "};\n");
+    place_declaration(*decl, source + "};\n");
+  }
+
+  void place_declaration(const clang::NamedDecl &decl, std::string source) {
+    if (const auto *owner = llvm::dyn_cast<clang::CXXRecordDecl>(decl.getDeclContext()))
+      nested_declarations_[owner->getCanonicalDecl()].push_back("public: " + std::move(source));
+    else
+      declarations_ += in_namespace(decl, std::move(source));
+  }
+
+  bool defer_to_owner(const clang::NamedDecl &decl) {
+    const auto *owner = llvm::dyn_cast<clang::CXXRecordDecl>(decl.getDeclContext());
+    if (!owner || emitting_.count(owner->getCanonicalDecl()))
+      return false;
+    if (emitted_.count(owner->getCanonicalDecl()))
+      unsupported(decl, "nested dependency was discovered after its owner was emitted");
+    nested_declarations_[owner->getCanonicalDecl()].push_back(&decl);
+    ensure_nested_owner(*owner, decl);
+    return true;
+  }
+
+  void ensure_nested_owner(const clang::CXXRecordDecl &owner,
+                           const clang::NamedDecl &dependency) {
+    if (emitted_.count(owner.getCanonicalDecl()))
+      return;
+    if (const auto *definition = owner.getDefinition())
+      emit_record(*definition);
+    else
+      unsupported(dependency, "nested type owner has no complete definition");
   }
 
   void standard_record(const clang::CXXRecordDecl &record) {
@@ -274,6 +344,21 @@ private:
   void forward(const clang::CXXRecordDecl &record) {
     if (!record.getIdentifier() || record.isDependentType())
       unsupported(record, "requires a named concrete declaration");
+    // A nested name can only be declared inside its owner. Its complete
+    // declaration is queued there by emit_record instead.
+    if (const auto *owner = llvm::dyn_cast<clang::CXXRecordDecl>(record.getDeclContext())) {
+      if (llvm::isa<clang::ClassTemplateSpecializationDecl>(record))
+        unsupported(record, "nested class template specializations are unsupported");
+      if (!forwarded_.insert(record.getCanonicalDecl()).second)
+        return;
+      const auto *owner_id = owner->getCanonicalDecl();
+      if (emitted_.count(owner_id) && !emitting_.count(owner_id))
+        unsupported(record, "nested dependency was discovered after its owner was emitted");
+      nested_declarations_[owner_id].push_back("public: " +
+          std::string(record.getKindName()) + " " + record.getNameAsString() + ";\n");
+      ensure_nested_owner(*owner, record);
+      return;
+    }
     if (!forwarded_.insert(record.getCanonicalDecl()).second)
       return;
     if (const auto *special = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(&record)) {
@@ -295,13 +380,13 @@ private:
             unsupported(record, "cannot extract the primary template parameters");
           }
         }
-        forwards_ += in_namespace(*record.getDeclContext(), declaration + "> " +
+        forwards_ += in_namespace(record, declaration + "> " +
             std::string(record.getKindName()) + " " + record.getNameAsString() + ";\n");
       }
       for (const auto &argument : special->getTemplateArgs().asArray())
         visit_template_arg(argument);
     }
-    forwards_ += in_namespace(*record.getDeclContext(),
+    forwards_ += in_namespace(record,
         specialization_prefix(record) + std::string(record.getKindName()) + " " +
         record_name(record) + ";\n");
   }
@@ -326,9 +411,12 @@ private:
       standard_record(record);
       return;
     }
-    forward(record);
-    if (!emitted_.insert(record.getCanonicalDecl()).second)
+    const auto *identity = record.getCanonicalDecl();
+    if (emitted_.count(identity) || defer_to_owner(record))
       return;
+    forward(record);
+    emitted_.insert(identity);
+    emitting_.insert(identity);
     if (record.isUnion())
       unsupported(record, "union layout requires an explicit adapter");
     const auto alignment = ast_.getASTRecordLayout(&record).getAlignment().getQuantity();
@@ -348,6 +436,7 @@ private:
       first = false;
     }
     source += " {\n";
+    const auto body = source.size();
     for (const auto *field : record.fields()) {
       visit(field->getType());
       source += access(field->getAccess()) + ": ";
@@ -406,12 +495,37 @@ private:
       }
       source += ";\n";
     }
-    if (!emitted_selected && selected_method_ && selected_method_->getParent()->getCanonicalDecl() ==
-                                record.getCanonicalDecl()) {
+    if (!emitted_selected && selected_method_ &&
+        selected_method_->getParent()->getCanonicalDecl() == record.getCanonicalDecl() &&
+        !nested_static_method(selected_method_)) {
       visit_signature(*selected_method_);
       source += "public: " + callable(*selected_method_);
     }
-    declarations_ += in_namespace(*record.getDeclContext(), source + "};\n");
+    source.insert(body, take_nested_declarations(identity));
+    emitting_.erase(identity);
+    place_declaration(record, source + "};\n");
+  }
+
+  std::string take_nested_declarations(const clang::CXXRecordDecl *owner) {
+    std::string source;
+    for (auto found = nested_declarations_.find(owner); found != nested_declarations_.end();
+         found = nested_declarations_.find(owner)) {
+      auto pending = std::move(found->second);
+      nested_declarations_.erase(found);
+      for (const auto &entry : pending) {
+        if (const auto *declaration = std::get_if<const clang::NamedDecl *>(&entry)) {
+          if (const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(*declaration))
+            emit_record(*record);
+          else if (const auto *alias = llvm::dyn_cast<clang::TypedefNameDecl>(*declaration))
+            emit_alias(*alias);
+          else
+            emit_enum(*llvm::cast<clang::EnumDecl>(*declaration));
+        } else {
+          source += std::get<std::string>(entry);
+        }
+      }
+    }
+    return source;
   }
 
   clang::ASTContext &ast_;
@@ -421,6 +535,9 @@ private:
   std::set<std::string> standard_headers_;
   std::unordered_set<const clang::Decl *> emitted_;
   std::unordered_set<const clang::Decl *> forwarded_;
+  using NestedEntry = std::variant<std::string, const clang::NamedDecl *>;
+  std::unordered_map<const clang::CXXRecordDecl *, std::vector<NestedEntry>> nested_declarations_;
+  std::unordered_set<const clang::Decl *> emitting_;
   std::string forwards_;
   std::string declarations_;
 };

@@ -36,3 +36,36 @@ struct OpaqueItem {
 const OpaqueItem *via_opaque(const OpaqueItem *item, int tag);
 
 } // namespace prepared_history
+
+namespace HFW {
+
+class HfwManager {
+  enum class ItemKind : int { Widget = 3 };
+  template <typename T> struct ItemBox;
+  struct Item;
+  using ItemResult = Item;
+
+public:
+  HfwManager() = default;
+  ItemResult createItem();
+  ItemBox<int> createBox();
+
+private:
+  template <typename T> struct ItemBox {
+    T value;
+  };
+
+  struct Details {
+    int quantity;
+  };
+
+  struct Item {
+    int id;
+    ItemKind kind;
+    Details details;
+  };
+
+  int seed = 71;
+};
+
+} // namespace HFW

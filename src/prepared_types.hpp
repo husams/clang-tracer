@@ -128,20 +128,21 @@ inline PreparedType prepared_type(clang::ASTContext &ast, clang::QualType type,
                            bool result) {
   type = type.getCanonicalType().getUnqualifiedType();
   const auto object = type.getNonReferenceType();
+  const auto spelling = type_name(ast, type);
   if (object.getAddressSpace() != clang::LangAS::Default)
-    throw std::runtime_error("non-default address-space types are unsupported");
+    throw std::runtime_error("non-default address-space type '" + spelling + "' is unsupported");
   const auto *record = object->getAsCXXRecordDecl();
   if (record)
     record = record->getDefinition();
-  const auto spelling = type_name(ast, type);
   if (type->isReferenceType())
     return {clangtracer::v1::POINTER, spelling, record, true};
   if (type->isRecordType()) {
     if (!record)
-      throw std::runtime_error("by-value types require a complete C++ record");
+      throw std::runtime_error("by-value type '" + spelling + "' requires a complete C++ record");
     if (record->hasAttr<clang::TrivialABIAttr>() &&
         (!record->hasTrivialCopyConstructor() || !record->hasTrivialDestructor()))
-      throw std::runtime_error("nontrivial [[clang::trivial_abi]] records are unsupported");
+      throw std::runtime_error("nontrivial [[clang::trivial_abi]] record '" + spelling +
+                               "' is unsupported");
     return {clangtracer::v1::OBJECT, spelling, record, false};
   }
   if (type->isBooleanType())
