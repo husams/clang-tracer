@@ -241,6 +241,14 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:repl-entry-target> "${CMAKE_OBJCOPY}" "${CMAKE_NM}")
       set_tests_properties(native_repl_entry_integration PROPERTIES TIMEOUT 100)
+      add_executable(repl-reload-target tests/fixtures/repl_reload.cpp)
+      target_compile_options(repl-reload-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
+      target_link_libraries(repl-reload-target PRIVATE Threads::Threads)
+      add_test(NAME native_repl_reload_integration
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_reload_integration.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:repl-reload-target>)
+      set_tests_properties(native_repl_reload_integration PROPERTIES TIMEOUT 240)
       add_executable(repl-bulk-concrete-target
         examples/prepared-injectors/concrete/target.cpp
         examples/prepared-injectors/concrete/virtual.cpp)

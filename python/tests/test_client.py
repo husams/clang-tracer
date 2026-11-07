@@ -172,6 +172,7 @@ def test_all_public_rpcs_have_client_methods():
     methods = {
         "Attach": "attach",
         "AddProbe": "add_probe",
+        "ReloadProbe": "reload_probe",
         "RemoveProbe": "remove_probe",
         "Detach": "detach",
         "ListSessions": "list_sessions",

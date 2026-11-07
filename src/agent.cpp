@@ -84,6 +84,7 @@
 #include "context_stdlib.hpp"
 #include "debug_resolver.hpp"
 #include "event_transport.hpp"
+#include "linux_syscalls.hpp"
 #include "native_detour.hpp"
 #include "native_stack.hpp"
 #include "runtime_identity.hpp"
@@ -122,6 +123,7 @@ struct VerifiedDebugEntry {
 };
 
 struct Probe {
+  static constexpr std::uint64_t admission_closed = std::uint64_t{1} << 63;
   tracer::Request request{};
   std::shared_ptr<OrcErrorCapture> orc_errors;
   std::unique_ptr<clang::Interpreter> interpreter;
@@ -136,6 +138,13 @@ struct Probe {
   std::atomic<std::uint64_t> in_flight{0};
   std::atomic<bool> callback_enabled{true};
   std::atomic<bool> active{false};
+  bool callbacks_active() const noexcept {
+    return active.load(std::memory_order_seq_cst) &&
+           !(in_flight.load(std::memory_order_seq_cst) & admission_closed);
+  }
+  std::uint64_t invocations_in_flight() const noexcept {
+    return in_flight.load(std::memory_order_seq_cst) & ~admission_closed;
+  }
   std::string session_id;
   long long (*callback)(const tracer::TraceContext *, void *, bool *) = nullptr;
   std::vector<std::string> argument_names;
@@ -456,7 +465,7 @@ extern "C" void *tracer_shared_enter(unsigned long long id,
                                      const tracer::TraceContext *raw) {
   auto *probe = find_probe(id);
   if (!probe || !raw || callback_depth || !probe->shared_runtime ||
-      !probe->active.load(std::memory_order_acquire) ||
+      !probe->callbacks_active() ||
       tracer::context_execution::check_entry(
           tracer::context_execution::Callee::ApplicationEndpoint) !=
           tracer::context_execution::EntryDecision::Trace)
@@ -1493,11 +1502,17 @@ std::uint64_t validate_debug_entry(const clangtracer::v1::ProbeSpec &spec) {
     const auto *current = agent.load(std::memory_order_acquire);
     if (current) {
       for (const auto &probe : current->probes) {
-        if (probe && probe->active.load() && probe->request.original_entry == address) {
-          const auto &patch = probe->request;
+        if (!probe || !probe->active.load() || probe->request.original_entry != address)
+          continue;
+        const auto &patch = probe->request;
+        std::array<unsigned char, tracer::kMaxPatchBytes> live{};
+        iovec local{live.data(), patch.patch_size};
+        iovec remote{reinterpret_cast<void *>(address), patch.patch_size};
+        if (tracer::linux_api::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0) ==
+                static_cast<ssize_t>(patch.patch_size) &&
+            std::memcmp(live.data(), patch.installed, patch.patch_size) == 0)
           return {{reinterpret_cast<const char *>(patch.original), patch.patch_size},
                   {reinterpret_cast<const char *>(patch.installed), patch.patch_size}};
-        }
       }
     }
     return {};
@@ -4855,7 +4870,7 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
                                               const tracer::TraceContext *ctx,
                                               void *instance) noexcept {
   auto *p = find_probe(id);
-  if (!p || !ctx || !p->active.load(std::memory_order_seq_cst) ||
+  if (!p || !ctx || !p->callbacks_active() ||
       !p->callback_enabled.load(std::memory_order_relaxed) || callback_depth) {
     return 0;
   }
@@ -4890,7 +4905,7 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
 extern "C" bool
 tracer_callback_lifecycle_enter(unsigned long long id) noexcept {
   auto *p = find_probe(id);
-  if (callback_depth || !p || !p->active.load(std::memory_order_seq_cst) ||
+  if (callback_depth || !p || !p->callbacks_active() ||
       !p->callback_enabled.load(std::memory_order_relaxed))
     return false;
   ++callback_depth;
@@ -4928,7 +4943,7 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
   const int saved_errno = errno;
   auto *p = find_probe(id);
   if (callback_depth || !p || !ctx ||
-      !p->active.load(std::memory_order_seq_cst) || p->delivery.socket_fd < 0) {
+      !p->callbacks_active() || p->delivery.socket_fd < 0) {
     errno = saved_errno;
     return;
   }
@@ -5131,7 +5146,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       const auto *prior = a.probes[i].get();
       if (prior &&
           (prior->active.load(std::memory_order_seq_cst) ||
-           prior->in_flight.load(std::memory_order_seq_cst) ||
+           prior->invocations_in_flight() ||
            prior->delivery.pending.load(std::memory_order_acquire) ||
            prior->transport_active)) {
         native_cache_quiescent = false;
@@ -5166,25 +5181,43 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     p->request.original_entry = reinterpret_cast<std::uintptr_t>(entry);
     int prot = 0;
     std::uintptr_t map_lo = 0, map_hi = 0;
-    if (!mapping(entry, map_lo, map_hi, prot) || (prot & PROT_EXEC) == 0) {
-      set_error(request, "target symbol is not in an executable mapping");
+    if (!mapping(entry, map_lo, map_hi, prot) ||
+        (prot & (PROT_READ | PROT_EXEC)) != (PROT_READ | PROT_EXEC)) {
+      set_error(request, "target symbol is not in a readable executable mapping");
       return -1;
     }
     Probe *replaced = nullptr;
+    bool entry_matches_original = true;
     for (std::size_t i = 0; i < a.retained; ++i) {
       auto *other = a.probes[i].get();
       if (other && other->active.load() &&
           other->request.original_entry == p->request.original_entry) {
-        if (request->reject_replacement ||
-            other->session_id != request->session_id || replaced ||
-            std::memcmp(entry, other->request.installed,
-                        other->request.patch_size) != 0) {
+        const auto &prior = other->request;
+        if (prior.patch_size > map_hi - p->request.original_entry) {
           set_error(request,
                     "target symbol address is already hooked by another probe");
           return -1;
         }
-        replaced = other;
+        if (std::memcmp(entry, prior.installed, prior.patch_size) == 0) {
+          // A retired wrapper from a previous session can remain resident
+          // after its entry is restored. Only the live detour has an owner.
+          if (request->reject_replacement || replaced || other->session_id != request->session_id) {
+            set_error(request, "target symbol address is already hooked by another probe");
+            return -1;
+          }
+          replaced = other;
+        }
+        entry_matches_original &= std::memcmp(entry, prior.original, prior.patch_size) == 0;
       }
+    }
+    if (request->expected_replaced_probe_id &&
+        (!replaced || replaced->request.probe_id != request->expected_replaced_probe_id)) {
+      set_error(request, "reload probe no longer owns the target entry");
+      return -1;
+    }
+    if (!replaced && !entry_matches_original) {
+      set_error(request, "live entry does not match any retained probe generation");
+      return -1;
     }
     tracer::native_detour::Patch target_patch;
     if (replaced) {
@@ -5212,9 +5245,14 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     }
     for (std::size_t i = 0; i < a.retained; ++i) {
       auto *other = a.probes[i].get();
-      if (!other || other == replaced || !other->active.load()) {
+      if (!other || !other->active.load()) {
         continue;
       }
+      const auto &prior = other->request;
+      if (prior.original_entry == p->request.original_entry &&
+          prior.patch_size == p->request.patch_size &&
+          std::memcmp(prior.original, p->request.original, prior.patch_size) == 0)
+        continue;
       const auto x = other->request.original_entry,
                  y = p->request.original_entry;
       const auto xe = x + other->request.patch_size,
@@ -5473,15 +5511,33 @@ extern "C" int tracer_agent_stop(tracer::Request *request) {
     std::uintptr_t lo = 0, hi = 0;
     int prot = 0;
     if (!mapping(entry, lo, hi, prot) ||
-        reinterpret_cast<std::uintptr_t>(entry) + p->request.patch_size > hi ||
-        !(prot & PROT_EXEC)) {
+        p->request.patch_size > hi - reinterpret_cast<std::uintptr_t>(entry) ||
+        (prot & (PROT_READ | PROT_EXEC)) != (PROT_READ | PROT_EXEC)) {
       set_error(request, "remove requires the original executable mapping");
       return -2;
     }
-    if (std::memcmp(entry, p->request.original, p->request.patch_size) != 0) {
-      set_error(request, "remove requires the caller to restore original "
-                         "bytes first");
+    const bool restored = std::memcmp(entry, p->request.original, p->request.patch_size) == 0;
+    const bool superseded = !restored && std::any_of(
+        a.probes.begin(), a.probes.end(), [&](const auto &other) {
+      return other && other.get() != p && other->active.load() &&
+             other->session_id == p->session_id &&
+             other->request.original_entry == p->request.original_entry &&
+             other->request.patch_size == p->request.patch_size &&
+             std::memcmp(other->request.original, p->request.original, p->request.patch_size) == 0 &&
+             std::memcmp(entry, other->request.installed, p->request.patch_size) == 0;
+    });
+    if (!restored && !superseded) {
+      set_error(request, "remove requires original bytes or a verified successor detour");
       return -2;
+    }
+    // Closing admission and testing for invocations must be one operation.
+    // A delayed wrapper entrant after closure can still run its trampoline.
+    std::uint64_t state = 0;
+    if (!p->in_flight.compare_exchange_strong(state, Probe::admission_closed) &&
+        !(state & Probe::admission_closed)) {
+      *request = p->request;
+      set_error(request, "probe invocations are in flight; remove can be retried");
+      return 1;
     }
     p->active.exchange(false, std::memory_order_seq_cst);
     if (p->scheduler_counted) {
@@ -5497,7 +5553,7 @@ extern "C" int tracer_agent_stop(tracer::Request *request) {
     p->request.pthread_create_active_tasks =
         static_cast<std::uint32_t>(std::min<std::size_t>(
             scheduler_tasks, std::numeric_limits<std::uint32_t>::max()));
-    if (p->in_flight.load(std::memory_order_seq_cst) ||
+    if (p->invocations_in_flight() ||
         p->delivery.pending.load(std::memory_order_acquire) ||
         (a.context_probe_count == 0 && scheduler_tasks != 0)) {
       p->request.event_drops =

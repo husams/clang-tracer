@@ -10,6 +10,7 @@ service Tracer {
   rpc ResolveProbe(ResolveProbeRequest) returns (ProbeSpec);
   rpc ValidateProbe(ValidateProbeRequest) returns (ValidationReport);
   rpc AddProbe(AddProbeRequest) returns (Probe);
+  rpc ReloadProbe(ReloadProbeRequest) returns (ReloadProbeResponse);
   rpc RemoveProbe(RemoveProbeRequest) returns (Probe);
   rpc Detach(DetachRequest) returns (Session);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
@@ -295,6 +296,19 @@ message Probe {
   uint64 jit_compile_ns = 11; // Target-side compilation and materialization.
   uint64 patch_install_ns = 12; // Code patch attempts, including retries.
   string bulk_batch_id = 13; // Set only for probes owned by a bulk apply.
+  uint64 replaces_probe_id = 14;
+  uint64 superseded_by_probe_id = 15;
+  bool draining = 16; // Superseded entry, still accepting events from its invocations.
+}
+message ReloadProbeRequest {
+  string session_id = 1;
+  uint64 probe_id = 2; // Must still own the entry.
+  string callback_source = 3;
+}
+message ReloadProbeResponse {
+  Probe probe = 1;
+  uint32 retained_limit = 2;
+  optional uint32 agent_retained = 3;
 }
 message RemoveProbeRequest {
   string session_id = 1;

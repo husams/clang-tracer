@@ -55,6 +55,11 @@ class TracerStub(object):
                 request_serializer=tracer__pb2.AddProbeRequest.SerializeToString,
                 response_deserializer=tracer__pb2.Probe.FromString,
                 _registered_method=True)
+        self.ReloadProbe = channel.unary_unary(
+                '/clangtracer.v1.Tracer/ReloadProbe',
+                request_serializer=tracer__pb2.ReloadProbeRequest.SerializeToString,
+                response_deserializer=tracer__pb2.ReloadProbeResponse.FromString,
+                _registered_method=True)
         self.RemoveProbe = channel.unary_unary(
                 '/clangtracer.v1.Tracer/RemoveProbe',
                 request_serializer=tracer__pb2.RemoveProbeRequest.SerializeToString,
@@ -161,6 +166,12 @@ class TracerServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def AddProbe(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReloadProbe(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -285,6 +296,11 @@ def add_TracerServicer_to_server(servicer, server):
                     servicer.AddProbe,
                     request_deserializer=tracer__pb2.AddProbeRequest.FromString,
                     response_serializer=tracer__pb2.Probe.SerializeToString,
+            ),
+            'ReloadProbe': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReloadProbe,
+                    request_deserializer=tracer__pb2.ReloadProbeRequest.FromString,
+                    response_serializer=tracer__pb2.ReloadProbeResponse.SerializeToString,
             ),
             'RemoveProbe': grpc.unary_unary_rpc_method_handler(
                     servicer.RemoveProbe,
@@ -476,6 +492,33 @@ class Tracer(object):
             '/clangtracer.v1.Tracer/AddProbe',
             tracer__pb2.AddProbeRequest.SerializeToString,
             tracer__pb2.Probe.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReloadProbe(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/ReloadProbe',
+            tracer__pb2.ReloadProbeRequest.SerializeToString,
+            tracer__pb2.ReloadProbeResponse.FromString,
             options,
             channel_credentials,
             insecure,

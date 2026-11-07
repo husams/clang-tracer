@@ -85,6 +85,8 @@ const CommandTopic commands[] = {
      "Read a local callback file and install it on the selected target.",
      R"example(%probe inject "demo::compute(int)" --callback hook.cpp --prepared prepared)example"},
     {"probe remove", "%probe remove ID", "Remove a probe from the selected session and restore the original code."},
+    {"probe reload", "%probe reload ID --callback FILE",
+     "Switch an active probe to a new observer generation while existing calls finish on their original generation."},
     {"probes", "%probes", "List the probes in the selected session."},
     {"interceptor", "", "Manage named C++ callback drafts."},
     {"interceptor load", "%interceptor load FILE --as NAME", "Load a local C++ file into a named draft."},
