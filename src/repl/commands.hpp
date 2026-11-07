@@ -15,6 +15,8 @@ enum class CommandKind {
   launch,
   resume,
   terminate,
+  target_call,
+  target_call_result,
   processes,
   sessions,
   use,

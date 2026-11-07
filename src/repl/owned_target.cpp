@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <iomanip>
+#include <limits>
 #include <map>
 #include <fcntl.h>
 #include <poll.h>
@@ -41,6 +43,55 @@ namespace {
 #if defined(__linux__) && defined(__x86_64__)
 namespace fs = std::filesystem;
 namespace gate = tracer::launch;
+namespace call = tracer::launch::detail;
+
+std::string render_call_reply(const call::CallReply &reply) {
+  switch (reply.status) {
+  case call::CallStatus::ok:
+    break;
+  case call::CallStatus::unknown_name:
+    throw std::invalid_argument("no function registered under this name");
+  case call::CallStatus::ambiguous_name:
+    throw std::invalid_argument("more than one function is registered under this name");
+  case call::CallStatus::wrong_count:
+    throw std::invalid_argument("registered function expects " +
+                                std::to_string(reply.detail) + " arguments");
+  case call::CallStatus::invalid_argument:
+    throw std::invalid_argument("argument " + std::to_string(reply.detail) +
+                                " is not valid for the registered scalar type");
+  case call::CallStatus::exception:
+    throw std::runtime_error("target function threw a C++ exception");
+  }
+  std::ostringstream result;
+  result.imbue(std::locale::classic());
+  switch (reply.type) {
+  case call::CallType::none:
+    result << "type=void";
+    break;
+  case call::CallType::boolean:
+    result << "type=bool value=" << std::boolalpha << (reply.unsigned_value != 0);
+    break;
+  case call::CallType::i32:
+  case call::CallType::i64:
+    result << (reply.type == call::CallType::i32 ? "type=int32" : "type=int64")
+           << " value=" << reply.signed_value;
+    break;
+  case call::CallType::u32:
+  case call::CallType::u64:
+    result << (reply.type == call::CallType::u32 ? "type=uint32" : "type=uint64")
+           << " value=" << reply.unsigned_value;
+    break;
+  case call::CallType::f32:
+    result << "type=float value=" << std::setprecision(std::numeric_limits<float>::max_digits10)
+           << reply.real_value;
+    break;
+  case call::CallType::f64:
+    result << "type=double value=" << std::setprecision(std::numeric_limits<double>::max_digits10)
+           << reply.real_value;
+    break;
+  }
+  return result.str();
+}
 
 struct Fd {
   int value;
@@ -232,6 +283,7 @@ void OwnedTarget::close_gate() noexcept {
   if (gate_ >= 0)
     ::close(gate_);
   gate_ = -1;
+  call_pending_ = false;
 }
 
 bool OwnedTarget::running() {
@@ -271,9 +323,11 @@ void OwnedTarget::wait_ready(unsigned seconds, const std::atomic<bool> &cancelle
       throw std::runtime_error("target readiness timed out waiting for the application checkpoint");
     SetupError report{};
     const auto count = ::recv(gate_, &report, sizeof(report), MSG_DONTWAIT | MSG_TRUNC);
-    if (count == 1 && *reinterpret_cast<const char *>(&report) == gate::ready) {
+    const char message = *reinterpret_cast<const char *>(&report);
+    if (count == 1 && (message == gate::ready || message == call::call_ready)) {
       if (!running())
         throw std::runtime_error("target " + exit_description() + " at readiness");
+      calls_enabled_ = message == call::call_ready;
       return;
     }
     if (count == static_cast<ssize_t>(sizeof(report)) && report.step >= isolate && report.step <= execute) {
@@ -315,6 +369,8 @@ void OwnedTarget::resume() {
     throw std::runtime_error("target " + exit_description());
   if (!paused())
     throw std::runtime_error("target has already resumed");
+  if (call_pending_)
+    throw std::runtime_error("collect the pending result with %call-result before resuming");
   ssize_t sent;
   do {
     sent = ::send(gate_, &gate::resume, 1, MSG_NOSIGNAL);
@@ -324,6 +380,79 @@ void OwnedTarget::resume() {
   close_gate();
 #else
   throw std::runtime_error("owned launch requires Linux x86-64");
+#endif
+}
+
+void OwnedTarget::start_call(const std::string &name, const std::vector<std::string> &arguments) {
+#if defined(__linux__) && defined(__x86_64__)
+  if (!running())
+    throw std::runtime_error("target " + exit_description());
+  if (!calls_enabled())
+    throw std::runtime_error("target calls require a paused checkpoint with registered functions");
+  if (call_pending_)
+    throw std::runtime_error("collect the pending result with %call-result before starting another call");
+  call::CallRequest request;
+  if (name.empty() || name.size() >= sizeof(request.name) || name.find('\0') != std::string::npos)
+    throw std::invalid_argument("function name must contain 1 to 255 non-NUL bytes");
+  if (arguments.size() > call::max_call_arguments)
+    throw std::invalid_argument("a target call accepts at most eight scalar arguments");
+  std::copy(name.begin(), name.end(), request.name);
+  request.count = static_cast<std::uint32_t>(arguments.size());
+  for (std::size_t index = 0; index < arguments.size(); ++index) {
+    const auto &argument = arguments[index];
+    if (argument.size() >= sizeof(request.arguments[index]) || argument.find('\0') != std::string::npos)
+      throw std::invalid_argument("a scalar argument must contain at most 63 non-NUL bytes");
+    std::copy(argument.begin(), argument.end(), request.arguments[index]);
+  }
+  ssize_t sent;
+  do {
+    sent = ::send(gate_, &request, sizeof(request), MSG_DONTWAIT | MSG_NOSIGNAL);
+  } while (sent == -1 && errno == EINTR);
+  if (sent != static_cast<ssize_t>(sizeof(request)))
+    launch_error("cannot send target call request");
+  call_pending_ = true;
+#else
+  (void)name;
+  (void)arguments;
+  throw std::runtime_error("target calls require Linux x86-64");
+#endif
+}
+
+std::string OwnedTarget::call_result(unsigned seconds, const std::atomic<bool> &cancelled) {
+#if defined(__linux__) && defined(__x86_64__)
+  if (!call_pending_)
+    throw std::runtime_error("no pending target call");
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+  while (!call_protocol_failed_) {
+    if (cancelled.load() || std::chrono::steady_clock::now() >= deadline) {
+      throw std::runtime_error(
+          std::string(cancelled.load() ? "target call wait interrupted" : "target call wait timed out") +
+          "; function may still be running; use %call-result to collect its reply");
+    }
+    call::CallReply reply;
+    const auto count = ::recv(gate_, &reply, sizeof(reply), MSG_DONTWAIT | MSG_TRUNC);
+    if (count == static_cast<ssize_t>(sizeof(reply)) &&
+        reply.version == call::call_protocol && reply.status <= call::CallStatus::exception &&
+        reply.type <= call::CallType::f64) {
+      call_pending_ = false;
+      return render_call_reply(reply);
+    }
+    if (count < 0 && errno == EINTR)
+      continue;
+    if (count >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+      break;
+    pollfd descriptor{gate_, POLLIN, 0};
+    if (::poll(&descriptor, 1, 20) < 0 && errno != EINTR)
+      break;
+  }
+  if (!running())
+    throw std::runtime_error("target " + exit_description() + " without returning a call result");
+  call_protocol_failed_ = true;
+  throw std::runtime_error("target call reply unavailable; execution may have occurred; use %terminate");
+#else
+  (void)seconds;
+  (void)cancelled;
+  throw std::runtime_error("target calls require Linux x86-64");
 #endif
 }
 

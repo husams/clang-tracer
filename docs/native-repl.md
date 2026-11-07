@@ -145,6 +145,52 @@ session IDs, blocks automatic retries for that PID, and reconciles again on
 appropriate. Candidates are never assumed to belong to this console on an
 external server; recovery information is retained until explicitly resolved.
 
+### Call a registered function in the paused target
+
+Register each callable at the startup checkpoint. The application compiler
+checks the function pointer's argument and result types. The name is an exact
+match to the name you register and can distinguish overloads.
+
+```cpp
+#include <tracer/launch.hpp>
+
+double scale(int value, double factor) { return value * factor; }
+
+int main() {
+  using tracer::launch::named_call;
+  if (!tracer::launch::wait_for_resume(named_call("app::scale", &scale)))
+    return 125;
+  // Continue normal application startup.
+}
+```
+
+```text
+%launch ./app
+%call app::scale --arg 6 --arg 1.5
+%resume
+```
+
+The result line shows the type and value, such as `type=double value=9`.
+Registered functions accept up to eight arguments drawn from `bool`,
+32-bit and 64-bit signed and unsigned integers, `float`, and `double`.
+The same types and `void` are available for results. Enter decimal integers,
+finite decimal floating-point values, and `true` or `false`. Wrong argument
+counts and invalid values are rejected before execution. Pointers, references,
+objects, variadic functions, and functions with an implicit receiver are
+outside this interface.
+
+Calls run one at a time on the thread that entered the checkpoint, before
+`%resume`. Choose functions that are ready to run at that point in startup.
+Their side effects remain in the target, and an escaping C++ exception is
+reported as a failed call. Returned scalars are copied into the REPL's reply.
+Calls require a target launched by this REPL with a registered checkpoint.
+
+Use `--timeout SECONDS` to bound how long the REPL waits. Timeout or
+interruption leaves the call pending and it may continue running. Use
+`%call-result [--timeout SECONDS]` to collect its reply. A pending call
+blocks another call, resume, or probe changes on that target.
+`%terminate` still kills the owned target if it cannot finish.
+
 ## Browse a local C++ target
 
 ```text

@@ -28,6 +28,12 @@ int main() {
           launch.number("--timeout", 0) == 5);
   require(parse_command("%resume").arguments.empty());
   require(parse_command("%terminate 123").kind == CommandKind::terminate);
+  const auto call = parse_command("%call app::sum --arg -3 --arg 1.25 --timeout 1");
+  require(call.kind == CommandKind::target_call && call.arguments[0] == "app::sum" &&
+          call.options.at("--arg") == std::vector<std::string>{"-3", "1.25"});
+  require(parse_command("%call-result --timeout 2").kind == CommandKind::target_call_result);
+  bad("%call");
+  bad("%call-result --arg 1");
   bad("%launch app --cwd here --cwd there");
   bad("%launch app --timeout 0");
   bad("%resume 0");

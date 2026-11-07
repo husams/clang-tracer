@@ -312,3 +312,22 @@ resume, and REPL exit with a paused child.
 Twelve focused native REPL CTests passed on Linux x86-64 with the GCC 8.5
 SDK and Clang 21.1.8. The launch fixture also passed with its executable,
 working directory, and output files on OverlayFS.
+
+### L2 Explicit scalar invocation
+
+The application registers named C++ function pointers at the owned launch
+checkpoint. `%call` dispatches one validated scalar call on the checkpoint
+thread before resume, and copies the typed result back to the REPL. A timeout
+or interrupted wait leaves one pending request per target. `%call-result`
+collects its reply without submitting the call again.
+
+The Linux x86-64 fixture checked mixed-width arguments, integer limits,
+floating-point and boolean values, exceptions, rejection before execution,
+and timeout recovery without executing twice. It verified that a named call
+runs on the startup thread, emits PRE/POST events when probed, and is reaped
+on REPL exit if still running. Compile checks rejected references, pointers,
+long double, variadics, member pointers and the Microsoft x64 calling convention.
+
+Eleven focused CTests passed with the GCC 8.5 SDK and Clang 21.1.8. The
+shell profile test timed out in the parallel run and passed on its isolated
+rerun.

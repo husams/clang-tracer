@@ -95,6 +95,8 @@ public:
 
     virtual std::any visitLaunchOption(TracerCommandsParser::LaunchOptionContext *context) = 0;
 
+    virtual std::any visitTargetCall(TracerCommandsParser::TargetCallContext *context) = 0;
+
 
 };
 

@@ -69,6 +69,57 @@ def main(repl, server, fixture):
             '--stdin input.txt --stdout out.txt --stderr err.txt'
         )
         assert stdout == root / "out.txt" and stderr == root / "err.txt"
+
+        def call(command, result):
+            send(f"%call {command}")
+            output.expect(rf"^call result pid={pid} {result}$")
+
+        send("%call-result")
+        output.expect("no pending target call")
+        call("app::startup-thread", "type=bool value=true")
+        call("app::float --arg 1.25", r"type=float value=1\.25")
+        call("app::double --arg -2.5", r"type=double value=-2\.5")
+        call("app::void", "type=void")
+        send("%call app::unknown")
+        output.expect("no function registered under this name")
+        send("%call app::duplicate")
+        output.expect("more than one function is registered under this name")
+        send("%call app::scalar --arg 1")
+        output.expect("registered function expects 7 arguments")
+        scalar_args = (
+            "--arg -2147483648 --arg 4294967295 --arg -9223372036854775808 "
+            "--arg 18446744073709551615 --arg true --arg 1.25 --arg -2.5"
+        )
+        for value, invalid, index in (
+            ("-2147483648", "-2147483649", 1),
+            ("4294967295", "-1", 2),
+            ("18446744073709551615", "18446744073709551616", 4),
+            ("true", "1", 5),
+            ("1.25", "1e100", 6),
+            ("-2.5", "1.0junk", 7),
+        ):
+            send(f"%call app::scalar {scalar_args.replace(value, invalid)}")
+            output.expect(rf"argument {index} is not valid for the registered scalar type")
+        call("app::count", "type=uint32 value=0")
+        call(f"app::scalar {scalar_args}", "type=uint64 value=18446744073709551615")
+        send("%call app::throw")
+        output.expect(r"target function threw a C\+\+ exception")
+        call("app::count", "type=uint32 value=1")
+        send("%call app::held --timeout 1")
+        output.expect("target call wait timed out; function may still be running")
+        send("%resume")
+        output.expect("target call pending; use %call-result or %terminate")
+        send("%call app::count")
+        output.expect("target call pending; use %call-result or %terminate")
+        send("%probe remove 1")
+        output.expect("target call pending; use %call-result or %terminate")
+        send("%threads")
+        output.expect(rf"^tid={pid} start=\d+ name=")
+        assert stdout.read_text() == stderr.read_text() == ""
+        (root / "work space" / "release-call").touch()
+        send("%call-result --timeout 2")
+        output.expect(rf"^call result pid={pid} type=int64 value=-9000000000$")
+        call("app::count", "type=uint32 value=2")
         send("%detach")
         output.expect(r"resume or terminate the paused target before detaching")
         send("%server stop")
@@ -77,9 +128,17 @@ def main(repl, server, fixture):
         probe = output.expect(r"^installed probe=(\d+)")[1]
         assert stdout.read_text() == stderr.read_text() == ""
 
+        call("app::startup --arg 9", "type=int32 value=19")
+        send(f"%events --probe {probe} --count 2 --timeout 10")
+        invoked = output.expect(rf"^cursor=\d+ .*probe={probe} phase=PRE call=(\d+)")
+        explicit = output.expect(
+            rf"^cursor=(\d+) .*probe={probe} phase=POST call={invoked[1]} .* startup=1 result=19(?: |$)"
+        )
+        output.expect(r"^received=2 .*complete=true")
+
         send("%resume")
         output.expect(rf"^resumed pid={pid}$")
-        send(f"%events --probe {probe} --count 2 --timeout 10")
+        send(f"%events --probe {probe} --count 2 --after {explicit[1]} --timeout 10")
         pre = output.expect(rf"^cursor=\d+ .*probe={probe} phase=PRE call=(\d+)")
         output.expect(
             rf"^cursor=\d+ .*probe={probe} phase=POST call={pre[1]} .* startup=1 result=17(?: |$)"
@@ -87,6 +146,8 @@ def main(repl, server, fixture):
         output.expect(r"^received=2 .*complete=true")
         send(f"%resume {pid}")
         output.expect(r"target has already resumed")
+        send("%call app::count")
+        output.expect("target calls require a paused checkpoint with registered functions")
         # An attached event stream can receive POST just before the program
         # writes its logs. Terminate only after the writes have completed.
         for path in (stdout, stderr):
@@ -145,10 +206,14 @@ def main(repl, server, fixture):
         send("%server stop")
         output.expect(r"^owned server stopped after restoration$")
 
-        paused, stdout, stderr = launch_default()
+        paused, stdout, stderr = launch_default('--arg "--no-calls"')
+        send("%call app::count")
+        output.expect("target calls require a paused checkpoint with registered functions")
         terminate(paused)
         assert stdout.read_text() == stderr.read_text() == ""
         leaving, stdout, stderr = launch_default()
+        send("%call app::held --timeout 1")
+        output.expect("target call wait timed out; function may still be running")
         send("%quit")
         assert console.wait(timeout=15) == 1, "".join(output.seen)
         reaped(leaving)

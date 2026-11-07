@@ -167,6 +167,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitTargetCall(TracerCommandsParser::TargetCallContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
 
 };
 

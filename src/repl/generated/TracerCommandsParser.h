@@ -30,8 +30,9 @@ public:
     T__92 = 93, T__93 = 94, T__94 = 95, T__95 = 96, T__96 = 97, T__97 = 98,
     T__98 = 99, T__99 = 100, T__100 = 101, T__101 = 102, T__102 = 103, T__103 = 104,
     T__104 = 105, T__105 = 106, T__106 = 107, T__107 = 108, T__108 = 109,
-    T__109 = 110, T__110 = 111, T__111 = 112, UINT = 113, STRING = 114,
-    SHELL = 115, METADATA_ONLY = 116, SQLITE = 117, WORD = 118, WS = 119
+    T__109 = 110, T__110 = 111, T__111 = 112, T__112 = 113, T__113 = 114,
+    UINT = 115, STRING = 116, SHELL = 117, METADATA_ONLY = 118, SQLITE = 119,
+    WORD = 120, WS = 121
   };
 
   enum {
@@ -43,7 +44,8 @@ public:
     RuleRecord = 21, RuleStreamOption = 22, RuleCpp = 23, RuleShell = 24,
     RuleComplete = 25, RuleType = 26, RuleHelp = 27, RuleQuit = 28, RuleBulkTrace = 29,
     RuleBulkTraceOption = 30, RuleValue = 31, RuleKeyword = 32, RuleMemory = 33,
-    RuleProbeEntry = 34, RuleProbeReload = 35, RuleTargetLaunch = 36, RuleLaunchOption = 37
+    RuleProbeEntry = 34, RuleProbeReload = 35, RuleTargetLaunch = 36, RuleLaunchOption = 37,
+    RuleTargetCall = 38
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -101,6 +103,7 @@ public:
   class ProbeReloadContext;
   class TargetLaunchContext;
   class LaunchOptionContext;
+  class TargetCallContext;
 
   class  LineContext : public antlr4::ParserRuleContext {
   public:
@@ -146,6 +149,7 @@ public:
     ProbeEntryContext *probeEntry();
     ProbeReloadContext *probeReload();
     TargetLaunchContext *targetLaunch();
+    TargetCallContext *targetCall();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -664,6 +668,22 @@ public:
   };
 
   LaunchOptionContext* launchOption();
+
+  class  TargetCallContext : public antlr4::ParserRuleContext {
+  public:
+    TargetCallContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    std::vector<ValueContext *> value();
+    ValueContext* value(size_t i);
+    std::vector<antlr4::tree::TerminalNode *> UINT();
+    antlr4::tree::TerminalNode* UINT(size_t i);
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  TargetCallContext* targetCall();
 
 
   // By default the static state used to implement the parser is lazily initialized during the first

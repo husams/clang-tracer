@@ -4,7 +4,7 @@ line : '%' command EOF;
 command : server | attach | processes | sessions | use | status | detach
         | modules | threads | symbols | probe | interceptor | events | collect | record
         | cpp | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload
-        | targetLaunch;
+        | targetLaunch | targetCall;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
 serverOption : ('--executable' | '--agent') value;
 attach : 'attach' (UINT ('--start-time' UINT)?)?;
@@ -64,7 +64,8 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'import'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
         | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview' | 'apply'
-        | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | 'launch' | 'resume' | 'terminate';
+        | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | 'launch' | 'resume' | 'terminate'
+        | 'call' | 'call-result';
 memory : 'memory' ('maps' | 'read' value '--mapping' value
                  ('--count' UINT | '--type' value)
                  | 'scan' value '--mapping' value '--count' UINT
@@ -75,6 +76,7 @@ probeReload : 'probe' 'reload' UINT '--callback' value;
 targetLaunch : 'launch' value launchOption* | ('resume' | 'terminate') UINT?;
 launchOption : ('--arg' | '--cwd' | '--env' | '--stdin' | '--stdout' | '--stderr') value
              | '--timeout' UINT;
+targetCall : 'call' value ('--arg' value | '--timeout' UINT)* | 'call-result' ('--timeout' UINT)?;
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';

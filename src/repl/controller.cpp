@@ -467,6 +467,13 @@ void Controller::require_session(const SessionHandle &session) {
   throw std::runtime_error("session is no longer attached: " + session.id);
 }
 
+void Controller::require_idle_target(const SessionHandle &session) const {
+  const auto owned = owned_targets_.find(session.pid);
+  if (owned != owned_targets_.end() && owned->second.session.id == session.id &&
+      owned->second.process->call_pending())
+    throw std::runtime_error("target call pending; use %call-result or %terminate");
+}
+
 SessionHandle Controller::attach(std::uint32_t pid,
                                  std::uint64_t expected_start_time,
                                  const std::string &expected_executable) {
@@ -630,6 +637,7 @@ void Controller::control_target(const Command &command) {
     throw std::runtime_error("specify a PID launched by this REPL or select its session");
   auto &owned = found->second;
   if (command.kind == CommandKind::resume) {
+    require_idle_target(owned.session);
     require_session(owned.session);
     owned.process->resume();
     out_ << "resumed pid=" << pid << '\n';
@@ -642,6 +650,25 @@ void Controller::control_target(const Command &command) {
   out_ << "terminated pid=" << pid << '\n';
   if (owned_sessions_.count(session.id))
     detach(session);
+}
+
+void Controller::call_target(const Command &command) {
+  const auto found = owned_targets_.find(selected_.pid);
+  if (found == owned_targets_.end() || found->second.session.id != selected_.id ||
+      found->second.session.connection != connection_)
+    throw std::runtime_error("select a target launched by this REPL");
+  auto &target = *found->second.process;
+  if (command.kind == CommandKind::target_call) {
+    require_idle_target(selected_);
+    require_session(selected_);
+    const auto args = command.options.find("--arg");
+    const std::vector<std::string> no_args;
+    if (interrupted.load())
+      throw std::runtime_error("target call cancelled before submission");
+    target.start_call(command.arguments.at(0), args == command.options.end() ? no_args : args->second);
+  }
+  const auto result = target.call_result(command.number("--timeout", settings_.timeout_seconds), interrupted);
+  out_ << "call result pid=" << found->first << ' ' << result << '\n';
 }
 
 void Controller::detach(const SessionHandle &session) {
@@ -790,6 +817,7 @@ std::uint64_t Controller::inject(const SessionHandle &session,
                                  const std::string &selector,
                                  const std::string &source,
                                  const Command &options) {
+  require_idle_target(session);
   require_session(session);
   const auto resolve_started = std::chrono::steady_clock::now();
   auto spec = resolve_for(session, selector, options);
@@ -1286,6 +1314,7 @@ void Controller::preview_bulk_trace(const Command &command) {
 }
 
 void Controller::apply_bulk_trace(const Command &command) {
+  require_idle_target(selected_);
   require_session(selected_);
   api::ApplyBulkTraceRequest request;
   request.set_session_id(selected_.id);
@@ -1323,6 +1352,7 @@ void Controller::apply_bulk_trace(const Command &command) {
 }
 
 void Controller::remove_bulk_trace(const std::string &batch_id) {
+  require_idle_target(selected_);
   require_session(selected_);
   api::RemoveBulkTraceRequest request;
   request.set_session_id(selected_.id);
@@ -1390,7 +1420,9 @@ bool Controller::execute(const Command &command) {
       out_ << reconcile_attaches() << '\n';
     for (const auto &target : owned_targets_)
       out_ << "owned_target pid=" << target.first
-           << " paused=" << (target.second.process->paused() ? "true" : "false") << '\n';
+           << " paused=" << (target.second.process->paused() ? "true" : "false")
+           << " calls=" << (target.second.process->calls_enabled() ? "enabled" : "unavailable")
+           << " call_pending=" << (target.second.process->call_pending() ? "true" : "false") << '\n';
     for (const auto &b : batches_) {
       out_ << "collection=" << b.first << " events=" << b.second.events().size()
            << " bytes=" << b.second.bytes() << '\n';
@@ -1407,6 +1439,10 @@ bool Controller::execute(const Command &command) {
   case K::resume:
   case K::terminate:
     control_target(command);
+    return true;
+  case K::target_call:
+  case K::target_call_result:
+    call_target(command);
     return true;
   case K::bulk_preview:
     preview_bulk_trace(command);
@@ -1662,6 +1698,7 @@ bool Controller::execute(const Command &command) {
     return true;
   case K::validate:
   case K::draft_validate: {
+    require_idle_target(selected_);
     require_session(selected_);
     const bool named = command.kind == K::draft_validate;
     const auto selector = named ? command.option("--target") : args.at(0);
@@ -1699,6 +1736,7 @@ bool Controller::execute(const Command &command) {
     return true;
   }
   case K::probe_reload: {
+    require_idle_target(selected_);
     require_session(selected_);
     api::ReloadProbeRequest request;
     request.set_session_id(selected_.id);
@@ -1721,6 +1759,7 @@ bool Controller::execute(const Command &command) {
     return true;
   }
   case K::remove: {
+    require_idle_target(selected_);
     require_session(selected_);
     api::RemoveProbeRequest request;
     request.set_session_id(selected_.id);

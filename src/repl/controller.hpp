@@ -62,6 +62,8 @@ class Controller {
   void require_no_owned_targets();
   void launch(const Command &command);
   void control_target(const Command &command);
+  void call_target(const Command &command);
+  void require_idle_target(const SessionHandle &session) const;
   std::string reconcile_attaches(bool *snapshot_available = nullptr);
   clangtracer::v1::ProbeSpec resolve(const std::string &selector,
                                      const Command &command);

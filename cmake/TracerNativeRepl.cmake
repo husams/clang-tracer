@@ -157,7 +157,9 @@ function(tracer_add_native_repl)
     set_source_files_properties("${_repl}/interpreter.cpp" "${_repl}/completion.cpp" PROPERTIES COMPILE_OPTIONS "-fno-rtti")
   endif()
   install(TARGETS clang-tracer-repl clang-tracer-repl-check RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Runtime)
-  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/launch.hpp" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/tracer" COMPONENT Runtime)
+  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/launch.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/launch_call.hpp"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/tracer" COMPONENT Runtime)
   install(FILES "${_repl}/api.hpp" "${_repl}/event_value.hpp" "${_repl}/event_ranges.hpp" DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer/repl" COMPONENT Runtime)
   option(TRACER_BUNDLE_CLANG_HEADERS "Install selected Clang builtin headers with the runtime" ON)
   if(TRACER_REPL_ONLY AND TRACER_BUNDLE_CLANG_HEADERS)
