@@ -112,6 +112,7 @@ def build_completer() -> NestedCompleter:
                 "--limit": None,
                 "--page": None,
             },
+            "modules": None,
             "help": {
                 "server": {"start": None, "status": None, "stop": None},
                 "probe": {
@@ -125,6 +126,7 @@ def build_completer() -> NestedCompleter:
                         "attach",
                         "sessions",
                         "symbols",
+                        "modules",
                         "use",
                         "detach",
                         "events",
@@ -225,6 +227,12 @@ class Console:
                 self.emit("no sessions")
             for session in sessions:
                 self.emit(session)
+        elif name == "modules":
+            modules = self.client.list_modules(self.selected())
+            for module in modules:
+                self.emit(module)
+            if not modules:
+                self.emit("no mapped application modules")
         elif name == "symbols":
             page = self.client.list_symbols(self.selected(), **options)
             self.emit(page)
@@ -235,7 +243,7 @@ class Console:
                     if value:
                         quoted = json.dumps(value, ensure_ascii=False)
                         next_command.extend((option, quoted))
-                next_command.extend(("--limit", str(options.get("page_size", 100))))
+                next_command.extend(("--limit", str(options.get("page_size", 0))))
                 next_command.extend(
                     ("--page", json.dumps(page.next_page_token, ensure_ascii=False))
                 )

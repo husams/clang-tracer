@@ -12,6 +12,7 @@ service Tracer {
   rpc RemoveProbe(RemoveProbeRequest) returns (Probe);
   rpc Detach(DetachRequest) returns (Session);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc ListModules(ListModulesRequest) returns (ListModulesResponse);
   rpc ListSymbols(ListSymbolsRequest) returns (ListSymbolsResponse);
   rpc WatchEvents(WatchEventsRequest) returns (stream TraceEvent);
   // Snapshot retained events; acknowledge only after storage commits.
@@ -169,6 +170,9 @@ message ResolveProbeRequest {
   string selector = 2; // C++ declaration, e.g. Calculator::add(int).
   repeated string include_headers = 3; // Paths on the server host.
   string compilation_database = 4; // Optional path on the server host.
+  string module = 5; // Optional mapped path substring; empty uses ELF symbol tables.
+  uint64 debug_max_entries = 6; // Zero is unlimited.
+  uint32 debug_max_depth = 7; // Zero is unlimited.
 }
 message Probe {
   uint64 id = 1;
@@ -189,11 +193,13 @@ message RemoveProbeRequest {
 message DetachRequest { string session_id = 1; }
 message ListSessionsRequest {}
 message ListSessionsResponse { repeated Session sessions = 1; }
+message ListModulesRequest { string session_id = 1; }
+message ListModulesResponse { repeated string modules = 1; }
 message ListSymbolsRequest {
   string session_id = 1;
   string query = 2; // Case-sensitive substring of selector or linkage name.
   string module = 3; // Case-sensitive substring of mapped ELF module path.
-  uint32 page_size = 4; // Zero selects 100; maximum 500.
+  uint32 page_size = 4; // Zero returns all matches; positive values opt into pagination.
   string page_token = 5; // Opaque continuation token from the previous page.
 }
 message FunctionSymbol {

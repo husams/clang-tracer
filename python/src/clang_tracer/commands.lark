@@ -4,6 +4,7 @@
       | "server" "stop" timeout_option?                  -> server_stop
       | "attach" INT                                    -> attach
       | "sessions"                                      -> sessions
+      | "modules"                                       -> modules
       | "symbols" symbol_option*                        -> symbols
       | "use" value                                     -> use
       | "detach" value?                                 -> detach
@@ -38,6 +39,9 @@
                  | resolution_option
 ?resolution_option: "--include" value                    -> include_headers
                   | "--compdb" value                    -> compilation_database
+                  | "--module" value                    -> module
+                  | "--debug-max-entries" INT            -> debug_max_entries
+                  | "--debug-max-depth" INT              -> debug_max_depth
 ?watch_option: "--count" INT                             -> count
              | stream_option
 ?record_option: "--sqlite"                              -> sqlite

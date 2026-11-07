@@ -23,6 +23,14 @@ from clang_tracer.command import (
         ("server stop --timeout 9", "server_stop", (), {"timeout": 9.0}),
         ("attach 123", "attach", (123,), {}),
         ("sessions", "sessions", (), {}),
+        ("modules", "modules", (), {}),
+        (
+            'probe resolve "add(int, int)" --module target '
+            "--debug-max-entries 2000001 --debug-max-depth 256",
+            "resolve",
+            ("add(int, int)",),
+            {"module": "target", "debug_max_entries": 2000001, "debug_max_depth": 256},
+        ),
         ("use s1", "use", ("s1",), {}),
         ("detach", "detach", (), {}),
         ("detach 's 1'", "detach", ("s 1",), {}),
