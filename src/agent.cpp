@@ -2,6 +2,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <bits/cxxabi_forced.h>
 #include <chrono>
 #include <cctype>
 #include <condition_variable>
@@ -96,6 +97,8 @@
 #include "tracer/compat.hpp"
 #include "tracer/compiler_options.hpp"
 #include "tracer/protocol.hpp"
+#include "scalar_overrides.hpp"
+#include "tracer/reclaim.h"
 #include "tracer/receiver_abi.hpp"
 
 #if !defined(__linux__) || !defined(__x86_64__)
@@ -156,6 +159,7 @@ struct Probe {
   bool has_post = false;
   bool transport_active = false;
   bool scheduler_counted = false;
+  bool reclaimable = false;
   void *wrapper = nullptr;
   std::vector<std::string> external_link_candidates;
   std::shared_ptr<const tracer::ContextActivationGeneration> shared_generation;
@@ -177,6 +181,7 @@ struct Probe {
 struct Agent {
   std::array<std::unique_ptr<Probe>, tracer::kMaxProbes> probes{};
   std::array<std::atomic<Probe *>, tracer::kMaxProbes> probe_slots{};
+  std::array<std::atomic<std::uint64_t>, tracer::kMaxProbes> slot_ids{};
   std::size_t retained = 0;
   pid_t pid = 0;
   tracer::ContextRegistry context_registry;
@@ -310,7 +315,7 @@ extern "C" void tracer_capture_entry_stack(const tracer::TraceContext *,
                                            unsigned) noexcept;
 extern "C" long long tracer_callback_dispatch(unsigned long long,
                                               const tracer::TraceContext *,
-                                              void *) noexcept;
+                                              void *);
 extern "C" bool tracer_callback_lifecycle_enter(unsigned long long) noexcept;
 extern "C" void tracer_callback_cleanup_enter() noexcept;
 extern "C" void tracer_callback_lifecycle_leave() noexcept;
@@ -337,12 +342,9 @@ Probe *find_probe(std::uint64_t id) noexcept {
   if (!current) {
     return nullptr;
   }
-  for (auto &slot : current->probe_slots) {
-    Probe *probe = slot.load(std::memory_order_acquire);
-    if (probe && probe->request.probe_id == id) {
-      return probe;
-    }
-  }
+  for (std::size_t i = 0; i < current->slot_ids.size(); ++i)
+    if (id && current->slot_ids[i].load(std::memory_order_acquire) == id)
+      return current->probe_slots[i].load(std::memory_order_acquire);
   return nullptr;
 }
 
@@ -1504,9 +1506,12 @@ std::string missing_recovered_record_declarations(
 }
 
 std::uint64_t validate_debug_entry(const clangtracer::v1::ProbeSpec &spec) {
+  if (const auto *error = tracer::scalar_override_error(spec))
+    throw std::invalid_argument(error);
   const auto &info = spec.debug_info();
   tracer::client::DebugLookupOptions lookup;
   lookup.module = info.module();
+  lookup.require_override_abi = tracer::has_scalar_overrides(spec);
   const auto live_patch = [](std::uint64_t address) -> tracer::client::PreparedCodePatch {
     const auto *current = agent.load(std::memory_order_acquire);
     if (current) {
@@ -2298,7 +2303,7 @@ bool prepare_context_pthread(Agent &owner, Probe &probe, std::string &error) {
     error = "pthread_create patch overlaps the target probe";
     return false;
   }
-  for (std::size_t i = 0; i < owner.retained; ++i) {
+  for (std::size_t i = 0; i < owner.probes.size(); ++i) {
     const auto *existing = owner.probes[i].get();
     if (!existing || !existing->active.load(std::memory_order_acquire))
       continue;
@@ -2360,6 +2365,12 @@ std::string make_wrapper(const tracer::Request &r,
                          const tracer::ValueSnapshotCode *snapshots = nullptr) {
   const bool typed = spec && tracer::prepared::is_typed_version(
                                   spec->prepared().format_version());
+  const bool override_arguments = spec && spec->allow_argument_overrides();
+  const bool override_result = spec && spec->allow_result_override();
+  const bool replace = spec && spec->allow_replacement();
+  const bool callable_original = spec && spec->allow_call_original();
+  const bool trace_exceptions = spec && spec->trace_exceptions();
+  const bool overrides = override_arguments || override_result || replace || callable_original;
   const auto indirect_argument = [&](unsigned i) {
     return typed && r.arguments[i] == tracer::ValueType::Object &&
            spec->debug_info().arguments(i).object_type().record_pass_by_reference();
@@ -2389,7 +2400,7 @@ std::string make_wrapper(const tracer::Request &r,
   };
   std::string code = (snapshots ? snapshots->declarations : std::string()) +
       "extern \"C\" long long tracer_callback_dispatch(unsigned long "
-      "long,const tracer::TraceContext*,void*) noexcept;\nextern \"C\" void "
+      "long,const tracer::TraceContext*,void*);\nextern \"C\" void "
       "tracer_event_dispatch(unsigned long long,const "
       "tracer::TraceContext*,long long) noexcept;\nextern \"C\" void "
       "tracer_probe_enter(unsigned long long) noexcept;\nextern \"C\" void "
@@ -2404,9 +2415,14 @@ std::string make_wrapper(const tracer::Request &r,
       "extern \"C\" void tracer_capture_stack(const "
       "tracer::TraceContext*,unsigned,bool) noexcept;\n";
   code += "extern \"C\" void tracer_context_check_entry();\n";
+  if (shared_mode || trace_exceptions || callable_original)
+    code += "#include <bits/cxxabi_forced.h>\n";
+  if (callable_original)
+    code += "#include <exception>\n#include <cerrno>\n"
+            "extern \"C\" unsigned tracer_swap_callback_depth(unsigned) noexcept;\n"
+            "extern \"C\" unsigned long long tracer_original_entry_time() noexcept;\n";
   if (shared_mode)
-    code += "#include <bits/cxxabi_forced.h>\n"
-            "extern \"C\" void* tracer_shared_enter(unsigned long long,const "
+    code += "extern \"C\" void* tracer_shared_enter(unsigned long long,const "
             "tracer::TraceContext*,unsigned);\n"
             "extern \"C\" void tracer_shared_leave(void*) noexcept;\n"
             "extern \"C\" void tracer_shared_release(void*) noexcept;\n"
@@ -2419,7 +2435,7 @@ std::string make_wrapper(const tracer::Request &r,
   if (result_sret)
     code += result_type() + "* (*) (" + result_type() + "*";
   else
-    code += result_type() + " (*) (";
+    code += result_type() + (overrides ? " (__attribute__((sysv_abi)) *) (" : " (*) (");
   bool comma = false;
   if (result_sret)
     comma = true;
@@ -2440,6 +2456,8 @@ std::string make_wrapper(const tracer::Request &r,
     code += "void";
   }
   code += ");\nextern \"C\" ";
+  if (overrides)
+    code += "__attribute__((sysv_abi)) ";
   code += result_sret ? result_type() + "* clangtracer_wrapper(" + result_type() +
                             "* result_slot"
                       : result_type() + " clangtracer_wrapper(";
@@ -2472,6 +2490,16 @@ std::string make_wrapper(const tracer::Request &r,
           std::to_string(r.probe_id) +
           "ULL); ctx.argument_count=" + std::to_string(r.argument_count) +
           "; ctx.phase=tracer::TracePhase::Pre;\n";
+  if (overrides) {
+    code += "tracer::ScalarOverrides overrides{}; ctx.scalar_overrides=&overrides;\n";
+    if (override_arguments)
+      code += "overrides.allow_arguments=true;\n";
+    if (override_result)
+      code += "overrides.allow_result=true;\n";
+    if (replace)
+      code += "overrides.allow_replacement=true; ctx.result.type=static_cast<tracer::ValueType>(" +
+              std::to_string(static_cast<unsigned>(r.result)) + ");\n";
+  }
   code += "ctx.target_entry=" + std::to_string(r.original_entry) +
           "ULL; ctx.bridge_begin=reinterpret_cast<uintptr_t>(&&original_begin);"
           "ctx.bridge_end=reinterpret_cast<uintptr_t>(&&original_end);"
@@ -2496,25 +2524,7 @@ std::string make_wrapper(const tracer::Request &r,
   if (!shared_mode && spec && spec->stack_depth())
     code += "tracer_capture_entry_stack(&ctx," +
             std::to_string(spec->stack_depth()) + ");\n";
-  if (shared_mode) {
-    code += "struct SharedGuard { void* token=nullptr; ~SharedGuard() noexcept "
-            "{ if(token){tracer_shared_leave(token); tracer_shared_release(token);} } } "
-            "shared_guard;\n"
-            "shared_guard.token=tracer_shared_enter(" +
-            std::to_string(r.probe_id) + "ULL,&ctx," +
-            std::to_string(spec ? spec->stack_depth() : 0) +
-            "U);\ntry { tracer_shared_resume(shared_guard.token);\n";
-  } else if (class_mode)
-    code += "tracer_invocation_instance tracer_invocation(ctx);\n";
-  const std::string instance = class_mode ? "&tracer_invocation" : "nullptr";
-  if (has_pre) {
-    if (shared_mode)
-      code += "tracer_shared_dispatch(shared_guard.token,&ctx);\n";
-    else
-      code += "(void)tracer_callback_dispatch(" + std::to_string(r.probe_id) +
-              "ULL,&ctx," + instance + ");\n";
-  }
-  code += "auto original=reinterpret_cast<Original>(" +
+  const auto original_declaration = "auto original=reinterpret_cast<Original>(" +
           std::to_string(original_trampoline) + "ULL);\n";
   std::string call = result_sret ? "original(result_slot" : "original(";
   comma = result_sret;
@@ -2534,6 +2544,80 @@ std::string make_wrapper(const tracer::Request &r,
     comma = true;
   }
   call += ")";
+  if (callable_original) {
+    code += original_declaration;
+    code += "ctx.result.type=static_cast<tracer::ValueType>(" +
+            std::to_string(static_cast<unsigned>(r.result)) + ");\n"
+            "bool original_called=false; uint64_t original_bits=0; "
+            "std::exception_ptr original_failure; "
+            "const int entry_errno=errno; int original_errno=entry_errno; "
+            "ctx.original_entry_time_ns=tracer_original_entry_time();\n"
+            "auto early_original = [&]() -> uint64_t { "
+            "if (!original_called) { original_called=true; "
+            "struct OriginalScope { unsigned depth; int error; "
+            "~OriginalScope() { tracer_swap_callback_depth(depth); errno=error; } }; "
+            "OriginalScope scope{tracer_swap_callback_depth(0), errno}; errno=entry_errno; "
+            "try { ";
+    if (r.result == tracer::ValueType::Void)
+      code += call + "; ";
+    else
+      code += "original_bits=tracer::ScalarOverrides::pack(" + call + "); ";
+    code += "} catch (const __cxxabiv1::__forced_unwind&) { throw; } "
+            "catch (...) { original_failure=std::current_exception(); } "
+            "original_errno=errno; } "
+            "if (original_failure) std::rethrow_exception(original_failure); "
+            "return original_bits; };\n"
+            "ctx.original_state=&early_original; "
+            "ctx.invoke_original=+[](void* state) -> uint64_t { "
+            "return (*static_cast<decltype(early_original)*>(state))(); };\n"
+            "auto run_original = [&]() -> " + result_type() + " { "
+            "if (!original_called) return " + call + "; "
+            "errno=original_errno; if (original_failure) std::rethrow_exception(original_failure); ";
+    if (r.result != tracer::ValueType::Void)
+      code += "return tracer::ScalarOverrides::unpack<" + result_type() + ">(original_bits); ";
+    code += "};\n";
+    call = "run_original()";
+  }
+  if (shared_mode) {
+    code += "struct SharedGuard { void* token=nullptr; ~SharedGuard() noexcept "
+            "{ if(token){tracer_shared_leave(token); tracer_shared_release(token);} } } "
+            "shared_guard;\n"
+            "shared_guard.token=tracer_shared_enter(" +
+            std::to_string(r.probe_id) + "ULL,&ctx," +
+            std::to_string(spec ? spec->stack_depth() : 0) +
+            "U);\ntry { tracer_shared_resume(shared_guard.token);\n";
+  } else if (class_mode)
+    code += "tracer_invocation_instance tracer_invocation(ctx);\n";
+  const std::string instance = class_mode ? "&tracer_invocation" : "nullptr";
+  if (has_pre) {
+    if (shared_mode)
+      code += "tracer_shared_dispatch(shared_guard.token,&ctx);\n";
+    else
+      code += "(void)tracer_callback_dispatch(" + std::to_string(r.probe_id) +
+              "ULL,&ctx," + instance + ");\n";
+  }
+  if (callable_original)
+    code += "ctx.invoke_original=nullptr; ctx.original_state=nullptr;\n";
+  if (override_arguments) {
+    for (unsigned i = 0; i < r.argument_count; ++i) {
+      const auto index = std::to_string(i);
+      const auto argument = "a" + index;
+      code += "if (overrides.argument_mask & (1u<<" + index + ")) { " +
+              argument + "=tracer::ScalarOverrides::unpack<decltype(" + argument +
+              ")>(overrides.arguments[" + index + "]);\n";
+      fill_value(code, i, r.arguments[i], false);
+      code += "}\n";
+    }
+  }
+  if (!callable_original)
+    code += original_declaration;
+  if (trace_exceptions) {
+    code += "auto report_original = [&]() -> decltype(auto) { try { return " + call +
+            "; } catch (const __cxxabiv1::__forced_unwind&) { throw; } catch (...) { "
+            "ctx.phase=tracer::TracePhase::Exception; tracer_event_dispatch(" +
+            std::to_string(r.probe_id) + "ULL,&ctx,0); throw; } };\n";
+    call = "report_original()";
+  }
   if (shared_mode && r.result != tracer::ValueType::Void)
     if (r.result != tracer::ValueType::Object)
       code += result_type() + " result;\n";
@@ -2543,7 +2627,8 @@ std::string make_wrapper(const tracer::Request &r,
             "tracer_shared_original_leave(token); } } "
             "original_guard{shared_guard.token};\n";
   if (r.result == tracer::ValueType::Void) {
-    code += "original_begin: " + call +
+    code += std::string("original_begin: ") +
+            (replace ? "if (!overrides.replacement_set) " : "") + call +
             ";\noriginal_end: ctx.result.type=tracer::ValueType::Void;\n";
   } else if (result_sret) {
     if (shared_mode)
@@ -2570,7 +2655,9 @@ std::string make_wrapper(const tracer::Request &r,
     } else {
       code += (shared_mode ? std::string()
                            : result_type() + " result; ") +
-              "original_begin: result=" + call + ";\noriginal_end: ;\n";
+              "original_begin: result=" +
+              (replace ? "overrides.replacement_set ? tracer::ScalarOverrides::unpack<decltype(result)>"
+                         "(overrides.replacement) : " : "") + call + ";\noriginal_end: ;\n";
     }
     code += "ctx.result.type=static_cast<tracer::ValueType>(" +
             std::to_string(static_cast<unsigned>(r.result)) + ");\n";
@@ -2613,6 +2700,9 @@ std::string make_wrapper(const tracer::Request &r,
               "(void)tracer_callback_dispatch(" +
               std::to_string(r.probe_id) + "ULL,&ctx," + instance + ");\n";
   }
+  if (override_result)
+    code += "if (overrides.result_set) result="
+            "tracer::ScalarOverrides::unpack<decltype(result)>(overrides.result);\n";
   if (shared_mode)
     code += "tracer_shared_leave(shared_guard.token); "
             "tracer_shared_resume(shared_guard.token); "
@@ -4094,6 +4184,15 @@ bool bind_probe_symbols(clang::Interpreter &interpreter,
         llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
   };
   bind("tracer_callback_dispatch", &tracer_callback_dispatch);
+  bind("tracer_swap_callback_depth", +[](unsigned depth) noexcept {
+    return std::exchange(callback_depth, depth);
+  });
+  bind("tracer_original_entry_time", +[]() noexcept -> unsigned long long {
+    timespec now{};
+    if (::clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+      return 0;
+    return static_cast<unsigned long long>(now.tv_sec) * 1000000000ULL + now.tv_nsec;
+  });
   bind("tracer_context_check_entry", &tracer_context_check_entry);
   bind("tracer_shared_enter", &tracer_shared_enter);
   bind("tracer_shared_leave", &tracer_shared_leave);
@@ -4235,6 +4334,11 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   const bool typed_prepared = tracer::prepared::is_typed_version(
       specification.prepared().format_version());
   const bool prepared_callback_context = typed_prepared && specification.has_header_context();
+  if (const auto *invalid = tracer::scalar_override_error(specification)) {
+    error = invalid;
+    return false;
+  }
+  const bool overrides = tracer::has_scalar_overrides(specification);
   const auto validate_options = [&error](const auto &first, const auto &last,
                                          const char *source,
                                          bool allow_toolchain = false) {
@@ -4651,6 +4755,10 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
     const auto context_declarations =
         tracer::analyze_context_declarations(user_ast->getASTContext());
     if (context_declarations.requires_context) {
+      if (overrides) {
+        error = "scalar overrides require an invocation-scoped Interceptor";
+        return false;
+      }
       std::string signature_assert;
       if (!interceptor_template_prelude(source).empty()) {
         shape_valid = inspect_callback_shape(user_ast->getASTContext(), shape,
@@ -4687,6 +4795,15 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   bool baseline_preflight_succeeded = false;
   DiagnosticCapture complete_capture(nullptr);
   if (shape_valid) {
+    if (overrides &&
+        (!shape.class_mode ||
+         ((specification.allow_argument_overrides() || specification.allow_replacement() ||
+           specification.allow_call_original()) &&
+          !shape.has_pre) ||
+         (specification.allow_result_override() && !shape.has_post))) {
+      error = "scalar control requires an Interceptor with pre() for arguments, replacement or calling the original and post() for result overrides";
+      return false;
+    }
     if (!validate_specialized_signature(user_ast->getASTContext(), shape,
                                         specification, error))
       return false;
@@ -5002,7 +5119,7 @@ tracer_next_call_id(unsigned long long id) noexcept {
 
 extern "C" long long tracer_callback_dispatch(unsigned long long id,
                                               const tracer::TraceContext *ctx,
-                                              void *instance) noexcept {
+                                              void *instance) {
   auto *p = find_probe(id);
   if (!p || !ctx || !p->callbacks_active() ||
       !p->callback_enabled.load(std::memory_order_relaxed) || callback_depth) {
@@ -5014,6 +5131,14 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
   bool succeeded = false;
   tracer::TraceContext invocation = *ctx;
   invocation.stack_storage = nullptr;
+  std::optional<tracer::ScalarOverrides> staged;
+  if (ctx->scalar_overrides) {
+    staged.emplace();
+    staged->allow_arguments = ctx->scalar_overrides->allow_arguments;
+    staged->allow_result = ctx->scalar_overrides->allow_result;
+    staged->allow_replacement = ctx->scalar_overrides->allow_replacement;
+    invocation.scalar_overrides = &*staged;
+  }
   invocation.named_count = 0;
   for (unsigned i = 0;
        i < invocation.argument_count && i < tracer::kMaxArguments; ++i)
@@ -5021,6 +5146,9 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
         i < p->argument_names.size() ? p->argument_names[i].c_str() : nullptr;
   try {
     value = p->callback(&invocation, instance, &succeeded);
+  } catch (const __cxxabiv1::__forced_unwind &) {
+    --callback_depth;
+    throw;
   } catch (...) {
     succeeded = false;
     // Class adapters disable only their failed invocation. Legacy callbacks
@@ -5031,6 +5159,8 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
   }
   --callback_depth;
   if (succeeded) {
+    if (staged)
+      *ctx->scalar_overrides = *staged;
     tracer_event_dispatch(id, &invocation, value);
   }
   tracer::release_native_stack(invocation);
@@ -5101,15 +5231,15 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
     event.set_protocol_version(tracer::kProtocolVersion);
     event.set_session_id(p->session_id);
     event.set_probe_id(id);
-    event.set_phase(ctx->phase == tracer::TracePhase::Pre
-                        ? clangtracer::v1::PRE
-                        : clangtracer::v1::POST);
+    event.set_phase(static_cast<clangtracer::v1::TracePhase>(ctx->phase));
     event.set_call_id(ctx->call_id);
     event.set_pid(static_cast<std::uint32_t>(::getpid()));
     event.set_tid(static_cast<std::uint32_t>(::syscall(SYS_gettid)));
     event.set_probe_sequence(sequence);
     timespec now{};
-    if (::clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+    if (ctx->phase == tracer::TracePhase::Pre && ctx->original_entry_time_ns) {
+      event.set_monotonic_time_ns(ctx->original_entry_time_ns);
+    } else if (::clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
       event.set_monotonic_time_ns(
           static_cast<std::uint64_t>(now.tv_sec) * 1000000000ULL + now.tv_nsec);
     }
@@ -5282,7 +5412,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     // Keep their shared metadata alive; refresh a new session only after the
     // previous callback cohort has drained.
     bool native_cache_quiescent = true;
-    for (std::size_t i = 0; i < a.retained; ++i) {
+    for (std::size_t i = 0; i < a.probes.size(); ++i) {
       const auto *prior = a.probes[i].get();
       if (prior &&
           (prior->active.load(std::memory_order_seq_cst) ||
@@ -5300,6 +5430,10 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     clangtracer::v1::ProbeSpec specification;
     if (!read_probe_spec(p->request, specification, error)) {
       set_error(request, error.c_str());
+      return -1;
+    }
+    if (const auto *invalid = tracer::scalar_override_error(specification)) {
+      set_error(request, invalid);
       return -1;
     }
     // Named tracing uses the target's own independently re-read DWARF and ELF
@@ -5328,7 +5462,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     }
     Probe *replaced = nullptr;
     bool entry_matches_original = true;
-    for (std::size_t i = 0; i < a.retained; ++i) {
+    for (std::size_t i = 0; i < a.probes.size(); ++i) {
       auto *other = a.probes[i].get();
       if (other && other->active.load() &&
           other->request.original_entry == p->request.original_entry) {
@@ -5383,7 +5517,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, "safe patch window exceeds the DWARF function range");
       return -1;
     }
-    for (std::size_t i = 0; i < a.retained; ++i) {
+    for (std::size_t i = 0; i < a.probes.size(); ++i) {
       auto *other = a.probes[i].get();
       if (!other || !other->active.load()) {
         continue;
@@ -5417,6 +5551,11 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     p->request.jit_compile_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - compile_started).count();
+    if (specification.reclaimable() && p->request.context_required) {
+      set_error(request, "reclaimable observers cannot schedule shared-context work");
+      return -1;
+    }
+    p->reclaimable = specification.reclaimable();
     if (p->request.context_required && !prepare_context_pthread(a, *p, error)) {
       set_error(request, error.c_str());
       return -1;
@@ -5451,7 +5590,8 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     }
     p->session_id = request->session_id;
     a.pid = ::getpid();
-    const auto slot = a.retained;
+    const auto slot = static_cast<std::size_t>(std::find_if(a.probes.begin(), a.probes.end(),
+        [](const auto &probe) { return !probe; }) - a.probes.begin());
     std::array<std::uint8_t, tracer::kMaxPatchBytes> patch{};
     add_jump(patch.data(), p->wrapper);
     std::fill(patch.begin() + kJumpBytes, patch.begin() + p->request.patch_size,
@@ -5463,6 +5603,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     a.probes[slot] = std::move(p);
     Probe *installed_probe = a.probes[slot].get();
     a.probe_slots[slot].store(installed_probe, std::memory_order_release);
+    a.slot_ids[slot].store(installed_probe->request.probe_id, std::memory_order_release);
     ++a.retained;
     tracer_agent_capacity_v1.store(tracer::kAgentCapacityTag | a.retained,
                                   std::memory_order_relaxed);
@@ -5475,6 +5616,47 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     set_error(request, "unexpected exception while adding probe");
     return -1;
   }
+}
+
+extern "C" int tracer_agent_reclaim_v1(std::uint64_t id, TracerRetiredCode *code,
+                                        unsigned release) {
+  try {
+    std::lock_guard<std::mutex> lock(agent_mutex);
+    auto *owner = agent.load(std::memory_order_acquire);
+    if (!owner || !code)
+      return -1;
+    for (std::size_t i = 0; i < owner->probes.size(); ++i) {
+      auto *probe = owner->probes[i].get();
+      if (!probe || probe->request.probe_id != id)
+        continue;
+      if (!probe->reclaimable || probe->active.load() || probe->transport_active ||
+          probe->in_flight.load() != Probe::admission_closed ||
+          probe->delivery.pending.load())
+        return -1;
+      if (!release) {
+        const void *entries[] = {probe->wrapper,
+            reinterpret_cast<const void *>(probe->callback), probe->trampoline};
+        for (std::size_t j = 0; j < 3; ++j) {
+          std::uintptr_t begin = 0, end = 0;
+          int protection = 0;
+          if (!entries[j] || !mapping(entries[j], begin, end, protection) ||
+              !(protection & PROT_EXEC))
+            return -1;
+          code->ranges[j] = {begin, end};
+        }
+      } else {
+        owner->slot_ids[i].store(0, std::memory_order_release);
+        owner->probe_slots[i].store(nullptr, std::memory_order_release);
+        owner->probes[i].reset();
+        --owner->retained;
+        tracer_agent_capacity_v1.store(tracer::kAgentCapacityTag | owner->retained,
+                                       std::memory_order_relaxed);
+      }
+      return 0;
+    }
+  } catch (...) {
+  }
+  return -1;
 }
 
 extern "C" int tracer_agent_validate(tracer::ValidationRequest *request) {

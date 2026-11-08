@@ -29,4 +29,5 @@ struct Preview {
 };
 
 Preview preview(std::uint64_t address, std::string_view bytes);
+bool compatible_patch(std::uint64_t address, std::string_view before, std::string_view after);
 } // namespace tracer::native_entry

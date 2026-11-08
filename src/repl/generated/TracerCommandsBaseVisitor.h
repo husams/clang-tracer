@@ -83,6 +83,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitValidateOption(TracerCommandsParser::ValidateOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitDeployOption(TracerCommandsParser::DeployOptionContext *ctx) override {
     return visitChildren(ctx);
   }
@@ -156,6 +160,42 @@ public:
   }
 
   virtual std::any visitProbeReload(TracerCommandsParser::ProbeReloadContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitTargetLaunch(TracerCommandsParser::TargetLaunchContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitLaunchOption(TracerCommandsParser::LaunchOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitChildList(TracerCommandsParser::ChildListContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitTargetCall(TracerCommandsParser::TargetCallContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitLocalPerf(TracerCommandsParser::LocalPerfContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitTargetLibrary(TracerCommandsParser::TargetLibraryContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitInstructions(TracerCommandsParser::InstructionsContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitInstructionOption(TracerCommandsParser::InstructionOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitWatchpoint(TracerCommandsParser::WatchpointContext *ctx) override {
     return visitChildren(ctx);
   }
 

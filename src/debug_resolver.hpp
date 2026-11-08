@@ -15,6 +15,7 @@ struct DebugLookupOptions {
   std::uint64_t max_entries = 0; // Zero is unlimited.
   std::uint32_t max_depth = 0; // Zero is unlimited.
   std::function<bool()> is_cancelled = [] { return false; };
+  bool require_override_abi = false;
 };
 
 class DebugLookupLimit : public std::runtime_error {
@@ -23,7 +24,8 @@ public:
 };
 
 std::vector<std::string> list_debug_modules(std::uint32_t pid);
-clangtracer::v1::ListModulesResponse list_debug_module_mappings(std::uint32_t pid);
+clangtracer::v1::ListModulesResponse list_debug_module_mappings(
+    std::uint32_t pid, const std::string &elf_path = {});
 clangtracer::v1::PreviewBulkTraceResponse preview_bulk_trace(
     std::uint32_t pid, const clangtracer::v1::BulkTraceRules &rules,
     const std::function<bool()> &is_cancelled);

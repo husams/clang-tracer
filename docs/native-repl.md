@@ -93,12 +93,103 @@ to attach only when the PID still has the displayed start time.
 Remote process enumeration is not in the service API, so remote attach uses an
 explicit PID.
 
+### Launch a local application
+
+Build the application with the installed C++17 `<tracer/launch.hpp>` header and add
+a checkpoint at the start of `main`, before starting threads or calling the
+code you want to trace. It returns immediately on an ordinary run. Treat a
+failed checkpoint as a startup failure.
+
+```cpp
+#include <tracer/launch.hpp>
+
+int main() {
+  if (!tracer::launch::wait_for_resume())
+    return 125;
+  return run_application();
+}
+```
+
+Use these commands in the native REPL with its private Linux x86-64 server.
+`%launch` selects the attached session and holds the application at the
+checkpoint while you install probes.
+
+```text
+%launch ./app --arg "example input" --env MODE=test --cwd ./work --stdin ./input.txt --timeout 5
+%probe inject "app::start()" --callback observer.cpp
+%resume
+%terminate
+```
+
+The earliest traceable work is the first eligible call after the checkpoint.
+The loader, global constructors, and any earlier application code have already
+run. Repeat `--arg` for arguments and `--env NAME=VALUE` for overrides to the
+inherited environment. Relative paths are resolved from the REPL's working
+directory. Standard input defaults to `/dev/null`. Use `--stdout NEW_FILE`
+and `--stderr NEW_FILE` to choose output files. The REPL reports the paths and
+otherwise creates private log files. Existing files are protected from overwrite.
+
+`--timeout` bounds the wait for the checkpoint in seconds. It defaults to
+the REPL timeout, which also applies separately to attach. Setup or attach
+failure and readiness timeout terminate and reap the child. `%resume [PID]`
+and `%terminate [PID]` use the selected target when PID is omitted.
+`%terminate` kills and reaps the launched child whether paused or resumed.
+The REPL retains ownership after detach and terminates any remaining owned
+children on exit. Use `%status` to list owned targets and reap any that have
+already exited. Only the launched process is managed.
+
 If an attach reply fails or times out, the operation may still finish on the
 server. The console reports the endpoint, PID and newly observed candidate
 session IDs, blocks automatic retries for that PID, and reconciles again on
 `%status` and exit. Inspect `%sessions` and explicitly `%detach SESSION` when
 appropriate. Candidates are never assumed to belong to this console on an
 external server; recovery information is retained until explicitly resolved.
+
+### Call a registered function in the paused target
+
+Register each callable at the startup checkpoint. The application compiler
+checks the function pointer's argument and result types. The name is an exact
+match to the name you register and can distinguish overloads.
+
+```cpp
+#include <tracer/launch.hpp>
+
+double scale(int value, double factor) { return value * factor; }
+
+int main() {
+  using tracer::launch::named_call;
+  if (!tracer::launch::wait_for_resume(named_call("app::scale", &scale)))
+    return 125;
+  // Continue normal application startup.
+}
+```
+
+```text
+%launch ./app
+%call app::scale --arg 6 --arg 1.5
+%resume
+```
+
+The result line shows the type and value, such as `type=double value=9`.
+Registered functions accept up to eight arguments drawn from `bool`,
+32-bit and 64-bit signed and unsigned integers, `float`, and `double`.
+The same types and `void` are available for results. Enter decimal integers,
+finite decimal floating-point values, and `true` or `false`. Wrong argument
+counts and invalid values are rejected before execution. Pointers, references,
+objects, variadic functions, and functions with an implicit receiver are
+outside this interface.
+
+Calls run one at a time on the thread that entered the checkpoint, before
+`%resume`. Choose functions that are ready to run at that point in startup.
+Their side effects remain in the target, and an escaping C++ exception is
+reported as a failed call. Returned scalars are copied into the REPL's reply.
+Calls require a target launched by this REPL with a registered checkpoint.
+
+Use `--timeout SECONDS` to bound how long the REPL waits. Timeout or
+interruption leaves the call pending and it may continue running. Use
+`%call-result [--timeout SECONDS]` to collect its reply. A pending call
+blocks another call, resume, or probe changes on that target.
+`%terminate` still kills the owned target if it cannot finish.
 
 ## Browse a local C++ target
 
@@ -121,6 +212,49 @@ supported callable also work. If the mappings or backing files change, take a
 new snapshot before using an address. The token checks observed mapping
 identity. An unload and reload of the same image at the same address between
 snapshots can produce identical observations.
+
+## Capture local syscalls or CPU samples
+
+Attach to a running Linux x86-64 target using the REPL's own local server,
+then choose a capture:
+
+```text
+%syscalls --timeout 2 --count 256
+%sample cpu --timeout 2 --count 256
+```
+
+`%syscalls` reports separate entry and exit records with the syscall number
+and the raw kernel return value on exit. `%sample cpu` reports user-space
+instruction addresses at roughly one sample per 10 ms of scheduled CPU time.
+Each record carries the process ID, thread ID, and a monotonic nanosecond
+timestamp on the same clock as probe events. Use a current mapping snapshot
+and `%symbols --address` to look up a sample address.
+
+Each capture snapshots and verifies up to 64 existing target threads.
+Threads created after that snapshot and child processes are outside the
+capture. The command releases its kernel resources before printing records
+in timestamp order. It stops on timeout, the record limit, Ctrl+C, or the
+exit of all monitored threads. The defaults are two seconds and 256 records,
+with ceilings of 60 seconds and 8192 records.
+
+The summary reports kernel loss, throttle notifications, and samples
+discarded at the requested limit separately. Kernels with a perf loss counter
+include loss still pending at shutdown. On older kernels, `loss_accounting=records`
+counts loss notifications the kernel wrote to the ring. Collection boundaries,
+loss, and the record limit can leave individual syscall entries or exits
+without a partner. These pilot records are printed by their capture command.
+
+Syscall capture reads the raw syscall tracepoint IDs and formats from tracefs
+and opens the events through perf for each target thread. It needs tracefs
+read access and permission to open those events. CPU sampling uses a user-space
+perf task-clock event and can work under a policy that denies syscall tracing.
+Both modes report permission failures directly. Perf events allow the target
+threads to continue running. A syscall-stop backend based on ptrace would stop
+them at each syscall boundary and compete with the injector for ptrace ownership.
+[Linux event tracing](https://docs.kernel.org/trace/events.html) ·
+[Perf permissions](https://docs.kernel.org/admin-guide/perf-security.html) ·
+[perf_event_open](https://man7.org/linux/man-pages/man2/perf_event_open.2.html) ·
+[ptrace](https://man7.org/linux/man-pages/man2/ptrace.2.html)
 
 ## Preview a bulk trace
 
@@ -334,6 +468,57 @@ successor in place. Detach drains all generations.
 
 Borrow target pointers and references only during the callback. Use owned
 snapshots for REPL inspection and replay.
+
+### Opt in to scalar overrides
+
+Mark an eligible free-function definition in the application and build it with
+Clang and DWARF. The marker declares the ordinary Linux x86-64 SysV ABI.
+Use it on functions that follow the standard register preservation rules.
+The agent verifies the marked ELF section, mapped entry, calling convention,
+and complete scalar signature before installing a detour.
+
+```cpp
+#include <tracer/override_target.hpp>
+
+TRACER_SCALAR_OVERRIDE_TARGET int compute(int input) { return input * 2; }
+```
+
+In the callback, request an argument change in `pre()` or a return change in
+`post()`. Indexes start at zero.
+
+```cpp
+struct Interceptor {
+  void pre(const Call &call) {
+    if (call.arg<int>(0) == 10)
+      call.override_argument(0, 12);
+  }
+  void post(const Call &call) {
+    if (call.result<int>() == 24)
+      call.override_result(25);
+  }
+};
+```
+
+```text
+%probe validate "compute(int)" --callback override.cpp --allow-arg-overrides --allow-result-override
+%probe inject "compute(int)" --callback override.cpp --allow-arg-overrides --allow-result-override
+```
+
+Each flag enables only its corresponding hook operation. Overrides require a
+local Unix control socket and a DWARF binding. Use `--prepared-mode off` if a
+prepared package would otherwise be selected. Supported values are `bool`,
+signed 32- and 64-bit integers, unsigned 64-bit integers, `float`, and
+`double`. Match the slot's type and width exactly. A `void` function can use
+argument overrides.
+
+The original function runs with the committed arguments. An escaping hook
+exception discards its staged writes. An exception from the original function
+propagates to its caller without running `post()`. Overrides apply per call,
+including recursion, and preserve the original function's `errno` behavior.
+PRE events show the incoming arguments. POST events show the arguments used
+by the function and its original return value. Reload retains the permissions
+of the active generation. Removing the probe or detaching restores the
+function entry.
 
 ## Collect and inspect
 

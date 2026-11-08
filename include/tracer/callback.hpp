@@ -97,6 +97,61 @@ public:
     return decode<T>(context_.arguments[index]);
   }
 
+  template <class T> void override_argument(std::size_t index, T value) const {
+    auto *overrides = context_.scalar_overrides;
+    if (context_.phase != TracePhase::Pre || !overrides || !overrides->allow_arguments)
+      throw std::logic_error("argument overrides require an opted-in pre() hook");
+    if (index >= context_.argument_count || index >= kMaxArguments)
+      throw std::out_of_range("callback argument index is out of range");
+    require_type(context_.arguments[index], override_type<T>());
+    overrides->arguments[index] = ScalarOverrides::pack(value);
+    overrides->argument_mask |= std::uint32_t{1} << index;
+  }
+
+  template <class T> void override_result(T value) const {
+    auto *overrides = context_.scalar_overrides;
+    if (context_.phase != TracePhase::Post || !overrides || !overrides->allow_result)
+      throw std::logic_error("result overrides require an opted-in post() hook");
+    require_type(context_.result, override_type<T>());
+    overrides->result = ScalarOverrides::pack(value);
+    overrides->result_set = true;
+  }
+
+  template <class T> void replace_with(T value) const {
+    auto *overrides = replacement_overrides(override_type<T>());
+    overrides->replacement = ScalarOverrides::pack(value);
+    overrides->replacement_set = true;
+  }
+
+  // Invokes the original with its entry arguments. Repeated calls return the
+  // first result. The wrapper propagates any original C++ exception to the caller.
+  template <class T = void> T call_original() const {
+    if (context_.phase != TracePhase::Pre || !context_.invoke_original)
+      throw std::logic_error("calling the original requires an opted-in pre() hook");
+    if constexpr (std::is_void_v<T>) {
+      require_type(context_.result, ValueType::Void);
+      context_.invoke_original(context_.original_state);
+    } else {
+      require_type(context_.result, override_type<T>());
+      return ScalarOverrides::unpack<T>(context_.invoke_original(context_.original_state));
+    }
+  }
+
+  void replace_with() const {
+    replacement_overrides(ValueType::Void)->replacement_set = true;
+  }
+
+private:
+  ScalarOverrides *replacement_overrides(ValueType type) const {
+    auto *overrides = context_.scalar_overrides;
+    if (context_.phase != TracePhase::Pre || !overrides || !overrides->allow_replacement)
+      throw std::logic_error("replacement requires an opted-in pre() hook");
+    require_type(context_.result, type);
+    return overrides;
+  }
+
+public:
+
   template <class T = InferResultType> decltype(auto) result() const {
     if (context_.phase != TracePhase::Post) {
       throw std::logic_error("callback result is only available in post()");
@@ -328,6 +383,23 @@ private:
   }
 
   template <class> static constexpr bool kUnsupportedType = false;
+
+  template <class T> static constexpr ValueType override_type() {
+    if constexpr (std::is_same_v<T, bool>)
+      return ValueType::Bool;
+    else if constexpr (std::is_same_v<T, int>)
+      return ValueType::Int32;
+    else if constexpr (std::is_same_v<T, long> || std::is_same_v<T, long long>)
+      return ValueType::Int64;
+    else if constexpr (std::is_same_v<T, unsigned long> || std::is_same_v<T, unsigned long long>)
+      return ValueType::UInt64;
+    else if constexpr (std::is_same_v<T, float>)
+      return ValueType::Float32;
+    else if constexpr (std::is_same_v<T, double>)
+      return ValueType::Float64;
+    else
+      static_assert(kUnsupportedType<T>, "override requires a supported scalar value");
+  }
 
   static void require_type(const TraceValue &value, ValueType expected) {
     if (value.type != expected) {

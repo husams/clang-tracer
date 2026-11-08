@@ -5,6 +5,8 @@
 #include "native_entry.hpp"
 #include "proc_identity.hpp"
 #include "session.hpp"
+#include "tracer/instruction_trace.h"
+#include "tracer/page_monitor.h"
 
 #include <algorithm>
 #include <array>
@@ -501,6 +503,97 @@ void verify_entry_image(const Target &target,
   result.set_entry_bytes(std::move(bytes));
 }
 
+const api::MemoryMapping &mapping_at(const api::ListMemoryMappingsResponse &snapshot,
+                                     std::uint64_t address, std::size_t size) {
+  if (!address || size > UINT64_MAX - address)
+    throw MemoryError(Code::INVALID_ARGUMENT, "invalid memory patch range");
+  const auto found = std::find_if(snapshot.mappings().begin(), snapshot.mappings().end(),
+                                  [&](const auto &mapping) {
+    return mapping.begin_address() <= address && address + size <= mapping.end_address() &&
+           mapping.permissions()[0] == 'r';
+  });
+  if (found == snapshot.mappings().end())
+    throw MemoryError(Code::OUT_OF_RANGE, "patch range must fit one readable mapping");
+  return *found;
+}
+
+std::uint64_t import_slot_address(const Target &target,
+                                 const api::ListMemoryMappingsResponse &snapshot,
+                                 const std::string &path, const std::string &name) {
+  const Fd fd(::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
+  struct stat file{};
+  if (fd.value < 0 || ::fstat(fd.value, &file) != 0 || !S_ISREG(file.st_mode) ||
+      file.st_size <= 0 || static_cast<std::uint64_t>(file.st_size) > max_entry_image_bytes)
+    throw MemoryError(Code::FAILED_PRECONDITION, "cannot open the importing ELF file");
+  std::string bytes(static_cast<std::size_t>(file.st_size), '\0');
+  for (std::size_t done = 0; done < bytes.size();) {
+    target.checkpoint();
+    const auto count = ::pread(fd.value, bytes.data() + done, bytes.size() - done, done);
+    if (count < 0 && errno == EINTR)
+      continue;
+    if (count <= 0)
+      throw MemoryError(Code::ABORTED, "cannot read the importing ELF file");
+    done += static_cast<std::size_t>(count);
+  }
+  auto binary = llvm::object::createBinary(llvm::MemoryBufferRef(bytes, path));
+  if (!binary)
+    throw MemoryError(Code::FAILED_PRECONDITION, llvm::toString(binary.takeError()));
+  const auto *elf = llvm::dyn_cast<Object>(binary->get());
+  if (!elf || elf->getArch() != llvm::Triple::x86_64)
+    throw MemoryError(Code::FAILED_PRECONDITION, "importer must be an x86-64 ELF");
+  const auto page = ::sysconf(_SC_PAGESIZE);
+  auto programs = elf->getELFFile().program_headers();
+  if (!programs)
+    throw MemoryError(Code::FAILED_PRECONDITION, llvm::toString(programs.takeError()));
+  if (page <= 0)
+    throw MemoryError(Code::INTERNAL, "cannot determine the ELF page size");
+  const auto same_file = [&](const auto &mapping) {
+    const std::string_view device(mapping.device());
+    const auto colon = device.find(':');
+    return mapping.path() == path && mapping.inode() == file.st_ino && colon != device.npos &&
+           parse_number(device.substr(0, colon), 16) == major(file.st_dev) &&
+           parse_number(device.substr(colon + 1), 16) == minor(file.st_dev);
+  };
+  std::set<std::uint64_t> biases;
+  for (const auto &segment : *programs) {
+    if (segment.p_type != llvm::ELF::PT_LOAD || !(segment.p_flags & llvm::ELF::PF_X))
+      continue;
+    const auto offset = segment.p_offset - segment.p_offset % page;
+    const auto address = segment.p_vaddr - segment.p_vaddr % page;
+    for (const auto &mapping : snapshot.mappings()) {
+      if (mapping.permissions()[2] == 'x' && same_file(mapping) &&
+          mapping.file_offset() == offset && mapping.begin_address() >= address)
+        biases.insert(mapping.begin_address() - address);
+    }
+  }
+  if (biases.size() != 1)
+    throw MemoryError(Code::FAILED_PRECONDITION, "importer has no unique verified ELF load bias");
+  std::set<std::uint64_t> slots;
+  for (const auto &section : elf->sections()) {
+    for (const auto &relocation : section.relocations()) {
+      target.checkpoint();
+      if (relocation.getType() != llvm::ELF::R_X86_64_JUMP_SLOT)
+        continue;
+      const auto symbol = relocation.getSymbol();
+      if (symbol == elf->symbol_end())
+        continue;
+      auto symbol_name = symbol->getName();
+      if (!symbol_name)
+        throw MemoryError(Code::FAILED_PRECONDITION, llvm::toString(symbol_name.takeError()));
+      if (*symbol_name == name && relocation.getOffset() <= UINT64_MAX - *biases.begin())
+        slots.insert(*biases.begin() + relocation.getOffset());
+    }
+  }
+  if (slots.size() != 1 || *slots.begin() % sizeof(std::uint64_t) ||
+      !same_file(mapping_at(snapshot, *slots.begin(), sizeof(std::uint64_t))))
+    throw MemoryError(Code::FAILED_PRECONDITION, "symbol has no unique mapped JUMP_SLOT in the importer");
+  struct stat after{};
+  if (::fstat(fd.value, &after) != 0 || after.st_size != file.st_size ||
+      after.st_ctim.tv_sec != file.st_ctim.tv_sec || after.st_ctim.tv_nsec != file.st_ctim.tv_nsec)
+    throw MemoryError(Code::ABORTED, "importer ELF changed while resolving its slot");
+  return *slots.begin();
+}
+
 void find_matches(const Target &target, std::string_view bytes, std::uint64_t address,
                   std::string_view pattern, std::string_view mask, int limit,
                   api::ScanMemoryResponse &result) {
@@ -552,6 +645,158 @@ grpc::Status list_mappings(grpc::ServerContext &context, Session &session,
     target.verify_live();
     result.set_mapping_token(mapping_token(session, maps));
     response.Swap(&result);
+  });
+}
+
+grpc::Status apply_patch(grpc::ServerContext &context, Session &session, std::chrono::seconds timeout,
+                         const api::ApplyMemoryPatchRequest &request, api::MemoryPatch &response) {
+  if (!request.has_writable() && (request.module().empty() || request.module().size() > 4096 ||
+      request.module().find('\0') != std::string::npos))
+    return {Code::INVALID_ARGUMENT, "memory patch requires an exact mapped module path"};
+  return inspect(context, session, timeout, [&](const Target &target) {
+    const auto maps = target.maps();
+    if (mapping_token(session, maps) != request.mapping_token())
+      throw MemoryError(Code::ABORTED, "memory mapping snapshot is stale; run %memory maps again");
+    const auto snapshot = parse_mappings(maps, target);
+    std::uint64_t address = 0;
+    std::string before, after;
+    std::vector<api::MemoryMapping> required;
+    if (request.has_executable()) {
+      const auto &patch = request.executable();
+      before = patch.expected();
+      after = patch.replacement();
+      if (before.empty() || before.size() > native_entry::preview_bytes ||
+          before.size() != after.size() || before == after)
+        throw MemoryError(Code::INVALID_ARGUMENT, "executable patch requires distinct equal-length bytes up to 64");
+      Entry entry;
+      entry.set_module(request.module());
+      entry.set_elf_address(patch.elf_address());
+      verify_entry_image(target, snapshot, entry);
+      address = entry.runtime_address();
+      if (entry.entry_bytes().compare(0, before.size(), before) != 0 ||
+          !native_entry::compatible_patch(address, before, after))
+        throw MemoryError(Code::FAILED_PRECONDITION,
+                          "patch requires matching original bytes and equal-width, safe instructions");
+    } else if (request.has_import_slot()) {
+      const auto &hook = request.import_slot();
+      if (hook.abi() != native_abi || hook.symbol().empty() || hook.symbol().size() > 1024 ||
+          hook.expected_target() == hook.replacement_target())
+        throw MemoryError(Code::INVALID_ARGUMENT, "import hook requires a symbol and distinct SysV ABI addresses");
+      const auto &original = mapping_at(snapshot, hook.expected_target(), 1);
+      const auto &replacement = mapping_at(snapshot, hook.replacement_target(), 1);
+      if (original.permissions()[2] != 'x' || original.path() == request.module() ||
+          replacement.permissions()[2] != 'x' || replacement.path() != session.snapshot().executable())
+        throw MemoryError(Code::FAILED_PRECONDITION,
+                          "import must already be resolved and the replacement must be in the main executable");
+      address = import_slot_address(target, snapshot, request.module(), hook.symbol());
+      const auto expected = hook.expected_target(), next = hook.replacement_target();
+      before.assign(reinterpret_cast<const char *>(&expected), sizeof(expected));
+      after.assign(reinterpret_cast<const char *>(&next), sizeof(next));
+      required = {original, replacement};
+    } else if (request.has_writable()) {
+      const auto &patch = request.writable();
+      address = patch.address();
+      before = patch.expected();
+      after = patch.replacement();
+      if (!request.module().empty() || before.empty() || before.size() > max_pattern_bytes ||
+          before.size() != after.size() || before == after)
+        throw MemoryError(Code::INVALID_ARGUMENT, "memory write requires distinct equal-length bytes up to 256");
+    } else {
+      throw MemoryError(Code::INVALID_ARGUMENT, "memory patch operation is required");
+    }
+    const auto &patch_mapping = mapping_at(snapshot, address, before.size());
+    if (request.has_executable() ? patch_mapping.permissions() != "r-xp" :
+        (patch_mapping.permissions() != "rw-p" &&
+         (request.has_writable() || patch_mapping.permissions() != "r--p")))
+      throw MemoryError(Code::FAILED_PRECONDITION, "patch requires a private mapping with expected permissions");
+    required.push_back(patch_mapping);
+    if (maps != target.maps() || target.read_bytes(address, before.size()) != before)
+      throw MemoryError(Code::ABORTED, "target mapping or expected patch bytes changed");
+    target.verify_live();
+    response = session.apply_memory_patch(address, std::move(before), std::move(after), std::move(required));
+  });
+}
+
+grpc::Status start_page_monitor(grpc::ServerContext &context, Session &session,
+                                std::chrono::seconds timeout,
+                                const api::StartPageMonitorRequest &request,
+                                api::PageMonitorResult &response) {
+  const auto page = ::sysconf(_SC_PAGESIZE);
+  const auto address = request.address();
+  const auto size = request.size();
+  if (page <= 0 || !address || address % page || !size || size % page ||
+      size / page > TRACER_PAGE_MONITOR_MAX_PAGES || size > UINT64_MAX - address ||
+      !request.tid() || request.tid() > INT32_MAX ||
+      !request.timeout_seconds() || request.timeout_seconds() > 60)
+    return {Code::INVALID_ARGUMENT, "page monitoring requires 1 to 16 aligned pages, a TID and 1 to 60 seconds"};
+  return inspect(context, session, timeout, [&](const Target &target) {
+    const auto maps = target.maps();
+    if (mapping_token(session, maps) != request.mapping_token())
+      throw MemoryError(Code::ABORTED, "memory mapping snapshot is stale; run %memory maps again");
+    const auto snapshot = parse_mappings(maps, target);
+    const auto &mapping = mapping_at(snapshot, address, size);
+    if (mapping.permissions() != "rw-p" || mapping.inode() || !mapping.path().empty() ||
+        mapping.begin_address() != address || mapping.end_address() != address + size)
+      throw MemoryError(Code::FAILED_PRECONDITION,
+                        "page monitoring requires one entire dedicated anonymous rw-p mapping");
+    target.verify_live();
+    try {
+      response = session.start_page_monitor(request);
+    } catch (const std::invalid_argument &error) {
+      throw MemoryError(Code::FAILED_PRECONDITION, error.what());
+    }
+  });
+}
+
+grpc::Status start_instruction_trace(
+    grpc::ServerContext &context, Session &session, std::chrono::seconds timeout,
+    const api::StartInstructionTraceRequest &request, api::InstructionTrace &response) {
+  const auto begin = request.address();
+  const auto size = request.size();
+  if (!request.tid() || request.tid() > INT32_MAX || !begin || !size ||
+      size > TRACER_INSTRUCTION_MAX_BYTES || size > UINT64_MAX - begin ||
+      !request.max_records() || request.max_records() > TRACER_INSTRUCTION_MAX_RECORDS ||
+      !request.timeout_seconds() || request.timeout_seconds() > TRACER_INSTRUCTION_MAX_SECONDS)
+    return {Code::INVALID_ARGUMENT, "invalid instruction trace thread, range or limits"};
+  const auto data_begin = request.memory_address();
+  const auto data_size = request.memory_size();
+  if ((data_begin == 0) != (data_size == 0) || data_size > TRACER_INSTRUCTION_MAX_BYTES ||
+      data_size > UINT64_MAX - data_begin)
+    return {Code::INVALID_ARGUMENT, "invalid monitored memory range"};
+  return inspect(context, session, timeout, [&](const Target &target) {
+    const auto maps = target.maps();
+    if (mapping_token(session, maps) != request.mapping_token())
+      throw MemoryError(Code::ABORTED, "instruction mapping snapshot is stale; run %memory maps again");
+    const auto snapshot = parse_mappings(maps, target);
+    const auto executable = std::any_of(snapshot.mappings().begin(), snapshot.mappings().end(),
+                                       [&](const auto &mapping) {
+      return mapping.begin_address() <= begin && begin + size <= mapping.end_address() &&
+             mapping.inode() != 0 && mapping.permissions().at(0) == 'r' &&
+             mapping.permissions().at(1) == '-' && mapping.permissions().at(2) == 'x';
+    });
+    if (!executable)
+      throw MemoryError(Code::FAILED_PRECONDITION,
+                        "instruction range must fit one readable file-backed executable mapping");
+    if (data_size) {
+      const auto readable = std::any_of(snapshot.mappings().begin(), snapshot.mappings().end(),
+                                        [&](const auto &mapping) {
+        return mapping.begin_address() <= data_begin &&
+               data_begin + data_size <= mapping.end_address() &&
+               mapping.permissions().at(0) == 'r';
+      });
+      if (!readable)
+        throw MemoryError(Code::FAILED_PRECONDITION,
+                          "monitored data must fit one readable mapping");
+    }
+    const auto bytes = target.read_bytes(begin, size);
+    if (maps != target.maps())
+      throw MemoryError(Code::ABORTED, "target mappings changed during setup; run %memory maps again");
+    target.verify_live();
+    try {
+      response = session.start_instruction_trace(request, bytes);
+    } catch (const std::invalid_argument &error) {
+      throw MemoryError(Code::FAILED_PRECONDITION, error.what());
+    }
   });
 }
 

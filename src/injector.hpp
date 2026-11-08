@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -12,6 +13,7 @@
 
 #include "admission.hpp"
 #include "tracer/compat.hpp"
+#include "tracer/reclaim.h"
 
 namespace tracer::injector {
 
@@ -46,7 +48,8 @@ public:
   Process &operator=(Process &&other) noexcept;
 
   void attach(pid_t process_id,
-              ::tracer::compat::span<const ApplicationModule> application_modules = {});
+              ::tracer::compat::span<const ApplicationModule> application_modules = {},
+              pid_t excluded_tid = 0, pid_t required_tid = 0);
   void detach();
 
   // Prevent normal detach/resume after the caller detects an unsafe target
@@ -60,6 +63,7 @@ public:
   [[nodiscard]] pid_t pid() const noexcept { return process_id_; }
 
   [[nodiscard]] std::uintptr_t instruction_pointer() const;
+  [[nodiscard]] bool signal_blocked(int signal) const;
 
   [[nodiscard]] std::uintptr_t remote_allocate(std::size_t size);
   void remote_read(std::uintptr_t address, void *destination,
@@ -74,8 +78,13 @@ public:
   // Validates and commits the complete disjoint patch set while all target
   // threads are stopped. A precondition/active-instruction failure changes no
   // bytes; a write failure rolls back every range before resuming threads.
-  [[nodiscard]] bool patch_code_batch(::tracer::compat::span<const CodePatch> patches);
-  void remote_free(std::uintptr_t address, std::size_t size);
+  [[nodiscard]] bool patch_code_batch(
+      ::tracer::compat::span<const CodePatch> patches,
+      const std::function<void()> &verify = {});
+  [[nodiscard]] bool retired_code_quiescent(const TracerRetiredCode &code);
+  [[nodiscard]] std::uintptr_t remote_map_file(std::string_view path, std::size_t size);
+  void remote_free(std::uintptr_t address, std::size_t size,
+                   const std::function<void()> &verify = {});
 
   [[nodiscard]] std::uintptr_t
   remote_call(std::uintptr_t function,
@@ -102,7 +111,8 @@ private:
   void ensure_usable() const;
   void poison_process() noexcept;
   [[nodiscard]] std::uintptr_t
-  remote_syscall(long number, const std::array<std::uintptr_t, 6> &arguments);
+  remote_syscall(long number, const std::array<std::uintptr_t, 6> &arguments,
+                 const std::function<void()> &verify = {});
   [[nodiscard]] std::uintptr_t
   remote_call_raw(std::uintptr_t function,
                   const std::array<std::uintptr_t, 6> &arguments,

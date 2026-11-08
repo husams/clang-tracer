@@ -857,11 +857,12 @@ struct CallPair {
 };
 
 struct CallCounts {
-  std::size_t paired = 0, missing_pre = 0, missing_post = 0, timed = 0;
+  std::size_t paired = 0, missing_pre = 0, missing_post = 0, timed = 0, exceptional = 0;
   std::size_t ambiguous = 0;
 
   void add(const CallPair &pair, bool has_duration) {
     paired += pair.pre && pair.post;
+    exceptional += pair.post && pair.post->phase() == api::EXCEPTION;
     missing_pre += !pair.pre;
     missing_post += !pair.post;
     timed += has_duration;
@@ -1026,7 +1027,7 @@ void event_statistics(const EventBuffer &buffer, std::ostream &out,
   std::map<CallKey, CallPair> pairs;
   std::map<ProbeKey, std::uint64_t> agent_losses;
   std::map<std::string_view, std::uint64_t> server_losses;
-  std::uint64_t pre = 0, post = 0, other = 0, unidentified = 0;
+  std::uint64_t pre = 0, post = 0, exceptions = 0, other = 0, unidentified = 0;
   for (const auto &item : buffer.events()) {
     const auto &e = item->message;
     const ProbeKey probe{e.server_instance_id(), e.session_id(), e.probe_id()};
@@ -1036,8 +1037,10 @@ void event_statistics(const EventBuffer &buffer, std::ostream &out,
     server_loss = std::max(server_loss, e.server_dropped_events());
     pre += e.phase() == api::PRE;
     post += e.phase() == api::POST;
-    other += e.phase() != api::PRE && e.phase() != api::POST;
-    if (e.has_context() || (e.phase() != api::PRE && e.phase() != api::POST))
+    exceptions += e.phase() == api::EXCEPTION;
+    const bool paired_phase = e.phase() == api::PRE || e.phase() == api::POST || e.phase() == api::EXCEPTION;
+    other += !paired_phase;
+    if (e.has_context() || !paired_phase)
       continue;
     if (e.session_id().empty() || !e.probe_id() || !e.tid() || !e.call_id()) {
       ++unidentified;
@@ -1065,7 +1068,8 @@ void event_statistics(const EventBuffer &buffer, std::ostream &out,
           << " probe=" << e->probe_id()
           << " tid=" << e->tid() << " call=" << e->call_id()
           << " PRE=" << (pair.pre ? "present" : "missing")
-          << " POST=" << (pair.post ? "present" : "missing");
+          << (pair.post && pair.post->phase() == api::EXCEPTION
+                  ? " EXCEPTION=present" : pair.post ? " POST=present" : " POST=missing");
       if (duration)
         out << " duration_ns=" << *duration;
       if (pair.ambiguous)
@@ -1097,12 +1101,13 @@ void event_statistics(const EventBuffer &buffer, std::ostream &out,
   out << "received=" << buffer.received
       << " retained=" << buffer.events().size() << " bytes=" << buffer.bytes()
       << " evicted=" << buffer.evicted << " PRE=" << pre << " POST=" << post
-      << " other_phases=" << other << " paired=" << counts.paired
+      << " EXCEPTION=" << exceptions << " other_phases=" << other << " paired=" << counts.paired
       << " incomplete=" << counts.incomplete()
       << " lost(agent=" << sum_losses(agent_losses)
       << ",server=" << sum_losses(server_losses) << ')'
       << " calls=" << counts.paired + counts.incomplete()
-      << " timed=" << counts.timed << " missing_pre=" << counts.missing_pre
+      << " timed=" << counts.timed << " exceptional=" << counts.exceptional
+      << " missing_pre=" << counts.missing_pre
       << " missing_post=" << counts.missing_post
       << " untimed_pairs=" << counts.paired - counts.timed
       << " ambiguous=" << counts.ambiguous

@@ -16,8 +16,17 @@ service Tracer {
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc ListModules(ListModulesRequest) returns (ListModulesResponse);
   rpc ListMemoryMappings(ListMemoryMappingsRequest) returns (ListMemoryMappingsResponse);
+  rpc AllocateMemory(AllocateMemoryRequest) returns (MemoryAllocation);
+  rpc FreeMemory(FreeMemoryRequest) returns (MemoryAllocation);
+  rpc LoadTargetLibrary(LoadTargetLibraryRequest) returns (TargetLibrary);
   rpc ReadMemory(ReadMemoryRequest) returns (ReadMemoryResponse);
+  rpc ApplyMemoryPatch(ApplyMemoryPatchRequest) returns (MemoryPatch);
+  rpc RestoreMemoryPatch(RestoreMemoryPatchRequest) returns (MemoryPatch);
+  rpc StartPageMonitor(StartPageMonitorRequest) returns (PageMonitorResult);
+  rpc StopPageMonitor(StopPageMonitorRequest) returns (PageMonitorResult);
   rpc ScanMemory(ScanMemoryRequest) returns (ScanMemoryResponse);
+  rpc StartInstructionTrace(StartInstructionTraceRequest) returns (InstructionTrace);
+  rpc StopInstructionTrace(StopInstructionTraceRequest) returns (InstructionTrace);
   rpc PreviewFunctionEntry(PreviewFunctionEntryRequest) returns (PreviewFunctionEntryResponse);
   rpc ListThreads(ListThreadsRequest) returns (ListThreadsResponse);
   rpc ListSymbols(ListSymbolsRequest) returns (ListSymbolsResponse);
@@ -51,6 +60,7 @@ enum TracePhase {
   TRACE_PHASE_UNSPECIFIED = 0;
   PRE = 1;
   POST = 2;
+  EXCEPTION = 3;
 }
 message Signature {
   CallableKind kind = 1;
@@ -201,6 +211,12 @@ message ProbeSpec {
   PreparedInjector prepared = 18;
   repeated string extra_compile_arguments = 19; // Validated additive flags.
   bool extra_compile_arguments_checked = 20;
+  bool allow_argument_overrides = 25;
+  bool allow_result_override = 26;
+  bool allow_replacement = 21;
+  bool reclaimable = 22; // Trusted observer declares no escaping JIT addresses or TLS.
+  bool allow_call_original = 23;
+  bool trace_exceptions = 24;
 }
 message AttachRequest {
   uint32 pid = 1;
@@ -223,6 +239,7 @@ message JitRuntimeProfile {
   // The agent build default. Probe-specific flags and target signatures are
   // checked independently. Presence distinguishes the old ABI from unknown.
   optional bool libstdcxx_default_cxx11_abi = 9;
+  bool scalar_overrides_supported = 10;
 }
 message Session {
   string id = 1;
@@ -275,6 +292,12 @@ message ValidateProbeRequest {
   PreparedInjector prepared = 11;
   string translation_unit = 12; // Optional entry in the server-host compilation database.
   repeated string extra_compile_arguments = 13;
+  bool allow_argument_overrides = 18;
+  bool allow_result_override = 19;
+  bool allow_replacement = 14;
+  bool reclaimable = 15;
+  bool allow_call_original = 16;
+  bool trace_exceptions = 17;
 }
 message ValidationDiagnostic {
   string stage = 1;
@@ -309,6 +332,12 @@ message Probe {
   uint64 replaces_probe_id = 14;
   uint64 superseded_by_probe_id = 15;
   bool draining = 16; // Superseded entry, still accepting events from its invocations.
+  bool allow_argument_overrides = 17;
+  bool allow_result_override = 18;
+  bool allow_replacement = 19;
+  bool reclaimed = 20;
+  bool allow_call_original = 21;
+  bool trace_exceptions = 22;
 }
 message ReloadProbeRequest {
   string session_id = 1;
@@ -330,6 +359,7 @@ message ListSessionsResponse { repeated Session sessions = 1; }
 message ListModulesRequest {
   string session_id = 1;
   bool include_mappings = 2;
+  string elf_path = 3; // Exact path in the mapped module snapshot.
 }
 message ModuleMapping {
   string path = 1;
@@ -344,6 +374,14 @@ message ListModulesResponse {
   repeated string modules = 1;
   repeated ModuleMapping mappings = 2;
   string mapping_token = 3;
+  repeated ModuleElfEntry elf_entries = 4;
+}
+message ModuleElfEntry {
+  enum Kind { IMPORT = 0; EXPORT = 1; SECTION = 2; }
+  Kind kind = 1;
+  string name = 2;
+  uint64 elf_address = 3;
+  uint64 size = 4;
 }
 message ListMemoryMappingsRequest { string session_id = 1; }
 message MemoryMapping {
@@ -368,6 +406,116 @@ message ReadMemoryRequest {
 message ReadMemoryResponse {
   uint64 address = 1;
   bytes data = 2; // On success, exactly size bytes owned by the response.
+}
+message ApplyMemoryPatchRequest {
+  string session_id = 1;
+  string mapping_token = 2;
+  string module = 3;
+  oneof operation {
+    ExecutablePatch executable = 4;
+    ImportSlotHook import_slot = 5;
+    WritablePatch writable = 6;
+  }
+}
+message AllocateMemoryRequest { string session_id = 1; uint32 size = 2; }
+message FreeMemoryRequest { string session_id = 1; uint64 allocation_id = 2; }
+message MemoryAllocation {
+  uint64 id = 1;
+  uint64 address = 2;
+  uint32 size = 3;
+  bool freed = 4;
+}
+message LoadTargetLibraryRequest { string session_id = 1; string path = 2; }
+message TargetLibrary { string path = 1; }
+message WritablePatch {
+  uint64 address = 1;
+  bytes expected = 2;
+  bytes replacement = 3;
+}
+message ExecutablePatch {
+  uint64 elf_address = 1;
+  bytes expected = 2;
+  bytes replacement = 3;
+}
+message ImportSlotHook {
+  string symbol = 1;
+  uint64 expected_target = 2;
+  uint64 replacement_target = 3;
+  string abi = 4;
+}
+message RestoreMemoryPatchRequest {
+  string session_id = 1;
+  uint64 patch_id = 2;
+}
+message MemoryPatch {
+  uint64 id = 1;
+  uint64 address = 2;
+  uint32 size = 3;
+  bool restored = 4;
+}
+message StartPageMonitorRequest {
+  string session_id = 1;
+  string mapping_token = 2;
+  uint32 tid = 3;
+  uint64 address = 4;
+  uint32 size = 5;
+  uint32 timeout_seconds = 6;
+}
+message StopPageMonitorRequest { string session_id = 1; }
+message PageMonitorResult {
+  uint32 tid = 1;
+  uint64 address = 2;
+  uint32 size = 3;
+  bool expired = 4;
+  message Access {
+    uint64 address = 1;
+    uint64 pc = 2;
+    bool write = 3;
+  }
+  repeated Access accesses = 5;
+}
+message StartInstructionTraceRequest {
+  string session_id = 1;
+  string mapping_token = 2;
+  uint32 tid = 3;
+  uint64 address = 4;
+  uint32 size = 5;
+  uint32 max_records = 6;
+  uint32 timeout_seconds = 7;
+  bool registers = 8;
+  string callback_library = 9;
+  uint64 memory_address = 10;
+  uint32 memory_size = 11;
+  bool discover_calls = 12;
+}
+message StopInstructionTraceRequest { string session_id = 1; }
+message InstructionTrace {
+  enum Reason {
+    RUNNING = 0;
+    STOPPED = 1;
+    LIMIT = 2;
+    TIMEOUT = 3;
+  }
+  uint32 tid = 1;
+  uint64 address = 2;
+  uint32 size = 3;
+  Reason reason = 4;
+  repeated uint64 pcs = 5;
+  repeated InstructionDetail details = 6; // One per PC when an extension is enabled.
+  repeated uint64 call_targets = 7; // One executed call destination per PC in discovery mode.
+  bool discover_calls = 8;
+}
+message InstructionRecording {
+  fixed64 magic = 1;
+  uint32 version = 2;
+  InstructionTrace trace = 3;
+}
+message InstructionDetail {
+  repeated fixed64 registers = 1; // RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP, R8 through R15.
+  optional fixed64 callback_value = 2;
+  uint64 memory_address = 3;
+  uint32 memory_size = 4;
+  uint32 memory_access = 5; // Bit 0 read, bit 1 write.
 }
 message ScanMemoryRequest {
   string session_id = 1;

@@ -53,6 +53,8 @@ public:
 
     virtual std::any visitResolveOption(TracerCommandsParser::ResolveOptionContext *context) = 0;
 
+    virtual std::any visitValidateOption(TracerCommandsParser::ValidateOptionContext *context) = 0;
+
     virtual std::any visitDeployOption(TracerCommandsParser::DeployOptionContext *context) = 0;
 
     virtual std::any visitInterceptor(TracerCommandsParser::InterceptorContext *context) = 0;
@@ -90,6 +92,24 @@ public:
     virtual std::any visitProbeEntry(TracerCommandsParser::ProbeEntryContext *context) = 0;
 
     virtual std::any visitProbeReload(TracerCommandsParser::ProbeReloadContext *context) = 0;
+
+    virtual std::any visitTargetLaunch(TracerCommandsParser::TargetLaunchContext *context) = 0;
+
+    virtual std::any visitLaunchOption(TracerCommandsParser::LaunchOptionContext *context) = 0;
+
+    virtual std::any visitChildList(TracerCommandsParser::ChildListContext *context) = 0;
+
+    virtual std::any visitTargetCall(TracerCommandsParser::TargetCallContext *context) = 0;
+
+    virtual std::any visitLocalPerf(TracerCommandsParser::LocalPerfContext *context) = 0;
+
+    virtual std::any visitTargetLibrary(TracerCommandsParser::TargetLibraryContext *context) = 0;
+
+    virtual std::any visitInstructions(TracerCommandsParser::InstructionsContext *context) = 0;
+
+    virtual std::any visitInstructionOption(TracerCommandsParser::InstructionOptionContext *context) = 0;
+
+    virtual std::any visitWatchpoint(TracerCommandsParser::WatchpointContext *context) = 0;
 
     virtual std::any visitStackFilter(TracerCommandsParser::StackFilterContext *context) = 0;
 

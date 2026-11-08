@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace tracer {
 inline constexpr std::uint32_t kProtocolVersion = 2;
@@ -15,7 +16,8 @@ inline constexpr std::uint32_t kProtocolVersion = 2;
 // Version 26 replaces the inline callback stack array with an invocation view.
 // Version 27 configures the shared-context event budget in the bootstrap.
 // Version 28 also carries the shared transport memory budget.
-inline constexpr std::uint32_t kBootstrapVersion = 28;
+// Version 29 adds scalar control to the invocation layout.
+inline constexpr std::uint32_t kBootstrapVersion = 29;
 inline constexpr std::uint32_t kDefaultContextEventBytes = 256 * 1024;
 inline constexpr std::uint64_t kDefaultContextTransportMemoryBytes = 64ull * 1024 * 1024;
 struct ContextTransportBudget {
@@ -82,7 +84,7 @@ enum class CallableKind : std::uint32_t {
   Function = 1,
   Method = 2
 };
-enum class TracePhase : std::uint32_t { Pre = 1, Post = 2 };
+enum class TracePhase : std::uint32_t { Pre = 1, Post = 2, Exception = 3 };
 
 struct ValueSnapshot {
   enum Status : std::uint32_t {
@@ -121,6 +123,32 @@ struct CallbackPrintOptions {
 
 struct NativeStackStorage;
 
+struct ScalarOverrides {
+  bool allow_arguments = false;
+  bool allow_result = false;
+  bool allow_replacement = false;
+  std::uint32_t argument_mask = 0;
+  bool result_set = false;
+  bool replacement_set = false;
+  std::uint64_t arguments[kMaxArguments]{};
+  std::uint64_t result = 0;
+  std::uint64_t replacement = 0;
+
+  template <class T> static std::uint64_t pack(T value) noexcept {
+    static_assert(sizeof(T) <= sizeof(std::uint64_t));
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(T));
+    return bits;
+  }
+
+  template <class T> static T unpack(std::uint64_t bits) noexcept {
+    static_assert(sizeof(T) <= sizeof(std::uint64_t));
+    T value;
+    std::memcpy(&value, &bits, sizeof(T));
+    return value;
+  }
+};
+
 struct TraceContext {
   std::uint64_t probe_id = 0;
   std::uint64_t object_address = 0;
@@ -157,6 +185,11 @@ struct TraceContext {
   mutable StackTrace stack{};
   // Agent-owned storage backing this invocation's stack view.
   mutable NativeStackStorage *stack_storage = nullptr;
+  // Wrapper-owned storage. Callbacks receive private staging storage.
+  ScalarOverrides *scalar_overrides = nullptr;
+  std::uint64_t original_entry_time_ns = 0;
+  void *original_state = nullptr;
+  std::uint64_t (*invoke_original)(void *) = nullptr;
 };
 
 struct Request {

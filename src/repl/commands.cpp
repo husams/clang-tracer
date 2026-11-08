@@ -1,4 +1,6 @@
 #include "commands.hpp"
+#include "local_perf.hpp"
+#include "tracer/instruction_trace.h"
 
 #include <charconv>
 #include <limits>
@@ -52,6 +54,21 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"server status", K::server_status},
                                         {"server stop", K::server_stop},
                                         {"attach", K::attach},
+                                        {"launch", K::launch},
+                                        {"children", K::children},
+                                        {"resume", K::resume},
+                                        {"terminate", K::terminate},
+                                        {"call", K::target_call},
+                                        {"call-result", K::target_call_result},
+                                        {"syscalls", K::syscalls},
+                                        {"sample cpu", K::sample_cpu},
+                                        {"sample allocations", K::sample_allocations},
+                                        {"faults", K::faults},
+                                        {"watchpoint", K::watchpoint},
+                                        {"instructions start", K::instructions_start},
+                                        {"instructions stop", K::instructions_stop},
+                                        {"instructions replay", K::instructions_replay},
+                                        {"library load", K::library_load},
                                         {"processes", K::processes},
                                         {"sessions", K::sessions},
                                         {"use", K::use},
@@ -63,6 +80,14 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"memory maps", K::memory_maps},
                                         {"memory read", K::memory_read},
                                         {"memory scan", K::memory_scan},
+                                        {"memory patch", K::memory_patch},
+                                        {"memory write", K::memory_write},
+                                        {"memory allocate", K::memory_allocate},
+                                        {"memory free", K::memory_free},
+                                        {"memory restore", K::memory_restore},
+                                        {"memory import-hook", K::memory_import_hook},
+                                        {"memory monitor-start", K::page_monitor_start},
+                                        {"memory monitor-stop", K::page_monitor_stop},
                                         {"trace preview", K::bulk_preview},
                                         {"trace apply", K::bulk_apply},
                                         {"trace remove", K::bulk_remove},
@@ -170,9 +195,11 @@ public:
     }
     const std::set<std::string> flags = {
         "--all", "--metadata-only", "--print-arguments", "--print-result",
-        "--details", "--addresses", "--sqlite"};
+        "--details", "--addresses", "--sqlite", "--allow-arg-overrides", "--allow-result-override",
+        "--registers", "--discover", "--watch", "--supervise", "--gate-children", "--allow-replacement", "--allow-call-original",
+        "--trace-exceptions", "--reclaimable"};
     const std::set<std::string> repeated = {"--include", "--compile-option",
-                                           "--name", "--type"};
+                                           "--name", "--type", "--arg", "--env"};
     const std::set<std::string> bulk_repeated = {"--module", "--exclude", "--exact"};
     for (; i + 1 < ts.size(); ++i) {
       if (const auto extra = extra_compile_options_.find(i);
@@ -312,7 +339,15 @@ Command parse_command(const std::string &input) {
   if (command.number("--limit", 0) > UINT32_MAX) {
     throw std::invalid_argument("--limit must fit a 32-bit page size");
   }
-  if (command.kind == K::attach && !command.arguments.empty()) {
+  if (command.kind == K::launch) {
+    if (command.arguments[0].empty())
+      throw std::invalid_argument("%launch requires an executable path");
+    for (const auto *key : {"--cwd", "--stdin", "--stdout", "--stderr", "--preload"})
+      if (command.has(key) && command.option(key).empty())
+        throw std::invalid_argument(std::string(key) + " requires a path");
+  }
+  if ((command.kind == K::attach || command.kind == K::resume ||
+       command.kind == K::terminate) && !command.arguments.empty()) {
     if (!unsigned_number(command.arguments[0], "PID", INT32_MAX)) {
       throw std::invalid_argument("PID must be positive");
     }
@@ -348,6 +383,49 @@ Command parse_command(const std::string &input) {
   }
   if (command.number("--stack-depth", 0) > UINT32_MAX) {
     throw std::invalid_argument("--stack-depth must fit a 32-bit depth");
+  }
+  if ((command.kind == K::modules || command.kind == K::probe_reload) && command.has("--watch") &&
+      (command.number("--timeout", 0) > 60 || command.number("--count", 0) > 256))
+    throw std::invalid_argument("watch is capped at 60 seconds and 256 changes");
+  if (command.kind == K::modules && command.has("--elf") && command.option("--elf").empty())
+    throw std::invalid_argument("--elf requires an exact mapped path");
+  if (command.kind == K::syscalls || command.kind == K::sample_cpu ||
+      command.kind == K::sample_allocations || command.kind == K::faults ||
+      command.kind == K::watchpoint) {
+    if (command.number("--timeout", 0) > max_local_perf_seconds)
+      throw std::invalid_argument("local perf capture timeout is capped at 60 seconds");
+    if (command.number("--count", 0) > max_local_perf_events)
+      throw std::invalid_argument("local perf capture is capped at 8192 events");
+  }
+  if (command.kind == K::instructions_start || command.kind == K::watchpoint) {
+    if (!command.has("--address") || command.option("--mapping").empty() ||
+        !unsigned_number(command.option("--tid"), "thread ID", INT32_MAX) ||
+        !unsigned_number(command.option("--size"), "instruction range size", TRACER_INSTRUCTION_MAX_BYTES))
+      throw std::invalid_argument("capture requires --tid, --address, --size and --mapping");
+  }
+  if (command.kind == K::watchpoint) {
+    const auto size = command.number("--size", 0);
+    if ((size != 1 && size != 2 && size != 4 && size != 8) ||
+        address_number(command.option("--address")) % size != 0)
+      throw std::invalid_argument("watchpoints require a naturally aligned size of 1, 2, 4 or 8 bytes");
+    const auto access = command.option("--access");
+    if (access != "write" && access != "read-write")
+      throw std::invalid_argument("watchpoint --access must be write or read-write");
+  }
+  if (command.kind == K::instructions_start) {
+    if (command.number("--timeout", 0) > TRACER_INSTRUCTION_MAX_SECONDS ||
+        command.number("--count", 0) > TRACER_INSTRUCTION_MAX_RECORDS)
+      throw std::invalid_argument("instruction capture is capped at 60 seconds and 8192 records");
+    if (command.has("--memory-address") != command.has("--memory-size"))
+      throw std::invalid_argument("memory monitoring requires both --memory-address and --memory-size");
+    if (command.has("--memory-address")) {
+      address_number(command.option("--memory-address"));
+      if (!unsigned_number(command.option("--memory-size"), "monitored memory size",
+                           TRACER_INSTRUCTION_MAX_BYTES))
+        throw std::invalid_argument("monitored memory size must be positive");
+    }
+    if (command.has("--callback-library") && command.option("--callback-library").empty())
+      throw std::invalid_argument("--callback-library requires an absolute shared library path");
   }
   if (command.has("--probe") && !command.number("--probe", 0)) {
     throw std::invalid_argument("probe ID must be positive");

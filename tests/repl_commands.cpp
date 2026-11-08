@@ -20,6 +20,50 @@ int main() {
     throw std::runtime_error("accepted malformed command: " + s);
   };
   require(parse_command("%attach 12345").kind == CommandKind::attach);
+  const auto launch = parse_command(
+      "%launch ./app --arg \"--first\" --arg \"\" --env VAR=1 --env \"VAR=two words\" --timeout 5");
+  require(launch.kind == CommandKind::launch && launch.arguments.at(0) == "./app" &&
+          launch.options.at("--arg") == std::vector<std::string>{"--first", ""} &&
+          launch.options.at("--env") == std::vector<std::string>{"VAR=1", "VAR=two words"} &&
+          launch.number("--timeout", 0) == 5);
+  require(parse_command("%resume").arguments.empty());
+  require(parse_command("%terminate 123").kind == CommandKind::terminate);
+  const auto call = parse_command("%call app::sum --arg -3 --arg 1.25 --timeout 1");
+  require(call.kind == CommandKind::target_call && call.arguments[0] == "app::sum" &&
+          call.options.at("--arg") == std::vector<std::string>{"-3", "1.25"});
+  require(parse_command("%call-result --timeout 2").kind == CommandKind::target_call_result);
+  require(parse_command("%syscalls --count 64").kind == CommandKind::syscalls);
+  require(parse_command("%sample cpu --timeout 1").kind == CommandKind::sample_cpu);
+  bad("%sample cpu --timeout 61");
+  bad("%syscalls --count 8193");
+  require(parse_command("%instructions start --tid 23 --address 0x4000 --size 64 --mapping m --count 7")
+              .kind == CommandKind::instructions_start);
+  require(parse_command("%instructions stop").kind == CommandKind::instructions_stop);
+  const auto extended = parse_command("%instructions start --tid 23 --address 0x4000 --size 64 "
+      "--mapping m --registers --callback-library /tmp/observer.so --memory-address 0x8000 --memory-size 8");
+  require(extended.has("--registers") && extended.option("--callback-library") == "/tmp/observer.so" &&
+          extended.option("--memory-address") == "0x8000" && extended.number("--memory-size", 0) == 8);
+  require(parse_command("%watchpoint --tid 23 --address 0x4000 --size 8 --mapping m --access read-write")
+              .kind == CommandKind::watchpoint);
+  bad("%watchpoint --tid 23 --address 0x4001 --size 8 --mapping m --access write");
+  bad("%watchpoint --tid 23 --address 0x4000 --size 8 --mapping m --access read");
+  bad("%instructions start --tid 23 --address 0x4000 --size 64 --mapping m --memory-address 0x8000");
+  bad("%instructions start --address 0x4000 --tid 23 --size 64");
+  bad("%instructions start --tid 0 --address 0x4000 --size 64 --mapping m");
+  bad("%instructions start --tid 23 --address 0x4000 --size 65537 --mapping m");
+  bad("%instructions start --tid 23 --address 0x4000 --size 64 --mapping m --timeout 61");
+  bad("%instructions start --tid 23 --address 0x4000 --size 64 --mapping m --count 8193");
+  const auto overrides = parse_command("%probe inject f --callback hook.cpp --allow-arg-overrides --allow-result-override");
+  require(overrides.has("--allow-arg-overrides") && overrides.has("--allow-result-override"));
+  require(parse_command("%probe validate f --callback hook.cpp --allow-result-override")
+              .has("--allow-result-override"));
+  bad("%probe inject f --callback hook.cpp --allow-arg-overrides --allow-arg-overrides");
+  bad("%call");
+  bad("%call-result --arg 1");
+  bad("%launch app --cwd here --cwd there");
+  bad("%launch app --timeout 0");
+  bad("%resume 0");
+  bad("%terminate 2147483648");
   require(parse_command("%probe prepare \"demo::compute(int)\" --include api.hpp "
       "--compdb build --translation-unit src/api.cpp --module app --output prepared").kind
           == CommandKind::prepare);
@@ -44,6 +88,14 @@ int main() {
               .has("--print-result"));
   require(parse_command("%probe validate f --callback hook.cpp --extra-args -DHOOK=1")
               .extra_compile_argument_inputs.size() == 1);
+  const auto original_with_flags = parse_command(
+      "%probe inject f --callback hook.cpp --extra-args -DHOOK=1 "
+      "--allow-call-original --trace-exceptions --stack-depth full");
+  require(original_with_flags.extra_compile_argument_inputs.size() == 1 &&
+          original_with_flags.extra_compile_argument_inputs.front().text == "-DHOOK=1");
+  require(original_with_flags.has("--allow-call-original") &&
+          original_with_flags.has("--trace-exceptions") &&
+          original_with_flags.number("--stack-depth", 0) == UINT32_MAX);
   bad("%probe prepare f --include api.hpp --output prepared --extra-args");
   bad("%probe validate f --callback hook.cpp --extra-args `unfinished");
   bad("%server start --extra-arg -DHOOK=1");

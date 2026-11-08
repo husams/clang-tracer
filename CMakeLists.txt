@@ -85,7 +85,7 @@ target_link_libraries(tracer_proto PUBLIC protobuf::libprotobuf tracer_context_t
 add_library(tracer_grpc STATIC ${TRACER_PROTO_DIR}/tracer.grpc.pb.cc)
 target_link_libraries(tracer_grpc PUBLIC tracer_proto gRPC::grpc++)
 
-add_library(clang_tracer_agent SHARED src/agent.cpp src/native_detour.cpp
+add_library(clang_tracer_agent SHARED src/agent.cpp src/native_detour.cpp src/page_monitor_agent.cpp
   src/value_snapshot_codegen.cpp src/value_snapshot_storage.cpp src/callback_pch.cpp
   src/debug_resolver.cpp src/native_stack.cpp src/event_transport.cpp
   src/context_agent_delivery.cpp src/agent_runtime_profile.cpp)
@@ -107,8 +107,9 @@ add_custom_command(TARGET clang_tracer_agent POST_BUILD
     -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckAgentSymbols.cmake
   VERBATIM)
 
-add_executable(clang-tracer-server src/main.cpp src/server.cpp src/session.cpp src/injector.cpp src/admission.cpp
-  src/debug_resolver.cpp src/header_context.cpp src/process_memory.cpp src/native_entry.cpp)
+add_executable(clang-tracer-server src/main.cpp src/server.cpp src/session.cpp src/injector.cpp src/admission.cpp src/memory_patch.cpp src/page_monitor.cpp
+  src/debug_resolver.cpp src/header_context.cpp src/process_memory.cpp src/native_entry.cpp
+  src/instruction_trace.cpp)
 target_include_directories(clang-tracer-server PRIVATE include ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_compile_definitions(clang-tracer-server PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
 target_link_libraries(clang-tracer-server PRIVATE tracer_grpc tracer_context_collector
@@ -122,6 +123,10 @@ target_link_libraries(clang-tracer PRIVATE tracer_grpc tracer_context_analysis c
 target_compile_options(clang-tracer PRIVATE -Wall -Wextra -Wpedantic)
 
 if(TRACER_BUILD_REPL)
+  add_library(clang_tracer_launch_preload SHARED src/launch_preload.c)
+  target_include_directories(clang_tracer_launch_preload PRIVATE include)
+  set_target_properties(clang_tracer_launch_preload PROPERTIES
+    SKIP_BUILD_RPATH TRUE INSTALL_RPATH "" INSTALL_RPATH_USE_LINK_PATH FALSE)
   include(cmake/TracerNativeRepl.cmake)
   tracer_add_native_repl()
 endif()

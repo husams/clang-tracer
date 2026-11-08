@@ -1,4 +1,6 @@
 #include "controller.hpp"
+#include "local_perf.hpp"
+#include "tracer/instruction_trace.h"
 #include "../prepared_contract.hpp"
 #include "../proc_identity.hpp"
 #include "../sqlite_events.hpp"
@@ -24,6 +26,7 @@
 #include <cerrno>
 #include <spawn.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <system_error>
 
 #include <grpcpp/grpcpp.h>
@@ -385,6 +388,7 @@ void Controller::start_server(const Command &command) {
   if (server_.running()) {
     throw std::runtime_error("this console already owns a running server");
   }
+  require_no_owned_targets();
   if (!owned_sessions_.empty() || !pending_attaches_.empty()) {
     throw std::runtime_error(
         "resolve console-created or uncertain sessions before changing server");
@@ -462,20 +466,31 @@ std::string Controller::prompt() const {
              : "tracer[" + std::to_string(selected_.pid) + "]> ";
 }
 
-void Controller::require_session(const SessionHandle &session) {
+std::uint64_t Controller::require_session(const SessionHandle &session, bool scalar_overrides) {
   if (!stub_ || session.id.empty() || session.connection != connection_) {
     throw std::runtime_error(
         "no valid selected session; use %attach PID or %use SESSION");
   }
+  if (scalar_overrides && endpoint_.rfind("unix:", 0) != 0)
+    throw std::runtime_error("scalar overrides require a local Unix control socket");
   api::ListSessionsRequest request;
   auto response = unary<api::ListSessionsResponse>(
       [&](auto &c, auto &r) { return stub_->ListSessions(&c, request, &r); });
   for (const auto &entry : response.sessions()) {
     if (entry.id() == session.id && entry.state() == api::Session::ATTACHED) {
-      return;
+      if (scalar_overrides && !entry.jit_runtime().scalar_overrides_supported())
+        throw std::runtime_error("the server and agent do not support scalar overrides");
+      return entry.process_start_time();
     }
   }
   throw std::runtime_error("session is no longer attached: " + session.id);
+}
+
+void Controller::require_idle_target(const SessionHandle &session) const {
+  const auto owned = owned_targets_.find(session.pid);
+  if (owned != owned_targets_.end() && owned->second.session.id == session.id &&
+      owned->second.process->call_pending())
+    throw std::runtime_error("target call pending; use %call-result or %terminate");
 }
 
 SessionHandle Controller::attach(std::uint32_t pid,
@@ -558,9 +573,144 @@ SessionHandle Controller::attach(std::uint32_t pid,
   return selected_;
 }
 
+void Controller::prune_owned_targets() {
+  for (auto it = owned_targets_.begin(); it != owned_targets_.end();) {
+    if (it->second.process->running())
+      ++it;
+    else
+      it = owned_targets_.erase(it);
+  }
+}
+
+void Controller::require_no_owned_targets() {
+  prune_owned_targets();
+  if (!owned_targets_.empty())
+    throw std::runtime_error("terminate owned targets before changing server");
+}
+
+void Controller::launch(const Command &command) {
+  prune_owned_targets();
+  if (owned_targets_.size() >= 16)
+    throw std::runtime_error("owned target limit reached");
+  ensure_connected();
+  if (!server_.running() || endpoint_ != server_.endpoint())
+    throw std::runtime_error("%launch requires a private local server owned by this REPL");
+
+  LaunchOptions options;
+  options.executable = command.arguments.at(0);
+  options.cwd = command.option("--cwd");
+  options.input = command.option("--stdin");
+  options.output = command.option("--stdout");
+  options.error = command.option("--stderr");
+  options.preload = command.option("--preload");
+  options.supervise = command.has("--supervise");
+  options.gate_children = command.has("--gate-children");
+  if (command.has("--arg"))
+    options.arguments = command.options.at("--arg");
+  if (command.has("--env"))
+    options.environment = command.options.at("--env");
+
+  auto target = OwnedTarget::start(options, server_.pid());
+  const auto pid = target->pid();
+  auto &owned = owned_targets_.emplace(pid, OwnedLaunch{std::move(target), {}}).first->second;
+  auto &process = *owned.process;
+  try {
+    out_ << "launching pid=" << pid
+         << " stdout=" << std::quoted(printable_proc_text(process.output_path()))
+         << " stderr=" << std::quoted(printable_proc_text(process.error_path()))
+         << '\n' << std::flush;
+    process.wait_ready(command.number("--timeout", settings_.timeout_seconds), interrupted);
+    const auto start = tracer::proc::start_time(tracer::proc::directory(pid) / "stat");
+    if (!start)
+      throw std::runtime_error("cannot verify owned target identity");
+    owned.session = attach(pid, start, process.executable());
+    if (interrupted.load())
+      throw std::runtime_error("target launch cancelled");
+  } catch (const std::exception &error) {
+    try {
+      process.terminate();
+    } catch (const std::exception &cleanup) {
+      throw std::runtime_error(std::string(error.what()) + "; " + cleanup.what() +
+                               "; retry with %terminate " + std::to_string(pid));
+    }
+    const auto session = std::move(owned.session);
+    owned_targets_.erase(pid);
+    pending_attaches_.erase(pid);
+    if (!session.id.empty()) {
+      try {
+        detach(session);
+      } catch (const std::exception &cleanup) {
+        throw std::runtime_error(std::string(error.what()) +
+                                 "; target reaped, session cleanup failed: " + cleanup.what());
+      }
+    }
+    throw;
+  }
+  out_ << "launched pid=" << pid << " session=" << owned.session.id
+       << " paused=true\n";
+}
+
+void Controller::control_target(const Command &command) {
+  const auto pid = command.arguments.empty()
+                       ? selected_.pid
+                       : static_cast<std::uint32_t>(unsigned_number(command.arguments[0], "PID", INT32_MAX));
+  const auto found = owned_targets_.find(pid);
+  if (found == owned_targets_.end()) {
+    if (command.kind == CommandKind::resume) {
+      for (const auto &entry : owned_targets_) {
+        if (entry.second.process->resume_child(pid)) {
+          out_ << "resumed child pid=" << pid << '\n';
+          return;
+        }
+      }
+    }
+    throw std::runtime_error("specify a PID launched by this REPL or select its session");
+  }
+  auto &owned = found->second;
+  if (command.kind == CommandKind::resume) {
+    require_idle_target(owned.session);
+    require_session(owned.session);
+    owned.process->resume();
+    out_ << "resumed pid=" << pid << '\n';
+    return;
+  }
+  owned.process->terminate();
+  const auto session = std::move(owned.session);
+  owned_targets_.erase(found);
+  pending_attaches_.erase(pid);
+  out_ << "terminated pid=" << pid << '\n';
+  if (owned_sessions_.count(session.id))
+    detach(session);
+}
+
+void Controller::call_target(const Command &command) {
+  const auto found = owned_targets_.find(selected_.pid);
+  if (found == owned_targets_.end() || found->second.session.id != selected_.id ||
+      found->second.session.connection != connection_)
+    throw std::runtime_error("select a target launched by this REPL");
+  auto &target = *found->second.process;
+  if (command.kind == CommandKind::target_call) {
+    require_idle_target(selected_);
+    require_session(selected_);
+    const auto args = command.options.find("--arg");
+    const std::vector<std::string> no_args;
+    if (interrupted.load())
+      throw std::runtime_error("target call cancelled before submission");
+    target.start_call(command.arguments.at(0), args == command.options.end() ? no_args : args->second);
+  }
+  const auto result = target.call_result(command.number("--timeout", settings_.timeout_seconds), interrupted);
+  out_ << "call result pid=" << found->first << ' ' << result << '\n';
+}
+
 void Controller::detach(const SessionHandle &session) {
   if (!stub_ || session.id.empty() || session.connection != connection_) {
     throw std::runtime_error("invalid session handle");
+  }
+  for (const auto &entry : owned_targets_) {
+    auto &target = entry.second;
+    if (target.session.id == session.id && target.process->paused() &&
+        target.process->running())
+      throw std::runtime_error("resume or terminate the paused target before detaching");
   }
   stop_background(session.id);
   api::DetachRequest request;
@@ -714,7 +864,12 @@ std::uint64_t Controller::inject(const SessionHandle &session,
                                  const std::string &selector,
                                  const std::string &source,
                                  const Command &options) {
-  require_session(session);
+  require_idle_target(session);
+  const bool override_arguments = options.has("--allow-arg-overrides");
+  const bool override_result = options.has("--allow-result-override");
+  const bool replacement = options.has("--allow-replacement");
+  const bool call_original = options.has("--allow-call-original");
+  require_session(session, override_arguments || override_result || replacement || call_original);
   const auto resolve_started = std::chrono::steady_clock::now();
   auto spec = resolve_for(session, selector, options);
   const auto resolve_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -726,6 +881,12 @@ std::uint64_t Controller::inject(const SessionHandle &session,
       options.option("--stack-application-only", "true") == "false");
   spec.set_print_arguments(options.has("--print-arguments"));
   spec.set_print_result(options.has("--print-result"));
+  spec.set_allow_argument_overrides(override_arguments);
+  spec.set_allow_result_override(override_result);
+  spec.set_allow_replacement(replacement);
+  spec.set_allow_call_original(call_original);
+  spec.set_trace_exceptions(options.has("--trace-exceptions"));
+  spec.set_reclaimable(options.has("--reclaimable"));
   api::AddProbeRequest request;
   request.set_session_id(session.id);
   *request.mutable_spec() = std::move(spec);
@@ -953,8 +1114,9 @@ RecordResult Controller::record(const std::string &path,
     throw std::invalid_argument("SQLite recording requires a persistent file path");
   if (options.session && options.all_sessions)
     throw std::invalid_argument("recording session conflicts with all_sessions");
-  if (!options.phase.empty() && options.phase != "PRE" && options.phase != "POST")
-    throw std::invalid_argument("recording phase must be PRE or POST");
+  if (!options.phase.empty() && options.phase != "PRE" && options.phase != "POST" &&
+      options.phase != "EXCEPTION")
+    throw std::invalid_argument("recording phase must be PRE, POST or EXCEPTION");
   if (options.timeout_seconds > 86400)
     throw std::invalid_argument("recording timeout must be at most 86400 seconds");
 
@@ -1212,6 +1374,7 @@ void Controller::preview_bulk_trace(const Command &command) {
 }
 
 void Controller::apply_bulk_trace(const Command &command) {
+  require_idle_target(selected_);
   require_session(selected_);
   api::ApplyBulkTraceRequest request;
   request.set_session_id(selected_.id);
@@ -1249,6 +1412,7 @@ void Controller::apply_bulk_trace(const Command &command) {
 }
 
 void Controller::remove_bulk_trace(const std::string &batch_id) {
+  require_idle_target(selected_);
   require_session(selected_);
   api::RemoveBulkTraceRequest request;
   request.set_session_id(selected_.id);
@@ -1271,6 +1435,7 @@ bool Controller::execute(const Command &command) {
     start_server(command);
     return true;
   case K::server_connect:
+    require_no_owned_targets();
     if (server_.running() || !owned_sessions_.empty() ||
         !pending_attaches_.empty()) {
       throw std::runtime_error(
@@ -1281,6 +1446,7 @@ bool Controller::execute(const Command &command) {
     out_ << "connected endpoint=" << endpoint_ << " ownership=external\n";
     return true;
   case K::server_stop:
+    require_no_owned_targets();
     if (server_.pid() < 0) {
       throw std::runtime_error("this console does not own a server");
     }
@@ -1292,6 +1458,7 @@ bool Controller::execute(const Command &command) {
     return true;
   case K::server_status:
   case K::status: {
+    prune_owned_targets();
     const bool owned = server_.running();
     out_ << "endpoint=" << (endpoint_.empty() ? settings_.endpoint : endpoint_)
          << " ownership="
@@ -1311,6 +1478,11 @@ bool Controller::execute(const Command &command) {
     }
     if (!pending_attaches_.empty())
       out_ << reconcile_attaches() << '\n';
+    for (const auto &target : owned_targets_)
+      out_ << "owned_target pid=" << target.first
+           << " paused=" << (target.second.process->paused() ? "true" : "false")
+           << " calls=" << (target.second.process->calls_enabled() ? "enabled" : "unavailable")
+           << " call_pending=" << (target.second.process->call_pending() ? "true" : "false") << '\n';
     for (const auto &b : batches_) {
       out_ << "collection=" << b.first << " events=" << b.second.events().size()
            << " bytes=" << b.second.bytes() << '\n';
@@ -1321,6 +1493,58 @@ bool Controller::execute(const Command &command) {
     attach(static_cast<unsigned>(unsigned_number(args.at(0), "PID", INT32_MAX)),
            command.number("--start-time", 0));
     return true;
+  case K::launch:
+    launch(command);
+    return true;
+  case K::children:
+    for (const auto &entry : owned_targets_)
+      for (const auto pid : entry.second.process->children())
+        out_ << "gated child pid=" << pid << " owner=" << entry.first << '\n';
+    return true;
+  case K::resume:
+  case K::terminate:
+    control_target(command);
+    return true;
+  case K::target_call:
+  case K::target_call_result:
+    call_target(command);
+    return true;
+  case K::syscalls:
+  case K::watchpoint:
+  case K::faults:
+  case K::sample_allocations:
+  case K::sample_cpu: {
+    if (!server_.running() || endpoint_ != server_.endpoint())
+      throw std::runtime_error("local perf capture requires the REPL's owned local server");
+    const auto start = require_session(selected_);
+    auto mode = command.kind == K::syscalls ? LocalPerfMode::syscalls : LocalPerfMode::cpu;
+    if (command.kind == K::faults)
+      mode = LocalPerfMode::faults;
+    if (command.kind == K::sample_allocations)
+      mode = LocalPerfMode::allocations;
+    Watchpoint watch{};
+    if (command.kind == K::watchpoint) {
+      mode = LocalPerfMode::watchpoint;
+      watch = {static_cast<std::uint32_t>(command.number("--tid", 0)),
+               address_number(command.option("--address")),
+               static_cast<unsigned>(command.number("--size", 0)),
+               command.option("--access") == "read-write"};
+      api::ReadMemoryRequest request;
+      request.set_session_id(selected_.id);
+      request.set_mapping_token(command.option("--mapping"));
+      request.set_address(watch.address);
+      request.set_size(watch.size);
+      const auto result = unary<api::ReadMemoryResponse>(
+          [&](auto &c, auto &r) { return stub_->ReadMemory(&c, request, &r); },
+          settings_.timeout_seconds);
+      if (result.address() != watch.address || result.data().size() != watch.size)
+        throw std::runtime_error("watchpoint range could not be verified");
+    }
+    capture_local_perf(mode, selected_.pid, start, command.number("--timeout", 2),
+                       command.number("--count", 256), interrupted, out_,
+                       mode == LocalPerfMode::watchpoint ? &watch : nullptr);
+    return true;
+  }
   case K::bulk_preview:
     preview_bulk_trace(command);
     return true;
@@ -1374,10 +1598,57 @@ bool Controller::execute(const Command &command) {
     require_session(selected_);
     api::ListModulesRequest request;
     request.set_session_id(selected_.id);
-    request.set_include_mappings(command.has("--details"));
-    const auto response = unary<api::ListModulesResponse>(
-        [&](auto &c, auto &r) { return stub_->ListModules(&c, request, &r); });
-    if (!command.has("--details")) {
+    request.set_include_mappings(command.has("--details") || command.has("--watch"));
+    request.set_elf_path(command.option("--elf"));
+    const auto modules = [&] { return unary<api::ListModulesResponse>(
+        [&](auto &c, auto &r) { return stub_->ListModules(&c, request, &r); }); };
+    const auto response = modules();
+    if (command.has("--watch")) {
+      const auto indexed = [](const api::ListModulesResponse &snapshot) {
+        std::map<std::string, api::ModuleMapping> entries;
+        for (const auto &mapping : snapshot.mappings())
+          entries.emplace(mapping.SerializeAsString(), mapping);
+        return entries;
+      };
+      if (response.mapping_token().empty())
+        throw std::runtime_error("server does not support mapped module snapshots");
+      auto before = indexed(response);
+      const auto deadline = std::chrono::steady_clock::now() +
+          std::chrono::seconds(command.number("--timeout", 5));
+      const auto limit = command.number("--count", 16);
+      std::uint64_t count = 0;
+      out_ << "module watch ready\n" << std::flush;
+      const auto report = [&](const auto &from, const auto &to, const char *kind) {
+        for (const auto &[key, mapping] : from) {
+          if (count == limit)
+            break;
+          if (to.count(key))
+            continue;
+          out_ << "module " << kind << " address=0x" << std::hex << mapping.begin_address()
+               << std::dec << " " << std::quoted(printable_proc_text(mapping.path())) << '\n'
+               << std::flush;
+          ++count;
+        }
+      };
+      while (!interrupted.load() && count < limit && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (interrupted.load() || std::chrono::steady_clock::now() >= deadline)
+          break;
+        auto after = indexed(modules());
+        report(before, after, "unloaded");
+        report(after, before, "loaded");
+        before = std::move(after);
+      }
+      out_ << "module watch complete changes=" << count << '\n';
+    } else if (command.has("--elf")) {
+      if (response.elf_entries().empty())
+        throw std::runtime_error("server did not return an ELF view");
+      for (const auto &entry : response.elf_entries())
+        out_ << "elf " << api::ModuleElfEntry::Kind_Name(entry.kind())
+             << " address=0x" << std::hex << entry.elf_address() << std::dec
+             << " size=" << entry.size() << ' '
+             << std::quoted(printable_proc_text(entry.name())) << '\n';
+    } else if (!command.has("--details")) {
       for (const auto &module : response.modules())
         out_ << module << '\n';
     } else {
@@ -1413,6 +1684,169 @@ bool Controller::execute(const Command &command) {
     out_ << "memory mappings=" << response.mappings_size() << '\n';
     return true;
   }
+  case K::instructions_start: {
+    require_session(selected_);
+    if (!server_.running())
+      throw std::runtime_error("instruction tracing requires the REPL's owned local server");
+    api::StartInstructionTraceRequest request;
+    request.set_session_id(selected_.id);
+    request.set_mapping_token(command.option("--mapping"));
+    request.set_tid(command.number("--tid", 0));
+    request.set_address(address_number(command.option("--address")));
+    request.set_size(command.number("--size", 0));
+    request.set_max_records(command.number("--count", 256));
+    request.set_timeout_seconds(command.number("--timeout", 5));
+    request.set_registers(command.has("--registers"));
+    request.set_discover_calls(command.has("--discover"));
+    request.set_callback_library(command.option("--callback-library"));
+    if (command.has("--memory-address")) {
+      request.set_memory_address(address_number(command.option("--memory-address")));
+      request.set_memory_size(command.number("--memory-size", 0));
+    }
+    const auto result = unary<api::InstructionTrace>(
+        [&](auto &c, auto &r) { return stub_->StartInstructionTrace(&c, request, &r); },
+        settings_.timeout_seconds);
+    out_ << "instructions started tid=" << result.tid() << " address=0x"
+         << std::hex << result.address() << std::dec << " size=" << result.size()
+         << " count-limit=" << request.max_records()
+         << " timeout=" << request.timeout_seconds() << '\n';
+    return true;
+  }
+  case K::page_monitor_start:
+  case K::page_monitor_stop: {
+    if (!server_.running() || endpoint_ != server_.endpoint())
+      throw std::runtime_error("page monitoring requires the REPL's owned local server");
+    require_idle_target(selected_);
+    require_session(selected_);
+    if (command.kind == K::page_monitor_start) {
+      api::StartPageMonitorRequest request;
+      request.set_session_id(selected_.id);
+      request.set_mapping_token(command.option("--mapping"));
+      request.set_tid(unsigned_number(command.option("--tid"), "monitor TID", INT32_MAX));
+      request.set_address(address_number(command.option("--address")));
+      request.set_size(unsigned_number(command.option("--size"), "monitor size", UINT32_MAX));
+      request.set_timeout_seconds(command.number("--timeout", 5));
+      const auto result = unary<api::PageMonitorResult>(
+          [&](auto &c, auto &r) { return stub_->StartPageMonitor(&c, request, &r); },
+          settings_.timeout_seconds);
+      out_ << "page monitor started tid=" << result.tid() << '\n' << std::flush;
+    } else {
+      api::StopPageMonitorRequest request;
+      request.set_session_id(selected_.id);
+      const auto result = unary<api::PageMonitorResult>(
+          [&](auto &c, auto &r) { return stub_->StopPageMonitor(&c, request, &r); },
+          settings_.timeout_seconds);
+      for (const auto &access : result.accesses())
+        out_ << "page " << (access.write() ? "write" : "read") << " address=0x"
+             << std::hex << access.address() << " pc=0x" << access.pc() << std::dec << '\n';
+      out_ << "page monitor stopped count=" << result.accesses_size()
+           << " expired=" << (result.expired() ? "true" : "false") << '\n';
+    }
+    return true;
+  }
+  case K::instructions_replay:
+  case K::instructions_stop: {
+    constexpr std::uint64_t magic = 0x3145434152545443ULL; // CTTRACE1
+    constexpr std::size_t max_bytes = 4 * 1024 * 1024;
+    api::InstructionRecording recording;
+    if (command.kind == K::instructions_replay) {
+      const int fd = ::open(args.at(0).c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+      if (fd < 0)
+        throw std::system_error(errno, std::generic_category(), "open instruction recording");
+      google::protobuf::io::FileInputStream input(fd);
+      input.SetCloseOnDelete(true);
+      struct stat status {};
+      if (::fstat(fd, &status) < 0 || !S_ISREG(status.st_mode) || status.st_size <= 0 ||
+          static_cast<std::uint64_t>(status.st_size) > max_bytes)
+        throw std::invalid_argument("instruction recording must be a regular file up to 4 MiB");
+      google::protobuf::io::CodedInputStream bytes(&input);
+      bytes.SetTotalBytesLimit(max_bytes);
+      const auto end = bytes.PushLimit(static_cast<int>(status.st_size));
+      if (!recording.ParseFromCodedStream(&bytes) || !bytes.ConsumedEntireMessage() ||
+          bytes.BytesUntilLimit() != 0)
+        throw std::invalid_argument("invalid instruction recording");
+      bytes.PopLimit(end);
+      if (recording.magic() != magic || recording.version() != 1 || !recording.has_trace())
+        throw std::invalid_argument("unsupported instruction recording format");
+    } else {
+      require_session(selected_);
+      if (!server_.running())
+        throw std::runtime_error("instruction tracing requires the REPL's owned local server");
+      api::StopInstructionTraceRequest request;
+      request.set_session_id(selected_.id);
+      *recording.mutable_trace() = unary<api::InstructionTrace>(
+          [&](auto &c, auto &r) { return stub_->StopInstructionTrace(&c, request, &r); },
+          settings_.timeout_seconds);
+    }
+    const auto &result = recording.trace();
+    if (!result.tid() || !result.address() || !result.size() ||
+        result.size() > TRACER_INSTRUCTION_MAX_BYTES ||
+        result.reason() < api::InstructionTrace::STOPPED || result.reason() > api::InstructionTrace::TIMEOUT ||
+        result.pcs_size() > TRACER_INSTRUCTION_MAX_RECORDS ||
+        (result.discover_calls() ? result.call_targets_size() != result.pcs_size() || result.details_size()
+                                 : result.call_targets_size() != 0) ||
+        (result.details_size() && result.details_size() != result.pcs_size()))
+      throw std::runtime_error("invalid instruction capture response");
+    for (const auto pc : result.pcs())
+      if (pc < result.address() || pc - result.address() >= result.size())
+        throw std::runtime_error("instruction capture PC outside its range");
+    for (const auto &detail : result.details())
+      if ((detail.registers_size() && detail.registers_size() != TRACER_INSTRUCTION_REGISTER_COUNT) ||
+          (detail.memory_size() && (detail.memory_size() > 8 || detail.memory_access() < 1 ||
+                                    detail.memory_access() > 3)))
+        throw std::runtime_error("invalid instruction capture detail");
+    if (command.has("--save")) {
+      recording.set_magic(magic);
+      recording.set_version(1);
+      const auto path = command.option("--save");
+      if (recording.ByteSizeLong() > max_bytes)
+        throw std::runtime_error("instruction recording exceeds 4 MiB");
+      const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+      if (fd < 0)
+        throw std::system_error(errno, std::generic_category(), "create instruction recording");
+      const bool written = recording.SerializeToFileDescriptor(fd);
+      const bool closed = ::close(fd) == 0;
+      if (!written || !closed) {
+        ::unlink(path.c_str());
+        throw std::runtime_error("could not write instruction recording");
+      }
+    }
+    constexpr const char *registers[] = {
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
+    static_assert(std::size(registers) == TRACER_INSTRUCTION_REGISTER_COUNT);
+    std::map<std::uint64_t, unsigned> targets;
+    for (int i = 0; i < result.pcs_size(); ++i) {
+      if (result.discover_calls()) {
+        const auto target = result.call_targets(i);
+        ++targets[target];
+        out_ << "call pc=0x" << std::hex << result.pcs(i) << " target=0x" << target << std::dec << '\n';
+        continue;
+      }
+      out_ << "instruction pc=0x" << std::hex << result.pcs(i);
+      if (result.details_size()) {
+        const auto &detail = result.details(i);
+        for (int j = 0; j < detail.registers_size(); ++j)
+          out_ << ' ' << registers[j] << "=0x" << detail.registers(j);
+        if (detail.has_callback_value())
+          out_ << " callback=0x" << detail.callback_value();
+        if (detail.memory_size()) {
+          out_ << " memory=0x" << detail.memory_address() << std::dec
+               << " size=" << detail.memory_size() << " access="
+               << (detail.memory_access() == TRACER_INSTRUCTION_MEMORY_READ ? "read" :
+                   detail.memory_access() == TRACER_INSTRUCTION_MEMORY_WRITE ? "write" : "read-write");
+        }
+      }
+      out_ << std::dec << '\n';
+    }
+    for (const auto &[target, count] : targets)
+      out_ << "discovered target=0x" << std::hex << target << std::dec << " calls=" << count << '\n';
+    out_ << "instructions stopped tid=" << result.tid() << " count=" << result.pcs_size()
+         << " reason=" << api::InstructionTrace::Reason_Name(result.reason())
+         << " truncated=" << (result.reason() == api::InstructionTrace::LIMIT ? "true" : "false")
+         << '\n';
+    return true;
+  }
   case K::memory_read: {
     require_session(selected_);
     api::ReadMemoryRequest request;
@@ -1433,6 +1867,99 @@ bool Controller::execute(const Command &command) {
       print_memory_scalar(out_, request.address(), response.data(), type);
     else
       print_memory_dump(out_, request.address(), response.data());
+    return true;
+  }
+  case K::library_load:
+  case K::memory_allocate:
+  case K::memory_free: {
+    if (!server_.running() || endpoint_ != server_.endpoint())
+      throw std::runtime_error("target mutation requires the REPL's owned local server");
+    require_idle_target(selected_);
+    require_session(selected_);
+    if (command.kind == K::library_load) {
+      api::LoadTargetLibraryRequest request;
+      request.set_session_id(selected_.id);
+      request.set_path(std::filesystem::absolute(args.at(0)).string());
+      const auto result = unary<api::TargetLibrary>(
+          [&](auto &c, auto &r) { return stub_->LoadTargetLibrary(&c, request, &r); },
+          settings_.timeout_seconds);
+      out_ << "library loaded path=" << result.path() << " lifetime=target-process\n";
+      return true;
+    }
+    api::MemoryAllocation result;
+    if (command.kind == K::memory_allocate) {
+      api::AllocateMemoryRequest request;
+      request.set_session_id(selected_.id);
+      request.set_size(unsigned_number(args.at(0), "allocation size", 1048576));
+      result = unary<api::MemoryAllocation>(
+          [&](auto &c, auto &r) { return stub_->AllocateMemory(&c, request, &r); },
+          settings_.timeout_seconds);
+    } else {
+      api::FreeMemoryRequest request;
+      request.set_session_id(selected_.id);
+      request.set_allocation_id(unsigned_number(args.at(0), "allocation ID"));
+      result = unary<api::MemoryAllocation>(
+          [&](auto &c, auto &r) { return stub_->FreeMemory(&c, request, &r); },
+          settings_.timeout_seconds);
+    }
+    out_ << "memory allocation=" << result.id() << " address=0x" << std::hex
+         << result.address() << std::dec << " size=" << result.size()
+         << " freed=" << (result.freed() ? "true" : "false") << '\n';
+    return true;
+  }
+  case K::memory_write:
+  case K::memory_patch:
+  case K::memory_import_hook:
+  case K::memory_restore: {
+    if (!server_.running() || endpoint_ != server_.endpoint())
+      throw std::runtime_error("memory mutation requires the REPL's owned local server");
+    require_idle_target(selected_);
+    require_session(selected_);
+    api::MemoryPatch response;
+    if (command.kind == K::memory_restore) {
+      api::RestoreMemoryPatchRequest request;
+      request.set_session_id(selected_.id);
+      request.set_patch_id(unsigned_number(args.at(0), "patch ID"));
+      response = unary<api::MemoryPatch>(
+          [&](auto &c, auto &r) { return stub_->RestoreMemoryPatch(&c, request, &r); },
+          settings_.timeout_seconds);
+    } else {
+      api::ApplyMemoryPatchRequest request;
+      request.set_session_id(selected_.id);
+      request.set_mapping_token(command.option("--mapping"));
+      request.set_module(command.option("--module"));
+      if (command.kind == K::memory_import_hook) {
+        auto *hook = request.mutable_import_slot();
+        hook->set_symbol(command.option("--symbol"));
+        hook->set_abi(command.option("--abi"));
+        hook->set_expected_target(address_number(command.option("--original")));
+        hook->set_replacement_target(address_number(command.option("--address")));
+      } else {
+        const auto bytes = [&](const char *option) {
+          auto [value, mask] = parse_memory_pattern(command.option(option));
+          if (mask.find_first_not_of(static_cast<char>(0xff)) != std::string::npos)
+            throw std::invalid_argument("memory patch bytes cannot use wildcards or masks");
+          return value;
+        };
+        if (command.kind == K::memory_write) {
+          auto *patch = request.mutable_writable();
+          patch->set_address(address_number(args.at(0)));
+          patch->set_expected(bytes("--expect"));
+          patch->set_replacement(bytes("--replace"));
+        } else {
+          auto *patch = request.mutable_executable();
+          patch->set_elf_address(address_number(command.option("--elf-address")));
+          patch->set_expected(bytes("--expect"));
+          patch->set_replacement(bytes("--replace"));
+        }
+      }
+      response = unary<api::MemoryPatch>(
+          [&](auto &c, auto &r) { return stub_->ApplyMemoryPatch(&c, request, &r); },
+          settings_.timeout_seconds);
+    }
+    out_ << "memory patch=" << response.id() << " address=0x" << std::hex << response.address()
+         << std::dec << " size=" << response.size()
+         << " restored=" << (response.restored() ? "true" : "false") << '\n';
     return true;
   }
   case K::memory_scan: {
@@ -1575,7 +2102,12 @@ bool Controller::execute(const Command &command) {
     return true;
   case K::validate:
   case K::draft_validate: {
-    require_session(selected_);
+    require_idle_target(selected_);
+    const bool override_arguments = command.has("--allow-arg-overrides");
+    const bool override_result = command.has("--allow-result-override");
+    const bool replacement = command.has("--allow-replacement");
+    const bool call_original = command.has("--allow-call-original");
+    require_session(selected_, override_arguments || override_result || replacement || call_original);
     const bool named = command.kind == K::draft_validate;
     const auto selector = named ? command.option("--target") : args.at(0);
     api::ResolveProbeRequest resolution;
@@ -1583,6 +2115,12 @@ bool Controller::execute(const Command &command) {
     api::ValidateProbeRequest request;
     request.set_session_id(selected_.id);
     request.set_selector(selector);
+    request.set_allow_argument_overrides(override_arguments);
+    request.set_allow_result_override(override_result);
+    request.set_allow_replacement(replacement);
+    request.set_allow_call_original(call_original);
+    request.set_trace_exceptions(command.has("--trace-exceptions"));
+    request.set_reclaimable(command.has("--reclaimable"));
     request.set_callback_source(named ? drafts_.at(args.at(0))
                                       : read_source(command.option("--callback")));
     *request.mutable_include_headers() = resolution.include_headers();
@@ -1619,28 +2157,70 @@ bool Controller::execute(const Command &command) {
     return true;
   }
   case K::probe_reload: {
+    require_idle_target(selected_);
     require_session(selected_);
     api::ReloadProbeRequest request;
     request.set_session_id(selected_.id);
     request.set_probe_id(unsigned_number(args.at(0), "probe ID"));
-    request.set_callback_source(read_source(command.option("--callback")));
-    const auto response = unary<api::ReloadProbeResponse>(
+    const auto reload = [&](const std::string &source) {
+      request.set_callback_source(source);
+      const auto response = unary<api::ReloadProbeResponse>(
         [&](auto &c, auto &r) {
           Cancellation cancellation(c);
           return stub_->ReloadProbe(&c, request, &r);
         },
         settings_.timeout_seconds);
-    out_ << "reloaded probe=" << response.probe().id()
-         << " replaces=" << response.probe().replaces_probe_id()
-         << " retained_limit=" << response.retained_limit();
-    if (response.has_agent_retained())
-      out_ << " agent_retained=" << response.agent_retained();
-    else
-      out_ << " agent_retained=unknown";
-    out_ << '\n';
+      out_ << "reloaded probe=" << response.probe().id()
+           << " replaces=" << response.probe().replaces_probe_id()
+           << " retained_limit=" << response.retained_limit();
+      if (response.has_agent_retained())
+        out_ << " agent_retained=" << response.agent_retained();
+      else
+        out_ << " agent_retained=unknown";
+      out_ << '\n' << std::flush;
+      request.set_probe_id(response.probe().id());
+    };
+    const auto path = command.option("--callback");
+    if (!command.has("--watch")) {
+      reload(read_source(path));
+      return true;
+    }
+    auto previous = read_source(path);
+    auto candidate = previous;
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(command.number("--timeout", 15));
+    const auto limit = command.number("--count", 16);
+    std::uint64_t count = 0;
+    out_ << "probe watch ready probe=" << request.probe_id() << '\n' << std::flush;
+    while (!interrupted.load() && count < limit && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      if (interrupted.load() || std::chrono::steady_clock::now() >= deadline)
+        break;
+      try {
+        auto source = read_source(path);
+        if (source != candidate) {
+          candidate = std::move(source);
+          continue;
+        }
+      } catch (const std::exception &) {
+        candidate = previous;
+        continue; // An editor may briefly remove the file during a save.
+      }
+      if (candidate == previous)
+        continue;
+      previous = candidate;
+      try {
+        reload(candidate);
+      } catch (const std::exception &error) {
+        out_ << "probe watch rejected: " << error.what() << '\n' << std::flush;
+      }
+      ++count;
+    }
+    out_ << "probe watch complete changes=" << count << " probe=" << request.probe_id() << '\n';
     return true;
   }
   case K::remove: {
+    require_idle_target(selected_);
     require_session(selected_);
     api::RemoveProbeRequest request;
     request.set_session_id(selected_.id);
@@ -1649,7 +2229,8 @@ bool Controller::execute(const Command &command) {
         [&](auto &c, auto &r) { return stub_->RemoveProbe(&c, request, &r); },
         settings_.timeout_seconds);
     out_ << "removed probe=" << response.id() << " restored="
-         << (response.original_bytes_restored() ? "true" : "false") << '\n';
+         << (response.original_bytes_restored() ? "true" : "false")
+         << (response.reclaimed() ? " reclaimed=true" : "") << '\n';
     if (!response.original_bytes_restored() && !response.superseded_by_probe_id()) {
       throw std::runtime_error("probe restoration incomplete");
     }
@@ -1752,6 +2333,16 @@ bool Controller::execute(const Command &command) {
 void Controller::shutdown() {
   stop_background();
   std::string failures;
+  for (auto it = owned_targets_.begin(); it != owned_targets_.end();) {
+    try {
+      it->second.process->terminate();
+      pending_attaches_.erase(it->first);
+      it = owned_targets_.erase(it);
+    } catch (const std::exception &e) {
+      failures += "pid=" + std::to_string(it->first) + ": " + e.what() + "\n";
+      ++it;
+    }
+  }
   for (const auto &id : std::vector<std::string>(owned_sessions_.begin(),
                                                  owned_sessions_.end())) {
     try {

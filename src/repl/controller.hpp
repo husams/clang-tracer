@@ -11,6 +11,7 @@
 #include "api.hpp"
 #include "commands.hpp"
 #include "events.hpp"
+#include "owned_target.hpp"
 #include "server_process.hpp"
 #include "tracer.grpc.pb.h"
 
@@ -39,6 +40,11 @@ class Controller {
     std::set<std::string> candidate_ids;
   };
   std::map<std::uint32_t, PendingAttach> pending_attaches_;
+  struct OwnedLaunch {
+    std::unique_ptr<OwnedTarget> process;
+    SessionHandle session;
+  };
+  std::map<std::uint32_t, OwnedLaunch> owned_targets_;
   std::map<std::string, std::string> drafts_;
   struct PreparedPackage {
     std::string directory;
@@ -56,6 +62,12 @@ class Controller {
   void start_server(const Command &command);
   void connect(const std::string &endpoint);
   void disconnect();
+  void prune_owned_targets();
+  void require_no_owned_targets();
+  void launch(const Command &command);
+  void control_target(const Command &command);
+  void call_target(const Command &command);
+  void require_idle_target(const SessionHandle &session) const;
   std::string reconcile_attaches(bool *snapshot_available = nullptr);
   clangtracer::v1::ProbeSpec resolve(const std::string &selector,
                                      const Command &command);
@@ -93,7 +105,7 @@ public:
   SessionHandle attach(std::uint32_t pid, std::uint64_t expected_start_time = 0,
                        const std::string &expected_executable = {});
   void detach(const SessionHandle &session);
-  void require_session(const SessionHandle &session);
+  std::uint64_t require_session(const SessionHandle &session, bool scalar_overrides = false);
   std::uint64_t inject(const SessionHandle &session,
                        const std::string &selector, const std::string &source,
                        const Command &options);

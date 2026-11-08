@@ -49,6 +49,20 @@ public:
                  const std::string &source_directory,
                  clangtracer::v1::ValidateProbeRequest::Level level);
   clangtracer::v1::Probe remove_probe(std::uint64_t probe_id);
+  clangtracer::v1::InstructionTrace start_instruction_trace(
+      const clangtracer::v1::StartInstructionTraceRequest &request,
+      const std::string &expected_code);
+  clangtracer::v1::InstructionTrace stop_instruction_trace();
+  clangtracer::v1::MemoryPatch apply_memory_patch(
+      std::uint64_t address, std::string expected, std::string replacement,
+      std::vector<clangtracer::v1::MemoryMapping> mappings);
+  clangtracer::v1::MemoryPatch restore_memory_patch(std::uint64_t id);
+  clangtracer::v1::MemoryAllocation allocate_memory(std::uint32_t size);
+  clangtracer::v1::MemoryAllocation free_memory(std::uint64_t id);
+  clangtracer::v1::TargetLibrary load_target_library(std::string path);
+  clangtracer::v1::PageMonitorResult start_page_monitor(
+      const clangtracer::v1::StartPageMonitorRequest &request);
+  clangtracer::v1::PageMonitorResult stop_page_monitor();
   void detach();
   void shutdown() noexcept;
   void record_failure(const std::string &message);
@@ -66,6 +80,17 @@ public:
   [[nodiscard]] static std::uint64_t ProcessStartTime(std::uint32_t pid);
 
 private:
+  struct InstructionCapture {
+    clangtracer::v1::InstructionTrace trace;
+    std::uint32_t max_records;
+    std::uintptr_t handle;
+    std::uintptr_t stop;
+    std::uintptr_t callback_handle;
+    bool has_callback;
+    bool registers;
+    std::uint64_t memory_address;
+    std::uint32_t memory_size;
+  };
   struct PthreadCreatePatch {
     std::uintptr_t entry = 0;
     std::uintptr_t trampoline = 0;
@@ -106,13 +131,41 @@ private:
   std::uintptr_t stop_address_ = 0;
   std::uintptr_t validate_address_ = 0;
   std::uintptr_t capacity_address_ = 0;
+  std::uintptr_t reclaim_address_ = 0;
+  std::uintptr_t start_page_monitor_address_ = 0;
+  std::uintptr_t stop_page_monitor_address_ = 0;
   std::uintptr_t pthread_detour_address_ = 0;
   std::map<std::uint64_t, ProbeRecord> probes_;
+  void reclaim_probe_locked(ProbeRecord &probe, injector::Process &process);
+  std::optional<InstructionCapture> instructions_;
+  std::optional<clangtracer::v1::InstructionTrace> last_instruction_trace_;
+  std::optional<clangtracer::v1::PageMonitorResult> page_monitor_;
+  clangtracer::v1::PageMonitorResult stop_page_monitor_locked(
+      std::chrono::steady_clock::time_point deadline);
+  struct MemoryPatchRecord {
+    clangtracer::v1::MemoryPatch value;
+    std::string expected, replacement;
+    std::vector<clangtracer::v1::MemoryMapping> mappings;
+  };
+  std::vector<MemoryPatchRecord> memory_patches_;
+  struct AllocationRecord {
+    clangtracer::v1::MemoryAllocation value;
+    std::string device;
+    std::uint64_t inode = 0;
+  };
+  std::vector<AllocationRecord> allocations_;
+  std::map<std::string, std::uintptr_t> resident_libraries_;
+  void free_memory_locked(AllocationRecord &record, std::chrono::steady_clock::time_point deadline);
+  void write_memory_patch_locked(MemoryPatchRecord &record, bool restore,
+                                 std::chrono::steady_clock::time_point deadline);
   std::optional<PthreadCreatePatch> pthread_create_patch_;
   bool pthread_create_patch_committed_ = false;
 
   void attach_process(tracer::injector::Process &process,
-                      std::chrono::steady_clock::time_point deadline);
+                      std::chrono::steady_clock::time_point deadline,
+                      pid_t excluded_tid = 0, pid_t required_tid = 0);
+  clangtracer::v1::InstructionTrace stop_instruction_trace_locked(
+      std::chrono::steady_clock::time_point deadline);
   void check_identity_locked();
   void set_failed_locked(const std::string &message);
   ProbeRecord &find_probe_locked(std::uint64_t probe_id);

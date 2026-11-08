@@ -980,6 +980,8 @@ void print_event(TextWriter &out, const api::TraceEvent &e,
     phase = "pre";
   } else if (e.phase() == api::POST) {
     phase = "post";
+  } else if (e.phase() == api::EXCEPTION) {
+    phase = "exception";
   }
   out.line(
       "cursor=", e.sequence(), " pid=", e.pid(), " tid=",

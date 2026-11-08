@@ -22,10 +22,12 @@
 
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/Object/BuildID.h>
+#include <llvm/Object/ELFObjectFile.h>
 #include <llvm/Object/ObjectFile.h>
 #include <llvm/Support/Error.h>
 
 #include "agent_runtime_profile.hpp"
+#include "admission.hpp"
 #include "injector.hpp"
 #include "linux_syscalls.hpp"
 #include "proc_identity.hpp"
@@ -89,18 +91,66 @@ void copy_signature(const clangtracer::v1::Signature &signature,
   }
 }
 
-std::string configured_agent_build_id(const std::string &path) {
+struct AgentBootstrap {
+  std::string build_id;
+  std::vector<std::string> dependencies;
+};
+
+AgentBootstrap configured_agent(const std::string &path) {
   auto binary = llvm::object::createBinary(path);
   if (!binary)
     throw AgentRuntimeIncompatible("cannot read configured agent ELF: " +
                                    llvm::toString(binary.takeError()));
   const auto *object =
-      llvm::dyn_cast<llvm::object::ObjectFile>(binary->getBinary());
-  const auto id = object ? llvm::object::getBuildID(object)
-                         : llvm::ArrayRef<std::uint8_t>{};
+      llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(binary->getBinary());
+  if (!object || object->getELFFile().getHeader().e_machine != llvm::ELF::EM_X86_64) {
+    throw AgentRuntimeIncompatible("configured agent is not a Linux x86-64 ELF");
+  }
+  const auto id = llvm::object::getBuildID(object);
   if (id.empty())
     throw AgentRuntimeIncompatible("configured agent has no ELF build ID");
-  return llvm::toHex(id, /*LowerCase=*/true);
+  AgentBootstrap result{llvm::toHex(id, /*LowerCase=*/true), {}};
+  const auto &elf = object->getELFFile();
+  auto dynamic = elf.dynamicEntries();
+  if (!dynamic) {
+    throw AgentRuntimeIncompatible("cannot read agent dependencies: " +
+                                   llvm::toString(dynamic.takeError()));
+  }
+  std::uint64_t string_address = 0;
+  std::uint64_t string_size = 0;
+  std::vector<std::uint64_t> needed;
+  for (const auto &entry : *dynamic) {
+    if (entry.d_tag == llvm::ELF::DT_NULL) {
+      break;
+    }
+    if (entry.d_tag == llvm::ELF::DT_NEEDED) {
+      needed.push_back(entry.d_un.d_val);
+    } else if (entry.d_tag == llvm::ELF::DT_STRTAB) {
+      string_address = entry.d_un.d_ptr;
+    } else if (entry.d_tag == llvm::ELF::DT_STRSZ) {
+      string_size = entry.d_un.d_val;
+    }
+  }
+  if (needed.empty()) {
+    return result;
+  }
+  auto strings = elf.toMappedAddr(string_address);
+  if (!strings) {
+    throw AgentRuntimeIncompatible("cannot read agent dependency names: " +
+                                   llvm::toString(strings.takeError()));
+  }
+  if (string_size > static_cast<std::uint64_t>(elf.end() - *strings)) {
+    throw AgentRuntimeIncompatible("agent dependency names exceed its ELF image");
+  }
+  const std::string_view table(reinterpret_cast<const char *>(*strings), string_size);
+  for (auto offset : needed) {
+    const auto end = table.find('\0', offset);
+    if (offset >= table.size() || end == std::string_view::npos || end == offset) {
+      throw AgentRuntimeIncompatible("agent has an invalid dependency name");
+    }
+    result.dependencies.emplace_back(table.substr(offset, end - offset));
+  }
+  return result;
 }
 
 template <std::size_t N> std::string profile_text(const char (&value)[N]) {
@@ -146,6 +196,7 @@ clangtracer::v1::JitRuntimeProfile read_agent_profile(
   result.set_target_abi("linux-x86-64-sysv");
   result.set_clang_version(profile_text(profile.clang_version));
   result.set_llvm_version(profile_text(profile.llvm_version));
+  result.set_scalar_overrides_supported(true);
   result.set_glibc_version(profile_text(profile.glibc_version));
   result.set_cxx_runtime_path(profile_text(profile.cxx_runtime_path));
   result.set_libstdcxx_header_release(profile.libstdcxx_header_release);
@@ -175,11 +226,12 @@ std::uint64_t Session::ProcessStartTime(std::uint32_t pid) {
 }
 
 void Session::attach_process(injector::Process &process,
-                             std::chrono::steady_clock::time_point deadline) {
+                             std::chrono::steady_clock::time_point deadline,
+                             pid_t excluded_tid, pid_t required_tid) {
   for (;;) {
     check_identity_locked();
     try {
-      process.attach(static_cast<pid_t>(pid_), application_modules_);
+      process.attach(static_cast<pid_t>(pid_), application_modules_, excluded_tid, required_tid);
       check_identity_locked();
       return;
     } catch (const injector::IdlePointUnavailable &) {
@@ -202,6 +254,8 @@ void Session::check_identity_locked() {
   try {
     if (ProcessStartTime(pid_) != process_start_) {
       state_ = clangtracer::v1::Session::EXITED;
+      instructions_.reset();
+      last_instruction_trace_.reset();
       application_modules_.clear();
       error_ = "target process exited; PID was reused";
       throw std::runtime_error(error_);
@@ -209,6 +263,8 @@ void Session::check_identity_locked() {
   } catch (const std::runtime_error &error) {
     if (std::string(error.what()) == "target process is no longer available") {
       state_ = clangtracer::v1::Session::EXITED;
+      instructions_.reset();
+      last_instruction_trace_.reset();
       application_modules_.clear();
       error_ = error.what();
     }
@@ -227,7 +283,7 @@ void Session::attach(const std::string &expected_executable) {
   if (state_ != clangtracer::v1::Session::ATTACHED) {
     throw std::runtime_error("session is not attachable");
   }
-  const auto expected_agent_id = configured_agent_build_id(agent_path_);
+  const auto agent = configured_agent(agent_path_);
   injector::Process process;
   const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
   try {
@@ -253,19 +309,49 @@ void Session::attach(const std::string &expected_executable) {
   std::uintptr_t scratch = 0;
   // Each synchronous loader call has finished using its string before the
   // scratch buffer is reused for another symbol name or the profile.
-  const auto scratch_size =
+  auto scratch_size =
       std::max(agent_path_.size() + 1, sizeof(AgentRuntimeProfile));
+  std::vector<std::uintptr_t> companion_handles;
+  std::uintptr_t dlclose_address = 0;
+  const auto release_companions = [&] {
+    while (!companion_handles.empty()) {
+      const auto handle = companion_handles.back();
+      companion_handles.pop_back();
+      if (process.remote_call(dlclose_address, {handle}, 1) != 0) {
+        throw std::runtime_error("target dlclose failed to release a glibc companion");
+      }
+    }
+  };
   try {
+    const auto companions = injector::target_runtime_companions(
+        static_cast<pid_t>(pid_), agent.dependencies);
+    companion_handles.reserve(companions.size());
+    for (const auto &path : companions) {
+      scratch_size = std::max(scratch_size, path.size() + 1);
+    }
     scratch = process.remote_allocate(scratch_size);
-    process.remote_write(scratch, agent_path_.c_str(), agent_path_.size() + 1);
     const auto dlopen_address = process.resolve_remote_symbol("dlopen");
     const auto dlsym_address = process.resolve_remote_symbol("dlsym");
+    if (!companions.empty()) {
+      dlclose_address = process.resolve_remote_symbol("dlclose");
+    }
+    for (const auto &path : companions) {
+      process.remote_write(scratch, path.c_str(), path.size() + 1);
+      const auto handle = process.remote_call(
+          dlopen_address, {scratch, RTLD_NOW | RTLD_LOCAL}, 2);
+      if (!handle) {
+        throw std::runtime_error("target dlopen failed to load glibc companion " + path);
+      }
+      companion_handles.push_back(handle);
+    }
+    process.remote_write(scratch, agent_path_.c_str(), agent_path_.size() + 1);
     const auto handle = process.remote_call(
         dlopen_address, {scratch, RTLD_NOW | RTLD_GLOBAL}, 2);
     if (!handle) {
       throw std::runtime_error(
           "target dlopen failed to load the agent and its dependencies");
     }
+    release_companions();
     const auto agent_symbol = [&](const char *name) {
       process.remote_write(scratch, name, std::strlen(name) + 1);
       return process.remote_call(dlsym_address, {handle, scratch}, 2);
@@ -273,7 +359,7 @@ void Session::attach(const std::string &expected_executable) {
     const auto profile_entry = agent_symbol("tracer_agent_runtime_profile_v1");
     try {
       jit_runtime_ =
-          read_agent_profile(process, profile_entry, scratch, expected_agent_id);
+          read_agent_profile(process, profile_entry, scratch, agent.build_id);
     } catch (const AgentRuntimeIncompatible &) {
       // The handshake does not install hooks. Return a definitive failure
       // only after scratch memory and ptrace ownership have been released.
@@ -286,6 +372,9 @@ void Session::attach(const std::string &expected_executable) {
     const auto stop = agent_symbol("tracer_agent_stop");
     const auto validate = agent_symbol("tracer_agent_validate");
     const auto capacity = agent_symbol("tracer_agent_capacity_v1");
+    const auto reclaim = agent_symbol("tracer_agent_reclaim_v1");
+    const auto page_start = agent_symbol("tracer_agent_page_monitor_start_v1");
+    const auto page_stop = agent_symbol("tracer_agent_page_monitor_stop_v1");
     const auto pthread_detour =
         agent_symbol("tracer_context_pthread_create_detour");
     if (!start || !stop) {
@@ -299,8 +388,17 @@ void Session::attach(const std::string &expected_executable) {
     stop_address_ = stop;
     validate_address_ = validate;
     capacity_address_ = capacity;
+    reclaim_address_ = reclaim;
+    start_page_monitor_address_ = page_start;
+    stop_page_monitor_address_ = page_stop;
     pthread_detour_address_ = pthread_detour;
   } catch (...) {
+    if (!process.unsafe()) {
+      try {
+        release_companions();
+      } catch (...) {
+      }
+    }
     if (process.unsafe()) {
       unsafe_target_ = true;
       set_failed_locked("agent bootstrap recovery is uncertain; target "
@@ -404,9 +502,31 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
   if (state_ != clangtracer::v1::Session::ATTACHED) {
     throw std::runtime_error("session is not attached");
   }
-  if (probes_.size() >= kMaxProbes) {
-    throw std::invalid_argument("session probe limit reached");
+  for (auto &[id, prior] : probes_) {
+    (void)id;
+    if (!prior.reload_spec.reclaimable() || prior.value.reclaimed() || prior.value.active())
+      continue;
+    const auto retry_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(30);
+    try {
+      if (prior.value.draining()) {
+        stop_probe_locked(prior, true, retry_deadline);
+      } else {
+        injector::Process process;
+        attach_process(process, retry_deadline);
+        reclaim_probe_locked(prior, process);
+        process.detach();
+      }
+    } catch (const std::exception &) {
+      if (unsafe_target_ || state_ != clangtracer::v1::Session::ATTACHED)
+        throw;
+    }
   }
+  const auto retained = std::count_if(probes_.begin(), probes_.end(),
+      [](const auto &entry) { return !entry.second.value.reclaimed(); });
+  if (retained >= kMaxProbes)
+    throw std::runtime_error("session reached the 32 retained-probe limit");
+  if (probes_.size() >= 1024)
+    throw std::runtime_error("session reached the 1024 probe history limit");
   if (probe_id == 0 || probes_.count(probe_id) != 0) {
     throw std::invalid_argument("probe id is invalid or already used");
   }
@@ -507,6 +627,11 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     record.value.set_symbol(spec.symbol());
     record.value.set_bulk_batch_id(batch_id);
     record.value.mutable_signature()->CopyFrom(spec.signature());
+    record.value.set_allow_argument_overrides(spec.allow_argument_overrides());
+    record.value.set_allow_result_override(spec.allow_result_override());
+    record.value.set_allow_replacement(spec.allow_replacement());
+    record.value.set_allow_call_original(spec.allow_call_original());
+    record.value.set_trace_exceptions(spec.trace_exceptions());
     record.reload_spec.CopyFrom(spec);
     record.reload_spec.clear_callback_source();
     auto [it, inserted] = probes_.emplace(probe_id, std::move(record));
@@ -660,6 +785,12 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
         throw std::runtime_error("agent returned inconsistent replacement patch metadata");
     }
 
+    for (const auto &patch : memory_patches_) {
+      const auto start = patch.value.address();
+      if (!patch.value.restored() && start < response.original_entry + response.patch_size &&
+          response.original_entry < start + patch.value.size())
+        throw std::runtime_error("native probe overlaps an active memory patch");
+    }
     const auto patch_started = std::chrono::steady_clock::now();
     constexpr unsigned kPatchAttempts = 12;
     bool committed = false;
@@ -772,6 +903,15 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
           std::string("probe committed but target detach failed: ") +
           error.what());
       throw std::runtime_error(error_);
+    }
+    if (previous && previous->reload_spec.reclaimable()) {
+      try {
+        stop_probe_locked(*previous, true,
+                          std::chrono::steady_clock::now() + std::chrono::milliseconds(30));
+      } catch (const std::exception &) {
+        if (unsafe_target_ || state_ != clangtracer::v1::Session::ATTACHED)
+          throw;
+      }
     }
     return it->second.value;
   } catch (...) {
@@ -1086,6 +1226,8 @@ bool Session::stop_probe_locked(
     probe.value.set_entry_address(response.original_entry);
     probe.value.set_agent_dropped_events(response.event_drops);
     probe.value.set_callback_errors(response.callback_errors);
+    if (probe.reload_spec.reclaimable())
+      reclaim_probe_locked(probe, process);
     try {
       process.remote_free(probe.remote_request, sizeof(Request));
       probe.remote_request = 0;
@@ -1153,6 +1295,32 @@ void Session::release_request_locked(
   }
 }
 
+void Session::reclaim_probe_locked(ProbeRecord &probe, injector::Process &process) {
+  if (!reclaim_address_ || probe.value.reclaimed())
+    return;
+  TracerRetiredCode code{};
+  std::uintptr_t scratch = 0;
+  try {
+    scratch = process.remote_allocate(sizeof(code));
+    if (process.remote_call(reclaim_address_, {probe.value.id(), scratch, 0}, 3) == 0) {
+      process.remote_read(scratch, &code, sizeof(code));
+      if (process.retired_code_quiescent(code) &&
+          process.remote_call(reclaim_address_, {probe.value.id(), scratch, 1}, 3) == 0)
+        probe.value.set_reclaimed(true);
+    }
+    process.remote_free(scratch, sizeof(code));
+  } catch (...) {
+    if (scratch && !process.unsafe()) {
+      try { process.remote_free(scratch, sizeof(code)); } catch (...) {}
+    }
+    if (process.unsafe()) {
+      unsafe_target_ = true;
+      set_failed_locked("JIT reclamation recovery is uncertain; target remains stopped");
+      throw;
+    }
+  }
+}
+
 std::uint64_t Session::events_sent(std::uint64_t probe_id) const {
   std::lock_guard lock(mutex_);
   const auto found = probes_.find(probe_id);
@@ -1169,8 +1337,15 @@ clangtracer::v1::Probe Session::remove_probe(std::uint64_t probe_id) {
   auto &probe = find_probe_locked(probe_id);
   if (probe.value.active() || probe.value.draining())
     stop_probe_locked(probe, false);
-  else
+  else {
     release_request_locked(probe, std::chrono::steady_clock::now() + operation_timeout_);
+    if (probe.reload_spec.reclaimable() && !probe.value.reclaimed()) {
+      injector::Process process;
+      attach_process(process, std::chrono::steady_clock::now() + operation_timeout_);
+      reclaim_probe_locked(probe, process);
+      process.detach();
+    }
+  }
   return probe.value;
 }
 
@@ -1184,6 +1359,14 @@ void Session::detach() {
                                             : error_);
   }
   check_identity_locked();
+  if (instructions_)
+    stop_instruction_trace_locked(std::chrono::steady_clock::now() + operation_timeout_);
+  if (page_monitor_)
+    stop_page_monitor_locked(std::chrono::steady_clock::now() + operation_timeout_);
+  last_instruction_trace_.reset();
+  for (auto &patch : memory_patches_)
+    if (!patch.value.restored())
+      write_memory_patch_locked(patch, true, std::chrono::steady_clock::now() + operation_timeout_);
   for (auto &[id, probe] : probes_) {
     (void)id;
     if (probe.value.active() || probe.value.draining())
@@ -1192,6 +1375,8 @@ void Session::detach() {
       release_request_locked(probe, std::chrono::steady_clock::now() +
                                         operation_timeout_);
   }
+  for (auto &allocation : allocations_)
+    free_memory_locked(allocation, std::chrono::steady_clock::now() + operation_timeout_);
   state_ = clangtracer::v1::Session::DETACHED;
   application_modules_.clear();
   error_.clear();
@@ -1206,6 +1391,37 @@ void Session::shutdown() noexcept {
       state_ == clangtracer::v1::Session::FAILED ? error_ : std::string{};
   const auto shutdown_deadline =
       std::chrono::steady_clock::now() + operation_timeout_;
+  if (instructions_) {
+    try {
+      stop_instruction_trace_locked(shutdown_deadline);
+    } catch (const std::exception &error) {
+      first_error = error.what();
+      if (unsafe_target_)
+        return;
+    }
+  }
+  if (page_monitor_) {
+    try {
+      stop_page_monitor_locked(shutdown_deadline);
+    } catch (const std::exception &error) {
+      if (first_error.empty())
+        first_error = error.what();
+      if (unsafe_target_)
+        return;
+    }
+  }
+  for (auto &patch : memory_patches_) {
+    if (patch.value.restored())
+      continue;
+    try {
+      write_memory_patch_locked(patch, true, shutdown_deadline);
+    } catch (const std::exception &error) {
+      if (first_error.empty())
+        first_error = error.what();
+      if (unsafe_target_)
+        return;
+    }
+  }
   for (auto &[id, probe] : probes_) {
     (void)id;
     if (!probe.value.active() && !probe.value.draining() && !probe.remote_request)
@@ -1220,6 +1436,18 @@ void Session::shutdown() noexcept {
         first_error = error.what();
       if (unsafe_target_)
         break;
+    }
+  }
+  if (!unsafe_target_) {
+    for (auto &allocation : allocations_) {
+      try {
+        free_memory_locked(allocation, shutdown_deadline);
+      } catch (const std::exception &error) {
+        if (first_error.empty())
+          first_error = error.what();
+        if (unsafe_target_)
+          break;
+      }
     }
   }
   const bool any_active =

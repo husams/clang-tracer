@@ -293,3 +293,209 @@ checked original entry bytes after detach.
 Eight focused CTests passed with the GCC 8.5 SDK and Clang 21.1.8,
 including staged CLI replacement across a collector restart. All 198
 portable Python tests passed.
+
+### L1 Owned local launch
+
+`%launch` starts a local Linux x86-64 application with explicit arguments,
+working directory, environment overrides, file-based stdio, and a readiness
+deadline. It attaches at the C++ application's opt-in startup checkpoint and
+keeps application work paused while probes are installed. `%resume [PID]`
+releases the checkpoint. `%terminate [PID]` kills and reaps a child owned by
+the REPL. Failed launches and REPL exit clean up the owned child.
+
+The Linux fixture captures the first call after the checkpoint and checks
+its result, arguments, environment, working directory and stdio. It also
+covers ordinary launch, paused termination, rejected detach while paused,
+readiness timeout, early exit, exec and attach failures, natural exit after
+resume, and REPL exit with a paused child.
+
+Twelve focused native REPL CTests passed on Linux x86-64 with the GCC 8.5
+SDK and Clang 21.1.8. The launch fixture also passed with its executable,
+working directory, and output files on OverlayFS.
+
+### L2 Explicit scalar invocation
+
+The application registers named C++ function pointers at the owned launch
+checkpoint. `%call` dispatches one validated scalar call on the checkpoint
+thread before resume, and copies the typed result back to the REPL. A timeout
+or interrupted wait leaves one pending request per target. `%call-result`
+collects its reply without submitting the call again.
+
+The Linux x86-64 fixture checked mixed-width arguments, integer limits,
+floating-point and boolean values, exceptions, rejection before execution,
+and timeout recovery without executing twice. It verified that a named call
+runs on the startup thread, emits PRE/POST events when probed, and is reaped
+on REPL exit if still running. Compile checks rejected references, pointers,
+long double, variadics, member pointers and the Microsoft x64 calling convention.
+
+Eleven focused CTests passed with the GCC 8.5 SDK and Clang 21.1.8. The
+shell profile test timed out in the parallel run and passed on its isolated
+rerun.
+
+### L3 Opt-in scalar overrides
+
+A Clang-built target marks a free function with
+`TRACER_SCALAR_OVERRIDE_TARGET`. The agent verifies its mapped ELF section
+and DWARF signature before installing an ordinary SysV wrapper. Argument
+and result overrides have independent deployment flags and are available
+only on the local Unix control socket. Each successful hook commits its
+own staged changes. Failed hooks discard them, and exceptions from the
+original function propagate without running the POST hook.
+
+The live fixture covered independent opt-ins, a stack-passed argument,
+floating-point and 64-bit integer return registers, per-call recursion,
+hook rollback, target exceptions, errno preservation, and restoration on
+detach. Fourteen focused Linux x86-64 CTests passed with the GCC 8.5 SDK
+and Clang 21.1.8. The override fixture also passed on OverlayFS, and 198
+portable Python tests passed with the regenerated bindings.
+
+### A1 Local syscall and CPU capture
+
+`%syscalls` uses task-scoped perf tracepoints for syscall entry and exit.
+`%sample cpu` uses user-space task-clock samples. Both verify the selected
+process and its thread snapshot, report monotonic timestamps and kernel
+loss, and close all event descriptors before displaying results. Permission
+failures identify the unavailable backend. Both modes leave target threads
+running throughout collection.
+
+The Linux x86-64 fixture correlated samples with a worker's hot-loop address
+range and syscall entries and exits with its thread and parent process.
+It verified forced loss reporting, timeout, interruption, target exit, and
+descriptor cleanup. Fifteen focused CTests passed unprivileged on the GCC
+8.5 SDK with Clang 21.1.8. The syscall test reported the tracefs permission
+denial and passed on an elevated run with the same binaries.
+
+### A2 Bounded instruction tracing pilot
+
+The standalone pilot compares Frida Gum Stalker 17.26.1 with native ptrace
+single-step on one owned fixture thread and address range. Both matched the
+instruction oracle, preserved SIGUSR1 delivery, reported truncation and
+stopped cleanly. Gum's median was 1.200 ms versus 23.664 ms for native
+stepping in the 1,929-instruction GCC 8.5 SDK run.
+Four focused native REPL regression CTests passed. The native-only pilot,
+normal completion, cap teardown, and five-second watchdog reaping passed.
+
+The live follow-up attached to an existing C++ worker with an active Clang
+JIT observer. The stripped plugin passed three runs on glibc 2.23 and
+four on 2.34 with matching loader profiles. Each matched the instruction oracle,
+reported truncation at the cap, preserved six native PRE and POST pairs,
+and unloaded before native detach restored the original code. Three focused
+REPL regression CTests passed. The plugin uses public `dlopen` in place
+of Gum's private import and the build rejects private glibc symbol
+versions. The license audit identified statically linked LGPL code.
+The pilot now builds a bundle with notices, pinned source, and the objects
+and scripts needed to relink against modified GLib. GNU BFD 2.35.2 links
+the SDK plugin without warnings while using the SDK sysroot. The injector
+resolves loader calls from the target's mapped glibc and loads the agent's
+missing glibc dependencies from that runtime. See
+`benchmarks/instruction-trace/README.md` for reproduction.
+
+Live capture now verifies worker-directed SIGUSR1, guard-page SIGSEGV
+recovery, and install, reload and removal of a warmed native probe on
+glibc 2.23 and 2.34. The callback PCH cache writes directly to its private
+generation path so LLVM does not replace the target's signal handlers.
+
+The optional Gum bundle now powers `%instructions start` and
+`%instructions stop` through the native REPL. The server verifies the
+range and thread, and the module enforces the record and time limits.
+Stop returns ordered PCs and a completion reason. Detach drains active
+capture before restoring probes.
+
+The extended Gum ABI adds pre-instruction general-purpose registers,
+trusted C++ callbacks, and monitoring of explicit scalar memory accesses
+within a selected thread and code range. Hardware watchpoints use the
+kernel perf breakpoint interface and release their slot when capture
+ends. The live fixture checks register values, callback results and
+errno, memory access addresses and kinds, and hardware watchpoint PCs
+alongside a typed PRE/POST probe.
+
+The offline-relinked bundle passed three live runs each on glibc 2.23
+and 2.34 with automatic plugin and loader selection. Each run verified
+six register snapshots, eight callback results, six monitored accesses,
+three hardware watchpoint hits, 18 native PRE/POST pairs, module unload
+and restored probe bytes. Eleven focused Linux CTests passed, including
+the syscall test rerun with tracefs access, and 199 Python tests passed.
+
+### Original Frida plan follow-ups
+
+- `%modules --elf PATH` lists dynamic imports, exports and sections for a
+  verified mapped ELF. `%modules --watch` reports executable mappings that
+  appear or disappear between bounded snapshots.
+- `%probe reload ID --callback FILE --watch` checks stable file contents,
+  keeps the previous observer after rejection, and follows successful
+  replacements. `--reclaimable` admits observers whose JIT code, callbacks
+  and references stay within their invocations. Retirement closes admission,
+  drains delivery and checks stopped threads before reclaiming code.
+- `%launch --preload PATH` pauses an owned target in the installed launch
+  gate before main. `--supervise` terminates descendants that stay in its
+  process group. The target can register a bound member function and scalar
+  lvalue references at its ordinary checkpoint. Results are copied.
+- `--allow-replacement` enables `Call::replace_with` in an observer's PRE
+  hook for a verified scalar or void function. The original runs when PRE
+  does not commit a replacement.
+- `%memory patch` changes complete, equal-width instructions at a verified
+  ELF entry. `%memory import-hook` redirects one already resolved SysV
+  JUMP_SLOT to an ABI-compatible function in the main executable.
+  `%memory restore` and detach restore original bytes.
+- `%memory monitor-start` reports the nominated thread's first read or
+  write to each dedicated anonymous page. The thread must be sleeping for
+  setup and teardown and the process must use the default SIGSEGV
+  disposition. The target owns the mapping exclusively for that thread and
+  keeps its address and protections stable until stop. The deadline restores
+  page permissions even if collection is delayed.
+
+The same SDK-built REPL, server, agent and libc-only preload gate
+passed the live matrix on native glibc 2.34 and SDK glibc 2.23 targets.
+Each run verified all follow-ups, 34 successive reloads below the 32
+retained-generation limit, a probe installed before main, child cleanup
+after the leader exited, and byte and permission restoration on detach.
+The Gum register, callback, scalar memory access and hardware watchpoint
+suite also passed on both profiles with active native probes.
+Twelve focused native CTests and 199 Python tests passed.
+
+### Remaining local C++ capabilities
+
+| Capability | Native REPL entry point and scope |
+| --- | --- |
+| Writable memory and allocation | `%memory write ADDRESS --mapping TOKEN --expect HEX --replace HEX` uses the existing transactional patch and restore path for private writable mappings. `%memory allocate BYTES` creates up to 1 MiB of session-owned writable memory. `%memory free ID` verifies its backing inode while the target is stopped. Detach restores patches before releasing allocations. |
+| Dynamic function discovery | `%instructions start ... --discover` captures actual direct and indirect call destinations from the selected thread and code range, then lists destination addresses and counts. |
+| Instruction recording and replay | `%instructions stop --save NEW_FILE` writes a versioned, bounded capture with its stop reason. `%instructions replay FILE` renders the same addresses, registers, callback results, memory accesses or discovered calls offline. |
+| Native faults and C++ exceptions | `%faults` observes kernel-delivered fault signals on the selected target's existing threads with tracefs access. `--trace-exceptions` adds an exceptional completion event when a probed original throws, preserving the exception for the C++ caller and pairing it with PRE in summaries. |
+| Callable original | `--allow-call-original` enables `Call::call_original<T>()` in a PRE observer on a verified scalar or void free function. It executes the trampoline at most once with the entry arguments, caches the result, and preserves the original's errno and exception behavior. |
+| Child gating | `%launch ... --preload PATH --supervise --gate-children` pauses exec descendants that inherit the gate and remain in the owned process group. Use `%children`, then `%attach PID` and `%resume PID`. The child checkpoint expires after 60 seconds. |
+| Target library injection | `%library load PATH` loads a trusted Linux x86-64 ELF shared object with local symbol visibility. The library stays resident for the life of the target. |
+| Allocation profiling | `%sample allocations` uses task-scoped Linux perf uprobes on the mapped glibc to report `malloc`, `calloc` and `realloc` request counts and requested bytes, with capture limits and loss counters. |
+
+The complete native REPL integration fixture passed on glibc 2.23 and
+2.34 with a probe active during instruction capture, fault delivery and
+allocation profiling. It verified once-only trampoline execution and
+exception propagation, write restoration and allocation ownership,
+trusted DSO initialization, direct and indirect call discovery,
+gated child attach before resume, and offline replay of both register
+and discovery recordings. The test also checked expected-byte mismatch,
+stale mapping tokens, free with an outstanding patch, unmapped memory,
+invalid ELF input and truncated recording rejection.
+
+The SDK-built server matched Gum's glibc dependencies to the selected
+target. The discovery-capable plugin was relinked offline from the
+supplied bundle and retained a maximum public requirement of GLIBC_2.17.
+The previous Gum live suite passed on both runtimes with the same plugin.
+The fault and allocation tests used perf and tracefs access.
+
+Thirteen focused native regressions passed, including the launch test
+rerun after preserving its existing diagnostic and the syscall test
+rerun with tracefs access. The Python suite passed 199 tests.
+
+### C++17 backport
+
+Integrated the 15 tracing commits after `f20cc29` on top of the
+`c++17` tip `2db705d`. Existing C++17 clients retain all 387 protobuf
+field definitions. The integrated agent uses bootstrap version 29.
+The command parser supports supplemental compiler arguments and full
+stack capture alongside callable originals and exception events.
+
+The GCC 8.5 SDK build used Clang 21.1.8. The complete live matrix passed
+on glibc 2.23 and 2.34 with active probes. Its callback requires a
+supplemental compiler definition and exercises full stack capture with
+callable originals and exception events. The Python suite passed 201
+tests.
