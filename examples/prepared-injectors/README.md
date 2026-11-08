@@ -22,9 +22,9 @@ The launcher links the build's compilation database into the current directory.
 `%probe prepare` uses `./compile_commands.json` by default. Pass `--compdb FILE`
 to select another database.
 
-Preparation uses the flags from the first database entry whose source file is
-in the first header's directory. Pass `--translation-unit FILE` to choose a
-different entry or when the database has no source in that directory.
+Preparation prefers the first header's recorded compile command. If that header
+has no entry, it uses the first eligible source entry in the same directory. Pass
+`--translation-unit FILE` to select an entry explicitly.
 
 The selector chooses the integer overload declared in the header. Clang parses
 the headers with the selected flags and records the symbol and ABI. This can

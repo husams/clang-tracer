@@ -55,6 +55,14 @@ The native request ABI is version 13 (binary Protobuf probe payload, prepare,
 then controller commit); the public event protocol remains version 2. Earlier
 agents reject the new native request before interpreting its payload.
 
+## User and developer guides
+
+- [User guide](docs/guide/user.md), [command reference](docs/guide/commands.md), and [tutorials](docs/guide/tutorials.md)
+- [Developer guide and client and agent API reference](docs/guide/developer.md)
+- [Interactive HTML guide](docs/guide/index.html). Serve it with `./docs/guide/serve.sh --bind 127.0.0.1 --port 8000`.
+
+The Runtime package installs the guides and launcher in `docs/guide` under its documentation directory. To regenerate the HTML after editing the Markdown, install `docs/guide/requirements.txt` in a Python environment and run `python docs/guide/build.py`. Use `python docs/guide/build.py --check` to check that the checked-in HTML is current.
+
 ## Buffered event delivery
 
 Traced calls enqueue owned binary events into a bounded 4,096-slot queue; a
