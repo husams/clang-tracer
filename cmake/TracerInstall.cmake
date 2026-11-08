@@ -50,8 +50,7 @@ install(FILES proto/context_transport.proto
 install(DIRECTORY include/tracer DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}" COMPONENT Development)
 install(FILES proto/tracer.proto DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer/proto" COMPONENT Development)
 install(FILES LICENSE README.md DESTINATION "${CMAKE_INSTALL_DOCDIR}" COMPONENT Runtime)
-install(FILES python/README.md DESTINATION "${CMAKE_INSTALL_DOCDIR}/python" COMPONENT Runtime)
-install(DIRECTORY docs DESTINATION "${CMAKE_INSTALL_DOCDIR}" COMPONENT Runtime)
+include("${CMAKE_CURRENT_LIST_DIR}/TracerDocumentation.cmake")
 install(DIRECTORY examples DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer"
   COMPONENT Development FILES_MATCHING
   PATTERN "*.cpp" PATTERN "*.hpp" PATTERN "*.md" PATTERN "*.py" PATTERN "*.repl"

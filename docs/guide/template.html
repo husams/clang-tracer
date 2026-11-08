@@ -1,0 +1,192 @@
+<!doctype html>
+<!-- Generated from Markdown by docs/guide/build.py. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clang Tracer Guide</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  color-scheme: dark;
+  --background: #101419;
+  --surface: #151b22;
+  --raised: #1c2530;
+  --border: #344253;
+  --text: #e6edf5;
+  --muted: #aebdd0;
+  --accent: #8ddcd2;
+  --header: 3.75rem;
+  --nav: 20rem;
+  font-family: system-ui, -apple-system, sans-serif;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--background); color: var(--text); line-height: 1.65; }
+[hidden] { display: none !important; }
+a { color: var(--accent); text-underline-offset: .2em; }
+a:hover { text-decoration-thickness: .16em; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+button, input { font: inherit; color: inherit; }
+button { cursor: pointer; }
+.skip { position: fixed; top: .5rem; left: .5rem; z-index: 4; background: var(--surface); padding: .4rem 1rem; transform: translateY(-150%); }
+.skip:focus { transform: none; }
+.bar { position: sticky; top: 0; height: var(--header); z-index: 3; display: flex; align-items: center; gap: 1rem; background: var(--surface); border-bottom: 1px solid var(--border); padding: 0 1rem; }
+.bar > a { color: var(--text); text-decoration: none; font-weight: 700; }
+#nav-toggle, .copy { background: var(--raised); border: 1px solid var(--border); border-radius: .4rem; padding: .2rem .65rem; }
+#nav-toggle:hover, .copy:hover { border-color: var(--accent); }
+.sidebar { position: fixed; inset: var(--header) auto 0 0; width: var(--nav); overflow: auto; z-index: 2; padding: 1.25rem 1rem; background: var(--surface); border-right: 1px solid var(--border); }
+.sidebar label { display: block; font-size: .82rem; color: var(--muted); margin-bottom: .35rem; }
+.sidebar input { width: 100%; background: var(--background); border: 1px solid var(--border); padding: .45rem .6rem; border-radius: .4rem; }
+.nav-group h2 { margin: 1.15rem 0 .3rem; font-size: .75rem; text-transform: uppercase; letter-spacing: .12em; color: var(--muted); }
+.nav-group ul { list-style: none; padding: 0; margin: 0; }
+.nav-group summary { cursor: pointer; padding: .35rem .25rem; line-height: 1.35; }
+.nav-group summary:hover { color: var(--accent); }
+.subnav { padding: .2rem 0 .4rem .7rem; margin-left: .45rem; border-left: 1px solid var(--border); }
+.subnav a { display: block; color: var(--muted); text-decoration: none; padding: .22rem .25rem; line-height: 1.45; font-size: .875rem; }
+.subnav a:hover, .subnav a[aria-current="location"] { color: var(--accent); text-decoration: underline; }
+.layout { margin-left: var(--nav); }
+.nav-closed .layout { margin-left: 0; }
+main { width: min(100%, 74rem); margin-inline: auto; padding: clamp(1rem, 4vw, 4rem); }
+h1 { font-size: clamp(2rem, 5vw, 3.4rem); line-height: 1.08; letter-spacing: -.035em; margin: 0; }
+.intro { color: var(--muted); margin-bottom: 2rem; font-size: 1.1rem; }
+article { padding: 2.75rem 0; border-top: 1px solid var(--border); }
+article h2 { font-size: clamp(1.65rem, 3vw, 2.3rem); margin: 0 0 1rem; line-height: 1.2; }
+article h3 { font-size: 1.42rem; margin: 2.1rem 0 .65rem; line-height: 1.3; }
+article h4, article h5 { margin: 1.5rem 0 .55rem; }
+article :is(h2,h3,h4,h5,h6) { scroll-margin-top: calc(var(--header) + 1rem); }
+article :target { color: var(--accent); }
+p, li { overflow-wrap: break-word; }
+blockquote { margin: 1rem 0; padding: .1rem 1rem; border-left: .2rem solid var(--accent); background: var(--surface); }
+table { display: block; border-collapse: collapse; overflow-x: auto; width: fit-content; max-width: 100%; margin: 1.25rem 0; }
+th, td { text-align: left; vertical-align: top; border: 1px solid var(--border); padding: .55rem .75rem; }
+th { background: var(--raised); }
+tr:nth-child(even) { background: var(--surface); }
+code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .9em; }
+:not(pre) > code { background: var(--raised); padding: .05em .23em; border-radius: .25em; }
+.code-block { background: #0d1117; border: 1px solid var(--border); border-radius: .55rem; margin: 1rem 0; }
+.code-bar { display: flex; align-items: center; justify-content: space-between; padding: .35rem .75rem; color: var(--muted); border-bottom: 1px solid var(--border); font-size: .8rem; }
+.code-block pre { color: #e6edf3; overflow-x: auto; margin: 0; padding: .9rem; line-height: 1.55; }
+#copy-status { position: fixed; bottom: 1rem; right: 1rem; background: var(--raised); border: 1px solid var(--border); border-radius: .4rem; padding: .4rem .8rem; }
+#copy-status:empty { display: none; }
+<!-- HIGHLIGHT -->
+@media (max-width: 52rem) {
+  .layout { margin-left: 0; }
+  .sidebar { width: min(var(--nav), 90vw); box-shadow: 0 0 1.5rem #0008; }
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="bar">
+  <button id="nav-toggle" type="button" aria-controls="sidebar" aria-expanded="true">Contents</button>
+  <a href="#content">Clang Tracer</a>
+</header>
+<aside id="sidebar" class="sidebar" aria-label="Guide contents">
+  <label for="nav-filter">Find a section</label>
+  <input id="nav-filter" type="search" placeholder="Probe, replay, Python…" autocomplete="off">
+  <p id="no-sections" role="status" hidden>No sections match.</p>
+  <nav aria-label="Chapters">
+  <!-- NAVIGATION -->
+  </nav>
+</aside>
+<div class="layout">
+<main id="content" tabindex="-1">
+<h1>Clang Tracer Guide</h1>
+<p class="intro">Install the tracer, capture a C++ call, and build reusable probes and analysis workflows.</p>
+<!-- CHAPTERS -->
+</main>
+</div>
+<div id="copy-status" role="status"></div>
+<script>
+const sidebar = document.querySelector('#sidebar');
+const toggle = document.querySelector('#nav-toggle');
+const narrow = matchMedia('(max-width: 52rem)');
+const filter = document.querySelector('#nav-filter');
+const groups = [...sidebar.querySelectorAll('.nav-group')];
+const links = [...sidebar.querySelectorAll('.subnav a')];
+const copyStatus = document.querySelector('#copy-status');
+
+function showNavigation(open) {
+  sidebar.hidden = !open;
+  document.body.classList.toggle('nav-closed', !open);
+  toggle.setAttribute('aria-expanded', String(open));
+}
+
+function highlightLocation() {
+  const current = links.find(link => link.hash === location.hash);
+  for (const link of links) link.removeAttribute('aria-current');
+  if (current) {
+    current.setAttribute('aria-current', 'location');
+    current.closest('details').open = true;
+  } else {
+    groups[0].querySelector('details').open = true;
+  }
+}
+
+showNavigation(!narrow.matches);
+highlightLocation();
+narrow.addEventListener('change', () => showNavigation(!narrow.matches));
+window.addEventListener('hashchange', highlightLocation);
+toggle.addEventListener('click', () => showNavigation(sidebar.hidden));
+sidebar.addEventListener('keydown', event => {
+  if (event.key === 'Escape') {
+    showNavigation(false);
+    toggle.focus();
+  }
+});
+sidebar.addEventListener('click', event => {
+  if (narrow.matches && event.target.closest('a[href^="#"]')) {
+    showNavigation(false);
+    document.querySelector('#content').focus({preventScroll: true});
+  }
+});
+
+filter.addEventListener('input', () => {
+  const query = filter.value.trim().toLowerCase();
+  let matched = false;
+  for (const group of groups) {
+    let any = false;
+    for (const item of group.querySelectorAll('li')) {
+      const titleMatches = item.querySelector('summary').textContent.toLowerCase().includes(query);
+      let found = false;
+      for (const link of item.querySelectorAll('a')) {
+        link.hidden = !titleMatches && !link.textContent.toLowerCase().includes(query);
+        found ||= !link.hidden;
+      }
+      item.hidden = !found;
+      if (query && found) item.querySelector('details').open = true;
+      any ||= found;
+    }
+    group.hidden = !any;
+    matched ||= any;
+  }
+  document.querySelector('#no-sections').hidden = matched;
+});
+
+let statusTimer;
+document.querySelector('main').addEventListener('click', async event => {
+  const button = event.target.closest('.copy');
+  if (!button) return;
+  const code = button.closest('.code-block').querySelector('code');
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(code.textContent);
+    } else {
+      const range = document.createRange();
+      range.selectNodeContents(code);
+      const selection = getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      if (!document.execCommand('copy')) throw new Error('Clipboard unavailable');
+      selection.removeAllRanges();
+    }
+    copyStatus.textContent = 'Copied to clipboard';
+  } catch {
+    copyStatus.textContent = 'Select the code and copy it manually';
+  }
+  clearTimeout(statusTimer);
+  statusTimer = setTimeout(() => { copyStatus.textContent = ''; }, 2500);
+});
+</script>
+</body>
+</html>
