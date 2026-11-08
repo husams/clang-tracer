@@ -255,10 +255,16 @@ try {{ tracer.detach(saved_session); std::cout << "stale-detach-accepted" << std
                 assert "received=2" in restored.stdout, restored.stdout
                 if args.bool_target:
                     boolean_source = root / "boolean.cpp"
-                    boolean_source.write_text('class Interceptor { public: void pre(const Call& c) { c.argument<bool>(0); } void post(const Call& c) { c.argument<bool>(0); } };\n')
+                    boolean_source.write_text('''static_assert(BOOLEAN_CALLBACK_EXTRA == 19);
+class Interceptor {
+public:
+  void pre(const Call& c) { c.argument<bool>(0); }
+  void post(const Call& c) { c.argument<bool>(0); }
+};
+''')
                     boolean_target = subprocess.Popen([args.bool_target], stdout=target_log, stderr=subprocess.STDOUT)
                     boolean_recording = root / "booleans.pb"
-                    commands = f'''%probe inject "signature_fixture::boolean_target(bool)" --callback "{boolean_source}"
+                    commands = f'''%probe inject "signature_fixture::boolean_target(bool)" --callback "{boolean_source}" --extra-args "-DBOOLEAN_CALLBACK_EXTRA=19"
 %collect --count 4 --timeout 10 --phase POST --as bools
 auto booleans = tracer.batch("bools");
 bool typed_pass = booleans.size() == 4;

@@ -19,15 +19,66 @@ printf '[{"directory":"%s/application","file":"history.cpp","arguments":["clang+
   "$run" > compile_commands.json
 printf '[{"directory":"%s/application","file":"history.cpp","arguments":["clang","--driver-mode=cl","--target=x86_64-unknown-linux-gnu","/std:c++17","/c","history.cpp"]}]\n' \
   "$run" > clang-cl-compile_commands.json
+mkdir -p application/include 'supplemental include'
+cat >application/extra.hpp <<'CPP'
+#include "history.hpp"
+#include <prepare-priority.hpp>
+#include <prepare-extra.hpp>
+#if PREPARE_EXTRA != 37 || PREPARE_EXTRA_HEADER != 19 || PREPARE_DATABASE_HEADER != 73
+#error expected additive flags and the original compilation database include order
+#endif
+CPP
+echo '#define PREPARE_DATABASE_HEADER 73' >application/include/prepare-priority.hpp
+echo '#error the supplemental directory shadowed the database include' >'supplemental include/prepare-priority.hpp'
+echo '#define PREPARE_EXTRA_HEADER 19' >'supplemental include/prepare-extra.hpp'
+printf '[{"directory":"%s/application","file":"extra.cpp","arguments":["clang++","-std=c++17","-isystem","include","-UPREPARE_DATABASE_UNDEFINED","-c","extra.cpp"]}]\n' \
+  "$run" > extra-compile_commands.json
+mkdir application/-include-dir
+sed 's/"-isystem","include"/"-I","-include-dir"/' extra-compile_commands.json > extra-dash-compile_commands.json
+mkdir -p alternate-cwd/alternate-include
+printf '[{"directory":"%s/application","file":"extra.cpp","arguments":["clang++","-std=c++17","-working-directory","%s/alternate-cwd","-I","alternate-include","-c","extra.cpp"]}]\n' \
+  "$run" "$run" > extra-working-directory-compile_commands.json
+cat >extra-flags.sh <<'SH'
+printf '%s\n' "-DPREPARE_EXTRA=37 -I'supplemental include'"
+SH
 cat >prepare.repl <<'REPL'
 %probe prepare "prepared_history::via_pointer(const prepared_history::HistoryItem*, int)" --include application/history.hpp --output pointer
 %probe prepare "prepared_history::via_reference(const prepared_history::HistoryItem&, int)" --include application/history.hpp --output reference
 %probe prepare "prepared_history::via_value(prepared_history::HistoryItem, int)" --include application/history.hpp --output value
-%probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include application/history.hpp --output opaque
 %probe prepare "HFW::HfwManager::createItem()" --include application/history.hpp --include application/payload.hpp --output manager-item --metadata-only
 %probe prepare "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --include application/payload.hpp --compdb clang-cl-compile_commands.json --output toolchain-headers
+%probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include application/extra.hpp --compdb extra-compile_commands.json --output extra-literal --extra-args "-DPREPARE_EXTRA=37 -I'supplemental include'"
+%probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include application/extra.hpp --compdb extra-compile_commands.json --output opaque --extra-args `sh ./extra-flags.sh`
 REPL
 "$repl" --fail-fast <prepare.repl
+test -f extra-literal/generated/adapter.hpp
+test -f opaque/generated/adapter.hpp
+cat >prepare-startup.repl <<'REPL'
+%probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include application/extra.hpp --compdb extra-compile_commands.json --output extra-startup
+REPL
+"$repl" --extra-args "$(sh ./extra-flags.sh)" --fail-fast <prepare-startup.repl
+test -f extra-startup/generated/adapter.hpp
+cat >conflicting-extra.repl <<'REPL'
+%probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include application/extra.hpp --compdb extra-compile_commands.json --output extra-conflict --extra-args "-DPREPARE_EXTRA=37 -I'supplemental include' -DPREPARE_DATABASE_UNDEFINED=1"
+%probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include application/extra.hpp --compdb extra-compile_commands.json --output extra-duplicate --extra-args "-Iapplication/include"
+%probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include application/extra.hpp --compdb extra-dash-compile_commands.json --output extra-duplicate-dash --extra-args "-Iapplication/-include-dir"
+%probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include application/extra.hpp --compdb extra-working-directory-compile_commands.json --output extra-duplicate-cwd --extra-args "-Ialternate-cwd/alternate-include"
+%probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include application/extra.hpp --compdb extra-compile_commands.json --output extra-standard --extra-args "-std=c++20"
+%probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include application/extra.hpp --compdb extra-compile_commands.json --output extra-shell-failed --extra-args `false`
+REPL
+if "$repl" <conflicting-extra.repl >conflicting-extra.log 2>&1; then
+  echo "invalid extra compiler arguments unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -F 'extra compiler macro conflicts with existing compiler arguments: PREPARE_DATABASE_UNDEFINED' conflicting-extra.log
+grep -F 'extra compiler include duplicates an existing compiler include: include' conflicting-extra.log
+grep -F 'extra compiler include duplicates an existing compiler include: -include-dir' conflicting-extra.log
+grep -F 'extra compiler include duplicates an existing compiler include: alternate-include' conflicting-extra.log
+grep -F 'unsupported extra compiler option: -std' conflicting-extra.log
+grep -F -- '--extra-args shell returned 1' conflicting-extra.log
+for package in extra-conflict extra-duplicate extra-duplicate-dash extra-duplicate-cwd extra-standard extra-shell-failed; do
+  test ! -e "$package"
+done
 cat >unsupported.repl <<'REPL'
 %probe prepare "HFW::HfwManager::createBox()" --include application/history.hpp --output manager-box --metadata-only
 REPL
@@ -41,8 +92,14 @@ grep -Fx '#include <system_error>' toolchain-headers/generated/adapter.hpp
 grep -Ex '#include <(time\.h|ctime)>' toolchain-headers/generated/adapter.hpp
 unlink application/history.hpp
 unlink application/payload.hpp
+unlink application/extra.hpp
+unlink application/include/prepare-priority.hpp
+unlink 'supplemental include/prepare-priority.hpp'
+unlink 'supplemental include/prepare-extra.hpp'
+rmdir application/include application/-include-dir
 unlink compile_commands.json
 unlink clang-cl-compile_commands.json
+unlink extra-compile_commands.json
 rmdir application
 test ! -e application
 echo APPLICATION_HEADERS_REMOVED
@@ -105,6 +162,8 @@ CPP
 cat >callback-build/include/history-callback-config.hpp <<'CPP'
 constexpr int expected_callback_result = 1;
 CPP
+echo '#error the supplemental directory shadowed the callback database include' >'supplemental include/history-callback.hpp'
+echo 'constexpr int expected_extra_value = 19;' >'supplemental include/callback-extra.hpp'
 touch callback-build/callback-donor.cpp callback-build/decoy.cpp
 printf -v callback_command '{"directory":"%s/callback-build","file":"callback-donor.cpp","arguments":["clang-cl","--target=x86_64-unknown-linux-gnu","/std:c++17","/Iinclude","/DHISTORY_CALLBACK_CONTEXT=73","/FIhistory-callback-config.hpp","/c","callback-donor.cpp"]}' "$run"
 printf -v decoy_command '{"directory":"%s/callback-build","file":"decoy.cpp","arguments":["clang++","-std=c++17","-Iinclude","-DHISTORY_CALLBACK_CONTEXT=42","-c","decoy.cpp"]}' "$run"
@@ -121,6 +180,10 @@ public:
 CPP
 cat >toolchain-callback.cpp <<'CPP'
 #include <history-callback.hpp>
+#include <callback-extra.hpp>
+
+static_assert(CALLBACK_STARTUP_EXTRA == 41);
+static_assert(CALLBACK_LOCAL_EXTRA == expected_extra_value);
 
 template<> class Interceptor<tracer::ResolvedSignature> {
 public:
@@ -155,8 +218,8 @@ auto returned_item = manager_item.result_snapshot();
 if (returned_item.field("id").as<int>() != 73 || returned_item.field("kind").as<int>() != 3 || returned_item.field("details").field("quantity").as<int>() != 5) throw std::runtime_error("wrong nested manager item fields");
 if (manager_item.receiver_snapshot().field("seed").as<int>() != 71) throw std::runtime_error("wrong manager receiver fields");
 %probe validate "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --callback clang-cl-mode.cpp --prepared toolchain-headers --prepared-mode require
-%probe validate "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --callback toolchain-callback.cpp --prepared toolchain-headers --prepared-mode require --compdb callback-compile_commands.json
-%probe inject "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --callback toolchain-callback.cpp --prepared toolchain-headers --prepared-mode require --compdb callback-choices-compile_commands.json --translation-unit callback-build/callback-donor.cpp
+%probe validate "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --callback toolchain-callback.cpp --prepared toolchain-headers --prepared-mode require --compdb callback-compile_commands.json --extra-args "/DCALLBACK_LOCAL_EXTRA=19 /I'supplemental include'"
+%probe inject "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --callback toolchain-callback.cpp --prepared toolchain-headers --prepared-mode require --compdb callback-choices-compile_commands.json --translation-unit callback-build/callback-donor.cpp --extra-args "-DCALLBACK_LOCAL_EXTRA=19 -I'supplemental include'"
 %collect --name history.callback-compdb --count 1 --timeout 15 --as callback-compdb
 if (tracer.batch("callback-compdb").size() != 1) throw std::runtime_error("missing compilation database callback event");
 std::cout << "PREPARED_CLANG_CL_DRIVER=1" << std::endl;
@@ -168,7 +231,7 @@ REPL
 pid=$!
 trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
 "$repl" --server "$server" --agent "$agent" --attach "$pid" --timeout 60 \
-  --fail-fast <verify.repl | tee smoke.log
+  --extra-arg=-DCALLBACK_STARTUP_EXTRA=41 --fail-fast <verify.repl | tee smoke.log
 test "$(grep -c '^installed probe=' smoke.log)" -eq 6
 grep -qx 'prepared_used: true' smoke.log
 grep -qx PREPARED_CLANG_CL_DRIVER=1 smoke.log
@@ -181,6 +244,7 @@ sed 's|"/std:c++17",|"/std:c++17","-Xclang","-load","-Xclang","missing.so",|' \
 cat >invalid-compdb.repl <<'REPL'
 %probe validate "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --callback toolchain-callback.cpp --prepared toolchain-headers --prepared-mode require --compdb incompatible-compile_commands.json
 %probe inject "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --callback toolchain-callback.cpp --prepared toolchain-headers --prepared-mode require --compdb unsafe-compile_commands.json
+%probe inject "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --callback toolchain-callback.cpp --prepared toolchain-headers --prepared-mode require --compdb callback-compile_commands.json --extra-args "-DHISTORY_CALLBACK_CONTEXT=74"
 %quit
 REPL
 if "$repl" --server "$server" --agent "$agent" --attach "$pid" --timeout 60 \
@@ -190,6 +254,7 @@ if "$repl" --server "$server" --agent "$agent" --attach "$pid" --timeout 60 \
 fi
 grep -F 'compilation database target does not match the engine target' invalid-compdb.log
 grep -F 'header compilation command contains unsupported option: -Xclang' invalid-compdb.log
+grep -F 'extra compiler macro conflicts with existing compiler arguments: HISTORY_CALLBACK_CONTEXT' invalid-compdb.log
 if grep -q '^installed probe=' invalid-compdb.log; then
   cat invalid-compdb.log >&2
   exit 1

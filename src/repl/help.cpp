@@ -71,7 +71,7 @@ const CommandTopic commands[] = {
      "Verify and disassemble a function entry and show the copy-only detour window and bounded control flow."},
     {"probe prepare",
      "%probe prepare SELECTOR --include HEADER --output NEW_DIRECTORY\n"
-     "  [--compdb PATH] [--translation-unit FILE] [--module ELF] [--metadata-only]",
+     "  [--compdb PATH] [--translation-unit FILE] [--module ELF] [--metadata-only] [EXTRA COMPILER ARGUMENTS]",
      "Build a reusable probe package from local source. Repeat --include for extra headers. "
      "By default, preparation uses compile_commands.json in the current directory and a source "
      "beside the first header. Use --module to pin the package to a specific build. "
@@ -492,11 +492,22 @@ void command_details(std::ostream& out, const CommandTopic& entry, bool color) {
     heading(out, "Resolution options", color);
     block(out, "--include SERVER_HEADER --compdb SERVER_PATH [--translation-unit SERVER_FILE]\n"
                "--module TEXT --compile-option FLAG\n"
-               "--prepared DIRECTORY --prepared-mode off|prefer|require",
+               "--prepared DIRECTORY --prepared-mode off|prefer|require\n"
+               "[EXTRA COMPILER ARGUMENTS]",
           Syntax::command, color);
     out << "The default mode, prefer, uses an available prepared package and falls back to DWARF.\n";
     out << "With a typed prepared package, --compdb supplies include paths, forced includes and macros to the callback.\n"
            "Extra headers must coexist with the prepared declarations. Use --translation-unit to override the donor.\n";
+  }
+  if (entry.usage.find("EXTRA COMPILER ARGUMENTS") != string_view::npos ||
+      entry.usage.find("RESOLUTION OPTIONS") != string_view::npos) {
+    out << '\n';
+    heading(out, "Extra compiler arguments", color);
+    block(out, R"(--extra-arg ARG | --extra-args "-I dir -DNAME=1" | --extra-args `my-conf --cxxflags`)",
+          Syntax::command, color);
+    out << "Repeat these options to add fallback include paths and new macro definitions. "
+           "Compilation database settings take priority.\n"
+           "Set startup defaults with --extra-arg=ARG or --extra-args \"$(my-conf --cxxflags)\".\n";
   }
   if (entry.usage.find("DEPLOYMENT OPTIONS") != string_view::npos) {
     out << '\n';

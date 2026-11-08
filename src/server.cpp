@@ -1,5 +1,6 @@
 #include "server.hpp"
 #include "prepared_contract.hpp"
+#include "probe_extra_arguments.hpp"
 #include "proc_identity.hpp"
 #include "process_memory.hpp"
 
@@ -61,6 +62,17 @@ namespace api = clangtracer::v1;
 
 constexpr std::size_t kSessionLimit = 64;
 constexpr std::size_t kMaxCallbackSource = 64 * 1024;
+
+void set_probe_extra_compile_arguments(
+    api::ProbeSpec &spec, const google::protobuf::RepeatedPtrField<std::string> &options) {
+  if (options.empty()) return;
+  auto extra = normalize_extra_compile_arguments(
+      {options.begin(), options.end()}, primary_probe_compile_arguments(spec),
+      primary_probe_compile_directory(spec));
+  for (auto &argument : extra)
+    spec.add_extra_compile_arguments(std::move(argument));
+  spec.set_extra_compile_arguments_checked(true);
+}
 
 template <class Headers, class Options>
 grpc::Status validate_resolution_inputs(std::string_view selector,
@@ -1403,6 +1415,7 @@ public:
       if (!resolved.spec.has_header_context())
         client::resolve_header_context(resolved.spec, request->compilation_database(),
                                        request->translation_unit());
+      set_probe_extra_compile_arguments(resolved.spec, request->extra_compile_arguments());
       response->Swap(&resolved.spec);
       return grpc::Status::OK;
     } catch (const client::DebugLookupLimit &error) {
@@ -1466,6 +1479,7 @@ public:
       if (!resolved.spec.has_header_context())
         client::resolve_header_context(resolved.spec, request->compilation_database(),
                                        request->translation_unit());
+      set_probe_extra_compile_arguments(resolved.spec, request->extra_compile_arguments());
       resolved.spec.set_callback_source(request->callback_source());
       const auto input_valid = validate_probe(resolved.spec);
       if (!input_valid.ok())
@@ -2368,6 +2382,16 @@ private:
                                           spec.compile_options().end())) {
       return {grpc::StatusCode::INVALID_ARGUMENT,
               "compiler options contain an unsupported preflight option"};
+    }
+    if (!spec.extra_compile_arguments().empty()) {
+      try {
+        const auto &extra = spec.extra_compile_arguments();
+        validate_extra_compile_arguments({extra.begin(), extra.end()},
+                                         primary_probe_compile_arguments(spec),
+                                         primary_probe_compile_directory(spec));
+      } catch (const std::invalid_argument &error) {
+        return {grpc::StatusCode::INVALID_ARGUMENT, error.what()};
+      }
     }
     if (spec.argument_names_size() > 8 || spec.include_headers_size() > 16 ||
         (spec.has_debug_info() &&

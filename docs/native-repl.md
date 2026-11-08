@@ -276,6 +276,34 @@ the server host. Source files are limited to 4 MiB. Uploaded interceptors are
 compiled by the server/agent; local REPL variables, pointers and lambdas are not
 implicitly transferred into the target.
 
+### Supplemental probe compiler arguments
+
+Use `--extra-arg` for one compiler argument and `--extra-args` for a list.
+Backticks run a command on the REPL host and split its stdout into arguments.
+A failed shell command stops the probe command.
+
+```text
+%probe prepare "Calculator::multiply(int, int) const" --include calculator.hpp --output multiply --extra-args `my-conf --cxxflags`
+%probe inject "Calculator::multiply(int, int) const" --callback method.cpp --prepared multiply --extra-args "-I/opt/project/include -DTRACE_EXTRA=1"
+```
+
+Set defaults for preparation and agent compilation at REPL startup.
+
+```bash
+clang-tracer-repl --attach 12345 --extra-arg=-DTRACE_EXTRA=1
+clang-tracer-repl --attach 12345 --extra-args "$(my-conf --cxxflags)"
+```
+
+Supplemental `-I`, `-isystem`, and `-idirafter` directories are searched
+after the selected toolchain and compilation database directories. Supplemental
+`-D` accepts new object-like macros and rejects names defined or undefined by
+the compilation database. The clang-cl spellings `/I` and `/D` are also
+accepted. The selected driver, language standard, target,
+sysroot, and ABI remain authoritative. Preparation extras apply while reading
+the original headers. Pass callback-specific extras to injection or at startup.
+Relative supplemental include paths are resolved from the REPL's working
+directory. These paths must be visible to the agent during callback compilation.
+
 Attach checks the loaded agent's bootstrap protocol and ELF build ID against
 the server and its configured agent file before accepting the session. Use
 `%sessions` to see the process start time and target JIT runtime profile.

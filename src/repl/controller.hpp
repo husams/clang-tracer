@@ -4,6 +4,7 @@
 #include <iosfwd>
 #include <map>
 #include <set>
+#include <vector>
 
 #include <signal.h>
 
@@ -18,6 +19,7 @@ extern std::atomic<bool> interrupted;
 
 struct Settings {
   std::string endpoint, server, agent;
+  std::vector<std::string> extra_compile_arguments;
   unsigned timeout_seconds = 30;
   std::uint32_t context_event_bytes = 0;
   std::uint64_t context_transport_memory_bytes = 0;

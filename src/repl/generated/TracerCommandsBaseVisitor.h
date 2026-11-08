@@ -167,6 +167,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitExtraCompileOption(TracerCommandsParser::ExtraCompileOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
 
 };
 

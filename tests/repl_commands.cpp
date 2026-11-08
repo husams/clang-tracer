@@ -27,6 +27,26 @@ int main() {
       "--output prepared");
   require(prepare.kind == CommandKind::prepare && !prepare.has("--compdb") &&
           !prepare.has("--translation-unit") && !prepare.has("--module"));
+  using ExtraKind = ExtraCompileArgumentInput::Kind;
+  const auto extra = parse_command(
+      R"args(%probe prepare f --extra-args "-I generated -DFIRST=1" )args"
+      R"args(--include api.hpp --extra-args -I'generated files' -DSECOND=2 `my-conf --cxxflags` )args"
+      R"args(--extra-arg "-Ione more" --output prepared)args");
+  const auto &inputs = extra.extra_compile_argument_inputs;
+  require(extra.arguments == std::vector<std::string>{"f"} &&
+          extra.option("--include") == "api.hpp" &&
+          extra.option("--output") == "prepared" && inputs.size() == 4);
+  require(inputs[0].kind == ExtraKind::list && inputs[0].text == "-I generated -DFIRST=1");
+  require(inputs[1].kind == ExtraKind::list && inputs[1].text == "-I'generated files' -DSECOND=2");
+  require(inputs[2].kind == ExtraKind::shell && inputs[2].text == "my-conf --cxxflags");
+  require(inputs[3].kind == ExtraKind::argument && inputs[3].text == "-Ione more");
+  require(parse_command("%probe inject f --callback hook.cpp --extra-arg -DHOOK=1 --print-result")
+              .has("--print-result"));
+  require(parse_command("%probe validate f --callback hook.cpp --extra-args -DHOOK=1")
+              .extra_compile_argument_inputs.size() == 1);
+  bad("%probe prepare f --include api.hpp --output prepared --extra-args");
+  bad("%probe validate f --callback hook.cpp --extra-args `unfinished");
+  bad("%server start --extra-arg -DHOOK=1");
   bad("%probe prepare f --include api.hpp --compdb \"\" "
       "--translation-unit src/api.cpp --module app --output prepared");
   bad("%probe prepare f --include api.hpp --translation-unit \"\" --module app --output prepared");

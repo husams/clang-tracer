@@ -1,6 +1,7 @@
 #include "cpp_resolver.hpp"
 #include "header_context.hpp"
 #include "prepared_contract.hpp"
+#include "tracer/compiler_options.hpp"
 
 #include <exception>
 #include <filesystem>
@@ -52,6 +53,7 @@ int main(int argc, char **argv) {
   try {
     std::map<std::string, std::string> options;
     std::vector<std::string> headers;
+    std::vector<std::string> extra_arguments;
     bool metadata_only = false;
     for (int i = 1; i < argc; ++i) {
       const std::string option = argv[i];
@@ -59,7 +61,8 @@ int main(int argc, char **argv) {
         std::cout << "Native header preparation: --selector SELECTOR --include "
                      "HEADER "
                      "--compdb FILE [--translation-unit FILE] "
-                     "--output NEW_DIRECTORY [--module ELF] [--metadata-only]\n"
+                     "--output NEW_DIRECTORY [--module ELF] [--metadata-only] "
+                     "[--extra-arg ARG]...\n"
                      "By default, uses the first compile command for a source "
                      "beside the first header. --module pins the package to an ELF image.\n";
         return 0;
@@ -72,12 +75,14 @@ int main(int argc, char **argv) {
       }
       if (option != "--include" && option != "--selector" &&
           option != "--compdb" && option != "--translation-unit" &&
-          option != "--module" && option != "--output")
+          option != "--module" && option != "--output" && option != "--extra-arg")
         throw std::runtime_error("unknown option: " + option);
       if (++i == argc || std::string(argv[i]).empty())
         throw std::runtime_error("missing value for " + option);
       if (option == "--include")
         headers.push_back(fs::canonical(argv[i]).string());
+      else if (option == "--extra-arg")
+        extra_arguments.emplace_back(argv[i]);
       else if (!options.emplace(option, argv[i]).second)
         throw std::runtime_error("duplicate option: " + option);
     }
@@ -103,9 +108,13 @@ int main(int argc, char **argv) {
       digest = image_digest(module);
     }
     const auto unit = options.find("--translation-unit");
-    const auto command = tracer::client::resolve_prepared_header_command(
+    auto command = tracer::client::resolve_prepared_header_command(
         headers.front(), options.at("--compdb"),
         unit == options.end() ? std::string{} : unit->second);
+    const auto supplemental = tracer::normalize_extra_compile_arguments(
+        extra_arguments, command.arguments, command.directory);
+    for (const auto &argument : supplemental)
+      command.arguments.push_back(command.driver_mode == "cl" ? "/clang:" + argument : argument);
     const auto resolve_adapter = [&](bool pointer_layouts) {
       auto callable = tracer::client::resolve_header_callable(
           options.at("--selector"), context, command, pointer_layouts);
