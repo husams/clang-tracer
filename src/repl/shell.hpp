@@ -10,6 +10,7 @@ struct ShellOutput {
 };
 // Explicit user-requested shell execution; never used for compilation
 // databases.
-ShellOutput run_shell(const std::string &command);
+ShellOutput run_shell(const std::string &command,
+                      const std::string &directory = {});
 std::vector<std::string> split_compiler_flags(const std::string &text);
 } // namespace tracer_repl

@@ -252,18 +252,41 @@ public:
   }
 };
 
+std::string probe_path(const Command &command, const std::string &path) {
+  if (path.empty() || !command.has("--cwd"))
+    return path;
+  return (std::filesystem::path(command.option("--cwd")) / path).string();
+}
+
+std::string probe_module(const Command &command, bool path_required = false) {
+  const auto module = command.option("--module");
+  const std::filesystem::path path(module);
+  if (!command.has("--cwd") || path.is_absolute() ||
+      (!path_required && !path.has_parent_path()))
+    return module;
+  return std::filesystem::path(probe_path(command, module)).lexically_normal().string();
+}
+
+std::vector<std::string> probe_extra_arguments(const Command &command,
+                                               const Settings &settings) {
+  auto arguments = settings.extra_compile_arguments;
+  arguments.insert(arguments.end(), command.extra_compile_arguments.begin(),
+                   command.extra_compile_arguments.end());
+  return arguments;
+}
+
 void resolution_options(api::ResolveProbeRequest &request,
                         const Command &command,
                         const Settings &settings) {
-  request.set_module(command.option("--module"));
-  request.set_compilation_database(command.option("--compdb"));
-  request.set_translation_unit(command.option("--translation-unit"));
+  request.set_module(probe_module(command));
+  request.set_compilation_database(probe_path(command, command.option("--compdb")));
+  request.set_translation_unit(probe_path(command, command.option("--translation-unit")));
   if (command.has("--compdb") && request.compilation_database().empty())
     throw std::invalid_argument("--compdb requires a path");
   auto includes = command.options.find("--include");
   if (includes != command.options.end()) {
     for (const auto &value : includes->second) {
-      request.add_include_headers(value);
+      request.add_include_headers(probe_path(command, value));
     }
   }
   auto options = command.options.find("--compile-option");
@@ -275,10 +298,8 @@ void resolution_options(api::ResolveProbeRequest &request,
   if (command.has("--translation-unit") &&
       (request.translation_unit().empty() || request.compilation_database().empty()))
     throw std::invalid_argument("--translation-unit requires a file and --compdb");
-  auto extra = settings.extra_compile_arguments;
-  extra.insert(extra.end(), command.extra_compile_arguments.begin(),
-               command.extra_compile_arguments.end());
-  for (const auto &argument : tracer::normalize_extra_compile_arguments(extra, {}))
+  for (const auto &argument : tracer::normalize_extra_compile_arguments(
+           probe_extra_arguments(command, settings), {}, {}, command.option("--cwd")))
     request.add_extra_compile_arguments(argument);
 }
 
@@ -306,7 +327,7 @@ PreparedMode prepared_options(Request &request, const Command &options,
                               const Packages &packages,
                               std::ostream &out) {
   const auto selector = compact_selector(request.selector());
-  auto directory = options.option("--prepared");
+  auto directory = probe_path(options, options.option("--prepared"));
   if (!options.has("--prepared")) {
     const auto package = packages.find(selector);
     if (package != packages.end()) directory = package->second.directory;
@@ -635,7 +656,7 @@ api::ProbeSpec Controller::resolve_for(const SessionHandle &session,
 }
 
 void Controller::prepare(const std::string &selector, const Command &options) {
-  const auto database = options.option("--compdb", "compile_commands.json");
+  const auto database = probe_path(options, options.option("--compdb", "compile_commands.json"));
   if (!options.has("--compdb") && !std::filesystem::is_regular_file(database))
     throw std::invalid_argument(
         "compile_commands.json was not found in the current directory. Pass --compdb FILE.");
@@ -659,7 +680,7 @@ void Controller::prepare(const std::string &selector, const Command &options) {
   for (const auto *key : {"--translation-unit", "--module"}) {
     if (options.has(key)) {
       arguments.emplace_back(key);
-      arguments.push_back(options.option(key));
+      arguments.push_back(probe_path(options, options.option(key)));
     }
   }
   for (const auto *key : {"--include", "--output"}) {
@@ -668,16 +689,15 @@ void Controller::prepare(const std::string &selector, const Command &options) {
       throw std::invalid_argument(std::string("preparation requires ") + key);
     for (const auto &value : found->second) {
       arguments.emplace_back(key);
-      arguments.push_back(value);
+      arguments.push_back(probe_path(options, value));
     }
   }
-  const std::vector<std::string> *extra_options[] = {
-      &settings_.extra_compile_arguments, &options.extra_compile_arguments};
-  for (const auto *extra : extra_options) {
-    for (const auto &argument : *extra) {
-      arguments.emplace_back("--extra-arg");
-      arguments.push_back(argument);
-    }
+  auto extra = probe_extra_arguments(options, settings_);
+  if (options.has("--cwd"))
+    extra = tracer::normalize_extra_compile_arguments(extra, {}, {}, options.option("--cwd"));
+  for (const auto &argument : extra) {
+    arguments.emplace_back("--extra-arg");
+    arguments.push_back(argument);
   }
   std::vector<char *> argv;
   for (auto &argument : arguments) argv.push_back(argument.data());
@@ -691,7 +711,9 @@ void Controller::prepare(const std::string &selector, const Command &options) {
     if (errno != EINTR) throw std::runtime_error("cannot wait for native preparation");
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
     throw std::runtime_error("native header preparation failed");
-  const auto directory = std::filesystem::absolute(options.option("--output"));
+  const auto output = probe_path(options, options.option("--output"));
+  const auto directory = options.has("--cwd") ? std::filesystem::canonical(output)
+                                               : std::filesystem::absolute(output);
   PreparedPackage package{directory.string(), {}};
   const auto file = directory / "prepared.pb";
   std::ifstream input(file, std::ios::binary);
@@ -1469,7 +1491,7 @@ bool Controller::execute(const Command &command) {
     api::PreviewFunctionEntryRequest request;
     request.set_session_id(selected_.id);
     request.set_mapping_token(command.option("--mapping"));
-    request.set_module(command.option("--module"));
+    request.set_module(probe_module(command, command.has("--elf-address")));
     if (command.has("--elf-address")) {
       request.set_elf_address(address_number(command.option("--elf-address")));
       request.set_abi(command.option("--abi"));
@@ -1569,10 +1591,11 @@ bool Controller::execute(const Command &command) {
   case K::resolve:
     out_ << resolve(args.at(0), command).DebugString();
     return true;
-  case K::inject:
-    inject(selected_, args.at(0), read_source(command.option("--callback")),
-           command);
+  case K::inject: {
+    const auto callback = probe_path(command, command.option("--callback"));
+    inject(selected_, args.at(0), read_source(callback), command);
     return true;
+  }
   case K::validate:
   case K::draft_validate: {
     require_session(selected_);
@@ -1583,8 +1606,8 @@ bool Controller::execute(const Command &command) {
     api::ValidateProbeRequest request;
     request.set_session_id(selected_.id);
     request.set_selector(selector);
-    request.set_callback_source(named ? drafts_.at(args.at(0))
-                                      : read_source(command.option("--callback")));
+    const auto callback = probe_path(command, command.option("--callback"));
+    request.set_callback_source(named ? drafts_.at(args.at(0)) : read_source(callback));
     *request.mutable_include_headers() = resolution.include_headers();
     *request.mutable_compile_options() = resolution.compile_options();
     *request.mutable_extra_compile_arguments() = resolution.extra_compile_arguments();
@@ -1623,7 +1646,7 @@ bool Controller::execute(const Command &command) {
     api::ReloadProbeRequest request;
     request.set_session_id(selected_.id);
     request.set_probe_id(unsigned_number(args.at(0), "probe ID"));
-    request.set_callback_source(read_source(command.option("--callback")));
+    request.set_callback_source(read_source(probe_path(command, command.option("--callback"))));
     const auto response = unary<api::ReloadProbeResponse>(
         [&](auto &c, auto &r) {
           Cancellation cancellation(c);

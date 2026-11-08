@@ -35,6 +35,7 @@ void append_compiler_flags(std::vector<std::string> &arguments,
 void expand_extra_compile_arguments(tr::Command &command) {
   using Kind = tr::ExtraCompileArgumentInput::Kind;
   auto &arguments = command.extra_compile_arguments;
+  const auto directory = command.option("--cwd");
   for (const auto &input : command.extra_compile_argument_inputs) {
     switch (input.kind) {
     case Kind::argument:
@@ -46,7 +47,7 @@ void expand_extra_compile_arguments(tr::Command &command) {
       append_compiler_flags(arguments, input.text);
       break;
     case Kind::shell: {
-      const auto reply = tr::run_shell(input.text);
+      const auto reply = tr::run_shell(input.text, directory);
       std::cerr << reply.error;
       if (reply.status)
         throw std::runtime_error("--extra-args shell returned " +
@@ -367,6 +368,14 @@ int main(int argc, char **argv) {
           continue;
         }
         auto command = tr::parse_command(*line);
+        if (command.has("--cwd")) {
+          auto &directory = command.options.at("--cwd").front();
+          std::error_code error;
+          const auto absolute = std::filesystem::canonical(directory, error);
+          if (error || !std::filesystem::is_directory(absolute, error))
+            throw std::invalid_argument("--cwd is not an accessible directory: " + directory);
+          directory = absolute.string();
+        }
         expand_extra_compile_arguments(command);
         if (command.kind == tr::CommandKind::help) {
           tr::print_help(std::cout, command.arguments, cpp, color);
