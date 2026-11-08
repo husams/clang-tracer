@@ -223,7 +223,8 @@ if (data.size()) {
 })",
      "Use argument_as<T>(index) or result_as<T>() when T matches the captured type. "
      "has_result() includes void returns. Use argument_snapshot(), receiver_snapshot(), or state_snapshot() "
-     "to inspect captured fields without rebuilding an application type.", "Event"},
+     "to inspect captured fields without rebuilding an application type. "
+     "Use stack() to iterate over the captured frames.", "Event"},
     {"Collection", "A retained set of events with capture counters and status.",
      R"(auto data = tracer.batch("results");
 std::cout << data.received << " received, " << data.evicted << " evicted\n";
@@ -267,6 +268,10 @@ auto order = e.argument_as<app::Order>(0);)",
      R"(auto e = tracer.batch("results").at(0);
 auto input = e.argument_as<int>(0);)",
      "Use the captured C++ type. Use argument_snapshot(index) to inspect fields without a type mapping."},
+    {"Event::stack", "Return the captured stack frames in order as an owned vector.",
+     R"(auto e = tracer.batch("results").at(0);
+for (const auto& frame : e.stack()) { std::cout << frame.pc << ' ' << frame.function << '\n'; })",
+     "An event with no stored frames returns an empty vector."},
     {"Event::result_as", "Decode a captured return value as an owned C++ value.",
      R"(auto e = tracer.batch("results").at(0);
 if (e.phase() == "POST" && e.has_result()) {

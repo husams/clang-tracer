@@ -27,6 +27,18 @@ struct SessionHandle {
   std::uint64_t connection = 0;
 };
 
+struct StackFrame {
+  std::uint64_t pc;
+  std::uint64_t stack_pointer;
+  std::string kind;
+  std::string module;
+  std::uint64_t module_offset;
+  std::string function;
+  std::string file;
+  std::uint32_t line;
+  bool application_frame;
+};
+
 class Event {
   std::shared_ptr<const EventData> data_;
 
@@ -37,6 +49,8 @@ public:
   std::uint64_t call_id() const;
   std::string phase() const;
   std::string function_name() const;
+  // Owned frames in capture order. Empty when the event has no stored frames.
+  std::vector<StackFrame> stack() const;
   // Presence includes VOID results; reading void as a value is rejected.
   bool has_result() const;
   // Values own their scalar data and do not retain target addresses.

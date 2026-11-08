@@ -683,6 +683,8 @@ int main(int argc, char **argv) {
     last->set_module_offset(0x40);
     last->set_file("/app/main.cpp");
     last->set_line(42);
+    last->set_stack_pointer(0x8000);
+    last->set_application_frame(true);
     write_record(fd, with_stack);
     write_record(fd, limited.events().back()->message);
     ::close(fd);
@@ -703,6 +705,16 @@ int main(int argc, char **argv) {
     out.str("");
     offline.execute(parse_command("%events stack saved --index 1"));
     require(out.str() == "no stack captured\n", "missing stack has a clear response");
+    const auto saved = offline.batch("saved");
+    const auto frames = saved.at(0).stack();
+    require(frames.size() == 1025 && frames.front().pc == 0x1000 &&
+                frames.back().pc == 0x1400 && frames.back().stack_pointer == 0x8000 &&
+                frames.back().kind == "NATIVE" && frames.back().function == "last_frame()" &&
+                frames.back().module == "/app" && frames.back().module_offset == 0x40 &&
+                frames.back().file == "/app/main.cpp" && frames.back().line == 42 &&
+                frames.back().application_frame,
+            "Event::stack exposes every retained frame and its metadata in order");
+    require(saved.at(1).stack().empty(), "Event::stack is empty without a stack");
     try {
       create_recording(path);
       throw std::logic_error("overwrote recording");

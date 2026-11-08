@@ -588,6 +588,19 @@ std::string Event::function_name() const {
   return data_->message.function_name();
 }
 
+std::vector<StackFrame> Event::stack() const {
+  const auto &captured = data_->message.stack().frames();
+  std::vector<StackFrame> frames;
+  frames.reserve(captured.size());
+  for (const auto &frame : captured) {
+    frames.push_back({frame.pc(), frame.stack_pointer(),
+                      api::StackFrame::Kind_Name(frame.kind()), frame.module(),
+                      frame.module_offset(), frame.function(), frame.file(),
+                      frame.line(), frame.application_frame()});
+  }
+  return frames;
+}
+
 bool Event::has_result() const {
   const auto &event = data_->message;
   return (event.has_context() && event.context().event().has_result()) ||

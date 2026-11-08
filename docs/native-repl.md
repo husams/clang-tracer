@@ -703,6 +703,14 @@ first, so a corrupt recording cannot overwrite an existing capture.
 Detail inspection shows typed arguments/results, receiver fields, stack frames,
 and raw metadata. `%events stack NAME --index N` prints the capture status and
 each retained stack frame directly, including frames from replayed events.
+In C++, `event.stack()` returns an owned vector of frames in capture order.
+It is empty when the event has no stored frames.
+
+```cpp
+auto event = tracer.batch("batch").at(0);
+for (const auto& frame : event.stack()) { std::cout << frame.pc << ' ' << frame.function << '\n'; }
+```
+
 Shared-state payloads are decoded with their attached schema when available.
 Native PRE/POST pairing includes server lifetime, session,
 probe, thread and call identity, and marks missing halves. Shared-context
