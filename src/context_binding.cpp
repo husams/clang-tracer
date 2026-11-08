@@ -9,6 +9,7 @@
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h>
 #include <llvm/ExecutionEngine/SectionMemoryManager.h>
+#include <llvm/IR/Attributes.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/GlobalAlias.h>
 #include <llvm/IR/IRBuilder.h>
@@ -488,6 +489,10 @@ PrivateContextCode::load(
         (!impl->standard_library && !ir.alias_empty()))
       return invalid(
           "unvalidated assembly, resolver or alias in support closure");
+    constexpr llvm::StringLiteral stack_check_failure = "__stack_chk_fail";
+    if (ir.getNamedValue(stack_check_failure))
+      return invalid("stack protector failure symbol is reserved for the backend");
+    bool needs_stack_check = false;
     std::set<const llvm::Value *> seen;
     for (const auto &alias : ir.aliases()) {
       if (!llvm::isa<llvm::Function>(alias.getAliaseeObject()))
@@ -580,6 +585,9 @@ PrivateContextCode::load(
           return invalid("owner bridge C++ pointee/definition mismatch: " +
                          function.getName().str());
       } else {
+        needs_stack_check |= function.hasFnAttribute(llvm::Attribute::StackProtect) ||
+                             function.hasFnAttribute(llvm::Attribute::StackProtectReq) ||
+                             function.hasFnAttribute(llvm::Attribute::StackProtectStrong);
         if (::tracer::compat::contains(imported, function.getName().str()) ||
             ::tracer::compat::contains(native, function.getName().str())) {
           return invalid("callback definition shadows owner bridge: " + function.getName().str());
@@ -669,6 +677,9 @@ PrivateContextCode::load(
     for (const auto &[name, symbol] : imported)
       if (!ir.getFunction(name))
         return invalid("unused/unmatched owner import: " + name);
+    // The backend adds this failure call after the audited IR stage.
+    if (needs_stack_check)
+      return sealed(stack_check_failure);
     return llvm::Error::success();
   });
   if (audited)

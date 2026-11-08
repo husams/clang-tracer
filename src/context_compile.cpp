@@ -12,6 +12,7 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include "context_binding.hpp"
+#include "tracer/compiler_options.hpp"
 
 namespace tracer {
 llvm::Error initialize_private_context_target();
@@ -34,9 +35,10 @@ compile_context_module(const std::string &source,
     return std::move(error);
   }
   clang::IncrementalCompilerBuilder builder;
+  const auto driver_arguments = clang_driver_arguments(compiler_arguments);
   std::vector<const char *> arguments;
-  arguments.reserve(compiler_arguments.size());
-  for (const auto &argument : compiler_arguments) {
+  arguments.reserve(driver_arguments.size());
+  for (const auto &argument : driver_arguments) {
     arguments.push_back(argument.c_str());
   }
   builder.SetCompilerArgs(arguments);

@@ -52,6 +52,10 @@ inline bool toolchain_switch(std::string_view option) {
          option == "-nobuiltininc" || option == "-ibuiltininc";
 }
 
+inline bool supported_driver_mode(std::string_view mode) {
+  return mode == "gcc" || mode == "g++" || mode == "cl";
+}
+
 inline std::vector<std::string> toolchain_arguments(
     const clangtracer::v1::PreparedInjector &package, std::vector<std::string> defaults) {
   const auto &options = package.adapter_toolchain_options();
@@ -60,8 +64,16 @@ inline std::vector<std::string> toolchain_arguments(
   if (package.format_version() != typed_version || options.empty() || options.size() > 32 ||
       options.Get(0) != "--no-default-config")
     throw std::invalid_argument("invalid prepared toolchain profile");
+  bool has_driver_mode = false;
   for (int index = 1; index < options.size(); ++index) {
     const std::string_view option = options.Get(index);
+    constexpr std::string_view driver_prefix = "--driver-mode=";
+    if (option.rfind(driver_prefix, 0) == 0) {
+      if (has_driver_mode || !supported_driver_mode(option.substr(driver_prefix.size())))
+        throw std::invalid_argument("invalid prepared driver mode");
+      has_driver_mode = true;
+      continue;
+    }
     const auto prefix = toolchain_path_option(option);
     if (option.size() <= 4096 && !prefix.empty() && toolchain_path(option.substr(prefix.size())))
       continue;

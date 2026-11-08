@@ -3,6 +3,7 @@ CLANGTRACER_CONTEXT_1 {
   clangtracer_stdlib_*;
   __cxa_*;
   __gxx_personality_v0;
+  __stack_chk_fail;
   _Unwind_*;
   malloc; free; realloc; calloc;
   memcpy; memmove; memset; memcmp; bcmp; memchr;

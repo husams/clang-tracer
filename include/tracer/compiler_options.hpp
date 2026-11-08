@@ -1,9 +1,39 @@
 #pragma once
 
-#include <string_view>
+#include <algorithm>
+#include <iterator>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace tracer {
+
+inline bool clang_cl_driver(const std::vector<std::string> &arguments) {
+  return std::find(arguments.begin(), arguments.end(), "--driver-mode=cl") != arguments.end();
+}
+
+// Apply after validating user options. Clang's CL driver accepts GNU options
+// through /clang:, while driver selection and installation paths are parsed
+// before those forwarded options.
+inline std::vector<std::string> clang_driver_arguments(std::vector<std::string> arguments) {
+  if (!clang_cl_driver(arguments))
+    return arguments;
+  for (auto argument = arguments.begin(); argument != arguments.end(); ++argument) {
+    if ((*argument == "-ccc-install-dir" || *argument == "-x") &&
+        std::next(argument) != arguments.end()) {
+      ++argument;
+      continue;
+    }
+    if (*argument == "-fcxx-exceptions") {
+      *argument = "/EHs";
+      continue;
+    }
+    if (*argument != "--driver-mode=cl" && *argument != "--no-default-config" &&
+        argument->rfind("--target=", 0) != 0 && *argument != "-fsyntax-only")
+      argument->insert(0, "/clang:");
+  }
+  return arguments;
+}
 
 // Only these argument families may reach a compiler running in the attached
 // target. In particular, plugin loading and raw driver/frontend forwarding

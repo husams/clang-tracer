@@ -8,6 +8,7 @@
 
 #include "../include/tracer/receiver_abi.hpp"
 #include "tracer/compat.hpp"
+#include "tracer/compiler_options.hpp"
 
 #ifndef TRACER_CLANG_RESOURCE_DIR
 #error                                                                                             \
@@ -555,7 +556,7 @@ public:
           "-resource-dir=" + std::string(TRACER_CLANG_RESOURCE_DIR)});
       const auto &abi_options = invocation_.prepared_profile.adapter_abi_options();
       arguments.insert(arguments.end(), abi_options.begin(), abi_options.end());
-      toolchain = clang::tooling::buildASTFromCodeWithArgs("", arguments,
+      toolchain = clang::tooling::buildASTFromCodeWithArgs("", tracer::clang_driver_arguments(std::move(arguments)),
           "prepared-toolchain.cc", "clang-tool", std::make_shared<clang::PCHContainerOperations>(),
           clang::tooling::getClangStripDependencyFileAdjuster(), {}, &diagnostics);
       if (!toolchain || diagnostics.had_error() || toolchain->getDiagnostics().hasErrorOccurred())
@@ -1036,6 +1037,7 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   // Use the SDK fallback unless the database names a different installed
   // compiler by path or explicitly selects a toolchain.
   std::vector<std::string> arguments{"--no-default-config"};
+  const bool clang_cl = command.driver_mode == "cl";
   std::error_code path_error;
   const bool installed_driver = fs::path(command.driver).is_absolute() &&
       fs::is_regular_file(command.driver, path_error);
@@ -1045,12 +1047,13 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   auto &profile = invocation.prepared_profile;
   profile.set_format_version(tracer::prepared::typed_version);
   profile.add_adapter_toolchain_options("--no-default-config");
+  profile.add_adapter_toolchain_options("--driver-mode=" + command.driver_mode);
   for (const auto &option : command.adapter_abi_options)
     profile.add_adapter_abi_options(option);
   if (command.use_default_toolchain && !alternate_driver) {
     profile.set_adapter_uses_default_toolchain(true);
     for (const auto* flag : runtime::jit_flags) {
-      arguments.push_back(command.clang_cl ? std::string("/clang:") + flag : flag);
+      arguments.push_back(clang_cl ? std::string("/clang:") + flag : flag);
     }
   }
   if (installed_driver && !profile.adapter_uses_default_toolchain()) {
@@ -1124,7 +1127,7 @@ ResolvedCallable resolve_header_callable(const std::string& name,
       code += "template<class R> void select(R (*)" + type + ");\n";
     code += "template<class R, class C> void select(R (C::*)" + member + ");\n"
             "using Selected = decltype(select(&" + qualified + "));\n}\n";
-    arguments.push_back(command.clang_cl ? "/clang:-fno-access-control" : "-fno-access-control");
+    arguments.push_back(clang_cl ? "/clang:-fno-access-control" : "-fno-access-control");
   }
   clang::tooling::FixedCompilationDatabase database(command.directory, arguments);
   clang::DiagnosticOptions diagnostic_options;
@@ -1168,7 +1171,8 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
   clang::DiagnosticOptions diagnostic_options;
   PrepareDiagnostics diagnostics(diagnostic_options);
   auto unit = clang::tooling::buildASTFromCodeWithArgs(
-      tracer::prepared::adapter_source(adapter), arguments, "prepared-adapter.cc",
+      tracer::prepared::adapter_source(adapter), tracer::clang_driver_arguments(std::move(arguments)),
+      "prepared-adapter.cc",
       "clang-tool", std::make_shared<clang::PCHContainerOperations>(),
       clang::tooling::getClangStripDependencyFileAdjuster(), {}, &diagnostics);
   // A compiler error must bypass the address-only pointer retry.

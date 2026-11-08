@@ -3955,7 +3955,8 @@ bool compile_shared_probe(Probe &p,
       syntax_arguments.push_back("-fsyntax-only");
       DiagnosticCapture capture(nullptr);
       auto ast = clang::tooling::buildASTFromCodeWithArgs(
-          complete_source, syntax_arguments, "clang-tracer-shared-wrapper.cc",
+          complete_source, tracer::clang_driver_arguments(std::move(syntax_arguments)),
+          "clang-tracer-shared-wrapper.cc",
           "clang-tracer", std::make_shared<clang::PCHContainerOperations>(),
           clang::tooling::getClangStripOutputAdjuster(), {}, &capture);
       if (report)
@@ -4399,13 +4400,17 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   compiler_arguments.insert(
       compiler_arguments.end(),
       {"-std=c++20", "-x", "c++", "-fPIC", "-O0", resource_dir_argument});
+  // The generated wrapper uses C++ exceptions, which CL mode disables by default.
+  if (tracer::clang_cl_driver(compiler_arguments))
+    compiler_arguments.push_back("-fcxx-exceptions");
   std::vector<llvm::sys::fs::UniqueID> prepared_header_files;
   if (typed_prepared) {
     auto header_check_arguments = compiler_arguments;
     header_check_arguments.push_back("-fsyntax-only");
     DiagnosticCapture capture(nullptr);
     auto toolchain_ast = clang::tooling::buildASTFromCodeWithArgs(
-        "", header_check_arguments, "clang-tracer-toolchain-headers.cc",
+        "", tracer::clang_driver_arguments(std::move(header_check_arguments)),
+        "clang-tracer-toolchain-headers.cc",
         "clang-tracer", std::make_shared<clang::PCHContainerOperations>(),
         clang::tooling::getClangStripOutputAdjuster(), {}, &capture);
     if (!toolchain_ast || capture.had_error()) {
@@ -4456,7 +4461,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   }
   compiler_arguments.insert(compiler_arguments.end(), user_options.begin(),
                             user_options.end());
-  auto interpreter_arguments = compiler_arguments;
+  const auto interpreter_arguments = tracer::clang_driver_arguments(compiler_arguments);
   std::vector<const char *> args;
   for (const auto &argument : interpreter_arguments)
     args.push_back(argument.c_str());
@@ -4551,11 +4556,13 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
    * temporary syntax-only translation unit. This keeps callback validation
    * ahead of Interpreter::ParseAndExecute without copying the class text.
    */
-  auto syntax_args = interpreter_arguments;
+  auto syntax_args = compiler_arguments;
   syntax_args.push_back("-fsyntax-only");
   auto syntax_pch_args = syntax_args;
   if (syntax_pch)
     tracer::callback_pch::append_syntax_args(syntax_pch_args, *syntax_pch);
+  syntax_args = tracer::clang_driver_arguments(std::move(syntax_args));
+  syntax_pch_args = tracer::clang_driver_arguments(std::move(syntax_pch_args));
   const auto build_callback_ast =
       [&](const std::string &code, const char *file_name,
           DiagnosticCapture &capture) -> std::unique_ptr<clang::ASTUnit> {
@@ -4642,7 +4649,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
             user_ast->getASTContext(), shape);
       }
       return compile_shared_probe(
-          p, specification, interpreter_arguments,
+          p, specification, compiler_arguments,
           forced_include_source + prelude + context_prelude +
               tracer::kEmbeddedCallbackHeader,
           forced_include_source, receiver_alias,
@@ -5521,9 +5528,14 @@ extern "C" int tracer_agent_validate(tracer::ValidationRequest *request) {
     for (int i = 0; i < spec.signature().arguments_size(); ++i)
       native_request.arguments[i] = static_cast<tracer::ValueType>(
           spec.signature().arguments(i));
-    if (tracer::prepared::is_typed_version(spec.prepared().format_version()) && spec.has_header_context())
-      for (const auto &option : spec.header_context().compiler_arguments())
-        report.add_effective_options(option);
+    if (tracer::prepared::is_typed_version(spec.prepared().format_version())) {
+      for (const auto &option : spec.prepared().adapter_toolchain_options())
+        if (::tracer::compat::starts_with(option, "--driver-mode="))
+          report.add_effective_options(option);
+      if (spec.has_header_context())
+        for (const auto &option : spec.header_context().compiler_arguments())
+          report.add_effective_options(option);
+    }
     for (const auto &option : spec.compile_options())
       report.add_effective_options(option);
 

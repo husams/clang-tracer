@@ -48,6 +48,7 @@
 #include "context_stdlib.hpp"
 #include "context_support_effects.hpp"
 #include "tracer/compat.hpp"
+#include "tracer/compiler_options.hpp"
 
 namespace tracer {
 namespace {
@@ -87,7 +88,7 @@ parse_source(const std::string &source,
   return clang::tooling::buildASTFromCodeWithArgs(
       "#include \"tracer/callback.hpp\"\n#include \"context_facade.hpp\"\n" +
           source,
-      arguments, file_name, "clang-context-activation",
+      clang_driver_arguments(arguments), file_name, "clang-context-activation",
       std::make_shared<clang::PCHContainerOperations>(),
       clang::tooling::getClangStripDependencyFileAdjuster(), {}, &ignored);
 }
@@ -634,7 +635,8 @@ native_owner_abi_contract(const GeneratedContextOwner &owner,
   }
   clang::IgnoringDiagConsumer ignored;
   auto ast = clang::tooling::buildASTFromCodeWithArgs(
-      source, arguments, file_name, "clang-context-native-owner-abi",
+      source, clang_driver_arguments(arguments), file_name,
+      "clang-context-native-owner-abi",
       std::make_shared<clang::PCHContainerOperations>(),
       clang::tooling::getClangStripDependencyFileAdjuster(), {}, &ignored);
   if (!ast || ast->getDiagnostics().hasErrorOccurred()) {

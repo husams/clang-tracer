@@ -13,6 +13,7 @@
 
 #include "context_analysis.hpp"
 #include "tracer/compat.hpp"
+#include "tracer/compiler_options.hpp"
 
 namespace tracer {
 namespace {
@@ -396,7 +397,8 @@ ContextHookParseCopy prepare_context_hook_parse_copy(
   clang::IgnoringDiagConsumer ignore_diagnostics;
   auto ast = clang::tooling::buildASTFromCodeWithArgs(
       "#include \"tracer/callback.hpp\"\n" + source,
-      compiler_arguments, file_name, "clang-context-preparse",
+      clang_driver_arguments(compiler_arguments), file_name,
+      "clang-context-preparse",
       std::make_shared<clang::PCHContainerOperations>(),
       clang::tooling::getClangStripDependencyFileAdjuster(), {},
       &ignore_diagnostics);

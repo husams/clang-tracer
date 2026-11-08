@@ -243,6 +243,8 @@ static PreparedHeaderCommand normalize_prepared_header_command(tooling::CompileC
   if (mode == "cpp") {
     throw std::invalid_argument("compilation database driver mode cpp only preprocesses input");
   }
+  if (!mode.empty() && !tracer::prepared::supported_driver_mode(mode.str()))
+    throw std::invalid_argument("compilation database driver mode is not a supported C++ driver");
   const bool clang_cl = clang::driver::IsClangCL(mode);
   if (clang_cl) {
     for (std::size_t i = 1; i < donor.CommandLine.size(); ++i) {
@@ -270,7 +272,8 @@ static PreparedHeaderCommand normalize_prepared_header_command(tooling::CompileC
   }
   const auto directory = fs::absolute(donor.Directory).lexically_normal();
   const fs::path driver = donor.CommandLine.front();
-  PreparedHeaderCommand result{directory.string(), driver.string(), {}, {}, clang_cl, true,
+  PreparedHeaderCommand result{directory.string(), driver.string(), {}, {},
+                               mode.empty() ? "gcc" : mode.str(), true,
                                (directory / donor.Filename).lexically_normal().string()};
   if (driver.is_relative() && driver.has_parent_path()) {
     result.driver = (directory / driver).lexically_normal().string();
@@ -524,7 +527,7 @@ void resolve_prepared_callback_context(clangtracer::v1::ProbeSpec& spec, const s
       select_callback_command(*database, spec, translation_unit));
   std::vector<const char*> arguments;
   for (const auto& argument : command.arguments)
-    arguments.push_back(command.clang_cl && llvm::StringRef(argument).starts_with("/clang:")
+    arguments.push_back(command.driver_mode == "cl" && llvm::StringRef(argument).starts_with("/clang:")
                             ? argument.c_str() + 7 : argument.c_str());
   unsigned missing_index = 0, missing_count = 0;
   const auto parsed = prepared_driver_opt_table().ParseArgs(arguments, missing_index, missing_count);
