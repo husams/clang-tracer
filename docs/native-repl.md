@@ -266,6 +266,9 @@ and its projected stack. The short equivalent is:
 %probe inject "Calculator::multiply(int, int) const" --callback method.cpp
 ```
 
+Omit `--callback` to use the built-in observer for event capture, including
+receiver snapshots when class layout is available.
+
 Use `%interceptor edit NAME` for a multiline draft, `.end` to save, and `.cancel`
 to discard. `%probe validate SELECTOR --callback FILE` requests validation.
 Resolution/deployment options include `--include`, `--compdb`, `--module` and

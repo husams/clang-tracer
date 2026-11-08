@@ -10,6 +10,7 @@
 
 namespace tracer::native_detour {
 inline constexpr std::size_t kJumpBytes = 14;
+inline constexpr std::size_t kRelativeJumpBytes = 5;
 inline constexpr std::size_t kMaxDecodedBytes = kMaxPatchBytes - kJumpBytes;
 
 struct RipRelocation {
@@ -23,17 +24,22 @@ struct Patch {
   std::uintptr_t entry = 0;
   std::array<std::uint8_t, kMaxPatchBytes> original{};
   std::size_t size = 0;
+  std::size_t jump_size = kJumpBytes;
   std::vector<RipRelocation> relocations;
 };
 
 bool initialize_llvm(std::string &error);
 // Publishes a plan only after every instruction and relocation is admitted.
 bool decode(std::span<const std::uint8_t> bytes, std::uintptr_t entry,
-            Patch &patch, std::string &error);
+            Patch &patch, std::string &error, std::size_t jump_size = kJumpBytes);
 // Writes only on success, preserving the original bytes in patch.
 bool relocate(const Patch &patch, std::uintptr_t destination,
               std::span<std::uint8_t> output, std::string &error);
 // The caller owns the returned RX mapping and must retain it while in use.
 bool create_trampoline(const Patch &patch, void *&address,
                        std::size_t &mapping_size, std::string &error);
+// Completes a new trampoline's relay, if needed, and encodes the entry patch.
+bool prepare_entry_jump(const Patch &patch, void *trampoline,
+                        std::size_t mapping_size, const void *destination,
+                        std::span<std::uint8_t> output, std::string &error);
 } // namespace tracer::native_detour

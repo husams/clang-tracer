@@ -31,7 +31,7 @@ public:
     T__98 = 99, T__99 = 100, T__100 = 101, T__101 = 102, T__102 = 103, T__103 = 104,
     T__104 = 105, T__105 = 106, T__106 = 107, T__107 = 108, UINT = 109,
     STRING = 110, SHELL = 111, METADATA_ONLY = 112, SQLITE = 113, STACK = 114,
-    CWD = 115, WORD = 116, WS = 117
+    CWD = 115, SIGNATURE = 116, MEMBER = 117, WORD = 118, WS = 119
   };
 
   enum {
@@ -342,6 +342,8 @@ public:
     PrepareOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
     ValueContext *value();
+    antlr4::tree::TerminalNode *SIGNATURE();
+    antlr4::tree::TerminalNode *MEMBER();
     antlr4::tree::TerminalNode *METADATA_ONLY();
     ExtraCompileOptionContext *extraCompileOption();
     CwdOptionContext *cwdOption();

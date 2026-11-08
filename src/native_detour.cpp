@@ -37,6 +37,18 @@ namespace {
 using Wide = __int128_t;
 constexpr auto kMinDisp = std::numeric_limits<std::int32_t>::min();
 constexpr auto kMaxDisp = std::numeric_limits<std::int32_t>::max();
+constexpr auto kRelayOffset = kMaxPatchBytes;
+
+void write_absolute_jump(std::uint8_t *bytes, std::uintptr_t destination) {
+  bytes[0] = 0xff;
+  bytes[1] = 0x25;
+  std::memset(bytes + 2, 0, 4);
+  std::memcpy(bytes + 6, &destination, sizeof(destination));
+}
+
+bool valid_jump_size(std::size_t size) {
+  return size == kJumpBytes || size == kRelativeJumpBytes;
+}
 
 bool fail(std::string &error, const char *message) {
   error = message;
@@ -218,7 +230,7 @@ bool record_relocation(Decoder &d, llvm::MCInst inst,
 }
 
 void *allocate(const Patch &patch, std::size_t size, std::string &error) {
-  if (patch.relocations.empty()) {
+  if (patch.relocations.empty() && patch.jump_size == kJumpBytes) {
     return ::mmap(nullptr, size, PROT_READ | PROT_WRITE,
                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   }
@@ -231,10 +243,15 @@ void *allocate(const Patch &patch, std::size_t size, std::string &error) {
     low = std::max(low, origin - kMaxDisp);
     high = std::min(high, origin - kMinDisp);
   }
+  if (patch.jump_size == kRelativeJumpBytes) {
+    const Wide origin = Wide(patch.entry) + kRelativeJumpBytes - kRelayOffset;
+    low = std::max(low, origin + kMinDisp);
+    high = std::min(high, origin + kMaxDisp);
+  }
   low = (low + size - 1) / size * size;
   high = high / size * size;
   if (low > high) {
-    fail(error, "no common address range for RIP-relative trampoline");
+    fail(error, "no common address range for near trampoline");
     return MAP_FAILED;
   }
 
@@ -258,7 +275,7 @@ void *allocate(const Patch &patch, std::size_t size, std::string &error) {
   };
   std::ifstream maps("/proc/self/maps");
   if (!maps) {
-    fail(error, "cannot read mappings for RIP-relative trampoline allocation");
+    fail(error, "cannot read mappings for near trampoline allocation");
     return MAP_FAILED;
   }
   std::string line;
@@ -267,14 +284,14 @@ void *allocate(const Patch &patch, std::size_t size, std::string &error) {
     unsigned long long begin = 0, end = 0;
     if (std::sscanf(line.c_str(), "%llx-%llx", &begin, &end) != 2 ||
         Wide(begin) < previous || end < begin) {
-      fail(error, "invalid mappings for RIP-relative trampoline allocation");
+      fail(error, "invalid mappings for near trampoline allocation");
       return MAP_FAILED;
     }
     add_gap(previous, begin);
     previous = end;
   }
   if (!maps.eof()) {
-    fail(error, "incomplete mappings for RIP-relative trampoline allocation");
+    fail(error, "incomplete mappings for near trampoline allocation");
     return MAP_FAILED;
   }
   add_gap(previous, Wide(std::numeric_limits<std::uintptr_t>::max()));
@@ -297,7 +314,7 @@ void *allocate(const Patch &patch, std::size_t size, std::string &error) {
     }
     ::munmap(memory, size);
   }
-  fail(error, "could not allocate a trampoline in RIP-relative address range");
+  fail(error, "could not allocate a trampoline in the required address range");
   return MAP_FAILED;
 }
 } // namespace
@@ -319,9 +336,9 @@ bool initialize_llvm(std::string &error) {
 }
 
 bool decode(std::span<const std::uint8_t> bytes, std::uintptr_t entry,
-            Patch &patch, std::string &error) {
+            Patch &patch, std::string &error, std::size_t jump_size) {
   bytes = bytes.first(std::min(bytes.size(), kMaxDecodedBytes));
-  if (bytes.size() < kJumpBytes ||
+  if (!valid_jump_size(jump_size) || bytes.size() < jump_size ||
       Wide(entry) + bytes.size() > std::numeric_limits<std::uintptr_t>::max()) {
     return fail(error, "target entry has insufficient mapped bytes");
   }
@@ -335,7 +352,8 @@ bool decode(std::span<const std::uint8_t> bytes, std::uintptr_t entry,
   }
   Patch pending;
   pending.entry = entry;
-  while (pending.size < kJumpBytes) {
+  pending.jump_size = jump_size;
+  while (pending.size < jump_size) {
     llvm::MCInst inst;
     std::uint64_t size = 0;
     const auto status = decoder.dis->getInstruction(
@@ -371,7 +389,8 @@ bool decode(std::span<const std::uint8_t> bytes, std::uintptr_t entry,
 
 bool relocate(const Patch &patch, std::uintptr_t destination,
               std::span<std::uint8_t> output, std::string &error) {
-  if (patch.size < kJumpBytes || patch.size > kMaxDecodedBytes ||
+  if (!valid_jump_size(patch.jump_size) || patch.size < patch.jump_size ||
+      patch.size > kMaxDecodedBytes ||
       output.size() < patch.size ||
       Wide(destination) + patch.size >
           std::numeric_limits<std::uintptr_t>::max()) {
@@ -400,7 +419,9 @@ bool relocate(const Patch &patch, std::uintptr_t destination,
 bool create_trampoline(const Patch &patch, void *&address,
                        std::size_t &mapping_size, std::string &error) {
   const long page = ::sysconf(_SC_PAGESIZE);
-  if (page <= 0 || patch.size < kJumpBytes || patch.size > kMaxDecodedBytes ||
+  if (page < static_cast<long>(kRelayOffset + kJumpBytes) ||
+      !valid_jump_size(patch.jump_size) || patch.size < patch.jump_size ||
+      patch.size > kMaxDecodedBytes ||
       Wide(patch.entry) + patch.size >
           std::numeric_limits<std::uintptr_t>::max()) {
     return fail(error, "invalid trampoline allocation bounds");
@@ -408,7 +429,7 @@ bool create_trampoline(const Patch &patch, void *&address,
   const auto size = static_cast<std::size_t>(page);
   void *memory = allocate(patch, size, error);
   if (memory == MAP_FAILED) {
-    if (patch.relocations.empty()) {
+    if (patch.relocations.empty() && patch.jump_size == kJumpBytes) {
       fail(error, "could not allocate trampoline");
     }
     return false;
@@ -420,17 +441,44 @@ bool create_trampoline(const Patch &patch, void *&address,
     return false;
   }
   // Register-neutral absolute indirect jump back after the copied prologue.
-  bytes[patch.size] = 0xff;
-  bytes[patch.size + 1] = 0x25;
-  std::memset(bytes + patch.size + 2, 0, 4);
-  const auto continuation = patch.entry + patch.size;
-  std::memcpy(bytes + patch.size + 6, &continuation, sizeof(continuation));
+  write_absolute_jump(bytes + patch.size, patch.entry + patch.size);
   if (::mprotect(memory, size, PROT_READ | PROT_EXEC) != 0) {
     ::munmap(memory, size);
     return fail(error, "could not make trampoline executable");
   }
   address = memory;
   mapping_size = size;
+  return true;
+}
+bool prepare_entry_jump(const Patch &patch, void *trampoline,
+                        std::size_t mapping_size, const void *destination,
+                        std::span<std::uint8_t> output, std::string &error) {
+  if (!valid_jump_size(patch.jump_size) || patch.size < patch.jump_size ||
+      output.size() < patch.size)
+    return fail(error, "invalid entry jump bounds");
+  const auto target = reinterpret_cast<std::uintptr_t>(destination);
+  if (patch.jump_size == kRelativeJumpBytes) {
+    if (!trampoline || trampoline == MAP_FAILED ||
+        mapping_size < kRelayOffset + kJumpBytes)
+      return fail(error, "invalid trampoline relay bounds");
+    auto *relay = static_cast<std::uint8_t *>(trampoline) + kRelayOffset;
+    const Wide displacement = Wide(reinterpret_cast<std::uintptr_t>(relay)) -
+                              patch.entry - kRelativeJumpBytes;
+    if (displacement < kMinDisp || displacement > kMaxDisp)
+      return fail(error, "entry relay displacement is out of range");
+    // The new trampoline is private until the server installs the entry jump.
+    if (::mprotect(trampoline, mapping_size, PROT_READ | PROT_WRITE) != 0)
+      return fail(error, "could not make the entry relay writable");
+    write_absolute_jump(relay, target);
+    if (::mprotect(trampoline, mapping_size, PROT_READ | PROT_EXEC) != 0)
+      return fail(error, "could not make the entry relay executable");
+    const auto encoded = static_cast<std::int32_t>(displacement);
+    output[0] = 0xe9;
+    std::memcpy(output.data() + 1, &encoded, sizeof(encoded));
+  } else {
+    write_absolute_jump(output.data(), target);
+  }
+  std::fill(output.begin() + patch.jump_size, output.begin() + patch.size, 0x90);
   return true;
 }
 } // namespace tracer::native_detour

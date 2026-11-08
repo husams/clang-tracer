@@ -60,6 +60,9 @@ bool codec_types_supported(clang::QualType type,
   const auto *record = type.getNonReferenceType()->getAsCXXRecordDecl();
   if (!record || !seen.insert(record->getCanonicalDecl()).second)
     return true;
+  // The any codec reads the active payload through the public interface.
+  if (record->isInStdNamespace() && record->getName() == "any")
+    return true;
   if (const auto *special =
           llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record)) {
     const auto name =

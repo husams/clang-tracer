@@ -285,6 +285,7 @@ struct Probe {
   DebugRecords debug_records;
   void *trampoline = MAP_FAILED;
   std::size_t mapping_size = 0;
+  std::size_t entry_jump_size = kJumpBytes;
   std::atomic<std::uint64_t> sequence{0};
   tracer::EventDelivery delivery;
   std::atomic<std::uint64_t> callback_errors{0};
@@ -2401,20 +2402,28 @@ bool mapping(const void *address, std::uintptr_t &begin, std::uintptr_t &end,
 }
 
 bool decode_patch(const std::uint8_t *entry, tracer::Request &req,
-                  tracer::native_detour::Patch &patch, std::string &error) {
+                  tracer::native_detour::Patch &patch, std::string &error,
+                  std::uint64_t function_size = 0) {
   std::uintptr_t lo = 0, hi = 0;
   int prot = 0;
   if (!mapping(entry, lo, hi, prot) || (prot & PROT_READ) == 0) {
     error = "target entry is not in a readable mapping";
     return false;
   }
-  const auto available = std::min<std::size_t>(
+  auto available = std::min<std::size_t>(
       tracer::native_detour::kMaxDecodedBytes,
       hi - reinterpret_cast<std::uintptr_t>(entry));
-  if (!tracer::native_detour::decode(
-          {entry, available}, reinterpret_cast<std::uintptr_t>(entry), patch,
-          error))
-    return false;
+  if (function_size)
+    available = std::min<std::uint64_t>(available, function_size);
+  const auto address = reinterpret_cast<std::uintptr_t>(entry);
+  if (!tracer::native_detour::decode({entry, available}, address, patch, error)) {
+    // Only use the short relay when the resolver verified the function range.
+    if (!function_size ||
+        !tracer::native_detour::decode({entry, available}, address, patch, error,
+                                      tracer::native_detour::kRelativeJumpBytes))
+      return false;
+    error.clear();
+  }
   req.patch_size = static_cast<std::uint32_t>(patch.size);
   std::memcpy(req.original, patch.original.data(), patch.size);
   return true;
@@ -5688,18 +5697,20 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
                   p->request.patch_size);
       if (!tracer::native_detour::decode(
               {p->request.original, p->request.patch_size},
-              p->request.original_entry, target_patch, error)) {
+              p->request.original_entry, target_patch, error,
+              replaced->entry_jump_size)) {
         set_error(request, error.c_str());
         return operation.finish(-1);
       }
     } else if (!decode_patch(static_cast<const std::uint8_t *>(entry), p->request,
-                             target_patch, error)) {
+                             target_patch, error,
+                             specification.debug_info().entry_size())) {
       set_error(request, error.c_str());
       return operation.finish(-1);
     }
     if (specification.has_debug_info() &&
         p->request.patch_size > specification.debug_info().entry_size()) {
-      set_error(request, "safe patch window exceeds the DWARF function range");
+      set_error(request, "safe patch window exceeds the verified function range");
       return operation.finish(-1);
     }
     for (std::size_t i = 0; i < a.retained; ++i) {
@@ -5735,6 +5746,13 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, error.c_str());
       return operation.finish(-1);
     }
+    if (!tracer::native_detour::prepare_entry_jump(
+            target_patch, p->trampoline, p->mapping_size, p->wrapper,
+            {p->request.installed, p->request.patch_size}, error)) {
+      set_error(request, error.c_str());
+      return operation.finish(-1);
+    }
+    p->entry_jump_size = target_patch.jump_size;
     p->request.jit_compile_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - compile_started).count();
@@ -5780,11 +5798,6 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     p->session_id = request->session_id;
     a.pid = ::getpid();
     const auto slot = a.retained;
-    std::array<std::uint8_t, tracer::kMaxPatchBytes> patch{};
-    add_jump(patch.data(), p->wrapper);
-    std::fill(patch.begin() + kJumpBytes, patch.begin() + p->request.patch_size,
-              0x90);
-    std::memcpy(p->request.installed, patch.data(), p->request.patch_size);
     a.transport.activate();
     p->transport_active = true;
     p->active.store(true, std::memory_order_seq_cst);
