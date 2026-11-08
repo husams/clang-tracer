@@ -9,10 +9,7 @@ __attribute__((always_inline)) inline void keep_patch_window() {
 template <class T> struct Configuration {
   T value;
 
-  __attribute__((noinline)) const T &get() const {
-    keep_patch_window();
-    return value;
-  }
+  const T &get() const { return value; }
 };
 
 template <class T, int Offset> struct AdjustedConfiguration {
