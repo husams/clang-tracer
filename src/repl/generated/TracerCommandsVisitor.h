@@ -97,6 +97,8 @@ public:
 
     virtual std::any visitExtraCompileOption(TracerCommandsParser::ExtraCompileOptionContext *context) = 0;
 
+    virtual std::any visitCwdOption(TracerCommandsParser::CwdOptionContext *context) = 0;
+
 
 };
 

@@ -36,7 +36,7 @@ struct Child {
 };
 } // namespace
 
-ShellOutput run_shell(const std::string &command) {
+ShellOutput run_shell(const std::string &command, const std::string &directory) {
   if (command.empty() || command.size() > 65536 ||
       command.find('\0') != std::string::npos)
     throw std::invalid_argument(
@@ -73,13 +73,15 @@ ShellOutput run_shell(const std::string &command) {
                                               STDERR_FILENO);
   setup |= ::posix_spawnattr_setflags(&attrs, POSIX_SPAWN_SETPGROUP);
   setup |= ::posix_spawnattr_setpgroup(&attrs, 0);
-  std::array<char *, 4> argv{const_cast<char *>("/bin/sh"),
-                             const_cast<char *>("-c"),
-                             const_cast<char *>(command.c_str()), nullptr};
+  // Pass the directory and command as data to a fixed shell program.
+  const char *direct[] = {"/bin/sh", "-c", command.c_str(), nullptr};
+  const char *with_directory[] = {"/bin/sh", "-c", "cd -P \"$1\" && exec /bin/sh -c \"$2\"",
+                                  "sh", directory.c_str(), command.c_str(), nullptr};
+  auto argv = directory.empty() ? direct : with_directory;
   Child child;
   const auto started = setup ? setup
                              : ::posix_spawn(&child.pid, "/bin/sh", &actions,
-                                             &attrs, argv.data(), environ);
+                                             &attrs, const_cast<char **>(argv), environ);
   ::posix_spawnattr_destroy(&attrs);
   ::posix_spawn_file_actions_destroy(&actions);
   if (started) {
