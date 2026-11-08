@@ -264,6 +264,7 @@ if(BUILD_TESTING)
       --server $<TARGET_FILE:clang-tracer-server>
       --agent $<TARGET_FILE:clang_tracer_agent>
       --target $<TARGET_FILE:trace-target-pie>
+      --agent-logging
       --output-dir ${CMAKE_CURRENT_BINARY_DIR}/pie-test-results)
   set_tests_properties(grpc_native_pie_integration PROPERTIES TIMEOUT 120)
   add_test(NAME grpc_client_integration

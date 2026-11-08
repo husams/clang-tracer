@@ -13,6 +13,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -188,10 +189,20 @@ void verify_context_activation() {
     tracer::ContextActivationRequest context_only_request = request;
     context_only_request.source_lineage_id[0] = 0x78;
     context_only_request.file_name = "context-only-activation.cc";
+    context_only_request.callback_log =
+        [](const tracer::TraceContext *context, const char *text,
+           std::size_t size, tracer::LogLevel level) noexcept {
+          return context && context->call_id == 42 &&
+                 std::string_view(text, size) == "context log" &&
+                 level == tracer::LogLevel::Warning;
+        };
     context_only_request.source = R"CPP(
 namespace emitter {
 struct EventInterceptor {
-  void pre(const Call& call) { call.context().event("context.only"); }
+  void pre(const Call& call) {
+    if (!call.log("context log", tracer::LogLevel::Warning)) throw 7;
+    call.context().event("context.only");
+  }
 };
 }
 )CPP";

@@ -1112,8 +1112,13 @@ extern "C" bool clangtracer_context_post(void* storage,
   return source;
 }
 
-std::vector<ContextNativeAddress> native_addresses() {
+std::vector<ContextNativeAddress>
+native_addresses(decltype(&detail::tracer_enqueue_log) callback_log) {
   using namespace context_facade;
+  if (!callback_log) {
+    callback_log = [](const TraceContext *, const char *, std::size_t,
+                      LogLevel) noexcept { return false; };
+  }
   return {{"::tracer::context_facade::active_generation",
            reinterpret_cast<std::uintptr_t>(&active_generation)},
           {"::tracer::context_facade::current_context",
@@ -1121,7 +1126,9 @@ std::vector<ContextNativeAddress> native_addresses() {
           {"::tracer::context_facade::emit_event",
            reinterpret_cast<std::uintptr_t>(&emit_event)},
           {"::tracer::context_facade::active_thread_id",
-           reinterpret_cast<std::uintptr_t>(&active_thread_id)}};
+           reinterpret_cast<std::uintptr_t>(&active_thread_id)},
+          {"::tracer::detail::tracer_enqueue_log",
+           reinterpret_cast<std::uintptr_t>(callback_log)}};
 }
 
 std::string entry_declarations() {
@@ -1456,7 +1463,8 @@ activate_context_source(const ContextActivationRequest &request,
   callback_source = hooks_source + wrappers;
 
   auto native_imports = ContextNativeSymbol::catalog(
-      "#include \"context_facade.hpp\"\n", arguments, native_addresses());
+      "#include \"context_facade.hpp\"\n", arguments,
+      native_addresses(request.callback_log));
   if (!native_imports) {
     return fail("invalid_context_activation: native facade catalog failed: " +
                 error_text(native_imports.takeError()));

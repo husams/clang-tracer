@@ -543,6 +543,30 @@ Source code is trusted native code: target memory faults are not isolated, and
 initialization must avoid blocking, spawning threads, or changing loader/runtime
 state during compilation.
 
+## Injected agent diagnostics
+
+Set `CLANG_TRACER_AGENT_LOG` in the **target application's** environment before
+launching it. Use an absolute path in a directory writable by the target.
+
+```sh
+CLANG_TRACER_AGENT_LOG="$HOME/clang-tracer-agent.log" ./your-application
+```
+
+The agent appends probe preparation stages, stop outcomes, and changes in
+callback failure and event drop counts. Each record includes the target PID
+and probe ID. It reports the Linux errno for socket setup failures and the
+last failed event send. The agent creates a private log file or appends to an
+existing private regular file owned by the target user. Logging is off by
+default.
+
+Use `call.log("message")` or `call.log("message", tracer::LogLevel::Warning)`
+in an interceptor. Legacy callbacks can use `context.log(...)` on their
+`TraceContext`. Both return whether the message entered the bounded queue.
+The sender writes queued messages with their call ID and PRE or POST phase.
+Messages are capped at 192 bytes and control characters are replaced with
+`?`. Queued messages are best effort and may be lost if the target exits
+before the sender writes them.
+
 ## Client usage
 
 The client presents readable text in the terminal; it still sends gRPC requests
