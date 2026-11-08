@@ -163,6 +163,7 @@ int main(int argc, char **argv) {
     Collection populated;
     auto recovered_event = std::make_shared<EventData>();
     recovered_event->message.set_function_name("recovered_event");
+    recovered_event->message.mutable_stack()->add_frames()->set_pc(42);
     populated.events.emplace_back(recovered_event);
     const auto populated_address =
         std::to_string(reinterpret_cast<std::uintptr_t>(&populated));
@@ -172,6 +173,10 @@ int main(int argc, char **argv) {
     require(cpp.evaluate("tracer.print(e)") &&
                 output.str().find("recovered_event") != std::string::npos,
             "printing the redeclared event keeps the REPL usable");
+    require(cpp.evaluate("std::uint64_t frame_pc = 0;") &&
+                cpp.evaluate("for (const auto& frame : e.stack()) { frame_pc = frame.pc; }") &&
+                cpp.evaluate("if (frame_pc != 42) throw std::runtime_error(\"wrong stack frame\");"),
+            "the REPL can iterate an Event's captured frames");
     {
       int destroyed = 0;
       CppEngine cleanup(facade, {});
