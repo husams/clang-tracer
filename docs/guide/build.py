@@ -15,7 +15,7 @@ from pygments.util import ClassNotFound
 
 GUIDE = Path(__file__).resolve().parent
 ROOT = GUIDE.parent.parent
-GITHUB = "https://github.com/husams/clang-tracer/blob/main/"
+GITHUB = "https://github.com/husams/clang-tracer/blob/c++17/"
 CHAPTERS = {
     "Get started": {
         "user": "docs/guide/user.md",
@@ -24,9 +24,12 @@ CHAPTERS = {
     "Reference": {
         "commands": "docs/guide/commands.md",
         "developer": "docs/guide/developer.md",
+        "cpp17": "docs/guide/cpp17.md",
     },
     "Walkthroughs": {
         "install": "docs/build-rhel.md",
+        "gcc85": "docs/gcc85-compatibility.md",
+        "gcc85-results": "docs/gcc85-runtime-results.md",
         "repl": "docs/native-repl.md",
         "python": "python/README.md",
         "storage": "docs/event-storage.md",

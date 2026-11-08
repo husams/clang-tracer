@@ -8,7 +8,7 @@ Use the Python client or the native REPL facade to control a session. A callback
 | Server | Verify target identity, read ELF and DWARF, validate the ABI, coordinate injection, retain events and report loss. |
 | Agent | Run the JIT-compiled callback in the target and export captured data through a bounded transport. |
 
-See the [user guide](user.md) for installation and the first callback, and the [tutorials](tutorials.md) for complete workflows.
+See the [C++17 branch reference](cpp17.md#additional-client-and-callback-apis) for additional APIs. See the [user guide](user.md) for installation and the first callback, and the [tutorials](tutorials.md) for complete workflows.
 
 ## Python client API
 
@@ -183,6 +183,7 @@ with client.watch_events([session.id], timeout=30) as stream:
 | `EventRange::snapshot(), running(), error(), stop(), begin(), end()` | Copy a stable bounded collection, check the producer or error text, stop it while retaining data, or iterate a point-in-time snapshot. Release all range copies to release its capture reservation. |
 | `Event::sequence(), probe_id(), call_id(), phase(), function_name()` | Read the event cursor, emitting probe, call identity, phase, and name. |
 | `Event::has_result(), argument_value(index), result_value()` | Check return presence or decode a scalar into `ScalarValue` (bool, signed or unsigned 64-bit integer, or double). Void is present but has no scalar value. |
+| `Event::stack()` | Return an owned `std::vector<tracer_repl::StackFrame>` in capture order. Empty when the event has no stored frames. |
 | `Event::argument_snapshot(index), result_snapshot(), receiver_snapshot(), state_snapshot(index=0)` | Read owned structured data from an argument, return, method receiver, or context state. A receiver snapshot represents entry fields. |
 | `Event::argument_as<T>(index), result_as<T>(), state_as<T>(index=0)` | Decode a snapshot into an owning C++ value using `EventValue::as<T>()`. |
 | `Event::argument(index), result(), describe()` | Get display strings for an argument, return, or whole event. |
@@ -206,7 +207,7 @@ live.stop();
 
 ## Agent callback API
 
-For a typed callback, define one top-level explicit specialization of `Interceptor<Signature>` with either or both of `pre(const Call&)` and `post(const Call&)`. Write the original function type as `R(Args...)`, for example `int(int, int)`, or use `tracer::ResolvedSignature` to reuse the type recovered for the selected target. The callback compiler supplies the primary template, checks the specialization against the target, and exposes its argument and result types through `Call`. For a supported non-static method, the selector identifies the class and method qualifiers. The signature lists the return and explicit parameter types, and `call.self()` provides the receiver separately.
+For a typed callback, define one top-level explicit specialization of `Interceptor<Signature>` with either or both of `pre(const Call&)` and `post(const Call&)`. Write the original function type as `R(Args...)`, for example `int(int, int)`, or use `tracer::ResolvedSignature` to reuse the type recovered from DWARF or a prepared package for the selected target. The callback compiler supplies the primary template, checks the specialization against the target, and exposes its argument and result types through `Call`. For a supported non-static method, the selector identifies the class and method qualifiers. The signature lists the return and explicit parameter types, and `call.self()` provides the receiver separately.
 
 Hooks can return `void` or a `long long` callback value carried in the event. The original function still receives its arguments and returns its own result. Existing plain `class Interceptor` callbacks remain supported. Raw-symbol callbacks can use the entry-only `extern "C" long long trace_callback(const TraceContext&)` API.
 

@@ -49,7 +49,7 @@ The POST event now includes `new_sum`; the target still returns 42. Remove the a
 
 ## Trace a function template instantiation
 
-Extend the first lab's `target.cpp` with this function above `main`. Inside the existing newline branch, add `std::printf("echo<int>(42) = %d\n", echo<int>(42));` before the flush. Rebuild and restart the target using the same commands as the first lab.
+Save this function in `echo.hpp` and add `#include "echo.hpp"` to the first lab's `target.cpp`. Inside the existing newline branch, add `std::printf("echo<int>(42) = %d\n", echo<int>(42));` before the flush. Rebuild and restart the target. Use the [compilation database setup](#prepare-a-reusable-probe) with the compiler used to build the target.
 
 ```cpp
 template <class T>
@@ -75,13 +75,14 @@ public:
 };
 ```
 
-Start a fresh REPL and attach using the new PID. Quote the complete selector, including the concrete template arguments and function parameters. With `--prepared-mode off`, the tracer recovers the signature from DWARF.
+Start a fresh REPL and attach using the new PID. Quote the complete selector, including the concrete template arguments and function parameters. Build a prepared package from `echo.hpp` to supply the concrete signature on this branch.
 
 ```bash
 %attach 12345
 %symbols --filter "echo<"
-%probe validate "echo<int>(int)" --callback echo-hook.cpp --prepared-mode off
-%probe inject "echo<int>(int)" --callback echo-hook.cpp --prepared-mode off --print-result
+%probe prepare "echo<int>(int)" --include echo.hpp --translation-unit target.cpp --module ./target --output prepared-echo
+%probe validate "echo<int>(int)" --callback echo-hook.cpp --prepared prepared-echo --prepared-mode require
+%probe inject "echo<int>(int)" --callback echo-hook.cpp --prepared prepared-echo --prepared-mode require --print-result
 %collect --name "echo<int>(int)" --count 2 --timeout 30 --as echo_call
 %events list echo_call
 ```
@@ -111,7 +112,7 @@ Trigger a call during collection. The summary should show one PRE/POST pair. To 
 %events stats fullstack
 ```
 
-Trigger one call. The stack shows the entry and available caller frames, with native PC, function/module, and source location where recovered. Both phases describe the entry stack. `full` follows the supported unwind chain and can report a partial unwind. If a deep stack exceeds shared transport capacity, raise the managed server's `--context-event-bytes` and, if needed, `--context-transport-memory-bytes` before starting a new session. See the [stack lab sources](https://github.com/husams/clang-tracer/tree/main/examples/call-stacks) for application-only filtering and callback-side symbolization.
+Trigger one call. The stack shows the entry and available caller frames, with native PC, function/module, and source location where recovered. Both phases describe the entry stack. `full` follows the supported unwind chain and can report a partial unwind. If a deep stack exceeds shared transport capacity, raise the managed server's `--context-event-bytes` and, if needed, `--context-transport-memory-bytes` before starting a new session. See the [stack lab sources](https://github.com/husams/clang-tracer/tree/c++17/examples/call-stacks) for application-only filtering and callback-side symbolization.
 
 ## Capture in the background and query in C++
 
@@ -132,7 +133,7 @@ for (auto value : sums) std::cout << value << '\n';
 range.stop();
 ```
 
-Expect two values of 42 when both calls have finished. Try `first()` to get the first optional match, `take(1)` to limit iteration, or `enumerate()` to pair each retained event with an index. `%cpp load analysis.cpp` can run an analysis script and `%cpp reset` resets only the interpreter and its capture handles. See [event ranges and adaptors](../native-repl.md#event-ranges) for further examples.
+Expect two values of 42 when both calls have finished. Try `first()` to get the first optional match, `take(1)` to limit iteration, or `enumerate()` to pair each retained event with an index. `%cpp load analysis.cpp` can run an analysis script and `%cpp reset` resets only the interpreter and its capture handles. See [event ranges and adaptors](../native-repl.md#c17-event-ranges) for further examples.
 
 ## Record and replay offline
 
@@ -191,7 +192,7 @@ Rebuild and restart the target. Generate a package with a new output directory a
 %events show prepared_call --index 1
 ```
 
-Trigger one call and check for 42. `require` verifies that injection uses the package. Multiple `--include` options can bring in callback payload declarations. `--cwd` runs the probe command relative to another project directory, and `--extra-arg` passes supplemental compiler flags. Use the offline preparer from the [command reference](commands.md#offline-probe-preparation) for the equivalent shell workflow. Run the [prepared method lab](https://github.com/husams/clang-tracer/tree/main/examples/prepared-injectors) to capture a receiver and replay a custom typed event.
+Trigger one call and check for 42. `require` verifies that injection uses the package. Multiple `--include` options can bring in callback payload declarations. `--cwd` runs the probe command relative to another project directory, and `--extra-arg` passes supplemental compiler flags. Use the offline preparer from the [command reference](commands.md#offline-probe-preparation) for the equivalent shell workflow. Run the [prepared method lab](https://github.com/husams/clang-tracer/tree/c++17/examples/prepared-injectors) to capture a receiver and replay a custom typed event.
 
 ## Decode objects, containers, and method receivers
 
@@ -215,11 +216,11 @@ auto sample = tracer.batch("orders").at(0);
 auto order = sample.argument_as<app::Order>(0);
 ```
 
-Alternatively `%cpp import model.hpp --type app::Order` generates, caches, and loads a mapping in one step. Automatic mapping requires supported public members and an accessible default constructor. Use `EventCodec<T>` for construction through a factory, or `argument_snapshot(0).field("id")` to inspect fields without a mapping. For a method receiver, inspect `receiver_snapshot()` in the client and use `call.self()` in the agent. The [typed C++ argument example](https://github.com/husams/clang-tracer/tree/main/examples/order-arguments) covers references, pointers, headerless DWARF recovery, and opt-in application headers.
+Alternatively `%cpp import model.hpp --type app::Order` generates, caches, and loads a mapping in one step. Automatic mapping requires supported public members and an accessible default constructor. Use `EventCodec<T>` for construction through a factory, or `argument_snapshot(0).field("id")` to inspect fields without a mapping. For a method receiver, inspect `receiver_snapshot()` in the client and use `call.self()` in the agent. The [typed C++ argument example](https://github.com/husams/clang-tracer/tree/c++17/examples/order-arguments) covers references, pointers, headerless DWARF recovery, and opt-in application headers.
 
 ## Observe shared context and thread propagation
 
-Run the [shared-context example](https://github.com/husams/clang-tracer/tree/main/examples/shared-context) from a configured source checkout with examples enabled. Start the server and target, then install the same observer on the outer and worker functions.
+Run the [shared-context example](https://github.com/husams/clang-tracer/tree/c++17/examples/shared-context) from a configured source checkout with examples enabled. Start the server and target, then install the same observer on the outer and worker functions.
 
 ```bash
 cmake --build build-rhel --target shared-context-target
@@ -294,4 +295,4 @@ cd /usr/local/share/clang-tracer/examples/native-repl-jit
 ./run.sh --interactive
 ```
 
-The first run performs bulk trace setup, capture, SQLite recording, and offline C++ analysis. It reports `JIT_EXAMPLE_PASSED=3`. The interactive run lets you explore mapping inspection, function entry previews and observer reload. See the [example walkthrough](https://github.com/husams/clang-tracer/tree/main/examples/native-repl-jit).
+The first run performs bulk trace setup, capture, SQLite recording, and offline C++ analysis. It reports `JIT_EXAMPLE_PASSED=3`. The interactive run lets you explore mapping inspection, function entry previews and observer reload. See the [example walkthrough](https://github.com/husams/clang-tracer/tree/c++17/examples/native-repl-jit).

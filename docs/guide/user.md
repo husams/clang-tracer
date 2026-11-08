@@ -13,7 +13,7 @@ Start with the first probe below, then use the [command reference](commands.md) 
 
 ## Install and check the tools
 
-The main-branch native build requires Linux x86-64, a C++23 compiler, matching LLVM/Clang 21 or 22 development libraries, CMake, Protobuf, gRPC and SQLite development packages. The injected agent needs compatible runtime libraries on the target machine. Build the target with debug info, preserve its ELF or separate debug files, and use a compiler and ABI supported by the agent. The tracer must have permission to attach to the target under the host's Linux tracing policy.
+On the `c++17` branch, the native Linux x86-64 backend builds as C++20 and the native REPL builds as C++17. Use matching LLVM/Clang 21 or 22 development libraries, CMake, Protobuf, gRPC and SQLite development packages. The injected agent needs compatible runtime libraries on the target machine. Build the target with debug info, preserve its ELF or separate debug files, and use a compiler and ABI supported by the agent. The tracer must have permission to attach to the target under the host's Linux tracing policy.
 
 From the repository root, configure, build and install into a user-owned prefix. Replace the toolchain path with the matching LLVM/Clang installation.
 
@@ -26,7 +26,7 @@ clang-tracer-server --help
 clang-tracer-repl --help
 ```
 
-For a split LLVM installation, CMake options, staging, tarball and RPM packaging, see [Build and deploy on RHEL-compatible Linux](../build-rhel.md). If you already have the native package, put its binary directory on `PATH` and run the two help commands. The server finds its matching installed agent automatically. The native REPL starts and owns a private server unless you specify an endpoint.
+For a split LLVM installation, CMake options, staging, tarball and RPM packaging, see [Build and deploy on RHEL-compatible Linux](../build-rhel.md). For GCC 8.5 SDK targets, use the [SDK compatibility build](../gcc85-compatibility.md). If you already have the native package, put its binary directory on `PATH` and run the two help commands. The server finds its matching installed agent automatically. The native REPL starts and owns a private server unless you specify an endpoint.
 
 The Python client is installed separately. Use Python 3.12 or newer. Install from the repository or replace `./python` with your distribution's wheel.
 
@@ -52,7 +52,7 @@ Open `http://127.0.0.1:8000/` for the first command. For a wildcard bind, use th
 
 ## Create a target and a basic probe
 
-Work in a scratch directory that both terminals can access. Save this as `target.cpp`. The target prints its PID and waits for Enter so you control when the probe fires. It permits tracing from the second terminal for this demo process.
+Work in a scratch directory that both terminals can access. Save this as `target.cpp`. The target prints its PID and waits for Enter so you control when the probe fires. When the SDK headers expose `PR_SET_PTRACER`, the demo requests permission for a tracer in the second terminal.
 
 ```cpp
 #include <cstdio>
@@ -63,10 +63,12 @@ Work in a scratch directory that both terminals can access. Save this as `target
 __attribute__((noinline)) int add(int a, int b) { return a + b; }
 
 int main() {
+#ifdef PR_SET_PTRACER
   if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) == -1) {
     perror("PR_SET_PTRACER");
     return 1;
   }
+#endif
   std::printf("PID %ld | press Enter to call add, Ctrl+C to exit\n",
               static_cast<long>(getpid()));
   std::fflush(stdout);

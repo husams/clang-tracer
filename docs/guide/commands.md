@@ -1,6 +1,6 @@
 # Command reference
 
-Use the [first probe](user.md#create-a-target-and-a-basic-probe) for the examples below. Substitute its PID for `12345` and use actual session IDs, probe IDs, addresses, and tokens from your output.
+See [the C++17 branch reference](cpp17.md) for additional commands and options. Use the [first probe](user.md#create-a-target-and-a-basic-probe) for the examples below. Substitute its PID for `12345` and use actual session IDs, probe IDs, addresses, and tokens from your output.
 
 ## Native REPL startup
 
@@ -105,7 +105,7 @@ Inside the REPL, quote selectors and paths containing spaces. Commands start wit
 | `%events list sample --limit 10` | List indexed summaries. `--limit N` defaults to 20. |
 | `%events show sample --index 1` | Print one event and its values by zero-based index. |
 | `%events stack sample --index 0` | Print one event's full retained stack and capture status. |
-| `%events calls sample` | Pair PRE and POST, report durations and identify missing halves. |
+| `%events calls sample` | Pair PRE with POST or EXCEPTION, report durations and identify missing events. |
 | `%events stats sample` | Aggregate call counts, duration buckets, caller edges and loss per probe. |
 | `%events clear sample` | Release the named collection's buffer allocation. |
 | `%events open capture.db --as replayed` | Replay framed Protobuf or SQLite into a new named bounded collection. SQLite can load stored C++ types and mappings. |
@@ -116,7 +116,7 @@ Inside the REPL, quote selectors and paths containing spaces. Commands start wit
 | `--count N`, `--timeout SEC` | Stop after N matching events or at the deadline. Without a count, streams normally run until Ctrl+C. Counted streams default to a 30-second deadline. |
 | `--name NAME`, `--after CURSOR` | Match an exact selector, linkage name or custom event name and begin strictly after the cursor. Repeat names for an OR filter. |
 | `--session ID`, `--all` | Use one named session or every session. Omit both to use the selected session. |
-| `--probe ID`, `--phase PRE\|POST` | Narrow by probe ID or phase in the client. |
+| `--probe ID`, `--phase PRE\|POST\|EXCEPTION` | Narrow by probe ID or phase in the client. |
 | `--as NAME` | Name the retained live collection. Valid on `%events` and `%collect`. |
 
 Ctrl+C cancels active capture and preserves partial results. Trigger new calls from the target terminal while a synchronous capture waits. The [native REPL walkthrough](../native-repl.md) explains replay filters, stack attribution, retention and mapping details.
