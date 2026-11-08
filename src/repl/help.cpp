@@ -71,12 +71,15 @@ const CommandTopic commands[] = {
      "Verify and disassemble a function entry and show the copy-only detour window and bounded control flow."},
     {"probe prepare",
      "%probe prepare SELECTOR --include HEADER --output NEW_DIRECTORY\n"
-     "  [--compdb PATH] [--translation-unit FILE] [--module ELF] [--metadata-only] [--cwd DIRECTORY] [EXTRA COMPILER ARGUMENTS]",
+     "  [--compdb PATH] [--translation-unit FILE] [--module ELF] [--metadata-only] [--cwd DIRECTORY] [EXTRA COMPILER ARGUMENTS]\n"
+     "  or %probe prepare SELECTOR --signature TYPE --module ELF --output NEW_DIRECTORY [--member] [--metadata-only] [--cwd DIRECTORY]",
      "Build a reusable probe package from local source. Repeat --include for extra headers. "
      "Preparation uses compile_commands.json in the command's working directory by default. "
      "It prefers the first include's recorded compile command and falls back to the first source beside it. "
      "Use --module to pin the package to a specific build. "
-     "Use --metadata-only to skip the separate C++ adapter files.",
+     "Use --metadata-only to skip the separate C++ adapter files. "
+     "With --signature, supply the C++ result and explicit parameter types, for example 'const int&()'. "
+     "Qualified methods receive an opaque receiver. Pass --member for an unqualified instance method.",
      R"example(%probe prepare "demo::compute(int)" --include demo.hpp --output prepared)example"},
     {"probe resolve", "%probe resolve SELECTOR [RESOLUTION OPTIONS] [--cwd DIRECTORY]",
      "Resolve a selector in the selected target and show the available metadata.",
