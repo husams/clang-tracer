@@ -1,4 +1,5 @@
 #include <atomic>
+#include <chrono>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -7,6 +8,7 @@
 #include <type_traits>
 
 #include "context_engine.hpp"
+#include "tracer/compat.hpp"
 
 namespace ce = tracer::context_engine;
 void verify_engine_storage();
@@ -118,7 +120,7 @@ void nested_invocations_share_and_restore() {
       b.create_or_attach(r);
       require(context.binding_count() == 2, "nested attachment not pushed");
       ce::HookExit exit(context);
-      ce::HookAccess access(context, std::span(&data, 1));
+      ce::HookAccess access(context, ::tracer::compat::span(&data, 1));
       auto &injected = *static_cast<Data *>(access.ref(data));
       require(&injected == context.get(data), "injection/get alias differs");
       context.with(data, plus32, nullptr);
@@ -194,7 +196,7 @@ void context_only_consumers_and_complete_plan() {
   {
     ce::InvocationFrame b(context); // No constructor dependency.
     ce::HookExit exit(context);
-    ce::HookAccess access(context, std::span(&data, 1));
+    ce::HookAccess access(context, ::tracer::compat::span(&data, 1));
     rejects(ce::ErrorCode::unplanned_access, [&] { context.get(other); });
     rejects(ce::ErrorCode::active_access, [&] { context.init_scope(r); });
     require(context.get(data) == access.ref(data),
@@ -271,7 +273,7 @@ void end_on_failure_restores_parent_before_publication() {
           },
           &publication);
       try {
-        ce::HookAccess access(context, std::span(&data, 1));
+        ce::HookAccess access(context, ::tracer::compat::span(&data, 1));
         context.end_scope(1);
         rejects(ce::ErrorCode::repeated_end, [&] { context.end_scope(1); });
         require(static_cast<Data *>(context.get(data))->value == 42,
@@ -310,7 +312,7 @@ void borrowed_end_status_is_noexcept_under_payload_guard() {
     ce::InvocationFrame child(context);
     child.create_or_attach(r);
     ce::HookExit exit(context);
-    ce::HookAccess access(context, std::span(&data, 1));
+    ce::HookAccess access(context, ::tracer::compat::span(&data, 1));
     const auto status = context.try_end_scope(1);
     require(status == ce::ErrorCode::borrowed_end,
             "borrowed end status did not reject an attached scope");
@@ -575,7 +577,7 @@ void finalization_waits_until_all_thread_guards_release() {
   victim->create_or_attach(b);
   {
     ce::HookExit exit(guarded);
-    ce::HookAccess access(guarded, std::span(&data, 1));
+    ce::HookAccess access(guarded, ::tracer::compat::span(&data, 1));
     victim.reset();
     require(lifecycle == "AB",
             "unrelated payload finalized under a thread guard");
@@ -613,12 +615,27 @@ void closure_and_admission_race_cannot_resurrect_records() {
     while (!ready)
       std::this_thread::yield();
     race = true;
-    {
-      ce::HookExit exit(context);
-      context.end_scope(1);
-    }
+    // Capture and closure intentionally compete for the admission gate.
+    // Closing uses a nonblocking try-lock, so contention is a retry rather
+    // than a failed lifecycle invariant. Release the hook before yielding.
+    auto close_status = ce::ErrorCode::active_access;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(5);
+    do {
+      {
+        ce::HookExit exit(context);
+        close_status = context.try_end_scope(1);
+      }
+      if (close_status != ce::ErrorCode::active_access)
+        break;
+      std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < deadline);
+    // Always release and join the worker before reporting an unexpected
+    // result; unwinding past its joinable thread would call terminate().
     closed = true;
     worker.join();
+    require(close_status == ce::ErrorCode::ok,
+            "closure/admission race could not close the scope before deadline");
     require(!resurrected && ledger->outstanding() == 0 && lifecycle == "Aa",
             "closure/admission race resurrected state or leaked ownership");
   }

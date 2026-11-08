@@ -1,6 +1,6 @@
 # Build and deploy on RHEL-compatible Linux
 
-The native backend requires Linux x86-64, C++20 and matching LLVM/Clang 21 or 22
+The native backend requires Linux x86-64, C++23 and matching LLVM/Clang 21 or 22
 development libraries. The scripts have been verified on Rocky Linux 9.8 with
 LLVM/Clang 21.1.8. Red Hat Enterprise Linux itself has not been tested.
 

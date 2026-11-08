@@ -1,11 +1,11 @@
 #pragma once
 
-#include "context_stream.hpp"
-#include "tracer/protocol.hpp"
-
 #include <cstddef>
 #include <memory>
-#include <span>
+
+#include "context_stream.hpp"
+#include "tracer/compat.hpp"
+#include "tracer/protocol.hpp"
 
 namespace tracer::context_delivery {
 
@@ -19,9 +19,8 @@ public:
   ContextAgentDelivery(const ContextAgentDelivery &) = delete;
   ContextAgentDelivery &operator=(const ContextAgentDelivery &) = delete;
 
-  bool try_publish_capture(
-      std::span<const std::byte> event_record,
-      const std::shared_ptr<const void> &schema_lease) noexcept;
+  bool try_publish_capture(::tracer::compat::span<const std::byte> event_record,
+                           const std::shared_ptr<const void>& schema_lease) noexcept;
   ContextHookRing &hook_ring() noexcept;
   bool ready() const noexcept;
   bool paused() const noexcept;

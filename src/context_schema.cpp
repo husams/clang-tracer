@@ -11,11 +11,14 @@
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/DeclTemplate.h>
+#include <clang/AST/RecordLayout.h>
 #include <clang/AST/Type.h>
 #include <clang/Basic/SourceManager.h>
 #include <google/protobuf/descriptor.pb.h>
 #include <llvm/ADT/SmallString.h>
 #include <llvm/Support/FileSystem.h>
+
+#include "tracer/compat.hpp"
 
 namespace tracer::context_engine {
 namespace {
@@ -24,9 +27,16 @@ using MP = google::protobuf::DescriptorProto;
 using FP = google::protobuf::FileDescriptorProto;
 using FDS = google::protobuf::FileDescriptorSet;
 
+std::string record_spelling(const clang::CXXRecordDecl *record) {
+  clang::PrintingPolicy policy(record->getASTContext().getLangOpts());
+  policy.SuppressTagKeyword = true;
+  return clang::QualType(record->getTypeForDecl(), 0)
+      .getCanonicalType().getAsString(policy);
+}
+
 std::string canonical(clang::QualType t) {
   if (const auto *r = t.getCanonicalType()->getAsCXXRecordDecl()) {
-    return r->getQualifiedNameAsString();
+    return record_spelling(r);
   }
   return t.getCanonicalType().getAsString();
 }
@@ -68,7 +78,7 @@ std::string normalize_std(std::string s) {
   p = 0;
   while ((p = s.find("std::basic_string", p)) != std::string::npos) {
     const auto after = p + 17;
-    if (after >= s.size() || s[after] != '<') {
+    if (after >= s.size() || (s[after] != '<' && s[after] != '_')) {
       s.insert(after, "<char>");
       p = after + 6;
     } else {
@@ -101,8 +111,9 @@ bool physical_standard_library_header(clang::ASTContext &ast,
       continue;
     llvm::SmallString<256> canonical_root;
     if (!llvm::sys::fs::real_path(pair.first, canonical_root) &&
-        path.starts_with(llvm::StringRef(canonical_root).str() + "/"))
+        ::tracer::compat::starts_with(path, llvm::StringRef(canonical_root).str() + "/")) {
       return true;
+    }
   }
   return false;
 }
@@ -127,6 +138,25 @@ clang::QualType arg(const clang::ClassTemplateSpecializationDecl *s,
              : clang::QualType{};
 }
 
+bool owning_snapshot_pointer(const std::string &name) {
+  return name == "std::unique_ptr" || name == "std::shared_ptr";
+}
+
+bool snapshot_pointee(clang::QualType type) {
+  return !type.isNull() && type->isObjectType() && !type->isArrayType() &&
+         !type->isIncompleteType() && !type.isVolatileQualified();
+}
+
+SchemaField snapshot_scalar(std::string name, std::uint32_t number,
+                            SchemaKind kind, unsigned width) {
+  SchemaField field;
+  field.name = std::move(name);
+  field.number = number;
+  field.kind = kind;
+  field.bit_width = width;
+  return field;
+}
+
 struct Builder {
   clang::ASTContext &ast;
   SchemaLimits limits;
@@ -138,6 +168,7 @@ struct Builder {
       cache;
   std::size_t fields = 0, messages = 0;
   std::string error;
+  bool snapshot = false;
 
   bool system_default_specialization(
       const clang::ClassTemplateSpecializationDecl *s) const {
@@ -176,7 +207,8 @@ struct Builder {
 
   void collect_fields(const clang::CXXRecordDecl *r, SchemaMessage &out,
                       unsigned depth, std::uint32_t &id,
-                      std::unordered_set<const clang::CXXRecordDecl *> &seen) {
+                      std::unordered_set<const clang::CXXRecordDecl *> &seen,
+                      std::unordered_map<std::string, std::pair<std::size_t, std::string>> &owners) {
     if (!r || !r->hasDefinition() || !error.empty()) {
       return;
     }
@@ -199,11 +231,13 @@ struct Builder {
       }
       auto *br = bt->getAsCXXRecordDecl();
       if (br && br->hasDefinition()) {
-        collect_fields(br, out, depth, id, seen);
+        collect_fields(br, out, depth, id, seen, owners);
       }
     }
     for (const auto *f : r->fields()) {
-      if (f->isBitField()) {
+      if (snapshot && f->isUnnamedBitField())
+        continue;
+      if (f->isBitField() && !snapshot) {
         error = "bit-field state member unsupported";
         return;
       }
@@ -211,7 +245,16 @@ struct Builder {
       if (!error.empty()) {
         return;
       }
-      if (std::any_of(
+      if (snapshot) {
+        const auto owner = record_spelling(r);
+        const auto [it, inserted] = owners.try_emplace(sf.name, out.fields.size(), owner);
+        if (!inserted) {
+          auto &first = out.fields[it->second.first];
+          if (first.name == sf.name)
+            first.name = it->second.second + "::" + first.name;
+          sf.name = owner + "::" + sf.name;
+        }
+      } else if (std::any_of(
               out.fields.begin(), out.fields.end(),
               [&](const auto &prior) { return prior.name == sf.name; })) {
         error = "ambiguous inherited state member: " + sf.name;
@@ -264,6 +307,10 @@ struct Builder {
       return out;
     }
     if (t->isIntegerType()) {
+      if (snapshot && (ast.getTypeSize(t) > 64 || t->isBitIntType())) {
+        error = "unsupported integer width in snapshot: " + name;
+        return out;
+      }
       out.kind = t->isUnsignedIntegerType() ? SchemaKind::unsigned_integer
                                             : SchemaKind::signed_integer;
       out.bit_width = ast.getTypeSize(t);
@@ -277,6 +324,21 @@ struct Builder {
       out.kind = SchemaKind::float64;
       return out;
     }
+    if (snapshot && t->isPointerType()) {
+      out.kind = SchemaKind::unsigned_integer;
+      out.bit_width = ast.getTypeSize(t);
+      return out;
+    }
+    if (snapshot) {
+      if (const auto *array = ast.getAsConstantArrayType(t)) {
+        out.kind = SchemaKind::array;
+        out.repeated = true;
+        out.fixed_count = array->getSize().getLimitedValue();
+        out.value = std::make_shared<SchemaField>(
+            describe(array->getElementType(), name + "[]", 1, depth + 1));
+        return out;
+      }
+    }
     if (t->isPointerType() || t->isReferenceType() ||
         t->isMemberPointerType()) {
       error = "unsupported pointer/reference field: " + name;
@@ -287,6 +349,92 @@ struct Builder {
     if (s && tn.rfind("std::", 0) == 0 && !system_default_specialization(s)) {
       error =
           "user-defined standard-library specialization is unsupported: " + tn;
+      return out;
+    }
+    if (snapshot && (owning_snapshot_pointer(tn) || tn == "std::weak_ptr" ||
+                     tn == "std::variant")) {
+      auto record = std::make_shared<SchemaMessage>();
+      record->cpp_type = out.cpp_type;
+      record->full_name = record->cpp_type;
+      const auto add_optional = [&](clang::QualType type, std::string field) {
+        SchemaField optional;
+        optional.name = std::move(field);
+        optional.number = record->fields.size() + 1;
+        optional.kind = SchemaKind::optional;
+        optional.optional = true;
+        optional.value = std::make_shared<SchemaField>(
+            describe(type, optional.name, 1, depth + 1));
+        record->fields.push_back(std::move(optional));
+      };
+      if (tn == "std::variant") {
+        record->fields.push_back(snapshot_scalar("index", 1, SchemaKind::unsigned_integer, 64));
+        for (const auto &element : s->getTemplateArgs()[0].pack_elements()) {
+          if (!error.empty())
+            break;
+          add_optional(element.getAsType(),
+                       "alternative_" + std::to_string(record->fields.size() - 1));
+        }
+      } else if (tn == "std::weak_ptr") {
+        record->fields.push_back(snapshot_scalar("expired", 1, SchemaKind::boolean, 1));
+      } else {
+        if (tn == "std::unique_ptr") {
+          const auto *deleter = spec(arg(s, 1));
+          if (template_name(deleter) != "std::default_delete" ||
+              !system_default_specialization(deleter) ||
+              arg(deleter, 0).getCanonicalType() != arg(s, 0).getCanonicalType()) {
+            error = "smart pointer snapshot requires std::default_delete: " + name;
+            return out;
+          }
+        }
+        record->fields.push_back(snapshot_scalar("address", 1, SchemaKind::unsigned_integer, 64));
+        if (snapshot_pointee(arg(s, 0)))
+          add_optional(arg(s, 0), "value");
+      }
+      out.kind = SchemaKind::message;
+      out.message = std::move(record);
+      return out;
+    }
+    if (snapshot && tn.empty()) {
+      const auto *record = t->getAsCXXRecordDecl();
+      if (record && normalize_std(record->getQualifiedNameAsString()) == "std::monostate" &&
+          physical_standard_library_header(ast, record->getLocation())) {
+        auto empty = std::make_shared<SchemaMessage>();
+        empty->cpp_type = out.cpp_type;
+        empty->full_name = empty->cpp_type;
+        out.kind = SchemaKind::message;
+        out.message = std::move(empty);
+        return out;
+      }
+    }
+    if (snapshot && (tn == "std::pair" || tn == "std::tuple")) {
+      auto record = std::make_shared<SchemaMessage>();
+      record->cpp_type = out.cpp_type;
+      record->full_name = record->cpp_type;
+      const auto add = [&](clang::QualType type, const std::string &field) {
+        record->fields.push_back(describe(type, field, record->fields.size() + 1,
+                                          depth + 1));
+      };
+      if (tn == "std::pair") {
+        add(arg(s, 0), "first");
+        add(arg(s, 1), "second");
+      } else {
+        for (const auto &element : s->getTemplateArgs()[0].pack_elements())
+          add(element.getAsType(), "item_" + std::to_string(record->fields.size()));
+      }
+      out.kind = SchemaKind::message;
+      out.message = std::move(record);
+      return out;
+    }
+    if (snapshot && tn == "std::basic_string_view") {
+      const auto character = arg(s, 0);
+      const auto *traits = spec(arg(s, 1));
+      if (!character->isCharType() || !traits ||
+          template_name(traits) != "std::char_traits" ||
+          !system_default_specialization(traits)) {
+        error = "unsupported string_view specialization: " + name;
+        return out;
+      }
+      out.kind = SchemaKind::string;
       return out;
     }
     if (tn.rfind("std::basic_string", 0) == 0) {
@@ -458,7 +606,7 @@ struct Builder {
   std::shared_ptr<const SchemaMessage> message(const clang::CXXRecordDecl *r,
                                                unsigned depth) {
     auto result = std::make_shared<SchemaMessage>();
-    result->cpp_type = r->getQualifiedNameAsString();
+    result->cpp_type = record_spelling(r);
     result->full_name = result->cpp_type;
     if (auto i = cache.find(r); i != cache.end()) {
       return i->second;
@@ -475,7 +623,8 @@ struct Builder {
     active.insert(r);
     std::uint32_t id = 1;
     std::unordered_set<const clang::CXXRecordDecl *> seen;
-    collect_fields(r, *result, depth, id, seen);
+    std::unordered_map<std::string, std::pair<std::size_t, std::string>> owners;
+    collect_fields(r, *result, depth, id, seen, owners);
     active.erase(r);
     cache.emplace(r, result);
     return result;
@@ -495,6 +644,7 @@ std::string ident(std::string_view text) {
 
 struct DescriptorEmitter {
   FP &file;
+  bool snapshot = false;
   std::unordered_set<std::string> emitted_messages, emitted_enums;
 
   std::string full(std::string_view n) {
@@ -674,11 +824,13 @@ struct DescriptorEmitter {
               f.name.begin(), f.name.end(),
               [](unsigned char c) { return std::isalnum(c) || c == '_'; }) &&
           !std::isdigit(static_cast<unsigned char>(f.name.front()));
-      x->set_name(simple ? f.name : "field_" + std::to_string(f.number));
+      x->set_name(snapshot || !simple ? "field_" + std::to_string(f.number) : f.name);
+      if (snapshot)
+        x->set_json_name(f.name);
       x->set_number(f.number);
       x->set_label(f.repeated ? FD::LABEL_REPEATED : FD::LABEL_OPTIONAL);
       set_type(f, m.cpp_type + "." + f.name, x);
-      if (!simple) {
+      if (!snapshot && !simple) {
         auto *opt = x->mutable_options()->add_uninterpreted_option();
         auto *part = opt->add_name();
         part->set_name_part("tracer_cpp_field_name");
@@ -772,9 +924,9 @@ void hash_length_prefixed(std::uint64_t &hash, std::string_view value) {
 }
 } // namespace
 
-std::string compute_schema_revision_id(
-    std::string_view descriptor_bytes, const StateFamilyKey &family,
-    std::string_view root_type, std::span<const std::string> container_roles) {
+std::string compute_schema_revision_id(std::string_view descriptor_bytes,
+                                       const StateFamilyKey& family, std::string_view root_type,
+                                       ::tracer::compat::span<const std::string> container_roles) {
   std::uint64_t hash = 1469598103934665603ULL;
   hash_length_prefixed(hash, "clang-tracer-context-schema-revision-v1");
   hash_length_prefixed(hash, descriptor_bytes);
@@ -812,7 +964,9 @@ SchemaRecord::SchemaRecord(StateFamilyKey f, std::string root, std::string rev,
 }
 
 CodecSourceResult
-render_state_codec_sources(std::span<const clang::CXXRecordDecl *const> roots) {
+render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* const> roots,
+                           CodecAccess access_policy) {
+  const bool snapshot = access_policy == CodecAccess::snapshot_members;
   CodecSourceResult result;
   std::vector<const clang::CXXRecordDecl *> records;
   std::unordered_set<const clang::CXXRecordDecl *> done, active;
@@ -826,6 +980,12 @@ render_state_codec_sources(std::span<const clang::CXXRecordDecl *const> roots) {
     return false;
   };
   gather_type = [&](clang::QualType t) {
+    if (snapshot) {
+      if (const auto *array = t->getAsArrayTypeUnsafe()) {
+        gather_type(array->getElementType());
+        return;
+      }
+    }
     if (auto *s = spec(t)) {
       auto n = template_name(s);
       if (n == "std::optional" || n == "std::array" || n == "std::vector" ||
@@ -834,7 +994,16 @@ render_state_codec_sources(std::span<const clang::CXXRecordDecl *const> roots) {
         gather_type(arg(s, 0));
         return;
       }
-      if (n == "std::map" || n == "std::unordered_map") {
+      if (snapshot && owning_snapshot_pointer(n) && snapshot_pointee(arg(s, 0))) {
+        gather_type(arg(s, 0));
+        return;
+      }
+      if (snapshot && (n == "std::tuple" || n == "std::variant")) {
+        for (const auto &element : s->getTemplateArgs()[0].pack_elements())
+          gather_type(element.getAsType());
+        return;
+      }
+      if (n == "std::map" || n == "std::unordered_map" || (snapshot && n == "std::pair")) {
         gather_type(arg(s, 0));
         gather_type(arg(s, 1));
         return;
@@ -875,7 +1044,7 @@ render_state_codec_sources(std::span<const clang::CXXRecordDecl *const> roots) {
         result.error = "unsupported state base class";
         return;
       }
-      if (base.getAccessSpecifier() != clang::AS_public &&
+      if (!snapshot && base.getAccessSpecifier() != clang::AS_public &&
           !(base.getAccessSpecifier() == clang::AS_none && r->isStruct())) {
         result.error = "non-public state base is unsupported by automatic "
                        "codec generation";
@@ -898,48 +1067,100 @@ render_state_codec_sources(std::span<const clang::CXXRecordDecl *const> roots) {
   }
   std::ostringstream source;
   source << "namespace tracer::context_engine {\n";
-  std::function<void(const clang::CXXRecordDecl *, std::uint32_t &)> fields =
-      [&](const clang::CXXRecordDecl *r, std::uint32_t &number) {
-        for (const auto &base : r->bases()) {
-          if (is_marker(base.getType())) {
-            continue;
-          }
-          auto *br = base.getType()->getAsCXXRecordDecl();
-          if (br) {
-            source << "  if (!Codec<::" << br->getQualifiedNameAsString()
-                   << ">::write_fields(w, static_cast<const ::"
-                   << br->getQualifiedNameAsString()
-                   << "&>(value), budget, field_number)) return false;\n";
-          }
+  std::size_t next_tag = 0;
+  if (snapshot) {
+    source << "namespace snapshot_access {\n"
+              "template<class Tag, auto Member> struct Grant {\n"
+              "  friend constexpr auto member(Tag) { return Member; }\n"
+              "};\n"
+              "template<class T> T bit_field(const void* object, unsigned offset, unsigned width) {\n"
+              "  const auto* bytes = static_cast<const unsigned char*>(object);\n"
+              "  std::uint64_t bits = 0;\n"
+              "  for (unsigned i = 0; i < width; ++i)\n"
+              "    bits |= std::uint64_t((bytes[(offset+i)/8] >> ((offset+i)%8)) & 1) << i;\n"
+              "  if constexpr (std::is_enum_v<T>) {\n"
+              "    return static_cast<T>(bit_field<std::underlying_type_t<T>>(object, offset, width));\n"
+              "  } else if constexpr (std::is_signed_v<T>) {\n"
+              "    const auto sign = std::uint64_t(1) << (width-1);\n"
+              "    return static_cast<T>(static_cast<std::int64_t>((bits ^ sign) - sign));\n"
+              "  } else { return static_cast<T>(bits); }\n"
+              "}\n}\n";
+  }
+  for (const auto *record : records) {
+    const auto type_name = record_spelling(record);
+    std::ostringstream fields;
+    std::unordered_map<const clang::CXXRecordDecl *, bool> seen_bases;
+    const auto emit_fields = [&](auto &&emit, const clang::CXXRecordDecl *r,
+                                 const std::string &object, bool virtual_base) -> void {
+      r = r->getDefinition();
+      const auto [previous, inserted] = seen_bases.emplace(r, virtual_base);
+      if (!inserted) {
+        if (!virtual_base || !previous->second)
+          result.error = "repeated non-virtual snapshot base: " + record_spelling(r);
+        return;
+      }
+      for (const auto &base : r->bases()) {
+        if (is_marker(base.getType()))
+          continue;
+        const auto *br = base.getType()->getAsCXXRecordDecl();
+        const auto base_name = record_spelling(br);
+        if (snapshot) {
+          // An otherwise valid derived-to-base reference conversion can
+          // ignore base access with the explicit cast syntax.
+          emit(emit, br, "((const ::" + base_name + "&)" + object + ")",
+               base.isVirtual());
+        } else {
+          fields << "  if (!Codec<::" << base_name
+                 << ">::write_fields(w, static_cast<const ::" << base_name
+                 << "&>(value), budget, field_number)) return false;\n";
         }
-        for (const auto *f : r->fields()) {
-          clang::AccessSpecifier access = f->getAccess();
-          if (access == clang::AS_none) {
-            access = r->isStruct() ? clang::AS_public : clang::AS_private;
-          }
-          if (access != clang::AS_public) {
-            result.error =
-                "non-public state member cannot be automatically serialized: " +
-                f->getNameAsString();
+      }
+      for (const auto *field : r->fields()) {
+        if (snapshot && field->isUnnamedBitField())
+          continue;
+        auto access = field->getAccess();
+        if (access == clang::AS_none)
+          access = r->isStruct() ? clang::AS_public : clang::AS_private;
+        const auto name = field->getNameAsString();
+        std::string expression = object + "." + name;
+        if (snapshot && field->isBitField()) {
+          auto &ast = r->getASTContext();
+          const auto width = std::min<std::uint64_t>(field->getBitWidthValue(),
+                                                     ast.getTypeSize(field->getType()));
+          if (!width || width > 64) {
+            result.error = "unsupported snapshot bit-field width: " + name;
             return;
           }
-          source << "  if (!encode_value(w, field_number++, value."
-                 << f->getNameAsString() << ", budget)) return false;\n";
-          ++number;
+          expression = "snapshot_access::bit_field<" + canonical(field->getType()) +
+                       ">(__builtin_addressof(" + object + "), " +
+                       std::to_string(ast.getASTRecordLayout(r).getFieldOffset(field->getFieldIndex())) +
+                       ", " + std::to_string(width) + ")";
+        } else if (access != clang::AS_public) {
+          if (!snapshot || field->getType()->isReferenceType()) {
+            result.error = "non-public member cannot be automatically serialized: " + name;
+            return;
+          }
+          const auto tag = "Tag" + std::to_string(next_tag++);
+          // Access is checked on uses of the resulting pointer. The
+          // explicit instantiation itself can name a private member.
+          source << "namespace snapshot_access {\nstruct " << tag
+                 << " { friend constexpr auto member(" << tag << "); };\n"
+                 << "template struct Grant<" << tag << ", &::" << record_spelling(r)
+                 << "::" << name << ">;\n}\n";
+          expression = object + ".*member(snapshot_access::" + tag + "{})";
         }
-      };
-  for (const auto *r : records) {
-    std::uint32_t number = 1;
-    const auto type_name = r->getQualifiedNameAsString();
+        fields << "  if (!encode_value(w, field_number++, " << expression
+               << ", budget)) return false;\n";
+      }
+    };
+    emit_fields(emit_fields, record, "value", false);
+    if (!result.error.empty())
+      return result;
     source << "template <> struct Codec<::" << type_name << "> {\n"
            << " static bool write_fields(BoundedProtoWriter& w, const ::"
            << type_name
            << "& value, EncodeBudget& budget, std::uint32_t& field_number) "
-              "noexcept {\n";
-    fields(r, number);
-    if (!result.error.empty()) {
-      return result;
-    }
+              "noexcept {\n" << fields.str();
     source << "  return true;\n }\n"
            << " static bool write(BoundedProtoWriter& w, std::uint32_t field, "
               "const ::"
@@ -959,10 +1180,11 @@ CodecSourceResult render_state_codec_source(const clang::CXXRecordDecl &root) {
   return render_state_codec_sources(roots);
 }
 
-CodecSourceResult render_context_codec_sources(
-    clang::ASTContext &ast,
-    std::span<const clang::CXXRecordDecl *const> state_roots,
-    std::span<const clang::QualType> payload_roots) {
+CodecSourceResult
+render_context_codec_sources(clang::ASTContext& ast,
+                             ::tracer::compat::span<const clang::CXXRecordDecl* const> state_roots,
+                             ::tracer::compat::span<const clang::QualType> payload_roots,
+                             CodecAccess access_policy) {
   std::vector<const clang::CXXRecordDecl *> roots(state_roots.begin(),
                                                   state_roots.end());
   std::unordered_set<const clang::CXXRecordDecl *> seen(roots.begin(),
@@ -984,7 +1206,19 @@ CodecSourceResult render_context_codec_sources(
         visit(arg(special, 0));
         return;
       }
-      if (name == "std::map" || name == "std::unordered_map") {
+      if (access_policy == CodecAccess::snapshot_members && owning_snapshot_pointer(name) &&
+          snapshot_pointee(arg(special, 0))) {
+        visit(arg(special, 0));
+        return;
+      }
+      if (access_policy == CodecAccess::snapshot_members &&
+          (name == "std::tuple" || name == "std::variant")) {
+        for (const auto &element : special->getTemplateArgs()[0].pack_elements())
+          visit(element.getAsType());
+        return;
+      }
+      if (name == "std::map" || name == "std::unordered_map" ||
+          (access_policy == CodecAccess::snapshot_members && name == "std::pair")) {
         visit(arg(special, 0));
         visit(arg(special, 1));
         return;
@@ -1006,11 +1240,12 @@ CodecSourceResult render_context_codec_sources(
   for (const auto payload : payload_roots) {
     visit(payload);
   }
-  return render_state_codec_sources(roots);
+  return render_state_codec_sources(roots, access_policy);
 }
 
 CodecSourceResult render_payload_codec_source(clang::ASTContext &ast,
-                                              clang::QualType payload) {
+                                              clang::QualType payload,
+                                              CodecAccess access_policy) {
   CodecSourceResult result;
   const auto type = payload.getCanonicalType().getAsString();
   if (type.empty()) {
@@ -1018,13 +1253,14 @@ CodecSourceResult render_payload_codec_source(clang::ASTContext &ast,
     return result;
   }
   Builder validator{ast, SchemaLimits{}};
+  validator.snapshot = access_policy == CodecAccess::snapshot_members;
   (void)validator.describe(payload, "value", 1, 0);
   if (!validator.error.empty()) {
     result.error = std::move(validator.error);
     return result;
   }
   const clang::QualType payload_roots[] = {payload};
-  const auto generated = render_context_codec_sources(ast, {}, payload_roots);
+  const auto generated = render_context_codec_sources(ast, {}, payload_roots, access_policy);
   if (!generated) {
     result.error = generated.error;
     return result;
@@ -1041,8 +1277,8 @@ CodecSourceResult render_payload_codec_source(clang::ASTContext &ast,
 }
 
 std::vector<RevisionField>
-query_field_path(std::span<const std::shared_ptr<const SchemaRecord>> revisions,
-                 std::span<const std::string_view> path) {
+query_field_path(::tracer::compat::span<const std::shared_ptr<const SchemaRecord>> revisions,
+                 ::tracer::compat::span<const std::string_view> path) {
   std::vector<RevisionField> out;
   out.reserve(revisions.size());
   const StateFamilyKey *family = nullptr;
@@ -1300,7 +1536,8 @@ SchemaResult build_state_schema(clang::ASTContext &ast,
 
 SchemaResult build_payload_schema(clang::ASTContext &ast,
                                   clang::QualType payload,
-                                  StateFamilyKey family, SchemaLimits limits) {
+                                  StateFamilyKey family, SchemaLimits limits,
+                                  CodecAccess access_policy) {
   SchemaResult result;
   const auto payload_type = canonical_with_template_arguments(payload);
   if (payload.isNull() || payload_type.empty()) {
@@ -1324,6 +1561,7 @@ SchemaResult build_payload_schema(clang::ASTContext &ast,
     return result;
   }
   Builder b{ast, limits};
+  b.snapshot = access_policy == CodecAccess::snapshot_members;
   auto *file = b.files.add_file();
   file->set_name("state_schema.proto");
   file->set_package("tracer.generated.state");
@@ -1401,7 +1639,7 @@ SchemaResult build_payload_schema(clang::ASTContext &ast,
     result.error = "duplicate generated container role";
     return result;
   }
-  DescriptorEmitter emitter{*file};
+  DescriptorEmitter emitter{*file, b.snapshot};
   emitter.emit(*root);
   const auto root_name = emitter.message_name(root->cpp_type);
   const auto root_full = "tracer.generated.state." + root_name;

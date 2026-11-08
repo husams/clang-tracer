@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
-#include <span>
 #include <string>
 #include <vector>
 
@@ -13,6 +12,7 @@
 #include "context_engine.hpp"
 #include "context_owner.hpp"
 #include "context_schema.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer {
 
@@ -92,11 +92,10 @@ public:
   ContextRegistry(const ContextRegistry&) = delete;
   ContextRegistry& operator=(const ContextRegistry&) = delete;
 
-  ContextRegistryResult
-  register_owner(const std::array<std::uint8_t, 16>& source_lineage_id,
-                 std::shared_ptr<const PrivateContextCode> owner_code,
-                 const GeneratedContextOwner& generated,
-                 std::span<const std::shared_ptr<const context_engine::SchemaRecord>> schemas);
+  ContextRegistryResult register_owner(
+      const std::array<std::uint8_t, 16>& source_lineage_id,
+      std::shared_ptr<const PrivateContextCode> owner_code, const GeneratedContextOwner& generated,
+      ::tracer::compat::span<const std::shared_ptr<const context_engine::SchemaRecord>> schemas);
 
   std::shared_ptr<const RegisteredContextScope>
   find_scope(const std::array<std::uint8_t, 16>& source_lineage_id,

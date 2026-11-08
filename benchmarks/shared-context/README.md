@@ -27,7 +27,7 @@ The harness expects CPUs 2–5 for targets and CPUs 6–7 for servers.
 Compile the same frozen workload for both revisions, using the same flags:
 
 ```sh
-clang++ -std=c++20 -O2 -g -fno-omit-frame-pointer \
+clang++ -std=c++23 -O2 -g -fno-omit-frame-pointer \
   -fno-optimize-sibling-calls -fcf-protection=none -pthread \
   "$BENCH_ROOT/fixture/target.cpp" -o "$BENCH_ROOT/fixture/target"
 ```

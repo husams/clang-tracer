@@ -1,5 +1,6 @@
 #include "history.hpp"
 
+
 #include <utility>
 #include <unistd.h>
 
@@ -42,12 +43,26 @@ const OpaqueItem *via_opaque(const OpaqueItem *item, int tag) {
   return item;
 }
 
+int uses_toolchain_headers(const std::error_code *error, const struct tm *time) {
+  return error && time ? 1 : 0;
+}
+
 } // namespace prepared_history
 
+HFW::HfwManager::Item HFW::HfwManager::createItem() {
+  return Item{seed + 2, ItemKind::Widget, {5}};
+}
+
+HFW::HfwManager::ItemBox<int> HFW::HfwManager::createBox() {
+  return ItemBox<int>{17};
+}
 int main() {
   using namespace prepared_history;
   const HistoryItem item;
   const OpaqueItem opaque{3};
+  HFW::HfwManager manager;
+  const std::error_code toolchain_error;
+  const struct tm toolchain_time{};
   for (;;) {
     copies = moves = destructions = 0;
     if (via_pointer(nullptr, 1) || via_pointer(&item, 1) != &item ||
@@ -60,6 +75,15 @@ int main() {
     }
     if (copies != 1 || moves != 1 || destructions != 2)
       return 3;
+    const auto created = manager.createItem();
+    if (created.id != 73 || static_cast<int>(created.kind) != 3 ||
+        created.details.quantity != 5)
+      return 4;
+    const auto box = manager.createBox();
+    if (box.value != 17)
+      return 5;
+    if (uses_toolchain_headers(&toolchain_error, &toolchain_time) != 1)
+      return 6;
     ::usleep(100000);
   }
 }

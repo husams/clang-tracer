@@ -3,11 +3,14 @@ CLANGTRACER_CONTEXT_1 {
   clangtracer_stdlib_*;
   __cxa_*;
   __gxx_personality_v0;
+  __stack_chk_fail;
   _Unwind_*;
   malloc; free; realloc; calloc;
   memcpy; memmove; memset; memcmp; bcmp; memchr;
   strlen; strcmp; strncmp; strchr;
   __libc_single_threaded;
+  __pthread_key_create;
+  _ZNSaIcE*; _ZNSaIwE*;
   _Znwm; _Znam; _ZdlPv; _ZdaPv; _ZdlPvm; _ZdaPvm;
   _ZnwmSt11align_val_t; _ZnamSt11align_val_t;
   _ZdlPvSt11align_val_t; _ZdaPvSt11align_val_t;

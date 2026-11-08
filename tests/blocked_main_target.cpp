@@ -19,6 +19,12 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#ifndef PR_SET_PTRACER
+#define PR_SET_PTRACER 0x59616d61
+#endif
+#ifndef PR_SET_PTRACER_ANY
+#define PR_SET_PTRACER_ANY (~0UL)
+#endif
 extern "C" int blocked_worker_probe(int value);
 
 namespace {
@@ -92,6 +98,7 @@ extern "C" __attribute__((visibility("default"))) std::atomic<std::uint64_t>
 
 extern "C" __attribute__((visibility("default"), noinline)) int
 blocked_worker_probe(int value) {
+  asm volatile("nop; nop; nop; nop; nop; nop; nop; nop; nop; nop");
   blocked_worker_calls.fetch_add(1, std::memory_order_relaxed);
   return value + 41;
 }

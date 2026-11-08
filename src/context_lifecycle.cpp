@@ -1,5 +1,4 @@
 #include "context_lifecycle.hpp"
-#include "context_analysis.hpp"
 
 #include <algorithm>
 
@@ -7,6 +6,9 @@
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/Frontend/ASTUnit.h>
 #include <clang/Lex/Preprocessor.h>
+
+#include "context_analysis.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer {
 namespace {
@@ -32,7 +34,7 @@ public:
   bool VisitCXXRecordDecl(clang::CXXRecordDecl *record) {
     if (!record->isThisDeclarationADefinition() || record->isImplicit())
       return true;
-    const auto type = record->getQualifiedNameAsString();
+    const auto type = context_class_type_name(*record);
     const auto found =
         std::find_if(declarations_.classes.begin(), declarations_.classes.end(),
                      [&](const auto &plan) { return plan.type == type; });
@@ -47,10 +49,14 @@ public:
     const auto close = record->getBraceRange().getEnd();
     if (!record->getIdentifier() || record->isLocalClass() ||
         record->isUnion() || record->getDescribedClassTemplate() ||
-        llvm::isa<clang::ClassTemplateSpecializationDecl>(record) ||
+        llvm::isa<clang::ClassTemplatePartialSpecializationDecl>(record) ||
+        record->isDependentType() ||
+        (llvm::isa<clang::ClassTemplateSpecializationDecl>(record) &&
+         llvm::cast<clang::ClassTemplateSpecializationDecl>(record)
+                 ->getSpecializationKind() != clang::TSK_ExplicitSpecialization) ||
         llvm::isa<clang::CXXRecordDecl>(record->getDeclContext()))
       return reject(
-          "interceptor must be a named non-template namespace-scope class");
+          "interceptor must be a named namespace-scope class or explicit specialization");
     for (const auto *scope = record->getDeclContext(); scope;
          scope = scope->getParent())
       if (const auto *ns = llvm::dyn_cast<clang::NamespaceDecl>(scope);
@@ -126,8 +132,9 @@ public:
       auto *identifier = &context.Idents.get(member);
       if (!unit_.getPreprocessor().isMacroDefined(identifier) &&
           record->lookup(clang::DeclarationName(identifier)).empty() &&
-          !buffer.contains(member))
+          !::tracer::compat::contains(buffer, member)) {
         break;
+      }
       member.clear();
     }
     if (member.empty())

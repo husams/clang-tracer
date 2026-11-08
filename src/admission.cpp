@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -29,7 +31,9 @@
 #include <unistd.h>
 
 #include "injector.hpp"
+#include "linux_syscalls.hpp"
 #include "mapped_path.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer::injector {
 
@@ -37,6 +41,11 @@ namespace detail {
 struct ApprovedModuleIdentity {
   std::string path;
   std::uint64_t load_bias = 0;
+  std::uint16_t elf_type = 0;
+  std::string soname;
+  std::uint64_t eh_frame_addr = 0;
+  std::string eh_frame;
+  std::vector<Elf64_Phdr> loads;
 };
 } // namespace detail
 
@@ -56,8 +65,67 @@ namespace {
 }
 
 template <class T>
-bool range_ok(std::size_t size, std::uint64_t offset, std::uint64_t count) {
+bool file_range_ok(std::uint64_t size, std::uint64_t offset,
+                   std::uint64_t count) {
   return offset <= size && count <= (size - offset) / sizeof(T);
+}
+
+void pread_exact(int fd, std::uint64_t file_size, std::uint64_t offset,
+                 void *destination, std::size_t length,
+                 std::string_view description) {
+  if (offset > file_size || length > file_size - offset ||
+      offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
+    unavailable(std::string(description) + " is outside the ELF file");
+  }
+  auto *out = static_cast<std::uint8_t *>(destination);
+  std::size_t read = 0;
+  while (read < length) {
+    if (read > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) -
+                   offset) {
+      unavailable(std::string(description) + " offset overflows off_t");
+    }
+    const auto n = ::pread(fd, out + read, length - read,
+                           static_cast<off_t>(offset + read));
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    if (n <= 0) {
+      unavailable("could not read " + std::string(description));
+    }
+    read += static_cast<std::size_t>(n);
+  }
+}
+
+template <class T>
+std::vector<T> read_file_objects(int fd, std::uint64_t file_size,
+                                 std::uint64_t offset, std::uint64_t count,
+                                 std::string_view description) {
+  if (!file_range_ok<T>(file_size, offset, count) ||
+      count > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+    unavailable(std::string(description) + " is outside the ELF file");
+  }
+  std::vector<T> result(static_cast<std::size_t>(count));
+  if (!result.empty()) {
+    pread_exact(fd, file_size, offset, result.data(), result.size() * sizeof(T),
+                description);
+  }
+  return result;
+}
+
+std::vector<std::uint8_t> read_file_bytes(int fd, std::uint64_t file_size,
+                                          std::uint64_t offset,
+                                          std::uint64_t length,
+                                          std::string_view description) {
+  if (offset > file_size || length > file_size - offset ||
+      length > std::numeric_limits<std::size_t>::max()) {
+    unavailable(std::string(description) + " is outside the ELF file");
+  }
+  std::vector<std::uint8_t> result(static_cast<std::size_t>(length));
+  if (!result.empty()) {
+    pread_exact(fd, file_size, offset, result.data(), result.size(),
+                description);
+  }
+  return result;
 }
 
 struct Mapping {
@@ -122,7 +190,6 @@ struct FileImage {
   std::uint16_t elf_type = 0;
   std::string soname;
   std::string interpreter;
-  std::vector<std::uint8_t> bytes;
   std::uint64_t bias = 0;
   std::vector<Elf64_Phdr> loads;
 
@@ -192,8 +259,31 @@ struct FileImage {
   }
 };
 
-FileImage load_image_fd(const std::string &path, int fd,
-                        const std::vector<Mapping> &maps) {
+enum class StartupSymbolSet {
+  none,
+  libc,
+  executable,
+  pthread,
+};
+
+bool is_startup_symbol(StartupSymbolSet set, std::string_view name) {
+  switch (set) {
+  case StartupSymbolSet::libc:
+    return name == "__libc_start_call_main" || name == "__libc_start_main" ||
+           name == "start_thread" || name == "__clone" || name == "__clone3";
+  case StartupSymbolSet::executable:
+    return name == "main";
+  case StartupSymbolSet::pthread:
+    return name == "start_thread";
+  case StartupSymbolSet::none:
+    return false;
+  }
+  return false;
+}
+
+FileImage
+load_image_fd(const std::string &path, int fd, const std::vector<Mapping> &maps,
+              StartupSymbolSet startup_symbols = StartupSymbolSet::none) {
   FileImage image;
   image.path = path;
   struct stat st{};
@@ -204,39 +294,32 @@ FileImage load_image_fd(const std::string &path, int fd,
       static_cast<std::uint64_t>(st.st_size) > 512ULL * 1024 * 1024) {
     unavailable("mapped ELF has an unsupported size");
   }
-  image.bytes.resize(static_cast<std::size_t>(st.st_size));
-  std::size_t got = 0;
-  while (got < image.bytes.size()) {
-    const auto n = ::pread(fd, image.bytes.data() + got,
-                           image.bytes.size() - got, static_cast<off_t>(got));
-    if (n <= 0) {
-      unavailable("could not read complete mapped ELF image");
-    }
-    got += static_cast<std::size_t>(n);
-  }
-  const auto *eh = reinterpret_cast<const Elf64_Ehdr *>(image.bytes.data());
-  if (std::memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 ||
-      eh->e_ident[EI_CLASS] != ELFCLASS64 ||
-      eh->e_ident[EI_DATA] != ELFDATA2LSB || eh->e_machine != EM_X86_64 ||
-      eh->e_phentsize != sizeof(Elf64_Phdr) ||
-      eh->e_shentsize != sizeof(Elf64_Shdr) ||
-      (eh->e_type != ET_DYN && eh->e_type != ET_EXEC) ||
-      !range_ok<Elf64_Phdr>(image.bytes.size(), eh->e_phoff, eh->e_phnum) ||
-      !range_ok<Elf64_Shdr>(image.bytes.size(), eh->e_shoff, eh->e_shnum)) {
+  const auto file_size = static_cast<std::uint64_t>(st.st_size);
+  Elf64_Ehdr eh{};
+  pread_exact(fd, file_size, 0, &eh, sizeof(eh), "mapped ELF header");
+  if (std::memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
+      eh.e_ident[EI_CLASS] != ELFCLASS64 ||
+      eh.e_ident[EI_DATA] != ELFDATA2LSB || eh.e_machine != EM_X86_64 ||
+      eh.e_phentsize != sizeof(Elf64_Phdr) ||
+      eh.e_shentsize != sizeof(Elf64_Shdr) ||
+      (eh.e_type != ET_DYN && eh.e_type != ET_EXEC) ||
+      !file_range_ok<Elf64_Phdr>(file_size, eh.e_phoff, eh.e_phnum) ||
+      !file_range_ok<Elf64_Shdr>(file_size, eh.e_shoff, eh.e_shnum)) {
     unavailable("mapped image is not a supported x86_64 ELF");
   }
-  image.elf_type = eh->e_type;
-  const auto *ph =
-      reinterpret_cast<const Elf64_Phdr *>(image.bytes.data() + eh->e_phoff);
-  for (unsigned i = 0; i < eh->e_phnum; ++i) {
+  image.elf_type = eh.e_type;
+  const auto ph = read_file_objects<Elf64_Phdr>(
+      fd, file_size, eh.e_phoff, eh.e_phnum, "ELF program headers");
+  for (unsigned i = 0; i < eh.e_phnum; ++i) {
     if (ph[i].p_type == PT_INTERP) {
-      if (ph[i].p_offset > image.bytes.size() || ph[i].p_filesz == 0 ||
+      if (ph[i].p_offset > file_size || ph[i].p_filesz == 0 ||
           ph[i].p_filesz > 4096 ||
-          ph[i].p_filesz > image.bytes.size() - ph[i].p_offset) {
+          ph[i].p_filesz > file_size - ph[i].p_offset) {
         unavailable("ELF interpreter path is malformed");
       }
-      const char *interp =
-          reinterpret_cast<const char *>(image.bytes.data() + ph[i].p_offset);
+      const auto interp_bytes = read_file_bytes(
+          fd, file_size, ph[i].p_offset, ph[i].p_filesz, "ELF interpreter");
+      const char *interp = reinterpret_cast<const char *>(interp_bytes.data());
       const auto *terminator =
           static_cast<const char *>(std::memchr(interp, 0, ph[i].p_filesz));
       if (!terminator || terminator == interp || interp[0] != '/') {
@@ -245,9 +328,8 @@ FileImage load_image_fd(const std::string &path, int fd,
       image.interpreter.assign(interp, terminator);
     }
     if (ph[i].p_type == PT_LOAD) {
-      if (ph[i].p_filesz > ph[i].p_memsz ||
-          ph[i].p_offset > image.bytes.size() ||
-          ph[i].p_filesz > image.bytes.size() - ph[i].p_offset ||
+      if (ph[i].p_filesz > ph[i].p_memsz || ph[i].p_offset > file_size ||
+          ph[i].p_filesz > file_size - ph[i].p_offset ||
           ph[i].p_memsz >
               std::numeric_limits<std::uint64_t>::max() - ph[i].p_vaddr) {
         unavailable("ELF load segment is malformed");
@@ -385,60 +467,64 @@ FileImage load_image_fd(const std::string &path, int fd,
                 "is incomplete for " +
                 path);
   }
-  if (eh->e_type == ET_EXEC && image.bias != 0) {
+  if (eh.e_type == ET_EXEC && image.bias != 0) {
     unavailable("unexpected load bias for fixed-address ELF");
   }
 
-  const auto *sh =
-      reinterpret_cast<const Elf64_Shdr *>(image.bytes.data() + eh->e_shoff);
-  if (eh->e_shstrndx >= eh->e_shnum) {
+  const auto sh = read_file_objects<Elf64_Shdr>(
+      fd, file_size, eh.e_shoff, eh.e_shnum, "ELF section headers");
+  if (eh.e_shstrndx >= eh.e_shnum) {
     unavailable("ELF section names are unavailable");
   }
-  const auto &names = sh[eh->e_shstrndx];
-  if (names.sh_offset > image.bytes.size() ||
-      names.sh_size > image.bytes.size() - names.sh_offset) {
+  const auto &names = sh[eh.e_shstrndx];
+  if (names.sh_offset > file_size ||
+      names.sh_size > file_size - names.sh_offset) {
     unavailable("ELF section-name table is malformed");
   }
-  const char *strtab =
-      reinterpret_cast<const char *>(image.bytes.data() + names.sh_offset);
-  for (unsigned i = 0; i < eh->e_shnum; ++i) {
+  const auto section_names = read_file_bytes(
+      fd, file_size, names.sh_offset, names.sh_size, "ELF section names");
+  const char *strtab = reinterpret_cast<const char *>(section_names.data());
+  for (unsigned i = 0; i < eh.e_shnum; ++i) {
     if (sh[i].sh_name < names.sh_size) {
       const char *name = strtab + sh[i].sh_name;
       const auto rem = names.sh_size - sh[i].sh_name;
       if (std::memchr(name, 0, rem) && std::strcmp(name, ".eh_frame") == 0 &&
           sh[i].sh_type != SHT_NOBITS) {
-        if (sh[i].sh_offset > image.bytes.size() ||
-            sh[i].sh_size > image.bytes.size() - sh[i].sh_offset) {
+        if (sh[i].sh_offset > file_size ||
+            sh[i].sh_size > file_size - sh[i].sh_offset) {
           unavailable("ELF .eh_frame section is malformed");
         }
         image.eh_frame_addr = sh[i].sh_addr;
-        image.eh_frame.assign(reinterpret_cast<const char *>(
-                                  image.bytes.data() + sh[i].sh_offset),
-                              sh[i].sh_size);
+        const auto bytes = read_file_bytes(fd, file_size, sh[i].sh_offset,
+                                           sh[i].sh_size, "ELF .eh_frame");
+        image.eh_frame.assign(reinterpret_cast<const char *>(bytes.data()),
+                              bytes.size());
       }
     }
     if (sh[i].sh_type != SHT_DYNAMIC || sh[i].sh_entsize != sizeof(Elf64_Dyn) ||
-        sh[i].sh_link >= eh->e_shnum || sh[i].sh_offset > image.bytes.size() ||
-        sh[i].sh_size > image.bytes.size() - sh[i].sh_offset) {
+        sh[i].sh_link >= eh.e_shnum || sh[i].sh_offset > file_size ||
+        sh[i].sh_size > file_size - sh[i].sh_offset) {
       continue;
     }
     const auto &dynamic_strings = sh[sh[i].sh_link];
-    if (dynamic_strings.sh_offset > image.bytes.size() ||
-        dynamic_strings.sh_size >
-            image.bytes.size() - dynamic_strings.sh_offset) {
+    if (dynamic_strings.sh_offset > file_size ||
+        dynamic_strings.sh_size > file_size - dynamic_strings.sh_offset) {
       continue;
     }
-    const char *dynstr = reinterpret_cast<const char *>(
-        image.bytes.data() + dynamic_strings.sh_offset);
-    const auto *entries = reinterpret_cast<const Elf64_Dyn *>(
-        image.bytes.data() + sh[i].sh_offset);
+    const auto dynstr =
+        read_file_bytes(fd, file_size, dynamic_strings.sh_offset,
+                        dynamic_strings.sh_size, "ELF dynamic strings");
+    const auto entries = read_file_objects<Elf64_Dyn>(
+        fd, file_size, sh[i].sh_offset, sh[i].sh_size / sizeof(Elf64_Dyn),
+        "ELF dynamic entries");
     const auto count = sh[i].sh_size / sizeof(Elf64_Dyn);
     for (std::uint64_t j = 0; j < count; ++j) {
       if (entries[j].d_tag != DT_SONAME ||
           entries[j].d_un.d_val >= dynamic_strings.sh_size) {
         continue;
       }
-      const char *value = dynstr + entries[j].d_un.d_val;
+      const char *value =
+          reinterpret_cast<const char *>(dynstr.data()) + entries[j].d_un.d_val;
       const auto available = dynamic_strings.sh_size - entries[j].d_un.d_val;
       const auto *end =
           static_cast<const char *>(std::memchr(value, 0, available));
@@ -447,54 +533,67 @@ FileImage load_image_fd(const std::string &path, int fd,
       }
     }
   }
-  for (unsigned i = 0; i < eh->e_shnum; ++i) {
-    if (sh[i].sh_type != SHT_SYMTAB && sh[i].sh_type != SHT_DYNSYM) {
-      continue;
-    }
-    if (sh[i].sh_link >= eh->e_shnum || sh[i].sh_entsize != sizeof(Elf64_Sym) ||
-        sh[i].sh_offset > image.bytes.size() ||
-        sh[i].sh_size > image.bytes.size() - sh[i].sh_offset) {
-      continue;
-    }
-    const auto &strings = sh[sh[i].sh_link];
-    if (strings.sh_offset > image.bytes.size() ||
-        strings.sh_size > image.bytes.size() - strings.sh_offset) {
-      continue;
-    }
-    const char *string_data =
-        reinterpret_cast<const char *>(image.bytes.data() + strings.sh_offset);
-    const auto *symbols = reinterpret_cast<const Elf64_Sym *>(
-        image.bytes.data() + sh[i].sh_offset);
-    const auto count = sh[i].sh_size / sizeof(Elf64_Sym);
-    for (std::uint64_t j = 0; j < count; ++j) {
-      const auto &sym = symbols[j];
-      if (ELF64_ST_TYPE(sym.st_info) != STT_FUNC ||
-          sym.st_name >= strings.sh_size || !sym.st_size) {
+  if (startup_symbols != StartupSymbolSet::none) {
+    for (unsigned i = 0; i < eh.e_shnum; ++i) {
+      if (sh[i].sh_type != SHT_SYMTAB && sh[i].sh_type != SHT_DYNSYM) {
         continue;
       }
-      const char *name = string_data + sym.st_name;
-      if (!std::memchr(name, 0, strings.sh_size - sym.st_name)) {
+      if (sh[i].sh_link >= eh.e_shnum ||
+          sh[i].sh_entsize != sizeof(Elf64_Sym) ||
+          sh[i].sh_offset > file_size ||
+          sh[i].sh_size > file_size - sh[i].sh_offset) {
         continue;
       }
-      image.functions.push_back({name, sym.st_value, sym.st_size});
+      const auto &strings = sh[sh[i].sh_link];
+      if (strings.sh_offset > file_size ||
+          strings.sh_size > file_size - strings.sh_offset) {
+        continue;
+      }
+      const auto string_data =
+          read_file_bytes(fd, file_size, strings.sh_offset, strings.sh_size,
+                          "ELF symbol strings");
+      const auto symbols = read_file_objects<Elf64_Sym>(
+          fd, file_size, sh[i].sh_offset, sh[i].sh_size / sizeof(Elf64_Sym),
+          "ELF symbols");
+      const auto count = sh[i].sh_size / sizeof(Elf64_Sym);
+      for (std::uint64_t j = 0; j < count; ++j) {
+        const auto &sym = symbols[j];
+        if (ELF64_ST_TYPE(sym.st_info) != STT_FUNC ||
+            sym.st_name >= strings.sh_size || !sym.st_size) {
+          continue;
+        }
+        const char *name =
+            reinterpret_cast<const char *>(string_data.data()) + sym.st_name;
+        const auto *terminator = static_cast<const char *>(
+            std::memchr(name, 0, strings.sh_size - sym.st_name));
+        if (!terminator) {
+          continue;
+        }
+        const std::string_view function_name(
+            name, static_cast<std::size_t>(terminator - name));
+        if (is_startup_symbol(startup_symbols, function_name)) {
+          image.functions.push_back(
+              {std::string(function_name), sym.st_value, sym.st_size});
+        }
+      }
     }
   }
   if (image.eh_frame.empty()) {
     unavailable("mapped ELF has no usable .eh_frame section");
   }
-  image.bytes.clear();
-  image.bytes.shrink_to_fit();
   return image;
 }
 
-FileImage load_image(const std::string &path, const std::vector<Mapping> &maps) {
+FileImage
+load_image(const std::string &path, const std::vector<Mapping> &maps,
+           StartupSymbolSet startup_symbols = StartupSymbolSet::none) {
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     unavailable("cannot open mapped ELF image");
   }
   FileImage image;
   try {
-    image = load_image_fd(path, fd, maps);
+    image = load_image_fd(path, fd, maps, startup_symbols);
   } catch (...) {
     ::close(fd);
     throw;
@@ -503,31 +602,53 @@ FileImage load_image(const std::string &path, const std::vector<Mapping> &maps) 
   return image;
 }
 
-FileImage load_executable(pid_t pid, const std::vector<Mapping> &maps) {
+FileImage load_executable(pid_t pid, const std::vector<Mapping> &maps,
+                          bool collect_main = false) {
   const std::string proc_path = "/proc/" + std::to_string(pid) + "/exe";
   const auto path = ::tracer::detail::canonical_mapped_path(proc_path);
   if (path.empty()) {
     unavailable("cannot identify the target executable");
   }
-  return load_image(path, maps);
+  return load_image(path, maps,
+                    collect_main ? StartupSymbolSet::executable
+                                 : StartupSymbolSet::none);
 }
 
 FileImage load_libc(const std::vector<Mapping> &maps) {
   for (const auto &m : maps) {
     const auto basename = m.path.substr(m.path.find_last_of('/') + 1);
     const bool candidate =
-        basename == "libc.so.6" || (basename.starts_with("libc-") &&
-                                    basename.ends_with(".so"));
+        basename == "libc.so.6" || (::tracer::compat::starts_with(basename, "libc-") &&
+                                    ::tracer::compat::ends_with(basename, ".so"));
     if (m.canonical_path.empty() || !candidate) {
       continue;
     }
     const auto &path = m.canonical_path;
-    auto image = load_image(path, maps);
+    auto image = load_image(path, maps, StartupSymbolSet::libc);
     if (image.soname == "libc.so.6") {
       return image;
     }
   }
   unavailable("cannot identify the mapped libc ELF image");
+}
+
+std::optional<FileImage> load_libpthread(const std::vector<Mapping> &maps) {
+  for (const auto &mapping : maps) {
+    const auto basename =
+        mapping.path.substr(mapping.path.find_last_of('/') + 1);
+    const bool candidate =
+        basename == "libpthread.so.0" ||
+        ::tracer::compat::starts_with(basename, "libpthread-");
+    if (!candidate || mapping.canonical_path.empty()) {
+      continue;
+    }
+    auto image =
+        load_image(mapping.canonical_path, maps, StartupSymbolSet::pthread);
+    if (image.soname == "libpthread.so.0") {
+      return image;
+    }
+  }
+  return std::nullopt;
 }
 
 using ExecutableMapRecord =
@@ -590,17 +711,16 @@ bool forbidden_soname(std::string soname) {
   std::transform(
       soname.begin(), soname.end(), soname.begin(),
       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  constexpr std::array<std::string_view, 27> denied = {
-      "libc.so",     "libpthread.so", "libdl.so",    "libstdc++.so",
-      "libgcc_s.so", "libgcc.so",     "libc++.so",   "libc++abi.so",
-      "libllvm",     "libclang",      "libunwind",   "libasan",
-      "libtsan",     "libubsan",      "libomp",      "libgomp",
-      "libatomic",   "libm.so",       "librt.so",    "libresolv.so",
-      "libnss_",     "libutil.so",    "libcrypt.so", "libanl.so",
+  constexpr std::array<std::string_view, 33> denied = {
+      "libc-",       "libpthread-",   "libdl-",   "ld-",          "libm-",       "librt-",
+      "libc.so",     "libpthread.so", "libdl.so", "libstdc++.so", "libgcc_s.so", "libgcc.so",
+      "libc++.so",   "libc++abi.so",  "libllvm",  "libclang",     "libunwind",   "libasan",
+      "libtsan",     "libubsan",      "libomp",   "libgomp",      "libatomic",   "libm.so",
+      "librt.so",    "libresolv.so",  "libnss_",  "libutil.so",   "libcrypt.so", "libanl.so",
       "libgfortran", "clang-tracer",  "libtracer"};
-  return std::any_of(
-      denied.begin(), denied.end(),
-      [&](std::string_view prefix) { return soname.starts_with(prefix); });
+  return std::any_of(denied.begin(), denied.end(), [&](std::string_view prefix) {
+    return ::tracer::compat::starts_with(soname, prefix);
+  });
 }
 
 void require_usable_module(const FileImage &image) {
@@ -662,6 +782,25 @@ void require_usable_module(const FileImage &image) {
   }
 }
 
+bool same_validation_inputs(const detail::ApprovedModuleIdentity &identity,
+                            const FileImage &image) {
+  if (identity.elf_type != image.elf_type || identity.soname != image.soname ||
+      identity.eh_frame_addr != image.eh_frame_addr ||
+      identity.eh_frame != image.eh_frame ||
+      identity.loads.size() != image.loads.size()) {
+    return false;
+  }
+  return std::equal(
+      identity.loads.begin(), identity.loads.end(), image.loads.begin(),
+      [](const auto &left, const auto &right) {
+        return left.p_type == right.p_type && left.p_flags == right.p_flags &&
+               left.p_offset == right.p_offset &&
+               left.p_vaddr == right.p_vaddr && left.p_paddr == right.p_paddr &&
+               left.p_filesz == right.p_filesz &&
+               left.p_memsz == right.p_memsz && left.p_align == right.p_align;
+      });
+}
+
 std::vector<FileImage> revalidate_modules(
     const std::vector<std::shared_ptr<const detail::ApprovedModuleIdentity>>
         &modules,
@@ -700,7 +839,9 @@ std::vector<FileImage> revalidate_modules(
     FileImage image;
     try {
       image = load_image(identity.path, maps);
-      require_usable_module(image);
+      if (!same_validation_inputs(identity, image)) {
+        require_usable_module(image);
+      }
       if (image.bias != identity.load_bias) {
         throw std::runtime_error(
             "approved application module load bias changed");
@@ -749,7 +890,7 @@ std::vector<llvm::dwarf::UnwindRow> rows_for(const FileImage &image,
       continue;
     }
     const auto *cie = fde->getLinkedCIE();
-    if (!cie || cie->getAugmentationString().contains('S')) {
+    if (!cie || ::tracer::compat::contains(cie->getAugmentationString(), 'S')) {
       unavailable("signal-frame or incomplete DWARF CFI is not admissible");
     }
     auto table = llvm::dwarf::createUnwindTable(fde);
@@ -906,7 +1047,7 @@ std::uint64_t read_remote(pid_t pid, std::uint64_t address,
   std::uint64_t value = 0;
   iovec local{&value, sizeof(value)};
   iovec remote{reinterpret_cast<void *>(address), sizeof(value)};
-  if (::process_vm_readv(pid, &local, 1, &remote, 1, 0) != sizeof(value)) {
+  if (::tracer::linux_api::process_vm_readv(pid, &local, 1, &remote, 1, 0) != sizeof(value)) {
     unavailable("cannot read a stopped target stack frame");
   }
   return value;
@@ -1076,6 +1217,11 @@ std::vector<ApplicationModule> discover_application_modules(pid_t pid) {
     auto identity = std::make_shared<detail::ApprovedModuleIdentity>();
     identity->path = candidate.path;
     identity->load_bias = image.bias;
+    identity->elf_type = image.elf_type;
+    identity->soname = image.soname;
+    identity->eh_frame_addr = image.eh_frame_addr;
+    identity->eh_frame = std::move(image.eh_frame);
+    identity->loads = std::move(image.loads);
     ::close(fd);
     result.emplace_back(ApplicationModule(std::move(identity)));
   }
@@ -1088,7 +1234,7 @@ std::vector<ApplicationModule> discover_application_modules(pid_t pid) {
 }
 
 void validate_application_modules(pid_t pid,
-                                  std::span<const ApplicationModule> modules) {
+                                  ::tracer::compat::span<const ApplicationModule> modules) {
   if (pid <= 0) {
     throw std::invalid_argument("application module process id is invalid");
   }
@@ -1113,13 +1259,13 @@ void validate_application_modules(pid_t pid,
 }
 
 std::size_t
-require_application_rendezvous(pid_t pid, const user_regs_struct &regs,
-                               std::span<const ApplicationModule> modules) {
+require_application_rendezvous(pid_t pid, const user_regs_struct& regs,
+                               ::tracer::compat::span<const ApplicationModule> modules) {
   if (pid <= 0 || regs.rip == 0) {
     unavailable("invalid stopped-process state");
   }
   const auto maps = read_mappings(pid);
-  auto executable = load_executable(pid, maps);
+  auto executable = load_executable(pid, maps, true);
   auto libc = load_libc(maps);
   const auto loader = loader_identity(executable, maps);
   const auto protected_files = protected_runtime_identities(maps, libc, loader);
@@ -1131,9 +1277,9 @@ require_application_rendezvous(pid_t pid, const user_regs_struct &regs,
   auto approved = revalidate_modules(identities, maps, protected_files);
   const auto *start_call_main = libc.named("__libc_start_call_main");
   const auto *start_main = libc.named("__libc_start_main");
-  const auto *thread_start = libc.named("start_thread");
-  const auto *clone = libc.named("__clone");
-  const auto *clone3 = libc.named("__clone3");
+  if (!start_main) {
+    unavailable("required exact startup function symbols are unavailable");
+  }
   const FileImage *current_image =
       application_image_for(regs.rip, executable, approved, maps);
   if (!current_image) {
@@ -1148,6 +1294,7 @@ require_application_rendezvous(pid_t pid, const user_regs_struct &regs,
   bool pc_is_return_address = false;
   std::size_t application_frames = 1;
   std::size_t traversed_frames = 1;
+  std::optional<FileImage> pthread;
   std::set<std::pair<std::uint64_t, std::uint64_t>> seen;
   seen.emplace(regs.rip, regs.rsp);
 
@@ -1176,42 +1323,72 @@ require_application_rendezvous(pid_t pid, const user_regs_struct &regs,
       pc_is_return_address = true;
       continue;
     }
-    const auto within = [&](const FileImage::Function *function,
+    const auto within = [&](const FileImage &image,
+                            const FileImage::Function *function,
                             std::uint64_t address) {
-      return function && address >= libc.runtime(*function) &&
-             address - libc.runtime(*function) < function->size &&
-             libc.executable_pc(address, maps);
+      return function && address >= image.runtime(*function) &&
+             address - image.runtime(*function) < function->size &&
+             image.executable_pc(address, maps);
     };
-    if (within(start_call_main, caller_pc)) {
-      if (!start_main || traversed_frames + 2 > 128) {
-        unavailable("required exact main startup symbols are unavailable");
+    if (!start_call_main && within(libc, start_main, caller_pc)) {
+      // glibc 2.23 calls main directly from __libc_start_main. Unlike its
+      // newer dedicated wrapper, that routine also runs initializers, so
+      // require the final application frame to be the ELF's exact main.
+      const auto *main = executable.named("main");
+      const auto application_pc = pc_is_return_address ? pc - 1 : pc;
+      if (!main || !main->size || current_image != &executable ||
+          application_pc < executable.runtime(*main) ||
+          application_pc - executable.runtime(*main) >= main->size) {
+        unavailable(
+            "legacy libc startup requires a proven main application frame");
+      }
+      return application_frames;
+    }
+    if (within(libc, start_call_main, caller_pc)) {
+      if (traversed_frames + 2 > 128) {
+        unavailable("startup unwind exceeds the 128-frame admission bound");
       }
       ++traversed_frames;
       auto startup_caller =
           unwind_one(pid, libc, return_pc, caller, known, stack, true);
       const auto startup_return_pc = startup_caller.rip;
       if (startup_return_pc == 0 ||
-          !within(start_main, startup_return_pc - 1)) {
+          !within(libc, start_main, startup_return_pc - 1)) {
         unavailable(
             "libc startup caller chain does not reach __libc_start_main");
       }
       return application_frames;
     }
-    if (!within(thread_start, caller_pc) || traversed_frames + 2 > 128) {
+
+    const FileImage::Function *thread_start = libc.named("start_thread");
+    const FileImage *thread_image = &libc;
+    if (!thread_start) {
+      pthread = load_libpthread(maps);
+      if (pthread) {
+        thread_start = pthread->named("start_thread");
+        if (thread_start) {
+          thread_image = &*pthread;
+        }
+      }
+    }
+    if (!thread_start || !within(*thread_image, thread_start, caller_pc) ||
+        traversed_frames + 2 > 128) {
       unavailable(
-          "application unwind leaves the executable outside a validated "
-          "libc startup chain");
+          "application unwind leaves approved modules outside exact libc or "
+          "libpthread start_thread");
     }
 
     ++traversed_frames;
     auto thread_caller =
-        unwind_one(pid, libc, return_pc, caller, known, stack, true);
+        unwind_one(pid, *thread_image, return_pc, caller, known, stack, true);
     const auto thread_return_pc = thread_caller.rip;
     const auto clone_pc = thread_return_pc == 0 ? 0 : thread_return_pc - 1;
+    const auto *clone = libc.named("__clone");
+    const auto *clone3 = libc.named("__clone3");
     if (thread_return_pc == 0 ||
-        (!within(clone, clone_pc) && !within(clone3, clone_pc))) {
+        (!within(libc, clone, clone_pc) && !within(libc, clone3, clone_pc))) {
       unavailable(
-          "pthread startup caller chain does not reach exact __clone or "
+          "pthread startup chain does not reach exact libc __clone or "
           "__clone3");
     }
     return application_frames;

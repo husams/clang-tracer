@@ -17,8 +17,72 @@ from clang_tracer import Client
 from clang_tracer import messages as pb
 from clang_tracer.command import parse_command
 from clang_tracer.console import Console
+from clang_tracer.display import render
 
 pytestmark = pytest.mark.native
+
+
+def test_reprobe_keeps_old_hook_on_compile_error_and_displays_string_state(native):
+    build, target, temporary = native
+    with Client(f"unix://{temporary}/control.sock", timeout=60) as client:
+        client.start_server(
+            str(build / "clang-tracer-server"),
+            agent=str(build / "libclang_tracer_agent.so"),
+        )
+        session = client.attach(target.pid)
+        first = client.inject(session.id, "add(int, int)", INTERCEPTOR)
+        before = client.collect_traces(2, session_ids=[session.id], timeout=10)
+        cursor = before[-1].sequence
+        with pytest.raises(grpc.RpcError):
+            client.inject(session.id, "add(int, int)", "struct Interceptor { broken };")
+        assert next(
+            p for p in client.list_sessions()[0].probes if p.id == first.id
+        ).active
+        alive = client.collect_traces(
+            2, session_ids=[session.id], after_sequence=cursor, timeout=10
+        )
+        assert all(event.probe_id == first.id for event in alive)
+        source = """#include <string>
+struct Scope {};
+struct Snapshot : state<Scope> { std::string message; };
+struct Interceptor {
+  Interceptor(State<Snapshot>);
+  void pre(const Call &call, Snapshot &snapshot) {
+    snapshot.message = "actual string value";
+    call.context().event("snapshot.ready");
+  }
+};
+"""
+        callback = temporary / "interceptor.cpp"
+        callback.write_text(source)
+        console = Console(client, output=DummyOutput())
+        console.session_id = session.id
+        installed = []
+        console.emit = installed.append
+        console.execute(
+            parse_command(f'probe inject "add(int, int)" --callback "{callback}"')
+        )
+        second = installed[-1]
+        assert isinstance(second, pb.Probe) and second.active
+        assert second.id != first.id
+        previous = next(p for p in client.list_sessions()[0].probes if p.id == first.id)
+        assert not previous.active and previous.original_bytes_restored
+        events = client.collect_traces(
+            2,
+            session_ids=[session.id],
+            names=["snapshot.ready"],
+            after_sequence=alive[-1].sequence,
+            timeout=10,
+        )
+        assert all(event.probe_id == second.id for event in events)
+        text = "".join(fragment for _, fragment in render(events[-1]))
+        assert 'message = "actual string value"' in text
+        # Replace a shared-context hook too, then restore the true original bytes.
+        third = client.inject(session.id, "add(int, int)", INTERCEPTOR)
+        assert third.id != second.id
+        assert client.remove_probe(session.id, third.id).original_bytes_restored
+        client.detach(session.id)
+        assert target.poll() is None
 
 
 def test_native_retention_snapshot_ack_and_cli_storage(native):
@@ -290,6 +354,134 @@ def native(tmp_path):
             target.wait(timeout=5)
 
 
+def test_deep_native_stacks_keep_all_frames_and_honor_requested_depth(tmp_path):
+    configured = os.getenv("CLANG_TRACER_NATIVE_BUILD")
+    if not configured or platform.system() != "Linux":
+        pytest.skip("set CLANG_TRACER_NATIVE_BUILD to a Linux native build directory")
+    build = Path(configured).resolve()
+    with subprocess.Popen(
+        [build / "deep-stack-target"], stdin=subprocess.PIPE, stdout=subprocess.PIPE
+    ) as target:
+        try:
+            assert target.stdout is not None and target.stdin is not None
+            assert target.stdout.readline() == b"READY\n"
+            with Client(f"unix://{tmp_path}/control.sock", timeout=60) as client:
+                client.start_server(
+                    str(build / "clang-tracer-server"),
+                    agent=str(build / "libclang_tracer_agent.so"),
+                )
+                session = client.attach(target.pid)
+                cursor = 0
+                for depth, status in (
+                    (128, pb.StackTrace.TRUNCATED), ("full", pb.StackTrace.COMPLETE)
+                ):
+                    probe = client.inject(
+                        session.id, "traced_deep_leaf(int)", INTERCEPTOR,
+                        stack_depth=depth, include_internal_stack_frames=True,
+                    )
+                    target.stdin.write(b"x")
+                    target.stdin.flush()
+                    events = client.collect_traces(
+                        2, session_ids=[session.id], after_sequence=cursor, timeout=15
+                    )
+                    for event in events:
+                        assert event.probe_id == probe.id
+                        stack = event.stack
+                        assert stack.status == status, stack.detail
+                        assert stack.frames[0].function == "traced_deep_leaf(int)"
+                        if depth == "full":
+                            assert len(stack.frames) > 1200
+                            assert any(frame.function == "main" for frame in stack.frames)
+                            assert event.ByteSize() > 64 * 1024
+                        else:
+                            assert len(stack.frames) == depth
+                    client.remove_probe(session.id, probe.id)
+                    cursor = client.read_events().through_sequence
+                context_source = """
+struct Interceptor {
+  void pre(const Call &call) {
+    call.capture_stack(tracer::kUnlimitedStackDepth, false);
+    call.context().event("deep.stack");
+  }
+};
+"""
+                probe = client.inject(session.id, "traced_deep_leaf(int)", context_source)
+                target.stdin.write(b"x")
+                target.stdin.flush()
+                event, = client.collect_traces(
+                    1, session_ids=[session.id], after_sequence=cursor,
+                    names=["deep.stack"], timeout=15,
+                )
+                assert event.probe_id == probe.id
+                assert event.stack.status == pb.StackTrace.COMPLETE, event.stack.detail
+                assert len(event.stack.frames) > 1200
+                client.remove_probe(session.id, probe.id)
+                client.detach(session.id)
+        finally:
+            target.terminate()
+            try:
+                target.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                target.kill()
+                target.wait()
+
+
+@pytest.mark.parametrize("durable", [False, True])
+def test_configured_shared_event_bytes_preserve_large_stack(tmp_path, durable):
+    configured = os.getenv("CLANG_TRACER_NATIVE_BUILD")
+    if not configured or platform.system() != "Linux":
+        pytest.skip("set CLANG_TRACER_NATIVE_BUILD to a Linux native build directory")
+    build = Path(configured).resolve()
+    depth = 100_000
+    event_bytes = 24 * 1024 * 1024
+    transport_bytes = 224 * 1024 * 1024
+    source = """
+struct Interceptor {
+  void pre(const Call &call) {
+    call.capture_stack(tracer::kUnlimitedStackDepth, false);
+    call.context().event("deep.shared");
+  }
+};
+"""
+    with subprocess.Popen(
+        [build / "deep-stack-target", str(depth)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    ) as target:
+        try:
+            assert target.stdin is not None and target.stdout is not None
+            assert target.stdout.readline() == b"READY\n"
+            with Client(f"unix://{tmp_path}/control.sock", timeout=60) as client:
+                client.start_server(
+                    str(build / "clang-tracer-server"),
+                    agent=str(build / "libclang_tracer_agent.so"),
+                    context_event_bytes=event_bytes,
+                    context_transport_memory_bytes=transport_bytes,
+                    durable_directory=str(tmp_path / "journal") if durable else None,
+                )
+                session = client.attach(target.pid)
+                probe = client.inject(session.id, "traced_deep_leaf(int)", source)
+                target.stdin.write(b"x")
+                target.stdin.flush()
+                (event,) = client.collect_traces(
+                    1, session_ids=[session.id], names=["deep.shared"], timeout=60,
+                )
+                assert event.probe_id == probe.id
+                assert 7269888 < event.context.event.ByteSize() <= event_bytes
+                assert event.stack.status == pb.StackTrace.COMPLETE, event.stack.detail
+                assert len(event.stack.frames) > depth
+                assert any(frame.function == "main" for frame in event.stack.frames)
+                client.detach(session.id)
+        finally:
+            if target.stdin is not None:
+                target.stdin.close()
+            try:
+                target.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                target.kill()
+                target.wait()
+
+
 def test_real_native_api_resolution_injection_and_shutdown_restore(native):
     build, target, temporary = native
     with Client(f"unix://{temporary}/control.sock", timeout=30) as client:
@@ -349,6 +541,163 @@ def test_real_native_api_resolution_injection_and_shutdown_restore(native):
         with pytest.raises(grpc.RpcError) as missing:
             client.resolve_probe("missing", "add(int, int)")
         assert missing.value.code() == grpc.StatusCode.NOT_FOUND
+
+
+def test_real_native_add_probe_rejects_tampered_resolved_metadata(native):
+    build, target, temporary = native
+    with Client(f"unix://{temporary}/control.sock", timeout=30) as client:
+        client.start_server(
+            str(build / "clang-tracer-server"),
+            agent=str(build / "libclang_tracer_agent.so"),
+        )
+        session = client.attach(target.pid)
+        resolved = client.resolve_probe(session.id, "add(int, int)")
+
+        def assert_no_active_probes():
+            current = next(
+                value for value in client.list_sessions() if value.id == session.id
+            )
+            assert not any(probe.active for probe in current.probes)
+
+        tampered_specs = []
+        changed_debug_info = pb.ProbeSpec()
+        changed_debug_info.CopyFrom(resolved)
+        changed_debug_info.debug_info.entry_size += 1
+        tampered_specs.append(changed_debug_info)
+
+        changed_signature = pb.ProbeSpec()
+        changed_signature.CopyFrom(resolved)
+        changed_signature.signature.ClearField("arguments")
+        changed_signature.signature.arguments.extend([pb.INT64, pb.INT32])
+        tampered_specs.append(changed_signature)
+
+        changed_argument_name = pb.ProbeSpec()
+        changed_argument_name.CopyFrom(resolved)
+        changed_argument_name.ClearField("argument_names")
+        changed_argument_name.argument_names.extend(
+            ["altered_argument", resolved.argument_names[1]]
+        )
+        tampered_specs.append(changed_argument_name)
+
+        for spec in tampered_specs:
+            spec.callback_source = INTERCEPTOR
+            with pytest.raises(grpc.RpcError) as rejected:
+                client.add_probe(session.id, spec)
+            assert (
+                "mapped debug image, entry or callable metadata changed"
+                in rejected.value.details()
+            )
+            assert_no_active_probes()
+
+        valid_spec = pb.ProbeSpec()
+        valid_spec.CopyFrom(resolved)
+        valid_spec.callback_source = INTERCEPTOR
+        probe = client.add_probe(session.id, valid_spec)
+        assert probe.active
+        events = client.collect_traces(4, session_ids=[session.id], timeout=10)
+        assert events
+        assert all(event.probe_id == probe.id for event in events)
+        assert client.remove_probe(session.id, probe.id).original_bytes_restored
+        assert_no_active_probes()
+        assert client.detach(session.id).state == pb.Session.DETACHED
+
+
+def test_native_common_headers_preserve_callback_isolation_and_typed_receivers(native):
+    build, target, temporary = native
+    rejected_source = """
+#define TRACER_FAILED_CALLBACK_MARKER 1
+namespace callback_scope { struct RejectedType {}; }
+struct Interceptor {
+  void pre(const Call &) { missing_callback_symbol(); }
+};
+"""
+    function_source = """
+#ifdef TRACER_FAILED_CALLBACK_MARKER
+#error rejected callback macros leaked
+#endif
+#define TRACER_PREVIOUS_CALLBACK_MARKER 1
+namespace callback_scope { using RejectedType = int; }
+static int probe_counter = 0;
+static constexpr int identity = 11;
+struct Interceptor {
+  void pre(const Call &call) {
+    call.field("identity", identity);
+    call.field("counter", ++probe_counter);
+    call.field("first", call.argument<0>());
+  }
+};
+"""
+    method_source = """
+#ifdef TRACER_FAILED_CALLBACK_MARKER
+#error rejected callback macros leaked
+#endif
+#ifdef TRACER_PREVIOUS_CALLBACK_MARKER
+#error another callback's macros leaked
+#endif
+namespace callback_scope { struct RejectedType {}; }
+static int probe_counter = 0;
+static constexpr int identity = 22;
+struct Interceptor {
+  void pre(const Call &call) {
+    call.field("identity", identity);
+    call.field("counter", ++probe_counter);
+    call.field(call.self()->bias);
+  }
+};
+"""
+    with Client(f"unix://{temporary}/control.sock", timeout=30) as client:
+        client.start_server(
+            str(build / "clang-tracer-server"),
+            agent=str(build / "libclang_tracer_agent.so"),
+        )
+        session = client.attach(target.pid)
+
+        def reject_callback():
+            with pytest.raises(grpc.RpcError) as rejected:
+                client.inject(session.id, "add(int, int)", rejected_source)
+            assert "missing_callback_symbol" in rejected.value.details()
+            assert target.poll() is None
+
+        # A failed cold compile must leave the reusable headers usable.
+        reject_callback()
+        function = client.inject(session.id, "add(int, int)", function_source)
+        # Exercise rejection again after a successful compile, with a live probe.
+        with pytest.raises(grpc.RpcError) as rejected:
+            client.inject(
+                session.id, "Calculator::multiply(int, int) const", rejected_source
+            )
+        assert "missing_callback_symbol" in rejected.value.details()
+        method = client.inject(
+            session.id, "Calculator::multiply(int, int) const", method_source
+        )
+        seen = set()
+        with client.watch_events([session.id], timeout=10) as events:
+            for event in events:
+                if event.phase != pb.PRE:
+                    continue
+                fields = {
+                    item.name: item.value.signed_value for item in event.object_fields
+                }
+                if event.probe_id == function.id:
+                    assert fields["identity"] == 11
+                    assert fields["first"] == event.arguments[0].signed_value
+                elif event.probe_id == method.id:
+                    assert fields["identity"] == 22
+                    assert fields["bias"] == 7
+                    assert event.object_address
+                else:
+                    pytest.fail(f"unexpected probe event: {event.probe_id}")
+                if event.probe_id not in seen:
+                    assert fields["counter"] == 1
+                seen.add(event.probe_id)
+                if seen == {function.id, method.id}:
+                    break
+            else:
+                pytest.fail("did not observe both independent callbacks")
+        assert client.remove_probe(session.id, method.id).original_bytes_restored
+        assert client.remove_probe(session.id, function.id).original_bytes_restored
+        assert target.poll() is None
+        assert client.detach(session.id).state == pb.Session.DETACHED
 
 
 def test_real_native_console_commands(native):
@@ -634,6 +983,32 @@ def test_native_symbol_listing_has_no_implicit_limits(native):
             )
             session = client.attach(target.pid)
             assert str(unrelated) in client.list_modules(session.id)
+            cancelled_lookup = client.stub.ResolveProbe.future(
+                pb.ResolveProbeRequest(
+                    session_id=session.id,
+                    selector="clang_tracer_cancel_missing_selector",
+                ),
+                timeout=120,
+            )
+            # Cancellation can race a fast lookup on another machine. Accept
+            # either an observed cancellation or the expected missing-name
+            # result, without requiring the scan to take a minimum duration.
+            if cancelled_lookup.cancel():
+                assert cancelled_lookup.cancelled()
+                with pytest.raises(grpc.FutureCancelledError):
+                    cancelled_lookup.result()
+                assert cancelled_lookup.code() == grpc.StatusCode.CANCELLED
+            else:
+                with pytest.raises(grpc.RpcError) as completed_lookup:
+                    cancelled_lookup.result(timeout=120)
+                assert completed_lookup.value.code() == grpc.StatusCode.INTERNAL
+                assert (
+                    "no supported matching callable" in completed_lookup.value.details()
+                )
+            current = next(
+                value for value in client.list_sessions() if value.id == session.id
+            )
+            assert not any(probe.active for probe in current.probes)
             # Use a raw default request too: unlimited is a server contract.
             all_symbols = client.stub.ListSymbols(
                 pb.ListSymbolsRequest(session_id=session.id), timeout=120

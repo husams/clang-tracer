@@ -323,8 +323,10 @@ def main() -> int:
         try:
             target = subprocess.Popen([str(args.target)], stdout=target_log,
                                       stderr=target_log)
+            # Match the REPL's operation budget: installed schema preparation
+            # includes parsing the complete target and standard-library types.
             server = subprocess.Popen([str(args.server), "--agent", str(args.agent),
-                                       "--listen", endpoint, "--timeout", "10",
+                                       "--listen", endpoint, "--timeout", "30",
                                        "--context-durable-dir", str(durable_directory)],
                                       stdout=server_log, stderr=server_log)
             ready_by = time.monotonic() + 12
@@ -343,8 +345,6 @@ def main() -> int:
                     f"could not attach to class target: {attached}")
             session_match = re.search(r"\bsession=([^\s]+)", attached)
             require(session_match is not None, f"attach output lacks session ID: {attached}")
-            session_id = session_match.group(1)
-
             callback = args.output_dir / "canonical-interceptor.cpp"
             callback.write_text((Path(__file__).resolve().parents[1] /
                                  "examples/basic-callbacks/interceptor.cpp").read_text(encoding="utf-8"),
@@ -429,7 +429,30 @@ def main() -> int:
                     f"callback return values differ from the typed call: {paired}")
             require("result {" in post_row and "signed_value:" in post_row,
                     f"post event lacks the original typed result: {post_row}")
+            # Failed replacement must leave the installed callback usable.
+            broken = args.output_dir / "broken-replacement.cpp"
+            write_text(broken, "struct Interceptor { broken }; ")
+            run(args.client, endpoint, "trace", str(target.pid),
+                "Fixture::overloaded(int)", "--callback", str(broken), ok=False)
+            _, event_cursor = wait_binary(
+                args.client, endpoint, target.pid, probe, args.output_dir,
+                args.protoc, args.proto, 2, event_cursor)
+            replacement = args.output_dir / "replacement.cpp"
+            write_text(replacement, """struct Interceptor {
+              long long pre(const Call&) { return 9001; }
+            };""")
+            previous_probe = probe
+            probe, _ = trace(args.client, endpoint, target.pid,
+                             "Fixture::overloaded(int)", replacement,
+                             args.compdb, args.source)
+            require(probe != previous_probe, "replacement reused the old probe ID")
+            replaced_rows, event_cursor = wait_binary(
+                args.client, endpoint, target.pid, probe, args.output_dir,
+                args.protoc, args.proto, 2, event_cursor)
+            require(all(callback_value(row) == 9001 for row in replaced_rows),
+                    f"replacement did not run the new callback: {replaced_rows}")
             remove(args.client, endpoint, target.pid, probe)
+            report.append("reprobing replaced the callback and compile failure preserved the old hook")
             report.append("class pre/post events exposed typed arguments, results, object address, and matching call IDs")
 
             # Optional pre-only and post-only methods, including a void-returning hook.
@@ -701,7 +724,6 @@ def main() -> int:
             session_match = re.search(r"\bsession=([^\s]+)", reattached)
             require(session_match is not None,
                     f"reattach output lacks session ID: {reattached}")
-            session_id = session_match.group(1)
             event_cursor = 0  # The restarted server's event sequence is fresh.
 
             # Floating point and pointer Call accessors use the same paired hooks.

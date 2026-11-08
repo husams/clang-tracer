@@ -1,5 +1,4 @@
 #include "context_hooks.hpp"
-#include "context_analysis.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -11,6 +10,10 @@
 #include <clang/Lex/Lexer.h>
 #include <clang/Lex/Preprocessor.h>
 #include <clang/Tooling/Tooling.h>
+
+#include "context_analysis.hpp"
+#include "tracer/compat.hpp"
+#include "tracer/compiler_options.hpp"
 
 namespace tracer {
 namespace {
@@ -36,7 +39,7 @@ std::string cpp_type(const std::string &type) {
                          std::string_view("struct "),
                          std::string_view("union "),
                          std::string_view("enum ")}) {
-    if (spelling.starts_with(tag)) {
+    if (::tracer::compat::starts_with(spelling, tag)) {
       spelling.erase(0, tag.size());
       break;
     }
@@ -46,9 +49,10 @@ std::string cpp_type(const std::string &type) {
       "char8_t", "char16_t", "char32_t", "short", "unsigned short",
       "int", "unsigned int", "long", "unsigned long", "long long",
       "unsigned long long", "float", "double", "long double"};
-  if (spelling.starts_with("::") ||
-      std::find(builtins.begin(), builtins.end(), spelling) != builtins.end())
+  if (::tracer::compat::starts_with(spelling, "::") ||
+      std::find(builtins.begin(), builtins.end(), spelling) != builtins.end()) {
     return spelling;
+  }
   return "::" + spelling;
 }
 bool main_file_range(clang::ASTUnit &unit, clang::SourceRange range,
@@ -84,7 +88,9 @@ public:
         unit.getSourceManager().getMainFileID());
     for (unsigned i = 0; i < 4096; ++i) {
       binding_type = "__clang_tracer_context_bindings_" + std::to_string(i);
-      if (!source.contains(binding_type)) break;
+      if (!::tracer::compat::contains(source, binding_type)) {
+        break;
+      }
       binding_type.clear();
     }
     if (binding_type.empty())
@@ -125,7 +131,7 @@ public:
         return false;
       }
       std::string marker = "/*__TRACER_CONTEXT_PLACEHOLDER_BEGIN:" +
-          record->getQualifiedNameAsString() + ":" + method_name +
+          context_class_type_name(*record) + ":" + method_name +
           "__*/\n#pragma clang diagnostic push\n#pragma clang diagnostic ignored \"-Wnull-dereference\"\n";
       if (dependencies.size() == 1) {
         marker += "::" + dependencies.front().first +
@@ -158,7 +164,7 @@ private:
   clang::ASTUnit &unit;
 };
 std::string qualified(const clang::CXXRecordDecl &record) {
-  return record.getQualifiedNameAsString();
+  return context_class_type_name(record);
 }
 std::string render(const ContextHookPlan &hook, const clang::CXXRecordDecl &r,
                    const std::string &facade) {
@@ -236,7 +242,9 @@ public:
         unit.getSourceManager().getMainFileID());
     for (unsigned i = 0; i < 4096; ++i) {
       binding_type = "__clang_tracer_context_bindings_" + std::to_string(i);
-      if (!source.contains(binding_type)) break;
+      if (!::tracer::compat::contains(source, binding_type)) {
+        break;
+      }
       binding_type.clear();
     }
     if (binding_type.empty())
@@ -312,7 +320,7 @@ public:
         const auto placeholder = "/*__TRACER_CONTEXT_PLACEHOLDER_BEGIN:" +
             found->type + ":" + hook.method + "__*/";
         const auto parse_buffer = sm.getBufferData(sm.getMainFileID());
-        if (!locals.empty() && !parse_buffer.contains(placeholder)) {
+        if (!locals.empty() && !::tracer::compat::contains(parse_buffer, placeholder)) {
           const auto offset = sm.getFileOffset(body) + 1;
           insertions.push_back({offset, std::move(locals)});
         }
@@ -389,7 +397,8 @@ ContextHookParseCopy prepare_context_hook_parse_copy(
   clang::IgnoringDiagConsumer ignore_diagnostics;
   auto ast = clang::tooling::buildASTFromCodeWithArgs(
       "#include \"tracer/callback.hpp\"\n" + source,
-      compiler_arguments, file_name, "clang-context-preparse",
+      clang_driver_arguments(compiler_arguments), file_name,
+      "clang-context-preparse",
       std::make_shared<clang::PCHContainerOperations>(),
       clang::tooling::getClangStripDependencyFileAdjuster(), {},
       &ignore_diagnostics);

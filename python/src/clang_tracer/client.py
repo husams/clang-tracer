@@ -8,7 +8,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Literal, Self
 
 import grpc
 
@@ -66,6 +66,31 @@ def _name_filters(names: Iterable[str]) -> tuple[str, ...]:
         if len(name.encode("utf-8")) > 4096:
             raise ValueError("each name filter must be at most 4096 UTF-8 bytes")
     return values
+
+
+def _compiler_options(options: Iterable[str]) -> tuple[str, ...]:
+    if isinstance(options, str):
+        raise ValueError("compile_options must be an iterable of strings")
+    values: list[str] = []
+    total = 0
+    try:
+        for option in options:
+            if len(values) == 128:
+                raise ValueError("compile_options accepts at most 128 options")
+            if not isinstance(option, str) or not option or "\0" in option:
+                raise ValueError(
+                    "each compile option must be nonempty and contain no NUL"
+                )
+            size = len(option.encode("utf-8"))
+            if size > 4096:
+                raise ValueError("each compile option must be at most 4096 UTF-8 bytes")
+            total += size + 1
+            if total > 65536:
+                raise ValueError("compile_options must total at most 64 KiB")
+            values.append(option)
+    except TypeError as error:
+        raise ValueError("compile_options must be an iterable of strings") from error
+    return tuple(values)
 
 
 @dataclass(frozen=True)
@@ -172,6 +197,91 @@ class Client:
         )
         return list(response.modules)
 
+    def preview_bulk_trace(
+        self, session_id: str, rules: pb.BulkTraceRules
+    ) -> pb.PreviewBulkTraceResponse:
+        """Resolve bulk trace rules and report capacity without installing probes."""
+        response: pb.PreviewBulkTraceResponse = self.stub.PreviewBulkTrace(
+            pb.PreviewBulkTraceRequest(session_id=session_id, rules=rules),
+            timeout=self.timeout,
+        )
+        return response
+
+    def list_memory_mappings(self, session_id: str) -> pb.ListMemoryMappingsResponse:
+        """Snapshot the mapped ranges and permissions for an attached target."""
+        return self.stub.ListMemoryMappings(
+            pb.ListMemoryMappingsRequest(session_id=session_id), timeout=self.timeout
+        )
+
+    def read_memory(
+        self, session_id: str, address: int, size: int, *, mapping_token: str
+    ) -> bytes:
+        """Return a complete, owned copy of a readable range in a current snapshot."""
+        response = self.stub.ReadMemory(
+            pb.ReadMemoryRequest(
+                session_id=session_id, address=address, size=size, mapping_token=mapping_token
+            ),
+            timeout=self.timeout,
+        )
+        return response.data
+
+    def scan_memory(
+        self, session_id: str, address: int, size: int, *,
+        mapping_token: str, pattern: bytes, mask: bytes, max_matches: int = 0,
+    ) -> pb.ScanMemoryResponse:
+        """Find masked matches in a current mapping snapshot."""
+        return self.stub.ScanMemory(
+            pb.ScanMemoryRequest(
+                session_id=session_id, address=address, size=size,
+                mapping_token=mapping_token, pattern=pattern, mask=mask,
+                max_matches=max_matches,
+            ),
+            timeout=self.timeout,
+        )
+
+    def preview_function_entry(
+        self, session_id: str, *, mapping_token: str, selector: str | None = None,
+        elf_address: int | None = None, module: str = "", abi: str = "",
+    ) -> pb.PreviewFunctionEntryResponse:
+        """Verify and disassemble a live entry without installing a probe."""
+        if (selector is None) == (elf_address is None):
+            raise ValueError("provide exactly one selector or ELF address")
+        request = pb.PreviewFunctionEntryRequest(
+            session_id=session_id, mapping_token=mapping_token, module=module, abi=abi
+        )
+        if selector is not None:
+            request.selector = selector
+        else:
+            assert elf_address is not None
+            request.elf_address = elf_address
+        return self.stub.PreviewFunctionEntry(request, timeout=self.timeout)
+
+    def list_threads(self, session_id: str) -> list[pb.TargetThread]:
+        """List thread IDs, names and start times for an attached target."""
+        response = self.stub.ListThreads(
+            pb.ListThreadsRequest(session_id=session_id), timeout=self.timeout
+        )
+        return list(response.threads)
+
+    def apply_bulk_trace(
+        self, session_id: str, rules: pb.BulkTraceRules, batch_id: str,
+        *, callback_source: str | None = None,
+    ) -> pb.BulkTraceReport:
+        """Apply rules with a caller-owned batch ID, such as uuid.uuid4().hex."""
+        request = pb.ApplyBulkTraceRequest(
+            session_id=session_id, rules=rules, batch_id=batch_id
+        )
+        if callback_source is not None:
+            request.callback_source = callback_source
+        return self.stub.ApplyBulkTrace(request, timeout=self.timeout)
+
+    def remove_bulk_trace(self, session_id: str, batch_id: str) -> pb.BulkTraceReport:
+        """Restore the probes owned by a retained batch in this session."""
+        return self.stub.RemoveBulkTrace(
+            pb.RemoveBulkTraceRequest(session_id=session_id, batch_id=batch_id),
+            timeout=self.timeout,
+        )
+
     def list_symbols(
         self,
         session_id: str,
@@ -212,14 +322,73 @@ class Client:
         module: str = "",
         debug_max_entries: int = 0,
         debug_max_depth: int = 0,
+        compile_options: Iterable[str] = (),
     ) -> pb.ProbeSpec:
         """Infer the signature from DWARF on the server (requires ResolveProbe)."""
+        options = _compiler_options(compile_options)
         response: pb.ProbeSpec = self.stub.ResolveProbe(
             pb.ResolveProbeRequest(
                 session_id=session_id,
                 selector=selector,
                 include_headers=list(include_headers),
                 compilation_database=compilation_database,
+                module=module,
+                debug_max_entries=uint(debug_max_entries, 64, "debug_max_entries"),
+                debug_max_depth=uint(debug_max_depth, 32, "debug_max_depth"),
+                compile_options=options,
+            ),
+            timeout=self.timeout,
+        )
+        response.compile_options[:] = options
+        return response
+
+    def validate_probe(
+        self,
+        session_id: str,
+        selector: str,
+        callback_source: str,
+        *,
+        include_headers: Iterable[str] = (),
+        compilation_database: str = "",
+        compile_options: Iterable[str] = (),
+        level: str = "compile",
+        module: str = "",
+        debug_max_entries: int = 0,
+        debug_max_depth: int = 0,
+    ) -> pb.ValidationReport:
+        """Check callback syntax or full compilation without installing it."""
+        if not isinstance(session_id, str) or not session_id or "\0" in session_id:
+            raise ValueError("session_id must be a nonempty string without NUL")
+        if not isinstance(selector, str) or not selector or "\0" in selector:
+            raise ValueError("selector must be a nonempty string without NUL")
+        if (
+            not isinstance(callback_source, str)
+            or not callback_source.strip()
+            or "\0" in callback_source
+        ):
+            raise ValueError("callback_source must be nonempty and contain no NUL")
+        if len(callback_source.encode("utf-8")) > 64 * 1024:
+            raise ValueError("callback_source exceeds 64 KiB")
+        if level not in {"syntax", "compile"}:
+            raise ValueError("level must be 'syntax' or 'compile'")
+        if not isinstance(compilation_database, str) or "\0" in compilation_database:
+            raise ValueError("compilation_database must be a string without NUL")
+        if not isinstance(module, str) or "\0" in module:
+            raise ValueError("module must be a string without NUL")
+        options = _compiler_options(compile_options)
+        response: pb.ValidationReport = self.stub.ValidateProbe(
+            pb.ValidateProbeRequest(
+                session_id=session_id,
+                selector=selector,
+                callback_source=callback_source,
+                include_headers=list(include_headers),
+                compilation_database=compilation_database,
+                compile_options=options,
+                level=(
+                    pb.ValidateProbeRequest.SYNTAX
+                    if level == "syntax"
+                    else pb.ValidateProbeRequest.COMPILE
+                ),
                 module=module,
                 debug_max_entries=uint(debug_max_entries, 64, "debug_max_entries"),
                 debug_max_depth=uint(debug_max_depth, 32, "debug_max_depth"),
@@ -238,6 +407,17 @@ class Client:
         )
         return response
 
+    def reload_probe(
+        self, session_id: str, probe_id: int, callback_source: str
+    ) -> pb.ReloadProbeResponse:
+        """Switch an active probe to a new observer generation."""
+        return self.stub.ReloadProbe(
+            pb.ReloadProbeRequest(
+                session_id=session_id, probe_id=probe_id, callback_source=callback_source
+            ),
+            timeout=self.timeout,
+        )
+
     def inject(
         self,
         session_id: str,
@@ -246,7 +426,7 @@ class Client:
         *,
         include_headers: Iterable[str] = (),
         compilation_database: str = "",
-        stack_depth: int = 0,
+        stack_depth: int | Literal["full"] = 0,
         include_internal_stack_frames: bool = False,
         print_arguments: bool = False,
         print_result: bool = False,
@@ -254,6 +434,7 @@ class Client:
         module: str = "",
         debug_max_entries: int = 0,
         debug_max_depth: int = 0,
+        compile_options: Iterable[str] = (),
     ) -> pb.Probe:
         """Compile and install a C++ interceptor without manual ABI declarations.
 
@@ -264,9 +445,10 @@ class Client:
             raise ValueError("callback source must be nonempty and contain no NUL")
         if len(callback_source.encode()) > 64 * 1024:
             raise ValueError("callback source exceeds 64 KiB")
-        uint(stack_depth, 32, "stack_depth")
-        if stack_depth > 64:
-            raise ValueError("stack_depth must be between 0 and 64")
+        depth = (
+            (1 << 32) - 1 if stack_depth == "full" else uint(stack_depth, 32, "stack_depth")
+        )
+        options = _compiler_options(compile_options)
         spec = self.resolve_probe(
             session_id,
             selector,
@@ -275,9 +457,11 @@ class Client:
             module=module,
             debug_max_entries=debug_max_entries,
             debug_max_depth=debug_max_depth,
+            compile_options=options,
         )
+        spec.compile_options[:] = options
         spec.callback_source = callback_source
-        spec.stack_depth = stack_depth
+        spec.stack_depth = depth
         spec.include_internal_stack_frames = include_internal_stack_frames
         spec.print_arguments = print_arguments
         spec.print_result = print_result
@@ -600,6 +784,8 @@ class Client:
         event_history_limit: int | None = None,
         context_history_limit: int | None = None,
         context_history_bytes: int | None = None,
+        context_event_bytes: int | None = None,
+        context_transport_memory_bytes: int | None = None,
     ) -> ServerStatus:
         """Start a local child and confirm both managed and client readiness.
 
@@ -626,6 +812,8 @@ class Client:
             event_history_limit=event_history_limit,
             context_history_limit=context_history_limit,
             context_history_bytes=context_history_bytes,
+            context_event_bytes=context_event_bytes,
+            context_transport_memory_bytes=context_transport_memory_bytes,
         )
         # A channel used before a restart may still be reconnecting after a
         # failed status check; wait until this client's channel is usable too.

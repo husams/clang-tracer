@@ -58,7 +58,7 @@ inline int initialized = object.in_another_library();
 }
 HEADER
     printf '\n#include "unrelated.hpp"\n' >> application/include/account.hpp
-    printf '[{"directory":"%s/application/build","file":"../include/account.cpp","arguments":["clang++","-std=c++17","-c","../include/account.cpp"]}]\n' \
+    printf '[{"directory":"%s/application/build","file":"../include/account.cpp","arguments":["clang++","-std=c++23","-c","../include/account.cpp"]}]\n' \
       "$run" > application/build/compile_commands.json
     {
       IFS= read -r prepare

@@ -1,0 +1,7 @@
+#pragma once
+#define TRACER_REPL_RESOURCE_DIR "@_tracer_resource_dir@"
+#define TRACER_REPL_RESOURCE_RELATIVE "@_repl_resource_relative@"
+#define TRACER_REPL_API_HEADER "@_repl@/api.hpp"
+#define TRACER_REPL_API_RELATIVE "@_repl_api_relative@"
+inline const char *const repl_compiler_arguments[] = {
+@_repl_compiler_arguments@};

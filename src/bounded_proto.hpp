@@ -3,8 +3,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <span>
 #include <string_view>
+
+#include "tracer/compat.hpp"
 
 namespace tracer::context_engine {
 
@@ -34,14 +35,20 @@ struct CaptureLimits {
 // A sticky failure invalidates the entire capture, including earlier fields.
 class BoundedProtoWriter final {
 public:
-  explicit BoundedProtoWriter(std::span<std::byte>,
-                              CaptureLimits = {}) noexcept;
+  explicit BoundedProtoWriter(::tracer::compat::span<std::byte>, CaptureLimits = {}) noexcept;
   BoundedProtoWriter(const BoundedProtoWriter &) = delete;
   BoundedProtoWriter &operator=(const BoundedProtoWriter &) = delete;
   BoundedProtoWriter(BoundedProtoWriter &&) = delete;
   BoundedProtoWriter &operator=(BoundedProtoWriter &&) = delete;
   CaptureStatus status() const noexcept { return status_; }
-  std::span<const std::byte> finish() noexcept;
+
+  // Fixed-format metadata has no generated codec traversal. Each field
+  // consumes a byte, so the remaining storage also bounds its field visits.
+  void bound_remaining_visits_by_bytes() noexcept {
+    limits_.visits = visits_ + (storage_.size() - used_);
+  }
+
+  ::tracer::compat::span<const std::byte> finish() noexcept;
   bool u64(std::uint32_t field, std::uint64_t) noexcept;
   bool s64(std::uint32_t field, std::int64_t) noexcept;
   bool boolean(std::uint32_t field, bool) noexcept;
@@ -63,8 +70,9 @@ private:
   struct Message {
     std::size_t length_position, payload_position;
   };
-  const std::span<std::byte> storage_;
-  const CaptureLimits limits_;
+
+  const ::tracer::compat::span<std::byte> storage_;
+  CaptureLimits limits_;
   CaptureStatus status_ = CaptureStatus::ok;
   std::size_t used_ = 0, visits_ = 0, items_ = 0, depth_ = 0, work_ = 0;
   std::array<Message, 32> messages_{};

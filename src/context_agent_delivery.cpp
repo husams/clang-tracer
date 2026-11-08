@@ -1,15 +1,16 @@
 #include "context_agent_delivery.hpp"
 
-#include "context_journal.hpp"
-
-#include <grpcpp/grpcpp.h>
-
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+
+#include <grpcpp/grpcpp.h>
 #include <unistd.h>
+
+#include "context_journal.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer::context_delivery {
 namespace {
@@ -64,6 +65,7 @@ ContextAgentDelivery::ContextAgentDelivery(const Request &request) {
       request.context_native_pid != static_cast<std::uint32_t>(::getpid()) ||
       request.context_process_start_time == 0)
     throw std::invalid_argument("invalid native process identity for context delivery");
+  const auto limits = stream_limits_for_context(request.context_budget);
   const bool durable = request.context_delivery_profile == 2;
   auto open = clangtracer::context::v1::ExportOpen{};
   open.set_producer_session_id(
@@ -81,7 +83,9 @@ ContextAgentDelivery::ContextAgentDelivery(const Request &request) {
                                           "shared-context recording id", true);
     const auto sink = request_string(request.context_sink_id,
                                      "shared-context sink id", true);
-    journal_ = std::make_shared<ContextJournal>(directory);
+    journal_ = std::make_shared<ContextJournal>(
+        directory, journal_limits_for_packet(limits.max_packet_bytes,
+                                             limits.max_epoch_schema_bytes));
     if (!journal_->healthy())
       throw std::runtime_error(journal_->error());
     const auto state = journal_->state();
@@ -99,7 +103,7 @@ ContextAgentDelivery::ContextAgentDelivery(const Request &request) {
 
   grpc::ChannelArguments arguments;
   arguments.SetInt(GRPC_ARG_ENABLE_RETRIES, 0);
-  arguments.SetMaxSendMessageSize(static_cast<int>(StreamLimits{}.max_packet_bytes));
+  arguments.SetMaxSendMessageSize(static_cast<int>(limits.max_packet_bytes));
   arguments.SetMaxReceiveMessageSize(4 * 1024);
   auto channel = grpc::CreateCustomChannel(
       endpoint, grpc::InsecureChannelCredentials(), arguments);
@@ -107,7 +111,7 @@ ContextAgentDelivery::ContextAgentDelivery(const Request &request) {
     return true;
   };
   client_ = std::make_unique<ContextExportClient>(
-      std::move(channel), std::move(open), StreamLimits{},
+      std::move(channel), std::move(open), limits,
       durable ? ContextExportClient::DurableConfirmation(confirmation)
               : ContextExportClient::DurableConfirmation{},
       journal_);
@@ -121,8 +125,8 @@ ContextAgentDelivery::~ContextAgentDelivery() {
 }
 
 bool ContextAgentDelivery::try_publish_capture(
-    std::span<const std::byte> event_record,
-    const std::shared_ptr<const void> &schema_lease) noexcept {
+    ::tracer::compat::span<const std::byte> event_record,
+    const std::shared_ptr<const void>& schema_lease) noexcept {
   return client_ && client_->try_publish_capture(event_record, schema_lease);
 }
 

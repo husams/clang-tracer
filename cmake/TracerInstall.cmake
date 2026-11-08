@@ -1,17 +1,5 @@
 option(TRACER_BUNDLE_CLANG_HEADERS "Install selected Clang builtin headers with the runtime" ON)
-set(TRACER_JIT_FLAGS "" CACHE STRING "Semicolon-separated default compiler flags for embedded callback compilation")
-set(_tracer_jit_entries "")
-set(_tracer_jit_count 0)
-foreach(_flag IN LISTS TRACER_JIT_FLAGS)
-  string(REPLACE "\\" "\\\\" _escaped "${_flag}")
-  string(REPLACE "\"" "\\\"" _escaped "${_escaped}")
-  string(REPLACE "\n" "\\n" _escaped "${_escaped}")
-  string(REPLACE "\r" "\\r" _escaped "${_escaped}")
-  string(APPEND _tracer_jit_entries "  \"${_escaped}\",\n")
-  math(EXPR _tracer_jit_count "${_tracer_jit_count} + 1")
-endforeach()
-configure_file("${PROJECT_SOURCE_DIR}/src/runtime_config.hpp.in"
-  "${PROJECT_BINARY_DIR}/generated/tracer_runtime_config.hpp" @ONLY)
+include("${CMAKE_CURRENT_LIST_DIR}/TracerJitConfig.cmake")
 set(_tracer_resource_destination "${CMAKE_INSTALL_DATADIR}/clang-tracer/clang-resource")
 if(IS_ABSOLUTE "${_tracer_resource_destination}")
   set(_tracer_full_resource_destination "${_tracer_resource_destination}")
@@ -66,8 +54,13 @@ install(FILES python/README.md DESTINATION "${CMAKE_INSTALL_DOCDIR}/python" COMP
 install(DIRECTORY docs DESTINATION "${CMAKE_INSTALL_DOCDIR}" COMPONENT Runtime)
 install(DIRECTORY examples DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer"
   COMPONENT Development FILES_MATCHING
-  PATTERN "*.cpp" PATTERN "*.hpp" PATTERN "*.md" PATTERN "*.py"
+  PATTERN "*.cpp" PATTERN "*.hpp" PATTERN "*.md" PATTERN "*.py" PATTERN "*.repl"
   PATTERN "__pycache__" EXCLUDE)
+foreach(_example native-repl-values native-repl-jit)
+  install(PROGRAMS examples/${_example}/run.sh
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer/examples/${_example}"
+    COMPONENT Development)
+endforeach()
 install(FILES LICENSES/LLVM.txt DESTINATION "${CMAKE_INSTALL_DOCDIR}/licenses" COMPONENT Runtime)
 if(TRACER_BUNDLE_CLANG_HEADERS)
   install(DIRECTORY "${_tracer_resource_dir}/include"

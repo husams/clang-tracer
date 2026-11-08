@@ -10,10 +10,11 @@
       | "detach" value?                                 -> detach
       | "probe" "inject" value injection_option*        -> inject
       | "probe" "resolve" value resolution_option*      -> resolve
+      | "probe" "validate" value validation_option*     -> validate
       | "probe" "add" value                             -> add_spec
       | "probe" "remove" INT                            -> remove
       | "events" watch_option*                          -> events
-      | "collect" INT stream_option*                    -> collect
+      | "collect" INT? stream_option*                   -> collect
       | "record" value INT record_option*               -> record
       | "drain" value drain_option*                     -> drain
       | "help" value*                                  -> help
@@ -29,9 +30,11 @@
               | "--event-history-limit" INT             -> event_history_limit
               | "--context-history-limit" INT           -> context_history_limit
               | "--context-history-bytes" INT           -> context_history_bytes
+              | "--context-event-bytes" INT             -> context_event_bytes
+              | "--context-transport-memory-bytes" INT  -> context_transport_memory_bytes
               | timeout_option
 ?injection_option: "--callback" value                    -> callback
-                 | "--stack" INT                        -> stack_depth
+                 | "--stack" (INT | FULL_STACK)         -> stack_depth
                  | "--internal-frames"                  -> internal_frames
                  | "--print-arguments"                  -> print_arguments
                  | "--print-result"                     -> print_result
@@ -39,9 +42,13 @@
                  | resolution_option
 ?resolution_option: "--include" value                    -> include_headers
                   | "--compdb" value                    -> compilation_database
+                  | "--compile-option" value            -> compile_options
                   | "--module" value                    -> module
                   | "--debug-max-entries" INT            -> debug_max_entries
                   | "--debug-max-depth" INT              -> debug_max_depth
+?validation_option: "--callback" value                   -> callback
+                  | "--level" value                     -> validation_level
+                  | resolution_option
 ?watch_option: "--count" INT                             -> count
              | stream_option
 ?record_option: "--sqlite"                              -> sqlite
@@ -62,6 +69,7 @@ SHELL_COMMAND.10: /![ \t][^\n]*/
 ?value: STRING | BARE
 STRING.3: /"(?:[^"\\]|\\.)*"/ | /'(?:[^'\\]|\\.)*'/
 BARE.-1: /[^\s'"#]+/
+FULL_STACK: "full"
 INT.1: /[0-9]+/
 NUMBER.2: /[0-9]+(?:\.[0-9]+)?/
 %import common.WS

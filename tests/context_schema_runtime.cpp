@@ -1,5 +1,6 @@
 // clang-format off
 #include "tracer/callback.hpp"
+#include "tracer/compat.hpp"
 #include "fixtures/context_schema_catalog.cpp"
 #include "fixtures/context_schema_generic.cpp"
 #include "fixtures/context_schema_history_v1.cpp"
@@ -49,8 +50,8 @@ void register_schema(ContextReceiver &r, std::uint64_t id,
 struct Limits {
   std::size_t truncations = 0;
   bool saw_billing = false, saw_unsigned_key = false;
-  static bool record(void *context,
-                     std::span<const EncodeBudget::PathStep> path,
+
+  static bool record(void* context, ::tracer::compat::span<const EncodeBudget::PathStep> path,
                      std::uint64_t total, std::uint64_t captured) noexcept {
     auto &self = *static_cast<Limits *>(context);
     if (total <= captured)
@@ -176,7 +177,7 @@ void verify_context_schema_roundtrip() {
   auto query_bytes = encode_root(query_state, query_limits, 100);
   StateAttachmentView query_attachment{9, query_bytes};
   auto query_event = receiver.decode_event(
-      std::span<const StateAttachmentView>(&query_attachment, 1));
+      ::tracer::compat::span<const StateAttachmentView>(&query_attachment, 1));
   require(bool(query_event), "container-aware query fixture decode failed");
   const auto &query_message = *query_event->states[0].message();
   auto admitted = receiver.admitted_schemas();
@@ -187,13 +188,13 @@ void verify_context_schema_roundtrip() {
   require(query_schema != admitted.end(),
           "receiver did not expose a leased query schema view");
   const auto query_paths = tracer::context_query::discover_field_paths(*query_schema);
-  require(!query_paths.truncated && query_paths.paths.contains("matrix") &&
-              query_paths.paths.contains("groups.label") &&
-              query_paths.paths.contains("recent.id") &&
-              !query_paths.paths.contains("matrix.items") &&
-              !query_paths.paths.contains("groups.key") &&
-              !query_paths.paths.contains("groups.value") &&
-              !query_paths.paths.contains("recent.value"),
+  require(!query_paths.truncated && ::tracer::compat::contains(query_paths.paths, "matrix") &&
+              ::tracer::compat::contains(query_paths.paths, "groups.label") &&
+              ::tracer::compat::contains(query_paths.paths, "recent.id") &&
+              !::tracer::compat::contains(query_paths.paths, "matrix.items") &&
+              !::tracer::compat::contains(query_paths.paths, "groups.key") &&
+              !::tracer::compat::contains(query_paths.paths, "groups.value") &&
+              !::tracer::compat::contains(query_paths.paths, "recent.value"),
           "logical paths exposed protobuf container wrappers");
   require(tracer::context_query::query_field(query_message, *query_schema,
                                               "matrix") ==
@@ -220,7 +221,7 @@ void verify_context_schema_roundtrip() {
   auto generic_bytes = generic_writer.finish();
   StateAttachmentView generic_int_attachment{5, generic_bytes};
   auto generic_int_event = receiver.decode_event(
-      std::span<const StateAttachmentView>(&generic_int_attachment, 1));
+      ::tracer::compat::span<const StateAttachmentView>(&generic_int_attachment, 1));
   require(bool(generic_int_event), "generic int payload decode failed");
   const auto &generic_int_message = *generic_int_event->states[0].message();
   const auto *generic_value = field(generic_int_message, "value");
@@ -238,8 +239,8 @@ void verify_context_schema_roundtrip() {
           "generic string payload encode failed");
   auto text_bytes = text_writer.finish();
   StateAttachmentView text_attachment{6, text_bytes};
-  auto text_event = receiver.decode_event(
-      std::span<const StateAttachmentView>(&text_attachment, 1));
+  auto text_event =
+      receiver.decode_event(::tracer::compat::span<const StateAttachmentView>(&text_attachment, 1));
   require(bool(text_event), "generic string payload decode failed");
   const auto &text_message = *text_event->states[0].message();
   require(reflection(text_message)
@@ -261,9 +262,9 @@ void verify_context_schema_roundtrip() {
       {{CapturePathSelector::field_number, 1}}};
   const CaptureLimitView generic_limit{generic_path, 3, 1};
   StateAttachmentView vector_attachment{
-      7, vector_bytes, std::span<const CaptureLimitView>(&generic_limit, 1)};
+      7, vector_bytes, ::tracer::compat::span<const CaptureLimitView>(&generic_limit, 1)};
   auto vector_event = receiver.decode_event(
-      std::span<const StateAttachmentView>(&vector_attachment, 1));
+      ::tracer::compat::span<const StateAttachmentView>(&vector_attachment, 1));
   require(bool(vector_event), "generic vector payload decode failed");
   const auto &vector_message = *vector_event->states[0].message();
   const auto *vector_field = field(vector_message, "value");
@@ -281,10 +282,10 @@ void verify_context_schema_roundtrip() {
                context_schema_generated::generic_values_revision;
       });
   require(generic_schema != generic_admitted.end() &&
-              tracer::context_query::discover_field_paths(*generic_schema)
-                  .paths.contains("value") &&
-              tracer::context_query::query_field(vector_message, *generic_schema,
-                                                  "value") == "[int32:3]",
+              ::tracer::compat::contains(
+                  tracer::context_query::discover_field_paths(*generic_schema).paths, "value") &&
+              tracer::context_query::query_field(vector_message, *generic_schema, "value") ==
+                  "[int32:3]",
           "generic container root was not queried through its admitted schema");
   generic_payload::Object generic_object{17, "payload"};
   BoundedProtoWriter object_writer(generic_storage);
@@ -295,7 +296,7 @@ void verify_context_schema_roundtrip() {
   auto object_bytes = object_writer.finish();
   StateAttachmentView object_attachment{8, object_bytes};
   auto object_event = receiver.decode_event(
-      std::span<const StateAttachmentView>(&object_attachment, 1));
+      ::tracer::compat::span<const StateAttachmentView>(&object_attachment, 1));
   require(bool(object_event), "generic object payload decode failed");
   const auto &object_root = *object_event->states[0].message();
   const auto &object_message =
@@ -344,9 +345,9 @@ void verify_context_schema_roundtrip() {
        {CapturePathSelector::field_number, 2}}};
   const CaptureLimitView duration_limit{duration_path, 2, 1};
   StateAttachmentView request_attachment{
-      1, request_bytes, std::span<const CaptureLimitView>(&duration_limit, 1)};
+      1, request_bytes, ::tracer::compat::span<const CaptureLimitView>(&duration_limit, 1)};
   auto request_event = receiver.decode_event(
-      std::span<const StateAttachmentView>(&request_attachment, 1));
+      ::tracer::compat::span<const StateAttachmentView>(&request_attachment, 1));
   require(bool(request_event), "request event decode failed");
   const auto decoded_limits = request_event->states[0].truncations();
   require(decoded_limits.size() == 1 && decoded_limits[0].total_items == 2 &&
@@ -421,7 +422,7 @@ void verify_context_schema_roundtrip() {
           "catalog container caps or typed map keys were not reported");
   StateAttachmentView catalog_attachment{2, catalog_bytes};
   auto catalog_event = receiver.decode_event(
-      std::span<const StateAttachmentView>(&catalog_attachment, 1));
+      ::tracer::compat::span<const StateAttachmentView>(&catalog_attachment, 1));
   require(bool(catalog_event), "catalog event decode failed");
   const auto &catalog_message = *catalog_event->states[0].message();
   const auto *queues = field(catalog_message, "queues");
@@ -470,8 +471,8 @@ void verify_context_schema_roundtrip() {
   Limits history_limits;
   auto old_bytes = encode_root(old_state, history_limits);
   StateAttachmentView old_attachment{3, old_bytes};
-  auto old_event = receiver.decode_event(
-      std::span<const StateAttachmentView>(&old_attachment, 1));
+  auto old_event =
+      receiver.decode_event(::tracer::compat::span<const StateAttachmentView>(&old_attachment, 1));
   require(bool(old_event), "old revision decode failed");
   const auto &old_message = *old_event->states[0].message();
   require(field(old_message, "removed") &&
@@ -493,7 +494,7 @@ void verify_context_schema_roundtrip() {
   auto newer_bytes = newer_writer.finish();
   StateAttachmentView newer_attachment{4, newer_bytes};
   auto newer_event = receiver.decode_event(
-      std::span<const StateAttachmentView>(&newer_attachment, 1));
+      ::tracer::compat::span<const StateAttachmentView>(&newer_attachment, 1));
   require(bool(newer_event), "new revision decode failed");
   const auto &new_message = *newer_event->states[0].message();
   require(!field(new_message, "removed") && field(new_message, "added") &&

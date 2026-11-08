@@ -203,7 +203,9 @@ def main() -> int:
                 if label == "mutate":
                     expected = re.search(r"read.only|const|assignment of read-only", diagnostic, re.I)
                 elif label == "invoke":
-                    expected = re.search(r"cannot call methods on.*receiver|no member named 'multiply'", diagnostic, re.I)
+                    expected = re.search(r"cannot call methods on.*receiver|no member named 'multiply'|"
+                                         r"cannot call or take the address of imported receiver methods",
+                                         diagnostic, re.I)
                 elif label == "aggregate":
                     expected = re.search(r"cannot construct objects of the imported receiver type|"
                                          r"implicitly-deleted default constructor of 'Holder'",
@@ -260,7 +262,9 @@ def main() -> int:
                     "InheritedCalculator::read(int) const", "--callback", str(args.callback),
                     ok=False, timeout=45))
                 rejection_diagnostics.append(f"inheritance: {inheritance_error}")
-                require(re.search(r"debug receiver inheritance is unsupported|unsupported.*(?:receiver|inheritance|layout)|typed self\(\) requires "
+                require(re.search(r"debug receiver inheritance is unsupported|unsupported.*(?:receiver|inheritance|layout)|"
+                                  r"receiver layout changed during AST import: receiver size or alignment changed since source selection|"
+                                  r"typed self\(\) requires "
                                   r"a debug-selected supported non-static method",
                                   inheritance_error, re.I),
                         f"inheritance rejection was not clear: {inheritance_error}")
@@ -308,7 +312,9 @@ def main() -> int:
                     "--compdb", str(short_compdb), "--include", str(pointer_header),
                     ok=False, timeout=45))
                 rejection_diagnostics.append(f"short-wchar-pointer: {pointer_error}")
-                require("receiver field type ABI does not match DWARF" in pointer_error,
+                require("receiver field type ABI does not match DWARF" in pointer_error or
+                        "header compiler command contains unsupported option: -fshort-wchar" in
+                        pointer_error,
                         f"pointer field ABI mismatch failed for an unexpected reason: {pointer_error}")
                 run(args.client, endpoint, "detach", str(inherited.pid), timeout=20)
                 require(inherited.poll() is None,

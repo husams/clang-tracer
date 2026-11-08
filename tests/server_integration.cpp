@@ -3,7 +3,6 @@
 #endif
 
 #include <algorithm>
-#include <barrier>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -29,14 +28,15 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <grpcpp/grpcpp.h>
 #include <spawn.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <grpcpp/grpcpp.h>
-
+#include "../src/linux_syscalls.hpp"
+#include "thread_barrier.hpp"
 #include "tracer.grpc.pb.h"
 
 extern char **environ;
@@ -208,7 +208,7 @@ read_process_memory(pid_t pid, std::uintptr_t address, std::size_t size) {
   std::vector<unsigned char> bytes(size);
   iovec local{bytes.data(), bytes.size()};
   iovec remote{reinterpret_cast<void *>(address), bytes.size()};
-  const auto copied = ::process_vm_readv(pid, &local, 1, &remote, 1, 0);
+  const auto copied = ::tracer::linux_api::process_vm_readv(pid, &local, 1, &remote, 1, 0);
   require(copied == static_cast<ssize_t>(size),
           "could not read target function bytes");
   return bytes;
@@ -549,7 +549,7 @@ void run(const std::filesystem::path &server_path,
   const std::string callback =
       read_file(std::filesystem::path(__FILE__).parent_path().parent_path() /
                 "tests/fixtures/probe.cpp");
-  std::barrier attach_gate(3);
+  ThreadBarrier attach_gate(3);
   auto concurrent_attach = [&]() {
     attach_gate.arrive_and_wait();
     return attach_once(*stub, target_a.pid());
@@ -604,7 +604,7 @@ void run(const std::filesystem::path &server_path,
   const auto free_spec = make_spec(
       "traced_work", api::FUNCTION, api::INT32, {api::INT32},
       agent_logging ? logging_callback : callback);
-  const auto free_a =
+  auto free_a =
       add_probe_ok(*stub, session_a.id(), free_spec, output_dir, "free-a");
   require(free_a.entry_address() == *target_a_entry,
           "server resolved traced_work to an unexpected address");
@@ -650,16 +650,22 @@ void run(const std::filesystem::path &server_path,
                                       output_dir, "pointer-a");
   const auto void_spec = make_spec("traced_void", api::FUNCTION, api::VOID,
                                    {api::INT32}, callback);
-  const auto void_a =
+  auto void_a =
       add_probe_ok(*stub, session_a.id(), void_spec, output_dir, "void-a");
 
-  api::Probe duplicate_probe;
-  const auto duplicate_probe_status =
-      add_probe(*stub, session_a.id(), free_spec, &duplicate_probe);
-  require_failure_category(duplicate_probe_status, "duplicate probe",
-                           {"already hooked"});
-  report(report_file,
-         "duplicate probe rejected: " + duplicate_probe_status.error_message());
+  const auto replace_probe = [&](const api::ProbeSpec &spec, api::Probe &probe) {
+    api::Probe replacement;
+    const auto status = add_probe(*stub, session_a.id(), spec, &replacement);
+    require(status.ok(), "replacement probe failed: " + status.error_message());
+    require(replacement.active() && replacement.id() != probe.id() &&
+                replacement.entry_address() == probe.entry_address(),
+            "replacement did not activate a new probe at the same entry");
+    probe = replacement;
+  };
+  replace_probe(free_spec, free_a);
+  // The PIE fixture needs relocation again when replacing this probe.
+  replace_probe(void_spec, void_a);
+  report(report_file, "same-session probe replaced with a new version");
 
   api::ProbeSpec missing = free_spec;
   missing.set_symbol("missing_target_symbol");
@@ -695,6 +701,62 @@ void run(const std::filesystem::path &server_path,
                            {"trace_callback must be"});
   report(report_file,
          "wrong callback signature rejected: " + wrong_status.error_message());
+
+  api::ProbeSpec invalid_compile_option = free_spec;
+  invalid_compile_option.add_compile_options("");
+  api::Probe invalid_compile_option_response;
+  const auto invalid_compile_option_status =
+      add_probe(*stub, session_a.id(), invalid_compile_option,
+                &invalid_compile_option_response);
+  require_failure_category(invalid_compile_option_status,
+                           "empty compiler option",
+                           {"compiler options must be nonempty"});
+  report(report_file, "empty compiler option rejected before native preparation");
+
+  api::ValidateProbeRequest invalid_validation_option;
+  invalid_validation_option.set_selector("target(int)");
+  invalid_validation_option.set_callback_source("struct Interceptor {};");
+  invalid_validation_option.add_compile_options("");
+  api::ValidationReport invalid_validation_response;
+  grpc::ClientContext invalid_validation_context;
+  set_rpc_deadline(invalid_validation_context);
+  const auto invalid_validation_status = stub->ValidateProbe(
+      &invalid_validation_context, invalid_validation_option,
+      &invalid_validation_response);
+  require(invalid_validation_status.error_code() ==
+              grpc::StatusCode::INVALID_ARGUMENT &&
+              invalid_validation_status.error_message().find("compiler options") !=
+                  std::string::npos,
+          "ValidateProbe accepted an empty compiler option");
+  report(report_file,
+         "ValidateProbe rejects malformed compiler options before resolution");
+
+  const std::vector<std::string> unsafe_preflight_options = {
+      "@/tmp/clang-tracer-args.rsp", "--config=/tmp/clang-tracer.cfg",
+      "-fplugin=/tmp/plugin.so", "-fpass-plugin=/tmp/pass-plugin.so",
+      "-Xclang", "-Xclang=-load", "-Wp,-load,/tmp/plugin.so",
+      "-Xpreprocessor", "--driver-mode=cl",
+      "/clang:-fplugin=/tmp/plugin.so", "--config-user-dir=/tmp/clang",
+      "-mllvm", "-target=x86_64-unknown-linux-gnu", "-m32",
+      "-fpack-struct", "-include-pch=/tmp/header.pch", "-imacros",
+      "-c",
+      "-fsyntax-only"};
+  for (const auto &option : unsafe_preflight_options) {
+    api::ValidateProbeRequest request;
+    request.set_selector("target(int)");
+    request.set_callback_source("struct Interceptor {};");
+    request.add_compile_options(option);
+    api::ValidationReport response;
+    grpc::ClientContext context;
+    set_rpc_deadline(context);
+    const auto status = stub->ValidateProbe(&context, request, &response);
+    require(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT &&
+                status.error_message().find("compiler options") !=
+                    std::string::npos,
+            "ValidateProbe accepted unsafe preflight option: " + option);
+  }
+  report(report_file,
+         "ValidateProbe rejects plugin, opaque, response-file, and ABI options before resolution");
 
   api::ProbeSpec unsafe = free_spec;
   unsafe.set_symbol("unsafe_target");

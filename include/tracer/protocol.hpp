@@ -9,11 +9,24 @@ inline constexpr std::uint32_t kProtocolVersion = 2;
 // engine-assigned package lineage UUID. It reads a binary ProbeSpec at
 // source_path, including optional Clang receiver context. Older agents reject
 // the version before interpreting the expanded bootstrap request.
-inline constexpr std::uint32_t kBootstrapVersion = 18;
+// Version 19 reports a prepared replacement's previous probe ID.
+// Version 20 adds capture-time owned value snapshots to TraceValue.
+// Version 21 verifies header-prepared scalar contracts without rescanning DWARF.
+// Version 23 reports target-side JIT compile time for prepared probes.
+// Version 26 replaces the inline callback stack array with an invocation view.
+// Version 27 configures the shared-context event budget in the bootstrap.
+// Version 28 also carries the shared transport memory budget.
+inline constexpr std::uint32_t kBootstrapVersion = 28;
+inline constexpr std::uint32_t kDefaultContextEventBytes = 256 * 1024;
+inline constexpr std::uint64_t kDefaultContextTransportMemoryBytes = 64ull * 1024 * 1024;
+struct ContextTransportBudget {
+  std::uint32_t event_bytes = kDefaultContextEventBytes;
+  std::uint64_t memory_bytes = kDefaultContextTransportMemoryBytes;
+};
 inline constexpr unsigned kMaxPatchBytes = 64;
 inline constexpr unsigned kMaxArguments = 8;
 inline constexpr unsigned kMaxProbes = 32;
-inline constexpr unsigned kMaxStackDepth = 64;
+inline constexpr std::uint32_t kUnlimitedStackDepth = UINT32_MAX;
 
 enum class StackStatus : std::uint32_t {
   Disabled = 0,
@@ -49,7 +62,7 @@ struct StackTrace {
   std::uint32_t captured_depth =
       0; // Before filtering; depth/status cover this unwind.
   char detail[160]{};
-  StackFrame frames[kMaxStackDepth]{};
+  const StackFrame *frames = nullptr;
 };
 
 // Numeric values match proto/tracer.proto; this is the native bootstrap ABI.
@@ -62,7 +75,8 @@ enum class ValueType : std::uint32_t {
   Float32 = 5,
   Float64 = 6,
   Pointer = 7,
-  Object = 8
+  Object = 8,
+  Bool = 9
 };
 enum class CallableKind : std::uint32_t {
   Unspecified = 0,
@@ -72,12 +86,34 @@ enum class CallableKind : std::uint32_t {
 enum class TracePhase : std::uint32_t { Pre = 1, Post = 2 };
 enum class LogLevel : std::uint8_t { Info, Warning, Error };
 
+struct ValueSnapshot {
+  enum Status : std::uint32_t {
+    Complete = 1,
+    Unsupported = 2,
+    LimitExceeded = 3,
+    Failed = 4
+  };
+  const char *cpp_type = nullptr;
+  const char *root_type = nullptr;
+  const char *descriptor = nullptr;
+  std::size_t descriptor_size = 0;
+  const std::byte *payload = nullptr;
+  std::size_t payload_size = 0;
+  Status status = Unsupported;
+  const char *detail = nullptr;
+  const char *const *container_roles = nullptr;
+  std::size_t container_role_count = 0;
+  const char *const *record_types = nullptr;
+  std::size_t record_type_count = 0;
+};
+
 struct TraceValue {
   ValueType type{};
   std::uint32_t reserved = 0;
   std::int64_t signed_value = 0;
   std::uint64_t unsigned_value = 0;
   double real_value = 0;
+  const ValueSnapshot *snapshot = nullptr;
 };
 
 struct CallbackPrintOptions {
@@ -90,10 +126,12 @@ namespace detail {
 extern "C" bool tracer_enqueue_log(const TraceContext *, const char *,
                                    std::size_t, LogLevel) noexcept;
 }
+struct NativeStackStorage;
 
 struct TraceContext {
   std::uint64_t probe_id = 0;
   std::uint64_t object_address = 0;
+  const ValueSnapshot *receiver_snapshot = nullptr;
   std::uint32_t argument_count = 0;
   std::uint32_t reserved = 0;
   TraceValue arguments[kMaxArguments]{};
@@ -130,6 +168,8 @@ struct TraceContext {
     return detail::tracer_enqueue_log(this, message.data(), message.size(),
                                      level);
   }
+  // Agent-owned storage backing this invocation's stack view.
+  mutable NativeStackStorage *stack_storage = nullptr;
 };
 
 struct Request {
@@ -176,8 +216,26 @@ struct Request {
   // These fields are engine-populated from the attached Session.
   std::uint32_t context_native_pid = 0;
   std::uint64_t context_process_start_time = 0;
+  // Agent-selected owner of the currently installed detour.
+  std::uint64_t replaced_probe_id = 0;
+  std::uint64_t jit_compile_ns = 0;
+  bool reject_replacement = false;
+  std::uint64_t expected_replaced_probe_id = 0;
+  ContextTransportBudget context_budget{};
+};
+
+// Side-effect-free callback preparation request. The agent reads a serialized
+// ProbeSpec from spec_path and writes a serialized ValidationReport to
+// report_path. Level values match clangtracer::v1::ValidateProbeRequest.
+struct ValidationRequest {
+  std::uint32_t version = kBootstrapVersion;
+  std::uint32_t level = 0; // 0=full compilation, 1=syntax only.
+  char spec_path[1024]{};
+  char report_path[1024]{};
+  char error[2048]{};
 };
 } // namespace tracer
 
 extern "C" int tracer_agent_start(tracer::Request *request);
 extern "C" int tracer_agent_stop(tracer::Request *request);
+extern "C" int tracer_agent_validate(tracer::ValidationRequest *request);

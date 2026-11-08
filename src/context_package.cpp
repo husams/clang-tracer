@@ -14,6 +14,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "tracer/compat.hpp"
+
 namespace tracer::context_package {
 namespace {
 
@@ -49,8 +51,9 @@ std::filesystem::path git_common_directory(
 
   std::ifstream git_file(marker);
   std::string line;
-  if (!std::getline(git_file, line) || !line.starts_with("gitdir: "))
+  if (!std::getline(git_file, line) || !::tracer::compat::starts_with(line, "gitdir: ")) {
     return {};
+  }
   auto git_directory = std::filesystem::path(line.substr(8));
   if (git_directory.is_relative())
     git_directory = package_root / git_directory;
@@ -207,8 +210,7 @@ bool read_manifest(const std::filesystem::path &path,
     contents.append(buffer.data(), static_cast<std::size_t>(count));
   }
   ::close(fd);
-  if (contents.size() > 128 ||
-      !contents.starts_with(kManifestHeader)) {
+  if (contents.size() > 128 || !::tracer::compat::starts_with(contents, kManifestHeader)) {
     error = "package lineage metadata is malformed";
     return false;
   }

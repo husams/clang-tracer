@@ -1,8 +1,6 @@
 // Compiled into a separately sealed support image, never the native engine.
 // It retains the toolchain's ordinary standard object layouts/default
 // allocator types; only private runtime entry-point binding is changed.
-#include "context_stdlib_abi.hpp"
-
 #include <any>
 #include <exception>
 #include <map>
@@ -11,8 +9,12 @@
 #include <stdexcept>
 #include <string>
 #include <typeinfo>
-#include <unwind.h>
 #include <vector>
+
+#include <pthread.h>
+#include <unwind.h>
+
+#include "context_stdlib_abi.hpp"
 
 #ifndef __GLIBCXX__
 #error This sealed image requires the matching libstdc++ toolchain profile
@@ -45,6 +47,21 @@ constexpr std::size_t dependent_exception_bytes = 112;
 static_assert(sizeof(void *) == 8,
               "only the checked x86_64 Itanium profile is admitted");
 } // namespace
+
+#if defined(_GLIBCXX_RELEASE) && _GLIBCXX_RELEASE <= 8
+// These archives use weak function addresses as the gthread-active predicate.
+// Keep it true so shared ownership remains atomic, while binding the predicate
+// inside the sealed image. TLS/exception globals use the installed kernel;
+// creating pthread keys is not an admitted private-runtime operation.
+extern "C" int __pthread_key_create(pthread_key_t*, void (*)(void*)) noexcept {
+  fail(11);
+}
+
+extern "C" int __clang_tracer_unwind___pthread_key_create(pthread_key_t*,
+                                                          void (*)(void*)) noexcept {
+  fail(11);
+}
+#endif
 
 extern "C" __attribute__((visibility("default")))
 const tracer::context_support::Profile *

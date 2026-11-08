@@ -39,9 +39,17 @@
 
 #include "admission.hpp"
 #include "mapped_path.hpp"
+#include "runtime_identity.hpp"
+#include "tracer/compat.hpp"
 
 #ifndef NT_X86_XSTATE
 #define NT_X86_XSTATE 0x202
+#endif
+
+// glibc exposes the seize requests even with this SDK's older kernel headers.
+// The running kernel must still support the existing seize/interrupt protocol.
+#ifndef PTRACE_EVENT_STOP
+#define PTRACE_EVENT_STOP 128
 #endif
 
 namespace tracer::injector {
@@ -293,6 +301,73 @@ std::uintptr_t register_ip(const user_regs_struct &registers) {
   return static_cast<std::uintptr_t>(registers.rip);
 }
 
+bool confirmed_injected_fault(const siginfo_t &info,
+                              const user_regs_struct &registers,
+                              pid_t process_id, pid_t tid) {
+  // A signal-specific synchronous fault was raised while this thread was
+  // executing the injected code. Generic SI_KERNEL and async codes do not
+  // establish that, even when their value is positive.
+  switch (info.si_signo) {
+  case SIGSEGV:
+    return info.si_code == SEGV_MAPERR || info.si_code == SEGV_ACCERR;
+  case SIGBUS:
+    return info.si_code == BUS_ADRALN || info.si_code == BUS_ADRERR ||
+           info.si_code == BUS_OBJERR;
+  case SIGILL:
+    return info.si_code >= ILL_ILLOPC && info.si_code <= ILL_BADSTK;
+  case SIGFPE:
+    return info.si_code >= FPE_INTDIV && info.si_code <= FPE_FLTSUB;
+  case SIGABRT:
+    // si_pid is shared by peer threads. Confirm that the stopped thread
+    // itself issued a successful thread-directed abort to its own TID.
+    return info.si_code == SI_TKILL && info.si_pid == process_id &&
+           registers.rax == 0 &&
+           ((registers.orig_rax == SYS_tgkill &&
+             registers.rdi == static_cast<unsigned long long>(process_id) &&
+             registers.rsi == static_cast<unsigned long long>(tid) &&
+             registers.rdx == SIGABRT) ||
+            (registers.orig_rax == SYS_tkill &&
+             registers.rdi == static_cast<unsigned long long>(tid) &&
+             registers.rsi == SIGABRT));
+  default:
+    return false;
+  }
+}
+
+enum class InjectedStopKind { unexpected, completion, confirmed_fault };
+
+struct InjectedStop {
+  user_regs_struct registers{};
+  int signal;
+  InjectedStopKind kind = InjectedStopKind::unexpected;
+};
+
+InjectedStop inspect_injected_stop(pid_t process_id, pid_t tid, int status,
+                                   std::uintptr_t completion_ip,
+                                   int &pending_signal) {
+  InjectedStop stop{{}, WSTOPSIG(status)};
+  const bool signal_stop = (static_cast<unsigned int>(status) >> 16) == 0;
+  const int earlier_signal = pending_signal;
+  // Record the signal first so a failed attribution or register read leaves
+  // it available to the normal recovery path.
+  if (signal_stop)
+    pending_signal = stop.signal;
+  ptrace_checked(PTRACE_GETREGS, tid, nullptr, &stop.registers,
+                 "read injected stop registers");
+  siginfo_t info{};
+  if (!signal_stop || ::ptrace(PTRACE_GETSIGINFO, tid, nullptr, &info) != 0 ||
+      info.si_signo != stop.signal)
+    return stop;
+  if (stop.signal == SIGTRAP && stop.registers.rip == completion_ip &&
+      (info.si_code == TRAP_BRKPT || info.si_code == SI_KERNEL))
+    stop.kind = InjectedStopKind::completion;
+  else if (confirmed_injected_fault(info, stop.registers, process_id, tid))
+    stop.kind = InjectedStopKind::confirmed_fault;
+  if (stop.kind != InjectedStopKind::unexpected)
+    pending_signal = earlier_signal;
+  return stop;
+}
+
 std::vector<unsigned char> read_remote(pid_t tid, std::uintptr_t address,
                                        std::size_t size) {
   std::vector<unsigned char> result(size);
@@ -342,6 +417,7 @@ struct MapEntry {
   std::uintptr_t start = 0;
   std::uintptr_t end = 0;
   std::uintptr_t offset = 0;
+  std::string path;
   std::string module_path;
   bool readable = false, executable = false;
 };
@@ -360,6 +436,8 @@ std::vector<MapEntry> read_maps(pid_t process_id) {
       continue;
     }
     MapEntry entry;
+    entry.readable = permissions.find('r') != std::string::npos;
+    entry.executable = permissions.find('x') != std::string::npos;
     const auto dash = range.find('-');
     if (dash == std::string::npos) {
       continue;
@@ -371,11 +449,8 @@ std::vector<MapEntry> read_maps(pid_t process_id) {
     if (colon == std::string::npos) {
       continue;
     }
-    std::string path;
-    std::getline(row >> std::ws, path);
-    entry.module_path = tracer::detail::canonical_mapped_path(path);
-    entry.readable = !permissions.empty() && permissions[0] == 'r';
-    entry.executable = permissions.size() >= 3 && permissions[2] == 'x';
+    std::getline(row >> std::ws, entry.path);
+    entry.module_path = tracer::detail::canonical_mapped_path(entry.path);
     maps.push_back(std::move(entry));
   }
   return maps;
@@ -820,7 +895,7 @@ void Process::poison_process() noexcept {
 void Process::mark_unsafe() noexcept { poison_process(); }
 
 void Process::attach(pid_t process_id,
-                     std::span<const ApplicationModule> application_modules) {
+                     ::tracer::compat::span<const ApplicationModule> application_modules) {
 #if !defined(__linux__) || !defined(__x86_64__)
   (void)process_id;
   throw std::runtime_error("native injector is supported only on Linux x86_64");
@@ -1159,7 +1234,7 @@ bool Process::patch_code(std::uintptr_t address, const void *expected,
   return true;
 }
 
-bool Process::patch_code_batch(std::span<const CodePatch> patches) {
+bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches) {
   ensure_usable();
   if (patches.empty())
     return true;
@@ -1337,20 +1412,16 @@ Process::remote_syscall(long number,
     }
     tracee_stopped = true;
     tracee_stopped_ = true;
-    if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
-      if (WIFSTOPPED(status) &&
-          (static_cast<unsigned int>(status) >> 16) == 0) {
-        pending_signal_ = WSTOPSIG(status);
-      }
-      throw std::runtime_error("native syscall ended at an unexpected stop; "
-                               "tracee stopped for recovery");
+    const auto stop = inspect_injected_stop(process_id_, tid_, status,
+                                           ip + stub.size(), pending_signal_);
+    if (stop.kind != InjectedStopKind::completion) {
+      throw std::runtime_error(
+          "native syscall stopped on signal " + std::to_string(stop.signal) +
+          (stop.kind == InjectedStopKind::confirmed_fault
+               ? " (confirmed injected fault; signal delivery suppressed)"
+               : ""));
     }
-    const auto after = read_registers(tid_);
-    if (after.general.rip != ip + stub.size()) {
-      throw std::runtime_error("native syscall stub stopped at an unexpected "
-                               "instruction; state restored");
-    }
-    result = after.general.rax;
+    result = stop.registers.rax;
     if (static_cast<long long>(result) < 0 &&
         static_cast<long long>(result) >= -4095) {
       throw std::runtime_error("remote syscall failed with errno " +
@@ -1532,24 +1603,18 @@ Process::remote_call_raw(std::uintptr_t function,
     }
     tracee_stopped = true;
     tracee_stopped_ = true;
-    if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
-      if (WIFSTOPPED(status) &&
-          (static_cast<unsigned int>(status) >> 16) == 0) {
-        pending_signal_ = WSTOPSIG(status);
-      }
+    const auto stop = inspect_injected_stop(process_id_, tid_, status,
+                                           call_page_ + 3, pending_signal_);
+    if (stop.kind != InjectedStopKind::completion) {
       throw std::runtime_error(
-          "remote call stopped on signal " +
-          std::to_string(WIFSTOPPED(status) ? WSTOPSIG(status) : 0) +
-          " at PC " + std::to_string(read_registers(tid_).general.rip) +
-          " before its completion; the callee "
-          "may have side effects");
+          "remote call stopped on signal " + std::to_string(stop.signal) +
+          " at PC " + std::to_string(stop.registers.rip) +
+          " before its completion; the callee may have side effects" +
+          (stop.kind == InjectedStopKind::confirmed_fault
+               ? "; confirmed injected fault, signal delivery suppressed"
+               : ""));
     }
-    const auto after = read_registers(tid_);
-    if (after.general.rip != call_page_ + 3) {
-      throw std::runtime_error(
-          "remote call stopped at an unexpected instruction");
-    }
-    result = after.general.rax;
+    result = stop.registers.rax;
   } catch (...) {
     failure = std::current_exception();
     if (execution_started && !tracee_stopped) {
@@ -1594,13 +1659,14 @@ Process::remote_call_raw(std::uintptr_t function,
   return result;
 }
 
-std::uintptr_t Process::resolve_remote_symbol(std::string_view name, const CodePatch *owned_patch) {
+std::uintptr_t Process::resolve_remote_symbol(std::string_view name, const CodePatch* owned_patch) {
   ensure_usable();
   if (name.empty() || name.find('\0') != std::string_view::npos) {
     throw std::invalid_argument(
         "symbol name must be nonempty and contain no NUL byte");
   }
-  const std::string symbol_name(name);
+  std::string symbol_name(name);
+  const auto remote_maps = read_maps(process_id_);
   ::dlerror();
   void *local_address = ::dlsym(RTLD_DEFAULT, symbol_name.c_str());
   if (const char *error = ::dlerror()) {
@@ -1617,18 +1683,62 @@ std::uintptr_t Process::resolve_remote_symbol(std::string_view name, const CodeP
     throw std::runtime_error("dladdr could not identify the local module for " +
                              symbol_name);
   }
-  const auto module_path = tracer::detail::canonical_mapped_path(info.dli_fname);
+  auto module_path = tracer::detail::canonical_mapped_path(info.dli_fname);
   if (module_path.empty()) {
     throw std::runtime_error("cannot resolve local symbol module path");
   }
+  // Before glibc 2.34, an otherwise ordinary application need not map libdl.
+  // Bootstrap through libc's loader entry points in that case. These are
+  // admitted through the same session path, mapped range and live-entry checks
+  // below. Runtime files remain fixed for the duration of the session.
+  const bool mapped =
+      std::any_of(remote_maps.begin(), remote_maps.end(),
+                  [&](const MapEntry& entry) { return same_module_path(entry, module_path); });
+  if (!mapped && (name == "dlopen" || name == "dlsym" || name == "__errno_location")) {
+    const char* bootstrap = name == "dlopen"  ? "__libc_dlopen_mode"
+                            : name == "dlsym" ? "__libc_dlsym"
+                                              : "__errno_location";
+    // Old libpthread also exports errno_location; a single-threaded target
+    // legitimately uses libc's implementation without mapping libpthread yet.
+    void* libc_handle = name == "__errno_location"
+                            ? ::dlopen("libc.so.6", RTLD_NOLOAD | RTLD_LAZY | RTLD_LOCAL)
+                            : nullptr;
+    ::dlerror();
+    auto* candidate = ::dlsym(libc_handle ? libc_handle : RTLD_DEFAULT, bootstrap);
+    const auto* lookup_error = ::dlerror();
+    Dl_info bootstrap_info{};
+    if (!lookup_error && candidate && tracer::runtime::has_soname(candidate, "libc.so.6") &&
+        ::dladdr(candidate, &bootstrap_info) && bootstrap_info.dli_fname &&
+        bootstrap_info.dli_fbase &&
+        std::any_of(remote_maps.begin(), remote_maps.end(),
+                    [&](const MapEntry& entry) {
+                      return same_module_path(entry, tracer::detail::canonical_mapped_path(
+                                                         bootstrap_info.dli_fname));
+                    })) {
+      local_address = candidate;
+      info = bootstrap_info;
+      module_path = tracer::detail::canonical_mapped_path(info.dli_fname);
+      symbol_name = bootstrap;
+    }
+    if (libc_handle) {
+      ::dlclose(libc_handle);
+    }
+  }
   const auto local_maps = read_maps(::getpid());
-  const auto remote_maps = read_maps(process_id_);
   const auto local_bias = map_load_bias(local_maps, module_path);
-  const auto remote_bias = map_load_bias(remote_maps, module_path);
+  std::uintptr_t remote_bias = 0;
+  try {
+    remote_bias = map_load_bias(remote_maps, module_path);
+  } catch (const std::exception& error) {
+    throw std::runtime_error("cannot translate " + symbol_name + " from " + info.dli_fname + ": " +
+                             error.what());
+  }
   const auto actual_local_base =
       reinterpret_cast<std::uintptr_t>(info.dli_fbase);
   if (local_bias != actual_local_base) {
-    throw std::runtime_error("local module mapping base is inconsistent for " + symbol_name);
+    throw std::runtime_error(
+        "local module mapping identity/base is inconsistent for " +
+        symbol_name);
   }
   const auto symbol = reinterpret_cast<std::uintptr_t>(local_address);
   if (symbol < local_bias ||
@@ -1636,40 +1746,49 @@ std::uintptr_t Process::resolve_remote_symbol(std::string_view name, const CodeP
     throw std::runtime_error("runtime symbol address translation overflows");
   }
   const auto remote_symbol = remote_bias + (symbol - local_bias);
-
-  // Runtime files remain fixed for the session. Check the actual instructions
-  // used for runtime calls without comparing filesystem identities or times.
-  constexpr std::size_t bytes = 32;
-  const auto contains_entry = [&](const auto &maps, std::uintptr_t address) {
-    return std::any_of(maps.begin(), maps.end(), [&](const MapEntry &entry) {
-      return same_module_path(entry, module_path) && entry.readable && entry.executable &&
-             address >= entry.start && address < entry.end && bytes <= entry.end - address;
-    });
-  };
-  if (!contains_entry(local_maps, symbol) || !contains_entry(remote_maps, remote_symbol)) {
-    throw std::runtime_error("runtime entry is outside its executable mapping");
-  }
-  std::array<std::uint8_t, bytes> remote_entry{};
-  remote_read(remote_symbol, remote_entry.data(), remote_entry.size());
-  if (owned_patch) {
-    // Additional shared probes see the session's installed pthread adapter.
-    // Verify its live bytes, then compare its original entry to the local code.
-    if (name != "pthread_create" || !owned_patch->expected || !owned_patch->replacement ||
-        owned_patch->address < remote_symbol || owned_patch->address - remote_symbol > 4 ||
-        !owned_patch->size ||
-        owned_patch->size > bytes - (owned_patch->address - remote_symbol)) {
-      throw std::runtime_error("invalid owned runtime patch");
+  {
+    // Verify the instructions involved in runtime calls and owned detours.
+    // Filesystem identities and rebuild polling are not part of this check.
+    if ((name != "dlopen" && name != "dlsym" && name != "__errno_location" &&
+         name != "pthread_create") ||
+        (!tracer::runtime::has_soname(local_address, "libc.so.6") &&
+         !tracer::runtime::has_soname(local_address, "libdl.so.2") &&
+         !tracer::runtime::has_soname(local_address, "libpthread.so.0"))) {
+      throw std::runtime_error("runtime loader identity is unavailable for " + symbol_name);
     }
-    std::array<std::uint8_t, bytes> installed{};
-    remote_read(owned_patch->address, installed.data(), owned_patch->size);
-    if (std::memcmp(installed.data(), owned_patch->replacement, owned_patch->size) != 0) {
-      throw std::runtime_error("owned runtime patch bytes changed");
+    constexpr std::size_t bytes = 32;
+    auto contains_entry = [&](const auto& maps, std::uintptr_t address) {
+      return std::any_of(maps.begin(), maps.end(), [&](const MapEntry& entry) {
+        return same_module_path(entry, module_path) && entry.readable && entry.executable &&
+               address >= entry.start && address < entry.end && bytes <= entry.end - address;
+      });
+    };
+    std::array<std::uint8_t, bytes> remote_entry{};
+    if (!contains_entry(local_maps, symbol) || !contains_entry(remote_maps, remote_symbol)) {
+      throw std::runtime_error("loader entry is outside its verified executable mapping");
     }
-    std::memcpy(remote_entry.data() + (owned_patch->address - remote_symbol),
-                owned_patch->expected, owned_patch->size);
-  }
-  if (std::memcmp(local_address, remote_entry.data(), bytes) != 0) {
-    throw std::runtime_error("runtime entry instructions do not match");
+    remote_read(remote_symbol, remote_entry.data(), remote_entry.size());
+    if (owned_patch) {
+      // A second shared probe sees this session's already-installed pthread
+      // adapter. Verify its complete live bytes, then compare its original
+      // entry to the exact local ELF, without exempting any other patch.
+      if (name != "pthread_create" || !owned_patch->expected || !owned_patch->replacement ||
+          owned_patch->address < remote_symbol || owned_patch->address - remote_symbol > 4 ||
+          !owned_patch->size ||
+          owned_patch->size > bytes - (owned_patch->address - remote_symbol)) {
+        throw std::runtime_error("invalid owned runtime patch identity");
+      }
+      std::array<std::uint8_t, bytes> installed{};
+      remote_read(owned_patch->address, installed.data(), owned_patch->size);
+      if (std::memcmp(installed.data(), owned_patch->replacement, owned_patch->size) != 0) {
+        throw std::runtime_error("owned runtime patch bytes changed");
+      }
+      std::memcpy(remote_entry.data() + (owned_patch->address - remote_symbol),
+                  owned_patch->expected, owned_patch->size);
+    }
+    if (std::memcmp(local_address, remote_entry.data(), bytes) != 0) {
+      throw std::runtime_error("runtime entry instructions do not match");
+    }
   }
   return remote_symbol;
 }

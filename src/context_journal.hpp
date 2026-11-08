@@ -41,6 +41,9 @@ struct JournalLimits {
   std::function<bool(std::string_view)> fail_operation;
 };
 
+JournalLimits journal_limits_for_packet(std::uint32_t packet_bytes,
+                                      std::uint64_t schema_bytes);
+
 class JournalBudget final {
 public:
   explicit JournalBudget(std::uint64_t limit = kDataBudget) : limit_(limit) {}
@@ -51,15 +54,16 @@ public:
   bool claim_control(const std::string &key);
   std::uint64_t used() const noexcept;
   std::uint64_t control_used() const noexcept;
+  void ensure_data_capacity(std::uint64_t minimum) noexcept;
 private:
-  const std::uint64_t limit_;
+  std::uint64_t limit_;
   mutable std::mutex mutex_;
   std::unordered_map<std::string, std::uint64_t> charges_;
   std::uint64_t used_ = 0;
   std::unordered_map<std::string, bool> control_keys_;
   std::uint64_t control_used_ = 0;
 };
-std::shared_ptr<JournalBudget> process_journal_budget();
+std::shared_ptr<JournalBudget> process_journal_budget(std::uint64_t minimum = kDataBudget);
 
 struct CollectorOpenResult {
   bool accepted = false;

@@ -11,6 +11,7 @@
 
 #include "context_registry.hpp"
 #include "context_test_config.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer::test {
 namespace {
@@ -234,7 +235,8 @@ void verify_context_registry() {
     new_frame.create_or_attach(new_native_registration);
     context_engine::HookExit hook(new_context);
     const context_engine::SlotRequest new_slot{new_native_registration, state_id};
-    context_engine::HookAccess access(new_context, std::span(&new_slot, std::size_t{1}));
+    context_engine::HookAccess access(new_context,
+                                      ::tracer::compat::span(&new_slot, std::size_t{1}));
     require(access.ref(new_slot) != nullptr,
             "fresh context could not use the new state generation");
   }

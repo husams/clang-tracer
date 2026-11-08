@@ -1,3 +1,8 @@
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -14,6 +19,7 @@ def test_repl_uses_api_and_binary_transport(peer, tmp_path):
     client, service = peer
     callback = tmp_path / "interceptor.cpp"
     callback.write_text("struct Interceptor {};")
+    client.validate_probe = Mock(return_value=pb.ValidationReport(success=True))
     console = Console(client, output=DummyOutput())
     for command in [
         "attach 123",
@@ -38,6 +44,32 @@ def test_real_prompt_session_accepts_commands_and_eof(peer):
         prompt = PromptSession(input=pipe, output=DummyOutput(), lexer=CommandLexer())
         pipe.send_text("attach 123\nsessions\nexit\n")
         assert Console(client, output=DummyOutput()).run(prompt) == 0
+
+
+def test_validate_console_command_forwards_options_without_injection(peer, tmp_path):
+    client, _service = peer
+    callback = tmp_path / "interceptor.cpp"
+    callback.write_text("struct Interceptor {};")
+    client.validate_probe = Mock(return_value=pb.ValidationReport(success=True))
+    console = Console(client, output=DummyOutput())
+    console.session_id = "s1"
+    command = (
+        f'probe validate "add(int, int)" --callback "{callback}" '
+        '--level syntax --compile-option "-std=c++17" '
+        '--compile-option "-DORDER=1" --module target '
+        "--debug-max-entries 2000001 --debug-max-depth 256"
+    )
+    assert console.execute(parse_command(command))
+    client.validate_probe.assert_called_once_with(
+        "s1",
+        "add(int, int)",
+        "struct Interceptor {};",
+        level="syntax",
+        compile_options=["-std=c++17", "-DORDER=1"],
+        module="target",
+        debug_max_entries=2000001,
+        debug_max_depth=256,
+    )
 
 
 def test_stream_commands_accept_and_forward_repeated_names(peer, tmp_path):
@@ -67,6 +99,120 @@ def test_stream_commands_accept_and_forward_repeated_names(peer, tmp_path):
         if isinstance(request, pb.WatchEventsRequest)
     )
     assert list(record_request.names) == ["add(int, int)"]
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_timeout"),
+    [
+        ("collect", None),
+        ("collect 1", None),
+        ("collect 1 --timeout 4", 4.0),
+    ],
+)
+def test_collect_defaults_to_unbounded_stream_and_keeps_explicit_options(
+    peer, command, expected_timeout
+):
+    client, service = peer
+    console = Console(client, output=DummyOutput())
+    assert console.execute(parse_command(command))
+    request = next(
+        request
+        for request in reversed(service.requests)
+        if isinstance(request, pb.WatchEventsRequest)
+    )
+    if expected_timeout is None:
+        assert service.watch_time_remaining[-1] > 300
+    else:
+        assert 0 < service.watch_time_remaining[-1] <= expected_timeout + 0.1
+    assert len(list(request.session_ids)) == 0
+
+
+def test_collect_count_stops_after_the_requested_number_of_events(peer):
+    client, _service = peer
+    console = Console(client, output=DummyOutput())
+    displayed = []
+
+    def capture(event):
+        displayed.append(event)
+
+    console.emit = capture
+    assert console.execute(parse_command("collect 1"))
+    assert len(displayed) == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a POSIX pseudo-terminal")
+@pytest.mark.parametrize("command", ["collect", "events"])
+def test_bare_stream_ctrl_c_cancels_live_stream_and_returns_to_prompt(peer, command):
+    import fcntl
+    import pty
+    import select
+    import termios
+
+    _client, service = peer
+    endpoint = _client.endpoint
+    master_fd, slave_fd = pty.openpty()
+    env = os.environ.copy()
+    env["CLANG_TRACER_ENDPOINT"] = endpoint
+    env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    env["TERM"] = "xterm"
+
+    def set_controlling_terminal():
+        os.setsid()
+        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os; from clang_tracer.client import Client; "
+            "from clang_tracer.console import Console; "
+            "raise SystemExit(Console(Client("
+            "os.environ['CLANG_TRACER_ENDPOINT'])).run())",
+        ],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+        preexec_fn=set_controlling_terminal,
+    )
+    os.close(slave_fd)
+
+    def read_until(needle, timeout=5):
+        received = bytearray()
+        deadline = time.monotonic() + timeout
+        while needle not in received and time.monotonic() < deadline:
+            ready, _, _ = select.select([master_fd], [], [], 0.1)
+            if ready:
+                received.extend(os.read(master_fd, 4096))
+        assert needle in received, received.decode(errors="replace")
+        return bytes(received)
+
+    try:
+        read_until(b"tracer>")
+        os.write(master_fd, f"{command} --pid 999\n".encode())
+        deadline = time.monotonic() + 5
+        while not any(
+            isinstance(req, pb.WatchEventsRequest) for req in service.requests
+        ):
+            assert time.monotonic() < deadline, (
+                f"{command} did not start its gRPC stream"
+            )
+            time.sleep(0.01)
+        assert service.watch_time_remaining[-1] > 300
+        os.write(master_fd, b"\x03")
+        output = read_until(b"cancelled")
+        # A redraw of the submitted command also contains tracer>; only the
+        # prompt after cancellation proves the console resumed accepting input.
+        if b"tracer>" not in output.split(b"cancelled", 1)[1]:
+            read_until(b"tracer>")
+        assert service.cancelled.wait(5), "Ctrl-C did not cancel the gRPC stream"
+        os.write(master_fd, b"exit\n")
+        assert process.wait(timeout=5) == 0
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+        os.close(master_fd)
 
 
 def test_symbols_command_lists_attached_process_functions(peer):
@@ -268,7 +414,7 @@ def test_help_topics_complete_after_help_prefix():
             Document("help probe "), CompleteEvent()
         )
     }
-    assert probe_completions >= {"inject", "resolve", "add", "remove"}
+    assert probe_completions >= {"inject", "resolve", "validate", "add", "remove"}
     symbol_completions = {
         item.text
         for item in build_completer().get_completions(

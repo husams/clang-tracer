@@ -15,7 +15,73 @@
 
 namespace tracer {
 
+struct InferResultType {};
 template <std::size_t> struct ArgumentType;
+template <std::size_t> struct ResultType;
+template <class, std::size_t Index>
+struct InferredResultType : ResultType<Index> {};
+
+template <class T> struct ReadOnlyPointee {
+  using type = const T;
+};
+template <class T> struct ReadOnlyPointee<T *> {
+  using type = std::add_const_t<typename ReadOnlyPointee<T>::type *>;
+};
+template <class T> struct ReadOnlyPointee<T *const> {
+  using type = std::add_const_t<typename ReadOnlyPointee<T>::type *const>;
+};
+template <class T> struct ReadOnlyPointee<T *volatile> {
+  using type = std::add_const_t<typename ReadOnlyPointee<T>::type *volatile>;
+};
+template <class T> struct ReadOnlyPointee<T *const volatile> {
+  using type = std::add_const_t<
+      typename ReadOnlyPointee<T>::type *const volatile>;
+};
+template <class T> struct ReadOnlyObservationType {
+  using type = T;
+};
+template <class T> struct ReadOnlyObservationType<T &> {
+  using type = const T &;
+};
+template <class T> struct ReadOnlyObservationType<T &&> {
+  using type = const T &;
+};
+template <class T> struct ReadOnlyObservationType<T *> {
+  using type = typename ReadOnlyPointee<T>::type *;
+};
+template <class T> struct ReadOnlyObservationType<T *const> {
+  using type = typename ReadOnlyPointee<T>::type *;
+};
+template <class T> struct ReadOnlyObservationType<T *&> {
+  using type = typename ReadOnlyPointee<T>::type *const &;
+};
+template <class T> struct ReadOnlyObservationType<T *const &> {
+  using type = typename ReadOnlyPointee<T>::type *const &;
+};
+template <class T> struct ReadOnlyObservationType<T *&&> {
+  using type = typename ReadOnlyPointee<T>::type *const &;
+};
+template <class T> struct ReadOnlyObservationType<T *const &&> {
+  using type = typename ReadOnlyPointee<T>::type *const &;
+};
+template <class T> struct ReadOnlyObservationType<T *volatile> {
+  using type = typename ReadOnlyPointee<T>::type *;
+};
+template <class T> struct ReadOnlyObservationType<T *const volatile> {
+  using type = typename ReadOnlyPointee<T>::type *;
+};
+template <class T> struct ReadOnlyObservationType<T *volatile &> {
+  using type = typename ReadOnlyPointee<T>::type *const volatile &;
+};
+template <class T> struct ReadOnlyObservationType<T *const volatile &> {
+  using type = typename ReadOnlyPointee<T>::type *const volatile &;
+};
+template <class T> struct ReadOnlyObservationType<T *volatile &&> {
+  using type = typename ReadOnlyPointee<T>::type *const volatile &;
+};
+template <class T> struct ReadOnlyObservationType<T *const volatile &&> {
+  using type = typename ReadOnlyPointee<T>::type *const volatile &;
+};
 namespace context_facade { struct NativeHookContextFactory; }
 
 class Call {
@@ -31,11 +97,33 @@ public:
     return decode<T>(context_.arguments[index]);
   }
 
-  template <class T> T result() const {
+  template <class T = InferResultType> decltype(auto) result() const {
     if (context_.phase != TracePhase::Post) {
       throw std::logic_error("callback result is only available in post()");
     }
-    if constexpr (std::is_void_v<T>) {
+    if constexpr (std::is_same_v<T, InferResultType>) {
+      using Inferred = typename InferredResultType<T, 0>::type;
+      if constexpr (std::is_void_v<Inferred>) {
+        require_type(context_.result, ValueType::Void);
+        return;
+      } else if constexpr (std::is_reference_v<Inferred>) {
+        require_type(context_.result, ValueType::Pointer);
+        if (!context_.result.unsigned_value)
+          throw std::logic_error("reference result is unavailable");
+        using Referent = std::remove_reference_t<Inferred>;
+        auto *referent = reinterpret_cast<Referent *>(
+            static_cast<std::uintptr_t>(context_.result.unsigned_value));
+        return static_cast<Inferred>(*referent);
+      } else if constexpr (InferredResultType<T, 0>::object_value) {
+        require_type(context_.result, ValueType::Object);
+        if (!context_.result.unsigned_value)
+          throw std::logic_error("object result is unavailable");
+        return *reinterpret_cast<const Inferred *>(
+            static_cast<std::uintptr_t>(context_.result.unsigned_value));
+      } else {
+        return decode<Inferred>(context_.result);
+      }
+    } else if constexpr (std::is_void_v<T>) {
       require_type(context_.result, ValueType::Void);
       return;
     } else {
@@ -106,8 +194,8 @@ public:
     return capture_stack(depth, context_.stack_application_only);
   }
   const StackTrace &capture_stack(unsigned depth, bool application_only) const {
-    if (!depth || depth > kMaxStackDepth)
-      throw std::out_of_range("stack depth must be between 1 and 64");
+    if (!depth)
+      throw std::out_of_range("stack depth must be positive");
     if (!context_.stack_capture)
       throw std::logic_error("native stack capture is unavailable");
     context_.stack_capture(&context_, depth, application_only);
@@ -221,6 +309,9 @@ private:
       result.type =
           std::is_same_v<T, float> ? ValueType::Float32 : ValueType::Float64;
       result.real_value = value;
+    } else if constexpr (std::is_same_v<T, bool>) {
+      result.type = ValueType::Bool;
+      result.signed_value = value ? 1 : 0;
     } else if constexpr (std::is_integral_v<T> && std::is_signed_v<T> &&
                          sizeof(T) <= 4) {
       result.type = ValueType::Int32;
@@ -252,26 +343,31 @@ private:
 
   template <class T> static T decode(const TraceValue &value) {
     using U = std::remove_cv_t<T>;
-    if constexpr (std::is_pointer_v<U>) {
+    if constexpr (std::is_enum_v<U>) {
+      return static_cast<U>(decode<std::underlying_type_t<U>>(value));
+    } else if constexpr (std::is_pointer_v<U>) {
       require_type(value, ValueType::Pointer);
       return reinterpret_cast<U>(
           static_cast<std::uintptr_t>(value.unsigned_value));
+    } else if constexpr (std::is_same_v<U, bool>) {
+      require_type(value, ValueType::Bool);
+      return value.signed_value != 0;
     } else if constexpr (std::is_same_v<U, float>) {
       require_type(value, ValueType::Float32);
       return static_cast<T>(value.real_value);
     } else if constexpr (std::is_same_v<U, double>) {
       require_type(value, ValueType::Float64);
       return static_cast<T>(value.real_value);
-    } else if constexpr (std::is_integral_v<U> && !std::is_same_v<U, bool> &&
-                         std::is_signed_v<U> && sizeof(U) == 4) {
+    } else if constexpr (std::is_integral_v<U> && std::is_signed_v<U> &&
+                         sizeof(U) == 4) {
       require_type(value, ValueType::Int32);
       return static_cast<T>(value.signed_value);
-    } else if constexpr (std::is_integral_v<U> && !std::is_same_v<U, bool> &&
-                         std::is_signed_v<U> && sizeof(U) == 8) {
+    } else if constexpr (std::is_integral_v<U> && std::is_signed_v<U> &&
+                         sizeof(U) == 8) {
       require_type(value, ValueType::Int64);
       return static_cast<T>(value.signed_value);
-    } else if constexpr (std::is_integral_v<U> && !std::is_same_v<U, bool> &&
-                         std::is_unsigned_v<U> && sizeof(U) == 8) {
+    } else if constexpr (std::is_integral_v<U> && std::is_unsigned_v<U> &&
+                         sizeof(U) == 8) {
       require_type(value, ValueType::UInt64);
       return static_cast<T>(value.unsigned_value);
     } else {

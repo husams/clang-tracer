@@ -1,11 +1,13 @@
 #include "engine_storage.hpp"
 
 #include <algorithm>
-#include <bit>
 #include <limits>
 #include <stdexcept>
+
 #include <sys/mman.h>
 #include <unistd.h>
+
+#include "tracer/compat.hpp"
 
 namespace tracer::context_engine {
 namespace {
@@ -18,9 +20,9 @@ EngineStorage::EngineStorage(std::size_t budget) {
   static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
   static_assert(std::atomic<unsigned>::is_always_lock_free);
   const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
-  if (!std::has_single_bit(page) || budget > kDefaultBudget ||
-      budget < page * 2)
+  if (!::tracer::compat::has_single_bit(page) || budget > kDefaultBudget || budget < page * 2) {
     throw std::invalid_argument("invalid engine storage budget");
+  }
   mapped_bytes_ = budget / page * page;
   // Each unit charges one payload quantum, one metadata entry and its bitmap.
   units_ =
@@ -43,9 +45,9 @@ EngineStorage::EngineStorage(std::size_t budget) {
   metadata_ = reinterpret_cast<Unit *>(base + metadata_offset);
   payload_ = base + payload_offset;
   for (std::size_t i = 0; i < words_; ++i)
-    std::construct_at(bits_ + i, 0);
+    ::tracer::compat::construct_at(bits_ + i, 0);
   for (std::size_t i = 0; i < units_; ++i)
-    std::construct_at(metadata_ + i);
+    ::tracer::compat::construct_at(metadata_ + i);
   // Touch all payload pages now; the first guarded allocation never initializes
   // a lazy mapping or metadata array through the application allocator.
   for (std::size_t i = 0; i < units_ * kUnit; i += page)
@@ -86,8 +88,9 @@ EngineStorage::allocate(Domain domain, std::size_t bytes,
     failures_.fetch_add(1, std::memory_order_relaxed);
     return Allocation{nullptr, reason};
   };
-  if (!domain || !std::has_single_bit(alignment) || bytes > payload_capacity())
+  if (!domain || !::tracer::compat::has_single_bit(alignment) || bytes > payload_capacity()) {
     return failed(StorageStatus::exhausted);
+  }
   const auto count = (std::max(bytes, std::size_t{1}) + kUnit - 1) / kUnit;
   if (allocating_.test_and_set(std::memory_order_acquire))
     return failed(StorageStatus::busy);

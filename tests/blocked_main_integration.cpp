@@ -23,6 +23,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include "tracer.grpc.pb.h"
+#include "../src/linux_syscalls.hpp"
 
 extern char **environ;
 
@@ -178,7 +179,7 @@ std::uint64_t read_remote_calls(pid_t pid, std::uintptr_t address) {
   std::uint64_t value = 0;
   iovec local{&value, sizeof(value)};
   iovec remote{reinterpret_cast<void *>(address), sizeof(value)};
-  require(::process_vm_readv(pid, &local, 1, &remote, 1, 0) ==
+  require(::tracer::linux_api::process_vm_readv(pid, &local, 1, &remote, 1, 0) ==
               static_cast<ssize_t>(sizeof(value)),
           "could not read target call counter");
   return value;

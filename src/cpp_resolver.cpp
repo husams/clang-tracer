@@ -1,6 +1,14 @@
 #include "cpp_resolver.hpp"
+#include "header_context.hpp"
+#include "prepared_types.hpp"
+#include "prepared_adapter.hpp"
+#include "prepared_contract.hpp"
+#include "prepared_header_search.hpp"
+#include "tracer_runtime_config.hpp"
 
 #include "../include/tracer/receiver_abi.hpp"
+#include "tracer/compat.hpp"
+#include "tracer/compiler_options.hpp"
 
 #ifndef TRACER_CLANG_RESOURCE_DIR
 #error                                                                                             \
@@ -23,13 +31,17 @@
 #include <clang/AST/Attr.h>
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/DeclTemplate.h>
+#include <clang/AST/Expr.h>
 #include <clang/AST/Mangle.h>
 #include <clang/AST/RecordLayout.h>
 #include <clang/AST/RecursiveASTVisitor.h>
+#include <clang/Basic/DiagnosticOptions.h>
 #include <clang/Basic/TargetInfo.h>
 #include <clang/Basic/Version.h>
 #include <clang/Frontend/CompilerInstance.h>
+#include <clang/Lex/Preprocessor.h>
 #include <clang/Frontend/FrontendActions.h>
+#include <clang/Frontend/TextDiagnosticPrinter.h>
 #include <clang/Tooling/ArgumentsAdjusters.h>
 #include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/JSONCompilationDatabase.h>
@@ -147,7 +159,26 @@ std::vector<std::string> split_parameters(std::string_view text) {
 
 Selector parse_selector(const std::string& text) {
   Selector selector;
-  const auto open = text.find('(');
+  auto open = std::string::npos;
+  unsigned angles = 0, parentheses = 0;
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    const char ch = text[i];
+    if (ch == '(') {
+      if (!angles) {
+        open = i;
+        break;
+      }
+      ++parentheses;
+    } else if (ch == ')' && parentheses) {
+      --parentheses;
+    } else if (!parentheses && ch == '<') {
+      ++angles;
+    } else if (!parentheses && ch == '>' && angles) {
+      --angles;
+    }
+  }
+  if (open == std::string::npos)
+    open = text.find('('); // Preserve legacy parsing for operator spellings.
   if (open == std::string::npos) {
     selector.qualified_name = trim(text);
     if (selector.qualified_name.empty()) {
@@ -168,25 +199,25 @@ Selector parse_selector(const std::string& text) {
   auto suffix = compact(trim(text.substr(close + 1)));
   while (!suffix.empty()) {
     suffix = trim(std::move(suffix));
-    if (suffix.starts_with("const")) {
+    if (::tracer::compat::starts_with(suffix, "const")) {
       if (selector.is_const) {
         throw std::runtime_error("duplicate const qualifier in selector");
       }
       selector.is_const = true;
       suffix.erase(0, 5);
-    } else if (suffix.starts_with("volatile")) {
+    } else if (::tracer::compat::starts_with(suffix, "volatile")) {
       if (selector.is_volatile) {
         throw std::runtime_error("duplicate volatile qualifier in selector");
       }
       selector.is_volatile = true;
       suffix.erase(0, 8);
-    } else if (suffix.starts_with("&&")) {
+    } else if (::tracer::compat::starts_with(suffix, "&&")) {
       if (selector.ref_qualifier != clang::RQ_None) {
         throw std::runtime_error("duplicate ref qualifier in selector");
       }
       selector.ref_qualifier = clang::RQ_RValue;
       suffix.erase(0, 2);
-    } else if (suffix.starts_with("&")) {
+    } else if (::tracer::compat::starts_with(suffix, "&")) {
       if (selector.ref_qualifier != clang::RQ_None) {
         throw std::runtime_error("duplicate ref qualifier in selector");
       }
@@ -212,12 +243,37 @@ struct Candidate {
   clang::RefQualifierKind ref_qualifier = clang::RQ_None;
   api::ProbeSpec spec;
   std::string unsupported_reason;
+  bool selected_by_type = false;
+  bool requires_typed_adapter = false;
 };
 
 struct FrozenInvocation {
   std::string working_directory;
   std::string source_argument;
   std::vector<std::string> arguments;
+  std::vector<std::string> prepared_headers;
+  api::PreparedInjector prepared_profile;
+  std::string adapter_symbol;
+  bool select_template = false;
+  bool pointer_layouts = true;
+};
+
+class PrepareDiagnostics final : public clang::TextDiagnosticPrinter {
+public:
+  explicit PrepareDiagnostics(clang::DiagnosticOptions& options)
+      : clang::TextDiagnosticPrinter(llvm::errs(), options) {}
+
+  void HandleDiagnostic(clang::DiagnosticsEngine::Level level,
+                        const clang::Diagnostic& diagnostic) override {
+    had_error_ |= level >= clang::DiagnosticsEngine::Error;
+    clang::TextDiagnosticPrinter::HandleDiagnostic(level, diagnostic);
+  }
+
+  // A ToolInvocation can continue into the frontend after a driver error.
+  bool had_error() const { return had_error_; }
+
+private:
+  bool had_error_ = false;
 };
 
 bool is_receiver_field_type(clang::QualType type) {
@@ -304,36 +360,46 @@ api::ValueType scalar_type(clang::QualType type, clang::ASTContext& context, boo
   throw std::runtime_error("aggregate, vector, and other non-scalar types are unsupported");
 }
 
-std::string mangle(const clang::FunctionDecl* declaration, clang::ASTContext& context) {
-  auto mangler = std::unique_ptr<clang::MangleContext>(context.createMangleContext());
-  if (!mangler->shouldMangleDeclName(declaration)) {
-    if (declaration->getLanguageLinkage() == clang::CLanguageLinkage) {
-      return declaration->getNameAsString();
-    }
-    throw std::runtime_error("callable has no supported C++ mangled symbol");
-  }
-  std::string symbol;
-  llvm::raw_string_ostream output(symbol);
-  mangler->mangleName(clang::GlobalDecl(declaration), output);
-  output.flush();
-  return symbol;
-}
-
 class Collector : public clang::RecursiveASTVisitor<Collector> {
 public:
   Collector(std::vector<Candidate>& candidates, const std::string& qualified_name,
-            FrozenInvocation invocation, std::string translation_unit, std::string target_triple)
+            FrozenInvocation invocation, std::string translation_unit, std::string target_triple,
+            clang::Sema *sema)
       : candidates_(candidates)
       , qualified_name_(qualified_name)
       , invocation_(std::move(invocation))
       , translation_unit_(std::move(translation_unit))
-      , target_triple_(std::move(target_triple)) {}
+      , target_triple_(std::move(target_triple)), sema_(sema) {}
 
   bool VisitFunctionDecl(clang::FunctionDecl* declaration) {
-    if (declaration->getQualifiedNameAsString() != qualified_name_) {
+    if (invocation_.select_template)
+      return true;
+    if (!invocation_.adapter_symbol.empty()) {
+      if (!tracer::prepared::adapter_callable(*declaration, *context_, qualified_name_,
+                                             invocation_.adapter_symbol))
+        return true;
+    } else if (declaration->getQualifiedNameAsString() != qualified_name_) {
       return true;
     }
+    return collect(declaration, false);
+  }
 
+  bool VisitTypeAliasDecl(clang::TypeAliasDecl *alias) {
+    if (!invocation_.select_template ||
+        alias->getQualifiedNameAsString() != "tracer_prepared_selection::Selected")
+      return true;
+    const auto *type = llvm::dyn_cast<clang::DecltypeType>(alias->getUnderlyingType().getTypePtr());
+    const auto *call = type ? llvm::dyn_cast<clang::CallExpr>(
+        type->getUnderlyingExpr()->IgnoreParenImpCasts()) : nullptr;
+    const auto *address = call && call->getNumArgs() == 1
+        ? llvm::dyn_cast<clang::UnaryOperator>(call->getArg(0)->IgnoreParenImpCasts()) : nullptr;
+    const auto *reference = address && address->getOpcode() == clang::UO_AddrOf
+        ? llvm::dyn_cast<clang::DeclRefExpr>(address->getSubExpr()->IgnoreParenImpCasts()) : nullptr;
+    auto *function = reference ? llvm::dyn_cast<clang::FunctionDecl>(reference->getDecl()) : nullptr;
+    return function ? collect(function, true) : true;
+  }
+
+  bool collect(const clang::FunctionDecl *declaration, bool selected_by_type) {
     auto* prototype = declaration->getType()->getAs<clang::FunctionProtoType>();
     if (!prototype) {
       return true;
@@ -341,7 +407,10 @@ public:
     const auto* method = llvm::dyn_cast<clang::CXXMethodDecl>(declaration);
 
     Candidate candidate;
-    candidate.name = declaration->getQualifiedNameAsString();
+    candidate.name = selected_by_type ? qualified_name_ : declaration->getQualifiedNameAsString();
+    candidate.selected_by_type = selected_by_type;
+    candidate.requires_typed_adapter = tracer::prepared::template_instance(*declaration) ||
+                                       tracer::prepared::nested_static_method(method);
     candidate.is_const = method && method->isConst();
     candidate.is_volatile = method && method->isVolatile();
     candidate.ref_qualifier = method ? method->getRefQualifier() : clang::RQ_None;
@@ -349,6 +418,9 @@ public:
     policy.SuppressScope = false;
     for (const auto* parameter : declaration->parameters()) {
       candidate.parameter_spellings.push_back(type_spelling(parameter->getType(), policy));
+      candidate.spec.add_argument_names(parameter->getName().empty()
+          ? "arg" + std::to_string(candidate.parameter_spellings.size() - 1)
+          : parameter->getNameAsString());
     }
     for (unsigned i = 0; i < prototype->getNumParams(); ++i) {
       candidate.canonical_parameter_spellings.push_back(
@@ -385,7 +457,7 @@ public:
         "|volatile=" + (candidate.is_volatile ? "1" : "0") +
         "|ref=" + std::to_string(static_cast<int>(candidate.ref_qualifier));
 
-    if (method && !method->isStatic()) {
+    if (method && !method->isStatic() && !sema_) {
       set_receiver(candidate, method, policy);
       if (candidate.spec.has_receiver()) {
         candidate.canonical_identity += receiver_layout_identity(candidate.spec.receiver());
@@ -397,7 +469,7 @@ public:
           declaration->getType()->isDependentType()) {
         throw std::runtime_error("dependent callable types are unsupported");
       }
-      if (method && method->isVirtual()) {
+      if (!sema_ && method && method->isVirtual()) {
         throw std::runtime_error("virtual methods and their possible thunks are unsupported");
       }
       if (llvm::isa<clang::CXXConstructorDecl>(declaration) ||
@@ -415,7 +487,7 @@ public:
           function_info.getNoCallerSavedRegs() || function_info.getCmseNSCall()) {
         throw std::runtime_error("ABI-changing function attributes are unsupported");
       }
-      if (declaration->hasAttr<clang::AsmLabelAttr>()) {
+      if (invocation_.adapter_symbol.empty() && declaration->hasAttr<clang::AsmLabelAttr>()) {
         throw std::runtime_error("asm-labelled declarations are unsupported");
       }
       if (prototype->isVariadic()) {
@@ -434,13 +506,28 @@ public:
       if (method && !method->isStatic() && !method->getParent()->isCompleteDefinition()) {
         throw std::runtime_error("incomplete class method is unsupported");
       }
-      candidate.spec.set_symbol(mangle(declaration, *context_));
+      candidate.spec.set_symbol(invocation_.adapter_symbol.empty()
+          ? tracer::prepared::mangle(declaration, *context_) : invocation_.adapter_symbol);
       candidate.spec.mutable_signature()->set_kind(method && !method->isStatic() ? api::METHOD
                                                                                  : api::FUNCTION);
-      auto* signature = candidate.spec.mutable_signature();
-      signature->set_result(scalar_type(declaration->getReturnType(), *context_, true));
-      for (const auto* parameter : declaration->parameters()) {
-        signature->add_arguments(scalar_type(parameter->getType(), *context_, false));
+      if (sema_) {
+        tracer::prepared::describe_prepared_callable(*context_, *declaration, method,
+            candidate.spec, sema_, nullptr, invocation_.pointer_layouts);
+        if (!invocation_.prepared_headers.empty()) {
+          auto adapter = tracer::prepared::AdapterEmitter::emit(*context_, *header_search_,
+              *declaration, invocation_.prepared_headers, invocation_.pointer_layouts);
+          auto &package = *candidate.spec.mutable_prepared();
+          package = invocation_.prepared_profile;
+          package.set_target_triple(context_->getTargetInfo().getTriple().str());
+          package.set_adapter_declarations(std::move(adapter.source));
+          for (const auto &header : adapter.standard_headers)
+            package.add_adapter_standard_headers(header);
+        }
+      } else {
+        auto *signature = candidate.spec.mutable_signature();
+        signature->set_result(scalar_type(declaration->getReturnType(), *context_, true));
+        for (const auto *parameter : declaration->parameters())
+          signature->add_arguments(scalar_type(parameter->getType(), *context_, false));
       }
       candidate.symbol = candidate.spec.symbol();
     } catch (const std::exception& error) {
@@ -451,7 +538,33 @@ public:
     return true;
   }
 
-  void set_context(clang::ASTContext& context) { context_ = &context; }
+  void set_context(clang::ASTContext& context, clang::Sema *sema,
+                   const clang::HeaderSearch *header_search = nullptr) {
+    context_ = &context;
+    sema_ = sema;
+    header_search_ = header_search;
+  }
+
+  void collect_translation_unit(clang::ASTContext &context, clang::Sema *sema) {
+    clang::DiagnosticOptions diagnostic_options;
+    PrepareDiagnostics diagnostics(diagnostic_options);
+    std::unique_ptr<clang::ASTUnit> toolchain;
+    if (!invocation_.prepared_headers.empty()) {
+      auto arguments = tracer::prepared::toolchain_arguments(invocation_.prepared_profile,
+          {runtime::jit_flags.begin(), runtime::jit_flags.end()});
+      arguments.insert(arguments.end(), {"-std=c++23", "-x", "c++",
+          "-resource-dir=" + std::string(TRACER_CLANG_RESOURCE_DIR)});
+      const auto &abi_options = invocation_.prepared_profile.adapter_abi_options();
+      arguments.insert(arguments.end(), abi_options.begin(), abi_options.end());
+      toolchain = clang::tooling::buildASTFromCodeWithArgs("", tracer::clang_driver_arguments(std::move(arguments)),
+          "prepared-toolchain.cc", "clang-tool", std::make_shared<clang::PCHContainerOperations>(),
+          clang::tooling::getClangStripDependencyFileAdjuster(), {}, &diagnostics);
+      if (!toolchain || diagnostics.had_error() || toolchain->getDiagnostics().hasErrorOccurred())
+        throw std::invalid_argument("Clang could not resolve the prepared toolchain headers");
+    }
+    set_context(context, sema, toolchain ? &toolchain->getPreprocessor().getHeaderSearchInfo() : nullptr);
+    TraverseDecl(context.getTranslationUnitDecl());
+  }
 
 private:
   void set_receiver(Candidate& candidate, const clang::CXXMethodDecl* method,
@@ -559,25 +672,32 @@ private:
   FrozenInvocation invocation_;
   std::string translation_unit_;
   std::string target_triple_;
+  clang::Sema *sema_;
+  const clang::HeaderSearch *header_search_ = nullptr;
 };
 
 class Action : public clang::ASTFrontendAction {
 public:
   explicit Action(std::vector<Candidate>& candidates, std::string& target_error,
                   const std::string& qualified_name, FrozenInvocation& frozen_invocation,
-                  std::string& invocation_error)
+                  std::string& invocation_error, bool prepared = false)
       : candidates_(candidates)
       , target_error_(target_error)
       , qualified_name_(qualified_name)
       , frozen_invocation_(frozen_invocation)
-      , invocation_error_(invocation_error) {}
+      , invocation_error_(invocation_error), prepared_(prepared) {}
 
   bool BeginSourceFileAction(clang::CompilerInstance& compiler) override {
     const auto& target = compiler.getTarget();
     const auto& triple = target.getTriple();
     if (triple.getArch() != llvm::Triple::x86_64 || !triple.isOSLinux() ||
-        target.getPointerWidth(clang::LangAS::Default) != 64 || target.getLongWidth() != 64) {
-      target_error_ = "compilation database must target Linux x86_64 (found " + triple.str() + ")";
+        target.getPointerWidth(clang::LangAS::Default) != 64 || target.getLongWidth() != 64 ||
+        (prepared_ && (!triple.isOSBinFormatELF() || !target.isLittleEndian() ||
+                       !target.getCXXABI().isItaniumFamily()))) {
+      target_error_ = prepared_
+          ? "compilation database ABI does not match the trace target (expected Linux x86_64 "
+            "ELF LP64 with the Itanium C++ ABI, found " + triple.str() + ")"
+          : "compilation database must target Linux x86_64 (found " + triple.str() + ")";
       return false;
     }
     return true;
@@ -592,22 +712,24 @@ private:
   const std::string& qualified_name_;
   FrozenInvocation& frozen_invocation_;
   std::string& invocation_error_;
+  bool prepared_;
 };
 
 class Consumer : public clang::ASTConsumer {
 public:
   Consumer(std::vector<Candidate>& candidates, const std::string& qualified_name,
-           FrozenInvocation invocation, std::string translation_unit, std::string target_triple)
+           FrozenInvocation invocation, std::string translation_unit, std::string target_triple,
+           clang::CompilerInstance *compiler)
       : visitor_(candidates, qualified_name, std::move(invocation), std::move(translation_unit),
-                 std::move(target_triple)) {}
+                 std::move(target_triple), nullptr), compiler_(compiler) {}
 
   void HandleTranslationUnit(clang::ASTContext& context) override {
-    visitor_.set_context(context);
-    visitor_.TraverseDecl(context.getTranslationUnitDecl());
+    visitor_.collect_translation_unit(context, compiler_ ? &compiler_->getSema() : nullptr);
   }
 
 private:
   Collector visitor_;
+  clang::CompilerInstance *compiler_;
 };
 
 std::unique_ptr<clang::ASTConsumer> Action::CreateASTConsumer(clang::CompilerInstance& compiler,
@@ -616,7 +738,7 @@ std::unique_ptr<clang::ASTConsumer> Action::CreateASTConsumer(clang::CompilerIns
   if (compiler.getFrontendOpts().Inputs.empty()) {
     invocation_error_ = "Clang action has no main translation unit input";
     return std::make_unique<Consumer>(candidates_, qualified_name_, std::move(invocation), "",
-                                      compiler.getTarget().getTriple().str());
+                                      compiler.getTarget().getTriple().str(), prepared_ ? &compiler : nullptr);
   }
   const auto input = compiler.getFrontendOpts().Inputs.front().getFile().str();
   auto& vfs = compiler.getFileManager().getVirtualFileSystem();
@@ -625,7 +747,7 @@ std::unique_ptr<clang::ASTConsumer> Action::CreateASTConsumer(clang::CompilerIns
     invocation_error_ =
         "cannot read Clang VFS working directory: " + vfs_working_directory.getError().message();
     return std::make_unique<Consumer>(candidates_, qualified_name_, std::move(invocation), "",
-                                      compiler.getTarget().getTriple().str());
+                                      compiler.getTarget().getTriple().str(), prepared_ ? &compiler : nullptr);
   }
   auto absolute_vfs_path = [&vfs](llvm::StringRef path) {
     llvm::SmallString<256> normalized(path);
@@ -662,23 +784,24 @@ std::unique_ptr<clang::ASTConsumer> Action::CreateASTConsumer(clang::CompilerIns
   }
   invocation.arguments = std::move(normalized_arguments);
   return std::make_unique<Consumer>(candidates_, qualified_name_, std::move(invocation),
-                                    absolute_input, compiler.getTarget().getTriple().str());
+                                    absolute_input, compiler.getTarget().getTriple().str(),
+                                    prepared_ ? &compiler : nullptr);
 }
 
 class ActionFactory : public clang::tooling::FrontendActionFactory {
 public:
   ActionFactory(std::vector<Candidate>& candidates, std::string& target_error,
                 const std::string& qualified_name, FrozenInvocation& frozen_invocation,
-                std::string& invocation_error)
+                std::string& invocation_error, bool prepared = false)
       : candidates_(candidates)
       , target_error_(target_error)
       , qualified_name_(qualified_name)
       , frozen_invocation_(frozen_invocation)
-      , invocation_error_(invocation_error) {}
+      , invocation_error_(invocation_error), prepared_(prepared) {}
 
   std::unique_ptr<clang::FrontendAction> create() override {
     return std::make_unique<Action>(candidates_, target_error_, qualified_name_, frozen_invocation_,
-                                    invocation_error_);
+                                    invocation_error_, prepared_);
   }
 
 private:
@@ -687,6 +810,7 @@ private:
   const std::string& qualified_name_;
   FrozenInvocation& frozen_invocation_;
   std::string& invocation_error_;
+  bool prepared_;
 };
 
 std::unique_ptr<clang::tooling::CompilationDatabase> load_database(const std::string& requested) {
@@ -736,7 +860,7 @@ std::string normalized_path(const std::string& path, const std::string& director
 
 bool has_resource_dir_argument(const clang::tooling::CommandLineArguments& arguments) {
   return std::any_of(arguments.begin(), arguments.end(), [](const auto& argument) {
-    return argument == "-resource-dir" || argument.starts_with("-resource-dir=");
+    return argument == "-resource-dir" || ::tracer::compat::starts_with(argument, "-resource-dir=");
   });
 }
 
@@ -744,7 +868,7 @@ bool matches(const Candidate& candidate, const Selector& selector) {
   if (candidate.name != selector.qualified_name) {
     return false;
   }
-  if (!selector.has_parameters) {
+  if (!selector.has_parameters || candidate.selected_by_type) {
     return true;
   }
   if (candidate.parameter_spellings.size() != selector.parameters.size() ||
@@ -763,6 +887,45 @@ bool matches(const Candidate& candidate, const Selector& selector) {
 }
 
 } // namespace
+
+static ResolvedCallable select_cpp_candidate(std::vector<Candidate> candidates,
+                                                const Selector& selector,
+                                                const std::string& name) {
+  std::unordered_map<std::string, Candidate> unique;
+  for (auto& candidate : candidates) {
+    if (!matches(candidate, selector)) {
+      continue;
+    }
+    const auto existing = unique.find(candidate.symbol);
+    if (existing == unique.end()) {
+      unique.try_emplace(candidate.symbol, std::move(candidate));
+    } else if (existing->second.canonical_identity != candidate.canonical_identity ||
+               existing->second.unsupported_reason != candidate.unsupported_reason) {
+      throw std::runtime_error("conflicting declarations resolve to the same symbol '" +
+                               existing->second.spec.symbol() + "'");
+    }
+  }
+  if (unique.empty()) {
+    throw std::runtime_error("no callable matched '" + name + "'");
+  }
+  if (unique.size() != 1) {
+    std::string message = "callable selector is ambiguous; candidates:";
+    for (const auto& [_, candidate] : unique) {
+      message += "\n  " + candidate.declaration;
+    }
+    throw std::runtime_error(message);
+  }
+  auto candidate = std::move(unique.begin()->second);
+  if (!candidate.unsupported_reason.empty()) {
+    throw std::runtime_error("callable is unsupported: " + candidate.unsupported_reason);
+  }
+  ResolvedCallable resolved;
+  resolved.spec = std::move(candidate.spec);
+  resolved.declaration = std::move(candidate.declaration);
+  resolved.source = std::move(candidate.source);
+  resolved.requires_typed_adapter = candidate.requires_typed_adapter;
+  return resolved;
+}
 
 ResolvedCallable resolve_cpp_callable(const std::string& name,
                                       const std::string& compilation_database,
@@ -784,7 +947,7 @@ ResolvedCallable resolve_cpp_callable(const std::string& name,
       const auto commands = database->getCompileCommands(file);
       bool found = false;
       for (const auto& command : commands) {
-        if (requested.contains(normalized_path(file, command.Directory))) {
+        if (::tracer::compat::contains(requested, normalized_path(file, command.Directory))) {
           found = true;
           break;
         }
@@ -861,39 +1024,204 @@ ResolvedCallable resolve_cpp_callable(const std::string& name,
                              "diagnostics or restrict --source");
   }
 
-  std::unordered_map<std::string, Candidate> unique;
-  for (auto& candidate : candidates) {
-    if (!matches(candidate, selector)) {
-      continue;
+  return select_cpp_candidate(std::move(candidates), selector, name);
+}
+
+ResolvedCallable resolve_header_callable(const std::string& name,
+                                         const api::ProbeSpec& headers,
+                                         const PreparedHeaderCommand& command,
+                                         bool pointer_layouts) {
+  const auto selector = parse_selector(name);
+  if (!selector.has_parameters || headers.include_headers().empty())
+    throw std::runtime_error("prepared generation requires an explicit selector and header context");
+  // Use the SDK fallback unless the database names a different installed
+  // compiler by path or explicitly selects a toolchain.
+  std::vector<std::string> arguments{"--no-default-config"};
+  const bool clang_cl = command.driver_mode == "cl";
+  std::error_code path_error;
+  const bool installed_driver = fs::path(command.driver).is_absolute() &&
+      fs::is_regular_file(command.driver, path_error);
+  const bool alternate_driver = installed_driver &&
+      !fs::equivalent(command.driver, TRACER_PREPARE_BUILD_CXX, path_error) && !path_error;
+  FrozenInvocation invocation;
+  auto &profile = invocation.prepared_profile;
+  profile.set_format_version(tracer::prepared::typed_version);
+  profile.add_adapter_toolchain_options("--no-default-config");
+  profile.add_adapter_toolchain_options("--driver-mode=" + command.driver_mode);
+  for (const auto &option : command.adapter_abi_options)
+    profile.add_adapter_abi_options(option);
+  if (command.use_default_toolchain && !alternate_driver) {
+    profile.set_adapter_uses_default_toolchain(true);
+    for (const auto* flag : runtime::jit_flags) {
+      arguments.push_back(clang_cl ? std::string("/clang:") + flag : flag);
     }
-    const auto existing = unique.find(candidate.symbol);
-    if (existing == unique.end()) {
-      unique.try_emplace(candidate.symbol, std::move(candidate));
-    } else if (existing->second.canonical_identity != candidate.canonical_identity ||
-               existing->second.unsupported_reason != candidate.unsupported_reason) {
-      throw std::runtime_error("conflicting declarations resolve to the same symbol '" +
-                               existing->second.spec.symbol() + "'");
+  }
+  if (installed_driver && !profile.adapter_uses_default_toolchain()) {
+    // The standalone compiler has a synthetic argv[0]. Preserve the donor's
+    // installation directory so Clang can find its C++ standard library.
+    profile.add_adapter_toolchain_options("-ccc-install-dir");
+    profile.add_adapter_toolchain_options(fs::path(command.driver).parent_path().string());
+  }
+  const auto absolute_option_path = [&](llvm::StringRef path) {
+    return (fs::path(command.directory) / fs::path(path.str())).lexically_normal().string();
+  };
+  // Carry driver toolchain selection, without the donor's application include
+  // paths, forced headers, defines or other unrelated compiler switches.
+  for (std::size_t index = 0; index < command.arguments.size(); ++index) {
+    llvm::StringRef option(command.arguments[index]);
+    option.consume_front("/clang:");
+    const auto prefix = tracer::prepared::toolchain_path_option(
+        std::string_view(option.data(), option.size()));
+    if (option == "-isysroot" || option == "-ccc-install-dir") {
+      if (++index == command.arguments.size())
+        throw std::invalid_argument("missing prepared toolchain path");
+      llvm::StringRef path(command.arguments[index]);
+      path.consume_front("/clang:");
+      if (option == "-ccc-install-dir") {
+        profile.add_adapter_toolchain_options("-ccc-install-dir");
+        profile.add_adapter_toolchain_options(absolute_option_path(path));
+      } else {
+        profile.add_adapter_toolchain_options("-isysroot" + absolute_option_path(path));
+      }
+    } else if (!prefix.empty()) {
+      auto path = option.drop_front(prefix.size());
+      if (prefix == "-isysroot")
+        path.consume_front("=");
+      if (!path.empty())
+        profile.add_adapter_toolchain_options(std::string(prefix) + absolute_option_path(path));
+    } else if (option.consume_front("--target=")) {
+      profile.add_adapter_toolchain_options("--target=" + llvm::Triple::normalize(option));
+    } else if (tracer::prepared::toolchain_switch(std::string_view(option.data(), option.size()))) {
+      profile.add_adapter_toolchain_options(option.str());
     }
   }
-  if (unique.empty()) {
-    throw std::runtime_error("no callable matched '" + name + "'");
-  }
-  if (unique.size() != 1) {
-    std::string message = "callable selector is ambiguous; candidates:";
-    for (const auto& [_, candidate] : unique) {
-      message += "\n  " + candidate.declaration;
+  arguments.insert(arguments.end(), command.arguments.begin(), command.arguments.end());
+  arguments.push_back("-resource-dir=" + std::string(TRACER_CLANG_RESOURCE_DIR));
+  arguments.insert(arguments.end(), {"-fsyntax-only", "-x", "c++"});
+  const auto source = (fs::path(command.directory) / "clang-tracer-prepared-headers.cc").string();
+  std::string code;
+  for (const auto& header : headers.include_headers())
+    code += "#include \"" + header + "\"\n";
+  const auto angle = selector.qualified_name.find('<');
+  const bool select_template = angle != std::string::npos &&
+      selector.qualified_name.find('>', angle) != std::string::npos;
+  if (select_template) {
+    if (name.find_first_of("#;{}\\\r\n") != std::string::npos)
+      throw std::invalid_argument("invalid character in prepared template selector");
+    std::string parameters;
+    for (const auto &parameter : selector.parameters) {
+      if (!parameters.empty())
+        parameters += ", ";
+      parameters += parameter;
     }
-    throw std::runtime_error(message);
+    const auto type = "(" + parameters + ")";
+    std::string member = type;
+    if (selector.is_const) member += " const";
+    if (selector.is_volatile) member += " volatile";
+    if (selector.ref_qualifier == clang::RQ_LValue) member += " &";
+    if (selector.ref_qualifier == clang::RQ_RValue) member += " &&";
+    const auto qualified = selector.qualified_name.rfind("::", 0) == 0
+        ? selector.qualified_name : "::" + selector.qualified_name;
+    code += "\nnamespace tracer_prepared_selection {\n";
+    if (member == type)
+      code += "template<class R> void select(R (*)" + type + ");\n";
+    code += "template<class R, class C> void select(R (C::*)" + member + ");\n"
+            "using Selected = decltype(select(&" + qualified + "));\n}\n";
+    arguments.push_back(clang_cl ? "/clang:-fno-access-control" : "-fno-access-control");
   }
-  auto candidate = std::move(unique.begin()->second);
-  if (!candidate.unsupported_reason.empty()) {
-    throw std::runtime_error("callable is unsupported: " + candidate.unsupported_reason);
+  clang::tooling::FixedCompilationDatabase database(command.directory, arguments);
+  clang::DiagnosticOptions diagnostic_options;
+  PrepareDiagnostics diagnostics(diagnostic_options);
+  clang::tooling::ClangTool tool(database, {source});
+  tool.clearArgumentsAdjusters();
+  tool.setDiagnosticConsumer(&diagnostics);
+  tool.mapVirtualFile(source, code);
+  std::vector<Candidate> candidates;
+  std::string target_error, invocation_error;
+  invocation.select_template = select_template;
+  invocation.pointer_layouts = pointer_layouts;
+  invocation.prepared_headers.assign(headers.include_headers().begin(),
+                                     headers.include_headers().end());
+  tool.appendArgumentsAdjuster([&](const clang::tooling::CommandLineArguments& args,
+                                   llvm::StringRef filename) {
+    invocation.arguments = args;
+    invocation.arguments.front() = command.driver;
+    invocation.source_argument = filename.str();
+    return invocation.arguments;
+  });
+  ActionFactory factory(candidates, target_error, selector.qualified_name, invocation,
+                        invocation_error, true);
+  const auto result = tool.run(&factory);
+  if (diagnostics.had_error())
+    throw std::invalid_argument("Clang reported an error while parsing prepared headers");
+  if (!target_error.empty() || !invocation_error.empty() || result != 0)
+    throw std::runtime_error("cannot parse prepared headers: " + target_error + invocation_error);
+  return select_cpp_candidate(std::move(candidates), selector, name);
+}
+
+void verify_prepared_adapter(const std::string &name, const api::PreparedInjector &adapter,
+                             const ResolvedCallable &original, bool pointer_layouts) {
+  const auto selector = parse_selector(name);
+  auto arguments = tracer::prepared::toolchain_arguments(adapter,
+      {runtime::jit_flags.begin(), runtime::jit_flags.end()});
+  arguments.insert(arguments.end(), {"-std=c++23", "-x", "c++",
+      "-resource-dir=" + std::string(TRACER_CLANG_RESOURCE_DIR)});
+  arguments.insert(arguments.end(), adapter.adapter_abi_options().begin(),
+                   adapter.adapter_abi_options().end());
+  clang::DiagnosticOptions diagnostic_options;
+  PrepareDiagnostics diagnostics(diagnostic_options);
+  auto unit = clang::tooling::buildASTFromCodeWithArgs(
+      tracer::prepared::adapter_source(adapter), tracer::clang_driver_arguments(std::move(arguments)),
+      "prepared-adapter.cc",
+      "clang-tool", std::make_shared<clang::PCHContainerOperations>(),
+      clang::tooling::getClangStripDependencyFileAdjuster(), {}, &diagnostics);
+  // A compiler error must bypass the address-only pointer retry.
+  if (diagnostics.had_error() || (unit && unit->getDiagnostics().hasErrorOccurred()))
+    throw std::invalid_argument("Clang reported an error while compiling the prepared adapter");
+  if (!unit)
+    throw std::runtime_error("generated prepared adapter does not compile independently");
+  tracer::prepared::check_toolchain_headers(unit->getPreprocessor().getHeaderSearchInfo(), adapter);
+  std::vector<Candidate> candidates;
+  FrozenInvocation invocation;
+  invocation.adapter_symbol = original.spec.symbol();
+  invocation.pointer_layouts = pointer_layouts;
+  Collector visitor(candidates, selector.qualified_name, std::move(invocation), "", "",
+                    &unit->getSema());
+  visitor.set_context(unit->getASTContext(), &unit->getSema());
+  visitor.TraverseDecl(unit->getASTContext().getTranslationUnitDecl());
+  if (diagnostics.had_error())
+    throw std::invalid_argument("Clang reported an error while compiling the prepared adapter");
+  // Match by linkage because the adapter writes canonical parameter types.
+  const auto candidate = std::find_if(candidates.begin(), candidates.end(), [&](const auto &item) {
+    return item.symbol == original.spec.symbol() && item.unsupported_reason.empty();
+  });
+  const std::string failure = "generated prepared adapter does not reproduce the target ABI and layout";
+  if (candidate == candidates.end())
+    throw std::runtime_error(failure + " for '" + name + "'");
+  const auto &expected = original.spec.debug_info();
+  const auto &actual = candidate->spec.debug_info();
+  const auto &expected_signature = original.spec.signature();
+  const auto &actual_signature = candidate->spec.signature();
+  if (actual_signature.SerializeAsString() == expected_signature.SerializeAsString() &&
+      actual.SerializeAsString() == expected.SerializeAsString())
+    return;
+
+  if (actual_signature.result() != expected_signature.result() ||
+      actual.result_cpp_type() != expected.result_cpp_type() ||
+      actual.result_is_reference() != expected.result_is_reference() ||
+      actual.result_pass_by_reference() != expected.result_pass_by_reference() ||
+      actual.result_object_type().SerializeAsString() !=
+          expected.result_object_type().SerializeAsString())
+    throw std::runtime_error(failure + " for result type '" + expected.result_cpp_type() + "'");
+  for (int i = 0; i < std::min(expected.arguments_size(), actual.arguments_size()); ++i) {
+    if (actual.arguments(i).SerializeAsString() != expected.arguments(i).SerializeAsString())
+      throw std::runtime_error(failure + " for argument type '" +
+                               expected.arguments(i).cpp_type() + "'");
   }
-  ResolvedCallable resolved;
-  resolved.spec = std::move(candidate.spec);
-  resolved.declaration = std::move(candidate.declaration);
-  resolved.source = std::move(candidate.source);
-  return resolved;
+  if (!expected.record_name().empty() &&
+      actual.prepared_layout_sha256() != expected.prepared_layout_sha256())
+    throw std::runtime_error(failure + " for receiver type '" + expected.record_name() + "'");
+  throw std::runtime_error(failure + " for '" + name + "'");
 }
 
 } // namespace tracer::client

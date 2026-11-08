@@ -2,6 +2,9 @@
 
 #include <string>
 
+
+#include "payload.hpp"
+
 namespace prepared_history {
 
 struct EntryBase {
@@ -36,3 +39,37 @@ struct OpaqueItem {
 const OpaqueItem *via_opaque(const OpaqueItem *item, int tag);
 
 } // namespace prepared_history
+
+namespace HFW {
+
+template <typename T = int, UP_SQLObject::Flag Enabled = UP_SQLObject::False>
+struct ItemDetails {
+  T quantity;
+};
+
+class HfwManager {
+  enum class ItemKind : int { Widget = 3 };
+  template <typename T> struct ItemBox;
+  struct Item;
+  using ItemResult = Item;
+
+public:
+  HfwManager() = default;
+  ItemResult createItem();
+  ItemBox<int> createBox();
+
+private:
+  template <typename T> struct ItemBox {
+    T value;
+  };
+
+  struct Item {
+    int id;
+    ItemKind kind;
+    ItemDetails<> details;
+  };
+
+  int seed = 71;
+};
+
+} // namespace HFW

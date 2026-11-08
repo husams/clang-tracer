@@ -6,13 +6,25 @@
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/ExprCXX.h>
 #include <clang/AST/RecursiveASTVisitor.h>
-#include <clang/Basic/Version.h>
 #include <clang/Basic/SourceManager.h>
+#include <clang/Basic/Version.h>
 #include <clang/Lex/Lexer.h>
 
 #include "context_support_effects.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer {
+std::string context_class_type_name(const clang::CXXRecordDecl &record) {
+  if (!llvm::isa<clang::ClassTemplateSpecializationDecl>(record))
+    return record.getQualifiedNameAsString();
+  auto &context = record.getASTContext();
+  clang::PrintingPolicy policy(context.getLangOpts());
+  policy.SuppressTagKeyword = true;
+  policy.SuppressDefaultTemplateArgs = false;
+  policy.SuppressInlineNamespace = false;
+  return context.getRecordType(&record).getAsString(policy);
+}
+
 namespace {
 const clang::ClassTemplateSpecializationDecl *
 specialization(clang::QualType type, const char *name) {
@@ -139,15 +151,17 @@ void append_cleanup(clang::QualType type,
   const auto *destructor = record ? record->getDestructor() : nullptr;
   const auto record_name = record ? record->getQualifiedNameAsString() : "";
   if (destructor && destructor->isUserProvided() && destructor->hasBody() &&
-      !record_name.starts_with("std::"))
+      !::tracer::compat::starts_with(record_name, "std::")) {
     calls.push_back(destructor);
+  }
 }
 
 bool user_provided_type_method(const clang::FunctionDecl *function) {
   if (!function || !function->isUserProvided() || !function->hasBody())
     return false;
   const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(function);
-  return !method || !method->getParent()->getQualifiedNameAsString().starts_with("std::");
+  return !method ||
+         !::tracer::compat::starts_with(method->getParent()->getQualifiedNameAsString(), "std::");
 }
 
 void append_user_operator(const clang::CXXRecordDecl *record,
@@ -196,9 +210,9 @@ public:
   }
   bool VisitNamedDecl(clang::NamedDecl *declaration) {
     const auto qualified = declaration->getQualifiedNameAsString();
-    const bool protected_namespace = qualified.starts_with("std::") ||
-        qualified.starts_with("__gnu_cxx::") ||
-        qualified.starts_with("__cxxabiv1::");
+    const bool protected_namespace = ::tracer::compat::starts_with(qualified, "std::") ||
+                                     ::tracer::compat::starts_with(qualified, "__gnu_cxx::") ||
+                                     ::tracer::compat::starts_with(qualified, "__cxxabiv1::");
     if (protected_namespace && declaration->getLocation().isValid() &&
         !sources_.isInSystemHeader(declaration->getLocation())) {
       error = "unsupported_context_effect: source declaration in protected "
@@ -224,10 +238,12 @@ public:
   bool TraverseFunctionDecl(clang::FunctionDecl *function) {
     if (function) {
       const auto name = function->getQualifiedNameAsString();
-      if (name.starts_with("std::") || name.starts_with("__gnu_cxx::") ||
-          name.starts_with("__cxxabiv1::") ||
-          name.starts_with("tracer::Call::"))
+      if (::tracer::compat::starts_with(name, "std::") ||
+          ::tracer::compat::starts_with(name, "__gnu_cxx::") ||
+          ::tracer::compat::starts_with(name, "__cxxabiv1::") ||
+          ::tracer::compat::starts_with(name, "tracer::Call::")) {
         return true;
+      }
     }
     return clang::RecursiveASTVisitor<ContextUseScanner>::
         TraverseFunctionDecl(function);
@@ -331,9 +347,11 @@ bool function_reaches_context_use(
   if (scanner.uses_context) return true;
   for (const auto *callee : scanner.callees) {
     const auto name = callee->getQualifiedNameAsString();
-    if (name.starts_with("std::") || name.starts_with("__gnu_cxx::") ||
-        name.starts_with("__cxxabiv1::"))
+    if (::tracer::compat::starts_with(name, "std::") ||
+        ::tracer::compat::starts_with(name, "__gnu_cxx::") ||
+        ::tracer::compat::starts_with(name, "__cxxabiv1::")) {
       continue;
+    }
     if (callee->getLocation().isValid() &&
         function_reaches_context_use(callee, visited))
       return true;
@@ -354,9 +372,11 @@ bool function_reaches_stack_capture(
   if (scanner.uses_stack_capture) return true;
   for (const auto *callee : scanner.callees) {
     const auto name = callee->getQualifiedNameAsString();
-    if (name.starts_with("std::") || name.starts_with("__gnu_cxx::") ||
-        name.starts_with("__cxxabiv1::"))
+    if (::tracer::compat::starts_with(name, "std::") ||
+        ::tracer::compat::starts_with(name, "__gnu_cxx::") ||
+        ::tracer::compat::starts_with(name, "__cxxabiv1::")) {
       continue;
+    }
     if (callee->getLocation().isValid() &&
         function_reaches_stack_capture(callee, visited))
       return true;
@@ -374,10 +394,12 @@ public:
   bool TraverseFunctionDecl(clang::FunctionDecl *function) {
     if (function) {
       const auto name = function->getQualifiedNameAsString();
-      if (name.starts_with("std::") || name.starts_with("__gnu_cxx::") ||
-          name.starts_with("__cxxabiv1::") ||
-          name.starts_with("tracer::Call::"))
+      if (::tracer::compat::starts_with(name, "std::") ||
+          ::tracer::compat::starts_with(name, "__gnu_cxx::") ||
+          ::tracer::compat::starts_with(name, "__cxxabiv1::") ||
+          ::tracer::compat::starts_with(name, "tracer::Call::")) {
         return true;
+      }
     }
     return clang::RecursiveASTVisitor<GenericPayloadStackScan>::
         TraverseFunctionDecl(function);
@@ -561,8 +583,9 @@ public:
       if (!method || method->getNameAsString() != "operator+=") return false;
       if (!context_source_is_trusted_support(sources_, method->getLocation()))
         return false;
-      const auto is_std_basic_string = [](const std::string &name) {
-        return name.starts_with("std::") && name.ends_with("basic_string");
+      const auto is_std_basic_string = [](const std::string& name) {
+        return ::tracer::compat::starts_with(name, "std::") &&
+               ::tracer::compat::ends_with(name, "basic_string");
       };
       const auto *specialization = llvm::dyn_cast_or_null<
           clang::ClassTemplateSpecializationDecl>(method->getParent());
@@ -762,10 +785,11 @@ public:
           // borrowed state reference. User-defined callbacks remain traversed
           // and are checked below; protected-namespace spoofing is rejected by
           // the context declaration and native effect validators.
-          if (qualified_name.starts_with("std::") ||
-              qualified_name.starts_with("__gnu_cxx::") ||
-              qualified_name.starts_with("__cxxabiv1::"))
+          if (::tracer::compat::starts_with(qualified_name, "std::") ||
+              ::tracer::compat::starts_with(qualified_name, "__gnu_cxx::") ||
+              ::tracer::compat::starts_with(qualified_name, "__cxxabiv1::")) {
             continue;
+          }
           if (!callee->hasBody() ||
               std::find(visited.begin(), visited.end(), callee->getCanonicalDecl()) !=
                   visited.end()) continue;
@@ -972,9 +996,9 @@ void scan_reachable(const clang::FunctionDecl *function, ContextHookPlan &plan,
           // exemption for exception_ptr values.
           "current_exception"};
       const auto name = callee->getQualifiedNameAsString();
-      const bool supported = name.starts_with("std::") &&
-          std::find(supported_std_effects.begin(), supported_std_effects.end(),
-                    callee->getNameAsString()) != supported_std_effects.end();
+      const bool supported = ::tracer::compat::starts_with(name, "std::") &&
+                             std::find(supported_std_effects.begin(), supported_std_effects.end(),
+                                       callee->getNameAsString()) != supported_std_effects.end();
       if (supported) continue;
       if (!callee->hasBody()) {
         plan.unsupported_effects = true;
@@ -1039,7 +1063,7 @@ public:
       }
     }
     ContextClassPlan plan;
-    plan.type = record->getQualifiedNameAsString();
+    plan.type = context_class_type_name(*record);
     unsigned dependency_constructors = 0;
     for (const auto *constructor : record->ctors()) {
       bool has_dependency = false;
@@ -1186,12 +1210,11 @@ public:
       std::vector<const clang::FunctionDecl *> visited;
       scan_reachable(method, hook, result_, context_, visited);
       if (hook.invalid_access) {
-        if (hook.invalid_access_effect.starts_with("init_scope"))
-          result_.error = "invalid_context_access_plan: " +
-                          hook.invalid_access_effect;
-        else
-          result_.error = "invalid_context_borrow: " +
-                          hook.invalid_access_effect;
+        if (::tracer::compat::starts_with(hook.invalid_access_effect, "init_scope")) {
+          result_.error = "invalid_context_access_plan: " + hook.invalid_access_effect;
+        } else {
+          result_.error = "invalid_context_borrow: " + hook.invalid_access_effect;
+        }
         return false;
       }
       if (!has_state_parameter && has_dependency && hook.uses_state_name) {

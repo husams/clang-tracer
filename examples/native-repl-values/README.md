@@ -1,10 +1,10 @@
-# Typed values in the native C++17 REPL
+# Typed values in the native REPL
 
 These examples attach to a real process, upload an interceptor, collect POST
 events, and read arguments and results as C++ values. Run them on Linux x86-64
 with a matching native REPL and server. For a source checkout, use Clang 21
 (`clang++-21`) or set `CXX` to a compiler targeting the server's runtime.
-The target and REPL examples use C++17.
+The target and REPL examples use the project C++23 default.
 The existing Linux process-attach/ptrace permission requirements also apply.
 
 From this directory:

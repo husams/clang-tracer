@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <unordered_set>
 
+#include "tracer/compat.hpp"
+
 namespace tracer::context_facade {
 namespace {
 struct ThreadBindings {
@@ -91,7 +93,7 @@ std::string type_name(const std::string &type) {
       spelling.erase(offset, keyword.size());
     }
   }
-  return spelling.starts_with("::") ? spelling : "::" + spelling;
+  return ::tracer::compat::starts_with(spelling, "::") ? spelling : "::" + spelling;
 }
 
 std::string descriptor_source(const RequestDescriptor &d) {

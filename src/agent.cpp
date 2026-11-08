@@ -17,12 +17,15 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cctype>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <fcntl.h>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -33,18 +36,29 @@
 #include <type_traits>
 #include <unordered_set>
 #include <vector>
+#include "value_snapshot_codegen.hpp"
+#include "value_snapshot_storage.hpp"
+#include "context_paths.hpp"
+#include "prepared_types.hpp"
+#include "prepared_contract.hpp"
+#include "prepared_header_search.hpp"
 
 #include <clang/AST/ASTImporter.h>
 #include <clang/AST/DeclCXX.h>
+#include <clang/Sema/Sema.h>
 #include <clang/AST/Mangle.h>
 #include <clang/AST/RecordLayout.h>
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/Basic/Diagnostic.h>
 #include <clang/Basic/Version.h>
+#include <clang/CodeGen/CGFunctionInfo.h>
+#include <clang/CodeGen/CodeGenABITypes.h>
+#include <clang/CodeGen/ModuleBuilder.h>
 #include <clang/Frontend/ASTUnit.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendActions.h>
-#include <clang/Interpreter/Interpreter.h>
+#include <clang/Lex/Lexer.h>
+#include <clang/Lex/Preprocessor.h>
 #include <clang/Parse/ParseAST.h>
 #include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/Tooling.h>
@@ -52,9 +66,16 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <llvm/ADT/ArrayRef.h>
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/SmallString.h>
 #include <llvm/BinaryFormat/Dwarf.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+#include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Module.h>
+#include <clang/Interpreter/Interpreter.h>
 #include <llvm/MC/MCAsmInfo.h>
 #include <llvm/MC/MCContext.h>
 #include <llvm/MC/MCDisassembler/MCDisassembler.h>
@@ -66,10 +87,8 @@
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/MemoryBuffer.h>
-#include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/VirtualFileSystem.h>
 #include <llvm/Support/raw_ostream.h>
-#include <llvm/TargetParser/Host.h>
 #include <llvm/TargetParser/Triple.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -79,8 +98,28 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "callback_bridge.hpp"
+#include "agent_runtime_profile.hpp"
+#include "callback_pch.hpp"
 #include "callback_source.hpp"
+#include "context_activation.hpp"
+#include "context_agent_delivery.hpp"
+#include "context_analysis.hpp"
+#include "context_engine.hpp"
+#include "context_execution.hpp"
+#include "context_pthread_detour.hpp"
+#include "context_runtime.hpp"
+#include "context_stdlib.hpp"
+#include "debug_resolver.hpp"
+#include "event_transport.hpp"
+#include "linux_syscalls.hpp"
+#include "native_detour.hpp"
+#include "native_stack.hpp"
+#include "runtime_identity.hpp"
+#include "runtime_paths.hpp"
 #include "tracer.pb.h"
+#include "tracer/compat.hpp"
+#include "tracer/compiler_options.hpp"
 #include "tracer/protocol.hpp"
 #include "tracer/receiver_abi.hpp"
 
@@ -218,11 +257,25 @@ struct CallbackLog {
 struct DebugRecord {
   clang::CXXRecordDecl *decl;
   clangtracer::v1::ReceiverContext layout;
+  bool opaque = false;
 };
 using DebugRecords = std::vector<DebugRecord>;
 
+struct OrcErrorCapture {
+  std::mutex mutex;
+  std::condition_variable ready;
+  std::string message;
+};
+
+struct VerifiedDebugEntry {
+  const clangtracer::v1::ProbeSpec *spec = nullptr;
+  std::uint64_t runtime_entry = 0;
+};
+
 struct Probe {
+  static constexpr std::uint64_t admission_closed = std::uint64_t{1} << 63;
   tracer::Request request{};
+  std::shared_ptr<OrcErrorCapture> orc_errors;
   std::unique_ptr<clang::Interpreter> interpreter;
   std::unique_ptr<clang::ASTUnit> receiver_ast;
   DebugRecords debug_records;
@@ -239,6 +292,13 @@ struct Probe {
   std::atomic<std::uint64_t> in_flight{0};
   std::atomic<bool> callback_enabled{true};
   std::atomic<bool> active{false};
+  bool callbacks_active() const noexcept {
+    return active.load(std::memory_order_seq_cst) &&
+           !(in_flight.load(std::memory_order_seq_cst) & admission_closed);
+  }
+  std::uint64_t invocations_in_flight() const noexcept {
+    return in_flight.load(std::memory_order_seq_cst) & ~admission_closed;
+  }
   std::string session_id;
   long long (*callback)(const tracer::TraceContext *, void *, bool *) = nullptr;
   std::vector<std::string> argument_names;
@@ -248,7 +308,9 @@ struct Probe {
   bool transport_active = false;
   bool scheduler_counted = false;
   void *wrapper = nullptr;
+  std::vector<std::string> external_link_candidates;
   std::shared_ptr<const tracer::ContextActivationGeneration> shared_generation;
+  std::shared_ptr<tracer::context_engine::ContextCapturePool> capture_pool;
   std::shared_ptr<tracer::context_runtime::SharedSourceRuntime> shared_runtime;
   std::shared_ptr<tracer::context_delivery::ContextAgentDelivery>
       context_delivery;
@@ -269,7 +331,7 @@ struct Agent {
   std::size_t retained = 0;
   pid_t pid = 0;
   tracer::ContextRegistry context_registry;
-  std::unique_ptr<tracer::context_engine::ContextCapturePool> context_capture;
+  std::shared_ptr<tracer::context_engine::ContextCapturePool> context_capture;
   unsigned next_context_hook = 0;
   const bool logging_enabled = agent_log_path()[0] != '\0';
   tracer::EventTransport transport;
@@ -290,6 +352,14 @@ struct Agent {
   }
 };
 
+struct CapturedDiagnostic {
+  std::string severity;
+  std::string file;
+  std::uint32_t line = 0;
+  std::uint32_t column = 0;
+  std::string message;
+};
+
 class DiagnosticCapture final : public clang::DiagnosticConsumer {
 public:
   explicit DiagnosticCapture(clang::DiagnosticConsumer *forward)
@@ -303,6 +373,25 @@ public:
     }
     llvm::SmallString<256> formatted;
     info.FormatDiagnostic(formatted);
+    CapturedDiagnostic diagnostic;
+    diagnostic.severity =
+        level >= clang::DiagnosticsEngine::Error
+            ? "error"
+            : (level == clang::DiagnosticsEngine::Warning ? "warning"
+                                                          : "note");
+    diagnostic.message.assign(formatted.begin(), formatted.end());
+    const auto &source_manager = info.getSourceManager();
+    const auto location = info.getLocation();
+    if (location.isValid()) {
+      const auto presumed = source_manager.getPresumedLoc(location);
+      if (presumed.isValid()) {
+        diagnostic.file = presumed.getFilename();
+        diagnostic.line = presumed.getLine();
+        diagnostic.column = presumed.getColumn();
+      }
+    }
+    if (!diagnostic.message.empty())
+      diagnostics_.push_back(std::move(diagnostic));
     if (!formatted.empty()) {
       if (!message_.empty()) {
         message_ += '\n';
@@ -317,12 +406,54 @@ public:
   const std::string &message() const { return message_; }
 
   bool had_error() const { return had_error_; }
+  const std::vector<CapturedDiagnostic> &diagnostics() const {
+    return diagnostics_;
+  }
+
+  void reset_capture() {
+    message_.clear();
+    diagnostics_.clear();
+    had_error_ = false;
+  }
 
 private:
   clang::DiagnosticConsumer *forward_;
   std::string message_;
+  std::vector<CapturedDiagnostic> diagnostics_;
   bool had_error_ = false;
 };
+
+void append_diagnostics(clangtracer::v1::ValidationReport &report,
+                        const DiagnosticCapture &capture,
+                        const char *stage) {
+  for (const auto &diagnostic : capture.diagnostics()) {
+    auto *output = report.add_diagnostics();
+    output->set_stage(stage);
+    output->set_severity(diagnostic.severity);
+    output->set_file(diagnostic.file);
+    output->set_line(diagnostic.line);
+    output->set_column(diagnostic.column);
+    output->set_message(diagnostic.message);
+  }
+}
+
+void append_failure(clangtracer::v1::ValidationReport &report,
+                    const char *stage, const std::string &message) {
+  if (message.empty())
+    return;
+  auto *diagnostic = report.add_diagnostics();
+  diagnostic->set_stage(stage);
+  diagnostic->set_severity("error");
+  diagnostic->set_message(message);
+}
+
+void append_diagnostic_text(std::string &error, const std::string &message) {
+  if (message.empty() || error.find(message) != std::string::npos)
+    return;
+  if (!error.empty())
+    error += '\n';
+  error += message;
+}
 
 extern "C" void tracer_probe_enter(unsigned long long) noexcept;
 extern "C" void tracer_probe_leave(unsigned long long) noexcept;
@@ -343,7 +474,7 @@ extern "C" void tracer_event_dispatch(unsigned long long,
                                       long long) noexcept;
 extern "C" void tracer_context_check_entry();
 extern "C" void *tracer_shared_enter(unsigned long long,
-                                     const tracer::TraceContext *);
+                                     const tracer::TraceContext *, unsigned);
 extern "C" void tracer_shared_leave(void *) noexcept;
 extern "C" void tracer_shared_release(void *) noexcept;
 extern "C" void tracer_shared_dispatch(void *, const tracer::TraceContext *);
@@ -353,6 +484,7 @@ extern "C" void tracer_shared_resume(void *);
 
 std::mutex agent_mutex;
 std::atomic<Agent *> agent{nullptr};
+std::atomic<std::uint64_t> validation_report_sequence{0};
 
 const char *log_level_name(tracer::LogLevel level) noexcept {
   switch (level) {
@@ -419,7 +551,8 @@ Probe *find_probe(std::uint64_t id) noexcept {
 struct SharedInvocationToken {
   Probe *probe = nullptr;
   tracer::TraceContext raw{};
-  tracer::StackTrace entry_stack{};
+  tracer::TraceContext entry_context{};
+  std::vector<tracer::StackFrame> filtered_frames;
   tracer::Call call{raw};
   std::optional<tracer::ContextStdlibImage::Frame> support;
   std::optional<tracer::context_runtime::SharedSourceRuntime::Invocation>
@@ -453,41 +586,32 @@ void copy_shared_value(T &destination, const T &source) noexcept {
 // from the immutable invocation-entry snapshot prepared before scope access.
 void shared_capture_stack(const tracer::TraceContext *context, unsigned depth,
                           bool application_only) noexcept {
-  for (const auto &token : shared_invocations) {
+  for (auto &token : shared_invocations) {
     if (&token.raw != context ||
         !token.occupied.load(std::memory_order_acquire))
       continue;
-    copy_shared_value(context->stack, token.entry_stack);
+    const auto &entry = token.entry_context.stack;
     auto &stack = context->stack;
-    const auto count = std::min<unsigned>(depth, token.entry_stack.count);
+    copy_shared_value(stack, entry);
+    const auto count = std::min(depth, entry.count);
     stack.requested_depth = depth;
     stack.application_only = application_only;
     stack.captured_depth = count;
-    stack.hidden_frames = 0;
-    stack.count = 0;
-    if (count < token.entry_stack.count) {
+    if (count < entry.count) {
       stack.status = tracer::StackStatus::Truncated;
       constexpr char detail[] = "entry stack exceeds requested depth";
       for (std::size_t i = 0; i < sizeof(detail); ++i)
         stack.detail[i] = detail[i];
     }
-    for (unsigned i = 0; i < count; ++i) {
-      if (application_only && !token.entry_stack.frames[i].application_frame) {
-        ++stack.hidden_frames;
-        continue;
+    stack.count = count;
+    if (application_only) {
+      stack.count = 0;
+      for (unsigned i = 0; i < count; ++i) {
+        if (entry.frames[i].application_frame)
+          copy_shared_value(token.filtered_frames[stack.count++], entry.frames[i]);
       }
-      auto *frame = reinterpret_cast<volatile unsigned char *>(
-          &stack.frames[stack.count++]);
-      const auto *source = reinterpret_cast<const volatile unsigned char *>(
-          &token.entry_stack.frames[i]);
-      for (std::size_t j = 0; j < sizeof(tracer::StackFrame); ++j)
-        frame[j] = source[j];
-    }
-    for (unsigned i = stack.count; i < tracer::kMaxStackDepth; ++i) {
-      auto *frame =
-          reinterpret_cast<volatile unsigned char *>(&stack.frames[i]);
-      for (std::size_t j = 0; j < sizeof(tracer::StackFrame); ++j)
-        frame[j] = 0;
+      stack.hidden_frames = count - stack.count;
+      stack.frames = token.filtered_frames.data();
     }
     return;
   }
@@ -536,10 +660,11 @@ extern "C" void tracer_context_check_entry() {
 }
 
 extern "C" void *tracer_shared_enter(unsigned long long id,
-                                     const tracer::TraceContext *raw) {
+                                     const tracer::TraceContext *raw,
+                                     unsigned stack_depth) {
   auto *probe = find_probe(id);
   if (!probe || !raw || callback_depth || !probe->shared_runtime ||
-      !probe->active.load(std::memory_order_acquire) ||
+      !probe->callbacks_active() ||
       tracer::context_execution::check_entry(
           tracer::context_execution::Callee::ApplicationEndpoint) !=
           tracer::context_execution::EntryDecision::Trace)
@@ -587,13 +712,23 @@ extern "C" void *tracer_shared_enter(unsigned long long id,
   ::pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &token->cancel_state);
   token->cancel_disabled = true;
   ++callback_depth;
-  if (probe->shared_generation->requires_stack()) {
-    tracer::capture_native_stack(token->raw, tracer::kMaxStackDepth, false);
-    copy_shared_value(token->entry_stack, token->raw.stack);
-    copy_shared_value(token->raw.stack, raw->stack);
-  }
   token->raw.stack_capture = &shared_capture_stack;
   try {
+    if (probe->shared_generation->requires_stack()) {
+      // The callback can choose its depth while a shared scope is active.
+      // Capture once before entering that scope and reuse it for automatic
+      // entry capture and for any callback-requested views.
+      copy_shared_value(token->entry_context, *raw);
+      token->entry_context.stack_storage = nullptr;
+      tracer::capture_native_stack(token->entry_context,
+                                   tracer::kUnlimitedStackDepth, false);
+      token->filtered_frames.resize(token->entry_context.stack.count);
+      if (stack_depth)
+        shared_capture_stack(&token->raw, stack_depth, raw->stack_application_only);
+    } else if (stack_depth) {
+      tracer::capture_native_stack(*raw, stack_depth, raw->stack_application_only);
+      copy_shared_value(token->raw.stack, raw->stack);
+    }
     const auto &code = probe->shared_generation->callback_code();
     // Reserve the teardown lane before constructing any generated frame. It
     // stays pinned through the original call and final owner destruction.
@@ -721,8 +856,14 @@ extern "C" void tracer_shared_leave(void *opaque) noexcept {
 
 extern "C" void tracer_shared_release(void *opaque) noexcept {
   auto *token = static_cast<SharedInvocationToken *>(opaque);
-  if (token && token->finished)
+  if (token && token->finished) {
+    const int saved_errno = errno;
+    tracer::release_native_stack(token->entry_context);
+    token->entry_context.stack = {};
+    std::vector<tracer::StackFrame>().swap(token->filtered_frames);
     token->occupied.store(false, std::memory_order_release);
+    errno = saved_errno;
+  }
 }
 
 std::uint64_t address_value(auto address) {
@@ -785,10 +926,6 @@ bool read_probe_spec(const tracer::Request &request,
     error = "callback source exceeds 64 KiB";
     return false;
   }
-  if (spec.stack_depth() > tracer::kMaxStackDepth) {
-    error = "stack depth must be between 0 and 64";
-    return false;
-  }
   if (spec.has_receiver()) {
     const auto &receiver = spec.receiver();
     if (receiver.ByteSizeLong() > kMaxCallbackSource) {
@@ -839,11 +976,13 @@ bool matches_receiver_value_type(clang::QualType type,
   if (type->isVoidType()) {
     return result && expected == tracer::ValueType::Void;
   }
+  if (type->isBooleanType())
+    return expected == tracer::ValueType::Bool;
   if (type->isPointerType()) {
     return expected == tracer::ValueType::Pointer &&
            context.getTypeSize(type) == 64;
   }
-  if (type->isBooleanType() || type->isCharType() || type->isBitIntType()) {
+  if (type->isCharType() || type->isBitIntType()) {
     return false;
   }
   if (type->isFloatingType()) {
@@ -955,6 +1094,137 @@ bool debug_identifier(llvm::StringRef text) {
   return true;
 }
 
+std::string normalized_cpp_type(llvm::StringRef text) {
+  std::string result;
+  bool pending_space = false;
+  for (const unsigned char c : text) {
+    if (std::isspace(c)) {
+      pending_space = true;
+      continue;
+    }
+    const bool punctuation = c == ':' || c == '<' || c == '>' || c == ',' ||
+                             c == '*' || c == '&';
+    if (pending_space && !result.empty() && !punctuation &&
+        result.back() != ':' && result.back() != '<' &&
+        result.back() != ',' && result.back() != '*' &&
+        result.back() != '&')
+      result.push_back(' ');
+    result.push_back(static_cast<char>(c));
+    pending_space = false;
+  }
+  return result;
+}
+
+bool standard_library_record_name(llvm::StringRef name) {
+  return ::tracer::compat::starts_with(name, "std::") ||
+         ::tracer::compat::starts_with(name, "__gnu_cxx::") ||
+         ::tracer::compat::starts_with(name, "__cxxabiv1::");
+}
+
+bool split_debug_template_arguments(llvm::StringRef spelling,
+                                    std::string &primary,
+                                    std::vector<std::string> &arguments) {
+  const auto open = spelling.find('<');
+  if (open == llvm::StringRef::npos || spelling.empty() ||
+      spelling.back() != '>')
+    return false;
+  primary = normalized_cpp_type(spelling.take_front(open));
+  llvm::StringRef remaining = spelling.drop_front(open + 1).drop_back();
+  unsigned depth = 0;
+  std::size_t begin = 0;
+  for (std::size_t i = 0; i < remaining.size(); ++i) {
+    if (remaining[i] == '<')
+      ++depth;
+    else if (remaining[i] == '>') {
+      if (!depth)
+        return false;
+      --depth;
+    } else if (remaining[i] == ',' && depth == 0) {
+      arguments.push_back(normalized_cpp_type(remaining.slice(begin, i)));
+      begin = i + 1;
+    }
+  }
+  if (depth != 0)
+    return false;
+  arguments.push_back(normalized_cpp_type(remaining.drop_front(begin)));
+  return !arguments.empty();
+}
+
+bool debug_record_identity_matches(clang::ASTContext &context,
+                                   const clang::CXXRecordDecl *record,
+                                   llvm::StringRef expected,
+                                   std::string *mismatch = nullptr) {
+  clang::PrintingPolicy policy(context.getLangOpts());
+  policy.SuppressTagKeyword = true;
+  policy.SuppressDefaultTemplateArgs = false;
+  policy.SuppressInlineNamespace = false;
+  // Compare semantic template arguments, not typedef spellings such as string
+  // inside hash/equal_to. Preserve ABI-bearing inline namespaces throughout.
+  policy.PrintAsCanonical = true;
+  policy.UsePreferredNames = false;
+  const auto actual = context.getRecordType(record).getAsString(policy);
+  if (normalized_cpp_type(actual) == normalized_cpp_type(expected))
+    return true;
+  if (!standard_library_record_name(expected))
+    return false;
+
+  const auto *specialization =
+      llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record);
+  if (!specialization) {
+    if (mismatch)
+      *mismatch = "candidate=" + actual + " is not a class-template "
+                  "specialization";
+    return false;
+  }
+  std::string expected_primary;
+  std::vector<std::string> expected_arguments;
+  if (!split_debug_template_arguments(expected, expected_primary,
+                                      expected_arguments)) {
+    if (mismatch)
+      *mismatch = "cannot parse DWARF template identity: " +
+                  normalized_cpp_type(expected);
+    return false;
+  }
+  // getQualifiedNameAsString uses a default policy that can hide ABI-bearing
+  // inline namespaces such as std::__cxx11. Use the same explicit policy as
+  // the complete record and its template arguments.
+  std::string primary_name;
+  llvm::raw_string_ostream primary_output(primary_name);
+  specialization->getSpecializedTemplate()->printQualifiedName(primary_output,
+                                                               policy);
+  primary_output.flush();
+  const auto actual_primary = normalized_cpp_type(primary_name);
+  if (actual_primary != expected_primary) {
+    if (mismatch)
+      *mismatch = "candidate-primary=" + actual_primary +
+                  " expected-primary=" + expected_primary + " type=" + actual;
+    return false;
+  }
+  const auto actual_arguments = specialization->getTemplateArgs().asArray();
+  if (actual_arguments.size() != expected_arguments.size()) {
+    if (mismatch)
+      *mismatch = "candidate-template-arity=" +
+                  std::to_string(actual_arguments.size()) +
+                  " expected-template-arity=" +
+                  std::to_string(expected_arguments.size()) + " type=" + actual;
+    return false;
+  }
+  for (std::size_t i = 0; i < actual_arguments.size(); ++i) {
+    std::string argument;
+    llvm::raw_string_ostream output(argument);
+    actual_arguments[i].print(policy, output, true);
+    output.flush();
+    if (normalized_cpp_type(argument) != expected_arguments[i]) {
+      if (mismatch)
+        *mismatch = "candidate-template-argument[" + std::to_string(i) +
+                    "]=" + normalized_cpp_type(argument) +
+                    " expected=" + expected_arguments[i] + " type=" + actual;
+      return false;
+    }
+  }
+  return true;
+}
+
 bool debug_path_identifier(llvm::StringRef text) {
   if (text.size() > 63 || text.empty())
     return false;
@@ -963,26 +1233,27 @@ bool debug_path_identifier(llvm::StringRef text) {
     if (!debug_identifier(part.first))
       return false;
     if (part.second.empty())
-      return !text.ends_with(".");
+      return !::tracer::compat::ends_with(text, ".");
     text = part.second;
   }
 }
 
 clang::QualType debug_builtin(clang::ASTContext &context,
                               llvm::StringRef type) {
-  if (type.ends_with(" const")) {
+  if (::tracer::compat::ends_with(type, " const")) {
     auto t = debug_builtin(context, type.drop_back(6));
     t.addConst();
     return t;
   }
-  if (type.ends_with(" volatile")) {
+  if (::tracer::compat::ends_with(type, " volatile")) {
     auto t = debug_builtin(context, type.drop_back(9));
     t.addVolatile();
     return t;
   }
-  if (type.ends_with("*"))
+  if (::tracer::compat::ends_with(type, "*")) {
     return context.getPointerType(debug_builtin(context, type.drop_back()));
-  if (type.starts_with("const ")) {
+  }
+  if (::tracer::compat::starts_with(type, "const ")) {
     auto t = debug_builtin(context, type.drop_front(6));
     t.addConst();
     return t;
@@ -1071,26 +1342,135 @@ bool matches_debug_type_chain(clang::QualType type, clang::ASTContext &context,
   return false; // A pointer chain without its terminal type is incomplete.
 }
 
-DebugRecord construct_debug_record(clang::ASTContext &context,
+DebugRecord construct_debug_record(clang::ASTUnit &unit,
                                    const clangtracer::v1::DebugInfo &info) {
+  auto &context = unit.getASTContext();
   class Finder : public clang::RecursiveASTVisitor<Finder> {
   public:
+    clang::ASTContext *context = nullptr;
     std::string selected;
     clang::CXXRecordDecl *found = nullptr;
+    std::vector<clang::CXXRecordDecl *> incomplete;
+    std::string candidate_mismatch;
+    bool shouldVisitTemplateInstantiations() const { return true; }
     bool VisitCXXRecordDecl(clang::CXXRecordDecl *d) {
-      if (d->isCompleteDefinition() &&
-          d->getQualifiedNameAsString() == selected)
+      if (d->isDependentType())
+        return true;
+      if (!d->isCompleteDefinition()) {
+        std::string mismatch;
+        if (standard_library_record_name(selected) &&
+            debug_record_identity_matches(*context, d, selected, &mismatch))
+          incomplete.push_back(d);
+        else if (!mismatch.empty() && ::tracer::compat::starts_with(
+                     selected, d->getQualifiedNameAsString() + "<"))
+          candidate_mismatch = std::move(mismatch);
+        return true;
+      }
+      if (d->getQualifiedNameAsString() == selected &&
+          !llvm::isa<clang::ClassTemplateSpecializationDecl>(d)) {
         found = d;
+        return true;
+      }
+      std::string mismatch;
+      if (debug_record_identity_matches(*context, d, selected, &mismatch))
+        found = d;
+      else if (!mismatch.empty() &&
+               (::tracer::compat::starts_with(
+                    selected, d->getQualifiedNameAsString() + "<") ||
+                (candidate_mismatch.empty() &&
+                 ::tracer::compat::contains(d->getQualifiedNameAsString(),
+                                            "basic_string"))))
+        candidate_mismatch = std::move(mismatch);
       return true;
     }
   } finder;
+  finder.context = &context;
   finder.selected = info.record_name();
   finder.TraverseDecl(context.getTranslationUnitDecl());
+  // A reference-only declaration need not instantiate an STL specialization.
+  // Complete the matching compiler-owned type after traversal, without parsing
+  // DWARF strings as C++ or relaxing the identity/layout checks below.
+  if (!finder.found && unit.hasSema()) {
+    for (auto *candidate : finder.incomplete) {
+      if (unit.getSema().isCompleteType(candidate->getLocation(),
+                                      context.getRecordType(candidate))) {
+        auto *definition = candidate->getDefinition();
+        if (definition &&
+            debug_record_identity_matches(context, definition, finder.selected)) {
+          finder.found = definition;
+          break;
+        }
+      }
+    }
+  }
   auto *record = finder.found;
+  const bool standard_library_type =
+      ::tracer::compat::starts_with(info.record_name(), "std::") ||
+      ::tracer::compat::starts_with(info.record_name(), "__gnu_cxx::") ||
+      ::tracer::compat::starts_with(info.record_name(), "__cxxabiv1::");
+  if (!record && standard_library_type)
+    throw std::runtime_error(
+        "standard-library ABI mismatch: target DWARF type " +
+        info.record_name() +
+        " is not the type selected by callback headers and compiler options" +
+        (finder.candidate_mismatch.empty()
+             ? std::string()
+             : "; candidate mismatch: " + finder.candidate_mismatch));
+  if (record && info.record_is_opaque()) {
+    if (!record->isCompleteDefinition())
+      throw std::runtime_error("header record is incomplete for opaque DWARF type");
+    const auto &layout = context.getASTRecordLayout(record);
+    if ((info.record_size() &&
+         static_cast<std::uint64_t>(layout.getSize().getQuantity()) !=
+             info.record_size()) ||
+        (info.record_alignment() &&
+         layout.getAlignment().getQuantity() != info.record_alignment()))
+      throw std::runtime_error(
+          "header record size/alignment does not match opaque DWARF type");
+    clangtracer::v1::ReceiverContext metadata;
+    metadata.set_record_name(info.record_name());
+    metadata.set_size(info.record_size());
+    metadata.set_alignment(info.record_alignment());
+    metadata.set_is_volatile(info.receiver_volatile());
+    return {record, std::move(metadata), true};
+  }
+  if (!record && info.record_is_opaque()) {
+    clang::DeclContext *scope = context.getTranslationUnitDecl();
+    llvm::StringRef remaining = info.record_name();
+    while (::tracer::compat::contains(remaining, "::")) {
+      auto part = remaining.split("::");
+      if (!debug_identifier(part.first))
+        throw std::runtime_error("unsupported debug record scope");
+      auto &id = context.Idents.get(part.first);
+      clang::NamespaceDecl *ns = nullptr;
+      for (auto *named : scope->lookup(&id))
+        if ((ns = llvm::dyn_cast<clang::NamespaceDecl>(named)))
+          break;
+      if (!ns) {
+        ns = clang::NamespaceDecl::Create(context, scope, false, {}, {}, &id,
+                                          nullptr, false);
+        scope->addDecl(ns);
+      }
+      scope = ns;
+      remaining = part.second;
+    }
+    if (!debug_identifier(remaining))
+      throw std::runtime_error("unsupported debug record name");
+    record = clang::CXXRecordDecl::Create(
+        context, clang::TagTypeKind::Struct, scope, {}, {},
+        &context.Idents.get(remaining));
+    scope->addDecl(record);
+    clangtracer::v1::ReceiverContext metadata;
+    metadata.set_record_name(info.record_name());
+    metadata.set_size(info.record_size());
+    metadata.set_alignment(info.record_alignment());
+    metadata.set_is_volatile(info.receiver_volatile());
+    return {record, std::move(metadata), true};
+  }
   if (!record) {
     clang::DeclContext *scope = context.getTranslationUnitDecl();
     llvm::StringRef remaining = info.record_name();
-    while (remaining.contains("::")) {
+    while (::tracer::compat::contains(remaining, "::")) {
       auto part = remaining.split("::");
       if (!debug_identifier(part.first))
         throw std::runtime_error("unsupported debug receiver scope");
@@ -1129,7 +1509,10 @@ DebugRecord construct_debug_record(clang::ASTContext &context,
     }
     record->completeDefinition();
     record->setArgPassingRestrictions(
-        clang::RecordArgPassingKind::CanPassInRegs);
+        info.record_calling_convention() ==
+                clangtracer::v1::RECORD_PASS_BY_REFERENCE
+            ? clang::RecordArgPassingKind::CannotPassInRegs
+            : clang::RecordArgPassingKind::CanPassInRegs);
   }
   if (record->isUnion() || record->isDynamicClass() || record->getNumBases() ||
       std::distance(record->field_begin(), record->field_end()) !=
@@ -1177,15 +1560,177 @@ DebugRecord construct_debug_record(clang::ASTContext &context,
   std::string error;
   if (!validate_receiver_layout(context, record, metadata, error))
     throw std::runtime_error(error);
-  return {record, std::move(metadata)};
+  return {record, std::move(metadata), false};
+}
+
+std::string recovered_record_declaration(
+    const clangtracer::v1::DebugInfo &info) {
+  if (info.record_name().empty())
+    return {};
+  std::string result;
+  std::vector<std::string> namespaces;
+  llvm::StringRef name(info.record_name());
+  while (::tracer::compat::contains(name, "::")) {
+    auto part = name.split("::");
+    if (!debug_identifier(part.first))
+      throw std::runtime_error("unsupported recovered record namespace");
+    namespaces.push_back(part.first.str());
+    name = part.second;
+  }
+  if (!debug_identifier(name))
+    throw std::runtime_error("unsupported recovered record name");
+  for (const auto &part : namespaces)
+    result += "namespace " + part + " { ";
+  if (info.record_is_opaque()) {
+    result += "class " + name.str() + "; ";
+  } else {
+    result += "class";
+    if (info.record_alignment() > 1)
+      result += " alignas(" + std::to_string(info.record_alignment()) + ")";
+    result += " " + name.str();
+    result += " { ";
+    std::string access;
+    for (const auto &field : info.fields()) {
+      if (!debug_identifier(field.name()))
+        throw std::runtime_error("unsupported recovered field name");
+      if (field.access() != access) {
+        access = field.access();
+        result += access + ": ";
+      }
+      result += field.builtin_type() + " " + field.name() + "; ";
+    }
+    if (info.record_calling_convention() ==
+        clangtracer::v1::RECORD_PASS_BY_REFERENCE) {
+      result += "public: " + name.str() + "(const " + name.str() + "&); ";
+      result += name.str() + "(" + name.str() + "&&); ~" + name.str() +
+                "(); ";
+    }
+    if (!info.methods().empty()) {
+      if (access != "public")
+        result += "public: ";
+      for (const auto &method : info.methods()) {
+        if (!debug_identifier(method.name()) || method.is_static() ||
+            method.is_virtual())
+          continue;
+        if (method.linkage_symbol().empty() ||
+            !std::all_of(method.linkage_symbol().begin(),
+                         method.linkage_symbol().end(), [](unsigned char c) {
+                           return (c >= 'a' && c <= 'z') ||
+                                  (c >= 'A' && c <= 'Z') ||
+                                  (c >= '0' && c <= '9') || c == '_' ||
+                                  c == '.' || c == '$';
+                         }))
+          continue;
+        result += method.cpp_result_type() + " " + method.name() + "(";
+        for (int i = 0; i < method.cpp_parameter_types_size(); ++i) {
+          if (i)
+            result += ", ";
+          result += method.cpp_parameter_types(i);
+        }
+        result += ")";
+        if (method.is_const())
+          result += " const";
+        if (method.is_volatile())
+          result += " volatile";
+        result += method.ref_qualifier();
+        result += " __asm__(\"" + method.linkage_symbol() + "\"); ";
+      }
+    }
+    result += "}; ";
+  }
+  for (std::size_t i = 0; i < namespaces.size(); ++i)
+    result += "} ";
+  return result;
+}
+
+std::string recovered_record_declarations(
+    const clangtracer::v1::ProbeSpec &spec) {
+  const auto &info = spec.debug_info();
+  std::string declarations;
+  std::unordered_set<std::string> seen;
+  auto append = [&](const clangtracer::v1::DebugInfo &record) {
+    if (!record.record_name().empty() &&
+        seen.insert(record.record_name()).second)
+      declarations += recovered_record_declaration(record);
+  };
+  if (!info.record_name().empty())
+    append(info);
+  for (const auto &argument : info.arguments())
+    if (argument.has_object_type())
+      append(argument.object_type());
+  if (info.has_result_object_type())
+    append(info.result_object_type());
+  return declarations;
+}
+
+bool ast_has_debug_record(clang::ASTContext &context,
+                          const clangtracer::v1::DebugInfo &info) {
+  class Finder : public clang::RecursiveASTVisitor<Finder> {
+  public:
+    Finder(clang::ASTContext &context, llvm::StringRef expected)
+        : context(context), expected(expected) {}
+    bool VisitCXXRecordDecl(clang::CXXRecordDecl *record) {
+      if (debug_record_identity_matches(context, record, expected))
+        found = true;
+      return !found;
+    }
+    clang::ASTContext &context;
+    llvm::StringRef expected;
+    bool found = false;
+  } finder(context, info.record_name());
+  finder.TraverseDecl(context.getTranslationUnitDecl());
+  return finder.found;
+}
+
+std::string missing_recovered_record_declarations(
+    clang::ASTContext &context,
+    const clangtracer::v1::ProbeSpec &spec) {
+  std::string declarations;
+  std::unordered_set<std::string> seen;
+  const auto append = [&](const clangtracer::v1::DebugInfo &record) {
+    if (record.record_name().empty() ||
+        !seen.insert(record.record_name()).second ||
+        ast_has_debug_record(context, record))
+      return;
+    declarations += recovered_record_declaration(record);
+  };
+  const auto &info = spec.debug_info();
+  if (!info.record_name().empty())
+    append(info);
+  for (const auto &argument : info.arguments())
+    if (argument.has_object_type())
+      append(argument.object_type());
+  if (info.has_result_object_type())
+    append(info.result_object_type());
+  return declarations;
 }
 
 std::uint64_t validate_debug_entry(const clangtracer::v1::ProbeSpec &spec) {
   const auto &info = spec.debug_info();
   tracer::client::DebugLookupOptions lookup;
   lookup.module = info.module();
-  const auto checked =
-      tracer::client::resolve_debug_callable(::getpid(), info.selector(), lookup);
+  const auto live_patch = [](std::uint64_t address) -> tracer::client::PreparedCodePatch {
+    const auto *current = agent.load(std::memory_order_acquire);
+    if (current) {
+      for (const auto &probe : current->probes) {
+        if (!probe || !probe->active.load() || probe->request.original_entry != address)
+          continue;
+        const auto &patch = probe->request;
+        std::array<unsigned char, tracer::kMaxPatchBytes> live{};
+        iovec local{live.data(), patch.patch_size};
+        iovec remote{reinterpret_cast<void *>(address), patch.patch_size};
+        if (tracer::linux_api::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0) ==
+                static_cast<ssize_t>(patch.patch_size) &&
+            std::memcmp(live.data(), patch.installed, patch.patch_size) == 0)
+          return {{reinterpret_cast<const char *>(patch.original), patch.patch_size},
+                  {reinterpret_cast<const char *>(patch.installed), patch.patch_size}};
+      }
+    }
+    return {};
+  };
+  const auto checked = spec.has_prepared()
+      ? tracer::client::bind_prepared_callable(::getpid(), spec.prepared(), lookup, live_patch)
+      : tracer::client::resolve_debug_callable(::getpid(), info.selector(), lookup);
   if (!info.runtime_entry() || !info.entry_size() ||
       checked.spec.debug_info().SerializeAsString() !=
           info.SerializeAsString() ||
@@ -1204,17 +1749,51 @@ std::uint64_t validate_debug_entry(const clangtracer::v1::ProbeSpec &spec) {
 bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
                           std::unique_ptr<clang::ASTUnit> &output,
                           clang::CXXRecordDecl *&record, std::string &error,
-                          DebugRecords &records) {
+                          DebugRecords &records,
+                          const std::string &callback_includes,
+                          const VerifiedDebugEntry *verified_entry) {
   try {
     const auto &info = spec.debug_info();
-    // Match the mapped entry, signature and type metadata before constructing
-    // any AST. Binary contents remain fixed for the tracing session.
-    validate_debug_entry(spec);
+    // tracer_agent_start performed the full serialized metadata comparison
+    // and entry lookup. Reuse only that operation's result; never cache across
+    // requests or sessions. The spec address guards against passing a token
+    // verified for a different request.
+    if (!verified_entry || verified_entry->spec != &spec ||
+        verified_entry->runtime_entry != info.runtime_entry())
+      throw std::runtime_error(
+          "debug entry verification does not match probe");
     bool has_record = !info.record_name().empty();
     for (const auto &argument : info.arguments())
       has_record |= argument.has_object_type();
+    has_record |= info.has_result_object_type();
     if (!has_record)
       return true;
+    const bool headers_available = spec.has_header_context() ||
+                                   spec.include_headers_size() != 0 ||
+                                   !callback_includes.empty();
+    const auto standard_library_record = [](const auto &record) {
+      return ::tracer::compat::starts_with(record.record_name(), "std::") ||
+             ::tracer::compat::starts_with(record.record_name(),
+                                           "__gnu_cxx::") ||
+             ::tracer::compat::starts_with(record.record_name(),
+                                           "__cxxabiv1::");
+    };
+    if (!headers_available && standard_library_record(info)) {
+      error = "standard-library record types require their real headers";
+      return false;
+    }
+    if (!headers_available)
+      for (const auto &argument : info.arguments())
+        if (argument.has_object_type() &&
+            standard_library_record(argument.object_type())) {
+          error = "standard-library record types require their real headers";
+          return false;
+        }
+    if (!headers_available && info.has_result_object_type() &&
+        standard_library_record(info.result_object_type())) {
+      error = "standard-library record types require their real headers";
+      return false;
+    }
     std::string headers;
     if (spec.include_headers_size() > 16)
       throw std::runtime_error("at most 16 optional includes");
@@ -1225,6 +1804,11 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
         throw std::runtime_error("invalid optional include path");
       headers += "#include \"" + header + "\"\n";
     }
+    if (!spec.has_header_context() && spec.include_headers().empty() &&
+        callback_includes.empty())
+      headers += recovered_record_declarations(spec);
+    if (!callback_includes.empty())
+      headers = callback_includes + headers;
     DiagnosticCapture capture(nullptr);
     if (spec.has_header_context()) {
       const auto &header_context = spec.header_context();
@@ -1244,7 +1828,7 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
         if (argument.find('\0') != std::string::npos)
           throw std::runtime_error("invalid header compiler argument");
         resource_dir |= argument == "-resource-dir" ||
-                        argument.starts_with("-resource-dir=");
+                        ::tracer::compat::starts_with(argument, "-resource-dir=");
       }
       if (!resource_dir)
         arguments.push_back(std::string("-resource-dir=") +
@@ -1279,9 +1863,11 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
     } else {
       auto arguments = tracer::runtime::jit_arguments();
       arguments.insert(arguments.end(),
-                       {"-std=c++20", "-x", "c++",
+                       {"-std=c++23", "-x", "c++",
                         std::string("-resource-dir=") +
                             tracer::runtime::clang_resource_dir()});
+      arguments.insert(arguments.end(), spec.compile_options().begin(),
+                       spec.compile_options().end());
       output = clang::tooling::buildASTFromCodeWithArgs(
           headers, arguments, "clang-tracer-debug-types.cc", "clang-tracer",
           std::make_shared<clang::PCHContainerOperations>(),
@@ -1295,8 +1881,40 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
     if (triple.getArch() != llvm::Triple::x86_64 || !triple.isOSLinux() ||
         context.getTypeSize(context.VoidPtrTy) != 64)
       throw std::runtime_error("header target does not match Linux x86_64");
+    bool target_has_std_string = false;
+    bool target_uses_cxx11_string_abi =
+        spec.symbol().find("__cxx11") != std::string::npos;
+    const auto note_standard_type = [&](const auto &record) {
+      const auto &record_name = record.record_name();
+      target_has_std_string |= record_name.find("basic_string") !=
+                               std::string::npos;
+      target_uses_cxx11_string_abi |=
+          record_name.find("__cxx11") != std::string::npos;
+    };
+    note_standard_type(info);
+    for (const auto &argument : info.arguments())
+      if (argument.has_object_type())
+        note_standard_type(argument.object_type());
+    if (info.has_result_object_type())
+      note_standard_type(info.result_object_type());
+    if (target_has_std_string) {
+      auto &preprocessor = output->getPreprocessor();
+      auto &identifier = preprocessor.getIdentifierTable().get(
+          "_GLIBCXX_USE_CXX11_ABI");
+      if (const auto *macro = preprocessor.getMacroInfo(&identifier);
+          macro && macro->getNumTokens() == 1) {
+        const auto value = clang::Lexer::getSpelling(
+            macro->tokens().front(), output->getSourceManager(),
+            context.getLangOpts());
+        if ((value == "0" && target_uses_cxx11_string_abi) ||
+            (value == "1" && !target_uses_cxx11_string_abi))
+          throw std::runtime_error(
+              "libstdc++ ABI mismatch: target DWARF string linkage name and "
+              "_GLIBCXX_USE_CXX11_ABI selected by headers/options disagree");
+      }
+    }
     if (!info.record_name().empty())
-      records.push_back(construct_debug_record(context, info));
+      records.push_back(construct_debug_record(*output, info));
     for (const auto &argument : info.arguments()) {
       if (!argument.has_object_type())
         continue;
@@ -1305,16 +1923,31 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
       for (const auto &previous : records)
         if (previous.layout.record_name() == object.record_name())
           duplicate = true;
-      auto checked_record = construct_debug_record(context, object);
-      if (argument.is_object_value() &&
-          !checked_record.decl->canPassInRegisters())
-        throw std::runtime_error(
-            "nontrivial header type disagrees with by-value DWARF ABI");
+      auto checked_record = construct_debug_record(*output, object);
       if (!duplicate)
         records.push_back(std::move(checked_record));
     }
-    record = records.front().decl;
-    *spec.mutable_receiver() = records.front().layout;
+    if (info.has_result_object_type()) {
+      const auto &object = info.result_object_type();
+      bool duplicate = false;
+      for (const auto &previous : records)
+        if (previous.layout.record_name() == object.record_name())
+          duplicate = true;
+      auto checked_record = construct_debug_record(*output, object);
+      if (!duplicate)
+        records.push_back(std::move(checked_record));
+    }
+    record = nullptr;
+    if (!info.record_name().empty()) {
+      const auto found = std::find_if(
+          records.begin(), records.end(), [&](const DebugRecord &entry) {
+            return entry.layout.record_name() == info.record_name();
+          });
+      if (found == records.end())
+        throw std::runtime_error("selected receiver type was not recovered");
+      record = found->decl;
+      *spec.mutable_receiver() = found->layout;
+    }
     return true;
   } catch (const std::exception &e) {
     error = e.what();
@@ -1327,9 +1960,12 @@ bool build_and_validate_receiver_ast(clangtracer::v1::ProbeSpec &spec,
                                      std::unique_ptr<clang::ASTUnit> &output,
                                      clang::CXXRecordDecl *&output_record,
                                      std::string &error,
-                                     DebugRecords &records) {
+                                     DebugRecords &records,
+                                     const std::string &callback_includes,
+                                     const VerifiedDebugEntry *verified_entry) {
   if (spec.has_debug_info())
-    return build_debug_receiver(spec, output, output_record, error, records);
+    return build_debug_receiver(spec, output, output_record, error, records,
+                                callback_includes, verified_entry);
   if (!spec.has_receiver()) {
     return true;
   }
@@ -1467,11 +2103,88 @@ bool build_and_validate_receiver_ast(clangtracer::v1::ProbeSpec &spec,
   return true;
 }
 
+bool validate_object_abi_evidence(
+    const clangtracer::v1::ProbeSpec &spec,
+    const std::string &callback_includes,
+    const std::string &forced_include_source, std::string &error) {
+  const bool header_available = spec.has_header_context() ||
+                                spec.include_headers_size() != 0 ||
+                                !callback_includes.empty() ||
+                                !forced_include_source.empty();
+  if (!spec.has_debug_info())
+    return true;
+  const auto validate = [&](const clangtracer::v1::DebugInfo &record,
+                            const char *role,
+                            bool allow_nontrivial_result) {
+    const auto convention = record.record_calling_convention();
+    if (header_available)
+      return true;
+    if (convention ==
+            clangtracer::v1::RECORD_CALLING_CONVENTION_UNSPECIFIED ||
+        record.record_is_opaque() || record.record_size() == 0 ||
+        record.record_alignment() == 0) {
+      error = std::string(role) +
+              " record ABI is not fully described by DWARF; include its "
+              "definition to validate the compiler ABI";
+      return false;
+    }
+    if (convention == clangtracer::v1::RECORD_PASS_BY_REFERENCE) {
+      if (allow_nontrivial_result)
+        return true;
+      error = "nontrivial by-value argument requires its real type definition "
+              "to preserve copy semantics";
+      return false;
+    }
+    return convention == clangtracer::v1::RECORD_PASS_BY_VALUE;
+  };
+  for (const auto &argument : spec.debug_info().arguments()) {
+    if (argument.is_object_value() && argument.has_object_type() &&
+        !validate(argument.object_type(), "by-value argument", false))
+      return false;
+  }
+  if (spec.debug_info().result_is_object_value() &&
+      spec.debug_info().has_result_object_type() &&
+      !validate(spec.debug_info().result_object_type(), "by-value result",
+                true))
+    return false;
+  return true;
+}
+
+bool determine_object_result_sret(const clangtracer::v1::ProbeSpec &spec,
+                                  const DebugRecords &records,
+                                  bool &result_sret, std::string &error) {
+  result_sret = false;
+  if (!spec.has_debug_info() ||
+      !spec.debug_info().result_is_object_value())
+    return true;
+  if (!spec.debug_info().has_result_object_type()) {
+    error = "by-value result has no recovered record ABI";
+    return false;
+  }
+  const auto &name = spec.debug_info().result_object_type().record_name();
+  const auto found = std::find_if(
+      records.begin(), records.end(), [&](const DebugRecord &record) {
+        return record.layout.record_name() == name;
+      });
+  if (found == records.end() || !found->decl ||
+      !found->decl->isCompleteDefinition()) {
+    error = "by-value result ABI cannot be determined without a complete "
+            "record definition";
+    return false;
+  }
+  // On the supported Linux x86-64 SysV target, Clang's record argument
+  // classification matches the indirect-result decision for C++ records.
+  result_sret = spec.debug_info().result_object_type().record_size() > 16 ||
+                !found->decl->canPassInRegisters();
+  return true;
+}
+
 bool valid_type(tracer::ValueType type, bool result) {
   switch (type) {
   case tracer::ValueType::Void:
     return result;
   case tracer::ValueType::Int32:
+  case tracer::ValueType::Bool:
   case tracer::ValueType::Int64:
   case tracer::ValueType::UInt64:
   case tracer::ValueType::Float32:
@@ -1479,7 +2192,7 @@ bool valid_type(tracer::ValueType type, bool result) {
   case tracer::ValueType::Pointer:
     return true;
   case tracer::ValueType::Object:
-    return !result;
+    return true;
   default:
     return false;
   }
@@ -1491,6 +2204,8 @@ const char *type_name(tracer::ValueType type) {
     return "void";
   case tracer::ValueType::Int32:
     return "int32_t";
+  case tracer::ValueType::Bool:
+    return "bool";
   case tracer::ValueType::Int64:
     return "int64_t";
   case tracer::ValueType::UInt64:
@@ -1506,13 +2221,19 @@ const char *type_name(tracer::ValueType type) {
   }
 }
 
-void fill_value(std::string &code, unsigned i, tracer::ValueType type) {
+void fill_value(std::string &code, unsigned i, tracer::ValueType type,
+                bool indirect_object) {
   code += "ctx.arguments[" + std::to_string(i) +
           "].type=static_cast<tracer::ValueType>(" +
           std::to_string(static_cast<unsigned>(type)) + ");\n";
   switch (type) {
   case tracer::ValueType::Int32:
   case tracer::ValueType::Int64:
+    code += "ctx.arguments[" + std::to_string(i) +
+            "].signed_value=static_cast<int64_t>(a" + std::to_string(i) +
+            ");\n";
+    break;
+  case tracer::ValueType::Bool:
     code += "ctx.arguments[" + std::to_string(i) +
             "].signed_value=static_cast<int64_t>(a" + std::to_string(i) +
             ");\n";
@@ -1532,11 +2253,13 @@ void fill_value(std::string &code, unsigned i, tracer::ValueType type) {
             "].unsigned_value=reinterpret_cast<uintptr_t>(a" +
             std::to_string(i) + ");\n";
     break;
-  case tracer::ValueType::Object:
+  case tracer::ValueType::Object: {
+    const auto argument = "a" + std::to_string(i);
+    const auto address = indirect_object ? argument : "__builtin_addressof(" + argument + ")";
     code += "ctx.arguments[" + std::to_string(i) +
-            "].unsigned_value=reinterpret_cast<uintptr_t>(&a" +
-            std::to_string(i) + ");\n";
+            "].unsigned_value=reinterpret_cast<uintptr_t>(" + address + ");\n";
     break;
+  }
   default:
     break;
   }
@@ -1677,8 +2400,9 @@ bool native_cet_disabled(std::string &error) {
       bool found = false;
       for (std::string line; std::getline(status, line);) {
         constexpr std::string_view prefix = "x86_Thread_features:";
-        if (!line.starts_with(prefix))
+        if (!::tracer::compat::starts_with(line, prefix)) {
           continue;
+        }
         found = true;
         if (line.find_first_not_of(" \t\r", prefix.size()) !=
             std::string::npos) {
@@ -1731,10 +2455,8 @@ bool prepare_context_pthread(Agent &owner, Probe &probe, std::string &error) {
     error = "pthread_create module identity is unavailable";
     return false;
   }
-  const auto module_name =
-      std::filesystem::path(module.dli_fname).filename().string();
-  if (!module_name.starts_with("libc.so") &&
-      !module_name.starts_with("libpthread.so")) {
+  if (!tracer::runtime::has_soname(symbol, "libc.so.6") &&
+      !tracer::runtime::has_soname(symbol, "libpthread.so.0")) {
     error = "pthread_create is interposed by an unsupported runtime module";
     return false;
   }
@@ -1829,19 +2551,39 @@ std::string make_wrapper(const tracer::Request &r,
                          std::uintptr_t original_trampoline, bool has_pre,
                          bool has_post,
                          const clangtracer::v1::ProbeSpec *spec = nullptr,
-                         bool class_mode = false, bool shared_mode = false) {
-  auto argument_type = [&](unsigned i) -> std::string {
+                         bool class_mode = false, bool shared_mode = false,
+                         bool result_sret = false,
+                         const tracer::ValueSnapshotCode *snapshots = nullptr) {
+  const bool typed = spec && tracer::prepared::is_typed_version(
+                                  spec->prepared().format_version());
+  const auto indirect_argument = [&](unsigned i) {
+    return typed && r.arguments[i] == tracer::ValueType::Object &&
+           spec->debug_info().arguments(i).object_type().record_pass_by_reference();
+  };
+  const auto result_type = [&]() -> std::string {
+    if (typed && r.result != tracer::ValueType::Pointer)
+      return "tracer::ResolvedResult";
+    if (r.result != tracer::ValueType::Object)
+      return type_name(r.result);
+    if (!spec || spec->debug_info().result_cpp_type().empty())
+      throw std::runtime_error("missing object result ABI metadata");
+    return spec->debug_info().result_cpp_type();
+  };
+  const auto argument_type = [&](unsigned i) -> std::string {
+    if (indirect_argument(i))
+      return "void*";
+    if (typed && r.arguments[i] != tracer::ValueType::Pointer)
+      return "tracer::ResolvedArgument<" + std::to_string(i) + ">";
     if (r.arguments[i] != tracer::ValueType::Object)
       return type_name(r.arguments[i]);
-    if (!spec || !spec->has_debug_info() ||
-        i >= static_cast<unsigned>(spec->debug_info().arguments_size()))
+    if (!spec || i >= static_cast<unsigned>(spec->debug_info().arguments_size()))
       throw std::runtime_error("missing object argument ABI metadata");
     const auto &argument = spec->debug_info().arguments(i);
     if (!argument.is_object_value() || !argument.has_object_type())
       throw std::runtime_error("invalid by-value argument metadata");
-    return "::" + argument.object_type().record_name();
+    return argument.cpp_type();
   };
-  std::string code =
+  std::string code = (snapshots ? snapshots->declarations : std::string()) +
       "extern \"C\" long long tracer_callback_dispatch(unsigned long "
       "long,const tracer::TraceContext*,void*) noexcept;\nextern \"C\" void "
       "tracer_event_dispatch(unsigned long long,const "
@@ -1861,7 +2603,7 @@ std::string make_wrapper(const tracer::Request &r,
   if (shared_mode)
     code += "#include <bits/cxxabi_forced.h>\n"
             "extern \"C\" void* tracer_shared_enter(unsigned long long,const "
-            "tracer::TraceContext*);\n"
+            "tracer::TraceContext*,unsigned);\n"
             "extern \"C\" void tracer_shared_leave(void*) noexcept;\n"
             "extern \"C\" void tracer_shared_release(void*) noexcept;\n"
             "extern \"C\" void tracer_shared_resume(void*);\n"
@@ -1870,10 +2612,16 @@ std::string make_wrapper(const tracer::Request &r,
             "extern \"C\" void tracer_shared_original_enter(void*);\n"
             "extern \"C\" void tracer_shared_original_leave(void*) noexcept;\n";
   code += "using Original= ";
-  code += type_name(r.result);
-  code += " (*) (";
+  if (result_sret)
+    code += result_type() + "* (*) (" + result_type() + "*";
+  else
+    code += result_type() + " (*) (";
   bool comma = false;
+  if (result_sret)
+    comma = true;
   if (r.kind == tracer::CallableKind::Method) {
+    if (comma)
+      code += ",";
     code += "void*";
     comma = true;
   }
@@ -1888,10 +2636,13 @@ std::string make_wrapper(const tracer::Request &r,
     code += "void";
   }
   code += ");\nextern \"C\" ";
-  code += type_name(r.result);
-  code += " clangtracer_wrapper(";
-  comma = false;
+  code += result_sret ? result_type() + "* clangtracer_wrapper(" + result_type() +
+                            "* result_slot"
+                      : result_type() + " clangtracer_wrapper(";
+  comma = result_sret;
   if (r.kind == tracer::CallableKind::Method) {
+    if (comma)
+      code += ",";
     code += "void* self";
     comma = true;
   }
@@ -1905,10 +2656,11 @@ std::string make_wrapper(const tracer::Request &r,
   if (!comma) {
     code += "void";
   }
-  code += "){\ntracer_context_check_entry();\ntracer_probe_enter(" +
+  code += "){\n";
+  code += "tracer_context_check_entry();\ntracer_probe_enter(" +
           std::to_string(r.probe_id) +
           "ULL); struct FlightGuard{unsigned long long id; "
-          "~FlightGuard(){tracer_probe_leave(id);}} flight{" +
+          "~FlightGuard(){if(id)tracer_probe_leave(id);}} flight{" +
           std::to_string(r.probe_id) +
           "ULL};\nstatic constexpr tracer::TraceContext empty_context{}; "
           "tracer::TraceContext ctx=empty_context; ctx.probe_id=" +
@@ -1922,7 +2674,7 @@ std::string make_wrapper(const tracer::Request &r,
           "ctx.stack_capture=&tracer_capture_stack;"
           "tracer_stack_enter(&ctx,__builtin_frame_address(0));"
           "struct StackGuard { tracer::TraceContext *ctx;"
-          "~StackGuard(){tracer_stack_leave(ctx);} } stack_guard{&ctx};\n";
+          "~StackGuard(){if(ctx)tracer_stack_leave(ctx);} } stack_guard{&ctx};\n";
   code +=
       std::string("ctx.stack_application_only=") +
       (spec && spec->include_internal_stack_frames() ? "false;\n" : "true;\n");
@@ -1934,18 +2686,20 @@ std::string make_wrapper(const tracer::Request &r,
     code += "ctx.object_address=reinterpret_cast<uintptr_t>(self);\n";
   }
   for (unsigned i = 0; i < r.argument_count; ++i) {
-    fill_value(code, i, r.arguments[i]);
+    fill_value(code, i, r.arguments[i], indirect_argument(i));
   }
-  if (spec && spec->stack_depth())
+  if (snapshots) code += snapshots->arguments;
+  if (!shared_mode && spec && spec->stack_depth())
     code += "tracer_capture_entry_stack(&ctx," +
             std::to_string(spec->stack_depth()) + ");\n";
   if (shared_mode) {
     code += "struct SharedGuard { void* token=nullptr; ~SharedGuard() noexcept "
-            "{ tracer_shared_leave(token); tracer_shared_release(token); } } "
+            "{ if(token){tracer_shared_leave(token); tracer_shared_release(token);} } } "
             "shared_guard;\n"
             "shared_guard.token=tracer_shared_enter(" +
-            std::to_string(r.probe_id) +
-            "ULL,&ctx);\ntry { tracer_shared_resume(shared_guard.token);\n";
+            std::to_string(r.probe_id) + "ULL,&ctx," +
+            std::to_string(spec ? spec->stack_depth() : 0) +
+            "U);\ntry { tracer_shared_resume(shared_guard.token);\n";
   } else if (class_mode)
     code += "tracer_invocation_instance tracer_invocation(ctx);\n";
   const std::string instance = class_mode ? "&tracer_invocation" : "nullptr";
@@ -1958,9 +2712,11 @@ std::string make_wrapper(const tracer::Request &r,
   }
   code += "auto original=reinterpret_cast<Original>(" +
           std::to_string(original_trampoline) + "ULL);\n";
-  std::string call = "original(";
-  comma = false;
+  std::string call = result_sret ? "original(result_slot" : "original(";
+  comma = result_sret;
   if (r.kind == tracer::CallableKind::Method) {
+    if (comma)
+      call += ",";
     call += "self";
     comma = true;
   }
@@ -1968,13 +2724,16 @@ std::string make_wrapper(const tracer::Request &r,
     if (comma) {
       call += ",";
     }
-    call += "a" + std::to_string(i);
+    const auto argument = "a" + std::to_string(i);
+    call += typed && r.arguments[i] == tracer::ValueType::Object && !indirect_argument(i)
+                ? "std::move_if_noexcept(" + argument + ")" : argument;
     comma = true;
   }
   call += ")";
   if (shared_mode && r.result != tracer::ValueType::Void)
-    code += std::string(type_name(r.result)) + " result;\n";
-  if (shared_mode)
+    if (r.result != tracer::ValueType::Object)
+      code += result_type() + " result;\n";
+  if (shared_mode && r.result != tracer::ValueType::Object)
     code += "{ tracer_shared_original_enter(shared_guard.token); struct "
             "OriginalGuard { void* token; ~OriginalGuard() noexcept { "
             "tracer_shared_original_leave(token); } } "
@@ -1982,15 +2741,41 @@ std::string make_wrapper(const tracer::Request &r,
   if (r.result == tracer::ValueType::Void) {
     code += "original_begin: " + call +
             ";\noriginal_end: ctx.result.type=tracer::ValueType::Void;\n";
+  } else if (result_sret) {
+    if (shared_mode)
+      code += "{ tracer_shared_original_enter(shared_guard.token); struct "
+              "OriginalGuard { void* token; ~OriginalGuard() noexcept { "
+              "tracer_shared_original_leave(token); } } "
+              "original_guard{shared_guard.token};\n";
+    code += "original_begin: result_slot=" + call +
+            ";\noriginal_end: ;\nctx.result.type=static_cast<tracer::ValueType>(" +
+            std::to_string(static_cast<unsigned>(r.result)) +
+            ");\nctx.result.unsigned_value=reinterpret_cast<uintptr_t>(result_slot);\n";
+    if (shared_mode)
+      code += "}\n";
   } else {
-    code += (shared_mode ? std::string()
-                         : std::string(type_name(r.result)) + " result; ") +
-            "original_begin: result=" + call + ";\noriginal_end: ;\n";
+    if (r.result == tracer::ValueType::Object) {
+      code += "original_begin: ; " + result_type() +
+              " result=([&]() -> " + result_type() + " { ";
+      if (shared_mode)
+        code += "tracer_shared_original_enter(shared_guard.token); struct "
+                "OriginalGuard { void* token; ~OriginalGuard() noexcept { "
+                "tracer_shared_original_leave(token); } } "
+                "original_guard{shared_guard.token}; ";
+      code += "return " + call + "; })();\noriginal_end: ;\n";
+    } else {
+      code += (shared_mode ? std::string()
+                           : result_type() + " result; ") +
+              "original_begin: result=" + call + ";\noriginal_end: ;\n";
+    }
     code += "ctx.result.type=static_cast<tracer::ValueType>(" +
             std::to_string(static_cast<unsigned>(r.result)) + ");\n";
     switch (r.result) {
     case tracer::ValueType::Int32:
     case tracer::ValueType::Int64:
+      code += "ctx.result.signed_value=static_cast<int64_t>(result);\n";
+      break;
+    case tracer::ValueType::Bool:
       code += "ctx.result.signed_value=static_cast<int64_t>(result);\n";
       break;
     case tracer::ValueType::UInt64:
@@ -2004,13 +2789,18 @@ std::string make_wrapper(const tracer::Request &r,
       code +=
           "ctx.result.unsigned_value=reinterpret_cast<uintptr_t>(result);\n";
       break;
+    case tracer::ValueType::Object:
+      code +=
+          "ctx.result.unsigned_value=reinterpret_cast<uintptr_t>(__builtin_addressof(result));\n";
+      break;
     default:
       break;
     }
   }
-  if (shared_mode)
+  if (shared_mode && r.result != tracer::ValueType::Object)
     code += "}\n";
   if (has_post) {
+    if (snapshots) code += "ctx.phase=tracer::TracePhase::Post;\n" + snapshots->result;
     if (shared_mode)
       code += "ctx.phase=tracer::TracePhase::Post; "
               "tracer_shared_dispatch(shared_guard.token,&ctx);\n";
@@ -2024,7 +2814,15 @@ std::string make_wrapper(const tracer::Request &r,
             "tracer_shared_resume(shared_guard.token); "
             "tracer_shared_release(shared_guard.token); "
             "shared_guard.token=nullptr;\n";
-  if (r.result == tracer::ValueType::Void) {
+  if (result_sret) {
+    if (class_mode)
+      code += "tracer_invocation.destroy();\n";
+    if (snapshots && !snapshots->arguments.empty())
+      code += "snapshot_scope.release();\n";
+    code += "tracer_stack_leave(&ctx); stack_guard.ctx=nullptr; "
+            "tracer_probe_leave(" + std::to_string(r.probe_id) +
+            "ULL); flight.id=0; return result_slot;\n";
+  } else if (r.result == tracer::ValueType::Void) {
     code += "return;\n";
   } else {
     code += "return result;\n";
@@ -2043,6 +2841,10 @@ struct CallbackShape {
   bool class_mode = false;
   bool has_pre = false;
   bool has_post = false;
+  bool signature_specialization = false;
+  std::string interceptor_type = "Interceptor";
+  std::string specialized_signature_spelling;
+  clang::QualType specialized_signature;
   const clang::FunctionDecl *legacy = nullptr;
   const clang::CXXMethodDecl *pre = nullptr;
   const clang::CXXMethodDecl *post = nullptr;
@@ -2070,9 +2872,11 @@ bool has_identifier(const clang::NamedDecl &declaration, llvm::StringRef name) {
 }
 
 bool inspect_callback_shape(clang::ASTContext &context, CallbackShape &shape,
-                            std::string &error) {
-  error = tracer::context_activation_error(
-      tracer::analyze_context_declarations(context));
+                            std::string &error,
+                            bool allow_shared_context = false) {
+  if (!allow_shared_context)
+    error = tracer::context_activation_error(
+        tracer::analyze_context_declarations(context));
   if (!error.empty())
     return false;
   const clang::TranslationUnitDecl *unit = context.getTranslationUnitDecl();
@@ -2110,6 +2914,23 @@ bool inspect_callback_shape(clang::ASTContext &context, CallbackShape &shape,
           return false;
         }
         interceptor = record;
+        if (const auto *specialization =
+                llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record)) {
+          shape.signature_specialization = true;
+          if (specialization->getTemplateArgs().size() != 1 ||
+              specialization->getTemplateArgs()[0].getKind() !=
+                  clang::TemplateArgument::Type) {
+            error = "Interceptor specialization requires one function signature";
+            return false;
+          }
+          shape.specialized_signature =
+              specialization->getTemplateArgs()[0].getAsType();
+          clang::PrintingPolicy policy(context.getLangOpts());
+          shape.specialized_signature_spelling =
+              shape.specialized_signature.getAsString(policy);
+          shape.interceptor_type =
+              context.getRecordType(specialization).getAsString(policy);
+        }
       }
     }
     if (const auto *linkage = llvm::dyn_cast<clang::LinkageSpecDecl>(decl)) {
@@ -2192,6 +3013,192 @@ bool inspect_callback_shape(clang::ASTContext &context, CallbackShape &shape,
   return true;
 }
 
+bool debug_type_matches(clang::ASTContext &context, clang::QualType actual,
+                        const std::string &spelling,
+                        const clangtracer::v1::DebugInfo *object,
+                        bool is_reference, bool object_value) {
+  clang::QualType expected;
+  bool record_pointer = false;
+  if (object && !object->record_name().empty()) {
+    std::string base = spelling;
+    const bool rvalue_reference = ::tracer::compat::ends_with(base, "&&");
+    const bool lvalue_reference =
+        !rvalue_reference && ::tracer::compat::ends_with(base, "&");
+    if (rvalue_reference)
+      base.resize(base.size() - 2);
+    else if (lvalue_reference)
+      base.resize(base.size() - 1);
+    if (is_reference != (rvalue_reference || lvalue_reference))
+      return false;
+    if (!is_reference && ::tracer::compat::contains(base, "*") &&
+        ::tracer::compat::ends_with(base, " const"))
+      base.resize(base.size() - 6);
+    if (!is_reference && ::tracer::compat::contains(base, "*") &&
+        ::tracer::compat::ends_with(base, " volatile"))
+      base.resize(base.size() - 9);
+
+    clang::QualType actual_base = actual;
+    if (const auto *reference = actual_base->getAs<clang::ReferenceType>()) {
+      if (actual_base->isRValueReferenceType() != rvalue_reference)
+        return false;
+      actual_base = reference->getPointeeType();
+    }
+    record_pointer = ::tracer::compat::ends_with(base, "*");
+    if (record_pointer) {
+      base.resize(base.size() - 1);
+      while (!base.empty() && std::isspace(static_cast<unsigned char>(base.back())))
+        base.pop_back();
+      // Top-level cv on a by-value pointer is not part of its function type.
+      if (::tracer::compat::ends_with(base, " const"))
+        base.resize(base.size() - 6);
+      if (::tracer::compat::ends_with(base, " volatile"))
+        base.resize(base.size() - 9);
+      const auto *pointer_type = actual_base->getAs<clang::PointerType>();
+      if (!pointer_type)
+        return false;
+      actual_base = pointer_type->getPointeeType();
+    }
+    bool expected_const =
+        ::tracer::compat::starts_with(base, "const ") ||
+        ::tracer::compat::contains(base, " const");
+    bool expected_volatile =
+        ::tracer::compat::starts_with(base, "volatile ") ||
+        ::tracer::compat::contains(base, " volatile");
+    if (::tracer::compat::starts_with(base, "const "))
+      base.erase(0, 6);
+    if (::tracer::compat::starts_with(base, "volatile "))
+      base.erase(0, 9);
+    if (::tracer::compat::ends_with(base, " const"))
+      base.resize(base.size() - 6);
+    if (::tracer::compat::ends_with(base, " volatile"))
+      base.resize(base.size() - 9);
+    // Function types discard top-level cv from by-value parameters, including
+    // records. Keep qualifiers on references and pointer pointees intact.
+    if (object_value && !is_reference && !record_pointer) {
+      expected_const = false;
+      expected_volatile = false;
+    }
+    const auto *record = actual_base->getAsCXXRecordDecl();
+    if (!record)
+      return false;
+    const auto expected_identity = normalized_cpp_type(object->record_name());
+    if (!debug_record_identity_matches(context, record,
+                                       object->record_name()))
+      return false;
+    if (normalized_cpp_type(base) != expected_identity &&
+        normalized_cpp_type(base) !=
+            normalized_cpp_type(record->getQualifiedNameAsString()))
+      return false;
+    expected = actual_base.getUnqualifiedType();
+    if (expected_const)
+      expected.addConst();
+    if (expected_volatile)
+      expected.addVolatile();
+    if (record_pointer)
+      expected = context.getPointerType(expected);
+    if (rvalue_reference)
+      expected = context.getRValueReferenceType(expected);
+    else if (lvalue_reference)
+      expected = context.getLValueReferenceType(expected);
+  } else {
+    std::string base = spelling;
+    const bool rvalue_reference =
+        ::tracer::compat::ends_with(base, "&&");
+    const bool lvalue_reference =
+        !rvalue_reference && ::tracer::compat::ends_with(base, "&");
+    if (rvalue_reference)
+      base.resize(base.size() - 2);
+    else if (lvalue_reference)
+      base.resize(base.size() - 1);
+    try {
+      expected = debug_builtin(context, base);
+    } catch (const std::exception &) {
+      return false;
+    }
+    if (is_reference != (rvalue_reference || lvalue_reference))
+      return false;
+    if (rvalue_reference)
+      expected = context.getRValueReferenceType(expected);
+    else if (lvalue_reference)
+      expected = context.getLValueReferenceType(expected);
+    else
+      expected = expected.getUnqualifiedType();
+  }
+  if (object_value && (actual->isReferenceType() || actual->isPointerType()))
+    return false;
+  return context.hasSameType(actual.getCanonicalType(),
+                             expected.getCanonicalType());
+}
+
+bool validate_specialized_signature(
+    clang::ASTContext &context, const CallbackShape &shape,
+    const clangtracer::v1::ProbeSpec &spec, std::string &error) {
+  if (!shape.signature_specialization)
+    return true;
+  if (!spec.has_debug_info()) {
+    error = "Interceptor<Signature> requires a DWARF-resolved target";
+    return false;
+  }
+  const auto *function =
+      shape.specialized_signature->getAs<clang::FunctionProtoType>();
+  if (!function || function->isVariadic()) {
+    error = "Interceptor template argument must be a function signature";
+    return false;
+  }
+  // Prepared aliases retain the exact Clang type. The generated
+  // static_assert compares the complete signature in the same TU.
+  if (tracer::prepared::is_typed_version(spec.prepared().format_version()))
+    return true;
+  const auto &info = spec.debug_info();
+  if (function->getNumParams() != info.arguments_size()) {
+    error = "Interceptor signature argument count does not match target";
+    return false;
+  }
+  const auto has_multilevel_record_pointer = [](const std::string &type,
+                                                 bool has_record) {
+    return has_record &&
+           std::count(type.begin(), type.end(), '*') > 1;
+  };
+  const auto &result_info = info;
+  if (has_multilevel_record_pointer(
+          result_info.result_cpp_type(), result_info.has_result_object_type())) {
+    error = "multi-level pointers to recovered record results are not "
+            "supported by Interceptor signature validation";
+    return false;
+  }
+  if (!debug_type_matches(context, function->getReturnType(),
+                          result_info.result_cpp_type(),
+                          result_info.has_result_object_type()
+                              ? &result_info.result_object_type()
+                              : nullptr,
+                          result_info.result_is_reference(),
+                          result_info.result_is_object_value())) {
+    error = "Interceptor signature result type does not match target DWARF";
+    return false;
+  }
+  for (unsigned i = 0; i < function->getNumParams(); ++i) {
+    const auto &argument = info.arguments(static_cast<int>(i));
+    if (has_multilevel_record_pointer(argument.cpp_type(),
+                                      argument.has_object_type())) {
+      error = "multi-level pointers to recovered record argument " +
+              std::to_string(i) +
+              " are not supported by Interceptor signature validation";
+      return false;
+    }
+    if (!debug_type_matches(
+            context, function->getParamType(i), argument.cpp_type(),
+            argument.has_object_type() ? &argument.object_type() : nullptr,
+            argument.is_reference(), argument.is_object_value())) {
+      error = "Interceptor signature argument " + std::to_string(i) +
+              " type does not match target DWARF (callback: " +
+              function->getParamType(i).getAsString() + "; target: " +
+              argument.cpp_type() + ")";
+      return false;
+    }
+  }
+  return true;
+}
+
 clang::TypeAliasDecl *
 create_receiver_alias(clang::ASTContext &context,
                       const clang::CXXRecordDecl *imported_record,
@@ -2237,24 +3244,32 @@ struct ReceiverCallbackShape {
   bool class_mode = false;
   bool has_pre = false;
   bool has_post = false;
+  bool signature_specialization = false;
+  std::string interceptor_type = "Interceptor";
+  clang::QualType specialized_signature;
   std::string bridge;
   std::string error;
   std::vector<std::pair<unsigned, std::string>> inferred_fields;
   std::vector<std::string> argument_names;
+  tracer::ValueSnapshotCode snapshots;
 };
 
 std::string make_class_bridge(const CallbackShape &shape);
 
 class ReceiverShapeConsumer final : public clang::ASTConsumer {
 public:
-  explicit ReceiverShapeConsumer(ReceiverCallbackShape &result)
-      : result_(result) {}
+  ReceiverShapeConsumer(ReceiverCallbackShape &result,
+                        const clangtracer::v1::ProbeSpec &spec)
+      : result_(result), spec_(spec) {}
 
   void HandleTranslationUnit(clang::ASTContext &context) override {
     CallbackShape shape;
     if (!inspect_callback_shape(context, shape, result_.error)) {
       return;
     }
+    if (!validate_specialized_signature(context, shape, spec_, result_.error))
+      return;
+    result_.snapshots = tracer::make_value_snapshot_code(context, spec_);
     class Fields : public clang::RecursiveASTVisitor<Fields> {
     public:
       Fields(clang::ASTContext &c, ReceiverCallbackShape &r)
@@ -2326,6 +3341,8 @@ public:
     result_.class_mode = shape.class_mode;
     result_.has_pre = shape.has_pre;
     result_.has_post = shape.has_post;
+    result_.signature_specialization = shape.signature_specialization;
+    result_.interceptor_type = shape.interceptor_type;
     if (shape.class_mode) {
       result_.bridge = make_class_bridge(shape);
     } else {
@@ -2336,6 +3353,7 @@ public:
 
 private:
   ReceiverCallbackShape &result_;
+  const clangtracer::v1::ProbeSpec &spec_;
 };
 
 class ReceiverASTImporter : public clang::ASTImporter {
@@ -2428,11 +3446,12 @@ public:
                        const clangtracer::v1::ReceiverContext *receiver_context,
                        clang::CXXRecordDecl *target_record,
                        std::string *validation_error,
-                       const DebugRecords *records = nullptr)
+                       const DebugRecords *records = nullptr,
+                       const clangtracer::v1::ProbeSpec *spec = nullptr)
       : records_(records), donor_context_(donor_context),
         donor_files_(donor_files), donor_record_(donor_record), shape_(shape),
         receiver_context_(receiver_context), target_record_(target_record),
-        validation_error_(validation_error) {}
+        validation_error_(validation_error), spec_(spec) {}
 
   bool BeginSourceFileAction(clang::CompilerInstance &compiler) override {
     if (!clang::ASTFrontendAction::BeginSourceFileAction(compiler)) {
@@ -2445,7 +3464,11 @@ public:
 
   std::unique_ptr<clang::ASTConsumer>
   CreateASTConsumer(clang::CompilerInstance &, llvm::StringRef) override {
-    return std::make_unique<ReceiverShapeConsumer>(shape_);
+    if (!spec_) {
+      *validation_error_ = "signature metadata is unavailable during callback validation";
+      return std::make_unique<clang::ASTConsumer>();
+    }
+    return std::make_unique<ReceiverShapeConsumer>(shape_, *spec_);
   }
 
   void ExecuteAction() override {
@@ -2455,6 +3478,7 @@ public:
                                  compiler.getFileManager(), donor_context_,
                                  donor_files_, false);
     std::vector<clang::CXXRecordDecl *> imported_targets;
+    clang::CXXRecordDecl *selected_imported_record = nullptr;
     if (records_)
       for (const auto &entry : *records_) {
         if (auto err = importer.ImportDefinition(entry.decl)) {
@@ -2467,50 +3491,51 @@ public:
           return;
         }
         auto *target = llvm::cast<clang::CXXRecordDecl>(*imported);
-        if (!validate_receiver_layout(compiler.getASTContext(), target,
+        if (!entry.opaque &&
+            !validate_receiver_layout(compiler.getASTContext(), target,
                                       entry.layout, *validation_error_))
           return;
         imported_targets.push_back(target);
       }
-    if (!donor_record_) {
-      *validation_error_ = "imported receiver declaration is missing";
-      return;
-    }
-    if (llvm::Error import_error = importer.ImportDefinition(donor_record_)) {
-      *validation_error_ = llvm::toString(std::move(import_error));
-      return;
-    }
-    auto imported_decl = importer.Import(donor_record_);
-    if (!imported_decl) {
-      *validation_error_ = llvm::toString(imported_decl.takeError());
-      return;
-    }
-    auto *imported_record_const =
-        llvm::dyn_cast<clang::CXXRecordDecl>(*imported_decl);
-    auto *imported_record =
-        const_cast<clang::CXXRecordDecl *>(imported_record_const);
-    if (!imported_record || !receiver_context_ ||
-        !validate_receiver_layout(compiler.getASTContext(), imported_record,
-                                  *receiver_context_, *validation_error_)) {
-      if (validation_error_->empty()) {
-        *validation_error_ = "receiver declaration did not survive AST import";
-      } else {
-        *validation_error_ =
-            "preflight receiver layout mismatch: " + *validation_error_;
+    if (donor_record_) {
+      if (llvm::Error import_error = importer.ImportDefinition(donor_record_)) {
+        *validation_error_ = llvm::toString(std::move(import_error));
+        return;
       }
-      return;
+      auto imported_decl = importer.Import(donor_record_);
+      if (!imported_decl) {
+        *validation_error_ = llvm::toString(imported_decl.takeError());
+        return;
+      }
+      auto *imported_record_const =
+          llvm::dyn_cast<clang::CXXRecordDecl>(*imported_decl);
+      auto *imported_record =
+          const_cast<clang::CXXRecordDecl *>(imported_record_const);
+      selected_imported_record = imported_record;
+      if (!imported_record || !receiver_context_ ||
+          !validate_receiver_layout(compiler.getASTContext(), imported_record,
+                                    *receiver_context_, *validation_error_)) {
+        if (validation_error_->empty()) {
+          *validation_error_ =
+              "receiver declaration did not survive AST import";
+        } else {
+          *validation_error_ =
+              "preflight receiver layout mismatch: " + *validation_error_;
+        }
+        return;
+      }
+      if (!create_receiver_alias(compiler.getASTContext(), imported_record,
+                                 *receiver_context_)) {
+        *validation_error_ =
+            "cannot create typed receiver alias in preflight AST";
+        return;
+      }
     }
-    if (!create_receiver_alias(compiler.getASTContext(), imported_record,
-                               *receiver_context_)) {
-      *validation_error_ =
-          "cannot create typed receiver alias in preflight AST";
-      return;
-    }
-    if (target_record_) {
+    if (target_record_ && donor_record_ && selected_imported_record) {
       // Skip imported receiver method bodies while checking callback and
       // included helper code for ODR uses of the selected target.
       visitor_ = std::make_unique<ForbiddenReceiverUseVisitor>(
-          imported_record, importer.declarations, imported_targets);
+          selected_imported_record, importer.declarations, imported_targets);
     }
     clang::ParseAST(compiler.getSema());
     if (diagnostic_capture_ && diagnostic_capture_->had_error()) {
@@ -2689,13 +3714,14 @@ private:
   const clangtracer::v1::ReceiverContext *receiver_context_;
   clang::CXXRecordDecl *target_record_;
   std::string *validation_error_;
+  const clangtracer::v1::ProbeSpec *spec_;
   std::unique_ptr<ForbiddenReceiverUseVisitor> visitor_;
   std::unique_ptr<DiagnosticCaptureScope> diagnostic_capture_;
 };
 
 std::string make_class_bridge(const CallbackShape &shape) {
   return tracer::make_class_callback_bridge(
-      {"Interceptor", shape.has_pre,
+      {shape.interceptor_type, shape.has_pre,
        !shape.pre || shape.pre->getReturnType()->isVoidType(), shape.has_post,
        !shape.post || shape.post->getReturnType()->isVoidType()});
 }
@@ -2704,45 +3730,466 @@ std::string argument_aliases(const clangtracer::v1::ProbeSpec &spec) {
   if (!spec.has_debug_info())
     return {};
   std::string code =
-      "namespace tracer { template<unsigned long> struct ArgumentType;\n";
+      "namespace tracer { template<unsigned long> struct ArgumentType; "
+      "template<unsigned long> struct ResultType;\n";
+  const bool typed = tracer::prepared::is_typed_version(
+      spec.prepared().format_version());
+  if (typed)
+    code += "template<unsigned> struct PreparedArgument;\n"
+            "template<unsigned N> using ResolvedArgument = typename PreparedArgument<N>::type;\n";
   for (const auto &argument : spec.debug_info().arguments()) {
-    std::string type = argument.cpp_type();
-    if (argument.has_object_type()) {
-      type = "const ::" + argument.object_type().record_name();
-      if (argument.cpp_type().find("volatile") != std::string::npos)
-        type += " volatile";
-      type +=
-          (argument.is_reference() || argument.is_object_value()) ? "&" : "*";
-    } else if (argument.is_reference() && !type.starts_with("const "))
-      type = "const " + type;
+    // Preserve the full DWARF pointer chain. Multi-level pointers to records
+    // are rejected by signature validation until their CV chain is modeled.
+    std::string type = "typename ReadOnlyObservationType<" +
+                       argument.cpp_type() + ">::type";
+    if (argument.is_object_value()) {
+      type = "const " + argument.cpp_type() + "&";
+    }
+    if (typed)
+      code += "template<> struct PreparedArgument<" +
+              std::to_string(argument.index()) + "> { using type = " +
+              argument.cpp_type() + "; };\n";
     code += "template<> struct ArgumentType<" +
             std::to_string(argument.index()) + "> { using type=" + type +
             "; static constexpr bool object_value=" +
             (argument.is_object_value() ? "true" : "false") + "; };\n";
   }
+  const auto &info = spec.debug_info();
+  if (!info.result_cpp_type().empty()) {
+    std::string result_type = info.result_is_object_value()
+                                  ? info.result_cpp_type()
+                                  : "typename ReadOnlyObservationType<" +
+                                        info.result_cpp_type() + ">::type";
+    code += "template<> struct ResultType<0> { using type=" + result_type +
+            "; static constexpr bool object_value=" +
+            (info.result_is_object_value() ? "true" : "false") + "; };\n";
+  }
+  code += "using ResolvedResult=" + info.result_cpp_type() + ";\n";
+  code += "using ResolvedSignature=ResolvedResult(";
+  for (int i = 0; i < info.arguments_size(); ++i) {
+    if (i)
+      code += ",";
+    code += info.arguments(i).cpp_type();
+  }
+  code += ");\n";
   return code + "}\n";
+}
+
+std::string specialized_signature_assert(clang::ASTContext &context,
+                                         const CallbackShape &shape) {
+  if (!shape.signature_specialization ||
+      shape.specialized_signature_spelling.empty())
+    return {};
+  (void)context;
+  return "static_assert(std::is_same_v<" +
+         shape.specialized_signature_spelling +
+         ", tracer::ResolvedSignature>, \"Interceptor signature does not "
+         "match the resolved target signature\");\n";
+}
+
+std::string interceptor_template_prelude(const std::string &source) {
+  const auto skip_trivia = [&](std::size_t &offset) {
+    for (;;) {
+      while (offset < source.size() &&
+             std::isspace(static_cast<unsigned char>(source[offset])))
+        ++offset;
+      if (offset + 1 < source.size() && source[offset] == '/' &&
+          source[offset + 1] == '/') {
+        offset = source.find('\n', offset + 2);
+        if (offset == std::string::npos)
+          return;
+        continue;
+      }
+      if (offset + 1 < source.size() && source[offset] == '/' &&
+          source[offset + 1] == '*') {
+        const auto end = source.find("*/", offset + 2);
+        if (end == std::string::npos) {
+          offset = source.size();
+          return;
+        }
+        offset = end + 2;
+        continue;
+      }
+      return;
+    }
+  };
+  for (std::size_t offset = 0; offset < source.size();) {
+    skip_trivia(offset);
+    if (offset >= source.size())
+      break;
+    const char c = source[offset];
+    std::size_t raw_prefix = 0;
+    if (source.compare(offset, 4, "u8R\"") == 0)
+      raw_prefix = 4;
+    else if (source.compare(offset, 3, "uR\"") == 0 ||
+             source.compare(offset, 3, "UR\"") == 0 ||
+             source.compare(offset, 3, "LR\"") == 0)
+      raw_prefix = 3;
+    else if (source.compare(offset, 2, "R\"") == 0)
+      raw_prefix = 2;
+    if (raw_prefix) {
+      const auto delimiter_begin = offset + raw_prefix;
+      const auto open = source.find('(', delimiter_begin);
+      if (open == std::string::npos) {
+        offset = source.size();
+        break;
+      }
+      const auto delimiter = source.substr(delimiter_begin, open - delimiter_begin);
+      const auto close = source.find(")" + delimiter + "\"", open + 1);
+      offset = close == std::string::npos ? source.size()
+                                          : close + delimiter.size() + 2;
+      continue;
+    }
+    if (c == '"' || c == '\'') {
+      const char quote = c;
+      ++offset;
+      while (offset < source.size()) {
+        if (source[offset] == '\\') {
+          offset = std::min(source.size(), offset + 2);
+          continue;
+        }
+        if (source[offset++] == quote)
+          break;
+      }
+      continue;
+    }
+    if (!(std::isalpha(static_cast<unsigned char>(c)) || c == '_')) {
+      ++offset;
+      continue;
+    }
+    const auto begin = offset++;
+    while (offset < source.size() &&
+           (std::isalnum(static_cast<unsigned char>(source[offset])) ||
+            source[offset] == '_'))
+      ++offset;
+    if (source.compare(begin, offset - begin, "Interceptor") != 0)
+      continue;
+    auto next = offset;
+    skip_trivia(next);
+    if (next < source.size() && source[next] == '<')
+      return "template<class Signature> class Interceptor;\n";
+    offset = next;
+  }
+  return {};
+}
+
+std::pair<std::string, std::string>
+split_callback_includes(const std::string &source) {
+  std::string includes;
+  std::size_t consumed = 0;
+  for (;;) {
+    std::size_t offset = consumed;
+    while (offset < source.size()) {
+      if (std::isspace(static_cast<unsigned char>(source[offset]))) {
+        ++offset;
+      } else if (offset + 1 < source.size() && source[offset] == '/' &&
+                 source[offset + 1] == '/') {
+        const auto end = source.find('\n', offset + 2);
+        offset = end == std::string::npos ? source.size() : end + 1;
+      } else if (offset + 1 < source.size() && source[offset] == '/' &&
+                 source[offset + 1] == '*') {
+        const auto end = source.find("*/", offset + 2);
+        if (end == std::string::npos)
+          break;
+        offset = end + 2;
+      } else {
+        break;
+      }
+    }
+    if (offset >= source.size())
+      break;
+    const auto line_end = source.find('\n', offset);
+    const auto end = line_end == std::string::npos ? source.size() : line_end + 1;
+    std::string_view line(source.data() + offset, end - offset);
+    std::size_t first = 0;
+    while (first < line.size() &&
+           std::isspace(static_cast<unsigned char>(line[first])) &&
+           line[first] != '\n' && line[first] != '\r')
+      ++first;
+    if (line.substr(first, 8) != "#include")
+      break;
+    includes.append(source.data() + consumed, end - consumed);
+    consumed = end;
+  }
+  return {std::move(includes), source.substr(consumed)};
+}
+
+bool extract_forced_includes(std::vector<std::string> &arguments,
+                             std::string &source, std::string &error) {
+  std::vector<std::string> filtered;
+  filtered.reserve(arguments.size());
+  for (std::size_t i = 0; i < arguments.size(); ++i) {
+    const auto &argument = arguments[i];
+    if (argument == "-imacros" ||
+        ::tracer::compat::starts_with(argument, "-imacros")) {
+      error = "-imacros is not supported by side-effect-free preparation";
+      return false;
+    }
+    if (argument == "-include") {
+      if (++i >= arguments.size()) {
+        error = "-include requires a header path";
+        return false;
+      }
+      const auto &path = arguments[i];
+      if (path.empty() || path.find_first_of("\"\r\n") != std::string::npos ||
+          path.find('\0') != std::string::npos) {
+        error = "-include has an invalid header path";
+        return false;
+      }
+      source += "#include \"" + path + "\"\n";
+      continue;
+    }
+    if (::tracer::compat::starts_with(argument, "-include")) {
+      if (::tracer::compat::starts_with(argument, "-include-pch")) {
+        error = "-include-pch is not supported by side-effect-free preparation";
+        return false;
+      }
+      const auto path = ::tracer::compat::starts_with(argument, "-include=")
+                            ? argument.substr(sizeof("-include=") - 1)
+                            : argument.substr(sizeof("-include") - 1);
+      if (path.empty() || path.find_first_of("\"\r\n") != std::string::npos ||
+          path.find('\0') != std::string::npos) {
+        error = "-include has an invalid header path";
+        return false;
+      }
+      source += "#include \"" + path + "\"\n";
+      continue;
+    }
+    filtered.push_back(argument);
+  }
+  arguments.swap(filtered);
+  return true;
+}
+
+bool parse_and_materialize(Probe &probe, clang::Interpreter &interpreter,
+                          const std::string &source, std::string &error) {
+  auto parsed = interpreter.Parse(source);
+  if (!parsed) {
+    error = llvm::toString(parsed.takeError());
+    return false;
+  }
+  if (!parsed->TheModule) {
+    error = "Clang parser produced no LLVM module";
+    return false;
+  }
+  for (const auto &function : parsed->TheModule->functions()) {
+    if (function.isDeclaration() && function.hasExternalLinkage() &&
+        !function.isIntrinsic() &&
+        !::tracer::compat::starts_with(function.getName(), "llvm."))
+      probe.external_link_candidates.push_back(function.getName().str());
+  }
+  for (const auto &global : parsed->TheModule->globals()) {
+    if (global.isDeclaration() && global.hasExternalLinkage() &&
+        !::tracer::compat::starts_with(global.getName(), "llvm."))
+      probe.external_link_candidates.push_back(global.getName().str());
+  }
+  llvm::SmallVector<char, 0> bitcode;
+  llvm::raw_svector_ostream output(bitcode);
+  llvm::WriteBitcodeToFile(*parsed->TheModule, output);
+  auto owned_context = std::make_unique<llvm::LLVMContext>();
+  auto copied_buffer = llvm::MemoryBuffer::getMemBufferCopy(
+      llvm::StringRef(bitcode.data(), bitcode.size()),
+      "clang-tracer-prepared-callback.bc");
+  auto copied_module = llvm::parseBitcodeFile(copied_buffer->getMemBufferRef(),
+                                               *owned_context);
+  if (!copied_module) {
+    error = llvm::toString(copied_module.takeError());
+    return false;
+  }
+  auto execution_engine = interpreter.getExecutionEngine();
+  if (!execution_engine) {
+    error = llvm::toString(execution_engine.takeError());
+    return false;
+  }
+  llvm::orc::ThreadSafeContext safe_context(std::move(owned_context));
+  llvm::orc::ThreadSafeModule safe_module(std::move(*copied_module),
+                                          std::move(safe_context));
+  if (auto failure = execution_engine->addIRModule(std::move(safe_module))) {
+    error = llvm::toString(std::move(failure));
+    return false;
+  }
+  return true;
+}
+
+bool capture_orc_errors(Probe &probe, std::string &error) {
+  auto jit = probe.interpreter->getExecutionEngine();
+  if (!jit) {
+    error = llvm::toString(jit.takeError());
+    return false;
+  }
+  probe.orc_errors = std::make_shared<OrcErrorCapture>();
+  const auto capture = probe.orc_errors;
+  jit->getExecutionSession().setErrorReporter([capture](llvm::Error failure) {
+    const auto message = llvm::toString(std::move(failure));
+    std::lock_guard<std::mutex> lock(capture->mutex);
+    if (!capture->message.empty())
+      capture->message += '\n';
+    capture->message += message;
+    capture->ready.notify_all();
+  });
+  return true;
+}
+
+void append_orc_errors(const Probe &probe, std::string &error) {
+  if (!probe.orc_errors)
+    return;
+  std::unique_lock<std::mutex> lock(probe.orc_errors->mutex);
+  if (probe.orc_errors->message.empty())
+    probe.orc_errors->ready.wait_for(
+        lock, std::chrono::milliseconds(100),
+        [&] { return !probe.orc_errors->message.empty(); });
+  if (probe.orc_errors->message.empty())
+    return;
+  if (!error.empty())
+    error += '\n';
+  error += probe.orc_errors->message;
+}
+
+void append_unresolved_link_candidates(
+    const Probe &probe, const clangtracer::v1::ProbeSpec &spec,
+    std::string &error) {
+  std::unordered_set<std::string> bound_methods;
+  const auto collect_methods = [&](const auto &self,
+                                  const clangtracer::v1::DebugInfo &info) -> void {
+    for (const auto &method : info.methods())
+      if (method.runtime_entry() && !method.linkage_symbol().empty())
+        bound_methods.insert(method.linkage_symbol());
+    for (const auto &argument : info.arguments())
+      if (argument.has_object_type())
+        self(self, argument.object_type());
+    if (info.has_result_object_type())
+      self(self, info.result_object_type());
+  };
+  if (spec.has_debug_info())
+    collect_methods(collect_methods, spec.debug_info());
+
+  std::vector<std::string> missing;
+  for (const auto &name : probe.external_link_candidates) {
+    if (name.empty() || name.rfind("tracer_", 0) == 0 ||
+        bound_methods.count(name) || ::dlsym(RTLD_DEFAULT, name.c_str()))
+      continue;
+    if (std::find(missing.begin(), missing.end(), name) == missing.end())
+      missing.push_back(name);
+  }
+  if (missing.empty())
+    return;
+  for (const auto &name : missing) {
+    if (error.find(name) != std::string::npos)
+      continue;
+    if (!error.empty())
+      error += '\n';
+    error += "unresolved external symbol: " + name;
+  }
+}
+
+bool initialize_prepared_code(clang::Interpreter &interpreter,
+                              std::string &error) {
+  auto execution_engine = interpreter.getExecutionEngine();
+  if (!execution_engine) {
+    error = llvm::toString(execution_engine.takeError());
+    return false;
+  }
+  if (auto failure = execution_engine->initialize(
+          execution_engine->getMainJITDylib())) {
+    error = llvm::toString(std::move(failure));
+    return false;
+  }
+  return true;
 }
 
 bool compile_shared_probe(Probe &p,
                           const clangtracer::v1::ProbeSpec &specification,
                           const std::vector<std::string> &arguments,
                           const std::string &wrapper_prelude,
-                          std::string &error) {
-  auto *owner = agent.load(std::memory_order_acquire);
-  if (!owner ||
-      owner->next_context_hook >= tracer::context_engine::kCaptureHooks) {
-    error = "shared-context generation capacity exceeded";
-    return false;
-  }
+                          const std::string &forced_include_source,
+                          const std::string &receiver_alias,
+                          const std::string &signature_assert,
+                          std::string &error, bool run_initializers,
+                          clangtracer::v1::ValidationReport *report,
+                          bool result_sret, bool syntax_only,
+                          const tracer::ValueSnapshotCode &snapshots) {
   tracer::ContextActivationRequest activation;
-  activation.source =
-      argument_aliases(specification) + specification.callback_source();
+  const auto [callback_includes, callback_body] =
+      split_callback_includes(specification.callback_source());
+  const bool typed_prepared = tracer::prepared::is_typed_version(
+      specification.prepared().format_version());
+  std::string requested_header_source = typed_prepared
+      ? tracer::prepared::adapter_source(specification.prepared()) : std::string();
+  for (const auto &header : specification.include_headers())
+    requested_header_source += "#include \"" + header + "\"\n";
+  const bool has_real_headers = typed_prepared || specification.has_header_context() ||
+                                specification.include_headers_size() != 0 ||
+                                !callback_includes.empty() ||
+                                !forced_include_source.empty();
+  activation.source = forced_include_source + callback_includes +
+                      requested_header_source +
+                      (has_real_headers
+                           ? std::string()
+                           : recovered_record_declarations(specification)) +
+                      argument_aliases(specification) +
+                      interceptor_template_prelude(specification.callback_source()) +
+                      callback_body + "\n" + signature_assert;
+  // Scalar shared wrappers need no user declarations. Recompiling their full
+  // callback headers here can consume the operation deadline before admission.
+  const auto *wrapper_snapshots = snapshots.arguments.empty() ? nullptr : &snapshots;
+  const std::string wrapper_types = !wrapper_snapshots && !typed_prepared ? std::string() :
+      callback_includes + requested_header_source +
+      (has_real_headers ? std::string() : recovered_record_declarations(specification)) +
+      receiver_alias + argument_aliases(specification);
   activation.compiler_arguments = arguments;
   activation.callback_log = &tracer::detail::tracer_enqueue_log;
   if (!specification.callback_package_path().empty())
     activation.file_name = specification.callback_package_path();
   std::copy_n(p.request.source_lineage_id, activation.source_lineage_id.size(),
               activation.source_lineage_id.begin());
+  if (!run_initializers) {
+    const auto preflight =
+        tracer::preflight_context_source(activation, syntax_only);
+    if (!preflight) {
+      error = preflight.error;
+      return false;
+    }
+    const auto generated_wrapper =
+        make_wrapper(p.request,
+                     reinterpret_cast<std::uintptr_t>(p.trampoline), true,
+                     true, &specification, false, true, result_sret, wrapper_snapshots);
+    const auto complete_source = wrapper_prelude + wrapper_types + generated_wrapper;
+    if (syntax_only) {
+      auto syntax_arguments = arguments;
+      syntax_arguments.push_back("-fsyntax-only");
+      DiagnosticCapture capture(nullptr);
+      auto ast = clang::tooling::buildASTFromCodeWithArgs(
+          complete_source, tracer::clang_driver_arguments(std::move(syntax_arguments)),
+          "clang-tracer-shared-wrapper.cc",
+          "clang-tracer", std::make_shared<clang::PCHContainerOperations>(),
+          clang::tooling::getClangStripOutputAdjuster(), {}, &capture);
+      if (report)
+        append_diagnostics(*report, capture, "syntax");
+      if (!ast || capture.had_error()) {
+        error = capture.message().empty()
+                    ? "shared callback wrapper failed syntax validation"
+                    : capture.message();
+        return false;
+      }
+      return true;
+    }
+    if (!parse_and_materialize(p, *p.interpreter, complete_source, error))
+      return false;
+    auto wrapper = p.interpreter->getSymbolAddress("clangtracer_wrapper");
+    if (!wrapper) {
+      error = llvm::toString(wrapper.takeError());
+      append_orc_errors(p, error);
+      append_unresolved_link_candidates(p, specification, error);
+      return false;
+    }
+    return true;
+  }
+  auto *owner = agent.load(std::memory_order_acquire);
+  if (!owner ||
+      owner->next_context_hook >= tracer::context_engine::kCaptureHooks) {
+    error = "shared-context generation capacity exceeded";
+    return false;
+  }
   if (std::all_of(activation.source_lineage_id.begin(),
                   activation.source_lineage_id.end(),
                   [](std::uint8_t byte) { return byte == 0; })) {
@@ -2762,11 +4209,13 @@ bool compile_shared_probe(Probe &p,
     return false;
   }
   try {
-    if (!owner->context_capture)
-      owner->context_capture =
-          std::make_unique<tracer::context_engine::ContextCapturePool>();
     p.context_delivery =
         tracer::context_delivery::ContextAgentDelivery::acquire(p.request);
+    const auto event_bytes = p.request.context_budget.event_bytes;
+    if (!owner->context_capture || event_bytes > owner->context_capture->capacity())
+      owner->context_capture =
+          std::make_shared<tracer::context_engine::ContextCapturePool>(event_bytes);
+    p.capture_pool = owner->context_capture;
     tracer::context_runtime::EventMetadata metadata;
     metadata.source_id.assign(
         reinterpret_cast<const char *>(activation.source_lineage_id.data()),
@@ -2778,12 +4227,11 @@ bool compile_shared_probe(Probe &p,
     metadata.print_arguments = specification.print_arguments();
     metadata.print_result = specification.print_result();
     metadata.capture_hook_id = owner->next_context_hook++;
-    p.shared_runtime = std::make_shared<
-        tracer::context_runtime::SharedSourceRuntime>(
-        generation.generation->scopes(), *owner->context_capture,
-        std::move(metadata),
-        [](void *opaque, std::span<const std::byte> bytes,
-           const std::shared_ptr<const void> &schema_lease) noexcept {
+    metadata.capture_event_bytes = event_bytes;
+    p.shared_runtime = std::make_shared<tracer::context_runtime::SharedSourceRuntime>(
+        generation.generation->scopes(), *p.capture_pool, std::move(metadata),
+        [](void* opaque, ::tracer::compat::span<const std::byte> bytes,
+           const std::shared_ptr<const void>& schema_lease) noexcept {
           return static_cast<tracer::context_delivery::ContextAgentDelivery *>(
                      opaque)
               ->try_publish_capture(bytes, schema_lease);
@@ -2799,12 +4247,14 @@ bool compile_shared_probe(Probe &p,
   p.request.context_required = true;
   const auto generated_wrapper =
       make_wrapper(p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
-                   true, true, &specification, false, true);
-  if (auto failure =
-          p.interpreter->ParseAndExecute(wrapper_prelude + generated_wrapper)) {
-    error = llvm::toString(std::move(failure));
+                   true, true, &specification, false, true, result_sret, wrapper_snapshots);
+  if (!parse_and_materialize(p, *p.interpreter,
+                             wrapper_prelude + wrapper_types + generated_wrapper, error)) {
     return false;
   }
+  if (run_initializers &&
+      !initialize_prepared_code(*p.interpreter, error))
+    return false;
   auto wrapper = p.interpreter->getSymbolAddress("clangtracer_wrapper");
   if (!wrapper) {
     error = llvm::toString(wrapper.takeError());
@@ -2824,7 +4274,9 @@ bool compile_shared_probe(Probe &p,
   return true;
 }
 
-bool bind_probe_symbols(clang::Interpreter &interpreter, std::string &error) {
+bool bind_probe_symbols(clang::Interpreter &interpreter,
+                        const clangtracer::v1::ProbeSpec &spec,
+                        std::string &error) {
   auto jit = interpreter.getExecutionEngine();
   if (!jit) {
     error = llvm::toString(jit.takeError());
@@ -2859,7 +4311,40 @@ bool bind_probe_symbols(clang::Interpreter &interpreter, std::string &error) {
   bind("tracer_stack_enter", &tracer_stack_enter);
   bind("tracer_stack_leave", &tracer_stack_leave);
   bind("tracer_capture_stack", &tracer_capture_stack);
+  bind("tracer_snapshot_mark", &tracer_snapshot_mark);
+  bind("tracer_snapshot_reset", &tracer_snapshot_reset);
+  bind("tracer_snapshot_storage", &tracer_snapshot_storage);
+  bind("tracer_snapshot_commit", &tracer_snapshot_commit);
   bind("tracer_capture_entry_stack", &tracer_capture_entry_stack);
+  auto bind_debug_methods = [&](const clangtracer::v1::DebugInfo &info) {
+    for (const auto &method : info.methods()) {
+      if (method.is_virtual() || method.is_variadic() ||
+          method.calling_convention() != llvm::dwarf::DW_CC_normal) {
+        error = "debug method uses an unsupported virtual, variadic, or "
+                "nondefault calling convention: " + method.name();
+        return false;
+      }
+      if (method.linkage_symbol().empty() || !method.runtime_entry())
+        continue;
+      symbols[jit->mangleAndIntern(method.linkage_symbol())] =
+          llvm::orc::ExecutorSymbolDef(
+              llvm::orc::ExecutorAddr::fromPtr(reinterpret_cast<void *>(
+                  static_cast<std::uintptr_t>(method.runtime_entry()))),
+              llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
+    }
+    return true;
+  };
+  if (spec.has_debug_info()) {
+    if (!bind_debug_methods(spec.debug_info()))
+      return false;
+    for (const auto &argument : spec.debug_info().arguments())
+      if (argument.has_object_type() &&
+          !bind_debug_methods(argument.object_type()))
+        return false;
+    if (spec.debug_info().has_result_object_type() &&
+        !bind_debug_methods(spec.debug_info().result_object_type()))
+      return false;
+  }
   if (auto failure = jit->getMainJITDylib().define(
           llvm::orc::absoluteSymbols(std::move(symbols)))) {
     error = llvm::toString(std::move(failure));
@@ -2868,28 +4353,322 @@ bool bind_probe_symbols(clang::Interpreter &interpreter, std::string &error) {
   return true;
 }
 
+bool validate_prepared_types(clang::ASTUnit &unit,
+                             const clangtracer::v1::ProbeSpec &spec,
+                             bool &result_sret, std::string &error) {
+  using namespace clangtracer::v1;
+  auto &ast = unit.getASTContext();
+  class Finder : public clang::RecursiveASTVisitor<Finder> {
+  public:
+    Finder(clang::ASTContext &ast, const ProbeSpec &spec)
+        : ast(ast), spec(spec), name(spec.prepared().selector().substr(
+              0, spec.prepared().selector().find('('))) {
+      name.erase(0, name.find_first_not_of(" \t"));
+      name.erase(name.find_last_not_of(" \t") + 1);
+      if (name.compare(0, 2, "::") == 0)
+        name.erase(0, 2);
+    }
+    bool VisitFunctionDecl(clang::FunctionDecl *candidate) {
+      if (!tracer::prepared::adapter_callable(*candidate, ast, name, spec.symbol()))
+        return true;
+      decl = candidate;
+      return false;
+    }
+    clang::ASTContext &ast;
+    const ProbeSpec &spec;
+    std::string name;
+    clang::FunctionDecl *decl = nullptr;
+  } finder(ast, spec);
+  try {
+    finder.TraverseDecl(ast.getTranslationUnitDecl());
+    const auto *decl = finder.decl;
+    if (!decl)
+      throw std::runtime_error("prepared declaration is absent from its adapter");
+    const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(decl);
+    const auto *function = decl->getType()->getAs<clang::FunctionProtoType>();
+    if (!function || function->isVariadic() || function->getCallConv() != clang::CC_C)
+      throw std::runtime_error("prepared declaration now has an unsupported ABI");
+    const auto function_info = function->getExtInfo();
+    if (function_info.getHasRegParm() || function_info.getProducesResult() ||
+        function_info.getNoCallerSavedRegs() || function_info.getCmseNSCall())
+      throw std::runtime_error("prepared declaration now has an ABI-changing attribute");
+    if (function->hasExtParameterInfos())
+      for (const auto &parameter : function->getExtParameterInfos())
+        if (parameter != clang::FunctionProtoType::ExtParameterInfo{})
+          throw std::runtime_error("prepared declaration now has an ABI-annotated parameter");
+    ProbeSpec actual;
+    actual.mutable_signature()->set_kind(method && !method->isStatic() ? METHOD : FUNCTION);
+    tracer::prepared::describe_prepared_callable(ast, *decl, method, actual,
+        unit.hasSema() ? &unit.getSema() : nullptr, &spec.prepared().header_types());
+    if (actual.debug_info().SerializeAsString() != spec.prepared().header_types().SerializeAsString() ||
+        actual.signature().SerializeAsString() != spec.signature().SerializeAsString())
+      throw std::runtime_error("prepared types or record layout changed; prepare again");
+    if (spec.signature().result() == OBJECT) {
+      llvm::LLVMContext llvm;
+      clang::CodeGenOptions options;
+      auto fs = llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem>(
+          &unit.getFileManager().getVirtualFileSystem());
+      std::unique_ptr<clang::CodeGenerator> generator(clang::CreateLLVMCodeGen(
+          unit.getDiagnostics(), "prepared-abi", std::move(fs),
+          unit.getHeaderSearchOpts(), unit.getPreprocessorOpts(), options, llvm));
+      generator->Initialize(ast);
+      const auto &abi = actual.signature().kind() == METHOD
+          ? clang::CodeGen::arrangeCXXMethodType(generator->CGM(), method->getParent(), function, method)
+          : clang::CodeGen::arrangeFreeFunctionType(generator->CGM(),
+                ast.getCanonicalType(decl->getType()).getAs<clang::FunctionProtoType>());
+      result_sret = abi.getReturnInfo().isIndirect();
+    }
+    return true;
+  } catch (const std::exception &exception) {
+    error = exception.what();
+    return false;
+  }
+}
+
 bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
-                   std::string &error) {
+                   std::string &error, bool run_initializers = true,
+                   bool syntax_only = false,
+                   clangtracer::v1::ValidationReport *report = nullptr,
+                   const VerifiedDebugEntry *verified_entry = nullptr) {
+  const bool typed_prepared = tracer::prepared::is_typed_version(
+      specification.prepared().format_version());
+  const bool prepared_callback_context = typed_prepared && specification.has_header_context();
+  const auto validate_options = [&error](const auto &first, const auto &last,
+                                         const char *source,
+                                         bool allow_toolchain = false) {
+    for (auto current = first; current != last; ++current) {
+      if (current->find('\0') != std::string::npos) {
+        error = std::string("invalid compiler option in ") + source;
+        return false;
+      }
+    }
+    if (!tracer::safe_preflight_compiler_arguments(first, last,
+                                                   allow_toolchain)) {
+      error = std::string("unsupported compiler option in ") + source;
+      return false;
+    }
+    return true;
+  };
+  // Do this before header AST recovery and before constructing either Clang
+  // compiler. Driver plugins and raw frontend escapes can execute code during
+  // nominally syntax-only validation.
+  if (!validate_options(specification.compile_options().begin(),
+                        specification.compile_options().end(),
+                        "probe options") ||
+      (!typed_prepared && specification.has_header_context() &&
+       !validate_options(
+           specification.header_context().compiler_arguments().begin(),
+           specification.header_context().compiler_arguments().end(),
+           "header context", true)) ||
+      (specification.has_receiver() &&
+       (specification.receiver().compiler_arguments_size() == 0 ||
+        !validate_options(
+            std::next(specification.receiver().compiler_arguments().begin()),
+            specification.receiver().compiler_arguments().end(),
+            "receiver context", true)))) {
+    return false;
+  }
+  if (typed_prepared) {
+    if (!prepared_callback_context && !specification.include_headers().empty()) {
+      error = "prepared injection requires a callback compilation context for optional includes";
+      return false;
+    }
+    if (prepared_callback_context) {
+      const auto &context = specification.header_context();
+      const auto &directory = context.working_directory();
+      if (directory.empty() || directory.front() != '/' || directory.size() > 4095 ||
+          directory.find('\0') != std::string::npos || context.ByteSizeLong() > 64 * 1024 ||
+          context.compiler_arguments_size() > 512 ||
+          !tracer::safe_prepared_callback_compiler_arguments(
+              context.compiler_arguments().begin(), context.compiler_arguments().end())) {
+        error = "invalid prepared callback compilation context";
+        return false;
+      }
+    }
+    if (specification.include_headers_size() > 16 ||
+        std::any_of(specification.include_headers().begin(), specification.include_headers().end(),
+                    [](const auto &header) {
+                      return header.empty() || header.front() != '/' || header.size() > 4095 ||
+                             header.find_first_of("\"\r\n\0", 0, 4) != std::string::npos;
+                    })) {
+      error = "invalid optional include path";
+      return false;
+    }
+  }
   const std::string &source = specification.callback_source();
+  const auto [callback_includes, callback_body] =
+      split_callback_includes(source);
+  std::vector<std::string> user_options;
+  if (prepared_callback_context) {
+    const auto &options = specification.header_context().compiler_arguments();
+    user_options.assign(options.begin(), options.end());
+    const auto &explicit_options = specification.compile_options();
+    for (auto it = explicit_options.begin(); it != explicit_options.end(); ++it) {
+      const std::string_view option(*it);
+      if (option.rfind("-D", 0) != 0 && option.rfind("-U", 0) != 0)
+        continue;
+      // The explicit options passed preflight, so split macro flags have operands.
+      const auto value = option.size() == 2 ? std::string_view(*++it) : option.substr(2);
+      if (tracer::prepared_callback_abi_macro(value)) {
+        error = "callback compiler options cannot override prepared _GLIBCXX_USE_CXX11_ABI";
+        return false;
+      }
+    }
+  }
+  user_options.insert(user_options.end(), specification.compile_options().begin(),
+                      specification.compile_options().end());
+  std::string forced_include_source;
+  if (!extract_forced_includes(user_options, forced_include_source, error))
+    return false;
+  const std::string type_header_prefix =
+      forced_include_source + callback_includes;
+  std::string requested_header_source = typed_prepared
+      ? tracer::prepared::adapter_source(specification.prepared()) : std::string();
+  for (const auto &header : specification.include_headers())
+    requested_header_source += "#include \"" + header + "\"\n";
+  const std::string callback_header_source =
+      callback_includes + requested_header_source;
+  const bool callback_headers_available =
+      typed_prepared || specification.has_header_context() ||
+      specification.include_headers_size() != 0 ||
+      !callback_includes.empty() || !forced_include_source.empty();
+  const std::string callback_type_declarations =
+      callback_headers_available ? std::string()
+                                 : recovered_record_declarations(specification);
+  if (!typed_prepared && specification.has_debug_info() &&
+      !interceptor_template_prelude(source).empty()) {
+    const auto has_multiple_pointers = [](const std::string &type) {
+      return std::count(type.begin(), type.end(), '*') > 1;
+    };
+    for (const auto &argument : specification.debug_info().arguments()) {
+      if (argument.has_object_type() &&
+          has_multiple_pointers(argument.cpp_type())) {
+        error = "multi-level pointers to recovered record argument " +
+                std::to_string(argument.index()) +
+                " are not supported by Interceptor signature validation";
+        return false;
+      }
+    }
+    if (specification.debug_info().has_result_object_type() &&
+        has_multiple_pointers(
+            specification.debug_info().result_cpp_type())) {
+      error = "multi-level pointers to recovered record results are not "
+              "supported by Interceptor signature validation";
+      return false;
+    }
+  }
+  if (!typed_prepared && !validate_object_abi_evidence(specification, callback_includes,
+                                    forced_include_source, error))
+    return false;
+  std::optional<VerifiedDebugEntry> local_verified_entry;
+  if (specification.has_debug_info() && !verified_entry) {
+    try {
+      const auto runtime_entry = validate_debug_entry(specification);
+      local_verified_entry =
+          VerifiedDebugEntry{&specification, runtime_entry};
+      verified_entry = &*local_verified_entry;
+    } catch (const std::exception &exception) {
+      error = exception.what();
+      return false;
+    }
+  }
   p.argument_names.assign(specification.argument_names().begin(),
                           specification.argument_names().end());
   clang::CXXRecordDecl *receiver_record = nullptr;
-  if (!build_and_validate_receiver_ast(specification, p.request, p.receiver_ast,
+  if (!typed_prepared &&
+      !build_and_validate_receiver_ast(specification, p.request, p.receiver_ast,
                                        receiver_record, error,
-                                       p.debug_records)) {
+                                       p.debug_records, type_header_prefix,
+                                       verified_entry)) {
     return false;
   }
+  bool result_sret = false;
+  if (!typed_prepared &&
+      !determine_object_result_sret(specification, p.debug_records,
+                                    result_sret, error))
+    return false;
   if (!initialize_llvm(error)) {
     return false;
   }
   const std::string resource_dir_argument =
       std::string("-resource-dir=") + tracer::runtime::clang_resource_dir();
   auto compiler_arguments = tracer::runtime::jit_arguments();
+  if (typed_prepared) {
+    try {
+      compiler_arguments = tracer::prepared::toolchain_arguments(
+          specification.prepared(), std::move(compiler_arguments));
+    } catch (const std::exception &exception) {
+      error = exception.what();
+      return false;
+    }
+  }
   compiler_arguments.insert(
       compiler_arguments.end(),
-      {"-std=c++20", "-x", "c++", "-fPIC", "-O0", resource_dir_argument});
+      {"-std=c++23", "-x", "c++", "-fPIC", "-O0", resource_dir_argument});
+  // The generated wrapper uses C++ exceptions, which CL mode disables by default.
+  if (tracer::clang_cl_driver(compiler_arguments))
+    compiler_arguments.push_back("-fcxx-exceptions");
+  std::vector<llvm::sys::fs::UniqueID> prepared_header_files;
+  if (typed_prepared) {
+    auto header_check_arguments = compiler_arguments;
+    header_check_arguments.push_back("-fsyntax-only");
+    DiagnosticCapture capture(nullptr);
+    auto toolchain_ast = clang::tooling::buildASTFromCodeWithArgs(
+        "", tracer::clang_driver_arguments(std::move(header_check_arguments)),
+        "clang-tracer-toolchain-headers.cc",
+        "clang-tracer", std::make_shared<clang::PCHContainerOperations>(),
+        clang::tooling::getClangStripOutputAdjuster(), {}, &capture);
+    if (!toolchain_ast || capture.had_error()) {
+      error = capture.message().empty()
+                  ? "cannot initialize the selected toolchain header search"
+                  : capture.message();
+      return false;
+    }
+    try {
+      const auto &target = toolchain_ast->getASTContext().getTargetInfo();
+      const auto &triple = target.getTriple();
+      if (triple.getArch() != llvm::Triple::x86_64 || !triple.isOSLinux() ||
+          !triple.isOSBinFormatELF() || !target.isLittleEndian() ||
+          target.getPointerWidth(clang::LangAS::Default) != 64 || target.getLongWidth() != 64 ||
+          !target.getCXXABI().isItaniumFamily())
+        throw std::invalid_argument("prepared toolchain ABI does not match the trace target");
+      const auto &search = toolchain_ast->getPreprocessor().getHeaderSearchInfo();
+      tracer::prepared::check_toolchain_headers(search, specification.prepared());
+      if (prepared_callback_context)
+        for (const auto &header : specification.prepared().adapter_standard_headers())
+          prepared_header_files.push_back(tracer::prepared::toolchain_header(search, header)->getUniqueID());
+    } catch (const std::exception &exception) {
+      error = exception.what();
+      return false;
+    }
+  }
+  const auto &snapshot_debug = specification.debug_info();
+  const bool needs_snapshot_headers =
+      (typed_prepared && specification.signature().kind() == clangtracer::v1::METHOD) ||
+      snapshot_debug.result_is_reference() ||
+      snapshot_debug.result_is_object_value() ||
+      std::any_of(snapshot_debug.arguments().begin(), snapshot_debug.arguments().end(),
+                  [](const auto &argument) {
+                    return argument.is_reference() || argument.is_object_value();
+                  });
+  if (needs_snapshot_headers) {
+    try {
+      const auto snapshot_headers = tracer::context_header_directory();
+      compiler_arguments.push_back("-I" + snapshot_headers);
+      compiler_arguments.push_back("-I" + snapshot_headers + "/../include");
+    } catch (const std::exception &) {
+      // Scalar/legacy hooks use embedded headers and need no snapshot codecs.
+    }
+  }
+  if (typed_prepared) {
+    const auto &options = specification.prepared().adapter_abi_options();
+    compiler_arguments.insert(compiler_arguments.end(), options.begin(), options.end());
+  }
+  compiler_arguments.insert(compiler_arguments.end(), user_options.begin(),
+                            user_options.end());
+  const auto interpreter_arguments = tracer::clang_driver_arguments(compiler_arguments);
   std::vector<const char *> args;
-  for (const auto &argument : compiler_arguments)
+  for (const auto &argument : interpreter_arguments)
     args.push_back(argument.c_str());
   clang::IncrementalCompilerBuilder builder;
   builder.SetCompilerArgs(args);
@@ -2898,13 +4677,59 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
     error = llvm::toString(compiler.takeError());
     return false;
   }
-  auto created = clang::Interpreter::create(std::move(*compiler));
-  if (!created) {
-    error = llvm::toString(created.takeError());
-    return false;
+  std::optional<tracer::callback_pch::Artifact> interpreter_pch;
+  std::optional<tracer::callback_pch::Artifact> syntax_pch;
+  // The C++ frontend extracts user -include options into source text. Keep the PCH out of
+  // both frontends in that case so macro and include order stay unchanged.
+  if (forced_include_source.empty()) {
+    interpreter_pch = tracer::callback_pch::prepare(
+        (*compiler)->getInvocation(), tracer::callback_pch::Mode::Interpreter);
+    syntax_pch = tracer::callback_pch::prepare(
+        (*compiler)->getInvocation(), tracer::callback_pch::Mode::Syntax);
   }
-  p.interpreter = std::move(*created);
-  if (!bind_probe_symbols(*p.interpreter, error)) {
+  if (interpreter_pch) {
+    try {
+      tracer::callback_pch::attach((*compiler)->getInvocation(),
+                                   *interpreter_pch);
+    } catch (...) {
+      tracer::callback_pch::disable(*interpreter_pch);
+      interpreter_pch.reset();
+    }
+  }
+  {
+    // Interpreter creation may initialize the PCH's initial header IR and
+    // start LLVM worker threads. Those are compiler workers, not application
+    // child tasks; do not associate them with an active shared context.
+    tracer::context_execution::Scope compiler_startup(
+        tracer::context_execution::Mode::LifecycleNoTrace);
+    if (!compiler_startup.entered()) {
+      error = "cannot suppress context propagation during interpreter "
+              "creation";
+      return false;
+    }
+    auto created = clang::Interpreter::create(std::move(*compiler));
+    if (!created && interpreter_pch) {
+      llvm::consumeError(created.takeError());
+      tracer::callback_pch::disable(*interpreter_pch);
+      interpreter_pch.reset();
+      clang::IncrementalCompilerBuilder fallback_builder;
+      fallback_builder.SetCompilerArgs(args);
+      auto fallback_compiler = fallback_builder.CreateCpp();
+      if (!fallback_compiler) {
+        error = llvm::toString(fallback_compiler.takeError());
+        return false;
+      }
+      created = clang::Interpreter::create(std::move(*fallback_compiler));
+    }
+    if (!created) {
+      error = llvm::toString(created.takeError());
+      return false;
+    }
+    p.interpreter = std::move(*created);
+  }
+  if (!capture_orc_errors(p, error))
+    return false;
+  if (!bind_probe_symbols(*p.interpreter, specification, error)) {
     return false;
   }
   const std::string prelude =
@@ -2916,9 +4741,21 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   const std::string context_prelude =
       std::string(tracer::kEmbeddedContextHeader) +
       "\n#define CLANG_TRACER_CONTEXT_TYPES_DEFINED 1\n";
-  const std::string user_source = prelude + context_prelude +
+  const std::string receiver_alias =
+      typed_prepared && specification.signature().kind() == clangtracer::v1::METHOD
+          ? "namespace tracer { using ResolvedTarget = " +
+                std::string(snapshot_debug.receiver_volatile() ? "volatile " : "") +
+                snapshot_debug.record_name() +
+                "; }\n#define CLANG_TRACER_HAS_TYPED_RECEIVER 1\n"
+          : std::string();
+  const std::string user_source = forced_include_source + prelude + context_prelude +
+                                  callback_header_source +
+                                  callback_type_declarations + receiver_alias +
+                                  tracer::kEmbeddedCallbackHeader +
                                   argument_aliases(specification) +
-                                  tracer::kEmbeddedCallbackHeader + source;
+                                  interceptor_template_prelude(source) +
+                                  "#line 1 \"callback_source\"\n" +
+                                  callback_body;
   /*
    * A typed receiver preflight imports the same real Clang declaration into a
    * temporary syntax-only translation unit. This keeps callback validation
@@ -2926,23 +4763,104 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
    */
   auto syntax_args = compiler_arguments;
   syntax_args.push_back("-fsyntax-only");
+  auto syntax_pch_args = syntax_args;
+  if (syntax_pch)
+    tracer::callback_pch::append_syntax_args(syntax_pch_args, *syntax_pch);
+  syntax_args = tracer::clang_driver_arguments(std::move(syntax_args));
+  syntax_pch_args = tracer::clang_driver_arguments(std::move(syntax_pch_args));
+  const auto build_callback_ast =
+      [&](const std::string &code, const char *file_name,
+          DiagnosticCapture &capture) -> std::unique_ptr<clang::ASTUnit> {
+    auto ast = clang::tooling::buildASTFromCodeWithArgs(
+        code, syntax_pch ? syntax_pch_args : syntax_args, file_name,
+        "clang-tracer", std::make_shared<clang::PCHContainerOperations>(),
+        clang::tooling::getClangStripOutputAdjuster(), {}, &capture);
+    if ((!ast || capture.had_error()) && syntax_pch) {
+      capture.reset_capture();
+      auto fallback = clang::tooling::buildASTFromCodeWithArgs(
+          code, syntax_args, file_name, "clang-tracer",
+          std::make_shared<clang::PCHContainerOperations>(),
+          clang::tooling::getClangStripOutputAdjuster(), {}, &capture);
+      if (fallback && !capture.had_error()) {
+        tracer::callback_pch::disable(*syntax_pch);
+        syntax_pch.reset();
+        syntax_pch_args = syntax_args;
+      }
+      return fallback;
+    }
+    return ast;
+  };
+  const auto run_callback_tool = [&](auto &&make_action,
+                                     const std::string &code,
+                                     auto &&postcondition) {
+    const auto run = [&](const std::vector<std::string> &arguments) {
+      const bool frontend_succeeded = clang::tooling::runToolOnCodeWithArgs(
+          make_action(), code, arguments, "clang-tracer-callback.cc",
+          "clang-tracer", std::make_shared<clang::PCHContainerOperations>());
+      return frontend_succeeded && postcondition();
+    };
+    const bool tried_pch = syntax_pch.has_value();
+    const bool succeeded = run(tried_pch ? syntax_pch_args : syntax_args);
+    if (!succeeded && tried_pch) {
+      const bool fallback_succeeded = run(syntax_args);
+      if (fallback_succeeded) {
+        tracer::callback_pch::disable(*syntax_pch);
+        syntax_pch.reset();
+        syntax_pch_args = syntax_args;
+      }
+      return fallback_succeeded;
+    }
+    return succeeded;
+  };
   CallbackShape shape;
   std::string bridge;
   std::string complete_source;
   std::string baseline_error;
   DiagnosticCapture user_capture(nullptr);
-  auto user_ast = clang::tooling::buildASTFromCodeWithArgs(
-      user_source, syntax_args, "clang-tracer-callback.cc", "clang-tracer",
-      std::make_shared<clang::PCHContainerOperations>(),
-      clang::tooling::getClangStripOutputAdjuster(), {}, &user_capture);
+  auto user_ast =
+      build_callback_ast(user_source, "clang-tracer-callback.cc", user_capture);
   bool shape_valid = false;
   if (user_ast) {
+    if (prepared_callback_context) {
+      const auto &search = user_ast->getPreprocessor().getHeaderSearchInfo();
+      std::size_t index = 0;
+      for (const auto &header : specification.prepared().adapter_standard_headers()) {
+        const auto file = tracer::prepared::toolchain_header(search, header);
+        if (!file || file->getUniqueID() != prepared_header_files[index++]) {
+          error = "callback include paths shadow prepared toolchain header <" + header + ">";
+          return false;
+        }
+      }
+    }
+    if (typed_prepared && !validate_prepared_types(*user_ast, specification, result_sret, error))
+      return false;
     const auto context_declarations =
         tracer::analyze_context_declarations(user_ast->getASTContext());
-    if (context_declarations.requires_context)
+    if (context_declarations.requires_context) {
+      std::string signature_assert;
+      if (!interceptor_template_prelude(source).empty()) {
+        shape_valid = inspect_callback_shape(user_ast->getASTContext(), shape,
+                                             baseline_error, true);
+        if (!shape_valid ||
+            !validate_specialized_signature(user_ast->getASTContext(), shape,
+                                            specification, error)) {
+          if (error.empty())
+            error = baseline_error.empty()
+                        ? "shared callback has an invalid Interceptor signature"
+                        : baseline_error;
+          return false;
+        }
+        signature_assert = specialized_signature_assert(
+            user_ast->getASTContext(), shape);
+      }
       return compile_shared_probe(
           p, specification, compiler_arguments,
-          prelude + context_prelude + tracer::kEmbeddedCallbackHeader, error);
+          forced_include_source + prelude + context_prelude +
+              tracer::kEmbeddedCallbackHeader,
+          forced_include_source, receiver_alias,
+          signature_assert, error, run_initializers, report, result_sret,
+          syntax_only, tracer::make_value_snapshot_code(user_ast->getASTContext(), specification));
+    }
     shape_valid = inspect_callback_shape(user_ast->getASTContext(), shape,
                                          baseline_error);
   } else {
@@ -2953,21 +4871,27 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   }
 
   bool baseline_preflight_succeeded = false;
+  DiagnosticCapture complete_capture(nullptr);
   if (shape_valid) {
+    if (!validate_specialized_signature(user_ast->getASTContext(), shape,
+                                        specification, error))
+      return false;
     if (shape.class_mode) {
       bridge = make_class_bridge(shape);
     } else {
       bridge = tracer::make_legacy_callback_bridge();
     }
+    const auto snapshots = tracer::make_value_snapshot_code(user_ast->getASTContext(), specification);
     const std::string generated = make_wrapper(
         p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
-        shape.has_pre, shape.has_post, &specification, shape.class_mode);
-    complete_source = user_source + "\n" + bridge + "\n" + generated;
-    DiagnosticCapture complete_capture(nullptr);
-    auto complete_ast = clang::tooling::buildASTFromCodeWithArgs(
-        complete_source, syntax_args, "clang-tracer-callback.cc",
-        "clang-tracer", std::make_shared<clang::PCHContainerOperations>(),
-        clang::tooling::getClangStripOutputAdjuster(), {}, &complete_capture);
+        shape.has_pre, shape.has_post, &specification, shape.class_mode,
+        false, result_sret, &snapshots);
+    complete_source = user_source + "\n" +
+                      specialized_signature_assert(user_ast->getASTContext(),
+                                                   shape) +
+                      bridge + "\n" + generated;
+    auto complete_ast = build_callback_ast(
+        complete_source, "clang-tracer-callback.cc", complete_capture);
     baseline_preflight_succeeded =
         complete_ast && !complete_capture.had_error();
     if (!baseline_preflight_succeeded) {
@@ -2978,8 +4902,16 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
     }
   }
 
+  if (baseline_preflight_succeeded && report) {
+    append_diagnostics(*report, complete_capture, "wrapper");
+  }
+
   if (!baseline_preflight_succeeded) {
     if (!p.receiver_ast) {
+      if (report) {
+        append_diagnostics(*report, user_capture, "syntax");
+        append_diagnostics(*report, complete_capture, "wrapper");
+      }
       error = baseline_error.empty()
                   ? "callback source failed Clang syntax validation"
                   : baseline_error;
@@ -2996,6 +4928,11 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
                                  p.receiver_ast->getASTContext(),
                                  p.receiver_ast->getFileManager(), false);
     for (const auto &entry : p.debug_records) {
+      // Real standard-library headers are compiled in the callback/JIT TU.
+      // Importing their donor-AST declarations and then including the header
+      // again creates duplicate specializations and builtin declarations.
+      if (standard_library_record_name(entry.layout.record_name()))
+        continue;
       if (auto err = importer.ImportDefinition(entry.decl)) {
         error = llvm::toString(std::move(err));
         return false;
@@ -3005,56 +4942,72 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
         error = llvm::toString(imported.takeError());
         return false;
       }
-      if (!validate_receiver_layout(p.interpreter->getASTContext(),
-                                    llvm::cast<clang::CXXRecordDecl>(*imported),
-                                    entry.layout, error))
+      if (!entry.opaque &&
+          !validate_receiver_layout(
+              p.interpreter->getASTContext(),
+              llvm::cast<clang::CXXRecordDecl>(*imported), entry.layout,
+              error))
         return false;
     }
-    if (llvm::Error import_error = importer.ImportDefinition(receiver_record)) {
-      error = "cannot import selected receiver declaration: " +
-              llvm::toString(std::move(import_error));
-      return false;
-    }
-    auto imported_decl = importer.Import(receiver_record);
-    if (!imported_decl) {
-      error = "cannot retrieve imported selected receiver declaration: " +
-              llvm::toString(imported_decl.takeError());
-      return false;
-    }
-    auto *imported_receiver =
-        llvm::dyn_cast<clang::CXXRecordDecl>(*imported_decl);
-    if (!imported_receiver ||
-        !validate_receiver_layout(p.interpreter->getASTContext(),
-                                  imported_receiver, specification.receiver(),
-                                  error)) {
-      error = "receiver layout changed during AST import: " + error;
-      return false;
-    }
-    if (!create_receiver_alias(p.interpreter->getASTContext(),
-                               imported_receiver, specification.receiver())) {
-      error = "cannot create typed receiver alias in interpreter AST";
-      return false;
+    if (receiver_record) {
+      if (llvm::Error import_error = importer.ImportDefinition(receiver_record)) {
+        error = "cannot import selected receiver declaration: " +
+                llvm::toString(std::move(import_error));
+        return false;
+      }
+      auto imported_decl = importer.Import(receiver_record);
+      if (!imported_decl) {
+        error = "cannot retrieve imported selected receiver declaration: " +
+                llvm::toString(imported_decl.takeError());
+        return false;
+      }
+      auto *imported_receiver =
+          llvm::dyn_cast<clang::CXXRecordDecl>(*imported_decl);
+      if (!imported_receiver ||
+          !validate_receiver_layout(p.interpreter->getASTContext(),
+                                    imported_receiver, specification.receiver(),
+                                    error)) {
+        error = "receiver layout changed during AST import: " + error;
+        return false;
+      }
+      if (!create_receiver_alias(p.interpreter->getASTContext(),
+                                 imported_receiver, specification.receiver())) {
+        error = "cannot create typed receiver alias in interpreter AST";
+        return false;
+      }
     }
 
     std::string typed_user_source =
         prelude + context_prelude +
-        (p.request.kind == tracer::CallableKind::Method
+        (receiver_record && p.request.kind == tracer::CallableKind::Method
              ? "#define CLANG_TRACER_HAS_TYPED_RECEIVER 1\n"
              : "") +
         "#define CLANG_TRACER_FIELD_INFERENCE 1\n" +
-        argument_aliases(specification) + tracer::kEmbeddedCallbackHeader +
-        source;
+        callback_header_source +
+        (callback_headers_available
+             ? std::string()
+             : missing_recovered_record_declarations(
+                   p.interpreter->getASTContext(), specification)) +
+        tracer::kEmbeddedCallbackHeader +
+        argument_aliases(specification) +
+        interceptor_template_prelude(source) +
+        "#line 1 \"callback_source\"\n" + callback_body;
     std::string import_error;
     ReceiverCallbackShape receiver_shape;
-    receiver_shape.argument_names = p.argument_names;
-    auto typed_action = std::make_unique<ReceiverImportAction>(
-        p.receiver_ast->getASTContext(), p.receiver_ast->getFileManager(),
-        receiver_record, receiver_shape, &specification.receiver(),
-        receiver_record, &import_error, &p.debug_records);
-    const bool user_syntax_ok = clang::tooling::runToolOnCodeWithArgs(
-        std::move(typed_action), typed_user_source, syntax_args,
-        "clang-tracer-callback.cc", "clang-tracer",
-        std::make_shared<clang::PCHContainerOperations>());
+    const auto make_user_action =
+        [&]() -> std::unique_ptr<clang::FrontendAction> {
+      receiver_shape = ReceiverCallbackShape{};
+      receiver_shape.argument_names = p.argument_names;
+      import_error.clear();
+      return std::make_unique<ReceiverImportAction>(
+          p.receiver_ast->getASTContext(), p.receiver_ast->getFileManager(),
+          receiver_record, receiver_shape, &specification.receiver(),
+          receiver_record, &import_error, &p.debug_records, &specification);
+    };
+    const bool user_syntax_ok =
+        run_callback_tool(make_user_action, typed_user_source, [&] {
+          return receiver_shape.valid && import_error.empty();
+        });
     if (!user_syntax_ok || !receiver_shape.valid || !import_error.empty()) {
       error = import_error.empty() ? receiver_shape.error : import_error;
       if (error.empty()) {
@@ -3086,19 +5039,28 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
     bridge = receiver_shape.bridge;
     const std::string generated = make_wrapper(
         p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
-        shape.has_pre, shape.has_post, &specification, shape.class_mode);
-    complete_source = typed_user_source + "\n" + bridge + "\n" + generated;
+        shape.has_pre, shape.has_post, &specification, shape.class_mode,
+        false, result_sret, &receiver_shape.snapshots);
+    complete_source = typed_user_source + "\n" +
+                      specialized_signature_assert(user_ast->getASTContext(),
+                                                   shape) +
+                      bridge + "\n" + generated;
     import_error.clear();
     ReceiverCallbackShape final_shape;
-    final_shape.argument_names = p.argument_names;
-    auto final_action = std::make_unique<ReceiverImportAction>(
-        p.receiver_ast->getASTContext(), p.receiver_ast->getFileManager(),
-        receiver_record, final_shape, &specification.receiver(),
-        receiver_record, &import_error, &p.debug_records);
-    const bool complete_syntax_ok = clang::tooling::runToolOnCodeWithArgs(
-        std::move(final_action), complete_source, syntax_args,
-        "clang-tracer-callback.cc", "clang-tracer",
-        std::make_shared<clang::PCHContainerOperations>());
+    const auto make_final_action =
+        [&]() -> std::unique_ptr<clang::FrontendAction> {
+      final_shape = ReceiverCallbackShape{};
+      final_shape.argument_names = p.argument_names;
+      import_error.clear();
+      return std::make_unique<ReceiverImportAction>(
+          p.receiver_ast->getASTContext(), p.receiver_ast->getFileManager(),
+          receiver_record, final_shape, &specification.receiver(),
+          receiver_record, &import_error, &p.debug_records, &specification);
+    };
+    const bool complete_syntax_ok =
+        run_callback_tool(make_final_action, complete_source, [&] {
+          return final_shape.valid && import_error.empty();
+        });
     if (!complete_syntax_ok || !final_shape.valid || !import_error.empty()) {
       error = import_error.empty() ? final_shape.error : import_error;
       if (error.empty()) {
@@ -3106,11 +5068,15 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
       }
       return false;
     }
+    if (syntax_only)
+      return true;
   } else {
     // The callback and generated wrapper compiled without the receiver alias;
     // preserve legacy callbacks and avoid importing unrelated target bodies.
     p.receiver_ast.reset();
   }
+  if (syntax_only)
+    return true;
   p.class_callback = shape.class_mode;
   p.has_pre = shape.has_pre;
   p.has_post = shape.has_post;
@@ -3120,19 +5086,20 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
     return false;
   }
   DiagnosticCaptureScope capture(ci->getDiagnostics());
-  auto parsed = p.interpreter->ParseAndExecute(complete_source);
-  if (parsed) {
-    error = capture.message();
-    if (error.empty()) {
-      error = llvm::toString(std::move(parsed));
-    } else {
-      llvm::consumeError(std::move(parsed));
-    }
+  if (!parse_and_materialize(p, *p.interpreter, complete_source, error)) {
+    append_diagnostic_text(error, capture.message());
+    append_orc_errors(p, error);
+    append_unresolved_link_candidates(p, specification, error);
     return false;
   }
+  if (run_initializers &&
+      !initialize_prepared_code(*p.interpreter, error))
+    return false;
   auto cb = p.interpreter->getSymbolAddress("tracer_user_dispatch");
   if (!cb) {
     error = llvm::toString(cb.takeError());
+    append_orc_errors(p, error);
+    append_unresolved_link_candidates(p, specification, error);
     return false;
   }
   p.request.callback_address = address_value(*cb);
@@ -3142,8 +5109,11 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   auto wrapper = p.interpreter->getSymbolAddress("clangtracer_wrapper");
   if (!wrapper) {
     error = llvm::toString(wrapper.takeError());
+    append_orc_errors(p, error);
+    append_unresolved_link_candidates(p, specification, error);
     return false;
   }
+  append_diagnostic_text(error, capture.message());
   p.wrapper = reinterpret_cast<void *>(
       static_cast<std::uintptr_t>(address_value(*wrapper)));
   p.request.wrapper_address = reinterpret_cast<std::uintptr_t>(p.wrapper);
@@ -3154,8 +5124,30 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
 clangtracer::v1::Value to_proto_value(const tracer::TraceValue &v) {
   clangtracer::v1::Value out;
   out.set_type(static_cast<clangtracer::v1::ValueType>(v.type));
+  if (v.snapshot) {
+    const auto &in = *v.snapshot;
+    auto *snapshot = out.mutable_snapshot();
+    snapshot->set_status(static_cast<clangtracer::context::v1::ValueSnapshot::Status>(in.status));
+    if (in.cpp_type) snapshot->set_cpp_type(in.cpp_type);
+    if (in.detail) snapshot->set_detail(in.detail);
+    if (in.status == tracer::ValueSnapshot::Complete && in.descriptor &&
+        in.root_type && in.descriptor_size <= 4096 && in.payload_size <= 4096 &&
+        (in.payload || in.payload_size == 0) && in.container_role_count <= 128 && in.record_type_count <= 128) {
+      snapshot->set_root_type(in.root_type);
+      snapshot->set_descriptor_set(in.descriptor, in.descriptor_size);
+      snapshot->set_payload(in.payload, in.payload_size);
+      for (std::size_t i = 0; i < in.container_role_count; ++i)
+        snapshot->add_container_roles(in.container_roles[i]);
+      for (std::size_t i = 0; i < in.record_type_count; ++i)
+        snapshot->add_record_types(in.record_types[i]);
+    } else if (in.status == tracer::ValueSnapshot::Complete) {
+      snapshot->set_status(clangtracer::context::v1::ValueSnapshot::FAILED);
+      snapshot->set_detail("invalid snapshot storage or capture bounds");
+    }
+  }
   switch (v.type) {
   case tracer::ValueType::Int32:
+  case tracer::ValueType::Bool:
   case tracer::ValueType::Int64:
     out.set_signed_value(v.signed_value);
     break;
@@ -3198,7 +5190,7 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
                                               const tracer::TraceContext *ctx,
                                               void *instance) noexcept {
   auto *p = find_probe(id);
-  if (!p || !ctx || !p->active.load(std::memory_order_seq_cst) ||
+  if (!p || !ctx || !p->callbacks_active() ||
       !p->callback_enabled.load(std::memory_order_relaxed) || callback_depth) {
     return 0;
   }
@@ -3207,6 +5199,7 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
   long long value = 0;
   bool succeeded = false;
   tracer::TraceContext invocation = *ctx;
+  invocation.stack_storage = nullptr;
   invocation.named_count = 0;
   for (unsigned i = 0;
        i < invocation.argument_count && i < tracer::kMaxArguments; ++i)
@@ -3226,6 +5219,7 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
   if (succeeded) {
     tracer_event_dispatch(id, &invocation, value);
   }
+  tracer::release_native_stack(invocation);
   errno = saved_errno;
   return value;
 }
@@ -3233,7 +5227,7 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
 extern "C" bool
 tracer_callback_lifecycle_enter(unsigned long long id) noexcept {
   auto *p = find_probe(id);
-  if (callback_depth || !p || !p->active.load(std::memory_order_seq_cst) ||
+  if (callback_depth || !p || !p->callbacks_active() ||
       !p->callback_enabled.load(std::memory_order_relaxed))
     return false;
   ++callback_depth;
@@ -3249,7 +5243,10 @@ extern "C" void tracer_callback_failure(unsigned long long id) noexcept {
 extern "C" void tracer_capture_stack(const tracer::TraceContext *ctx,
                                      unsigned depth,
                                      bool application_only) noexcept {
-  if (!ctx)
+  if (!ctx || (ctx->stack.requested_depth == depth &&
+               ctx->stack.application_only == application_only &&
+               (ctx->stack.status == tracer::StackStatus::Complete ||
+                ctx->stack.status == tracer::StackStatus::Truncated)))
     return;
   const int saved_errno = errno;
   ++callback_depth;
@@ -3264,13 +5261,14 @@ extern "C" void tracer_capture_entry_stack(const tracer::TraceContext *ctx,
     tracer_capture_stack(ctx, depth, ctx->stack_application_only);
 }
 
+
 extern "C" void tracer_event_dispatch(unsigned long long id,
                                       const tracer::TraceContext *ctx,
                                       long long cb) noexcept {
   const int saved_errno = errno;
   auto *p = find_probe(id);
   if (callback_depth || !p || !ctx ||
-      !p->active.load(std::memory_order_seq_cst) || p->delivery.socket_fd < 0) {
+      !p->callbacks_active() || p->delivery.socket_fd < 0) {
     errno = saved_errno;
     return;
   }
@@ -3302,6 +5300,11 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
           static_cast<std::uint64_t>(now.tv_sec) * 1000000000ULL + now.tv_nsec);
     }
     event.set_object_address(ctx->object_address);
+    if (ctx->receiver_snapshot) {
+      tracer::TraceValue receiver;
+      receiver.snapshot = ctx->receiver_snapshot;
+      *event.mutable_receiver_snapshot() = to_proto_value(receiver).snapshot();
+    }
     for (std::uint32_t i = 0;
          i < ctx->argument_count && i < tracer::kMaxArguments; ++i) {
       *event.add_arguments() = to_proto_value(ctx->arguments[i]);
@@ -3336,15 +5339,34 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
       }
     }
     event.set_callback_value(cb);
-    if (ctx->stack.status != tracer::StackStatus::Disabled)
-      tracer::serialize_native_stack(ctx->stack, *event.mutable_stack());
     if (ctx->phase == tracer::TracePhase::Post) {
       *event.mutable_result() = to_proto_value(ctx->result);
     }
     event.set_agent_dropped_events(
         p->delivery.dropped.load(std::memory_order_relaxed));
+    // Preserve the event when positional/named snapshot duplication exceeds
+    // the native packet budget; the typed getter reports explicit truncation.
+    const auto discard_snapshot = [](clangtracer::context::v1::ValueSnapshot *snapshot) {
+      snapshot->Clear();
+      snapshot->set_status(clangtracer::context::v1::ValueSnapshot::LIMIT_EXCEEDED);
+      snapshot->set_detail("snapshot exceeds native event packet budget");
+    };
+    for (int i = 0; i < event.arguments_size() && event.ByteSizeLong() > tracer::EventTransport::kInlineEventBytes; ++i) {
+      auto &value = *event.mutable_arguments(i);
+      if (!value.has_snapshot()) continue;
+      discard_snapshot(value.mutable_snapshot());
+      for (auto &named : *event.mutable_named_arguments())
+        if (named.argument_index() == static_cast<unsigned>(i)) *named.mutable_value() = value;
+    }
+    if (event.ByteSizeLong() > tracer::EventTransport::kInlineEventBytes && event.has_result() && event.result().has_snapshot())
+      discard_snapshot(event.mutable_result()->mutable_snapshot());
+    if (event.ByteSizeLong() > tracer::EventTransport::kInlineEventBytes && event.has_receiver_snapshot())
+      discard_snapshot(event.mutable_receiver_snapshot());
+    const bool base_fits = event.ByteSizeLong() <= tracer::EventTransport::kInlineEventBytes;
+    if (ctx->stack.status != tracer::StackStatus::Disabled)
+      tracer::serialize_native_stack(ctx->stack, *event.mutable_stack());
     const auto size = event.ByteSizeLong();
-    if (size <= tracer::EventTransport::kMaxEventBytes) {
+    if (base_fits && size <= static_cast<std::size_t>(std::numeric_limits<int>::max())) {
       packet->bytes.resize(size);
       valid =
           event.SerializeToArray(packet->bytes.data(), static_cast<int>(size));
@@ -3431,9 +5453,17 @@ bool tracer::detail::tracer_enqueue_log(const TraceContext *context,
   return queued;
 }
 
+extern "C" {
+// The server reads this word without stopping or executing code in the target.
+static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+static_assert(sizeof(std::atomic<std::uint64_t>) == sizeof(std::uint64_t));
+std::atomic<std::uint64_t> tracer_agent_capacity_v1{tracer::kAgentCapacityTag};
+}
+
 extern "C" int tracer_agent_start(tracer::Request *request) {
   AgentOperation operation("prepare", request);
   try {
+    tracer::context_scheduler::ScopedPthreadBypass compiler_threads;
     if (!request || request->version != tracer::kBootstrapVersion) {
       return operation.finish(-1);
     }
@@ -3474,7 +5504,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       const auto *prior = a.probes[i].get();
       if (prior &&
           (prior->active.load(std::memory_order_seq_cst) ||
-           prior->in_flight.load(std::memory_order_seq_cst) ||
+           prior->invocations_in_flight() ||
            prior->delivery.pending.load(std::memory_order_acquire) ||
            prior->transport_active)) {
         native_cache_quiescent = false;
@@ -3495,10 +5525,15 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     // mappings. No dynamic symbol lookup is involved, including for local and
     // hidden functions. Raw-symbol requests retain their explicit dlsym path.
     operation.stage = "resolve_symbol";
-    void *entry =
-        specification.has_debug_info()
-            ? reinterpret_cast<void *>(validate_debug_entry(specification))
-            : ::dlsym(RTLD_DEFAULT, request->symbol);
+    std::optional<VerifiedDebugEntry> verified_debug_entry;
+    void *entry = nullptr;
+    if (specification.has_debug_info()) {
+      const auto runtime_entry = validate_debug_entry(specification);
+      verified_debug_entry = VerifiedDebugEntry{&specification, runtime_entry};
+      entry = reinterpret_cast<void *>(runtime_entry);
+    } else {
+      entry = ::dlsym(RTLD_DEFAULT, request->symbol);
+    }
     if (!entry) {
       set_error(request, "target symbol was not found in the process");
       return operation.finish(-1);
@@ -3507,21 +5542,60 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     p->request.original_entry = reinterpret_cast<std::uintptr_t>(entry);
     int prot = 0;
     std::uintptr_t map_lo = 0, map_hi = 0;
-    if (!mapping(entry, map_lo, map_hi, prot) || (prot & PROT_EXEC) == 0) {
-      set_error(request, "target symbol is not in an executable mapping");
+    if (!mapping(entry, map_lo, map_hi, prot) ||
+        (prot & (PROT_READ | PROT_EXEC)) != (PROT_READ | PROT_EXEC)) {
+      set_error(request, "target symbol is not in a readable executable mapping");
       return operation.finish(-1);
     }
+    Probe *replaced = nullptr;
+    bool entry_matches_original = true;
     for (std::size_t i = 0; i < a.retained; ++i) {
       auto *other = a.probes[i].get();
       if (other && other->active.load() &&
           other->request.original_entry == p->request.original_entry) {
-        set_error(request, "target symbol address is already hooked");
-        return operation.finish(-1);
+        const auto &prior = other->request;
+        if (prior.patch_size > map_hi - p->request.original_entry) {
+          set_error(request,
+                    "target symbol address is already hooked by another probe");
+          return operation.finish(-1);
+        }
+        if (std::memcmp(entry, prior.installed, prior.patch_size) == 0) {
+          // A retired wrapper from a previous session can remain resident
+          // after its entry is restored. Only the live detour has an owner.
+          if (request->reject_replacement || replaced || other->session_id != request->session_id) {
+            set_error(request, "target symbol address is already hooked by another probe");
+            return operation.finish(-1);
+          }
+          replaced = other;
+        }
+        entry_matches_original &= std::memcmp(entry, prior.original, prior.patch_size) == 0;
       }
     }
+    if (request->expected_replaced_probe_id &&
+        (!replaced || replaced->request.probe_id != request->expected_replaced_probe_id)) {
+      set_error(request, "reload probe no longer owns the target entry");
+      return operation.finish(-1);
+    }
+    if (!replaced && !entry_matches_original) {
+      set_error(request, "live entry does not match any retained probe generation");
+      return operation.finish(-1);
+    }
     tracer::native_detour::Patch target_patch;
-    if (!decode_patch(static_cast<const std::uint8_t *>(entry), p->request,
-                      target_patch, error)) {
+    if (replaced) {
+      // The live entry contains our jump. Decode the saved prologue at its
+      // original address so RIP-relative operands keep their original targets.
+      p->request.replaced_probe_id = replaced->request.probe_id;
+      p->request.patch_size = replaced->request.patch_size;
+      std::memcpy(p->request.original, replaced->request.original,
+                  p->request.patch_size);
+      if (!tracer::native_detour::decode(
+              {p->request.original, p->request.patch_size},
+              p->request.original_entry, target_patch, error)) {
+        set_error(request, error.c_str());
+        return operation.finish(-1);
+      }
+    } else if (!decode_patch(static_cast<const std::uint8_t *>(entry), p->request,
+                             target_patch, error)) {
       set_error(request, error.c_str());
       return operation.finish(-1);
     }
@@ -3535,6 +5609,11 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       if (!other || !other->active.load()) {
         continue;
       }
+      const auto &prior = other->request;
+      if (prior.original_entry == p->request.original_entry &&
+          prior.patch_size == p->request.patch_size &&
+          std::memcmp(prior.original, p->request.original, prior.patch_size) == 0)
+        continue;
       const auto x = other->request.original_entry,
                  y = p->request.original_entry;
       const auto xe = x + other->request.patch_size,
@@ -3551,10 +5630,16 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       return operation.finish(-1);
     }
     operation.progress("compile_callback");
-    if (!compile_probe(*p, specification, error)) {
+    const auto compile_started = std::chrono::steady_clock::now();
+    if (!compile_probe(
+            *p, specification, error, true, false, nullptr,
+            verified_debug_entry ? &*verified_debug_entry : nullptr)) {
       set_error(request, error.c_str());
       return operation.finish(-1);
     }
+    p->request.jit_compile_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - compile_started).count();
     operation.stage = "prepare_context";
     if (p->request.context_required && !prepare_context_pthread(a, *p, error)) {
       set_error(request, error.c_str());
@@ -3609,6 +5694,8 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     Probe *installed_probe = a.probes[slot].get();
     a.probe_slots[slot].store(installed_probe, std::memory_order_release);
     ++a.retained;
+    tracer_agent_capacity_v1.store(tracer::kAgentCapacityTag | a.retained,
+                                  std::memory_order_relaxed);
     *request = installed_probe->request;
     return operation.finish(0);
   } catch (const std::exception &e) {
@@ -3617,6 +5704,162 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
   } catch (...) {
     set_error(request, "unexpected exception while adding probe");
     return operation.finish(-1);
+  }
+}
+
+extern "C" int tracer_agent_validate(tracer::ValidationRequest *request) {
+  tracer::context_scheduler::ScopedPthreadBypass compiler_threads;
+  const auto set_error = [&](const std::string &message) {
+    if (!request)
+      return;
+    std::strncpy(request->error, message.c_str(), sizeof(request->error) - 1);
+    request->error[sizeof(request->error) - 1] = '\0';
+  };
+  try {
+    if (!request || request->version != tracer::kBootstrapVersion ||
+        request->level > 1) {
+      set_error("invalid native validation request");
+      return -1;
+    }
+    request->error[0] = '\0';
+    const auto spec_length = ::strnlen(request->spec_path,
+                                       sizeof(request->spec_path));
+    const auto report_length = ::strnlen(request->report_path,
+                                         sizeof(request->report_path));
+    if (spec_length == 0 || spec_length == sizeof(request->spec_path) ||
+        report_length == 0 || report_length == sizeof(request->report_path)) {
+      set_error("validation spec/report path is missing or too long");
+      return -1;
+    }
+    std::ifstream input(request->spec_path, std::ios::binary);
+    if (!input) {
+      set_error("cannot open serialized validation ProbeSpec");
+      return -1;
+    }
+    std::string serialized(kMaxSerializedProbeSpec + 1, '\0');
+    input.read(serialized.data(), static_cast<std::streamsize>(serialized.size()));
+    const auto serialized_size = static_cast<std::size_t>(input.gcount());
+    if (serialized_size > kMaxSerializedProbeSpec) {
+      set_error("serialized validation ProbeSpec exceeds 256 KiB");
+      return -1;
+    }
+    serialized.resize(serialized_size);
+    clangtracer::v1::ProbeSpec spec;
+    if (!spec.ParseFromArray(serialized.data(),
+                             static_cast<int>(serialized.size())) ||
+        !spec.has_signature() || spec.callback_source().empty() ||
+        spec.symbol().empty() || !spec.has_debug_info()) {
+      set_error("validation ProbeSpec is incomplete or malformed");
+      return -1;
+    }
+
+    clangtracer::v1::ValidationReport report;
+    report.set_level(static_cast<clangtracer::v1::ValidateProbeRequest::Level>(
+        request->level));
+    tracer::Request native_request{};
+    native_request.version = tracer::kBootstrapVersion;
+    native_request.probe_id = std::numeric_limits<std::uint64_t>::max();
+    native_request.kind = static_cast<tracer::CallableKind>(
+        spec.signature().kind());
+    native_request.result = static_cast<tracer::ValueType>(
+        spec.signature().result());
+    native_request.argument_count = static_cast<std::uint32_t>(
+        spec.signature().arguments_size());
+    native_request.original_entry = spec.debug_info().runtime_entry();
+    std::strncpy(native_request.symbol, spec.symbol().c_str(),
+                 sizeof(native_request.symbol) - 1);
+    std::strncpy(native_request.session_id, "validation",
+                 sizeof(native_request.session_id) - 1);
+    std::strncpy(native_request.source_path, request->spec_path,
+                 sizeof(native_request.source_path) - 1);
+    std::strncpy(native_request.event_socket, "/tmp/clang-tracer-validation",
+                 sizeof(native_request.event_socket) - 1);
+    for (int i = 0; i < spec.signature().arguments_size(); ++i)
+      native_request.arguments[i] = static_cast<tracer::ValueType>(
+          spec.signature().arguments(i));
+    if (tracer::prepared::is_typed_version(spec.prepared().format_version())) {
+      for (const auto &option : spec.prepared().adapter_toolchain_options())
+        if (::tracer::compat::starts_with(option, "--driver-mode="))
+          report.add_effective_options(option);
+      if (spec.has_header_context())
+        for (const auto &option : spec.header_context().compiler_arguments())
+          report.add_effective_options(option);
+    }
+    for (const auto &option : spec.compile_options())
+      report.add_effective_options(option);
+
+    std::string error;
+    Probe prepared;
+    prepared.request = native_request;
+    prepared.trampoline = nullptr;
+    prepared.session_id = "validation";
+    const bool syntax_only = request->level == 1;
+    bool success = false;
+    {
+      std::lock_guard<std::mutex> lock(agent_mutex);
+      success = compile_probe(prepared, spec, error, false, syntax_only,
+                              &report);
+    }
+    if (!success && !error.empty()) {
+      bool represented = false;
+      for (const auto &diagnostic : report.diagnostics()) {
+        if (diagnostic.severity() == "error" &&
+            (diagnostic.message() == error ||
+             error.find(diagnostic.message()) != std::string::npos)) {
+          represented = true;
+          break;
+        }
+      }
+      if (!represented)
+        append_failure(report, syntax_only ? "syntax" : "compile", error);
+    }
+    report.set_success(success);
+    std::string report_bytes;
+    if (!report.SerializeToString(&report_bytes) || report_bytes.size() > 1024 * 1024) {
+      set_error("cannot serialize native validation report");
+      return -1;
+    }
+    const std::string report_path(request->report_path, report_length);
+    const std::string temporary_path =
+        report_path + ".tmp." + std::to_string(::getpid()) + "." +
+        std::to_string(validation_report_sequence.fetch_add(
+            1, std::memory_order_relaxed));
+    const int fd = ::open(temporary_path.c_str(),
+                          O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                          0600);
+    if (fd < 0) {
+      set_error("cannot create private validation report file");
+      return -1;
+    }
+    bool write_ok = true;
+    std::size_t written = 0;
+    while (written < report_bytes.size()) {
+      const auto count = ::write(fd, report_bytes.data() + written,
+                                 report_bytes.size() - written);
+      if (count < 0 && errno == EINTR)
+        continue;
+      if (count <= 0) {
+        write_ok = false;
+        break;
+      }
+      written += static_cast<std::size_t>(count);
+    }
+    if (write_ok && ::fsync(fd) != 0)
+      write_ok = false;
+    if (::close(fd) != 0)
+      write_ok = false;
+    if (!write_ok || ::rename(temporary_path.c_str(), report_path.c_str()) != 0) {
+      ::unlink(temporary_path.c_str());
+      set_error("cannot atomically publish native validation report");
+      return -1;
+    }
+    return 0;
+  } catch (const std::exception &exception) {
+    set_error(exception.what());
+    return -1;
+  } catch (...) {
+    set_error("unexpected failure during native validation");
+    return -1;
   }
 }
 
@@ -3648,15 +5891,33 @@ extern "C" int tracer_agent_stop(tracer::Request *request) {
     std::uintptr_t lo = 0, hi = 0;
     int prot = 0;
     if (!mapping(entry, lo, hi, prot) ||
-        reinterpret_cast<std::uintptr_t>(entry) + p->request.patch_size > hi ||
-        !(prot & PROT_EXEC)) {
+        p->request.patch_size > hi - reinterpret_cast<std::uintptr_t>(entry) ||
+        (prot & (PROT_READ | PROT_EXEC)) != (PROT_READ | PROT_EXEC)) {
       set_error(request, "remove requires the original executable mapping");
       return operation.finish(-2);
     }
-    if (std::memcmp(entry, p->request.original, p->request.patch_size) != 0) {
-      set_error(request, "remove requires the caller to restore original "
-                         "bytes first");
-      return operation.finish(-2);
+    const bool restored = std::memcmp(entry, p->request.original, p->request.patch_size) == 0;
+    const bool superseded = !restored && std::any_of(
+        a.probes.begin(), a.probes.end(), [&](const auto &other) {
+      return other && other.get() != p && other->active.load() &&
+             other->session_id == p->session_id &&
+             other->request.original_entry == p->request.original_entry &&
+             other->request.patch_size == p->request.patch_size &&
+             std::memcmp(other->request.original, p->request.original, p->request.patch_size) == 0 &&
+             std::memcmp(entry, other->request.installed, p->request.patch_size) == 0;
+    });
+    if (!restored && !superseded) {
+      set_error(request, "remove requires original bytes or a verified successor detour");
+      return -2;
+    }
+    // Closing admission and testing for invocations must be one operation.
+    // A delayed wrapper entrant after closure can still run its trampoline.
+    std::uint64_t state = 0;
+    if (!p->in_flight.compare_exchange_strong(state, Probe::admission_closed) &&
+        !(state & Probe::admission_closed)) {
+      *request = p->request;
+      set_error(request, "probe invocations are in flight; remove can be retried");
+      return 1;
     }
     operation.stage = "drain";
     p->active.exchange(false, std::memory_order_seq_cst);
@@ -3673,7 +5934,7 @@ extern "C" int tracer_agent_stop(tracer::Request *request) {
     p->request.pthread_create_active_tasks =
         static_cast<std::uint32_t>(std::min<std::size_t>(
             scheduler_tasks, std::numeric_limits<std::uint32_t>::max()));
-    if (p->in_flight.load(std::memory_order_seq_cst) ||
+    if (p->invocations_in_flight() ||
         p->delivery.pending.load(std::memory_order_acquire) ||
         (a.context_probe_count == 0 && scheduler_tasks != 0)) {
       p->request.event_drops =

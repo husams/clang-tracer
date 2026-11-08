@@ -5,9 +5,16 @@ add_library(tracer_context_analysis STATIC src/context_analysis.cpp src/context_
   src/context_hooks.cpp src/context_schema.cpp src/context_receiver.cpp src/context_stdlib.cpp
   src/context_unwind.cpp src/context_support_effects.cpp src/context_registry.cpp
   src/context_facade.cpp src/context_runtime.cpp src/context_activation.cpp src/context_paths.cpp
-  src/context_query.cpp)
+  src/context_query.cpp src/runtime_identity.cpp)
 set_target_properties(tracer_context_analysis PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_compile_features(tracer_context_analysis PUBLIC cxx_std_20)
+# LLVM's default SDK profile may omit RTTI for its polymorphic base classes.
+# The importer and memory-manager translation units derive from LLVM/Clang
+# classes. Keep state/runtime RTTI enabled for std::any/exception contracts.
+if(NOT LLVM_ENABLE_RTTI)
+  set_property(SOURCE src/context_binding.cpp src/agent.cpp src/callback_pch.cpp
+    APPEND PROPERTY COMPILE_OPTIONS -fno-rtti)
+endif()
+target_compile_features(tracer_context_analysis PUBLIC cxx_std_23)
 target_include_directories(tracer_context_analysis SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_include_directories(tracer_context_analysis PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(tracer_context_analysis PUBLIC clang-cpp LLVM tracer_context_engine
@@ -16,7 +23,7 @@ target_compile_options(tracer_context_analysis PRIVATE -Wall -Wextra -Wpedantic
   -fvisibility=hidden -fvisibility-inlines-hidden)
 add_library(tracer_context_collector STATIC src/context_collector.cpp)
 set_target_properties(tracer_context_collector PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_compile_features(tracer_context_collector PUBLIC cxx_std_20)
+target_compile_features(tracer_context_collector PUBLIC cxx_std_23)
 target_include_directories(tracer_context_collector PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(tracer_context_collector PUBLIC tracer_context_analysis
   tracer_context_delivery)
@@ -50,7 +57,7 @@ if(BUILD_TESTING)
     tracer_context_collector)
   target_include_directories(context-analysis-tests SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
   target_include_directories(context-analysis-tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-  set(_context_system_arguments "")
+  set(_context_system_arguments "  \"-nostdinc++\",\n")
   foreach(_include IN LISTS CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES)
     string(APPEND _context_system_arguments "  \"-isystem\", \"${_include}\",\n")
   endforeach()

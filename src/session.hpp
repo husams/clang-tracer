@@ -3,10 +3,12 @@
 #include <chrono>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -20,18 +22,32 @@ namespace injector {
 class Process;
 }
 
+class AgentRuntimeIncompatible final : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
 class Session final {
 public:
   Session(std::string id, std::uint32_t pid, std::uint64_t process_start,
           std::string agent_path, std::string event_path,
           std::string context_endpoint, std::string context_durable_directory,
-          std::chrono::seconds operation_timeout);
+          std::chrono::seconds operation_timeout,
+          ContextTransportBudget context_budget = {});
 
-  void attach();
+  void attach(const std::string &expected_executable);
   clangtracer::v1::Probe add_probe(const clangtracer::v1::ProbeSpec &spec,
                                    const std::string &source_directory,
                                    std::uint64_t probe_id,
-                                   const std::array<std::uint8_t, 16> &lineage);
+                                   const std::array<std::uint8_t, 16> &lineage,
+                                   const std::string &bulk_batch_id = {},
+                                   std::uint64_t reload_probe_id = 0,
+                                   const std::function<bool()> &cancelled = {});
+  clangtracer::v1::ProbeSpec reload_spec(std::uint64_t probe_id, std::string source);
+  clangtracer::v1::ValidationReport
+  validate_probe(const clangtracer::v1::ProbeSpec &spec,
+                 const std::string &source_directory,
+                 clangtracer::v1::ValidateProbeRequest::Level level);
   clangtracer::v1::Probe remove_probe(std::uint64_t probe_id);
   void detach();
   void shutdown() noexcept;
@@ -39,6 +55,7 @@ public:
   void refresh_process_state() noexcept;
 
   [[nodiscard]] clangtracer::v1::Session snapshot() const;
+  [[nodiscard]] std::optional<unsigned> agent_retained_count() const;
   [[nodiscard]] std::uint64_t events_sent(std::uint64_t probe_id) const;
   [[nodiscard]] bool accepts_event(std::uint64_t probe_id,
                                    std::uint32_t pid) const;
@@ -60,6 +77,7 @@ private:
 
   struct ProbeRecord {
     clangtracer::v1::Probe value;
+    clangtracer::v1::ProbeSpec reload_spec;
     std::uintptr_t remote_request = 0;
     std::string source_file;
     bool patch_committed = false;
@@ -74,15 +92,20 @@ private:
   std::string context_endpoint_;
   std::string context_durable_directory_;
   std::chrono::seconds operation_timeout_;
+  ContextTransportBudget context_budget_;
   std::vector<std::string> discovered_module_paths_;
   std::vector<injector::ApplicationModule> application_modules_;
   mutable std::mutex mutex_;
   std::mutex operation_mutex_;
   clangtracer::v1::Session::State state_ = clangtracer::v1::Session::ATTACHED;
   std::string error_;
+  std::string executable_;
+  std::optional<clangtracer::v1::JitRuntimeProfile> jit_runtime_;
   bool unsafe_target_ = false;
   std::uintptr_t start_address_ = 0;
   std::uintptr_t stop_address_ = 0;
+  std::uintptr_t validate_address_ = 0;
+  std::uintptr_t capacity_address_ = 0;
   std::uintptr_t pthread_detour_address_ = 0;
   std::map<std::uint64_t, ProbeRecord> probes_;
   std::optional<PthreadCreatePatch> pthread_create_patch_;

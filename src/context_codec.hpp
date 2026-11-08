@@ -1,28 +1,32 @@
 #pragma once
 
-#include "bounded_proto.hpp"
-#include "context_schema.hpp"
-
 #include <algorithm>
 #include <array>
 #include <deque>
 #include <list>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
-#include <span>
 #include <string>
+#include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
+
+#include "bounded_proto.hpp"
+#include "context_schema.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer::context_engine {
 
 struct EncodeBudget {
   using Selector = CapturePathSelector;
   using PathStep = CapturePathStep;
-  using Truncation = bool (*)(void *, std::span<const PathStep>, std::uint64_t,
+  using Truncation = bool (*)(void*, ::tracer::compat::span<const PathStep>, std::uint64_t,
                               std::uint64_t) noexcept;
   std::size_t max_items = 100, items = 0, visits = 0, depth = 0, path_size = 0;
   CaptureLimits limits{};
@@ -82,6 +86,8 @@ bool encode_state_payload(BoundedProtoWriter &w, const T &value,
 }
 template <class T> struct IsContainer : std::false_type {};
 template <class T, std::size_t N>
+struct IsContainer<T[N]> : std::true_type {};
+template <class T, std::size_t N>
 struct IsContainer<std::array<T, N>> : std::true_type {};
 template <class T, class A>
 struct IsContainer<std::vector<T, A>> : std::true_type {};
@@ -139,15 +145,120 @@ template <> struct Codec<std::string> {
     return w.string(f, v);
   }
 };
-template <class T> struct Codec<std::optional<T>> {
+template <> struct Codec<std::string_view> {
   static bool write(BoundedProtoWriter &w, std::uint32_t f,
-                    const std::optional<T> &v, EncodeBudget &b) noexcept {
-    if (!v)
-      return true;
+                    std::string_view v, EncodeBudget &) noexcept {
+    return w.string(f, v);
+  }
+};
+template <class T> struct Codec<T *> {
+  static bool write(BoundedProtoWriter &w, std::uint32_t f, T *v,
+                    EncodeBudget &) noexcept {
+    return w.u64(f, reinterpret_cast<std::uintptr_t>(v));
+  }
+};
+template <class A, class B> struct Codec<std::pair<A, B>> {
+  static bool write(BoundedProtoWriter &w, std::uint32_t f,
+                    const std::pair<A, B> &v, EncodeBudget &b) noexcept {
     if (!w.begin_message(f))
       return false;
-    const bool ok = encode_value(w, 1, *v, b);
+    const bool ok = encode_value(w, 1, v.first, b) && encode_value(w, 2, v.second, b);
     return w.end_message() && ok;
+  }
+};
+template <class... T> struct Codec<std::tuple<T...>> {
+  static bool write(BoundedProtoWriter &w, std::uint32_t f,
+                    const std::tuple<T...> &v, EncodeBudget &b) noexcept {
+    if (!w.begin_message(f))
+      return false;
+    std::uint32_t field = 1;
+    const bool ok = std::apply([&](const auto &...item) {
+      return (encode_value(w, field++, item, b) && ...);
+    }, v);
+    return w.end_message() && ok;
+  }
+};
+template <class T>
+bool encode_present_value(BoundedProtoWriter &w, std::uint32_t field,
+                          const T &value, EncodeBudget &budget) noexcept {
+  if (!w.begin_message(field))
+    return false;
+  const bool ok = encode_value(w, 1, value, budget);
+  return w.end_message() && ok;
+}
+
+template <class T> struct Codec<std::optional<T>> {
+  static bool write(BoundedProtoWriter &w, std::uint32_t field,
+                    const std::optional<T> &value, EncodeBudget &budget) noexcept {
+    return !value || encode_present_value(w, field, *value, budget);
+  }
+};
+
+template <> struct Codec<std::monostate> {
+  static bool write(BoundedProtoWriter &w, std::uint32_t field,
+                    std::monostate, EncodeBudget &) noexcept {
+    return w.begin_message(field) && w.end_message();
+  }
+};
+
+template <class... T> struct Codec<std::variant<T...>> {
+  using Variant = std::variant<T...>;
+
+  template <std::size_t... I>
+  static bool write_active(BoundedProtoWriter &w, const Variant &value,
+                           EncodeBudget &budget, std::index_sequence<I...>) noexcept {
+    return ((value.index() == I &&
+             encode_present_value(w, I + 2, std::get<I>(value), budget)) || ...);
+  }
+
+  static bool write(BoundedProtoWriter &w, std::uint32_t field,
+                    const Variant &value, EncodeBudget &budget) noexcept {
+    if (!w.begin_message(field))
+      return false;
+    const bool ok = w.u64(1, value.index()) &&
+        (value.valueless_by_exception() ||
+         write_active(w, value, budget, std::index_sequence_for<T...>{}));
+    return w.end_message() && ok;
+  }
+};
+
+template <class T, class = void> struct CanSnapshotPointee : std::false_type {};
+template <class T>
+struct CanSnapshotPointee<T, std::void_t<decltype(sizeof(T))>>
+    : std::bool_constant<std::is_object_v<T> && !std::is_array_v<T> &&
+                         !std::is_volatile_v<T>> {};
+
+template <class T, class Pointer>
+bool encode_snapshot_pointer(BoundedProtoWriter &w, std::uint32_t field,
+                             Pointer *pointer, bool owned,
+                             EncodeBudget &budget) noexcept {
+  if (!w.begin_message(field))
+    return false;
+  bool ok = w.u64(1, reinterpret_cast<std::uintptr_t>(pointer));
+  if constexpr (CanSnapshotPointee<T>::value)
+    if (ok && owned && pointer)
+      ok = encode_present_value(w, 2, *pointer, budget);
+  return w.end_message() && ok;
+}
+
+template <class T> struct Codec<std::unique_ptr<T>> {
+  static bool write(BoundedProtoWriter &w, std::uint32_t field,
+                    const std::unique_ptr<T> &value, EncodeBudget &budget) noexcept {
+    return encode_snapshot_pointer<T>(w, field, value.get(), true, budget);
+  }
+};
+
+template <class T> struct Codec<std::shared_ptr<T>> {
+  static bool write(BoundedProtoWriter &w, std::uint32_t field,
+                    const std::shared_ptr<T> &value, EncodeBudget &budget) noexcept {
+    return encode_snapshot_pointer<T>(w, field, value.get(), value.use_count() != 0, budget);
+  }
+};
+
+template <class T> struct Codec<std::weak_ptr<T>> {
+  static bool write(BoundedProtoWriter &w, std::uint32_t field,
+                    const std::weak_ptr<T> &value, EncodeBudget &) noexcept {
+    return w.begin_message(field) && w.boolean(1, value.expired()) && w.end_message();
   }
 };
 
@@ -179,6 +290,18 @@ bool encode_sequence(BoundedProtoWriter &w, std::uint32_t f, const C &v,
   }
   return true;
 }
+template <class T, std::size_t N> struct Codec<T[N]> {
+  static bool write(BoundedProtoWriter &w, std::uint32_t f,
+                    const T (&v)[N], EncodeBudget &b) noexcept {
+    struct View {
+      using value_type = T;
+      const T *data;
+      const T *begin() const { return data; }
+      std::size_t size() const { return N; }
+    };
+    return encode_sequence(w, f, View{v}, b);
+  }
+};
 template <class T, std::size_t N> struct Codec<std::array<T, N>> {
   static bool write(BoundedProtoWriter &w, std::uint32_t f,
                     const std::array<T, N> &v, EncodeBudget &b) noexcept {

@@ -10,8 +10,7 @@ is `tracer[PID]>`. Use the [Python client skill](../clang-tracer-python/SKILL.md
 when the task explicitly calls for Python. For supported syntax and examples,
 use the repository revision that matches the running binaries. If the current
 checkout lacks the linked demos or manual, read them from the matching branch
-or release. For a current `c++17` build, start with
-`git show origin/c++17:docs/native-repl.md`.
+or release. For the current checkout, start with `docs/native-repl.md` and the linked examples.
 
 At the prompt, use `%help` to discover the installed commands and `%help probe inject`
 or `%help events open` for options. `%help api` lists the C++ API, and topics such

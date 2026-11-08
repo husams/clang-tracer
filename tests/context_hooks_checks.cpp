@@ -1,5 +1,5 @@
-#include <fstream>
 #include <algorithm>
+#include <fstream>
 #include <iterator>
 #include <stdexcept>
 #include <string>
@@ -12,6 +12,7 @@
 #include "context_hooks.hpp"
 #include "context_lifecycle.hpp"
 #include "context_test_config.hpp"
+#include "tracer/compat.hpp"
 
 void verify_context_hooks() {
   std::ifstream file(TRACER_TEST_SOURCE_DIR "/tests/fixtures/context_hooks_reachable.cpp");
@@ -350,29 +351,33 @@ void verify_context_hooks() {
       "#include \"tracer/callback.hpp\"\n" + unmarked_source, args,
       "unmarked-state-injection.cc");
   if (!unmarked_ast || unmarked_ast->getDiagnostics().hasErrorOccurred() ||
-      !tracer::analyze_context_declarations(unmarked_ast->getASTContext())
-           .error.starts_with("invalid_state_injection:"))
+      !::tracer::compat::starts_with(
+          tracer::analyze_context_declarations(unmarked_ast->getASTContext()).error,
+          "invalid_state_injection:")) {
     throw std::runtime_error("unmarked typed injection was accepted");
+  }
   const std::string unbound_marked_source =
       "struct Scope {}; struct Data : shared_state<Scope> {}; "
       "struct Hook { void pre(const Call& call, Data& value) {} };";
   auto unbound_marked_ast = clang::tooling::buildASTFromCodeWithArgs(
       "#include \"tracer/callback.hpp\"\n" + unbound_marked_source,
       args, "unbound-marked-state-injection.cc");
-  if (!unbound_marked_ast ||
-      unbound_marked_ast->getDiagnostics().hasErrorOccurred() ||
-      !tracer::analyze_context_declarations(unbound_marked_ast->getASTContext())
-           .error.starts_with("invalid_state_injection:"))
-    throw std::runtime_error(
-        "marked typed injection without a matching dependency was accepted");
+  if (!unbound_marked_ast || unbound_marked_ast->getDiagnostics().hasErrorOccurred() ||
+      !::tracer::compat::starts_with(
+          tracer::analyze_context_declarations(unbound_marked_ast->getASTContext()).error,
+          "invalid_state_injection:")) {
+    throw std::runtime_error("marked typed injection without a matching dependency was accepted");
+  }
   auto scalar_state_ast = clang::tooling::buildASTFromCodeWithArgs(
       "#include \"tracer/callback.hpp\"\n"
       "struct Hook { Hook(State<int>); void pre(const Call& call) {} };",
       args, "scalar-state-marker-rejected.cc");
   if (!scalar_state_ast || scalar_state_ast->getDiagnostics().hasErrorOccurred() ||
-      !tracer::analyze_context_declarations(scalar_state_ast->getASTContext())
-           .error.starts_with("invalid_state_marker:"))
+      !::tracer::compat::starts_with(
+          tracer::analyze_context_declarations(scalar_state_ast->getASTContext()).error,
+          "invalid_state_marker:")) {
     throw std::runtime_error("State<int> was accepted as a marked state");
+  }
 
   const std::string generic_payload_source = R"CPP(
     #include <string>
@@ -560,9 +565,11 @@ void verify_context_hooks() {
       "#include \"tracer/callback.hpp\"\n" + mixed_generic_source, args,
       "generic-init-get-rejected.cc");
   if (!mixed_generic_ast || mixed_generic_ast->getDiagnostics().hasErrorOccurred() ||
-      !tracer::analyze_context_declarations(mixed_generic_ast->getASTContext())
-           .error.starts_with("invalid_context_access_plan:"))
+      !::tracer::compat::starts_with(
+          tracer::analyze_context_declarations(mixed_generic_ast->getASTContext()).error,
+          "invalid_context_access_plan:")) {
     throw std::runtime_error("direct get after dynamic init_scope was admitted");
+  }
 
   const auto cleanup_plan = [&](const std::string &source) {
     auto cleanup_ast = clang::tooling::buildASTFromCodeWithArgs(
@@ -608,17 +615,19 @@ void verify_context_hooks() {
       "call.context().event(\"visitor cleanup\"); } }; "
       "struct Hook { void pre(const Call& call) { "
       "call.context().with<Data>([&](Data&) { Cleanup cleanup{call}; }); } };");
-  if (!visitor_cleanup_event.error.starts_with("invalid_context_borrow:"))
+  if (!::tracer::compat::starts_with(visitor_cleanup_event.error, "invalid_context_borrow:")) {
     throw std::runtime_error("visitor temporary destructor event was admitted");
+  }
 
   const auto visitor_scope_init = cleanup_plan(
       "struct Scope {}; struct Data : shared_state<Scope> {}; "
       "struct Hook { void pre(const Call& call) { "
       "call.context().with<Data>([&](Data&) { "
       "call.context().init_scope<Scope>(); }); } };");
-  if (!visitor_scope_init.error.starts_with("invalid_context_access_plan:") ||
-      visitor_scope_init.error.find("init_scope") == std::string::npos)
+  if (!::tracer::compat::starts_with(visitor_scope_init.error, "invalid_context_access_plan:") ||
+      visitor_scope_init.error.find("init_scope") == std::string::npos) {
     throw std::runtime_error("init_scope inside a visitor lacked an explicit rejection");
+  }
 
   const auto container_cleanup = cleanup_plan(
       "#include <vector>\n"
@@ -650,9 +659,8 @@ void verify_context_hooks() {
       "void (*function)() = nullptr; function(); } }; } "
       "struct Hook { void pre(const Call& call) { "
       "call.context().event(\"visible\"); std::FakeNative{}.run(); } };");
-  if (!spoofed_std.error.starts_with("unsupported_context_effect:") ||
-      spoofed_std.error.find("protected standard namespace") ==
-          std::string::npos)
-    throw std::runtime_error("source std namespace spoof was not rejected: " +
-                             spoofed_std.error);
+  if (!::tracer::compat::starts_with(spoofed_std.error, "unsupported_context_effect:") ||
+      spoofed_std.error.find("protected standard namespace") == std::string::npos) {
+    throw std::runtime_error("source std namespace spoof was not rejected: " + spoofed_std.error);
+  }
 }

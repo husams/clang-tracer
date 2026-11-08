@@ -1,21 +1,24 @@
 #include "context_stream.hpp"
-#include "context_capture.hpp"
-#include "context_journal.hpp"
-#include "context_schema.hpp"
-#include "context_execution.hpp"
-#include "context_diagnostic_format.hpp"
-#include <grpcpp/channel.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <limits>
-#include <stdexcept>
 #include <random>
-#include <array>
+#include <stdexcept>
 #include <tuple>
-#include <cstdio>
+
+#include <grpcpp/channel.h>
 #include <unistd.h>
+
+#include "context_capture.hpp"
+#include "context_diagnostic_format.hpp"
+#include "context_execution.hpp"
+#include "context_journal.hpp"
+#include "context_schema.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer::context_delivery {
 namespace {
@@ -24,18 +27,20 @@ constexpr std::size_t kGlobalPacketLimit = 4096;
 constexpr std::size_t kGlobalRingLimit = 64;
 constexpr std::size_t kCaptureSchemasPerEvent = 64;
 constexpr std::size_t kRingStorageBudgetBytes = 8ull * 1024 * 1024;
-constexpr std::size_t kStagingCreditBudgetBytes =
-    tracer::context_engine::kCaptureQueueBudgetBytes - kRingStorageBudgetBytes;
+std::size_t staging_budget(std::size_t transport_memory_bytes) noexcept {
+  return transport_memory_bytes > kRingStorageBudgetBytes
+             ? transport_memory_bytes - kRingStorageBudgetBytes : 0;
+}
 constexpr std::size_t kStagingMultiplier = 8;
 constexpr std::size_t kStagingPerPacket = 4096;
 std::atomic<std::size_t> g_live_rings{0};
 std::atomic<std::size_t> g_live_packets{0};
 std::atomic<std::size_t> g_staging_credits_used{0};
 std::atomic<std::uint64_t> g_next_storage_domain{1};
-bool reserve_staging_credit(std::size_t bytes) noexcept {
+bool reserve_staging_credit(std::size_t bytes, std::size_t budget) noexcept {
   auto used = g_staging_credits_used.load(std::memory_order_relaxed);
   do {
-    if (bytes > kStagingCreditBudgetBytes - used) return false;
+    if (used > budget || bytes > budget - used) return false;
   } while (!g_staging_credits_used.compare_exchange_weak(
       used, used + bytes, std::memory_order_acq_rel,
       std::memory_order_relaxed));
@@ -74,6 +79,39 @@ void report_export_failure(const char *label, std::uint64_t code = 0) noexcept {
 }
 }
 
+std::size_t ContextHookRing::max_capture_event_bytes(
+    std::size_t transport_memory_bytes) noexcept {
+  const auto overhead = StreamLimits{}.queued_packets * sizeof(Entry) +
+                        kStagingPerPacket * (kCaptureSchemasPerEvent + 1);
+  const auto staging = staging_budget(transport_memory_bytes);
+  return staging > overhead ? (staging - overhead) / kStagingMultiplier : 0;
+}
+
+StreamLimits stream_limits_for_context(ContextTransportBudget budget) {
+  StreamLimits limits;
+  if (budget.memory_bytes > std::numeric_limits<std::size_t>::max())
+    throw std::invalid_argument("--context-transport-memory-bytes exceeds size_t");
+  limits.transport_memory_bytes = static_cast<std::size_t>(budget.memory_bytes);
+  // TraceEvent includes both the original event and its projected trace fields.
+  // Leave room for the schema envelope and protobuf framing within its signed
+  // message length.
+  const auto wire_maximum = (std::numeric_limits<int>::max() -
+                             limits.max_epoch_schema_bytes - 4096) / 2;
+  if (!budget.event_bytes || budget.event_bytes > wire_maximum)
+    throw std::invalid_argument("--context-event-bytes must be between 1 and " +
+                                std::to_string(wire_maximum) +
+                                " bytes for the protobuf message format");
+  const auto maximum = ContextHookRing::max_capture_event_bytes(limits.transport_memory_bytes);
+  if (budget.event_bytes > maximum)
+    throw std::invalid_argument("--context-transport-memory-bytes is too small for "
+                                "--context-event-bytes (maximum " +
+                                std::to_string(maximum) + " event bytes at this budget)");
+  limits.max_event_bytes = budget.event_bytes;
+  limits.max_packet_bytes = std::max(limits.max_packet_bytes, budget.event_bytes + 64);
+  limits.queued_bytes = limits.transport_memory_bytes;
+  return limits;
+}
+
 HookPacket::StorageCharge::~StorageCharge() noexcept {
   reset();
 }
@@ -100,9 +138,11 @@ void HookPacket::StorageCharge::take(
 
 ContextHookRing::ContextHookRing(std::size_t byte_capacity, std::size_t packet_limit,
                                  std::size_t packet_bytes,
-                                 std::size_t capture_event_bytes)
+                                 std::size_t capture_event_bytes,
+                                 std::size_t transport_memory_bytes)
     : capacity_(byte_capacity), packet_limit_(packet_limit), packet_bytes_(packet_bytes),
       capture_event_bytes_(std::min(capture_event_bytes, packet_bytes)),
+      staging_budget_(staging_budget(transport_memory_bytes)),
       storage_(&shared_hook_storage()), domain_(g_next_storage_domain.fetch_add(1)) {
   if (capacity_ == 0 || packet_limit_ == 0 || packet_limit_ > kGlobalPacketLimit ||
       packet_bytes_ == 0 || packet_bytes_ > capacity_ ||
@@ -118,7 +158,7 @@ ContextHookRing::ContextHookRing(std::size_t byte_capacity, std::size_t packet_l
     throw std::invalid_argument("hook ring metadata size overflow");
   }
   entries_bytes_ = packet_limit_ * sizeof(Entry);
-  if (!reserve_staging_credit(entries_bytes_)) {
+  if (!reserve_staging_credit(entries_bytes_, staging_budget_)) {
     g_live_rings.fetch_sub(1, std::memory_order_relaxed);
     throw std::bad_alloc();
   }
@@ -148,13 +188,14 @@ ContextHookRing::~ContextHookRing() {
   g_live_rings.fetch_sub(1, std::memory_order_relaxed);
 }
 
-bool ContextHookRing::try_publish(std::span<const std::byte> bytes,
+bool ContextHookRing::try_publish(::tracer::compat::span<const std::byte> bytes,
                                   std::shared_ptr<const void> lease) noexcept {
   const HookPacketView packet{bytes, std::move(lease)};
-  return try_publish_batch(std::span<const HookPacketView>(&packet, 1));
+  return try_publish_batch(::tracer::compat::span<const HookPacketView>(&packet, 1));
 }
 
-bool ContextHookRing::try_publish_batch(std::span<const HookPacketView> packets) noexcept {
+bool ContextHookRing::try_publish_batch(
+    ::tracer::compat::span<const HookPacketView> packets) noexcept {
   std::unique_lock lock(mutex_, std::try_to_lock);
   if (!lock.owns_lock() || packets.empty() || packets.size() > packet_limit_) {
     dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -206,7 +247,7 @@ bool ContextHookRing::try_publish_batch(std::span<const HookPacketView> packets)
     }
     staging_total += staging;
   }
-  if (!reserve_staging_credit(staging_total)) {
+  if (!reserve_staging_credit(staging_total, staging_budget_)) {
     g_live_packets.fetch_sub(packets.size(), std::memory_order_release);
     dropped_.fetch_add(1, std::memory_order_relaxed);
     return false;
@@ -236,8 +277,6 @@ bool ContextHookRing::try_publish_batch(std::span<const HookPacketView> packets)
     entry.allocation_size = bytes.size();
     entry.queue_charge = bytes.size();
     entry.reservation = next_reservation_++;
-    entry.schema_records = nullptr;
-    entry.schema_count = 0;
     entry.capture_event = false;
     std::memcpy(entry.storage, bytes.data(), bytes.size());
     entry.lease = packet.lease;
@@ -249,8 +288,8 @@ bool ContextHookRing::try_publish_batch(std::span<const HookPacketView> packets)
 }
 
 bool ContextHookRing::try_publish_capture(
-    std::span<const std::byte> event_record,
-    const std::shared_ptr<const void> &schema_lease) noexcept {
+    ::tracer::compat::span<const std::byte> event_record,
+    const std::shared_ptr<const void>& schema_lease) noexcept {
   const auto *schema_set =
       tracer::context_engine::capture_schema_set(schema_lease);
   if (!schema_set || schema_set->size() > kCaptureSchemasPerEvent) {
@@ -260,6 +299,11 @@ bool ContextHookRing::try_publish_capture(
   std::unique_lock lock(mutex_, std::try_to_lock);
   if (!lock.owns_lock() || event_record.empty() ||
       event_record.size() > capture_event_bytes_ || item_count_ == packet_limit_) {
+    dropped_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  const auto captured = schema_set->event_bytes();
+  if (event_record.data() != captured.data() || event_record.size() != captured.size()) {
     dropped_.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
@@ -291,28 +335,12 @@ bool ContextHookRing::try_publish_capture(
   const auto staging_bytes = (schema_bytes + event_record.size()) *
                                  kStagingMultiplier +
                              kStagingPerPacket * (schema_count + 1);
-  const auto remainder = event_record.size() % alignof(const tracer::context_engine::SchemaRecord *);
-  const auto padding = remainder == 0 ? 0 :
-      alignof(const tracer::context_engine::SchemaRecord *) - remainder;
-  if (schema_count > (std::numeric_limits<std::size_t>::max() -
-                      event_record.size() - padding) /
-                         sizeof(const tracer::context_engine::SchemaRecord *)) {
-    dropped_.fetch_add(1, std::memory_order_relaxed);
-    return false;
-  }
-  const auto allocation_bytes = event_record.size() + padding +
-      schema_count * sizeof(const tracer::context_engine::SchemaRecord *);
-  const auto queue_charge = event_record.size() + padding +
-      schema_count * sizeof(const tracer::context_engine::SchemaRecord *);
-  if (staging_bytes > std::numeric_limits<std::size_t>::max() - queue_charge) {
-    dropped_.fetch_add(1, std::memory_order_relaxed);
-    return false;
-  }
+  const auto queue_charge = event_record.size();
   if (queue_charge > capacity_ - queued_bytes_) {
     dropped_.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
-  if (!reserve_staging_credit(staging_bytes)) {
+  if (!reserve_staging_credit(staging_bytes, staging_budget_)) {
     dropped_.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
@@ -326,36 +354,13 @@ bool ContextHookRing::try_publish_capture(
   } while (!g_live_packets.compare_exchange_weak(
       global_packets, global_packets + 1, std::memory_order_acq_rel,
       std::memory_order_relaxed));
-  const auto allocation = storage_->allocate(domain_, allocation_bytes);
-  if (allocation.status != tracer::context_engine::StorageStatus::ok) {
-    release_staging_credit(staging_bytes);
-    g_live_packets.fetch_sub(1, std::memory_order_release);
-    dropped_.fetch_add(1, std::memory_order_relaxed);
-    return false;
-  }
-  auto *base = static_cast<std::byte *>(allocation.pointer);
-  std::memcpy(base, event_record.data(), event_record.size());
-  auto *schema_records = reinterpret_cast<const tracer::context_engine::SchemaRecord **>(
-      base + event_record.size() + padding);
-  for (std::size_t i = 0; i < schema_count; ++i) {
-    schema_records[i] = schema_set->record(i);
-    if (!schema_records[i]) {
-      storage_->release(domain_, allocation.pointer, allocation_bytes);
-      release_staging_credit(staging_bytes);
-      g_live_packets.fetch_sub(1, std::memory_order_release);
-      dropped_.fetch_add(1, std::memory_order_relaxed);
-      return false;
-    }
-  }
+  // The lease already pins this buffer and its schemas. Keep it in the
+  // capture arena until the consumer has copied the packet outside the hook.
   Entry &entry = entries_[item_tail_];
-  entry.storage = allocation.pointer;
   entry.length = event_record.size();
   entry.staging_bytes = staging_bytes;
-  entry.allocation_size = allocation_bytes;
   entry.queue_charge = queue_charge;
   entry.reservation = next_reservation_++;
-  entry.schema_records = schema_records;
-  entry.schema_count = schema_count;
   entry.capture_event = true;
   entry.lease = schema_lease;
   queued_bytes_ += queue_charge;
@@ -369,12 +374,18 @@ bool ContextHookRing::try_take(HookPacket &packet) noexcept {
   if (in_flight_ || item_count_ == 0) return false;
   Entry &entry = entries_[item_head_];
   try {
-    packet.serialized_frame.assign(reinterpret_cast<const char *>(entry.storage), entry.length);
-    if (entry.schema_count)
-      packet.schema_records.assign(entry.schema_records,
-                                   entry.schema_records + entry.schema_count);
-    else
-      packet.schema_records.clear();
+    packet.schema_records.clear();
+    if (entry.capture_event) {
+      const auto *set = tracer::context_engine::capture_schema_set(entry.lease);
+      const auto bytes = set->event_bytes();
+      packet.serialized_frame.assign(reinterpret_cast<const char *>(bytes.data()),
+                                     bytes.size());
+      for (std::size_t i = 0; i < set->size(); ++i)
+        packet.schema_records.push_back(set->record(i));
+    } else {
+      packet.serialized_frame.assign(reinterpret_cast<const char *>(entry.storage),
+                                     entry.length);
+    }
   } catch (...) { return false; }
   packet.storage_charge.take(entry.staging_bytes);
   entry.staging_bytes = 0;
@@ -389,7 +400,7 @@ bool ContextHookRing::try_take(HookPacket &packet) noexcept {
 bool ContextHookRing::reserve_worker_staging(
     std::size_t bytes, HookPacket::StorageCharge &charge) noexcept {
   if (bytes == 0) return true;
-  if (!reserve_staging_credit(bytes)) return false;
+  if (!reserve_staging_credit(bytes, staging_budget_)) return false;
   charge.take(bytes);
   return true;
 }
@@ -411,8 +422,6 @@ void ContextHookRing::complete(std::uint64_t reservation) noexcept {
   entry.allocation_size = 0;
   entry.queue_charge = 0;
   entry.reservation = 0;
-  entry.schema_records = nullptr;
-  entry.schema_count = 0;
   entry.capture_event = false;
   item_head_ = (item_head_ + 1) % packet_limit_;
   --item_count_;
@@ -435,7 +444,8 @@ ContextExportClient::ContextExportClient(std::shared_ptr<grpc::Channel> channel,
               limits.max_packet_bytes > 16 ? limits.max_packet_bytes - 16 : 0),
           std::min<std::size_t>(limits.max_event_bytes,
               open.max_event_bytes() ? open.max_event_bytes()
-                                     : limits.max_event_bytes)),
+                                     : limits.max_event_bytes),
+          limits.transport_memory_bytes),
       open_(std::move(open)),
       stub_(clangtracer::context::v1::ContextTransport::NewStub(std::move(channel))),
       durable_confirmation_(std::move(durable_confirmation)), journal_(std::move(journal)) {
@@ -479,11 +489,14 @@ bool ContextExportClient::publish_from_worker(const clangtracer::context::v1::Co
   std::string bytes;
   if (!frame.SerializeToString(&bytes) ||
       bytes.size() > limits_.max_packet_bytes - 16) return false;
-  return hook_ring_.try_publish(std::as_bytes(std::span(bytes.data(), bytes.size())), std::move(lease));
+  return hook_ring_.try_publish(
+      ::tracer::compat::as_bytes(::tracer::compat::span(bytes.data(), bytes.size())),
+      std::move(lease));
 }
+
 bool ContextExportClient::try_publish_capture(
-    std::span<const std::byte> event_record,
-    const std::shared_ptr<const void> &schema_lease) noexcept {
+    ::tracer::compat::span<const std::byte> event_record,
+    const std::shared_ptr<const void>& schema_lease) noexcept {
   return hook_ring_.try_publish_capture(event_record, schema_lease);
 }
 ExportCounters ContextExportClient::counters() const noexcept {
@@ -852,7 +865,11 @@ void ContextExportClient::run() noexcept {
           }
           if (has_event && !malformed) {
             for (const auto &state : event.states()) {
-              if (!complete_schema_definitions.contains(state.schema_identity())) { malformed = true; break; }
+              if (!::tracer::compat::contains(complete_schema_definitions,
+                                              state.schema_identity())) {
+                malformed = true;
+                break;
+              }
             }
           }
           if (malformed) {
@@ -1160,8 +1177,10 @@ grpc::Status ContextExportService::Export(grpc::ServerContext *context,
       ExportCounters cumulative;
       {
         std::lock_guard lock(counter_mutex_);
-        if (!counters_by_session_.contains(open.producer_session_id()) && counters_by_session_.size() >= 4096)
+        if (!::tracer::compat::contains(counters_by_session_, open.producer_session_id()) &&
+            counters_by_session_.size() >= 4096) {
           return {grpc::StatusCode::RESOURCE_EXHAUSTED, "producer counter registry full"};
+        }
         auto &last = counters_by_session_[open.producer_session_id()];
         last.capture_failed = std::max(last.capture_failed, packet.counters().capture_failed());
         last.queue_dropped = std::max(last.queue_dropped, packet.counters().queue_dropped());
@@ -1189,8 +1208,9 @@ grpc::Status ContextExportService::Export(grpc::ServerContext *context,
       } else {
         if (schemas.size() == negotiated_schema_count ||
             schema.ByteSizeLong() > negotiated_schema_bytes - schema_bytes ||
-            identities_by_id.contains(schema.epoch_schema_id()))
+            ::tracer::compat::contains(identities_by_id, schema.epoch_schema_id())) {
           return {grpc::StatusCode::RESOURCE_EXHAUSTED, "schema epoch limit exceeded"};
+        }
         schema_bytes += schema.ByteSizeLong(); schemas.emplace(schema.schema_identity(), schema.SerializeAsString());
         schema_ids.emplace(schema.schema_identity(), schema.epoch_schema_id());
         identities_by_id.emplace(schema.epoch_schema_id(), schema.schema_identity());

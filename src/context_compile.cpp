@@ -1,16 +1,18 @@
 #include <string>
+#include <string_view>
 
 #include <clang/Frontend/CompilerInstance.h>
-#include <clang/Interpreter/Interpreter.h>
 #include <clang/Interpreter/PartialTranslationUnit.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/IR/Module.h>
+#include <clang/Interpreter/Interpreter.h>
 #include <llvm/Support/MemoryBufferRef.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include "context_binding.hpp"
+#include "tracer/compiler_options.hpp"
 
 namespace tracer {
 llvm::Error initialize_private_context_target();
@@ -19,13 +21,24 @@ llvm::Expected<CompiledContextModule>
 compile_context_module(const std::string &source,
                        const std::vector<std::string> &compiler_arguments,
                        const std::vector<std::string> &state_types) {
+  for (const auto &argument : compiler_arguments) {
+    const std::string_view value(argument);
+    if (value == "-include" || value.rfind("-include", 0) == 0 ||
+        value == "-imacros" || value.rfind("-imacros", 0) == 0) {
+      return llvm::createStringError(
+          llvm::inconvertibleErrorCode(),
+          "forced headers must be lowered into controlled source before "
+          "creating a context interpreter");
+    }
+  }
   if (auto error = initialize_private_context_target()) {
     return std::move(error);
   }
   clang::IncrementalCompilerBuilder builder;
+  const auto driver_arguments = clang_driver_arguments(compiler_arguments);
   std::vector<const char *> arguments;
-  arguments.reserve(compiler_arguments.size());
-  for (const auto &argument : compiler_arguments) {
+  arguments.reserve(driver_arguments.size());
+  for (const auto &argument : driver_arguments) {
     arguments.push_back(argument.c_str());
   }
   builder.SetCompilerArgs(arguments);

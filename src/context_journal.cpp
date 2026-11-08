@@ -1,19 +1,20 @@
 #include "context_journal.hpp"
 
-#include "context_transport.pb.h"
-
-#include <array>
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <fstream>
-#include <limits>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <system_error>
 
 #include <fcntl.h>
 #include <unistd.h>
+
+#include "context_transport.pb.h"
+#include "tracer/compat.hpp"
 
 namespace tracer::context_delivery {
 namespace {
@@ -55,6 +56,16 @@ std::string budget_key_for(const std::filesystem::path &path) {
 }
 }
 
+JournalLimits journal_limits_for_packet(std::uint32_t packet_bytes,
+                                      std::uint64_t schema_bytes) {
+  JournalLimits limits;
+  // The producer persists the event together with schema announcements.
+  limits.segment_limit = std::max(limits.segment_limit,
+                                  packet_bytes + schema_bytes + 4096);
+  limits.data_budget = std::max(limits.data_budget, limits.segment_limit);
+  return limits;
+}
+
 bool JournalBudget::claim(std::string key, std::uint64_t bytes) {
   std::lock_guard lock(mutex_);
   const auto found = charges_.find(key);
@@ -81,14 +92,21 @@ void JournalBudget::release(const std::string &key, std::uint64_t bytes) noexcep
 std::uint64_t JournalBudget::used() const noexcept { std::lock_guard lock(mutex_); return used_; }
 bool JournalBudget::admit_control(const std::string &key) {
   std::lock_guard lock(mutex_);
-  if (control_keys_.contains(key)) return true;
+  if (::tracer::compat::contains(control_keys_, key)) {
+    return true;
+  }
   if (kControlOperationLimit > kControlReserve - control_used_) return false;
   control_keys_.emplace(key, true); control_used_ += kControlOperationLimit; return true;
 }
 bool JournalBudget::claim_control(const std::string &key) { return admit_control(key); }
 std::uint64_t JournalBudget::control_used() const noexcept { std::lock_guard lock(mutex_); return control_used_; }
-std::shared_ptr<JournalBudget> process_journal_budget() {
+void JournalBudget::ensure_data_capacity(std::uint64_t minimum) noexcept {
+  std::lock_guard lock(mutex_);
+  limit_ = std::max(limit_, minimum);
+}
+std::shared_ptr<JournalBudget> process_journal_budget(std::uint64_t minimum) {
   static auto budget = std::make_shared<JournalBudget>();
+  budget->ensure_data_capacity(minimum);
   return budget;
 }
 
@@ -96,7 +114,7 @@ ContextJournal::ContextJournal(std::filesystem::path directory, JournalLimits li
                               std::shared_ptr<JournalBudget> budget)
     : directory_(std::move(directory)),
       state_path_(directory_ / "checkpoint.bin"), limits_(limits),
-      budget_(budget ? std::move(budget) : process_journal_budget()), budget_key_(budget_key_for(directory_)) {
+      budget_(budget ? std::move(budget) : process_journal_budget(limits.data_budget)), budget_key_(budget_key_for(directory_)) {
   std::error_code ec;
   std::filesystem::create_directories(directory_, ec);
   if (ec) { fail("create journal directory: " + ec.message()); return; }
@@ -255,7 +273,10 @@ bool ContextJournal::recover() {
   std::vector<std::pair<std::uint64_t, std::filesystem::path>> segments;
   for (const auto &entry : std::filesystem::directory_iterator(directory_)) {
     const auto name = entry.path().filename().string();
-    if (!name.starts_with("segment-") || !name.ends_with(".bin")) continue;
+    if (!::tracer::compat::starts_with(name, "segment-") ||
+        !::tracer::compat::ends_with(name, ".bin")) {
+      continue;
+    }
     try { segments.emplace_back(std::stoull(name.substr(8, name.size() - 12)), entry.path()); }
     catch (...) { error_ = "invalid journal segment name"; return false; }
   }
@@ -269,7 +290,11 @@ bool ContextJournal::recover() {
       if (in.gcount() != static_cast<std::streamsize>(h.size()) || get32(h,0) != kMagic || get32(h,20) != 1) break;
       const auto size = get32(h,4);
       const auto pos = get64(h,12);
-      if (size == 0 || size > limits_.segment_limit - kHeaderSize) break;
+      if (size == 0) break;
+      if (size > limits_.segment_limit - kHeaderSize) {
+        error_ = "journal record exceeds configured segment capacity";
+        return false;
+      }
       std::string payload(size, '\0'); in.read(payload.data(), size);
       if (!in || checksum(payload) != get32(h,8)) break;
       clangtracer::context::v1::ContextBatch batch;
@@ -311,7 +336,8 @@ bool ContextJournal::reclaim_acknowledged() {
     if (ec) continue;
     data_bytes_ -= bytes;
     budget_->release(budget_key_, bytes);
-    std::erase_if(records_, [&](const JournalRecord &record) { return record.segment_index == segment; });
+    ::tracer::compat::erase_if(
+        records_, [&](const JournalRecord& record) { return record.segment_index == segment; });
     if (segment == current_segment_) current_segment_bytes_ = 0;
   }
   if (!records_.empty()) return true;
@@ -322,7 +348,7 @@ bool ContextJournal::reclaim_acknowledged() {
 ContextCollectorStore::ContextCollectorStore(std::filesystem::path directory, JournalLimits limits,
                                              std::shared_ptr<JournalBudget> budget)
     : directory_(std::move(directory)), checkpoint_path_(directory_ / "collector-checkpoint.bin"), limits_(limits),
-      budget_(budget ? std::move(budget) : process_journal_budget()), budget_key_(budget_key_for(directory_)) {
+      budget_(budget ? std::move(budget) : process_journal_budget(limits.data_budget)), budget_key_(budget_key_for(directory_)) {
   std::error_code ec;
   std::filesystem::create_directories(directory_, ec);
   if (ec) error_ = "create collector directory: " + ec.message();
@@ -466,7 +492,10 @@ bool ContextCollectorStore::recover() {
   std::vector<std::pair<std::uint64_t, std::filesystem::path>> segments;
   for (const auto &entry : std::filesystem::directory_iterator(directory_)) {
     const auto name = entry.path().filename().string();
-    if (!name.starts_with("collector-segment-") || !name.ends_with(".bin")) continue;
+    if (!::tracer::compat::starts_with(name, "collector-segment-") ||
+        !::tracer::compat::ends_with(name, ".bin")) {
+      continue;
+    }
     try { segments.emplace_back(std::stoull(name.substr(18, name.size() - 22)), entry.path()); }
     catch (...) { error_ = "invalid collector segment name"; return false; }
   }
@@ -481,7 +510,11 @@ bool ContextCollectorStore::recover() {
       if (in.gcount() == 0) break;
       in.read(reinterpret_cast<char *>(&size), 4); in.read(reinterpret_cast<char *>(&check), 4);
       in.read(reinterpret_cast<char *>(&position), 8); in.read(reinterpret_cast<char *>(&version), 4);
-      if (!in || magic != 0x52585443 || version != 1 || size == 0 || size > limits_.segment_limit - 24) break;
+      if (!in || magic != 0x52585443 || version != 1 || size == 0) break;
+      if (size > limits_.segment_limit - 24) {
+        error_ = "collector record exceeds configured segment capacity";
+        return false;
+      }
       std::string payload(size, '\0'); in.read(payload.data(), size);
       clangtracer::context::v1::ContextFrame frame;
       if (!in || checksum(payload) != check || !frame.ParseFromString(payload)) break;

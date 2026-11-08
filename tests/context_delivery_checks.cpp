@@ -1,21 +1,22 @@
-#include "context_journal.hpp"
-#include "context_stream.hpp"
-#include "context_capture.hpp"
-#include "context_schema.hpp"
-#include "context_transport.pb.h"
-
-#include <grpcpp/grpcpp.h>
-
-#include <cassert>
 #include <array>
+#include <cassert>
+#include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
-#include <condition_variable>
-#include <chrono>
 #include <mutex>
 #include <string>
 #include <thread>
+
+#include <grpcpp/grpcpp.h>
 #include <unistd.h>
+
+#include "context_capture.hpp"
+#include "context_journal.hpp"
+#include "context_schema.hpp"
+#include "context_stream.hpp"
+#include "context_transport.pb.h"
+#include "tracer/compat.hpp"
 
 namespace {
 std::filesystem::path temp_path() {
@@ -34,9 +35,8 @@ bool encode_delivery_state(const void *, tracer::context_engine::BoundedProtoWri
   return payload && writer.s64(1, *static_cast<const std::int64_t *>(payload));
 }
 
-bool publish_capture_to_client(
-    void *opaque, std::span<const std::byte> event_record,
-    const std::shared_ptr<const void> &schema_lease) noexcept {
+bool publish_capture_to_client(void* opaque, ::tracer::compat::span<const std::byte> event_record,
+                               const std::shared_ptr<const void>& schema_lease) noexcept {
   return static_cast<tracer::context_delivery::ContextExportClient *>(opaque)
       ->try_publish_capture(event_record, schema_lease);
 }
@@ -234,6 +234,28 @@ void verify_context_delivery() {
   }
   std::filesystem::remove_all(segment_dir);
 
+  const auto large_dir = dir.string() + "-large";
+  std::filesystem::remove_all(large_dir);
+  {
+    ContextJournal journal(large_dir, {4096, 1024, {}});
+    assert(journal.begin_create("recording-large", "sink-large"));
+    assert(journal.confirm_create("recording-large", 0));
+    ContextFrame large;
+    large.mutable_event()->set_name(std::string(256, 'x'));
+    std::uint64_t position = 0;
+    assert(journal.append(large, position) && position == 1);
+  }
+  {
+    ContextJournal smaller(large_dir, {4096, 128, {}});
+    assert(!smaller.healthy());
+  }
+  {
+    ContextJournal restored(large_dir, {4096, 1024, {}});
+    assert(restored.healthy());
+    assert(restored.read_after(0, 1, 1024).size() == 1);
+  }
+  std::filesystem::remove_all(large_dir);
+
   const auto fault_dir = dir.string() + "-fault";
   std::filesystem::remove_all(fault_dir);
 
@@ -348,7 +370,8 @@ void verify_context_delivery() {
     std::shared_ptr<const void> lease(owner, owner.get());
     owner.reset();
     const std::string bytes = "serialized";
-    assert(ring.try_publish(std::as_bytes(std::span(bytes.data(), bytes.size())), lease));
+    assert(ring.try_publish(
+        ::tracer::compat::as_bytes(::tracer::compat::span(bytes.data(), bytes.size())), lease));
     lease.reset();
     tracer::context_delivery::HookPacket packet;
     assert(ring.try_take(packet));
@@ -365,7 +388,7 @@ void verify_context_delivery() {
     tracer::context_delivery::ContextHookRing first(64ull * 1024 * 1024, 4096, 32);
     tracer::context_delivery::ContextHookRing second(64ull * 1024 * 1024, 4096, 32);
     const std::string one = "x";
-    const auto bytes = std::as_bytes(std::span(one.data(), one.size()));
+    const auto bytes = ::tracer::compat::as_bytes(::tracer::compat::span(one.data(), one.size()));
     for (std::size_t i = 0; i < 4095; ++i) assert(first.try_publish(bytes));
     const tracer::context_delivery::HookPacketView pair[] = {{bytes, {}}, {bytes, {}}};
     assert(!second.try_publish_batch(pair));
@@ -383,7 +406,8 @@ void verify_context_delivery() {
     tracer::context_delivery::ContextHookRing first;
     tracer::context_delivery::ContextHookRing second;
     const std::string large(1024 * 1024, 's');
-    const auto bytes = std::as_bytes(std::span(large.data(), large.size()));
+    const auto bytes =
+        ::tracer::compat::as_bytes(::tracer::compat::span(large.data(), large.size()));
     std::size_t first_count = 0, second_count = 0;
     for (std::size_t i = 0; i < 32; ++i) {
       const bool admitted_first = first.try_publish(bytes);
@@ -445,7 +469,8 @@ void verify_context_delivery() {
     auto *attachment = event->add_states(); attachment->set_schema_identity("revision-1");
     attachment->set_payload("bytes");
     const auto batch_bytes = batch.SerializeAsString();
-    assert(client.hook_ring().try_publish(std::as_bytes(std::span(batch_bytes.data(), batch_bytes.size()))));
+    assert(client.hook_ring().try_publish(::tracer::compat::as_bytes(
+        ::tracer::compat::span(batch_bytes.data(), batch_bytes.size()))));
     {
       std::unique_lock lock(mutex);
       assert(cv.wait_for(lock, 5s, [&] { return received && durable_controls >= 2; }));
@@ -464,7 +489,8 @@ void verify_context_delivery() {
       return control.result() == DurableControl::ACCEPTED && control.durable_prefix() == 1;
     }, producer_journal);
     assert(resumed.start());
-    assert(resumed.hook_ring().try_publish(std::as_bytes(std::span(replay_bytes.data(), replay_bytes.size()))));
+    assert(resumed.hook_ring().try_publish(::tracer::compat::as_bytes(
+        ::tracer::compat::span(replay_bytes.data(), replay_bytes.size()))));
     {
       std::unique_lock lock(mutex);
       assert(cv.wait_for(lock, 5s, [&] { return resume_controls >= 2; }));
@@ -535,7 +561,7 @@ void verify_context_delivery() {
       frame.mutable_event()->set_name("event");
       const auto bytes = frame.SerializeAsString();
       assert(client.hook_ring().try_publish(
-          std::as_bytes(std::span(bytes.data(), bytes.size()))));
+          ::tracer::compat::as_bytes(::tracer::compat::span(bytes.data(), bytes.size()))));
       {
         std::unique_lock lock(mutex);
         assert(cv.wait_for(lock, 5s, [&] { return confirmations >= 2; }));
@@ -592,7 +618,8 @@ void verify_context_delivery() {
       event->set_event_id(std::string("batch-event-") + std::to_string(i));
       auto *state = event->add_states(); state->set_schema_identity(identity); state->set_payload("state");
       const auto encoded = batch.SerializeAsString();
-      assert(client.hook_ring().try_publish(std::as_bytes(std::span(encoded.data(), encoded.size()))));
+      assert(client.hook_ring().try_publish(
+          ::tracer::compat::as_bytes(::tracer::compat::span(encoded.data(), encoded.size()))));
     }
     {
       std::unique_lock lock(mutex);
@@ -629,7 +656,7 @@ void verify_context_delivery() {
     state->set_payload("owned-bytes");
     const auto encoded = batch.SerializeAsString();
     assert(client.hook_ring().try_publish(
-        std::as_bytes(std::span(encoded.data(), encoded.size()))));
+        ::tracer::compat::as_bytes(::tracer::compat::span(encoded.data(), encoded.size()))));
     service.wait_for_event();
     client.stop();
     rpc.server->Shutdown();
@@ -695,8 +722,8 @@ void verify_context_delivery() {
     ContextCapturePool capture_pool;
     auto capture = capture_pool.try_reserve(4);
     assert(capture);
-    const auto captured = capture.capture(metadata, std::span(&schema, 1),
-                                          std::span(&state, 1));
+    const auto captured = capture.capture(metadata, ::tracer::compat::span(&schema, 1),
+                                          ::tracer::compat::span(&state, 1));
     assert(captured && captured.bytes < 256 * 1024);
     assert(capture.publish_leased(&publish_capture_to_client, &client));
     {

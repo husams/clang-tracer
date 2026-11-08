@@ -79,6 +79,8 @@ HELP_TOPICS = {
             ("start --event-history-limit N", "Retained event count; default 4096."),
             ("start --context-history-limit N", "Context event count; default 128."),
             ("start --context-history-bytes N", "Serialized context-byte budget."),
+            ("start --context-event-bytes N", "Maximum bytes per shared event."),
+            ("start --context-transport-memory-bytes N", "Shared transport memory budget."),
             ("stop --timeout SECONDS", "Graceful shutdown wait; default 30 seconds."),
         ),
         examples=("server start", "server status", "server stop --timeout 45"),
@@ -113,6 +115,8 @@ HELP_TOPICS = {
             ("--context-history-limit N", "Retained context count; default 128."),
             (
                 "--context-history-bytes N",
+                "--context-event-bytes N",
+                "--context-transport-memory-bytes N",
                 "Serialized context bytes; default 16777216.",
             ),
         ),
@@ -154,9 +158,7 @@ HELP_TOPICS = {
         "symbols",
         "List traceable functions and methods from eligible application "
         "ELF/DWARF on the server host.",
-        usage=(
-            "symbols [--filter TEXT] [--module TEXT] [--limit N] [--page TOKEN]",
-        ),
+        usage=("symbols [--filter TEXT] [--module TEXT] [--limit N] [--page TOKEN]",),
         options=(
             ("--filter TEXT", "Case-sensitive substring of selector or linkage name."),
             (
@@ -195,6 +197,7 @@ HELP_TOPICS = {
         usage=(
             'probe resolve "C++ selector" [OPTIONS]',
             'probe inject "C++ selector" --callback FILE [OPTIONS]',
+            'probe validate "C++ selector" --callback FILE [OPTIONS]',
             "probe add SPEC.pbtxt",
             "probe remove PROBE_ID",
         ),
@@ -213,6 +216,10 @@ HELP_TOPICS = {
                 "--compdb PATH",
                 "Compilation database directory or JSON file on the server host.",
             ),
+            (
+                "--compile-option ARG",
+                "Append one compiler option; may be repeated in order.",
+            ),
         ),
         examples=('probe resolve "Calculator::multiply(int, int) const"',),
     ),
@@ -226,7 +233,7 @@ HELP_TOPICS = {
                 "--callback FILE",
                 "Required C++ Interceptor source, read on the console host.",
             ),
-            ("--stack 0..64", "Capture entry stacks; default 0 disables capture."),
+            ("--stack N|full", "Capture entry stacks. Zero disables capture."),
             (
                 "--internal-frames",
                 "Include tracer/JIT/runtime frames; default filters them.",
@@ -244,6 +251,10 @@ HELP_TOPICS = {
             ("--debug-max-entries N", "Optional DWARF entry limit; 0 is unlimited."),
             ("--debug-max-depth N", "Optional DWARF depth limit; 0 is unlimited."),
             (
+                "--compile-option ARG",
+                "Append one compiler option; may be repeated in order.",
+            ),
+            (
                 "--compdb PATH",
                 "Compilation database directory or JSON file on the server host.",
             ),
@@ -260,6 +271,8 @@ HELP_TOPICS = {
             "/usr/local/share/clang-tracer/examples/cpp-interceptors/method.cpp",
         ),
         notes=(
+            "Injecting the same target again replaces its active probe in this "
+            "session. The new callback compiles before the old hook is removed.",
             "Callback source is sent by value; include and compilation-"
             "database paths refer to the server host.",
             "If --compdb is omitted, the server can infer compiler flags from the "
@@ -273,6 +286,29 @@ HELP_TOPICS = {
         "Install a full Protobuf ProbeSpec parsed from a text-format file.",
         usage=("probe add SPEC.pbtxt",),
         examples=("probe add /tmp/probe.pbtxt",),
+    ),
+    "probe validate": HelpTopic(
+        "probe validate",
+        "Check callback syntax or complete compilation without installing a probe.",
+        usage=('probe validate "C++ selector" --callback FILE [OPTIONS]',),
+        options=(
+            ("--callback FILE", "Callback source file on the console host."),
+            (
+                "--level syntax|compile",
+                "Select syntax parsing or full code generation and symbol checks.",
+            ),
+            ("--include HEADER", "Header on the server host; may be repeated."),
+            ("--compdb PATH", "Compilation database on the server host."),
+            (
+                "--compile-option ARG",
+                "Append one compiler option; may be repeated in order.",
+            ),
+            ("--debug-max-entries N", "Optional DWARF entry limit; 0 is unlimited."),
+            ("--debug-max-depth N", "Optional DWARF depth limit; 0 is unlimited."),
+            ("--module TEXT", "Mapped path or path substring to search explicitly."),
+        ),
+        examples=('probe validate "add(int, int)" --callback interceptor.cpp',),
+        notes=("Validation does not install a probe or execute callback code.",),
     ),
     "probe remove": HelpTopic(
         "probe remove",
@@ -313,10 +349,13 @@ HELP_TOPICS = {
     ),
     "collect": HelpTopic(
         "collect",
-        "Collect a bounded list of events in memory and display each one.",
-        usage=("collect COUNT [STREAM_OPTIONS]",),
+        "Stream and display events until interrupted or an optional limit is reached.",
+        usage=("collect [COUNT] [STREAM_OPTIONS]",),
         options=(
-            ("COUNT", "Required positive event count."),
+            (
+                "COUNT",
+                "Optional positive event count; default streams until interrupted.",
+            ),
             (
                 "--session ID",
                 "Filter session; may be repeated. Defaults to selected session or all.",
@@ -329,7 +368,7 @@ HELP_TOPICS = {
                 "repeatable and ORed (up to 4096 UTF-8 bytes).",
             ),
             ("--after CURSOR", "Start strictly after this sequence; default 0."),
-            ("--timeout SECONDS", "Total deadline; default 30."),
+            ("--timeout SECONDS", "Total deadline; default has no deadline."),
         ),
         examples=("collect 20 --timeout 10",),
     ),

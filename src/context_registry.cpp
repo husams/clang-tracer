@@ -10,6 +10,7 @@
 #include <llvm/Support/Error.h>
 
 #include "context_stdlib.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer {
 namespace {
@@ -31,9 +32,8 @@ NativeSchemaAdmission &native_schema_admission() {
   return admission;
 }
 
-bool admit_native_schemas(
-    std::span<const std::shared_ptr<const SchemaRecord>> schemas,
-    std::string &error) {
+bool admit_native_schemas(::tracer::compat::span<const std::shared_ptr<const SchemaRecord>> schemas,
+                          std::string& error) {
   auto &admission = native_schema_admission();
   std::lock_guard lock(admission.mutex);
   std::size_t used = 0;
@@ -54,9 +54,10 @@ bool admit_native_schemas(
   std::set<const SchemaRecord *> pending;
   std::size_t additional = 0;
   for (const auto &record : schemas) {
-    if (!record || admission.records.contains(record.get()) ||
-        !pending.insert(record.get()).second)
+    if (!record || ::tracer::compat::contains(admission.records, record.get()) ||
+        !pending.insert(record.get()).second) {
       continue;
+    }
     if (record->accounted_bytes >
         kNativeSchemaMetadataBytes -
             std::min(used + additional, kNativeSchemaMetadataBytes)) {
@@ -403,11 +404,9 @@ RegisteredContextScope::RegisteredContextScope(
 }
 
 ContextRegistryResult ContextRegistry::register_owner(
-    const std::array<std::uint8_t, 16> &source_lineage_id,
-    std::shared_ptr<const PrivateContextCode> owner_code,
-    const GeneratedContextOwner &generated,
-    std::span<const std::shared_ptr<const context_engine::SchemaRecord>>
-        schemas) {
+    const std::array<std::uint8_t, 16>& source_lineage_id,
+    std::shared_ptr<const PrivateContextCode> owner_code, const GeneratedContextOwner& generated,
+    ::tracer::compat::span<const std::shared_ptr<const context_engine::SchemaRecord>> schemas) {
   ContextRegistryResult result;
   if (empty_lineage(source_lineage_id) || !owner_code ||
       !generated.error.empty() || generated.states.empty()) {
@@ -507,7 +506,7 @@ ContextRegistryResult ContextRegistry::register_owner(
   }
 
   for (const auto &schema : schemas) {
-    if (schema && !matched_schemas.contains(schema.get())) {
+    if (schema && !::tracer::compat::contains(matched_schemas, schema.get())) {
       result.error = "incompatible_registration: schema has no generated owner "
                      "state serializer";
       return result;
@@ -587,7 +586,7 @@ ContextRegistryResult ContextRegistry::register_owner(
             });
 
   std::lock_guard lock(mutex_);
-  std::erase_if(scopes_, [](const auto &scope) { return scope.expired(); });
+  ::tracer::compat::erase_if(scopes_, [](const auto& scope) { return scope.expired(); });
   // Hash collisions are rejected across the complete transaction before any
   // new group is visible.
   for (std::size_t i = 0; i < candidates.size(); ++i) {

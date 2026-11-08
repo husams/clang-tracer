@@ -1,15 +1,16 @@
 #pragma once
 
-#include "bounded_proto.hpp"
-#include "context_codec.hpp"
-
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <span>
 #include <string_view>
+
+#include "bounded_proto.hpp"
+#include "context_codec.hpp"
+#include "tracer/compat.hpp"
+#include "tracer/protocol.hpp"
 
 namespace tracer::context_engine {
 struct SchemaRecord;
@@ -23,11 +24,12 @@ struct TraceContext;
 
 namespace tracer::context_engine {
 
-// The event arena, its fixed slot tables, 64MiB queued attachments, and 16MiB
-// native workspace fit within the 128MiB process capture-storage budget.
-inline constexpr std::size_t kCaptureEventBytes = 256ull * 1024;
+// The default event arena, queued attachments, and native workspace fit
+// within the default process capture-storage budget.
+// Allocation quantum and default event size. Larger events reserve adjacent blocks.
+inline constexpr std::size_t kCaptureEventBytes = tracer::kDefaultContextEventBytes;
 inline constexpr std::size_t kCaptureGlobalBudgetBytes = 128ull * 1024 * 1024;
-inline constexpr std::size_t kCaptureQueueBudgetBytes = 64ull * 1024 * 1024;
+inline constexpr std::size_t kCaptureQueueBudgetBytes = tracer::kDefaultContextTransportMemoryBytes;
 inline constexpr std::size_t kCaptureInvocationWorkspaceBytes =
     7ull * 1024 * 1024;
 inline constexpr std::size_t kCaptureRuntimeWorkspaceBytes = 4ull * 1024 * 1024;
@@ -56,7 +58,7 @@ struct CaptureSchemaView {
   std::string_view cpp_state_type;
   std::string_view cpp_scope_type;
   std::string_view revision_id;
-  std::span<const std::string> container_roles;
+  ::tracer::compat::span<const std::string> container_roles;
   std::uint64_t epoch_schema_id = 0;
   std::shared_ptr<const SchemaRecord> retained_record;
 };
@@ -69,7 +71,7 @@ public:
   std::size_t size() const noexcept { return size_; }
   std::uint64_t epoch_schema_id(std::size_t) const noexcept;
   const SchemaRecord *record(std::size_t) const noexcept;
-  std::span<const std::byte> event_bytes() const noexcept;
+  ::tracer::compat::span<const std::byte> event_bytes() const noexcept;
 
 private:
   friend struct CaptureSlotState;
@@ -163,41 +165,40 @@ public:
 
     // Serializes one EventRecord. State payloads are read only during this
     // call; schema metadata remains pinned separately by the slot lease.
-    CaptureResult capture(const CaptureEventMetadata &,
-                          std::span<const CaptureSchemaView>,
-                          std::span<const CaptureStateView>) noexcept;
-    std::span<const std::byte> bytes() const noexcept;
+    CaptureResult capture(const CaptureEventMetadata&,
+                          ::tracer::compat::span<const CaptureSchemaView>,
+                          ::tracer::compat::span<const CaptureStateView>) noexcept;
+    ::tracer::compat::span<const std::byte> bytes() const noexcept;
     // Legacy byte-only publication releases after the callback returns.
-    using Publish = bool (*)(void *, std::span<const std::byte>) noexcept;
+    using Publish = bool (*)(void*, ::tracer::compat::span<const std::byte>) noexcept;
     bool publish(Publish, void *) noexcept;
-    using LeasedPublish =
-        bool (*)(void *, std::span<const std::byte>,
-                 const std::shared_ptr<const void> &) noexcept;
+    using LeasedPublish = bool (*)(void*, ::tracer::compat::span<const std::byte>,
+                                   const std::shared_ptr<const void>&) noexcept;
     bool publish_leased(LeasedPublish, void *) noexcept;
     std::shared_ptr<const void> schema_lease_token() const noexcept;
 
   private:
     friend class ContextCapturePool;
-    Lease(std::shared_ptr<CaptureSlotState>, std::size_t,
-          std::uint32_t) noexcept;
+    Lease(std::shared_ptr<CaptureSlotState>, std::uint32_t) noexcept;
     void reset() noexcept;
     std::shared_ptr<CaptureSlotState> slot_state_;
     std::shared_ptr<const void> schema_token_;
-    std::size_t slot_ = 0;
     std::uint32_t hook_ = 0;
     std::size_t bytes_ = 0;
     bool captured_ = false;
     bool published_ = false;
   };
 
-  ContextCapturePool();
+  explicit ContextCapturePool(std::size_t event_bytes = kCaptureEventBytes);
+  std::size_t capacity() const noexcept;
   ~ContextCapturePool();
   ContextCapturePool(const ContextCapturePool &) = delete;
   ContextCapturePool &operator=(const ContextCapturePool &) = delete;
 
   // Hook identifiers are assigned at setup. try_reserve is nonblocking and
-  // enforces 16 outstanding events/4MiB per hook within its arena allocation.
-  Lease try_reserve(std::uint32_t hook_id) noexcept;
+  // enforces the per-hook event quota and the shared arena budget.
+  Lease try_reserve(std::uint32_t hook_id,
+                    std::size_t event_bytes = kCaptureEventBytes) noexcept;
   std::size_t outstanding(std::uint32_t hook_id) const noexcept;
 
 private:
@@ -214,7 +215,7 @@ inline constexpr std::size_t kCaptureArenaHeaderEstimate = 512;
 static_assert(
     kCaptureSlots * (sizeof(CaptureSchemaSetLease) +
                      sizeof(std::shared_ptr<CaptureArena>) +
-                     sizeof(std::atomic<bool>) + sizeof(std::size_t) +
+                     2 * sizeof(std::atomic<bool>) + 3 * sizeof(std::size_t) +
                      kCaptureSlotControlBlockEstimate) +
             sizeof(ContextCapturePool) + kCaptureArenaHeaderEstimate <=
         kCaptureSlotMetadataReserve,

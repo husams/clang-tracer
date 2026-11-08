@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(prepared_injectors_example LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
    NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
@@ -14,7 +16,6 @@ endif()
 
 function(prepared_demo_target target calculator bias)
   add_executable(${target} target.cpp "${calculator}")
-  set_target_properties(${target} PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
   target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
   target_compile_definitions(${target} PRIVATE PREPARED_DEMO_BIAS=${bias})
   target_compile_options(${target} PRIVATE
@@ -24,11 +25,9 @@ endfunction()
 prepared_demo_target(prepared-injectors-target calculator.cpp "${PREPARED_DEMO_BIAS}")
 if(BUILD_TESTING AND TRACER_BUILD_REPL)
   add_executable(prepared-concrete-target concrete/target.cpp concrete/virtual.cpp)
-  target_compile_features(prepared-concrete-target PRIVATE cxx_std_17)
   target_compile_options(prepared-concrete-target PRIVATE
     -g0 -O0 -fno-omit-frame-pointer -fcf-protection=none)
   add_executable(prepared-history-target concrete/history.cpp)
-  target_compile_features(prepared-history-target PRIVATE cxx_std_17)
   target_compile_options(prepared-history-target PRIVATE
     -g0 -O0 -fno-omit-frame-pointer -fcf-protection=none)
   # Exercise prepared binding both with and without a loaded ELF build ID.
@@ -42,8 +41,6 @@ if(BUILD_TESTING AND TRACER_BUILD_REPL)
 endif()
 
 add_executable(prepared-methods-target methods/target.cpp methods/account.cpp)
-set_target_properties(prepared-methods-target PROPERTIES
-  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 # The runnable demo has no debug information. Its package is bound by ELF
 # linkage and its typed metadata comes from account.hpp.
 target_compile_options(prepared-methods-target PRIVATE

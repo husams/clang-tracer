@@ -34,6 +34,19 @@ struct ContextActivationResult;
 ContextActivationResult
 activate_context_source(const ContextActivationRequest &, ContextRegistry &);
 
+struct ContextPreflightResult final {
+  std::string error;
+
+  explicit operator bool() const noexcept { return error.empty(); }
+};
+
+// Performs the same source lowering and wrapper checks as activation without
+// publishing schemas, registering owners, constructing user state, or running
+// any generated entrypoint. Full mode also materializes and resolves generated
+// symbols; syntax-only mode stops after parsing the lowered wrapper.
+ContextPreflightResult
+preflight_context_source(const ContextActivationRequest &, bool syntax_only);
+
 // A fully admitted generation. All generated code, the exact owner imported by
 // the callback, immutable schemas and registry leases remain pinned together.
 class ContextActivationGeneration final {
@@ -82,6 +95,8 @@ public:
   bool requires_stack() const noexcept { return requires_stack_; }
 
 private:
+  friend ContextActivationResult prepare_context_source(
+      const ContextActivationRequest &, ContextRegistry *, bool, bool);
   friend ContextActivationResult
   activate_context_source(const ContextActivationRequest &, ContextRegistry &);
   ContextActivationGeneration(
@@ -106,8 +121,11 @@ private:
 struct ContextActivationResult final {
   std::shared_ptr<const ContextActivationGeneration> generation;
   std::string error;
+  bool preflight_success = false;
 
-  explicit operator bool() const noexcept { return bool(generation); }
+  explicit operator bool() const noexcept {
+    return bool(generation) || preflight_success;
+  }
 };
 
 // Parses and validates one source generation, compiles state owners and hook

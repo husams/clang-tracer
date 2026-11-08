@@ -1,24 +1,25 @@
 #pragma once
 
-#include "context_transport.grpc.pb.h"
-#include "engine_storage.hpp"
-
-#include <condition_variable>
+#include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <span>
-#include <array>
-#include <atomic>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "context_transport.grpc.pb.h"
+#include "tracer/protocol.hpp"
+#include "engine_storage.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer::context_delivery {
 class ContextCollectorStore;
@@ -42,10 +43,13 @@ struct StreamLimits {
   std::size_t queued_packets = 4096;
   std::size_t queued_bytes = 64ull * 1024 * 1024;
   std::uint32_t max_packet_bytes = 2 * 1024 * 1024;
-  std::uint32_t max_event_bytes = 256 * 1024;
+  std::uint32_t max_event_bytes = tracer::kDefaultContextEventBytes;
   std::uint32_t max_epoch_schemas = 256;
   std::uint64_t max_epoch_schema_bytes = 16ull * 1024 * 1024;
+  std::size_t transport_memory_bytes = tracer::kDefaultContextTransportMemoryBytes;
 };
+
+StreamLimits stream_limits_for_context(ContextTransportBudget budget);
 
 struct ExportCounters {
   std::uint64_t capture_failed = 0, queue_dropped = 0;
@@ -81,7 +85,7 @@ struct HookPacket {
   std::uint64_t reservation = 0;
 };
 struct HookPacketView {
-  std::span<const std::byte> serialized_frame;
+  ::tracer::compat::span<const std::byte> serialized_frame;
   std::shared_ptr<const void> lease;
 };
 
@@ -92,16 +96,18 @@ public:
   explicit ContextHookRing(std::size_t byte_capacity = 64ull * 1024 * 1024,
                            std::size_t packet_limit = 4096,
                            std::size_t packet_bytes = 2 * 1024 * 1024,
-                           std::size_t capture_event_bytes = 256 * 1024);
+                           std::size_t capture_event_bytes = tracer::kDefaultContextEventBytes,
+                           std::size_t transport_memory_bytes =
+                               tracer::kDefaultContextTransportMemoryBytes);
+  static std::size_t max_capture_event_bytes(std::size_t transport_memory_bytes) noexcept;
   ~ContextHookRing();
   ContextHookRing(const ContextHookRing &) = delete;
   ContextHookRing &operator=(const ContextHookRing &) = delete;
-  bool try_publish(std::span<const std::byte> serialized_frame,
+  bool try_publish(::tracer::compat::span<const std::byte> serialized_frame,
                    std::shared_ptr<const void> lease = {}) noexcept;
-  bool try_publish_batch(std::span<const HookPacketView> packets) noexcept;
-  bool try_publish_capture(
-      std::span<const std::byte> event_record,
-      const std::shared_ptr<const void> &schema_lease) noexcept;
+  bool try_publish_batch(::tracer::compat::span<const HookPacketView> packets) noexcept;
+  bool try_publish_capture(::tracer::compat::span<const std::byte> event_record,
+                           const std::shared_ptr<const void>& schema_lease) noexcept;
   bool try_take(HookPacket &packet) noexcept; // Worker only.
   bool reserve_worker_staging(std::size_t bytes,
                               HookPacket::StorageCharge &charge) noexcept;
@@ -116,11 +122,10 @@ private:
     std::size_t queue_charge = 0;
     std::uint64_t reservation = 0;
     std::shared_ptr<const void> lease;
-    const tracer::context_engine::SchemaRecord **schema_records = nullptr;
-    std::size_t schema_count = 0;
     bool capture_event = false;
   };
   const std::size_t capacity_, packet_limit_, packet_bytes_, capture_event_bytes_;
+  const std::size_t staging_budget_;
   tracer::context_engine::EngineStorage *storage_ = nullptr;
   tracer::context_engine::EngineStorage::Domain domain_ = 0;
   Entry *entries_ = nullptr; // View into EngineStorage; lifetime owned by storage_.
@@ -153,9 +158,8 @@ public:
   // Worker-only compatibility path; callers from hooks must use hook_ring().
   bool publish_from_worker(const clangtracer::context::v1::ContextFrame &frame,
                            std::shared_ptr<const void> lease = {});
-  bool try_publish_capture(
-      std::span<const std::byte> event_record,
-      const std::shared_ptr<const void> &schema_lease) noexcept;
+  bool try_publish_capture(::tracer::compat::span<const std::byte> event_record,
+                           const std::shared_ptr<const void>& schema_lease) noexcept;
   ExportCounters counters() const noexcept;
   bool ready() const noexcept;
   bool paused() const noexcept;

@@ -113,8 +113,9 @@ void *shared_context_child_entry(void *opaque) {
 
 extern "C" __attribute__((visibility("default"), noinline)) int
 shared_child_target(int value) {
+  volatile int saved = value;
+  volatile int result = saved + 31;
   shared_child_calls.fetch_add(1, std::memory_order_relaxed);
-  volatile int result = value + 31;
   return result;
 }
 

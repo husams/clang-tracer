@@ -1,12 +1,14 @@
 ---
 name: clang-tracer-python
-description: Use the Clang Tracer Python client to attach to native processes, install C++ interceptors, receive or record traces, and manage a local tracing server. Apply to tracing operations through this project's API, rather than static Clang analysis.
+description: Use the clang_tracer Python API or clang-tracer-console when the task explicitly calls for Python. Covers Python integrations, injection, event streams, and recordings.
 ---
 
 # Clang Tracer Python
 
-Operate the public `clang_tracer` Python API directly. The console is another
-consumer of this same client; avoid parsing console output for automation.
+For native demos, prepared injection, typed C++ inspection, and runnable
+`.repl` scripts, use the [native REPL skill](../clang-tracer-native-repl/SKILL.md).
+For Python automation, operate the public `clang_tracer` API directly.
+`clang-tracer-console` is the interactive Python client.
 
 ## Find the environment and target
 
@@ -45,6 +47,13 @@ is needed. Consult the wiki manuals first for project facts when available:
    metadata intact unless the user actually requests low-level ABI work.
 4. Preserve returned probe IDs for removal and event filtering. `stack_depth`
    is 0–64; application-only frames are the default.
+
+Use `list_modules(session.id)` and `list_symbols(session.id, query=..., page_size=20)`
+to find the mapped image and exact selector. Pass `module=...` to resolution
+and injection when the selector is ambiguous across images. When the client
+and server support `ValidateProbe`, call `validate_probe(session.id, selector, source)`
+to compile-check the callback before installing it. Check `report.success`
+and its diagnostics.
 
 Callback source is transmitted **by value**. `include_headers`,
 `compilation_database` and optional `callback_package_path` are paths on the
@@ -85,11 +94,20 @@ unrelated target.
 - `watch_events([session_id], after_sequence=cursor, timeout=...)` returns an
   `EventStream`. Use a context manager or `close()` to cancel; another thread
   can close a blocked read. Without a supplied timeout, a live stream can wait
-  indefinitely. The timeout is a total stream deadline.
+  indefinitely. The timeout is a total stream deadline. Use `names=[...]`
+  to filter by native function selector or custom event name.
 - `collect_traces(count, ..., timeout=...)` keeps a bounded batch in memory;
   `record_traces(path, count, ..., timeout=...)` writes directly to disk.
   Recording creates its path exclusively and preserves completed records on
   failure. Use a fresh path rather than overwriting a recording.
+- `record_sqlite(path, count, session_ids=[session_id], timeout=...)` saves a
+  bounded live stream to SQLite and leaves server history available. In the
+  console, use `record capture.db 100 --sqlite --timeout 30`. Use
+  `drain_traces()` or console `drain` only when the task calls for consuming
+  retained history. It commits the database writes before acknowledging events,
+  which removes those events for all readers.
+- For recording and replay with standalone prepared C++ type bundles, use the
+  [native REPL recording workflow](../clang-tracer-native-repl/SKILL.md#record-and-replay-events).
 - Scope session/PID filters to the task. Empty `session_ids` subscribes to all
   sessions. Resume with the last delivered `stream.after_sequence`; report
   `OUT_OF_RANGE` as an expired bounded-history cursor, not a reason to reset it
@@ -98,7 +116,7 @@ unrelated target.
   arguments/results, receiver fields, stack metadata and optional `context`
   schema/payload data. Check drop counters and per-probe sequence gaps before
   claiming a complete trace.
-- Saved framing is uint32 little-endian length plus serialized `TraceEvent`.
+- Protobuf recording framing is uint32 little-endian length plus serialized `TraceEvent`.
   Reuse the bounded reader in [record.py](../../../examples/python/record.py)
   for replay, including truncated-frame and size checks.
 

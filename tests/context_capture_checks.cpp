@@ -1,13 +1,13 @@
-#include "context_capture.hpp"
-#include "context_schema.hpp"
-
-#include "context_transport.pb.h"
-#include "tracer/protocol.hpp"
-
 #include <array>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "context_capture.hpp"
+#include "context_schema.hpp"
+#include "context_transport.pb.h"
+#include "tracer/compat.hpp"
+#include "tracer/protocol.hpp"
 
 namespace tracer::context_engine::test {
 namespace {
@@ -23,8 +23,8 @@ struct LeasedSink {
   std::size_t bytes = 0;
 };
 
-bool retain_capture(void *opaque, std::span<const std::byte> bytes,
-                    const std::shared_ptr<const void> &token) noexcept {
+bool retain_capture(void* opaque, ::tracer::compat::span<const std::byte> bytes,
+                    const std::shared_ptr<const void>& token) noexcept {
   auto &sink = *static_cast<LeasedSink *>(opaque);
   sink.token = token;
   sink.bytes = bytes.size();
@@ -47,11 +47,13 @@ void verify_context_capture() {
   const auto invocation_id = id('I');
   const auto probe_id = id('Q');
   tracer::TraceContext trace{};
-  trace.argument_count = 2;
+  trace.argument_count = 3;
   trace.argument_names[0] = "count";
   trace.arguments[0] = {tracer::ValueType::Int32, 0, -7, 0, 0.0};
   trace.argument_names[1] = "address";
   trace.arguments[1] = {tracer::ValueType::Pointer, 0, 0, 0x1234, 0.0};
+  trace.argument_names[2] = "enabled";
+  trace.arguments[2] = {tracer::ValueType::Bool, 0, 1, 0, 0.0};
   trace.named_count = 1;
   trace.named_values[0].kind = 2;
   trace.named_values[0].name[0] = 'f';
@@ -116,7 +118,7 @@ void verify_context_capture() {
               event.print_arguments() && event.print_result() &&
               event.states(0).scope_id() == 11,
           "event identity metadata was not preserved");
-  require(event.arguments_size() == 2 && event.arguments(0).name() == "count" &&
+  require(event.arguments_size() == 3 && event.arguments(0).name() == "count" &&
               event.arguments(0).value().value_type() ==
                   static_cast<std::uint32_t>(tracer::ValueType::Int32) &&
               event.arguments(0).value().value_case() ==
@@ -124,7 +126,13 @@ void verify_context_capture() {
               event.arguments(0).value().signed_value() == -7 &&
               event.arguments(1).value().value_case() ==
                   clangtracer::context::v1::TypedTraceValue::kUnsignedValue &&
-              event.arguments(1).value().unsigned_value() == 0x1234,
+              event.arguments(1).value().unsigned_value() == 0x1234 &&
+              event.arguments(2).name() == "enabled" &&
+              event.arguments(2).value().value_type() ==
+                  static_cast<std::uint32_t>(tracer::ValueType::Bool) &&
+              event.arguments(2).value().value_case() ==
+                  clangtracer::context::v1::TypedTraceValue::kSignedValue &&
+              event.arguments(2).value().signed_value() == 1,
           "typed PRE/POST arguments were not preserved");
   require(event.named_values_size() == 1 && event.named_values(0).kind() == 2 &&
               event.named_values(0).name() == "f" &&
@@ -183,6 +191,19 @@ void verify_context_capture() {
   for (auto &entry : more)
     entry = {};
   pool.reset();
+
+  {
+    const auto event_bytes = kCapturePoolBytes + 1;
+    ContextCapturePool expanded(event_bytes);
+    auto first = expanded.try_reserve(3, event_bytes);
+    auto second = expanded.try_reserve(4, event_bytes);
+    require(bool(first) && bool(second),
+            "expanded arena cannot reserve two events above the default arena size");
+    require(!expanded.try_reserve(5, event_bytes), "expanded arena overlapped reservations");
+    first = {};
+    require(bool(expanded.try_reserve(5, event_bytes)),
+            "expanded arena did not reuse released blocks");
+  }
 
   auto short_lived_pool = std::make_unique<ContextCapturePool>();
   auto detached = short_lived_pool->try_reserve(9);

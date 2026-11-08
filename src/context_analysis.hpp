@@ -5,6 +5,7 @@
 
 namespace clang {
 class ASTContext;
+class CXXRecordDecl;
 }
 
 namespace tracer {
@@ -66,6 +67,10 @@ struct ContextDeclarations {
 };
 
 ContextDeclarations analyze_context_declarations(clang::ASTContext &);
+
+// Includes arguments for fully specialized interceptor classes, while keeping
+// ordinary record names unchanged throughout planning and generated dispatch.
+std::string context_class_type_name(const clang::CXXRecordDecl &);
 
 // Declaration discovery grants no authority to execute user state. The caller
 // must separately prove the exact owner/support/boundary/unwind generation.

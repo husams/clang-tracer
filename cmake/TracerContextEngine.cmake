@@ -6,15 +6,37 @@ add_library(tracer_context_engine STATIC src/context_engine.cpp src/callback_bri
   src/context_capture.cpp
   src/context_package.cpp src/engine_storage.cpp src/context_storage_support.cpp src/context_execution.cpp
   src/context_scheduler.cpp src/context_pthread_detour.cpp)
-target_compile_features(tracer_context_engine PUBLIC cxx_std_20)
+target_compile_features(tracer_context_engine PUBLIC cxx_std_23)
 set_target_properties(tracer_context_engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(tracer_context_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(tracer_context_engine PUBLIC Threads::Threads)
+target_link_libraries(tracer_context_engine PUBLIC Threads::Threads tracer_headers)
 target_compile_options(tracer_context_engine PRIVATE -Wall -Wextra -Wpedantic)
 # Private support entry points and their inline helpers must not become ELF
 # preemption points when this archive is linked into the injected agent.
 target_compile_options(tracer_context_engine PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
 if(BUILD_TESTING)
+  foreach(result_kind IN ITEMS scalar object)
+    add_executable(inferred-${result_kind}-checks tests/inferred_call_checks.cpp)
+    target_include_directories(inferred-${result_kind}-checks PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(inferred-${result_kind}-checks PRIVATE -UNDEBUG)
+    if(result_kind STREQUAL "object")
+      target_compile_definitions(inferred-${result_kind}-checks PRIVATE
+        TRACER_TEST_OBJECT_RESULT=1)
+    endif()
+    add_test(NAME inferred_${result_kind} COMMAND inferred-${result_kind}-checks)
+  endforeach()
+  add_executable(legacy-call-checks tests/legacy_call_checks.cpp)
+  target_include_directories(legacy-call-checks PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_options(legacy-call-checks PRIVATE -UNDEBUG)
+  add_test(NAME legacy_call COMMAND legacy-call-checks)
+  add_executable(bool-call-checks tests/bool_call_checks.cpp)
+  target_include_directories(bool-call-checks PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_options(bool-call-checks PRIVATE -UNDEBUG)
+  add_test(NAME bool_call COMMAND bool-call-checks)
+  add_executable(compat-checks tests/compat_checks.cpp)
+  target_link_libraries(compat-checks PRIVATE tracer_headers)
+  add_test(NAME library_helpers COMMAND compat-checks)
   file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/shared_context_nested.cpp _nested_source_hash)
   if(NOT _nested_source_hash STREQUAL "bd37dc43fb05e89cde09643b369937fe78dad38b3c6fe6ed40fad1037cbf9f5d")
     message(FATAL_ERROR "The original shared-context acceptance source has changed")
@@ -33,7 +55,7 @@ if(BUILD_TESTING)
     DEPENDS generate-callback-fixture VERBATIM)
   add_executable(callback-lifecycle-tests tests/callback_lifecycle_tests.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/callback_fixture.hpp)
-  target_compile_features(callback-lifecycle-tests PRIVATE cxx_std_20)
+  target_compile_features(callback-lifecycle-tests PRIVATE cxx_std_23)
   target_include_directories(callback-lifecycle-tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR})
   target_compile_options(callback-lifecycle-tests PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)

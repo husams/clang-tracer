@@ -106,12 +106,72 @@ resulting `ProbeSpec` with the interceptor source. It requires the additive
 server from this revision before using it; an older server returns gRPC
 `UNIMPLEMENTED`. Existing RPCs remain compatible with older servers.
 
+Injecting a target already hooked in the same session replaces that probe with
+a new ID. Compilation failure leaves the existing hook active. A successful
+replacement restores and drains the old hook before installing the new one, so
+there is a brief interval without tracing. The existing 32 retained-probe limit
+also counts replaced versions. Rebuild the server and agent together for this
+behavior; an already loaded older agent requires restarting the target.
+
+The console decodes shared-state payloads using each event's bundled schema and
+shows field values, including strings, nested records, and containers, beneath
+the payload summary. Invalid payloads produce a diagnostic, and large values
+are visibly truncated. Pointer arguments still display their captured address.
+
 Callback source is transmitted by value. Optional `include_headers`,
 `compilation_database` and `callback_package_path` refer to paths **on the server
 host**. Package location is optional; pass it when the source belongs to a
 retained shared-context package. Omitting it follows the native service's
 isolated source-lineage behavior. The client never assumes a local callback
 path exists remotely.
+
+`compile_options` is an ordered list of compiler arguments for resolving and
+compiling the callback. Pass it to either `resolve_probe()` or `inject()`;
+`inject()` carries the same options through resolution and `AddProbe`, and
+`add_probe()` preserves options already stored in the `ProbeSpec`. Include
+directories and any header/compilation-database paths are interpreted on the
+server host. For example, use `compile_options=["-std=c++17", "-I/opt/app/include"]`
+when the target headers live under `/opt/app/include` on that host.
+Supported options cover include paths (`-I`, `-isystem`, `-iquote`, `-include`),
+defines and undefines (`-D`, `-U`), language standard (`-std=`), common warning,
+optimization and debug flags. A compilation database can also supply its
+matching `--sysroot` and `--gcc-toolchain` settings; target triples are checked
+against the engine. Unsupported compiler flags are rejected before preflight
+or installation.
+Forced `-include` headers are processed in source order during preparation;
+preflight does not execute their global initializers.
+Standard-library types such as `std::string` use the real target headers, and
+their ABI macros (including `_GLIBCXX_USE_CXX11_ABI`) must match the target
+build. For example, a `std::string` callback validated against a target built
+with the new libstdc++ ABI must keep `_GLIBCXX_USE_CXX11_ABI=1`.
+Object arguments and by-value results are exposed as borrowed references during
+the callback; a returned object is available only during POST.
+
+Use `validate_probe()` to check callback source without installing a probe:
+
+```python
+report = tracer.validate_probe(
+    session.id,
+    "Calculator::add(int, int)",
+    Path("interceptor.cpp").read_text(),
+    compile_options=["-std=c++17", "-I/opt/app/include"],
+    level="compile",
+)
+if not report.success:
+    for diagnostic in report.diagnostics:
+        print(diagnostic.stage, diagnostic.file, diagnostic.line,
+              diagnostic.column, diagnostic.message)
+```
+
+`level="syntax"` checks parsing and reports source diagnostics. The default,
+`level="compile"`, also generates and checks the complete callback wrapper and
+its method bindings. Validation does not install or execute callbacks and
+does not run callback global initializers. The report includes `success`,
+diagnostics with severity, stage and source location, and the ordered compiler
+options supplied for the callback. The console exposes the same operation as
+`probe validate SESSION SELECTOR --callback FILE --level compile`; add repeated
+`--compile-option ARG` flags for ordered compiler arguments. Validation requires
+the server's additive `ValidateProbe` RPC.
 
 `resolve_probe(session_id, selector, ...)` returns the complete inferred spec
 without installing it. `add_probe(session_id, spec)` accepts a generated
@@ -249,6 +309,10 @@ with Client() as tracer:
     tracer.shutdown_server(timeout=30)
 ```
 
+Set `context_event_bytes=25165824` and `context_transport_memory_bytes=234881024`
+in `start_server()` for 24 MiB shared events. The console equivalent is
+`server start --context-event-bytes 25165824 --context-transport-memory-bytes 234881024`.
+
 `ServerProcess` is also exported for standalone process management. Startup
 checks that the endpoint is unused, launches without a shell, and waits for a
 successful `ListSessions` RPC. Startup output is captured for failure diagnostics.
@@ -292,7 +356,7 @@ probe inject "Calculator::add(int, int)" --callback interceptor.cpp --stack 24
 events --count 10 --after 0 --timeout 20
 events --name "Calculator::multiply(int, int) const" --count 4 --timeout 10
 events --name snapshot --name finished --timeout 20
-collect 10 --timeout 20
+collect
 record capture.pb 1000 --timeout 60
 probe remove PROBE_ID
 detach
@@ -320,8 +384,11 @@ command when more results are available. `help symbols` explains all options.
 Use repeatable `--name NAME` on `events`, `collect`, or `record` to select emitted
 event names or full C++ function signatures with the same matching rules as the
 Python API. The function name is displayed with each trace event.
-Ctrl-C clears an input or cancels a live stream, returning to the prompt. EOF,
-`exit` and `quit` leave the console.
+`events` and bare `collect` have no default deadline and run until Ctrl-C.
+`collect COUNT` runs until COUNT matching events arrive or Ctrl-C. Set
+`--timeout SECONDS` to add a total deadline. Ctrl-C clears input or cancels a
+live operation and returns to the prompt. EOF, `exit` and `quit` leave the
+console.
 
 An explicit `!` prefix executes the rest of the line with `/bin/sh` **on the
 console's host**, using its current directory, environment and terminal streams.

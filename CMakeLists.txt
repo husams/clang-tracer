@@ -1,6 +1,23 @@
 cmake_minimum_required(VERSION 3.20)
 project(clang_tracer LANGUAGES C CXX)
 
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+add_library(tracer_headers INTERFACE)
+target_include_directories(tracer_headers INTERFACE "${PROJECT_SOURCE_DIR}/include")
+
+option(TRACER_BUILD_REPL "Build the native interactive client" ON)
+option(TRACER_REPL_ONLY "Build only the portable REPL client and its tests" OFF)
+if(TRACER_REPL_ONLY)
+  include(GNUInstallDirs)
+  include(CTest)
+  include(cmake/TracerNativeRepl.cmake)
+  tracer_add_native_repl()
+  return()
+endif()
+
 option(TRACER_CONTEXT_ENGINE_ONLY "Build only portable context engine checks" OFF)
 if(TRACER_CONTEXT_ENGINE_ONLY)
   include(CTest)
@@ -18,14 +35,14 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
   message(FATAL_ERROR "The native tracing backend requires Linux x86_64")
 endif()
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include(GNUInstallDirs)
 include(CTest)
 include(cmake/TracerContextEngine.cmake)
 include(cmake/TracerToolchain.cmake)
+if(NOT LLVM_ENABLE_RTTI)
+  set_source_files_properties(src/debug_resolver.cpp src/native_stack.cpp src/admission.cpp
+    PROPERTIES COMPILE_OPTIONS "-fno-rtti")
+endif()
 include(cmake/TracerContextAnalysis.cmake)
 find_package(Threads REQUIRED)
 find_package(Protobuf REQUIRED)
@@ -60,12 +77,14 @@ add_custom_command(
 add_library(tracer_proto STATIC ${TRACER_PROTO_DIR}/tracer.pb.cc)
 set_target_properties(tracer_proto PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(tracer_proto PUBLIC ${TRACER_PROTO_DIR})
-target_link_libraries(tracer_proto PUBLIC protobuf::libprotobuf tracer_context_transport_proto)
+target_link_libraries(tracer_proto PUBLIC protobuf::libprotobuf tracer_context_transport_proto tracer_headers)
 add_library(tracer_grpc STATIC ${TRACER_PROTO_DIR}/tracer.grpc.pb.cc)
 target_link_libraries(tracer_grpc PUBLIC tracer_proto gRPC::grpc++)
 
-add_library(clang_tracer_agent SHARED src/agent.cpp src/native_detour.cpp src/debug_resolver.cpp src/native_stack.cpp
-  src/event_transport.cpp src/context_agent_delivery.cpp)
+add_library(clang_tracer_agent SHARED src/agent.cpp src/native_detour.cpp
+  src/value_snapshot_codegen.cpp src/value_snapshot_storage.cpp src/callback_pch.cpp
+  src/debug_resolver.cpp src/native_stack.cpp src/event_transport.cpp
+  src/context_agent_delivery.cpp src/agent_runtime_profile.cpp)
 target_include_directories(clang_tracer_agent PRIVATE include ${TRACER_PROTO_DIR} ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_compile_definitions(clang_tracer_agent PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
 target_link_libraries(clang_tracer_agent PRIVATE tracer_context_engine tracer_context_analysis tracer_proto clang-cpp LLVM ${CMAKE_DL_LIBS} Threads::Threads)
@@ -74,7 +93,7 @@ target_compile_options(clang_tracer_agent PRIVATE -Wall -Wextra -Wpedantic)
 # --exclude-libs,ALL would also hide the required pthread detour entry point
 # from tracer_context_engine; the version script preserves that exact export.
 target_link_options(clang_tracer_agent PRIVATE
-  "LINKER:--no-undefined,-Bsymbolic,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/agent_exports.map")
+  "LINKER:--no-undefined,-Bsymbolic,--build-id=sha1,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/agent_exports.map")
 set_property(TARGET clang_tracer_agent APPEND PROPERTY LINK_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/agent_exports.map
   ${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckAgentSymbols.cmake)
@@ -85,7 +104,7 @@ add_custom_command(TARGET clang_tracer_agent POST_BUILD
   VERBATIM)
 
 add_executable(clang-tracer-server src/main.cpp src/server.cpp src/session.cpp src/injector.cpp src/admission.cpp
-  src/debug_resolver.cpp src/header_context.cpp)
+  src/debug_resolver.cpp src/header_context.cpp src/process_memory.cpp src/native_entry.cpp)
 target_include_directories(clang-tracer-server PRIVATE include ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_compile_definitions(clang-tracer-server PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
 target_link_libraries(clang-tracer-server PRIVATE tracer_grpc tracer_context_collector
@@ -98,17 +117,50 @@ target_compile_definitions(clang-tracer PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tr
 target_link_libraries(clang-tracer PRIVATE tracer_grpc tracer_context_analysis clang-cpp LLVM Threads::Threads SQLite::SQLite3)
 target_compile_options(clang-tracer PRIVATE -Wall -Wextra -Wpedantic)
 
+if(TRACER_BUILD_REPL)
+  include(cmake/TracerNativeRepl.cmake)
+  tracer_add_native_repl()
+endif()
 include(cmake/TracerInstall.cmake)
 
 option(TRACER_BUILD_EXAMPLES "Build example target programs" ON)
 if(TRACER_BUILD_EXAMPLES OR BUILD_TESTING)
+add_subdirectory(examples/prepared-injectors)
 add_executable(trace-target tests/fixtures/target.cpp)
+target_link_libraries(trace-target PRIVATE Threads::Threads)
 set_target_properties(trace-target PROPERTIES ENABLE_EXPORTS ON)
-target_compile_options(trace-target PRIVATE -O0 -fno-omit-frame-pointer -fcf-protection=none)
+target_compile_options(trace-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
 
 add_executable(cpp-interceptors-target examples/cpp-interceptors/target.cpp)
 target_compile_options(cpp-interceptors-target PRIVATE -g -O0 -fno-omit-frame-pointer
   -fcf-protection=none)
+if(TRACER_BUILD_REPL)
+  # Keep DWARF in the demo fixture even when the runtime is installed stripped.
+  install(PROGRAMS "$<TARGET_FILE:cpp-interceptors-target>"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer/examples/native-repl-jit"
+    RENAME target COMPONENT Development)
+endif()
+
+add_executable(signature-interceptor-fixture tests/signature_interceptor_fixture.cpp)
+add_executable(repl-complex-fixture tests/repl_complex_fixture.cpp)
+if(BUILD_TESTING OR TRACER_BUILD_REPL)
+  add_executable(repl-values-example-target examples/native-repl-values/target.cpp)
+  target_link_libraries(repl-values-example-target PRIVATE Threads::Threads)
+  set_target_properties(repl-values-example-target PROPERTIES ENABLE_EXPORTS ON)
+  target_compile_options(repl-values-example-target PRIVATE -g -O0
+    -fno-omit-frame-pointer -fcf-protection=none)
+  if(TRACER_BUILD_REPL)
+    install(PROGRAMS "$<TARGET_FILE:repl-values-example-target>"
+      DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer/examples/native-repl-values"
+      RENAME target COMPONENT Development)
+  endif()
+endif()
+target_link_libraries(repl-complex-fixture PRIVATE Threads::Threads)
+set_target_properties(repl-complex-fixture PROPERTIES ENABLE_EXPORTS ON)
+target_compile_options(repl-complex-fixture PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
+set_target_properties(signature-interceptor-fixture PROPERTIES ENABLE_EXPORTS ON)
+target_compile_options(signature-interceptor-fixture PRIVATE -g -O0
+  -fno-omit-frame-pointer -fcf-protection=none)
 
 add_executable(shared-context-target examples/shared-context/target.cpp)
 target_link_libraries(shared-context-target PRIVATE Threads::Threads)
@@ -119,6 +171,10 @@ add_executable(order-arguments-target examples/order-arguments/target.cpp)
 target_compile_options(order-arguments-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
 
 add_library(call-stacks-calculator SHARED examples/call-stacks/calculator.cpp)
+if(BUILD_TESTING)
+  # Also use this as a valid ELF without the agent handshake in the REPL test.
+  target_link_options(call-stacks-calculator PRIVATE "LINKER:--build-id=sha1")
+endif()
 target_compile_options(call-stacks-calculator PRIVATE -g -O0 -fomit-frame-pointer
   -fno-optimize-sibling-calls -fasynchronous-unwind-tables -fcf-protection=none)
 add_library(call-stacks-no-cfi OBJECT examples/call-stacks/no_cfi.cpp)
@@ -138,6 +194,12 @@ target_link_libraries(call-stacks-filter-target PRIVATE call-stacks-calculator T
 target_compile_options(call-stacks-filter-target PRIVATE -g -O1 -fno-inline -fomit-frame-pointer
   -fno-optimize-sibling-calls -fasynchronous-unwind-tables -fcf-protection=none)
 
+if(BUILD_TESTING)
+  add_executable(deep-stack-target tests/fixtures/deep_stack.cpp)
+  target_compile_options(deep-stack-target PRIVATE -g -O1 -fomit-frame-pointer
+    -fno-optimize-sibling-calls -fasynchronous-unwind-tables -fcf-protection=none)
+endif()
+
 add_executable(trace-threaded-target tests/fixtures/threaded/target.cpp)
 add_library(trace-stack-b SHARED tests/fixtures/threaded/shared_stack_b.cpp)
 add_library(trace-stack-a SHARED tests/fixtures/threaded/shared_stack_a.cpp)
@@ -156,9 +218,19 @@ endif()
 
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_executable(callback-pch-tests tests/callback_pch_tests.cpp src/callback_pch.cpp)
+  target_include_directories(callback-pch-tests PRIVATE src ${TRACER_PROTO_DIR})
+  target_include_directories(callback-pch-tests SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
+  target_link_libraries(callback-pch-tests PRIVATE clang-cpp LLVM tracer_headers)
+  target_compile_options(callback-pch-tests PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME callback_pch_reuse
+    COMMAND callback-pch-tests "${_tracer_resource_dir}")
+  add_test(NAME callback_pch_unavailable
+    COMMAND callback-pch-tests "${_tracer_resource_dir}" --unavailable-cache)
+  set_tests_properties(callback_pch_reuse callback_pch_unavailable PROPERTIES TIMEOUT 60)
   add_executable(native-detour-tests tests/native_detour_tests.cpp src/native_detour.cpp)
   target_include_directories(native-detour-tests PRIVATE include src ${LLVM_INCLUDE_DIRS})
-  target_link_libraries(native-detour-tests PRIVATE LLVM)
+  target_link_libraries(native-detour-tests PRIVATE LLVM tracer_headers)
   target_compile_options(native-detour-tests PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME native_detour_relocation COMMAND native-detour-tests)
   set_tests_properties(native_detour_relocation PROPERTIES TIMEOUT 30)
@@ -166,6 +238,7 @@ if(BUILD_TESTING)
   # Exercise the unchanged fixture with PIE regardless of the driver default.
   add_executable(trace-target-pie tests/fixtures/target.cpp)
   set_target_properties(trace-target-pie PROPERTIES ENABLE_EXPORTS ON)
+  target_link_libraries(trace-target-pie PRIVATE Threads::Threads)
   target_compile_options(trace-target-pie PRIVATE -g -O0 -fPIE
     -fno-omit-frame-pointer -fcf-protection=none)
   target_link_options(trace-target-pie PRIVATE -pie)
@@ -178,7 +251,7 @@ if(BUILD_TESTING)
     tests/fixtures/dependency_collision.cpp)
   set_target_properties(trace-collision-target PROPERTIES ENABLE_EXPORTS ON)
   target_link_libraries(trace-collision-target PRIVATE Threads::Threads)
-  target_compile_options(trace-collision-target PRIVATE -O0 -fno-omit-frame-pointer
+  target_compile_options(trace-collision-target PRIVATE -g -O0 -fno-omit-frame-pointer
     -fcf-protection=none)
   add_test(NAME grpc_agent_dependency_collision
     COMMAND server-integration
@@ -202,12 +275,16 @@ if(BUILD_TESTING)
       --threaded-source ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/threaded/target.cpp
       --output-dir ${CMAKE_CURRENT_BINARY_DIR}/collision-class-results)
   set_tests_properties(grpc_agent_shared_dependency_collision PROPERTIES TIMEOUT 360)
+  add_executable(runtime-identity-tests tests/runtime_identity_checks.cpp src/runtime_identity.cpp)
+  target_include_directories(runtime-identity-tests PRIVATE src)
+  target_link_libraries(runtime-identity-tests PRIVATE tracer_headers Threads::Threads ${CMAKE_DL_LIBS})
+  add_test(NAME runtime_module_identity COMMAND runtime-identity-tests)
   add_library(admission-leaf OBJECT tests/admission_leaf.cpp)
   target_compile_options(admission-leaf PRIVATE -O2 -fomit-frame-pointer -momit-leaf-frame-pointer
     -fasynchronous-unwind-tables -Wall -Wextra -Wpedantic)
   add_executable(admission-integration tests/admission_integration.cpp src/admission.cpp)
   target_include_directories(admission-integration PRIVATE src ${LLVM_INCLUDE_DIRS})
-  target_link_libraries(admission-integration PRIVATE admission-leaf trace-stack-a trace-stack-b LLVM ${CMAKE_DL_LIBS})
+  target_link_libraries(admission-integration PRIVATE tracer_headers admission-leaf trace-stack-a trace-stack-b LLVM ${CMAKE_DL_LIBS})
   target_compile_options(admission-integration PRIVATE -O2 -fomit-frame-pointer
     -fno-optimize-sibling-calls -fasynchronous-unwind-tables -Wall -Wextra -Wpedantic)
   add_test(NAME native_admission_integration COMMAND admission-integration
@@ -216,7 +293,7 @@ if(BUILD_TESTING)
   set_tests_properties(native_admission_integration PROPERTIES TIMEOUT 30)
   add_executable(admission-frame-pointer-integration tests/admission_integration.cpp src/admission.cpp)
   target_include_directories(admission-frame-pointer-integration PRIVATE src ${LLVM_INCLUDE_DIRS})
-  target_link_libraries(admission-frame-pointer-integration PRIVATE admission-leaf trace-stack-a trace-stack-b LLVM ${CMAKE_DL_LIBS})
+  target_link_libraries(admission-frame-pointer-integration PRIVATE tracer_headers admission-leaf trace-stack-a trace-stack-b LLVM ${CMAKE_DL_LIBS})
   target_compile_options(admission-frame-pointer-integration PRIVATE -O2 -fno-omit-frame-pointer
     -fno-optimize-sibling-calls -fasynchronous-unwind-tables -Wall -Wextra -Wpedantic)
   add_test(NAME native_admission_frame_pointer_integration COMMAND admission-frame-pointer-integration
@@ -244,11 +321,23 @@ if(BUILD_TESTING)
   set_tests_properties(native_admission_stripped_integration PROPERTIES TIMEOUT 30)
   add_executable(module-identity-integration tests/module_identity_integration.cpp src/admission.cpp)
   target_include_directories(module-identity-integration PRIVATE src ${LLVM_INCLUDE_DIRS})
-  target_link_libraries(module-identity-integration PRIVATE LLVM ${CMAKE_DL_LIBS})
+  target_link_libraries(module-identity-integration PRIVATE tracer_headers LLVM ${CMAKE_DL_LIBS})
   target_compile_options(module-identity-integration PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME native_module_identity_integration COMMAND module-identity-integration
     --module $<TARGET_FILE:trace-stack-b>)
   set_tests_properties(native_module_identity_integration PROPERTIES TIMEOUT 30)
+  add_test(NAME native_module_cfi_cache_integration COMMAND module-identity-integration
+    --module $<TARGET_FILE:trace-stack-b> --cfi-cache-only)
+  set_tests_properties(native_module_cfi_cache_integration PROPERTIES TIMEOUT 30)
+  add_executable(remote-call-signal-integration tests/remote_call_signal_integration.cpp
+    src/injector.cpp src/admission.cpp src/runtime_identity.cpp)
+  target_include_directories(remote-call-signal-integration PRIVATE src ${LLVM_INCLUDE_DIRS})
+  target_link_libraries(remote-call-signal-integration PRIVATE tracer_headers LLVM
+    ${CMAKE_DL_LIBS} Threads::Threads)
+  target_link_options(remote-call-signal-integration PRIVATE "LINKER:--wrap=ptrace")
+  target_compile_options(remote-call-signal-integration PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME native_remote_call_signal_recovery COMMAND remote-call-signal-integration)
+  set_tests_properties(native_remote_call_signal_recovery PROPERTIES TIMEOUT 60)
   add_executable(server-integration tests/server_integration.cpp)
   target_link_libraries(server-integration PRIVATE tracer_grpc Threads::Threads)
   target_compile_options(server-integration PRIVATE -Wall -Wextra -Wpedantic)
@@ -288,8 +377,9 @@ if(BUILD_TESTING)
       --output-dir ${CMAKE_CURRENT_BINARY_DIR}/friendly-test-results)
   set_tests_properties(grpc_friendly_client_integration PROPERTIES TIMEOUT 90)
   add_executable(cpp-name-fixture tests/cpp_name_fixture.cpp)
-  target_compile_options(cpp-name-fixture PRIVATE -g -O0 -fno-omit-frame-pointer
+  target_compile_options(cpp-name-fixture PRIVATE -g -O0 -fPIE -fno-omit-frame-pointer
     -fcf-protection=none)
+  target_link_options(cpp-name-fixture PRIVATE -pie)
   add_test(NAME grpc_cpp_name_integration
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp_name_integration.py
       --server $<TARGET_FILE:clang-tracer-server>
@@ -315,7 +405,7 @@ if(BUILD_TESTING)
   set_tests_properties(grpc_class_interceptor_integration PROPERTIES TIMEOUT 360)
   add_executable(typed-this-fixture tests/typed_this_fixture.cpp)
   set_target_properties(typed-this-fixture PROPERTIES ENABLE_EXPORTS ON)
-  target_compile_options(typed-this-fixture PRIVATE -O0 -fno-omit-frame-pointer
+  target_compile_options(typed-this-fixture PRIVATE -g -O0 -fno-omit-frame-pointer
     -fcf-protection=none)
   add_test(NAME grpc_typed_this_integration
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/typed_this_integration.py

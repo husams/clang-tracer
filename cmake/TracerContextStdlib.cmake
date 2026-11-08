@@ -16,6 +16,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_
     message(FATAL_ERROR "The shared-context profile needs its matching static unwind archive")
   endif()
   find_program(_context_objcopy NAMES llvm-objcopy objcopy REQUIRED)
+  execute_process(COMMAND ${CMAKE_NM} -g --defined-only ${_context_stdlib_archive}
+    OUTPUT_VARIABLE _context_archive_symbols COMMAND_ERROR_IS_FATAL ANY
+    ERROR_QUIET)
   set(_context_personality_dir ${CMAKE_CURRENT_BINARY_DIR}/context-personality)
   file(MAKE_DIRECTORY ${_context_personality_dir})
   set(_context_personality ${_context_personality_dir}/private-personality.o)
@@ -38,7 +41,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_
   add_library(tracer_context_stdlib SHARED src/context_stdlib_runtime.cpp)
   add_dependencies(tracer_context_stdlib tracer_context_unwind_archive)
   set_target_properties(tracer_context_stdlib PROPERTIES OUTPUT_NAME clang_tracer_context_stdlib)
-  target_compile_features(tracer_context_stdlib PRIVATE cxx_std_20)
+  target_compile_features(tracer_context_stdlib PRIVATE cxx_std_23)
   target_compile_options(tracer_context_stdlib PRIVATE -O2 -fPIC -fno-builtin
     -fvisibility-inlines-hidden -ffunction-sections -fdata-sections
     -fasynchronous-unwind-tables -fexceptions)
@@ -48,6 +51,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_
   target_link_options(tracer_context_stdlib PRIVATE -nostdlib
     "LINKER:-Bsymbolic,-z,now,--no-undefined,--gc-sections,--eh-frame-hdr,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/context_stdlib.map")
   set(_context_stdlib_roots
+    _ZNSaIcEC1ERKS_ _ZNSaIcEC1Ev _ZNSaIcEC2ERKS_ _ZNSaIcEC2Ev _ZNSaIcED1Ev _ZNSaIcED2Ev
+    _ZNSaIwEC1ERKS_ _ZNSaIwEC1Ev _ZNSaIwEC2ERKS_ _ZNSaIwEC2Ev _ZNSaIwED1Ev _ZNSaIwED2Ev
     _ZTIb _ZTIc _ZTIa _ZTIh _ZTIs _ZTIt _ZTIi _ZTIj _ZTIl _ZTIm _ZTIx _ZTIy
     _ZTIf _ZTId _ZTIe _ZTIw _ZTIDi _ZTIDs _ZTIDu
     _ZSt17__throw_bad_allocv _ZSt20__throw_length_errorPKc
@@ -66,7 +71,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_
     _ZNSt8__detail15_List_node_base10_M_reverseEv
     _ZNSt8__detail15_List_node_base4swapERS0_S1_)
   foreach(_root IN LISTS _context_stdlib_roots)
-    target_link_options(tracer_context_stdlib PRIVATE "LINKER:-u,${_root}")
+    # GCC 8's headers never reference newer helper entry points such as
+    # __throw_bad_array_new_length. Do not manufacture an undefined export.
+    if(_context_archive_symbols MATCHES "[ \t][TWVDRB] ${_root}(\n|$)")
+      target_link_options(tracer_context_stdlib PRIVATE "LINKER:-u,${_root}")
+    endif()
   endforeach()
   set_property(TARGET tracer_context_stdlib APPEND PROPERTY LINK_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/context_stdlib.map)

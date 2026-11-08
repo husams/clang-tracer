@@ -15,6 +15,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include "context_collector.hpp"
+#include "tracer/compat.hpp"
 
 namespace {
 struct RpcServer {
@@ -138,7 +139,7 @@ void verify_context_collector() {
 
   const auto encoded = batch.SerializeAsString();
   assert(client.hook_ring().try_publish(
-      std::as_bytes(std::span(encoded.data(), encoded.size()))));
+      ::tracer::compat::as_bytes(::tracer::compat::span(encoded.data(), encoded.size()))));
   {
     std::unique_lock lock(mutex);
     assert(cv.wait_for(lock, 5s, [&] { return static_cast<bool>(received); }));

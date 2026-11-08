@@ -9,8 +9,9 @@
 #include <exception>
 #include <memory>
 #include <mutex>
-#include <span>
 #include <vector>
+
+#include "tracer/compat.hpp"
 
 namespace tracer::context_engine {
 
@@ -198,7 +199,7 @@ public:
   enum class Kind { direct, independent };
   // The complete set is resolved, checked and pinned before the first wait.
   // all_visible is for generated direct hooks with reachable event emission.
-  HookAccess(Context &, std::span<const SlotRequest>, bool all_visible = false,
+  HookAccess(Context&, ::tracer::compat::span<const SlotRequest>, bool all_visible = false,
              Kind = Kind::direct);
   ~HookAccess() noexcept;
   HookAccess(const HookAccess &) = delete;

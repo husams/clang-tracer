@@ -109,10 +109,12 @@ remain available for custom callbacks. See `stack-capture-results/2026-10-30-opt
 
 ## Native call stacks
 
-Add `--stack 24` to an ordinary `trace` command to capture the calling thread's
-entry stack, with a depth from 1 to 64. Capture is optional. An interceptor may
-also call `call.capture_stack(24)` without that flag; `call.stack()` reads the
-automatic snapshot. Both PRE and POST refer to the invocation's entry stack.
+Add `--stack full` to a `trace` command to unwind the calling thread's entry
+stack to its root. Use `--stack N` to choose a frame limit, or omit it to
+disable automatic capture. The native REPL uses `--stack-depth full` or
+`--stack-depth N`. An interceptor can request a snapshot with
+`call.capture_stack(tracer::kUnlimitedStackDepth)` or `call.capture_stack(N)`.
+`call.stack()` reads the automatic snapshot. Both PRE and POST refer to the invocation's entry stack.
 Stacks are application-only by default in both callbacks and CLI output.
 `--stack-application-only false` restores all native, JIT and runtime frames;
 `true` explicitly selects the default. Callback-requested capture inherits this
@@ -124,14 +126,22 @@ Application functions taking `std::` arguments remain visible. ELF ownership,
 SONAME and LLVM declaration context drive classification, not a substring match
 on parameter types.
 
-Filtering happens after the bounded native unwind: requested depth includes
+Filtering happens after the native unwind, so requested depth includes
 hidden frames, and COMPLETE/PARTIAL/TRUNCATED continues to describe that unwind.
 `stack.captured_depth` records raw depth and `stack.hidden_frames` records the
 omissions; the CLI prints both. Filtering never turns a truncated unwind into
 a complete one. A fully hidden snapshot may contain zero visible frames.
 The corresponding Protobuf fields preserve the same callback/CLI view.
+Shared events include the stack in their payload. Start the server with
+`--context-event-bytes 4194304` to allow 4 MiB per shared event. The default
+is 256 KiB. For larger events, set both `--context-event-bytes 25165824`
+and `--context-transport-memory-bytes 234881024` for a 24 MiB event budget and
+224 MiB of transport memory. The transport default is 64 MiB. It accounts for
+staging copies, so it needs roughly eight times the event budget plus overhead.
+The server grows the default context history budget to retain a large event
+and still honors an explicit `--context-history-bytes` setting.
 
-Callbacks can inspect the bounded frame array (`pc`, `stack_pointer`, `kind`,
+Callbacks can inspect the invocation’s frames (`pc`, `stack_pointer`, `kind`,
 `function`, `module`, `file`, `line`, `module_offset`, `application_frame`), frame count, requested
 depth, status and stop reason. LLVM resolves metadata before PRE/POST can read
 it; events reuse the exact same snapshot. `function`, `module`, and `file` are
@@ -200,7 +210,7 @@ shows the supported state shapes.
 
 ## Build and run
 
-Use Linux x86-64, C++20, matching LLVM/Clang development packages (21 or 22),
+Use Linux x86-64, C++23, matching LLVM/Clang development packages (21 or 22),
 Protobuf with `protoc`, gRPC C++ with `grpc_cpp_plugin`, SQLite development
 headers, CMake, and Ninja. Supply PIC static Protobuf/gRPC and their transport
 dependencies to isolate the injected agent from the application's libraries.
@@ -369,9 +379,22 @@ Canonical mapped paths and ELF offsets/ranges must match; PIE, fixed-address
 executables and shared libraries use the same translation. The agent independently
 re-resolves the exact entry, range and callable metadata inside the target before
 decoding or preparing a hook. A patch cannot extend beyond the selected function.
+That verified result is reused during the same injection's receiver setup;
+each new injection performs its own verification. Cancellation is checked at
+module/unit boundaries, periodically during traversal, and before completion;
+explicit entry/depth budgets still apply to every visited entry.
 No target relinking or rebuilding is needed when supported DWARF is already
 present. Missing concrete code ranges, ambiguous mappings and unpatchable entries
 fail closed. Fragmented DWARF range lists are currently unsupported.
+
+Callback compilation lazily precompiles its common standard C++ headers once per
+agent process, with separate artifacts for syntax validation and incremental
+JIT compilation. Each injector restores the matching headers into fresh compiler
+and JIT state. Callback source, argument aliases and receiver declarations remain
+private to that injector, and the existing syntax/layout checks still run.
+Changed headers or include-search results invalidate the cache. Unsupported
+compiler profiles, unavailable cache storage, and headers with startup or
+shutdown effects use the original compilation path.
 
 Normal CLI verification covered non-exported free functions and methods in
 already-running PIE and fixed-address executables, plus a mapped shared library,
@@ -405,13 +428,13 @@ a private filesystem so the target's working directory stays unchanged.
 ```
 
 Without `--compdb`, Clang searches the first header's parent directories for a
-database. If none exists, optional standalone headers use the default C++20
+database. If none exists, optional standalone headers use the default C++23
 context. An explicit missing/empty database fails clearly. Multiple headers use
 the first header's command; inspect the printed inference when build variants
 or nearby sources use different flags. Output/dependency-generation flags and
 the donor source input are removed. Supplied headers must be accessible in the
 target filesystem and must still pass the DWARF layout/type checks. These flags
-configure the header AST; callback compilation retains its C++20 context.
+configure the header AST; callback compilation retains its C++23 context.
 
 The raw exported-symbol interface with explicit `--return`/`--arg` remains
 available. It does not provide a typed receiver. The CLI no longer accepts
@@ -635,9 +658,10 @@ threads, including a CPU-busy leader inside nested C++ functions and methods.
 Attachment prefers the leader and can select an eligible existing worker when
 the leader is blocked in futex, epoll, pipe reads, or another unsupported syscall.
 The process PID remains the session identity; the selected TID runs native
-control operations. Tasks in `nanosleep` or `clock_nanosleep` retain the existing
-sleep admission policy. Other blocked syscalls are left intact, and external
-job-control stops are preserved.
+control operations. Workers must have a valid thread pointer. Tasks in
+`nanosleep` or `clock_nanosleep` retain the existing sleep admission policy.
+Other blocked syscalls are left intact, and external job-control stops are
+preserved.
 
 Admission no longer requires an instruction in `main`, a `main` symbol, or an
 immediate return into libc. LLVM parses `.eh_frame` and unwinds each application
@@ -668,6 +692,11 @@ retried within the operation deadline.
 The session snapshots canonical mapped paths and load biases without retaining
 binary file handles or policing file timestamps. Control attachments validate
 the paths and executable ELF mapping ranges, including the sleep admission path.
+Admission reads the required ELF metadata and unwind sections without copying
+unrelated debug sections or application symbol tables. Each discovered module
+retains its successful CFI validation inputs; later attachments reuse that
+validation only when fresh unwind bytes, load headers, type, and SONAME match
+exactly. Mapping and load-bias checks still run on every attachment.
 Unmapping or rebasing invalidates that snapshot. Rebuilding or replacing binary
 contents requires a new session. Native stack caches refresh after prior probes
 drain; reconnecting a durable collector keeps active probe metadata alive.
@@ -739,8 +768,8 @@ outside the current lifecycle contract.
 
 The reconciled worker-admission changes passed **25/25 CTests in 419.70 seconds**
 on `linux-dev` on 2 November 2026; both regression sets also passed from
-OverlayFS (**7/7 in 44.09 seconds**). Main retains C++20. The original overlapping
-local implementation is preserved in the merge's second-parent snapshot.
+OverlayFS (**7/7 in 44.09 seconds**). The C++23 main build keeps the
+existing runtime profile.
 
 Blocked-main worker selection was verified on 2 November 2026 on `linux-dev`:
 **24/24 CTests passed in 411.09 seconds**, and the six new regression cases
@@ -748,10 +777,9 @@ passed from OverlayFS in 35.26 seconds. The supplied condition-variable/sleeping
 worker reproduction also attached, detached and shut down successfully.
 
 The session-path backport was verified on 2 November 2026 with the normal
-C++20 build on `linux-dev`: **18/18 CTests passed natively in 373.84 seconds**
+C++23 build on `linux-dev`: **18/18 CTests passed natively in 373.84 seconds**
 and **18/18 passed from OverlayFS in 378.11 seconds**. The build configuration,
-dependencies and standard C++20 APIs remain unchanged; this backport includes
-no GCC 8.5 compatibility profile or library fallbacks.
+dependencies and standard C++23 APIs remain unchanged.
 
 Class-instance arguments verified on 30 October 2026 through the normal CLI,
 with Order target source and compilation database temporarily unavailable.
@@ -876,6 +904,10 @@ under `auto-test-results/`. Reproduce the focused live test with
 `ctest --test-dir build -R grpc_shared_main_integration --output-on-failure`;
 new evidence is written under `build/auto-test-results/`. Earlier milestone
 results remain recorded in `PROGRESS.md` (local recording).
+
+The [native REPL](docs/native-repl.md) adds an interactive client with owned
+server startup, PID/process attach, interceptor upload, continuous event collection,
+recording, offline inspection and local C++ analysis.
 
 Implementation references: [Clang Interpreter](https://clang.llvm.org/docs/ClangRepl.html),
 [LLVM ORC](https://llvm.org/docs/ORCv2.html),

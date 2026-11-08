@@ -1,8 +1,5 @@
 #pragma once
 
-#include "context_facade.hpp"
-#include "context_registry.hpp"
-
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -10,9 +7,12 @@
 #include <functional>
 #include <memory>
 #include <optional>
-#include <span>
 #include <string>
 #include <vector>
+
+#include "context_facade.hpp"
+#include "context_registry.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer::context_runtime {
 
@@ -34,6 +34,7 @@ struct EventMetadata final {
   std::uint64_t recording_position = 0;
   std::uint64_t epoch_schema_id = 1;
   std::uint32_t capture_hook_id = 0;
+  std::uint32_t capture_event_bytes = tracer::kDefaultContextEventBytes;
   bool print_arguments = false;
   bool print_result = false;
 };

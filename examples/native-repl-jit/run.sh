@@ -41,7 +41,7 @@ trap 'exit 143' TERM HUP
 target=$example_dir/target
 if [[ ! -x $target || -n ${CXX:-} ]]; then
   target=$run_dir/target
-  "$compiler" -std=c++17 -g -O0 -fno-omit-frame-pointer -fcf-protection=none \
+  "$compiler" -std=c++23 -g -O0 -fno-omit-frame-pointer -fcf-protection=none \
     -rdynamic "$example_dir/../cpp-interceptors/target.cpp" -o "$target"
 fi
 cp -- "$example_dir/observer.cpp" "$run_dir/"

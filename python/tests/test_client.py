@@ -34,6 +34,7 @@ def test_public_control_and_injection(peer):
         module="target",
         debug_max_entries=2_000_001,
         debug_max_depth=256,
+        compile_options=["-std=c++17", "-DORDER=1", "-I/srv/include"],
     )
     assert probe.id == 7
     resolution, addition = service.requests[-2:]
@@ -43,9 +44,19 @@ def test_public_control_and_injection(peer):
     assert resolution.module == "target"
     assert resolution.debug_max_entries == 2_000_001
     assert resolution.debug_max_depth == 256
+    assert list(resolution.compile_options) == [
+        "-std=c++17",
+        "-DORDER=1",
+        "-I/srv/include",
+    ]
     assert addition.spec.stack_depth == 24
     assert addition.spec.print_arguments and addition.spec.print_result
     assert addition.spec.callback_package_path == "/srv/interceptor.cpp"
+    assert list(addition.spec.compile_options) == [
+        "-std=c++17",
+        "-DORDER=1",
+        "-I/srv/include",
+    ]
     assert not addition.spec.include_internal_stack_frames
     assert client.remove_probe("s1", 7).original_bytes_restored
     assert client.detach("s1").state == pb.Session.DETACHED
@@ -100,6 +111,38 @@ def test_list_modules_and_default_lookup_limits(peer):
     assert request.debug_max_entries == request.debug_max_depth == 0
 
 
+def test_resolve_probe_preserves_ordered_compiler_options(peer):
+    client, service = peer
+    spec = client.resolve_probe(
+        "s1",
+        "add(int, int)",
+        compile_options=["-std=c++17", "-DVALUE=1", "-I/opt/app/include"],
+    )
+    request = service.requests[-1]
+    assert list(request.compile_options) == [
+        "-std=c++17",
+        "-DVALUE=1",
+        "-I/opt/app/include",
+    ]
+    assert list(spec.compile_options) == list(request.compile_options)
+
+
+def test_add_probe_preserves_options_in_the_complete_spec(peer):
+    client, service = peer
+    spec = pb.ProbeSpec(
+        symbol="_Z3addii",
+        callback_source="struct Interceptor {};",
+        compile_options=["-std=c++17", "-DVALUE=1"],
+    )
+    spec.signature.kind = pb.FUNCTION
+    spec.signature.result = pb.INT32
+    spec.signature.arguments.extend([pb.INT32, pb.INT32])
+    client.add_probe("s1", spec)
+    request = service.requests[-1]
+    assert isinstance(request, pb.AddProbeRequest)
+    assert list(request.spec.compile_options) == ["-std=c++17", "-DVALUE=1"]
+
+
 def test_list_symbols_does_not_cap_filters_or_tokens(peer):
     client, service = peer
     client.list_symbols(
@@ -129,13 +172,23 @@ def test_all_public_rpcs_have_client_methods():
     methods = {
         "Attach": "attach",
         "AddProbe": "add_probe",
+        "ReloadProbe": "reload_probe",
         "RemoveProbe": "remove_probe",
         "Detach": "detach",
         "ListSessions": "list_sessions",
         "ListSymbols": "list_symbols",
         "ListModules": "list_modules",
+        "ListMemoryMappings": "list_memory_mappings",
+        "ReadMemory": "read_memory",
+        "ScanMemory": "scan_memory",
+        "PreviewFunctionEntry": "preview_function_entry",
+        "ListThreads": "list_threads",
+        "PreviewBulkTrace": "preview_bulk_trace",
+        "ApplyBulkTrace": "apply_bulk_trace",
+        "RemoveBulkTrace": "remove_bulk_trace",
         "WatchEvents": "watch_events",
         "ResolveProbe": "resolve_probe",
+        "ValidateProbe": "validate_probe",
         "ReadEvents": "read_events",
         "AcknowledgeEvents": "acknowledge_events",
     }
@@ -143,6 +196,68 @@ def test_all_public_rpcs_have_client_methods():
         m.name for m in pb.DESCRIPTOR.services_by_name["Tracer"].methods
     }
     assert all(callable(getattr(Client, name)) for name in methods.values())
+
+
+def test_validation_transmits_ordered_options_and_returns_diagnostics(
+    peer, monkeypatch
+):
+    client, _service = peer
+    report = pb.ValidationReport(success=False, level=pb.ValidateProbeRequest.SYNTAX)
+    report.diagnostics.add(
+        stage="parse",
+        severity="error",
+        file="callback.cpp",
+        line=3,
+        column=8,
+        message="expected ;",
+    )
+    calls = []
+
+    def validate(request, timeout=None):
+        calls.append((request, timeout))
+        return report
+
+    monkeypatch.setattr(client.stub, "ValidateProbe", validate)
+    result = client.validate_probe(
+        "s1",
+        "add(int, int)",
+        "struct Interceptor {};",
+        include_headers=["/srv/add.hpp"],
+        compilation_database="/srv/build",
+        compile_options=["-std=c++17", "-DORDER=1"],
+        level="syntax",
+        module="target",
+        debug_max_entries=2000001,
+        debug_max_depth=256,
+    )
+    assert result is report
+    request, timeout = calls[0]
+    assert request.session_id == "s1"
+    assert request.selector == "add(int, int)"
+    assert request.callback_source == "struct Interceptor {};"
+    assert list(request.include_headers) == ["/srv/add.hpp"]
+    assert request.compilation_database == "/srv/build"
+    assert list(request.compile_options) == ["-std=c++17", "-DORDER=1"]
+    assert request.level == pb.ValidateProbeRequest.SYNTAX
+    assert request.module == "target"
+    assert request.debug_max_entries == 2000001
+    assert request.debug_max_depth == 256
+    assert timeout == client.timeout
+
+
+@pytest.mark.parametrize(
+    "options",
+    ["-std=c++17", [""], ["bad\0option"], ["x" * 4097], ["-D1"] * 129],
+)
+def test_validation_rejects_invalid_compile_options_before_rpc(peer, options):
+    client, service = peer
+    with pytest.raises(ValueError, match="compile_options|compile option"):
+        client.validate_probe(
+            "s1", "add", "struct Interceptor {};", compile_options=options
+        )
+    assert not any(
+        isinstance(request, pb.ValidateProbeRequest) for request in service.requests
+    )
 
 
 def test_stream_filters_cursor_and_context(peer):
@@ -294,7 +409,14 @@ def test_invalid_pid_is_rejected_before_rpc(peer, pid):
     assert not service.requests
 
 
-@pytest.mark.parametrize("depth", [-1, 65, True])
+@pytest.mark.parametrize("depth, wire_depth", [(128, 128), ("full", (1 << 32) - 1)])
+def test_extended_stack_depth_is_sent_to_server(peer, depth, wire_depth):
+    client, service = peer
+    client.inject("s1", "add(int,int)", "struct Interceptor {};", stack_depth=depth)
+    assert service.requests[-1].spec.stack_depth == wire_depth
+
+
+@pytest.mark.parametrize("depth", [-1, 1 << 32, True])
 def test_invalid_stack_depth_is_rejected_before_resolution(peer, depth):
     client, service = peer
     with pytest.raises(ValueError):

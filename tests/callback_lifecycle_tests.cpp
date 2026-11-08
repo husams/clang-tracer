@@ -1,4 +1,5 @@
 #include <cerrno>
+#include <exception>
 #include <iostream>
 #include <stdexcept>
 #include <type_traits>

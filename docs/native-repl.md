@@ -1,4 +1,4 @@
-# Native C++17 REPL
+# Native C++ REPL
 
 For runnable examples of structs/classes, strings, optionals, sequence
 containers, maps, sets and nested containers, see
@@ -11,10 +11,8 @@ Interpreter. Python is not required to run the console.
 
 ## Build
 
-The new console, its controller, generated RPC bindings and command parser are
-compiled as C++17. The `c++17` base branch still selects C++20 for the existing
-backend; the REPL does not inherit that requirement. Build the client alone on
-Linux or macOS:
+The console, controller, generated RPC bindings and command parser are built
+with the project C++23 toolchain. Build the client alone on Linux or macOS:
 
 ```sh
 cmake -S . -B build-repl -G Ninja -DTRACER_REPL_ONLY=ON \
@@ -254,7 +252,15 @@ no installation or writes.
 
 `load` reads the file on the console machine. `upload` sends its source by value
 through ResolveProbe/AddProbe and reports success only for an active probe.
-The draft remains available after deployment errors. The short equivalent is:
+The draft remains available after deployment errors. Use
+`--stack-depth full --stack-application-only false` to capture through the
+thread root and include runtime and JIT frames. A numeric depth caps the
+unwind at that many frames before filtering. For large shared events, pass
+`--context-event-bytes 25165824 --context-transport-memory-bytes 234881024`
+to the REPL at launch or to `%server start` for 24 MiB events. Pass the same
+options to `clang-tracer-server` when starting an external server. For REPL collections,
+`--buffer-bytes` controls how much space is available for the retained event
+and its projected stack. The short equivalent is:
 
 ```text
 %probe inject "Calculator::multiply(int, int) const" --callback method.cpp
@@ -307,7 +313,7 @@ earlier variables, sessions and background collectors remain usable. Bare
 top-level void calls retain their optional trailing semicolon. Temporary
 collections can be inspected directly, including `live.snapshot().size()`.
 
-### C++17 event ranges
+### Event ranges
 
 Synchronous collection waits for the count, timeout (30 seconds by default),
 or Ctrl+C, then returns an iterable snapshot range:
@@ -335,8 +341,8 @@ for new arrivals or consuming them. Later loops can include the same events.
 cancellation and timeout flags. Stream failures appear in `error()` in either
 mode; partial results remain inspectable. `events_async(session, 100, 10)` stops
 at 100 events or 10 seconds; zero count/timeout means no corresponding limit.
-Synchronous counts and timeouts must be positive. Both modes use C++17, without
-coroutines or C++20 ranges.
+Synchronous counts and timeouts must be positive. Both modes use the REPL
+collection API without requiring coroutines or standard-library ranges.
 
 A range reserves the remaining shared event-count and byte budget. While it is
 retained, another capture may have no room; release all copies of the range
@@ -351,7 +357,7 @@ than calling the facade from user-created threads.
 Use `%help api EventRange` for the range API. Existing `tracer.collect(...)` and
 named collection commands retain their behavior.
 
-### C++17 collection adaptors
+### Collection adaptors
 
 Use `%help api adaptors` for an overview, or look up an individual operation
 with `%help api drop`, `%help api filter`, or any other adaptor name.
@@ -423,6 +429,7 @@ can include `event_ranges.hpp` and use the `tracer_repl` namespace explicitly.
 %collect --count 100 --timeout 10 --as batch
 %events list batch --limit 20
 %events show batch --index 0
+%events stack batch --index 0
 %events calls batch
 %events stats batch
 %record capture.pb --count 1000
@@ -456,8 +463,10 @@ new events. Offline replay requires an unused name or an explicit `%events clear
 first, so a corrupt recording cannot overwrite an existing capture.
 
 Detail inspection shows typed arguments/results, receiver fields, stack frames,
-and raw metadata. Shared-state payloads are decoded with their attached schema
-when available. Native PRE/POST pairing includes server lifetime, session,
+and raw metadata. `%events stack NAME --index N` prints the capture status and
+each retained stack frame directly, including frames from replayed events.
+Shared-state payloads are decoded with their attached schema when available.
+Native PRE/POST pairing includes server lifetime, session,
 probe, thread and call identity, and marks missing halves. Shared-context
 invocation/task identities remain available in event details.
 Loss statistics sum the latest observed cumulative agent counter per probe and

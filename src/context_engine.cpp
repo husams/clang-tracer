@@ -1,9 +1,11 @@
 #include "context_engine.hpp"
-#include "context_execution.hpp"
 
 #include <algorithm>
 #include <optional>
 #include <utility>
+
+#include "context_execution.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer::context_engine {
 namespace {
@@ -21,6 +23,7 @@ struct Execution {
   unsigned guards = 0;
   bool lifecycle = false;
   std::unique_ptr<ScopeRecord> retired;
+  Execution();
   ~Execution();
 };
 
@@ -176,6 +179,7 @@ void drain_retired() noexcept {
   }
 }
 
+Execution::Execution() = default;
 Execution::~Execution() { drain_retired(); }
 
 void retire(ScopeRecord *record) noexcept {
@@ -450,9 +454,10 @@ void HookAccess::add(std::shared_ptr<ScopeRecord> record, Identity state) {
   entries_[size_++].slot = slot;
 }
 
-HookAccess::HookAccess(Context &context, std::span<const SlotRequest> requests,
+HookAccess::HookAccess(Context& context, ::tracer::compat::span<const SlotRequest> requests,
                        bool all_visible, Kind kind)
-    : context_(context), kind_(kind) {
+    : context_(context)
+    , kind_(kind) {
   context.check_lifecycle();
   if (!context.hook_) {
     fail(ErrorCode::no_active_hook);
@@ -619,7 +624,7 @@ void Context::with(const SlotRequest &request, void (*visitor)(void *, void *),
     visitor(access_->ref(request), argument);
     return;
   }
-  HookAccess access(*this, std::span(&request, 1), false,
+  HookAccess access(*this, ::tracer::compat::span(&request, 1), false,
                     HookAccess::Kind::independent);
   visitor(access.ref(request), argument);
 }

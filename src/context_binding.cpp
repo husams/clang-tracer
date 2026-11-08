@@ -1,8 +1,4 @@
 #include "context_binding.hpp"
-#include "context_stdlib.hpp"
-#include "context_storage_support.hpp"
-#include "context_unwind.hpp"
-#include "engine_storage.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -13,6 +9,7 @@
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h>
 #include <llvm/ExecutionEngine/SectionMemoryManager.h>
+#include <llvm/IR/Attributes.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/GlobalAlias.h>
 #include <llvm/IR/IRBuilder.h>
@@ -23,6 +20,12 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Transforms/Utils/Local.h>
+
+#include "context_stdlib.hpp"
+#include "context_storage_support.hpp"
+#include "context_unwind.hpp"
+#include "engine_storage.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer {
 namespace {
@@ -72,6 +75,7 @@ bool intrinsic(llvm::Intrinsic::ID id) {
   case llvm::Intrinsic::lifetime_start:
   case llvm::Intrinsic::lifetime_end:
   case llvm::Intrinsic::assume:
+  case llvm::Intrinsic::is_constant: // GCC 8 std::less; resolved by code generation.
   case llvm::Intrinsic::experimental_noalias_scope_decl:
   case llvm::Intrinsic::sadd_with_overflow:
   case llvm::Intrinsic::uadd_with_overflow:
@@ -307,8 +311,9 @@ llvm::Expected<std::vector<ContextNativeSymbol>> ContextNativeSymbol::catalog(
     if (!address.address)
       return invalid("null native capability");
     auto source_name = address.source_name;
-    if (source_name.starts_with("::"))
+    if (::tracer::compat::starts_with(source_name, "::")) {
       source_name.erase(0, 2);
+    }
     auto symbols = context_bridge_symbols(compiled->contract, {source_name});
     if (!symbols)
       return symbols.takeError();
@@ -439,9 +444,9 @@ PrivateContextCode::load(
     };
     collect(collect, *owner);
     for (const auto &symbol : imports)
-      if (!allowed.contains(symbol.owner_.get()))
-        return invalid(
-            "callback support is not from its owner's sealed generation");
+      if (!::tracer::compat::contains(allowed, symbol.owner_.get())) {
+        return invalid("callback support is not from its owner's sealed generation");
+      }
   }
   auto impl = std::make_unique<Impl>();
   impl->role = role;
@@ -484,6 +489,10 @@ PrivateContextCode::load(
         (!impl->standard_library && !ir.alias_empty()))
       return invalid(
           "unvalidated assembly, resolver or alias in support closure");
+    constexpr llvm::StringLiteral stack_check_failure = "__stack_chk_fail";
+    if (ir.getNamedValue(stack_check_failure))
+      return invalid("stack protector failure symbol is reserved for the backend");
+    bool needs_stack_check = false;
     std::set<const llvm::Value *> seen;
     for (const auto &alias : ir.aliases()) {
       if (!llvm::isa<llvm::Function>(alias.getAliaseeObject()))
@@ -495,23 +504,21 @@ PrivateContextCode::load(
           return error;
         continue;
       }
-      if (global.getName().starts_with("llvm.") || global.isThreadLocal() ||
-          global.getName().starts_with("__tracer_") || global.isDeclaration() ||
-          global.hasAvailableExternallyLinkage() ||
-          global.isExternallyInitialized())
-        return invalid("unvalidated global/lifecycle reference: " +
-                       global.getName().str());
+      if (::tracer::compat::starts_with(global.getName(), "llvm.") || global.isThreadLocal() ||
+          ::tracer::compat::starts_with(global.getName(), "__tracer_") || global.isDeclaration() ||
+          global.hasAvailableExternallyLinkage() || global.isExternallyInitialized()) {
+        return invalid("unvalidated global/lifecycle reference: " + global.getName().str());
+      }
       if (auto error = constants(&global, seen))
         return error;
     }
     for (auto &function : ir) {
       const auto primitive = storage_primitive(function.getName());
-      if (function.getName().starts_with("__tracer_") &&
+      if (::tracer::compat::starts_with(function.getName(), "__tracer_") &&
           !(role == Role::support && function.isDeclaration() &&
-            primitive != StoragePrimitive::none &&
-            storage_signature(function, primitive)))
-        return invalid("reserved private support symbol or ABI: " +
-                       function.getName().str());
+            primitive != StoragePrimitive::none && storage_signature(function, primitive))) {
+        return invalid("reserved private support symbol or ABI: " + function.getName().str());
+      }
       if (function.isIntrinsic()) {
         if (impl->standard_library &&
             function.getIntrinsicID() == llvm::Intrinsic::trap) {
@@ -578,10 +585,13 @@ PrivateContextCode::load(
           return invalid("owner bridge C++ pointee/definition mismatch: " +
                          function.getName().str());
       } else {
-        if (imported.contains(function.getName().str()) ||
-            native.contains(function.getName().str()))
-          return invalid("callback definition shadows owner bridge: " +
-                         function.getName().str());
+        needs_stack_check |= function.hasFnAttribute(llvm::Attribute::StackProtect) ||
+                             function.hasFnAttribute(llvm::Attribute::StackProtectReq) ||
+                             function.hasFnAttribute(llvm::Attribute::StackProtectStrong);
+        if (::tracer::compat::contains(imported, function.getName().str()) ||
+            ::tracer::compat::contains(native, function.getName().str())) {
+          return invalid("callback definition shadows owner bridge: " + function.getName().str());
+        }
         if (function.hasAvailableExternallyLinkage() ||
             (function.hasPersonalityFn() && !impl->standard_library) ||
             function.hasGC() || function.isVarArg())
@@ -667,6 +677,9 @@ PrivateContextCode::load(
     for (const auto &[name, symbol] : imported)
       if (!ir.getFunction(name))
         return invalid("unused/unmatched owner import: " + name);
+    // The backend adds this failure call after the audited IR stage.
+    if (needs_stack_check)
+      return sealed(stack_check_failure);
     return llvm::Error::success();
   });
   if (audited)

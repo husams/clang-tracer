@@ -221,7 +221,7 @@ header's command from source entries using filename and directory similarity;
 the CLI prints which entry it selected. It uses the command's flags and working
 directory to parse a synthetic header-only translation unit. The selected .cpp
 does not need to exist. Without `--compdb`, the CLI searches parent directories
-of the first header for a database; if none exists, standalone headers use C++20.
+of the first header for a database; if none exists, standalone headers use C++23.
 All supplied headers share the first header's inferred command. The resulting
 class layout and ABI must still match the binary's DWARF before patching.
 

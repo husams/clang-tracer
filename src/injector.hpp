@@ -4,14 +4,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
-#include <span>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-#include "admission.hpp"
-
 #include <sys/types.h>
+
+#include "admission.hpp"
+#include "tracer/compat.hpp"
 
 namespace tracer::injector {
 
@@ -46,7 +46,7 @@ public:
   Process &operator=(Process &&other) noexcept;
 
   void attach(pid_t process_id,
-              std::span<const ApplicationModule> application_modules = {});
+              ::tracer::compat::span<const ApplicationModule> application_modules = {});
   void detach();
 
   // Prevent normal detach/resume after the caller detects an unsafe target
@@ -74,7 +74,7 @@ public:
   // Validates and commits the complete disjoint patch set while all target
   // threads are stopped. A precondition/active-instruction failure changes no
   // bytes; a write failure rolls back every range before resuming threads.
-  [[nodiscard]] bool patch_code_batch(std::span<const CodePatch> patches);
+  [[nodiscard]] bool patch_code_batch(::tracer::compat::span<const CodePatch> patches);
   void remote_free(std::uintptr_t address, std::size_t size);
 
   [[nodiscard]] std::uintptr_t

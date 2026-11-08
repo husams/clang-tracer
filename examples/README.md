@@ -10,7 +10,7 @@ commands; start with basic callbacks, then shared context.
 | [Object arguments](order-arguments/README.md) | Read an Order passed by reference, pointer or value. |
 | [Native REPL local JIT](native-repl-jit/README.md) | Preview and apply bulk traces, inspect mapped memory, reload an observer, and record and replay SQLite. |
 | [Prepared injection](prepared-injectors/README.md) | Prepare typed probes from headers and inspect captured methods and custom state. |
-| [Native REPL typed values](native-repl-values/README.md) | Read structs/classes, strings, optionals, sequences, maps, sets, and nested containers as C++17 values. |
+| [Native REPL typed values](native-repl-values/README.md) | Read structs/classes, strings, optionals, sequences, maps, sets, and nested containers as typed C++ values. |
 | [Shared context](shared-context/README.md) | Share one request's state across two probes and a worker thread. |
 | [Call stacks](call-stacks/README.md) | Capture and display symbolized native stacks. |
 | [Legacy callbacks](legacy-callbacks/README.md) | Use the older entry-only TraceContext interface. |

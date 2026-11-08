@@ -6,7 +6,6 @@
 #include <span>
 #include <string>
 #include <vector>
-
 #include "tracer/protocol.hpp"
 
 namespace tracer::native_detour {

@@ -42,6 +42,9 @@ CREATE TABLE IF NOT EXISTS trace_events (
   agent_dropped_events TEXT NOT NULL, server_dropped_events TEXT NOT NULL,
   payload BLOB NOT NULL, PRIMARY KEY (server_instance_id, sequence));
 CREATE INDEX IF NOT EXISTS trace_events_process ON trace_events(pid, session_id);
+CREATE TABLE IF NOT EXISTS trace_event_types (
+  server_instance_id TEXT NOT NULL, session_id TEXT NOT NULL, probe_id TEXT NOT NULL,
+  adapter BLOB NOT NULL, PRIMARY KEY (server_instance_id, session_id, probe_id));
 )sql");
       check(sqlite3_prepare_v2(
           database_,
@@ -49,8 +52,13 @@ CREATE INDEX IF NOT EXISTS trace_events_process ON trace_events(pid, session_id)
           "?, ?) "
           "ON CONFLICT (server_instance_id, sequence) DO NOTHING",
           -1, &insert_, nullptr));
+      check(sqlite3_prepare_v2(
+          database_, "INSERT INTO trace_event_types VALUES (?, ?, ?, ?) "
+                     "ON CONFLICT (server_instance_id, session_id, probe_id) DO NOTHING",
+          -1, &insert_types_, nullptr));
     } catch (...) {
       sqlite3_finalize(insert_);
+      sqlite3_finalize(insert_types_);
       sqlite3_close(database_);
       throw;
     }
@@ -58,6 +66,7 @@ CREATE INDEX IF NOT EXISTS trace_events_process ON trace_events(pid, session_id)
 
   ~SQLiteEvents() {
     sqlite3_finalize(insert_);
+    sqlite3_finalize(insert_types_);
     sqlite3_close(database_);
   }
 
@@ -80,6 +89,7 @@ CREATE INDEX IF NOT EXISTS trace_events_process ON trace_events(pid, session_id)
 private:
   sqlite3 *database_ = nullptr;
   sqlite3_stmt *insert_ = nullptr;
+  sqlite3_stmt *insert_types_ = nullptr;
 
   void check(int result) {
     if (result != SQLITE_OK) {
@@ -95,6 +105,23 @@ private:
   void text(int position, const std::string &value) {
     check(sqlite3_bind_text(insert_, position, value.data(),
                             static_cast<int>(value.size()), SQLITE_TRANSIENT));
+  }
+
+  void append_types(const clangtracer::v1::TraceEvent &event) {
+    sqlite3_reset(insert_types_);
+    sqlite3_clear_bindings(insert_types_);
+    const auto bind = [&](int index, const std::string &value) {
+      check(sqlite3_bind_text(insert_types_, index, value.c_str(), -1, SQLITE_TRANSIENT));
+    };
+    bind(1, event.server_instance_id());
+    bind(2, event.session_id());
+    bind(3, std::to_string(event.probe_id()));
+    const auto payload = event.replay_types().SerializeAsString();
+    check(sqlite3_bind_blob(insert_types_, 4, payload.data(),
+                            static_cast<int>(payload.size()), SQLITE_TRANSIENT));
+    if (sqlite3_step(insert_types_) != SQLITE_DONE)
+      throw std::runtime_error(std::string("SQLite: ") + sqlite3_errmsg(database_));
+    check(sqlite3_reset(insert_types_));
   }
 
   void append(const clangtracer::v1::TraceEvent &event) {
@@ -117,7 +144,15 @@ private:
     text(11, std::to_string(event.agent_dropped_events()));
     text(12, std::to_string(event.server_dropped_events()));
     std::string payload;
-    if (!event.SerializeToString(&payload)) {
+    const auto serialize = [&] {
+      if (!event.has_replay_types())
+        return event.SerializeToString(&payload);
+      append_types(event);
+      auto stored = event;
+      stored.clear_replay_types();
+      return stored.SerializeToString(&payload);
+    };
+    if (!serialize()) {
       throw std::runtime_error("cannot serialize trace event");
     }
     check(sqlite3_bind_blob(insert_, 13, payload.data(),

@@ -9,7 +9,7 @@ source checkout. The target is compiled from the installed C++ example source:
 TRACER_PYTHON="$HOME/.local/share/uv/tools/clang-tracer-client/bin/python"
 TRACER_EXAMPLES=/usr/local/share/clang-tracer/examples
 TRACER_RUN=$(mktemp -d /tmp/clang-tracer-example.XXXXXX)
-clang++ -std=c++20 -g -O0 -fno-omit-frame-pointer -fcf-protection=none \
+clang++ -std=c++23 -g -O0 -fno-omit-frame-pointer -fcf-protection=none \
   "$TRACER_EXAMPLES/cpp-interceptors/target.cpp" -o "$TRACER_RUN/target"
 "$TRACER_RUN/target" >"$TRACER_RUN/target.log" 2>&1 &
 target_pid=$!

@@ -1,5 +1,6 @@
-# Module-provider gRPC packages reference protobuf targets without finding
-# them. Prefer the complete protobuf config export before importing gRPC.
+# gRPC's module-provider builds reference protobuf targets without finding
+# them, while newer config providers also export upb targets. Prefer the full
+# config export so a legacy FindProtobuf import cannot create a partial set.
 find_package(Protobuf QUIET CONFIG)
 if(NOT Protobuf_FOUND)
   find_package(Protobuf REQUIRED)
@@ -19,13 +20,13 @@ add_custom_command(
   VERBATIM)
 add_library(tracer_context_transport_proto STATIC
   ${_context_proto_dir}/context_transport.pb.cc)
-target_compile_features(tracer_context_transport_proto PUBLIC cxx_std_20)
+target_compile_features(tracer_context_transport_proto PUBLIC cxx_std_23)
 set_target_properties(tracer_context_transport_proto PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(tracer_context_transport_proto PUBLIC ${_context_proto_dir})
 target_link_libraries(tracer_context_transport_proto PUBLIC protobuf::libprotobuf)
 add_library(tracer_context_delivery STATIC src/context_journal.cpp src/context_stream.cpp
   ${_context_proto_dir}/context_transport.grpc.pb.cc)
-target_compile_features(tracer_context_delivery PUBLIC cxx_std_20)
+target_compile_features(tracer_context_delivery PUBLIC cxx_std_23)
 set_target_properties(tracer_context_delivery PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(tracer_context_delivery PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${_context_proto_dir})
 target_link_libraries(tracer_context_delivery PUBLIC protobuf::libprotobuf gRPC::grpc++

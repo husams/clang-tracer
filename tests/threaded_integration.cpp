@@ -35,7 +35,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "../src/linux_syscalls.hpp"
 #include "tracer.grpc.pb.h"
+#include "tracer/compat.hpp"
 
 extern char **environ;
 
@@ -215,7 +217,7 @@ read_process_memory(pid_t pid, std::uintptr_t address, std::size_t size) {
   std::vector<unsigned char> bytes(size);
   iovec local{bytes.data(), bytes.size()};
   iovec remote{reinterpret_cast<void *>(address), bytes.size()};
-  const auto read = ::process_vm_readv(pid, &local, 1, &remote, 1, 0);
+  const auto read = ::tracer::linux_api::process_vm_readv(pid, &local, 1, &remote, 1, 0);
   require(read == static_cast<ssize_t>(size),
           "could not read target function bytes: " + std::string(std::strerror(errno)));
   return bytes;
@@ -225,7 +227,7 @@ void write_process_memory(pid_t pid, std::uintptr_t address, const void *data,
                           std::size_t size) {
   iovec local{const_cast<void *>(data), size};
   iovec remote{reinterpret_cast<void *>(address), size};
-  require(::process_vm_writev(pid, &local, 1, &remote, 1, 0) ==
+  require(::tracer::linux_api::process_vm_writev(pid, &local, 1, &remote, 1, 0) ==
               static_cast<ssize_t>(size),
           "could not write target process memory");
 }
@@ -260,7 +262,7 @@ public:
     const std::uint32_t value = 0;
     iovec local{const_cast<std::uint32_t *>(&value), sizeof(value)};
     iovec remote{reinterpret_cast<void *>(address_), sizeof(value)};
-    (void)::process_vm_writev(pid_, &local, 1, &remote, 1, 0);
+    (void)::tracer::linux_api::process_vm_writev(pid_, &local, 1, &remote, 1, 0);
     armed_ = false;
   }
 
@@ -494,7 +496,7 @@ std::size_t count_server_module_fds(
       continue;
     }
     const auto canonical = std::filesystem::weakly_canonical(target, error);
-    if (!error && expected.contains(canonical)) {
+    if (!error && ::tracer::compat::contains(expected, canonical)) {
       ++count;
     }
   }
@@ -532,7 +534,7 @@ void require_session_modules(
             label + " included a protected runtime module");
   }
   for (const auto &module : expected_modules) {
-    require(discovered.contains(std::filesystem::canonical(module)),
+    require(::tracer::compat::contains(discovered, std::filesystem::canonical(module)),
             label + " did not discover expected DSO " + module.string());
   }
 }
@@ -779,7 +781,7 @@ void verify_events(const std::vector<api::TraceEvent> &events,
       require(objects[probe_id].size() >= 4,
               "method events did not capture four distinct object addresses");
       for (const auto object_address : stable_objects) {
-        require(objects[probe_id].contains(object_address),
+        require(::tracer::compat::contains(objects[probe_id], object_address),
                 "method event did not capture a stable worker object address");
       }
     }

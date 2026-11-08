@@ -50,7 +50,7 @@ if [[ -z $target_executable && -z ${CXX:-} && -x $example_dir/target ]]; then
 fi
 if [[ -z "$target_executable" ]]; then
   target_executable=$run_dir/target
-  "$compiler" -std=c++17 -g -O0 -fno-omit-frame-pointer -fcf-protection=none \
+  "$compiler" -std=c++23 -g -O0 -fno-omit-frame-pointer -fcf-protection=none \
     -rdynamic -pthread "$example_dir/target.cpp" -o "$target_executable"
 fi
 "$target_executable" >"$run_dir/target.log" 2>&1 &

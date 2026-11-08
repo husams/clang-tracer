@@ -7,6 +7,7 @@ from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.formatted_text.utils import fragment_list_to_text
 
 from .client import ServerStatus
+from .context_values import state_values
 from .proto import context_transport_pb2 as cpb
 from .proto import tracer_pb2 as pb
 
@@ -164,9 +165,10 @@ def _probe_spec(lines: _Lines, spec: pb.ProbeSpec) -> None:
             f"entry={_hex(spec.debug_info.runtime_entry)}",
             indent=1,
         )
+    depth = "full" if spec.stack_depth == (1 << 32) - 1 else spec.stack_depth
     lines.add(
         "options",
-        f"stack_depth={spec.stack_depth} "
+        f"stack_depth={depth} "
         f"internal_frames={spec.include_internal_stack_frames} "
         f"print_arguments={spec.print_arguments} print_result={spec.print_result}",
         indent=1,
@@ -181,9 +183,10 @@ def _probe_spec(lines: _Lines, spec: pb.ProbeSpec) -> None:
 
 def _stack(lines: _Lines, stack: pb.StackTrace, *, indent: int) -> None:
     status = _enum(pb.StackTrace.Status, stack.status)
+    depth = "full" if stack.requested_depth == (1 << 32) - 1 else stack.requested_depth
     lines.add(
         "stack",
-        f"{status} captured={stack.captured_depth}/{stack.requested_depth} "
+        f"{status} captured={stack.captured_depth}/{depth} "
         f"hidden={stack.hidden_frames} application_only={stack.application_only}",
         indent=indent,
         style="class:warning"
@@ -258,6 +261,8 @@ def _context(lines: _Lines, envelope: cpb.ContextEventEnvelope) -> None:
             f"bytes={len(state.payload)} truncations={len(state.truncations)}",
             indent=2,
         )
+        for name, value in state_values(envelope, state):
+            lines.add(name, f"= {value}", indent=3)
         for truncation in state.truncations:
             lines.add(
                 "truncation",
@@ -321,6 +326,26 @@ def _symbols(lines: _Lines, page: pb.ListSymbolsResponse) -> None:
         lines.add("more", "use the next-page command printed by the console")
 
 
+def _validation_report(lines: _Lines, report: pb.ValidationReport) -> None:
+    level = "syntax" if report.level == pb.ValidateProbeRequest.SYNTAX else "compile"
+    lines.add(
+        "validation",
+        f"{'success' if report.success else 'failed'} level={level}",
+        style="class:ok" if report.success else "class:error",
+    )
+    for option in report.effective_options:
+        lines.add("option", option, indent=1)
+    for diagnostic in report.diagnostics:
+        location = diagnostic.file
+        if diagnostic.line:
+            location += f":{diagnostic.line}"
+            if diagnostic.column:
+                location += f":{diagnostic.column}"
+        label = f"{diagnostic.severity} [{diagnostic.stage}]"
+        lines.add(label, location, indent=1, style="class:error")
+        lines.add("message", diagnostic.message, indent=2)
+
+
 def render(value: object, *, error: bool = False) -> FormattedText:
     """Render known tracer objects without exposing Protobuf debug reprs."""
     if isinstance(value, str):
@@ -347,6 +372,8 @@ def render(value: object, *, error: bool = False) -> FormattedText:
         _trace_event(lines, value)
     elif isinstance(value, pb.ListSymbolsResponse):
         _symbols(lines, value)
+    elif isinstance(value, pb.ValidationReport):
+        _validation_report(lines, value)
     elif isinstance(value, Message):
         lines.add("message", value.DESCRIPTOR.full_name)
     else:

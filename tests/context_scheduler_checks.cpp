@@ -3,18 +3,20 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <utility>
-#include <exception>
-#include <cstdio>
+
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "context_scheduler.hpp"
 #include "context_pthread_detour.hpp"
+#include "context_scheduler.hpp"
+#include "tracer/compat.hpp"
 
 namespace {
 namespace ce = tracer::context_engine;
@@ -110,7 +112,7 @@ void inspect_inherited_state(ce::Context& context, const ce::SlotRequest& reques
   cx::CurrentHook current_hook(&hook);
   assert(current_hook.installed());
   ce::HookExit exit(context);
-  ce::HookAccess access(context, std::span(&request, 1));
+  ce::HookAccess access(context, ::tracer::compat::span(&request, 1));
   assert(static_cast<State*>(access.ref(request))->value == 41);
 }
 
@@ -216,10 +218,41 @@ void* admission_failure_start(void* opaque) {
   return nullptr;
 }
 
+int require_unwrapped_start(pthread_t*, const pthread_attr_t*,
+                            void* (*start)(void*), void*) {
+  assert(start == &admission_failure_start);
+  return EAGAIN;
+}
+
 } // namespace
 
 void verify_context_scheduler() {
   using namespace std::chrono_literals;
+  {
+    Fixture fixture;
+    auto* previous = set_context(nullptr);
+    assert(fixture.adapter.create(&require_unwrapped_start, nullptr, nullptr,
+                                  &admission_failure_start, nullptr) == EAGAIN);
+    set_context(previous);
+    assert(cs::NativePthreadAdapter::outstanding_wrapper_count() == 0);
+  }
+  {
+    Fixture fixture;
+    AdmissionFailureWork work;
+    pthread_t thread{};
+    {
+      cs::ScopedPthreadBypass compiler_threads;
+      cs::ScopedPthreadBypass nested_compiler_work;
+      assert(fixture.adapter.create(&pthread_create, &thread, nullptr,
+                                    &admission_failure_start, &work) == 0);
+      assert(pthread_join(thread, nullptr) == 0);
+      assert(!work.inherited && fixture.ledger->outstanding() == 0);
+    }
+    assert(fixture.adapter.create(&pthread_create, &thread, nullptr,
+                                  &admission_failure_start, &work) == 0);
+    assert(pthread_join(thread, nullptr) == 0);
+    assert(work.inherited && fixture.ledger->outstanding() == 0);
+  }
   {
     Fixture fixture;
     Work work{};

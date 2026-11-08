@@ -103,6 +103,7 @@ def build_completer() -> NestedCompleter:
             "probe": {
                 "inject": None,
                 "resolve": None,
+                "validate": None,
                 "add": None,
                 "remove": None,
             },
@@ -118,6 +119,7 @@ def build_completer() -> NestedCompleter:
                 "probe": {
                     "inject": None,
                     "resolve": None,
+                    "validate": None,
                     "add": None,
                     "remove": None,
                 },
@@ -275,6 +277,15 @@ class Console:
             self.emit(
                 self.client.inject(selected, str(arguments[0]), source, **options)
             )
+        elif name == "validate":
+            selected = self.selected()
+            source = Path(options.pop("callback")).read_text()
+            options["level"] = options.pop("validation_level", "compile")
+            self.emit(
+                self.client.validate_probe(
+                    selected, str(arguments[0]), source, **options
+                )
+            )
         elif name == "add_spec":
             selected = self.selected()
             spec = text_format.Parse(
@@ -287,11 +298,17 @@ class Console:
             if "session_ids" not in options and self.session_id is not None:
                 options["session_ids"] = [self.session_id]
             if name == "drain":
-                count = self.client.drain_traces(str(arguments[0]), **options)
-                self.emit(f"drained {count} events to SQLite")
+                drained = self.client.drain_traces(str(arguments[0]), **options)
+                self.emit(f"drained {drained} events to SQLite")
             elif name == "collect":
-                for event in self.client.collect_traces(int(arguments[0]), **options):
-                    self.emit(event)
+                count = int(arguments[0]) if arguments else None
+                if count is not None and count < 1:
+                    raise CommandError("count must be positive")
+                with self.client.watch_events(**options) as stream:
+                    for i, event in enumerate(stream, 1):
+                        self.emit(event)
+                        if count is not None and i >= count:
+                            break
             elif name == "record":
                 record = (
                     self.client.record_sqlite

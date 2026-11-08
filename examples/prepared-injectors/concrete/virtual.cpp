@@ -8,6 +8,14 @@ int Prefix::unused() const { return prefix; }
 
 int Handler::route(int value) const { return value + factor + base + shared; }
 
+int Handler::scale(int value) {
+  // Keep enough straight-line instructions in the entry window for patching.
+  const volatile int result = value * 3;
+  return result;
+}
+
+int Handler::Nested::adjust(int value) { return value + 9; }
+
 int through_base(const Interface *object, int value) {
   return object->route(value);
 }

@@ -45,10 +45,20 @@ class TracerStub(object):
                 request_serializer=tracer__pb2.ResolveProbeRequest.SerializeToString,
                 response_deserializer=tracer__pb2.ProbeSpec.FromString,
                 _registered_method=True)
+        self.ValidateProbe = channel.unary_unary(
+                '/clangtracer.v1.Tracer/ValidateProbe',
+                request_serializer=tracer__pb2.ValidateProbeRequest.SerializeToString,
+                response_deserializer=tracer__pb2.ValidationReport.FromString,
+                _registered_method=True)
         self.AddProbe = channel.unary_unary(
                 '/clangtracer.v1.Tracer/AddProbe',
                 request_serializer=tracer__pb2.AddProbeRequest.SerializeToString,
                 response_deserializer=tracer__pb2.Probe.FromString,
+                _registered_method=True)
+        self.ReloadProbe = channel.unary_unary(
+                '/clangtracer.v1.Tracer/ReloadProbe',
+                request_serializer=tracer__pb2.ReloadProbeRequest.SerializeToString,
+                response_deserializer=tracer__pb2.ReloadProbeResponse.FromString,
                 _registered_method=True)
         self.RemoveProbe = channel.unary_unary(
                 '/clangtracer.v1.Tracer/RemoveProbe',
@@ -70,10 +80,50 @@ class TracerStub(object):
                 request_serializer=tracer__pb2.ListModulesRequest.SerializeToString,
                 response_deserializer=tracer__pb2.ListModulesResponse.FromString,
                 _registered_method=True)
+        self.ListMemoryMappings = channel.unary_unary(
+                '/clangtracer.v1.Tracer/ListMemoryMappings',
+                request_serializer=tracer__pb2.ListMemoryMappingsRequest.SerializeToString,
+                response_deserializer=tracer__pb2.ListMemoryMappingsResponse.FromString,
+                _registered_method=True)
+        self.ReadMemory = channel.unary_unary(
+                '/clangtracer.v1.Tracer/ReadMemory',
+                request_serializer=tracer__pb2.ReadMemoryRequest.SerializeToString,
+                response_deserializer=tracer__pb2.ReadMemoryResponse.FromString,
+                _registered_method=True)
+        self.ScanMemory = channel.unary_unary(
+                '/clangtracer.v1.Tracer/ScanMemory',
+                request_serializer=tracer__pb2.ScanMemoryRequest.SerializeToString,
+                response_deserializer=tracer__pb2.ScanMemoryResponse.FromString,
+                _registered_method=True)
+        self.PreviewFunctionEntry = channel.unary_unary(
+                '/clangtracer.v1.Tracer/PreviewFunctionEntry',
+                request_serializer=tracer__pb2.PreviewFunctionEntryRequest.SerializeToString,
+                response_deserializer=tracer__pb2.PreviewFunctionEntryResponse.FromString,
+                _registered_method=True)
+        self.ListThreads = channel.unary_unary(
+                '/clangtracer.v1.Tracer/ListThreads',
+                request_serializer=tracer__pb2.ListThreadsRequest.SerializeToString,
+                response_deserializer=tracer__pb2.ListThreadsResponse.FromString,
+                _registered_method=True)
         self.ListSymbols = channel.unary_unary(
                 '/clangtracer.v1.Tracer/ListSymbols',
                 request_serializer=tracer__pb2.ListSymbolsRequest.SerializeToString,
                 response_deserializer=tracer__pb2.ListSymbolsResponse.FromString,
+                _registered_method=True)
+        self.PreviewBulkTrace = channel.unary_unary(
+                '/clangtracer.v1.Tracer/PreviewBulkTrace',
+                request_serializer=tracer__pb2.PreviewBulkTraceRequest.SerializeToString,
+                response_deserializer=tracer__pb2.PreviewBulkTraceResponse.FromString,
+                _registered_method=True)
+        self.ApplyBulkTrace = channel.unary_unary(
+                '/clangtracer.v1.Tracer/ApplyBulkTrace',
+                request_serializer=tracer__pb2.ApplyBulkTraceRequest.SerializeToString,
+                response_deserializer=tracer__pb2.BulkTraceReport.FromString,
+                _registered_method=True)
+        self.RemoveBulkTrace = channel.unary_unary(
+                '/clangtracer.v1.Tracer/RemoveBulkTrace',
+                request_serializer=tracer__pb2.RemoveBulkTraceRequest.SerializeToString,
+                response_deserializer=tracer__pb2.BulkTraceReport.FromString,
                 _registered_method=True)
         self.WatchEvents = channel.unary_stream(
                 '/clangtracer.v1.Tracer/WatchEvents',
@@ -109,7 +159,19 @@ class TracerServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ValidateProbe(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def AddProbe(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReloadProbe(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -139,7 +201,55 @@ class TracerServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ListMemoryMappings(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReadMemory(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ScanMemory(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PreviewFunctionEntry(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListThreads(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ListSymbols(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PreviewBulkTrace(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ApplyBulkTrace(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RemoveBulkTrace(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -177,10 +287,20 @@ def add_TracerServicer_to_server(servicer, server):
                     request_deserializer=tracer__pb2.ResolveProbeRequest.FromString,
                     response_serializer=tracer__pb2.ProbeSpec.SerializeToString,
             ),
+            'ValidateProbe': grpc.unary_unary_rpc_method_handler(
+                    servicer.ValidateProbe,
+                    request_deserializer=tracer__pb2.ValidateProbeRequest.FromString,
+                    response_serializer=tracer__pb2.ValidationReport.SerializeToString,
+            ),
             'AddProbe': grpc.unary_unary_rpc_method_handler(
                     servicer.AddProbe,
                     request_deserializer=tracer__pb2.AddProbeRequest.FromString,
                     response_serializer=tracer__pb2.Probe.SerializeToString,
+            ),
+            'ReloadProbe': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReloadProbe,
+                    request_deserializer=tracer__pb2.ReloadProbeRequest.FromString,
+                    response_serializer=tracer__pb2.ReloadProbeResponse.SerializeToString,
             ),
             'RemoveProbe': grpc.unary_unary_rpc_method_handler(
                     servicer.RemoveProbe,
@@ -202,10 +322,50 @@ def add_TracerServicer_to_server(servicer, server):
                     request_deserializer=tracer__pb2.ListModulesRequest.FromString,
                     response_serializer=tracer__pb2.ListModulesResponse.SerializeToString,
             ),
+            'ListMemoryMappings': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListMemoryMappings,
+                    request_deserializer=tracer__pb2.ListMemoryMappingsRequest.FromString,
+                    response_serializer=tracer__pb2.ListMemoryMappingsResponse.SerializeToString,
+            ),
+            'ReadMemory': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReadMemory,
+                    request_deserializer=tracer__pb2.ReadMemoryRequest.FromString,
+                    response_serializer=tracer__pb2.ReadMemoryResponse.SerializeToString,
+            ),
+            'ScanMemory': grpc.unary_unary_rpc_method_handler(
+                    servicer.ScanMemory,
+                    request_deserializer=tracer__pb2.ScanMemoryRequest.FromString,
+                    response_serializer=tracer__pb2.ScanMemoryResponse.SerializeToString,
+            ),
+            'PreviewFunctionEntry': grpc.unary_unary_rpc_method_handler(
+                    servicer.PreviewFunctionEntry,
+                    request_deserializer=tracer__pb2.PreviewFunctionEntryRequest.FromString,
+                    response_serializer=tracer__pb2.PreviewFunctionEntryResponse.SerializeToString,
+            ),
+            'ListThreads': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListThreads,
+                    request_deserializer=tracer__pb2.ListThreadsRequest.FromString,
+                    response_serializer=tracer__pb2.ListThreadsResponse.SerializeToString,
+            ),
             'ListSymbols': grpc.unary_unary_rpc_method_handler(
                     servicer.ListSymbols,
                     request_deserializer=tracer__pb2.ListSymbolsRequest.FromString,
                     response_serializer=tracer__pb2.ListSymbolsResponse.SerializeToString,
+            ),
+            'PreviewBulkTrace': grpc.unary_unary_rpc_method_handler(
+                    servicer.PreviewBulkTrace,
+                    request_deserializer=tracer__pb2.PreviewBulkTraceRequest.FromString,
+                    response_serializer=tracer__pb2.PreviewBulkTraceResponse.SerializeToString,
+            ),
+            'ApplyBulkTrace': grpc.unary_unary_rpc_method_handler(
+                    servicer.ApplyBulkTrace,
+                    request_deserializer=tracer__pb2.ApplyBulkTraceRequest.FromString,
+                    response_serializer=tracer__pb2.BulkTraceReport.SerializeToString,
+            ),
+            'RemoveBulkTrace': grpc.unary_unary_rpc_method_handler(
+                    servicer.RemoveBulkTrace,
+                    request_deserializer=tracer__pb2.RemoveBulkTraceRequest.FromString,
+                    response_serializer=tracer__pb2.BulkTraceReport.SerializeToString,
             ),
             'WatchEvents': grpc.unary_stream_rpc_method_handler(
                     servicer.WatchEvents,
@@ -289,6 +449,33 @@ class Tracer(object):
             _registered_method=True)
 
     @staticmethod
+    def ValidateProbe(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/ValidateProbe',
+            tracer__pb2.ValidateProbeRequest.SerializeToString,
+            tracer__pb2.ValidationReport.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def AddProbe(request,
             target,
             options=(),
@@ -305,6 +492,33 @@ class Tracer(object):
             '/clangtracer.v1.Tracer/AddProbe',
             tracer__pb2.AddProbeRequest.SerializeToString,
             tracer__pb2.Probe.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReloadProbe(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/ReloadProbe',
+            tracer__pb2.ReloadProbeRequest.SerializeToString,
+            tracer__pb2.ReloadProbeResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -424,6 +638,141 @@ class Tracer(object):
             _registered_method=True)
 
     @staticmethod
+    def ListMemoryMappings(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/ListMemoryMappings',
+            tracer__pb2.ListMemoryMappingsRequest.SerializeToString,
+            tracer__pb2.ListMemoryMappingsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReadMemory(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/ReadMemory',
+            tracer__pb2.ReadMemoryRequest.SerializeToString,
+            tracer__pb2.ReadMemoryResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ScanMemory(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/ScanMemory',
+            tracer__pb2.ScanMemoryRequest.SerializeToString,
+            tracer__pb2.ScanMemoryResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PreviewFunctionEntry(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/PreviewFunctionEntry',
+            tracer__pb2.PreviewFunctionEntryRequest.SerializeToString,
+            tracer__pb2.PreviewFunctionEntryResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListThreads(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/ListThreads',
+            tracer__pb2.ListThreadsRequest.SerializeToString,
+            tracer__pb2.ListThreadsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def ListSymbols(request,
             target,
             options=(),
@@ -440,6 +789,87 @@ class Tracer(object):
             '/clangtracer.v1.Tracer/ListSymbols',
             tracer__pb2.ListSymbolsRequest.SerializeToString,
             tracer__pb2.ListSymbolsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PreviewBulkTrace(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/PreviewBulkTrace',
+            tracer__pb2.PreviewBulkTraceRequest.SerializeToString,
+            tracer__pb2.PreviewBulkTraceResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ApplyBulkTrace(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/ApplyBulkTrace',
+            tracer__pb2.ApplyBulkTraceRequest.SerializeToString,
+            tracer__pb2.BulkTraceReport.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RemoveBulkTrace(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/RemoveBulkTrace',
+            tracer__pb2.RemoveBulkTraceRequest.SerializeToString,
+            tracer__pb2.BulkTraceReport.FromString,
             options,
             channel_credentials,
             insecure,
