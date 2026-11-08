@@ -385,6 +385,8 @@ of Gum's private import and the build rejects private glibc symbol
 versions. The license audit identified statically linked LGPL code.
 The pilot now builds a bundle with notices, pinned source, and the objects
 and scripts needed to relink against modified GLib. GNU BFD 2.35.2 links
-the SDK plugin without warnings while using the SDK sysroot. Keep Gum
-experimental while loader routing and broader tracing cases are validated. See
+the SDK plugin without warnings while using the SDK sysroot. The injector
+resolves loader calls from the target's mapped glibc and loads the agent's
+missing glibc dependencies from that runtime. Keep Gum experimental while
+broader tracing cases are validated. See
 `benchmarks/instruction-trace/README.md` for reproduction.

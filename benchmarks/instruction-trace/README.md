@@ -128,23 +128,25 @@ after start and stop. The host had `kernel.yama.ptrace_scope=0`.
 [Pinned x86 source](https://github.com/frida/frida-gum/blob/00a05282d1074c0e043b285c70a4412d784c573d/gum/backend-x86/gumstalker-x86.c),
 [Pinned Linux source](https://github.com/frida/frida-gum/blob/00a05282d1074c0e043b285c70a4412d784c573d/gum/backend-linux/gumprocess-linux.c#L792)
 
-The SDK run used the executable's linked SDK interpreter and matching
-server and agent libraries. For the host run, build `live-target` with the
-same SDK Clang and omit `PILOT_LDFLAGS` to use the host interpreter. Run the
-server through a wrapper executing
-`/lib64/ld-linux-x86-64.so.2 --library-path /lib64:$SDK/lib.llvm` with the
-absolute server executable path and its arguments. Pass
-`--target-library-path "/lib64:$SDK/lib.llvm"` to the runner so the SDK-built
-agent resolves host glibc libraries in the target. The same relocated
-SDK-built plugin worked in both runs.
+Run the same REPL, server, agent, and relocated plugin against both
+fixtures. Build the SDK fixture with its SDK interpreter and runtime
+paths. Omit `PILOT_LDFLAGS` to build the host fixture with the host
+interpreter. Invoke each fixture directly using the runner above.
+The runner checks that the agent and fixture report the same glibc
+version and records whether libdl was already mapped before attach.
 
-Using the SDK server's default libraries against the host target failed
-before Gum loaded because the injector could not translate its `dlopen`
-address to the target. After switching the server to host libraries,
-the SDK-built agent also needed host library precedence to avoid an
-`__libc_vfork@GLIBC_PRIVATE` loader failure. Invoking the target through an
-explicit loader failed native attach admission because `/proc/PID/exe`
-identified the loader itself.
+The injector resolves loader functions from the target's mapped glibc
+and verifies their live entry bytes. Before loading an SDK-built agent,
+it loads any missing glibc companion libraries required by the agent
+from beside the target's libc. The agent then uses those copies rather
+than libraries from an incompatible SDK runtime. Both fixtures can
+start without libdl. glibc 2.34 provides the public loader functions in
+libc, while the legacy SDK can bootstrap through its mapped libc when
+libdl is absent. [glibc 2.34 release notes](https://sourceware.org/pipermail/libc-announce/2021/000032.html)
+
+Launch the fixture as an executable with its linked interpreter. An
+explicit loader command makes `/proc/PID/exe` identify the loader, which
+fails native attach admission.
 The stock GCC 11.5 debug build attached and ran the native observer, then
 failed to resolve the control observer's signature. A fresh host-linked
 Clang 21.1.8 build passed the same live run.

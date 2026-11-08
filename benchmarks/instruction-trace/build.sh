@@ -18,6 +18,6 @@ if [[ "$gum" != - ]]; then
   "${CXX:-c++}" -std=c++17 -O0 -g -Wall -Wextra -Wpedantic -fPIE -pie \
     -fno-omit-frame-pointer -fcf-protection=none \
     "$src/live_target.cpp" "$src/workload.S" -pthread \
-    -Wl,--no-as-needed -ldl -Wl,--as-needed "${link_flags[@]}" -o "$out/live-target"
+    "${link_flags[@]}" -o "$out/live-target"
   "$src/link-gum.sh" "$out" "$gum" "$gum/libfrida-gum.a"
 fi

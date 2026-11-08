@@ -100,6 +100,8 @@ struct Interceptor {
 
         original = code()
         assert not mapped() and task.exists()
+        initial_libdl = any(re.search(r"/libdl(?:-\S+|\.so\.2)(?:\s|$)", line)
+                            for line in maps.read_text().splitlines())
         console = subprocess.Popen(
             [repl, "--server", server, "--agent", agent, "--attach", str(child.pid)],
             cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -152,6 +154,7 @@ struct Interceptor {
                                    + "".join(target_out.seen))
 
         output.expect(rf"^attached session=\S+ pid={child.pid}$")
+        output.expect(rf'^target JIT runtime .*glibc_version: "{re.escape(glibc)}"')
         native_probe = install("pilot_observed(int)", observer)
         patch = code()
         assert patch != original
@@ -181,6 +184,7 @@ struct Interceptor {
         child.stdin.flush()
         assert child.wait(timeout=5) == 0, "".join(target_out.seen)
         return {"glibc": glibc, "pid": child.pid, "worker_tid": tid,
+                "libdl_mapped_before_attach": initial_libdl,
                 "full_records": len(expected[3]) + len(expected[2]), "capped_records": 7,
                 "native_pairs": 6, "unloaded": True, "restored": True}
 

@@ -22,10 +22,12 @@
 
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/Object/BuildID.h>
+#include <llvm/Object/ELFObjectFile.h>
 #include <llvm/Object/ObjectFile.h>
 #include <llvm/Support/Error.h>
 
 #include "agent_runtime_profile.hpp"
+#include "admission.hpp"
 #include "injector.hpp"
 #include "linux_syscalls.hpp"
 #include "proc_identity.hpp"
@@ -89,18 +91,66 @@ void copy_signature(const clangtracer::v1::Signature &signature,
   }
 }
 
-std::string configured_agent_build_id(const std::string &path) {
+struct AgentBootstrap {
+  std::string build_id;
+  std::vector<std::string> dependencies;
+};
+
+AgentBootstrap configured_agent(const std::string &path) {
   auto binary = llvm::object::createBinary(path);
   if (!binary)
     throw AgentRuntimeIncompatible("cannot read configured agent ELF: " +
                                    llvm::toString(binary.takeError()));
   const auto *object =
-      llvm::dyn_cast<llvm::object::ObjectFile>(binary->getBinary());
-  const auto id = object ? llvm::object::getBuildID(object)
-                         : llvm::ArrayRef<std::uint8_t>{};
+      llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(binary->getBinary());
+  if (!object || object->getELFFile().getHeader().e_machine != llvm::ELF::EM_X86_64) {
+    throw AgentRuntimeIncompatible("configured agent is not a Linux x86-64 ELF");
+  }
+  const auto id = llvm::object::getBuildID(object);
   if (id.empty())
     throw AgentRuntimeIncompatible("configured agent has no ELF build ID");
-  return llvm::toHex(id, /*LowerCase=*/true);
+  AgentBootstrap result{llvm::toHex(id, /*LowerCase=*/true), {}};
+  const auto &elf = object->getELFFile();
+  auto dynamic = elf.dynamicEntries();
+  if (!dynamic) {
+    throw AgentRuntimeIncompatible("cannot read agent dependencies: " +
+                                   llvm::toString(dynamic.takeError()));
+  }
+  std::uint64_t string_address = 0;
+  std::uint64_t string_size = 0;
+  std::vector<std::uint64_t> needed;
+  for (const auto &entry : *dynamic) {
+    if (entry.d_tag == llvm::ELF::DT_NULL) {
+      break;
+    }
+    if (entry.d_tag == llvm::ELF::DT_NEEDED) {
+      needed.push_back(entry.d_un.d_val);
+    } else if (entry.d_tag == llvm::ELF::DT_STRTAB) {
+      string_address = entry.d_un.d_ptr;
+    } else if (entry.d_tag == llvm::ELF::DT_STRSZ) {
+      string_size = entry.d_un.d_val;
+    }
+  }
+  if (needed.empty()) {
+    return result;
+  }
+  auto strings = elf.toMappedAddr(string_address);
+  if (!strings) {
+    throw AgentRuntimeIncompatible("cannot read agent dependency names: " +
+                                   llvm::toString(strings.takeError()));
+  }
+  if (string_size > static_cast<std::uint64_t>(elf.end() - *strings)) {
+    throw AgentRuntimeIncompatible("agent dependency names exceed its ELF image");
+  }
+  const std::string_view table(reinterpret_cast<const char *>(*strings), string_size);
+  for (auto offset : needed) {
+    const auto end = table.find('\0', offset);
+    if (offset >= table.size() || end == std::string_view::npos || end == offset) {
+      throw AgentRuntimeIncompatible("agent has an invalid dependency name");
+    }
+    result.dependencies.emplace_back(table.substr(offset, end - offset));
+  }
+  return result;
 }
 
 template <std::size_t N> std::string profile_text(const char (&value)[N]) {
@@ -226,7 +276,7 @@ void Session::attach(const std::string &expected_executable) {
   if (state_ != clangtracer::v1::Session::ATTACHED) {
     throw std::runtime_error("session is not attachable");
   }
-  const auto expected_agent_id = configured_agent_build_id(agent_path_);
+  const auto agent = configured_agent(agent_path_);
   injector::Process process;
   const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
   try {
@@ -252,19 +302,49 @@ void Session::attach(const std::string &expected_executable) {
   std::uintptr_t scratch = 0;
   // Each synchronous loader call has finished using its string before the
   // scratch buffer is reused for another symbol name or the profile.
-  const auto scratch_size =
+  auto scratch_size =
       std::max(agent_path_.size() + 1, sizeof(AgentRuntimeProfile));
+  std::vector<std::uintptr_t> companion_handles;
+  std::uintptr_t dlclose_address = 0;
+  const auto release_companions = [&] {
+    while (!companion_handles.empty()) {
+      const auto handle = companion_handles.back();
+      companion_handles.pop_back();
+      if (process.remote_call(dlclose_address, {handle}, 1) != 0) {
+        throw std::runtime_error("target dlclose failed to release a glibc companion");
+      }
+    }
+  };
   try {
+    const auto companions = injector::target_runtime_companions(
+        static_cast<pid_t>(pid_), agent.dependencies);
+    companion_handles.reserve(companions.size());
+    for (const auto &path : companions) {
+      scratch_size = std::max(scratch_size, path.size() + 1);
+    }
     scratch = process.remote_allocate(scratch_size);
-    process.remote_write(scratch, agent_path_.c_str(), agent_path_.size() + 1);
     const auto dlopen_address = process.resolve_remote_symbol("dlopen");
     const auto dlsym_address = process.resolve_remote_symbol("dlsym");
+    if (!companions.empty()) {
+      dlclose_address = process.resolve_remote_symbol("dlclose");
+    }
+    for (const auto &path : companions) {
+      process.remote_write(scratch, path.c_str(), path.size() + 1);
+      const auto handle = process.remote_call(
+          dlopen_address, {scratch, RTLD_NOW | RTLD_LOCAL}, 2);
+      if (!handle) {
+        throw std::runtime_error("target dlopen failed to load glibc companion " + path);
+      }
+      companion_handles.push_back(handle);
+    }
+    process.remote_write(scratch, agent_path_.c_str(), agent_path_.size() + 1);
     const auto handle = process.remote_call(
         dlopen_address, {scratch, RTLD_NOW | RTLD_GLOBAL}, 2);
     if (!handle) {
       throw std::runtime_error(
           "target dlopen failed to load the agent and its dependencies");
     }
+    release_companions();
     const auto agent_symbol = [&](const char *name) {
       process.remote_write(scratch, name, std::strlen(name) + 1);
       return process.remote_call(dlsym_address, {handle, scratch}, 2);
@@ -272,7 +352,7 @@ void Session::attach(const std::string &expected_executable) {
     const auto profile_entry = agent_symbol("tracer_agent_runtime_profile_v1");
     try {
       jit_runtime_ =
-          read_agent_profile(process, profile_entry, scratch, expected_agent_id);
+          read_agent_profile(process, profile_entry, scratch, agent.build_id);
     } catch (const AgentRuntimeIncompatible &) {
       // The handshake does not install hooks. Return a definitive failure
       // only after scratch memory and ptrace ownership have been released.
@@ -300,6 +380,12 @@ void Session::attach(const std::string &expected_executable) {
     capacity_address_ = capacity;
     pthread_detour_address_ = pthread_detour;
   } catch (...) {
+    if (!process.unsafe()) {
+      try {
+        release_companions();
+      } catch (...) {
+      }
+    }
     if (process.unsafe()) {
       unsafe_target_ = true;
       set_failed_locked("agent bootstrap recovery is uncertain; target "
