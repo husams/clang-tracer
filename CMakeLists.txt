@@ -211,7 +211,7 @@ foreach(stack_target trace-stack-a trace-stack-b)
 endforeach()
 set_target_properties(trace-threaded-target PROPERTIES ENABLE_EXPORTS ON)
 target_link_libraries(trace-threaded-target PRIVATE Threads::Threads trace-stack-a trace-stack-b)
-target_compile_options(trace-threaded-target PRIVATE -O0 -fno-omit-frame-pointer
+target_compile_options(trace-threaded-target PRIVATE -g -O0 -fno-omit-frame-pointer
   -fno-optimize-sibling-calls -fcf-protection=none)
 
 endif()
