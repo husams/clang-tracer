@@ -1,4 +1,4 @@
-# Relink the Gum Stalker pilot
+# Relink the native REPL Gum Stalker backend
 
 `gum-backend.so` uses GLib, GObject and GLib's bundled libintl and
 formatting code. The applicable LGPL notices and texts are in `notices/`
@@ -6,7 +6,7 @@ and the original source headers are in `source/`. Recipients may modify
 this work for their own use and reverse engineer it to debug those
 modifications as permitted by the LGPL.
 
-The package contains the pilot's plugin, complete GLib and GVDB source
+The package contains the REPL plugin, complete GLib and GVDB source
 trees, the dependency sources used by the build, and `relink/libgum-base.a`.
 That archive holds the Frida Gum, Capstone and liblzma objects needed to
 link the plugin. It excludes the original GLib, libffi and PCRE2 objects.
@@ -39,7 +39,8 @@ GLib, edit the copy under `source/glib/` and run the same command with a
 new destination. Set `MESON` to select a Meson executable and `JOBS` to
 set the compiler job count.
 
-The rebuilt plugin uses the same pilot ABI. Use its absolute path in the
-native REPL live runner described in the Clang Tracer pilot README. The
-loader profile for the REPL server, target and agent still needs to match
-the target glibc version.
+Install the rebuilt `gum-backend.so` beside the native tracer agent or set
+`CLANG_TRACER_GUM_PLUGIN` to its absolute path before launching the REPL.
+Attach through the REPL's owned local server, use `%threads` and
+`%memory maps` to select the thread and range, then run
+`%help instructions start` for the capture options.

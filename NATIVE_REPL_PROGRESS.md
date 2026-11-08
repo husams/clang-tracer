@@ -387,11 +387,16 @@ The pilot now builds a bundle with notices, pinned source, and the objects
 and scripts needed to relink against modified GLib. GNU BFD 2.35.2 links
 the SDK plugin without warnings while using the SDK sysroot. The injector
 resolves loader calls from the target's mapped glibc and loads the agent's
-missing glibc dependencies from that runtime. Keep Gum experimental while
-broader tracing cases are validated. See
+missing glibc dependencies from that runtime. See
 `benchmarks/instruction-trace/README.md` for reproduction.
 
 Live capture now verifies worker-directed SIGUSR1, guard-page SIGSEGV
 recovery, and install, reload and removal of a warmed native probe on
 glibc 2.23 and 2.34. The callback PCH cache writes directly to its private
 generation path so LLVM does not replace the target's signal handlers.
+
+The optional Gum bundle now powers `%instructions start` and
+`%instructions stop` through the native REPL. The server verifies the
+range and thread, and the module enforces the record and time limits.
+Stop returns ordered PCs and a completion reason. Detach drains active
+capture before restoring probes.

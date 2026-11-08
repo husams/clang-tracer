@@ -46,7 +46,8 @@ public:
   Process &operator=(Process &&other) noexcept;
 
   void attach(pid_t process_id,
-              ::tracer::compat::span<const ApplicationModule> application_modules = {});
+              ::tracer::compat::span<const ApplicationModule> application_modules = {},
+              pid_t excluded_tid = 0);
   void detach();
 
   // Prevent normal detach/resume after the caller detects an unsafe target

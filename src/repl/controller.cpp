@@ -1,5 +1,6 @@
 #include "controller.hpp"
 #include "local_perf.hpp"
+#include "tracer/instruction_trace.h"
 #include "../prepared_contract.hpp"
 #include "../proc_identity.hpp"
 #include "../sqlite_events.hpp"
@@ -1553,6 +1554,47 @@ bool Controller::execute(const Command &command) {
            << ' ' << std::quoted(printable_proc_text(entry.path())) << '\n';
     }
     out_ << "memory mappings=" << response.mappings_size() << '\n';
+    return true;
+  }
+  case K::instructions_start: {
+    require_session(selected_);
+    if (!server_.running())
+      throw std::runtime_error("instruction tracing requires the REPL's owned local server");
+    api::StartInstructionTraceRequest request;
+    request.set_session_id(selected_.id);
+    request.set_mapping_token(command.option("--mapping"));
+    request.set_tid(command.number("--tid", 0));
+    request.set_address(address_number(command.option("--address")));
+    request.set_size(command.number("--size", 0));
+    request.set_max_records(command.number("--count", 256));
+    request.set_timeout_seconds(command.number("--timeout", 5));
+    const auto result = unary<api::InstructionTrace>(
+        [&](auto &c, auto &r) { return stub_->StartInstructionTrace(&c, request, &r); },
+        settings_.timeout_seconds);
+    out_ << "instructions started tid=" << result.tid() << " address=0x"
+         << std::hex << result.address() << std::dec << " size=" << result.size()
+         << " count-limit=" << request.max_records()
+         << " timeout=" << request.timeout_seconds() << '\n';
+    return true;
+  }
+  case K::instructions_stop: {
+    require_session(selected_);
+    if (!server_.running())
+      throw std::runtime_error("instruction tracing requires the REPL's owned local server");
+    api::StopInstructionTraceRequest request;
+    request.set_session_id(selected_.id);
+    const auto result = unary<api::InstructionTrace>(
+        [&](auto &c, auto &r) { return stub_->StopInstructionTrace(&c, request, &r); },
+        settings_.timeout_seconds);
+    if (result.reason() == api::InstructionTrace::RUNNING ||
+        result.pcs_size() > TRACER_INSTRUCTION_MAX_RECORDS)
+      throw std::runtime_error("invalid instruction capture response");
+    for (const auto pc : result.pcs())
+      out_ << "instruction pc=0x" << std::hex << pc << std::dec << '\n';
+    out_ << "instructions stopped tid=" << result.tid() << " count=" << result.pcs_size()
+         << " reason=" << api::InstructionTrace::Reason_Name(result.reason())
+         << " truncated=" << (result.reason() == api::InstructionTrace::LIMIT ? "true" : "false")
+         << '\n';
     return true;
   }
   case K::memory_read: {

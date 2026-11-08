@@ -1594,6 +1594,34 @@ public:
     return memory::scan(*context, *session, timeout_, *request, *response);
   }
 
+  grpc::Status StartInstructionTrace(grpc::ServerContext *context,
+      const api::StartInstructionTraceRequest *request, api::InstructionTrace *response) override {
+    if (!local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "instruction tracing requires local control"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    return memory::start_instruction_trace(*context, *session, timeout_, *request, *response);
+  }
+
+  grpc::Status StopInstructionTrace(grpc::ServerContext *,
+      const api::StopInstructionTraceRequest *request, api::InstructionTrace *response) override {
+    if (!local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "instruction tracing requires local control"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    try {
+      *response = session->stop_instruction_trace();
+      return grpc::Status::OK;
+    } catch (const std::invalid_argument &error) {
+      return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
+  }
+
   grpc::Status PreviewFunctionEntry(grpc::ServerContext *context,
                                    const api::PreviewFunctionEntryRequest *request,
                                    api::PreviewFunctionEntryResponse *response) override {

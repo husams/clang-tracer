@@ -48,6 +48,10 @@ public:
                  const std::string &source_directory,
                  clangtracer::v1::ValidateProbeRequest::Level level);
   clangtracer::v1::Probe remove_probe(std::uint64_t probe_id);
+  clangtracer::v1::InstructionTrace start_instruction_trace(
+      const clangtracer::v1::StartInstructionTraceRequest &request,
+      const std::string &expected_code);
+  clangtracer::v1::InstructionTrace stop_instruction_trace();
   void detach();
   void shutdown() noexcept;
   void record_failure(const std::string &message);
@@ -65,6 +69,12 @@ public:
   [[nodiscard]] static std::uint64_t ProcessStartTime(std::uint32_t pid);
 
 private:
+  struct InstructionCapture {
+    clangtracer::v1::InstructionTrace trace;
+    std::uint32_t max_records;
+    std::uintptr_t handle;
+    std::uintptr_t stop;
+  };
   struct PthreadCreatePatch {
     std::uintptr_t entry = 0;
     std::uintptr_t trampoline = 0;
@@ -106,11 +116,16 @@ private:
   std::uintptr_t capacity_address_ = 0;
   std::uintptr_t pthread_detour_address_ = 0;
   std::map<std::uint64_t, ProbeRecord> probes_;
+  std::optional<InstructionCapture> instructions_;
+  std::optional<clangtracer::v1::InstructionTrace> last_instruction_trace_;
   std::optional<PthreadCreatePatch> pthread_create_patch_;
   bool pthread_create_patch_committed_ = false;
 
   void attach_process(tracer::injector::Process &process,
-                      std::chrono::steady_clock::time_point deadline);
+                      std::chrono::steady_clock::time_point deadline,
+                      pid_t excluded_tid = 0);
+  clangtracer::v1::InstructionTrace stop_instruction_trace_locked(
+      std::chrono::steady_clock::time_point deadline);
   void check_identity_locked();
   void set_failed_locked(const std::string &message);
   ProbeRecord &find_probe_locked(std::uint64_t probe_id);

@@ -18,6 +18,8 @@ service Tracer {
   rpc ListMemoryMappings(ListMemoryMappingsRequest) returns (ListMemoryMappingsResponse);
   rpc ReadMemory(ReadMemoryRequest) returns (ReadMemoryResponse);
   rpc ScanMemory(ScanMemoryRequest) returns (ScanMemoryResponse);
+  rpc StartInstructionTrace(StartInstructionTraceRequest) returns (InstructionTrace);
+  rpc StopInstructionTrace(StopInstructionTraceRequest) returns (InstructionTrace);
   rpc PreviewFunctionEntry(PreviewFunctionEntryRequest) returns (PreviewFunctionEntryResponse);
   rpc ListThreads(ListThreadsRequest) returns (ListThreadsResponse);
   rpc ListSymbols(ListSymbolsRequest) returns (ListSymbolsResponse);
@@ -365,6 +367,29 @@ message ReadMemoryRequest {
 message ReadMemoryResponse {
   uint64 address = 1;
   bytes data = 2; // On success, exactly size bytes owned by the response.
+}
+message StartInstructionTraceRequest {
+  string session_id = 1;
+  string mapping_token = 2;
+  uint32 tid = 3;
+  uint64 address = 4;
+  uint32 size = 5;
+  uint32 max_records = 6;
+  uint32 timeout_seconds = 7;
+}
+message StopInstructionTraceRequest { string session_id = 1; }
+message InstructionTrace {
+  enum Reason {
+    RUNNING = 0;
+    STOPPED = 1;
+    LIMIT = 2;
+    TIMEOUT = 3;
+  }
+  uint32 tid = 1;
+  uint64 address = 2;
+  uint32 size = 3;
+  Reason reason = 4;
+  repeated uint64 pcs = 5;
 }
 message ScanMemoryRequest {
   string session_id = 1;

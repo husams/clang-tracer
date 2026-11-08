@@ -1,12 +1,36 @@
 # Bounded instruction tracing pilot
 
-**Decision for P4 A2.** Keep Gum Stalker as an experimental backend. It was
-faster on the standalone fixture and passed live attachment with an existing
-native observer. The pilot has a source and relinking bundle. Automatic
-loader selection, a handled signal, guard-page recovery and warmed probe
-changes passed on both glibc profiles. A maintained backend still needs
-broader validation.
-Native single-step remains the fixture reference.
+**Decision for P4 A2.** Use the optional Gum Stalker backend for bounded
+instruction capture in the native REPL on local Linux x86-64 C++ targets.
+Native single-step remains the standalone fixture reference.
+
+## Use the native REPL feature
+
+Install the supported `gum-backend.so` from the source and relinking
+bundle beside `libclang_tracer_agent.so`, or set
+`CLANG_TRACER_GUM_PLUGIN` to its absolute path before starting the REPL.
+Use the REPL's owned local server. The target must be dumpable, its
+ptrace policy must allow the Gum helper, and the system must report
+`kernel.yama.ptrace_scope=0`. The backend preserves the target's existing
+ptracer authorization. Pick one target thread and keep another application
+thread available at an eligible control point. [Linux Yama](https://docs.kernel.org/admin-guide/LSM/Yama.html)
+
+```text
+%threads
+%memory maps
+%instructions start --tid 1234 --address 0x401000 --size 64 --mapping TOKEN --count 256 --timeout 5
+%instructions stop
+```
+
+Use a fresh mapping token and a range within one readable, file-backed
+executable mapping. Limits are 65,536 bytes, 8,192 records and 60
+seconds, with one outstanding capture per session. The target enforces
+both capture limits while probes remain available. Stop prints original
+PCs in order and reports `STOPPED`, `LIMIT` or `TIMEOUT`. Read the last
+result again with `%instructions stop` before starting a new capture.
+Detach and owned-server shutdown stop active capture before removing
+probes. If Gum is still draining, let the worker reach a dispatch
+boundary and retry stop.
 
 ## Reproduce
 
@@ -99,13 +123,14 @@ strip --strip-unneeded -o /tmp/instruction-stage/gum-backend.so \
   /tmp/instruction-pilot/gum-backend.so
 python3 benchmarks/instruction-trace/live_compare.py \
   "$REPL" "$SERVER" "$AGENT" /tmp/instruction-pilot/live-target \
-  /tmp/instruction-stage/gum-backend.so
+  /tmp/instruction-stage/gum-backend.so --native-repl
 ```
 
 The runner starts a C++ target and waits for its worker to come up. It then
 attaches with `clang-tracer-repl --attach`, installs a Clang JIT PRE and POST
-observer, and installs a temporary control observer. The control observer
-loads the plugin through `dlopen` and follows the existing worker. The
+observer, then starts capture through the native REPL commands. The
+runner can also exercise the original fixture control observer by
+omitting `--native-repl`. The
 instruction range is the same 65-byte leaf used by the standalone pilot,
 reached through the actively probed caller on that worker.
 
@@ -169,7 +194,11 @@ two-instruction leaf. The application handler checks the fault address and
 The fixture compares signal counts and return values before the capture,
 during it, and after detach. The combined capture matched all 151
 instruction offsets with one signal, one recovered fault and ten native
-PRE and POST pairs across the live trial. [Linux sigaction](https://man7.org/linux/man-pages/man2/sigaction.2.html)
+PRE and POST pairs in the pilot path and eleven in the native REPL path. [Linux sigaction](https://man7.org/linux/man-pages/man2/sigaction.2.html)
+
+The native-command run also covers mapping, thread and duplicate-start
+rejections, an idle timeout with no later PCs, repeat collection, and
+detach with both Gum and a native probe still active.
 
 The initial test exposed a native agent issue. Clang's temporary PCH output
 registered LLVM's process-wide signal handlers and replaced the fixture's

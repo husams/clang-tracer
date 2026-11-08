@@ -19,6 +19,10 @@ grpc::Status scan(grpc::ServerContext &context, Session &session,
                   std::chrono::seconds timeout,
                   const clangtracer::v1::ScanMemoryRequest &request,
                   clangtracer::v1::ScanMemoryResponse &response);
+grpc::Status start_instruction_trace(
+    grpc::ServerContext &context, Session &session, std::chrono::seconds timeout,
+    const clangtracer::v1::StartInstructionTraceRequest &request,
+    clangtracer::v1::InstructionTrace &response);
 grpc::Status preview_entry(grpc::ServerContext &context, Session &session,
                            std::chrono::seconds timeout,
                            const clangtracer::v1::PreviewFunctionEntryRequest &request,

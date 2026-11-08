@@ -91,9 +91,9 @@ struct Interceptor {
       if (status == 0) {
         status = backend.start(call.arg<int>(1), call.arg<unsigned long>(2),
                                call.arg<unsigned long>(3), call.arg<int>(4));
-        if (status != 0)
+        if (status != 0 && status != -2)
           backend.close();
-        else
+        else if (status == 0)
           status = restore_fixture_ptracer();
       }
     }

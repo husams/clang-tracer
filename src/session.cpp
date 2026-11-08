@@ -224,11 +224,12 @@ std::uint64_t Session::ProcessStartTime(std::uint32_t pid) {
 }
 
 void Session::attach_process(injector::Process &process,
-                             std::chrono::steady_clock::time_point deadline) {
+                             std::chrono::steady_clock::time_point deadline,
+                             pid_t excluded_tid) {
   for (;;) {
     check_identity_locked();
     try {
-      process.attach(static_cast<pid_t>(pid_), application_modules_);
+      process.attach(static_cast<pid_t>(pid_), application_modules_, excluded_tid);
       check_identity_locked();
       return;
     } catch (const injector::IdlePointUnavailable &) {
@@ -251,6 +252,8 @@ void Session::check_identity_locked() {
   try {
     if (ProcessStartTime(pid_) != process_start_) {
       state_ = clangtracer::v1::Session::EXITED;
+      instructions_.reset();
+      last_instruction_trace_.reset();
       application_modules_.clear();
       error_ = "target process exited; PID was reused";
       throw std::runtime_error(error_);
@@ -258,6 +261,8 @@ void Session::check_identity_locked() {
   } catch (const std::runtime_error &error) {
     if (std::string(error.what()) == "target process is no longer available") {
       state_ = clangtracer::v1::Session::EXITED;
+      instructions_.reset();
+      last_instruction_trace_.reset();
       application_modules_.clear();
       error_ = error.what();
     }
@@ -1270,6 +1275,9 @@ void Session::detach() {
                                             : error_);
   }
   check_identity_locked();
+  if (instructions_)
+    stop_instruction_trace_locked(std::chrono::steady_clock::now() + operation_timeout_);
+  last_instruction_trace_.reset();
   for (auto &[id, probe] : probes_) {
     (void)id;
     if (probe.value.active() || probe.value.draining())
@@ -1292,6 +1300,15 @@ void Session::shutdown() noexcept {
       state_ == clangtracer::v1::Session::FAILED ? error_ : std::string{};
   const auto shutdown_deadline =
       std::chrono::steady_clock::now() + operation_timeout_;
+  if (instructions_) {
+    try {
+      stop_instruction_trace_locked(shutdown_deadline);
+    } catch (const std::exception &error) {
+      first_error = error.what();
+      if (unsafe_target_)
+        return;
+    }
+  }
   for (auto &[id, probe] : probes_) {
     (void)id;
     if (!probe.value.active() && !probe.value.draining() && !probe.remote_request)

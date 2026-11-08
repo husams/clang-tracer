@@ -42,6 +42,7 @@ fi
 )
 cp "$work/devkit/frida-gum.h" "$bundle/relink/"
 cp "$src/"{link-gum.sh,gum_backend.c,gum.exports,pilot.h} "$bundle/relink/"
+cp "$src/../../include/tracer/instruction_trace.h" "$bundle/relink/"
 cp "$src/"{relink.sh,GUM_LICENSE_AUDIT.md,gum-source-pins.tsv} "$bundle/"
 cp "$src/RELINK.md" "$bundle/README.md"
 cp "$src/../../LICENSE" "$bundle/notices/clang-tracer.txt"

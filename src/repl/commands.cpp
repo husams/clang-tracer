@@ -1,5 +1,6 @@
 #include "commands.hpp"
 #include "local_perf.hpp"
+#include "tracer/instruction_trace.h"
 
 #include <charconv>
 #include <limits>
@@ -60,6 +61,8 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"call-result", K::target_call_result},
                                         {"syscalls", K::syscalls},
                                         {"sample cpu", K::sample_cpu},
+                                        {"instructions start", K::instructions_start},
+                                        {"instructions stop", K::instructions_stop},
                                         {"processes", K::processes},
                                         {"sessions", K::sessions},
                                         {"use", K::use},
@@ -300,6 +303,15 @@ Command parse_command(const std::string &input) {
       throw std::invalid_argument("local perf capture timeout is capped at 60 seconds");
     if (command.number("--count", 0) > max_local_perf_events)
       throw std::invalid_argument("local perf capture is capped at 8192 events");
+  }
+  if (command.kind == K::instructions_start) {
+    if (!command.has("--address") || command.option("--mapping").empty() ||
+        !unsigned_number(command.option("--tid"), "thread ID", INT32_MAX) ||
+        !unsigned_number(command.option("--size"), "instruction range size", TRACER_INSTRUCTION_MAX_BYTES))
+      throw std::invalid_argument("instruction tracing requires --tid, --address, --size and --mapping");
+    if (command.number("--timeout", 0) > TRACER_INSTRUCTION_MAX_SECONDS ||
+        command.number("--count", 0) > TRACER_INSTRUCTION_MAX_RECORDS)
+      throw std::invalid_argument("instruction capture is capped at 60 seconds and 8192 records");
   }
   if (command.number("--stack-depth", 0) > 64) {
     throw std::invalid_argument("--stack-depth must be at most 64");

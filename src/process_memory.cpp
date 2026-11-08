@@ -5,6 +5,7 @@
 #include "native_entry.hpp"
 #include "proc_identity.hpp"
 #include "session.hpp"
+#include "tracer/instruction_trace.h"
 
 #include <algorithm>
 #include <array>
@@ -552,6 +553,42 @@ grpc::Status list_mappings(grpc::ServerContext &context, Session &session,
     target.verify_live();
     result.set_mapping_token(mapping_token(session, maps));
     response.Swap(&result);
+  });
+}
+
+grpc::Status start_instruction_trace(
+    grpc::ServerContext &context, Session &session, std::chrono::seconds timeout,
+    const api::StartInstructionTraceRequest &request, api::InstructionTrace &response) {
+  const auto begin = request.address();
+  const auto size = request.size();
+  if (!request.tid() || request.tid() > INT32_MAX || !begin || !size ||
+      size > TRACER_INSTRUCTION_MAX_BYTES || size > UINT64_MAX - begin ||
+      !request.max_records() || request.max_records() > TRACER_INSTRUCTION_MAX_RECORDS ||
+      !request.timeout_seconds() || request.timeout_seconds() > TRACER_INSTRUCTION_MAX_SECONDS)
+    return {Code::INVALID_ARGUMENT, "invalid instruction trace thread, range or limits"};
+  return inspect(context, session, timeout, [&](const Target &target) {
+    const auto maps = target.maps();
+    if (mapping_token(session, maps) != request.mapping_token())
+      throw MemoryError(Code::ABORTED, "instruction mapping snapshot is stale; run %memory maps again");
+    const auto snapshot = parse_mappings(maps, target);
+    const auto executable = std::any_of(snapshot.mappings().begin(), snapshot.mappings().end(),
+                                       [&](const auto &mapping) {
+      return mapping.begin_address() <= begin && begin + size <= mapping.end_address() &&
+             mapping.inode() != 0 && mapping.permissions().at(0) == 'r' &&
+             mapping.permissions().at(1) == '-' && mapping.permissions().at(2) == 'x';
+    });
+    if (!executable)
+      throw MemoryError(Code::FAILED_PRECONDITION,
+                        "instruction range must fit one readable file-backed executable mapping");
+    const auto bytes = target.read_bytes(begin, size);
+    if (maps != target.maps())
+      throw MemoryError(Code::ABORTED, "target mappings changed during setup; run %memory maps again");
+    target.verify_live();
+    try {
+      response = session.start_instruction_trace(request, bytes);
+    } catch (const std::invalid_argument &error) {
+      throw MemoryError(Code::FAILED_PRECONDITION, error.what());
+    }
   });
 }
 

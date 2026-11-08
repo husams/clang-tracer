@@ -36,6 +36,14 @@ int main() {
   require(parse_command("%sample cpu --timeout 1").kind == CommandKind::sample_cpu);
   bad("%sample cpu --timeout 61");
   bad("%syscalls --count 8193");
+  require(parse_command("%instructions start --tid 23 --address 0x4000 --size 64 --mapping m --count 7")
+              .kind == CommandKind::instructions_start);
+  require(parse_command("%instructions stop").kind == CommandKind::instructions_stop);
+  bad("%instructions start --address 0x4000 --tid 23 --size 64");
+  bad("%instructions start --tid 0 --address 0x4000 --size 64 --mapping m");
+  bad("%instructions start --tid 23 --address 0x4000 --size 65537 --mapping m");
+  bad("%instructions start --tid 23 --address 0x4000 --size 64 --mapping m --timeout 61");
+  bad("%instructions start --tid 23 --address 0x4000 --size 64 --mapping m --count 8193");
   const auto overrides = parse_command("%probe inject f --callback hook.cpp --allow-arg-overrides --allow-result-override");
   require(overrides.has("--allow-arg-overrides") && overrides.has("--allow-result-override"));
   require(parse_command("%probe validate f --callback hook.cpp --allow-result-override")

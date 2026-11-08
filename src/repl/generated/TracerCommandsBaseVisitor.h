@@ -179,6 +179,14 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitInstructions(TracerCommandsParser::InstructionsContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitInstructionOption(TracerCommandsParser::InstructionOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
 
 };
 

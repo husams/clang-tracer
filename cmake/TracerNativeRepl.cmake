@@ -34,7 +34,8 @@ function(tracer_add_native_repl)
     "${_repl}/generated/TracerCommandsParser.cpp"
     "${_repl}/generated/TracerCommandsVisitor.cpp"
     "${_repl}/generated/TracerCommandsBaseVisitor.cpp")
-  target_include_directories(tracer_repl_commands PUBLIC "${_repl}")
+  target_include_directories(tracer_repl_commands PUBLIC "${_repl}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
   target_include_directories(tracer_repl_commands SYSTEM PRIVATE "${_repl}/generated")
   target_link_libraries(tracer_repl_commands PRIVATE antlr4_static)
   find_package(Threads REQUIRED)

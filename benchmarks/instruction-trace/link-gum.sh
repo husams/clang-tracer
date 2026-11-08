@@ -18,9 +18,10 @@ fi
 
 "$cc" "${linker_args[@]}" -std=c11 -O2 -fPIC -shared -fvisibility=hidden -Wall -Wextra \
   -Wl,--fatal-warnings,--exclude-libs,ALL,-z,defs,-z,relro,-z,now,-z,noexecstack,--build-id=sha1 \
-  -Wl,--wrap=__libc_dlopen_mode \
+  -Wl,--wrap=__libc_dlopen_mode,--wrap=prctl,--wrap=gum_process_modify_thread \
   -Xlinker --version-script -Xlinker "$src/gum.exports" \
-  -Xlinker -Map -Xlinker "$out/gum-backend.map" -I "$headers" "$src/gum_backend.c" \
+  -Xlinker -Map -Xlinker "$out/gum-backend.map" -I "$headers" -I "$src/../../include/tracer" \
+  "$src/gum_backend.c" \
   "$archive" -ldl -lpthread -lresolv -lm -o "$out/gum-backend.so"
 readelf -WV "$out/gum-backend.so" > "$out/gum-backend.versions"
 if grep -qw GLIBC_PRIVATE "$out/gum-backend.versions"; then

@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 from compare import expected_pcs, symbols
 
@@ -22,11 +23,13 @@ def inspect_plugin(plugin):
     versions = subprocess.check_output(["readelf", "-WV", plugin], text=True)
     exports = subprocess.check_output(["nm", "-D", "--defined-only", plugin], text=True)
     needed = sorted(re.findall(r"Shared library: \[([^\]]+)\]", dynamic))
-    allowed = {"libc.so.6", "libdl.so.2", "libgcc_s.so.1", "libm.so.6",
+    allowed = {"ld-linux-x86-64.so.2", "libc.so.6", "libdl.so.2", "libgcc_s.so.1", "libm.so.6",
                "libpthread.so.0", "libresolv.so.2"}
     names = {line.split()[-1] for line in exports.splitlines() if line}
-    assert names == {"pilot_gum_init", "pilot_gum_shutdown", "pilot_gum_run",
-                     "pilot_gum_live_start", "pilot_gum_live_stop"}, names
+    pilot = {"pilot_gum_init", "pilot_gum_shutdown", "pilot_gum_run",
+             "pilot_gum_live_start", "pilot_gum_live_stop"}
+    supported = {"tracer_gum_instruction_start_v1", "tracer_gum_instruction_stop_v1"}
+    assert names in (pilot, pilot | supported), names
     assert "libc.so.6" in needed and set(needed) <= allowed, needed
     assert "(BIND_NOW)" in dynamic or re.search(r"Flags:.*\bNOW\b", dynamic)
     assert not re.search(r"\((?:TEXTREL|RPATH|RUNPATH)\)", dynamic)
@@ -41,7 +44,8 @@ def inspect_plugin(plugin):
             "exports": sorted(names), "relro": "full", "executable_stack": False}
 
 
-def verify(repl, server, agent, fixture, plugin, command, target_library_path):
+def verify(repl, server, agent, fixture, plugin, command, target_library_path,
+           native_repl=False):
     names = symbols(fixture)
     workloads = {"w": (3, 19, 0, 0), "v": (2, 16, 0, 0),
                  "s": (-3, 19, 1, 0), "f": (0, 39, 0, 1)}
@@ -106,10 +110,17 @@ struct Interceptor {{
         assert not mapped() and task.exists()
         initial_libdl = any(re.search(r"/libdl(?:-\S+|\.so\.2)(?:\s|$)", line)
                             for line in maps.read_text().splitlines())
+        console_environment = None
+        if native_repl:
+            console_environment = dict(os.environ)
+            if plugin == agent.parent / "gum-backend.so":
+                console_environment.pop("CLANG_TRACER_GUM_PLUGIN", None)
+            else:
+                console_environment["CLANG_TRACER_GUM_PLUGIN"] = str(plugin)
         console = subprocess.Popen(
             [repl, "--server", server, "--agent", agent, "--attach", str(child.pid)],
             cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True,
+            text=True, env=console_environment,
         )
         output = Transcript(console.stdout)
 
@@ -148,8 +159,40 @@ struct Interceptor {{
             output.expect(r"^received=2 .*complete=true")
             cursor = int(post[1])
 
-        def control(letter):
-            nonlocal cursor
+        capture_reply = None
+        capture_reason = None
+
+        def mapping_token():
+            send("%memory maps")
+            token = output.expect(r"^memory mapping=(\S+)$")[1]
+            output.expect(r"^memory mappings=\d+$")
+            return token
+
+        def start_command(token, worker_tid=tid, size=end - begin, cap=256, seconds=60):
+            return (f"%instructions start --tid {worker_tid} --address {begin:#x} "
+                    f"--size {size} --mapping {token} --count {cap} --timeout {seconds}")
+
+        def control(letter, seconds=60):
+            nonlocal cursor, capture_reply, capture_reason
+            if native_repl:
+                if letter == "e":
+                    send("%instructions stop")
+                    offsets = []
+                    while True:
+                        row = output.expect(
+                            rf"^instruction pc=(0x\w+)$|^instructions stopped tid={tid} "
+                            r"count=(\d+) reason=(\w+) truncated=(true|false)$")
+                        if row[1]:
+                            offsets.append(int(row[1], 16) - begin)
+                            continue
+                        assert int(row[2]) == len(offsets)
+                        capture_reply = {"truncated": int(row[4] == "true"), "offsets": offsets}
+                        capture_reason = row[3]
+                        return
+                send(start_command(mapping_token(), cap=7 if letter == "c" else 256,
+                                   seconds=seconds))
+                output.expect(rf"^instructions started tid={tid} address={begin:#x} ")
+                return
             target(letter, rf"^control returned {ord(letter) + 1}$")
             send(f"%events --probe {control_probe} --after {cursor} --count 1 --phase PRE --timeout 8")
             event = output.expect(
@@ -166,26 +209,45 @@ struct Interceptor {{
             output.expect(rf"^removed probe={probe} restored=true$")
             assert code() == original
 
-        def check_capture(calls, cap):
+        def check_capture(calls, cap, reason=None):
             wanted = [pc for letter in calls for pc in expected[letter]]
-            actual = json.loads(capture.read_text())
+            if native_repl:
+                actual = capture_reply
+                assert capture_reason == (reason or ("LIMIT" if len(wanted) > cap else "STOPPED"))
+            else:
+                actual = json.loads(capture.read_text())
+                capture.unlink()
             assert actual == {"truncated": int(len(wanted) > cap), "offsets": wanted[:cap]}, (
                 calls, actual, wanted)
-            capture.unlink()
             return len(actual["offsets"])
 
         output.expect(rf"^attached session=\S+ pid={child.pid}$")
         output.expect(rf'^target JIT runtime .*glibc_version: "{re.escape(glibc)}"')
+        if native_repl:
+            send("%instructions stop")
+            output.expect(r"RPC 9: session has no instruction capture")
+            send(start_command("stale"))
+            output.expect(r"RPC 10: instruction mapping snapshot is stale")
+            token = mapping_token()
+            send(start_command(token, size=65536))
+            output.expect(r"RPC 9: instruction range must fit one readable file-backed executable mapping")
+            send(start_command(token, worker_tid=2147483647))
+            output.expect(r"RPC 9: instruction thread is unavailable in the selected target")
+            assert not mapped()
         selector = "pilot_observed(int)"
         native_probe = install(selector, observers[0])
         patch = code()
         assert patch != original
         native_call("w", native_probe)
-        control_probe = install("pilot_control(int, int, unsigned long, unsigned long, int)", loader)
+        if not native_repl:
+            control_probe = install("pilot_control(int, int, unsigned long, unsigned long, int)", loader)
         for arm, calls, cap in (("b", "wv", 256), ("c", "w", 7)):
             assert not mapped()
             control(arm)
             assert mapped() and code() == patch and task.exists()
+            if native_repl and arm == "b":
+                send(start_command(mapping_token()))
+                output.expect(r"RPC 9: stop the existing instruction capture")
             for letter in calls:
                 native_call(letter, native_probe)
             control("e")
@@ -220,6 +282,22 @@ struct Interceptor {{
         assert not mapped() and code() == original and task.exists()
         mutation_records = check_capture("wwsfvv", 256)
 
+        deadline_records = None
+        if native_repl:
+            control("b", seconds=1)
+            worker("w")
+            time.sleep(1.25)
+            worker("v")
+            control("e")
+            deadline_records = check_capture("w", 256, reason="TIMEOUT")
+            assert not mapped()
+            control("e")
+            assert check_capture("w", 256, reason="TIMEOUT") == deadline_records
+            last = install(selector, observers[0])
+            control("b")
+            native_call("v", last)
+            assert mapped() and code() != original
+
         send("%detach")
         output.expect(r"^detached session=\S+$")
         assert code() == original and not mapped()
@@ -227,7 +305,7 @@ struct Interceptor {{
         worker("s")
         worker("f")
         send("%quit")
-        assert console.wait(timeout=15) == 0, "".join(output.seen)
+        assert console.wait(timeout=15) == (1 if native_repl else 0), "".join(output.seen)
         child.stdin.write("q")
         child.stdin.flush()
         assert child.wait(timeout=5) == 0, "".join(target_out.seen)
@@ -235,7 +313,11 @@ struct Interceptor {{
                 "libdl_mapped_before_attach": initial_libdl,
                 "full_records": len(expected["w"]) + len(expected["v"]), "capped_records": 7,
                 "mutation_records": mutation_records, "signals": 1, "recovered_faults": 1,
-                "native_pairs": 10, "probe_changes": ["install", "reload", "remove"],
+                "native_pairs": 11 if native_repl else 10,
+                "probe_changes": ["install", "reload", "remove"],
+                "deadline_records": deadline_records,
+                "detached_while_active": native_repl,
+                "rejection_checks": 5 if native_repl else 0,
                 "unloaded": True, "restored": True}
 
 
@@ -247,6 +329,8 @@ def main():
     parser.add_argument("--library-path")
     parser.add_argument("--target-library-path",
                         help="set LD_LIBRARY_PATH only for the target fixture")
+    parser.add_argument("--native-repl", action="store_true",
+                        help="use the supported REPL commands instead of the pilot's control observer")
     args = parser.parse_args()
     if bool(args.loader) != bool(args.library_path):
         parser.error("--loader and --library-path must be supplied together")
@@ -257,7 +341,7 @@ def main():
     plugin = args.plugin.resolve()
     packaging = inspect_plugin(plugin)
     result = verify(args.repl.resolve(), args.server.resolve(), args.agent.resolve(),
-                    fixture, plugin, command, args.target_library_path)
+                    fixture, plugin, command, args.target_library_path, args.native_repl)
     print(json.dumps({"capture": result, "packaging": packaging}))
 
 

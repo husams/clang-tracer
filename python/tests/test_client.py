@@ -181,6 +181,8 @@ def test_all_public_rpcs_have_client_methods():
         "ListMemoryMappings": "list_memory_mappings",
         "ReadMemory": "read_memory",
         "ScanMemory": "scan_memory",
+        "StartInstructionTrace": "start_instruction_trace",
+        "StopInstructionTrace": "stop_instruction_trace",
         "PreviewFunctionEntry": "preview_function_entry",
         "ListThreads": "list_threads",
         "PreviewBulkTrace": "preview_bulk_trace",
@@ -196,6 +198,27 @@ def test_all_public_rpcs_have_client_methods():
         m.name for m in pb.DESCRIPTOR.services_by_name["Tracer"].methods
     }
     assert all(callable(getattr(Client, name)) for name in methods.values())
+
+
+def test_instruction_trace_transmits_capture_limits(peer, monkeypatch):
+    client, _ = peer
+    start = Mock(return_value=pb.InstructionTrace(tid=45, address=0x4000, size=64))
+    stop = Mock(return_value=pb.InstructionTrace(reason=pb.InstructionTrace.LIMIT, pcs=[0x4000]))
+    monkeypatch.setattr(client.stub, "StartInstructionTrace", start)
+    monkeypatch.setattr(client.stub, "StopInstructionTrace", stop)
+    result = client.start_instruction_trace(
+        "s1", 0x4000, 64, tid=45, mapping_token="opaque", max_records=1, timeout_seconds=2
+    )
+    assert result.tid == 45
+    start.assert_called_once_with(
+        pb.StartInstructionTraceRequest(
+            session_id="s1", tid=45, address=0x4000, size=64, mapping_token="opaque",
+            max_records=1, timeout_seconds=2,
+        ),
+        timeout=client.timeout,
+    )
+    assert list(client.stop_instruction_trace("s1").pcs) == [0x4000]
+    stop.assert_called_once_with(pb.StopInstructionTraceRequest(session_id="s1"), timeout=client.timeout)
 
 
 def test_validation_transmits_ordered_options_and_returns_diagnostics(

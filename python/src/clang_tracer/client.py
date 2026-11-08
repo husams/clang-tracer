@@ -256,6 +256,26 @@ class Client:
             request.elf_address = elf_address
         return self.stub.PreviewFunctionEntry(request, timeout=self.timeout)
 
+    def start_instruction_trace(
+        self, session_id: str, address: int, size: int, *,
+        tid: int, mapping_token: str, max_records: int = 256, timeout_seconds: int = 5,
+    ) -> pb.InstructionTrace:
+        """Start bounded Gum capture on a local server with the optional backend."""
+        return self.stub.StartInstructionTrace(
+            pb.StartInstructionTraceRequest(
+                session_id=session_id, address=address, size=size, tid=tid,
+                mapping_token=mapping_token, max_records=max_records,
+                timeout_seconds=timeout_seconds,
+            ),
+            timeout=self.timeout,
+        )
+
+    def stop_instruction_trace(self, session_id: str) -> pb.InstructionTrace:
+        """Stop capture and return the original PCs in execution order."""
+        return self.stub.StopInstructionTrace(
+            pb.StopInstructionTraceRequest(session_id=session_id), timeout=self.timeout
+        )
+
     def list_threads(self, session_id: str) -> list[pb.TargetThread]:
         """List thread IDs, names and start times for an attached target."""
         response = self.stub.ListThreads(

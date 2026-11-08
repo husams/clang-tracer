@@ -95,6 +95,16 @@ class TracerStub(object):
                 request_serializer=tracer__pb2.ScanMemoryRequest.SerializeToString,
                 response_deserializer=tracer__pb2.ScanMemoryResponse.FromString,
                 _registered_method=True)
+        self.StartInstructionTrace = channel.unary_unary(
+                '/clangtracer.v1.Tracer/StartInstructionTrace',
+                request_serializer=tracer__pb2.StartInstructionTraceRequest.SerializeToString,
+                response_deserializer=tracer__pb2.InstructionTrace.FromString,
+                _registered_method=True)
+        self.StopInstructionTrace = channel.unary_unary(
+                '/clangtracer.v1.Tracer/StopInstructionTrace',
+                request_serializer=tracer__pb2.StopInstructionTraceRequest.SerializeToString,
+                response_deserializer=tracer__pb2.InstructionTrace.FromString,
+                _registered_method=True)
         self.PreviewFunctionEntry = channel.unary_unary(
                 '/clangtracer.v1.Tracer/PreviewFunctionEntry',
                 request_serializer=tracer__pb2.PreviewFunctionEntryRequest.SerializeToString,
@@ -219,6 +229,18 @@ class TracerServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def StartInstructionTrace(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def StopInstructionTrace(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def PreviewFunctionEntry(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -336,6 +358,16 @@ def add_TracerServicer_to_server(servicer, server):
                     servicer.ScanMemory,
                     request_deserializer=tracer__pb2.ScanMemoryRequest.FromString,
                     response_serializer=tracer__pb2.ScanMemoryResponse.SerializeToString,
+            ),
+            'StartInstructionTrace': grpc.unary_unary_rpc_method_handler(
+                    servicer.StartInstructionTrace,
+                    request_deserializer=tracer__pb2.StartInstructionTraceRequest.FromString,
+                    response_serializer=tracer__pb2.InstructionTrace.SerializeToString,
+            ),
+            'StopInstructionTrace': grpc.unary_unary_rpc_method_handler(
+                    servicer.StopInstructionTrace,
+                    request_deserializer=tracer__pb2.StopInstructionTraceRequest.FromString,
+                    response_serializer=tracer__pb2.InstructionTrace.SerializeToString,
             ),
             'PreviewFunctionEntry': grpc.unary_unary_rpc_method_handler(
                     servicer.PreviewFunctionEntry,
@@ -708,6 +740,60 @@ class Tracer(object):
             '/clangtracer.v1.Tracer/ScanMemory',
             tracer__pb2.ScanMemoryRequest.SerializeToString,
             tracer__pb2.ScanMemoryResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StartInstructionTrace(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/StartInstructionTrace',
+            tracer__pb2.StartInstructionTraceRequest.SerializeToString,
+            tracer__pb2.InstructionTrace.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StopInstructionTrace(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/StopInstructionTrace',
+            tracer__pb2.StopInstructionTraceRequest.SerializeToString,
+            tracer__pb2.InstructionTrace.FromString,
             options,
             channel_credentials,
             insecure,

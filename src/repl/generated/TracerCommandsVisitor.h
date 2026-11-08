@@ -101,6 +101,10 @@ public:
 
     virtual std::any visitLocalPerf(TracerCommandsParser::LocalPerfContext *context) = 0;
 
+    virtual std::any visitInstructions(TracerCommandsParser::InstructionsContext *context) = 0;
+
+    virtual std::any visitInstructionOption(TracerCommandsParser::InstructionOptionContext *context) = 0;
+
 
 };
 

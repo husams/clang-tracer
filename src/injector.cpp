@@ -824,7 +824,8 @@ void Process::poison_process() noexcept {
 void Process::mark_unsafe() noexcept { poison_process(); }
 
 void Process::attach(pid_t process_id,
-                     ::tracer::compat::span<const ApplicationModule> application_modules) {
+                     ::tracer::compat::span<const ApplicationModule> application_modules,
+                     pid_t excluded_tid) {
 #if !defined(__linux__) || !defined(__x86_64__)
   (void)process_id;
   throw std::runtime_error("native injector is supported only on Linux x86_64");
@@ -873,6 +874,10 @@ void Process::attach(pid_t process_id,
     };
     std::vector<Rejection> rejected;
     auto eligible = [&](pid_t candidate_tid) {
+      if (candidate_tid == excluded_tid) {
+        rejected.push_back({candidate_tid, -1, "reserved for instruction tracing"});
+        return false;
+      }
       const long syscall_number = stopped_syscall(candidate_tid);
       const auto registers = read_registers(candidate_tid).general;
       if (candidate_tid != process_id_ && registers.fs_base == 0) {

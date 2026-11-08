@@ -669,6 +669,54 @@ class ReadMemoryResponse(_message.Message):
     data: bytes
     def __init__(self, address: _Optional[int] = ..., data: _Optional[bytes] = ...) -> None: ...
 
+class StartInstructionTraceRequest(_message.Message):
+    __slots__ = ("session_id", "mapping_token", "tid", "address", "size", "max_records", "timeout_seconds")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    MAPPING_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    TID_FIELD_NUMBER: _ClassVar[int]
+    ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    SIZE_FIELD_NUMBER: _ClassVar[int]
+    MAX_RECORDS_FIELD_NUMBER: _ClassVar[int]
+    TIMEOUT_SECONDS_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    mapping_token: str
+    tid: int
+    address: int
+    size: int
+    max_records: int
+    timeout_seconds: int
+    def __init__(self, session_id: _Optional[str] = ..., mapping_token: _Optional[str] = ..., tid: _Optional[int] = ..., address: _Optional[int] = ..., size: _Optional[int] = ..., max_records: _Optional[int] = ..., timeout_seconds: _Optional[int] = ...) -> None: ...
+
+class StopInstructionTraceRequest(_message.Message):
+    __slots__ = ("session_id",)
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    def __init__(self, session_id: _Optional[str] = ...) -> None: ...
+
+class InstructionTrace(_message.Message):
+    __slots__ = ("tid", "address", "size", "reason", "pcs")
+    class Reason(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = ()
+        RUNNING: _ClassVar[InstructionTrace.Reason]
+        STOPPED: _ClassVar[InstructionTrace.Reason]
+        LIMIT: _ClassVar[InstructionTrace.Reason]
+        TIMEOUT: _ClassVar[InstructionTrace.Reason]
+    RUNNING: InstructionTrace.Reason
+    STOPPED: InstructionTrace.Reason
+    LIMIT: InstructionTrace.Reason
+    TIMEOUT: InstructionTrace.Reason
+    TID_FIELD_NUMBER: _ClassVar[int]
+    ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    SIZE_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    PCS_FIELD_NUMBER: _ClassVar[int]
+    tid: int
+    address: int
+    size: int
+    reason: InstructionTrace.Reason
+    pcs: _containers.RepeatedScalarFieldContainer[int]
+    def __init__(self, tid: _Optional[int] = ..., address: _Optional[int] = ..., size: _Optional[int] = ..., reason: _Optional[_Union[InstructionTrace.Reason, str]] = ..., pcs: _Optional[_Iterable[int]] = ...) -> None: ...
+
 class ScanMemoryRequest(_message.Message):
     __slots__ = ("session_id", "mapping_token", "address", "size", "pattern", "mask", "max_matches")
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
