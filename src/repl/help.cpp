@@ -107,31 +107,32 @@ const CommandTopic commands[] = {
     {"trace remove", "%trace remove BATCH_ID",
      "Remove or retry restoration of the probes owned by a batch in the selected session."},
     {"probe", "", "Prepare, resolve, validate, install, or remove a probe."},
-    {"probe entry", "%probe entry SELECTOR --mapping TOKEN [--module MODULE]\n"
-     "  or %probe entry --module PATH --elf-address ADDRESS --abi linux-x86-64-sysv --mapping TOKEN",
+    {"probe entry", "%probe entry SELECTOR --mapping TOKEN [--module MODULE] [--cwd DIRECTORY]\n"
+     "  or %probe entry --module PATH --elf-address ADDRESS --abi linux-x86-64-sysv --mapping TOKEN [--cwd DIRECTORY]",
      "Verify and disassemble a function entry and show the copy-only detour window and bounded control flow."},
     {"probe prepare",
      "%probe prepare SELECTOR --include HEADER --output NEW_DIRECTORY\n"
-     "  [--compdb PATH] [--translation-unit FILE] [--module ELF] [--metadata-only] [EXTRA COMPILER ARGUMENTS]",
+     "  [--compdb PATH] [--translation-unit FILE] [--module ELF] [--metadata-only] [--cwd DIRECTORY] [EXTRA COMPILER ARGUMENTS]",
      "Build a reusable probe package from local source. Repeat --include for extra headers. "
-     "By default, preparation uses compile_commands.json in the current directory and a source "
-     "beside the first header. Use --module to pin the package to a specific build. "
+     "Preparation uses compile_commands.json in the command's working directory by default. "
+     "It prefers the first include's recorded compile command and falls back to the first source beside it. "
+     "Use --module to pin the package to a specific build. "
      "Use --metadata-only to skip the separate C++ adapter files.",
      R"example(%probe prepare "demo::compute(int)" --include demo.hpp --output prepared)example"},
-    {"probe resolve", "%probe resolve SELECTOR [RESOLUTION OPTIONS]",
+    {"probe resolve", "%probe resolve SELECTOR [RESOLUTION OPTIONS] [--cwd DIRECTORY]",
      "Resolve a selector in the selected target and show the available metadata.",
      R"(%probe resolve "Calculator::multiply(int, int) const")"},
-    {"probe validate", "%probe validate SELECTOR --callback FILE [RESOLUTION OPTIONS]\n"
+    {"probe validate", "%probe validate SELECTOR --callback FILE [RESOLUTION OPTIONS] [--cwd DIRECTORY]\n"
      "  [--allow-arg-overrides] [--allow-result-override] [--allow-replacement] [--allow-call-original] [--trace-exceptions] [--reclaimable]",
      "Check whether the callback can be deployed for the selected function."},
-    {"probe inject", "%probe inject SELECTOR --callback FILE [RESOLUTION OPTIONS] [DEPLOYMENT OPTIONS]\n"
+    {"probe inject", "%probe inject SELECTOR --callback FILE [RESOLUTION OPTIONS] [DEPLOYMENT OPTIONS] [--cwd DIRECTORY]\n"
      "  [--allow-arg-overrides] [--allow-result-override] [--allow-replacement] [--allow-call-original] [--trace-exceptions] [--reclaimable]",
      "Install a callback. The two override flags separately enable scalar writes in pre() and post().",
      R"example(%probe inject "demo::compute(int)" --callback hook.cpp --prepared prepared)example"},
-    {"probe remove", "%probe remove ID", "Remove a probe from the selected session and restore the original code."},
-    {"probe reload", "%probe reload ID --callback FILE [--watch [--count N] [--timeout SECONDS]]",
+    {"probe remove", "%probe remove ID [--cwd DIRECTORY]", "Remove a probe from the selected session and restore the original code."},
+    {"probe reload", "%probe reload ID --callback FILE [--cwd DIRECTORY] [--watch [--count N] [--timeout SECONDS]]",
      "Switch an active probe to a new observer generation while existing calls finish on their original generation."},
-    {"probes", "%probes", "List the probes in the selected session."},
+    {"probes", "%probes [--cwd DIRECTORY]", "List the probes in the selected session."},
     {"interceptor", "", "Manage named C++ callback drafts."},
     {"interceptor load", "%interceptor load FILE --as NAME", "Load a local C++ file into a named draft."},
     {"interceptor edit", "%interceptor edit NAME", "Enter C++ source interactively. Use .end to save or .cancel to discard."},
@@ -521,6 +522,10 @@ void command_details(std::ostream& out, const CommandTopic& entry, bool color) {
         out << '\n' << "    " << sub.summary << '\n';
       }
     }
+  }
+  if (entry.name == "probe" || entry.usage.find("--cwd DIRECTORY") != string_view::npos) {
+    out << "\n--cwd DIRECTORY sets the base for relative paths and shell expansions for this command.\n"
+           "Server-side inputs must be available at the resulting paths on the server host.\n";
   }
   if (entry.usage.find("STREAM OPTIONS") != string_view::npos) {
     out << '\n';

@@ -71,6 +71,21 @@ int main() {
       "--output prepared");
   require(prepare.kind == CommandKind::prepare && !prepare.has("--compdb") &&
           !prepare.has("--translation-unit") && !prepare.has("--module"));
+  for (const auto *probe : {"%probe prepare f --include h --output out",
+                            "%probe resolve f",
+                            "%probe validate f --callback hook.cpp",
+                            "%probe inject f --callback hook.cpp",
+                            "%probe entry f --mapping token",
+                            "%probe entry --module app --elf-address 0x1 --abi linux-x86-64-sysv --mapping token",
+                            "%probe reload 1 --callback hook.cpp",
+                            "%probe remove 1", "%probes"}) {
+    const auto command = parse_command(std::string(probe) + " --cwd 'work dir'");
+    require(command.option("--cwd") == "work dir");
+  }
+  bad("%probe resolve f --cwd");
+  bad("%probe resolve f --cwd ''");
+  bad("%probe resolve f --cwd one --cwd two");
+  bad("%server start --cwd dir");
   using ExtraKind = ExtraCompileArgumentInput::Kind;
   const auto extra = parse_command(
       R"args(%probe prepare f --extra-args "-I generated -DFIRST=1" )args"

@@ -410,6 +410,29 @@ the server host. Source files are limited to 4 MiB. Uploaded interceptors are
 compiled by the server/agent; local REPL variables, pointers and lambdas are not
 implicitly transferred into the target.
 
+### Probe working directory
+
+Add `--cwd DIRECTORY` to any `%probe` subcommand or to `%probes`.
+Relative paths for that command use the specified directory on the REPL host.
+This includes callbacks, prepared packages, supplemental include paths, and
+preparation inputs and output. Backtick expansions also run in that directory.
+For server-side headers, databases and translation units, the resulting paths
+must be accessible on the server host. Paths inside raw `--compile-option`
+arguments follow the compiler's working directory. A plain module name still
+works as a filter. Later commands use their own working directory.
+
+```text
+%probe prepare "demo::compute(int)" --include src/compute.cpp --output prepared --cwd /work/demo
+%probe inject "demo::compute(int)" --callback hook.cpp --prepared prepared --cwd /work/demo
+```
+
+Preparation looks for `compile_commands.json` in the command's working directory
+by default. With either a database file or a directory supplied through
+`--compdb`, it prefers a unique recorded command for the first include. If the
+include has no entry, it uses the first source beside it. Use a unique
+`--translation-unit` or a narrower database when the included source has
+multiple commands.
+
 ### Supplemental probe compiler arguments
 
 Use `--extra-arg` for one compiler argument and `--extra-args` for a list.
@@ -435,8 +458,8 @@ the compilation database. The clang-cl spellings `/I` and `/D` are also
 accepted. The selected driver, language standard, target,
 sysroot, and ABI remain authoritative. Preparation extras apply while reading
 the original headers. Pass callback-specific extras to injection or at startup.
-Relative supplemental include paths are resolved from the REPL's working
-directory. These paths must be visible to the agent during callback compilation.
+Relative supplemental include paths are resolved from the probe command's working
+directory, which defaults to the REPL's working directory. These paths must be visible to the agent during callback compilation.
 
 Attach checks the loaded agent's bootstrap protocol and ELF build ID against
 the server and its configured agent file before accepting the session. Use

@@ -24,7 +24,8 @@ def verify(repl, server, agent, target, watch_image, preload):
     with tempfile.TemporaryDirectory(prefix="ct-follow-") as name:
         root = Path(name)
         flag, stdout = root / "control", root / "stdout"
-        callback = root / "observer.cpp"
+        callback = root / "callbacks" / "observer.cpp"
+        callback.parent.mkdir()
 
         def update(path, content):
             draft = path.with_suffix(".tmp")
@@ -101,7 +102,8 @@ def verify(repl, server, agent, target, watch_image, preload):
                  "--allow-replacement --reclaimable")
             old = int(output.expect(r"^installed probe=(\d+)")[1])
             values(901, 202, 11, 0)
-            send(f'%probe reload {old} --callback "{callback}" --watch --count 2 --timeout 15')
+            send(f'%probe reload {old} --callback "{callback.name}" --watch --count 2 '
+                 f'--timeout 15 --cwd "{callback.parent}"')
             output.expect(rf"^probe watch ready probe={old}$")
             update(callback, "this is invalid C++\n")
             output.expect(r"^probe watch rejected:")

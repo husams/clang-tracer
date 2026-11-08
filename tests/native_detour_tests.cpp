@@ -194,6 +194,34 @@ void execute_cases(bool data_before) {
   }
 }
 
+void stack_compare() {
+  const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+  Mapping original(page);
+  // GCC 8.5 entry followed by a continuation that consumes the compare flags.
+  const std::array<std::uint8_t, 25> code{
+      0x55, 0x48, 0x89, 0xe5,        // push %rbp; mov %rsp,%rbp
+      0x48, 0x89, 0x7d, 0xf8,        // mov %rdi,-8(%rbp)
+      0x48, 0x89, 0x75, 0xf0,        // mov %rsi,-16(%rbp)
+      0x48, 0x83, 0x7d, 0xf8, 0x00,  // cmpq $0,-8(%rbp)
+      0x0f, 0x95, 0xc0,              // setne %al
+      0x0f, 0xb6, 0xc0, 0x5d, 0xc3}; // movzbl %al,%eax; pop %rbp; ret
+  std::memcpy(original.address, code.data(), code.size());
+  require(::mprotect(original.address, page, PROT_READ | PROT_EXEC) == 0,
+          "could not make compare fixture executable");
+  nd::Patch patch;
+  std::string error;
+  require(nd::decode(code, reinterpret_cast<std::uintptr_t>(original.address),
+                     patch, error) &&
+              patch.size == 17 && patch.relocations.empty(),
+          "GCC stack compare was not admitted as a copy-only instruction");
+  Trampoline trampoline;
+  require(nd::create_trampoline(patch, trampoline.address, trampoline.size, error),
+          "could not create the stack compare trampoline");
+  const auto call = reinterpret_cast<int (*)(const void *, const void *)>(trampoline.address);
+  require(call(nullptr, nullptr) == 0 && call(&patch, nullptr) == 1,
+          "copied stack compare did not preserve the condition flags");
+}
+
 void rejection_cases() {
   for (const auto &start : std::vector<std::vector<std::uint8_t>>{
            {0xe8, 0, 0, 0, 0},
@@ -201,6 +229,7 @@ void rejection_cases() {
            {0xc3},
            {0x0f, 0xa2},
            {0xf3, 0x0f, 0x1e, 0xfa},
+           {0x48, 0x83, 0x3d, 0, 0x10, 0, 0, 0}, // RIP-relative CMP64mi8
            {0x67, 0x8b, 0x05, 0, 0x10, 0, 0},
            {0x64, 0x8b, 0x05, 0, 0x10, 0, 0},
            {0x8b, 0x05, 0xfa, 0xff, 0xff, 0xff}}) {
@@ -307,6 +336,7 @@ int main() {
   try {
     execute_cases(false);
     execute_cases(true);
+    stack_compare();
     rejection_cases();
     displacement_limits();
     overlap_boundaries();

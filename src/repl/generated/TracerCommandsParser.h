@@ -40,8 +40,8 @@ public:
     T__144 = 145, T__145 = 146, T__146 = 147, T__147 = 148, T__148 = 149,
     T__149 = 150, T__150 = 151, T__151 = 152, T__152 = 153, T__153 = 154,
     T__154 = 155, T__155 = 156, T__156 = 157, T__157 = 158, T__158 = 159,
-    T__159 = 160, T__160 = 161, UINT = 162, STRING = 163, SHELL = 164, METADATA_ONLY = 165,
-    SQLITE = 166, STACK = 167, WORD = 168, WS = 169
+    T__159 = 160, UINT = 161, STRING = 162, SHELL = 163, METADATA_ONLY = 164,
+    SQLITE = 165, STACK = 166, CWD = 167, WORD = 168, WS = 169
   };
 
   enum {
@@ -57,7 +57,7 @@ public:
     RuleTargetLaunch = 37, RuleLaunchOption = 38, RuleChildList = 39, RuleTargetCall = 40,
     RuleLocalPerf = 41, RuleTargetLibrary = 42, RuleInstructions = 43, RuleInstructionOption = 44,
     RuleWatchpoint = 45, RuleStackFilter = 46, RuleContextEventBytes = 47,
-    RuleExtraCompileOption = 48
+    RuleExtraCompileOption = 48, RuleCwdOption = 49
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -126,6 +126,7 @@ public:
   class StackFilterContext;
   class ContextEventBytesContext;
   class ExtraCompileOptionContext;
+  class CwdOptionContext;
 
   class  LineContext : public antlr4::ParserRuleContext {
   public:
@@ -357,6 +358,8 @@ public:
     PrepareOptionContext* prepareOption(size_t i);
     std::vector<ResolveOptionContext *> resolveOption();
     ResolveOptionContext* resolveOption(size_t i);
+    std::vector<CwdOptionContext *> cwdOption();
+    CwdOptionContext* cwdOption(size_t i);
     std::vector<DeployOptionContext *> deployOption();
     DeployOptionContext* deployOption(size_t i);
     std::vector<ValidateOptionContext *> validateOption();
@@ -376,6 +379,7 @@ public:
     ValueContext *value();
     antlr4::tree::TerminalNode *METADATA_ONLY();
     ExtraCompileOptionContext *extraCompileOption();
+    CwdOptionContext *cwdOption();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -669,6 +673,7 @@ public:
     virtual size_t getRuleIndex() const override;
     std::vector<ValueContext *> value();
     ValueContext* value(size_t i);
+    CwdOptionContext *cwdOption();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -684,6 +689,8 @@ public:
     std::vector<antlr4::tree::TerminalNode *> UINT();
     antlr4::tree::TerminalNode* UINT(size_t i);
     ValueContext *value();
+    std::vector<CwdOptionContext *> cwdOption();
+    CwdOptionContext* cwdOption(size_t i);
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -713,6 +720,7 @@ public:
     LaunchOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
     ValueContext *value();
+    antlr4::tree::TerminalNode *CWD();
     antlr4::tree::TerminalNode *UINT();
 
 
@@ -863,6 +871,20 @@ public:
   };
 
   ExtraCompileOptionContext* extraCompileOption();
+
+  class  CwdOptionContext : public antlr4::ParserRuleContext {
+  public:
+    CwdOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    antlr4::tree::TerminalNode *CWD();
+    ValueContext *value();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  CwdOptionContext* cwdOption();
 
 
   // By default the static state used to implement the parser is lazily initialized during the first

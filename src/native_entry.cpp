@@ -121,7 +121,7 @@ bool safe_instruction(const llvm::MCInst &inst, const llvm::MCInstrInfo &ins,
       "CMP64rr",   "CMP32rr",   "AND8i8",     "AND8ri",    "AND64ri8",
       "AND64ri32", "XOR8i8",    "XOR8ri",     "NOP",
       "NOOP",      "MOV64mi32", "MOV32mi",    "MOV16mi",   "MOV8mi"};
-  bool known = false;
+  bool known = name == "CMP64mi8";
   for (auto p : allowed) {
     if (name == p || (name.size() > p.size() && ::tracer::compat::starts_with(name, p))) {
       known = true;

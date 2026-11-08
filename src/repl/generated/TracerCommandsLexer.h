@@ -40,8 +40,8 @@ public:
     T__144 = 145, T__145 = 146, T__146 = 147, T__147 = 148, T__148 = 149,
     T__149 = 150, T__150 = 151, T__151 = 152, T__152 = 153, T__153 = 154,
     T__154 = 155, T__155 = 156, T__156 = 157, T__157 = 158, T__158 = 159,
-    T__159 = 160, T__160 = 161, UINT = 162, STRING = 163, SHELL = 164, METADATA_ONLY = 165,
-    SQLITE = 166, STACK = 167, WORD = 168, WS = 169
+    T__159 = 160, UINT = 161, STRING = 162, SHELL = 163, METADATA_ONLY = 164,
+    SQLITE = 165, STACK = 166, CWD = 167, WORD = 168, WS = 169
   };
 
   explicit TracerCommandsLexer(antlr4::CharStream *input);

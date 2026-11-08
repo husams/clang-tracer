@@ -20,12 +20,12 @@ symbols : 'symbols' symbolOption*;
 symbolOption : ('--filter' | '--module' | '--page' | '--address' | '--mapping') value
              | '--limit' UINT | '--addresses';
 probe : 'probe' ('prepare' value prepareOption+
-      | 'resolve' value resolveOption*
-      | 'inject' value '--callback' value deployOption*
-      | 'validate' value '--callback' value validateOption*
-      | 'remove' UINT) | 'probes';
+      | 'resolve' value (resolveOption | cwdOption)*
+      | 'inject' value '--callback' value (deployOption | cwdOption)*
+      | 'validate' value '--callback' value (validateOption | cwdOption)*
+      | 'remove' UINT cwdOption?) | 'probes' cwdOption?;
 prepareOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--output') value
-              | METADATA_ONLY | extraCompileOption;
+              | METADATA_ONLY | extraCompileOption | cwdOption;
 resolveOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--compile-option'
                 | '--prepared' | '--prepared-mode') value
               | extraCompileOption;
@@ -87,9 +87,9 @@ memory : 'memory' ('maps' | 'read' value '--mapping' value
                  | 'import-hook' '--module' value '--symbol' value '--original' value
                    '--address' value '--mapping' value '--abi' value);
 probeEntry : 'probe' 'entry' (value '--mapping' value ('--module' value)?
-           | '--module' value '--elf-address' value '--abi' value '--mapping' value);
+           | '--module' value '--elf-address' value '--abi' value '--mapping' value) cwdOption?;
 probeReload : 'probe' 'reload' UINT '--callback' value
-              ('--watch' (('--timeout' | '--count') UINT)*)?;
+              (cwdOption | '--watch' (('--timeout' | '--count') UINT)*)*;
 targetLaunch : 'launch' value launchOption* | ('resume' | 'terminate') UINT?;
 launchOption : ('--arg' | '--cwd' | '--env' | '--stdin' | '--stdout' | '--stderr' | '--preload') value
              | '--timeout' UINT | '--supervise' | '--gate-children';
@@ -106,6 +106,7 @@ watchpoint : 'watchpoint' (('--tid' | '--size' | '--count' | '--timeout') UINT
 stackFilter : '--stack-application-only' value;
 contextEventBytes : ('--context-event-bytes' | '--context-transport-memory-bytes') UINT;
 extraCompileOption : '--extra-arg' value | '--extra-args' (value | SHELL)+;
+cwdOption : CWD value;
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';
@@ -113,5 +114,6 @@ SHELL : '`' ~[`\r\n]+ '`';
 METADATA_ONLY : '--metadata-only';
 SQLITE : '--sqlite';
 STACK : 'stack';
+CWD : '--cwd';
 WORD : ~[ \t\r\n"'\\%`]+;
 WS : [ \t\r\n]+ -> skip;
