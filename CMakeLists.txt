@@ -15,6 +15,7 @@ if(TRACER_REPL_ONLY)
   include(CTest)
   include(cmake/TracerNativeRepl.cmake)
   tracer_add_native_repl()
+  include(cmake/TracerDocumentation.cmake)
   return()
 endif()
 

@@ -98,7 +98,7 @@ The install tree contains:
 | `CMAKE_INSTALL_LIBDIR` | `lib64` | `libclang_tracer_agent.so` |
 | `CMAKE_INSTALL_INCLUDEDIR` | `include` | Public `tracer/` headers |
 | `CMAKE_INSTALL_DATADIR` | `share` | Protocol schema, example sources, Clang builtin headers |
-| `CMAKE_INSTALL_DOCDIR` | `share/doc/clang_tracer` | README, documentation and licenses |
+| `CMAKE_INSTALL_DOCDIR` | `share/doc/clang_tracer` | README, Markdown and HTML guides, documentation launcher, and licenses |
 
 `--prefix`, `--bindir` and `--libdir` configure the common choices in the build
 script. Pass other GNUInstallDirs variables after `--`, for example
