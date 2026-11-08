@@ -538,19 +538,22 @@ private:
     }
     source += " {\n";
     const auto body = source.size();
-    // Extra headers can emit an owner before a template default needs its
-    // constants. Keep these declarations available inside that owner.
     const auto &sm = ast_.getSourceManager();
-    if (extra_headers_.count(sm.getFilename(sm.getExpansionLoc(record.getLocation())).str())) {
-      for (const auto *member : record.decls()) {
-        if (const auto *enumeration = llvm::dyn_cast<clang::EnumDecl>(member);
-            enumeration && enumeration->isCompleteDefinition()) {
-          emit_enum(*enumeration, /*allow_anonymous=*/true);
-        } else if (const auto *constant = llvm::dyn_cast<clang::VarDecl>(member);
-                   constant && constant->isConstexpr() && constant->hasInit() &&
-                   constant->getType()->isIntegerType() && !constant->getType()->isDependentType()) {
+    const bool extra_header =
+        extra_headers_.count(sm.getFilename(sm.getExpansionLoc(record.getLocation())).str()) != 0;
+    for (const auto *member : record.decls()) {
+      if (const auto *enumeration = llvm::dyn_cast<clang::EnumDecl>(member);
+          extra_header && enumeration && enumeration->isCompleteDefinition()) {
+        emit_enum(*enumeration, /*allow_anonymous=*/true);
+      } else if (const auto *constant = llvm::dyn_cast<clang::VarDecl>(member);
+                 constant && constant->isConstexpr() && constant->hasInit() &&
+                 constant->getType()->isIntegerType() && !constant->getType()->isDependentType()) {
+        // Emit referenced constants before a later template default needs them.
+        // Limit new eager emission to values the adapter can print as literals.
+        if (extra_header || (constant->isReferenced() &&
+                             constant->isUsableInConstantExpressions(ast_) &&
+                             ast_.getIntWidth(constant->getType()) <= 64))
           emit_constant(*constant);
-        }
       }
     }
     for (const auto *field : record.fields()) {
