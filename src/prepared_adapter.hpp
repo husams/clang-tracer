@@ -8,6 +8,7 @@
 #include <clang/Basic/SourceManager.h>
 #include <llvm/ADT/StringExtras.h>
 
+#include <algorithm>
 #include <iterator>
 #include <set>
 #include <stdexcept>
@@ -28,17 +29,44 @@ struct AdapterDeclarations {
 
 class AdapterEmitter {
 public:
-  explicit AdapterEmitter(clang::ASTContext &ast,
-                          const clang::HeaderSearch &toolchain_search)
+  static AdapterDeclarations emit(clang::ASTContext &ast,
+                                  const clang::HeaderSearch &toolchain_search,
+                                  const clang::FunctionDecl &function,
+                                  const std::vector<std::string> &headers,
+                                  bool pointer_layouts) {
+    std::vector<NestedRequest> late_requests;
+    for (;;) {
+      const auto reserved = late_requests.size();
+      AdapterEmitter pass(ast, toolchain_search, late_requests);
+      pass.emit_declarations(function, headers, pointer_layouts);
+      if (!pass.first_late_dependency_)
+        return {pass.forwards_ + pass.declarations_, std::move(pass.standard_headers_)};
+      // Each retry must discover another dependency. Reuse the original
+      // traversal so new prerequisites are emitted before their owners.
+      if (late_requests.size() == reserved)
+        unsupported(*pass.first_late_dependency_,
+                    "nested dependency was discovered after its owner was emitted");
+    }
+  }
+
+private:
+  struct NestedRequest {
+    const clang::NamedDecl *decl;
+    bool complete;
+  };
+
+  AdapterEmitter(clang::ASTContext &ast,
+                 const clang::HeaderSearch &toolchain_search,
+                 std::vector<NestedRequest> &late_requests)
       : ast_(ast), policy_(ast.getLangOpts()),
-        header_discovery_(ast, toolchain_search) {
+        header_discovery_(ast, toolchain_search), late_requests_(late_requests) {
     policy_.SuppressTagKeyword = true;
     policy_.FullyQualifiedName = true;
   }
 
-  AdapterDeclarations emit(const clang::FunctionDecl &function,
-                           const std::vector<std::string> &headers,
-                           bool pointer_layouts) {
+  void emit_declarations(const clang::FunctionDecl &function,
+                         const std::vector<std::string> &headers,
+                         bool pointer_layouts) {
     selected_method_ = llvm::dyn_cast<clang::CXXMethodDecl>(&function);
     const bool linkage_alias = nested_static_method(selected_method_);
     if (selected_method_ && !linkage_alias)
@@ -46,6 +74,8 @@ public:
     register_nested_type(function.getReturnType(), pointer_layouts);
     for (const auto *parameter : function.parameters())
       register_nested_type(parameter->getType(), pointer_layouts);
+    for (const auto &request : late_requests_)
+      register_nested(*request.decl, request.complete);
     // Additional inputs can provide callback-only payload declarations.
     extra_headers_.insert(std::next(headers.begin()), headers.end());
     excluded_headers_.insert(headers.begin(), headers.end());
@@ -72,10 +102,8 @@ public:
           if (!llvm::isa<clang::CXXRecordDecl>(record->getDeclContext()))
             emit_record(*record);
     }
-    return {forwards_ + declarations_, std::move(standard_headers_)};
   }
 
-private:
   [[noreturn]] static void unsupported(const clang::NamedDecl &decl, const char *reason) {
     std::string name;
     llvm::raw_string_ostream out(name);
@@ -126,11 +154,11 @@ private:
 
   // Reserve direct signature dependencies before additional headers or another
   // signature type can cause their owning record to be emitted.
-  void register_nested(const clang::NamedDecl &decl) {
+  void register_nested(const clang::NamedDecl &decl, bool complete = true) {
     const auto *owner = llvm::dyn_cast<clang::CXXRecordDecl>(decl.getDeclContext());
     if (!owner)
       return;
-    nested_declarations_[owner->getCanonicalDecl()].push_back(&decl);
+    nested_declarations_[owner->getCanonicalDecl()].push_back(NestedRequest{&decl, complete});
     if (const auto *definition = owner->getDefinition())
       register_nested(*definition);
   }
@@ -291,13 +319,27 @@ private:
       declarations_ += in_namespace(decl, std::move(source));
   }
 
+  void remember_late_nested(const clang::NamedDecl &decl, bool complete) {
+    if (!first_late_dependency_)
+      first_late_dependency_ = &decl;
+    const auto known = std::find_if(late_requests_.begin(), late_requests_.end(),
+        [&](const NestedRequest &request) {
+          return request.decl->getCanonicalDecl() == decl.getCanonicalDecl() &&
+                 (request.complete || !complete);
+        });
+    if (known == late_requests_.end())
+      late_requests_.push_back({&decl, complete});
+  }
+
   bool defer_to_owner(const clang::NamedDecl &decl) {
     const auto *owner = llvm::dyn_cast<clang::CXXRecordDecl>(decl.getDeclContext());
     if (!owner || emitting_.count(owner->getCanonicalDecl()))
       return false;
-    if (emitted_.count(owner->getCanonicalDecl()))
-      unsupported(decl, "nested dependency was discovered after its owner was emitted");
-    nested_declarations_[owner->getCanonicalDecl()].push_back(&decl);
+    if (emitted_.count(owner->getCanonicalDecl())) {
+      remember_late_nested(decl, /*complete=*/true);
+      return false;
+    }
+    nested_declarations_[owner->getCanonicalDecl()].push_back(NestedRequest{&decl, true});
     ensure_nested_owner(*owner, decl);
     return true;
   }
@@ -470,7 +512,7 @@ private:
         return;
       const auto *owner_id = owner->getCanonicalDecl();
       if (emitted_.count(owner_id) && !emitting_.count(owner_id))
-        unsupported(record, "nested dependency was discovered after its owner was emitted");
+        remember_late_nested(record, /*complete=*/false);
       nested_declarations_[owner_id].push_back("public: " +
           std::string(record.getKindName()) + " " + record.getNameAsString() + ";\n");
       ensure_nested_owner(*owner, record);
@@ -632,15 +674,18 @@ private:
       auto pending = std::move(found->second);
       nested_declarations_.erase(found);
       for (const auto &entry : pending) {
-        if (const auto *declaration = std::get_if<const clang::NamedDecl *>(&entry)) {
-          if (const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(*declaration))
+        if (const auto *request = std::get_if<NestedRequest>(&entry)) {
+          const auto *declaration = request->decl;
+          if (!request->complete)
+            forward(*llvm::cast<clang::CXXRecordDecl>(declaration));
+          else if (const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(declaration))
             emit_record(*record);
-          else if (const auto *alias = llvm::dyn_cast<clang::TypedefNameDecl>(*declaration))
+          else if (const auto *alias = llvm::dyn_cast<clang::TypedefNameDecl>(declaration))
             emit_alias(*alias);
-          else if (const auto *constant = llvm::dyn_cast<clang::VarDecl>(*declaration))
+          else if (const auto *constant = llvm::dyn_cast<clang::VarDecl>(declaration))
             emit_constant(*constant);
           else
-            emit_enum(*llvm::cast<clang::EnumDecl>(*declaration), /*allow_anonymous=*/true);
+            emit_enum(*llvm::cast<clang::EnumDecl>(declaration), /*allow_anonymous=*/true);
         } else {
           source += std::get<std::string>(entry);
         }
@@ -658,11 +703,13 @@ private:
   std::set<std::string> standard_headers_;
   std::unordered_set<const clang::Decl *> emitted_;
   std::unordered_set<const clang::Decl *> forwarded_;
-  using NestedEntry = std::variant<std::string, const clang::NamedDecl *>;
+  using NestedEntry = std::variant<std::string, NestedRequest>;
   std::unordered_map<const clang::CXXRecordDecl *, std::vector<NestedEntry>> nested_declarations_;
   std::unordered_set<const clang::Decl *> emitting_;
   std::string forwards_;
   std::string declarations_;
+  std::vector<NestedRequest> &late_requests_;
+  const clang::NamedDecl *first_late_dependency_ = nullptr;
 };
 
 } // namespace tracer::prepared

@@ -514,7 +514,7 @@ public:
         tracer::prepared::describe_prepared_callable(*context_, *declaration, method,
             candidate.spec, sema_, nullptr, invocation_.pointer_layouts);
         if (!invocation_.prepared_headers.empty()) {
-          auto adapter = tracer::prepared::AdapterEmitter(*context_, *header_search_).emit(
+          auto adapter = tracer::prepared::AdapterEmitter::emit(*context_, *header_search_,
               *declaration, invocation_.prepared_headers, invocation_.pointer_layouts);
           auto &package = *candidate.spec.mutable_prepared();
           package = invocation_.prepared_profile;

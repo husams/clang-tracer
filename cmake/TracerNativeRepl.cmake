@@ -286,6 +286,11 @@ function(tracer_add_native_repl)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/flags_generator_regression.py"
           $<TARGET_FILE:clang-tracer-prepare-injectors-native> "${CMAKE_CXX_COMPILER}")
       set_tests_properties(native_repl_flags_generator PROPERTIES TIMEOUT 120)
+      add_test(NAME native_repl_nested_dependency_generator
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/flags_generator_regression.py"
+          $<TARGET_FILE:clang-tracer-prepare-injectors-native> "${CMAKE_CXX_COMPILER}"
+          nested-dependency)
+      set_tests_properties(native_repl_nested_dependency_generator PROPERTIES TIMEOUT 120)
       add_test(NAME native_repl_prepared_history
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_prepared_history.sh"
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>

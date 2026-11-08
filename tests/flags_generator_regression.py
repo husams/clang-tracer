@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regress standalone preparation of nested constexpr/template dependencies."""
+"""Exercise standalone generation for late declaration dependencies."""
 
 import json
 import pathlib
@@ -8,24 +8,43 @@ import sys
 import tempfile
 
 
-def main():
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: flags_generator_regression.py PREPARER CXX")
-
-    preparer = pathlib.Path(sys.argv[1]).resolve()
-    compiler = sys.argv[2]
-    with tempfile.TemporaryDirectory(prefix="clang-tracer-flags-") as temp:
+def run_case(preparer, compiler, case):
+    with tempfile.TemporaryDirectory(prefix="clang-tracer-") as temp:
         root = pathlib.Path(temp)
         app = root / "application"
         app.mkdir()
         header = app / "types.hpp"
-        header.write_text(
-            "struct Flags { static constexpr int Off = 0; };\n"
-            "struct Holder { Flags flags; };\n"
-            "template<int Mode = Flags::Off> struct Config {};\n"
-            "struct Result { Holder first; Config<> second; };\n"
-            "Result make_result();\n"
-        )
+        if case == "nested-dependency":
+            header.write_text(
+                "struct Container { struct Nested { int value; }; };\n"
+                "struct First { Container value; };\n"
+                "struct Later { Container::Nested value; };\n"
+                "struct Result { First first; Later later; };\n"
+                "Result make_result();\n"
+            )
+            verify = (
+                '#include "generated/adapter.cpp"\n'
+                "#include <cstddef>\n"
+                "static_assert(sizeof(Container::Nested) == sizeof(int));\n"
+                "static_assert(sizeof(decltype(Later::value)) == sizeof(int));\n"
+                "static_assert(offsetof(Result, later) > offsetof(Result, first));\n"
+                "int check_nested_layout(Result& result) {\n"
+                "  return result.later.value.value;\n"
+                "}\n"
+            )
+        else:
+            header.write_text(
+                "struct Flags { static constexpr int Off = 0; };\n"
+                "struct Holder { Flags flags; };\n"
+                "template<int Mode = Flags::Off> struct Config {};\n"
+                "struct Result { Holder first; Config<> second; };\n"
+                "Result make_result();\n"
+            )
+            verify = (
+                '#include "generated/adapter.cpp"\n'
+                "static_assert(Flags::Off == 0);\n"
+                "Config<>& check_default(Result& result) { return result.second; }\n"
+            )
         source = app / "target.cpp"
         source.write_text(
             '#include "types.hpp"\n'
@@ -68,16 +87,26 @@ def main():
 
         # Compile the generated adapter without the application's declarations.
         header.unlink()
-        (output / "verify.cpp").write_text(
-            '#include "generated/adapter.cpp"\n'
-            "static_assert(Flags::Off == 0);\n"
-            "Config<>& check_default(Result& result) { return result.second; }\n"
-        )
+        (output / "verify.cpp").write_text(verify)
         subprocess.run(
             [compiler, "-std=c++17", "-fsyntax-only", "verify.cpp"],
             cwd=output,
             check=True,
         )
+
+
+def main():
+    if len(sys.argv) not in (3, 4):
+        raise SystemExit(
+            "usage: flags_generator_regression.py PREPARER CXX [flags|nested-dependency]"
+        )
+
+    preparer = pathlib.Path(sys.argv[1]).resolve()
+    compiler = sys.argv[2]
+    case = sys.argv[3] if len(sys.argv) == 4 else "flags"
+    if case not in ("flags", "nested-dependency"):
+        raise SystemExit(f"unknown regression case: {case}")
+    run_case(preparer, compiler, case)
 
 
 if __name__ == "__main__":
