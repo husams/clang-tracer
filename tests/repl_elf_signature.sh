@@ -50,7 +50,7 @@ CPP
 pid=$!
 "$repl" --server "$server" --agent "$agent" --attach "$pid" --timeout 45 \
   --fail-fast <<'REPL'
-%probe inject "Configuration<int>::get() const" --callback observer.cpp --prepared getter --prepared-mode require
+%probe inject "Configuration<int>::get() const" --prepared getter --prepared-mode require
 %collect --name "Configuration<int>::get() const" --phase POST --count 1 --timeout 15 --as captured
 if (tracer.batch("captured").at(0).result_as<int>() != 42) throw std::runtime_error("wrong ELF reference result");
 
