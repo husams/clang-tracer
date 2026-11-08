@@ -113,7 +113,9 @@ bool allowed_instruction(const llvm::MCInst &inst,
       return true;
     }
   }
-  return false;
+  // GCC compares spilled pointers with this instruction at -O0. A
+  // RIP-relative form still needs a supported memory width to be relocated.
+  return name == "CMP64mi8";
 }
 
 std::optional<std::size_t> memory_access_size(const llvm::MCInst &inst,

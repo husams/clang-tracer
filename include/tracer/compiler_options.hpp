@@ -350,7 +350,8 @@ inline void validate_extra_compile_arguments(
 
 inline std::vector<std::string> normalize_extra_compile_arguments(
     const std::vector<std::string> &extra, const std::vector<std::string> &primary,
-    const std::filesystem::path &primary_directory = {}) {
+    const std::filesystem::path &primary_directory = {},
+    const std::filesystem::path &extra_directory = {}) {
   check_extra_compile_argument_limits(extra);
   std::vector<std::string> normalized;
   for (std::size_t index = 0; index < extra.size(); ++index) {
@@ -375,7 +376,7 @@ inline std::vector<std::string> normalize_extra_compile_arguments(
           value.rfind("$SYSROOT", 0) == 0)
         throw std::invalid_argument("invalid include directory for extra compiler option: " + option);
       normalized.push_back("-idirafter" +
-                           std::filesystem::absolute(std::filesystem::path(value)).string());
+                           std::filesystem::absolute(extra_directory / value).string());
     }
   }
   validate_extra_compile_arguments(normalized, primary, primary_directory);

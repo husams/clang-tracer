@@ -15,6 +15,26 @@ cd "$run"
 mkdir application
 cp "$header" application/history.hpp
 cp "$(dirname "$header")/payload.hpp" application/payload.hpp
+mkdir directory-compdb
+cat >application/exact_source.cpp <<'CPP'
+#ifndef EXACT_TU
+#error exact source compile command was not selected
+#endif
+namespace prepared_history {
+int exact_source(int value) { return value + 1; }
+}
+CPP
+cat >application/exact_source.hpp <<'CPP'
+#ifndef FALLBACK_TU
+#error the first same-directory compile command was not selected
+#endif
+namespace prepared_history {
+int sibling_fallback(int value);
+}
+CPP
+printf '[{"directory":"%s/application","file":"decoy.cpp","arguments":["clang++","-std=c++17","-DFALLBACK_TU=1","-c","decoy.cpp"]},{"directory":"%s/application","file":"exact_source.cpp","arguments":["clang++","-std=c++17","-DEXACT_TU=1","-c","exact_source.cpp"]}]\n' \
+  "$run" "$run" > directory-compdb/compile_commands.json
+cp directory-compdb/compile_commands.json application/compile_commands.json
 printf '[{"directory":"%s/application","file":"history.cpp","arguments":["clang++","-std=c++17","-c","history.cpp"]}]\n' \
   "$run" > compile_commands.json
 printf '[{"directory":"%s/application","file":"history.cpp","arguments":["clang","--driver-mode=cl","--target=x86_64-unknown-linux-gnu","/std:c++17","/c","history.cpp"]}]\n' \
@@ -47,10 +67,18 @@ cat >prepare.repl <<'REPL'
 %probe prepare "prepared_history::via_value(prepared_history::HistoryItem, int)" --include application/history.hpp --output value
 %probe prepare "HFW::HfwManager::createItem()" --include application/history.hpp --include application/payload.hpp --output manager-item --metadata-only
 %probe prepare "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --include application/payload.hpp --compdb clang-cl-compile_commands.json --output toolchain-headers
+%probe prepare "prepared_history::exact_source(int)" --include application/exact_source.cpp --compdb directory-compdb/compile_commands.json --output exact-source-file --metadata-only
+%probe prepare "prepared_history::exact_source(int)" --include application/exact_source.cpp --compdb directory-compdb --output exact-source-dir --metadata-only
+%probe prepare "prepared_history::sibling_fallback(int)" --include application/exact_source.hpp --compdb directory-compdb --output sibling-fallback --metadata-only
+%probe prepare "prepared_history::exact_source(int)" --include exact_source.cpp --output ../exact-source-cwd --metadata-only --cwd application
 %probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include application/extra.hpp --compdb extra-compile_commands.json --output extra-literal --extra-args "-DPREPARE_EXTRA=37 -I'supplemental include'"
 %probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include application/extra.hpp --compdb extra-compile_commands.json --output opaque --extra-args `sh ./extra-flags.sh`
+%probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include extra.hpp --compdb ../extra-compile_commands.json --output ../cwd-extra --extra-args `test -f extra.hpp && printf '%s\n' "-DPREPARE_EXTRA=37 -I'../supplemental include'"` --cwd application
 REPL
 "$repl" --fail-fast <prepare.repl
+for package in exact-source-file exact-source-dir sibling-fallback exact-source-cwd cwd-extra; do
+  test -s "$package/prepared.pb"
+done
 test -f extra-literal/generated/adapter.hpp
 test -f opaque/generated/adapter.hpp
 cat >prepare-startup.repl <<'REPL'
@@ -90,6 +118,11 @@ grep -F "cannot prepare standalone type 'HFW::HfwManager::ItemBox<int>'" unsuppo
 test ! -e manager-box
 grep -Fx '#include <system_error>' toolchain-headers/generated/adapter.hpp
 grep -Ex '#include <(time\.h|ctime)>' toolchain-headers/generated/adapter.hpp
+unlink application/compile_commands.json
+unlink application/exact_source.cpp
+unlink application/exact_source.hpp
+unlink directory-compdb/compile_commands.json
+rmdir directory-compdb
 unlink application/history.hpp
 unlink application/payload.hpp
 unlink application/extra.hpp
@@ -195,7 +228,7 @@ public:
 CPP
 cat >verify.repl <<'REPL'
 %probe validate "prepared_history::via_pointer(const prepared_history::HistoryItem*, int)" --callback pointer.cpp --compile-option "-fno-access-control" --prepared pointer --prepared-mode require
-%probe inject "prepared_history::via_pointer(const prepared_history::HistoryItem*, int)" --callback pointer.cpp --compile-option "-fno-access-control" --prepared pointer --prepared-mode require
+%probe inject "prepared_history::via_pointer(const prepared_history::HistoryItem*, int)" --callback ../pointer.cpp --compile-option "-fno-access-control" --prepared ../pointer --prepared-mode require --cwd "supplemental include"
 %collect --name history.pointer --count 1 --timeout 15 --as pointer
 auto pointer_fields = tracer.batch("pointer").at(0).state_snapshot();
 if (pointer_fields.field("label").as<std::string>() != "entry" || pointer_fields.field("code").as<int>() != 42 || pointer_fields.field("sequence").as<int>() != 7) throw std::runtime_error("wrong pointer fields");
@@ -207,7 +240,7 @@ if (ref.argument_snapshot(0).field("code").as<int>() != 42 || ref.argument_snaps
 %collect --name "prepared_history::via_value(prepared_history::HistoryItem, int)" --phase POST --count 1 --timeout 15 --as value
 auto value = tracer.batch("value").at(0);
 if (value.argument_snapshot(0).field("label").as<std::string>() != "entry" || value.result_snapshot().field("label").as<std::string>() != "entry4" || value.result_snapshot().field("code").as<int>() != 42) throw std::runtime_error("wrong by-value fields");
-%probe inject "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --callback snapshot.cpp --prepared opaque --prepared-mode require
+%probe inject "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --callback snapshot.cpp --prepared cwd-extra --prepared-mode require
 %collect --name "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --phase POST --count 1 --timeout 15 --as opaque
 if (tracer.batch("opaque").size() != 1) throw std::runtime_error("missing address-only pointer event");
 %probe validate "HFW::HfwManager::createItem()" --callback manager-snapshot.cpp --prepared manager-item --prepared-mode require
@@ -218,7 +251,7 @@ auto returned_item = manager_item.result_snapshot();
 if (returned_item.field("id").as<int>() != 73 || returned_item.field("kind").as<int>() != 3 || returned_item.field("details").field("quantity").as<int>() != 5) throw std::runtime_error("wrong nested manager item fields");
 if (manager_item.receiver_snapshot().field("seed").as<int>() != 71) throw std::runtime_error("wrong manager receiver fields");
 %probe validate "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --callback clang-cl-mode.cpp --prepared toolchain-headers --prepared-mode require
-%probe validate "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --callback toolchain-callback.cpp --prepared toolchain-headers --prepared-mode require --compdb callback-compile_commands.json --extra-args "/DCALLBACK_LOCAL_EXTRA=19 /I'supplemental include'"
+%probe validate "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --callback ../toolchain-callback.cpp --prepared ../toolchain-headers --prepared-mode require --compdb ../callback-compile_commands.json --extra-args "/DCALLBACK_LOCAL_EXTRA=19 /I." --cwd "supplemental include"
 %probe inject "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --callback toolchain-callback.cpp --prepared toolchain-headers --prepared-mode require --compdb callback-choices-compile_commands.json --translation-unit callback-build/callback-donor.cpp --extra-args "-DCALLBACK_LOCAL_EXTRA=19 -I'supplemental include'"
 %collect --name history.callback-compdb --count 1 --timeout 15 --as callback-compdb
 if (tracer.batch("callback-compdb").size() != 1) throw std::runtime_error("missing compilation database callback event");

@@ -61,8 +61,9 @@ def main(repl, server, fixture, objcopy, nm):
         send(f'%probe entry "named_entry(int)" --mapping {token}')
         output.expect(rf'^entry={named_addresses[3]:#x} .*boundary=DWARF .*selector="named_entry\(int\)"$')
         output.expect(r"^patch_size=[1-9][0-9]* relocation=copy$")
-        send(f'%probe entry --module "{fixture}" --elf-address {symbols["verified_entry"]:#x} '
-             f'--abi linux-x86-64-sysv --mapping {token}')
+        module = Path(fixture).resolve()
+        send(f'%probe entry --module "{module.name}" --elf-address {symbols["verified_entry"]:#x} '
+             f'--abi linux-x86-64-sysv --mapping {token} --cwd "{module.parent}"')
         output.expect(rf"^entry={named_addresses[0]:#x} .*boundary=ELF_SYMBOL ")
         output.expect(r"^patch_size=14 relocation=copy$")
         send("%detach")
