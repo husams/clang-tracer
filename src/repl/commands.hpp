@@ -62,10 +62,18 @@ enum class CommandKind {
   bulk_remove
 };
 
+struct ExtraCompileArgumentInput {
+  enum class Kind { argument, list, shell };
+  Kind kind;
+  std::string text;
+};
+
 struct Command {
   CommandKind kind = CommandKind::help;
   std::vector<std::string> arguments;
   std::vector<std::size_t> shell_arguments;
+  std::vector<ExtraCompileArgumentInput> extra_compile_argument_inputs;
+  std::vector<std::string> extra_compile_arguments;
   std::map<std::string, std::vector<std::string>> options;
   bool has(const std::string &name) const;
   std::string option(const std::string &name,

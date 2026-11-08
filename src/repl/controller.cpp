@@ -33,6 +33,7 @@
 #include <unistd.h>
 
 #include "background_events.hpp"
+#include "tracer/compiler_options.hpp"
 
 extern char **environ;
 
@@ -252,7 +253,8 @@ public:
 };
 
 void resolution_options(api::ResolveProbeRequest &request,
-                        const Command &command) {
+                        const Command &command,
+                        const Settings &settings) {
   request.set_module(command.option("--module"));
   request.set_compilation_database(command.option("--compdb"));
   request.set_translation_unit(command.option("--translation-unit"));
@@ -273,6 +275,11 @@ void resolution_options(api::ResolveProbeRequest &request,
   if (command.has("--translation-unit") &&
       (request.translation_unit().empty() || request.compilation_database().empty()))
     throw std::invalid_argument("--translation-unit requires a file and --compdb");
+  auto extra = settings.extra_compile_arguments;
+  extra.insert(extra.end(), command.extra_compile_arguments.begin(),
+               command.extra_compile_arguments.end());
+  for (const auto &argument : tracer::normalize_extra_compile_arguments(extra, {}))
+    request.add_extra_compile_arguments(argument);
 }
 
 std::string compact_selector(const std::string &value) {
@@ -596,12 +603,16 @@ api::ProbeSpec Controller::resolve_for(const SessionHandle &session,
   api::ResolveProbeRequest request;
   request.set_session_id(session.id);
   request.set_selector(selector);
-  resolution_options(request, command);
+  resolution_options(request, command, settings_);
   const auto prepared = prepared_options(request, command, prepared_packages_, out_);
   const auto resolve = [&] {
-    return unary<api::ProbeSpec>(
+    auto spec = unary<api::ProbeSpec>(
         [&](auto &c, auto &r) { return stub_->ResolveProbe(&c, request, &r); },
         settings_.timeout_seconds);
+    if (!request.extra_compile_arguments().empty() &&
+        !spec.extra_compile_arguments_checked())
+      throw std::runtime_error("server does not support extra compiler arguments");
+    return spec;
   };
   try {
     auto spec = resolve();
@@ -658,6 +669,14 @@ void Controller::prepare(const std::string &selector, const Command &options) {
     for (const auto &value : found->second) {
       arguments.emplace_back(key);
       arguments.push_back(value);
+    }
+  }
+  const std::vector<std::string> *extra_options[] = {
+      &settings_.extra_compile_arguments, &options.extra_compile_arguments};
+  for (const auto *extra : extra_options) {
+    for (const auto &argument : *extra) {
+      arguments.emplace_back("--extra-arg");
+      arguments.push_back(argument);
     }
   }
   std::vector<char *> argv;
@@ -1560,7 +1579,7 @@ bool Controller::execute(const Command &command) {
     const bool named = command.kind == K::draft_validate;
     const auto selector = named ? command.option("--target") : args.at(0);
     api::ResolveProbeRequest resolution;
-    resolution_options(resolution, command);
+    resolution_options(resolution, command, settings_);
     api::ValidateProbeRequest request;
     request.set_session_id(selected_.id);
     request.set_selector(selector);
@@ -1568,6 +1587,7 @@ bool Controller::execute(const Command &command) {
                                       : read_source(command.option("--callback")));
     *request.mutable_include_headers() = resolution.include_headers();
     *request.mutable_compile_options() = resolution.compile_options();
+    *request.mutable_extra_compile_arguments() = resolution.extra_compile_arguments();
     request.set_module(resolution.module());
     request.set_compilation_database(resolution.compilation_database());
     request.set_translation_unit(resolution.translation_unit());
@@ -1593,6 +1613,9 @@ bool Controller::execute(const Command &command) {
     if (!response.success()) {
       throw std::runtime_error("interceptor validation failed");
     }
+    if (!request.extra_compile_arguments().empty() &&
+        !response.extra_compile_arguments_applied())
+      throw std::runtime_error("server and agent do not support extra compiler arguments");
     return true;
   }
   case K::probe_reload: {

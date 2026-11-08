@@ -199,6 +199,8 @@ message ProbeSpec {
   reserved 16;
   repeated string compile_options = 17;
   PreparedInjector prepared = 18;
+  repeated string extra_compile_arguments = 19; // Validated additive flags.
+  bool extra_compile_arguments_checked = 20;
 }
 message AttachRequest {
   uint32 pid = 1;
@@ -256,6 +258,7 @@ message ResolveProbeRequest {
   repeated string compile_options = 8;
   PreparedInjector prepared = 9;
   string translation_unit = 10; // Optional entry in the server-host compilation database.
+  repeated string extra_compile_arguments = 11;
 }
 message ValidateProbeRequest {
   string session_id = 1;
@@ -271,6 +274,7 @@ message ValidateProbeRequest {
   uint32 debug_max_depth = 10;
   PreparedInjector prepared = 11;
   string translation_unit = 12; // Optional entry in the server-host compilation database.
+  repeated string extra_compile_arguments = 13;
 }
 message ValidationDiagnostic {
   string stage = 1;
@@ -286,6 +290,7 @@ message ValidationReport {
   repeated string effective_options = 3;
   repeated ValidationDiagnostic diagnostics = 4;
   bool prepared_used = 5;
+  bool extra_compile_arguments_applied = 6;
 }
 message Probe {
   uint64 id = 1;

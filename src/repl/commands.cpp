@@ -106,13 +106,54 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
 // input. It translates tokens into data; it never performs tracing operations.
 class Builder final : public TracerCommandsBaseVisitor {
   antlr4::CommonTokenStream &tokens_;
+  std::map<std::size_t, std::size_t> extra_compile_options_;
+
+  void add_extra_flag_list(antlr4::Token *first, antlr4::Token *last) {
+    // Keep quotes and spacing in unquoted groups for the argv splitter.
+    const auto span = antlr4::misc::Interval(first->getStartIndex(), last->getStopIndex());
+    const bool quoted_list = first == last && first->getType() == TracerCommandsLexer::STRING;
+    const auto text = quoted_list ? decode(first->getText())
+                                  : first->getInputStream()->getText(span);
+    result.extra_compile_argument_inputs.push_back(
+        {ExtraCompileArgumentInput::Kind::list, text});
+  }
+
+  void add_extra_compile_option(const std::vector<antlr4::Token *> &tokens,
+                                std::size_t option, std::size_t last) {
+    auto first = option + 1;
+    if (tokens[option]->getText() == "--extra-arg") {
+      result.extra_compile_argument_inputs.push_back(
+          {ExtraCompileArgumentInput::Kind::argument, decode(tokens[first]->getText())});
+      return;
+    }
+    for (auto i = first; i <= last; ++i) {
+      if (tokens[i]->getType() != TracerCommandsLexer::SHELL)
+        continue;
+      if (i != first)
+        add_extra_flag_list(tokens[first], tokens[i - 1]);
+      const auto text = tokens[i]->getText();
+      result.extra_compile_argument_inputs.push_back(
+          {ExtraCompileArgumentInput::Kind::shell, text.substr(1, text.size() - 2)});
+      first = i + 1;
+    }
+    if (first <= last)
+      add_extra_flag_list(tokens[first], tokens[last]);
+  }
 
 public:
   Command result;
 
   explicit Builder(antlr4::CommonTokenStream &tokens) : tokens_(tokens) {}
 
-  std::any visitLine(TracerCommandsParser::LineContext *) override {
+  std::any visitExtraCompileOption(
+      TracerCommandsParser::ExtraCompileOptionContext *option) override {
+    extra_compile_options_.emplace(option->getStart()->getTokenIndex(),
+                                   option->getStop()->getTokenIndex());
+    return {};
+  }
+
+  std::any visitLine(TracerCommandsParser::LineContext *line) override {
+    visitChildren(line);
     const auto ts = tokens_.getTokens();
     std::size_t i = 1;
     std::string name = ts.at(i++)->getText();
@@ -134,6 +175,12 @@ public:
                                            "--name", "--type"};
     const std::set<std::string> bulk_repeated = {"--module", "--exclude", "--exact"};
     for (; i + 1 < ts.size(); ++i) {
+      if (const auto extra = extra_compile_options_.find(i);
+          extra != extra_compile_options_.end()) {
+        add_extra_compile_option(ts, i, extra->second);
+        i = extra->second;
+        continue;
+      }
       const auto text = ts[i]->getText();
       const bool profile_add = result.kind == K::cpp_options &&
                                !result.arguments.empty() && result.arguments.front() == "add";

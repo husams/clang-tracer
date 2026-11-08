@@ -95,6 +95,8 @@ public:
 
     virtual std::any visitContextEventBytes(TracerCommandsParser::ContextEventBytesContext *context) = 0;
 
+    virtual std::any visitExtraCompileOption(TracerCommandsParser::ExtraCompileOptionContext *context) = 0;
+
 
 };
 
