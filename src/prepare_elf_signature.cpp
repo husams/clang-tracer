@@ -157,7 +157,7 @@ ResolvedCallable resolve_elf_signature(
   package.add_adapter_toolchain_options("--no-default-config");
   auto arguments = tracer::prepared::toolchain_arguments(
       package, {runtime::jit_flags.begin(), runtime::jit_flags.end()});
-  arguments.insert(arguments.end(), {"-std=c++23", "-x", "c++",
+  arguments.insert(arguments.end(), {"-std=c++20", "-x", "c++",
                                      "-resource-dir=" TRACER_CLANG_RESOURCE_DIR});
   const auto parse = [&](const std::string &source) {
     auto unit = clang::tooling::buildASTFromCodeWithArgs(
