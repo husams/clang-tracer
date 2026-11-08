@@ -281,8 +281,9 @@ Relative paths for that command use the specified directory on the REPL host.
 This includes callbacks, prepared packages, supplemental include paths, and
 preparation inputs and output. Backtick expansions also run in that directory.
 For server-side headers, databases and translation units, the resulting paths
-must be accessible on the server host. A plain module name still works as a
-filter. Later commands use their own working directory.
+must be accessible on the server host. Paths inside raw `--compile-option`
+arguments follow the compiler's working directory. A plain module name still
+works as a filter. Later commands use their own working directory.
 
 ```text
 %probe prepare "demo::compute(int)" --include src/compute.cpp --output prepared --cwd /work/demo
