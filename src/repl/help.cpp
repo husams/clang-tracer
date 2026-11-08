@@ -128,10 +128,10 @@ const CommandTopic commands[] = {
     {"probe validate", "%probe validate SELECTOR --callback FILE [RESOLUTION OPTIONS] [--cwd DIRECTORY]\n"
      "  [--allow-arg-overrides] [--allow-result-override] [--allow-replacement] [--allow-call-original] [--trace-exceptions] [--reclaimable]",
      "Check whether the callback can be deployed for the selected function."},
-    {"probe inject", "%probe inject SELECTOR --callback FILE [RESOLUTION OPTIONS] [DEPLOYMENT OPTIONS] [--cwd DIRECTORY]\n"
+    {"probe inject", "%probe inject SELECTOR [--callback FILE] [RESOLUTION OPTIONS] [DEPLOYMENT OPTIONS] [--cwd DIRECTORY]\n"
      "  [--allow-arg-overrides] [--allow-result-override] [--allow-replacement] [--allow-call-original] [--trace-exceptions] [--reclaimable]",
-     "Install a callback. The two override flags separately enable scalar writes in pre() and post().",
-     R"example(%probe inject "demo::compute(int)" --callback hook.cpp --prepared prepared)example"},
+     "Omit --callback to capture events with the built-in observer. The two override flags separately enable scalar writes in pre() and post().",
+     R"example(%probe inject "demo::compute(int)" --prepared prepared)example"},
     {"probe remove", "%probe remove ID [--cwd DIRECTORY]", "Remove a probe from the selected session and restore the original code."},
     {"probe reload", "%probe reload ID --callback FILE [--cwd DIRECTORY] [--watch [--count N] [--timeout SECONDS]]",
      "Switch an active probe to a new observer generation while existing calls finish on their original generation."},

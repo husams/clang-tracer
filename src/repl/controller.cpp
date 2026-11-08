@@ -2129,8 +2129,17 @@ bool Controller::execute(const Command &command) {
     out_ << resolve(args.at(0), command).DebugString();
     return true;
   case K::inject: {
-    const auto callback = probe_path(command, command.option("--callback"));
-    inject(selected_, args.at(0), read_source(callback), command);
+    constexpr auto observer = R"cpp(
+template <> class Interceptor<tracer::ResolvedSignature> {
+public:
+  void pre(const Call &) {}
+  void post(const Call &) {}
+};
+)cpp";
+    const auto source = command.has("--callback")
+                            ? read_source(probe_path(command, command.option("--callback")))
+                            : observer;
+    inject(selected_, args.at(0), source, command);
     return true;
   }
   case K::validate:

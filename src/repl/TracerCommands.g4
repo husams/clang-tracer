@@ -21,7 +21,7 @@ symbolOption : ('--filter' | '--module' | '--page' | '--address' | '--mapping') 
              | '--limit' UINT | '--addresses';
 probe : 'probe' ('prepare' value prepareOption+
       | 'resolve' value (resolveOption | cwdOption)*
-      | 'inject' value '--callback' value (deployOption | cwdOption)*
+      | 'inject' value ('--callback' value)? (deployOption | cwdOption)*
       | 'validate' value '--callback' value (validateOption | cwdOption)*
       | 'remove' UINT cwdOption?) | 'probes' cwdOption?;
 prepareOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--output') value
