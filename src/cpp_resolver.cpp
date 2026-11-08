@@ -1037,8 +1037,9 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   // compiler by path or explicitly selects a toolchain.
   std::vector<std::string> arguments{"--no-default-config"};
   std::error_code path_error;
-  const bool alternate_driver = fs::path(command.driver).is_absolute() &&
-      fs::is_regular_file(command.driver, path_error) &&
+  const bool installed_driver = fs::path(command.driver).is_absolute() &&
+      fs::is_regular_file(command.driver, path_error);
+  const bool alternate_driver = installed_driver &&
       !fs::equivalent(command.driver, TRACER_PREPARE_BUILD_CXX, path_error) && !path_error;
   FrozenInvocation invocation;
   auto &profile = invocation.prepared_profile;
@@ -1052,7 +1053,9 @@ ResolvedCallable resolve_header_callable(const std::string& name,
       arguments.push_back(command.clang_cl ? std::string("/clang:") + flag : flag);
     }
   }
-  if (alternate_driver) {
+  if (installed_driver && !profile.adapter_uses_default_toolchain()) {
+    // The standalone compiler has a synthetic argv[0]. Preserve the donor's
+    // installation directory so Clang can find its C++ standard library.
     profile.add_adapter_toolchain_options("-ccc-install-dir");
     profile.add_adapter_toolchain_options(fs::path(command.driver).parent_path().string());
   }
