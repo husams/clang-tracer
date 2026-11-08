@@ -20,6 +20,7 @@
 #include <string_view>
 #include <tuple>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include "value_snapshot_codegen.hpp"
@@ -51,6 +52,8 @@
 #include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/Tooling.h>
 #include <dlfcn.h>
+#include <limits.h>
+#include <llvm/ADT/StringExtras.h>
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/SmallString.h>
@@ -63,6 +66,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/SHA256.h>
 #include <llvm/Support/VirtualFileSystem.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/TargetParser/Triple.h>
@@ -1361,6 +1365,72 @@ DebugRecord construct_debug_record(clang::ASTUnit &unit,
   if (!validate_receiver_layout(context, record, metadata, error))
     throw std::runtime_error(error);
   return {record, std::move(metadata), false};
+}
+
+// DWARF describes the concrete layout, but cannot recreate the primary C++
+// template. Give each recovered specialization a private compiler name and
+// keep the original selector and linkage symbol for entry verification.
+std::optional<clangtracer::v1::ProbeSpec> template_recovery_spec(
+    const clangtracer::v1::ProbeSpec &target) {
+  const auto &debug = target.debug_info();
+  std::unordered_map<std::string, std::string> names;
+  const auto add = [&](const clangtracer::v1::DebugInfo &record) {
+    const auto &name = record.record_name();
+    if (name.find('<') == std::string::npos || standard_library_record_name(name))
+      return;
+    const auto digest = llvm::SHA256::hash(llvm::ArrayRef<std::uint8_t>(
+        reinterpret_cast<const std::uint8_t *>(name.data()), name.size()));
+    // Keep the generated identifier within the recovered identifier limit.
+    const auto key = llvm::toHex(llvm::ArrayRef<std::uint8_t>(digest).take_front(16), true);
+    names.try_emplace(name, "tracer_dwarf_types::record_" + key);
+  };
+  add(debug);
+  for (const auto &argument : debug.arguments())
+    if (argument.has_object_type())
+      add(argument.object_type());
+  if (debug.has_result_object_type())
+    add(debug.result_object_type());
+  if (names.empty())
+    return std::nullopt;
+
+  const auto rename_type = [&](std::string &type) {
+    // Recovered spellings consist of a base type and CV/pointer/reference
+    // modifiers. Match the base as a whole, including any nested template
+    // arguments, so two specializations cannot be confused.
+    const auto base = std::string_view(type);
+    const auto unqualified = ::tracer::compat::starts_with(base, "const ") ? base.substr(6) : base;
+    for (const auto &[original, recovered] : names) {
+      if (!::tracer::compat::starts_with(unqualified, original))
+        continue;
+      const auto suffix = unqualified.substr(original.size());
+      if (!suffix.empty() && suffix.front() != ' ' &&
+          suffix.front() != '*' && suffix.front() != '&')
+        continue;
+      type.replace(base.size() - unqualified.size(), original.size(), recovered);
+      break;
+    }
+  };
+  const auto rename_record = [&](clangtracer::v1::DebugInfo &record) {
+    if (const auto found = names.find(record.record_name()); found != names.end())
+      record.set_record_name(found->second);
+    for (auto &method : *record.mutable_methods()) {
+      rename_type(*method.mutable_cpp_result_type());
+      for (auto &parameter : *method.mutable_cpp_parameter_types())
+        rename_type(parameter);
+    }
+  };
+  auto recovered = target;
+  auto &info = *recovered.mutable_debug_info();
+  rename_record(info);
+  for (auto &argument : *info.mutable_arguments()) {
+    rename_type(*argument.mutable_cpp_type());
+    if (argument.has_object_type())
+      rename_record(*argument.mutable_object_type());
+  }
+  rename_type(*info.mutable_result_cpp_type());
+  if (info.has_result_object_type())
+    rename_record(*info.mutable_result_object_type());
+  return recovered;
 }
 
 std::string recovered_record_declaration(
@@ -4326,19 +4396,19 @@ bool validate_prepared_types(clang::ASTUnit &unit,
   }
 }
 
-bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
+bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
                    std::string &error, bool run_initializers = true,
                    bool syntax_only = false,
                    clangtracer::v1::ValidationReport *report = nullptr,
                    const VerifiedDebugEntry *verified_entry = nullptr) {
   const bool typed_prepared = tracer::prepared::is_typed_version(
-      specification.prepared().format_version());
-  const bool prepared_callback_context = typed_prepared && specification.has_header_context();
-  if (const auto *invalid = tracer::scalar_override_error(specification)) {
+      target_specification.prepared().format_version());
+  const bool prepared_callback_context = typed_prepared && target_specification.has_header_context();
+  if (const auto *invalid = tracer::scalar_override_error(target_specification)) {
     error = invalid;
     return false;
   }
-  const bool overrides = tracer::has_scalar_overrides(specification);
+  const bool overrides = tracer::has_scalar_overrides(target_specification);
   const auto validate_options = [&error](const auto &first, const auto &last,
                                          const char *source,
                                          bool allow_toolchain = false) {
@@ -4358,40 +4428,40 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   // Do this before header AST recovery and before constructing either Clang
   // compiler. Driver plugins and raw frontend escapes can execute code during
   // nominally syntax-only validation.
-  const auto &extra = specification.extra_compile_arguments();
+  const auto &extra = target_specification.extra_compile_arguments();
   if (!extra.empty()) {
     try {
       tracer::validate_extra_compile_arguments(
-          {extra.begin(), extra.end()}, tracer::primary_probe_compile_arguments(specification),
-          tracer::primary_probe_compile_directory(specification));
+          {extra.begin(), extra.end()}, tracer::primary_probe_compile_arguments(target_specification),
+          tracer::primary_probe_compile_directory(target_specification));
     } catch (const std::invalid_argument &exception) {
       error = exception.what();
       return false;
     }
   }
-  if (!validate_options(specification.compile_options().begin(),
-                        specification.compile_options().end(),
+  if (!validate_options(target_specification.compile_options().begin(),
+                        target_specification.compile_options().end(),
                         "probe options") ||
-      (!typed_prepared && specification.has_header_context() &&
+      (!typed_prepared && target_specification.has_header_context() &&
        !validate_options(
-           specification.header_context().compiler_arguments().begin(),
-           specification.header_context().compiler_arguments().end(),
+           target_specification.header_context().compiler_arguments().begin(),
+           target_specification.header_context().compiler_arguments().end(),
            "header context", true)) ||
-      (specification.has_receiver() &&
-       (specification.receiver().compiler_arguments_size() == 0 ||
+      (target_specification.has_receiver() &&
+       (target_specification.receiver().compiler_arguments_size() == 0 ||
         !validate_options(
-            std::next(specification.receiver().compiler_arguments().begin()),
-            specification.receiver().compiler_arguments().end(),
+            std::next(target_specification.receiver().compiler_arguments().begin()),
+            target_specification.receiver().compiler_arguments().end(),
             "receiver context", true)))) {
     return false;
   }
   if (typed_prepared) {
-    if (!prepared_callback_context && !specification.include_headers().empty()) {
+    if (!prepared_callback_context && !target_specification.include_headers().empty()) {
       error = "prepared injection requires a callback compilation context for optional includes";
       return false;
     }
     if (prepared_callback_context) {
-      const auto &context = specification.header_context();
+      const auto &context = target_specification.header_context();
       const auto &directory = context.working_directory();
       if (directory.empty() || directory.front() != '/' || directory.size() > 4095 ||
           directory.find('\0') != std::string::npos || context.ByteSizeLong() > 64 * 1024 ||
@@ -4402,8 +4472,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
         return false;
       }
     }
-    if (specification.include_headers_size() > 16 ||
-        std::any_of(specification.include_headers().begin(), specification.include_headers().end(),
+    if (target_specification.include_headers_size() > 16 ||
+        std::any_of(target_specification.include_headers().begin(), target_specification.include_headers().end(),
                     [](const auto &header) {
                       return header.empty() || header.front() != '/' || header.size() > 4095 ||
                              header.find_first_of("\"\r\n\0", 0, 4) != std::string::npos;
@@ -4412,14 +4482,14 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
       return false;
     }
   }
-  const std::string &source = specification.callback_source();
+  const std::string &source = target_specification.callback_source();
   const auto [callback_includes, callback_body] =
       split_callback_includes(source);
   std::vector<std::string> user_options;
   if (prepared_callback_context) {
-    const auto &options = specification.header_context().compiler_arguments();
+    const auto &options = target_specification.header_context().compiler_arguments();
     user_options.assign(options.begin(), options.end());
-    const auto &explicit_options = specification.compile_options();
+    const auto &explicit_options = target_specification.compile_options();
     for (auto it = explicit_options.begin(); it != explicit_options.end(); ++it) {
       const std::string_view option(*it);
       if (option.rfind("-D", 0) != 0 && option.rfind("-U", 0) != 0)
@@ -4432,8 +4502,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
       }
     }
   }
-  user_options.insert(user_options.end(), specification.compile_options().begin(),
-                      specification.compile_options().end());
+  user_options.insert(user_options.end(), target_specification.compile_options().begin(),
+                      target_specification.compile_options().end());
   user_options.insert(user_options.end(), extra.begin(), extra.end());
   std::string forced_include_source;
   if (!extract_forced_includes(user_options, forced_include_source, error))
@@ -4441,15 +4511,37 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   const std::string type_header_prefix =
       forced_include_source + callback_includes;
   std::string requested_header_source = typed_prepared
-      ? tracer::prepared::adapter_source(specification.prepared()) : std::string();
-  for (const auto &header : specification.include_headers())
+      ? tracer::prepared::adapter_source(target_specification.prepared()) : std::string();
+  for (const auto &header : target_specification.include_headers())
     requested_header_source += "#include \"" + header + "\"\n";
   const std::string callback_header_source =
       callback_includes + requested_header_source;
   const bool callback_headers_available =
-      typed_prepared || specification.has_header_context() ||
-      specification.include_headers_size() != 0 ||
+      typed_prepared || target_specification.has_header_context() ||
+      target_specification.include_headers_size() != 0 ||
       !callback_includes.empty() || !forced_include_source.empty();
+  std::optional<VerifiedDebugEntry> local_verified_entry;
+  if (target_specification.has_debug_info()) {
+    try {
+      if (!verified_entry)
+        local_verified_entry = VerifiedDebugEntry{
+            &target_specification, validate_debug_entry(target_specification)};
+      else if (verified_entry->spec != &target_specification)
+        throw std::runtime_error("debug entry verification does not match probe");
+      if (local_verified_entry)
+        verified_entry = &*local_verified_entry;
+    } catch (const std::exception &exception) {
+      error = exception.what();
+      return false;
+    }
+  }
+  auto recovered = callback_headers_available || !target_specification.has_debug_info()
+      ? std::nullopt : template_recovery_spec(target_specification);
+  auto &specification = recovered ? *recovered : target_specification;
+  if (recovered) {
+    local_verified_entry = VerifiedDebugEntry{&specification, verified_entry->runtime_entry};
+    verified_entry = &*local_verified_entry;
+  }
   const std::string callback_type_declarations =
       callback_headers_available ? std::string()
                                  : recovered_record_declarations(specification);
@@ -4478,18 +4570,6 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   if (!typed_prepared && !validate_object_abi_evidence(specification, callback_includes,
                                     forced_include_source, error))
     return false;
-  std::optional<VerifiedDebugEntry> local_verified_entry;
-  if (specification.has_debug_info() && !verified_entry) {
-    try {
-      const auto runtime_entry = validate_debug_entry(specification);
-      local_verified_entry =
-          VerifiedDebugEntry{&specification, runtime_entry};
-      verified_entry = &*local_verified_entry;
-    } catch (const std::exception &exception) {
-      error = exception.what();
-      return false;
-    }
-  }
   p.argument_names.assign(specification.argument_names().begin(),
                           specification.argument_names().end());
   clang::CXXRecordDecl *receiver_record = nullptr;
