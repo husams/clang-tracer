@@ -206,7 +206,9 @@ live.stop();
 
 ## Agent callback API
 
-A callback can define a class or struct named `Interceptor` with either or both of `pre(const Call&)` and `post(const Call&)`. Hooks can return `void` or a `long long` callback value that is carried in the event. The original function still receives its arguments and returns its own result. A legacy callback instead defines `extern "C" long long trace_callback(const TraceContext&)` and runs on entry only.
+For a typed callback, define one top-level explicit specialization of `Interceptor<Signature>` with either or both of `pre(const Call&)` and `post(const Call&)`. Write the original function type as `R(Args...)`, for example `int(int, int)`, or use `tracer::ResolvedSignature` to reuse the type recovered for the selected target. The callback compiler supplies the primary template, checks the specialization against the target, and exposes its argument and result types through `Call`. For a supported non-static method, the selector identifies the class and method qualifiers. The signature lists the return and explicit parameter types, and `call.self()` provides the receiver separately.
+
+Hooks can return `void` or a `long long` callback value carried in the event. The original function still receives its arguments and returns its own result. Existing plain `class Interceptor` callbacks remain supported. Raw-symbol callbacks can use the entry-only `extern "C" long long trace_callback(const TraceContext&)` API.
 
 The tracer compiles callback source with the effective target flags and checks the supported calling convention. The callback runs on the calling application thread. Keep work bounded and avoid retaining borrowed objects or invoking the probed entry recursively.
 
@@ -231,20 +233,25 @@ The tracer compiles callback source with the effective target flags and checks t
 `TraceValue` has a `type` tag, signed, unsigned, and real slots, and an optional `snapshot`. Decode the slot matching the tag. For snapshots, check the status and detail before reading the owned event representation. `StackTrace` has status, requested and captured depth, count, hidden frame count, filter, detail, and a borrowed `frames` array. Each frame can carry PC, stack pointer, kind, function, module, module offset, file, line, and application classification.
 
 ```cpp
-struct Interceptor {
+template <>
+class Interceptor<int(int, int)> {
+public:
   void pre(const Call& call) {
-    call.argument<int>("left", 0);
+    call.field("left", call.argument<0>());
     const auto& stack = call.capture_stack(12);
     call.field("visible_frames", stack.count);
     call.log("entered add");
   }
 
   long long post(const Call& call) {
-    call.field("sum", call.result<int>());
-    return call.result<int>();
+    const int sum = call.result();
+    call.field("sum", sum);
+    return sum;
   }
 };
 ```
+
+For a reusable specialization and a concrete C++ template target, see [Trace a function template instantiation](tutorials.md#trace-a-function-template-instantiation).
 
 Set `CLANG_TRACER_AGENT_LOG` to an absolute writable log path in the **target's environment before launching it**. The target owns the private log. Records include PID, probe ID, call ID and phase where applicable. Messages are capped at 192 bytes and delivered on a best-effort basis.
 
@@ -268,12 +275,14 @@ struct RequestState : shared_state<RequestScope> {
   int total = 0;
 };
 
-struct Interceptor {
+template <>
+class Interceptor<int(int, int)> {
+public:
   Interceptor(State<RequestState>);
 
   void post(const Call& call) {
     call.context().with<RequestState>([&](RequestState& state) {
-      state.total = call.result<int>();
+      state.total = call.result();
     });
     call.context().event("request.completed");
   }

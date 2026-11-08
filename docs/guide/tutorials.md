@@ -47,6 +47,47 @@ Save a separate `updated.cpp` with the field name changed from `sum` to `new_sum
 
 The POST event now includes `new_sum`; the target still returns 42. Remove the active probe ID shown by `%probes` and detach.
 
+## Trace a function template instantiation
+
+Extend the first lab's `target.cpp` with this function above `main`. Inside the existing newline branch, add `std::printf("echo<int>(42) = %d\n", echo<int>(42));` before the flush. Rebuild and restart the target using the same commands as the first lab.
+
+```cpp
+template <class T>
+__attribute__((noinline)) T echo(T value) {
+  volatile T saved = value;
+  return saved;
+}
+```
+
+Save this observer as `echo-hook.cpp`. `tracer::ResolvedSignature` lets the same callback source specialize against the type of the selected instantiation. For `echo<int>`, writing `Interceptor<int(int)>` explicitly would select the same signature.
+
+```cpp
+template <>
+class Interceptor<tracer::ResolvedSignature> {
+public:
+  void pre(const Call& call) {
+    call.field("input", call.argument<0>());
+  }
+
+  void post(const Call& call) {
+    call.field("output", call.result());
+  }
+};
+```
+
+Start a fresh REPL and attach using the new PID. Quote the complete selector, including the concrete template arguments and function parameters. With `--prepared-mode off`, the tracer recovers the signature from DWARF.
+
+```bash
+%attach 12345
+%symbols --filter "echo<"
+%probe validate "echo<int>(int)" --callback echo-hook.cpp --prepared-mode off
+%probe inject "echo<int>(int)" --callback echo-hook.cpp --prepared-mode off --print-result
+%collect --name "echo<int>(int)" --count 2 --timeout 30 --as echo_call
+%events list echo_call
+```
+
+Press Enter in the target terminal while capture waits. The events show `input=42` in PRE and `output=42` in POST. Detach before exiting. For a member template, use the complete selector for the concrete method, including its class, template arguments, parameter list, and qualifiers.
+
 ## Preview and apply bulk tracing
 
 Preview an exact selector, save the selection as a reusable manifest, then install it as a batch. Use repeated include or exclude patterns to broaden or narrow the selection on a larger target.
