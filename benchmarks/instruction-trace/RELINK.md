@@ -44,6 +44,8 @@ Install the rebuilt `gum-backend.so` beside the native tracer agent or set
 Attach through the REPL's owned local server, use `%threads` and
 `%memory maps` to select the thread and range, then run
 `%help instructions start` for register snapshots, target callbacks and
-bounded memory-access monitoring. The callback ABI is in
+bounded memory-access monitoring. Use `--discover` to collect executed call
+destinations. Use `%instructions stop --save FILE` and `%instructions replay FILE`
+to record and inspect captures offline. The callback ABI is in
 `relink/instruction_trace.h`. Hardware watchpoints use the native REPL's
 Linux perf interface and are described by `%help watchpoint`.

@@ -1125,6 +1125,7 @@ private:
         // Older version-2 agents published entry-only events without call IDs.
         valid_phase = event.call_id() == 0 && !event.has_result();
         break;
+      case clangtracer::v1::EXCEPTION:
       case clangtracer::v1::PRE:
         valid_phase = event.call_id() != 0 && !event.has_result();
         break;
@@ -1405,6 +1406,8 @@ public:
       resolved.spec.set_allow_argument_overrides(request->allow_argument_overrides());
       resolved.spec.set_allow_result_override(request->allow_result_override());
       resolved.spec.set_allow_replacement(request->allow_replacement());
+      resolved.spec.set_allow_call_original(request->allow_call_original());
+      resolved.spec.set_trace_exceptions(request->trace_exceptions());
       resolved.spec.set_reclaimable(request->reclaimable());
       const auto input_valid = validate_probe(resolved.spec);
       if (!input_valid.ok())
@@ -1589,6 +1592,54 @@ public:
     if (!session)
       return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
     return memory::read(*context, *session, timeout_, *request, *response);
+  }
+
+  grpc::Status AllocateMemory(grpc::ServerContext *, const api::AllocateMemoryRequest *request,
+                           api::MemoryAllocation *response) override {
+    if (!local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "operation requires local control"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    try {
+      *response = session->allocate_memory(request->size());
+      return grpc::Status::OK;
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
+  }
+
+  grpc::Status FreeMemory(grpc::ServerContext *, const api::FreeMemoryRequest *request,
+                           api::MemoryAllocation *response) override {
+    if (!local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "operation requires local control"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    try {
+      *response = session->free_memory(request->allocation_id());
+      return grpc::Status::OK;
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
+  }
+
+  grpc::Status LoadTargetLibrary(grpc::ServerContext *, const api::LoadTargetLibraryRequest *request,
+                           api::TargetLibrary *response) override {
+    if (!local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "operation requires local control"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    try {
+      *response = session->load_target_library(request->path());
+      return grpc::Status::OK;
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
   }
 
   grpc::Status ApplyMemoryPatch(grpc::ServerContext *context, const api::ApplyMemoryPatchRequest *request,

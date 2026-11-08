@@ -650,8 +650,8 @@ grpc::Status list_mappings(grpc::ServerContext &context, Session &session,
 
 grpc::Status apply_patch(grpc::ServerContext &context, Session &session, std::chrono::seconds timeout,
                          const api::ApplyMemoryPatchRequest &request, api::MemoryPatch &response) {
-  if (request.module().empty() || request.module().size() > 4096 ||
-      request.module().find('\0') != std::string::npos)
+  if (!request.has_writable() && (request.module().empty() || request.module().size() > 4096 ||
+      request.module().find('\0') != std::string::npos))
     return {Code::INVALID_ARGUMENT, "memory patch requires an exact mapped module path"};
   return inspect(context, session, timeout, [&](const Target &target) {
     const auto maps = target.maps();
@@ -693,12 +693,21 @@ grpc::Status apply_patch(grpc::ServerContext &context, Session &session, std::ch
       before.assign(reinterpret_cast<const char *>(&expected), sizeof(expected));
       after.assign(reinterpret_cast<const char *>(&next), sizeof(next));
       required = {original, replacement};
+    } else if (request.has_writable()) {
+      const auto &patch = request.writable();
+      address = patch.address();
+      before = patch.expected();
+      after = patch.replacement();
+      if (!request.module().empty() || before.empty() || before.size() > max_pattern_bytes ||
+          before.size() != after.size() || before == after)
+        throw MemoryError(Code::INVALID_ARGUMENT, "memory write requires distinct equal-length bytes up to 256");
     } else {
       throw MemoryError(Code::INVALID_ARGUMENT, "memory patch operation is required");
     }
     const auto &patch_mapping = mapping_at(snapshot, address, before.size());
     if (request.has_executable() ? patch_mapping.permissions() != "r-xp" :
-        (patch_mapping.permissions() != "r--p" && patch_mapping.permissions() != "rw-p"))
+        (patch_mapping.permissions() != "rw-p" &&
+         (request.has_writable() || patch_mapping.permissions() != "r--p")))
       throw MemoryError(Code::FAILED_PRECONDITION, "patch requires a private mapping with expected permissions");
     required.push_back(patch_mapping);
     if (maps != target.maps() || target.read_bytes(address, before.size()) != before)

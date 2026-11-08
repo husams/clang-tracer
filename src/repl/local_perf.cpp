@@ -9,6 +9,15 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
+#include <limits>
+#include <map>
+#include <string_view>
+#include <set>
+#include <sstream>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <llvm/Object/ELFObjectFile.h>
 #include <cstddef>
 #include <cstring>
 #include <iomanip>
@@ -48,6 +57,7 @@ constexpr std::uint64_t exclude_hv = 1ULL << 6;
 constexpr std::uint64_t use_clockid = 1ULL << 25;
 constexpr unsigned long fd_cloexec = 1UL << 3;
 constexpr unsigned type_breakpoint = 5; // PERF_TYPE_BREAKPOINT in Linux UAPI.
+constexpr std::uint64_t sample_regs_user = 1ULL << 12; // PERF_SAMPLE_REGS_USER.
 constexpr std::uint64_t format_lost = 1ULL << 4;
 constexpr unsigned record_lost_samples = 13;
 constexpr std::size_t max_threads = 64;
@@ -59,12 +69,14 @@ struct RingMetadata {
 constexpr auto metadata_offset = offsetof(perf_event_mmap_page, data_head);
 static_assert(metadata_offset == 1024);
 
-enum class Kind { enter, exit, cpu, watchpoint };
+enum class Kind { enter, exit, cpu, watchpoint, fault, allocation };
 struct Event {
   Kind kind;
   std::uint32_t tid = 0;
   std::uint64_t time = 0, ip = 0;
   std::int64_t number = 0, result = 0;
+  const char *allocator = nullptr;
+  std::uint64_t argument = 0, second = 0;
 };
 bool earlier(const Event &left, const Event &right) {
   return left.time < right.time;
@@ -76,6 +88,12 @@ struct EventSource {
   std::uint64_t address = 0;
   unsigned length = 0;
   bool reads = false;
+  std::uint32_t pmu_type = 0;
+  std::string object;
+  const char *allocator = nullptr;
+
+  EventSource(Kind event_kind, std::uint64_t event_config)
+      : kind(event_kind), config(event_config) {}
 };
 
 [[noreturn]] void perf_error(const std::string &operation, int code = errno) {
@@ -88,19 +106,112 @@ const char *name(Kind kind) {
   case Kind::exit: return "syscall-exit";
   case Kind::cpu: return "cpu-sample";
   case Kind::watchpoint: return "watchpoint";
+  case Kind::fault: return "native-fault";
+  case Kind::allocation: return "allocation";
   }
   throw std::logic_error("unknown local perf event");
 }
 
-std::vector<EventSource> sources(LocalPerfMode mode) {
+std::vector<EventSource> allocator_sources(const std::filesystem::path &process) {
+  std::uint32_t pmu_type = 0;
+  if (!(std::ifstream("/sys/bus/event_source/devices/uprobe/type") >> pmu_type) || !pmu_type)
+    throw std::runtime_error("Linux uprobe PMU is unavailable");
+  struct Image {
+    std::uint64_t inode;
+    unsigned major, minor;
+  };
+  std::map<std::string, Image> images;
+  std::ifstream maps(process / "maps");
+  for (std::string line; std::getline(maps, line);) {
+    std::istringstream row(line);
+    std::string range, perms, offset;
+    Image image{};
+    char colon;
+    if (!(row >> range >> perms >> offset >> std::hex >> image.major >> colon >>
+          image.minor >> std::dec >> image.inode) || colon != ':' || perms != "r-xp")
+      continue;
+    std::string path;
+    std::getline(row >> std::ws, path);
+    if (path.empty() || path.front() != '/')
+      continue;
+    const auto basename = std::filesystem::path(path).filename().string();
+    if (basename == "libc.so.6" ||
+        (basename.compare(0, 5, "libc-") == 0 && basename.size() > 8 &&
+         basename.compare(basename.size() - 3, 3, ".so") == 0))
+      images.emplace(std::move(path), image);
+  }
+  if (images.size() != 1)
+    throw std::runtime_error("allocation profiling requires one identifiable glibc image");
+  const auto &[path, identity] = *images.begin();
+  const auto target = (process / "root" / path.substr(1)).string();
+  struct stat info{};
+  if (::stat(target.c_str(), &info) != 0 || !S_ISREG(info.st_mode) ||
+      info.st_ino != identity.inode || major(info.st_dev) != identity.major ||
+      minor(info.st_dev) != identity.minor || info.st_size <= 0 || info.st_size > 64 * 1024 * 1024)
+    throw std::runtime_error("cannot verify mapped glibc file for allocation profiling");
+  auto binary = llvm::object::createBinary(target);
+  if (!binary) {
+    llvm::consumeError(binary.takeError());
+    throw std::runtime_error("cannot read mapped glibc ELF for allocation profiling");
+  }
+  const auto *object = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(binary->getBinary());
+  if (!object || object->getArch() != llvm::Triple::x86_64)
+    throw std::runtime_error("allocation profiling requires an x86-64 glibc ELF");
+  const auto &elf = object->getELFFile();
+  auto programs = elf.program_headers();
+  if (!programs) {
+    llvm::consumeError(programs.takeError());
+    throw std::runtime_error("invalid glibc ELF program headers");
+  }
+  std::vector<EventSource> result;
+  for (const char *allocator : {"malloc", "calloc", "realloc"}) {
+    std::set<std::uint64_t> offsets;
+    for (const auto &symbol : object->getDynamicSymbolIterators()) {
+      auto symbol_name = symbol.getName();
+      if (!symbol_name) {
+        llvm::consumeError(symbol_name.takeError());
+        continue;
+      }
+      if (*symbol_name != allocator || symbol.getELFType() != llvm::ELF::STT_FUNC)
+        continue;
+      auto address = symbol.getAddress();
+      if (!address) {
+        llvm::consumeError(address.takeError());
+        continue;
+      }
+      for (const auto &program : *programs)
+        if (program.p_type == llvm::ELF::PT_LOAD && (program.p_flags & llvm::ELF::PF_X) &&
+            *address >= program.p_vaddr && *address - program.p_vaddr < program.p_filesz)
+          offsets.insert(program.p_offset + (*address - program.p_vaddr));
+    }
+    if (offsets.size() != 1)
+      throw std::runtime_error(std::string("cannot resolve glibc allocator ") + allocator);
+    EventSource source{Kind::allocation, 0};
+    source.pmu_type = pmu_type;
+    source.address = *offsets.begin();
+    source.object = target;
+    source.allocator = allocator;
+    result.push_back(std::move(source));
+  }
+  return result;
+}
+
+std::vector<EventSource> sources(LocalPerfMode mode, const std::filesystem::path &process) {
   if (mode == LocalPerfMode::cpu)
     return {{Kind::cpu, PERF_COUNT_SW_TASK_CLOCK}};
+  if (mode == LocalPerfMode::allocations)
+    return allocator_sources(process);
+  const bool faults = mode == LocalPerfMode::faults;
+  const auto label = faults ? "signal delivery" : "syscall";
+  const std::vector<Kind> kinds = faults ? std::vector<Kind>{Kind::fault}
+                                         : std::vector<Kind>{Kind::enter, Kind::exit};
   bool permission = false;
   for (const auto *root : {"/sys/kernel/tracing", "/sys/kernel/debug/tracing"}) {
     std::vector<EventSource> events;
-    for (const auto kind : {Kind::enter, Kind::exit}) {
-      const auto path = std::filesystem::path(root) / "events/raw_syscalls" /
-                        (kind == Kind::enter ? "sys_enter" : "sys_exit");
+    for (const auto kind : kinds) {
+      const auto path = std::filesystem::path(root) / "events" /
+                        (faults ? "signal/signal_deliver" :
+                         kind == Kind::enter ? "raw_syscalls/sys_enter" : "raw_syscalls/sys_exit");
       std::ifstream id(path / "id");
       if (!id) {
         permission |= errno == EACCES || errno == EPERM;
@@ -113,9 +224,10 @@ std::vector<EventSource> sources(LocalPerfMode mode) {
       }
       EventSource source{kind, 0};
       if (!(id >> source.config) || !source.config)
-        throw std::runtime_error("invalid syscall tracepoint ID in tracefs");
+        throw std::runtime_error(std::string("invalid ") + label + " tracepoint ID in tracefs");
 
-      const std::regex field(R"(\b(id|ret);\s*offset:(\d+);\s*size:8;\s*signed:1;)");
+      const std::regex field(faults ? R"(\b(sig|code);\s*offset:(\d+);\s*size:4;\s*signed:1;)"
+                                    : R"(\b(id|ret);\s*offset:(\d+);\s*size:8;\s*signed:1;)");
       std::optional<std::size_t> number, result;
       std::string line;
       while (std::getline(format, line)) {
@@ -124,21 +236,21 @@ std::vector<EventSource> sources(LocalPerfMode mode) {
           const auto offset = std::stoul(match[2]);
           if (offset > 256)
             throw std::runtime_error("unsupported syscall tracepoint offset");
-          (match[1] == "id" ? number : result) = offset;
+          (match[1] == "id" || match[1] == "sig" ? number : result) = offset;
         }
       }
-      if (!number || (kind == Kind::exit && !result))
-        throw std::runtime_error("unsupported syscall tracepoint format in tracefs");
+      if (!number || (kind != Kind::enter && !result))
+        throw std::runtime_error(std::string("unsupported ") + label + " tracepoint format in tracefs");
       source.number_offset = *number;
       source.result_offset = result.value_or(0);
       events.push_back(source);
     }
-    if (events.size() == 2)
+    if (events.size() == kinds.size())
       return events;
   }
   if (permission)
-    throw std::runtime_error("permission denied reading syscall tracepoints in tracefs");
-  throw std::runtime_error("raw syscall tracepoints are unavailable in tracefs");
+    throw std::runtime_error(std::string("permission denied reading ") + label + " tracepoints in tracefs");
+  throw std::runtime_error(std::string(label) + " tracepoints are unavailable in tracefs");
 }
 
 struct Task {
@@ -193,7 +305,9 @@ class Ring {
 
   Event decode(const unsigned char *payload, std::size_t length, std::uint32_t pid) const {
     Event event{source_.kind};
-    const bool instruction_pointer = source_.kind == Kind::cpu || source_.kind == Kind::watchpoint;
+    const bool allocation = source_.kind == Kind::allocation;
+    const bool instruction_pointer = allocation || source_.kind == Kind::cpu ||
+                                     source_.kind == Kind::watchpoint;
     const std::size_t base = instruction_pointer ? sizeof(std::uint64_t) : 0;
     if (instruction_pointer)
       event.ip = read_at<std::uint64_t>(payload, length, 0);
@@ -201,16 +315,27 @@ class Ring {
         (event.tid = read_at<std::uint32_t>(payload, length, base + 4)) != tid_)
       throw std::runtime_error("perf sample identity differs from the selected target");
     event.time = read_at<std::uint64_t>(payload, length, base + 8);
-    if (!instruction_pointer) {
+    if (allocation) {
+      constexpr std::uint64_t abi_64 = 2;
+      if (read_at<std::uint64_t>(payload, length, 24) != abi_64)
+        return event;
+      // Register order follows ascending x86 perf register IDs (SI then DI).
+      event.second = read_at<std::uint64_t>(payload, length, 32);
+      event.argument = read_at<std::uint64_t>(payload, length, 40);
+      event.allocator = source_.allocator;
+    } else if (!instruction_pointer) {
       const auto raw_size = read_at<std::uint32_t>(payload, length, 16);
       constexpr std::size_t raw_offset = 20;
       if (length - raw_offset < raw_size)
         throw std::runtime_error("truncated syscall tracepoint payload");
-      event.number = read_at<std::int64_t>(payload + raw_offset, raw_size,
-                                           source_.number_offset);
-      if (source_.kind == Kind::exit)
-        event.result = read_at<std::int64_t>(payload + raw_offset, raw_size,
-                                             source_.result_offset);
+      if (source_.kind == Kind::fault) {
+        event.number = read_at<std::int32_t>(payload + raw_offset, raw_size, source_.number_offset);
+        event.result = read_at<std::int32_t>(payload + raw_offset, raw_size, source_.result_offset);
+      } else {
+        event.number = read_at<std::int64_t>(payload + raw_offset, raw_size, source_.number_offset);
+        if (source_.kind == Kind::exit)
+          event.result = read_at<std::int64_t>(payload + raw_offset, raw_size, source_.result_offset);
+      }
     }
     return event;
   }
@@ -229,13 +354,21 @@ public:
   void open(std::size_t page_size, bool &try_loss_counter) {
     const bool cpu = source_.kind == Kind::cpu;
     const bool watch = source_.kind == Kind::watchpoint;
+    const bool allocation = source_.kind == Kind::allocation;
     PerfAttributes attr{};
-    attr.type = watch ? type_breakpoint : cpu ? PERF_TYPE_SOFTWARE : PERF_TYPE_TRACEPOINT;
+    attr.type = allocation ? source_.pmu_type : watch ? type_breakpoint
+                             : cpu ? PERF_TYPE_SOFTWARE : PERF_TYPE_TRACEPOINT;
     attr.size = sizeof(attr);
     attr.config = source_.config;
     attr.period = cpu ? 10'000'000 : 1;
     attr.sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_TIME |
-                       (cpu || watch ? PERF_SAMPLE_IP : PERF_SAMPLE_RAW);
+                       (cpu || watch || allocation ? PERF_SAMPLE_IP : PERF_SAMPLE_RAW);
+    if (allocation) {
+      attr.sample_type |= sample_regs_user;
+      attr.sample_regs_user = (1ULL << 4) | (1ULL << 5); // PERF_REG_X86_SI and DI.
+      attr.config1 = reinterpret_cast<std::uintptr_t>(source_.object.c_str());
+      attr.config2 = source_.address;
+    }
     attr.flags = disabled | use_clockid | (cpu || watch ? exclude_kernel | exclude_hv : 0);
     if (watch) {
       attr.flags |= pinned;
@@ -319,6 +452,14 @@ public:
         copy(tail + sizeof(header), payload.data(), payload_size);
         if (header.type == PERF_RECORD_SAMPLE) {
           const auto event = decode(payload.data(), payload_size, pid);
+          if ((event.kind == Kind::allocation && !event.allocator) ||
+              (event.kind == Kind::fault &&
+               (event.result <= 0 || (event.number != SIGSEGV && event.number != SIGBUS &&
+                                      event.number != SIGILL && event.number != SIGFPE &&
+                                      event.number != SIGTRAP)))) {
+            tail += header.size;
+            continue;
+          }
           if (events.size() < limit) {
             events.push_back(event);
             std::push_heap(events.begin(), events.end(), earlier);
@@ -383,10 +524,13 @@ void capture_local_perf(LocalPerfMode mode, std::uint32_t pid,
       throw std::logic_error("missing hardware watchpoint parameters");
     const auto stat = process / "task" / std::to_string(watchpoint->tid) / "stat";
     tasks.push_back({stat, watchpoint->tid, tracer::proc::start_time(stat)});
-    event_sources.push_back({Kind::watchpoint, 0, 0, 0, watchpoint->address,
-                             watchpoint->size, watchpoint->reads});
+    EventSource source{Kind::watchpoint, 0};
+    source.address = watchpoint->address;
+    source.length = watchpoint->size;
+    source.reads = watchpoint->reads;
+    event_sources.push_back(std::move(source));
   } else {
-    event_sources = sources(mode);
+    event_sources = sources(mode, process);
     tasks = snapshot_tasks(process);
   }
   const auto page = ::sysconf(_SC_PAGESIZE);
@@ -411,7 +555,9 @@ void capture_local_perf(LocalPerfMode mode, std::uint32_t pid,
   if (interrupted.load())
     throw std::runtime_error("local perf capture interrupted before enabling events");
 
-  const auto label = watchpoint ? "watchpoint" : mode == LocalPerfMode::cpu ? "cpu" : "syscalls";
+  const auto label = watchpoint ? "watchpoint" : mode == LocalPerfMode::cpu ? "cpu" :
+                     mode == LocalPerfMode::faults ? "faults" :
+                     mode == LocalPerfMode::allocations ? "allocations" : "syscalls";
   std::vector<Event> events;
   events.reserve(limit);
   std::uint64_t discarded = 0;
@@ -462,12 +608,38 @@ void capture_local_perf(LocalPerfMode mode, std::uint32_t pid,
   }
   rings.clear();
   std::sort_heap(events.begin(), events.end(), earlier);
+  struct AllocationTotals { std::uint64_t requests = 0, bytes = 0, overflow = 0; };
+  std::map<std::string, AllocationTotals> totals;
   for (const auto &event : events) {
     out << "kind=" << name(event.kind) << " pid=" << pid << " tid=" << event.tid
         << " time_ns=" << event.time;
     if (event.kind == Kind::cpu || event.kind == Kind::watchpoint)
       out << " ip=0x" << std::hex << event.ip << std::dec;
-    else
+    else if (event.kind == Kind::fault)
+      out << " signal=" << event.number << " code=" << event.result;
+    else if (event.kind == Kind::allocation) {
+      auto &total = totals[event.allocator];
+      ++total.requests;
+      const auto max = std::numeric_limits<std::uint64_t>::max();
+      std::uint64_t bytes = event.argument;
+      bool overflow = false;
+      const std::string_view allocator(event.allocator);
+      if (allocator == "calloc") {
+        overflow = event.second && bytes > max / event.second;
+        bytes *= event.second;
+      } else if (allocator == "realloc") {
+        bytes = event.second;
+      }
+      out << " allocator=" << allocator << " ip=0x" << std::hex << event.ip << std::dec;
+      if (overflow)
+        out << " requested=overflow";
+      else
+        out << " requested=" << bytes;
+      if (overflow || bytes > max - total.bytes)
+        ++total.overflow;
+      else
+        total.bytes += bytes;
+    } else
       out << " nr=" << event.number;
     if (event.kind == Kind::exit)
       out << " result=" << event.result;
@@ -476,6 +648,9 @@ void capture_local_perf(LocalPerfMode mode, std::uint32_t pid,
           << " size=" << watchpoint->size << " access=" << (watchpoint->reads ? "read-write" : "write");
     out << '\n';
   }
+  for (const auto &[allocator, total] : totals)
+    out << "allocation-summary allocator=" << allocator << " requests=" << total.requests
+        << " requested_bytes=" << total.bytes << " overflow=" << total.overflow << '\n';
   out << "local capture complete kind=" << label << " events=" << events.size()
       << " lost=" << lost << " loss_accounting=" << (loss_counter ? "counter" : "records")
       << " throttles=" << throttles << " discarded=" << discarded

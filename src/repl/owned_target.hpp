@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -13,6 +14,7 @@ struct LaunchOptions {
   std::string executable, cwd, input, output, error, preload;
   std::vector<std::string> arguments, environment;
   bool supervise = false;
+  bool gate_children = false;
 };
 
 class OwnedTarget {
@@ -26,6 +28,11 @@ class OwnedTarget {
   std::mutex lifecycle_;
   std::thread supervisor_;
   bool supervise_ = false;
+  int child_listener_ = -1;
+  std::string child_directory_, child_socket_;
+  struct ChildGate { int fd; bool ready = false; };
+  std::map<std::uint32_t, ChildGate> child_connections_;
+  void close_children() noexcept;
 
   OwnedTarget() = default;
   void close_gate() noexcept;
@@ -41,6 +48,8 @@ public:
   bool running();
   void wait_ready(unsigned seconds, const std::atomic<bool> &cancelled);
   void resume();
+  std::vector<std::uint32_t> children();
+  bool resume_child(std::uint32_t pid);
   void terminate();
   void start_call(const std::string &name, const std::vector<std::string> &arguments);
   std::string call_result(unsigned seconds, const std::atomic<bool> &cancelled);

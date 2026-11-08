@@ -23,6 +23,8 @@
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
+#include <cstring>
 
 #ifndef PR_SET_PTRACER
 #define PR_SET_PTRACER 0x59616d61
@@ -153,7 +155,7 @@ std::vector<char *> pointers(std::vector<std::string> &strings) {
 }
 
 std::vector<std::string> environment(const LaunchOptions &options, int socket,
-                                     const std::string &preload) {
+                                     const std::string &preload, const std::string &child_path, int tracer_pid) {
   std::map<std::string, std::string> values;
   for (auto entry = environ; *entry; ++entry) {
     std::string text(*entry);
@@ -169,12 +171,19 @@ std::vector<std::string> environment(const LaunchOptions &options, int socket,
         !std::all_of(key.begin(), key.end(), [](unsigned char c) {
           return std::isalnum(c) || c == '_';
         }) || key == gate::gate_environment || key == gate::preload_environment ||
+        key == TRACER_CHILD_GATE || key == TRACER_CHILD_TRACER ||
         text.find('\0') != std::string::npos)
       throw std::invalid_argument("invalid or reserved launch environment assignment");
     values[key] = text.substr(equals + 1);
   }
   values[gate::gate_environment] = std::to_string(socket);
   values.erase(gate::preload_environment);
+  values.erase(TRACER_CHILD_GATE);
+  values.erase(TRACER_CHILD_TRACER);
+  if (!child_path.empty()) {
+    values[TRACER_CHILD_GATE] = child_path;
+    values[TRACER_CHILD_TRACER] = std::to_string(tracer_pid);
+  }
   if (!preload.empty()) {
     const auto previous = values["LD_PRELOAD"];
     values[gate::preload_environment] = previous;
@@ -246,7 +255,24 @@ std::unique_ptr<OwnedTarget> OwnedTarget::start(const LaunchOptions &options, in
   for (auto *fd : {&input, &output, &error, &parent, &child})
     fd->above_stdio();
 
-  auto env = environment(options, child.value, preload);
+  std::string child_path;
+  if (options.gate_children) {
+    if (preload.empty() || !options.supervise)
+      throw std::invalid_argument("--gate-children requires --preload and --supervise");
+    target->child_directory_ = log_directory();
+    child_path = target->child_socket_ = target->child_directory_ + "/children";
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    if (child_path.size() >= sizeof(address.sun_path))
+      throw std::invalid_argument("child gate socket path is too long; use a shorter TMPDIR");
+    std::memcpy(address.sun_path, child_path.c_str(), child_path.size() + 1);
+    Fd listener(::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
+    if (listener.value < 0 || ::bind(listener.value, reinterpret_cast<sockaddr *>(&address),
+                                    sizeof(address)) < 0 || ::listen(listener.value, 32) < 0)
+      launch_error("cannot start child checkpoint listener");
+    target->child_listener_ = listener.take();
+  }
+  auto env = environment(options, child.value, preload, child_path, tracer_pid);
   auto envp = pointers(env);
   std::vector<std::string> arguments{target->executable_};
   arguments.insert(arguments.end(), options.arguments.begin(), options.arguments.end());
@@ -303,6 +329,91 @@ void OwnedTarget::close_gate() noexcept {
   call_pending_ = false;
 }
 
+void OwnedTarget::close_children() noexcept {
+  for (const auto &connection : child_connections_)
+    ::close(connection.second.fd);
+  child_connections_.clear();
+  if (child_listener_ >= 0)
+    ::close(child_listener_);
+  child_listener_ = -1;
+  if (!child_directory_.empty()) {
+    ::unlink(child_socket_.c_str());
+    ::rmdir(child_directory_.c_str());
+    child_directory_.clear();
+  }
+}
+
+std::vector<std::uint32_t> OwnedTarget::children() {
+  std::vector<std::uint32_t> result;
+#if defined(__linux__) && defined(__x86_64__)
+  if (child_listener_ < 0 || !running())
+    return result;
+  std::lock_guard lock(lifecycle_);
+  for (unsigned i = 0; i < 32; ++i) {
+    Fd connection(::accept4(child_listener_, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK));
+    if (connection.value < 0) {
+      if (errno == EINTR)
+        continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        break;
+      launch_error("cannot accept child checkpoint");
+    }
+    ucred peer{};
+    socklen_t length = sizeof(peer);
+    if (child_connections_.size() < 32 &&
+        ::getsockopt(connection.value, SOL_SOCKET, SO_PEERCRED, &peer, &length) == 0 &&
+        peer.uid == ::geteuid() && peer.pid > 0 && peer.pid != pid_ &&
+        ::getpgid(peer.pid) == pid_ && !child_connections_.count(peer.pid)) {
+      auto &gate = child_connections_.try_emplace(peer.pid, ChildGate{-1}).first->second;
+      gate.fd = connection.take();
+    }
+  }
+  for (auto it = child_connections_.begin(); it != child_connections_.end();) {
+    auto &gate = it->second;
+    pollfd status{gate.fd, 0, 0};
+    (void)::poll(&status, 1, 0);
+    if (!(status.revents & (POLLERR | POLLHUP | POLLNVAL)) &&
+        ::getpgid(static_cast<pid_t>(it->first)) == pid_) {
+      if (!gate.ready) {
+        char message = 0;
+        const auto count = ::recv(gate.fd, &message, 1, MSG_DONTWAIT | MSG_TRUNC);
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+          ++it;
+          continue;
+        }
+        gate.ready = count == 1 && message == TRACER_LAUNCH_READY;
+      }
+      if (gate.ready) {
+        result.push_back(it++->first);
+        continue;
+      }
+    }
+    ::close(gate.fd);
+    it = child_connections_.erase(it);
+  }
+#endif
+  return result;
+}
+
+bool OwnedTarget::resume_child(std::uint32_t pid) {
+#if defined(__linux__) && defined(__x86_64__)
+  const auto ready = children();
+  if (std::find(ready.begin(), ready.end(), pid) == ready.end())
+    return false;
+  std::lock_guard lock(lifecycle_);
+  const auto connection = child_connections_.find(pid);
+  const char resume = TRACER_LAUNCH_RESUME;
+  if (::send(connection->second.fd, &resume, 1, MSG_NOSIGNAL) != 1)
+    launch_error("cannot resume the gated child");
+  ::close(connection->second.fd);
+  child_connections_.erase(connection);
+  return true;
+#else
+  (void)pid;
+  return false;
+#endif
+}
+
 bool OwnedTarget::running() {
   std::lock_guard lock(lifecycle_);
   if (pid_ < 0)
@@ -335,6 +446,7 @@ bool OwnedTarget::running() {
     exit_status_ = status;
   pid_ = -1;
   close_gate();
+  close_children();
   return false;
 }
 
@@ -524,6 +636,7 @@ void OwnedTarget::terminate() {
 }
 
 OwnedTarget::~OwnedTarget() {
+  close_children();
   try {
     terminate();
   } catch (...) {

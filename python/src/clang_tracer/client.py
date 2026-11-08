@@ -260,7 +260,7 @@ class Client:
         self, session_id: str, address: int, size: int, *,
         tid: int, mapping_token: str, max_records: int = 256, timeout_seconds: int = 5,
         registers: bool = False, callback_library: str = "",
-        memory_address: int = 0, memory_size: int = 0,
+        memory_address: int = 0, memory_size: int = 0, discover_calls: bool = False,
     ) -> pb.InstructionTrace:
         """Start bounded Gum capture on a local server with the optional backend."""
         return self.stub.StartInstructionTrace(
@@ -269,9 +269,25 @@ class Client:
                 mapping_token=mapping_token, max_records=max_records,
                 timeout_seconds=timeout_seconds,
                 registers=registers, callback_library=callback_library,
-                memory_address=memory_address, memory_size=memory_size,
+                memory_address=memory_address, memory_size=memory_size, discover_calls=discover_calls,
             ),
             timeout=self.timeout,
+        )
+
+    def allocate_memory(self, session_id: str, size: int) -> pb.MemoryAllocation:
+        return self.stub.AllocateMemory(
+            pb.AllocateMemoryRequest(session_id=session_id, size=size), timeout=self.timeout
+        )
+
+    def free_memory(self, session_id: str, allocation_id: int) -> pb.MemoryAllocation:
+        return self.stub.FreeMemory(
+            pb.FreeMemoryRequest(session_id=session_id, allocation_id=allocation_id),
+            timeout=self.timeout,
+        )
+
+    def load_target_library(self, session_id: str, path: str) -> pb.TargetLibrary:
+        return self.stub.LoadTargetLibrary(
+            pb.LoadTargetLibraryRequest(session_id=session_id, path=path), timeout=self.timeout
         )
 
     def apply_memory_patch(self, request: pb.ApplyMemoryPatchRequest) -> pb.MemoryPatch:
@@ -395,6 +411,8 @@ class Client:
         compilation_database: str = "",
         compile_options: Iterable[str] = (),
         level: str = "compile",
+        allow_call_original: bool = False,
+        trace_exceptions: bool = False,
         module: str = "",
         debug_max_entries: int = 0,
         debug_max_depth: int = 0,
@@ -424,6 +442,8 @@ class Client:
                 session_id=session_id,
                 selector=selector,
                 callback_source=callback_source,
+                allow_call_original=allow_call_original,
+                trace_exceptions=trace_exceptions,
                 include_headers=list(include_headers),
                 compilation_database=compilation_database,
                 compile_options=options,
@@ -473,6 +493,8 @@ class Client:
         include_internal_stack_frames: bool = False,
         print_arguments: bool = False,
         print_result: bool = False,
+        allow_call_original: bool = False,
+        trace_exceptions: bool = False,
         callback_package_path: str = "",
         module: str = "",
         debug_max_entries: int = 0,
@@ -508,6 +530,8 @@ class Client:
         spec.include_internal_stack_frames = include_internal_stack_frames
         spec.print_arguments = print_arguments
         spec.print_result = print_result
+        spec.allow_call_original = allow_call_original
+        spec.trace_exceptions = trace_exceptions
         spec.callback_package_path = callback_package_path
         return self.add_probe(session_id, spec)
 

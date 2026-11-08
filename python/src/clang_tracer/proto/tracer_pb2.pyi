@@ -31,6 +31,7 @@ class TracePhase(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     TRACE_PHASE_UNSPECIFIED: _ClassVar[TracePhase]
     PRE: _ClassVar[TracePhase]
     POST: _ClassVar[TracePhase]
+    EXCEPTION: _ClassVar[TracePhase]
 
 class RecordCallingConvention(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -53,6 +54,7 @@ METHOD: CallableKind
 TRACE_PHASE_UNSPECIFIED: TracePhase
 PRE: TracePhase
 POST: TracePhase
+EXCEPTION: TracePhase
 RECORD_CALLING_CONVENTION_UNSPECIFIED: RecordCallingConvention
 RECORD_PASS_BY_VALUE: RecordCallingConvention
 RECORD_PASS_BY_REFERENCE: RecordCallingConvention
@@ -294,7 +296,7 @@ class PreparedInjector(_message.Message):
     def __init__(self, format_version: _Optional[int] = ..., module_sha256: _Optional[bytes] = ..., module_name: _Optional[str] = ..., selector: _Optional[str] = ..., symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., target_triple: _Optional[str] = ..., header_types: _Optional[_Union[DebugInfo, _Mapping]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., adapter_declarations: _Optional[str] = ..., adapter_standard_headers: _Optional[_Iterable[str]] = ..., adapter_abi_options: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class ProbeSpec(_message.Message):
-    __slots__ = ("symbol", "signature", "callback_source", "receiver", "receiver_unavailable_reason", "debug_info", "argument_names", "include_headers", "header_context", "stack_depth", "include_internal_stack_frames", "print_arguments", "print_result", "callback_package_path", "compile_options", "prepared", "allow_argument_overrides", "allow_result_override", "allow_replacement", "reclaimable")
+    __slots__ = ("symbol", "signature", "callback_source", "receiver", "receiver_unavailable_reason", "debug_info", "argument_names", "include_headers", "header_context", "stack_depth", "include_internal_stack_frames", "print_arguments", "print_result", "callback_package_path", "compile_options", "prepared", "allow_argument_overrides", "allow_result_override", "allow_replacement", "reclaimable", "allow_call_original", "trace_exceptions")
     SYMBOL_FIELD_NUMBER: _ClassVar[int]
     SIGNATURE_FIELD_NUMBER: _ClassVar[int]
     CALLBACK_SOURCE_FIELD_NUMBER: _ClassVar[int]
@@ -315,6 +317,8 @@ class ProbeSpec(_message.Message):
     ALLOW_RESULT_OVERRIDE_FIELD_NUMBER: _ClassVar[int]
     ALLOW_REPLACEMENT_FIELD_NUMBER: _ClassVar[int]
     RECLAIMABLE_FIELD_NUMBER: _ClassVar[int]
+    ALLOW_CALL_ORIGINAL_FIELD_NUMBER: _ClassVar[int]
+    TRACE_EXCEPTIONS_FIELD_NUMBER: _ClassVar[int]
     symbol: str
     signature: Signature
     callback_source: str
@@ -335,7 +339,9 @@ class ProbeSpec(_message.Message):
     allow_result_override: bool
     allow_replacement: bool
     reclaimable: bool
-    def __init__(self, symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., callback_source: _Optional[str] = ..., receiver: _Optional[_Union[ReceiverContext, _Mapping]] = ..., receiver_unavailable_reason: _Optional[str] = ..., debug_info: _Optional[_Union[DebugInfo, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., stack_depth: _Optional[int] = ..., include_internal_stack_frames: bool = ..., print_arguments: bool = ..., print_result: bool = ..., callback_package_path: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ..., allow_argument_overrides: bool = ..., allow_result_override: bool = ..., allow_replacement: bool = ..., reclaimable: bool = ...) -> None: ...
+    allow_call_original: bool
+    trace_exceptions: bool
+    def __init__(self, symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., callback_source: _Optional[str] = ..., receiver: _Optional[_Union[ReceiverContext, _Mapping]] = ..., receiver_unavailable_reason: _Optional[str] = ..., debug_info: _Optional[_Union[DebugInfo, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., stack_depth: _Optional[int] = ..., include_internal_stack_frames: bool = ..., print_arguments: bool = ..., print_result: bool = ..., callback_package_path: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ..., allow_argument_overrides: bool = ..., allow_result_override: bool = ..., allow_replacement: bool = ..., reclaimable: bool = ..., allow_call_original: bool = ..., trace_exceptions: bool = ...) -> None: ...
 
 class AttachRequest(_message.Message):
     __slots__ = ("pid", "expected_process_start_time", "expected_executable")
@@ -436,7 +442,7 @@ class ResolveProbeRequest(_message.Message):
     def __init__(self, session_id: _Optional[str] = ..., selector: _Optional[str] = ..., include_headers: _Optional[_Iterable[str]] = ..., compilation_database: _Optional[str] = ..., module: _Optional[str] = ..., debug_max_entries: _Optional[int] = ..., debug_max_depth: _Optional[int] = ..., compile_options: _Optional[_Iterable[str]] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ...) -> None: ...
 
 class ValidateProbeRequest(_message.Message):
-    __slots__ = ("session_id", "selector", "callback_source", "include_headers", "compilation_database", "compile_options", "level", "module", "debug_max_entries", "debug_max_depth", "prepared", "allow_argument_overrides", "allow_result_override", "allow_replacement", "reclaimable")
+    __slots__ = ("session_id", "selector", "callback_source", "include_headers", "compilation_database", "compile_options", "level", "module", "debug_max_entries", "debug_max_depth", "prepared", "allow_argument_overrides", "allow_result_override", "allow_replacement", "reclaimable", "allow_call_original", "trace_exceptions")
     class Level(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         COMPILE: _ClassVar[ValidateProbeRequest.Level]
@@ -458,6 +464,8 @@ class ValidateProbeRequest(_message.Message):
     ALLOW_RESULT_OVERRIDE_FIELD_NUMBER: _ClassVar[int]
     ALLOW_REPLACEMENT_FIELD_NUMBER: _ClassVar[int]
     RECLAIMABLE_FIELD_NUMBER: _ClassVar[int]
+    ALLOW_CALL_ORIGINAL_FIELD_NUMBER: _ClassVar[int]
+    TRACE_EXCEPTIONS_FIELD_NUMBER: _ClassVar[int]
     session_id: str
     selector: str
     callback_source: str
@@ -473,7 +481,9 @@ class ValidateProbeRequest(_message.Message):
     allow_result_override: bool
     allow_replacement: bool
     reclaimable: bool
-    def __init__(self, session_id: _Optional[str] = ..., selector: _Optional[str] = ..., callback_source: _Optional[str] = ..., include_headers: _Optional[_Iterable[str]] = ..., compilation_database: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ..., level: _Optional[_Union[ValidateProbeRequest.Level, str]] = ..., module: _Optional[str] = ..., debug_max_entries: _Optional[int] = ..., debug_max_depth: _Optional[int] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ..., allow_argument_overrides: bool = ..., allow_result_override: bool = ..., allow_replacement: bool = ..., reclaimable: bool = ...) -> None: ...
+    allow_call_original: bool
+    trace_exceptions: bool
+    def __init__(self, session_id: _Optional[str] = ..., selector: _Optional[str] = ..., callback_source: _Optional[str] = ..., include_headers: _Optional[_Iterable[str]] = ..., compilation_database: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ..., level: _Optional[_Union[ValidateProbeRequest.Level, str]] = ..., module: _Optional[str] = ..., debug_max_entries: _Optional[int] = ..., debug_max_depth: _Optional[int] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ..., allow_argument_overrides: bool = ..., allow_result_override: bool = ..., allow_replacement: bool = ..., reclaimable: bool = ..., allow_call_original: bool = ..., trace_exceptions: bool = ...) -> None: ...
 
 class ValidationDiagnostic(_message.Message):
     __slots__ = ("stage", "severity", "file", "line", "column", "message")
@@ -506,7 +516,7 @@ class ValidationReport(_message.Message):
     def __init__(self, success: bool = ..., level: _Optional[_Union[ValidateProbeRequest.Level, str]] = ..., effective_options: _Optional[_Iterable[str]] = ..., diagnostics: _Optional[_Iterable[_Union[ValidationDiagnostic, _Mapping]]] = ..., prepared_used: bool = ...) -> None: ...
 
 class Probe(_message.Message):
-    __slots__ = ("id", "session_id", "symbol", "signature", "active", "callback_address", "entry_address", "original_bytes_restored", "agent_dropped_events", "callback_errors", "jit_compile_ns", "patch_install_ns", "bulk_batch_id", "replaces_probe_id", "superseded_by_probe_id", "draining", "allow_argument_overrides", "allow_result_override", "allow_replacement", "reclaimed")
+    __slots__ = ("id", "session_id", "symbol", "signature", "active", "callback_address", "entry_address", "original_bytes_restored", "agent_dropped_events", "callback_errors", "jit_compile_ns", "patch_install_ns", "bulk_batch_id", "replaces_probe_id", "superseded_by_probe_id", "draining", "allow_argument_overrides", "allow_result_override", "allow_replacement", "reclaimed", "allow_call_original", "trace_exceptions")
     ID_FIELD_NUMBER: _ClassVar[int]
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     SYMBOL_FIELD_NUMBER: _ClassVar[int]
@@ -527,6 +537,8 @@ class Probe(_message.Message):
     ALLOW_RESULT_OVERRIDE_FIELD_NUMBER: _ClassVar[int]
     ALLOW_REPLACEMENT_FIELD_NUMBER: _ClassVar[int]
     RECLAIMED_FIELD_NUMBER: _ClassVar[int]
+    ALLOW_CALL_ORIGINAL_FIELD_NUMBER: _ClassVar[int]
+    TRACE_EXCEPTIONS_FIELD_NUMBER: _ClassVar[int]
     id: int
     session_id: str
     symbol: str
@@ -547,7 +559,9 @@ class Probe(_message.Message):
     allow_result_override: bool
     allow_replacement: bool
     reclaimed: bool
-    def __init__(self, id: _Optional[int] = ..., session_id: _Optional[str] = ..., symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., active: bool = ..., callback_address: _Optional[int] = ..., entry_address: _Optional[int] = ..., original_bytes_restored: bool = ..., agent_dropped_events: _Optional[int] = ..., callback_errors: _Optional[int] = ..., jit_compile_ns: _Optional[int] = ..., patch_install_ns: _Optional[int] = ..., bulk_batch_id: _Optional[str] = ..., replaces_probe_id: _Optional[int] = ..., superseded_by_probe_id: _Optional[int] = ..., draining: bool = ..., allow_argument_overrides: bool = ..., allow_result_override: bool = ..., allow_replacement: bool = ..., reclaimed: bool = ...) -> None: ...
+    allow_call_original: bool
+    trace_exceptions: bool
+    def __init__(self, id: _Optional[int] = ..., session_id: _Optional[str] = ..., symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., active: bool = ..., callback_address: _Optional[int] = ..., entry_address: _Optional[int] = ..., original_bytes_restored: bool = ..., agent_dropped_events: _Optional[int] = ..., callback_errors: _Optional[int] = ..., jit_compile_ns: _Optional[int] = ..., patch_install_ns: _Optional[int] = ..., bulk_batch_id: _Optional[str] = ..., replaces_probe_id: _Optional[int] = ..., superseded_by_probe_id: _Optional[int] = ..., draining: bool = ..., allow_argument_overrides: bool = ..., allow_result_override: bool = ..., allow_replacement: bool = ..., reclaimed: bool = ..., allow_call_original: bool = ..., trace_exceptions: bool = ...) -> None: ...
 
 class ReloadProbeRequest(_message.Message):
     __slots__ = ("session_id", "probe_id", "callback_source")
@@ -706,18 +720,72 @@ class ReadMemoryResponse(_message.Message):
     def __init__(self, address: _Optional[int] = ..., data: _Optional[bytes] = ...) -> None: ...
 
 class ApplyMemoryPatchRequest(_message.Message):
-    __slots__ = ("session_id", "mapping_token", "module", "executable", "import_slot")
+    __slots__ = ("session_id", "mapping_token", "module", "executable", "import_slot", "writable")
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     MAPPING_TOKEN_FIELD_NUMBER: _ClassVar[int]
     MODULE_FIELD_NUMBER: _ClassVar[int]
     EXECUTABLE_FIELD_NUMBER: _ClassVar[int]
     IMPORT_SLOT_FIELD_NUMBER: _ClassVar[int]
+    WRITABLE_FIELD_NUMBER: _ClassVar[int]
     session_id: str
     mapping_token: str
     module: str
     executable: ExecutablePatch
     import_slot: ImportSlotHook
-    def __init__(self, session_id: _Optional[str] = ..., mapping_token: _Optional[str] = ..., module: _Optional[str] = ..., executable: _Optional[_Union[ExecutablePatch, _Mapping]] = ..., import_slot: _Optional[_Union[ImportSlotHook, _Mapping]] = ...) -> None: ...
+    writable: WritablePatch
+    def __init__(self, session_id: _Optional[str] = ..., mapping_token: _Optional[str] = ..., module: _Optional[str] = ..., executable: _Optional[_Union[ExecutablePatch, _Mapping]] = ..., import_slot: _Optional[_Union[ImportSlotHook, _Mapping]] = ..., writable: _Optional[_Union[WritablePatch, _Mapping]] = ...) -> None: ...
+
+class AllocateMemoryRequest(_message.Message):
+    __slots__ = ("session_id", "size")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    SIZE_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    size: int
+    def __init__(self, session_id: _Optional[str] = ..., size: _Optional[int] = ...) -> None: ...
+
+class FreeMemoryRequest(_message.Message):
+    __slots__ = ("session_id", "allocation_id")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    ALLOCATION_ID_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    allocation_id: int
+    def __init__(self, session_id: _Optional[str] = ..., allocation_id: _Optional[int] = ...) -> None: ...
+
+class MemoryAllocation(_message.Message):
+    __slots__ = ("id", "address", "size", "freed")
+    ID_FIELD_NUMBER: _ClassVar[int]
+    ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    SIZE_FIELD_NUMBER: _ClassVar[int]
+    FREED_FIELD_NUMBER: _ClassVar[int]
+    id: int
+    address: int
+    size: int
+    freed: bool
+    def __init__(self, id: _Optional[int] = ..., address: _Optional[int] = ..., size: _Optional[int] = ..., freed: bool = ...) -> None: ...
+
+class LoadTargetLibraryRequest(_message.Message):
+    __slots__ = ("session_id", "path")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    path: str
+    def __init__(self, session_id: _Optional[str] = ..., path: _Optional[str] = ...) -> None: ...
+
+class TargetLibrary(_message.Message):
+    __slots__ = ("path",)
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    path: str
+    def __init__(self, path: _Optional[str] = ...) -> None: ...
+
+class WritablePatch(_message.Message):
+    __slots__ = ("address", "expected", "replacement")
+    ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_FIELD_NUMBER: _ClassVar[int]
+    REPLACEMENT_FIELD_NUMBER: _ClassVar[int]
+    address: int
+    expected: bytes
+    replacement: bytes
+    def __init__(self, address: _Optional[int] = ..., expected: _Optional[bytes] = ..., replacement: _Optional[bytes] = ...) -> None: ...
 
 class ExecutablePatch(_message.Message):
     __slots__ = ("elf_address", "expected", "replacement")
@@ -807,7 +875,7 @@ class PageMonitorResult(_message.Message):
     def __init__(self, tid: _Optional[int] = ..., address: _Optional[int] = ..., size: _Optional[int] = ..., expired: bool = ..., accesses: _Optional[_Iterable[_Union[PageMonitorResult.Access, _Mapping]]] = ...) -> None: ...
 
 class StartInstructionTraceRequest(_message.Message):
-    __slots__ = ("session_id", "mapping_token", "tid", "address", "size", "max_records", "timeout_seconds", "registers", "callback_library", "memory_address", "memory_size")
+    __slots__ = ("session_id", "mapping_token", "tid", "address", "size", "max_records", "timeout_seconds", "registers", "callback_library", "memory_address", "memory_size", "discover_calls")
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     MAPPING_TOKEN_FIELD_NUMBER: _ClassVar[int]
     TID_FIELD_NUMBER: _ClassVar[int]
@@ -819,6 +887,7 @@ class StartInstructionTraceRequest(_message.Message):
     CALLBACK_LIBRARY_FIELD_NUMBER: _ClassVar[int]
     MEMORY_ADDRESS_FIELD_NUMBER: _ClassVar[int]
     MEMORY_SIZE_FIELD_NUMBER: _ClassVar[int]
+    DISCOVER_CALLS_FIELD_NUMBER: _ClassVar[int]
     session_id: str
     mapping_token: str
     tid: int
@@ -830,7 +899,8 @@ class StartInstructionTraceRequest(_message.Message):
     callback_library: str
     memory_address: int
     memory_size: int
-    def __init__(self, session_id: _Optional[str] = ..., mapping_token: _Optional[str] = ..., tid: _Optional[int] = ..., address: _Optional[int] = ..., size: _Optional[int] = ..., max_records: _Optional[int] = ..., timeout_seconds: _Optional[int] = ..., registers: bool = ..., callback_library: _Optional[str] = ..., memory_address: _Optional[int] = ..., memory_size: _Optional[int] = ...) -> None: ...
+    discover_calls: bool
+    def __init__(self, session_id: _Optional[str] = ..., mapping_token: _Optional[str] = ..., tid: _Optional[int] = ..., address: _Optional[int] = ..., size: _Optional[int] = ..., max_records: _Optional[int] = ..., timeout_seconds: _Optional[int] = ..., registers: bool = ..., callback_library: _Optional[str] = ..., memory_address: _Optional[int] = ..., memory_size: _Optional[int] = ..., discover_calls: bool = ...) -> None: ...
 
 class StopInstructionTraceRequest(_message.Message):
     __slots__ = ("session_id",)
@@ -839,7 +909,7 @@ class StopInstructionTraceRequest(_message.Message):
     def __init__(self, session_id: _Optional[str] = ...) -> None: ...
 
 class InstructionTrace(_message.Message):
-    __slots__ = ("tid", "address", "size", "reason", "pcs", "details")
+    __slots__ = ("tid", "address", "size", "reason", "pcs", "details", "call_targets", "discover_calls")
     class Reason(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         RUNNING: _ClassVar[InstructionTrace.Reason]
@@ -856,13 +926,27 @@ class InstructionTrace(_message.Message):
     REASON_FIELD_NUMBER: _ClassVar[int]
     PCS_FIELD_NUMBER: _ClassVar[int]
     DETAILS_FIELD_NUMBER: _ClassVar[int]
+    CALL_TARGETS_FIELD_NUMBER: _ClassVar[int]
+    DISCOVER_CALLS_FIELD_NUMBER: _ClassVar[int]
     tid: int
     address: int
     size: int
     reason: InstructionTrace.Reason
     pcs: _containers.RepeatedScalarFieldContainer[int]
     details: _containers.RepeatedCompositeFieldContainer[InstructionDetail]
-    def __init__(self, tid: _Optional[int] = ..., address: _Optional[int] = ..., size: _Optional[int] = ..., reason: _Optional[_Union[InstructionTrace.Reason, str]] = ..., pcs: _Optional[_Iterable[int]] = ..., details: _Optional[_Iterable[_Union[InstructionDetail, _Mapping]]] = ...) -> None: ...
+    call_targets: _containers.RepeatedScalarFieldContainer[int]
+    discover_calls: bool
+    def __init__(self, tid: _Optional[int] = ..., address: _Optional[int] = ..., size: _Optional[int] = ..., reason: _Optional[_Union[InstructionTrace.Reason, str]] = ..., pcs: _Optional[_Iterable[int]] = ..., details: _Optional[_Iterable[_Union[InstructionDetail, _Mapping]]] = ..., call_targets: _Optional[_Iterable[int]] = ..., discover_calls: bool = ...) -> None: ...
+
+class InstructionRecording(_message.Message):
+    __slots__ = ("magic", "version", "trace")
+    MAGIC_FIELD_NUMBER: _ClassVar[int]
+    VERSION_FIELD_NUMBER: _ClassVar[int]
+    TRACE_FIELD_NUMBER: _ClassVar[int]
+    magic: int
+    version: int
+    trace: InstructionTrace
+    def __init__(self, magic: _Optional[int] = ..., version: _Optional[int] = ..., trace: _Optional[_Union[InstructionTrace, _Mapping]] = ...) -> None: ...
 
 class InstructionDetail(_message.Message):
     __slots__ = ("registers", "callback_value", "memory_address", "memory_size", "memory_access")

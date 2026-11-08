@@ -56,6 +56,9 @@ public:
       std::uint64_t address, std::string expected, std::string replacement,
       std::vector<clangtracer::v1::MemoryMapping> mappings);
   clangtracer::v1::MemoryPatch restore_memory_patch(std::uint64_t id);
+  clangtracer::v1::MemoryAllocation allocate_memory(std::uint32_t size);
+  clangtracer::v1::MemoryAllocation free_memory(std::uint64_t id);
+  clangtracer::v1::TargetLibrary load_target_library(std::string path);
   clangtracer::v1::PageMonitorResult start_page_monitor(
       const clangtracer::v1::StartPageMonitorRequest &request);
   clangtracer::v1::PageMonitorResult stop_page_monitor();
@@ -143,6 +146,14 @@ private:
     std::vector<clangtracer::v1::MemoryMapping> mappings;
   };
   std::vector<MemoryPatchRecord> memory_patches_;
+  struct AllocationRecord {
+    clangtracer::v1::MemoryAllocation value;
+    std::string device;
+    std::uint64_t inode = 0;
+  };
+  std::vector<AllocationRecord> allocations_;
+  std::map<std::string, std::uintptr_t> resident_libraries_;
+  void free_memory_locked(AllocationRecord &record, std::chrono::steady_clock::time_point deadline);
   void write_memory_patch_locked(MemoryPatchRecord &record, bool restore,
                                  std::chrono::steady_clock::time_point deadline);
   std::optional<PthreadCreatePatch> pthread_create_patch_;

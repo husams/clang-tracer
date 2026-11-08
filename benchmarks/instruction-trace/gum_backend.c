@@ -28,7 +28,7 @@ typedef struct {
   uintptr_t memory_begin, memory_end;
   uint64_t (*callback)(const TracerInstructionRegistersV2 *);
   TracerInstructionDetailV2 *details;
-  int registers;
+  int registers, discover_calls;
   atomic_uint count, truncated;
   atomic_uint reason;
 } Capture;
@@ -83,7 +83,7 @@ static uint64_t now_ns(void) {
   return (uint64_t)t.tv_sec * 1000000000 + t.tv_nsec;
 }
 
-static void record_instruction(const GumCpuContext *cpu, Capture *capture,
+static void record_instruction(const GumCpuContext *cpu, uintptr_t pc, Capture *capture,
                                uintptr_t address, unsigned size, unsigned access) {
   if (atomic_load_explicit(&capture->reason, memory_order_relaxed) !=
       TRACER_INSTRUCTION_RUNNING)
@@ -96,7 +96,7 @@ static void record_instruction(const GumCpuContext *cpu, Capture *capture,
   }
   const unsigned count = atomic_load_explicit(&capture->count, memory_order_relaxed);
   if (count < capture->limit) {
-    capture->offsets[count] = (uint32_t)(cpu->rip - capture->begin);
+    capture->offsets[count] = (uint32_t)(pc - capture->begin);
     if (capture->details) {
       TracerInstructionDetailV2 *detail = &capture->details[count];
       detail->memory_address = address;
@@ -128,7 +128,7 @@ static void record_instruction(const GumCpuContext *cpu, Capture *capture,
 }
 
 static void record(GumCpuContext *cpu, gpointer opaque) {
-  record_instruction(cpu, opaque, 0, 0, 0);
+  record_instruction(cpu, cpu->rip, opaque, 0, 0, 0);
 }
 
 typedef struct {
@@ -170,7 +170,7 @@ static void record_memory(GumCpuContext *cpu, gpointer opaque) {
       operand->displacement;
   if (address < capture->memory_end &&
       (address >= capture->memory_begin || capture->memory_begin - address < operand->size))
-    record_instruction(cpu, capture, address, operand->size, operand->access);
+    record_instruction(cpu, cpu->rip, capture, address, operand->size, operand->access);
 }
 
 /* Admit single scalar memory operands whose attempted access is known before
@@ -214,13 +214,21 @@ static void instrument_memory(GumStalkerIterator *iterator, const cs_insn *instr
   }
 }
 
+static void observe_call(const GumEvent *event, GumCpuContext *cpu, gpointer data) {
+  Capture *capture = data;
+  const uintptr_t pc = (uintptr_t)event->call.location;
+  if (event->type == GUM_CALL && pc >= capture->begin && pc < capture->end)
+    record_instruction(cpu, pc, capture, (uintptr_t)event->call.target, 0, 0);
+}
+
 static void transform(GumStalkerIterator *iterator, GumStalkerOutput *output,
                       gpointer opaque) {
   (void)output;
   Capture *capture = opaque;
   const cs_insn *instruction;
   while (gum_stalker_iterator_next(iterator, &instruction)) {
-    if (instruction->address >= capture->begin && instruction->address < capture->end) {
+    if (!capture->discover_calls && instruction->address >= capture->begin &&
+        instruction->address < capture->end) {
       if (capture->memory_begin)
         instrument_memory(iterator, instruction, capture);
       else
@@ -253,6 +261,7 @@ static GumStalkerTransformer *prepare(Capture *capture, uintptr_t begin, uintptr
   capture->memory_end = options ? options->memory_end : 0;
   capture->callback = options ? (void *)options->callback : NULL;
   capture->registers = options && (options->flags & TRACER_INSTRUCTION_REGISTERS);
+  capture->discover_calls = options && (options->flags & TRACER_INSTRUCTION_DISCOVER_CALLS);
   capture->details = options ? completed.details : NULL;
   atomic_init(&capture->count, 0);
   atomic_init(&capture->truncated, 0);
@@ -299,7 +308,11 @@ static int live_start(int tid, uintptr_t begin, uintptr_t end, uint32_t limit,
   gum_stalker_set_trust_threshold(live.stalker, -1);
   int followed = 0;
   follow_result = &followed;
-  gum_stalker_follow(live.stalker, tid, live_transformer, NULL);
+  GumEventSink *sink = live.discover_calls
+      ? gum_event_sink_make_from_callback(GUM_CALL, observe_call, &live, NULL) : NULL;
+  gum_stalker_follow(live.stalker, tid, live_transformer, sink);
+  if (sink)
+    g_object_unref(sink);
   follow_result = NULL;
   if (!followed) {
     // The helper can fail after writing the worker's registers. Keep the
@@ -411,6 +424,15 @@ tracer_gum_instruction_start_v2(const TracerInstructionRequestV2 *request) {
   if (!request || request->flags & ~TRACER_INSTRUCTION_REGISTERS ||
       (request->memory_begin && request->memory_end <= request->memory_begin) ||
       (!request->memory_begin && request->memory_end))
+    return -1;
+  return start_capture(request->tid, request->begin, request->end,
+      request->limit, request->seconds, request);
+}
+
+__attribute__((visibility("default"))) int
+tracer_gum_instruction_start_v3(const TracerInstructionRequestV2 *request) {
+  if (!request || request->flags != TRACER_INSTRUCTION_DISCOVER_CALLS ||
+      request->memory_begin || request->memory_end || request->callback)
     return -1;
   return start_capture(request->tid, request->begin, request->end,
       request->limit, request->seconds, request);

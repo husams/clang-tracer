@@ -30,7 +30,9 @@ def inspect_plugin(plugin):
              "pilot_gum_live_start", "pilot_gum_live_stop"}
     supported = {"tracer_gum_instruction_start_v1", "tracer_gum_instruction_stop_v1"}
     extended = {"tracer_gum_instruction_start_v2", "tracer_gum_instruction_stop_v2"}
-    assert names in (pilot, pilot | supported, pilot | supported | extended), names
+    discovery = {"tracer_gum_instruction_start_v3"}
+    assert names in (pilot, pilot | supported, pilot | supported | extended,
+                     pilot | supported | extended | discovery), names
     assert "libc.so.6" in needed and set(needed) <= allowed, needed
     assert "(BIND_NOW)" in dynamic or re.search(r"Flags:.*\bNOW\b", dynamic)
     assert not re.search(r"\((?:TEXTREL|RPATH|RUNPATH)\)", dynamic)

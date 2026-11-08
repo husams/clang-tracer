@@ -5,7 +5,7 @@
 #include <iosfwd>
 
 namespace tracer_repl {
-enum class LocalPerfMode { syscalls, cpu, watchpoint };
+enum class LocalPerfMode { syscalls, cpu, watchpoint, faults, allocations };
 struct Watchpoint {
   std::uint32_t tid;
   std::uint64_t address;

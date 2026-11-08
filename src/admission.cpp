@@ -1303,21 +1303,20 @@ RuntimeEntry target_runtime_entry(pid_t pid, std::string_view name) {
 }
 
 std::vector<std::string> target_runtime_companions(
-    pid_t pid, const std::vector<std::string> &agent_dependencies) {
-  if (agent_dependencies.empty()) {
+    pid_t pid, const std::vector<std::string> &dependencies) {
+  if (dependencies.empty()) {
     return {};
   }
   const auto maps = read_mappings(pid);
   const auto libc = load_libc(maps, StartupSymbolSet::runtime, pid);
   const auto directory = libc.path.substr(0, libc.path.find_last_of('/') + 1);
   std::vector<std::string> paths;
-  // The SDK-built agent needs these glibc DSOs even on releases that moved
-  // their functions into libc. Bind their SONAMEs to the target's runtime
-  // before dlopen can search the agent's SDK RUNPATH.
+  // Bind these SONAMEs to the target's libc distribution before the loader
+  // consults a module's RUNPATH or the host's default search directories.
   for (const auto *soname : {"libdl.so.2", "libpthread.so.0", "librt.so.1",
-                             "libm.so.6"}) {
-    if (std::find(agent_dependencies.begin(), agent_dependencies.end(), soname) ==
-        agent_dependencies.end()) {
+                             "libm.so.6", "libresolv.so.2"}) {
+    if (std::find(dependencies.begin(), dependencies.end(), soname) ==
+        dependencies.end()) {
       continue;
     }
     const auto path = directory + soname;

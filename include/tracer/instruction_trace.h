@@ -16,6 +16,7 @@ enum {
   TRACER_INSTRUCTION_LIMIT = 2,
   TRACER_INSTRUCTION_TIMEOUT = 3,
   TRACER_INSTRUCTION_REGISTERS = 1,
+  TRACER_INSTRUCTION_DISCOVER_CALLS = 2,
   TRACER_INSTRUCTION_MEMORY_READ = 1,
   TRACER_INSTRUCTION_MEMORY_WRITE = 2,
   TRACER_INSTRUCTION_REGISTER_COUNT = 16
@@ -52,7 +53,10 @@ typedef struct {
 typedef struct {
   TracerInstructionRegistersV2 registers;
   uint64_t callback_value;
-  uint64_t memory_address;
+  union {
+    uint64_t memory_address; // v2 memory capture
+    uint64_t call_target; // v3 discovery
+  };
   uint32_t memory_size;
   uint32_t memory_access;
 } TracerInstructionDetailV2;

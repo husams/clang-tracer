@@ -75,7 +75,7 @@ enum class CallableKind : std::uint32_t {
   Function = 1,
   Method = 2
 };
-enum class TracePhase : std::uint32_t { Pre = 1, Post = 2 };
+enum class TracePhase : std::uint32_t { Pre = 1, Post = 2, Exception = 3 };
 
 struct ValueSnapshot {
   enum Status : std::uint32_t {
@@ -174,6 +174,9 @@ struct TraceContext {
   mutable StackTrace stack{};
   // Wrapper-owned storage. Callbacks receive private staging storage.
   ScalarOverrides *scalar_overrides = nullptr;
+  std::uint64_t original_entry_time_ns = 0;
+  void *original_state = nullptr;
+  std::uint64_t (*invoke_original)(void *) = nullptr;
 };
 
 struct Request {

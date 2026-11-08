@@ -452,3 +452,36 @@ after the leader exited, and byte and permission restoration on detach.
 The Gum register, callback, scalar memory access and hardware watchpoint
 suite also passed on both profiles with active native probes.
 Twelve focused native CTests and 199 Python tests passed.
+
+### Remaining local C++ capabilities
+
+| Capability | Native REPL entry point and scope |
+| --- | --- |
+| Writable memory and allocation | `%memory write ADDRESS --mapping TOKEN --expect HEX --replace HEX` uses the existing transactional patch and restore path for private writable mappings. `%memory allocate BYTES` creates up to 1 MiB of session-owned writable memory. `%memory free ID` verifies its backing inode while the target is stopped. Detach restores patches before releasing allocations. |
+| Dynamic function discovery | `%instructions start ... --discover` captures actual direct and indirect call destinations from the selected thread and code range, then lists destination addresses and counts. |
+| Instruction recording and replay | `%instructions stop --save NEW_FILE` writes a versioned, bounded capture with its stop reason. `%instructions replay FILE` renders the same addresses, registers, callback results, memory accesses or discovered calls offline. |
+| Native faults and C++ exceptions | `%faults` observes kernel-delivered fault signals on the selected target's existing threads with tracefs access. `--trace-exceptions` adds an exceptional completion event when a probed original throws, preserving the exception for the C++ caller and pairing it with PRE in summaries. |
+| Callable original | `--allow-call-original` enables `Call::call_original<T>()` in a PRE observer on a verified scalar or void free function. It executes the trampoline at most once with the entry arguments, caches the result, and preserves the original's errno and exception behavior. |
+| Child gating | `%launch ... --preload PATH --supervise --gate-children` pauses exec descendants that inherit the gate and remain in the owned process group. Use `%children`, then `%attach PID` and `%resume PID`. The child checkpoint expires after 60 seconds. |
+| Target library injection | `%library load PATH` loads a trusted Linux x86-64 ELF shared object with local symbol visibility. The library stays resident for the life of the target. |
+| Allocation profiling | `%sample allocations` uses task-scoped Linux perf uprobes on the mapped glibc to report `malloc`, `calloc` and `realloc` request counts and requested bytes, with capture limits and loss counters. |
+
+The complete native REPL integration fixture passed on glibc 2.23 and
+2.34 with a probe active during instruction capture, fault delivery and
+allocation profiling. It verified once-only trampoline execution and
+exception propagation, write restoration and allocation ownership,
+trusted DSO initialization, direct and indirect call discovery,
+gated child attach before resume, and offline replay of both register
+and discovery recordings. The test also checked expected-byte mismatch,
+stale mapping tokens, free with an outstanding patch, unmapped memory,
+invalid ELF input and truncated recording rejection.
+
+The SDK-built server matched Gum's glibc dependencies to the selected
+target. The discovery-capable plugin was relinked offline from the
+supplied bundle and retained a maximum public requirement of GLIBC_2.17.
+The previous Gum live suite passed on both runtimes with the same plugin.
+The fault and allocation tests used perf and tracefs access.
+
+Thirteen focused native regressions passed, including the launch test
+rerun after preserving its existing diagnostic and the syscall test
+rerun with tracefs access. The Python suite passed 199 tests.

@@ -4,7 +4,8 @@ line : '%' command EOF;
 command : server | attach | processes | sessions | use | status | detach
         | modules | threads | symbols | probe | interceptor | events | collect | record
         | cpp | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload
-        | targetLaunch | targetCall | localPerf | instructions | watchpoint;
+        | targetLaunch | targetCall | localPerf | instructions | watchpoint
+        | targetLibrary | childList;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
 serverOption : ('--executable' | '--agent') value;
 attach : 'attach' (UINT ('--start-time' UINT)?)?;
@@ -28,7 +29,7 @@ prepareOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | 
 resolveOption : ('--include' | '--compdb' | '--module' | '--compile-option'
                 | '--prepared' | '--prepared-mode') value;
 validateOption : resolveOption | '--allow-arg-overrides' | '--allow-result-override' | '--allow-replacement'
-               | '--reclaimable';
+               | '--reclaimable' | '--allow-call-original' | '--trace-exceptions';
 deployOption : validateOption | '--stack-depth' UINT | '--print-arguments' | '--print-result';
 interceptor : 'interceptor' ('load' value '--as' value | 'edit' value | 'show' value
       | 'validate' value '--target' value validateOption*
@@ -42,7 +43,7 @@ events : 'events' (streamOption*
 collect : 'collect' streamOption*;
 record : 'record' value (streamOption | SQLITE)*;
 streamOption : ('--count' | '--timeout' | '--after' | '--probe') UINT
-             | '--phase' ('PRE' | 'POST')
+             | '--phase' ('PRE' | 'POST' | 'EXCEPTION')
              | ('--as' | '--name' | '--session') value | '--all';
 cpp : 'cpp' ('load' value | 'reset'
             | ('import' | 'generate') value (('--type' | '--output') value)*
@@ -63,19 +64,21 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'probe' | 'prepare' | 'resolve' | 'inject' | 'validate' | 'remove' | 'probes'
         | 'interceptor' | 'load' | 'edit' | 'show' | 'upload' | 'events'
         | 'list' | 'calls' | 'stats' | 'clear' | 'open' | 'export' | 'json'
-        | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'import'
+        | 'collect' | 'record' | 'PRE' | 'POST' | 'EXCEPTION' | 'cpp' | 'reset' | 'import'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
         | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview' | 'apply'
         | 'memory' | 'maps' | 'read' | 'scan' | 'patch' | 'restore' | 'import-hook'
         | 'monitor-start' | 'monitor-stop'
         | 'entry' | 'reload' | 'launch' | 'resume' | 'terminate'
-        | 'call' | 'call-result' | 'syscalls' | 'sample' | 'cpu' | 'instructions' | 'watchpoint';
+        | 'call' | 'call-result' | 'syscalls' | 'sample' | 'cpu' | 'instructions' | 'watchpoint'
+        | 'library' | 'allocate' | 'free' | 'write' | 'replay' | 'children' | 'faults' | 'allocations';
 memory : 'memory' ('maps' | 'read' value '--mapping' value
                  ('--count' UINT | '--type' value)
                  | 'scan' value '--mapping' value '--count' UINT
                    '--pattern' value ('--limit' UINT)?
                  | 'patch' '--module' value '--elf-address' value '--mapping' value '--expect' value '--replace' value
-                 | 'restore' UINT
+                 | 'write' value '--mapping' value '--expect' value '--replace' value
+                 | ('restore' | 'allocate' | 'free') UINT
                  | 'monitor-start' '--tid' UINT '--address' value '--size' UINT '--mapping' value ('--timeout' UINT)?
                  | 'monitor-stop'
                  | 'import-hook' '--module' value '--symbol' value '--original' value
@@ -86,12 +89,14 @@ probeReload : 'probe' 'reload' UINT '--callback' value
               ('--watch' (('--timeout' | '--count') UINT)*)?;
 targetLaunch : 'launch' value launchOption* | ('resume' | 'terminate') UINT?;
 launchOption : ('--arg' | '--cwd' | '--env' | '--stdin' | '--stdout' | '--stderr' | '--preload') value
-             | '--timeout' UINT | '--supervise';
+             | '--timeout' UINT | '--supervise' | '--gate-children';
+childList : 'children';
 targetCall : 'call' value ('--arg' value | '--timeout' UINT)* | 'call-result' ('--timeout' UINT)?;
-localPerf : ('syscalls' | 'sample' 'cpu') (('--count' | '--timeout') UINT)*;
-instructions : 'instructions' ('start' instructionOption* | 'stop');
+localPerf : ('syscalls' | 'faults' | 'sample' ('cpu' | 'allocations')) (('--count' | '--timeout') UINT)*;
+targetLibrary : 'library' 'load' value;
+instructions : 'instructions' ('start' instructionOption* | 'stop' ('--save' value)? | 'replay' value);
 instructionOption : ('--tid' | '--size' | '--count' | '--timeout') UINT
-                  | '--memory-size' UINT | '--registers'
+                  | '--memory-size' UINT | '--registers' | '--discover'
                   | ('--address' | '--mapping' | '--callback-library' | '--memory-address') value;
 watchpoint : 'watchpoint' (('--tid' | '--size' | '--count' | '--timeout') UINT
                          | ('--address' | '--mapping' | '--access') value)*;

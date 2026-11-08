@@ -97,9 +97,13 @@ public:
 
     virtual std::any visitLaunchOption(TracerCommandsParser::LaunchOptionContext *context) = 0;
 
+    virtual std::any visitChildList(TracerCommandsParser::ChildListContext *context) = 0;
+
     virtual std::any visitTargetCall(TracerCommandsParser::TargetCallContext *context) = 0;
 
     virtual std::any visitLocalPerf(TracerCommandsParser::LocalPerfContext *context) = 0;
+
+    virtual std::any visitTargetLibrary(TracerCommandsParser::TargetLibraryContext *context) = 0;
 
     virtual std::any visitInstructions(TracerCommandsParser::InstructionsContext *context) = 0;
 

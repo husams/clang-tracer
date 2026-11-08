@@ -82,7 +82,9 @@ public:
       ::tracer::compat::span<const CodePatch> patches,
       const std::function<void()> &verify = {});
   [[nodiscard]] bool retired_code_quiescent(const TracerRetiredCode &code);
-  void remote_free(std::uintptr_t address, std::size_t size);
+  [[nodiscard]] std::uintptr_t remote_map_file(std::string_view path, std::size_t size);
+  void remote_free(std::uintptr_t address, std::size_t size,
+                   const std::function<void()> &verify = {});
 
   [[nodiscard]] std::uintptr_t
   remote_call(std::uintptr_t function,
@@ -109,7 +111,8 @@ private:
   void ensure_usable() const;
   void poison_process() noexcept;
   [[nodiscard]] std::uintptr_t
-  remote_syscall(long number, const std::array<std::uintptr_t, 6> &arguments);
+  remote_syscall(long number, const std::array<std::uintptr_t, 6> &arguments,
+                 const std::function<void()> &verify = {});
   [[nodiscard]] std::uintptr_t
   remote_call_raw(std::uintptr_t function,
                   const std::array<std::uintptr_t, 6> &arguments,

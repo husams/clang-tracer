@@ -123,6 +123,20 @@ public:
     overrides->replacement_set = true;
   }
 
+  // Invokes the original with its entry arguments. Repeated calls return the
+  // first result. The wrapper propagates any original C++ exception to the caller.
+  template <class T = void> T call_original() const {
+    if (context_.phase != TracePhase::Pre || !context_.invoke_original)
+      throw std::logic_error("calling the original requires an opted-in pre() hook");
+    if constexpr (std::is_void_v<T>) {
+      require_type(context_.result, ValueType::Void);
+      context_.invoke_original(context_.original_state);
+    } else {
+      require_type(context_.result, override_type<T>());
+      return ScalarOverrides::unpack<T>(context_.invoke_original(context_.original_state));
+    }
+  }
+
   void replace_with() const {
     replacement_overrides(ValueType::Void)->replacement_set = true;
   }

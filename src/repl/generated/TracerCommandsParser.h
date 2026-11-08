@@ -36,9 +36,11 @@ public:
     T__124 = 125, T__125 = 126, T__126 = 127, T__127 = 128, T__128 = 129,
     T__129 = 130, T__130 = 131, T__131 = 132, T__132 = 133, T__133 = 134,
     T__134 = 135, T__135 = 136, T__136 = 137, T__137 = 138, T__138 = 139,
-    T__139 = 140, T__140 = 141, T__141 = 142, T__142 = 143, UINT = 144,
-    STRING = 145, SHELL = 146, METADATA_ONLY = 147, SQLITE = 148, WORD = 149,
-    WS = 150
+    T__139 = 140, T__140 = 141, T__141 = 142, T__142 = 143, T__143 = 144,
+    T__144 = 145, T__145 = 146, T__146 = 147, T__147 = 148, T__148 = 149,
+    T__149 = 150, T__150 = 151, T__151 = 152, T__152 = 153, T__153 = 154,
+    T__154 = 155, T__155 = 156, UINT = 157, STRING = 158, SHELL = 159, METADATA_ONLY = 160,
+    SQLITE = 161, WORD = 162, WS = 163
   };
 
   enum {
@@ -51,8 +53,9 @@ public:
     RuleCpp = 24, RuleShell = 25, RuleComplete = 26, RuleType = 27, RuleHelp = 28,
     RuleQuit = 29, RuleBulkTrace = 30, RuleBulkTraceOption = 31, RuleValue = 32,
     RuleKeyword = 33, RuleMemory = 34, RuleProbeEntry = 35, RuleProbeReload = 36,
-    RuleTargetLaunch = 37, RuleLaunchOption = 38, RuleTargetCall = 39, RuleLocalPerf = 40,
-    RuleInstructions = 41, RuleInstructionOption = 42, RuleWatchpoint = 43
+    RuleTargetLaunch = 37, RuleLaunchOption = 38, RuleChildList = 39, RuleTargetCall = 40,
+    RuleLocalPerf = 41, RuleTargetLibrary = 42, RuleInstructions = 43, RuleInstructionOption = 44,
+    RuleWatchpoint = 45
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -111,8 +114,10 @@ public:
   class ProbeReloadContext;
   class TargetLaunchContext;
   class LaunchOptionContext;
+  class ChildListContext;
   class TargetCallContext;
   class LocalPerfContext;
+  class TargetLibraryContext;
   class InstructionsContext;
   class InstructionOptionContext;
   class WatchpointContext;
@@ -165,6 +170,8 @@ public:
     LocalPerfContext *localPerf();
     InstructionsContext *instructions();
     WatchpointContext *watchpoint();
+    TargetLibraryContext *targetLibrary();
+    ChildListContext *childList();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -703,6 +710,18 @@ public:
 
   LaunchOptionContext* launchOption();
 
+  class  ChildListContext : public antlr4::ParserRuleContext {
+  public:
+    ChildListContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  ChildListContext* childList();
+
   class  TargetCallContext : public antlr4::ParserRuleContext {
   public:
     TargetCallContext(antlr4::ParserRuleContext *parent, size_t invokingState);
@@ -733,10 +752,24 @@ public:
 
   LocalPerfContext* localPerf();
 
+  class  TargetLibraryContext : public antlr4::ParserRuleContext {
+  public:
+    TargetLibraryContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  TargetLibraryContext* targetLibrary();
+
   class  InstructionsContext : public antlr4::ParserRuleContext {
   public:
     InstructionsContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
+    ValueContext *value();
     std::vector<InstructionOptionContext *> instructionOption();
     InstructionOptionContext* instructionOption(size_t i);
 

@@ -1325,14 +1325,45 @@ bool Process::retired_code_quiescent(const TracerRetiredCode &code) {
   return result;
 }
 
-void Process::remote_free(std::uintptr_t address, std::size_t size) {
+std::uintptr_t Process::remote_map_file(std::string_view path, std::size_t size) {
+  const auto scratch_size = path.size() + 1;
+  const auto scratch = remote_allocate(scratch_size);
+  std::uintptr_t fd = static_cast<std::uintptr_t>(-1);
+  std::uintptr_t address = 0;
+  try {
+    remote_write(scratch, path.data(), path.size()); // mmap supplies the trailing zero.
+    fd = remote_syscall(SYS_openat, {static_cast<std::uintptr_t>(AT_FDCWD), scratch,
+                                    O_RDONLY | O_CLOEXEC, 0, 0, 0});
+    address = remote_syscall(SYS_mmap, {0, size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0});
+    const auto closing = std::exchange(fd, static_cast<std::uintptr_t>(-1));
+    (void)remote_syscall(SYS_close, {closing, 0, 0, 0, 0, 0});
+    remote_free(scratch, scratch_size);
+    return address;
+  } catch (...) {
+    if (!unsafe()) {
+      try {
+        if (address)
+          remote_free(address, size);
+        if (fd != static_cast<std::uintptr_t>(-1))
+          (void)remote_syscall(SYS_close, {fd, 0, 0, 0, 0, 0});
+        remote_free(scratch, scratch_size);
+      } catch (...) {
+        mark_unsafe();
+      }
+    }
+    throw;
+  }
+}
+
+void Process::remote_free(std::uintptr_t address, std::size_t size,
+                          const std::function<void()> &verify) {
   ensure_usable();
   if (address == 0 || size == 0) {
     throw std::invalid_argument(
         "remote_free requires a nonzero address and size");
   }
   const std::array<std::uintptr_t, 6> arguments{address, size, 0, 0, 0, 0};
-  if (remote_syscall(SYS_munmap, arguments) != 0) {
+  if (remote_syscall(SYS_munmap, arguments, verify) != 0) {
     throw std::runtime_error(
         "remote munmap returned an unexpected nonzero result");
   }
@@ -1362,9 +1393,12 @@ std::uintptr_t Process::remote_allocate(std::size_t size) {
 
 std::uintptr_t
 Process::remote_syscall(long number,
-                        const std::array<std::uintptr_t, 6> &arguments) {
+                        const std::array<std::uintptr_t, 6> &arguments,
+                        const std::function<void()> &verify) {
   ensure_usable();
   PeerFreeze peers(*this);
+  if (verify)
+    verify();
   const auto saved = read_registers(tid_);
   const auto saved_signal_mask = read_signal_mask(tid_);
   const auto ip = register_ip(saved.general);

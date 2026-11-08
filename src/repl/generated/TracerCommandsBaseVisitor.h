@@ -171,11 +171,19 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitChildList(TracerCommandsParser::ChildListContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitTargetCall(TracerCommandsParser::TargetCallContext *ctx) override {
     return visitChildren(ctx);
   }
 
   virtual std::any visitLocalPerf(TracerCommandsParser::LocalPerfContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitTargetLibrary(TracerCommandsParser::TargetLibraryContext *ctx) override {
     return visitChildren(ctx);
   }
 

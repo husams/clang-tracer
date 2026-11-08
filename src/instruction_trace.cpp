@@ -77,16 +77,31 @@ api::InstructionTrace Session::start_instruction_trace(
   require_unrestricted_ptrace();
   const auto path = gum_plugin(agent_path_);
   const auto callback_path = callback_library(request.callback_library());
-  const bool extended = request.registers() || !callback_path.empty() || request.memory_size();
+  if (request.discover_calls() && (request.registers() || !callback_path.empty() || request.memory_size()))
+    throw std::invalid_argument("call discovery is a separate capture mode");
+  const bool extended = request.registers() || !callback_path.empty() ||
+                        request.memory_size() || request.discover_calls();
   const auto tid = static_cast<pid_t>(request.tid());
   const auto stat = proc::directory(pid_) / "task" / std::to_string(tid) / "stat";
   const auto thread_start = thread_identity(stat);
-  const auto scratch_size = std::max({path.size() + 1, callback_path.size() + 1, std::size_t{64}});
+  const auto companions = injector::target_runtime_companions(
+      static_cast<pid_t>(pid_), {"libdl.so.2", "libpthread.so.0", "libm.so.6", "libresolv.so.2"});
+  auto scratch_size = std::max({path.size() + 1, callback_path.size() + 1, std::size_t{64}});
+  for (const auto &companion : companions)
+    scratch_size = std::max(scratch_size, companion.size() + 1);
   const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
   injector::Process process;
   std::uintptr_t scratch = 0;
   std::uintptr_t handle = 0;
   std::uintptr_t callback_handle = 0;
+  std::vector<std::uintptr_t> companion_handles;
+  companion_handles.reserve(companions.size());
+  const auto release_companions = [&] {
+    while (!companion_handles.empty()) {
+      close_plugin(process, companion_handles.back());
+      companion_handles.pop_back();
+    }
+  };
   try {
     attach_process(process, deadline, tid);
     scratch = process.remote_allocate(scratch_size);
@@ -96,6 +111,12 @@ api::InstructionTrace Session::start_instruction_trace(
       process.remote_write(scratch, module.c_str(), module.size() + 1);
       return process.remote_call(dlopen, {scratch, RTLD_NOW | RTLD_LOCAL}, 2);
     };
+    for (const auto &companion : companions) {
+      const auto loaded = open(companion);
+      if (!loaded)
+        throw std::runtime_error("cannot load target glibc companion " + companion);
+      companion_handles.push_back(loaded);
+    }
     handle = open(path);
     if (!handle)
       throw std::invalid_argument("target could not load the Gum module and its dependencies");
@@ -103,7 +124,8 @@ api::InstructionTrace Session::start_instruction_trace(
       process.remote_write(scratch, name, std::strlen(name) + 1);
       return process.remote_call(dlsym, {module, scratch}, 2);
     };
-    const auto start = symbol(handle, extended ? "tracer_gum_instruction_start_v2"
+    const auto start = symbol(handle, request.discover_calls() ? "tracer_gum_instruction_start_v3" :
+                                      extended ? "tracer_gum_instruction_start_v2"
                                                 : "tracer_gum_instruction_start_v1");
     const auto stop = symbol(handle, extended ? "tracer_gum_instruction_stop_v2"
                                                : "tracer_gum_instruction_stop_v1");
@@ -116,6 +138,7 @@ api::InstructionTrace Session::start_instruction_trace(
           !(callback = symbol(callback_handle, "tracer_instruction_callback_v1")))
         throw std::invalid_argument("target could not load tracer_instruction_callback_v1 from the library");
     }
+    release_companions();
     std::string live(expected_code.size(), '\0');
     process.remote_read(request.address(), live.data(), live.size());
     if (live != expected_code || thread_identity(stat) != thread_start)
@@ -124,10 +147,12 @@ api::InstructionTrace Session::start_instruction_trace(
     trace.set_tid(request.tid());
     trace.set_address(request.address());
     trace.set_size(request.size());
+    trace.set_discover_calls(request.discover_calls());
     const TracerInstructionRequestV2 options{
         request.address(), request.address() + request.size(), request.memory_address(),
         request.memory_address() + request.memory_size(), callback, request.tid(),
         request.max_records(), request.timeout_seconds(),
+        request.discover_calls() ? std::uint32_t{TRACER_INSTRUCTION_DISCOVER_CALLS} :
         request.registers() ? std::uint32_t{TRACER_INSTRUCTION_REGISTERS} : 0};
     if (extended)
       process.remote_write(scratch, &options, sizeof(options));
@@ -150,6 +175,9 @@ api::InstructionTrace Session::start_instruction_trace(
     process.detach();
     return trace;
   } catch (...) {
+    if (!process.unsafe()) {
+      try { release_companions(); } catch (...) {}
+    }
     if (!process.unsafe() && callback_handle && !instructions_) {
       try { close_plugin(process, callback_handle); } catch (...) {}
     }
@@ -185,7 +213,8 @@ api::InstructionTrace Session::stop_instruction_trace_locked(
   auto &capture = *instructions_;
   auto result = capture.trace;
   TracerInstructionResultV1 collected{};
-  const bool extended = capture.registers || capture.has_callback || capture.memory_size;
+  const bool discover = result.discover_calls();
+  const bool extended = capture.registers || capture.has_callback || capture.memory_size || discover;
   const auto result_size = extended ? sizeof(TracerInstructionResultV2) : sizeof(collected);
   injector::Process process;
   std::uintptr_t scratch = 0;
@@ -209,7 +238,9 @@ api::InstructionTrace Session::stop_instruction_trace_locked(
         throw std::runtime_error("Gum returned a PC outside the requested range");
       const auto pc = result.address() + collected.offsets[i];
       result.add_pcs(pc);
-      if (extended) {
+      if (discover) {
+        result.add_call_targets(details[i].call_target);
+      } else if (extended) {
         const auto &detail = details[i];
         auto *output = result.add_details();
         if (capture.registers) {

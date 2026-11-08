@@ -24,7 +24,7 @@ struct RuntimeEntry {
 // The caller must compare these file bytes to the stopped target before use.
 RuntimeEntry target_runtime_entry(pid_t pid, std::string_view name);
 std::vector<std::string> target_runtime_companions(
-    pid_t pid, const std::vector<std::string> &agent_dependencies);
+    pid_t pid, const std::vector<std::string> &dependencies);
 
 namespace detail {
 struct ApprovedModuleIdentity;

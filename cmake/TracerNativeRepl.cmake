@@ -70,8 +70,9 @@ function(tracer_add_native_repl)
   target_link_libraries(tracer_repl_rpc PUBLIC gRPC::grpc++ protobuf::libprotobuf)
   add_library(tracer_repl_client STATIC "${_repl}/controller.cpp" "${_repl}/server_process.cpp" "${_repl}/owned_target.cpp" "${_repl}/local_perf.cpp" "${_repl}/events.cpp" "${_repl}/background_events.cpp")
   target_include_directories(tracer_repl_client PUBLIC "${_repl}")
+  target_include_directories(tracer_repl_client SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
   target_link_libraries(tracer_repl_client PUBLIC tracer_repl_rpc tracer_repl_commands Threads::Threads
-    PRIVATE SQLite::SQLite3)
+    PRIVATE SQLite::SQLite3 LLVM)
   target_compile_options(tracer_repl_client PRIVATE -Wall -Wextra -Wpedantic)
   include(CheckCXXSourceCompiles)
   set(_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
@@ -258,6 +259,17 @@ function(tracer_add_native_repl)
         set_tests_properties(native_repl_local_perf_${mode} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
       endforeach()
       if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        add_executable(repl-remaining-target tests/fixtures/repl_remaining.cpp)
+        target_include_directories(repl-remaining-target PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_compile_options(repl-remaining-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
+        target_link_libraries(repl-remaining-target PRIVATE Threads::Threads)
+        add_library(repl-remaining-library SHARED tests/fixtures/repl_remaining_library.cpp)
+        add_test(NAME native_repl_remaining_integration
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_remaining_integration.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-remaining-target>
+            $<TARGET_FILE:repl-remaining-library> $<TARGET_FILE:clang_tracer_launch_preload>)
+        set_tests_properties(native_repl_remaining_integration PROPERTIES TIMEOUT 150)
         add_executable(repl-overrides-target tests/fixtures/repl_overrides.cpp)
         target_include_directories(repl-overrides-target PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
         target_compile_options(repl-overrides-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)

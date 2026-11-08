@@ -55,15 +55,20 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"server stop", K::server_stop},
                                         {"attach", K::attach},
                                         {"launch", K::launch},
+                                        {"children", K::children},
                                         {"resume", K::resume},
                                         {"terminate", K::terminate},
                                         {"call", K::target_call},
                                         {"call-result", K::target_call_result},
                                         {"syscalls", K::syscalls},
                                         {"sample cpu", K::sample_cpu},
+                                        {"sample allocations", K::sample_allocations},
+                                        {"faults", K::faults},
                                         {"watchpoint", K::watchpoint},
                                         {"instructions start", K::instructions_start},
                                         {"instructions stop", K::instructions_stop},
+                                        {"instructions replay", K::instructions_replay},
+                                        {"library load", K::library_load},
                                         {"processes", K::processes},
                                         {"sessions", K::sessions},
                                         {"use", K::use},
@@ -76,6 +81,9 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"memory read", K::memory_read},
                                         {"memory scan", K::memory_scan},
                                         {"memory patch", K::memory_patch},
+                                        {"memory write", K::memory_write},
+                                        {"memory allocate", K::memory_allocate},
+                                        {"memory free", K::memory_free},
                                         {"memory restore", K::memory_restore},
                                         {"memory import-hook", K::memory_import_hook},
                                         {"memory monitor-start", K::page_monitor_start},
@@ -146,7 +154,8 @@ public:
     const std::set<std::string> flags = {
         "--all", "--metadata-only", "--print-arguments", "--print-result",
         "--details", "--addresses", "--sqlite", "--allow-arg-overrides", "--allow-result-override",
-        "--registers", "--watch", "--supervise", "--allow-replacement", "--reclaimable"};
+        "--registers", "--discover", "--watch", "--supervise", "--gate-children", "--allow-replacement", "--allow-call-original",
+        "--trace-exceptions", "--reclaimable"};
     const std::set<std::string> repeated = {"--include", "--compile-option",
                                            "--name", "--type", "--arg", "--env"};
     const std::set<std::string> bulk_repeated = {"--module", "--exclude", "--exact"};
@@ -311,6 +320,7 @@ Command parse_command(const std::string &input) {
   if (command.kind == K::modules && command.has("--elf") && command.option("--elf").empty())
     throw std::invalid_argument("--elf requires an exact mapped path");
   if (command.kind == K::syscalls || command.kind == K::sample_cpu ||
+      command.kind == K::sample_allocations || command.kind == K::faults ||
       command.kind == K::watchpoint) {
     if (command.number("--timeout", 0) > max_local_perf_seconds)
       throw std::invalid_argument("local perf capture timeout is capped at 60 seconds");

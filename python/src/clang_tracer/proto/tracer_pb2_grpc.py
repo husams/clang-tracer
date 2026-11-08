@@ -85,6 +85,21 @@ class TracerStub(object):
                 request_serializer=tracer__pb2.ListMemoryMappingsRequest.SerializeToString,
                 response_deserializer=tracer__pb2.ListMemoryMappingsResponse.FromString,
                 _registered_method=True)
+        self.AllocateMemory = channel.unary_unary(
+                '/clangtracer.v1.Tracer/AllocateMemory',
+                request_serializer=tracer__pb2.AllocateMemoryRequest.SerializeToString,
+                response_deserializer=tracer__pb2.MemoryAllocation.FromString,
+                _registered_method=True)
+        self.FreeMemory = channel.unary_unary(
+                '/clangtracer.v1.Tracer/FreeMemory',
+                request_serializer=tracer__pb2.FreeMemoryRequest.SerializeToString,
+                response_deserializer=tracer__pb2.MemoryAllocation.FromString,
+                _registered_method=True)
+        self.LoadTargetLibrary = channel.unary_unary(
+                '/clangtracer.v1.Tracer/LoadTargetLibrary',
+                request_serializer=tracer__pb2.LoadTargetLibraryRequest.SerializeToString,
+                response_deserializer=tracer__pb2.TargetLibrary.FromString,
+                _registered_method=True)
         self.ReadMemory = channel.unary_unary(
                 '/clangtracer.v1.Tracer/ReadMemory',
                 request_serializer=tracer__pb2.ReadMemoryRequest.SerializeToString,
@@ -232,6 +247,24 @@ class TracerServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def ListMemoryMappings(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AllocateMemory(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def FreeMemory(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def LoadTargetLibrary(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -392,6 +425,21 @@ def add_TracerServicer_to_server(servicer, server):
                     servicer.ListMemoryMappings,
                     request_deserializer=tracer__pb2.ListMemoryMappingsRequest.FromString,
                     response_serializer=tracer__pb2.ListMemoryMappingsResponse.SerializeToString,
+            ),
+            'AllocateMemory': grpc.unary_unary_rpc_method_handler(
+                    servicer.AllocateMemory,
+                    request_deserializer=tracer__pb2.AllocateMemoryRequest.FromString,
+                    response_serializer=tracer__pb2.MemoryAllocation.SerializeToString,
+            ),
+            'FreeMemory': grpc.unary_unary_rpc_method_handler(
+                    servicer.FreeMemory,
+                    request_deserializer=tracer__pb2.FreeMemoryRequest.FromString,
+                    response_serializer=tracer__pb2.MemoryAllocation.SerializeToString,
+            ),
+            'LoadTargetLibrary': grpc.unary_unary_rpc_method_handler(
+                    servicer.LoadTargetLibrary,
+                    request_deserializer=tracer__pb2.LoadTargetLibraryRequest.FromString,
+                    response_serializer=tracer__pb2.TargetLibrary.SerializeToString,
             ),
             'ReadMemory': grpc.unary_unary_rpc_method_handler(
                     servicer.ReadMemory,
@@ -750,6 +798,87 @@ class Tracer(object):
             '/clangtracer.v1.Tracer/ListMemoryMappings',
             tracer__pb2.ListMemoryMappingsRequest.SerializeToString,
             tracer__pb2.ListMemoryMappingsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AllocateMemory(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/AllocateMemory',
+            tracer__pb2.AllocateMemoryRequest.SerializeToString,
+            tracer__pb2.MemoryAllocation.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def FreeMemory(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/FreeMemory',
+            tracer__pb2.FreeMemoryRequest.SerializeToString,
+            tracer__pb2.MemoryAllocation.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def LoadTargetLibrary(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/LoadTargetLibrary',
+            tracer__pb2.LoadTargetLibraryRequest.SerializeToString,
+            tracer__pb2.TargetLibrary.FromString,
             options,
             channel_credentials,
             insecure,

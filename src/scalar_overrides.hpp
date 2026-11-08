@@ -5,7 +5,7 @@
 namespace tracer {
 inline bool has_scalar_overrides(const clangtracer::v1::ProbeSpec &spec) {
   return spec.allow_argument_overrides() || spec.allow_result_override() ||
-         spec.allow_replacement();
+         spec.allow_replacement() || spec.allow_call_original();
 }
 
 inline const char *scalar_override_error(const clangtracer::v1::ProbeSpec &spec) {
@@ -27,6 +27,8 @@ inline const char *scalar_override_error(const clangtracer::v1::ProbeSpec &spec)
     if (!scalar(signature.arguments(i)) || debug.arguments(i).is_reference() ||
         debug.arguments(i).is_object_value())
       return "scalar overrides require an entirely scalar signature";
+  if (spec.allow_call_original() && (spec.allow_argument_overrides() || spec.allow_replacement()))
+    return "calling the original cannot be combined with argument overrides or replacement";
   if (spec.allow_argument_overrides() && signature.arguments().empty())
     return "argument overrides require at least one argument";
   if (spec.allow_result_override() && signature.result() == api::VOID)

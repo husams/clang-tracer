@@ -627,6 +627,8 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     record.value.set_allow_argument_overrides(spec.allow_argument_overrides());
     record.value.set_allow_result_override(spec.allow_result_override());
     record.value.set_allow_replacement(spec.allow_replacement());
+    record.value.set_allow_call_original(spec.allow_call_original());
+    record.value.set_trace_exceptions(spec.trace_exceptions());
     record.reload_spec.CopyFrom(spec);
     record.reload_spec.clear_callback_source();
     auto [it, inserted] = probes_.emplace(probe_id, std::move(record));
@@ -1370,6 +1372,8 @@ void Session::detach() {
       release_request_locked(probe, std::chrono::steady_clock::now() +
                                         operation_timeout_);
   }
+  for (auto &allocation : allocations_)
+    free_memory_locked(allocation, std::chrono::steady_clock::now() + operation_timeout_);
   state_ = clangtracer::v1::Session::DETACHED;
   application_modules_.clear();
   error_.clear();
@@ -1429,6 +1433,18 @@ void Session::shutdown() noexcept {
         first_error = error.what();
       if (unsafe_target_)
         break;
+    }
+  }
+  if (!unsafe_target_) {
+    for (auto &allocation : allocations_) {
+      try {
+        free_memory_locked(allocation, shutdown_deadline);
+      } catch (const std::exception &error) {
+        if (first_error.empty())
+          first_error = error.what();
+        if (unsafe_target_)
+          break;
+      }
     }
   }
   const bool any_active =

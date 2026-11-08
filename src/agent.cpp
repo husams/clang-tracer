@@ -2,6 +2,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <bits/cxxabi_forced.h>
 #include <chrono>
 #include <cctype>
 #include <condition_variable>
@@ -310,7 +311,7 @@ extern "C" void tracer_capture_entry_stack(const tracer::TraceContext *,
                                            unsigned) noexcept;
 extern "C" long long tracer_callback_dispatch(unsigned long long,
                                               const tracer::TraceContext *,
-                                              void *) noexcept;
+                                              void *);
 extern "C" bool tracer_callback_lifecycle_enter(unsigned long long) noexcept;
 extern "C" void tracer_callback_cleanup_enter() noexcept;
 extern "C" void tracer_callback_lifecycle_leave() noexcept;
@@ -2351,7 +2352,9 @@ std::string make_wrapper(const tracer::Request &r,
   const bool override_arguments = spec && spec->allow_argument_overrides();
   const bool override_result = spec && spec->allow_result_override();
   const bool replace = spec && spec->allow_replacement();
-  const bool overrides = override_arguments || override_result || replace;
+  const bool callable_original = spec && spec->allow_call_original();
+  const bool trace_exceptions = spec && spec->trace_exceptions();
+  const bool overrides = override_arguments || override_result || replace || callable_original;
   const auto indirect_argument = [&](unsigned i) {
     return typed && r.arguments[i] == tracer::ValueType::Object &&
            spec->debug_info().arguments(i).object_type().record_pass_by_reference();
@@ -2381,7 +2384,7 @@ std::string make_wrapper(const tracer::Request &r,
   };
   std::string code = (snapshots ? snapshots->declarations : std::string()) +
       "extern \"C\" long long tracer_callback_dispatch(unsigned long "
-      "long,const tracer::TraceContext*,void*) noexcept;\nextern \"C\" void "
+      "long,const tracer::TraceContext*,void*);\nextern \"C\" void "
       "tracer_event_dispatch(unsigned long long,const "
       "tracer::TraceContext*,long long) noexcept;\nextern \"C\" void "
       "tracer_probe_enter(unsigned long long) noexcept;\nextern \"C\" void "
@@ -2396,9 +2399,14 @@ std::string make_wrapper(const tracer::Request &r,
       "extern \"C\" void tracer_capture_stack(const "
       "tracer::TraceContext*,unsigned,bool) noexcept;\n";
   code += "extern \"C\" void tracer_context_check_entry();\n";
+  if (shared_mode || trace_exceptions || callable_original)
+    code += "#include <bits/cxxabi_forced.h>\n";
+  if (callable_original)
+    code += "#include <exception>\n#include <cerrno>\n"
+            "extern \"C\" unsigned tracer_swap_callback_depth(unsigned) noexcept;\n"
+            "extern \"C\" unsigned long long tracer_original_entry_time() noexcept;\n";
   if (shared_mode)
-    code += "#include <bits/cxxabi_forced.h>\n"
-            "extern \"C\" void* tracer_shared_enter(unsigned long long,const "
+    code += "extern \"C\" void* tracer_shared_enter(unsigned long long,const "
             "tracer::TraceContext*);\n"
             "extern \"C\" void tracer_shared_leave(void*) noexcept;\n"
             "extern \"C\" void tracer_shared_release(void*) noexcept;\n"
@@ -2500,35 +2508,7 @@ std::string make_wrapper(const tracer::Request &r,
   if (spec && spec->stack_depth())
     code += "tracer_capture_entry_stack(&ctx," +
             std::to_string(spec->stack_depth()) + ");\n";
-  if (shared_mode) {
-    code += "struct SharedGuard { void* token=nullptr; ~SharedGuard() noexcept "
-            "{ if(token){tracer_shared_leave(token); tracer_shared_release(token);} } } "
-            "shared_guard;\n"
-            "shared_guard.token=tracer_shared_enter(" +
-            std::to_string(r.probe_id) +
-            "ULL,&ctx);\ntry { tracer_shared_resume(shared_guard.token);\n";
-  } else if (class_mode)
-    code += "tracer_invocation_instance tracer_invocation(ctx);\n";
-  const std::string instance = class_mode ? "&tracer_invocation" : "nullptr";
-  if (has_pre) {
-    if (shared_mode)
-      code += "tracer_shared_dispatch(shared_guard.token,&ctx);\n";
-    else
-      code += "(void)tracer_callback_dispatch(" + std::to_string(r.probe_id) +
-              "ULL,&ctx," + instance + ");\n";
-  }
-  if (override_arguments) {
-    for (unsigned i = 0; i < r.argument_count; ++i) {
-      const auto index = std::to_string(i);
-      const auto argument = "a" + index;
-      code += "if (overrides.argument_mask & (1u<<" + index + ")) { " +
-              argument + "=tracer::ScalarOverrides::unpack<decltype(" + argument +
-              ")>(overrides.arguments[" + index + "]);\n";
-      fill_value(code, i, r.arguments[i], false);
-      code += "}\n";
-    }
-  }
-  code += "auto original=reinterpret_cast<Original>(" +
+  const auto original_declaration = "auto original=reinterpret_cast<Original>(" +
           std::to_string(original_trampoline) + "ULL);\n";
   std::string call = result_sret ? "original(result_slot" : "original(";
   comma = result_sret;
@@ -2548,6 +2528,79 @@ std::string make_wrapper(const tracer::Request &r,
     comma = true;
   }
   call += ")";
+  if (callable_original) {
+    code += original_declaration;
+    code += "ctx.result.type=static_cast<tracer::ValueType>(" +
+            std::to_string(static_cast<unsigned>(r.result)) + ");\n"
+            "bool original_called=false; uint64_t original_bits=0; "
+            "std::exception_ptr original_failure; "
+            "const int entry_errno=errno; int original_errno=entry_errno; "
+            "ctx.original_entry_time_ns=tracer_original_entry_time();\n"
+            "auto early_original = [&]() -> uint64_t { "
+            "if (!original_called) { original_called=true; "
+            "struct OriginalScope { unsigned depth; int error; "
+            "~OriginalScope() { tracer_swap_callback_depth(depth); errno=error; } }; "
+            "OriginalScope scope{tracer_swap_callback_depth(0), errno}; errno=entry_errno; "
+            "try { ";
+    if (r.result == tracer::ValueType::Void)
+      code += call + "; ";
+    else
+      code += "original_bits=tracer::ScalarOverrides::pack(" + call + "); ";
+    code += "} catch (const __cxxabiv1::__forced_unwind&) { throw; } "
+            "catch (...) { original_failure=std::current_exception(); } "
+            "original_errno=errno; } "
+            "if (original_failure) std::rethrow_exception(original_failure); "
+            "return original_bits; };\n"
+            "ctx.original_state=&early_original; "
+            "ctx.invoke_original=+[](void* state) -> uint64_t { "
+            "return (*static_cast<decltype(early_original)*>(state))(); };\n"
+            "auto run_original = [&]() -> " + result_type() + " { "
+            "if (!original_called) return " + call + "; "
+            "errno=original_errno; if (original_failure) std::rethrow_exception(original_failure); ";
+    if (r.result != tracer::ValueType::Void)
+      code += "return tracer::ScalarOverrides::unpack<" + result_type() + ">(original_bits); ";
+    code += "};\n";
+    call = "run_original()";
+  }
+  if (shared_mode) {
+    code += "struct SharedGuard { void* token=nullptr; ~SharedGuard() noexcept "
+            "{ if(token){tracer_shared_leave(token); tracer_shared_release(token);} } } "
+            "shared_guard;\n"
+            "shared_guard.token=tracer_shared_enter(" +
+            std::to_string(r.probe_id) +
+            "ULL,&ctx);\ntry { tracer_shared_resume(shared_guard.token);\n";
+  } else if (class_mode)
+    code += "tracer_invocation_instance tracer_invocation(ctx);\n";
+  const std::string instance = class_mode ? "&tracer_invocation" : "nullptr";
+  if (has_pre) {
+    if (shared_mode)
+      code += "tracer_shared_dispatch(shared_guard.token,&ctx);\n";
+    else
+      code += "(void)tracer_callback_dispatch(" + std::to_string(r.probe_id) +
+              "ULL,&ctx," + instance + ");\n";
+  }
+  if (callable_original)
+    code += "ctx.invoke_original=nullptr; ctx.original_state=nullptr;\n";
+  if (override_arguments) {
+    for (unsigned i = 0; i < r.argument_count; ++i) {
+      const auto index = std::to_string(i);
+      const auto argument = "a" + index;
+      code += "if (overrides.argument_mask & (1u<<" + index + ")) { " +
+              argument + "=tracer::ScalarOverrides::unpack<decltype(" + argument +
+              ")>(overrides.arguments[" + index + "]);\n";
+      fill_value(code, i, r.arguments[i], false);
+      code += "}\n";
+    }
+  }
+  if (!callable_original)
+    code += original_declaration;
+  if (trace_exceptions) {
+    code += "auto report_original = [&]() -> decltype(auto) { try { return " + call +
+            "; } catch (const __cxxabiv1::__forced_unwind&) { throw; } catch (...) { "
+            "ctx.phase=tracer::TracePhase::Exception; tracer_event_dispatch(" +
+            std::to_string(r.probe_id) + "ULL,&ctx,0); throw; } };\n";
+    call = "report_original()";
+  }
   if (shared_mode && r.result != tracer::ValueType::Void)
     if (r.result != tracer::ValueType::Object)
       code += result_type() + " result;\n";
@@ -4108,6 +4161,15 @@ bool bind_probe_symbols(clang::Interpreter &interpreter,
         llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
   };
   bind("tracer_callback_dispatch", &tracer_callback_dispatch);
+  bind("tracer_swap_callback_depth", +[](unsigned depth) noexcept {
+    return std::exchange(callback_depth, depth);
+  });
+  bind("tracer_original_entry_time", +[]() noexcept -> unsigned long long {
+    timespec now{};
+    if (::clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+      return 0;
+    return static_cast<unsigned long long>(now.tv_sec) * 1000000000ULL + now.tv_nsec;
+  });
   bind("tracer_context_check_entry", &tracer_context_check_entry);
   bind("tracer_shared_enter", &tracer_shared_enter);
   bind("tracer_shared_leave", &tracer_shared_leave);
@@ -4601,10 +4663,11 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   if (shape_valid) {
     if (overrides &&
         (!shape.class_mode ||
-         ((specification.allow_argument_overrides() || specification.allow_replacement()) &&
+         ((specification.allow_argument_overrides() || specification.allow_replacement() ||
+           specification.allow_call_original()) &&
           !shape.has_pre) ||
          (specification.allow_result_override() && !shape.has_post))) {
-      error = "scalar mutation requires an Interceptor with pre() for arguments or replacement and post() for results";
+      error = "scalar control requires an Interceptor with pre() for arguments, replacement or calling the original and post() for result overrides";
       return false;
     }
     if (!validate_specialized_signature(user_ast->getASTContext(), shape,
@@ -4922,7 +4985,7 @@ tracer_next_call_id(unsigned long long id) noexcept {
 
 extern "C" long long tracer_callback_dispatch(unsigned long long id,
                                               const tracer::TraceContext *ctx,
-                                              void *instance) noexcept {
+                                              void *instance) {
   auto *p = find_probe(id);
   if (!p || !ctx || !p->callbacks_active() ||
       !p->callback_enabled.load(std::memory_order_relaxed) || callback_depth) {
@@ -4948,6 +5011,9 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
         i < p->argument_names.size() ? p->argument_names[i].c_str() : nullptr;
   try {
     value = p->callback(&invocation, instance, &succeeded);
+  } catch (const __cxxabiv1::__forced_unwind &) {
+    --callback_depth;
+    throw;
   } catch (...) {
     succeeded = false;
     // Class adapters disable only their failed invocation. Legacy callbacks
@@ -5026,15 +5092,15 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
     event.set_protocol_version(tracer::kProtocolVersion);
     event.set_session_id(p->session_id);
     event.set_probe_id(id);
-    event.set_phase(ctx->phase == tracer::TracePhase::Pre
-                        ? clangtracer::v1::PRE
-                        : clangtracer::v1::POST);
+    event.set_phase(static_cast<clangtracer::v1::TracePhase>(ctx->phase));
     event.set_call_id(ctx->call_id);
     event.set_pid(static_cast<std::uint32_t>(::getpid()));
     event.set_tid(static_cast<std::uint32_t>(::syscall(SYS_gettid)));
     event.set_probe_sequence(sequence);
     timespec now{};
-    if (::clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+    if (ctx->phase == tracer::TracePhase::Pre && ctx->original_entry_time_ns) {
+      event.set_monotonic_time_ns(ctx->original_entry_time_ns);
+    } else if (::clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
       event.set_monotonic_time_ns(
           static_cast<std::uint64_t>(now.tv_sec) * 1000000000ULL + now.tv_nsec);
     }

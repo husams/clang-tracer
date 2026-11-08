@@ -26,6 +26,7 @@
 #include <cerrno>
 #include <spawn.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <system_error>
 
 #include <grpcpp/grpcpp.h>
@@ -591,6 +592,7 @@ void Controller::launch(const Command &command) {
   options.error = command.option("--stderr");
   options.preload = command.option("--preload");
   options.supervise = command.has("--supervise");
+  options.gate_children = command.has("--gate-children");
   if (command.has("--arg"))
     options.arguments = command.options.at("--arg");
   if (command.has("--env"))
@@ -641,8 +643,17 @@ void Controller::control_target(const Command &command) {
                        ? selected_.pid
                        : static_cast<std::uint32_t>(unsigned_number(command.arguments[0], "PID", INT32_MAX));
   const auto found = owned_targets_.find(pid);
-  if (found == owned_targets_.end())
+  if (found == owned_targets_.end()) {
+    if (command.kind == CommandKind::resume) {
+      for (const auto &entry : owned_targets_) {
+        if (entry.second.process->resume_child(pid)) {
+          out_ << "resumed child pid=" << pid << '\n';
+          return;
+        }
+      }
+    }
     throw std::runtime_error("specify a PID launched by this REPL or select its session");
+  }
   auto &owned = found->second;
   if (command.kind == CommandKind::resume) {
     require_idle_target(owned.session);
@@ -829,7 +840,8 @@ std::uint64_t Controller::inject(const SessionHandle &session,
   const bool override_arguments = options.has("--allow-arg-overrides");
   const bool override_result = options.has("--allow-result-override");
   const bool replacement = options.has("--allow-replacement");
-  require_session(session, override_arguments || override_result || replacement);
+  const bool call_original = options.has("--allow-call-original");
+  require_session(session, override_arguments || override_result || replacement || call_original);
   const auto resolve_started = std::chrono::steady_clock::now();
   auto spec = resolve_for(session, selector, options);
   const auto resolve_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -842,6 +854,8 @@ std::uint64_t Controller::inject(const SessionHandle &session,
   spec.set_allow_argument_overrides(override_arguments);
   spec.set_allow_result_override(override_result);
   spec.set_allow_replacement(replacement);
+  spec.set_allow_call_original(call_original);
+  spec.set_trace_exceptions(options.has("--trace-exceptions"));
   spec.set_reclaimable(options.has("--reclaimable"));
   api::AddProbeRequest request;
   request.set_session_id(session.id);
@@ -1070,8 +1084,9 @@ RecordResult Controller::record(const std::string &path,
     throw std::invalid_argument("SQLite recording requires a persistent file path");
   if (options.session && options.all_sessions)
     throw std::invalid_argument("recording session conflicts with all_sessions");
-  if (!options.phase.empty() && options.phase != "PRE" && options.phase != "POST")
-    throw std::invalid_argument("recording phase must be PRE or POST");
+  if (!options.phase.empty() && options.phase != "PRE" && options.phase != "POST" &&
+      options.phase != "EXCEPTION")
+    throw std::invalid_argument("recording phase must be PRE, POST or EXCEPTION");
   if (options.timeout_seconds > 86400)
     throw std::invalid_argument("recording timeout must be at most 86400 seconds");
 
@@ -1451,6 +1466,11 @@ bool Controller::execute(const Command &command) {
   case K::launch:
     launch(command);
     return true;
+  case K::children:
+    for (const auto &entry : owned_targets_)
+      for (const auto pid : entry.second.process->children())
+        out_ << "gated child pid=" << pid << " owner=" << entry.first << '\n';
+    return true;
   case K::resume:
   case K::terminate:
     control_target(command);
@@ -1461,11 +1481,17 @@ bool Controller::execute(const Command &command) {
     return true;
   case K::syscalls:
   case K::watchpoint:
+  case K::faults:
+  case K::sample_allocations:
   case K::sample_cpu: {
     if (!server_.running() || endpoint_ != server_.endpoint())
       throw std::runtime_error("local perf capture requires the REPL's owned local server");
     const auto start = require_session(selected_);
     auto mode = command.kind == K::syscalls ? LocalPerfMode::syscalls : LocalPerfMode::cpu;
+    if (command.kind == K::faults)
+      mode = LocalPerfMode::faults;
+    if (command.kind == K::sample_allocations)
+      mode = LocalPerfMode::allocations;
     Watchpoint watch{};
     if (command.kind == K::watchpoint) {
       mode = LocalPerfMode::watchpoint;
@@ -1641,6 +1667,7 @@ bool Controller::execute(const Command &command) {
     request.set_max_records(command.number("--count", 256));
     request.set_timeout_seconds(command.number("--timeout", 5));
     request.set_registers(command.has("--registers"));
+    request.set_discover_calls(command.has("--discover"));
     request.set_callback_library(command.option("--callback-library"));
     if (command.has("--memory-address")) {
       request.set_memory_address(address_number(command.option("--memory-address")));
@@ -1687,29 +1714,88 @@ bool Controller::execute(const Command &command) {
     }
     return true;
   }
+  case K::instructions_replay:
   case K::instructions_stop: {
-    require_session(selected_);
-    if (!server_.running())
-      throw std::runtime_error("instruction tracing requires the REPL's owned local server");
-    api::StopInstructionTraceRequest request;
-    request.set_session_id(selected_.id);
-    const auto result = unary<api::InstructionTrace>(
-        [&](auto &c, auto &r) { return stub_->StopInstructionTrace(&c, request, &r); },
-        settings_.timeout_seconds);
-    if (result.reason() == api::InstructionTrace::RUNNING ||
+    constexpr std::uint64_t magic = 0x3145434152545443ULL; // CTTRACE1
+    constexpr std::size_t max_bytes = 4 * 1024 * 1024;
+    api::InstructionRecording recording;
+    if (command.kind == K::instructions_replay) {
+      const int fd = ::open(args.at(0).c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+      if (fd < 0)
+        throw std::system_error(errno, std::generic_category(), "open instruction recording");
+      google::protobuf::io::FileInputStream input(fd);
+      input.SetCloseOnDelete(true);
+      struct stat status {};
+      if (::fstat(fd, &status) < 0 || !S_ISREG(status.st_mode) || status.st_size <= 0 ||
+          static_cast<std::uint64_t>(status.st_size) > max_bytes)
+        throw std::invalid_argument("instruction recording must be a regular file up to 4 MiB");
+      google::protobuf::io::CodedInputStream bytes(&input);
+      bytes.SetTotalBytesLimit(max_bytes);
+      const auto end = bytes.PushLimit(static_cast<int>(status.st_size));
+      if (!recording.ParseFromCodedStream(&bytes) || !bytes.ConsumedEntireMessage() ||
+          bytes.BytesUntilLimit() != 0)
+        throw std::invalid_argument("invalid instruction recording");
+      bytes.PopLimit(end);
+      if (recording.magic() != magic || recording.version() != 1 || !recording.has_trace())
+        throw std::invalid_argument("unsupported instruction recording format");
+    } else {
+      require_session(selected_);
+      if (!server_.running())
+        throw std::runtime_error("instruction tracing requires the REPL's owned local server");
+      api::StopInstructionTraceRequest request;
+      request.set_session_id(selected_.id);
+      *recording.mutable_trace() = unary<api::InstructionTrace>(
+          [&](auto &c, auto &r) { return stub_->StopInstructionTrace(&c, request, &r); },
+          settings_.timeout_seconds);
+    }
+    const auto &result = recording.trace();
+    if (!result.tid() || !result.address() || !result.size() ||
+        result.size() > TRACER_INSTRUCTION_MAX_BYTES ||
+        result.reason() < api::InstructionTrace::STOPPED || result.reason() > api::InstructionTrace::TIMEOUT ||
         result.pcs_size() > TRACER_INSTRUCTION_MAX_RECORDS ||
+        (result.discover_calls() ? result.call_targets_size() != result.pcs_size() || result.details_size()
+                                 : result.call_targets_size() != 0) ||
         (result.details_size() && result.details_size() != result.pcs_size()))
       throw std::runtime_error("invalid instruction capture response");
+    for (const auto pc : result.pcs())
+      if (pc < result.address() || pc - result.address() >= result.size())
+        throw std::runtime_error("instruction capture PC outside its range");
+    for (const auto &detail : result.details())
+      if ((detail.registers_size() && detail.registers_size() != TRACER_INSTRUCTION_REGISTER_COUNT) ||
+          (detail.memory_size() && (detail.memory_size() > 8 || detail.memory_access() < 1 ||
+                                    detail.memory_access() > 3)))
+        throw std::runtime_error("invalid instruction capture detail");
+    if (command.has("--save")) {
+      recording.set_magic(magic);
+      recording.set_version(1);
+      const auto path = command.option("--save");
+      if (recording.ByteSizeLong() > max_bytes)
+        throw std::runtime_error("instruction recording exceeds 4 MiB");
+      const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+      if (fd < 0)
+        throw std::system_error(errno, std::generic_category(), "create instruction recording");
+      const bool written = recording.SerializeToFileDescriptor(fd);
+      const bool closed = ::close(fd) == 0;
+      if (!written || !closed) {
+        ::unlink(path.c_str());
+        throw std::runtime_error("could not write instruction recording");
+      }
+    }
     constexpr const char *registers[] = {
         "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
         "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
     static_assert(std::size(registers) == TRACER_INSTRUCTION_REGISTER_COUNT);
+    std::map<std::uint64_t, unsigned> targets;
     for (int i = 0; i < result.pcs_size(); ++i) {
+      if (result.discover_calls()) {
+        const auto target = result.call_targets(i);
+        ++targets[target];
+        out_ << "call pc=0x" << std::hex << result.pcs(i) << " target=0x" << target << std::dec << '\n';
+        continue;
+      }
       out_ << "instruction pc=0x" << std::hex << result.pcs(i);
       if (result.details_size()) {
         const auto &detail = result.details(i);
-        if (detail.registers_size() && detail.registers_size() != TRACER_INSTRUCTION_REGISTER_COUNT)
-          throw std::runtime_error("invalid instruction register snapshot");
         for (int j = 0; j < detail.registers_size(); ++j)
           out_ << ' ' << registers[j] << "=0x" << detail.registers(j);
         if (detail.has_callback_value())
@@ -1723,6 +1809,8 @@ bool Controller::execute(const Command &command) {
       }
       out_ << std::dec << '\n';
     }
+    for (const auto &[target, count] : targets)
+      out_ << "discovered target=0x" << std::hex << target << std::dec << " calls=" << count << '\n';
     out_ << "instructions stopped tid=" << result.tid() << " count=" << result.pcs_size()
          << " reason=" << api::InstructionTrace::Reason_Name(result.reason())
          << " truncated=" << (result.reason() == api::InstructionTrace::LIMIT ? "true" : "false")
@@ -1751,6 +1839,45 @@ bool Controller::execute(const Command &command) {
       print_memory_dump(out_, request.address(), response.data());
     return true;
   }
+  case K::library_load:
+  case K::memory_allocate:
+  case K::memory_free: {
+    if (!server_.running() || endpoint_ != server_.endpoint())
+      throw std::runtime_error("target mutation requires the REPL's owned local server");
+    require_idle_target(selected_);
+    require_session(selected_);
+    if (command.kind == K::library_load) {
+      api::LoadTargetLibraryRequest request;
+      request.set_session_id(selected_.id);
+      request.set_path(std::filesystem::absolute(args.at(0)).string());
+      const auto result = unary<api::TargetLibrary>(
+          [&](auto &c, auto &r) { return stub_->LoadTargetLibrary(&c, request, &r); },
+          settings_.timeout_seconds);
+      out_ << "library loaded path=" << result.path() << " lifetime=target-process\n";
+      return true;
+    }
+    api::MemoryAllocation result;
+    if (command.kind == K::memory_allocate) {
+      api::AllocateMemoryRequest request;
+      request.set_session_id(selected_.id);
+      request.set_size(unsigned_number(args.at(0), "allocation size", 1048576));
+      result = unary<api::MemoryAllocation>(
+          [&](auto &c, auto &r) { return stub_->AllocateMemory(&c, request, &r); },
+          settings_.timeout_seconds);
+    } else {
+      api::FreeMemoryRequest request;
+      request.set_session_id(selected_.id);
+      request.set_allocation_id(unsigned_number(args.at(0), "allocation ID"));
+      result = unary<api::MemoryAllocation>(
+          [&](auto &c, auto &r) { return stub_->FreeMemory(&c, request, &r); },
+          settings_.timeout_seconds);
+    }
+    out_ << "memory allocation=" << result.id() << " address=0x" << std::hex
+         << result.address() << std::dec << " size=" << result.size()
+         << " freed=" << (result.freed() ? "true" : "false") << '\n';
+    return true;
+  }
+  case K::memory_write:
   case K::memory_patch:
   case K::memory_import_hook:
   case K::memory_restore: {
@@ -1784,10 +1911,17 @@ bool Controller::execute(const Command &command) {
             throw std::invalid_argument("memory patch bytes cannot use wildcards or masks");
           return value;
         };
-        auto *patch = request.mutable_executable();
-        patch->set_elf_address(address_number(command.option("--elf-address")));
-        patch->set_expected(bytes("--expect"));
-        patch->set_replacement(bytes("--replace"));
+        if (command.kind == K::memory_write) {
+          auto *patch = request.mutable_writable();
+          patch->set_address(address_number(args.at(0)));
+          patch->set_expected(bytes("--expect"));
+          patch->set_replacement(bytes("--replace"));
+        } else {
+          auto *patch = request.mutable_executable();
+          patch->set_elf_address(address_number(command.option("--elf-address")));
+          patch->set_expected(bytes("--expect"));
+          patch->set_replacement(bytes("--replace"));
+        }
       }
       response = unary<api::MemoryPatch>(
           [&](auto &c, auto &r) { return stub_->ApplyMemoryPatch(&c, request, &r); },
@@ -1942,7 +2076,8 @@ bool Controller::execute(const Command &command) {
     const bool override_arguments = command.has("--allow-arg-overrides");
     const bool override_result = command.has("--allow-result-override");
     const bool replacement = command.has("--allow-replacement");
-    require_session(selected_, override_arguments || override_result || replacement);
+    const bool call_original = command.has("--allow-call-original");
+    require_session(selected_, override_arguments || override_result || replacement || call_original);
     const bool named = command.kind == K::draft_validate;
     const auto selector = named ? command.option("--target") : args.at(0);
     api::ResolveProbeRequest resolution;
@@ -1953,6 +2088,8 @@ bool Controller::execute(const Command &command) {
     request.set_allow_argument_overrides(override_arguments);
     request.set_allow_result_override(override_result);
     request.set_allow_replacement(replacement);
+    request.set_allow_call_original(call_original);
+    request.set_trace_exceptions(command.has("--trace-exceptions"));
     request.set_reclaimable(command.has("--reclaimable"));
     request.set_callback_source(named ? drafts_.at(args.at(0))
                                       : read_source(command.option("--callback")));
