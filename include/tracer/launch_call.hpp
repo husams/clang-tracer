@@ -6,6 +6,7 @@
 #include <cxxabi.h>
 #include <charconv>
 #include <cmath>
+#include <functional>
 #include <locale>
 #include <sstream>
 #include <string>
@@ -47,8 +48,11 @@ struct CallReply {
   double real_value = 0;
 };
 
-template <class T>
+template <class T> using CallValue = std::remove_cv_t<std::remove_reference_t<T>>;
+
+template <class Value>
 constexpr CallType call_type() {
+  using T = CallValue<Value>;
   if constexpr (std::is_same_v<T, bool>)
     return CallType::boolean;
   if constexpr (std::is_same_v<T, int>)
@@ -95,15 +99,20 @@ class NamedCall {
                 "a named call accepts up to eight scalar arguments");
   static_assert(((call_type<Args>() != CallType::none) && ...),
                 "a named call requires supported scalar argument types");
+  static_assert(((!std::is_rvalue_reference_v<Args> &&
+                  !std::is_volatile_v<std::remove_reference_t<Args>>) && ...),
+                "a named call accepts only value or nonvolatile lvalue arguments");
   static_assert(std::is_void_v<R> || call_type<R>() != CallType::none,
                 "a named call requires a supported scalar or void result");
+  static_assert(!std::is_rvalue_reference_v<R> && !std::is_volatile_v<std::remove_reference_t<R>>,
+                "a named call accepts only value or nonvolatile lvalue results");
 
   std::string name_;
-  R (*function_)(Args...);
+  std::function<R(Args...)> function_;
 
   template <std::size_t... I>
   CallReply invoke(const CallRequest &request, std::index_sequence<I...>) const {
-    std::tuple<Args...> values{};
+    std::tuple<CallValue<Args>...> values{};
     unsigned index = 0;
     if (!((index = I, parse_scalar(request.arguments[I], std::get<I>(values))) && ...)) {
       CallReply reply;
@@ -117,9 +126,9 @@ class NamedCall {
       std::apply(function_, values);
     } else {
       const auto value = std::apply(function_, values);
-      if constexpr (std::is_floating_point_v<R>)
+      if constexpr (std::is_floating_point_v<CallValue<R>>)
         reply.real_value = value;
-      else if constexpr (std::is_signed_v<R>)
+      else if constexpr (std::is_signed_v<CallValue<R>>)
         reply.signed_value = value;
       else
         reply.unsigned_value = value;
@@ -128,8 +137,8 @@ class NamedCall {
   }
 
 public:
-  NamedCall(std::string name, R (*function)(Args...))
-      : name_(std::move(name)), function_(function) {}
+  NamedCall(std::string name, std::function<R(Args...)> function)
+      : name_(std::move(name)), function_(std::move(function)) {}
 
   bool matches(std::string_view name) const {
     return function_ && name_ == name;
@@ -172,6 +181,30 @@ CallReply dispatch_call(const CallRequest &request, const Calls &... calls) {
 template <class R, class... Args>
 auto named_call(std::string name, R (*function)(Args...)) {
   return detail::NamedCall<R, Args...>(std::move(name), function);
+}
+
+// The target supplies a receiver that stays alive through its checkpoint.
+template <class C, class R, class... Args>
+auto named_call(std::string name, std::reference_wrapper<C> receiver, R (C::*method)(Args...)) {
+  std::function<R(Args...)> bound;
+  if (method)
+    bound = [receiver, method](Args... values) -> R {
+      return std::invoke(method, receiver, std::forward<Args>(values)...);
+    };
+  return detail::NamedCall<R, Args...>(std::move(name), std::move(bound));
+}
+
+template <class Receiver, class C, class R, class... Args>
+auto named_call(std::string name, std::reference_wrapper<Receiver> receiver,
+                R (C::*method)(Args...) const) {
+  static_assert(std::is_invocable_r_v<R, decltype(method), Receiver &, Args...>,
+                "receiver must be compatible with the registered method");
+  std::function<R(Args...)> bound;
+  if (method)
+    bound = [receiver, method](Args... values) -> R {
+      return std::invoke(method, receiver, std::forward<Args>(values)...);
+    };
+  return detail::NamedCall<R, Args...>(std::move(name), std::move(bound));
 }
 } // namespace tracer::launch
 #endif

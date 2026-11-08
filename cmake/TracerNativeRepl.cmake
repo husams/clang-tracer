@@ -231,6 +231,22 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:repl-launch-target>)
       set_tests_properties(native_repl_launch_integration PROPERTIES TIMEOUT 120)
+      if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        add_library(repl-followup-import SHARED tests/fixtures/repl_followup_import.cpp)
+        add_library(repl-followup-watch SHARED tests/fixtures/repl_followup_import.cpp)
+        set_target_properties(repl-followup-watch PROPERTIES PREFIX "" OUTPUT_NAME watch)
+        add_executable(repl-followup-target tests/fixtures/repl_followups.cpp)
+        target_include_directories(repl-followup-target PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_compile_options(repl-followup-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
+        target_link_options(repl-followup-target PRIVATE -rdynamic "LINKER:-z,now")
+        target_link_libraries(repl-followup-target PRIVATE repl-followup-import ${CMAKE_DL_LIBS} Threads::Threads)
+        add_test(NAME native_repl_followups
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_followups_integration.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-followup-target>
+            $<TARGET_FILE:repl-followup-watch> $<TARGET_FILE:clang_tracer_launch_preload>)
+        set_tests_properties(native_repl_followups PROPERTIES TIMEOUT 150)
+      endif()
       add_executable(repl-local-perf-target tests/fixtures/repl_local_perf.cpp)
       target_include_directories(repl-local-perf-target PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
       target_link_libraries(repl-local-perf-target PRIVATE Threads::Threads)

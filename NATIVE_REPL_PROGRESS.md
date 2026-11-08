@@ -415,3 +415,40 @@ six register snapshots, eight callback results, six monitored accesses,
 three hardware watchpoint hits, 18 native PRE/POST pairs, module unload
 and restored probe bytes. Eleven focused Linux CTests passed, including
 the syscall test rerun with tracefs access, and 199 Python tests passed.
+
+### Original Frida plan follow-ups
+
+- `%modules --elf PATH` lists dynamic imports, exports and sections for a
+  verified mapped ELF. `%modules --watch` reports executable mappings that
+  appear or disappear between bounded snapshots.
+- `%probe reload ID --callback FILE --watch` checks stable file contents,
+  keeps the previous observer after rejection, and follows successful
+  replacements. `--reclaimable` admits observers whose JIT code, callbacks
+  and references stay within their invocations. Retirement closes admission,
+  drains delivery and checks stopped threads before reclaiming code.
+- `%launch --preload PATH` pauses an owned target in the installed launch
+  gate before main. `--supervise` terminates descendants that stay in its
+  process group. The target can register a bound member function and scalar
+  lvalue references at its ordinary checkpoint. Results are copied.
+- `--allow-replacement` enables `Call::replace_with` in an observer's PRE
+  hook for a verified scalar or void function. The original runs when PRE
+  does not commit a replacement.
+- `%memory patch` changes complete, equal-width instructions at a verified
+  ELF entry. `%memory import-hook` redirects one already resolved SysV
+  JUMP_SLOT to an ABI-compatible function in the main executable.
+  `%memory restore` and detach restore original bytes.
+- `%memory monitor-start` reports the nominated thread's first read or
+  write to each dedicated anonymous page. The thread must be sleeping for
+  setup and teardown and the process must use the default SIGSEGV
+  disposition. The target owns the mapping exclusively for that thread and
+  keeps its address and protections stable until stop. The deadline restores
+  page permissions even if collection is delayed.
+
+The same SDK-built REPL, server, agent and libc-only preload gate
+passed the live matrix on native glibc 2.34 and SDK glibc 2.23 targets.
+Each run verified all follow-ups, 34 successive reloads below the 32
+retained-generation limit, a probe installed before main, child cleanup
+after the leader exited, and byte and permission restoration on detach.
+The Gum register, callback, scalar memory access and hardware watchpoint
+suite also passed on both profiles with active native probes.
+Twelve focused native CTests and 199 Python tests passed.

@@ -33,9 +33,12 @@ public:
     T__109 = 110, T__110 = 111, T__111 = 112, T__112 = 113, T__113 = 114,
     T__114 = 115, T__115 = 116, T__116 = 117, T__117 = 118, T__118 = 119,
     T__119 = 120, T__120 = 121, T__121 = 122, T__122 = 123, T__123 = 124,
-    T__124 = 125, T__125 = 126, T__126 = 127, T__127 = 128, UINT = 129,
-    STRING = 130, SHELL = 131, METADATA_ONLY = 132, SQLITE = 133, WORD = 134,
-    WS = 135
+    T__124 = 125, T__125 = 126, T__126 = 127, T__127 = 128, T__128 = 129,
+    T__129 = 130, T__130 = 131, T__131 = 132, T__132 = 133, T__133 = 134,
+    T__134 = 135, T__135 = 136, T__136 = 137, T__137 = 138, T__138 = 139,
+    T__139 = 140, T__140 = 141, T__141 = 142, T__142 = 143, UINT = 144,
+    STRING = 145, SHELL = 146, METADATA_ONLY = 147, SQLITE = 148, WORD = 149,
+    WS = 150
   };
 
   enum {
@@ -279,6 +282,9 @@ public:
   public:
     ModulesContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+    std::vector<antlr4::tree::TerminalNode *> UINT();
+    antlr4::tree::TerminalNode* UINT(size_t i);
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -656,7 +662,8 @@ public:
   public:
     ProbeReloadContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
-    antlr4::tree::TerminalNode *UINT();
+    std::vector<antlr4::tree::TerminalNode *> UINT();
+    antlr4::tree::TerminalNode* UINT(size_t i);
     ValueContext *value();
 
 

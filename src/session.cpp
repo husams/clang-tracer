@@ -225,11 +225,11 @@ std::uint64_t Session::ProcessStartTime(std::uint32_t pid) {
 
 void Session::attach_process(injector::Process &process,
                              std::chrono::steady_clock::time_point deadline,
-                             pid_t excluded_tid) {
+                             pid_t excluded_tid, pid_t required_tid) {
   for (;;) {
     check_identity_locked();
     try {
-      process.attach(static_cast<pid_t>(pid_), application_modules_, excluded_tid);
+      process.attach(static_cast<pid_t>(pid_), application_modules_, excluded_tid, required_tid);
       check_identity_locked();
       return;
     } catch (const injector::IdlePointUnavailable &) {
@@ -370,6 +370,9 @@ void Session::attach(const std::string &expected_executable) {
     const auto stop = agent_symbol("tracer_agent_stop");
     const auto validate = agent_symbol("tracer_agent_validate");
     const auto capacity = agent_symbol("tracer_agent_capacity_v1");
+    const auto reclaim = agent_symbol("tracer_agent_reclaim_v1");
+    const auto page_start = agent_symbol("tracer_agent_page_monitor_start_v1");
+    const auto page_stop = agent_symbol("tracer_agent_page_monitor_stop_v1");
     const auto pthread_detour =
         agent_symbol("tracer_context_pthread_create_detour");
     if (!start || !stop) {
@@ -383,6 +386,9 @@ void Session::attach(const std::string &expected_executable) {
     stop_address_ = stop;
     validate_address_ = validate;
     capacity_address_ = capacity;
+    reclaim_address_ = reclaim;
+    start_page_monitor_address_ = page_start;
+    stop_page_monitor_address_ = page_stop;
     pthread_detour_address_ = pthread_detour;
   } catch (...) {
     if (!process.unsafe()) {
@@ -494,9 +500,31 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
   if (state_ != clangtracer::v1::Session::ATTACHED) {
     throw std::runtime_error("session is not attached");
   }
-  if (probes_.size() >= kMaxProbes) {
-    throw std::invalid_argument("session probe limit reached");
+  for (auto &[id, prior] : probes_) {
+    (void)id;
+    if (!prior.reload_spec.reclaimable() || prior.value.reclaimed() || prior.value.active())
+      continue;
+    const auto retry_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(30);
+    try {
+      if (prior.value.draining()) {
+        stop_probe_locked(prior, true, retry_deadline);
+      } else {
+        injector::Process process;
+        attach_process(process, retry_deadline);
+        reclaim_probe_locked(prior, process);
+        process.detach();
+      }
+    } catch (const std::exception &) {
+      if (unsafe_target_ || state_ != clangtracer::v1::Session::ATTACHED)
+        throw;
+    }
   }
+  const auto retained = std::count_if(probes_.begin(), probes_.end(),
+      [](const auto &entry) { return !entry.second.value.reclaimed(); });
+  if (retained >= kMaxProbes)
+    throw std::runtime_error("session reached the 32 retained-probe limit");
+  if (probes_.size() >= 1024)
+    throw std::runtime_error("session reached the 1024 probe history limit");
   if (probe_id == 0 || probes_.count(probe_id) != 0) {
     throw std::invalid_argument("probe id is invalid or already used");
   }
@@ -598,6 +626,7 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     record.value.mutable_signature()->CopyFrom(spec.signature());
     record.value.set_allow_argument_overrides(spec.allow_argument_overrides());
     record.value.set_allow_result_override(spec.allow_result_override());
+    record.value.set_allow_replacement(spec.allow_replacement());
     record.reload_spec.CopyFrom(spec);
     record.reload_spec.clear_callback_source();
     auto [it, inserted] = probes_.emplace(probe_id, std::move(record));
@@ -751,6 +780,12 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
         throw std::runtime_error("agent returned inconsistent replacement patch metadata");
     }
 
+    for (const auto &patch : memory_patches_) {
+      const auto start = patch.value.address();
+      if (!patch.value.restored() && start < response.original_entry + response.patch_size &&
+          response.original_entry < start + patch.value.size())
+        throw std::runtime_error("native probe overlaps an active memory patch");
+    }
     const auto patch_started = std::chrono::steady_clock::now();
     constexpr unsigned kPatchAttempts = 12;
     bool committed = false;
@@ -863,6 +898,15 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
           std::string("probe committed but target detach failed: ") +
           error.what());
       throw std::runtime_error(error_);
+    }
+    if (previous && previous->reload_spec.reclaimable()) {
+      try {
+        stop_probe_locked(*previous, true,
+                          std::chrono::steady_clock::now() + std::chrono::milliseconds(30));
+      } catch (const std::exception &) {
+        if (unsafe_target_ || state_ != clangtracer::v1::Session::ATTACHED)
+          throw;
+      }
     }
     return it->second.value;
   } catch (...) {
@@ -1177,6 +1221,8 @@ bool Session::stop_probe_locked(
     probe.value.set_entry_address(response.original_entry);
     probe.value.set_agent_dropped_events(response.event_drops);
     probe.value.set_callback_errors(response.callback_errors);
+    if (probe.reload_spec.reclaimable())
+      reclaim_probe_locked(probe, process);
     try {
       process.remote_free(probe.remote_request, sizeof(Request));
       probe.remote_request = 0;
@@ -1244,6 +1290,32 @@ void Session::release_request_locked(
   }
 }
 
+void Session::reclaim_probe_locked(ProbeRecord &probe, injector::Process &process) {
+  if (!reclaim_address_ || probe.value.reclaimed())
+    return;
+  TracerRetiredCode code{};
+  std::uintptr_t scratch = 0;
+  try {
+    scratch = process.remote_allocate(sizeof(code));
+    if (process.remote_call(reclaim_address_, {probe.value.id(), scratch, 0}, 3) == 0) {
+      process.remote_read(scratch, &code, sizeof(code));
+      if (process.retired_code_quiescent(code) &&
+          process.remote_call(reclaim_address_, {probe.value.id(), scratch, 1}, 3) == 0)
+        probe.value.set_reclaimed(true);
+    }
+    process.remote_free(scratch, sizeof(code));
+  } catch (...) {
+    if (scratch && !process.unsafe()) {
+      try { process.remote_free(scratch, sizeof(code)); } catch (...) {}
+    }
+    if (process.unsafe()) {
+      unsafe_target_ = true;
+      set_failed_locked("JIT reclamation recovery is uncertain; target remains stopped");
+      throw;
+    }
+  }
+}
+
 std::uint64_t Session::events_sent(std::uint64_t probe_id) const {
   std::lock_guard lock(mutex_);
   const auto found = probes_.find(probe_id);
@@ -1260,8 +1332,15 @@ clangtracer::v1::Probe Session::remove_probe(std::uint64_t probe_id) {
   auto &probe = find_probe_locked(probe_id);
   if (probe.value.active() || probe.value.draining())
     stop_probe_locked(probe, false);
-  else
+  else {
     release_request_locked(probe, std::chrono::steady_clock::now() + operation_timeout_);
+    if (probe.reload_spec.reclaimable() && !probe.value.reclaimed()) {
+      injector::Process process;
+      attach_process(process, std::chrono::steady_clock::now() + operation_timeout_);
+      reclaim_probe_locked(probe, process);
+      process.detach();
+    }
+  }
   return probe.value;
 }
 
@@ -1277,7 +1356,12 @@ void Session::detach() {
   check_identity_locked();
   if (instructions_)
     stop_instruction_trace_locked(std::chrono::steady_clock::now() + operation_timeout_);
+  if (page_monitor_)
+    stop_page_monitor_locked(std::chrono::steady_clock::now() + operation_timeout_);
   last_instruction_trace_.reset();
+  for (auto &patch : memory_patches_)
+    if (!patch.value.restored())
+      write_memory_patch_locked(patch, true, std::chrono::steady_clock::now() + operation_timeout_);
   for (auto &[id, probe] : probes_) {
     (void)id;
     if (probe.value.active() || probe.value.draining())
@@ -1305,6 +1389,28 @@ void Session::shutdown() noexcept {
       stop_instruction_trace_locked(shutdown_deadline);
     } catch (const std::exception &error) {
       first_error = error.what();
+      if (unsafe_target_)
+        return;
+    }
+  }
+  if (page_monitor_) {
+    try {
+      stop_page_monitor_locked(shutdown_deadline);
+    } catch (const std::exception &error) {
+      if (first_error.empty())
+        first_error = error.what();
+      if (unsafe_target_)
+        return;
+    }
+  }
+  for (auto &patch : memory_patches_) {
+    if (patch.value.restored())
+      continue;
+    try {
+      write_memory_patch_locked(patch, true, shutdown_deadline);
+    } catch (const std::exception &error) {
+      if (first_error.empty())
+        first_error = error.what();
       if (unsafe_target_)
         return;
     }

@@ -274,6 +274,25 @@ class Client:
             timeout=self.timeout,
         )
 
+    def apply_memory_patch(self, request: pb.ApplyMemoryPatchRequest) -> pb.MemoryPatch:
+        """Apply a verified executable patch or import-slot hook using local control."""
+        return self.stub.ApplyMemoryPatch(request, timeout=self.timeout)
+
+    def restore_memory_patch(self, session_id: str, patch_id: int) -> pb.MemoryPatch:
+        """Restore a patch and verify the original bytes."""
+        return self.stub.RestoreMemoryPatch(
+            pb.RestoreMemoryPatchRequest(session_id=session_id, patch_id=patch_id),
+            timeout=self.timeout,
+        )
+
+    def start_page_monitor(self, request: pb.StartPageMonitorRequest) -> pb.PageMonitorResult:
+        """Arm dedicated anonymous pages for first-touch monitoring."""
+        return self.stub.StartPageMonitor(request, timeout=self.timeout)
+
+    def stop_page_monitor(self, session_id: str) -> pb.PageMonitorResult:
+        """Restore the monitored pages and return first touches."""
+        return self.stub.StopPageMonitor(pb.StopPageMonitorRequest(session_id=session_id), timeout=self.timeout)
+
     def stop_instruction_trace(self, session_id: str) -> pb.InstructionTrace:
         """Stop capture and return the original PCs in execution order."""
         return self.stub.StopInstructionTrace(

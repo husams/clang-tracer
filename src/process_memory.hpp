@@ -19,6 +19,14 @@ grpc::Status scan(grpc::ServerContext &context, Session &session,
                   std::chrono::seconds timeout,
                   const clangtracer::v1::ScanMemoryRequest &request,
                   clangtracer::v1::ScanMemoryResponse &response);
+grpc::Status apply_patch(grpc::ServerContext &context, Session &session,
+                         std::chrono::seconds timeout,
+                         const clangtracer::v1::ApplyMemoryPatchRequest &request,
+                         clangtracer::v1::MemoryPatch &response);
+grpc::Status start_page_monitor(grpc::ServerContext &context, Session &session,
+                                std::chrono::seconds timeout,
+                                const clangtracer::v1::StartPageMonitorRequest &request,
+                                clangtracer::v1::PageMonitorResult &response);
 grpc::Status start_instruction_trace(
     grpc::ServerContext &context, Session &session, std::chrono::seconds timeout,
     const clangtracer::v1::StartInstructionTraceRequest &request,

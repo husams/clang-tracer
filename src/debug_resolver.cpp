@@ -1123,11 +1123,14 @@ std::vector<std::string> list_debug_modules(std::uint32_t pid) {
   return modules(pid);
 }
 
-api::ListModulesResponse list_debug_module_mappings(std::uint32_t pid) {
+api::ListModulesResponse list_debug_module_mappings(std::uint32_t pid,
+                                                   const std::string &elf_path) {
   const auto paths = modules(pid);
   const auto mappings = read_executable_mappings(pid, paths);
   const auto fingerprint = mapping_fingerprint(paths, mappings);
   api::ListModulesResponse result;
+  if (!elf_path.empty() && std::find(paths.begin(), paths.end(), elf_path) == paths.end())
+    throw std::runtime_error("ELF view requires an exact path from %modules");
   std::map<std::string, std::string> build_ids;
   for (const auto &path : paths) {
     result.add_modules(path);
@@ -1143,9 +1146,44 @@ api::ListModulesResponse list_debug_module_mappings(std::uint32_t pid) {
       continue;
     }
     if (const auto *elf = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(
-            binary->getBinary()))
+            binary->getBinary())) {
       build_ids.emplace(path, llvm::toHex(llvm::object::getBuildID(elf), true));
+      if (path != elf_path)
+        continue;
+      const auto checked = [](auto value) {
+        if (!value)
+          throw std::runtime_error("cannot read ELF view: " + llvm::toString(value.takeError()));
+        return *value;
+      };
+      std::size_t output_bytes = 0;
+      const auto add = [&](api::ModuleElfEntry::Kind kind, llvm::StringRef name,
+                           std::uint64_t address, std::uint64_t size) {
+        if (name.empty())
+          return;
+        output_bytes += name.size() + 32;
+        if (result.elf_entries_size() == 8192 || output_bytes > 1024 * 1024)
+          throw std::runtime_error("ELF view exceeds its output budget");
+        auto *entry = result.add_elf_entries();
+        entry->set_kind(kind);
+        entry->set_name(name.str());
+        entry->set_elf_address(address);
+        entry->set_size(size);
+      };
+      for (const auto &symbol : elf->getDynamicSymbolIterators()) {
+        const auto flags = checked(symbol.getFlags());
+        const auto symbol_name = checked(symbol.getName());
+        if (flags & llvm::object::SymbolRef::SF_Undefined)
+          add(api::ModuleElfEntry::IMPORT, symbol_name, 0, 0);
+        else if (flags & llvm::object::SymbolRef::SF_Exported)
+          add(api::ModuleElfEntry::EXPORT, symbol_name, checked(symbol.getAddress()), symbol.getSize());
+      }
+      for (const auto &section : elf->sections())
+        add(api::ModuleElfEntry::SECTION, checked(section.getName()),
+            section.getAddress(), section.getSize());
+    }
   }
+  if (!elf_path.empty() && !build_ids.count(elf_path))
+    throw std::runtime_error("ELF backing file no longer matches the mapped image");
   for (const auto &mapping : mappings) {
     auto &entry = *result.add_mappings();
     entry.set_path(mapping.path);

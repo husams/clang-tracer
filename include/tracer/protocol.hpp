@@ -115,10 +115,13 @@ struct CallbackPrintOptions {
 struct ScalarOverrides {
   bool allow_arguments = false;
   bool allow_result = false;
+  bool allow_replacement = false;
   std::uint32_t argument_mask = 0;
   bool result_set = false;
+  bool replacement_set = false;
   std::uint64_t arguments[kMaxArguments]{};
   std::uint64_t result = 0;
+  std::uint64_t replacement = 0;
 
   template <class T> static std::uint64_t pack(T value) noexcept {
     static_assert(sizeof(T) <= sizeof(std::uint64_t));

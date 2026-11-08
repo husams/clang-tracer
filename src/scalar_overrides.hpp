@@ -4,7 +4,8 @@
 
 namespace tracer {
 inline bool has_scalar_overrides(const clangtracer::v1::ProbeSpec &spec) {
-  return spec.allow_argument_overrides() || spec.allow_result_override();
+  return spec.allow_argument_overrides() || spec.allow_result_override() ||
+         spec.allow_replacement();
 }
 
 inline const char *scalar_override_error(const clangtracer::v1::ProbeSpec &spec) {

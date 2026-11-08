@@ -35,6 +35,10 @@ endforeach()
 install(TARGETS clang-tracer clang-tracer-server clang_tracer_agent
   RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Runtime
   LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Runtime)
+if(TARGET clang_tracer_launch_preload)
+  install(TARGETS clang_tracer_launch_preload
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Runtime)
+endif()
 if(TARGET tracer_context_stdlib)
   install(TARGETS tracer_context_stdlib
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Runtime)

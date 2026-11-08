@@ -13,7 +13,7 @@ sessions : 'sessions';
 use : 'use' value;
 status : 'status';
 detach : 'detach' value?;
-modules : 'modules' '--details'?;
+modules : 'modules' ('--details' | '--elf' value | '--watch' (('--timeout' | '--count') UINT)*)?;
 threads : 'threads';
 symbols : 'symbols' symbolOption*;
 symbolOption : ('--filter' | '--module' | '--page' | '--address' | '--mapping') value
@@ -27,7 +27,8 @@ prepareOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | 
               | METADATA_ONLY;
 resolveOption : ('--include' | '--compdb' | '--module' | '--compile-option'
                 | '--prepared' | '--prepared-mode') value;
-validateOption : resolveOption | '--allow-arg-overrides' | '--allow-result-override';
+validateOption : resolveOption | '--allow-arg-overrides' | '--allow-result-override' | '--allow-replacement'
+               | '--reclaimable';
 deployOption : validateOption | '--stack-depth' UINT | '--print-arguments' | '--print-result';
 interceptor : 'interceptor' ('load' value '--as' value | 'edit' value | 'show' value
       | 'validate' value '--target' value validateOption*
@@ -65,18 +66,27 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'import'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
         | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview' | 'apply'
-        | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | 'launch' | 'resume' | 'terminate'
+        | 'memory' | 'maps' | 'read' | 'scan' | 'patch' | 'restore' | 'import-hook'
+        | 'monitor-start' | 'monitor-stop'
+        | 'entry' | 'reload' | 'launch' | 'resume' | 'terminate'
         | 'call' | 'call-result' | 'syscalls' | 'sample' | 'cpu' | 'instructions' | 'watchpoint';
 memory : 'memory' ('maps' | 'read' value '--mapping' value
                  ('--count' UINT | '--type' value)
                  | 'scan' value '--mapping' value '--count' UINT
-                   '--pattern' value ('--limit' UINT)?);
+                   '--pattern' value ('--limit' UINT)?
+                 | 'patch' '--module' value '--elf-address' value '--mapping' value '--expect' value '--replace' value
+                 | 'restore' UINT
+                 | 'monitor-start' '--tid' UINT '--address' value '--size' UINT '--mapping' value ('--timeout' UINT)?
+                 | 'monitor-stop'
+                 | 'import-hook' '--module' value '--symbol' value '--original' value
+                   '--address' value '--mapping' value '--abi' value);
 probeEntry : 'probe' 'entry' (value '--mapping' value ('--module' value)?
            | '--module' value '--elf-address' value '--abi' value '--mapping' value);
-probeReload : 'probe' 'reload' UINT '--callback' value;
+probeReload : 'probe' 'reload' UINT '--callback' value
+              ('--watch' (('--timeout' | '--count') UINT)*)?;
 targetLaunch : 'launch' value launchOption* | ('resume' | 'terminate') UINT?;
-launchOption : ('--arg' | '--cwd' | '--env' | '--stdin' | '--stdout' | '--stderr') value
-             | '--timeout' UINT;
+launchOption : ('--arg' | '--cwd' | '--env' | '--stdin' | '--stdout' | '--stderr' | '--preload') value
+             | '--timeout' UINT | '--supervise';
 targetCall : 'call' value ('--arg' value | '--timeout' UINT)* | 'call-result' ('--timeout' UINT)?;
 localPerf : ('syscalls' | 'sample' 'cpu') (('--count' | '--timeout') UINT)*;
 instructions : 'instructions' ('start' instructionOption* | 'stop');

@@ -589,6 +589,8 @@ void Controller::launch(const Command &command) {
   options.input = command.option("--stdin");
   options.output = command.option("--stdout");
   options.error = command.option("--stderr");
+  options.preload = command.option("--preload");
+  options.supervise = command.has("--supervise");
   if (command.has("--arg"))
     options.arguments = command.options.at("--arg");
   if (command.has("--env"))
@@ -826,7 +828,8 @@ std::uint64_t Controller::inject(const SessionHandle &session,
   require_idle_target(session);
   const bool override_arguments = options.has("--allow-arg-overrides");
   const bool override_result = options.has("--allow-result-override");
-  require_session(session, override_arguments || override_result);
+  const bool replacement = options.has("--allow-replacement");
+  require_session(session, override_arguments || override_result || replacement);
   const auto resolve_started = std::chrono::steady_clock::now();
   auto spec = resolve_for(session, selector, options);
   const auto resolve_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -838,6 +841,8 @@ std::uint64_t Controller::inject(const SessionHandle &session,
   spec.set_print_result(options.has("--print-result"));
   spec.set_allow_argument_overrides(override_arguments);
   spec.set_allow_result_override(override_result);
+  spec.set_allow_replacement(replacement);
+  spec.set_reclaimable(options.has("--reclaimable"));
   api::AddProbeRequest request;
   request.set_session_id(session.id);
   *request.mutable_spec() = std::move(spec);
@@ -1537,10 +1542,57 @@ bool Controller::execute(const Command &command) {
     require_session(selected_);
     api::ListModulesRequest request;
     request.set_session_id(selected_.id);
-    request.set_include_mappings(command.has("--details"));
-    const auto response = unary<api::ListModulesResponse>(
-        [&](auto &c, auto &r) { return stub_->ListModules(&c, request, &r); });
-    if (!command.has("--details")) {
+    request.set_include_mappings(command.has("--details") || command.has("--watch"));
+    request.set_elf_path(command.option("--elf"));
+    const auto modules = [&] { return unary<api::ListModulesResponse>(
+        [&](auto &c, auto &r) { return stub_->ListModules(&c, request, &r); }); };
+    const auto response = modules();
+    if (command.has("--watch")) {
+      const auto indexed = [](const api::ListModulesResponse &snapshot) {
+        std::map<std::string, api::ModuleMapping> entries;
+        for (const auto &mapping : snapshot.mappings())
+          entries.emplace(mapping.SerializeAsString(), mapping);
+        return entries;
+      };
+      if (response.mapping_token().empty())
+        throw std::runtime_error("server does not support mapped module snapshots");
+      auto before = indexed(response);
+      const auto deadline = std::chrono::steady_clock::now() +
+          std::chrono::seconds(command.number("--timeout", 5));
+      const auto limit = command.number("--count", 16);
+      std::uint64_t count = 0;
+      out_ << "module watch ready\n" << std::flush;
+      const auto report = [&](const auto &from, const auto &to, const char *kind) {
+        for (const auto &[key, mapping] : from) {
+          if (count == limit)
+            break;
+          if (to.count(key))
+            continue;
+          out_ << "module " << kind << " address=0x" << std::hex << mapping.begin_address()
+               << std::dec << " " << std::quoted(printable_proc_text(mapping.path())) << '\n'
+               << std::flush;
+          ++count;
+        }
+      };
+      while (!interrupted.load() && count < limit && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (interrupted.load() || std::chrono::steady_clock::now() >= deadline)
+          break;
+        auto after = indexed(modules());
+        report(before, after, "unloaded");
+        report(after, before, "loaded");
+        before = std::move(after);
+      }
+      out_ << "module watch complete changes=" << count << '\n';
+    } else if (command.has("--elf")) {
+      if (response.elf_entries().empty())
+        throw std::runtime_error("server did not return an ELF view");
+      for (const auto &entry : response.elf_entries())
+        out_ << "elf " << api::ModuleElfEntry::Kind_Name(entry.kind())
+             << " address=0x" << std::hex << entry.elf_address() << std::dec
+             << " size=" << entry.size() << ' '
+             << std::quoted(printable_proc_text(entry.name())) << '\n';
+    } else if (!command.has("--details")) {
       for (const auto &module : response.modules())
         out_ << module << '\n';
     } else {
@@ -1601,6 +1653,38 @@ bool Controller::execute(const Command &command) {
          << std::hex << result.address() << std::dec << " size=" << result.size()
          << " count-limit=" << request.max_records()
          << " timeout=" << request.timeout_seconds() << '\n';
+    return true;
+  }
+  case K::page_monitor_start:
+  case K::page_monitor_stop: {
+    if (!server_.running() || endpoint_ != server_.endpoint())
+      throw std::runtime_error("page monitoring requires the REPL's owned local server");
+    require_idle_target(selected_);
+    require_session(selected_);
+    if (command.kind == K::page_monitor_start) {
+      api::StartPageMonitorRequest request;
+      request.set_session_id(selected_.id);
+      request.set_mapping_token(command.option("--mapping"));
+      request.set_tid(unsigned_number(command.option("--tid"), "monitor TID", INT32_MAX));
+      request.set_address(address_number(command.option("--address")));
+      request.set_size(unsigned_number(command.option("--size"), "monitor size", UINT32_MAX));
+      request.set_timeout_seconds(command.number("--timeout", 5));
+      const auto result = unary<api::PageMonitorResult>(
+          [&](auto &c, auto &r) { return stub_->StartPageMonitor(&c, request, &r); },
+          settings_.timeout_seconds);
+      out_ << "page monitor started tid=" << result.tid() << '\n' << std::flush;
+    } else {
+      api::StopPageMonitorRequest request;
+      request.set_session_id(selected_.id);
+      const auto result = unary<api::PageMonitorResult>(
+          [&](auto &c, auto &r) { return stub_->StopPageMonitor(&c, request, &r); },
+          settings_.timeout_seconds);
+      for (const auto &access : result.accesses())
+        out_ << "page " << (access.write() ? "write" : "read") << " address=0x"
+             << std::hex << access.address() << " pc=0x" << access.pc() << std::dec << '\n';
+      out_ << "page monitor stopped count=" << result.accesses_size()
+           << " expired=" << (result.expired() ? "true" : "false") << '\n';
+    }
     return true;
   }
   case K::instructions_stop: {
@@ -1665,6 +1749,53 @@ bool Controller::execute(const Command &command) {
       print_memory_scalar(out_, request.address(), response.data(), type);
     else
       print_memory_dump(out_, request.address(), response.data());
+    return true;
+  }
+  case K::memory_patch:
+  case K::memory_import_hook:
+  case K::memory_restore: {
+    if (!server_.running() || endpoint_ != server_.endpoint())
+      throw std::runtime_error("memory mutation requires the REPL's owned local server");
+    require_idle_target(selected_);
+    require_session(selected_);
+    api::MemoryPatch response;
+    if (command.kind == K::memory_restore) {
+      api::RestoreMemoryPatchRequest request;
+      request.set_session_id(selected_.id);
+      request.set_patch_id(unsigned_number(args.at(0), "patch ID"));
+      response = unary<api::MemoryPatch>(
+          [&](auto &c, auto &r) { return stub_->RestoreMemoryPatch(&c, request, &r); },
+          settings_.timeout_seconds);
+    } else {
+      api::ApplyMemoryPatchRequest request;
+      request.set_session_id(selected_.id);
+      request.set_mapping_token(command.option("--mapping"));
+      request.set_module(command.option("--module"));
+      if (command.kind == K::memory_import_hook) {
+        auto *hook = request.mutable_import_slot();
+        hook->set_symbol(command.option("--symbol"));
+        hook->set_abi(command.option("--abi"));
+        hook->set_expected_target(address_number(command.option("--original")));
+        hook->set_replacement_target(address_number(command.option("--address")));
+      } else {
+        const auto bytes = [&](const char *option) {
+          auto [value, mask] = parse_memory_pattern(command.option(option));
+          if (mask.find_first_not_of(static_cast<char>(0xff)) != std::string::npos)
+            throw std::invalid_argument("memory patch bytes cannot use wildcards or masks");
+          return value;
+        };
+        auto *patch = request.mutable_executable();
+        patch->set_elf_address(address_number(command.option("--elf-address")));
+        patch->set_expected(bytes("--expect"));
+        patch->set_replacement(bytes("--replace"));
+      }
+      response = unary<api::MemoryPatch>(
+          [&](auto &c, auto &r) { return stub_->ApplyMemoryPatch(&c, request, &r); },
+          settings_.timeout_seconds);
+    }
+    out_ << "memory patch=" << response.id() << " address=0x" << std::hex << response.address()
+         << std::dec << " size=" << response.size()
+         << " restored=" << (response.restored() ? "true" : "false") << '\n';
     return true;
   }
   case K::memory_scan: {
@@ -1810,7 +1941,8 @@ bool Controller::execute(const Command &command) {
     require_idle_target(selected_);
     const bool override_arguments = command.has("--allow-arg-overrides");
     const bool override_result = command.has("--allow-result-override");
-    require_session(selected_, override_arguments || override_result);
+    const bool replacement = command.has("--allow-replacement");
+    require_session(selected_, override_arguments || override_result || replacement);
     const bool named = command.kind == K::draft_validate;
     const auto selector = named ? command.option("--target") : args.at(0);
     api::ResolveProbeRequest resolution;
@@ -1820,6 +1952,8 @@ bool Controller::execute(const Command &command) {
     request.set_selector(selector);
     request.set_allow_argument_overrides(override_arguments);
     request.set_allow_result_override(override_result);
+    request.set_allow_replacement(replacement);
+    request.set_reclaimable(command.has("--reclaimable"));
     request.set_callback_source(named ? drafts_.at(args.at(0))
                                       : read_source(command.option("--callback")));
     *request.mutable_include_headers() = resolution.include_headers();
@@ -1854,21 +1988,61 @@ bool Controller::execute(const Command &command) {
     api::ReloadProbeRequest request;
     request.set_session_id(selected_.id);
     request.set_probe_id(unsigned_number(args.at(0), "probe ID"));
-    request.set_callback_source(read_source(command.option("--callback")));
-    const auto response = unary<api::ReloadProbeResponse>(
+    const auto reload = [&](const std::string &source) {
+      request.set_callback_source(source);
+      const auto response = unary<api::ReloadProbeResponse>(
         [&](auto &c, auto &r) {
           Cancellation cancellation(c);
           return stub_->ReloadProbe(&c, request, &r);
         },
         settings_.timeout_seconds);
-    out_ << "reloaded probe=" << response.probe().id()
-         << " replaces=" << response.probe().replaces_probe_id()
-         << " retained_limit=" << response.retained_limit();
-    if (response.has_agent_retained())
-      out_ << " agent_retained=" << response.agent_retained();
-    else
-      out_ << " agent_retained=unknown";
-    out_ << '\n';
+      out_ << "reloaded probe=" << response.probe().id()
+           << " replaces=" << response.probe().replaces_probe_id()
+           << " retained_limit=" << response.retained_limit();
+      if (response.has_agent_retained())
+        out_ << " agent_retained=" << response.agent_retained();
+      else
+        out_ << " agent_retained=unknown";
+      out_ << '\n' << std::flush;
+      request.set_probe_id(response.probe().id());
+    };
+    const auto path = command.option("--callback");
+    if (!command.has("--watch")) {
+      reload(read_source(path));
+      return true;
+    }
+    auto previous = read_source(path);
+    auto candidate = previous;
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(command.number("--timeout", 15));
+    const auto limit = command.number("--count", 16);
+    std::uint64_t count = 0;
+    out_ << "probe watch ready probe=" << request.probe_id() << '\n' << std::flush;
+    while (!interrupted.load() && count < limit && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      if (interrupted.load() || std::chrono::steady_clock::now() >= deadline)
+        break;
+      try {
+        auto source = read_source(path);
+        if (source != candidate) {
+          candidate = std::move(source);
+          continue;
+        }
+      } catch (const std::exception &) {
+        candidate = previous;
+        continue; // An editor may briefly remove the file during a save.
+      }
+      if (candidate == previous)
+        continue;
+      previous = candidate;
+      try {
+        reload(candidate);
+      } catch (const std::exception &error) {
+        out_ << "probe watch rejected: " << error.what() << '\n' << std::flush;
+      }
+      ++count;
+    }
+    out_ << "probe watch complete changes=" << count << " probe=" << request.probe_id() << '\n';
     return true;
   }
   case K::remove: {
@@ -1881,7 +2055,8 @@ bool Controller::execute(const Command &command) {
         [&](auto &c, auto &r) { return stub_->RemoveProbe(&c, request, &r); },
         settings_.timeout_seconds);
     out_ << "removed probe=" << response.id() << " restored="
-         << (response.original_bytes_restored() ? "true" : "false") << '\n';
+         << (response.original_bytes_restored() ? "true" : "false")
+         << (response.reclaimed() ? " reclaimed=true" : "") << '\n';
     if (!response.original_bytes_restored() && !response.superseded_by_probe_id()) {
       throw std::runtime_error("probe restoration incomplete");
     }

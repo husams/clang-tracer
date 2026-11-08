@@ -12,11 +12,13 @@
 #include <unistd.h>
 
 #include "launch_call.hpp"
+#include "launch_gate.h"
 
 namespace tracer::launch {
-inline constexpr char gate_environment[] = "CLANG_TRACER_LAUNCH_FD";
-inline constexpr char ready = 'R';
-inline constexpr char resume = 'G';
+inline constexpr char gate_environment[] = TRACER_LAUNCH_FD;
+inline constexpr char preload_environment[] = TRACER_LAUNCH_PRELOAD_RESTORE;
+inline constexpr char ready = TRACER_LAUNCH_READY;
+inline constexpr char resume = TRACER_LAUNCH_RESUME;
 
 // Call at the desired startup boundary, before starting other application
 // threads. An ordinary launch without a tracer proceeds immediately.

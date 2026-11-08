@@ -152,7 +152,8 @@ std::vector<char *> pointers(std::vector<std::string> &strings) {
   return result;
 }
 
-std::vector<std::string> environment(const LaunchOptions &options, int socket) {
+std::vector<std::string> environment(const LaunchOptions &options, int socket,
+                                     const std::string &preload) {
   std::map<std::string, std::string> values;
   for (auto entry = environ; *entry; ++entry) {
     std::string text(*entry);
@@ -167,11 +168,18 @@ std::vector<std::string> environment(const LaunchOptions &options, int socket) {
         !(std::isalpha(static_cast<unsigned char>(key.front())) || key.front() == '_') ||
         !std::all_of(key.begin(), key.end(), [](unsigned char c) {
           return std::isalnum(c) || c == '_';
-        }) || key == gate::gate_environment || text.find('\0') != std::string::npos)
+        }) || key == gate::gate_environment || key == gate::preload_environment ||
+        text.find('\0') != std::string::npos)
       throw std::invalid_argument("invalid or reserved launch environment assignment");
     values[key] = text.substr(equals + 1);
   }
   values[gate::gate_environment] = std::to_string(socket);
+  values.erase(gate::preload_environment);
+  if (!preload.empty()) {
+    const auto previous = values["LD_PRELOAD"];
+    values[gate::preload_environment] = previous;
+    values["LD_PRELOAD"] = preload + (previous.empty() ? "" : ":" + previous);
+  }
   std::vector<std::string> result;
   for (const auto &[key, value] : values)
     result.push_back(key + "=" + value);
@@ -197,6 +205,13 @@ std::unique_ptr<OwnedTarget> OwnedTarget::start(const LaunchOptions &options, in
       !std::all_of(options.arguments.begin(), options.arguments.end(), valid))
     throw std::invalid_argument("invalid launch path or argument");
   auto target = std::unique_ptr<OwnedTarget>(new OwnedTarget);
+  target->supervise_ = options.supervise;
+  std::string preload;
+  if (!options.preload.empty()) {
+    preload = fs::canonical(options.preload).string();
+    if (!fs::is_regular_file(preload) || preload.find_first_of(": \t\r\n") != std::string::npos)
+      throw std::invalid_argument("preload requires a regular shared library path without separators");
+  }
   target->executable_ = fs::canonical(options.executable).string();
   if (!fs::is_regular_file(target->executable_))
     throw std::invalid_argument("launch executable must be a regular file");
@@ -231,7 +246,7 @@ std::unique_ptr<OwnedTarget> OwnedTarget::start(const LaunchOptions &options, in
   for (auto *fd : {&input, &output, &error, &parent, &child})
     fd->above_stdio();
 
-  auto env = environment(options, child.value);
+  auto env = environment(options, child.value, preload);
   auto envp = pointers(env);
   std::vector<std::string> arguments{target->executable_};
   arguments.insert(arguments.end(), options.arguments.begin(), options.arguments.end());
@@ -270,6 +285,8 @@ std::unique_ptr<OwnedTarget> OwnedTarget::start(const LaunchOptions &options, in
   }
   target->pid_ = pid;
   target->gate_ = parent.take();
+  if (target->supervise_)
+    target->supervisor_ = std::thread(&OwnedTarget::supervise_group, target.get());
   cleanup.published = true;
   return target;
 #else
@@ -287,8 +304,24 @@ void OwnedTarget::close_gate() noexcept {
 }
 
 bool OwnedTarget::running() {
+  std::lock_guard lock(lifecycle_);
   if (pid_ < 0)
     return false;
+#if defined(__linux__) && defined(__x86_64__)
+  if (supervise_) {
+    siginfo_t status{};
+    int result;
+    do {
+      result = ::waitid(P_PID, pid_, &status, WEXITED | WNOHANG | WNOWAIT);
+    } while (result == -1 && errno == EINTR);
+    if (result == 0 && !status.si_pid)
+      return true;
+    if (result == -1 && errno != ECHILD)
+      launch_error("cannot check supervised target");
+    if (result == 0 && ::kill(-pid_, SIGKILL) == -1 && errno != ESRCH)
+      launch_error("cannot terminate the owned process group");
+  }
+#endif
   int status = 0;
   int result;
   do {
@@ -303,6 +336,25 @@ bool OwnedTarget::running() {
   pid_ = -1;
   close_gate();
   return false;
+}
+
+void OwnedTarget::supervise_group() {
+#if defined(__linux__) && defined(__x86_64__)
+  for (;;) {
+    {
+      std::lock_guard lock(lifecycle_);
+      if (pid_ < 0)
+        return;
+      siginfo_t status{};
+      if (::waitid(P_PID, pid_, &status, WEXITED | WNOHANG | WNOWAIT) == 0 && status.si_pid) {
+        // Keep the leader unreaped until the group has been signalled.
+        (void)::kill(-pid_, SIGKILL);
+        return;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+#endif
 }
 
 std::string OwnedTarget::exit_description() const {
@@ -459,6 +511,8 @@ std::string OwnedTarget::call_result(unsigned seconds, const std::atomic<bool> &
 void OwnedTarget::terminate() {
   if (!running())
     return;
+  if (supervise_ && ::kill(-pid_, SIGKILL) != 0 && errno != ESRCH)
+    launch_error("cannot terminate the owned process group");
   if (::kill(pid_, SIGKILL) != 0 && errno != ESRCH)
     launch_error("cannot terminate owned target");
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -473,6 +527,13 @@ OwnedTarget::~OwnedTarget() {
   try {
     terminate();
   } catch (...) {
+  }
+  if (supervisor_.joinable()) {
+    {
+      std::lock_guard lock(lifecycle_);
+      pid_ = -1;
+    }
+    supervisor_.join();
   }
   close_gate();
 }

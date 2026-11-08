@@ -1404,6 +1404,8 @@ public:
       resolved.spec.set_callback_source(request->callback_source());
       resolved.spec.set_allow_argument_overrides(request->allow_argument_overrides());
       resolved.spec.set_allow_result_override(request->allow_result_override());
+      resolved.spec.set_allow_replacement(request->allow_replacement());
+      resolved.spec.set_reclaimable(request->reclaimable());
       const auto input_valid = validate_probe(resolved.spec);
       if (!input_valid.ok())
         return input_valid;
@@ -1454,7 +1456,10 @@ public:
       if (!validation.ok())
         return validation;
       const auto retained = session->agent_retained_count();
-      if (retained == kMaxProbes || session->snapshot().probes_size() >= kMaxProbes)
+      const auto snapshot = session->snapshot();
+      const auto session_retained = std::count_if(snapshot.probes().begin(), snapshot.probes().end(),
+          [](const auto &probe) { return !probe.reclaimed(); });
+      if (!spec.reclaimable() && (retained == kMaxProbes || session_retained >= kMaxProbes))
         return {grpc::StatusCode::RESOURCE_EXHAUSTED, "reload reached the 32 retained-probe limit"};
       std::uint64_t pending_id = 0;
       const auto status = install_probe(session, spec, {}, pending_id, response->mutable_probe(),
@@ -1550,8 +1555,8 @@ public:
     if (session->snapshot().state() != clangtracer::v1::Session::ATTACHED)
       return {grpc::StatusCode::FAILED_PRECONDITION, "session is not attached"};
     try {
-      if (request->include_mappings()) {
-        *response = client::list_debug_module_mappings(session->pid());
+      if (request->include_mappings() || !request->elf_path().empty()) {
+        *response = client::list_debug_module_mappings(session->pid(), request->elf_path());
         response->set_mapping_token(session->id() + ":" + response->mapping_token());
       } else {
         for (const auto &path : client::list_debug_modules(session->pid()))
@@ -1584,6 +1589,58 @@ public:
     if (!session)
       return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
     return memory::read(*context, *session, timeout_, *request, *response);
+  }
+
+  grpc::Status ApplyMemoryPatch(grpc::ServerContext *context, const api::ApplyMemoryPatchRequest *request,
+                                api::MemoryPatch *response) override {
+    if (!local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "memory patching requires local control"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    return memory::apply_patch(*context, *session, timeout_, *request, *response);
+  }
+
+  grpc::Status RestoreMemoryPatch(grpc::ServerContext *, const api::RestoreMemoryPatchRequest *request,
+                                  api::MemoryPatch *response) override {
+    if (!local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "memory patching requires local control"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    try {
+      *response = session->restore_memory_patch(request->patch_id());
+      return grpc::Status::OK;
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
+  }
+
+  grpc::Status StartPageMonitor(grpc::ServerContext *context, const api::StartPageMonitorRequest *request,
+                                api::PageMonitorResult *response) override {
+    if (!local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "page monitoring requires local control"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    return memory::start_page_monitor(*context, *session, timeout_, *request, *response);
+  }
+
+  grpc::Status StopPageMonitor(grpc::ServerContext *, const api::StopPageMonitorRequest *request,
+                               api::PageMonitorResult *response) override {
+    if (!local_control_)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "page monitoring requires local control"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    try {
+      *response = session->stop_page_monitor();
+      return grpc::Status::OK;
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
   }
 
   grpc::Status ScanMemory(grpc::ServerContext *context, const api::ScanMemoryRequest *request,
@@ -2237,7 +2294,8 @@ private:
         return {grpc::StatusCode::FAILED_PRECONDITION,
                 "target process exited during bulk preview"};
       preview.set_retained_limit(kMaxProbes);
-      preview.set_session_retained(snapshot.probes_size());
+      preview.set_session_retained(std::count_if(snapshot.probes().begin(), snapshot.probes().end(),
+          [](const auto &probe) { return !probe.reclaimed(); }));
       if (agent_retained) {
         preview.set_agent_retained(*agent_retained);
         const auto retained = std::max(*agent_retained, preview.session_retained());
@@ -2276,7 +2334,7 @@ private:
   }
 
   grpc::Status validate_probe(const clangtracer::v1::ProbeSpec &spec) const {
-    if (has_scalar_overrides(spec) && !local_control_)
+    if ((has_scalar_overrides(spec) || spec.reclaimable()) && !local_control_)
       return {grpc::StatusCode::FAILED_PRECONDITION, "scalar overrides require a local Unix control socket"};
     if (const auto *error = scalar_override_error(spec))
       return {grpc::StatusCode::INVALID_ARGUMENT, error};

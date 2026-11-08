@@ -75,6 +75,11 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"memory maps", K::memory_maps},
                                         {"memory read", K::memory_read},
                                         {"memory scan", K::memory_scan},
+                                        {"memory patch", K::memory_patch},
+                                        {"memory restore", K::memory_restore},
+                                        {"memory import-hook", K::memory_import_hook},
+                                        {"memory monitor-start", K::page_monitor_start},
+                                        {"memory monitor-stop", K::page_monitor_stop},
                                         {"trace preview", K::bulk_preview},
                                         {"trace apply", K::bulk_apply},
                                         {"trace remove", K::bulk_remove},
@@ -141,7 +146,7 @@ public:
     const std::set<std::string> flags = {
         "--all", "--metadata-only", "--print-arguments", "--print-result",
         "--details", "--addresses", "--sqlite", "--allow-arg-overrides", "--allow-result-override",
-        "--registers"};
+        "--registers", "--watch", "--supervise", "--allow-replacement", "--reclaimable"};
     const std::set<std::string> repeated = {"--include", "--compile-option",
                                            "--name", "--type", "--arg", "--env"};
     const std::set<std::string> bulk_repeated = {"--module", "--exclude", "--exact"};
@@ -265,7 +270,7 @@ Command parse_command(const std::string &input) {
   if (command.kind == K::launch) {
     if (command.arguments[0].empty())
       throw std::invalid_argument("%launch requires an executable path");
-    for (const auto *key : {"--cwd", "--stdin", "--stdout", "--stderr"})
+    for (const auto *key : {"--cwd", "--stdin", "--stdout", "--stderr", "--preload"})
       if (command.has(key) && command.option(key).empty())
         throw std::invalid_argument(std::string(key) + " requires a path");
   }
@@ -300,6 +305,11 @@ Command parse_command(const std::string &input) {
   if (command.number("--timeout", 0) > 86400) {
     throw std::invalid_argument("--timeout must be at most 86400 seconds");
   }
+  if ((command.kind == K::modules || command.kind == K::probe_reload) && command.has("--watch") &&
+      (command.number("--timeout", 0) > 60 || command.number("--count", 0) > 256))
+    throw std::invalid_argument("watch is capped at 60 seconds and 256 changes");
+  if (command.kind == K::modules && command.has("--elf") && command.option("--elf").empty())
+    throw std::invalid_argument("--elf requires an exact mapped path");
   if (command.kind == K::syscalls || command.kind == K::sample_cpu ||
       command.kind == K::watchpoint) {
     if (command.number("--timeout", 0) > max_local_perf_seconds)

@@ -178,6 +178,30 @@ std::size_t patch_window(const Decoder &decoder, std::uint64_t address,
 }
 } // namespace
 
+bool compatible_patch(std::uint64_t address, std::string_view before, std::string_view after) {
+  std::string error;
+  Decoder decoder;
+  if (!make_decoder(decoder, error))
+    throw std::runtime_error(error);
+  if (before.empty() || before.size() != after.size())
+    return false;
+  for (std::size_t offset = 0; offset < before.size();) {
+    const auto width = [&](std::string_view bytes) -> std::uint64_t {
+      llvm::MCInst instruction;
+      std::uint64_t size = 0;
+      if (!decode(decoder, instruction, size, address + offset, bytes.substr(offset)) ||
+          !safe_instruction(instruction, *decoder.ins, *decoder.regs))
+        return 0;
+      return size;
+    };
+    const auto size = width(before);
+    if (!size || width(after) != size)
+      return false;
+    offset += size;
+  }
+  return true;
+}
+
 Preview preview(std::uint64_t address, std::string_view bytes) {
   Preview result;
   Decoder decoder;

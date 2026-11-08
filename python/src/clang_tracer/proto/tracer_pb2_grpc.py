@@ -90,6 +90,26 @@ class TracerStub(object):
                 request_serializer=tracer__pb2.ReadMemoryRequest.SerializeToString,
                 response_deserializer=tracer__pb2.ReadMemoryResponse.FromString,
                 _registered_method=True)
+        self.ApplyMemoryPatch = channel.unary_unary(
+                '/clangtracer.v1.Tracer/ApplyMemoryPatch',
+                request_serializer=tracer__pb2.ApplyMemoryPatchRequest.SerializeToString,
+                response_deserializer=tracer__pb2.MemoryPatch.FromString,
+                _registered_method=True)
+        self.RestoreMemoryPatch = channel.unary_unary(
+                '/clangtracer.v1.Tracer/RestoreMemoryPatch',
+                request_serializer=tracer__pb2.RestoreMemoryPatchRequest.SerializeToString,
+                response_deserializer=tracer__pb2.MemoryPatch.FromString,
+                _registered_method=True)
+        self.StartPageMonitor = channel.unary_unary(
+                '/clangtracer.v1.Tracer/StartPageMonitor',
+                request_serializer=tracer__pb2.StartPageMonitorRequest.SerializeToString,
+                response_deserializer=tracer__pb2.PageMonitorResult.FromString,
+                _registered_method=True)
+        self.StopPageMonitor = channel.unary_unary(
+                '/clangtracer.v1.Tracer/StopPageMonitor',
+                request_serializer=tracer__pb2.StopPageMonitorRequest.SerializeToString,
+                response_deserializer=tracer__pb2.PageMonitorResult.FromString,
+                _registered_method=True)
         self.ScanMemory = channel.unary_unary(
                 '/clangtracer.v1.Tracer/ScanMemory',
                 request_serializer=tracer__pb2.ScanMemoryRequest.SerializeToString,
@@ -218,6 +238,30 @@ class TracerServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def ReadMemory(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ApplyMemoryPatch(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RestoreMemoryPatch(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def StartPageMonitor(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def StopPageMonitor(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -353,6 +397,26 @@ def add_TracerServicer_to_server(servicer, server):
                     servicer.ReadMemory,
                     request_deserializer=tracer__pb2.ReadMemoryRequest.FromString,
                     response_serializer=tracer__pb2.ReadMemoryResponse.SerializeToString,
+            ),
+            'ApplyMemoryPatch': grpc.unary_unary_rpc_method_handler(
+                    servicer.ApplyMemoryPatch,
+                    request_deserializer=tracer__pb2.ApplyMemoryPatchRequest.FromString,
+                    response_serializer=tracer__pb2.MemoryPatch.SerializeToString,
+            ),
+            'RestoreMemoryPatch': grpc.unary_unary_rpc_method_handler(
+                    servicer.RestoreMemoryPatch,
+                    request_deserializer=tracer__pb2.RestoreMemoryPatchRequest.FromString,
+                    response_serializer=tracer__pb2.MemoryPatch.SerializeToString,
+            ),
+            'StartPageMonitor': grpc.unary_unary_rpc_method_handler(
+                    servicer.StartPageMonitor,
+                    request_deserializer=tracer__pb2.StartPageMonitorRequest.FromString,
+                    response_serializer=tracer__pb2.PageMonitorResult.SerializeToString,
+            ),
+            'StopPageMonitor': grpc.unary_unary_rpc_method_handler(
+                    servicer.StopPageMonitor,
+                    request_deserializer=tracer__pb2.StopPageMonitorRequest.FromString,
+                    response_serializer=tracer__pb2.PageMonitorResult.SerializeToString,
             ),
             'ScanMemory': grpc.unary_unary_rpc_method_handler(
                     servicer.ScanMemory,
@@ -713,6 +777,114 @@ class Tracer(object):
             '/clangtracer.v1.Tracer/ReadMemory',
             tracer__pb2.ReadMemoryRequest.SerializeToString,
             tracer__pb2.ReadMemoryResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ApplyMemoryPatch(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/ApplyMemoryPatch',
+            tracer__pb2.ApplyMemoryPatchRequest.SerializeToString,
+            tracer__pb2.MemoryPatch.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RestoreMemoryPatch(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/RestoreMemoryPatch',
+            tracer__pb2.RestoreMemoryPatchRequest.SerializeToString,
+            tracer__pb2.MemoryPatch.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StartPageMonitor(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/StartPageMonitor',
+            tracer__pb2.StartPageMonitorRequest.SerializeToString,
+            tracer__pb2.PageMonitorResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StopPageMonitor(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/clangtracer.v1.Tracer/StopPageMonitor',
+            tracer__pb2.StopPageMonitorRequest.SerializeToString,
+            tracer__pb2.PageMonitorResult.FromString,
             options,
             channel_credentials,
             insecure,

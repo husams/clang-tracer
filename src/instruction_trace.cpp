@@ -72,7 +72,7 @@ api::InstructionTrace Session::start_instruction_trace(
   check_identity_locked();
   if (state_ != api::Session::ATTACHED || unsafe_target_)
     throw std::invalid_argument("instruction tracing requires an attached session");
-  if (instructions_)
+  if (instructions_ || page_monitor_)
     throw std::invalid_argument("stop the existing instruction capture before starting another");
   require_unrestricted_ptrace();
   const auto path = gum_plugin(agent_path_);

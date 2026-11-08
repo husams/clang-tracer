@@ -117,6 +117,27 @@ public:
     overrides->result_set = true;
   }
 
+  template <class T> void replace_with(T value) const {
+    auto *overrides = replacement_overrides(override_type<T>());
+    overrides->replacement = ScalarOverrides::pack(value);
+    overrides->replacement_set = true;
+  }
+
+  void replace_with() const {
+    replacement_overrides(ValueType::Void)->replacement_set = true;
+  }
+
+private:
+  ScalarOverrides *replacement_overrides(ValueType type) const {
+    auto *overrides = context_.scalar_overrides;
+    if (context_.phase != TracePhase::Pre || !overrides || !overrides->allow_replacement)
+      throw std::logic_error("replacement requires an opted-in pre() hook");
+    require_type(context_.result, type);
+    return overrides;
+  }
+
+public:
+
   template <class T = InferResultType> decltype(auto) result() const {
     if (context_.phase != TracePhase::Post) {
       throw std::logic_error("callback result is only available in post()");

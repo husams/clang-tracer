@@ -3,13 +3,16 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace tracer_repl {
 struct LaunchOptions {
-  std::string executable, cwd, input, output, error;
+  std::string executable, cwd, input, output, error, preload;
   std::vector<std::string> arguments, environment;
+  bool supervise = false;
 };
 
 class OwnedTarget {
@@ -20,9 +23,13 @@ class OwnedTarget {
   bool call_pending_ = false;
   [[maybe_unused]] bool call_protocol_failed_ = false;
   std::string executable_, output_, error_;
+  std::mutex lifecycle_;
+  std::thread supervisor_;
+  bool supervise_ = false;
 
   OwnedTarget() = default;
   void close_gate() noexcept;
+  void supervise_group();
   std::string exit_description() const;
 
 public:

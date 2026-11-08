@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include "admission.hpp"
+#include "linux_syscalls.hpp"
 #include "tracer/compat.hpp"
 
 #ifndef NT_X86_XSTATE
@@ -825,7 +826,7 @@ void Process::mark_unsafe() noexcept { poison_process(); }
 
 void Process::attach(pid_t process_id,
                      ::tracer::compat::span<const ApplicationModule> application_modules,
-                     pid_t excluded_tid) {
+                     pid_t excluded_tid, pid_t required_tid) {
 #if !defined(__linux__) || !defined(__x86_64__)
   (void)process_id;
   throw std::runtime_error("native injector is supported only on Linux x86_64");
@@ -873,9 +874,13 @@ void Process::attach(pid_t process_id,
       std::string reason;
     };
     std::vector<Rejection> rejected;
-    auto eligible = [&](pid_t candidate_tid) {
-      if (candidate_tid == excluded_tid) {
+    auto eligible = [&](pid_t candidate_tid, int pending_signal) {
+      if (candidate_tid == excluded_tid || (required_tid && candidate_tid != required_tid)) {
         rejected.push_back({candidate_tid, -1, "reserved for instruction tracing"});
+        return false;
+      }
+      if (required_tid && pending_signal) {
+        rejected.push_back({candidate_tid, -1, "selected control thread has a pending signal"});
         return false;
       }
       const long syscall_number = stopped_syscall(candidate_tid);
@@ -888,6 +893,10 @@ void Process::attach(pid_t process_id,
       if (syscall_number == SYS_nanosleep ||
           syscall_number == SYS_clock_nanosleep) {
         return true;
+      }
+      if (required_tid) {
+        rejected.push_back({candidate_tid, syscall_number, "selected control thread must be sleeping"});
+        return false;
       }
       if (syscall_number >= 0) {
         rejected.push_back({candidate_tid, syscall_number,
@@ -904,11 +913,11 @@ void Process::attach(pid_t process_id,
       }
     };
 
-    if (!eligible(tid_)) {
+    if (!eligible(tid_, pending_signal_)) {
       PeerFreeze freeze(*this);
       pid_t selected_tid = -1;
       for (const auto &peer : freeze.peers) {
-        if (peer.stopped && eligible(peer.tid)) {
+        if (peer.stopped && eligible(peer.tid, peer.pending_signal)) {
           selected_tid = peer.tid;
           break;
         }
@@ -1091,6 +1100,12 @@ std::uintptr_t Process::instruction_pointer() const {
   return register_ip(read_registers(tid_).general);
 }
 
+bool Process::signal_blocked(int signal) const {
+  ensure_usable();
+  return signal > 0 && signal <= 64 &&
+         (read_signal_mask(tid_) & (std::uint64_t{1} << (signal - 1)));
+}
+
 void Process::remote_read(std::uintptr_t address, void *destination,
                           std::size_t size) const {
   ensure_usable();
@@ -1168,7 +1183,8 @@ bool Process::patch_code(std::uintptr_t address, const void *expected,
   return true;
 }
 
-bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches) {
+bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches,
+                               const std::function<void()> &verify) {
   ensure_usable();
   if (patches.empty())
     return true;
@@ -1193,6 +1209,8 @@ bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches) 
   }
 
   PeerFreeze peers(*this);
+  if (verify)
+    verify();
   for (const auto &patch : patches) {
     if (peers.contains_instruction(patch.address, patch.size)) {
       peers.release();
@@ -1249,6 +1267,62 @@ bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches) 
   }
   peers.release();
   return true;
+}
+
+bool Process::retired_code_quiescent(const TracerRetiredCode &code) {
+  ensure_usable();
+  for (const auto &range : code.ranges)
+    if (!range.begin || range.begin >= range.end)
+      return false;
+  PeerFreeze peers(*this);
+  std::vector<std::pair<std::uintptr_t, std::uintptr_t>> readable;
+  std::ifstream maps("/proc/" + std::to_string(process_id_) + "/maps");
+  for (std::string line; std::getline(maps, line);) {
+    std::istringstream row(line);
+    std::uintptr_t begin = 0, end = 0;
+    char dash = 0;
+    std::string permissions;
+    if (row >> std::hex >> begin >> dash >> end >> permissions &&
+        dash == '-' && !permissions.empty() && permissions.front() == 'r')
+      readable.emplace_back(begin, end);
+  }
+  const auto references = [&](const void *data, std::size_t size) {
+    const auto *bytes = static_cast<const unsigned char *>(data);
+    for (std::size_t i = 0; i + sizeof(std::uintptr_t) <= size; i += sizeof(std::uintptr_t)) {
+      std::uintptr_t value = 0;
+      std::memcpy(&value, bytes + i, sizeof(value));
+      for (const auto &range : code.ranges)
+        if (value >= range.begin && value < range.end)
+          return true;
+    }
+    return false;
+  };
+  const auto clean = [&](pid_t tid, int pending) {
+    if (pending)
+      return false;
+    const auto registers = read_registers(tid);
+    if (references(&registers.general, sizeof(registers.general)) ||
+        references(registers.xstate.data(), registers.xstate_size))
+      return false;
+    const auto sp = static_cast<std::uintptr_t>(registers.general.rsp) & ~std::uintptr_t{7};
+    const auto map = std::find_if(readable.begin(), readable.end(), [&](const auto &range) {
+      return range.first <= sp && sp < range.second;
+    });
+    if (map == readable.end() || map->second - sp > 128 * 1024)
+      return false;
+    const auto start = std::max(map->first, sp >= 128 ? sp - 128 : sp);
+    std::vector<unsigned char> stack(map->second - start);
+    iovec local{stack.data(), stack.size()};
+    iovec remote{reinterpret_cast<void *>(start), stack.size()};
+    return linux_api::process_vm_readv(process_id_, &local, 1, &remote, 1, 0) ==
+               static_cast<ssize_t>(stack.size()) && !references(stack.data(), stack.size());
+  };
+  const bool result = clean(tid_, pending_signal_) &&
+      std::all_of(peers.peers.begin(), peers.peers.end(), [&](const auto &peer) {
+        return !peer.stopped || clean(peer.tid, peer.pending_signal);
+      });
+  peers.release();
+  return result;
 }
 
 void Process::remote_free(std::uintptr_t address, std::size_t size) {
