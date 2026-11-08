@@ -505,8 +505,14 @@ std::size_t verify_target_output(const std::filesystem::path &path) {
 void run(const std::filesystem::path &server_path,
          const std::filesystem::path &agent_path,
          const std::filesystem::path &target_path,
-         const std::filesystem::path &output_dir) {
+         const std::filesystem::path &output_dir, bool agent_logging) {
   std::filesystem::create_directories(output_dir);
+  const auto agent_log = output_dir / "agent-diagnostics.log";
+  if (agent_logging) {
+    std::filesystem::remove(agent_log);
+    require(::setenv("CLANG_TRACER_AGENT_LOG", agent_log.c_str(), 1) == 0,
+            "cannot configure agent diagnostics");
+  }
   std::ofstream report_file(output_dir / "report.txt", std::ios::trunc);
   require(static_cast<bool>(report_file), "cannot create report.txt");
 
@@ -589,8 +595,15 @@ void run(const std::filesystem::path &server_path,
   report(report_file,
          "duplicate PID rejected: " + duplicate_status.error_message());
 
-  const auto free_spec = make_spec("traced_work", api::FUNCTION, api::INT32,
-                                   {api::INT32}, callback);
+  const std::string logging_callback = R"cpp(
+    extern "C" long long trace_callback(const TraceContext &context) {
+      if (context.call_id == 1) context.log("legacy callback");
+      return 1 + context.arguments[0].signed_value;
+    }
+  )cpp";
+  const auto free_spec = make_spec(
+      "traced_work", api::FUNCTION, api::INT32, {api::INT32},
+      agent_logging ? logging_callback : callback);
   const auto free_a =
       add_probe_ok(*stub, session_a.id(), free_spec, output_dir, "free-a");
   require(free_a.entry_address() == *target_a_entry,
@@ -786,8 +799,21 @@ void run(const std::filesystem::path &server_path,
       attach_ok(*stub, target_a.pid(), output_dir, "reattach-a");
   require(rebound_session.id() != session_a.id(),
           "reattach reused the detached session ID");
+  auto rebound_spec = free_spec;
+  if (agent_logging) {
+    rebound_spec.set_callback_source(R"cpp(
+      class Interceptor {
+      public:
+        long long pre(const Call &call) {
+          if (call.id() % 2 == 0) throw 7;
+          call.log("class\ncallback", tracer::LogLevel::Warning);
+          return 1LL + call.arg<int>(0);
+        }
+      };
+    )cpp");
+  }
   const auto rebound_probe = add_probe_ok(
-      *stub, rebound_session.id(), free_spec, output_dir, "reattach-probe-a");
+      *stub, rebound_session.id(), rebound_spec, output_dir, "reattach-probe-a");
   api::WatchEventsRequest rebound_request;
   rebound_request.add_session_ids(rebound_session.id());
   std::filesystem::create_directories(output_dir / "reattach");
@@ -802,6 +828,26 @@ void run(const std::filesystem::path &server_path,
   }
   report(report_file, "same live PID detached and reattached with a fresh "
                       "session and working hook");
+  if (agent_logging) {
+    const auto deadline = std::chrono::steady_clock::now() + 4s;
+    std::string lines;
+    do {
+      lines = read_file(agent_log);
+      if (lines.find("message=class?callback\n") != std::string::npos &&
+          lines.find("stage=runtime outcome=degraded") != std::string::npos)
+        break;
+      std::this_thread::sleep_for(50ms);
+    } while (std::chrono::steady_clock::now() < deadline);
+    for (const auto *expected : {"stage=compile_callback outcome=failed",
+                                 "stage=resolve_symbol outcome=failed",
+                                 "stage=publish_probe outcome=ok",
+                                 "operation=stop stage=drain outcome=ok",
+                                 "stage=runtime outcome=degraded",
+                                 "message=legacy callback\n",
+                                 "message=class?callback\n"})
+      require(lines.find(expected) != std::string::npos,
+              std::string("missing agent diagnostic: ") + expected);
+  }
 
   api::WatchEventsRequest continue_request;
   continue_request.add_session_ids(session_b.id());
@@ -872,8 +918,13 @@ int main(int argc, char **argv) {
     std::filesystem::path agent;
     std::filesystem::path target;
     std::filesystem::path output_dir;
+    bool agent_logging = false;
     for (int i = 1; i < argc; ++i) {
       const std::string key = argv[i];
+      if (key == "--agent-logging") {
+        agent_logging = true;
+        continue;
+      }
       if (i + 1 >= argc) {
         throw std::runtime_error("missing value for " + key);
       }
@@ -893,8 +944,8 @@ int main(int argc, char **argv) {
     require(!server.empty() && !agent.empty() && !target.empty() &&
                 !output_dir.empty(),
             "usage: server-integration --server PATH --agent PATH --target "
-            "PATH --output-dir DIR");
-    run(server, agent, target, output_dir);
+            "PATH --output-dir DIR [--agent-logging]");
+    run(server, agent, target, output_dir, agent_logging);
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "server integration failed: " << error.what() << '\n';

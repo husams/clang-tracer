@@ -37,9 +37,11 @@ void emit_context_diagnostic(void *,
 }
 } // namespace
 
-EventTransport::EventTransport(void (*suppress_callbacks)())
+EventTransport::EventTransport(void (*suppress_callbacks)(),
+                               void (*report_diagnostics)() noexcept)
     : slots_(std::make_unique<Packet[]>(kCapacity)),
-      suppress_callbacks_(suppress_callbacks) {
+      suppress_callbacks_(suppress_callbacks),
+      report_diagnostics_(report_diagnostics) {
   for (std::size_t i = 0; i < kCapacity; ++i)
     slots_[i].turn.store(i, std::memory_order_relaxed);
   wake_fd_ = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -121,10 +123,20 @@ bool EventTransport::ready() const noexcept {
              std::memory_order_acquire) == dequeue_ + 1;
 }
 
-void EventTransport::begin_drain(EventDelivery &delivery) noexcept {
+bool EventTransport::begin_drain(EventDelivery &delivery) noexcept {
   std::uint64_t unset = 0;
-  delivery.drain_deadline_ns.compare_exchange_strong(
+  return delivery.drain_deadline_ns.compare_exchange_strong(
       unset, monotonic_ns() + 1000000000ULL, std::memory_order_release);
+}
+
+void EventTransport::report_agent_diagnostics_if_due() noexcept {
+  if (!report_diagnostics_)
+    return;
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= next_agent_report_) {
+    report_diagnostics_();
+    next_agent_report_ = now + std::chrono::seconds(1);
+  }
 }
 
 bool EventTransport::send(EventDelivery &delivery, const void *bytes,
@@ -134,15 +146,22 @@ bool EventTransport::send(EventDelivery &delivery, const void *bytes,
         ::send(delivery.socket_fd, bytes, size, MSG_DONTWAIT | MSG_NOSIGNAL);
     if (count == static_cast<ssize_t>(size))
       return true;
+    const int error_number = count < 0 ? errno : EIO;
     if (count >= 0 ||
-        (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+        (error_number != EAGAIN && error_number != EWOULDBLOCK &&
+         error_number != EINTR)) {
+      delivery.last_send_errno.store(error_number, std::memory_order_relaxed);
       return false;
+    }
     const auto deadline =
         delivery.drain_deadline_ns.load(std::memory_order_acquire);
-    if (deadline && monotonic_ns() >= deadline)
+    if (deadline && monotonic_ns() >= deadline) {
+      delivery.last_send_errno.store(error_number, std::memory_order_relaxed);
       return false;
+    }
     pollfd writable{delivery.socket_fd, POLLOUT, 0};
     (void)::poll(&writable, 1, 10);
+    report_agent_diagnostics_if_due();
   }
   return false;
 }
@@ -153,7 +172,10 @@ void EventTransport::run() noexcept {
     suppress_callbacks_();
   auto next_diagnostic = std::chrono::steady_clock::now();
   for (;;) {
-    while (ready()) {
+    // When agent logging is enabled, give its worker a chance to report even
+    // if producers keep the event queue continuously occupied.
+    for (unsigned batch = 0; ready() && (!report_diagnostics_ || batch < 256);
+         ++batch) {
       auto &packet = slots_[dequeue_ & (kCapacity - 1)];
       auto &delivery = *packet.delivery;
       if (packet.valid) {
@@ -163,7 +185,7 @@ void EventTransport::run() noexcept {
         if (delivered)
           delivery.sent.fetch_add(1, std::memory_order_relaxed);
         else
-          delivery.dropped.fetch_add(1, std::memory_order_relaxed);
+          delivery.dropped.fetch_add(1, std::memory_order_release);
       }
       delivery.pending.fetch_sub(1, std::memory_order_release);
       packet.turn.store(dequeue_ + kCapacity, std::memory_order_release);
@@ -171,6 +193,7 @@ void EventTransport::run() noexcept {
     }
     if (stopping_.load(std::memory_order_acquire))
       return;
+    report_agent_diagnostics_if_due();
     if (std::chrono::steady_clock::now() >= next_diagnostic) {
       (void)context_execution::runtime_diagnostics().drain_coalesced(
           emit_context_diagnostic, nullptr, 32);

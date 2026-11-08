@@ -9,6 +9,7 @@
 
 #include "context_binding.hpp"
 #include "context_registry.hpp"
+#include "tracer/protocol.hpp"
 
 namespace tracer {
 
@@ -20,6 +21,7 @@ struct ContextActivationRequest final {
   std::string file_name = "context-activation-input.cc";
   std::size_t maximum_object_bytes = 4096;
   std::size_t maximum_object_alignment = 64;
+  decltype(&detail::tracer_enqueue_log) callback_log = nullptr;
 };
 
 struct ContextActivationError final {
