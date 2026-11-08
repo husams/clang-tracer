@@ -87,17 +87,19 @@ int main() {
 }
 ```
 
-Save the observer as `hook.cpp`. `Call` is available in the callback compilation environment. The named argument and field appear in the emitted events.
+Save the observer as `hook.cpp`. Specialize `Interceptor<int(int, int)>` to match the return and parameter types of `add`. Clang Tracer supplies the primary template and `Call`, so the callback can read typed arguments and results directly.
 
 ```cpp
-struct Interceptor {
+template <>
+class Interceptor<int(int, int)> {
+public:
   void pre(const Call& call) {
-    call.argument<int>("left", 0);
-    call.argument<int>("right", 1);
+    call.field("left", call.argument<0>());
+    call.field("right", call.argument<1>());
   }
 
   void post(const Call& call) {
-    call.field("sum", call.result<int>());
+    call.field("sum", call.result());
   }
 };
 ```
