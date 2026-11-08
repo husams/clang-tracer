@@ -400,3 +400,18 @@ The optional Gum bundle now powers `%instructions start` and
 range and thread, and the module enforces the record and time limits.
 Stop returns ordered PCs and a completion reason. Detach drains active
 capture before restoring probes.
+
+The extended Gum ABI adds pre-instruction general-purpose registers,
+trusted C++ callbacks, and monitoring of explicit scalar memory accesses
+within a selected thread and code range. Hardware watchpoints use the
+kernel perf breakpoint interface and release their slot when capture
+ends. The live fixture checks register values, callback results and
+errno, memory access addresses and kinds, and hardware watchpoint PCs
+alongside a typed PRE/POST probe.
+
+The offline-relinked bundle passed three live runs each on glibc 2.23
+and 2.34 with automatic plugin and loader selection. Each run verified
+six register snapshots, eight callback results, six monitored accesses,
+three hardware watchpoint hits, 18 native PRE/POST pairs, module unload
+and restored probe bytes. Eleven focused Linux CTests passed, including
+the syscall test rerun with tracefs access, and 199 Python tests passed.

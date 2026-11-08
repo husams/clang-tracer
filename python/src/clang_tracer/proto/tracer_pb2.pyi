@@ -670,7 +670,7 @@ class ReadMemoryResponse(_message.Message):
     def __init__(self, address: _Optional[int] = ..., data: _Optional[bytes] = ...) -> None: ...
 
 class StartInstructionTraceRequest(_message.Message):
-    __slots__ = ("session_id", "mapping_token", "tid", "address", "size", "max_records", "timeout_seconds")
+    __slots__ = ("session_id", "mapping_token", "tid", "address", "size", "max_records", "timeout_seconds", "registers", "callback_library", "memory_address", "memory_size")
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     MAPPING_TOKEN_FIELD_NUMBER: _ClassVar[int]
     TID_FIELD_NUMBER: _ClassVar[int]
@@ -678,6 +678,10 @@ class StartInstructionTraceRequest(_message.Message):
     SIZE_FIELD_NUMBER: _ClassVar[int]
     MAX_RECORDS_FIELD_NUMBER: _ClassVar[int]
     TIMEOUT_SECONDS_FIELD_NUMBER: _ClassVar[int]
+    REGISTERS_FIELD_NUMBER: _ClassVar[int]
+    CALLBACK_LIBRARY_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_SIZE_FIELD_NUMBER: _ClassVar[int]
     session_id: str
     mapping_token: str
     tid: int
@@ -685,7 +689,11 @@ class StartInstructionTraceRequest(_message.Message):
     size: int
     max_records: int
     timeout_seconds: int
-    def __init__(self, session_id: _Optional[str] = ..., mapping_token: _Optional[str] = ..., tid: _Optional[int] = ..., address: _Optional[int] = ..., size: _Optional[int] = ..., max_records: _Optional[int] = ..., timeout_seconds: _Optional[int] = ...) -> None: ...
+    registers: bool
+    callback_library: str
+    memory_address: int
+    memory_size: int
+    def __init__(self, session_id: _Optional[str] = ..., mapping_token: _Optional[str] = ..., tid: _Optional[int] = ..., address: _Optional[int] = ..., size: _Optional[int] = ..., max_records: _Optional[int] = ..., timeout_seconds: _Optional[int] = ..., registers: bool = ..., callback_library: _Optional[str] = ..., memory_address: _Optional[int] = ..., memory_size: _Optional[int] = ...) -> None: ...
 
 class StopInstructionTraceRequest(_message.Message):
     __slots__ = ("session_id",)
@@ -694,7 +702,7 @@ class StopInstructionTraceRequest(_message.Message):
     def __init__(self, session_id: _Optional[str] = ...) -> None: ...
 
 class InstructionTrace(_message.Message):
-    __slots__ = ("tid", "address", "size", "reason", "pcs")
+    __slots__ = ("tid", "address", "size", "reason", "pcs", "details")
     class Reason(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         RUNNING: _ClassVar[InstructionTrace.Reason]
@@ -710,12 +718,28 @@ class InstructionTrace(_message.Message):
     SIZE_FIELD_NUMBER: _ClassVar[int]
     REASON_FIELD_NUMBER: _ClassVar[int]
     PCS_FIELD_NUMBER: _ClassVar[int]
+    DETAILS_FIELD_NUMBER: _ClassVar[int]
     tid: int
     address: int
     size: int
     reason: InstructionTrace.Reason
     pcs: _containers.RepeatedScalarFieldContainer[int]
-    def __init__(self, tid: _Optional[int] = ..., address: _Optional[int] = ..., size: _Optional[int] = ..., reason: _Optional[_Union[InstructionTrace.Reason, str]] = ..., pcs: _Optional[_Iterable[int]] = ...) -> None: ...
+    details: _containers.RepeatedCompositeFieldContainer[InstructionDetail]
+    def __init__(self, tid: _Optional[int] = ..., address: _Optional[int] = ..., size: _Optional[int] = ..., reason: _Optional[_Union[InstructionTrace.Reason, str]] = ..., pcs: _Optional[_Iterable[int]] = ..., details: _Optional[_Iterable[_Union[InstructionDetail, _Mapping]]] = ...) -> None: ...
+
+class InstructionDetail(_message.Message):
+    __slots__ = ("registers", "callback_value", "memory_address", "memory_size", "memory_access")
+    REGISTERS_FIELD_NUMBER: _ClassVar[int]
+    CALLBACK_VALUE_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_SIZE_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_ACCESS_FIELD_NUMBER: _ClassVar[int]
+    registers: _containers.RepeatedScalarFieldContainer[int]
+    callback_value: int
+    memory_address: int
+    memory_size: int
+    memory_access: int
+    def __init__(self, registers: _Optional[_Iterable[int]] = ..., callback_value: _Optional[int] = ..., memory_address: _Optional[int] = ..., memory_size: _Optional[int] = ..., memory_access: _Optional[int] = ...) -> None: ...
 
 class ScanMemoryRequest(_message.Message):
     __slots__ = ("session_id", "mapping_token", "address", "size", "pattern", "mask", "max_matches")

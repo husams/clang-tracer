@@ -42,10 +42,12 @@ struct PerfAttributes {
 };
 static_assert(sizeof(PerfAttributes) == 96 && offsetof(PerfAttributes, clockid) == 92);
 constexpr std::uint64_t disabled = 1ULL << 0;
+constexpr std::uint64_t pinned = 1ULL << 2;
 constexpr std::uint64_t exclude_kernel = 1ULL << 5;
 constexpr std::uint64_t exclude_hv = 1ULL << 6;
 constexpr std::uint64_t use_clockid = 1ULL << 25;
 constexpr unsigned long fd_cloexec = 1UL << 3;
+constexpr unsigned type_breakpoint = 5; // PERF_TYPE_BREAKPOINT in Linux UAPI.
 constexpr std::uint64_t format_lost = 1ULL << 4;
 constexpr unsigned record_lost_samples = 13;
 constexpr std::size_t max_threads = 64;
@@ -57,7 +59,7 @@ struct RingMetadata {
 constexpr auto metadata_offset = offsetof(perf_event_mmap_page, data_head);
 static_assert(metadata_offset == 1024);
 
-enum class Kind { enter, exit, cpu };
+enum class Kind { enter, exit, cpu, watchpoint };
 struct Event {
   Kind kind;
   std::uint32_t tid = 0;
@@ -71,6 +73,9 @@ struct EventSource {
   Kind kind;
   std::uint64_t config;
   std::size_t number_offset = 0, result_offset = 0;
+  std::uint64_t address = 0;
+  unsigned length = 0;
+  bool reads = false;
 };
 
 [[noreturn]] void perf_error(const std::string &operation, int code = errno) {
@@ -82,6 +87,7 @@ const char *name(Kind kind) {
   case Kind::enter: return "syscall-enter";
   case Kind::exit: return "syscall-exit";
   case Kind::cpu: return "cpu-sample";
+  case Kind::watchpoint: return "watchpoint";
   }
   throw std::logic_error("unknown local perf event");
 }
@@ -187,15 +193,15 @@ class Ring {
 
   Event decode(const unsigned char *payload, std::size_t length, std::uint32_t pid) const {
     Event event{source_.kind};
-    const bool cpu = source_.kind == Kind::cpu;
-    const std::size_t base = cpu ? sizeof(std::uint64_t) : 0;
-    if (cpu)
+    const bool instruction_pointer = source_.kind == Kind::cpu || source_.kind == Kind::watchpoint;
+    const std::size_t base = instruction_pointer ? sizeof(std::uint64_t) : 0;
+    if (instruction_pointer)
       event.ip = read_at<std::uint64_t>(payload, length, 0);
     if (read_at<std::uint32_t>(payload, length, base) != pid ||
         (event.tid = read_at<std::uint32_t>(payload, length, base + 4)) != tid_)
       throw std::runtime_error("perf sample identity differs from the selected target");
     event.time = read_at<std::uint64_t>(payload, length, base + 8);
-    if (!cpu) {
+    if (!instruction_pointer) {
       const auto raw_size = read_at<std::uint32_t>(payload, length, 16);
       constexpr std::size_t raw_offset = 20;
       if (length - raw_offset < raw_size)
@@ -222,14 +228,22 @@ public:
 
   void open(std::size_t page_size, bool &try_loss_counter) {
     const bool cpu = source_.kind == Kind::cpu;
+    const bool watch = source_.kind == Kind::watchpoint;
     PerfAttributes attr{};
-    attr.type = cpu ? PERF_TYPE_SOFTWARE : PERF_TYPE_TRACEPOINT;
+    attr.type = watch ? type_breakpoint : cpu ? PERF_TYPE_SOFTWARE : PERF_TYPE_TRACEPOINT;
     attr.size = sizeof(attr);
     attr.config = source_.config;
     attr.period = cpu ? 10'000'000 : 1;
     attr.sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_TIME |
-                       (cpu ? PERF_SAMPLE_IP : PERF_SAMPLE_RAW);
-    attr.flags = disabled | use_clockid | (cpu ? exclude_kernel | exclude_hv : 0);
+                       (cpu || watch ? PERF_SAMPLE_IP : PERF_SAMPLE_RAW);
+    attr.flags = disabled | use_clockid | (cpu || watch ? exclude_kernel | exclude_hv : 0);
+    if (watch) {
+      attr.flags |= pinned;
+      // Linux hw_breakpoint UAPI defines read as bit 0 and write as bit 1.
+      attr.bp_type = source_.reads ? 3 : 2;
+      attr.config1 = source_.address;
+      attr.config2 = source_.length;
+    }
     attr.clockid = CLOCK_MONOTONIC;
     attr.wakeup_events = 1;
     const auto open_event = [&] {
@@ -351,7 +365,8 @@ public:
 
 void capture_local_perf(LocalPerfMode mode, std::uint32_t pid,
                         std::uint64_t start_time, unsigned seconds, unsigned limit,
-                        const std::atomic<bool> &interrupted, std::ostream &out) {
+                        const std::atomic<bool> &interrupted, std::ostream &out,
+                        const Watchpoint *watchpoint) {
   if (!seconds || seconds > max_local_perf_seconds ||
       !limit || limit > max_local_perf_events)
     throw std::invalid_argument("local perf capture requires 1 to 60 seconds and 1 to 8192 events");
@@ -361,8 +376,19 @@ void capture_local_perf(LocalPerfMode mode, std::uint32_t pid,
       throw std::runtime_error("target identity changed before local perf capture");
   };
   verify_process();
-  const auto event_sources = sources(mode);
-  const auto tasks = snapshot_tasks(process);
+  std::vector<EventSource> event_sources;
+  std::vector<Task> tasks;
+  if (mode == LocalPerfMode::watchpoint) {
+    if (!watchpoint)
+      throw std::logic_error("missing hardware watchpoint parameters");
+    const auto stat = process / "task" / std::to_string(watchpoint->tid) / "stat";
+    tasks.push_back({stat, watchpoint->tid, tracer::proc::start_time(stat)});
+    event_sources.push_back({Kind::watchpoint, 0, 0, 0, watchpoint->address,
+                             watchpoint->size, watchpoint->reads});
+  } else {
+    event_sources = sources(mode);
+    tasks = snapshot_tasks(process);
+  }
   const auto page = ::sysconf(_SC_PAGESIZE);
   if (page <= 0)
     throw std::runtime_error("cannot determine page size for local perf capture");
@@ -385,7 +411,7 @@ void capture_local_perf(LocalPerfMode mode, std::uint32_t pid,
   if (interrupted.load())
     throw std::runtime_error("local perf capture interrupted before enabling events");
 
-  const auto label = mode == LocalPerfMode::cpu ? "cpu" : "syscalls";
+  const auto label = watchpoint ? "watchpoint" : mode == LocalPerfMode::cpu ? "cpu" : "syscalls";
   std::vector<Event> events;
   events.reserve(limit);
   std::uint64_t discarded = 0;
@@ -439,12 +465,15 @@ void capture_local_perf(LocalPerfMode mode, std::uint32_t pid,
   for (const auto &event : events) {
     out << "kind=" << name(event.kind) << " pid=" << pid << " tid=" << event.tid
         << " time_ns=" << event.time;
-    if (event.kind == Kind::cpu)
+    if (event.kind == Kind::cpu || event.kind == Kind::watchpoint)
       out << " ip=0x" << std::hex << event.ip << std::dec;
     else
       out << " nr=" << event.number;
     if (event.kind == Kind::exit)
       out << " result=" << event.result;
+    if (event.kind == Kind::watchpoint)
+      out << " watched=0x" << std::hex << watchpoint->address << std::dec
+          << " size=" << watchpoint->size << " access=" << (watchpoint->reads ? "read-write" : "write");
     out << '\n';
   }
   out << "local capture complete kind=" << label << " events=" << events.size()
@@ -457,7 +486,7 @@ void capture_local_perf(LocalPerfMode mode, std::uint32_t pid,
 #else
 namespace tracer_repl {
 void capture_local_perf(LocalPerfMode, std::uint32_t, std::uint64_t, unsigned,
-                        unsigned, const std::atomic<bool> &, std::ostream &) {
+                        unsigned, const std::atomic<bool> &, std::ostream &, const Watchpoint *) {
   throw std::runtime_error("local perf capture requires Linux x86-64");
 }
 } // namespace tracer_repl

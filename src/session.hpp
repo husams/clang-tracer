@@ -74,6 +74,11 @@ private:
     std::uint32_t max_records;
     std::uintptr_t handle;
     std::uintptr_t stop;
+    std::uintptr_t callback_handle;
+    bool has_callback;
+    bool registers;
+    std::uint64_t memory_address;
+    std::uint32_t memory_size;
   };
   struct PthreadCreatePatch {
     std::uintptr_t entry = 0;

@@ -207,13 +207,15 @@ def test_instruction_trace_transmits_capture_limits(peer, monkeypatch):
     monkeypatch.setattr(client.stub, "StartInstructionTrace", start)
     monkeypatch.setattr(client.stub, "StopInstructionTrace", stop)
     result = client.start_instruction_trace(
-        "s1", 0x4000, 64, tid=45, mapping_token="opaque", max_records=1, timeout_seconds=2
+        "s1", 0x4000, 64, tid=45, mapping_token="opaque", max_records=1, timeout_seconds=2,
+        registers=True, callback_library="/tmp/observer.so", memory_address=0x8000, memory_size=8,
     )
     assert result.tid == 45
     start.assert_called_once_with(
         pb.StartInstructionTraceRequest(
             session_id="s1", tid=45, address=0x4000, size=64, mapping_token="opaque",
-            max_records=1, timeout_seconds=2,
+            max_records=1, timeout_seconds=2, registers=True,
+            callback_library="/tmp/observer.so", memory_address=0x8000, memory_size=8,
         ),
         timeout=client.timeout,
     )

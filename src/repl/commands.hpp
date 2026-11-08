@@ -19,6 +19,7 @@ enum class CommandKind {
   target_call_result,
   syscalls,
   sample_cpu,
+  watchpoint,
   instructions_start,
   instructions_stop,
   processes,

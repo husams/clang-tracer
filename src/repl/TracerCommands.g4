@@ -4,7 +4,7 @@ line : '%' command EOF;
 command : server | attach | processes | sessions | use | status | detach
         | modules | threads | symbols | probe | interceptor | events | collect | record
         | cpp | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload
-        | targetLaunch | targetCall | localPerf | instructions;
+        | targetLaunch | targetCall | localPerf | instructions | watchpoint;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
 serverOption : ('--executable' | '--agent') value;
 attach : 'attach' (UINT ('--start-time' UINT)?)?;
@@ -66,7 +66,7 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
         | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview' | 'apply'
         | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | 'launch' | 'resume' | 'terminate'
-        | 'call' | 'call-result' | 'syscalls' | 'sample' | 'cpu' | 'instructions';
+        | 'call' | 'call-result' | 'syscalls' | 'sample' | 'cpu' | 'instructions' | 'watchpoint';
 memory : 'memory' ('maps' | 'read' value '--mapping' value
                  ('--count' UINT | '--type' value)
                  | 'scan' value '--mapping' value '--count' UINT
@@ -81,7 +81,10 @@ targetCall : 'call' value ('--arg' value | '--timeout' UINT)* | 'call-result' ('
 localPerf : ('syscalls' | 'sample' 'cpu') (('--count' | '--timeout') UINT)*;
 instructions : 'instructions' ('start' instructionOption* | 'stop');
 instructionOption : ('--tid' | '--size' | '--count' | '--timeout') UINT
-                  | ('--address' | '--mapping') value;
+                  | '--memory-size' UINT | '--registers'
+                  | ('--address' | '--mapping' | '--callback-library' | '--memory-address') value;
+watchpoint : 'watchpoint' (('--tid' | '--size' | '--count' | '--timeout') UINT
+                         | ('--address' | '--mapping' | '--access') value)*;
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';

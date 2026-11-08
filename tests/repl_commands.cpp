@@ -39,6 +39,15 @@ int main() {
   require(parse_command("%instructions start --tid 23 --address 0x4000 --size 64 --mapping m --count 7")
               .kind == CommandKind::instructions_start);
   require(parse_command("%instructions stop").kind == CommandKind::instructions_stop);
+  const auto extended = parse_command("%instructions start --tid 23 --address 0x4000 --size 64 "
+      "--mapping m --registers --callback-library /tmp/observer.so --memory-address 0x8000 --memory-size 8");
+  require(extended.has("--registers") && extended.option("--callback-library") == "/tmp/observer.so" &&
+          extended.option("--memory-address") == "0x8000" && extended.number("--memory-size", 0) == 8);
+  require(parse_command("%watchpoint --tid 23 --address 0x4000 --size 8 --mapping m --access read-write")
+              .kind == CommandKind::watchpoint);
+  bad("%watchpoint --tid 23 --address 0x4001 --size 8 --mapping m --access write");
+  bad("%watchpoint --tid 23 --address 0x4000 --size 8 --mapping m --access read");
+  bad("%instructions start --tid 23 --address 0x4000 --size 64 --mapping m --memory-address 0x8000");
   bad("%instructions start --address 0x4000 --tid 23 --size 64");
   bad("%instructions start --tid 0 --address 0x4000 --size 64 --mapping m");
   bad("%instructions start --tid 23 --address 0x4000 --size 65537 --mapping m");

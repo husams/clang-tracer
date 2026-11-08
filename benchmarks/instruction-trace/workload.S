@@ -82,6 +82,25 @@ pilot_fault:
 .globl pilot_live_work_end
 pilot_live_work_end:
 
+.globl pilot_memory
+.type pilot_memory,@function
+pilot_memory:
+  pc memory_read
+  movq (%rdi), %rax
+  pc memory_write
+  movq %rsi, 8(%rdi)
+  pc memory_rmw
+  addq $1, (%rdi)
+  pc memory_read_after_write
+  movq 8(%rdi), %rcx
+  pc memory_add
+  addq %rcx, %rax
+  pc memory_return
+  ret
+.size pilot_memory,.-pilot_memory
+.globl pilot_memory_end
+pilot_memory_end:
+
 .globl pilot_native
 .type pilot_native,@function
 pilot_native:

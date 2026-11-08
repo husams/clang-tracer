@@ -32,6 +32,61 @@ Detach and owned-server shutdown stop active capture before removing
 probes. If Gum is still draining, let the worker reach a dispatch
 boundary and retry stop.
 
+### Register snapshots and callbacks
+
+Add `--registers` to collect RIP and the 16 general-purpose registers
+immediately before each recorded instruction. Add
+`--callback-library /absolute/path/observer.so` to invoke a trusted C++
+function on the followed thread at the same point, once per admitted
+record. The REPL prints its 64-bit return value with the corresponding PC.
+The two options can be used independently.
+
+Build the shared library against the target's C++ runtime. Export the
+callback declared in `include/tracer/instruction_trace.h`. For example:
+
+```cpp
+#include "tracer/instruction_trace.h"
+
+extern "C" uint64_t tracer_instruction_callback_v1(
+    const TracerInstructionRegistersV2 *registers) noexcept {
+  return registers->rax;
+}
+```
+
+Use `-shared -fPIC` and the repository's `include` directory. The callback
+receives a read-only snapshot valid only for the duration of the call.
+Keep it short, avoid blocking and exceptions, and return normally. The
+capture deadline prevents new calls and an invocation already in progress
+must finish before its library can be unloaded. [Pinned Gum CPU context](https://github.com/frida/frida-gum/blob/00a05282d1074c0e043b285c70a4412d784c573d/gum/gumdefs.h)
+
+### Memory-access monitoring and hardware watchpoints
+
+Add `--memory-address DATA --memory-size BYTES` to the instruction
+start command to record attempted accesses overlapping a readable data
+range of up to 64 KiB in the same mapping snapshot. Each record reports
+the original instruction PC, effective address, width and access kind.
+The filter applies to the selected thread and executable range, and the
+data mapping must stay stable during capture. It supports scalar
+move, arithmetic, bitwise, compare and exchange instructions with an
+explicit operand of up to eight bytes using 64-bit addressing. Implicit
+stack and string accesses, vector instructions, conditional stores, and
+segment overrides are outside this mode. Register snapshots and callback
+results can be collected for the matching accesses.
+
+Use a hardware watchpoint to observe a small data range regardless of the
+accessing code address. It covers one thread and a naturally aligned
+range of 1, 2, 4 or 8 bytes. The REPL waits until the count, timeout,
+interruption or thread exit and releases the kernel event descriptor.
+The mode requires permission to open the perf breakpoint event and a
+free hardware slot. It reports the configured address, sampled IP
+(after the triggering instruction on x86-64), and kernel loss and
+throttling counters. The read-write mode reports hits for both types.
+[Linux perf breakpoint events](https://man7.org/linux/man-pages/man2/perf_event_open.2.html)
+
+```text
+%watchpoint --tid 1234 --address 0x402000 --size 8 --mapping TOKEN --access write --count 4 --timeout 5
+```
+
 ## Reproduce
 
 Use Linux x86-64 with a C++17 compiler, Python 3.8 or newer, GNU binutils,
@@ -123,7 +178,8 @@ strip --strip-unneeded -o /tmp/instruction-stage/gum-backend.so \
   /tmp/instruction-pilot/gum-backend.so
 python3 benchmarks/instruction-trace/live_compare.py \
   "$REPL" "$SERVER" "$AGENT" /tmp/instruction-pilot/live-target \
-  /tmp/instruction-stage/gum-backend.so --native-repl
+  /tmp/instruction-stage/gum-backend.so --native-repl \
+  --callback-library /tmp/instruction-pilot/verify-callback.so
 ```
 
 The runner starts a C++ target and waits for its worker to come up. It then
@@ -133,6 +189,10 @@ runner can also exercise the original fixture control observer by
 omitting `--native-repl`. The
 instruction range is the same 65-byte leaf used by the standalone pilot,
 reached through the actively probed caller on that worker.
+Passing the fixture callback library also checks pre-instruction register
+values, exact callback results and caps, scalar read/write/RMW addresses,
+hardware write and read-write hits, and an idle watchpoint timeout with
+the native probe active.
 
 After replacing the private glibc import, three runs on SDK glibc 2.23 and
 four on Rocky Linux 9.8 glibc 2.34 each matched 56 instruction PCs and a

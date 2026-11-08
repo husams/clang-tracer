@@ -5,6 +5,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 
 #include <dlfcn.h>
 #include <sys/types.h>
@@ -29,6 +30,19 @@ std::string gum_plugin(const std::string &agent_path) {
   return canonical.string();
 }
 
+std::string callback_library(const std::string &value) {
+  if (value.empty())
+    return {};
+  const std::filesystem::path path(value);
+  std::error_code error;
+  if (value.size() >= 4096 || value.find('\0') != std::string::npos || !path.is_absolute())
+    throw std::invalid_argument("instruction callback library must be an absolute shared library path");
+  const auto canonical = std::filesystem::canonical(path, error);
+  if (error || !std::filesystem::is_regular_file(canonical, error))
+    throw std::invalid_argument("instruction callback library must be a readable regular file");
+  return canonical.string();
+}
+
 void require_unrestricted_ptrace() {
   std::ifstream policy("/proc/sys/kernel/yama/ptrace_scope");
   unsigned scope = 0;
@@ -39,7 +53,7 @@ void require_unrestricted_ptrace() {
 void close_plugin(injector::Process &process, std::uintptr_t handle) {
   const auto dlclose = process.resolve_remote_symbol("dlclose");
   if (process.remote_call(dlclose, {handle}, 1) != 0)
-    throw std::runtime_error("could not close the target Gum module");
+    throw std::runtime_error("could not close an instruction tracing module in the target");
 }
 
 std::uint64_t thread_identity(const std::filesystem::path &stat) {
@@ -62,31 +76,46 @@ api::InstructionTrace Session::start_instruction_trace(
     throw std::invalid_argument("stop the existing instruction capture before starting another");
   require_unrestricted_ptrace();
   const auto path = gum_plugin(agent_path_);
+  const auto callback_path = callback_library(request.callback_library());
+  const bool extended = request.registers() || !callback_path.empty() || request.memory_size();
   const auto tid = static_cast<pid_t>(request.tid());
   const auto stat = proc::directory(pid_) / "task" / std::to_string(tid) / "stat";
   const auto thread_start = thread_identity(stat);
-  const auto scratch_size = std::max(path.size() + 1, std::size_t{64});
+  const auto scratch_size = std::max({path.size() + 1, callback_path.size() + 1, std::size_t{64}});
   const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
   injector::Process process;
   std::uintptr_t scratch = 0;
   std::uintptr_t handle = 0;
+  std::uintptr_t callback_handle = 0;
   try {
     attach_process(process, deadline, tid);
     scratch = process.remote_allocate(scratch_size);
-    process.remote_write(scratch, path.c_str(), path.size() + 1);
     const auto dlopen = process.resolve_remote_symbol("dlopen");
     const auto dlsym = process.resolve_remote_symbol("dlsym");
-    handle = process.remote_call(dlopen, {scratch, RTLD_NOW | RTLD_LOCAL}, 2);
+    const auto open = [&](const std::string &module) {
+      process.remote_write(scratch, module.c_str(), module.size() + 1);
+      return process.remote_call(dlopen, {scratch, RTLD_NOW | RTLD_LOCAL}, 2);
+    };
+    handle = open(path);
     if (!handle)
       throw std::invalid_argument("target could not load the Gum module and its dependencies");
-    const auto symbol = [&](const char *name) {
+    const auto symbol = [&](std::uintptr_t module, const char *name) {
       process.remote_write(scratch, name, std::strlen(name) + 1);
-      return process.remote_call(dlsym, {handle, scratch}, 2);
+      return process.remote_call(dlsym, {module, scratch}, 2);
     };
-    const auto start = symbol("tracer_gum_instruction_start_v1");
-    const auto stop = symbol("tracer_gum_instruction_stop_v1");
+    const auto start = symbol(handle, extended ? "tracer_gum_instruction_start_v2"
+                                                : "tracer_gum_instruction_start_v1");
+    const auto stop = symbol(handle, extended ? "tracer_gum_instruction_stop_v2"
+                                               : "tracer_gum_instruction_stop_v1");
     if (!start || !stop)
       throw std::invalid_argument("Gum module does not support the native instruction tracing ABI");
+    std::uintptr_t callback = 0;
+    if (!callback_path.empty()) {
+      callback_handle = open(callback_path);
+      if (!callback_handle ||
+          !(callback = symbol(callback_handle, "tracer_instruction_callback_v1")))
+        throw std::invalid_argument("target could not load tracer_instruction_callback_v1 from the library");
+    }
     std::string live(expected_code.size(), '\0');
     process.remote_read(request.address(), live.data(), live.size());
     if (live != expected_code || thread_identity(stat) != thread_start)
@@ -95,10 +124,20 @@ api::InstructionTrace Session::start_instruction_trace(
     trace.set_tid(request.tid());
     trace.set_address(request.address());
     trace.set_size(request.size());
-    instructions_ = InstructionCapture{trace, request.max_records(), handle, stop};
-    const auto status = static_cast<std::int32_t>(process.remote_call(
-        start, {request.tid(), request.address(), request.address() + request.size(),
-                request.max_records(), request.timeout_seconds()}, 5));
+    const TracerInstructionRequestV2 options{
+        request.address(), request.address() + request.size(), request.memory_address(),
+        request.memory_address() + request.memory_size(), callback, request.tid(),
+        request.max_records(), request.timeout_seconds(),
+        request.registers() ? std::uint32_t{TRACER_INSTRUCTION_REGISTERS} : 0};
+    if (extended)
+      process.remote_write(scratch, &options, sizeof(options));
+    instructions_ = InstructionCapture{trace, request.max_records(), handle, stop, callback_handle,
+                                       callback != 0, request.registers(),
+                                       request.memory_address(), request.memory_size()};
+    const auto status = static_cast<std::int32_t>(extended
+        ? process.remote_call(start, {scratch}, 1)
+        : process.remote_call(start, {options.tid, options.begin, options.end,
+                                      options.limit, options.seconds}, 5));
     if (status != 0 && status != -2)
       instructions_.reset();
     if (status == -2)
@@ -111,6 +150,9 @@ api::InstructionTrace Session::start_instruction_trace(
     process.detach();
     return trace;
   } catch (...) {
+    if (!process.unsafe() && callback_handle && !instructions_) {
+      try { close_plugin(process, callback_handle); } catch (...) {}
+    }
     if (!process.unsafe() && handle && !instructions_) {
       try { close_plugin(process, handle); } catch (...) {}
     }
@@ -143,11 +185,13 @@ api::InstructionTrace Session::stop_instruction_trace_locked(
   auto &capture = *instructions_;
   auto result = capture.trace;
   TracerInstructionResultV1 collected{};
+  const bool extended = capture.registers || capture.has_callback || capture.memory_size;
+  const auto result_size = extended ? sizeof(TracerInstructionResultV2) : sizeof(collected);
   injector::Process process;
   std::uintptr_t scratch = 0;
   try {
     attach_process(process, deadline, static_cast<pid_t>(result.tid()));
-    scratch = process.remote_allocate(sizeof(collected));
+    scratch = process.remote_allocate(result_size);
     if (process.remote_call(capture.stop, {scratch}, 1) != 0)
       throw std::runtime_error("Gum has not drained; retry %instructions stop");
     process.remote_read(scratch, &collected, sizeof(collected));
@@ -156,13 +200,47 @@ api::InstructionTrace Session::stop_instruction_trace_locked(
         collected.reason > TRACER_INSTRUCTION_TIMEOUT)
       throw std::runtime_error("Gum returned an invalid instruction capture");
     result.set_reason(static_cast<api::InstructionTrace::Reason>(collected.reason));
+    std::vector<TracerInstructionDetailV2> details(extended ? collected.count : 0);
+    if (!details.empty())
+      process.remote_read(scratch + offsetof(TracerInstructionResultV2, details),
+                          details.data(), details.size() * sizeof(details.front()));
     for (std::uint32_t i = 0; i < collected.count; ++i) {
       if (collected.offsets[i] >= result.size())
         throw std::runtime_error("Gum returned a PC outside the requested range");
-      result.add_pcs(result.address() + collected.offsets[i]);
+      const auto pc = result.address() + collected.offsets[i];
+      result.add_pcs(pc);
+      if (extended) {
+        const auto &detail = details[i];
+        auto *output = result.add_details();
+        if (capture.registers) {
+          const auto &r = detail.registers;
+          if (r.rip != pc)
+            throw std::runtime_error("Gum register snapshot PC does not match its instruction");
+          for (auto value : {r.rax, r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.rbp, r.rsp,
+                             r.r8, r.r9, r.r10, r.r11, r.r12, r.r13, r.r14, r.r15})
+            output->add_registers(value);
+        }
+        if (capture.has_callback)
+          output->set_callback_value(detail.callback_value);
+        if (capture.memory_size) {
+          if (!detail.memory_size || detail.memory_size > 8 ||
+              detail.memory_access < 1 || detail.memory_access > 3 ||
+              detail.memory_address >= capture.memory_address + capture.memory_size ||
+              (detail.memory_address < capture.memory_address &&
+               capture.memory_address - detail.memory_address >= detail.memory_size))
+            throw std::runtime_error("Gum returned a memory access outside the requested range");
+          output->set_memory_address(detail.memory_address);
+          output->set_memory_size(detail.memory_size);
+          output->set_memory_access(detail.memory_access);
+        }
+      }
     }
-    process.remote_free(scratch, sizeof(collected));
+    process.remote_free(scratch, result_size);
     scratch = 0;
+    if (capture.callback_handle) {
+      close_plugin(process, capture.callback_handle);
+      capture.callback_handle = 0;
+    }
     close_plugin(process, capture.handle);
     instructions_.reset();
     last_instruction_trace_ = result;
@@ -170,7 +248,7 @@ api::InstructionTrace Session::stop_instruction_trace_locked(
     return result;
   } catch (...) {
     if (!process.unsafe() && scratch) {
-      try { process.remote_free(scratch, sizeof(collected)); } catch (...) {}
+      try { process.remote_free(scratch, result_size); } catch (...) {}
     }
     if (process.unsafe()) {
       unsafe_target_ = true;

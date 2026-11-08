@@ -43,4 +43,7 @@ Install the rebuilt `gum-backend.so` beside the native tracer agent or set
 `CLANG_TRACER_GUM_PLUGIN` to its absolute path before launching the REPL.
 Attach through the REPL's owned local server, use `%threads` and
 `%memory maps` to select the thread and range, then run
-`%help instructions start` for the capture options.
+`%help instructions start` for register snapshots, target callbacks and
+bounded memory-access monitoring. The callback ABI is in
+`relink/instruction_trace.h`. Hardware watchpoints use the native REPL's
+Linux perf interface and are described by `%help watchpoint`.

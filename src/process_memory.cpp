@@ -566,6 +566,11 @@ grpc::Status start_instruction_trace(
       !request.max_records() || request.max_records() > TRACER_INSTRUCTION_MAX_RECORDS ||
       !request.timeout_seconds() || request.timeout_seconds() > TRACER_INSTRUCTION_MAX_SECONDS)
     return {Code::INVALID_ARGUMENT, "invalid instruction trace thread, range or limits"};
+  const auto data_begin = request.memory_address();
+  const auto data_size = request.memory_size();
+  if ((data_begin == 0) != (data_size == 0) || data_size > TRACER_INSTRUCTION_MAX_BYTES ||
+      data_size > UINT64_MAX - data_begin)
+    return {Code::INVALID_ARGUMENT, "invalid monitored memory range"};
   return inspect(context, session, timeout, [&](const Target &target) {
     const auto maps = target.maps();
     if (mapping_token(session, maps) != request.mapping_token())
@@ -580,6 +585,17 @@ grpc::Status start_instruction_trace(
     if (!executable)
       throw MemoryError(Code::FAILED_PRECONDITION,
                         "instruction range must fit one readable file-backed executable mapping");
+    if (data_size) {
+      const auto readable = std::any_of(snapshot.mappings().begin(), snapshot.mappings().end(),
+                                        [&](const auto &mapping) {
+        return mapping.begin_address() <= data_begin &&
+               data_begin + data_size <= mapping.end_address() &&
+               mapping.permissions().at(0) == 'r';
+      });
+      if (!readable)
+        throw MemoryError(Code::FAILED_PRECONDITION,
+                          "monitored data must fit one readable mapping");
+    }
     const auto bytes = target.read_bytes(begin, size);
     if (maps != target.maps())
       throw MemoryError(Code::ABORTED, "target mappings changed during setup; run %memory maps again");

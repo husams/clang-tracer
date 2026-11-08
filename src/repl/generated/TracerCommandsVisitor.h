@@ -105,6 +105,8 @@ public:
 
     virtual std::any visitInstructionOption(TracerCommandsParser::InstructionOptionContext *context) = 0;
 
+    virtual std::any visitWatchpoint(TracerCommandsParser::WatchpointContext *context) = 0;
+
 
 };
 

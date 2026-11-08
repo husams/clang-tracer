@@ -1455,13 +1455,33 @@ bool Controller::execute(const Command &command) {
     call_target(command);
     return true;
   case K::syscalls:
+  case K::watchpoint:
   case K::sample_cpu: {
     if (!server_.running() || endpoint_ != server_.endpoint())
       throw std::runtime_error("local perf capture requires the REPL's owned local server");
     const auto start = require_session(selected_);
-    const auto mode = command.kind == K::syscalls ? LocalPerfMode::syscalls : LocalPerfMode::cpu;
+    auto mode = command.kind == K::syscalls ? LocalPerfMode::syscalls : LocalPerfMode::cpu;
+    Watchpoint watch{};
+    if (command.kind == K::watchpoint) {
+      mode = LocalPerfMode::watchpoint;
+      watch = {static_cast<std::uint32_t>(command.number("--tid", 0)),
+               address_number(command.option("--address")),
+               static_cast<unsigned>(command.number("--size", 0)),
+               command.option("--access") == "read-write"};
+      api::ReadMemoryRequest request;
+      request.set_session_id(selected_.id);
+      request.set_mapping_token(command.option("--mapping"));
+      request.set_address(watch.address);
+      request.set_size(watch.size);
+      const auto result = unary<api::ReadMemoryResponse>(
+          [&](auto &c, auto &r) { return stub_->ReadMemory(&c, request, &r); },
+          settings_.timeout_seconds);
+      if (result.address() != watch.address || result.data().size() != watch.size)
+        throw std::runtime_error("watchpoint range could not be verified");
+    }
     capture_local_perf(mode, selected_.pid, start, command.number("--timeout", 2),
-                       command.number("--count", 256), interrupted, out_);
+                       command.number("--count", 256), interrupted, out_,
+                       mode == LocalPerfMode::watchpoint ? &watch : nullptr);
     return true;
   }
   case K::bulk_preview:
@@ -1568,6 +1588,12 @@ bool Controller::execute(const Command &command) {
     request.set_size(command.number("--size", 0));
     request.set_max_records(command.number("--count", 256));
     request.set_timeout_seconds(command.number("--timeout", 5));
+    request.set_registers(command.has("--registers"));
+    request.set_callback_library(command.option("--callback-library"));
+    if (command.has("--memory-address")) {
+      request.set_memory_address(address_number(command.option("--memory-address")));
+      request.set_memory_size(command.number("--memory-size", 0));
+    }
     const auto result = unary<api::InstructionTrace>(
         [&](auto &c, auto &r) { return stub_->StartInstructionTrace(&c, request, &r); },
         settings_.timeout_seconds);
@@ -1587,10 +1613,32 @@ bool Controller::execute(const Command &command) {
         [&](auto &c, auto &r) { return stub_->StopInstructionTrace(&c, request, &r); },
         settings_.timeout_seconds);
     if (result.reason() == api::InstructionTrace::RUNNING ||
-        result.pcs_size() > TRACER_INSTRUCTION_MAX_RECORDS)
+        result.pcs_size() > TRACER_INSTRUCTION_MAX_RECORDS ||
+        (result.details_size() && result.details_size() != result.pcs_size()))
       throw std::runtime_error("invalid instruction capture response");
-    for (const auto pc : result.pcs())
-      out_ << "instruction pc=0x" << std::hex << pc << std::dec << '\n';
+    constexpr const char *registers[] = {
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
+    static_assert(std::size(registers) == TRACER_INSTRUCTION_REGISTER_COUNT);
+    for (int i = 0; i < result.pcs_size(); ++i) {
+      out_ << "instruction pc=0x" << std::hex << result.pcs(i);
+      if (result.details_size()) {
+        const auto &detail = result.details(i);
+        if (detail.registers_size() && detail.registers_size() != TRACER_INSTRUCTION_REGISTER_COUNT)
+          throw std::runtime_error("invalid instruction register snapshot");
+        for (int j = 0; j < detail.registers_size(); ++j)
+          out_ << ' ' << registers[j] << "=0x" << detail.registers(j);
+        if (detail.has_callback_value())
+          out_ << " callback=0x" << detail.callback_value();
+        if (detail.memory_size()) {
+          out_ << " memory=0x" << detail.memory_address() << std::dec
+               << " size=" << detail.memory_size() << " access="
+               << (detail.memory_access() == TRACER_INSTRUCTION_MEMORY_READ ? "read" :
+                   detail.memory_access() == TRACER_INSTRUCTION_MEMORY_WRITE ? "write" : "read-write");
+        }
+      }
+      out_ << std::dec << '\n';
+    }
     out_ << "instructions stopped tid=" << result.tid() << " count=" << result.pcs_size()
          << " reason=" << api::InstructionTrace::Reason_Name(result.reason())
          << " truncated=" << (result.reason() == api::InstructionTrace::LIMIT ? "true" : "false")

@@ -29,7 +29,8 @@ def inspect_plugin(plugin):
     pilot = {"pilot_gum_init", "pilot_gum_shutdown", "pilot_gum_run",
              "pilot_gum_live_start", "pilot_gum_live_stop"}
     supported = {"tracer_gum_instruction_start_v1", "tracer_gum_instruction_stop_v1"}
-    assert names in (pilot, pilot | supported), names
+    extended = {"tracer_gum_instruction_start_v2", "tracer_gum_instruction_stop_v2"}
+    assert names in (pilot, pilot | supported, pilot | supported | extended), names
     assert "libc.so.6" in needed and set(needed) <= allowed, needed
     assert "(BIND_NOW)" in dynamic or re.search(r"Flags:.*\bNOW\b", dynamic)
     assert not re.search(r"\((?:TEXTREL|RPATH|RUNPATH)\)", dynamic)
@@ -45,12 +46,14 @@ def inspect_plugin(plugin):
 
 
 def verify(repl, server, agent, fixture, plugin, command, target_library_path,
-           native_repl=False):
+           native_repl=False, callback_library=None):
     names = symbols(fixture)
     workloads = {"w": (3, 19, 0, 0), "v": (2, 16, 0, 0),
-                 "s": (-3, 19, 1, 0), "f": (0, 39, 0, 1)}
+                 "s": (-3, 19, 1, 0), "f": (0, 39, 0, 1), "m": (-4, 27, 0, 0)}
     expected = {}
     for letter, (rounds, _, signals, _) in workloads.items():
+        if letter == "m":
+            continue
         labels = expected_pcs(abs(rounds), signals) if rounds else ["fault_load", "fault_return"]
         expected[letter] = [names[f"pilot_pc_{label}"] - names["pilot_work"]
                             for label in labels]
@@ -96,6 +99,9 @@ struct Interceptor {{
         )
         assert tid != child.pid
         assert end - begin == names["pilot_live_work_end"] - names["pilot_work"]
+        if callback_library:
+            match = target_out.expect(r"^memory begin=(0x\w+) end=(0x\w+) data=(0x\w+)$")
+            mem_begin, mem_end, data = (int(value, 16) for value in match.groups())
         maps = Path(f"/proc/{child.pid}/maps")
         task = Path(f"/proc/{child.pid}/task/{tid}")
         memory = stack.enter_context(open(f"/proc/{child.pid}/mem", "rb", buffering=0))
@@ -144,9 +150,12 @@ struct Interceptor {{
             target(letter, rf"^worker returned {value} signals={signals} faults={faults}$")
 
         def native_call(letter, probe, version=1):
+            worker(letter)
+            verify_native_call(letter, probe, version)
+
+        def verify_native_call(letter, probe, version=1):
             nonlocal cursor
             rounds, value, _, _ = workloads[letter]
-            worker(letter)
             send(f"%events --probe {probe} --after {cursor} --count 2 --timeout 8")
             pre = output.expect(
                 rf"^cursor=(\d+) .*tid={tid} probe={probe} phase=PRE call=(\d+) "
@@ -209,6 +218,76 @@ struct Interceptor {{
             output.expect(rf"^removed probe={probe} restored=true$")
             assert code() == original
 
+        def verify_extensions(probe):
+            labels = ["read", "write", "rmw", "read_after_write", "add", "return"]
+            pcs = [mem_begin + names[f"pilot_pc_memory_{label}"] - names["pilot_memory"]
+                   for label in labels]
+            assert mem_end - mem_begin == names["pilot_memory_end"] - names["pilot_memory"]
+
+            def extended_start(options):
+                return (f"%instructions start --tid {tid} --address {mem_begin:#x} "
+                        f"--size {mem_end - mem_begin} --mapping {mapping_token()} {options}")
+
+            def extended_capture(options, count, reason="STOPPED"):
+                send(extended_start(options))
+                output.expect(rf"^instructions started tid={tid} address={mem_begin:#x} ")
+                assert mapped() and code() == patch
+                native_call("m", probe)
+                send("%instructions stop")
+                rows = [dict(item.split("=", 1) for item in output.expect(
+                            r"^instruction (.+)$")[1].split()) for _ in range(count)]
+                output.expect(rf"^instructions stopped tid={tid} count={count} reason={reason} ")
+                assert not mapped() and str(callback_library) not in maps.read_text() and code() == patch
+                return rows
+
+            send(extended_start(f'--callback-library "{plugin}"'))
+            output.expect(r"RPC 9: target could not load tracer_instruction_callback_v1")
+            assert not mapped() and code() == patch
+            send(extended_start("--memory-address 1 --memory-size 8"))
+            output.expect(r"RPC 9: monitored data must fit one readable mapping")
+
+            options = f'--registers --callback-library "{callback_library}"'
+            rows = extended_capture(options, len(pcs))
+            assert [int(row["pc"], 16) for row in rows] == pcs
+            for index, row in enumerate(rows, start=1):
+                assert len(row) == 18 and int(row["rdi"], 16) == data and int(row["rsi"], 16) == 7
+                assert int(row["callback"], 16) == (int(row["pc"], 16) ^ data ^ 7) + index
+            assert [int(row["rax"], 16) for row in rows[1:]] == [10, 10, 10, 10, 17]
+            capped = extended_capture(options + " --count 2", 2, "LIMIT")
+            assert [int(row["callback"], 16) for row in capped] == [
+                (pc ^ data ^ 7) + index for index, pc in enumerate(pcs[:2], start=1)]
+
+            access = extended_capture(f"--memory-address {data:#x} --memory-size 16", 4)
+            assert [(int(row["pc"], 16), int(row["memory"], 16), int(row["size"]), row["access"])
+                    for row in access] == list(zip(pcs, [data, data + 8, data, data + 8],
+                                                   [8] * 4, ["read", "write", "read-write", "read"]))
+            filtered = extended_capture(f"--memory-address {data + 9:#x} --memory-size 1", 2)
+            assert [int(row["pc"], 16) for row in filtered] == [pcs[1], pcs[3]]
+
+            def watch(access_mode, hit_pcs):
+                send(f"%watchpoint --tid {tid} --address {data + 8:#x} --size 8 "
+                     f"--mapping {mapping_token()} --access {access_mode} "
+                     f"--count {len(hit_pcs) or 1} --timeout 2")
+                output.expect(rf"^local capture ready kind=watchpoint pid={child.pid} threads=1$")
+                if hit_pcs:
+                    worker("m")
+                for ip in hit_pcs:
+                    output.expect(rf"^kind=watchpoint pid={child.pid} tid={tid} time_ns=\d+ "
+                                  rf"ip={ip:#x} watched={data + 8:#x} size=8 access={access_mode}$")
+                reason = "limit" if hit_pcs else "timeout"
+                output.expect(rf"^local capture complete kind=watchpoint events={len(hit_pcs)} "
+                              rf"lost=0 .* throttles=0 discarded=0 stopped={reason}$")
+                if hit_pcs:
+                    verify_native_call("m", probe)
+
+            watch("write", [pcs[2]])
+            watch("read-write", [pcs[2], pcs[4]])
+            watch("write", [])
+            native_call("m", probe)
+            return {"register_snapshots": len(rows), "callbacks": len(rows) + len(capped),
+                    "memory_accesses": len(access) + len(filtered), "hardware_watchpoint_hits": 3,
+                    "callback_errno_preserved": True, "watchpoint_idle_timeout": True}
+
         def check_capture(calls, cap, reason=None):
             wanted = [pc for letter in calls for pc in expected[letter]]
             if native_repl:
@@ -239,6 +318,7 @@ struct Interceptor {{
         patch = code()
         assert patch != original
         native_call("w", native_probe)
+        extensions = verify_extensions(native_probe) if callback_library else None
         if not native_repl:
             control_probe = install("pilot_control(int, int, unsigned long, unsigned long, int)", loader)
         for arm, calls, cap in (("b", "wv", 256), ("c", "w", 7)):
@@ -294,13 +374,20 @@ struct Interceptor {{
             control("e")
             assert check_capture("w", 256, reason="TIMEOUT") == deadline_records
             last = install(selector, observers[0])
-            control("b")
+            if callback_library:
+                send(start_command(mapping_token()) + f' --callback-library "{callback_library}"')
+                output.expect(rf"^instructions started tid={tid} address={begin:#x} ")
+                assert str(callback_library) in maps.read_text()
+            else:
+                control("b")
             native_call("v", last)
             assert mapped() and code() != original
 
         send("%detach")
         output.expect(r"^detached session=\S+$")
         assert code() == original and not mapped()
+        if callback_library:
+            assert str(callback_library) not in maps.read_text()
         worker("v")
         worker("s")
         worker("f")
@@ -313,11 +400,12 @@ struct Interceptor {{
                 "libdl_mapped_before_attach": initial_libdl,
                 "full_records": len(expected["w"]) + len(expected["v"]), "capped_records": 7,
                 "mutation_records": mutation_records, "signals": 1, "recovered_faults": 1,
-                "native_pairs": 11 if native_repl else 10,
+                "native_pairs": (11 + (7 if extensions else 0)) if native_repl else 10,
                 "probe_changes": ["install", "reload", "remove"],
                 "deadline_records": deadline_records,
                 "detached_while_active": native_repl,
-                "rejection_checks": 5 if native_repl else 0,
+                "rejection_checks": (5 + (2 if extensions else 0)) if native_repl else 0,
+                "extensions": extensions,
                 "unloaded": True, "restored": True}
 
 
@@ -331,9 +419,13 @@ def main():
                         help="set LD_LIBRARY_PATH only for the target fixture")
     parser.add_argument("--native-repl", action="store_true",
                         help="use the supported REPL commands instead of the pilot's control observer")
+    parser.add_argument("--callback-library", type=Path,
+                        help="verify snapshots, callbacks, memory-access monitoring and watchpoints")
     args = parser.parse_args()
     if bool(args.loader) != bool(args.library_path):
         parser.error("--loader and --library-path must be supplied together")
+    if args.callback_library and not args.native_repl:
+        parser.error("--callback-library requires --native-repl")
     fixture = args.fixture.resolve()
     command = [fixture]
     if args.loader:
@@ -341,7 +433,8 @@ def main():
     plugin = args.plugin.resolve()
     packaging = inspect_plugin(plugin)
     result = verify(args.repl.resolve(), args.server.resolve(), args.agent.resolve(),
-                    fixture, plugin, command, args.target_library_path, args.native_repl)
+                    fixture, plugin, command, args.target_library_path, args.native_repl,
+                    args.callback_library.resolve() if args.callback_library else None)
     print(json.dumps({"capture": result, "packaging": packaging}))
 
 

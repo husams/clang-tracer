@@ -15,11 +15,14 @@
 extern "C" unsigned long pilot_work(unsigned, int, int, int);
 extern "C" int pilot_fault(const void *);
 extern "C" char pilot_live_work_end[];
+extern "C" unsigned long pilot_memory(unsigned long *, unsigned long);
+extern "C" char pilot_memory_end[];
 
 namespace {
 std::atomic<int> pending{0};
 std::atomic<int> worker_tid{0};
 void *fault_page = nullptr;
+alignas(16) unsigned long watched[2]{10, 0};
 std::size_t page_size = 0;
 thread_local volatile sig_atomic_t received_signals = 0;
 thread_local volatile sig_atomic_t recovered_faults = 0;
@@ -59,6 +62,10 @@ bool install_handler(int signal, void (*handler)(int, siginfo_t *, void *)) {
   asm volatile(".rept 16\n\tnop\n\t.endr" ::: "memory");
   if (rounds == 0)
     return pilot_fault(fault_page) + 10;
+  if (rounds == -4) {
+    watched[0] = 10;
+    return static_cast<int>(pilot_memory(watched, 7)) + 10;
+  }
   const auto count = static_cast<unsigned>(rounds < 0 ? -rounds : rounds);
   return static_cast<int>(pilot_work(count, getpid(), ::syscall(SYS_gettid), rounds < 0)) + 10;
 }
@@ -93,12 +100,17 @@ int main() {
       if (command < 0)
         return;
       if (command) {
-        const auto rounds = command == 'f' ? 0 : command == 's' ? -3 : command == 'v' ? 2 : 3;
+        const auto rounds = command == 'm' ? -4 : command == 'f' ? 0 :
+                            command == 's' ? -3 : command == 'v' ? 2 : 3;
         if (command == 'f' && mprotect(fault_page, page_size, PROT_NONE) != 0)
           _exit(2);
         const auto signals_before = received_signals;
         const auto faults_before = recovered_faults;
+        if (command == 'm')
+          errno = E2BIG;
         const auto value = pilot_observed(rounds);
+        if (command == 'm' && errno != E2BIG)
+          _exit(3);
         std::printf("worker returned %d signals=%d faults=%d\n", value,
                     received_signals - signals_before, recovered_faults - faults_before);
         std::fflush(stdout);
@@ -113,6 +125,8 @@ int main() {
   std::printf("ready tid=%d begin=0x%lx end=0x%lx probe=%p glibc=%s\n",
               worker_tid.load(), begin, end, reinterpret_cast<void *>(&pilot_observed),
               gnu_get_libc_version());
+  std::printf("memory begin=%p end=%p data=%p\n", reinterpret_cast<void *>(&pilot_memory),
+              reinterpret_cast<void *>(pilot_memory_end), static_cast<void *>(watched));
   std::fflush(stdout);
   for (;;) {
     char command;
@@ -120,7 +134,7 @@ int main() {
     if (count == 0 || (count == 1 && command == 'q'))
       break;
     if (count == 1) {
-      if (command == 'w' || command == 'v' || command == 's' || command == 'f') {
+      if (command == 'w' || command == 'v' || command == 's' || command == 'f' || command == 'm') {
         pending.store(command);
       } else if (command == 'b' || command == 'c' || command == 'e') {
         const auto value = pilot_control(command, worker_tid.load(), begin, end,

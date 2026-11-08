@@ -187,6 +187,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitWatchpoint(TracerCommandsParser::WatchpointContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
 
 };
 

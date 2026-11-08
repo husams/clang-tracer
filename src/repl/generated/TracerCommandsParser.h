@@ -32,8 +32,10 @@ public:
     T__104 = 105, T__105 = 106, T__106 = 107, T__107 = 108, T__108 = 109,
     T__109 = 110, T__110 = 111, T__111 = 112, T__112 = 113, T__113 = 114,
     T__114 = 115, T__115 = 116, T__116 = 117, T__117 = 118, T__118 = 119,
-    T__119 = 120, T__120 = 121, T__121 = 122, UINT = 123, STRING = 124,
-    SHELL = 125, METADATA_ONLY = 126, SQLITE = 127, WORD = 128, WS = 129
+    T__119 = 120, T__120 = 121, T__121 = 122, T__122 = 123, T__123 = 124,
+    T__124 = 125, T__125 = 126, T__126 = 127, T__127 = 128, UINT = 129,
+    STRING = 130, SHELL = 131, METADATA_ONLY = 132, SQLITE = 133, WORD = 134,
+    WS = 135
   };
 
   enum {
@@ -47,7 +49,7 @@ public:
     RuleQuit = 29, RuleBulkTrace = 30, RuleBulkTraceOption = 31, RuleValue = 32,
     RuleKeyword = 33, RuleMemory = 34, RuleProbeEntry = 35, RuleProbeReload = 36,
     RuleTargetLaunch = 37, RuleLaunchOption = 38, RuleTargetCall = 39, RuleLocalPerf = 40,
-    RuleInstructions = 41, RuleInstructionOption = 42
+    RuleInstructions = 41, RuleInstructionOption = 42, RuleWatchpoint = 43
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -110,6 +112,7 @@ public:
   class LocalPerfContext;
   class InstructionsContext;
   class InstructionOptionContext;
+  class WatchpointContext;
 
   class  LineContext : public antlr4::ParserRuleContext {
   public:
@@ -158,6 +161,7 @@ public:
     TargetCallContext *targetCall();
     LocalPerfContext *localPerf();
     InstructionsContext *instructions();
+    WatchpointContext *watchpoint();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -749,6 +753,22 @@ public:
   };
 
   InstructionOptionContext* instructionOption();
+
+  class  WatchpointContext : public antlr4::ParserRuleContext {
+  public:
+    WatchpointContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    std::vector<antlr4::tree::TerminalNode *> UINT();
+    antlr4::tree::TerminalNode* UINT(size_t i);
+    std::vector<ValueContext *> value();
+    ValueContext* value(size_t i);
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  WatchpointContext* watchpoint();
 
 
   // By default the static state used to implement the parser is lazily initialized during the first

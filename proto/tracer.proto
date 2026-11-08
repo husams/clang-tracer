@@ -376,6 +376,10 @@ message StartInstructionTraceRequest {
   uint32 size = 5;
   uint32 max_records = 6;
   uint32 timeout_seconds = 7;
+  bool registers = 8;
+  string callback_library = 9;
+  uint64 memory_address = 10;
+  uint32 memory_size = 11;
 }
 message StopInstructionTraceRequest { string session_id = 1; }
 message InstructionTrace {
@@ -390,6 +394,14 @@ message InstructionTrace {
   uint32 size = 3;
   Reason reason = 4;
   repeated uint64 pcs = 5;
+  repeated InstructionDetail details = 6; // One per PC when an extension is enabled.
+}
+message InstructionDetail {
+  repeated fixed64 registers = 1; // RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP, R8 through R15.
+  optional fixed64 callback_value = 2;
+  uint64 memory_address = 3;
+  uint32 memory_size = 4;
+  uint32 memory_access = 5; // Bit 0 read, bit 1 write.
 }
 message ScanMemoryRequest {
   string session_id = 1;

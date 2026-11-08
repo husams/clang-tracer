@@ -20,7 +20,7 @@ fi
   -Wl,--fatal-warnings,--exclude-libs,ALL,-z,defs,-z,relro,-z,now,-z,noexecstack,--build-id=sha1 \
   -Wl,--wrap=__libc_dlopen_mode,--wrap=prctl,--wrap=gum_process_modify_thread \
   -Xlinker --version-script -Xlinker "$src/gum.exports" \
-  -Xlinker -Map -Xlinker "$out/gum-backend.map" -I "$headers" -I "$src/../../include/tracer" \
+  -Xlinker -Map -Xlinker "$out/gum-backend.map" -I "$src/../../include/tracer" -I "$headers" \
   "$src/gum_backend.c" \
   "$archive" -ldl -lpthread -lresolv -lm -o "$out/gum-backend.so"
 readelf -WV "$out/gum-backend.so" > "$out/gum-backend.versions"

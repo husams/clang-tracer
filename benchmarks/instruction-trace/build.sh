@@ -19,5 +19,7 @@ if [[ "$gum" != - ]]; then
     -fno-omit-frame-pointer -fcf-protection=none \
     "$src/live_target.cpp" "$src/workload.S" -pthread \
     "${link_flags[@]}" -o "$out/live-target"
+  "${CXX:-c++}" -std=c++17 -O2 -Wall -Wextra -Wpedantic -fPIC -shared -fvisibility=hidden \
+    -I "$src/../../include" "$src/verify_callback.cpp" "${link_flags[@]}" -o "$out/verify-callback.so"
   "$src/link-gum.sh" "$out" "$gum" "$gum/libfrida-gum.a"
 fi

@@ -259,6 +259,8 @@ class Client:
     def start_instruction_trace(
         self, session_id: str, address: int, size: int, *,
         tid: int, mapping_token: str, max_records: int = 256, timeout_seconds: int = 5,
+        registers: bool = False, callback_library: str = "",
+        memory_address: int = 0, memory_size: int = 0,
     ) -> pb.InstructionTrace:
         """Start bounded Gum capture on a local server with the optional backend."""
         return self.stub.StartInstructionTrace(
@@ -266,6 +268,8 @@ class Client:
                 session_id=session_id, address=address, size=size, tid=tid,
                 mapping_token=mapping_token, max_records=max_records,
                 timeout_seconds=timeout_seconds,
+                registers=registers, callback_library=callback_library,
+                memory_address=memory_address, memory_size=memory_size,
             ),
             timeout=self.timeout,
         )

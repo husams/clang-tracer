@@ -61,6 +61,7 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"call-result", K::target_call_result},
                                         {"syscalls", K::syscalls},
                                         {"sample cpu", K::sample_cpu},
+                                        {"watchpoint", K::watchpoint},
                                         {"instructions start", K::instructions_start},
                                         {"instructions stop", K::instructions_stop},
                                         {"processes", K::processes},
@@ -139,7 +140,8 @@ public:
     }
     const std::set<std::string> flags = {
         "--all", "--metadata-only", "--print-arguments", "--print-result",
-        "--details", "--addresses", "--sqlite", "--allow-arg-overrides", "--allow-result-override"};
+        "--details", "--addresses", "--sqlite", "--allow-arg-overrides", "--allow-result-override",
+        "--registers"};
     const std::set<std::string> repeated = {"--include", "--compile-option",
                                            "--name", "--type", "--arg", "--env"};
     const std::set<std::string> bulk_repeated = {"--module", "--exclude", "--exact"};
@@ -298,20 +300,42 @@ Command parse_command(const std::string &input) {
   if (command.number("--timeout", 0) > 86400) {
     throw std::invalid_argument("--timeout must be at most 86400 seconds");
   }
-  if (command.kind == K::syscalls || command.kind == K::sample_cpu) {
+  if (command.kind == K::syscalls || command.kind == K::sample_cpu ||
+      command.kind == K::watchpoint) {
     if (command.number("--timeout", 0) > max_local_perf_seconds)
       throw std::invalid_argument("local perf capture timeout is capped at 60 seconds");
     if (command.number("--count", 0) > max_local_perf_events)
       throw std::invalid_argument("local perf capture is capped at 8192 events");
   }
-  if (command.kind == K::instructions_start) {
+  if (command.kind == K::instructions_start || command.kind == K::watchpoint) {
     if (!command.has("--address") || command.option("--mapping").empty() ||
         !unsigned_number(command.option("--tid"), "thread ID", INT32_MAX) ||
         !unsigned_number(command.option("--size"), "instruction range size", TRACER_INSTRUCTION_MAX_BYTES))
-      throw std::invalid_argument("instruction tracing requires --tid, --address, --size and --mapping");
+      throw std::invalid_argument("capture requires --tid, --address, --size and --mapping");
+  }
+  if (command.kind == K::watchpoint) {
+    const auto size = command.number("--size", 0);
+    if ((size != 1 && size != 2 && size != 4 && size != 8) ||
+        address_number(command.option("--address")) % size != 0)
+      throw std::invalid_argument("watchpoints require a naturally aligned size of 1, 2, 4 or 8 bytes");
+    const auto access = command.option("--access");
+    if (access != "write" && access != "read-write")
+      throw std::invalid_argument("watchpoint --access must be write or read-write");
+  }
+  if (command.kind == K::instructions_start) {
     if (command.number("--timeout", 0) > TRACER_INSTRUCTION_MAX_SECONDS ||
         command.number("--count", 0) > TRACER_INSTRUCTION_MAX_RECORDS)
       throw std::invalid_argument("instruction capture is capped at 60 seconds and 8192 records");
+    if (command.has("--memory-address") != command.has("--memory-size"))
+      throw std::invalid_argument("memory monitoring requires both --memory-address and --memory-size");
+    if (command.has("--memory-address")) {
+      address_number(command.option("--memory-address"));
+      if (!unsigned_number(command.option("--memory-size"), "monitored memory size",
+                           TRACER_INSTRUCTION_MAX_BYTES))
+        throw std::invalid_argument("monitored memory size must be positive");
+    }
+    if (command.has("--callback-library") && command.option("--callback-library").empty())
+      throw std::invalid_argument("--callback-library requires an absolute shared library path");
   }
   if (command.number("--stack-depth", 0) > 64) {
     throw std::invalid_argument("--stack-depth must be at most 64");
