@@ -100,19 +100,36 @@ tooling::CompileCommand select_prepared_command(tooling::CompilationDatabase& da
     }
     return std::move(commands.front());
   }
-  const auto directory = fs::canonical(header).parent_path();
+  const auto included_source = fs::canonical(header);
+  const auto directory = included_source.parent_path();
+  // Directory databases can infer commands for unlisted files. Only recorded
+  // entries participate in exact matching and the same-directory fallback.
   auto commands = database.getAllCompileCommands();
-  const auto match = std::find_if(commands.begin(), commands.end(), [&](const auto& candidate) {
-    const auto source = fs::path(candidate.Directory) / candidate.Filename;
-    std::error_code path_error;
-    const auto source_directory = fs::weakly_canonical(source.parent_path(), path_error);
-    return !path_error && source_directory == directory;
-  });
-  if (match == commands.end()) {
+  tooling::CompileCommand* exact = nullptr;
+  tooling::CompileCommand* sibling = nullptr;
+  for (auto& command : commands) {
+    const auto source = fs::path(command.Directory) / command.Filename;
+    std::error_code error;
+    const auto canonical_source = fs::weakly_canonical(source, error);
+    if (!error && canonical_source == included_source) {
+      if (exact)
+        throw std::runtime_error("included source has multiple compile commands; choose "
+                                 "a unique --translation-unit or narrow --compdb.");
+      exact = &command;
+    }
+    if (!sibling) {
+      const auto source_directory = fs::weakly_canonical(source.parent_path(), error);
+      if (!error && source_directory == directory)
+        sibling = &command;
+    }
+  }
+  if (exact)
+    return std::move(*exact);
+  if (!sibling) {
     throw std::runtime_error("no compile command for a source in " + directory.string() +
                              ". Pass --translation-unit FILE.");
   }
-  return std::move(*match);
+  return std::move(*sibling);
 }
 
 bool selects_toolchain(llvm::StringRef argument) {

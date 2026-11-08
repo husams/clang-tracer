@@ -63,8 +63,9 @@ int main(int argc, char **argv) {
                      "--compdb FILE [--translation-unit FILE] "
                      "--output NEW_DIRECTORY [--module ELF] [--metadata-only] "
                      "[--extra-arg ARG]...\n"
-                     "By default, uses the first compile command for a source "
-                     "beside the first header. --module pins the package to an ELF image.\n";
+                     "Uses the first include's unique compile command if recorded, "
+                     "or the first command for a source beside it. "
+                     "--module pins the package to an ELF image.\n";
         return 0;
       }
       if (option == "--metadata-only") {

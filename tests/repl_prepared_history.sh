@@ -15,6 +15,25 @@ cd "$run"
 mkdir application
 cp "$header" application/history.hpp
 cp "$(dirname "$header")/payload.hpp" application/payload.hpp
+mkdir directory-compdb
+cat >application/exact_source.cpp <<'CPP'
+#ifndef EXACT_TU
+#error exact source compile command was not selected
+#endif
+namespace prepared_history {
+int exact_source(int value) { return value + 1; }
+}
+CPP
+cat >application/exact_source.hpp <<'CPP'
+#ifndef FALLBACK_TU
+#error the first same-directory compile command was not selected
+#endif
+namespace prepared_history {
+int sibling_fallback(int value);
+}
+CPP
+printf '[{"directory":"%s/application","file":"decoy.cpp","arguments":["clang++","-std=c++17","-DFALLBACK_TU=1","-c","decoy.cpp"]},{"directory":"%s/application","file":"exact_source.cpp","arguments":["clang++","-std=c++17","-DEXACT_TU=1","-c","exact_source.cpp"]}]\n' \
+  "$run" "$run" > directory-compdb/compile_commands.json
 printf '[{"directory":"%s/application","file":"history.cpp","arguments":["clang++","-std=c++17","-c","history.cpp"]}]\n' \
   "$run" > compile_commands.json
 printf '[{"directory":"%s/application","file":"history.cpp","arguments":["clang","--driver-mode=cl","--target=x86_64-unknown-linux-gnu","/std:c++17","/c","history.cpp"]}]\n' \
@@ -47,10 +66,16 @@ cat >prepare.repl <<'REPL'
 %probe prepare "prepared_history::via_value(prepared_history::HistoryItem, int)" --include application/history.hpp --output value
 %probe prepare "HFW::HfwManager::createItem()" --include application/history.hpp --include application/payload.hpp --output manager-item --metadata-only
 %probe prepare "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --include application/payload.hpp --compdb clang-cl-compile_commands.json --output toolchain-headers
+%probe prepare "prepared_history::exact_source(int)" --include application/exact_source.cpp --compdb directory-compdb/compile_commands.json --output exact-source-file --metadata-only
+%probe prepare "prepared_history::exact_source(int)" --include application/exact_source.cpp --compdb directory-compdb --output exact-source-dir --metadata-only
+%probe prepare "prepared_history::sibling_fallback(int)" --include application/exact_source.hpp --compdb directory-compdb --output sibling-fallback --metadata-only
 %probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include application/extra.hpp --compdb extra-compile_commands.json --output extra-literal --extra-args "-DPREPARE_EXTRA=37 -I'supplemental include'"
 %probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include application/extra.hpp --compdb extra-compile_commands.json --output opaque --extra-args `sh ./extra-flags.sh`
 REPL
 "$repl" --fail-fast <prepare.repl
+for package in exact-source-file exact-source-dir sibling-fallback; do
+  test -s "$package/prepared.pb"
+done
 test -f extra-literal/generated/adapter.hpp
 test -f opaque/generated/adapter.hpp
 cat >prepare-startup.repl <<'REPL'
@@ -90,6 +115,10 @@ grep -F "cannot prepare standalone type 'HFW::HfwManager::ItemBox<int>'" unsuppo
 test ! -e manager-box
 grep -Fx '#include <system_error>' toolchain-headers/generated/adapter.hpp
 grep -Ex '#include <(time\.h|ctime)>' toolchain-headers/generated/adapter.hpp
+unlink application/exact_source.cpp
+unlink application/exact_source.hpp
+unlink directory-compdb/compile_commands.json
+rmdir directory-compdb
 unlink application/history.hpp
 unlink application/payload.hpp
 unlink application/extra.hpp
