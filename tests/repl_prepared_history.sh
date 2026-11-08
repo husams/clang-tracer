@@ -15,7 +15,7 @@ cd "$run"
 mkdir application
 cp "$header" application/history.hpp
 cp "$(dirname "$header")/payload.hpp" application/payload.hpp
-mkdir directory-compdb
+mkdir directory-compdb decoy-only-compdb
 cat >application/exact_source.cpp <<'CPP'
 #ifndef EXACT_TU
 #error exact source compile command was not selected
@@ -32,8 +32,20 @@ namespace prepared_history {
 int sibling_fallback(int value);
 }
 CPP
-printf '[{"directory":"%s/application","file":"decoy.cpp","arguments":["clang++","-std=c++17","-DFALLBACK_TU=1","-c","decoy.cpp"]},{"directory":"%s/application","file":"exact_source.cpp","arguments":["clang++","-std=c++17","-DEXACT_TU=1","-c","exact_source.cpp"]}]\n' \
-  "$run" "$run" > directory-compdb/compile_commands.json
+cat >application/recorded_header.hpp <<'CPP'
+#if !defined(HEADER_ENTRY_FLAG) || HEADER_ENTRY_FLAG != 73 || defined(FALLBACK_TU)
+#error recorded_header.hpp requires its own compile command
+#endif
+namespace prepared_history {
+int exact_header(int value);
+}
+CPP
+printf 'void decoy() {}\n' >application/decoy.cpp
+printf -v decoy_command '{"directory":"%s/application","file":"decoy.cpp","arguments":["clang++","-std=c++17","-DFALLBACK_TU=1","-c","decoy.cpp"]}' "$run"
+printf -v source_command '{"directory":"%s/application","file":"exact_source.cpp","arguments":["clang++","-std=c++17","-DEXACT_TU=1","-c","exact_source.cpp"]}' "$run"
+printf -v header_command '{"directory":"%s/application","file":"recorded_header.hpp","arguments":["clang++","-std=c++17","-DHEADER_ENTRY_FLAG=73","-x","c++-header","-c","recorded_header.hpp"]}' "$run"
+printf '[%s,%s,%s]\n' "$decoy_command" "$source_command" "$header_command" > directory-compdb/compile_commands.json
+printf '[%s]\n' "$decoy_command" > decoy-only-compdb/compile_commands.json
 cp directory-compdb/compile_commands.json application/compile_commands.json
 printf '[{"directory":"%s/application","file":"history.cpp","arguments":["clang++","-std=c++17","-c","history.cpp"]}]\n' \
   "$run" > compile_commands.json
@@ -70,14 +82,25 @@ cat >prepare.repl <<'REPL'
 %probe prepare "prepared_history::exact_source(int)" --include application/exact_source.cpp --compdb directory-compdb/compile_commands.json --output exact-source-file --metadata-only
 %probe prepare "prepared_history::exact_source(int)" --include application/exact_source.cpp --compdb directory-compdb --output exact-source-dir --metadata-only
 %probe prepare "prepared_history::sibling_fallback(int)" --include application/exact_source.hpp --compdb directory-compdb --output sibling-fallback --metadata-only
+%probe prepare "prepared_history::exact_header(int)" --include application/recorded_header.hpp --compdb directory-compdb/compile_commands.json --output exact-header-file --metadata-only
+%probe prepare "prepared_history::exact_header(int)" --include application/recorded_header.hpp --compdb directory-compdb --output exact-header-dir --metadata-only
 %probe prepare "prepared_history::exact_source(int)" --include exact_source.cpp --output ../exact-source-cwd --metadata-only --cwd application
 %probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include application/extra.hpp --compdb extra-compile_commands.json --output extra-literal --extra-args "-DPREPARE_EXTRA=37 -I'supplemental include'"
 %probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include application/extra.hpp --compdb extra-compile_commands.json --output opaque --extra-args `sh ./extra-flags.sh`
 %probe prepare "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --include extra.hpp --compdb ../extra-compile_commands.json --output ../cwd-extra --extra-args `test -f extra.hpp && printf '%s\n' "-DPREPARE_EXTRA=37 -I'../supplemental include'"` --cwd application
 REPL
 "$repl" --fail-fast <prepare.repl
-for package in exact-source-file exact-source-dir sibling-fallback exact-source-cwd cwd-extra; do
+for package in exact-source-file exact-source-dir exact-header-file exact-header-dir sibling-fallback exact-source-cwd cwd-extra; do
   test -s "$package/prepared.pb"
+done
+for compdb in decoy-only-compdb/compile_commands.json decoy-only-compdb; do
+  if printf '%%probe prepare "prepared_history::exact_header(int)" --include application/recorded_header.hpp --compdb %s --output header-decoy --metadata-only\n' "$compdb" |
+    "$repl" --fail-fast >header-decoy.log 2>&1; then
+    echo "decoy-only compilation database unexpectedly prepared the header: $compdb" >&2
+    exit 1
+  fi
+  grep -F 'error: recorded_header.hpp requires its own compile command' header-decoy.log
+  test ! -e header-decoy
 done
 test -f extra-literal/generated/adapter.hpp
 test -f opaque/generated/adapter.hpp
@@ -121,6 +144,10 @@ grep -Ex '#include <(time\.h|ctime)>' toolchain-headers/generated/adapter.hpp
 unlink application/compile_commands.json
 unlink application/exact_source.cpp
 unlink application/exact_source.hpp
+unlink application/recorded_header.hpp
+unlink application/decoy.cpp
+unlink decoy-only-compdb/compile_commands.json
+rmdir decoy-only-compdb
 unlink directory-compdb/compile_commands.json
 rmdir directory-compdb
 unlink application/history.hpp
