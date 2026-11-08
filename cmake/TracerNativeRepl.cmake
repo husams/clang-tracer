@@ -60,7 +60,8 @@ function(tracer_add_native_repl)
   target_include_directories(tracer_repl_rpc PUBLIC "${_generated}")
   target_link_libraries(tracer_repl_rpc PUBLIC gRPC::grpc++ protobuf::libprotobuf)
   add_library(tracer_repl_client STATIC "${_repl}/controller.cpp" "${_repl}/server_process.cpp" "${_repl}/events.cpp" "${_repl}/background_events.cpp")
-  target_include_directories(tracer_repl_client PUBLIC "${_repl}")
+  target_include_directories(tracer_repl_client PUBLIC "${_repl}"
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
   target_link_libraries(tracer_repl_client PUBLIC tracer_repl_rpc tracer_repl_commands Threads::Threads
     PRIVATE SQLite::SQLite3)
   target_compile_options(tracer_repl_client PRIVATE -Wall -Wextra -Wpedantic)

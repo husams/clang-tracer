@@ -42,6 +42,7 @@
 #include "prepared_types.hpp"
 #include "prepared_contract.hpp"
 #include "prepared_header_search.hpp"
+#include "probe_extra_arguments.hpp"
 
 #include <clang/AST/ASTImporter.h>
 #include <clang/AST/DeclCXX.h>
@@ -1823,6 +1824,8 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
       arguments.insert(arguments.end(),
                        header_context.compiler_arguments().begin(),
                        header_context.compiler_arguments().end());
+      arguments.insert(arguments.end(), spec.extra_compile_arguments().begin(),
+                       spec.extra_compile_arguments().end());
       bool resource_dir = false;
       for (const auto &argument : arguments) {
         if (argument.find('\0') != std::string::npos)
@@ -1868,6 +1871,8 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
                             tracer::runtime::clang_resource_dir()});
       arguments.insert(arguments.end(), spec.compile_options().begin(),
                        spec.compile_options().end());
+      arguments.insert(arguments.end(), spec.extra_compile_arguments().begin(),
+                       spec.extra_compile_arguments().end());
       output = clang::tooling::buildASTFromCodeWithArgs(
           headers, arguments, "clang-tracer-debug-types.cc", "clang-tracer",
           std::make_shared<clang::PCHContainerOperations>(),
@@ -2005,6 +2010,8 @@ bool build_and_validate_receiver_ast(clangtracer::v1::ProbeSpec &spec,
     }
     arguments.push_back(argument);
   }
+  arguments.insert(arguments.end(), spec.extra_compile_arguments().begin(),
+                   spec.extra_compile_arguments().end());
   if (arguments.empty()) {
     error = "receiver compilation context has no compiler options";
     return false;
@@ -4452,6 +4459,17 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   // Do this before header AST recovery and before constructing either Clang
   // compiler. Driver plugins and raw frontend escapes can execute code during
   // nominally syntax-only validation.
+  const auto &extra = specification.extra_compile_arguments();
+  if (!extra.empty()) {
+    try {
+      tracer::validate_extra_compile_arguments(
+          {extra.begin(), extra.end()}, tracer::primary_probe_compile_arguments(specification),
+          tracer::primary_probe_compile_directory(specification));
+    } catch (const std::invalid_argument &exception) {
+      error = exception.what();
+      return false;
+    }
+  }
   if (!validate_options(specification.compile_options().begin(),
                         specification.compile_options().end(),
                         "probe options") ||
@@ -4517,6 +4535,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   }
   user_options.insert(user_options.end(), specification.compile_options().begin(),
                       specification.compile_options().end());
+  user_options.insert(user_options.end(), extra.begin(), extra.end());
   std::string forced_include_source;
   if (!extract_forced_includes(user_options, forced_include_source, error))
     return false;
@@ -5787,6 +5806,8 @@ extern "C" int tracer_agent_validate(tracer::ValidationRequest *request) {
     }
     for (const auto &option : spec.compile_options())
       report.add_effective_options(option);
+    for (const auto &option : spec.extra_compile_arguments())
+      report.add_effective_options(option);
 
     std::string error;
     Probe prepared;
@@ -5800,6 +5821,8 @@ extern "C" int tracer_agent_validate(tracer::ValidationRequest *request) {
       success = compile_probe(prepared, spec, error, false, syntax_only,
                               &report);
     }
+    if (success && spec.extra_compile_arguments_checked())
+      report.set_extra_compile_arguments_applied(true);
     if (!success && !error.empty()) {
       bool represented = false;
       for (const auto &diagnostic : report.diagnostics()) {

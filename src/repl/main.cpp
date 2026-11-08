@@ -26,6 +26,38 @@ namespace tr = tracer_repl;
 namespace {
 void interrupt(int) { tr::interrupted.store(true, std::memory_order_relaxed); }
 
+void append_compiler_flags(std::vector<std::string> &arguments,
+                           const std::string &text) {
+  const auto flags = tr::split_compiler_flags(text);
+  arguments.insert(arguments.end(), flags.begin(), flags.end());
+}
+
+void expand_extra_compile_arguments(tr::Command &command) {
+  using Kind = tr::ExtraCompileArgumentInput::Kind;
+  auto &arguments = command.extra_compile_arguments;
+  for (const auto &input : command.extra_compile_argument_inputs) {
+    switch (input.kind) {
+    case Kind::argument:
+      if (input.text.empty())
+        throw std::invalid_argument("--extra-arg requires a nonempty argument");
+      arguments.push_back(input.text);
+      break;
+    case Kind::list:
+      append_compiler_flags(arguments, input.text);
+      break;
+    case Kind::shell: {
+      const auto reply = tr::run_shell(input.text);
+      std::cerr << reply.error;
+      if (reply.status)
+        throw std::runtime_error("--extra-args shell returned " +
+                                 std::to_string(reply.status));
+      append_compiler_flags(arguments, reply.output);
+      break;
+    }
+    }
+  }
+}
+
 bool color_output() {
   const auto* term = std::getenv("TERM");
   const auto* no_color = std::getenv("NO_COLOR");
@@ -171,6 +203,7 @@ int main(int argc, char **argv) {
                      "--buffer-events N --buffer-bytes N\n"
                      "  --context-event-bytes N --context-transport-memory-bytes N (managed server)\n"
                      "  --cpp-arg ARG (repeatable) --startup FILE --fail-fast\n"
+                     "  --extra-arg=ARG --extra-args FLAGS (repeatable, for probe compilation)\n"
                      "C++23; replxx 0.0.4; ANTLR generator/runtime 4.13.2; "
                      "LLVM 21 or 22.\n"
                      "Use %help for tracing commands and %help api for C++ "
@@ -180,6 +213,22 @@ int main(int argc, char **argv) {
       }
       if (option == "--fail-fast") {
         fail_fast = true;
+        continue;
+      }
+      const auto equals = option.find('=');
+      const auto name = option.substr(0, equals);
+      if (name == "--extra-arg" || name == "--extra-args") {
+        if (equals == std::string::npos && ++i == argc)
+          throw std::invalid_argument("missing value for " + name);
+        const std::string value =
+            equals == std::string::npos ? argv[i] : option.substr(equals + 1);
+        if (name == "--extra-args") {
+          append_compiler_flags(settings.extra_compile_arguments, value);
+        } else {
+          if (value.empty())
+            throw std::invalid_argument("--extra-arg requires a nonempty argument");
+          settings.extra_compile_arguments.push_back(value);
+        }
         continue;
       }
       if (++i == argc) {
@@ -317,7 +366,8 @@ int main(int argc, char **argv) {
           }
           continue;
         }
-        const auto command = tr::parse_command(*line);
+        auto command = tr::parse_command(*line);
+        expand_extra_compile_arguments(command);
         if (command.kind == tr::CommandKind::help) {
           tr::print_help(std::cout, command.arguments, cpp, color);
         } else if (command.kind == tr::CommandKind::type) {

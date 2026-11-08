@@ -23,9 +23,10 @@ probe : 'probe' ('prepare' value prepareOption+
       | 'validate' value '--callback' value resolveOption*
       | 'remove' UINT) | 'probes';
 prepareOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--output') value
-              | METADATA_ONLY;
+              | METADATA_ONLY | extraCompileOption;
 resolveOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--compile-option'
-                | '--prepared' | '--prepared-mode') value;
+                | '--prepared' | '--prepared-mode') value
+              | extraCompileOption;
 deployOption : resolveOption | '--stack-depth' (UINT | WORD)
              | '--print-arguments' | '--print-result' | stackFilter;
 interceptor : 'interceptor' ('load' value '--as' value | 'edit' value | 'show' value
@@ -75,6 +76,7 @@ probeEntry : 'probe' 'entry' (value '--mapping' value ('--module' value)?
 probeReload : 'probe' 'reload' UINT '--callback' value;
 stackFilter : '--stack-application-only' value;
 contextEventBytes : ('--context-event-bytes' | '--context-transport-memory-bytes') UINT;
+extraCompileOption : '--extra-arg' value | '--extra-args' (value | SHELL)+;
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';

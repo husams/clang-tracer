@@ -29,8 +29,9 @@ public:
     T__86 = 87, T__87 = 88, T__88 = 89, T__89 = 90, T__90 = 91, T__91 = 92,
     T__92 = 93, T__93 = 94, T__94 = 95, T__95 = 96, T__96 = 97, T__97 = 98,
     T__98 = 99, T__99 = 100, T__100 = 101, T__101 = 102, T__102 = 103, T__103 = 104,
-    T__104 = 105, T__105 = 106, UINT = 107, STRING = 108, SHELL = 109, METADATA_ONLY = 110,
-    SQLITE = 111, STACK = 112, WORD = 113, WS = 114
+    T__104 = 105, T__105 = 106, T__106 = 107, T__107 = 108, UINT = 109,
+    STRING = 110, SHELL = 111, METADATA_ONLY = 112, SQLITE = 113, STACK = 114,
+    WORD = 115, WS = 116
   };
 
   enum {
@@ -42,7 +43,8 @@ public:
     RuleRecord = 21, RuleStreamOption = 22, RuleCpp = 23, RuleShell = 24,
     RuleComplete = 25, RuleType = 26, RuleHelp = 27, RuleQuit = 28, RuleBulkTrace = 29,
     RuleBulkTraceOption = 30, RuleValue = 31, RuleKeyword = 32, RuleMemory = 33,
-    RuleProbeEntry = 34, RuleProbeReload = 35, RuleStackFilter = 36, RuleContextEventBytes = 37
+    RuleProbeEntry = 34, RuleProbeReload = 35, RuleStackFilter = 36, RuleContextEventBytes = 37,
+    RuleExtraCompileOption = 38
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -100,6 +102,7 @@ public:
   class ProbeReloadContext;
   class StackFilterContext;
   class ContextEventBytesContext;
+  class ExtraCompileOptionContext;
 
   class  LineContext : public antlr4::ParserRuleContext {
   public:
@@ -337,6 +340,7 @@ public:
     virtual size_t getRuleIndex() const override;
     ValueContext *value();
     antlr4::tree::TerminalNode *METADATA_ONLY();
+    ExtraCompileOptionContext *extraCompileOption();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -350,6 +354,7 @@ public:
     ResolveOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
     ValueContext *value();
+    ExtraCompileOptionContext *extraCompileOption();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -663,6 +668,22 @@ public:
   };
 
   ContextEventBytesContext* contextEventBytes();
+
+  class  ExtraCompileOptionContext : public antlr4::ParserRuleContext {
+  public:
+    ExtraCompileOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    std::vector<ValueContext *> value();
+    ValueContext* value(size_t i);
+    std::vector<antlr4::tree::TerminalNode *> SHELL();
+    antlr4::tree::TerminalNode* SHELL(size_t i);
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  ExtraCompileOptionContext* extraCompileOption();
 
 
   // By default the static state used to implement the parser is lazily initialized during the first

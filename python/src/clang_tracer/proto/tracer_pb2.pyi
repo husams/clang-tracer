@@ -300,7 +300,7 @@ class PreparedInjector(_message.Message):
     def __init__(self, format_version: _Optional[int] = ..., module_sha256: _Optional[bytes] = ..., module_name: _Optional[str] = ..., selector: _Optional[str] = ..., symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., target_triple: _Optional[str] = ..., header_types: _Optional[_Union[DebugInfo, _Mapping]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., adapter_declarations: _Optional[str] = ..., adapter_standard_headers: _Optional[_Iterable[str]] = ..., adapter_abi_options: _Optional[_Iterable[str]] = ..., adapter_toolchain_options: _Optional[_Iterable[str]] = ..., adapter_uses_default_toolchain: bool = ..., source_translation_unit: _Optional[str] = ...) -> None: ...
 
 class ProbeSpec(_message.Message):
-    __slots__ = ("symbol", "signature", "callback_source", "receiver", "receiver_unavailable_reason", "debug_info", "argument_names", "include_headers", "header_context", "stack_depth", "include_internal_stack_frames", "print_arguments", "print_result", "callback_package_path", "compile_options", "prepared")
+    __slots__ = ("symbol", "signature", "callback_source", "receiver", "receiver_unavailable_reason", "debug_info", "argument_names", "include_headers", "header_context", "stack_depth", "include_internal_stack_frames", "print_arguments", "print_result", "callback_package_path", "compile_options", "prepared", "extra_compile_arguments", "extra_compile_arguments_checked")
     SYMBOL_FIELD_NUMBER: _ClassVar[int]
     SIGNATURE_FIELD_NUMBER: _ClassVar[int]
     CALLBACK_SOURCE_FIELD_NUMBER: _ClassVar[int]
@@ -317,6 +317,8 @@ class ProbeSpec(_message.Message):
     CALLBACK_PACKAGE_PATH_FIELD_NUMBER: _ClassVar[int]
     COMPILE_OPTIONS_FIELD_NUMBER: _ClassVar[int]
     PREPARED_FIELD_NUMBER: _ClassVar[int]
+    EXTRA_COMPILE_ARGUMENTS_FIELD_NUMBER: _ClassVar[int]
+    EXTRA_COMPILE_ARGUMENTS_CHECKED_FIELD_NUMBER: _ClassVar[int]
     symbol: str
     signature: Signature
     callback_source: str
@@ -333,7 +335,9 @@ class ProbeSpec(_message.Message):
     callback_package_path: str
     compile_options: _containers.RepeatedScalarFieldContainer[str]
     prepared: PreparedInjector
-    def __init__(self, symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., callback_source: _Optional[str] = ..., receiver: _Optional[_Union[ReceiverContext, _Mapping]] = ..., receiver_unavailable_reason: _Optional[str] = ..., debug_info: _Optional[_Union[DebugInfo, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., stack_depth: _Optional[int] = ..., include_internal_stack_frames: bool = ..., print_arguments: bool = ..., print_result: bool = ..., callback_package_path: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ...) -> None: ...
+    extra_compile_arguments: _containers.RepeatedScalarFieldContainer[str]
+    extra_compile_arguments_checked: bool
+    def __init__(self, symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., callback_source: _Optional[str] = ..., receiver: _Optional[_Union[ReceiverContext, _Mapping]] = ..., receiver_unavailable_reason: _Optional[str] = ..., debug_info: _Optional[_Union[DebugInfo, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., stack_depth: _Optional[int] = ..., include_internal_stack_frames: bool = ..., print_arguments: bool = ..., print_result: bool = ..., callback_package_path: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ..., extra_compile_arguments: _Optional[_Iterable[str]] = ..., extra_compile_arguments_checked: bool = ...) -> None: ...
 
 class AttachRequest(_message.Message):
     __slots__ = ("pid", "expected_process_start_time", "expected_executable")
@@ -410,7 +414,7 @@ class AddProbeRequest(_message.Message):
     def __init__(self, session_id: _Optional[str] = ..., spec: _Optional[_Union[ProbeSpec, _Mapping]] = ...) -> None: ...
 
 class ResolveProbeRequest(_message.Message):
-    __slots__ = ("session_id", "selector", "include_headers", "compilation_database", "module", "debug_max_entries", "debug_max_depth", "compile_options", "prepared", "translation_unit")
+    __slots__ = ("session_id", "selector", "include_headers", "compilation_database", "module", "debug_max_entries", "debug_max_depth", "compile_options", "prepared", "translation_unit", "extra_compile_arguments")
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     SELECTOR_FIELD_NUMBER: _ClassVar[int]
     INCLUDE_HEADERS_FIELD_NUMBER: _ClassVar[int]
@@ -421,6 +425,7 @@ class ResolveProbeRequest(_message.Message):
     COMPILE_OPTIONS_FIELD_NUMBER: _ClassVar[int]
     PREPARED_FIELD_NUMBER: _ClassVar[int]
     TRANSLATION_UNIT_FIELD_NUMBER: _ClassVar[int]
+    EXTRA_COMPILE_ARGUMENTS_FIELD_NUMBER: _ClassVar[int]
     session_id: str
     selector: str
     include_headers: _containers.RepeatedScalarFieldContainer[str]
@@ -431,10 +436,11 @@ class ResolveProbeRequest(_message.Message):
     compile_options: _containers.RepeatedScalarFieldContainer[str]
     prepared: PreparedInjector
     translation_unit: str
-    def __init__(self, session_id: _Optional[str] = ..., selector: _Optional[str] = ..., include_headers: _Optional[_Iterable[str]] = ..., compilation_database: _Optional[str] = ..., module: _Optional[str] = ..., debug_max_entries: _Optional[int] = ..., debug_max_depth: _Optional[int] = ..., compile_options: _Optional[_Iterable[str]] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ..., translation_unit: _Optional[str] = ...) -> None: ...
+    extra_compile_arguments: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, session_id: _Optional[str] = ..., selector: _Optional[str] = ..., include_headers: _Optional[_Iterable[str]] = ..., compilation_database: _Optional[str] = ..., module: _Optional[str] = ..., debug_max_entries: _Optional[int] = ..., debug_max_depth: _Optional[int] = ..., compile_options: _Optional[_Iterable[str]] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ..., translation_unit: _Optional[str] = ..., extra_compile_arguments: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class ValidateProbeRequest(_message.Message):
-    __slots__ = ("session_id", "selector", "callback_source", "include_headers", "compilation_database", "compile_options", "level", "module", "debug_max_entries", "debug_max_depth", "prepared", "translation_unit")
+    __slots__ = ("session_id", "selector", "callback_source", "include_headers", "compilation_database", "compile_options", "level", "module", "debug_max_entries", "debug_max_depth", "prepared", "translation_unit", "extra_compile_arguments")
     class Level(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         COMPILE: _ClassVar[ValidateProbeRequest.Level]
@@ -453,6 +459,7 @@ class ValidateProbeRequest(_message.Message):
     DEBUG_MAX_DEPTH_FIELD_NUMBER: _ClassVar[int]
     PREPARED_FIELD_NUMBER: _ClassVar[int]
     TRANSLATION_UNIT_FIELD_NUMBER: _ClassVar[int]
+    EXTRA_COMPILE_ARGUMENTS_FIELD_NUMBER: _ClassVar[int]
     session_id: str
     selector: str
     callback_source: str
@@ -465,7 +472,8 @@ class ValidateProbeRequest(_message.Message):
     debug_max_depth: int
     prepared: PreparedInjector
     translation_unit: str
-    def __init__(self, session_id: _Optional[str] = ..., selector: _Optional[str] = ..., callback_source: _Optional[str] = ..., include_headers: _Optional[_Iterable[str]] = ..., compilation_database: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ..., level: _Optional[_Union[ValidateProbeRequest.Level, str]] = ..., module: _Optional[str] = ..., debug_max_entries: _Optional[int] = ..., debug_max_depth: _Optional[int] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ..., translation_unit: _Optional[str] = ...) -> None: ...
+    extra_compile_arguments: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, session_id: _Optional[str] = ..., selector: _Optional[str] = ..., callback_source: _Optional[str] = ..., include_headers: _Optional[_Iterable[str]] = ..., compilation_database: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ..., level: _Optional[_Union[ValidateProbeRequest.Level, str]] = ..., module: _Optional[str] = ..., debug_max_entries: _Optional[int] = ..., debug_max_depth: _Optional[int] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ..., translation_unit: _Optional[str] = ..., extra_compile_arguments: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class ValidationDiagnostic(_message.Message):
     __slots__ = ("stage", "severity", "file", "line", "column", "message")
@@ -484,18 +492,20 @@ class ValidationDiagnostic(_message.Message):
     def __init__(self, stage: _Optional[str] = ..., severity: _Optional[str] = ..., file: _Optional[str] = ..., line: _Optional[int] = ..., column: _Optional[int] = ..., message: _Optional[str] = ...) -> None: ...
 
 class ValidationReport(_message.Message):
-    __slots__ = ("success", "level", "effective_options", "diagnostics", "prepared_used")
+    __slots__ = ("success", "level", "effective_options", "diagnostics", "prepared_used", "extra_compile_arguments_applied")
     SUCCESS_FIELD_NUMBER: _ClassVar[int]
     LEVEL_FIELD_NUMBER: _ClassVar[int]
     EFFECTIVE_OPTIONS_FIELD_NUMBER: _ClassVar[int]
     DIAGNOSTICS_FIELD_NUMBER: _ClassVar[int]
     PREPARED_USED_FIELD_NUMBER: _ClassVar[int]
+    EXTRA_COMPILE_ARGUMENTS_APPLIED_FIELD_NUMBER: _ClassVar[int]
     success: bool
     level: ValidateProbeRequest.Level
     effective_options: _containers.RepeatedScalarFieldContainer[str]
     diagnostics: _containers.RepeatedCompositeFieldContainer[ValidationDiagnostic]
     prepared_used: bool
-    def __init__(self, success: bool = ..., level: _Optional[_Union[ValidateProbeRequest.Level, str]] = ..., effective_options: _Optional[_Iterable[str]] = ..., diagnostics: _Optional[_Iterable[_Union[ValidationDiagnostic, _Mapping]]] = ..., prepared_used: bool = ...) -> None: ...
+    extra_compile_arguments_applied: bool
+    def __init__(self, success: bool = ..., level: _Optional[_Union[ValidateProbeRequest.Level, str]] = ..., effective_options: _Optional[_Iterable[str]] = ..., diagnostics: _Optional[_Iterable[_Union[ValidationDiagnostic, _Mapping]]] = ..., prepared_used: bool = ..., extra_compile_arguments_applied: bool = ...) -> None: ...
 
 class Probe(_message.Message):
     __slots__ = ("id", "session_id", "symbol", "signature", "active", "callback_address", "entry_address", "original_bytes_restored", "agent_dropped_events", "callback_errors", "jit_compile_ns", "patch_install_ns", "bulk_batch_id", "replaces_probe_id", "superseded_by_probe_id", "draining")

@@ -768,8 +768,8 @@ outside the current lifecycle contract.
 
 The reconciled worker-admission changes passed **25/25 CTests in 419.70 seconds**
 on `linux-dev` on 2 November 2026; both regression sets also passed from
-OverlayFS (**7/7 in 44.09 seconds**). The C++23 main build keeps the
-existing runtime profile.
+OverlayFS (**7/7 in 44.09 seconds**). These results used the C++20 build of
+`main` at the time.
 
 Blocked-main worker selection was verified on 2 November 2026 on `linux-dev`:
 **24/24 CTests passed in 411.09 seconds**, and the six new regression cases
@@ -777,9 +777,8 @@ passed from OverlayFS in 35.26 seconds. The supplied condition-variable/sleeping
 worker reproduction also attached, detached and shut down successfully.
 
 The session-path backport was verified on 2 November 2026 with the normal
-C++23 build on `linux-dev`: **18/18 CTests passed natively in 373.84 seconds**
-and **18/18 passed from OverlayFS in 378.11 seconds**. The build configuration,
-dependencies and standard C++23 APIs remain unchanged.
+C++20 build on `linux-dev`. All 18 CTests passed natively in 373.84 seconds
+and from OverlayFS in 378.11 seconds.
 
 Class-instance arguments verified on 30 October 2026 through the normal CLI,
 with Order target source and compilation database temporarily unavailable.
