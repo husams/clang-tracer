@@ -195,7 +195,7 @@ public:
     }
     const std::set<std::string> flags = {
         "--all", "--metadata-only", "--print-arguments", "--print-result",
-        "--details", "--addresses", "--sqlite", "--allow-arg-overrides", "--allow-result-override",
+        "--details", "--addresses", "--sqlite", "--member", "--allow-arg-overrides", "--allow-result-override",
         "--registers", "--discover", "--watch", "--supervise", "--gate-children", "--allow-replacement", "--allow-call-original",
         "--trace-exceptions", "--reclaimable"};
     const std::set<std::string> repeated = {"--include", "--compile-option",
@@ -308,9 +308,16 @@ Command parse_command(const std::string &input) {
           throw std::invalid_argument(option + " requires a nonempty value");
   }
   if (command.kind == K::prepare) {
-    for (const auto* option : {"--include", "--output"})
+    const bool elf_mode = command.has("--signature");
+    for (const auto *option : {elf_mode ? "--module" : "--include", "--output"})
       if (!command.has(option) || command.option(option).empty())
         throw std::invalid_argument(std::string("%probe prepare requires ") + option);
+    if (elf_mode && (command.option("--signature").empty() ||
+                     command.has("--include") || command.has("--compdb") ||
+                     command.has("--translation-unit")))
+      throw std::invalid_argument("--signature requires a C++ type and no source options");
+    if (!elf_mode && command.has("--member"))
+      throw std::invalid_argument("--member requires --signature");
     for (const auto* option : {"--compdb", "--translation-unit", "--module"})
       if (command.has(option) && command.option(option).empty())
         throw std::invalid_argument(std::string(option) + " requires a path");

@@ -25,7 +25,7 @@ probe : 'probe' ('prepare' value prepareOption+
       | 'validate' value '--callback' value (validateOption | cwdOption)*
       | 'remove' UINT cwdOption?) | 'probes' cwdOption?;
 prepareOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--output') value
-              | METADATA_ONLY | extraCompileOption | cwdOption;
+              | SIGNATURE value | MEMBER | METADATA_ONLY | extraCompileOption | cwdOption;
 resolveOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--compile-option'
                 | '--prepared' | '--prepared-mode') value
               | extraCompileOption;
@@ -115,5 +115,7 @@ METADATA_ONLY : '--metadata-only';
 SQLITE : '--sqlite';
 STACK : 'stack';
 CWD : '--cwd';
+SIGNATURE : '--signature';
+MEMBER : '--member';
 WORD : ~[ \t\r\n"'\\%`]+;
 WS : [ \t\r\n]+ -> skip;
