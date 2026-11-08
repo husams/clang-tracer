@@ -31,7 +31,7 @@ public:
     T__98 = 99, T__99 = 100, T__100 = 101, T__101 = 102, T__102 = 103, T__103 = 104,
     T__104 = 105, T__105 = 106, T__106 = 107, T__107 = 108, UINT = 109,
     STRING = 110, SHELL = 111, METADATA_ONLY = 112, SQLITE = 113, STACK = 114,
-    WORD = 115, WS = 116
+    CWD = 115, WORD = 116, WS = 117
   };
 
   explicit TracerCommandsLexer(antlr4::CharStream *input);

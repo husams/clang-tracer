@@ -62,7 +62,7 @@ def main(repl, server, fixture):
             target_out.expect(r"^short call returned 12$")
 
         def reload(probe, path, retained):
-            send(f'%probe reload {probe} --callback "{path}"')
+            send(f'%probe reload {probe} --callback "{path.name}" --cwd "{path.parent}"')
             return output.expect(
                 rf"^reloaded probe=(\d+) replaces={probe} retained_limit=32 agent_retained={retained}$"
             )[1]

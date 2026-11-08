@@ -171,6 +171,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitCwdOption(TracerCommandsParser::CwdOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
 
 };
 

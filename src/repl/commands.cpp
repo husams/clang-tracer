@@ -288,6 +288,8 @@ Command parse_command(const std::string &input) {
       if (command.has(option) && command.option(option).empty())
         throw std::invalid_argument(std::string(option) + " requires a path");
   }
+  if (command.has("--cwd") && command.option("--cwd").empty())
+    throw std::invalid_argument("--cwd requires a directory");
   const auto mode = command.option("--prepared-mode", "prefer");
   if (mode != "off" && mode != "prefer" && mode != "require")
     throw std::invalid_argument("--prepared-mode must be off, prefer or require");
