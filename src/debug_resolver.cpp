@@ -612,11 +612,12 @@ void describe_record(DWARFDie record, api::DebugInfo& info) {
   if (record.getTag() != dw::DW_TAG_class_type && record.getTag() != dw::DW_TAG_structure_type) {
     throw std::runtime_error("unsupported debug receiver");
   }
-  if (record.getParent().getTag() == dw::DW_TAG_class_type ||
-      record.getParent().getTag() == dw::DW_TAG_structure_type) {
+  info.set_record_name(qualified(record));
+  if ((record.getParent().getTag() == dw::DW_TAG_class_type ||
+       record.getParent().getTag() == dw::DW_TAG_structure_type) &&
+      info.record_name().find('<') == std::string::npos) {
     throw std::runtime_error("nested debug receiver classes are unsupported");
   }
-  info.set_record_name(qualified(record));
   info.set_record_size(number(record, dw::DW_AT_byte_size));
   const auto record_calling_convention =
       number(record, dw::DW_AT_calling_convention, 0);
@@ -812,6 +813,20 @@ void describe_methods(DWARFDie record, api::DebugInfo &info) {
   }
 }
 
+struct PreviewName {
+  std::string qualified;
+  std::string selector;
+};
+
+PreviewName preview_name(const std::string &linkage, std::string fallback);
+
+// Match a bare name or the name followed by its parameter list. A template
+// argument can itself contain parentheses, for example void (*)(int).
+bool selects_name(const std::string &selector, const std::string &name) {
+  return !name.empty() && ::tracer::compat::starts_with(selector, name) &&
+         (selector.size() == name.size() || selector[name.size()] == '(');
+}
+
 struct CallableShape {
   api::Signature signature;
   DWARFDie receiver;
@@ -819,11 +834,13 @@ struct CallableShape {
   bool receiver_volatile = false;
   std::string result_spelling;
   std::string selector;
+  std::string dwarf_selector;
   std::vector<api::DebugArgument> arguments;
   std::vector<std::string> argument_names;
 };
 
-CallableShape describe_callable(DWARFDie die, DWARFDie decl) {
+CallableShape describe_callable(DWARFDie die, DWARFDie decl,
+                                const PreviewName &display = {}) {
   if (::tracer::compat::starts_with(name(decl), "~") || name(decl) == name(decl.getParent())) {
     throw std::runtime_error("debug constructors/destructors are unsupported");
   }
@@ -908,7 +925,8 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl) {
     }
   }
   result.signature.set_kind(result.receiver ? api::METHOD : api::FUNCTION);
-  result.selector = qualified(decl) + "(";
+  const auto qualified_name = qualified(decl);
+  result.selector = "(";
   for (std::size_t i = 0; i < types.size(); ++i) {
     if (i) {
       result.selector += ", ";
@@ -921,6 +939,16 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl) {
   }
   if (result.receiver_volatile) {
     result.selector += " volatile";
+  }
+  if (display.qualified.find('<') != std::string::npos) {
+    if (::tracer::compat::ends_with(display.selector, " &&"))
+      result.selector += " &&";
+    else if (::tracer::compat::ends_with(display.selector, " &"))
+      result.selector += " &";
+    result.dwarf_selector = qualified_name + result.selector;
+    result.selector = display.qualified + result.selector;
+  } else {
+    result.selector = qualified_name + result.selector;
   }
   return result;
 }
@@ -1015,8 +1043,14 @@ bool lists_symbol(const llvm::object::ELF64LEObjectFile &object,
     const auto demangled = compact(llvm::demangle(symbol_name->str()));
     const auto name = demangled.substr(0, demangled.find('('));
     const auto scope = name.rfind("::");
-    return raw == selected || demangled == selected || name == selected_name ||
-           (scope != std::string::npos && name.substr(scope + 2) == selected_name);
+    if (raw == selected || demangled == selected || name == selected_name ||
+        (scope != std::string::npos && name.substr(scope + 2) == selected_name))
+      return true;
+    if (selected.find('<') == std::string::npos ||
+        demangled.find('<') == std::string::npos)
+      return false;
+    return selects_name(selected,
+                        compact(preview_name(symbol_name->str(), {}).qualified));
   };
   for (const auto &symbol : object.symbols())
     if (matches(symbol)) return true;
@@ -1214,11 +1248,6 @@ bool glob_matches(const std::string &pattern, const std::string &value) {
   return ::fnmatch(pattern.c_str(), value.c_str(), FNM_NOESCAPE) == 0;
 }
 
-struct PreviewName {
-  std::string qualified;
-  std::string selector;
-};
-
 PreviewName preview_name(const std::string &linkage, std::string fallback) {
   llvm::ItaniumPartialDemangler demangler;
   if (demangler.partialDemangle(linkage.c_str()) || !demangler.isFunction() ||
@@ -1402,7 +1431,7 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
             status = PreviewCandidate::PREPARED_REQUIRED;
             diagnostic = "virtual implementation requires a compatible prepared package";
           } else {
-            const auto shape = describe_callable(die, decl);
+            const auto shape = describe_callable(die, decl, display);
             if (shape.receiver) {
               api::DebugInfo record;
               describe_record(shape.receiver, record);
@@ -1809,7 +1838,17 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
       if (die.getTag() == dw::DW_TAG_subprogram) {
         auto decl = declaration(die);
         const auto qname = qualified(decl);
-        if (!qname.empty() && (compact(qname) == selected_name || name(decl) == selected_name)) {
+        const char *linkage = die.getName(llvm::DINameKind::LinkageName);
+        const std::string symbol = linkage ? linkage : name(decl);
+        const auto display = (qname.find('<') != std::string::npos ||
+                              selected.find('<') != std::string::npos)
+            ? preview_name(symbol, qname) : PreviewName{};
+        const auto dwarf_name = compact(qname);
+        const auto symbol_name = compact(display.qualified);
+        if (!qname.empty() &&
+            (selects_name(selected, dwarf_name) ||
+             selects_name(selected, name(decl)) ||
+             selects_name(selected, symbol_name))) {
           try {
             if (::tracer::compat::starts_with(name(decl), "~") ||
                 name(decl) == name(decl.getParent())) {
@@ -1821,13 +1860,15 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
             if (number(decl, dw::DW_AT_virtuality)) {
               throw std::runtime_error("virtual debug methods are unsupported");
             }
-            const char* linkage = die.getName(llvm::DINameKind::LinkageName);
-            std::string symbol = linkage ? linkage : name(decl);
             ResolvedCallable found;
-            const auto shape = describe_callable(die, decl);
-            if (paren != std::string::npos && compact(shape.selector) != selected) {
+            const auto shape = describe_callable(die, decl, display);
+            const bool bare_name = selected == dwarf_name ||
+                                   selected == name(decl) || selected == symbol_name;
+            if (!bare_name && compact(shape.selector) != selected &&
+                compact(shape.dwarf_selector) != selected &&
+                (display.qualified.find('<') == std::string::npos ||
+                 compact(display.selector) != selected))
               return;
-            }
             if (options.require_override_abi) {
               const auto producer = die.getDwarfUnit()->getUnitDIE().find(dw::DW_AT_producer);
               auto text = producer ? producer->getAsCString() : llvm::Expected<const char *>(nullptr);
@@ -2027,11 +2068,14 @@ DebugSymbolPage list_debug_symbols(
           if (qualified(decl).empty()) {
             throw std::runtime_error("callable has no qualified name");
           }
-          const auto shape = describe_callable(die, decl);
+          const char *linkage = die.getName(llvm::DINameKind::LinkageName);
+          const std::string linkage_symbol = linkage ? linkage : name(decl);
           const auto [low, high] = callable_code_range(die);
           if (!contains_code_range(mapped_ranges, low, high)) {
             throw std::runtime_error("callable is outside mapped executable image ranges");
           }
+          const auto display = preview_name(linkage_symbol, {});
+          const auto shape = describe_callable(die, decl, display);
           // The resolver validates the receiver layout too; discovery must not
           // advertise a method that the existing probe path cannot admit.
           if (shape.receiver) {
@@ -2039,8 +2083,6 @@ DebugSymbolPage list_debug_symbols(
             describe_record(shape.receiver, receiver_info);
           }
           const auto& selector = shape.selector;
-          const char* linkage = die.getName(llvm::DINameKind::LinkageName);
-          const std::string linkage_symbol = linkage ? linkage : name(decl);
           if (linkage_symbol.empty()) {
             throw std::runtime_error("callable has no linkage name");
           }

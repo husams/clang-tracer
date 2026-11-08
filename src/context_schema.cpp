@@ -396,13 +396,34 @@ struct Builder {
     }
     if (snapshot && tn.empty()) {
       const auto *record = t->getAsCXXRecordDecl();
-      if (record && normalize_std(record->getQualifiedNameAsString()) == "std::monostate" &&
+      const auto standard = record ? normalize_std(record->getQualifiedNameAsString())
+                                   : std::string{};
+      if ((standard == "std::monostate" || standard == "std::any") &&
           physical_standard_library_header(ast, record->getLocation())) {
-        auto empty = std::make_shared<SchemaMessage>();
-        empty->cpp_type = out.cpp_type;
-        empty->full_name = empty->cpp_type;
+        auto message = std::make_shared<SchemaMessage>();
+        message->cpp_type = out.cpp_type;
+        message->full_name = message->cpp_type;
+        if (standard == "std::any") {
+          // Matches the tagged payload encoded by Codec<std::any>.
+          message->fields.push_back(snapshot_scalar("kind", 1, SchemaKind::string, 0));
+          const auto add_optional = [&](const char *name, std::uint32_t number,
+                                        SchemaKind kind, unsigned width) {
+            SchemaField field;
+            field.name = name;
+            field.number = number;
+            field.kind = SchemaKind::optional;
+            field.optional = true;
+            field.value = std::make_shared<SchemaField>(
+                snapshot_scalar(name, 1, kind, width));
+            message->fields.push_back(std::move(field));
+          };
+          add_optional("int_value", 2, SchemaKind::signed_integer, 32);
+          add_optional("bool_value", 3, SchemaKind::boolean, 1);
+          add_optional("string_value", 4, SchemaKind::string, 0);
+          add_optional("type_name", 5, SchemaKind::string, 0);
+        }
         out.kind = SchemaKind::message;
-        out.message = std::move(empty);
+        out.message = std::move(message);
         return out;
       }
     }

@@ -120,6 +120,12 @@ int main() {
   require(parse_command("%probe inject \"demo::compute(int)\" --callback hook.cpp "
       "--prepared prepared --prepared-mode require").option("--prepared-mode") == "require");
   bad("%probe prepare \"demo::compute(int)\" --include api.hpp");
+  const auto observe = parse_command("%probe inject f --prepared d --prepared-mode require");
+  require(observe.kind == CommandKind::inject && !observe.has("--callback") &&
+          observe.option("--prepared") == "d" && observe.option("--prepared-mode") == "require");
+  bad("%probe inject f --callback");
+  bad("%probe validate f");
+  bad("%probe reload 1");
   const auto inject = parse_command("%probe inject f --callback h --prepared-mode require");
   require(inject.option("--prepared-mode") == "require" && !inject.has("--prepared"));
   bad("%probe inject f --callback h --prepared-mode require --prepared \"\"");

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <any>
 #include <array>
 #include <deque>
 #include <list>
@@ -186,6 +187,33 @@ bool encode_present_value(BoundedProtoWriter &w, std::uint32_t field,
   const bool ok = encode_value(w, 1, value, budget);
   return w.end_message() && ok;
 }
+
+// Field numbers match the std::any snapshot descriptor in context_schema.cpp.
+template <> struct Codec<std::any> {
+  static bool write(BoundedProtoWriter &w, std::uint32_t field,
+                    const std::any &value, EncodeBudget &budget) noexcept {
+    if (!w.begin_message(field))
+      return false;
+    const auto write_payload = [&] {
+      if (!value.has_value())
+        return w.string(1, "empty");
+      if (const auto *integer = std::any_cast<int>(&value))
+        return w.string(1, "int") && encode_present_value(w, 2, *integer, budget);
+      if (const auto *flag = std::any_cast<bool>(&value))
+        return w.string(1, "bool") && encode_present_value(w, 3, *flag, budget);
+      if (const auto *text = std::any_cast<std::string>(&value))
+        return w.string(1, "string") && encode_present_value(w, 4, *text, budget);
+#if defined(__cpp_rtti)
+      return w.string(1, "opaque") &&
+             encode_present_value(w, 5, std::string_view(value.type().name()), budget);
+#else
+      return w.string(1, "opaque");
+#endif
+    };
+    const bool ok = write_payload();
+    return w.end_message() && ok;
+  }
+};
 
 template <class T> struct Codec<std::optional<T>> {
   static bool write(BoundedProtoWriter &w, std::uint32_t field,

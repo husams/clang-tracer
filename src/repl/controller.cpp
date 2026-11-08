@@ -806,10 +806,6 @@ api::ProbeSpec Controller::resolve_for(const SessionHandle &session,
 }
 
 void Controller::prepare(const std::string &selector, const Command &options) {
-  const auto database = probe_path(options, options.option("--compdb", "compile_commands.json"));
-  if (!options.has("--compdb") && !std::filesystem::is_regular_file(database))
-    throw std::invalid_argument(
-        "compile_commands.json was not found in the current directory. Pass --compdb FILE.");
   const char *configured = std::getenv("TRACER_PREPARE_EXECUTABLE");
   std::string executable = "clang-tracer-prepare-injectors-native";
   if (configured && *configured) {
@@ -825,7 +821,18 @@ void Controller::prepare(const std::string &selector, const Command &options) {
     }
   }
 #endif
-  std::vector<std::string> arguments{executable, "--selector", selector, "--compdb", database};
+  const bool elf_mode = options.has("--signature");
+  std::vector<std::string> arguments{executable, "--selector", selector};
+  if (elf_mode) {
+    arguments.insert(arguments.end(), {"--signature", options.option("--signature")});
+    if (options.has("--member")) arguments.push_back("--member");
+  } else {
+    const auto database = probe_path(options, options.option("--compdb", "compile_commands.json"));
+    if (!options.has("--compdb") && !std::filesystem::is_regular_file(database))
+      throw std::invalid_argument(
+          "compile_commands.json was not found in the current directory. Pass --compdb FILE.");
+    arguments.insert(arguments.end(), {"--compdb", database});
+  }
   if (options.has("--metadata-only")) arguments.push_back("--metadata-only");
   for (const auto *key : {"--translation-unit", "--module"}) {
     if (options.has(key)) {
@@ -835,8 +842,10 @@ void Controller::prepare(const std::string &selector, const Command &options) {
   }
   for (const auto *key : {"--include", "--output"}) {
     const auto found = options.options.find(key);
-    if (found == options.options.end())
+    if (found == options.options.end()) {
+      if (elf_mode && std::string_view(key) == "--include") continue;
       throw std::invalid_argument(std::string("preparation requires ") + key);
+    }
     for (const auto &value : found->second) {
       arguments.emplace_back(key);
       arguments.push_back(probe_path(options, value));
@@ -860,7 +869,8 @@ void Controller::prepare(const std::string &selector, const Command &options) {
   while (::waitpid(pid, &status, 0) < 0)
     if (errno != EINTR) throw std::runtime_error("cannot wait for native preparation");
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-    throw std::runtime_error("native header preparation failed");
+    throw std::runtime_error(elf_mode ? "native ELF signature preparation failed"
+                                      : "native header preparation failed");
   const auto output = probe_path(options, options.option("--output"));
   const auto directory = options.has("--cwd") ? std::filesystem::canonical(output)
                                                : std::filesystem::absolute(output);
@@ -2119,8 +2129,17 @@ bool Controller::execute(const Command &command) {
     out_ << resolve(args.at(0), command).DebugString();
     return true;
   case K::inject: {
-    const auto callback = probe_path(command, command.option("--callback"));
-    inject(selected_, args.at(0), read_source(callback), command);
+    constexpr auto observer = R"cpp(
+template <> class Interceptor<tracer::ResolvedSignature> {
+public:
+  void pre(const Call &) {}
+  void post(const Call &) {}
+};
+)cpp";
+    const auto source = command.has("--callback")
+                            ? read_source(probe_path(command, command.option("--callback")))
+                            : observer;
+    inject(selected_, args.at(0), source, command);
     return true;
   }
   case K::validate:

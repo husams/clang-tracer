@@ -94,6 +94,7 @@ function(tracer_add_native_repl)
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/TracerJitConfig.cmake")
   add_executable(clang-tracer-prepare-injectors-native
     "${CMAKE_CURRENT_SOURCE_DIR}/src/prepare_injectors_main.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/prepare_elf_signature.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp_resolver.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/header_context.cpp")
   target_include_directories(clang-tracer-prepare-injectors-native PRIVATE
@@ -340,6 +341,20 @@ function(tracer_add_native_repl)
           --compdb "${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json"
           --compiler "${CMAKE_CXX_COMPILER}")
       set_tests_properties(native_repl_prepared_integration PROPERTIES TIMEOUT 240)
+      add_executable(repl-headerless-templates-target tests/fixtures/repl_headerless_templates.cpp)
+      target_compile_options(repl-headerless-templates-target PRIVATE -g -O0
+        -fno-omit-frame-pointer -fcf-protection=none)
+      add_test(NAME native_repl_headerless_templates
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_headerless_templates.sh"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-headerless-templates-target>)
+      set_tests_properties(native_repl_headerless_templates PROPERTIES TIMEOUT 180)
+      add_test(NAME native_repl_elf_signature
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_elf_signature.sh"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-headerless-templates-target>
+          "${CMAKE_OBJCOPY}")
+      set_tests_properties(native_repl_elf_signature PROPERTIES TIMEOUT 180)
       add_test(NAME native_repl_prepared_concrete
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_prepared_concrete.sh"
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>

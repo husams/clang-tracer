@@ -265,6 +265,46 @@ void rejection_cases() {
           "guard-page truncation was accepted");
 }
 
+void short_entry_relay() {
+  const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+  Mapping original(page);
+  auto *entry = static_cast<std::uint8_t *>(original.address);
+  // GCC's unoptimized one-line getter ends in RET at byte 14.
+  const std::array<std::uint8_t, 14> code{
+      0x55, 0x48, 0x89, 0xe5, 0x48, 0x89, 0x7d, 0xf8,
+      0x48, 0x8b, 0x45, 0xf8, 0x5d, 0xc3};
+  std::copy(code.begin(), code.end(), entry);
+  const auto address = reinterpret_cast<std::uintptr_t>(entry);
+  nd::Patch patch;
+  std::string error;
+  require(!nd::decode(code, address, patch, error),
+          "long jump admitted a return instruction");
+  require(!nd::decode({code.data(), 4}, address, patch, error,
+                      nd::kRelativeJumpBytes),
+          "short jump admitted a range shorter than the jump");
+  require(nd::decode(code, address, patch, error, nd::kRelativeJumpBytes) &&
+              patch.size == 8,
+          "short jump failed to cover complete entry instructions");
+
+  Trampoline trampoline;
+  require(nd::create_trampoline(patch, trampoline.address, trampoline.size,
+                                error),
+          "short trampoline allocation failed: " + error);
+  const auto replacement = +[](std::uint64_t value) { return value + 1; };
+  require(nd::prepare_entry_jump(patch, trampoline.address, trampoline.size,
+                                reinterpret_cast<const void *>(replacement),
+                                {entry, patch.size}, error),
+          "short entry relay failed: " + error);
+  check_rx(trampoline.address);
+  require(::mprotect(entry, page, PROT_READ | PROT_EXEC) == 0,
+          "could not seal short-entry fixture");
+  using Getter = std::uint64_t (*)(std::uint64_t);
+  require(reinterpret_cast<Getter>(trampoline.address)(42) == 42,
+          "short trampoline changed the original result");
+  require(reinterpret_cast<Getter>(entry)(42) == 43,
+          "short entry did not reach the replacement");
+}
+
 void displacement_limits() {
   std::vector<std::uint8_t> code{0x8b, 0x05, 0xfa, 0x0f, 0, 0};
   code.resize(14, 0x90);
@@ -338,6 +378,7 @@ int main() {
     execute_cases(true);
     stack_compare();
     rejection_cases();
+    short_entry_relay();
     displacement_limits();
     overlap_boundaries();
     std::cout << "native detour relocation checks passed\n";
