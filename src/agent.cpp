@@ -4224,6 +4224,9 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
                    bool syntax_only = false,
                    clangtracer::v1::ValidationReport *report = nullptr,
                    const VerifiedDebugEntry *verified_entry = nullptr) {
+  const bool typed_prepared = tracer::prepared::is_typed_version(
+      specification.prepared().format_version());
+  const bool prepared_callback_context = typed_prepared && specification.has_header_context();
   const auto validate_options = [&error](const auto &first, const auto &last,
                                          const char *source,
                                          bool allow_toolchain = false) {
@@ -4246,7 +4249,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   if (!validate_options(specification.compile_options().begin(),
                         specification.compile_options().end(),
                         "probe options") ||
-      (specification.has_header_context() &&
+      (!typed_prepared && specification.has_header_context() &&
        !validate_options(
            specification.header_context().compiler_arguments().begin(),
            specification.header_context().compiler_arguments().end(),
@@ -4259,19 +4262,55 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
             "receiver context", true)))) {
     return false;
   }
-  const bool typed_prepared = tracer::prepared::is_typed_version(
-      specification.prepared().format_version());
-  if (typed_prepared &&
-      (specification.has_header_context() || specification.include_headers_size())) {
-    error = "standalone prepared injection does not accept application headers";
-    return false;
+  if (typed_prepared) {
+    if (!prepared_callback_context && !specification.include_headers().empty()) {
+      error = "prepared injection requires a callback compilation context for optional includes";
+      return false;
+    }
+    if (prepared_callback_context) {
+      const auto &context = specification.header_context();
+      const auto &directory = context.working_directory();
+      if (directory.empty() || directory.front() != '/' || directory.size() > 4095 ||
+          directory.find('\0') != std::string::npos || context.ByteSizeLong() > 64 * 1024 ||
+          context.compiler_arguments_size() > 512 ||
+          !tracer::safe_prepared_callback_compiler_arguments(
+              context.compiler_arguments().begin(), context.compiler_arguments().end())) {
+        error = "invalid prepared callback compilation context";
+        return false;
+      }
+    }
+    if (specification.include_headers_size() > 16 ||
+        std::any_of(specification.include_headers().begin(), specification.include_headers().end(),
+                    [](const auto &header) {
+                      return header.empty() || header.front() != '/' || header.size() > 4095 ||
+                             header.find_first_of("\"\r\n\0", 0, 4) != std::string::npos;
+                    })) {
+      error = "invalid optional include path";
+      return false;
+    }
   }
   const std::string &source = specification.callback_source();
   const auto [callback_includes, callback_body] =
       split_callback_includes(source);
-  std::vector<std::string> user_options(
-      specification.compile_options().begin(),
-      specification.compile_options().end());
+  std::vector<std::string> user_options;
+  if (prepared_callback_context) {
+    const auto &options = specification.header_context().compiler_arguments();
+    user_options.assign(options.begin(), options.end());
+    const auto &explicit_options = specification.compile_options();
+    for (auto it = explicit_options.begin(); it != explicit_options.end(); ++it) {
+      const std::string_view option(*it);
+      if (option.rfind("-D", 0) != 0 && option.rfind("-U", 0) != 0)
+        continue;
+      // The explicit options passed preflight, so split macro flags have operands.
+      const auto value = option.size() == 2 ? std::string_view(*++it) : option.substr(2);
+      if (tracer::prepared_callback_abi_macro(value)) {
+        error = "callback compiler options cannot override prepared _GLIBCXX_USE_CXX11_ABI";
+        return false;
+      }
+    }
+  }
+  user_options.insert(user_options.end(), specification.compile_options().begin(),
+                      specification.compile_options().end());
   std::string forced_include_source;
   if (!extract_forced_includes(user_options, forced_include_source, error))
     return false;
@@ -4360,6 +4399,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
   compiler_arguments.insert(
       compiler_arguments.end(),
       {"-std=c++20", "-x", "c++", "-fPIC", "-O0", resource_dir_argument});
+  std::vector<llvm::sys::fs::UniqueID> prepared_header_files;
   if (typed_prepared) {
     auto header_check_arguments = compiler_arguments;
     header_check_arguments.push_back("-fsyntax-only");
@@ -4382,9 +4422,11 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
           target.getPointerWidth(clang::LangAS::Default) != 64 || target.getLongWidth() != 64 ||
           !target.getCXXABI().isItaniumFamily())
         throw std::invalid_argument("prepared toolchain ABI does not match the trace target");
-      tracer::prepared::check_toolchain_headers(
-          toolchain_ast->getPreprocessor().getHeaderSearchInfo(),
-          specification.prepared());
+      const auto &search = toolchain_ast->getPreprocessor().getHeaderSearchInfo();
+      tracer::prepared::check_toolchain_headers(search, specification.prepared());
+      if (prepared_callback_context)
+        for (const auto &header : specification.prepared().adapter_standard_headers())
+          prepared_header_files.push_back(tracer::prepared::toolchain_header(search, header)->getUniqueID());
     } catch (const std::exception &exception) {
       error = exception.what();
       return false;
@@ -4567,6 +4609,17 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &specification,
       build_callback_ast(user_source, "clang-tracer-callback.cc", user_capture);
   bool shape_valid = false;
   if (user_ast) {
+    if (prepared_callback_context) {
+      const auto &search = user_ast->getPreprocessor().getHeaderSearchInfo();
+      std::size_t index = 0;
+      for (const auto &header : specification.prepared().adapter_standard_headers()) {
+        const auto file = tracer::prepared::toolchain_header(search, header);
+        if (!file || file->getUniqueID() != prepared_header_files[index++]) {
+          error = "callback include paths shadow prepared toolchain header <" + header + ">";
+          return false;
+        }
+      }
+    }
     if (typed_prepared && !validate_prepared_types(*user_ast, specification, result_sret, error))
       return false;
     const auto context_declarations =
@@ -5468,6 +5521,9 @@ extern "C" int tracer_agent_validate(tracer::ValidationRequest *request) {
     for (int i = 0; i < spec.signature().arguments_size(); ++i)
       native_request.arguments[i] = static_cast<tracer::ValueType>(
           spec.signature().arguments(i));
+    if (tracer::prepared::is_typed_version(spec.prepared().format_version()) && spec.has_header_context())
+      for (const auto &option : spec.header_context().compiler_arguments())
+        report.add_effective_options(option);
     for (const auto &option : spec.compile_options())
       report.add_effective_options(option);
 

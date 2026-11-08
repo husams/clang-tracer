@@ -80,8 +80,21 @@ tooling::CompileCommand select_prepared_command(tooling::CompilationDatabase& da
                                                 const std::string& header,
                                                 const std::string& translation_unit) {
   if (!translation_unit.empty()) {
-    auto commands =
-        database.getCompileCommands(fs::absolute(translation_unit).lexically_normal().string());
+    const auto source = fs::absolute(translation_unit).lexically_normal();
+    auto commands = database.getCompileCommands(source.string());
+    // FileMatchTrie may need an existing file to match a symlinked directory.
+    // Resolve the existing parent path when the donor itself is absent.
+    std::error_code error;
+    if (commands.empty()) {
+      const auto canonical_source = fs::weakly_canonical(source, error);
+      if (!error)
+        for (auto& candidate : database.getAllCompileCommands()) {
+          const auto candidate_source = fs::weakly_canonical(
+              fs::path(candidate.Directory) / candidate.Filename, error);
+          if (!error && candidate_source == canonical_source)
+            commands.push_back(std::move(candidate));
+        }
+    }
     if (commands.size() != 1) {
       throw std::runtime_error("--translation-unit must have exactly one compile command");
     }
@@ -211,14 +224,7 @@ unsigned prepared_driver_visibility(bool clang_cl) {
 
 } // namespace
 
-PreparedHeaderCommand resolve_prepared_header_command(const std::string& header,
-                                                      const std::string& database_path,
-                                                      const std::string& translation_unit) {
-  auto database = load_database(header, database_path);
-  if (!database) {
-    throw std::runtime_error("compilation database was not found");
-  }
-  auto donor = select_prepared_command(*database, header, translation_unit);
+static PreparedHeaderCommand normalize_prepared_header_command(tooling::CompileCommand donor) {
   if (donor.CommandLine.empty() || donor.CommandLine.front().empty() ||
       donor.CommandLine.front().find('\0') != std::string::npos) {
     throw std::runtime_error("compilation database has no compiler executable");
@@ -264,7 +270,8 @@ PreparedHeaderCommand resolve_prepared_header_command(const std::string& header,
   }
   const auto directory = fs::absolute(donor.Directory).lexically_normal();
   const fs::path driver = donor.CommandLine.front();
-  PreparedHeaderCommand result{directory.string(), driver.string(), {}, {}, clang_cl};
+  PreparedHeaderCommand result{directory.string(), driver.string(), {}, {}, clang_cl, true,
+                               (directory / donor.Filename).lexically_normal().string()};
   if (driver.is_relative() && driver.has_parent_path()) {
     result.driver = (directory / driver).lexically_normal().string();
   }
@@ -408,7 +415,9 @@ PreparedHeaderCommand resolve_prepared_header_command(const std::string& header,
       }
     } else if ((name == "D" || name == "D_" || name == "D__" || argument->getSpelling() == "-D") &&
                argument->getNumValues() == 1) {
-      const auto definition = (llvm::Twine("-D") + argument->getValue()).str();
+      const auto value = llvm::StringRef(argument->getValue());
+      const auto definition = value == "_GLIBCXX_USE_CXX11_ABI" ? "-D_GLIBCXX_USE_CXX11_ABI=1"
+                                                                 : (llvm::Twine("-D") + value).str();
       if (tracer::prepared::abi_option(definition)) {
         result.adapter_abi_options.push_back(definition);
       }
@@ -437,7 +446,8 @@ PreparedHeaderCommand resolve_prepared_header_command(const std::string& header,
         result.adapter_abi_options.push_back(normalized);
       }
     } else if (value.consume_front("/clang:-D")) {
-      const auto definition = (llvm::Twine("-D") + value).str();
+      const auto definition = value == "_GLIBCXX_USE_CXX11_ABI" ? "-D_GLIBCXX_USE_CXX11_ABI=1"
+                                                                 : (llvm::Twine("-D") + value).str();
       if (tracer::prepared::abi_option(definition)) {
         result.adapter_abi_options.push_back(definition);
       }
@@ -451,7 +461,145 @@ PreparedHeaderCommand resolve_prepared_header_command(const std::string& header,
   return result;
 }
 
-void resolve_header_context(clangtracer::v1::ProbeSpec& spec, const std::string& database_path) {
+PreparedHeaderCommand resolve_prepared_header_command(const std::string& header,
+                                                      const std::string& database_path,
+                                                      const std::string& translation_unit) {
+  auto database = load_database(header, database_path);
+  if (!database)
+    throw std::runtime_error("compilation database was not found");
+  return normalize_prepared_header_command(select_prepared_command(*database, header, translation_unit));
+}
+
+namespace {
+tooling::CompileCommand select_callback_command(tooling::CompilationDatabase& database,
+                                                const clangtracer::v1::ProbeSpec& spec,
+                                                const std::string& translation_unit) {
+  if (!translation_unit.empty())
+    return select_prepared_command(database, {}, translation_unit);
+  const auto& hint = spec.prepared().source_translation_unit();
+  if (!hint.empty()) {
+    auto exact = database.getCompileCommands(hint);
+    if (exact.size() == 1)
+      return std::move(exact.front());
+    if (exact.size() > 1)
+      throw std::invalid_argument("multiple commands for the prepared translation unit; pass --translation-unit FILE with a unique command");
+  }
+  auto commands = database.getAllCompileCommands();
+  if (commands.size() == 1)
+    return std::move(commands.front());
+
+  const auto unique_match = [&](const auto& matches) -> tooling::CompileCommand* {
+    tooling::CompileCommand* selected = nullptr;
+    for (auto& command : commands) {
+      if (!matches(fs::path(command.Filename)))
+        continue;
+      if (selected)
+        return nullptr;
+      selected = &command;
+    }
+    return selected;
+  };
+  if (!hint.empty()) {
+    const auto filename = fs::path(hint).filename();
+    if (auto* command = unique_match([&](const fs::path& source) { return source.filename() == filename; }))
+      return std::move(*command);
+  }
+  auto owner = spec.debug_info().record_name();
+  if (owner.empty()) {
+    owner = spec.prepared().selector();
+    owner = owner.substr(0, owner.find('('));
+  }
+  owner = owner.substr(0, owner.find('<'));
+  const auto scope = owner.rfind("::");
+  const auto stem = scope == owner.npos ? owner : owner.substr(scope + 2);
+  if (auto* command = unique_match([&](const fs::path& source) { return source.stem() == stem; }))
+    return std::move(*command);
+  throw std::invalid_argument("cannot select a callback compile command; pass --translation-unit FILE");
+}
+
+void resolve_prepared_callback_context(clangtracer::v1::ProbeSpec& spec, const std::string& database_path,
+                                       const std::string& translation_unit) {
+  auto database = load_database({}, database_path);
+  const auto command = normalize_prepared_header_command(
+      select_callback_command(*database, spec, translation_unit));
+  std::vector<const char*> arguments;
+  for (const auto& argument : command.arguments)
+    arguments.push_back(command.clang_cl && llvm::StringRef(argument).starts_with("/clang:")
+                            ? argument.c_str() + 7 : argument.c_str());
+  unsigned missing_index = 0, missing_count = 0;
+  const auto parsed = prepared_driver_opt_table().ParseArgs(arguments, missing_index, missing_count);
+  if (missing_count)
+    throw std::invalid_argument("callback compilation command option is missing a value");
+
+  const auto& adapter_options = spec.prepared().adapter_abi_options();
+  const auto adapter_flag = [&](llvm::StringRef flag) {
+    return std::find(adapter_options.begin(), adapter_options.end(), flag.str()) != adapter_options.end();
+  };
+  std::string adapter_abi_macro;
+  for (const auto& option : adapter_options)
+    if (llvm::StringRef(option).starts_with("-D_GLIBCXX_USE_CXX11_ABI="))
+      adapter_abi_macro = option.substr(2);
+
+  auto* context = spec.mutable_header_context();
+  context->set_working_directory(command.directory);
+  context->set_inference(command.translation_unit);
+  bool relative_forced_include = false;
+  for (const auto* argument : parsed) {
+    const auto name = argument->getOption().getUnaliasedOption().getName();
+    if (name == "m32" || name == "mx32" || name.starts_with("mabi=") ||
+        (name == "target=" && !same_engine_target(argument->getValue())))
+      throw std::invalid_argument("compilation database target does not match the engine target");
+    if ((name == "fshort-enums" && !adapter_flag("-fshort-enums")) ||
+        (name == "fshort-wchar" && !adapter_flag("-fshort-wchar")) ||
+        (name == "fno-short-enums" && adapter_flag("-fshort-enums")) ||
+        (name == "fno-short-wchar" && adapter_flag("-fshort-wchar")))
+      throw std::invalid_argument("callback compilation database disagrees with prepared ABI option " +
+                                  argument->getSpelling().str());
+    const auto option = ("-" + name).str();
+    if (argument->getNumValues() != 1)
+      continue;
+    const auto value = std::string(argument->getValue());
+    if (option == "-D" || option == "-U") {
+      if (prepared_callback_abi_macro(value)) {
+        const auto definition = value == "_GLIBCXX_USE_CXX11_ABI" ? value + "=1" : value;
+        if (option == "-U" || definition != adapter_abi_macro)
+          throw std::invalid_argument("callback compilation database disagrees with prepared _GLIBCXX_USE_CXX11_ABI");
+        continue;
+      }
+    } else if (option == "-include") {
+      relative_forced_include |= fs::path(value).is_relative();
+    } else if (!prepared_callback_include_directory(option)) {
+      continue;
+    }
+    context->add_compiler_arguments(option);
+    if (prepared_callback_include_directory(option) && !value.empty() && value.front() != '=' &&
+        !llvm::StringRef(value).starts_with("$SYSROOT")) {
+      context->add_compiler_arguments((fs::path(command.directory) / value).lexically_normal().string());
+    } else {
+      context->add_compiler_arguments(value);
+    }
+  }
+  if (relative_forced_include) {
+    context->add_compiler_arguments("-iquote");
+    context->add_compiler_arguments(command.directory);
+    auto* options = context->mutable_compiler_arguments();
+    std::rotate(options->begin(), options->end() - 2, options->end());
+  }
+  if (context->ByteSizeLong() > 64 * 1024 || context->compiler_arguments_size() > 512)
+    throw std::invalid_argument("callback compilation command exceeds limits");
+  if (!safe_prepared_callback_compiler_arguments(context->compiler_arguments().begin(),
+                                                 context->compiler_arguments().end()))
+    throw std::invalid_argument("invalid callback include or macro option in compilation database");
+}
+} // namespace
+
+void resolve_header_context(clangtracer::v1::ProbeSpec& spec, const std::string& database_path,
+                            const std::string& translation_unit) {
+  if (tracer::prepared::is_typed_version(spec.prepared().format_version())) {
+    if (!database_path.empty())
+      resolve_prepared_callback_context(spec, database_path, translation_unit);
+    return;
+  }
   if (spec.include_headers().empty()) {
     if (!database_path.empty())
       throw std::runtime_error("--compdb requires --include HEADER");
@@ -460,11 +608,15 @@ void resolve_header_context(clangtracer::v1::ProbeSpec& spec, const std::string&
   auto database = load_database(spec.include_headers(0), database_path);
   if (!database)
     return;
-  database = tooling::inferMissingCompileCommands(std::move(database));
-  const auto commands = database->getCompileCommands(spec.include_headers(0));
-  if (commands.empty())
-    throw std::runtime_error("compilation database has no usable header command");
-  const auto& donor = commands.front();
+  const auto donor = [&] {
+    if (!translation_unit.empty())
+      return select_prepared_command(*database, {}, translation_unit);
+    database = tooling::inferMissingCompileCommands(std::move(database));
+    auto commands = database->getCompileCommands(spec.include_headers(0));
+    if (commands.empty())
+      throw std::runtime_error("compilation database has no usable header command");
+    return std::move(commands.front());
+  }();
   // All requested headers share the selected command's configuration.
   auto command = tooling::transferCompileCommand(donor, "clang-tracer-debug-types.cc");
   auto arguments =

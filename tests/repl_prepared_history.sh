@@ -73,14 +73,45 @@ public:
 };
 CPP
 cat >manager-snapshot.cpp <<'CPP'
+#include <type_traits>
+
 using NestedPayloadFromPackage = HFW::Payload::Nested;
 using NestedResultFromPackage = HFW::HfwManager::ItemResult;
+static_assert(std::is_same_v<HFW::ItemDetails<>,
+                             HFW::ItemDetails<int, UP_SQLObject::False>>);
+static_assert(UP_SQLObject::False == 2);
 template<> class Interceptor<tracer::ResolvedSignature> {
 public:
   void post(const Call &) {
     NestedPayloadFromPackage nested_payload_check{23};
     if (nested_payload_check.marker != 23)
       throw std::runtime_error("extra-header nested payload was not retained");
+  }
+};
+CPP
+mkdir -p callback-build/include
+cat >callback-build/include/history-callback.hpp <<'CPP'
+#if HISTORY_CALLBACK_CONTEXT != 73
+#error expected the callback compilation database macro
+#endif
+constexpr const char *callback_event = "history.callback-compdb";
+CPP
+cat >callback-build/include/history-callback-config.hpp <<'CPP'
+constexpr int expected_callback_result = 1;
+CPP
+touch callback-build/callback-donor.cpp callback-build/decoy.cpp
+printf -v callback_command '{"directory":"%s/callback-build","file":"callback-donor.cpp","arguments":["clang++","-std=c++17","-Iinclude","-DHISTORY_CALLBACK_CONTEXT=73","-include","history-callback-config.hpp","-c","callback-donor.cpp"]}' "$run"
+printf -v decoy_command '{"directory":"%s/callback-build","file":"decoy.cpp","arguments":["clang++","-std=c++17","-Iinclude","-DHISTORY_CALLBACK_CONTEXT=42","-c","decoy.cpp"]}' "$run"
+printf '[%s]\n' "$callback_command" > callback-compile_commands.json
+printf '[%s,%s]\n' "$decoy_command" "$callback_command" > callback-choices-compile_commands.json
+cat >toolchain-callback.cpp <<'CPP'
+#include <history-callback.hpp>
+
+template<> class Interceptor<tracer::ResolvedSignature> {
+public:
+  void post(const Call &call) {
+    if (call.result() == expected_callback_result)
+      call.context().event(callback_event);
   }
 };
 CPP
@@ -101,15 +132,17 @@ if (value.argument_snapshot(0).field("label").as<std::string>() != "entry" || va
 %probe inject "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --callback snapshot.cpp --prepared opaque --prepared-mode require
 %collect --name "prepared_history::via_opaque(const prepared_history::OpaqueItem*, int)" --phase POST --count 1 --timeout 15 --as opaque
 if (tracer.batch("opaque").size() != 1) throw std::runtime_error("missing address-only pointer event");
+%probe validate "HFW::HfwManager::createItem()" --callback manager-snapshot.cpp --prepared manager-item --prepared-mode require
 %probe inject "HFW::HfwManager::createItem()" --callback manager-snapshot.cpp --prepared manager-item --prepared-mode require
 %collect --name "HFW::HfwManager::createItem()" --phase POST --count 1 --timeout 15 --as manager-item
 auto manager_item = tracer.batch("manager-item").at(0);
 auto returned_item = manager_item.result_snapshot();
 if (returned_item.field("id").as<int>() != 73 || returned_item.field("kind").as<int>() != 3 || returned_item.field("details").field("quantity").as<int>() != 5) throw std::runtime_error("wrong nested manager item fields");
 if (manager_item.receiver_snapshot().field("seed").as<int>() != 71) throw std::runtime_error("wrong manager receiver fields");
-%probe inject "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --callback snapshot.cpp --prepared toolchain-headers --prepared-mode require
-%collect --name "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --phase POST --count 1 --timeout 15 --as toolchain-headers
-if (tracer.batch("toolchain-headers").at(0).result_as<int>() != 1) throw std::runtime_error("toolchain-header callable returned wrong result");
+%probe validate "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --callback toolchain-callback.cpp --prepared toolchain-headers --prepared-mode require --compdb callback-compile_commands.json
+%probe inject "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --callback toolchain-callback.cpp --prepared toolchain-headers --prepared-mode require --compdb callback-choices-compile_commands.json --translation-unit callback-build/callback-donor.cpp
+%collect --name history.callback-compdb --count 1 --timeout 15 --as callback-compdb
+if (tracer.batch("callback-compdb").size() != 1) throw std::runtime_error("missing compilation database callback event");
 std::cout << "PREPARED_HISTORY_FIELDS=1" << std::endl;
 %quit
 REPL
@@ -122,4 +155,25 @@ trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
 test "$(grep -c '^installed probe=' smoke.log)" -eq 6
 grep -qx 'prepared_used: true' smoke.log
 grep -qx PREPARED_HISTORY_FIELDS=1 smoke.log
+
+sed 's/"-std=c++17",/"-std=c++17","--target=x86_64-pc-windows-msvc",/' \
+  callback-compile_commands.json > incompatible-compile_commands.json
+sed 's/"-std=c++17",/"-std=c++17","-Xclang","-load","-Xclang","missing.so",/' \
+  callback-compile_commands.json > unsafe-compile_commands.json
+cat >invalid-compdb.repl <<'REPL'
+%probe validate "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --callback toolchain-callback.cpp --prepared toolchain-headers --prepared-mode require --compdb incompatible-compile_commands.json
+%probe inject "prepared_history::uses_toolchain_headers(const std::error_code*, const tm*)" --callback toolchain-callback.cpp --prepared toolchain-headers --prepared-mode require --compdb unsafe-compile_commands.json
+%quit
+REPL
+if "$repl" --server "$server" --agent "$agent" --attach "$pid" --timeout 60 \
+    <invalid-compdb.repl >invalid-compdb.log 2>&1; then
+  echo "invalid callback compilation database unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -F 'compilation database target does not match the engine target' invalid-compdb.log
+grep -F 'header compilation command contains unsupported option: -Xclang' invalid-compdb.log
+if grep -q '^installed probe=' invalid-compdb.log; then
+  cat invalid-compdb.log >&2
+  exit 1
+fi
 kill -0 "$pid"

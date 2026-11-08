@@ -4,6 +4,7 @@
 #include "prepared_header_discovery.hpp"
 
 #include <clang/AST/DeclCXX.h>
+#include <clang/AST/Expr.h>
 #include <clang/Basic/SourceManager.h>
 #include <llvm/ADT/StringExtras.h>
 
@@ -236,7 +237,7 @@ private:
     place_declaration(alias, declaration);
   }
 
-  void emit_enum(const clang::EnumDecl &enumeration) {
+  void emit_enum(const clang::EnumDecl &enumeration, bool allow_anonymous = false) {
     if (const auto header = header_discovery_.headerFor(enumeration, excluded_headers_)) {
       standard_headers_.insert(*header);
       return;
@@ -244,19 +245,43 @@ private:
     if (enumeration.isInStdNamespace())
       unsupported(enumeration, "cannot resolve a public toolchain header");
     const auto *decl = enumeration.getDefinition();
-    if (!decl || !decl->getIdentifier())
+    if (!decl || (!allow_anonymous && !decl->getIdentifier()))
       unsupported(enumeration, "enumeration requires a named definition");
     if (emitted_.count(decl->getCanonicalDecl()) || defer_to_owner(*decl))
       return;
     emitted_.insert(decl->getCanonicalDecl());
     std::string source = decl->isScoped() ? "enum class " : "enum ";
-    source += decl->getNameAsString() + " : " + spelling(decl->getIntegerType()) + " {\n";
+    if (decl->getIdentifier())
+      source += decl->getNameAsString() + " ";
+    source += ": " + spelling(decl->getIntegerType()) + " {\n";
     for (const auto *value : decl->enumerators()) {
       llvm::SmallString<32> number;
       value->getInitVal().toString(number, 10);
       source += value->getNameAsString() + " = " + number.str().str() + ",\n";
     }
     place_declaration(*decl, source + "};\n");
+  }
+
+  void emit_constant(const clang::VarDecl &constant) {
+    if (const auto header = header_discovery_.headerFor(constant, excluded_headers_)) {
+      standard_headers_.insert(*header);
+      return;
+    }
+    const auto *decl = constant.getInitializingDeclaration();
+    if (!decl || !decl->isUsableInConstantExpressions(ast_) ||
+        !decl->getType()->isIntegralOrEnumerationType() || !decl->getIdentifier())
+      unsupported(constant, "template default requires an integral constant definition");
+    const auto *value = decl->evaluateValue();
+    if (!value || !value->isInt())
+      unsupported(constant, "cannot evaluate template default constant");
+    if (emitted_.count(decl->getCanonicalDecl()) || defer_to_owner(*decl))
+      return;
+    emitted_.insert(decl->getCanonicalDecl());
+    const auto type = decl->getType().getUnqualifiedType();
+    visit(type);
+    const auto literal = print_template_arg(clang::TemplateArgument(ast_, value->getInt(), type));
+    place_declaration(*decl, std::string(decl->isStaticDataMember() ? "static " : "") +
+        "constexpr " + spelling(type, decl->getName()) + " = " + literal + ";\n");
   }
 
   void place_declaration(const clang::NamedDecl &decl, std::string source) {
@@ -301,12 +326,62 @@ private:
     return true;
   }
 
-  void visit_template_arg(const clang::TemplateArgument &arg) {
-    if (arg.getKind() == clang::TemplateArgument::Type)
-      visit(arg.getAsType());
-    if (arg.getKind() == clang::TemplateArgument::Pack)
+  std::string print_template_arg(const clang::TemplateArgument &arg) {
+    std::string result;
+    llvm::raw_string_ostream out(result);
+    arg.print(policy_, out, /*IncludeType=*/true);
+    return result;
+  }
+
+  void visit_default_expression(const clang::Stmt &expression) {
+    if (const auto *reference = llvm::dyn_cast<clang::DeclRefExpr>(&expression)) {
+      if (const auto *enumerator = llvm::dyn_cast<clang::EnumConstantDecl>(reference->getDecl()))
+        emit_enum(*llvm::cast<clang::EnumDecl>(enumerator->getDeclContext()),
+                  /*allow_anonymous=*/true);
+      else if (const auto *constant = llvm::dyn_cast<clang::VarDecl>(reference->getDecl()))
+        emit_constant(*constant);
+    }
+    for (const auto *child : expression.children())
+      if (child)
+        visit_default_expression(*child);
+  }
+
+  void visit_template_arg(const clang::TemplateArgument &arg, bool complete = true) {
+    if (arg.getKind() == clang::TemplateArgument::Type) {
+      visit(arg.getAsType(), complete);
+    } else if (arg.getKind() == clang::TemplateArgument::Integral) {
+      if (const auto *enumeration = arg.getIntegralType()->getAs<clang::EnumType>())
+        emit_enum(*enumeration->getDecl(), /*allow_anonymous=*/true);
+    } else if (arg.getKind() == clang::TemplateArgument::Pack) {
       for (const auto &element : arg.pack_elements())
-        visit_template_arg(element);
+        visit_template_arg(element, complete);
+    }
+  }
+
+  std::string template_default(const clang::TemplateArgument &arg) {
+    if (arg.getKind() == clang::TemplateArgument::Type) {
+      const auto type = arg.getAsType();
+      visit(type, /*complete=*/false);
+      // Preserve dependent parameter names, such as U = T.
+      return type->isDependentType() ? type.getAsString(policy_) : spelling(type);
+    }
+    if (arg.getKind() == clang::TemplateArgument::Expression) {
+      const auto *expression = arg.getAsExpr();
+      visit_default_expression(*expression);
+      if (const auto *reference =
+              llvm::dyn_cast<clang::DeclRefExpr>(expression->IgnoreParenImpCasts())) {
+        const auto *decl = reference->getDecl();
+        if (llvm::isa<clang::VarDecl, clang::EnumConstantDecl>(decl)) {
+          std::string result;
+          llvm::raw_string_ostream out(result);
+          out << "::";
+          decl->printQualifiedName(out, policy_);
+          return result;
+        }
+      }
+    }
+    visit_template_arg(arg, /*complete=*/false);
+    return print_template_arg(arg);
   }
 
   void visit(clang::QualType type, bool complete = true) {
@@ -333,7 +408,54 @@ private:
         forward(*record);
     } else if (const auto *enumeration = type->getAs<clang::EnumType>()) {
       emit_enum(*enumeration->getDecl());
+    } else if (const auto *specialization = type->getAs<clang::TemplateSpecializationType>()) {
+      if (const auto *primary = llvm::dyn_cast_or_null<clang::ClassTemplateDecl>(
+              specialization->getTemplateName().getAsTemplateDecl()))
+        forward_template(*primary);
+      for (const auto &argument : specialization->template_arguments())
+        visit_template_arg(argument, /*complete=*/false);
     }
+  }
+
+  void forward_template(const clang::ClassTemplateDecl &primary) {
+    if (!forwarded_.insert(primary.getCanonicalDecl()).second ||
+        include_toolchain_record(*primary.getTemplatedDecl()))
+      return;
+    const auto *declaration = primary.getMostRecentDecl();
+    const auto &record = *declaration->getTemplatedDecl();
+    std::string source = "template<";
+    bool first = true;
+    for (const auto *parameter : *declaration->getTemplateParameters()) {
+      if (!first)
+        source += ", ";
+      first = false;
+      std::string default_value;
+      const auto name = parameter->getNameAsString();
+      if (const auto *type = llvm::dyn_cast<clang::TemplateTypeParmDecl>(parameter)) {
+        source += std::string(type->isParameterPack() ? "class... " : "class ") + name;
+        if (type->hasDefaultArgument())
+          default_value = template_default(type->getDefaultArgument().getArgument());
+      } else if (const auto *value = llvm::dyn_cast<clang::NonTypeTemplateParmDecl>(parameter)) {
+        // A static enum constant and its parameter type can share an owner.
+        // Discover the constant before the type can emit that owner.
+        if (value->hasDefaultArgument())
+          default_value = template_default(value->getDefaultArgument().getArgument());
+        visit(value->getType(), /*complete=*/false);
+        const auto parameter_name = (value->isParameterPack() ? "..." : "") + name;
+        if (value->getType()->isDependentType()) {
+          llvm::raw_string_ostream out(source);
+          value->getType().print(out, policy_, parameter_name);
+        } else {
+          source += spelling(value->getType(), parameter_name);
+        }
+      } else {
+        unsupported(record, "cannot extract the primary template parameters");
+      }
+      if (!default_value.empty())
+        source += " = " + default_value;
+    }
+    declarations_ += in_namespace(record, source + "> " +
+        std::string(record.getKindName()) + " " + record.getNameAsString() + ";\n");
   }
 
   void forward(const clang::CXXRecordDecl &record) {
@@ -357,33 +479,18 @@ private:
     if (!forwarded_.insert(record.getCanonicalDecl()).second)
       return;
     if (const auto *special = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(&record)) {
-      const auto *primary = special->getSpecializedTemplate();
-      if (forwarded_.insert(primary->getCanonicalDecl()).second) {
-        std::string declaration = "template<";
-        bool first = true;
-        for (const auto *parameter : *primary->getTemplateParameters()) {
-          if (!first)
-            declaration += ", ";
-          first = false;
-          if (const auto *type = llvm::dyn_cast<clang::TemplateTypeParmDecl>(parameter)) {
-            declaration += type->isParameterPack() ? "class..." : "class";
-          } else if (const auto *value = llvm::dyn_cast<clang::NonTypeTemplateParmDecl>(parameter);
-                     value && !value->getType()->isDependentType()) {
-            visit(value->getType());
-            declaration += spelling(value->getType(), value->isParameterPack() ? "..." : "");
-          } else {
-            unsupported(record, "cannot extract the primary template parameters");
-          }
-        }
-        forwards_ += in_namespace(record, declaration + "> " +
-            std::string(record.getKindName()) + " " + record.getNameAsString() + ";\n");
-      }
+      forward_template(*special->getSpecializedTemplate());
+      // Template declarations must follow their argument dependencies.
+      for (const auto &argument : special->getTemplateArgs().asArray())
+        visit_template_arg(argument, /*complete=*/false);
+      declarations_ += in_namespace(record, specialization_prefix(record) +
+          std::string(record.getKindName()) + " " + record_name(record) + ";\n");
       for (const auto &argument : special->getTemplateArgs().asArray())
         visit_template_arg(argument);
+    } else {
+      forwards_ += in_namespace(record,
+          std::string(record.getKindName()) + " " + record.getNameAsString() + ";\n");
     }
-    forwards_ += in_namespace(record,
-        specialization_prefix(record) + std::string(record.getKindName()) + " " +
-        record_name(record) + ";\n");
   }
 
   static std::string specialization_prefix(const clang::CXXRecordDecl &record) {
@@ -393,11 +500,11 @@ private:
   std::string record_name(const clang::CXXRecordDecl &record) {
     if (!llvm::isa<clang::ClassTemplateSpecializationDecl>(record))
       return record.getNameAsString();
-    auto policy = policy_;
-    policy.SuppressDefaultTemplateArgs = false;
     std::string result;
     llvm::raw_string_ostream out(result);
-    record.getNameForDiagnostic(out, policy, false);
+    // Keep the original defaulted arguments implicit in the generated
+    // specialization too. Clang preserves that distinction in type names.
+    record.getNameForDiagnostic(out, policy_, false);
     return result;
   }
 
@@ -408,7 +515,8 @@ private:
     if (emitted_.count(identity) || defer_to_owner(record))
       return;
     forward(record);
-    emitted_.insert(identity);
+    if (!emitted_.insert(identity).second)
+      return;
     emitting_.insert(identity);
     if (record.isUnion())
       unsupported(record, "union layout requires an explicit adapter");
@@ -430,6 +538,21 @@ private:
     }
     source += " {\n";
     const auto body = source.size();
+    // Extra headers can emit an owner before a template default needs its
+    // constants. Keep these declarations available inside that owner.
+    const auto &sm = ast_.getSourceManager();
+    if (extra_headers_.count(sm.getFilename(sm.getExpansionLoc(record.getLocation())).str())) {
+      for (const auto *member : record.decls()) {
+        if (const auto *enumeration = llvm::dyn_cast<clang::EnumDecl>(member);
+            enumeration && enumeration->isCompleteDefinition()) {
+          emit_enum(*enumeration, /*allow_anonymous=*/true);
+        } else if (const auto *constant = llvm::dyn_cast<clang::VarDecl>(member);
+                   constant && constant->isConstexpr() && constant->hasInit() &&
+                   constant->getType()->isIntegerType() && !constant->getType()->isDependentType()) {
+          emit_constant(*constant);
+        }
+      }
+    }
     for (const auto *field : record.fields()) {
       visit(field->getType());
       source += access(field->getAccess()) + ": ";
@@ -511,8 +634,10 @@ private:
             emit_record(*record);
           else if (const auto *alias = llvm::dyn_cast<clang::TypedefNameDecl>(*declaration))
             emit_alias(*alias);
+          else if (const auto *constant = llvm::dyn_cast<clang::VarDecl>(*declaration))
+            emit_constant(*constant);
           else
-            emit_enum(*llvm::cast<clang::EnumDecl>(*declaration));
+            emit_enum(*llvm::cast<clang::EnumDecl>(*declaration), /*allow_anonymous=*/true);
         } else {
           source += std::get<std::string>(entry);
         }

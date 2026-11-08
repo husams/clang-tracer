@@ -133,7 +133,7 @@ void tracercommandsParserInitialize() {
     1,34,1,34,3,34,456,8,34,1,35,1,35,1,35,1,35,1,35,1,35,1,36,1,36,1,36,
     1,37,1,37,1,37,1,37,0,0,38,0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,
     32,34,36,38,40,42,44,46,48,50,52,54,56,58,60,62,64,66,68,70,72,74,0,14,
-    1,0,7,8,2,0,12,12,20,23,2,0,20,20,34,37,3,0,20,20,34,35,38,40,2,0,107,
+    1,0,7,8,2,0,12,12,20,23,2,0,20,20,34,37,3,0,20,20,34,36,38,40,2,0,107,
     107,113,113,1,0,63,66,1,0,68,69,2,0,46,46,70,71,1,0,75,76,2,0,37,37,77,
     77,1,0,86,87,3,0,20,20,34,34,91,94,18,0,2,6,9,9,11,11,13,16,18,19,26,
     29,31,33,44,45,47,48,50,52,54,58,60,62,68,69,73,76,78,80,82,90,95,100,
@@ -1577,7 +1577,7 @@ TracerCommandsParser::ProbeContext* TracerCommandsParser::probe() {
             _errHandler->sync(this);
             _la = _input->LA(1);
             while ((((_la & ~ 0x3fULL) == 0) &&
-              ((1ULL << _la) & 1975686004736) != 0)) {
+              ((1ULL << _la) & 2044405481472) != 0)) {
               setState(180);
               resolveOption();
               setState(185);
@@ -1600,7 +1600,7 @@ TracerCommandsParser::ProbeContext* TracerCommandsParser::probe() {
             _errHandler->sync(this);
             _la = _input->LA(1);
             while ((((_la & ~ 0x3fULL) == 0) &&
-              ((1ULL << _la) & 17368848793600) != 0) || _la == TracerCommandsParser::T__103) {
+              ((1ULL << _la) & 17437568270336) != 0) || _la == TracerCommandsParser::T__103) {
               setState(190);
               deployOption();
               setState(195);
@@ -1623,7 +1623,7 @@ TracerCommandsParser::ProbeContext* TracerCommandsParser::probe() {
             _errHandler->sync(this);
             _la = _input->LA(1);
             while ((((_la & ~ 0x3fULL) == 0) &&
-              ((1ULL << _la) & 1975686004736) != 0)) {
+              ((1ULL << _la) & 2044405481472) != 0)) {
               setState(200);
               resolveOption();
               setState(205);
@@ -1793,7 +1793,7 @@ TracerCommandsParser::ResolveOptionContext* TracerCommandsParser::resolveOption(
     setState(218);
     _la = _input->LA(1);
     if (!((((_la & ~ 0x3fULL) == 0) &&
-      ((1ULL << _la) & 1975686004736) != 0))) {
+      ((1ULL << _la) & 2044405481472) != 0))) {
     _errHandler->recoverInline(this);
     }
     else {
@@ -1867,6 +1867,7 @@ TracerCommandsParser::DeployOptionContext* TracerCommandsParser::deployOption() 
       case TracerCommandsParser::T__19:
       case TracerCommandsParser::T__33:
       case TracerCommandsParser::T__34:
+      case TracerCommandsParser::T__35:
       case TracerCommandsParser::T__37:
       case TracerCommandsParser::T__38:
       case TracerCommandsParser::T__39: {
@@ -2032,7 +2033,7 @@ TracerCommandsParser::InterceptorContext* TracerCommandsParser::interceptor() {
         _errHandler->sync(this);
         _la = _input->LA(1);
         while ((((_la & ~ 0x3fULL) == 0) &&
-          ((1ULL << _la) & 1975686004736) != 0)) {
+          ((1ULL << _la) & 2044405481472) != 0)) {
           setState(243);
           resolveOption();
           setState(248);
@@ -2055,7 +2056,7 @@ TracerCommandsParser::InterceptorContext* TracerCommandsParser::interceptor() {
         _errHandler->sync(this);
         _la = _input->LA(1);
         while ((((_la & ~ 0x3fULL) == 0) &&
-          ((1ULL << _la) & 17368848793600) != 0) || _la == TracerCommandsParser::T__103) {
+          ((1ULL << _la) & 17437568270336) != 0) || _la == TracerCommandsParser::T__103) {
           setState(253);
           deployOption();
           setState(258);

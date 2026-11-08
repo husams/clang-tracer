@@ -255,6 +255,9 @@ void resolution_options(api::ResolveProbeRequest &request,
                         const Command &command) {
   request.set_module(command.option("--module"));
   request.set_compilation_database(command.option("--compdb"));
+  request.set_translation_unit(command.option("--translation-unit"));
+  if (command.has("--compdb") && request.compilation_database().empty())
+    throw std::invalid_argument("--compdb requires a path");
   auto includes = command.options.find("--include");
   if (includes != command.options.end()) {
     for (const auto &value : includes->second) {
@@ -267,11 +270,9 @@ void resolution_options(api::ResolveProbeRequest &request,
       request.add_compile_options(value);
     }
   }
-  if (!request.compilation_database().empty() &&
-      request.include_headers().empty()) {
-    throw std::invalid_argument(
-        "--compdb requires --include with a server-host header path");
-  }
+  if (command.has("--translation-unit") &&
+      (request.translation_unit().empty() || request.compilation_database().empty()))
+    throw std::invalid_argument("--translation-unit requires a file and --compdb");
 }
 
 std::string compact_selector(const std::string &value) {
@@ -608,9 +609,13 @@ api::ProbeSpec Controller::resolve_for(const SessionHandle &session,
         (!spec.has_prepared() || spec.prepared().SerializeAsString() !=
                                     request.prepared().SerializeAsString()))
       throw std::runtime_error("server does not support the prepared contract");
+    if (!request.compilation_database().empty() && !spec.has_header_context())
+      throw std::runtime_error("server did not return the requested compilation database context");
     return spec;
   } catch (const std::exception &error) {
-    if (prepared != PreparedMode::prefer) throw;
+    if (prepared != PreparedMode::prefer ||
+        (!request.compilation_database().empty() && request.include_headers().empty()))
+      throw;
     out_ << "prepared contract rejected; falling back to DWARF: " << error.what() << '\n';
     request.clear_prepared();
     request.set_selector(selector);
@@ -1565,6 +1570,7 @@ bool Controller::execute(const Command &command) {
     *request.mutable_compile_options() = resolution.compile_options();
     request.set_module(resolution.module());
     request.set_compilation_database(resolution.compilation_database());
+    request.set_translation_unit(resolution.translation_unit());
     const auto prepared = prepared_options(request, command, prepared_packages_, out_);
     const auto validate = [&] { return unary<api::ValidationReport>(
         [&](auto &c, auto &r) { return stub_->ValidateProbe(&c, request, &r); },
@@ -1575,7 +1581,9 @@ bool Controller::execute(const Command &command) {
       if (prepared != PreparedMode::off && !response.prepared_used())
         throw std::runtime_error("server does not support prepared validation");
     } catch (const std::exception &error) {
-      if (prepared != PreparedMode::prefer) throw;
+      if (prepared != PreparedMode::prefer ||
+          (!request.compilation_database().empty() && request.include_headers().empty()))
+        throw;
       out_ << "prepared validation rejected; falling back to DWARF: " << error.what() << '\n';
       request.clear_prepared();
       request.set_selector(selector);

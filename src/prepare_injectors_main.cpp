@@ -150,6 +150,7 @@ int main(int argc, char **argv) {
     prepared.set_format_version(typed ? tracer::prepared::typed_version : module.empty() ? 2 : 1);
     if (typed) {
       *prepared.mutable_header_types() = types;
+      prepared.set_source_translation_unit(command.translation_unit);
     } else {
       prepared.clear_adapter_declarations();
       prepared.clear_adapter_standard_headers();

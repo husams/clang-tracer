@@ -24,7 +24,7 @@ probe : 'probe' ('prepare' value prepareOption+
       | 'remove' UINT) | 'probes';
 prepareOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--output') value
               | METADATA_ONLY;
-resolveOption : ('--include' | '--compdb' | '--module' | '--compile-option'
+resolveOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--compile-option'
                 | '--prepared' | '--prepared-mode') value;
 deployOption : resolveOption | '--stack-depth' (UINT | WORD)
              | '--print-arguments' | '--print-result' | stackFilter;

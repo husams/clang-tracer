@@ -6,6 +6,10 @@
 
 #include <time.h>
 
+struct UP_SQLObject {
+  enum Flag { False = 2, True = 3 };
+};
+
 namespace prepared_history {
 
 int uses_toolchain_headers(const std::error_code *error, const struct tm *time);

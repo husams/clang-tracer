@@ -490,10 +490,13 @@ void command_details(std::ostream& out, const CommandTopic& entry, bool color) {
   if (entry.usage.find("RESOLUTION OPTIONS") != string_view::npos) {
     out << '\n';
     heading(out, "Resolution options", color);
-    block(out, "--include SERVER_HEADER --compdb SERVER_PATH --module TEXT --compile-option FLAG\n"
+    block(out, "--include SERVER_HEADER --compdb SERVER_PATH [--translation-unit SERVER_FILE]\n"
+               "--module TEXT --compile-option FLAG\n"
                "--prepared DIRECTORY --prepared-mode off|prefer|require",
           Syntax::command, color);
     out << "The default mode, prefer, uses an available prepared package and falls back to DWARF.\n";
+    out << "With a typed prepared package, --compdb supplies include paths, forced includes and macros to the callback.\n"
+           "Extra headers must coexist with the prepared declarations. Use --translation-unit to override the donor.\n";
   }
   if (entry.usage.find("DEPLOYMENT OPTIONS") != string_view::npos) {
     out << '\n';

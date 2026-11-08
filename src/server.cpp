@@ -66,6 +66,8 @@ template <class Headers, class Options>
 grpc::Status validate_resolution_inputs(std::string_view selector,
                                         std::string_view module,
                                         std::string_view compdb,
+                                        std::string_view translation_unit,
+                                        bool typed_prepared,
                                         const Headers &headers,
                                         const Options &options) {
   const auto valid_text = [](std::string_view value, std::size_t limit,
@@ -74,13 +76,21 @@ grpc::Status validate_resolution_inputs(std::string_view selector,
            value.find('\0') == std::string_view::npos;
   };
   if (!valid_text(selector, 4096) || !valid_text(module, 4095, true) ||
-      !valid_text(compdb, 4095, true)) {
+      !valid_text(compdb, 4095, true) || !valid_text(translation_unit, 4095, true)) {
     return {grpc::StatusCode::INVALID_ARGUMENT,
-            "invalid selector, module, or compilation database path"};
+            "invalid selector, module, compilation database path, or translation unit"};
   }
-  if (!compdb.empty() && headers.empty()) {
+  if (!translation_unit.empty() && compdb.empty()) {
+    return {grpc::StatusCode::INVALID_ARGUMENT,
+            "--translation-unit requires --compdb"};
+  }
+  if (!typed_prepared && !compdb.empty() && headers.empty()) {
     return {grpc::StatusCode::INVALID_ARGUMENT,
             "--compdb requires --include HEADER"};
+  }
+  if (typed_prepared && compdb.empty() && !headers.empty()) {
+    return {grpc::StatusCode::INVALID_ARGUMENT,
+            "prepared injection requires --compdb to use --include"};
   }
   if (headers.size() > 16) {
     return {grpc::StatusCode::INVALID_ARGUMENT,
@@ -1364,6 +1374,7 @@ public:
                             clangtracer::v1::ProbeSpec *response) override {
     const auto request_valid = validate_resolution_inputs(
         request->selector(), request->module(), request->compilation_database(),
+        request->translation_unit(), tracer::prepared::is_typed_version(request->prepared().format_version()),
         request->include_headers(), request->compile_options());
     if (!request_valid.ok())
       return request_valid;
@@ -1382,9 +1393,6 @@ public:
       lookup.is_cancelled = [&] { return context->IsCancelled(); };
       if (request->has_prepared() && request->prepared().selector() != request->selector())
         return {grpc::StatusCode::INVALID_ARGUMENT, "prepared selector mismatch"};
-      if (tracer::prepared::is_typed_version(request->prepared().format_version()) &&
-          !request->include_headers().empty())
-        return {grpc::StatusCode::INVALID_ARGUMENT, "standalone prepared injection does not accept application headers"};
       auto resolved = request->has_prepared()
           ? client::bind_prepared_callable(session->pid(), request->prepared(), lookup)
           : client::resolve_debug_callable(session->pid(), request->selector(), lookup);
@@ -1393,7 +1401,8 @@ public:
       for (const auto &option : request->compile_options())
         resolved.spec.add_compile_options(option);
       if (!resolved.spec.has_header_context())
-        client::resolve_header_context(resolved.spec, request->compilation_database());
+        client::resolve_header_context(resolved.spec, request->compilation_database(),
+                                       request->translation_unit());
       response->Swap(&resolved.spec);
       return grpc::Status::OK;
     } catch (const client::DebugLookupLimit &error) {
@@ -1426,6 +1435,7 @@ public:
     }
     const auto request_valid = validate_resolution_inputs(
         request->selector(), request->module(), request->compilation_database(),
+        request->translation_unit(), tracer::prepared::is_typed_version(request->prepared().format_version()),
         request->include_headers(), request->compile_options());
     if (!request_valid.ok())
       return request_valid;
@@ -1446,9 +1456,6 @@ public:
       lookup.is_cancelled = [&] { return context->IsCancelled(); };
       if (request->has_prepared() && request->prepared().selector() != request->selector())
         return {grpc::StatusCode::INVALID_ARGUMENT, "prepared selector mismatch"};
-      if (tracer::prepared::is_typed_version(request->prepared().format_version()) &&
-          !request->include_headers().empty())
-        return {grpc::StatusCode::INVALID_ARGUMENT, "standalone prepared injection does not accept application headers"};
       auto resolved = request->has_prepared()
           ? client::bind_prepared_callable(session->pid(), request->prepared(), lookup)
           : client::resolve_debug_callable(session->pid(), request->selector(), lookup);
@@ -1457,7 +1464,8 @@ public:
       for (const auto &option : request->compile_options())
         resolved.spec.add_compile_options(option);
       if (!resolved.spec.has_header_context())
-        client::resolve_header_context(resolved.spec, request->compilation_database());
+        client::resolve_header_context(resolved.spec, request->compilation_database(),
+                                       request->translation_unit());
       resolved.spec.set_callback_source(request->callback_source());
       const auto input_valid = validate_probe(resolved.spec);
       if (!input_valid.ok())
@@ -2304,9 +2312,9 @@ private:
   grpc::Status validate_probe(const clangtracer::v1::ProbeSpec &spec) const {
     if (spec.has_prepared() && !spec.has_debug_info())
       return {grpc::StatusCode::INVALID_ARGUMENT, "prepared probe requires a live binding"};
-    if (tracer::prepared::is_typed_version(spec.prepared().format_version()) &&
-        (spec.has_header_context() || !spec.include_headers().empty()))
-      return {grpc::StatusCode::INVALID_ARGUMENT, "standalone prepared injection does not accept application headers"};
+    const bool typed_prepared = tracer::prepared::is_typed_version(spec.prepared().format_version());
+    if (typed_prepared && !spec.include_headers().empty() && !spec.has_header_context())
+      return {grpc::StatusCode::INVALID_ARGUMENT, "prepared injection requires a callback compilation context for optional includes"};
     if (spec.ByteSizeLong() > 256 * 1024) {
       return {grpc::StatusCode::INVALID_ARGUMENT,
               "probe specification exceeds 256 KiB"};
@@ -2392,7 +2400,7 @@ private:
     }
     if (spec.has_header_context()) {
       const auto &context = spec.header_context();
-      if (!spec.has_debug_info() || spec.include_headers().empty() ||
+      if (!spec.has_debug_info() || (!typed_prepared && spec.include_headers().empty()) ||
           !valid_text(context.working_directory(), 4095) ||
           context.working_directory().front() != '/' ||
           !valid_text(context.inference(), 4096, true) ||
@@ -2404,9 +2412,10 @@ private:
         if (!valid_text(argument, 65536, true))
           return {grpc::StatusCode::INVALID_ARGUMENT,
                   "invalid header compiler argument"};
-      if (!safe_preflight_compiler_arguments(
-              context.compiler_arguments().begin(),
-              context.compiler_arguments().end(), true))
+      const auto begin = context.compiler_arguments().begin();
+      const auto end = context.compiler_arguments().end();
+      if (typed_prepared ? !safe_prepared_callback_compiler_arguments(begin, end)
+                         : !safe_preflight_compiler_arguments(begin, end, true))
         return {grpc::StatusCode::INVALID_ARGUMENT,
                 "header compiler arguments contain an unsupported preflight option"};
     }

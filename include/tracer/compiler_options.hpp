@@ -111,4 +111,54 @@ inline bool safe_preflight_compiler_arguments(Iterator first, Iterator last,
   return true;
 }
 
+inline bool prepared_callback_include_directory(std::string_view option) {
+  return option == "-I" || option == "-isystem" || option == "-iquote" ||
+         option == "-idirafter";
+}
+
+inline bool prepared_callback_abi_macro(std::string_view value) {
+  for (;;) {
+    const auto first = value.find_first_not_of(" \t\v\f");
+    if (first == value.npos)
+      return false;
+    value.remove_prefix(first);
+    if (value.rfind("/*", 0) != 0)
+      break;
+    const auto end = value.find("*/", 2);
+    if (end == value.npos)
+      return false;
+    value.remove_prefix(end + 2);
+  }
+  constexpr std::string_view name = "_GLIBCXX_USE_CXX11_ABI";
+  if (value.substr(0, name.size()) != name)
+    return false;
+  if (value.size() == name.size())
+    return true;
+  return std::string_view(" \t\v\f=(/").find(value[name.size()]) != value.npos;
+}
+
+template <class Iterator>
+inline bool safe_prepared_callback_compiler_arguments(Iterator first, Iterator last) {
+  while (first != last) {
+    const std::string_view option(*first++);
+    if (first == last)
+      return false;
+    const std::string_view value(*first++);
+    if (value.empty() || value.front() == '-' || value.front() == '@' ||
+        value.find_first_of("\0\r\n", 0, 3) != value.npos)
+      return false;
+    if (prepared_callback_include_directory(option)) {
+      if (value.front() != '/' && value.front() != '=' &&
+          value.rfind("$SYSROOT", 0) != 0)
+        return false;
+    } else if (option == "-include") {
+      if (value.find('"') != value.npos)
+        return false;
+    } else if ((option != "-D" && option != "-U") || prepared_callback_abi_macro(value)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 } // namespace tracer
