@@ -69,6 +69,19 @@ pilot_work:
 .globl pilot_work_end
 pilot_work_end:
 
+.globl pilot_fault
+.type pilot_fault,@function
+pilot_fault:
+  .cfi_startproc
+  pc fault_load
+  movl (%rdi), %eax
+  pc fault_return
+  ret
+  .cfi_endproc
+.size pilot_fault,.-pilot_fault
+.globl pilot_live_work_end
+pilot_live_work_end:
+
 .globl pilot_native
 .type pilot_native,@function
 pilot_native:

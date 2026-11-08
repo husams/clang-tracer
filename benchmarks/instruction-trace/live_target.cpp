@@ -1,21 +1,51 @@
 #include <atomic>
 #include <cerrno>
+#include <cstddef>
 #include <cstdio>
 #include <thread>
 
 #include <fcntl.h>
 #include <gnu/libc-version.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
 extern "C" unsigned long pilot_work(unsigned, int, int, int);
-extern "C" char pilot_work_end[];
+extern "C" int pilot_fault(const void *);
+extern "C" char pilot_live_work_end[];
 
 namespace {
 std::atomic<int> pending{0};
 std::atomic<int> worker_tid{0};
+void *fault_page = nullptr;
+std::size_t page_size = 0;
+thread_local volatile sig_atomic_t received_signals = 0;
+thread_local volatile sig_atomic_t recovered_faults = 0;
+
+void on_signal(int signal, siginfo_t *info, void *) {
+  if (info->si_code != SI_TKILL || info->si_pid != getpid())
+    _exit(128 + signal);
+  ++received_signals;
+}
+
+void on_fault(int signal, siginfo_t *info, void *) {
+  const int saved_errno = errno;
+  // Retry the actual faulting instruction by restoring access to this page.
+  if (info->si_code != SEGV_ACCERR || info->si_addr != fault_page ||
+      ::syscall(SYS_mprotect, fault_page, page_size, PROT_READ) != 0)
+    _exit(128 + signal);
+  ++recovered_faults;
+  errno = saved_errno;
+}
+
+bool install_handler(int signal, void (*handler)(int, siginfo_t *, void *)) {
+  struct sigaction action {};
+  action.sa_sigaction = handler;
+  action.sa_flags = SA_SIGINFO;
+  return sigemptyset(&action.sa_mask) == 0 && sigaction(signal, &action, nullptr) == 0;
+}
 }
 
 // These entries are ordinary application functions before attachment.
@@ -27,7 +57,10 @@ std::atomic<int> worker_tid{0};
 
 [[gnu::noinline]] int pilot_observed(int rounds) {
   asm volatile(".rept 16\n\tnop\n\t.endr" ::: "memory");
-  return static_cast<int>(pilot_work(rounds, getpid(), ::syscall(SYS_gettid), 0)) + 10;
+  if (rounds == 0)
+    return pilot_fault(fault_page) + 10;
+  const auto count = static_cast<unsigned>(rounds < 0 ? -rounds : rounds);
+  return static_cast<int>(pilot_work(count, getpid(), ::syscall(SYS_gettid), rounds < 0)) + 10;
 }
 
 int main() {
@@ -43,15 +76,31 @@ int main() {
 #endif
   if (fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK) != 0)
     return 1;
+  const auto size = sysconf(_SC_PAGESIZE);
+  if (size <= 0)
+    return 1;
+  page_size = static_cast<std::size_t>(size);
+  fault_page = mmap(nullptr, page_size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (fault_page == MAP_FAILED || !install_handler(SIGUSR1, on_signal) ||
+      !install_handler(SIGSEGV, on_fault))
+    return 1;
+  *static_cast<int *>(fault_page) = 29;
   std::thread worker([] {
     worker_tid = ::syscall(SYS_gettid);
     for (;;) {
-      const auto rounds = pending.exchange(0);
-      if (rounds < 0)
+      const auto command = pending.exchange(0);
+      if (command < 0)
         return;
-      if (rounds) {
+      if (command) {
+        const auto rounds = command == 'f' ? 0 : command == 's' ? -3 : command == 'v' ? 2 : 3;
+        if (command == 'f' && mprotect(fault_page, page_size, PROT_NONE) != 0)
+          _exit(2);
+        const auto signals_before = received_signals;
+        const auto faults_before = recovered_faults;
         const auto value = pilot_observed(rounds);
-        std::printf("worker returned %d\n", value);
+        std::printf("worker returned %d signals=%d faults=%d\n", value,
+                    received_signals - signals_before, recovered_faults - faults_before);
         std::fflush(stdout);
       }
       ::usleep(5000);
@@ -60,7 +109,7 @@ int main() {
   while (!worker_tid.load())
     ::usleep(1000);
   const auto begin = reinterpret_cast<unsigned long>(&pilot_work);
-  const auto end = reinterpret_cast<unsigned long>(pilot_work_end);
+  const auto end = reinterpret_cast<unsigned long>(pilot_live_work_end);
   std::printf("ready tid=%d begin=0x%lx end=0x%lx probe=%p glibc=%s\n",
               worker_tid.load(), begin, end, reinterpret_cast<void *>(&pilot_observed),
               gnu_get_libc_version());
@@ -71,8 +120,8 @@ int main() {
     if (count == 0 || (count == 1 && command == 'q'))
       break;
     if (count == 1) {
-      if (command == 'w' || command == 'v') {
-        pending.store(command == 'w' ? 3 : 2);
+      if (command == 'w' || command == 'v' || command == 's' || command == 'f') {
+        pending.store(command);
       } else if (command == 'b' || command == 'c' || command == 'e') {
         const auto value = pilot_control(command, worker_tid.load(), begin, end,
                                          command == 'c' ? 7 : 256);
@@ -84,4 +133,5 @@ int main() {
   }
   pending.store(-1);
   worker.join();
+  return munmap(fault_page, page_size) == 0 ? 0 : 1;
 }

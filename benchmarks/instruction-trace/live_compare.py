@@ -43,11 +43,13 @@ def inspect_plugin(plugin):
 
 def verify(repl, server, agent, fixture, plugin, command, target_library_path):
     names = symbols(fixture)
-    expected = {
-        rounds: [names[f"pilot_pc_{label}"] - names["pilot_work"]
-                 for label in expected_pcs(rounds, False)]
-        for rounds in (2, 3)
-    }
+    workloads = {"w": (3, 19, 0, 0), "v": (2, 16, 0, 0),
+                 "s": (-3, 19, 1, 0), "f": (0, 39, 0, 1)}
+    expected = {}
+    for letter, (rounds, _, signals, _) in workloads.items():
+        labels = expected_pcs(abs(rounds), signals) if rounds else ["fault_load", "fault_return"]
+        expected[letter] = [names[f"pilot_pc_{label}"] - names["pilot_work"]
+                            for label in labels]
     with tempfile.TemporaryDirectory(prefix="ct-gum-live-") as tmp, ExitStack() as stack:
         root = Path(tmp)
         capture = root / "capture.json"
@@ -59,12 +61,13 @@ def verify(repl, server, agent, fixture, plugin, command, target_library_path):
             + body.replace("PILOT_PLUGIN_PATH", json.dumps(str(plugin)))
                   .replace("PILOT_RESULT_PATH", json.dumps(str(capture)))
         )
-        observer = root / "observer.cpp"
-        observer.write_text("""
-struct Interceptor {
-  void pre(const Call &call) { call.field("live_probe", 1); }
-  void post(const Call &call) { call.field("live_probe", 1); }
-};
+        observers = [root / f"observer-{version}.cpp" for version in (1, 2)]
+        for version, observer in enumerate(observers, start=1):
+            observer.write_text(f"""
+struct Interceptor {{
+  void pre(const Call &call) {{ call.field("live_probe", {version}); }}
+  void post(const Call &call) {{ call.field("live_probe", {version}); }}
+}};
 """)
         environment = None
         if target_library_path is not None:
@@ -87,7 +90,8 @@ struct Interceptor {
             int(ready[1]), int(ready[2], 16), int(ready[3], 16),
             int(ready[4], 16), ready[5]
         )
-        assert tid != child.pid and end - begin == names["pilot_work_end"] - names["pilot_work"]
+        assert tid != child.pid
+        assert end - begin == names["pilot_live_work_end"] - names["pilot_work"]
         maps = Path(f"/proc/{child.pid}/maps")
         task = Path(f"/proc/{child.pid}/task/{tid}")
         memory = stack.enter_context(open(f"/proc/{child.pid}/mem", "rb", buffering=0))
@@ -124,18 +128,22 @@ struct Interceptor {
 
         cursor = 0
 
-        def native_call(letter, rounds):
+        def worker(letter):
+            _, value, signals, faults = workloads[letter]
+            target(letter, rf"^worker returned {value} signals={signals} faults={faults}$")
+
+        def native_call(letter, probe, version=1):
             nonlocal cursor
-            value = 3 * rounds + 10
-            target(letter, rf"^worker returned {value}$")
-            send(f"%events --probe {native_probe} --after {cursor} --count 2 --timeout 8")
+            rounds, value, _, _ = workloads[letter]
+            worker(letter)
+            send(f"%events --probe {probe} --after {cursor} --count 2 --timeout 8")
             pre = output.expect(
-                rf"^cursor=(\d+) .*tid={tid} probe={native_probe} phase=PRE call=(\d+) "
-                rf".*rounds={rounds}.*live_probe=1"
+                rf"^cursor=(\d+) .*tid={tid} probe={probe} phase=PRE call=(\d+) "
+                rf".*rounds={rounds}.*live_probe={version}(?: |$)"
             )
             post = output.expect(
-                rf"^cursor=(\d+) .*tid={tid} probe={native_probe} phase=POST call={pre[2]} "
-                rf".*live_probe=1.*result={value}(?: |$)"
+                rf"^cursor=(\d+) .*tid={tid} probe={probe} phase=POST call={pre[2]} "
+                rf".*live_probe={version} .*result={value}(?: |$)"
             )
             output.expect(r"^received=2 .*complete=true")
             cursor = int(post[1])
@@ -153,31 +161,71 @@ struct Interceptor {
                 raise RuntimeError(f"Gum control {letter} failed ({event[2]})\n"
                                    + "".join(target_out.seen))
 
+        def remove(probe):
+            send(f"%probe remove {probe}")
+            output.expect(rf"^removed probe={probe} restored=true$")
+            assert code() == original
+
+        def check_capture(calls, cap):
+            wanted = [pc for letter in calls for pc in expected[letter]]
+            actual = json.loads(capture.read_text())
+            assert actual == {"truncated": int(len(wanted) > cap), "offsets": wanted[:cap]}, (
+                calls, actual, wanted)
+            capture.unlink()
+            return len(actual["offsets"])
+
         output.expect(rf"^attached session=\S+ pid={child.pid}$")
         output.expect(rf'^target JIT runtime .*glibc_version: "{re.escape(glibc)}"')
-        native_probe = install("pilot_observed(int)", observer)
+        selector = "pilot_observed(int)"
+        native_probe = install(selector, observers[0])
         patch = code()
         assert patch != original
-        native_call("w", 3)
+        native_call("w", native_probe)
         control_probe = install("pilot_control(int, int, unsigned long, unsigned long, int)", loader)
-        for arm, calls, cap in (("b", [("w", 3), ("v", 2)], 256), ("c", [("w", 3)], 7)):
+        for arm, calls, cap in (("b", "wv", 256), ("c", "w", 7)):
             assert not mapped()
             control(arm)
             assert mapped() and code() == patch and task.exists()
-            for letter, rounds in calls:
-                native_call(letter, rounds)
+            for letter in calls:
+                native_call(letter, native_probe)
             control("e")
             assert not mapped() and code() == patch and task.exists()
-            wanted = [pc for _, rounds in calls for pc in expected[rounds]]
-            actual = json.loads(capture.read_text())
-            assert actual == {"truncated": int(len(wanted) > cap), "offsets": wanted[:cap]}, actual
-            capture.unlink()
-            native_call("w", 3)
+            check_capture(calls, cap)
+            native_call("w", native_probe)
+
+        remove(native_probe)
+        worker("s")
+        worker("f")
+        control("b")
+        assert mapped() and task.exists()
+        worker("w")  # Warm the unpatched entry before modifying its instructions.
+        first = install(selector, observers[0])
+        first_patch = code()
+        assert first_patch != original and mapped()
+        native_call("w", first)
+        native_call("s", first)
+
+        send(f'%probe reload {first} --callback "{observers[1]}"')
+        second = output.expect(rf"^reloaded probe=(\d+) replaces={first} ")[1]
+        assert first != second and code() not in (original, first_patch) and mapped()
+        native_call("f", second, version=2)
+        native_call("v", second, version=2)
+        remove(second)
+        assert mapped() and task.exists()
+        worker("v")
+        send(f"%events --after {cursor} --count 1 --timeout 1")
+        output.expect(r"^received=0 .*timed_out=true")
+
+        control("e")
+        assert not mapped() and code() == original and task.exists()
+        mutation_records = check_capture("wwsfvv", 256)
 
         send("%detach")
         output.expect(r"^detached session=\S+$")
         assert code() == original and not mapped()
-        target("v", r"^worker returned 16$")
+        worker("v")
+        worker("s")
+        worker("f")
         send("%quit")
         assert console.wait(timeout=15) == 0, "".join(output.seen)
         child.stdin.write("q")
@@ -185,8 +233,10 @@ struct Interceptor {
         assert child.wait(timeout=5) == 0, "".join(target_out.seen)
         return {"glibc": glibc, "pid": child.pid, "worker_tid": tid,
                 "libdl_mapped_before_attach": initial_libdl,
-                "full_records": len(expected[3]) + len(expected[2]), "capped_records": 7,
-                "native_pairs": 6, "unloaded": True, "restored": True}
+                "full_records": len(expected["w"]) + len(expected["v"]), "capped_records": 7,
+                "mutation_records": mutation_records, "signals": 1, "recovered_faults": 1,
+                "native_pairs": 10, "probe_changes": ["install", "reload", "remove"],
+                "unloaded": True, "restored": True}
 
 
 def main():

@@ -390,3 +390,8 @@ resolves loader calls from the target's mapped glibc and loads the agent's
 missing glibc dependencies from that runtime. Keep Gum experimental while
 broader tracing cases are validated. See
 `benchmarks/instruction-trace/README.md` for reproduction.
+
+Live capture now verifies worker-directed SIGUSR1, guard-page SIGSEGV
+recovery, and install, reload and removal of a warmed native probe on
+glibc 2.23 and 2.34. The callback PCH cache writes directly to its private
+generation path so LLVM does not replace the target's signal handlers.

@@ -2,9 +2,10 @@
 
 **Decision for P4 A2.** Keep Gum Stalker as an experimental backend. It was
 faster on the standalone fixture and passed live attachment with an existing
-native observer. The pilot has a source and relinking bundle. A maintained
-backend still needs loader routing, broader signal and fault coverage, and
-validation of concurrent probe changes.
+native observer. The pilot has a source and relinking bundle. Automatic
+loader selection, a handled signal, guard-page recovery and warmed probe
+changes passed on both glibc profiles. A maintained backend still needs
+broader validation.
 Native single-step remains the fixture reference.
 
 ## Reproduce
@@ -150,6 +151,32 @@ fails native attach admission.
 The stock GCC 11.5 debug build attached and ran the native observer, then
 failed to resolve the control observer's signature. A fresh host-linked
 Clang 21.1.8 build passed the same live run.
+
+### Signals, faults and probe changes
+
+The live runner also follows the worker while it warms an unprobed
+`pilot_observed(int)`, installs a native observer, reloads the observer
+with a distinct generation marker, and removes it. It changes probes
+between worker calls while keeping the same Gum capture active. It checks
+the entry bytes after each change, the PRE and POST call IDs and generation
+markers, and the absence of native events after removal. Gum still records
+the work after the original entry bytes have been restored.
+
+While followed, the worker sends itself one `SIGUSR1` with `tgkill` from
+inside the recorded leaf. It also reads a `PROT_NONE` guard page from a
+two-instruction leaf. The application handler checks the fault address and
+`SEGV_ACCERR`, restores read access and returns so the faulting load retries.
+The fixture compares signal counts and return values before the capture,
+during it, and after detach. The combined capture matched all 151
+instruction offsets with one signal, one recovered fault and ten native
+PRE and POST pairs across the live trial. [Linux sigaction](https://man7.org/linux/man-pages/man2/sigaction.2.html)
+
+The initial test exposed a native agent issue. Clang's temporary PCH output
+registered LLVM's process-wide signal handlers and replaced the fixture's
+`SIGUSR1` handler. The PCH cache already owns a private generation path,
+so it now writes there directly and publishes only validated artifacts.
+[Clang output handling](https://github.com/llvm/llvm-project/blob/llvmorg-21.1.8/clang/lib/Frontend/CompilerInstance.cpp#L804),
+[LLVM temporary-file registration](https://github.com/llvm/llvm-project/blob/llvmorg-21.1.8/llvm/lib/Support/Path.cpp#L1325)
 
 ## Packaging and distribution
 
