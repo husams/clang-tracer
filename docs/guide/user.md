@@ -109,7 +109,7 @@ public:
 Start the target in terminal one with debug information and a predictable function entry. Keep the target running throughout the session.
 
 ```bash
-c++ -g -O0 -fno-omit-frame-pointer -fno-pie -no-pie target.cpp -o target
+c++ -g -O0 -fno-omit-frame-pointer -fno-pie -no-pie -Wl,--build-id target.cpp -o target
 ./target
 ```
 
@@ -144,24 +144,105 @@ first_call.at(1).result_as<int>()
 
 Stop the target with Ctrl+C. If discovery is empty, confirm the attached PID, use `%modules` to confirm the binary, and check that it still has its debug information. If attachment is refused, confirm the target is yours, its tracing policy permits the attachment, and no debugger already owns it.
 
-## Prepare a probe when you only have a binary
+## Index debug information and prepare a probe from a binary
 
-The native REPL can index a Linux ELF executable or shared library, browse its
-DWARF types and ELF exports, and build a probe package without application
-headers. For a library with matching DWARF, start with:
+A module index is a SQLite file built from a Linux x86-64 executable or shared
+library and its matching DWARF debug information. Use it to inspect signatures,
+ELF symbols, and known type layouts before attaching to a process. You can also
+prepare a probe from the index with just the matching ELF and your callback.
 
-```text
-%module index --file ./libdemo.so
-%module symbols --exported --filter "demo::*"
-%module show --type demo::Packet
-%probe prepare "demo::score(demo::Packet const&)" --output prepared-score
+### Build and browse the index
+
+Use `target` and `hook.cpp` from [the first probe](#create-a-target-and-a-basic-probe).
+Start a fresh native REPL in that directory. These commands work without a
+target attachment.
+
+```bash
+%module index --file ./target --output target.sqlite
+%module types --filter int
+%module symbols --filter "add*"
+%module show --symbol "add(int, int)"
+%module show --type int
 ```
 
-The index becomes the session default. Use `%module use INDEX` to reuse it in a
-new REPL, or pass `--module-index INDEX` for one preparation. Use
-`%module emit` to write C++ declarations and read-only accessors for selected
-types and functions. See [the native REPL walkthrough](../native-repl.md#prepare-a-probe-from-a-binary-without-headers)
-for the callback, injection commands, and C++ API, or the
+The symbol details include the linkage name, ELF address, return type and
+parameters when available. The type details report size and, for records,
+known fields and their offsets. Use the full signature or copy an ID from a
+listing when a name is ambiguous. Use `--exported` on `%module symbols` when
+you want only dynamic exports, such as the exported functions of a shared
+library. Regular functions in the first-probe executable can be indexed even
+when they are absent from that export list.
+
+Omit `--output` to write `<ELF>.tracer.sqlite`. Choose a new filename when
+rebuilding an index. The REPL selects the index after creating it. In a new
+REPL, use `%module use target.sqlite` to select it again, or pass
+`--index target.sqlite` on an individual query.
+
+When DWARF lives in a separate file, let the indexer find a matching debug
+companion or pass `--debug-file FILE`. For example, create a separate-debug
+copy of the lab binary and index that copy.
+
+```bash
+cp target target-split
+objcopy --only-keep-debug target-split target-split.debug
+objcopy --strip-debug --add-gnu-debuglink=target-split.debug target-split
+clang-tracer-module index --file ./target-split --debug-file ./target-split.debug --output target-split.sqlite
+clang-tracer-module info --index target-split.sqlite
+```
+
+If you already have a local target attached to the REPL's own server, you
+can index a loaded image using `%modules --details`. Copy the exact path
+and mapping token from its output. The mapped ELF must have a build ID.
+If the output says `build_id=unavailable`, use file indexing instead.
+
+```bash
+%module index --module /absolute/path/to/target --mapping TOKEN --output live-target.sqlite
+```
+
+An ELF without usable DWARF can still provide symbols, including exports, but
+preparation needs a supported signature and sufficient type information.
+Split DWARF units are reported as unresolved. If you see
+`debug_file_mismatch`, use the debug file from the same build.
+
+### Generate declarations and install the indexed probe
+
+Back in the REPL, select the original index. Emitting headers is optional.
+It writes `declarations.hpp`, `views.hpp` for supported read-only field access,
+and `manifest.json`. The final command below prepares a package using the
+generated files and verifies them against the selected index entry.
+
+```bash
+%module use target.sqlite
+%module emit --symbol "add(int, int)" --output recovered-add
+%probe prepare "add(int, int)" --module-index target.sqlite --module ./target --generated recovered-add --output prepared-add
+```
+
+Leave out `--generated` to let the preparer generate the same declarations
+internally. The package binds to the indexed ELF build and embeds the
+declarations it needs. Keep the package with your callback and use the same
+binary for the live step. If the application is rebuilt, index the new ELF
+and prepare a new package.
+
+Run `./target` in another terminal. Replace `12345` with its printed PID and
+use the same `hook.cpp` from the first lab.
+
+```bash
+%attach 12345
+%probe validate "add(int, int)" --callback hook.cpp --prepared prepared-add --prepared-mode require
+%probe inject "add(int, int)" --callback hook.cpp --prepared prepared-add --prepared-mode require --print-result
+%collect --name "add(int, int)" --count 2 --timeout 30 --as indexed
+%events list indexed
+%detach
+```
+
+Confirm that validation reports `prepared_used: true`. Press Enter in the
+target terminal while the capture waits. The POST event reports `sum=42`.
+The index and debug companion are needed to recover metadata. A completed
+prepared package can be reused for injection without either file.
+
+See [module index commands](commands.md#native-repl-module-index-commands) for
+all options, [the native REPL walkthrough](../native-repl.md#prepare-a-probe-from-a-binary-without-headers)
+for a callback that reads recovered record fields, and the
 [Python guide](../../python/README.md#index-a-module-and-prepare-a-probe-without-application-headers)
 for the programmatic workflow.
 

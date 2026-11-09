@@ -44,24 +44,50 @@ Inside the REPL, quote selectors and paths containing spaces. Commands start wit
 
 ## Native REPL module index commands
 
-| Command | Purpose |
-| --- | --- |
-| `%module index --file ELF [--debug-file FILE] [--output INDEX]` | Index ELF symbols and DWARF and select the index. The default output is `<ELF>.tracer.sqlite`. |
-| `%module index --module PATH --mapping TOKEN [--output INDEX]` | Index an exact mapped ELF using the REPL's local server. Get the path and token from `%modules --details`. |
-| `%module use INDEX` | Select a saved index for queries, emission and probe preparation. |
-| `%module types [--filter GLOB] [--index INDEX]` | List named types and known layout sizes. |
-| `%module symbols [--exported] [--filter GLOB] [--index INDEX]` | List symbols and their IDs. Use `--exported` to select dynamic exports. |
-| `%module show (--type NAME \| --symbol SELECTOR \| --id ID)` | Inspect a type or symbol. Add `--index INDEX` to select a saved index explicitly. |
-| `%module emit [--type NAME] [--symbol SELECTOR] [--id ID] --output DIR` | Generate declarations, read-only field views and a manifest for selected entries. |
+See [the module index walkthrough](user.md#index-debug-information-and-prepare-a-probe-from-a-binary) for a complete example. Queries and emission work offline once the index exists.
 
-List commands accept `--format json`, `--limit N` and `--page TOKEN`.
+| Command and example | Options and behavior |
+| --- | --- |
+| `%module index --file ./target --output target.sqlite` | Index a local Linux x86-64 ELF. `--file ELF` requires no attached process. |
+| `%module index --module /path/to/target --mapping TOKEN --output live.sqlite` | Index an attached module using the REPL's own local Linux server. Both `--module PATH` and `--mapping TOKEN` come from `%modules --details`. Refresh a stale token before retrying. |
+| `%module use target.sqlite` | Select a saved index for subsequent queries, emission, and probe preparation. |
+| `%module types --index target.sqlite --filter "demo::*" --limit 10` | List named types and known sizes. Accepts the query options below. |
+| `%module symbols --index target.sqlite --filter "demo::*" --exported` | List symbol IDs and selectors. `--exported` selects dynamic exports. Accepts the query options below. |
+| `%module show --symbol "add(int, int)"` | Print one detailed JSON record. Choose exactly one of `--type NAME`, `--symbol SELECTOR`, or `--id ID`. Add `--index INDEX` to select an index explicitly. |
+| `%module emit --symbol "add(int, int)" --output recovered-add` | Write `declarations.hpp`, `views.hpp`, and `manifest.json` to a new directory. Repeat `--type NAME`, `--symbol SELECTOR`, or `--id ID` to select entries. Add `--index INDEX` to select an index explicitly. |
+
+| Option | Meaning |
+| --- | --- |
+| Index `--output INDEX` | Write a new SQLite file. Defaults to `<ELF>.tracer.sqlite`. Successful indexing selects it for the current REPL. |
+| Index `--debug-file FILE` | Supply matching separate debug information. Without this option, the indexer looks for a verified companion and can read embedded DWARF. |
+| Index `--max-entries N`, `--max-depth N` | Bound scanned entries and DWARF depth. Omit or pass zero for no limit. Exceeding a budget aborts the build. Ctrl+C cancels REPL indexing. |
+| Query `--index INDEX` | Read this index for the command. Otherwise use the selected index, then `module-index.sqlite` in the current directory. |
+| Query `--filter GLOB` | Match named types or symbol names, selectors and linkage names with a glob. Quote patterns. |
+| Query `--limit N`, `--page TOKEN` | Limit a list and continue with the returned `next_page` token. Zero or omitted limit returns all matches. Keep the same index, filter, and export selection when paging. |
+| Query `--format json` | Return an object with `entries` and `next_page` from `types` or `symbols`. |
+
+## Standalone module index CLI
+
+Use `clang-tracer-module` for shell scripts and offline indexing. It takes local
+file paths and prints JSON for index metadata and queries.
+
+| Command and example | Options and behavior |
+| --- | --- |
+| `clang-tracer-module --help` | Show usage. |
+| `clang-tracer-module index --file ./target --output target.sqlite` | Create an index. The REPL's file-mode `--output`, `--debug-file`, `--max-entries`, and `--max-depth` options apply. |
+| `clang-tracer-module info --index target.sqlite` | Print the indexed ELF identity, debug provenance, and diagnostics. |
+| `clang-tracer-module types --index target.sqlite --filter int` | List types. Supports `--filter`, `--limit`, and `--page`. |
+| `clang-tracer-module symbols --index target.sqlite --exported --limit 20` | List symbols. Supports `--filter`, `--limit`, `--page`, and `--exported`. |
+| `clang-tracer-module show --index target.sqlite --symbol "add(int, int)"` | Show one record. Use exactly one of `--symbol SELECTOR`, `--type NAME`, or `--id ID`. |
+| `clang-tracer-module emit --index target.sqlite --symbol SYMBOL_ID --output recovered-add` | Emit headers and manifest. Copy IDs from the query results and repeat `--symbol SYMBOL_ID` or `--type TYPE_ID`. |
 
 ## Native REPL probe and bulk trace commands
 
 | Command and example | Options and behavior |
 | --- | --- |
 | `%probe prepare "add(int, int)" --include add.hpp --output prepared` | Generate a reusable local package. The first `--include HEADER` supplies the declaration and additional includes supply types. `--output NEW_DIR` must be new. `--compdb PATH` selects the compilation database, defaulting to the command's directory. `--translation-unit FILE` selects an explicit command. `--module ELF` pins ELF identity. `--metadata-only` skips adapter files. Accepts extra compiler arguments and `--cwd`. |
-| `%probe prepare SELECTOR --output prepared [--module-index INDEX] [--module ELF] [--generated DIR]` | Prepare from DWARF and ELF metadata in a module index. Omit `--module-index` to use the default. Use `--id ID` to select a specific indexed symbol. |
+| `%probe prepare "add(int, int)" --module-index target.sqlite --output prepared-add` | Prepare from an index using the recorded ELF path, or pass `--module ELF` to verify an explicit path to the same build. Use `--id ID` to disambiguate a matching selector and `--generated DIR` to reuse a verified emitted bundle. Accepts `--cwd` and `--metadata-only`. |
+| `%probe prepare "add(int, int)" --signature "int(int, int)" --module ./target --output prepared-explicit` | Prepare from a user-supplied function type and ELF. Use `--member` for an unqualified instance method. Accepts `--cwd` and `--metadata-only`. |
 | `%probe resolve "add(int, int)"` | Show resolved signature, ABI and target metadata. Accepts resolution options below. |
 | `%probe validate "add(int, int)" --callback hook.cpp` | Compile and link the local callback without installing it. Accepts resolution options. |
 | `%probe inject "add(int, int)" --callback hook.cpp --stack-depth 16` | Install or replace the probe. Accepts resolution and deployment options. |
@@ -77,6 +103,13 @@ List commands accept `--format json`, `--limit N` and `--page TOKEN`.
 | `%trace preview --exact "add(int, int)" --save trace.textproto` | Report eligibility and capacity before installing anything. Select using repeatable `--module GLOB`, `--include GLOB`, `--exclude GLOB`, and `--exact SELECTOR`. Require an include or exact rule. Alternatively `--manifest FILE` loads rules, and `--save NEW_FILE` writes the manifest. |
 | `%trace apply --manifest trace.textproto --callback hook.cpp` | Install eligible probes in a batch. `--callback FILE` overrides the default observer. The server attempts to restore newly installed probes on partial failure. |
 | `%trace remove batch-1` | Restore the probes owned by the returned batch ID, or retry restoration. |
+
+For indexed preparation, supply neither headers nor an explicit signature.
+The search order is `--module-index INDEX`, then `<ELF>.tracer.sqlite` when
+`--module ELF` is given, then the index selected with `%module index` or
+`%module use`, then `module-index.sqlite` in the command's working directory.
+Use `--prepared DIR --prepared-mode require` when validating and injecting the
+resulting package.
 
 | Resolution and deployment option | Meaning |
 | --- | --- |
@@ -248,15 +281,24 @@ clang-tracer-prepare-injectors-native --selector "add(int, int)" \
   --translation-unit target.cpp --output prepared
 ```
 
+For offline preparation from a saved index, use the same preparer.
+
+```bash
+clang-tracer-prepare-injectors-native --selector "add(int, int)" \
+  --module-index target.sqlite --module ./target --output prepared-indexed
+```
+
 | Option | Meaning |
 | --- | --- |
 | `--help` | Show usage. |
 | `--selector SELECTOR` | Required exact C++ selector. |
-| `--include HEADER` | Required declaration header. Repeat for supporting types. |
-| `--compdb FILE_OR_DIR` | Required compilation database. |
+| `--include HEADER` | Declaration header for source preparation. Repeat for supporting types. |
+| `--compdb FILE_OR_DIR` | Required compilation database for source preparation. |
 | `--translation-unit FILE` | Select an explicit entry. Otherwise preparation tries the first include's recorded command, then an adjacent source. |
 | `--output NEW_DIRECTORY` | Required new output directory. |
 | `--module ELF` | Pin the package to an ELF build. |
+| `--signature TYPE`, `--member` | Prepare with an explicit function type. Requires `--module`. Use `--member` for an unqualified instance method. |
+| `--module-index INDEX`, `--id ID`, `--generated DIR` | Prepare from a saved index, optionally selecting the symbol by ID and reusing an emitted bundle. With no explicit index, the CLI tries the module sidecar and then `module-index.sqlite`. |
 | `--metadata-only` | Skip separate C++ adapter files. |
 | `--extra-arg ARG` | Append one compiler argument. Repeat as needed. |
 
