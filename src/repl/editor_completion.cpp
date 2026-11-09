@@ -2,6 +2,8 @@
 
 #include "help.hpp"
 
+#include <llvm/ADT/StringRef.h>
+
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -9,6 +11,7 @@
 
 namespace tracer_repl {
 namespace {
+using llvm::StringRef;
 using std::string_view;
 namespace fs = std::filesystem;
 constexpr string_view whitespace = " \t\r\n";
@@ -64,11 +67,11 @@ std::string word_value(Word word) {
 
 std::vector<std::string> paths(std::string prefix, const fs::path& base,
                                bool directories_only) {
-  if (prefix == "~" || prefix.starts_with("~/")) {
+  if (prefix == "~" || StringRef(prefix).starts_with("~/")) {
     const auto* home = std::getenv("HOME");
     if (!home || !*home) return {};
     prefix.replace(0, 1, home);
-    if (!prefix.ends_with('/') && prefix == home) prefix += '/';
+    if (!StringRef(prefix).ends_with('/') && prefix == home) prefix += '/';
   }
   const auto slash = prefix.rfind('/');
   const auto parent = prefix.substr(0, slash == prefix.npos ? 0 : slash + 1);
@@ -78,8 +81,8 @@ std::vector<std::string> paths(std::string prefix, const fs::path& base,
   fs::directory_iterator it((base.empty() ? fs::path(".") : base) / parent, error), end;
   for (; it != end && !error; it.increment(error)) {
     const auto name = it->path().filename().string();
-    if (!string_view(name).starts_with(leaf) ||
-        (name.starts_with('.') && !leaf.starts_with('.')) ||
+    if (!StringRef(name).starts_with(leaf) ||
+        (StringRef(name).starts_with('.') && !StringRef(leaf).starts_with('.')) ||
         name.find_first_of("\r\n\t") != name.npos)
       continue;
     std::error_code status;
@@ -92,20 +95,20 @@ std::vector<std::string> paths(std::string prefix, const fs::path& base,
 }
 
 bool path_argument(string_view type) {
-  return type.ends_with("FILE") || type.ends_with("PATH") || type.ends_with("DIRECTORY") ||
-         type.ends_with("HEADER") || type == "ELF" || type == "DATABASE" ||
-         type.starts_with("NEW_FILE.");
+  return StringRef(type).ends_with("FILE") || StringRef(type).ends_with("PATH") || StringRef(type).ends_with("DIRECTORY") ||
+         StringRef(type).ends_with("HEADER") || type == "ELF" || type == "DATABASE" ||
+         StringRef(type).starts_with("NEW_FILE.");
 }
 
 std::string quote_path(const std::string& path, char quote, string_view after) {
-  if (!quote && !path.starts_with('-') && path.find_first_of(" \t'\"\\%`") == path.npos) return path;
+  if (!quote && !StringRef(path).starts_with('-') && path.find_first_of(" \t'\"\\%`") == path.npos) return path;
   if (!quote) quote = '"';
   std::string result(1, quote);
   for (char c : path) {
     if (c == quote || c == '\\') result += '\\';
     result += c;
   }
-  if (!path.ends_with('/') && !after.starts_with(quote)) result += quote;
+  if (!StringRef(path).ends_with('/') && !StringRef(after).starts_with(quote)) result += quote;
   return result;
 }
 
@@ -120,13 +123,13 @@ std::map<string_view, string_view> options(string_view usage) {
     const auto type = usage.substr(argument, stop - argument);
     result.emplace(option, !type.empty() && ((type.front() >= 'A' && type.front() <= 'Z') ||
                    option == "--format" || option == "--abi" || type.find('|') != type.npos)
-                   && !type.starts_with('|') && !type.starts_with('[') ? type : string_view{});
+                   && !StringRef(type).starts_with('|') && !StringRef(type).starts_with('[') ? type : string_view{});
   }
   return result;
 }
 
 void add_choice(EditorCompletions& result, string_view choice, string_view prefix) {
-  if (choice.starts_with(prefix)) result.items.emplace_back(choice);
+  if (StringRef(choice).starts_with(prefix)) result.items.emplace_back(choice);
 }
 
 void add_values(EditorCompletions& result, string_view type, string_view prefix) {
@@ -150,7 +153,7 @@ EditorCompletions complete_command(string_view input, string_view after) {
   }
   EditorCompletions names{input.size(), {}};
   for (const auto& name : command_completions()) {
-    if (string_view(name).starts_with(entered) && name != entered) names.items.push_back(name);
+    if (StringRef(name).starts_with(entered) && name != entered) names.items.push_back(name);
   }
 
   if (tokens.size() < 2 || (tokens[0].text == "%help" && !names.items.empty()))
@@ -160,7 +163,7 @@ EditorCompletions complete_command(string_view input, string_view after) {
   std::string usage;
   std::string command_name;
   std::size_t arguments_begin = 1;
-  for (std::size_t i = 0; i + 1 < tokens.size() && !tokens[i].text.starts_with('-'); ++i) {
+  for (std::size_t i = 0; i + 1 < tokens.size() && !StringRef(tokens[i].text).starts_with('-'); ++i) {
     if (i) command += ' ';
     command += i ? tokens[i].text : tokens[i].text.substr(1);
     if (auto candidate = command_usage(command); !candidate.empty()) {
@@ -204,7 +207,7 @@ EditorCompletions complete_command(string_view input, string_view after) {
   if (current.quote != '`' && (path_argument(argument) ||
       (option == "--module" && prefix.find('/') != prefix.npos))) {
     for (const auto& path : paths(prefix, option == "--cwd" ? fs::path{} : base,
-                                  argument.ends_with("DIRECTORY")))
+                                  StringRef(argument).ends_with("DIRECTORY")))
       result.items.push_back(quote_path(path, current.quote, after));
     return result;
   }
@@ -216,9 +219,9 @@ EditorCompletions complete_command(string_view input, string_view after) {
     } else {
       add_values(result, argument, prefix);
     }
-    if (option.empty() && (prefix.empty() || prefix.starts_with('-'))) {
+    if (option.empty() && (prefix.empty() || StringRef(prefix).starts_with('-'))) {
       for (const auto& [name, type] : available)
-        if (name.starts_with(prefix)) result.items.emplace_back(std::string(name) + ' ');
+        if (StringRef(name).starts_with(prefix)) result.items.emplace_back(std::string(name) + ' ');
       if (prefix.empty() && !names.items.empty()) {
         for (const auto& name : names.items)
           result.items.push_back(name.substr(entered.size()));
@@ -237,8 +240,8 @@ std::optional<EditorCompletions> complete_include(string_view input, string_view
   const auto start = input.find_first_not_of(" \t");
   if (start == input.npos) return {};
   input.remove_prefix(start);
-  if (input.starts_with("include_next")) input.remove_prefix(12);
-  else if (input.starts_with("include")) input.remove_prefix(7);
+  if (StringRef(input).starts_with("include_next")) input.remove_prefix(12);
+  else if (StringRef(input).starts_with("include")) input.remove_prefix(7);
   else return {};
   const auto opening = input.find_first_not_of(" \t");
   if (opening == input.npos || input[opening] != '"') return {};
@@ -247,7 +250,7 @@ std::optional<EditorCompletions> complete_include(string_view input, string_view
   EditorCompletions result{input.size(), {}};
   for (auto path : paths(std::string(input), {}, false)) {
     if (path.find('"') != path.npos) continue;
-    if (!path.ends_with('/') && !after.starts_with('"')) path += '"';
+    if (!StringRef(path).ends_with('/') && !StringRef(after).starts_with('"')) path += '"';
     result.items.push_back(std::move(path));
   }
   return result;

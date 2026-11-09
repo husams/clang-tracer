@@ -850,7 +850,7 @@ std::optional<CppCompletions> complete_cpp_directive(std::string_view source) {
            "define", "elif", "elifdef", "elifndef", "else", "endif", "error",
            "if", "ifdef", "ifndef", "include", "include_next", "line",
            "pragma", "undef", "warning"}) {
-    if (directive.starts_with(line)) result.items.emplace_back(directive);
+    if (llvm::StringRef(directive).starts_with(line)) result.items.emplace_back(directive);
   }
   return result;
 }
