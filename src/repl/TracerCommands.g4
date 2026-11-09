@@ -45,7 +45,7 @@ resolveOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | 
 validateOption : resolveOption | '--allow-arg-overrides' | '--allow-result-override' | '--allow-replacement'
                | '--reclaimable' | '--allow-call-original' | '--trace-exceptions';
 deployOption : validateOption | '--stack-depth' (UINT | WORD)
-             | '--print-arguments' | '--print-result' | stackFilter;
+             | '--print-arguments' | '--print-result' | SNAPSHOT_RETURN_POINTEE | stackFilter;
 interceptor : 'interceptor' ('load' value '--as' value | 'edit' value | 'show' value
       | 'validate' value '--target' value validateOption*
             | 'upload' value '--target' value deployOption*);
@@ -131,5 +131,6 @@ STACK : 'stack';
 CWD : '--cwd';
 SIGNATURE : '--signature';
 MEMBER : '--member';
+SNAPSHOT_RETURN_POINTEE : '--snapshot-return-pointee';
 WORD : ~[ \t\r\n"'\\%`]+;
 WS : [ \t\r\n]+ -> skip;

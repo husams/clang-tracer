@@ -30,7 +30,7 @@ constexpr string_view resolution_options =
     "--prepared DIRECTORY --prepared-mode off|prefer|require";
 constexpr string_view deployment_options =
     "--stack-depth N|full --stack-application-only true|false\n"
-    "--print-arguments --print-result";
+    "--print-arguments --print-result --snapshot-return-pointee";
 
 const CommandTopic commands[] = {
     {"server", "", "Start, connect to, inspect, or stop a tracing server."},
@@ -159,9 +159,9 @@ const CommandTopic commands[] = {
      "  [--allow-arg-overrides] [--allow-result-override] [--allow-replacement] [--allow-call-original] [--trace-exceptions] [--reclaimable]",
      "Check whether the callback can be deployed for the selected function."},
     {"probe inject", "%probe inject SELECTOR [--callback FILE] [RESOLUTION OPTIONS] [DEPLOYMENT OPTIONS] [--cwd DIRECTORY]\n"
-     "  [--allow-arg-overrides] [--allow-result-override] [--allow-replacement] [--allow-call-original] [--trace-exceptions] [--reclaimable]",
-     "Omit --callback to capture events with the built-in observer. The two override flags separately enable scalar writes in pre() and post().",
-     R"example(%probe inject "demo::compute(int)" --prepared prepared)example"},
+     "  [--allow-arg-overrides] [--allow-result-override] [--allow-replacement] [--allow-call-original] [--trace-exceptions] [--reclaimable] [--snapshot-return-pointee]",
+     "Omit --callback to capture events with the built-in observer. Snapshot returned record pointees only when the live layout matches and the pointee remains stable through POST; result() gives its address and result_as<T>() copies the record.",
+     R"example(%probe inject "prepared_pointee::HfwManager::createItem(int)" --prepared prepared --snapshot-return-pointee)example"},
     {"probe remove", "%probe remove ID [--cwd DIRECTORY]", "Remove a probe from the selected session and restore the original code."},
     {"probe reload", "%probe reload ID --callback FILE [--cwd DIRECTORY] [--watch [--count N] [--timeout SECONDS]]",
      "Switch an active probe to a new observer generation while existing calls finish on their original generation."},

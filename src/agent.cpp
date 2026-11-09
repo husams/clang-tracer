@@ -4656,6 +4656,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       (typed_prepared && specification.signature().kind() == clangtracer::v1::METHOD) ||
       snapshot_debug.result_is_reference() ||
       snapshot_debug.result_is_object_value() ||
+      specification.snapshot_return_pointee() ||
       std::any_of(snapshot_debug.arguments().begin(), snapshot_debug.arguments().end(),
                   [](const auto &argument) {
                     return argument.is_reference() || argument.is_object_value();

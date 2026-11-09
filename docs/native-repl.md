@@ -1037,6 +1037,15 @@ Reference/value arguments are snapshotted at entry; POST events retain that
 entry snapshot even if the function mutates or frees the original contents.
 Return objects are captured at return, before leaving their valid lifetime.
 
+For a raw pointer to a record with layout metadata, add
+`--snapshot-return-pointee` to `%probe inject`. The built-in observer copies
+the fields immediately after the function returns. Use a type declaration that
+matches the target build and ensure each non-null pointer refers to a live
+object whose fields are stable during capture.
+Read the fields with `event.result_snapshot()` or decode an owned `T` with
+`event.result_as<T>()` after importing a mapping for `T`. `event.result()`
+still shows the address, including `0x0` for null returns.
+
 Inspect a record without declaring a local C++ type:
 
 ```cpp

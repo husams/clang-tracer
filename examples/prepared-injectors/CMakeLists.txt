@@ -48,3 +48,9 @@ set_target_properties(prepared-methods-target PROPERTIES
 # linkage and its typed metadata comes from account.hpp.
 target_compile_options(prepared-methods-target PRIVATE
   -g0 -O0 -fno-omit-frame-pointer -fcf-protection=none)
+
+add_executable(prepared-pointee-target pointee/target.cpp pointee/item.cpp)
+set_target_properties(prepared-pointee-target PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+target_compile_options(prepared-pointee-target PRIVATE
+  -g -O0 -fno-omit-frame-pointer -fcf-protection=none)

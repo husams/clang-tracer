@@ -217,6 +217,7 @@ message ProbeSpec {
   bool reclaimable = 22; // Trusted observer declares no escaping JIT addresses or TLS.
   bool allow_call_original = 23;
   bool trace_exceptions = 24;
+  bool snapshot_return_pointee = 27; // Opt-in: callback may snapshot a live raw returned record.
 }
 message AttachRequest {
   uint32 pid = 1;

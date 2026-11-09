@@ -186,6 +186,43 @@ This variant restores its hook by detaching through `tracer.detach(session)`.
 
 Set `CLANG_TRACER_PREPARED_BUILD` to use a different CMake build directory.
 
+## Automatic snapshots for returned pointers
+
+Build and run the Linux x86-64 pointee example:
+
+```bash
+cmake --build build --target clang-tracer-repl clang-tracer-server clang_tracer_agent prepared-pointee-target
+./examples/prepared-injectors/run-native.sh --pointee
+```
+
+At the native prompt, prepare the declared return type and inject with the
+opt-in pointee snapshot flag:
+
+```text
+%probe prepare "prepared_pointee::HfwManager::createItem(int)" --include demo/pointee/item.hpp --output prepared
+%probe inject "prepared_pointee::HfwManager::createItem(int)" --prepared prepared --prepared-mode require --snapshot-return-pointee
+%collect --count 4 --timeout 15 --phase POST --as captured
+auto captured = tracer.batch("captured");
+auto event = captured.at(captured.at(0).result() == "0x0" ? 1 : 0);
+auto item = event.result_as<prepared_pointee::HfwItem>();
+auto snapshot = event.result_snapshot();
+std::cout << item.label << " " << snapshot.field("details").field("revision").as<int>() << std::endl;
+%quit
+```
+
+The target alternates between returning an `HfwItem*` and `nullptr`.
+For non-null returns, `result_snapshot()` includes `id`, `label`, and nested
+`details` fields. The prepared package imports the mapping automatically, so
+`result_as<prepared_pointee::HfwItem>()` returns an owned copy.
+`receiver_snapshot()` contains the manager's fields. Null returns display
+`0x0`. Run the same capture as a smoke test with this command.
+
+```bash
+./examples/prepared-injectors/run-native.sh --pointee --smoke
+```
+
+The corresponding CTest is `native_repl_prepared_pointee`.
+
 ## Typed method example
 
 Build `prepared-methods-target` and launch with `--methods`. The method demo

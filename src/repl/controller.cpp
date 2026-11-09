@@ -1124,6 +1124,7 @@ std::uint64_t Controller::inject(const SessionHandle &session,
   spec.set_allow_call_original(call_original);
   spec.set_trace_exceptions(options.has("--trace-exceptions"));
   spec.set_reclaimable(options.has("--reclaimable"));
+  spec.set_snapshot_return_pointee(options.has("--snapshot-return-pointee"));
   api::AddProbeRequest request;
   request.set_session_id(session.id);
   *request.mutable_spec() = std::move(spec);

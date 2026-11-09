@@ -302,7 +302,7 @@ class PreparedInjector(_message.Message):
     def __init__(self, format_version: _Optional[int] = ..., module_sha256: _Optional[bytes] = ..., module_name: _Optional[str] = ..., selector: _Optional[str] = ..., symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., target_triple: _Optional[str] = ..., header_types: _Optional[_Union[DebugInfo, _Mapping]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., adapter_declarations: _Optional[str] = ..., adapter_standard_headers: _Optional[_Iterable[str]] = ..., adapter_abi_options: _Optional[_Iterable[str]] = ..., adapter_toolchain_options: _Optional[_Iterable[str]] = ..., adapter_uses_default_toolchain: bool = ..., source_translation_unit: _Optional[str] = ...) -> None: ...
 
 class ProbeSpec(_message.Message):
-    __slots__ = ("symbol", "signature", "callback_source", "receiver", "receiver_unavailable_reason", "debug_info", "argument_names", "include_headers", "header_context", "stack_depth", "include_internal_stack_frames", "print_arguments", "print_result", "callback_package_path", "compile_options", "prepared", "extra_compile_arguments", "extra_compile_arguments_checked", "allow_argument_overrides", "allow_result_override", "allow_replacement", "reclaimable", "allow_call_original", "trace_exceptions")
+    __slots__ = ("symbol", "signature", "callback_source", "receiver", "receiver_unavailable_reason", "debug_info", "argument_names", "include_headers", "header_context", "stack_depth", "include_internal_stack_frames", "print_arguments", "print_result", "callback_package_path", "compile_options", "prepared", "extra_compile_arguments", "extra_compile_arguments_checked", "allow_argument_overrides", "allow_result_override", "allow_replacement", "reclaimable", "allow_call_original", "trace_exceptions", "snapshot_return_pointee")
     SYMBOL_FIELD_NUMBER: _ClassVar[int]
     SIGNATURE_FIELD_NUMBER: _ClassVar[int]
     CALLBACK_SOURCE_FIELD_NUMBER: _ClassVar[int]
@@ -327,6 +327,7 @@ class ProbeSpec(_message.Message):
     RECLAIMABLE_FIELD_NUMBER: _ClassVar[int]
     ALLOW_CALL_ORIGINAL_FIELD_NUMBER: _ClassVar[int]
     TRACE_EXCEPTIONS_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_RETURN_POINTEE_FIELD_NUMBER: _ClassVar[int]
     symbol: str
     signature: Signature
     callback_source: str
@@ -351,7 +352,8 @@ class ProbeSpec(_message.Message):
     reclaimable: bool
     allow_call_original: bool
     trace_exceptions: bool
-    def __init__(self, symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., callback_source: _Optional[str] = ..., receiver: _Optional[_Union[ReceiverContext, _Mapping]] = ..., receiver_unavailable_reason: _Optional[str] = ..., debug_info: _Optional[_Union[DebugInfo, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., stack_depth: _Optional[int] = ..., include_internal_stack_frames: bool = ..., print_arguments: bool = ..., print_result: bool = ..., callback_package_path: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ..., extra_compile_arguments: _Optional[_Iterable[str]] = ..., extra_compile_arguments_checked: bool = ..., allow_argument_overrides: bool = ..., allow_result_override: bool = ..., allow_replacement: bool = ..., reclaimable: bool = ..., allow_call_original: bool = ..., trace_exceptions: bool = ...) -> None: ...
+    snapshot_return_pointee: bool
+    def __init__(self, symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., callback_source: _Optional[str] = ..., receiver: _Optional[_Union[ReceiverContext, _Mapping]] = ..., receiver_unavailable_reason: _Optional[str] = ..., debug_info: _Optional[_Union[DebugInfo, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., stack_depth: _Optional[int] = ..., include_internal_stack_frames: bool = ..., print_arguments: bool = ..., print_result: bool = ..., callback_package_path: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ..., extra_compile_arguments: _Optional[_Iterable[str]] = ..., extra_compile_arguments_checked: bool = ..., allow_argument_overrides: bool = ..., allow_result_override: bool = ..., allow_replacement: bool = ..., reclaimable: bool = ..., allow_call_original: bool = ..., trace_exceptions: bool = ..., snapshot_return_pointee: bool = ...) -> None: ...
 
 class AttachRequest(_message.Message):
     __slots__ = ("pid", "expected_process_start_time", "expected_executable")

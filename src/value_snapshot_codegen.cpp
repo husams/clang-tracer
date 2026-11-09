@@ -191,23 +191,40 @@ make_value_snapshot_code(clang::ASTContext &ast,
   struct Entry {
     unsigned index;
     Role role;
+    bool result_pointee;
     clang::QualType type;
     std::string cpp_type;
     context_engine::SchemaResult schema;
     std::string error;
   };
   std::vector<Entry> entries;
+  const auto &info = spec.debug_info();
   const auto access = tracer::prepared::is_typed_version(spec.prepared().format_version())
       ? context_engine::CodecAccess::snapshot_members
       : context_engine::CodecAccess::public_members;
-  const auto add = [&](unsigned index, Role role, clang::QualType type) {
+  const auto add = [&](unsigned index, Role role, clang::QualType type,
+                       bool result_pointee = false) {
     const bool is_volatile = type.getNonReferenceType().isVolatileQualified();
     type = type.getNonReferenceType().getUnqualifiedType().getCanonicalType();
-    if (type->isPointerType() || type->isVoidType())
+    if (!result_pointee && (type->isPointerType() || type->isVoidType()))
       return;
     clang::PrintingPolicy policy(ast.getLangOpts());
     policy.SuppressTagKeyword = true;
-    Entry entry{index, role, type, type.getAsString(policy), {}, {}};
+    Entry entry{index, role, result_pointee, type, type.getAsString(policy), {}, {}};
+    if (result_pointee) {
+      const auto *record = type->getAsCXXRecordDecl();
+      if (!record || !record->getDefinition()) {
+        entry.error = "return-pointee snapshots require a complete record type";
+        entries.push_back(std::move(entry));
+        return;
+      }
+      if (!info.has_result_object_type()) {
+        entry.error =
+            "return-pointee snapshots require recovered pointee record metadata";
+        entries.push_back(std::move(entry));
+        return;
+      }
+    }
     context_engine::StateFamilyKey family;
     family.source_lineage_id[0] = 1;
     if (const auto *record = type->getAsCXXRecordDecl();
@@ -244,16 +261,17 @@ make_value_snapshot_code(clang::ASTContext &ast,
     }
     entries.push_back(std::move(entry));
   };
-  for (int i = 0; i < spec.debug_info().arguments_size() &&
+  for (int i = 0; i < info.arguments_size() &&
                   unsigned(i) < function->getNumParams();
        ++i) {
-    const auto &argument = spec.debug_info().arguments(i);
+    const auto &argument = info.arguments(i);
     if (argument.is_reference() || argument.is_object_value())
       add(unsigned(i), Role::argument, function->getParamType(unsigned(i)));
   }
-  const auto &info = spec.debug_info();
   if (info.result_is_reference() || info.result_is_object_value())
     add(0, Role::result, function->getReturnType());
+  else if (spec.snapshot_return_pointee() && function->getReturnType()->isPointerType())
+    add(0, Role::result, function->getReturnType()->getPointeeType(), true);
   if (access == context_engine::CodecAccess::snapshot_members &&
       spec.signature().kind() == clangtracer::v1::METHOD) {
     const auto receiver = tracer_alias(ast, "ResolvedTarget");
@@ -335,13 +353,17 @@ template<class T> void encode(tracer::ValueSnapshot& snapshot, const T& value) n
                                : result ? "ctx.result.snapshot"
                                         : "ctx.arguments[" + std::to_string(entry.index) + "].snapshot";
     auto &body = result ? code.result : code.arguments;
-    body += "tracer::ValueSnapshot snapshot_" + id + "; " + slot +
-            "=&snapshot_" + id + ";\n";
+    body += "tracer::ValueSnapshot snapshot_" + id + ";\n";
+    if (entry.result_pointee)
+      body += "if (auto *result_pointee=tracer::Call(ctx).result()) {\n";
+    body += slot + "=&snapshot_" + id + ";\n";
     body += "snapshot_" + id + ".cpp_type=" + literal(entry.cpp_type) + ";\n";
     if (!entry.error.empty()) {
       body += "snapshot_" + id +
               ".status=tracer::ValueSnapshot::Unsupported; snapshot_" + id +
               ".detail=" + literal(entry.error) + ";\n";
+      if (entry.result_pointee)
+        body += "}\n";
       continue;
     }
     std::vector<std::string> record_types;
@@ -370,11 +392,14 @@ template<class T> void encode(tracer::ValueSnapshot& snapshot, const T& value) n
               ";\n";
     }
     const auto expr = receiver ? "*reinterpret_cast<const tracer::ResolvedTarget*>(ctx.object_address)"
+                               : entry.result_pointee ? "*result_pointee"
                                : result ? "tracer::Call(ctx).result()"
                                         : "tracer::Call(ctx).argument<" +
                                               std::to_string(entry.index) + ">()";
     body +=
         "tracer_snapshot_detail::encode(snapshot_" + id + "," + expr + ");\n";
+    if (entry.result_pointee)
+      body += "}\n";
   }
   return code;
 }

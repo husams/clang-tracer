@@ -455,6 +455,16 @@ function(tracer_add_native_repl)
             --${_example} --smoke)
         set_tests_properties(native_repl_prepared_${_example} PROPERTIES TIMEOUT 120)
       endforeach()
+      add_test(NAME native_repl_prepared_pointee
+        COMMAND "${CMAKE_COMMAND}" -E env
+          "CLANG_TRACER_PREPARED_BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+          "CLANG_TRACER_REPL=$<TARGET_FILE:clang-tracer-repl>"
+          "CLANG_TRACER_SERVER=$<TARGET_FILE:clang-tracer-server>"
+          "CLANG_TRACER_AGENT=$<TARGET_FILE:clang_tracer_agent>"
+          "CLANG_TRACER_PREPARED_TARGET=$<TARGET_FILE:prepared-pointee-target>"
+          bash "${CMAKE_CURRENT_SOURCE_DIR}/examples/prepared-injectors/run-native.sh"
+          --pointee --smoke)
+      set_tests_properties(native_repl_prepared_pointee PROPERTIES TIMEOUT 120)
       add_test(NAME native_repl_integration
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_native_integration.py"
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
