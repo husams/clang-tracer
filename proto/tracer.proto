@@ -201,7 +201,8 @@ message ProbeSpec {
   PreparedInjector prepared = 18;
   repeated string extra_compile_arguments = 19; // Validated additive flags.
   bool extra_compile_arguments_checked = 20;
-  bool snapshot_return_pointee = 21; // Opt-in: callback may snapshot a live raw returned record.
+  // Fields 21-26 are in use by the C++17 port.
+  bool snapshot_return_pointee = 27; // Opt-in: callback may snapshot a live raw returned record.
 }
 message AttachRequest {
   uint32 pid = 1;
