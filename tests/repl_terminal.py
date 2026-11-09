@@ -85,7 +85,8 @@ def main():
         until(rb"\[Tab: insert template\]")
         send("\t")
         until(rb"%collect --count count --as name")
-        send("4\tbatch\t\r")
+        # A typed space can match the separator already after the count.
+        send("4 \tbatch\t\r")
         until(rb"received=4.*tracer\[7\]> ")
 
         start = len(transcript)

@@ -161,10 +161,14 @@ void Input::changed(std::string& text, int& cursor) {
     return;
   }
 
-  // Find the changed range, stopping at the cursor so repeated characters
-  // inserted before an auto-closing character do not consume its marker.
+  // Keep text after the active field out of the prefix match. A typed
+  // separator can be identical to the first character of the template suffix.
+  auto limit = pos;
+  if (!fields_.empty()) {
+    const auto& field = fields_[field_];
+    limit = std::min(limit, selected_ ? field.begin : field.end);
+  }
   std::size_t begin = 0;
-  const auto limit = selected_ ? std::min(pos, fields_[field_].begin) : pos;
   while (begin < std::min(limit, previous_.size()) && text[begin] == previous_[begin])
     ++begin;
   auto old_end = previous_.size(), new_end = text.size();
