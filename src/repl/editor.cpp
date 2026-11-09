@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <iostream>
 #include <string_view>
+#include <thread>
 #include <unistd.h>
 
 namespace tracer_repl {
@@ -48,6 +49,7 @@ string_view indentation(string_view line) {
 struct Snippet {
   string_view trigger;
   string_view body;
+  const char* final_field_hint = nullptr;
 };
 
 constexpr Snippet snippets[] = {
@@ -58,7 +60,10 @@ constexpr Snippet snippets[] = {
     {"%cpp load", "%cpp load \"@file@\""},
     {"%events open", "%events open \"@file@\" --as @name@"},
     {"%collect", "%collect --count @count@ --as @name@"},
-    {"%probe inject", "%probe inject \"@selector@\""},
+    {"%probe inject", "%probe inject \"@selector@\" @@",
+     "  [optional: --callback FILE or --prepared DIRECTORY]"},
+    {"%probe inject --callback", "%probe inject \"@selector@\" --callback \"@file@\""},
+    {"%probe inject --prepared", "%probe inject \"@selector@\" --prepared \"@directory@\""},
     {"%probe prepare", "%probe prepare \"@selector@\" --include \"@header@\" --output \"@directory@\""},
 };
 
@@ -66,8 +71,10 @@ const Snippet* find_snippet(string_view text) {
   const auto start = text.find_first_not_of(" \t");
   if (start == text.npos) return nullptr;
   const auto trigger = text.substr(start);
+  const auto trimmed = trigger.substr(0, trigger.find_last_not_of(" \t") + 1);
   for (const auto& snippet : snippets)
     if (snippet.trigger == trigger ||
+        (snippet.final_field_hint && snippet.trigger == trimmed) ||
         (snippet.trigger == "#include" && trigger.size() >= 5 && snippet.trigger.starts_with(trigger)))
       return &snippet;
   return nullptr;
@@ -139,7 +146,11 @@ Input::Input(bool color) : terminal_(::isatty(STDIN_FILENO)) {
   if (color) {
     editor_.set_highlighter_callback(
         [this](const auto& text, auto& colors) { colorize(text, colors); });
-    editor_.set_hint_callback([](const std::string& text, int& length, Color&) {
+    editor_.set_hint_callback([this](const std::string& text, int& length, Color&) {
+      if (selected_ && fields_[field_].hint) {
+        length = 0;
+        return replxx::Replxx::hints_t{fields_[field_].hint};
+      }
       const string_view line(text.data() + line_start(text), text.size() - line_start(text));
       if (find_snippet(line)) {
         length = 0;
@@ -161,10 +172,14 @@ void Input::changed(std::string& text, int& cursor) {
     return;
   }
 
-  // Find the changed range, stopping at the cursor so repeated characters
-  // inserted before an auto-closing character do not consume its marker.
+  // Keep text after the active field out of the prefix match. A typed
+  // separator can be identical to the first character of the template suffix.
+  auto limit = pos;
+  if (!fields_.empty()) {
+    const auto& field = fields_[field_];
+    limit = std::min(limit, selected_ ? field.begin : field.end);
+  }
   std::size_t begin = 0;
-  const auto limit = selected_ ? std::min(pos, fields_[field_].begin) : pos;
   while (begin < std::min(limit, previous_.size()) && text[begin] == previous_[begin])
     ++begin;
   auto old_end = previous_.size(), new_end = text.size();
@@ -254,6 +269,7 @@ Input::Result Input::tab(char32_t key, bool backwards) {
         if (c == '\n') expansion += spacing;
       }
     }
+    fields.back().hint = snippet->final_field_hint;
     fields.push_back({start + expansion.size(), start + expansion.size()});
     text.replace(start, pos - start, expansion);
     selected_ = false;
@@ -390,7 +406,12 @@ replxx::Replxx::completions_t Input::complete(const std::string& text, int& leng
         results.items.erase(std::unique(results.items.begin(), results.items.end()), results.items.end());
       }
     } catch (const std::exception& error) {
-      if (results.items.empty()) editor_.print("C++ completion: %s\n", error.what());
+      if (results.items.empty()) {
+        // replxx only clears and restores the input around cross-thread output.
+        std::thread([this, message = std::string(error.what())] {
+          editor_.print("C++ completion: %s\n", message.c_str());
+        }).join();
+      }
     }
   }
   if (results.bytes > text.size()) return {};

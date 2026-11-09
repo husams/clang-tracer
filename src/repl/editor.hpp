@@ -16,6 +16,7 @@ class Input {
   struct Field {
     std::size_t begin;
     std::size_t end;
+    const char* hint = nullptr;
   };
 
   bool terminal_;

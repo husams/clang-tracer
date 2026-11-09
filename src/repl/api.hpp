@@ -1,4 +1,5 @@
-#pragma once
+#ifndef CLANG_TRACER_REPL_API_HPP
+#define CLANG_TRACER_REPL_API_HPP
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -222,3 +223,5 @@ public:
   void print(const Collection &collection) const;
 };
 } // namespace tracer_repl
+
+#endif // CLANG_TRACER_REPL_API_HPP

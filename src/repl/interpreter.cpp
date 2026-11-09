@@ -130,24 +130,38 @@ struct CppEngine::Impl {
   std::string history;
   std::string check_history;
   const std::filesystem::path directory = std::filesystem::current_path();
+  const std::filesystem::path facade_directory;
   using Stamp = std::pair<std::uintmax_t, std::filesystem::file_time_type>;
-  std::map<std::filesystem::path, Stamp> headers;
+  struct HeaderInput {
+    Stamp stamp;
+    std::string facade_digest;
+  };
+  std::map<std::filesystem::path, HeaderInput> headers;
   std::map<std::pair<std::string, std::filesystem::path>, std::string> mappings;
   std::set<std::string> imported_adapters;
   bool synchronized = true;
   bool user_cells = false;
-  void verify_inputs() const {
+  explicit Impl(const std::filesystem::path& facade)
+      : facade_directory(std::filesystem::weakly_canonical(facade).parent_path()) {}
+  void verify_inputs() {
     if (std::filesystem::current_path() != directory)
       throw std::runtime_error("C++ working directory changed; restore it or "
                                "use %cpp reset; previous variables retained");
-    for (const auto &[path, stamp] : headers) {
+    for (auto &[path, input] : headers) {
       std::error_code error;
       const auto size = std::filesystem::file_size(path, error);
       const auto time = std::filesystem::last_write_time(path, error);
-      if (error || Stamp{size, time} != stamp)
-        throw std::runtime_error(
-            "C++ header changed: " + path.string() +
-            "; restore it or use %cpp reset; previous variables retained");
+      const Stamp current{size, time};
+      if (!error && current == input.stamp) continue;
+      // Reinstalling the same facade can change its timestamp.
+      if (!error && size == input.stamp.first && !input.facade_digest.empty() &&
+          mapping_file_digest(path) == input.facade_digest) {
+        input.stamp = current;
+        continue;
+      }
+      throw std::runtime_error(
+          "C++ header changed: " + path.string() +
+          "; restore it or use %cpp reset; previous variables retained");
     }
   }
   void remember(const std::string &cell) {
@@ -172,7 +186,8 @@ struct CppEngine::Impl {
       const auto size = std::filesystem::file_size(path, error);
       const auto time = std::filesystem::last_write_time(path, error);
       if (!error)
-        headers.emplace(path, Stamp{size, time});
+        headers.emplace(path, HeaderInput{{size, time},
+            path.parent_path() == facade_directory ? mapping_file_digest(path) : ""});
     }
   }
 };
@@ -446,7 +461,7 @@ void CppEngine::initialize() {
     throw std::runtime_error("cannot initialize C++ facade: " +
                              llvm::toString(std::move(error)));
   }
-  impl_ = std::make_unique<Impl>();
+  impl_ = std::make_unique<Impl>(path);
   impl_->interpreter = std::move(*interpreter);
   impl_->arguments = std::move(args);
   impl_->history = prelude.str() + "\n";

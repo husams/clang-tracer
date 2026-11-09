@@ -1,4 +1,5 @@
-#pragma once
+#ifndef CLANG_TRACER_MODULE_INDEX_HPP
+#define CLANG_TRACER_MODULE_INDEX_HPP
 
 #include <cstddef>
 #include <cstdint>
@@ -99,3 +100,5 @@ private:
 };
 
 } // namespace tracer_module
+
+#endif // CLANG_TRACER_MODULE_INDEX_HPP
