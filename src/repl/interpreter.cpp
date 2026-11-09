@@ -456,6 +456,7 @@ void CppEngine::initialize() {
 }
 
 CppCompletions CppEngine::complete(const std::string &source) {
+  if (auto directives = complete_cpp_directive(source)) return std::move(*directives);
   initialize();
   impl_->verify_inputs();
   if (!impl_->synchronized)
