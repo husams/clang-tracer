@@ -1,4 +1,5 @@
-#pragma once
+#ifndef CLANG_TRACER_REPL_EVENT_RANGES_HPP
+#define CLANG_TRACER_REPL_EVENT_RANGES_HPP
 #include <algorithm>
 #include <cstddef>
 #include <functional>
@@ -324,3 +325,5 @@ template <class Range> auto operator|(Range &&range, Reverse) {
   return result;
 }
 } // namespace tracer_repl
+
+#endif // CLANG_TRACER_REPL_EVENT_RANGES_HPP
