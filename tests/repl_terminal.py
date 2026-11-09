@@ -108,6 +108,23 @@ def main():
              'std::cout << "editor {ready}" << std::endl;\t\r')
         until(rb"(?m)^editor \{ready\}\n.*tracer\[7\]> ")
 
+        send("for\t")
+        until(rb"for \(init; condition; step\) \{")
+        # Typing and deleting a duplicate template separator must keep the fields.
+        send("int i = 0;\x7f\t")
+        until(rb"for \(int i = 0; condition; step\) \{")
+        send("i < 2\t++i\t")
+        until(rb"for \(int i = 0; i < 2; \+\+i\) \{")
+        send('std::cout << "loop-" << i << std::endl;\t\r')
+        until(rb"(?m)^loop-0\nloop-1\n.*tracer\[7\]> ")
+
+        send("%probe prepare\t")
+        until(rb'%probe prepare "selector" --include "header" --output "directory"')
+        send("demo::compute(int)\tdemo.hpp\tprepared\t")
+        until(rb'%probe prepare "demo::compute\(int\)" --include "demo.hpp" --output "prepared"')
+        send("\x03")
+        until(rb"\ntracer\[7\]> ")
+
         send("%cpp load\t")
         until(rb'%cpp load "file"')
         send("file w\x1b/\t\r")
