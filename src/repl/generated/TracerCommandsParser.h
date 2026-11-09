@@ -40,25 +40,29 @@ public:
     T__144 = 145, T__145 = 146, T__146 = 147, T__147 = 148, T__148 = 149,
     T__149 = 150, T__150 = 151, T__151 = 152, T__152 = 153, T__153 = 154,
     T__154 = 155, T__155 = 156, T__156 = 157, T__157 = 158, T__158 = 159,
-    T__159 = 160, UINT = 161, STRING = 162, SHELL = 163, METADATA_ONLY = 164,
-    SQLITE = 165, STACK = 166, CWD = 167, SIGNATURE = 168, MEMBER = 169,
-    WORD = 170, WS = 171
+    T__159 = 160, T__160 = 161, T__161 = 162, T__162 = 163, T__163 = 164,
+    T__164 = 165, T__165 = 166, T__166 = 167, T__167 = 168, T__168 = 169,
+    T__169 = 170, T__170 = 171, UINT = 172, STRING = 173, SHELL = 174, METADATA_ONLY = 175,
+    SQLITE = 176, STACK = 177, CWD = 178, SIGNATURE = 179, MEMBER = 180,
+    WORD = 181, WS = 182
   };
 
   enum {
     RuleLine = 0, RuleCommand = 1, RuleServer = 2, RuleServerOption = 3,
     RuleAttach = 4, RuleProcesses = 5, RuleSessions = 6, RuleUse = 7, RuleStatus = 8,
-    RuleDetach = 9, RuleModules = 10, RuleThreads = 11, RuleSymbols = 12,
-    RuleSymbolOption = 13, RuleProbe = 14, RulePrepareOption = 15, RuleResolveOption = 16,
-    RuleValidateOption = 17, RuleDeployOption = 18, RuleInterceptor = 19,
-    RuleEvents = 20, RuleCollect = 21, RuleRecord = 22, RuleStreamOption = 23,
-    RuleCpp = 24, RuleShell = 25, RuleComplete = 26, RuleType = 27, RuleHelp = 28,
-    RuleQuit = 29, RuleBulkTrace = 30, RuleBulkTraceOption = 31, RuleValue = 32,
-    RuleKeyword = 33, RuleMemory = 34, RuleProbeEntry = 35, RuleProbeReload = 36,
-    RuleTargetLaunch = 37, RuleLaunchOption = 38, RuleChildList = 39, RuleTargetCall = 40,
-    RuleLocalPerf = 41, RuleTargetLibrary = 42, RuleInstructions = 43, RuleInstructionOption = 44,
-    RuleWatchpoint = 45, RuleStackFilter = 46, RuleContextEventBytes = 47,
-    RuleExtraCompileOption = 48, RuleCwdOption = 49
+    RuleDetach = 9, RuleModules = 10, RuleModuleIndex = 11, RuleModuleBuildOption = 12,
+    RuleModuleQueryOption = 13, RuleModuleShowOption = 14, RuleModuleEmitOption = 15,
+    RuleThreads = 16, RuleSymbols = 17, RuleSymbolOption = 18, RuleProbe = 19,
+    RulePrepareOption = 20, RuleResolveOption = 21, RuleValidateOption = 22,
+    RuleDeployOption = 23, RuleInterceptor = 24, RuleEvents = 25, RuleCollect = 26,
+    RuleRecord = 27, RuleStreamOption = 28, RuleCpp = 29, RuleShell = 30,
+    RuleComplete = 31, RuleType = 32, RuleHelp = 33, RuleQuit = 34, RuleBulkTrace = 35,
+    RuleBulkTraceOption = 36, RuleValue = 37, RuleKeyword = 38, RuleMemory = 39,
+    RuleProbeEntry = 40, RuleProbeReload = 41, RuleTargetLaunch = 42, RuleLaunchOption = 43,
+    RuleChildList = 44, RuleTargetCall = 45, RuleLocalPerf = 46, RuleTargetLibrary = 47,
+    RuleInstructions = 48, RuleInstructionOption = 49, RuleWatchpoint = 50,
+    RuleStackFilter = 51, RuleContextEventBytes = 52, RuleExtraCompileOption = 53,
+    RuleCwdOption = 54
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -89,6 +93,11 @@ public:
   class StatusContext;
   class DetachContext;
   class ModulesContext;
+  class ModuleIndexContext;
+  class ModuleBuildOptionContext;
+  class ModuleQueryOptionContext;
+  class ModuleShowOptionContext;
+  class ModuleEmitOptionContext;
   class ThreadsContext;
   class SymbolsContext;
   class SymbolOptionContext;
@@ -155,6 +164,7 @@ public:
     StatusContext *status();
     DetachContext *detach();
     ModulesContext *modules();
+    ModuleIndexContext *moduleIndex();
     ThreadsContext *threads();
     SymbolsContext *symbols();
     ProbeContext *probe();
@@ -307,6 +317,82 @@ public:
   };
 
   ModulesContext* modules();
+
+  class  ModuleIndexContext : public antlr4::ParserRuleContext {
+  public:
+    ModuleIndexContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+    std::vector<ModuleBuildOptionContext *> moduleBuildOption();
+    ModuleBuildOptionContext* moduleBuildOption(size_t i);
+    std::vector<ModuleQueryOptionContext *> moduleQueryOption();
+    ModuleQueryOptionContext* moduleQueryOption(size_t i);
+    std::vector<ModuleShowOptionContext *> moduleShowOption();
+    ModuleShowOptionContext* moduleShowOption(size_t i);
+    std::vector<ModuleEmitOptionContext *> moduleEmitOption();
+    ModuleEmitOptionContext* moduleEmitOption(size_t i);
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  ModuleIndexContext* moduleIndex();
+
+  class  ModuleBuildOptionContext : public antlr4::ParserRuleContext {
+  public:
+    ModuleBuildOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+    antlr4::tree::TerminalNode *UINT();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  ModuleBuildOptionContext* moduleBuildOption();
+
+  class  ModuleQueryOptionContext : public antlr4::ParserRuleContext {
+  public:
+    ModuleQueryOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+    antlr4::tree::TerminalNode *UINT();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  ModuleQueryOptionContext* moduleQueryOption();
+
+  class  ModuleShowOptionContext : public antlr4::ParserRuleContext {
+  public:
+    ModuleShowOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  ModuleShowOptionContext* moduleShowOption();
+
+  class  ModuleEmitOptionContext : public antlr4::ParserRuleContext {
+  public:
+    ModuleEmitOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ModuleShowOptionContext *moduleShowOption();
+    ValueContext *value();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  ModuleEmitOptionContext* moduleEmitOption();
 
   class  ThreadsContext : public antlr4::ParserRuleContext {
   public:

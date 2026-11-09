@@ -1,4 +1,7 @@
 #include "cpp_resolver.hpp"
+#include "prepare_package.hpp"
+#include "module_index_internal.hpp"
+#include "tracer/module_index.hpp"
 #include "header_context.hpp"
 #include "prepare_elf_signature.hpp"
 #include "prepared_contract.hpp"
@@ -6,7 +9,6 @@
 
 #include <exception>
 #include <filesystem>
-#include <fstream>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -15,11 +17,7 @@
 #include <string>
 #include <vector>
 
-#include <llvm/ADT/ArrayRef.h>
-#include <llvm/Object/Binary.h>
-#include <llvm/Object/ELFObjectFile.h>
-#include <llvm/Support/Error.h>
-#include <llvm/Support/SHA256.h>
+#include <llvm/ADT/StringExtras.h>
 
 namespace fs = std::filesystem;
 namespace api = clangtracer::v1;
@@ -28,31 +26,9 @@ namespace {
 std::string image_digest(
     const fs::path &path,
     const std::function<void(const llvm::object::ELF64LEObjectFile &)> &inspect = {}) {
-  auto binary = llvm::object::createBinary(path.string());
-  if (!binary)
-    throw std::runtime_error(llvm::toString(binary.takeError()));
-  const auto *object =
-      llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(binary->getBinary());
-  if (!object ||
-      object->getELFFile().getHeader().e_machine != llvm::ELF::EM_X86_64 ||
-      (object->getELFFile().getHeader().e_type != llvm::ELF::ET_EXEC &&
-       object->getELFFile().getHeader().e_type != llvm::ELF::ET_DYN))
-    throw std::runtime_error("module must be a linked Linux x86_64 ELF image");
-  if (inspect) inspect(*object);
-  const auto bytes = binary->getBinary()->getMemoryBufferRef().getBuffer();
-  const auto digest = llvm::SHA256::hash(llvm::ArrayRef<std::uint8_t>(
-      reinterpret_cast<const std::uint8_t *>(bytes.data()), bytes.size()));
-  return std::string(reinterpret_cast<const char *>(digest.data()),
-                     digest.size());
+  return llvm::fromHex(tracer::module_index::inspect_elf(path, inspect));
 }
 
-void write(const fs::path &path, const std::string &data) {
-  std::ofstream out(path, std::ios::binary);
-  out.write(data.data(), static_cast<std::streamsize>(data.size()));
-  if (!out)
-    throw std::runtime_error("cannot write generated artifact: " +
-                             path.string());
-}
 } // namespace
 
 int main(int argc, char **argv) {
@@ -72,6 +48,8 @@ int main(int argc, char **argv) {
                      "[--extra-arg ARG]...\n"
                      "ELF preparation: --selector SELECTOR --signature TYPE "
                      "--module ELF --output NEW_DIRECTORY [--member] [--metadata-only]\n"
+                     "Indexed preparation: --selector SELECTOR --module-index INDEX "
+                     "--output NEW_DIRECTORY [--module ELF] [--id ID] [--generated DIR]\n"
                      "Uses the first include's unique compile command if recorded, "
                      "or the first command for a source beside it. "
                      "--module pins the package to an ELF image.\n";
@@ -84,7 +62,8 @@ int main(int argc, char **argv) {
         flag = true;
         continue;
       }
-      if (option != "--include" && option != "--selector" &&
+      if (option != "--module-index" && option != "--generated" && option != "--id" &&
+          option != "--include" && option != "--selector" &&
           option != "--compdb" && option != "--translation-unit" &&
           option != "--module" && option != "--output" && option != "--extra-arg" &&
           option != "--signature")
@@ -102,6 +81,40 @@ int main(int argc, char **argv) {
       if (!options.count(option))
         throw std::runtime_error(std::string("missing required option: ") +
                                  option);
+    if (!options.count("--module-index") && headers.empty() && !options.count("--signature") &&
+        !options.count("--compdb") && !options.count("--translation-unit")) {
+      if (const auto image = options.find("--module"); image != options.end()) {
+        const auto sidecar = image->second + ".tracer.sqlite";
+        if (fs::is_regular_file(sidecar)) options.emplace("--module-index", sidecar);
+      }
+      if (!options.count("--module-index") && fs::is_regular_file("module-index.sqlite"))
+        options.emplace("--module-index", "module-index.sqlite");
+      if (!options.count("--module-index"))
+        throw std::invalid_argument("no default module index; pass --module-index INDEX");
+    }
+    if (const auto indexed = options.find("--module-index"); indexed != options.end()) {
+      if (!headers.empty() || !extra_arguments.empty() || member ||
+          options.count("--compdb") || options.count("--translation-unit") ||
+          options.count("--signature"))
+        throw std::invalid_argument("--module-index is incompatible with source or signature options");
+      const auto index = tracer_module::ModuleIndex::open(indexed->second);
+      const auto &selector = options.at("--selector");
+      const auto symbol = options.count("--id") ? index.get_symbol(options.at("--id"))
+                                               : index.find_symbol(selector);
+      if (tracer::module_index::normalize_selector(selector) !=
+              tracer::module_index::normalize_selector(symbol.selector) &&
+          selector != symbol.name && selector != symbol.linkage &&
+          options.count("--id"))
+        throw std::invalid_argument("--id does not match the requested selector");
+      const auto output = tracer::module_index::prepare_indexed(index, symbol.id,
+          options.count("--module") ? options.at("--module") : "",
+          options.at("--output"), options.count("--generated") ? options.at("--generated") : "",
+          metadata_only);
+      std::cout << "prepared " << output << "\nsymbol=" << symbol.linkage << '\n';
+      return 0;
+    }
+    if (options.count("--generated") || options.count("--id"))
+      throw std::invalid_argument("--generated and --id require indexed preparation");
     const auto signature_option = options.find("--signature");
     const bool elf_mode = signature_option != options.end();
     if (elf_mode) {
@@ -175,82 +188,9 @@ int main(int argc, char **argv) {
         }
       }
     }();
-    const auto &signature = resolved.spec.signature();
-    const auto &types = resolved.spec.debug_info();
-    const auto legacy = [](api::ValueType type, const std::string &spelling) {
-      switch (type) {
-      case api::VOID: return spelling == "void";
-      case api::INT32: return spelling == "int";
-      case api::INT64: return spelling == "long long";
-      case api::UINT64: return spelling == "unsigned long long";
-      case api::FLOAT32: return spelling == "float";
-      case api::FLOAT64: return spelling == "double";
-      default: return false;
-      }
-    };
-    bool typed = cl_driver || resolved.requires_typed_adapter || signature.kind() == api::METHOD ||
-                 !legacy(signature.result(), types.result_cpp_type());
-    for (int i = 0; i < signature.arguments_size(); ++i)
-      typed |= !legacy(signature.arguments(i), types.arguments(i).cpp_type());
-    auto prepared = resolved.spec.prepared();
-    const auto adapter = tracer::prepared::adapter_source(prepared);
-    prepared.set_format_version(typed ? tracer::prepared::typed_version : module.empty() ? 2 : 1);
-    if (typed) {
-      *prepared.mutable_header_types() = types;
-      prepared.set_source_translation_unit(translation_unit);
-    } else {
-      prepared.clear_adapter_declarations();
-      prepared.clear_adapter_standard_headers();
-      prepared.clear_adapter_abi_options();
-      prepared.clear_adapter_toolchain_options();
-      prepared.clear_adapter_uses_default_toolchain();
-    }
-    if (!module.empty()) {
-      prepared.set_module_sha256(digest);
-      prepared.set_module_name(module.filename().string());
-    }
-    prepared.set_selector(options.at("--selector"));
-    prepared.set_symbol(resolved.spec.symbol());
-    *prepared.mutable_signature() = resolved.spec.signature();
-    *prepared.mutable_argument_names() = resolved.spec.argument_names();
-    if (!module.empty() && image_digest(module) != digest)
-      throw std::runtime_error("module changed during preparation");
-    if (prepared.ByteSizeLong() > 64 * 1024)
-      throw std::runtime_error("prepared metadata exceeds 64 KiB");
-    std::string arguments;
-    for (const auto &arg : types.arguments()) {
-      if (!arguments.empty())
-        arguments += ", ";
-      arguments += arg.cpp_type();
-    }
-    std::string declaration = "#pragma once\n" + adapter;
-    declaration += "namespace tracer_prepared {\nusing Result = " +
-                   types.result_cpp_type() + ";\nusing Signature = Result(" +
-                   arguments + ");\n";
-    std::string wrapper = "#include \"adapter.hpp\"\n";
-    const auto name = options.at("--selector").substr(0, options.at("--selector").find('('));
-    if (signature.kind() == api::METHOD) {
-      declaration += "using Receiver = " + types.record_name() + ";\n";
-    } else if (!typed) {
-      declaration += "using Function = Signature*;\nFunction target() noexcept;\n";
-      wrapper += "namespace tracer_prepared {\n"
-                 "Function target() noexcept { return static_cast<Function>(&" +
-                 name + "); }\n}\n";
-    }
-    declaration += "}\n";
-    if (!fs::create_directory(output))
-      throw std::runtime_error("cannot create new output directory");
-    try {
-      if (!metadata_only) {
-        fs::create_directory(output / "generated");
-        write(output / "generated/adapter.hpp", declaration);
-        write(output / "generated/adapter.cpp", wrapper);
-      }
-      write(output / "prepared.pb", prepared.SerializeAsString());
-    } catch (...) {
-      fs::remove_all(output);
-      throw;
-    }
+    const auto prepared = tracer::client::write_prepared_package(
+        resolved, options.at("--selector"), module, digest, output, metadata_only,
+        translation_unit, cl_driver);
     std::cout << "prepared " << output << "\n"
               << resolved.declaration << "\nsymbol=" << prepared.symbol()
               << "\n";

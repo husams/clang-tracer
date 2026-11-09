@@ -144,6 +144,27 @@ first_call.at(1).result_as<int>()
 
 Stop the target with Ctrl+C. If discovery is empty, confirm the attached PID, use `%modules` to confirm the binary, and check that it still has its debug information. If attachment is refused, confirm the target is yours, its tracing policy permits the attachment, and no debugger already owns it.
 
+## Prepare a probe when you only have a binary
+
+The native REPL can index a Linux ELF executable or shared library, browse its
+DWARF types and ELF exports, and build a probe package without application
+headers. For a library with matching DWARF, start with:
+
+```text
+%module index --file ./libdemo.so
+%module symbols --exported --filter "demo::*"
+%module show --type demo::Packet
+%probe prepare "demo::score(demo::Packet const&)" --output prepared-score
+```
+
+The index becomes the session default. Use `%module use INDEX` to reuse it in a
+new REPL, or pass `--module-index INDEX` for one preparation. Use
+`%module emit` to write C++ declarations and read-only accessors for selected
+types and functions. See [the native REPL walkthrough](../native-repl.md#prepare-a-probe-from-a-binary-without-headers)
+for the callback, injection commands, and C++ API, or the
+[Python guide](../../python/README.md#index-a-module-and-prepare-a-probe-without-application-headers)
+for the programmatic workflow.
+
 ## Related documentation
 
 - [Command reference](commands.md)

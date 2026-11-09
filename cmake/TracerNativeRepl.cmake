@@ -92,9 +92,38 @@ function(tracer_add_native_repl)
   set(CMAKE_REQUIRED_LIBRARIES "${_saved_required_libraries}")
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/TracerToolchain.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/TracerJitConfig.cmake")
+  set(_src "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  add_library(tracer_module_index SHARED
+    "${_src}/module_index.cpp" "${_src}/module_index_dwarf.cpp" "${_src}/module_index_headers.cpp")
+  target_include_directories(tracer_module_index PUBLIC
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
+  target_include_directories(tracer_module_index SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
+  target_link_libraries(tracer_module_index PRIVATE LLVM SQLite::SQLite3)
+  if(NOT TRACER_REPL_FILESYSTEM_LINKS)
+    target_link_libraries(tracer_module_index PUBLIC stdc++fs)
+  endif()
+  if(TRACER_SDK_ROOT AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(tracer_module_index PRIVATE
+      "-Wl,--push-state,--no-as-needed" rt pthread dl "-Wl,--pop-state")
+  endif()
+  if(NOT LLVM_ENABLE_RTTI)
+    target_compile_options(tracer_module_index PRIVATE -fno-rtti)
+  endif()
+  target_compile_options(tracer_module_index PRIVATE -Wall -Wextra -Wpedantic)
+  add_executable(clang-tracer-module "${_src}/module_index_cli.cpp")
+  target_include_directories(clang-tracer-module SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
+  target_link_libraries(clang-tracer-module PRIVATE tracer_module_index LLVM)
+  target_link_libraries(tracer_repl_client PUBLIC tracer_module_index)
+  install(TARGETS tracer_module_index clang-tracer-module
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Runtime
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Runtime)
+  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/module_index.hpp"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/tracer" COMPONENT Development)
   add_executable(clang-tracer-prepare-injectors-native
     "${CMAKE_CURRENT_SOURCE_DIR}/src/prepare_injectors_main.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/prepare_elf_signature.cpp"
+    "${_src}/prepare_package.cpp" "${_src}/module_index_prepare.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp_resolver.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/header_context.cpp")
   target_include_directories(clang-tracer-prepare-injectors-native PRIVATE
@@ -106,7 +135,7 @@ function(tracer_add_native_repl)
     TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}"
     TRACER_PREPARE_BUILD_CXX="${CMAKE_CXX_COMPILER}")
   target_link_libraries(clang-tracer-prepare-injectors-native PRIVATE
-    tracer_repl_rpc clang-cpp LLVM)
+    tracer_repl_rpc tracer_module_index clang-cpp LLVM)
   if(NOT TRACER_REPL_FILESYSTEM_LINKS)
     target_link_libraries(clang-tracer-prepare-injectors-native PRIVATE stdc++fs)
   endif()
@@ -114,7 +143,17 @@ function(tracer_add_native_repl)
     target_link_libraries(clang-tracer-prepare-injectors-native PRIVATE
       "-Wl,--push-state,--no-as-needed" rt pthread dl "-Wl,--pop-state")
   endif()
-  set_target_properties(clang-tracer-prepare-injectors-native PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
+  file(RELATIVE_PATH _module_lib_relative "${CMAKE_INSTALL_FULL_BINDIR}" "${CMAKE_INSTALL_FULL_LIBDIR}")
+  if(APPLE)
+    set(_module_origin "@loader_path")
+  else()
+    set(_module_origin "$ORIGIN")
+  endif()
+  foreach(_target clang-tracer-prepare-injectors-native clang-tracer-module)
+    set_target_properties(${_target} PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE
+      INSTALL_RPATH "${_module_origin}/${_module_lib_relative}")
+  endforeach()
+  set_target_properties(tracer_module_index PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
   if(NOT LLVM_ENABLE_RTTI)
     target_compile_options(clang-tracer-prepare-injectors-native PRIVATE -fno-rtti)
   endif()
@@ -157,7 +196,8 @@ function(tracer_add_native_repl)
   target_link_libraries(clang-tracer-repl PRIVATE tracer_repl_client replxx::replxx clang-cpp LLVM)
   target_compile_options(clang-tracer-repl PRIVATE -Wall -Wextra -Wpedantic)
   set_target_properties(clang-tracer-repl PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
-    CXX_EXTENSIONS OFF ENABLE_EXPORTS ON INSTALL_RPATH_USE_LINK_PATH TRUE)
+    CXX_EXTENSIONS OFF ENABLE_EXPORTS ON INSTALL_RPATH_USE_LINK_PATH TRUE
+    INSTALL_RPATH "${_module_origin}/${_module_lib_relative}")
   if(NOT LLVM_ENABLE_RTTI)
     set_source_files_properties("${_repl}/interpreter.cpp" "${_repl}/completion.cpp" PROPERTIES COMPILE_OPTIONS "-fno-rtti")
   endif()
@@ -168,7 +208,7 @@ function(tracer_add_native_repl)
     "${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/override_target.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/instruction_trace.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/tracer" COMPONENT Runtime)
-  install(FILES "${_repl}/api.hpp" "${_repl}/event_value.hpp" "${_repl}/event_ranges.hpp" DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer/repl" COMPONENT Runtime)
+  install(FILES "${_repl}/api.hpp" "${_repl}/event_value.hpp" "${_repl}/event_ranges.hpp" "${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/module_index.hpp" DESTINATION "${CMAKE_INSTALL_DATADIR}/clang-tracer/repl" COMPONENT Runtime)
   option(TRACER_BUNDLE_CLANG_HEADERS "Install selected Clang builtin headers with the runtime" ON)
   if(TRACER_REPL_ONLY AND TRACER_BUNDLE_CLANG_HEADERS)
     install(DIRECTORY "${_tracer_resource_dir}/include"
@@ -230,6 +270,12 @@ function(tracer_add_native_repl)
         $<TARGET_FILE:clang-tracer-repl>)
     set_tests_properties(native_repl_header_reuse PROPERTIES TIMEOUT 240)
     if(NOT TRACER_REPL_ONLY)
+      add_test(NAME native_repl_module_index
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_module_index.py"
+          --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+          --agent $<TARGET_FILE:clang_tracer_agent> --module-tool $<TARGET_FILE:clang-tracer-module>
+          --compiler "${CMAKE_CXX_COMPILER}" --objcopy "${CMAKE_OBJCOPY}")
+      set_tests_properties(native_repl_module_index PROPERTIES TIMEOUT 240)
       add_executable(repl-launch-target tests/fixtures/repl_launch.cpp)
       target_include_directories(repl-launch-target PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
       target_compile_options(repl-launch-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)

@@ -11,6 +11,7 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, Literal, Self
 
 import grpc
+from google.protobuf.message import DecodeError
 
 from .proto import tracer_pb2 as pb
 from .proto import tracer_pb2_grpc as rpc
@@ -91,6 +92,23 @@ def _compiler_options(options: Iterable[str]) -> tuple[str, ...]:
     except TypeError as error:
         raise ValueError("compile_options must be an iterable of strings") from error
     return tuple(values)
+
+
+def _prepared_package(path: str | os.PathLike[str] | None) -> pb.PreparedInjector | None:
+    if path is None:
+        return None
+    artifact = Path(path) / "prepared.pb"
+    with artifact.open("rb") as source:
+        data = source.read(64 * 1024 + 1)
+    if not data or len(data) > 64 * 1024:
+        raise ValueError("prepared.pb must contain at most 64 KiB of metadata")
+    try:
+        package = pb.PreparedInjector.FromString(data)
+    except DecodeError as error:
+        raise ValueError("invalid prepared.pb") from error
+    if not package.selector or not package.symbol:
+        raise ValueError("invalid prepared.pb")
+    return package
 
 
 @dataclass(frozen=True)
@@ -382,9 +400,11 @@ class Client:
         debug_max_entries: int = 0,
         debug_max_depth: int = 0,
         compile_options: Iterable[str] = (),
+        prepared: str | os.PathLike[str] | None = None,
     ) -> pb.ProbeSpec:
-        """Infer the signature from DWARF on the server (requires ResolveProbe)."""
+        """Resolve a callable from DWARF or require a prepared package."""
         options = _compiler_options(compile_options)
+        package = _prepared_package(prepared)
         response: pb.ProbeSpec = self.stub.ResolveProbe(
             pb.ResolveProbeRequest(
                 session_id=session_id,
@@ -395,9 +415,12 @@ class Client:
                 debug_max_entries=uint(debug_max_entries, 64, "debug_max_entries"),
                 debug_max_depth=uint(debug_max_depth, 32, "debug_max_depth"),
                 compile_options=options,
+                prepared=package,
             ),
             timeout=self.timeout,
         )
+        if package is not None and (not response.HasField("prepared") or response.prepared != package):
+            raise RuntimeError("server did not resolve the required prepared package")
         response.compile_options[:] = options
         return response
 
@@ -416,6 +439,7 @@ class Client:
         module: str = "",
         debug_max_entries: int = 0,
         debug_max_depth: int = 0,
+        prepared: str | os.PathLike[str] | None = None,
     ) -> pb.ValidationReport:
         """Check callback syntax or full compilation without installing it."""
         if not isinstance(session_id, str) or not session_id or "\0" in session_id:
@@ -444,6 +468,7 @@ class Client:
                 callback_source=callback_source,
                 allow_call_original=allow_call_original,
                 trace_exceptions=trace_exceptions,
+                prepared=_prepared_package(prepared),
                 include_headers=list(include_headers),
                 compilation_database=compilation_database,
                 compile_options=options,
@@ -458,6 +483,8 @@ class Client:
             ),
             timeout=self.timeout,
         )
+        if prepared is not None and response.success and not response.prepared_used:
+            raise RuntimeError("server did not validate the required prepared package")
         return response
 
     def add_probe(self, session_id: str, spec: pb.ProbeSpec) -> pb.Probe:
@@ -500,11 +527,12 @@ class Client:
         debug_max_entries: int = 0,
         debug_max_depth: int = 0,
         compile_options: Iterable[str] = (),
+        prepared: str | os.PathLike[str] | None = None,
     ) -> pb.Probe:
         """Compile and install a C++ interceptor without manual ABI declarations.
 
         Header, compilation database and optional package paths refer to the
-        server host. Callback source is sent by value, so it can be local.
+        server host. Callback source and a prepared package are sent by value.
         """
         if not callback_source.strip() or "\0" in callback_source:
             raise ValueError("callback source must be nonempty and contain no NUL")
@@ -523,6 +551,7 @@ class Client:
             debug_max_entries=debug_max_entries,
             debug_max_depth=debug_max_depth,
             compile_options=options,
+            prepared=prepared,
         )
         spec.compile_options[:] = options
         spec.callback_source = callback_source
