@@ -931,7 +931,9 @@ Quoted C++ includes also complete local paths.
 Press Tab after `#incl`, `if`, `for`, `while`, `%cpp load`, or
 `%probe prepare` to insert a template. Type to replace the current placeholder
 and press Tab or Shift+Tab to move between placeholders. Use Alt+/ to complete
-a value while editing a placeholder. The editor closes brackets and quotes as you type,
+a value while editing a placeholder. For `%probe inject`, Tab moves from the
+selector to an optional arguments field. Type `%probe inject --callback` or
+`%probe inject --prepared` before Tab to start with a path placeholder. The editor closes brackets and quotes as you type,
 and Enter indents continued C++ input. Inside an empty brace pair, Enter
 opens an indented line between the braces.
 
