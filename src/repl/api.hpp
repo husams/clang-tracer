@@ -46,6 +46,47 @@ struct StackFrame {
   bool application_frame;
 };
 
+struct ModuleList {
+  ModuleList() = default;
+  ModuleList(const ModuleList &) = default;
+  ModuleList(ModuleList &&) noexcept = default;
+  ModuleList &operator=(const ModuleList &) = default;
+  ModuleList &operator=(ModuleList &&) noexcept = default;
+  // Keep the destructor available to JIT expressions that return temporaries.
+  ~ModuleList();
+
+  std::vector<std::string> paths;
+
+  bool empty() const { return paths.empty(); }
+  std::size_t size() const { return paths.size(); }
+  const std::string &at(std::size_t index) const { return paths.at(index); }
+  auto begin() const { return paths.begin(); }
+  auto end() const { return paths.end(); }
+};
+
+struct ModuleMapping {
+  std::uint64_t begin_address = 0;
+  std::uint64_t end_address = 0; // Exclusive.
+  std::uint64_t file_offset = 0;
+  std::string device;
+  std::uint64_t inode = 0;
+  std::string build_id;
+};
+
+struct ModuleInfo {
+  ModuleInfo() = default;
+  ModuleInfo(const ModuleInfo &) = default;
+  ModuleInfo(ModuleInfo &&) noexcept = default;
+  ModuleInfo &operator=(const ModuleInfo &) = default;
+  ModuleInfo &operator=(ModuleInfo &&) noexcept = default;
+  // Keep the destructor available to JIT expressions that return temporaries.
+  ~ModuleInfo();
+
+  std::string path;
+  std::string mapping_token;
+  std::vector<ModuleMapping> mappings;
+};
+
 class Event {
   std::shared_ptr<const EventData> data_;
 
@@ -190,6 +231,10 @@ public:
   explicit Facade(Controller &controller);
   const SessionHandle &selected_session() const;
   SessionHandle attach(std::uint32_t pid);
+  // Query the selected attachment. The filter matches a case-sensitive path substring.
+  ModuleList modules(const std::string &filter = {});
+  // Accept an exact path or unique basename from the selected attachment.
+  ModuleInfo module_info(const std::string &name);
   void prepare(const std::string &selector, const std::string &header,
                const std::string &output, const std::string &compdb = {},
                const std::string &translation_unit = {});

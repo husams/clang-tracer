@@ -52,6 +52,7 @@ class Controller {
   };
   std::map<std::string, PreparedPackage> prepared_packages_;
   std::filesystem::path default_module_index_;
+  clangtracer::v1::ListModulesResponse module_snapshot(bool include_mappings);
   void module_command(const Command &);
   std::filesystem::path module_index_path(const Command &) const;
   std::vector<std::string> pending_imports_;
@@ -102,6 +103,8 @@ public:
   const SessionHandle &selected_session() const { return selected_; }
 
   std::string prompt() const;
+  ModuleList modules(const std::string &filter);
+  ModuleInfo module_info(const std::string &name);
   void prepare(const std::string &selector, const Command &options);
   ::tracer_module::ModuleIndex build_module_index(const ::tracer_module::ModuleSource &,
       const std::filesystem::path &, const ::tracer_module::ModuleIndexOptions &);

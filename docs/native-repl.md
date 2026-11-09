@@ -268,15 +268,34 @@ blocks another call, resume, or probe changes on that target.
 
 ```text
 %threads
-%modules --details
+%modules --filter libdemo.so --details
 %symbols --filter Calculator --addresses
 %symbols --address 0xADDRESS --mapping TOKEN
 ```
 
 `%threads` shows thread IDs, names and start times for the selected process.
-`%modules` lists application module paths. Add `--details` for file-backed
-executable address ranges, file offsets, device and inode, and the ELF build
-ID when the backing file can be verified.
+`%modules` lists application module paths from the selected attached process.
+`--filter TEXT` matches a case-sensitive substring of the full path. Add
+`--details` for file-backed executable address ranges, file offsets, device
+and inode, and the ELF build ID when the backing file can be verified. The
+mapping token describes the session's full snapshot, including when the
+display is filtered.
+
+Use the C++ API at the prompt or in a REPL script.
+
+```cpp
+auto paths = tracer.modules("libdemo.so");
+auto module = tracer.module_info(paths.at(0));
+for (const auto& entry : module.mappings) { std::cout << entry.begin_address << ' ' << entry.build_id << '\n'; }
+```
+
+Call `tracer.modules()` to list all application module paths. Its `ModuleList`
+result supports iteration, `size()`, `empty()`, and `at()`. The paths are
+also available as a vector in `.paths`. Pass an exact path from the list or a
+unique exact filename to `tracer.module_info()`.
+Missing or ambiguous names throw `std::invalid_argument`. The result includes
+`path`, `mapping_token`, and `mappings`. Each mapping has `begin_address`,
+exclusive `end_address`, `file_offset`, `device`, `inode`, and `build_id`.
 
 `%symbols --addresses` shows runtime and ELF entries for supported C++ callables
 when there is a unique verified mapping. For reverse lookup, copy a runtime

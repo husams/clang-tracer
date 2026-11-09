@@ -307,7 +307,8 @@ public:
   public:
     ModulesContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
-    ValueContext *value();
+    std::vector<ValueContext *> value();
+    ValueContext* value(size_t i);
     std::vector<antlr4::tree::TerminalNode *> UINT();
     antlr4::tree::TerminalNode* UINT(size_t i);
 

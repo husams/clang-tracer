@@ -824,6 +824,56 @@ std::filesystem::path Controller::module_index_path(const Command &command) cons
   throw std::invalid_argument("no default module index; run %module index or %module use INDEX");
 }
 
+ModuleList::~ModuleList() = default;
+ModuleInfo::~ModuleInfo() = default;
+
+api::ListModulesResponse Controller::module_snapshot(bool include_mappings) {
+  require_session(selected_);
+  api::ListModulesRequest request;
+  request.set_session_id(selected_.id);
+  request.set_include_mappings(include_mappings);
+  auto response = unary<api::ListModulesResponse>(
+      [&](auto &context, auto &result) { return stub_->ListModules(&context, request, &result); },
+      settings_.timeout_seconds);
+  if (include_mappings && response.mapping_token().empty())
+    throw std::runtime_error("server does not support mapped module details");
+  return response;
+}
+
+ModuleList Controller::modules(const std::string &filter) {
+  const auto response = module_snapshot(false);
+  ModuleList modules;
+  for (const auto &path : response.modules()) {
+    if (path.find(filter) != std::string::npos)
+      modules.paths.push_back(path);
+  }
+  return modules;
+}
+
+ModuleInfo Controller::module_info(const std::string &name) {
+  const auto response = module_snapshot(true);
+  const bool use_basename = name.find('/') == std::string::npos;
+  ModuleInfo info;
+  for (const auto &path : response.modules()) {
+    if (path != name && !(use_basename && std::filesystem::path(path).filename() == name))
+      continue;
+    if (!info.path.empty())
+      throw std::invalid_argument("ambiguous module name: " + name + " (use its full path)");
+    info.path = path;
+  }
+  if (info.path.empty())
+    throw std::invalid_argument("module not found: " + name);
+  info.mapping_token = response.mapping_token();
+  for (const auto &entry : response.mappings()) {
+    if (entry.path() == info.path) {
+      info.mappings.push_back({entry.begin_address(), entry.end_address(),
+                               entry.file_offset(), entry.device(), entry.inode(),
+                               entry.build_id()});
+    }
+  }
+  return info;
+}
+
 ::tracer_module::ModuleIndex Controller::open_module_index(const std::filesystem::path &path) {
   auto index = ::tracer_module::ModuleIndex::open(path.empty() ? module_index_path(Command{}) : path);
   default_module_index_ = index.path();
@@ -1790,10 +1840,31 @@ bool Controller::execute(const Command &command) {
     module_command(command);
     return true;
   case K::modules: {
+    if (!command.has("--watch") && !command.has("--elf")) {
+      const auto filter = command.option("--filter");
+      if (!command.has("--details")) {
+        for (const auto &module : modules(filter))
+          out_ << module << '\n';
+      } else {
+        const auto response = module_snapshot(true);
+        out_ << "mapping=" << response.mapping_token() << '\n';
+        for (const auto &entry : response.mappings()) {
+          if (entry.path().find(filter) == std::string::npos)
+            continue;
+          out_ << "0x" << std::hex << entry.begin_address() << "-0x"
+               << entry.end_address() << " offset=0x" << entry.file_offset()
+               << std::dec << " device=" << entry.device() << " inode="
+               << entry.inode() << " build_id="
+               << (entry.build_id().empty() ? "unavailable" : entry.build_id())
+               << " " << std::quoted(printable_proc_text(entry.path())) << '\n';
+        }
+      }
+      return true;
+    }
     require_session(selected_);
     api::ListModulesRequest request;
     request.set_session_id(selected_.id);
-    request.set_include_mappings(command.has("--details") || command.has("--watch"));
+    request.set_include_mappings(command.has("--watch"));
     request.set_elf_path(command.option("--elf"));
     const auto modules = [&] { return unary<api::ListModulesResponse>(
         [&](auto &c, auto &r) { return stub_->ListModules(&c, request, &r); }); };
@@ -1835,7 +1906,7 @@ bool Controller::execute(const Command &command) {
         before = std::move(after);
       }
       out_ << "module watch complete changes=" << count << '\n';
-    } else if (command.has("--elf")) {
+    } else {
       if (response.elf_entries().empty())
         throw std::runtime_error("server did not return an ELF view");
       for (const auto &entry : response.elf_entries())
@@ -1843,21 +1914,6 @@ bool Controller::execute(const Command &command) {
              << " address=0x" << std::hex << entry.elf_address() << std::dec
              << " size=" << entry.size() << ' '
              << std::quoted(printable_proc_text(entry.name())) << '\n';
-    } else if (!command.has("--details")) {
-      for (const auto &module : response.modules())
-        out_ << module << '\n';
-    } else {
-      if (response.mapping_token().empty())
-        throw std::runtime_error("server does not support mapped module details");
-      out_ << "mapping=" << response.mapping_token() << '\n';
-      for (const auto &entry : response.mappings()) {
-        out_ << "0x" << std::hex << entry.begin_address() << "-0x"
-             << entry.end_address() << " offset=0x" << entry.file_offset()
-             << std::dec << " device=" << entry.device() << " inode="
-             << entry.inode() << " build_id="
-             << (entry.build_id().empty() ? "unavailable" : entry.build_id())
-             << " " << std::quoted(printable_proc_text(entry.path())) << '\n';
-      }
     }
     return true;
   }
@@ -2582,6 +2638,14 @@ const SessionHandle &Facade::selected_session() const {
 
 SessionHandle Facade::attach(std::uint32_t pid) {
   return controller_->attach(pid);
+}
+
+ModuleList Facade::modules(const std::string &filter) {
+  return controller_->modules(filter);
+}
+
+ModuleInfo Facade::module_info(const std::string &name) {
+  return controller_->module_info(name);
 }
 
 ::tracer_module::ModuleIndex Facade::module_index(const ::tracer_module::ModuleSource &source,
