@@ -11,6 +11,7 @@ service Tracer {
   rpc ValidateProbe(ValidateProbeRequest) returns (ValidationReport);
   rpc AddProbe(AddProbeRequest) returns (Probe);
   rpc ReloadProbe(ReloadProbeRequest) returns (ReloadProbeResponse);
+  rpc AgentPlugin(AgentPluginRequest) returns (AgentPluginResponse);
   rpc RemoveProbe(RemoveProbeRequest) returns (Probe);
   rpc Detach(DetachRequest) returns (Session);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
@@ -324,6 +325,26 @@ message RemoveProbeRequest {
   string session_id = 1;
   uint64 probe_id = 2;
 }
+message AgentPluginRequest {
+  enum Operation {
+    OPERATION_UNSPECIFIED = 0;
+    LOAD = 1;
+    RELOAD = 2;
+    RUN = 3;
+  }
+  string session_id = 1;
+  Operation operation = 2;
+  string plugin_id = 3;
+  bytes source = 4;
+  string command = 5;
+}
+
+message AgentPluginResponse {
+  uint64 generation = 1;
+  bool cache_hit = 2;
+  uint64 value = 3;
+}
+
 message DetachRequest { string session_id = 1; }
 message ListSessionsRequest {}
 message ListSessionsResponse { repeated Session sessions = 1; }

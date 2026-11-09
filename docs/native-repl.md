@@ -1096,6 +1096,39 @@ its own symbols, so peer globals and host libraries are unavailable for
 linking. Run plugins from trusted sources because they execute native code in
 the REPL process.
 
+## Load plugins in an injected agent
+
+Start a local managed server with agent plugins enabled and attach to a Linux
+x86-64 target. For a remote REPL, set the same environment variable on the
+server before starting it.
+
+```sh
+CLANG_TRACER_ALLOW_AGENT_PLUGINS=1 clang-tracer-repl --attach "$pid"
+```
+
+```text
+%plugin agent load examples/jit-plugin-globals/plugin_a.cpp --as a
+%plugin agent load examples/jit-plugin-globals/plugin_b.cpp --as b
+%plugin agent run a tick
+%plugin agent run b tick
+%plugin agent reload a examples/jit-plugin-globals/plugin_a.cpp
+%plugin agent run a value
+%plugin agent run b value
+```
+
+The REPL sends the source to the agent, which compiles it inside the target
+using its configured Clang profile. The same V1 command descriptor works in
+both runtimes. The agent supplies the SDK header and resolves other includes
+from its own compiler environment. The target's cache is under
+`$XDG_CACHE_HOME/clang-tracer/agent/plugins` or
+`~/.cache/clang-tracer/agent/plugins` when XDG_CACHE_HOME is unset.
+
+The server opt-in authorizes its clients to execute trusted native plugin
+code with the target process's permissions. Each attachment owns its plugin
+instances. A reload links a fresh generation of the named plugin and
+preserves its peers. Detaching releases the attachment's instances, and the
+compiled objects remain available for reuse.
+
 ## Cleanup and scripted use
 
 ```text

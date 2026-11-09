@@ -1557,6 +1557,27 @@ public:
     }
   }
 
+  grpc::Status AgentPlugin(grpc::ServerContext *,
+                           const api::AgentPluginRequest *request,
+                           api::AgentPluginResponse *response) override {
+    const auto *enabled = std::getenv("CLANG_TRACER_ALLOW_AGENT_PLUGINS");
+    if (!enabled || std::string_view(enabled) != "1")
+      return {grpc::StatusCode::PERMISSION_DENIED,
+              "agent plugins require CLANG_TRACER_ALLOW_AGENT_PLUGINS=1 on the server"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    try {
+      *response = session->agent_plugin(*request);
+      return grpc::Status::OK;
+    } catch (const std::invalid_argument &error) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, error.what()};
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
+  }
+
   grpc::Status RemoveProbe(grpc::ServerContext *,
                            const clangtracer::v1::RemoveProbeRequest *request,
                            clangtracer::v1::Probe *response) override {

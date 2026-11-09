@@ -156,6 +156,7 @@ function(tracer_add_native_repl)
   set_target_properties(clang-tracer-repl-check PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
   add_executable(clang-tracer-repl "${_repl}/main.cpp" "${_repl}/interpreter.cpp" "${_repl}/completion.cpp" "${_repl}/record_mappings.cpp" "${_repl}/check_process.cpp" "${_repl}/check_session.cpp" "${_repl}/shell.cpp" "${_repl}/compiler_profile.cpp" "${_repl}/mapping_cache.cpp")
   target_sources(clang-tracer-repl PRIVATE "${_repl}/help.cpp" "${_repl}/syntax.cpp" "${_repl}/plugins.cpp"
+    "${_src}/native_plugins.cpp"
     "${_repl}/editor.cpp" "${_repl}/editor_completion.cpp")
   add_dependencies(clang-tracer-repl clang-tracer-repl-check clang-tracer-prepare-injectors-native)
   target_include_directories(clang-tracer-repl SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
@@ -165,7 +166,8 @@ function(tracer_add_native_repl)
   set_target_properties(clang-tracer-repl PROPERTIES ENABLE_EXPORTS ON INSTALL_RPATH_USE_LINK_PATH TRUE
     INSTALL_RPATH "${_module_origin}/${_module_lib_relative}")
   if(NOT LLVM_ENABLE_RTTI)
-    set_source_files_properties("${_repl}/interpreter.cpp" "${_repl}/completion.cpp" PROPERTIES COMPILE_OPTIONS "-fno-rtti")
+    set_source_files_properties("${_repl}/interpreter.cpp" "${_repl}/completion.cpp"
+      "${_src}/native_plugins.cpp" PROPERTIES COMPILE_OPTIONS "-fno-rtti")
   endif()
   install(FILES ${_repl_facade_headers} DESTINATION "${_repl_facade_directory}" COMPONENT Runtime)
   install(TARGETS clang-tracer-repl clang-tracer-repl-check RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Runtime)
@@ -271,6 +273,12 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:repl-reload-target>)
       set_tests_properties(native_repl_reload_integration PROPERTIES TIMEOUT 240)
+      add_test(NAME native_repl_agent_plugins
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_agent_plugins.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-reload-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/examples/jit-plugin-globals")
+      set_tests_properties(native_repl_agent_plugins PROPERTIES TIMEOUT 120)
       add_executable(repl-bulk-concrete-target
         examples/prepared-injectors/concrete/target.cpp
         examples/prepared-injectors/concrete/virtual.cpp)

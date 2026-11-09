@@ -91,8 +91,10 @@ contextEventBytes : ('--context-event-bytes' | '--context-transport-memory-bytes
 extraCompileOption : '--extra-arg' value | '--extra-args' (value | SHELL)+;
 cwdOption : CWD value;
 plugin : 'plugin' ('load' value '--as' value | 'reload' value | 'list'
-                  | 'run' value value | 'commands' value);
-pluginKeyword : 'plugin' | 'run' | 'commands';
+                  | 'run' value value | 'commands' value
+                  | 'agent' ('load' value '--as' value | 'reload' value value
+                            | 'run' value value));
+pluginKeyword : 'plugin' | 'run' | 'commands' | 'agent';
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';

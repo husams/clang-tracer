@@ -1824,6 +1824,35 @@ public:
       throw std::runtime_error("server and agent do not support extra compiler arguments");
     return true;
   }
+  case K::agent_plugin_load:
+  case K::agent_plugin_reload:
+  case K::agent_plugin_run: {
+    require_session(selected_);
+    using Request = api::AgentPluginRequest;
+    const bool run = command.kind == K::agent_plugin_run;
+    const bool load = command.kind == K::agent_plugin_load;
+    const auto id = load ? command.option("--as") : args.at(0);
+    Request request;
+    request.set_session_id(selected_.id);
+    request.set_plugin_id(id);
+    request.set_operation(run ? Request::RUN : load ? Request::LOAD : Request::RELOAD);
+    if (run)
+      request.set_command(args.at(1));
+    else
+      request.set_source(read_source(args.at(load ? 0 : 1)));
+    const auto response = unary<api::AgentPluginResponse>(
+        [&](auto &context, auto &reply) {
+          return stub_->AgentPlugin(&context, request, &reply);
+        }, settings_.timeout_seconds);
+    if (run)
+      out_ << "agent " << id << '.' << request.command() << " = "
+           << response.value() << '\n';
+    else
+      out_ << "agent " << id << " generation " << response.generation()
+           << " active (" << (response.cache_hit() ? "cache hit" : "compiled")
+           << ")\n";
+    return true;
+  }
   case K::probe_reload: {
     require_session(selected_);
     api::ReloadProbeRequest request;

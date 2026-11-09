@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "admission.hpp"
+#include "agent_plugin_protocol.hpp"
 
 #include "tracer.grpc.pb.h"
 #include "tracer/protocol.hpp"
@@ -49,6 +50,8 @@ public:
                  const std::string &source_directory,
                  clangtracer::v1::ValidateProbeRequest::Level level);
   clangtracer::v1::Probe remove_probe(std::uint64_t probe_id);
+  clangtracer::v1::AgentPluginResponse
+  agent_plugin(const clangtracer::v1::AgentPluginRequest &request);
   void detach();
   void shutdown() noexcept;
   void record_failure(const std::string &message);
@@ -105,6 +108,8 @@ private:
   std::uintptr_t start_address_ = 0;
   std::uintptr_t stop_address_ = 0;
   std::uintptr_t validate_address_ = 0;
+  std::uintptr_t plugin_address_ = 0;
+  bool plugins_may_be_active_ = false;
   std::uintptr_t capacity_address_ = 0;
   std::uintptr_t pthread_detour_address_ = 0;
   std::map<std::uint64_t, ProbeRecord> probes_;
@@ -114,6 +119,10 @@ private:
   void attach_process(tracer::injector::Process &process,
                       std::chrono::steady_clock::time_point deadline);
   void check_identity_locked();
+  void invoke_agent_plugin_locked(AgentPluginCall &request,
+                                  const std::string &source,
+                                  std::chrono::steady_clock::time_point deadline);
+  void clear_agent_plugins_locked(std::chrono::steady_clock::time_point deadline);
   void set_failed_locked(const std::string &message);
   ProbeRecord &find_probe_locked(std::uint64_t probe_id);
   void release_request_locked(ProbeRecord &probe,

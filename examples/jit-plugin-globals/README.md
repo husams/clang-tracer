@@ -53,4 +53,25 @@ The reload reports `cache hit`, followed by `a.value = 0` and `b.value = 10`.
 %plugin run b value
 ```
 
+## Run inside a Linux target
+
+From the worktree root, start the native REPL with
+`CLANG_TRACER_ALLOW_AGENT_PLUGINS=1 clang-tracer-repl --attach "$pid"` using a
+matching server and agent. Enter the following commands. The returned
+addresses are in the target process.
+
+```text
+%plugin agent load examples/jit-plugin-globals/plugin_a.cpp --as a
+%plugin agent load examples/jit-plugin-globals/plugin_b.cpp --as b
+%plugin agent run a address
+%plugin agent run b address
+%plugin agent run a tick
+%plugin agent run b tick
+%plugin agent reload a examples/jit-plugin-globals/plugin_a.cpp
+%plugin agent run a value
+%plugin agent run b value
+```
+
+The reload reports `cache hit`, then A reads `0` and B reads `10`.
+
 [LLVM ORC symbol resolution](https://llvm.org/docs/ORCv2.html#design-overview)

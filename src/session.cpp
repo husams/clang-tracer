@@ -285,6 +285,7 @@ void Session::attach(const std::string &expected_executable) {
     const auto start = agent_symbol("tracer_agent_start");
     const auto stop = agent_symbol("tracer_agent_stop");
     const auto validate = agent_symbol("tracer_agent_validate");
+    const auto plugin = agent_symbol("tracer_agent_plugin_v1");
     const auto capacity = agent_symbol("tracer_agent_capacity_v1");
     const auto pthread_detour =
         agent_symbol("tracer_context_pthread_create_detour");
@@ -298,6 +299,7 @@ void Session::attach(const std::string &expected_executable) {
     start_address_ = start;
     stop_address_ = stop;
     validate_address_ = validate;
+    plugin_address_ = plugin;
     capacity_address_ = capacity;
     pthread_detour_address_ = pthread_detour;
   } catch (...) {
@@ -382,6 +384,97 @@ Session::validate_probe(const clangtracer::v1::ProbeSpec &spec,
     }
     throw;
   }
+}
+
+void Session::invoke_agent_plugin_locked(
+    AgentPluginCall &request, const std::string &source,
+    std::chrono::steady_clock::time_point deadline) {
+  if (!plugin_address_)
+    throw std::runtime_error("loaded native agent does not support plugins");
+  copy_field(request.session_id, id_, "plugin session");
+  request.source_size = source.size();
+  const auto size = sizeof(request) + source.size();
+  injector::Process process;
+  std::uintptr_t buffer = 0;
+  try {
+    attach_process(process, deadline);
+    buffer = process.remote_allocate(size);
+    process.remote_write(buffer, &request, sizeof(request));
+    const auto remote_source = source.empty() ? 0 : buffer + sizeof(request);
+    if (remote_source) {
+      process.remote_write(remote_source, source.data(), source.size());
+      plugins_may_be_active_ = true;
+    }
+    const auto status =
+        process.remote_call(plugin_address_, {buffer, remote_source}, 2);
+    process.remote_read(buffer, &request, sizeof(request));
+    process.remote_free(buffer, size);
+    buffer = 0;
+    process.detach();
+    if (status != 0)
+      throw std::runtime_error(std::string("agent plugin failed: ") +
+                               request.error);
+  } catch (...) {
+    if (buffer && !process.unsafe()) {
+      try {
+        process.remote_free(buffer, size);
+      } catch (...) {
+      }
+    }
+    if (process.unsafe()) {
+      unsafe_target_ = true;
+      set_failed_locked("plugin recovery is uncertain; target remains stopped");
+    }
+    throw;
+  }
+}
+
+clangtracer::v1::AgentPluginResponse
+Session::agent_plugin(const clangtracer::v1::AgentPluginRequest &rpc) {
+  std::lock_guard lock(mutex_);
+  if (state_ != clangtracer::v1::Session::ATTACHED || unsafe_target_)
+    throw std::runtime_error("session is not attached");
+  AgentPluginCall request{};
+  using Rpc = clangtracer::v1::AgentPluginRequest;
+  switch (rpc.operation()) {
+  case Rpc::LOAD:
+  case Rpc::RELOAD:
+    if (rpc.source().empty() || rpc.source().size() > kMaxAgentPluginSource ||
+        !rpc.command().empty())
+      throw std::invalid_argument(
+          "load and reload require plugin source up to 4 MiB");
+    request.operation = rpc.operation() == Rpc::LOAD ? AgentPluginOperation::Load
+                                                    : AgentPluginOperation::Reload;
+    break;
+  case Rpc::RUN:
+    if (rpc.command().empty() || !rpc.source().empty())
+      throw std::invalid_argument("run requires a plugin command");
+    request.operation = AgentPluginOperation::Run;
+    break;
+  default:
+    throw std::invalid_argument("invalid agent plugin operation");
+  }
+  if (rpc.plugin_id().empty())
+    throw std::invalid_argument("plugin name is required");
+  copy_field(request.plugin_id, rpc.plugin_id(), "plugin name");
+  copy_field(request.command, rpc.command(), "plugin command");
+  invoke_agent_plugin_locked(request, rpc.source(),
+                             std::chrono::steady_clock::now() + operation_timeout_);
+  clangtracer::v1::AgentPluginResponse response;
+  response.set_generation(request.generation);
+  response.set_cache_hit(request.cache_hit);
+  response.set_value(request.value);
+  return response;
+}
+
+void Session::clear_agent_plugins_locked(
+    std::chrono::steady_clock::time_point deadline) {
+  if (!plugins_may_be_active_)
+    return;
+  AgentPluginCall request{};
+  request.operation = AgentPluginOperation::Clear;
+  invoke_agent_plugin_locked(request, {}, deadline);
+  plugins_may_be_active_ = false;
 }
 
 Session::ProbeRecord &Session::find_probe_locked(std::uint64_t probe_id) {
@@ -1192,6 +1285,8 @@ void Session::detach() {
       release_request_locked(probe, std::chrono::steady_clock::now() +
                                         operation_timeout_);
   }
+  clear_agent_plugins_locked(std::chrono::steady_clock::now() +
+                             operation_timeout_);
   state_ = clangtracer::v1::Session::DETACHED;
   application_modules_.clear();
   error_.clear();
@@ -1227,6 +1322,14 @@ void Session::shutdown() noexcept {
                   [](const auto &item) {
                     return item.second.value.active() || item.second.value.draining();
                   });
+  if (state_ != clangtracer::v1::Session::EXITED && !unsafe_target_) {
+    try {
+      clear_agent_plugins_locked(shutdown_deadline);
+    } catch (const std::exception &error) {
+      if (first_error.empty())
+        first_error = error.what();
+    }
+  }
   if (state_ == clangtracer::v1::Session::EXITED)
     return;
   if (!any_active && first_error.empty()) {
