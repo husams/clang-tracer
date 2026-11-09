@@ -101,9 +101,9 @@ def main():
         until(rb'  #include "edit\xc3\xb6r headers/"')
         send('editor-t\t"\r')
         until(rb"\ntracer\[7\]> ")
-        send("concep\t")
-        until(rb"concept")
-        assert b"\x1b[0;96mconcept" in transcript
+        send("contin\t")
+        until(rb"continue")
+        assert b"\x1b[0;96mcontinue" in transcript
         send("\x15if\t")
         until(rb"if \(condition\) \{")
         send('terminal_header_value == 28\t\x1b[Zterminal_header_value == 27\t'
