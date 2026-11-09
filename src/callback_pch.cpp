@@ -40,15 +40,15 @@ namespace tracer::callback_pch {
 namespace {
 namespace fs = std::filesystem;
 
-// GCC 8–11 string headers can leave an internal char_traits template undefined
-// when loaded from a PCH. Keep that suffix textual, including type_traits, to
-// preserve its order after string_view and stdexcept on that runtime.
+// The interpreter can omit definitions for templates first instantiated in
+// this PCH: char_traits with libstdc++ 8–11 and std::min with libstdc++ 15.
+// Keep the affected headers textual so callbacks emit those definitions.
 constexpr std::string_view kCommonPrefix = R"PCH(
 #pragma once
 #include <cstdint>
 #include <cstddef>
 #if !defined(__GLIBCXX__) || !defined(_GLIBCXX_RELEASE) || \
-    _GLIBCXX_RELEASE > 11
+    (_GLIBCXX_RELEASE > 11 && _GLIBCXX_RELEASE < 15)
 #include <string_view>
 #include <stdexcept>
 #include <type_traits>
