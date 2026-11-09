@@ -9,8 +9,10 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import time
+from pathlib import Path
 
 
 def main():
@@ -20,6 +22,12 @@ def main():
         endpoint = f"127.0.0.1:{listener.getsockname()[1]}"
     server = subprocess.Popen([fixture, "--listen", endpoint], stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, text=True)
+    workspace = tempfile.TemporaryDirectory(prefix="tracer-repl-editor-")
+    work = Path(workspace.name)
+    headers = work / "editör headers"
+    headers.mkdir()
+    (headers / "editor-test.hpp").write_text("constexpr int terminal_header_value = 27;\n")
+    (work / "file with spaces.cpp").write_text('std::cout << "snippet-loaded" << std::endl;\n')
     child = None
     master, slave = pty.openpty()
     transcript = bytearray()
@@ -67,16 +75,55 @@ def main():
         env.pop("NO_COLOR", None)
         child = subprocess.Popen([console, "--endpoint", endpoint],
                                  stdin=slave, stdout=slave, stderr=slave,
-                                 env=env, start_new_session=True)
+                                 env=env, cwd=work, start_new_session=True)
         os.close(slave)
         slave = -1
         until(rb"tracer> ")
         send("%attach 7\r")
         until(rb"attached session=s1.*tracer\[7\]> ")
-        send("%collect --count 4 --as batch\r")
+        send("%collect")
+        until(rb"\[Tab: insert template\]")
+        send("\t")
+        until(rb"%collect --count count --as name")
+        send("4\tbatch\t\r")
         until(rb"received=4.*tracer\[7\]> ")
+
         start = len(transcript)
-        send("%symbols --limit 9")
+        send("#incl\t")
+        until(rb"#include <header>")
+        assert b"\x1b[0;94m#include" in transcript[start:]
+        send("cstddef\t\r")
+        until(rb"\ntracer\[7\]> ")
+        send('  #include "edi\t')
+        until(rb'  #include "edit\xc3\xb6r headers/"')
+        send('editor-t\t"\r')
+        until(rb"\ntracer\[7\]> ")
+        send("concep\t")
+        until(rb"concept")
+        assert b"\x1b[0;96mconcept" in transcript
+        send("\x15if\t")
+        until(rb"if \(condition\) \{")
+        send('terminal_header_value == 28\t\x1b[Zterminal_header_value == 27\t'
+             'std::cout << "editor {ready}" << std::endl;\t\r')
+        until(rb"(?m)^editor \{ready\}\n.*tracer\[7\]> ")
+
+        send("%cpp load\t")
+        until(rb'%cpp load "file"')
+        send("file w\x1b/\t\r")
+        until(rb"(?m)^snippet-loaded\n.*tracer\[7\]> ")
+
+        send('%probe prepare "demo()" --cwd edi\t')
+        until(rb'--cwd "edit\xc3\xb6r headers/')
+        send("\x15%collect --phase PO\t")
+        until(rb"--phase POST")
+        send("\x15%events  ex\t")
+        until(rb"%events export")
+        send("\x15%shell foo|bar")
+        until(rb"%shell foo\|bar")
+        assert b"\x1b[0;22;35m|" in transcript
+        send("\x15")
+        start = len(transcript)
+        send("%symbols --lim\t9")
         until(rb"%symbols --limit 9")
         command = bytes(transcript[start:])
         assert b"\x1b[0;96m%symbols" in command, command
@@ -123,6 +170,7 @@ def main():
         assert b'\x1b[33m--callback\x1b[0m' in transcript
         # Enter must keep an unfinished block in the editor; Ctrl+C discards it.
         send("for (const auto& e : data.events) {\r")
+        until(rb"\{\n +\n *\}")
         send("tracer.print(e);\r")
         send("\x03")
         until(rb"tracer\[7\]> ")
@@ -150,6 +198,7 @@ def main():
             os.close(slave)
         server.terminate()
         server.communicate(timeout=10)
+        workspace.cleanup()
     print("native terminal print/completion checks passed")
 
 

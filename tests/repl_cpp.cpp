@@ -315,6 +315,8 @@ int main(int argc, char **argv) {
     {
       std::ofstream(header, std::ios::app) << "#define BODY {}\n";
     }
+    require(contains(forced.complete("#incl"), "include"),
+            "directive completion works even when a loaded header changes");
     bool changed = false;
     try {
       (void)forced.evaluate("for (int n : {1,2}) BODY");

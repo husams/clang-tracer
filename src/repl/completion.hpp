@@ -2,12 +2,16 @@
 
 #include "interpreter.hpp"
 
+#include <optional>
+#include <string_view>
+
 namespace clang {
 class CompilerInstance;
 class LangOptions;
 } // namespace clang
 
 namespace tracer_repl {
+std::optional<CppCompletions> complete_cpp_directive(std::string_view source);
 CppCompletions complete_cpp(const std::vector<std::string> &arguments,
                             const std::string &history,
                             const std::string &source);
