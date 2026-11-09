@@ -1,4 +1,5 @@
-#pragma once
+#ifndef CLANG_TRACER_REPL_EVENT_VALUE_HPP
+#define CLANG_TRACER_REPL_EVENT_VALUE_HPP
 
 #include <array>
 #include <cmath>
@@ -320,3 +321,5 @@ struct EventCodec<std::unordered_set<T, Hash, Equal, Allocator>> {
   }
 };
 } // namespace tracer_repl
+
+#endif // CLANG_TRACER_REPL_EVENT_VALUE_HPP
