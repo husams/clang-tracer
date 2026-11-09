@@ -72,6 +72,9 @@ addresses are in the target process.
 %plugin agent run b value
 ```
 
-The reload reports `cache hit`, then A reads `0` and B reads `10`.
+A compatible first load reports `REPL object`. When the REPL and target
+compiler profiles differ, the first load reports `compiled` on a cold
+target cache. The reload reports `cache hit`, then A reads `0` and B reads
+`10`.
 
 [LLVM ORC symbol resolution](https://llvm.org/docs/ORCv2.html#design-overview)

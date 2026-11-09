@@ -5,8 +5,10 @@
 
 namespace tracer {
 inline constexpr std::size_t kMaxAgentPluginSource = 4 * 1024 * 1024;
+inline constexpr std::size_t kMaxAgentPluginOffer = kMaxAgentPluginSource;
 
 enum class AgentPluginOperation : std::uint32_t { Load, Reload, Run, Clear };
+inline constexpr int kAgentPluginReusedReplObject = 1;
 
 struct AgentPluginCall {
   std::uint32_t version = 1;

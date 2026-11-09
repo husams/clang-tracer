@@ -4,6 +4,7 @@
 #include "context_scheduler.hpp"
 #include "native_plugins.hpp"
 #include "runtime_paths.hpp"
+#include "tracer.pb.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -35,10 +36,13 @@ fs::path cache_directory() {
 template <std::size_t N> bool terminated(const char (&text)[N]) {
   return std::memchr(text, '\0', N) != nullptr;
 }
-} // namespace
 
-extern "C" int tracer_agent_plugin_v1(tracer::AgentPluginCall *request,
-                                      const char *source) noexcept {
+bool absolute_path(const std::string &path) {
+  return path.find('\0') == std::string::npos && fs::path(path).is_absolute();
+}
+
+int agent_plugin(tracer::AgentPluginCall *request, const char *source,
+                 const char *offer_bytes, std::size_t offer_size) noexcept {
   if (!request || request->version != 1)
     return -1;
   try {
@@ -62,16 +66,40 @@ extern "C" int tracer_agent_plugin_v1(tracer::AgentPluginCall *request,
                      {"-std=c++23", "-O0", "-fPIC", "-resource-dir",
                       tracer::runtime::clang_resource_dir()});
       auto &plugins = sessions.try_emplace(request->session_id).first->second;
+      const bool reload = request->operation == AgentPluginOperation::Reload;
+      const std::string_view contents(source, request->source_size);
+      const auto cache = cache_directory();
+      std::optional<tracer::NativePlugins::LoadResult> offered;
+      clangtracer::v1::AgentPluginObject offer;
+      if (offer_bytes && offer_size &&
+          offer_size <= tracer::kMaxAgentPluginOffer &&
+          offer.ParseFromArray(offer_bytes, static_cast<int>(offer_size)) &&
+          !offer.object().empty() && absolute_path(offer.source_path()) &&
+          absolute_path(offer.sdk_directory())) {
+        // Mirror the REPL's driver arguments and file names, using the
+        // target's own profile, headers and embedded SDK to check the key.
+        auto offer_profile = profile;
+        std::swap(offer_profile[1], offer_profile[2]);
+        offer_profile.insert(offer_profile.begin(),
+                             {"-I", offer.sdk_directory()});
+        offered = plugins.load_offered(
+            request->plugin_id,
+            {offer.source_path(), contents, tracer::kEmbeddedPluginHeader,
+             fs::path(offer.sdk_directory()) / "clang_tracer_repl_plugin.h"},
+            offer_profile, cache, reload,
+            {offer.fingerprint(), offer.checksum(), offer.object()});
+      }
       const auto result =
-          plugins.load(request->plugin_id,
-                       {"/__clang_tracer_plugin__/source.cpp",
-                        std::string_view(source, request->source_size),
-                        tracer::kEmbeddedPluginHeader},
-                       profile, cache_directory(),
-                       request->operation == AgentPluginOperation::Reload);
+          offered ? *offered
+                  : plugins.load(request->plugin_id,
+                                 {"/__clang_tracer_plugin__/source.cpp",
+                                  contents,
+                                  tracer::kEmbeddedPluginHeader,
+                                  {}},
+                                 profile, cache, reload);
       request->generation = result.generation;
       request->cache_hit = result.cache_hit;
-      return 0;
+      return result.from_repl ? tracer::kAgentPluginReusedReplObject : 0;
     }
     case AgentPluginOperation::Run: {
       const auto session = sessions.find(request->session_id);
@@ -90,4 +118,17 @@ extern "C" int tracer_agent_plugin_v1(tracer::AgentPluginCall *request,
     std::snprintf(request->error, sizeof(request->error), "%s", error.what());
     return -1;
   }
+}
+
+} // namespace
+
+extern "C" int tracer_agent_plugin_v1(tracer::AgentPluginCall *request,
+                                      const char *source) noexcept {
+  return agent_plugin(request, source, nullptr, 0);
+}
+
+extern "C" int tracer_agent_plugin_v2(tracer::AgentPluginCall *request,
+                                      const char *source, const char *offer,
+                                      std::size_t offer_size) noexcept {
+  return agent_plugin(request, source, offer, offer_size);
 }

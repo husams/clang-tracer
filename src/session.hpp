@@ -109,6 +109,7 @@ private:
   std::uintptr_t stop_address_ = 0;
   std::uintptr_t validate_address_ = 0;
   std::uintptr_t plugin_address_ = 0;
+  std::uintptr_t plugin_v2_address_ = 0;
   bool plugins_may_be_active_ = false;
   std::uintptr_t capacity_address_ = 0;
   std::uintptr_t pthread_detour_address_ = 0;
@@ -119,9 +120,10 @@ private:
   void attach_process(tracer::injector::Process &process,
                       std::chrono::steady_clock::time_point deadline);
   void check_identity_locked();
-  void invoke_agent_plugin_locked(AgentPluginCall &request,
+  bool invoke_agent_plugin_locked(AgentPluginCall &request,
                                   const std::string &source,
-                                  std::chrono::steady_clock::time_point deadline);
+                                  std::chrono::steady_clock::time_point deadline,
+                                  const std::string &offer = {});
   void clear_agent_plugins_locked(std::chrono::steady_clock::time_point deadline);
   void set_failed_locked(const std::string &message);
   ProbeRecord &find_probe_locked(std::uint64_t probe_id);

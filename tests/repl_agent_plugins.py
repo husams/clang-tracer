@@ -10,7 +10,7 @@ import tempfile
 from repl_browser_integration import Transcript, stop
 
 
-def main(repl, server, agent, fixture, examples):
+def main(repl, server, agent, fixture, examples, mode="reuse"):
     with tempfile.TemporaryDirectory(prefix="ct-agent-plugins-") as directory, ExitStack() as stack:
         root = Path(directory)
         env = {**os.environ, "XDG_CACHE_HOME": str(root / "cache"),
@@ -21,11 +21,14 @@ def main(repl, server, agent, fixture, examples):
         Transcript(target.stdout).expect(r"^ready entry=")
         memory = stack.enter_context(open(f"/proc/{target.pid}/mem", "rb", buffering=0))
         command = [repl, "--server", server, "--agent", agent, "--attach", str(target.pid)]
+        if mode == "fallback":
+            command.extend(["--cpp-arg", "-DTRACER_TEST_DIFFERENT_PLUGIN_PROFILE=1"])
         denied = subprocess.run(
             command, input='%plugin agent load "' + str(examples / "plugin_a.cpp") +
             '" --as a\n%quit\n', text=True, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, timeout=25,
-            env={**env, "CLANG_TRACER_ALLOW_AGENT_PLUGINS": "0"},
+            env={**env, "CLANG_TRACER_ALLOW_AGENT_PLUGINS": "0",
+                 "XDG_CACHE_HOME": str(root / "denied-cache")},
         )
         assert denied.returncode == 1, denied.stdout
         assert "agent plugins require CLANG_TRACER_ALLOW_AGENT_PLUGINS=1" in denied.stdout
@@ -61,9 +64,19 @@ def main(repl, server, agent, fixture, examples):
         def target_value(address):
             return struct.unpack("=I", os.pread(memory.fileno(), 4, address))[0]
 
-        load("a", 1, "compiled")
-        load("b", 1, "compiled")
-        assert len(list((root / "cache/clang-tracer/agent/plugins").glob("*.o"))) == 2
+        first_load = "REPL object" if mode == "reuse" else "compiled"
+        load("a", 1, first_load)
+        load("b", 1, first_load)
+        agent_objects = list((root / "cache/clang-tracer/agent/plugins").glob("*.o"))
+        repl_objects = list((root / "cache/clang-tracer/repl/plugins").glob("*.o"))
+        assert len(agent_objects) == len(repl_objects) == 2
+        if mode == "reuse":
+            assert {p.read_bytes() for p in agent_objects} == {
+                p.read_bytes() for p in repl_objects}
+            for name in ("a", "b"):
+                source = examples / f"plugin_{name}.cpp"
+                send(f'%plugin load "{source}" --as local-{name}')
+                output.expect(rf"^local-{name} generation 1 active \(cache hit\)$")
         a, b = plugin("a", "address"), plugin("b", "address")
         assert a != b
         plugin("a", "tick", 1)
@@ -104,4 +117,4 @@ def main(repl, server, agent, fixture, examples):
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:5], Path(sys.argv[5]))
+    main(*sys.argv[1:5], Path(sys.argv[5]), *sys.argv[6:])

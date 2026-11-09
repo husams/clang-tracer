@@ -1116,16 +1116,22 @@ CLANG_TRACER_ALLOW_AGENT_PLUGINS=1 clang-tracer-repl --attach "$pid"
 %plugin agent run b value
 ```
 
-The REPL sends the source to the agent, which compiles it inside the target
-using its configured Clang profile. The same V1 command descriptor works in
-both runtimes. The agent supplies the SDK header and resolves other includes
-from its own compiler environment. The target's cache is under
+On a Linux x86-64 REPL, loading or reloading automatically offers an object
+from the REPL cache or compiles one if needed. The agent checks the compiler
+profile, target and CPU, resolved source and headers, and object integrity
+before linking an offer. It reports `REPL object` when it accepts the offer,
+`cache hit` when it uses its own cache, or `compiled` when it compiles the
+source in the target. The same commands handle all three cases.
+
+The same V1 command descriptor works in both runtimes. The agent supplies
+the SDK header and resolves other includes from its compiler environment.
+The target's cache is under
 `$XDG_CACHE_HOME/clang-tracer/agent/plugins` or
 `~/.cache/clang-tracer/agent/plugins` when XDG_CACHE_HOME is unset.
 
-The server opt-in authorizes its clients to execute trusted native plugin
-code with the target process's permissions. Each attachment owns its plugin
-instances. A reload links a fresh generation of the named plugin and
+The server opt-in authorizes its clients to supply trusted plugin source and
+objects that execute with the target process's permissions. Each attachment
+owns its plugin instances. A reload links a fresh generation of the named plugin and
 preserves its peers. Detaching releases the attachment's instances, and the
 compiled objects remain available for reuse.
 

@@ -29,6 +29,8 @@
 #include <llvm/Config/llvm-config.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/IR/Module.h>
+#include <llvm/Object/ELFObjectFile.h>
+#include <llvm/Object/ObjectFile.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/SHA256.h>
@@ -162,11 +164,13 @@ struct Artifact {
   fs::path path;
   std::unique_ptr<llvm::MemoryBuffer> object;
   bool reused;
+  bool from_repl;
 };
 
-Artifact plugin_object(llvm::orc::LLJIT &jit, const NativePluginSource &input,
-                       const std::vector<std::string> &profile,
-                       const fs::path &cache) {
+std::optional<Artifact>
+plugin_object(llvm::orc::LLJIT &jit, const NativePluginSource &input,
+              const std::vector<std::string> &profile, const fs::path &cache,
+              std::optional<NativePluginObjectView> offer = {}) {
   const auto &source = input.path;
   auto overlay = llvm::makeIntrusiveRefCnt<llvm::vfs::OverlayFileSystem>(
       llvm::vfs::getRealFileSystem());
@@ -175,9 +179,14 @@ Artifact plugin_object(llvm::orc::LLJIT &jit, const NativePluginSource &input,
   if (input.contents) {
     memory->addFile(source.string(), 0,
                     llvm::MemoryBuffer::getMemBufferCopy(*input.contents));
-    memory->addFile(
-        (source.parent_path() / "clang_tracer_repl_plugin.h").string(), 0,
-        llvm::MemoryBuffer::getMemBufferCopy(input.sdk));
+    if (!input.sdk.empty()) {
+      const auto sdk_file =
+          input.sdk_file.empty()
+              ? source.parent_path() / "clang_tracer_repl_plugin.h"
+              : input.sdk_file;
+      memory->addFile(sdk_file.string(), 0,
+                      llvm::MemoryBuffer::getMemBufferCopy(input.sdk));
+    }
   } else if (!fs::is_regular_file(source)) {
     throw std::runtime_error("plugin source is not a regular file: " +
                              source.string());
@@ -210,9 +219,36 @@ Artifact plugin_object(llvm::orc::LLJIT &jit, const NativePluginSource &input,
     identity += '\0' + flag;
   identity += '\0';
   identity.append(preprocessed.data(), preprocessed.size());
-  auto path = plugin_cache(cache) / (digest(identity) + ".o");
+  const auto fingerprint = digest(identity);
+  if (offer && (offer->fingerprint != fingerprint ||
+                offer->checksum != digest(offer->bytes)))
+    return {};
+  auto path = plugin_cache(cache) / (fingerprint + ".o");
   if (auto object = cached_object(path))
-    return {std::move(path), std::move(object), true};
+    return Artifact{std::move(path), std::move(object), true, false};
+  if (offer) {
+    auto object =
+        llvm::MemoryBuffer::getMemBufferCopy(offer->bytes, path.string());
+    auto parsed =
+        llvm::object::ObjectFile::createObjectFile(object->getMemBufferRef());
+    if (!parsed) {
+      llvm::consumeError(parsed.takeError());
+      return {};
+    }
+    if (!(*parsed)->isELF() || !(*parsed)->isRelocatableObject() ||
+        (*parsed)->getArch() != jit.getTargetTriple().getArch())
+      return {};
+    for (const auto &section : (*parsed)->sections()) {
+      const llvm::object::ELFSectionRef elf_section(section);
+      const auto type = elf_section.getType();
+      if ((elf_section.getFlags() & llvm::ELF::SHF_TLS) ||
+          type == llvm::ELF::SHT_INIT_ARRAY ||
+          type == llvm::ELF::SHT_FINI_ARRAY ||
+          type == llvm::ELF::SHT_PREINIT_ARRAY)
+        return {};
+    }
+    return Artifact{path, std::move(object), false, true};
+  }
 
   const auto snapshot = source.string() + ".ii";
   memory->addFile(
@@ -246,7 +282,7 @@ Artifact plugin_object(llvm::orc::LLJIT &jit, const NativePluginSource &input,
       throw std::runtime_error(
           "plugins cannot define or import thread-local variables");
   auto object = require(jit.getIRCompileLayer().getCompiler()(*module));
-  return {std::move(path), std::move(object), false};
+  return Artifact{std::move(path), std::move(object), false, false};
 }
 
 bool valid_name(const std::string &name) {
@@ -326,15 +362,25 @@ struct NativePlugins::Impl {
     return found->second;
   }
 
-  LoadResult load(const std::string &id, NativePluginSource source,
-                  const std::vector<std::string> &profile,
-                  const fs::path &cache, bool reload) {
+  std::optional<LoadResult>
+  load(const std::string &id, NativePluginSource source,
+       const std::vector<std::string> &profile, const fs::path &cache,
+       bool reload, std::optional<NativePluginObjectView> offer = {}) {
     const auto previous = active.find(id);
     if (reload)
       find(id);
     else if (previous != active.end())
       throw std::invalid_argument("plugin already loaded: " + id);
-    auto artifact = plugin_object(*jit, source, profile, cache);
+    std::optional<Artifact> artifact;
+    try {
+      artifact = plugin_object(*jit, source, profile, cache, offer);
+    } catch (const std::exception &) {
+      if (offer)
+        return {};
+      throw;
+    }
+    if (!artifact)
+      return {};
     jit_error.clear();
     auto &session = jit->getExecutionSession();
     // Bare scopes see only their own object. Peers and host process symbols
@@ -346,20 +392,22 @@ struct NativePlugins::Impl {
     auto *old_scope =
         previous == active.end() ? nullptr : previous->second.scope;
     try {
-      auto object = artifact.reused ? std::move(artifact.object)
-                                    : llvm::MemoryBuffer::getMemBufferCopy(
-                                          artifact.object->getBuffer(),
-                                          artifact.path.string());
+      auto object = artifact->reused ? std::move(artifact->object)
+                                     : llvm::MemoryBuffer::getMemBufferCopy(
+                                           artifact->object->getBuffer(),
+                                           artifact->path.string());
       require(jit->addObjectFile(scope, std::move(object)));
       auto handlers = read_handlers(*jit, scope);
-      if (!artifact.reused)
-        store_object(artifact.path, artifact.object->getBuffer());
+      if (!artifact->reused)
+        store_object(artifact->path, artifact->object->getBuffer());
       active.insert_or_assign(id, Generation{std::move(source.path), &scope,
                                              number, std::move(handlers)});
     } catch (const std::exception &error) {
       if (auto cleanup = session.removeJITDylib(scope))
         throw std::runtime_error(std::string(error.what()) + "; cleanup: " +
                                  llvm::toString(std::move(cleanup)));
+      if (offer)
+        return {};
       if (!jit_error.empty())
         throw std::runtime_error(std::string(error.what()) + ": " + jit_error);
       throw;
@@ -369,7 +417,7 @@ struct NativePlugins::Impl {
         throw std::runtime_error(id +
                                  " replacement active; retiring old scope: " +
                                  llvm::toString(std::move(retirement)));
-    return {number, artifact.reused};
+    return LoadResult{number, artifact->reused, artifact->from_repl};
   }
 };
 
@@ -386,7 +434,32 @@ NativePlugins::load(const std::string &id, NativePluginSource source,
     throw std::invalid_argument("plugin is not loaded: " + id);
   if (!impl_)
     impl_ = std::make_unique<Impl>();
-  return impl_->load(id, std::move(source), profile, cache, reload);
+  return *impl_->load(id, std::move(source), profile, cache, reload);
+}
+
+std::optional<NativePlugins::LoadResult>
+NativePlugins::load_offered(const std::string &id, NativePluginSource source,
+                            const std::vector<std::string> &profile,
+                            const fs::path &cache, bool reload,
+                            NativePluginObjectView offer) {
+  if (!valid_name(id))
+    throw std::invalid_argument("invalid plugin name: " + id);
+  if (!impl_)
+    impl_ = std::make_unique<Impl>();
+  return impl_->load(id, std::move(source), profile, cache, reload, offer);
+}
+
+NativePluginObject
+NativePlugins::prepare(NativePluginSource source,
+                       const std::vector<std::string> &profile,
+                       const fs::path &cache) {
+  if (!impl_)
+    impl_ = std::make_unique<Impl>();
+  auto artifact = *plugin_object(*impl_->jit, source, profile, cache);
+  const auto bytes = artifact.object->getBuffer();
+  if (!artifact.reused)
+    store_object(artifact.path, bytes);
+  return {artifact.path.stem().string(), digest(bytes), bytes.str()};
 }
 
 NativePlugins::Info NativePlugins::info(const std::string &id) const {

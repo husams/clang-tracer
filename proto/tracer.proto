@@ -325,6 +325,14 @@ message RemoveProbeRequest {
   string session_id = 1;
   uint64 probe_id = 2;
 }
+message AgentPluginObject {
+  string source_path = 1;
+  string sdk_directory = 2;
+  string fingerprint = 3;
+  string checksum = 4;
+  bytes object = 5;
+}
+
 message AgentPluginRequest {
   enum Operation {
     OPERATION_UNSPECIFIED = 0;
@@ -337,12 +345,14 @@ message AgentPluginRequest {
   string plugin_id = 3;
   bytes source = 4;
   string command = 5;
+  AgentPluginObject repl_object = 6;
 }
 
 message AgentPluginResponse {
   uint64 generation = 1;
   bool cache_hit = 2;
   uint64 value = 3;
+  bool reused_repl_object = 4;
 }
 
 message DetachRequest { string session_id = 1; }

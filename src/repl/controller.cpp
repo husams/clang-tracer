@@ -1449,7 +1449,7 @@ void Controller::remove_bulk_trace(const std::string &batch_id) {
     throw std::runtime_error(report.diagnostic() + " | retry with %trace remove " + batch_id);
 }
 
-bool Controller::execute(const Command &command) {
+bool Controller::execute(const Command &command, const PluginOffer &offer) {
   const auto &args = command.arguments;
   using K = CommandKind;
   switch (command.kind) {
@@ -1838,8 +1838,12 @@ public:
     request.set_operation(run ? Request::RUN : load ? Request::LOAD : Request::RELOAD);
     if (run)
       request.set_command(args.at(1));
-    else
-      request.set_source(read_source(args.at(load ? 0 : 1)));
+    else {
+      const auto &path = args.at(load ? 0 : 1);
+      request.set_source(read_source(path));
+      if (offer)
+        offer(request, path);
+    }
     const auto response = unary<api::AgentPluginResponse>(
         [&](auto &context, auto &reply) {
           return stub_->AgentPlugin(&context, request, &reply);
@@ -1849,7 +1853,8 @@ public:
            << response.value() << '\n';
     else
       out_ << "agent " << id << " generation " << response.generation()
-           << " active (" << (response.cache_hit() ? "cache hit" : "compiled")
+           << " active (" << (response.reused_repl_object() ? "REPL object"
+                               : response.cache_hit() ? "cache hit" : "compiled")
            << ")\n";
     return true;
   }

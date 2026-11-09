@@ -10,6 +10,7 @@ if(NOT _result EQUAL 0)
   message(FATAL_ERROR "Cannot inspect agent exports: ${_error}")
 endif()
 set(_required tracer_agent_start tracer_agent_stop tracer_agent_validate tracer_agent_plugin_v1
+  tracer_agent_plugin_v2
   tracer_agent_runtime_profile_v1 tracer_agent_capacity_v1
   tracer_context_pthread_create_detour)
 string(REPLACE "\n" ";" _lines "${_symbols}")

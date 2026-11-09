@@ -286,6 +286,7 @@ void Session::attach(const std::string &expected_executable) {
     const auto stop = agent_symbol("tracer_agent_stop");
     const auto validate = agent_symbol("tracer_agent_validate");
     const auto plugin = agent_symbol("tracer_agent_plugin_v1");
+    const auto plugin_v2 = agent_symbol("tracer_agent_plugin_v2");
     const auto capacity = agent_symbol("tracer_agent_capacity_v1");
     const auto pthread_detour =
         agent_symbol("tracer_context_pthread_create_detour");
@@ -300,6 +301,7 @@ void Session::attach(const std::string &expected_executable) {
     stop_address_ = stop;
     validate_address_ = validate;
     plugin_address_ = plugin;
+    plugin_v2_address_ = plugin_v2;
     capacity_address_ = capacity;
     pthread_detour_address_ = pthread_detour;
   } catch (...) {
@@ -386,14 +388,16 @@ Session::validate_probe(const clangtracer::v1::ProbeSpec &spec,
   }
 }
 
-void Session::invoke_agent_plugin_locked(
+bool Session::invoke_agent_plugin_locked(
     AgentPluginCall &request, const std::string &source,
-    std::chrono::steady_clock::time_point deadline) {
+    std::chrono::steady_clock::time_point deadline, const std::string &offer) {
   if (!plugin_address_)
     throw std::runtime_error("loaded native agent does not support plugins");
   copy_field(request.session_id, id_, "plugin session");
   request.source_size = source.size();
-  const auto size = sizeof(request) + source.size();
+  const bool send_offer = plugin_v2_address_ && !offer.empty();
+  const auto size = sizeof(request) + source.size() +
+                    (send_offer ? offer.size() : 0);
   injector::Process process;
   std::uintptr_t buffer = 0;
   try {
@@ -405,15 +409,22 @@ void Session::invoke_agent_plugin_locked(
       process.remote_write(remote_source, source.data(), source.size());
       plugins_may_be_active_ = true;
     }
-    const auto status =
-        process.remote_call(plugin_address_, {buffer, remote_source}, 2);
+    const auto remote_offer = remote_source + source.size();
+    if (send_offer)
+      process.remote_write(remote_offer, offer.data(), offer.size());
+    const auto status = send_offer
+        ? process.remote_call(plugin_v2_address_,
+                              {buffer, remote_source, remote_offer, offer.size()}, 4)
+        : process.remote_call(plugin_address_, {buffer, remote_source}, 2);
     process.remote_read(buffer, &request, sizeof(request));
     process.remote_free(buffer, size);
     buffer = 0;
     process.detach();
-    if (status != 0)
+    const bool reused = send_offer && status == kAgentPluginReusedReplObject;
+    if (status != 0 && !reused)
       throw std::runtime_error(std::string("agent plugin failed: ") +
                                request.error);
+    return reused;
   } catch (...) {
     if (buffer && !process.unsafe()) {
       try {
@@ -447,7 +458,7 @@ Session::agent_plugin(const clangtracer::v1::AgentPluginRequest &rpc) {
                                                     : AgentPluginOperation::Reload;
     break;
   case Rpc::RUN:
-    if (rpc.command().empty() || !rpc.source().empty())
+    if (rpc.command().empty() || !rpc.source().empty() || rpc.has_repl_object())
       throw std::invalid_argument("run requires a plugin command");
     request.operation = AgentPluginOperation::Run;
     break;
@@ -458,12 +469,17 @@ Session::agent_plugin(const clangtracer::v1::AgentPluginRequest &rpc) {
     throw std::invalid_argument("plugin name is required");
   copy_field(request.plugin_id, rpc.plugin_id(), "plugin name");
   copy_field(request.command, rpc.command(), "plugin command");
-  invoke_agent_plugin_locked(request, rpc.source(),
-                             std::chrono::steady_clock::now() + operation_timeout_);
+  const auto offer = plugin_v2_address_ && rpc.has_repl_object() &&
+                             rpc.repl_object().ByteSizeLong() <= kMaxAgentPluginOffer
+                         ? rpc.repl_object().SerializeAsString() : std::string{};
+  const auto reused = invoke_agent_plugin_locked(
+      request, rpc.source(), std::chrono::steady_clock::now() + operation_timeout_,
+      offer);
   clangtracer::v1::AgentPluginResponse response;
   response.set_generation(request.generation);
   response.set_cache_hit(request.cache_hit);
   response.set_value(request.value);
+  response.set_reused_repl_object(reused);
   return response;
 }
 

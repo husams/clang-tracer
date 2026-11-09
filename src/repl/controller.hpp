@@ -84,7 +84,9 @@ class Controller {
 public:
   explicit Controller(Settings settings, std::ostream &out);
   ~Controller();
-  bool execute(const Command &command);
+  using PluginOffer = std::function<void(clangtracer::v1::AgentPluginRequest &,
+                                         const std::string &)>;
+  bool execute(const Command &command, const PluginOffer &offer = {});
   void shutdown();
 
   const SessionHandle &selected_session() const { return selected_; }
