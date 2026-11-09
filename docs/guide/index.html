@@ -690,8 +690,8 @@ clang-tracer<span class="w"> </span>detach<span class="w"> </span><span class="s
 <td>Detach and restore that session. Omit the ID for the selected session.</td>
 </tr>
 <tr>
-<td><code>%modules --details</code></td>
-<td>List eligible application modules. <code>--details</code> adds executable mappings, ELF identity, and a mapping token.</td>
+<td><code>%modules --filter libdemo.so --details</code></td>
+<td>List application modules from the selected process. <code>--filter TEXT</code> matches a case-sensitive path substring in either listing. <code>--details</code> adds executable mappings, ELF identity, and a mapping token.</td>
 </tr>
 <tr>
 <td><code>%threads</code></td>
@@ -3013,14 +3013,29 @@ blocks another call, resume, or probe changes on that target.
 <code>%terminate</code> still kills the owned target if it cannot finish.</p>
 <h3 id="repl--browse-a-local-c-target">Browse a local C++ target</h3>
 <div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%threads
-%modules<span class="w"> </span>--details
+%modules<span class="w"> </span>--filter<span class="w"> </span>libdemo.so<span class="w"> </span>--details
 %symbols<span class="w"> </span>--filter<span class="w"> </span>Calculator<span class="w"> </span>--addresses
 %symbols<span class="w"> </span>--address<span class="w"> </span>0xADDRESS<span class="w"> </span>--mapping<span class="w"> </span>TOKEN
 </code></pre></div>
 <p><code>%threads</code> shows thread IDs, names and start times for the selected process.
-<code>%modules</code> lists application module paths. Add <code>--details</code> for file-backed
-executable address ranges, file offsets, device and inode, and the ELF build
-ID when the backing file can be verified.</p>
+<code>%modules</code> lists application module paths from the selected attached process.
+<code>--filter TEXT</code> matches a case-sensitive substring of the full path. Add
+<code>--details</code> for file-backed executable address ranges, file offsets, device
+and inode, and the ELF build ID when the backing file can be verified. The
+mapping token describes the session's full snapshot, including when the
+display is filtered.</p>
+<p>Use the C++ API at the prompt or in a REPL script.</p>
+<div class="code-block"><div class="code-bar"><span>cpp</span><button class="copy" type="button">Copy</button></div><pre><code><span class="k">auto</span><span class="w"> </span><span class="n">paths</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tracer</span><span class="p">.</span><span class="n">modules</span><span class="p">(</span><span class="s">&quot;libdemo.so&quot;</span><span class="p">);</span>
+<span class="k">auto</span><span class="w"> </span><span class="k">module</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tracer</span><span class="p">.</span><span class="n">module_info</span><span class="p">(</span><span class="n">paths</span><span class="p">.</span><span class="n">at</span><span class="p">(</span><span class="mi">0</span><span class="p">));</span>
+<span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="k">auto</span><span class="o">&amp;</span><span class="w"> </span><span class="n">entry</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="k">module</span><span class="p">.</span><span class="n">mappings</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">cout</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="n">entry</span><span class="p">.</span><span class="n">begin_address</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="sc">&#39; &#39;</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="n">entry</span><span class="p">.</span><span class="n">build_id</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="sc">&#39;\n&#39;</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+</code></pre></div>
+<p>Call <code>tracer.modules()</code> to list all application module paths. Its <code>ModuleList</code>
+result supports iteration, <code>size()</code>, <code>empty()</code>, and <code>at()</code>. The paths are
+also available as a vector in <code>.paths</code>. Pass an exact path from the list or a
+unique exact filename to <code>tracer.module_info()</code>.
+Missing or ambiguous names throw <code>std::invalid_argument</code>. The result includes
+<code>path</code>, <code>mapping_token</code>, and <code>mappings</code>. Each mapping has <code>begin_address</code>,
+exclusive <code>end_address</code>, <code>file_offset</code>, <code>device</code>, <code>inode</code>, and <code>build_id</code>.</p>
 <p><code>%symbols --addresses</code> shows runtime and ELF entries for supported C++ callables
 when there is a unique verified mapping. For reverse lookup, copy a runtime
 address and the <code>mapping=</code> token from the same session. Addresses inside a

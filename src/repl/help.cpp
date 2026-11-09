@@ -76,8 +76,11 @@ const CommandTopic commands[] = {
     {"use", "%use SESSION", "Select an attached session for subsequent commands.", "%use s1"},
     {"status", "%status", "Show connection details, the selected session, and retained collections."},
     {"detach", "%detach [SESSION]", "Detach the selected or named session and remove its probes."},
-    {"modules", "%modules [--details | --elf PATH | --watch [--count N] [--timeout SECONDS]]",
-     "List mapped modules, inspect ELF imports, exports and sections, or report changes between snapshots."},
+    {"modules", "%modules [[--filter TEXT] [--details] | --elf PATH | --watch [--count N] [--timeout SECONDS]]",
+     "List application modules in the selected process. The filter matches a case-sensitive path substring. "
+     "Details show executable mappings, file identity, and a mapping token. "
+     "Use --elf to inspect ELF imports, exports and sections or --watch to report mapping changes.",
+     "%modules --filter libdemo.so --details"},
     {"library load", "%library load PATH", "Load a trusted Linux x86-64 shared object into the selected target until it exits."},
     {"memory write", "%memory write ADDRESS --mapping TOKEN --expect HEX --replace HEX",
      "Write up to 256 verified bytes to a private writable mapping. Restore with %memory restore."},
@@ -317,6 +320,16 @@ auto state = e.state_as<app::State>();)",
      "Use state_snapshot(index) to inspect fields without a mapping, or %cpp import for a local type definition."},
     {"attach", "Attach to a target PID and return its session handle.", "auto target = tracer.attach(12345);"},
     {"selected_session", "Get the currently selected attachment.", "auto target = tracer.selected_session();"},
+    {"modules", "List application module paths in the selected process.",
+     R"(auto paths = tracer.modules("libdemo.so");)",
+     "Pass an optional case-sensitive path substring. The ModuleList supports iteration, "
+     "size(), empty(), and at(index)."},
+    {"module_info", "Read the executable mappings for one module in the selected process.",
+     R"(auto info = tracer.module_info("libdemo.so");
+std::cout << info.path << ' ' << info.mapping_token << '\n';)",
+     "Pass the exact path or a unique basename. Missing and ambiguous names throw std::invalid_argument. "
+     "Each entry in info.mappings contains begin_address, end_address (exclusive), "
+     "file_offset, device, inode, and build_id."},
     {"prepare", "Generate a reusable probe package from local headers.",
      R"example(tracer.prepare("demo::compute(int)", {"demo.hpp", "state.hpp"}, "prepared");)example",
      "Pass one header, a braced list, or a vector of header paths. Order the probe's declaration header first, "

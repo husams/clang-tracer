@@ -38,7 +38,7 @@ Inside the REPL, quote selectors and paths containing spaces. Commands start wit
 | `%use s1` | Select an attached session for subsequent commands. |
 | `%status` | Show current connection, session, and retained collections. |
 | `%detach s1` | Detach and restore that session. Omit the ID for the selected session. |
-| `%modules --details` | List eligible application modules. `--details` adds executable mappings, ELF identity, and a mapping token. |
+| `%modules --filter libdemo.so --details` | List application modules from the selected process. `--filter TEXT` matches a case-sensitive path substring in either listing. `--details` adds executable mappings, ELF identity, and a mapping token. |
 | `%threads` | List selected target threads, including TIDs, names, and start times. |
 | `%symbols --filter add --limit 20 --addresses` | Browse supported DWARF callables. `--filter TEXT` matches a substring and `--module TEXT` narrows module paths. `--limit N` is a page size, with 0 meaning unbounded. `--page TOKEN` continues the query. `--addresses` adds verified live entries. `--mapping TOKEN` supplies a module mapping snapshot. `--address PC --mapping TOKEN` looks up a live PC and disables paging. |
 

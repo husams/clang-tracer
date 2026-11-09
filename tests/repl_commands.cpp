@@ -237,6 +237,17 @@ int main() {
   bad("%symbols --limit 4294967296");
   require(parse_command("%threads").kind == CommandKind::threads);
   require(parse_command("%modules --details").has("--details"));
+  require(parse_command("%modules --filter libdemo.so").option("--filter") == "libdemo.so");
+  const auto module_filter = parse_command("%modules --details --filter 'lib with spaces'");
+  require(module_filter.kind == CommandKind::modules && module_filter.has("--details") &&
+          module_filter.option("--filter") == "lib with spaces");
+  require(parse_command("%modules --filter demo --details").has("--details"));
+  bad("%modules --filter");
+  bad("%modules --filter one --filter two");
+  require(parse_command("%modules --elf libdemo.so").option("--elf") == "libdemo.so");
+  require(parse_command("%modules --watch --count 2 --timeout 10").number("--count", 0) == 2);
+  bad("%modules --elf libdemo.so --filter demo");
+  bad("%modules --watch --filter demo");
   require(parse_command("%attach 42 --start-time 100").number("--start-time", 0) == 100);
   require(parse_command("%symbols --filter demo --addresses").has("--addresses"));
   require(address_number(parse_command("%symbols --address 0x100a --mapping s:token")

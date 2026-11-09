@@ -14,7 +14,9 @@ sessions : 'sessions';
 use : 'use' value;
 status : 'status';
 detach : 'detach' value?;
-modules : 'modules' ('--details' | '--elf' value | '--watch' (('--timeout' | '--count') UINT)*)?;
+modules : 'modules' (('--details' | '--filter' value)*
+                    | '--elf' value
+                    | '--watch' (('--timeout' | '--count') UINT)*);
 moduleIndex : 'module' ('index' moduleBuildOption+
             | 'use' value
             | ('types' | 'symbols') moduleQueryOption*
