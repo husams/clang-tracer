@@ -9,8 +9,10 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import time
+from pathlib import Path
 
 
 def main():
@@ -20,6 +22,14 @@ def main():
         endpoint = f"127.0.0.1:{listener.getsockname()[1]}"
     server = subprocess.Popen([fixture, "--listen", endpoint], stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, text=True)
+    workspace = tempfile.TemporaryDirectory(prefix="tracer-repl-editor-")
+    work = Path(workspace.name)
+    headers = work / "editör headers"
+    headers.mkdir()
+    changed_header = work / "changed.hpp"
+    changed_header.write_text("#pragma once\n")
+    (headers / "editor-test.hpp").write_text("constexpr int terminal_header_value = 27;\n")
+    (work / "file with spaces.cpp").write_text('std::cout << "snippet-loaded" << std::endl;\n')
     child = None
     master, slave = pty.openpty()
     transcript = bytearray()
@@ -67,16 +77,103 @@ def main():
         env.pop("NO_COLOR", None)
         child = subprocess.Popen([console, "--endpoint", endpoint],
                                  stdin=slave, stdout=slave, stderr=slave,
-                                 env=env, start_new_session=True)
+                                 env=env, cwd=work, start_new_session=True)
         os.close(slave)
         slave = -1
         until(rb"tracer> ")
         send("%attach 7\r")
         until(rb"attached session=s1.*tracer\[7\]> ")
-        send("%collect --count 4 --as batch\r")
+        send("%collect")
+        until(rb"\[Tab: insert template\]")
+        send("\t")
+        until(rb"%collect --count count --as name")
+        # A typed space can match the separator already after the count.
+        send("4 \tbatch\t\r")
         until(rb"received=4.*tracer\[7\]> ")
+
         start = len(transcript)
-        send("%symbols --limit 9")
+        send("#incl\t")
+        until(rb"#include <header>")
+        assert b"\x1b[0;94m#include" in transcript[start:]
+        send("cstddef\t\r")
+        until(rb"\ntracer\[7\]> ")
+        send('  #include "edi\t')
+        until(rb'  #include "edit\xc3\xb6r headers/"')
+        send('editor-t\t"\r')
+        until(rb"\ntracer\[7\]> ")
+        send("contin\t")
+        until(rb"continue")
+        assert b"\x1b[0;96mcontinue" in transcript
+        send("\x15if\t")
+        until(rb"if \(condition\) \{")
+        send('terminal_header_value == 28\t\x1b[Zterminal_header_value == 27\t'
+             'std::cout << "editor {ready}" << std::endl;\t\r')
+        until(rb"(?m)^editor \{ready\}\n.*tracer\[7\]> ")
+
+        send("for\t")
+        until(rb"for \(init; condition; step\) \{")
+        # Typing and deleting a duplicate template separator must keep the fields.
+        send("int i = 0;\x7f\t")
+        until(rb"for \(int i = 0; condition; step\) \{")
+        send("i < 2\t++i\t")
+        until(rb"for \(int i = 0; i < 2; \+\+i\) \{")
+        send('std::cout << "loop-" << i << std::endl;\t\r')
+        until(rb"(?m)^loop-0\nloop-1\n.*tracer\[7\]> ")
+
+        send('#include "changed.hpp"\r')
+        until(rb"\ntracer\[7\]> ")
+        original_header = changed_header.read_bytes()
+        stamp = changed_header.stat()
+        changed_header.write_bytes(original_header + b"// changed during editing\n")
+        send("for (int x = 1; x < 2; ++x) {\rstd::cou\t")
+        until(rb"C\+\+ completion: C\+\+ header changed: [^\n]*changed.hpp;[^\n]*\n"
+              rb"tracer\[7\]> \n?for \(int x = 1; x < 2; \+\+x\) \{\n +std::cou")
+        assert b"\x1b[JC++ completion:" in transcript
+        changed_header.write_bytes(original_header)
+        os.utime(changed_header, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        send('t << "completion-input-kept" << std::endl;\r}\r')
+        until(rb"(?m)^completion-input-kept\n.*tracer\[7\]> ")
+
+        send("%probe inject \t")
+        until(rb'%probe inject "selector"')
+        send("demo::compute(int)\t")
+        until(rb"\[optional: --callback FILE or --prepared DIRECTORY\]")
+        send("--prepared prepared\t")
+        until(rb'%probe inject "demo::compute\(int\)" --prepared prepared')
+        send("\x03")
+        until(rb"\ntracer\[7\]> ")
+
+        send("%probe inject --callback\t")
+        until(rb'%probe inject "selector" --callback "file"')
+        send("demo::compute(int)\thook.cpp\t")
+        until(rb'%probe inject "demo::compute\(int\)" --callback "hook.cpp"')
+        send("\x03")
+        until(rb"\ntracer\[7\]> ")
+
+        send("%probe prepare\t")
+        until(rb'%probe prepare "selector" --include "header" --output "directory"')
+        send("demo::compute(int)\tdemo.hpp\tprepared\t")
+        until(rb'%probe prepare "demo::compute\(int\)" --include "demo.hpp" --output "prepared"')
+        send("\x03")
+        until(rb"\ntracer\[7\]> ")
+
+        send("%cpp load\t")
+        until(rb'%cpp load "file"')
+        send("file w\x1b/\t\r")
+        until(rb"(?m)^snippet-loaded\n.*tracer\[7\]> ")
+
+        send('%probe prepare "demo()" --cwd edi\t')
+        until(rb'--cwd "edit\xc3\xb6r headers/')
+        send("\x15%collect --phase PO\t")
+        until(rb"--phase POST")
+        send("\x15%events  ex\t")
+        until(rb"%events export")
+        send("\x15%shell foo|bar")
+        until(rb"%shell foo\|bar")
+        assert b"\x1b[0;22;35m|" in transcript
+        send("\x15")
+        start = len(transcript)
+        send("%symbols --lim\t9")
         until(rb"%symbols --limit 9")
         command = bytes(transcript[start:])
         assert b"\x1b[0;96m%symbols" in command, command
@@ -123,6 +220,7 @@ def main():
         assert b'\x1b[33m--callback\x1b[0m' in transcript
         # Enter must keep an unfinished block in the editor; Ctrl+C discards it.
         send("for (const auto& e : data.events) {\r")
+        until(rb"\{\n +\n *\}")
         send("tracer.print(e);\r")
         send("\x03")
         until(rb"tracer\[7\]> ")
@@ -150,6 +248,7 @@ def main():
             os.close(slave)
         server.terminate()
         server.communicate(timeout=10)
+        workspace.cleanup()
     print("native terminal print/completion checks passed")
 
 

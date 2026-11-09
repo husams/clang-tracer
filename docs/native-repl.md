@@ -921,9 +921,24 @@ also show the public signatures from the loaded declarations. Shortcuts such
 as `%help Event` still work. Help uses syntax highlighting on color terminals
 and plain text for redirected output or when `NO_COLOR` is set.
 
-Tab completes help topics and C++ names and members, including
-`tracer.`, `data.`, and `data.at(0).`, using Clang's semantic analysis and the
-session's semantically accepted inputs. `%complete "data.at(0)."` prints the same candidates
+Tab completes commands, subcommands, options, known option values, help topics,
+and C++ keywords and members. For example, `%collect --ph` completes to
+`--phase`, and `%collect --phase PO` completes to `POST`. In a path argument
+such as `%cpp load ./` or `%probe prepare "demo()" --cwd ./`, Tab lists local
+matches. Directories end in `/` so you can continue completing the path.
+Quoted C++ includes also complete local paths.
+
+Press Tab after `#incl`, `if`, `for`, `while`, `%cpp load`, or
+`%probe prepare` to insert a template. Type to replace the current placeholder
+and press Tab or Shift+Tab to move between placeholders. Use Alt+/ to complete
+a value while editing a placeholder. For `%probe inject`, Tab moves from the
+selector to an optional arguments field. Type `%probe inject --callback` or
+`%probe inject --prepared` before Tab to start with a path placeholder. The editor closes brackets and quotes as you type,
+and Enter indents continued C++ input. Inside an empty brace pair, Enter
+opens an indented line between the braces.
+
+Member completion for expressions such as `tracer.`, `data.`, and
+`data.at(0).` uses Clang and the session's accepted inputs. `%complete "data.at(0)."` prints the same candidates
 when `data` has been declared. Completion parses code without executing it or
 issuing tracing operations. It runs on Tab, rather than on each keystroke;
 longer sessions can increase completion time. `%cpp reset` clears that session.
@@ -939,9 +954,9 @@ and members such as `tracer.events_async`. It lists function overloads and
 shows readable types such as `std::string` and `std::map<std::string, int>`.
 It looks up declarations without evaluating C++ expressions.
 
-Color terminals highlight C++ keywords and percent commands in cyan, literals
-in green, operators in magenta, command options in yellow, and comments in
-gray. The prompt, help examples, and `%type` output share the palette.
+Color terminals distinguish preprocessor directives, include headers, C++
+keywords, strings, numbers, operators, percent commands, options, and
+comments. The prompt, help examples, and `%type` output share the palette.
 
 Ordinary C++ checks retain accepted syntax in a separate, syntax-only compiler
 process. Each new input is checked in a disposable fork, so rejected declarations

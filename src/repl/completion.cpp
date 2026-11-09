@@ -833,6 +833,28 @@ bool incomplete_cpp(const std::string &source) {
   return !brackets.empty();
 }
 
+std::optional<CppCompletions> complete_cpp_directive(std::string_view source) {
+  const auto newline = source.rfind('\n');
+  auto line = newline == source.npos ? source : source.substr(newline + 1);
+  const auto first = line.find_first_not_of(" \t");
+  if (first == line.npos || line[first] != '#') return {};
+  line.remove_prefix(first + 1);
+  const auto start = line.find_first_not_of(" \t");
+  line.remove_prefix(start == line.npos ? line.size() : start);
+  if (line.find_first_not_of("abcdefghijklmnopqrstuvwxyz_") != line.npos)
+    return {};
+
+  CppCompletions result;
+  result.prefix = line;
+  for (const std::string_view directive : {
+           "define", "elif", "elifdef", "elifndef", "else", "endif", "error",
+           "if", "ifdef", "ifndef", "include", "include_next", "line",
+           "pragma", "undef", "warning"}) {
+    if (llvm::StringRef(directive).starts_with(line)) result.items.emplace_back(directive);
+  }
+  return result;
+}
+
 CppCompletions complete_cpp(const std::vector<std::string> &arguments,
                             const std::string &history,
                             const std::string &source) {

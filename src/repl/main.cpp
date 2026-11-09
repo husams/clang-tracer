@@ -10,10 +10,10 @@
 #include <string>
 #include <string_view>
 
-#include <replxx.hxx>
 #include <unistd.h>
 
 #include "completion.hpp"
+#include "editor.hpp"
 #include "controller.hpp"
 #include "help.hpp"
 #include "interpreter.hpp"
@@ -79,109 +79,6 @@ struct Signals {
   ~Signals() { sigaction(SIGINT, &old, nullptr); }
 };
 
-class Input {
-  bool terminal_ = ::isatty(STDIN_FILENO);
-  replxx::Replxx editor_;
-  tr::CppEngine *cpp_ = nullptr;
-
-public:
-  explicit Input(bool color) {
-    editor_.set_no_color(!color);
-    editor_.set_max_history_size(1000);
-    editor_.set_double_tab_completion(false);
-    editor_.bind_key(replxx::Replxx::KEY::ENTER, [this](char32_t key) {
-      const std::string source = editor_.get_state().text();
-      const auto first = source.find_first_not_of(" \t\r\n");
-      const bool more = first != std::string::npos && source[first] != '%' &&
-                        tr::incomplete_cpp(source);
-      return editor_.invoke(more ? replxx::Replxx::ACTION::NEW_LINE
-                                 : replxx::Replxx::ACTION::COMMIT_LINE,
-                            key);
-    });
-    editor_.set_completion_callback(
-        [this](const std::string &input, int &length) {
-          replxx::Replxx::completions_t completions;
-          const auto first = input.find_first_not_of(" \t\r\n");
-          if (first == std::string::npos)
-            return completions;
-          const auto entered = input.substr(first);
-          if (entered.front() == '%') {
-            // Command completions never perform RPCs on the editor's input
-            // thread.
-            for (const auto &name : tr::command_completions()) {
-              if (name.rfind(entered, 0) == 0) {
-                completions.emplace_back(name);
-              }
-            }
-            // Matching command prefixes are ASCII; preserve replxx's code-point
-            // context length for arbitrary UTF-8 argument text.
-            if (!completions.empty()) {
-              length = static_cast<int>(entered.size());
-            }
-          } else if (cpp_) {
-            try {
-              const auto candidates = cpp_->complete(input);
-              length = static_cast<int>(std::count_if(
-                  candidates.prefix.begin(), candidates.prefix.end(),
-                  [](unsigned char byte) { return (byte & 0xc0) != 0x80; }));
-              for (const auto &candidate : candidates.items)
-                completions.emplace_back(candidate);
-            } catch (const std::exception &error) {
-              editor_.print("C++ completion: %s\n", error.what());
-            }
-          }
-          return completions;
-        });
-    if (color) editor_.set_highlighter_callback(
-        [](const std::string& input, auto& colors) {
-          using Color = replxx::Replxx::Color;
-          constexpr Color palette[] = {
-              Color::BRIGHTCYAN, Color::GREEN, Color::MAGENTA, Color::BROWN, Color::GRAY};
-          const auto first = input.find_first_not_of(" \t\r\n");
-          if (first == std::string::npos) return;
-          const auto syntax = input[first] == '%' ? tr::Syntax::command : tr::Syntax::cpp;
-          std::size_t byte = 0, character = 0;
-          for (const auto& span : tr::highlight(input, syntax)) {
-            for (; byte < span.end; ++byte) {
-              if ((static_cast<unsigned char>(input[byte]) & 0xc0) == 0x80) continue;
-              if (character == colors.size()) return;
-              if (byte >= span.begin)
-                colors[character] = palette[static_cast<std::size_t>(span.style)];
-              ++character;
-            }
-          }
-        });
-  }
-
-  bool terminal() const { return terminal_; }
-  void use_cpp(tr::CppEngine &cpp) { cpp_ = &cpp; }
-
-  std::optional<std::string> read(const std::string &prompt) {
-    if (!terminal_) {
-      std::string line;
-      if (!std::getline(std::cin, line)) {
-        return {};
-      }
-      return line;
-    }
-    for (;;) {
-      errno = 0;
-      const auto *line = editor_.input(prompt);
-      if (!line && (errno == EAGAIN || tr::interrupted.load())) {
-        tr::interrupted = false;
-        continue;
-      }
-      if (!line) {
-        return {};
-      }
-      std::string result(line);
-      if (!result.empty()) {
-        editor_.history_add(result);
-      }
-      return result;
-    }
-  }
-};
 } // namespace
 
 int main(int argc, char **argv) {
@@ -297,7 +194,7 @@ int main(int argc, char **argv) {
     }
     Signals signals;
     const bool color = color_output();
-    Input input(color);
+    tr::Input input(color);
     tr::Controller controller(settings, std::cout);
     tr::Facade facade(controller);
     tr::CppEngine cpp(facade, std::move(cpp_args));
@@ -312,7 +209,7 @@ int main(int argc, char **argv) {
     }
     if (input.terminal()) {
       std::cout << "Clang Tracer native C++17 REPL. %help lists commands; "
-                   "%help api lists C++ APIs. Tab completes help topics and members.\n";
+                   "%help api lists C++ APIs. Tab completes commands, paths, and C++.\n";
     }
     bool failed = false;
     while (true) {

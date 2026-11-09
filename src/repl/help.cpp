@@ -21,6 +21,17 @@ struct CommandTopic {
   string_view example{};
 };
 
+constexpr string_view stream_options =
+    "--count N --timeout SECONDS --after CURSOR --probe ID\n"
+    "--phase PRE|POST|EXCEPTION --name SELECTOR --session ID | --all";
+constexpr string_view resolution_options =
+    "--include SERVER_HEADER --compdb SERVER_PATH [--translation-unit SERVER_FILE]\n"
+    "--module TEXT --compile-option FLAG\n"
+    "--prepared DIRECTORY --prepared-mode off|prefer|require";
+constexpr string_view deployment_options =
+    "--stack-depth N|full --stack-application-only true|false\n"
+    "--print-arguments --print-result";
+
 const CommandTopic commands[] = {
     {"server", "", "Start, connect to, inspect, or stop a tracing server."},
     {"server start", "%server start [--executable PATH] [--agent PATH] [--context-event-bytes N] "
@@ -118,6 +129,7 @@ const CommandTopic commands[] = {
      "%trace apply --manifest trace.textproto"},
     {"trace remove", "%trace remove BATCH_ID",
      "Remove or retry restoration of the probes owned by a batch in the selected session."},
+    {"probes", "%probes [--cwd DIRECTORY]", "List the probes in the selected session."},
     {"probe", "", "Prepare, resolve, validate, install, or remove a probe."},
     {"probe entry", "%probe entry SELECTOR --mapping TOKEN [--module MODULE] [--cwd DIRECTORY]\n"
      "  or %probe entry --module PATH --elf-address ADDRESS --abi linux-x86-64-sysv --mapping TOKEN [--cwd DIRECTORY]",
@@ -558,19 +570,14 @@ void command_details(std::ostream& out, const CommandTopic& entry, bool color) {
   if (entry.usage.find("STREAM OPTIONS") != string_view::npos) {
     out << '\n';
     heading(out, "Stream options", color);
-    block(out, "--count N --timeout SECONDS --after CURSOR --probe ID\n"
-               "--phase PRE|POST|EXCEPTION --name SELECTOR --session ID | --all",
-          Syntax::command, color);
+    block(out, stream_options, Syntax::command, color);
     out << "The selected session is the default. Without a count or timeout, press Ctrl+C to stop.\n";
   }
   if (entry.usage.find("RESOLUTION OPTIONS") != string_view::npos) {
     out << '\n';
     heading(out, "Resolution options", color);
-    block(out, "--include SERVER_HEADER --compdb SERVER_PATH [--translation-unit SERVER_FILE]\n"
-               "--module TEXT --compile-option FLAG\n"
-               "--prepared DIRECTORY --prepared-mode off|prefer|require\n"
-               "[EXTRA COMPILER ARGUMENTS]",
-          Syntax::command, color);
+    block(out, resolution_options, Syntax::command, color);
+    block(out, "[EXTRA COMPILER ARGUMENTS]", Syntax::command, color);
     out << "The default mode, prefer, uses an available prepared package and falls back to DWARF.\n";
     out << "With a typed prepared package, --compdb supplies include paths, forced includes and macros to the callback.\n"
            "Extra headers must coexist with the prepared declarations. Use --translation-unit to override the donor.\n";
@@ -588,9 +595,7 @@ void command_details(std::ostream& out, const CommandTopic& entry, bool color) {
   if (entry.usage.find("DEPLOYMENT OPTIONS") != string_view::npos) {
     out << '\n';
     heading(out, "Deployment options", color);
-    block(out, "--stack-depth N|full --stack-application-only true|false",
-          Syntax::command, color);
-    block(out, "--print-arguments --print-result", Syntax::command, color);
+    block(out, deployment_options, Syntax::command, color);
   }
   if (!entry.example.empty()) {
     out << '\n';
@@ -619,8 +624,10 @@ void api_details(std::ostream& out, const ApiTopic& entry, CppEngine& cpp, bool 
 const std::vector<std::string>& command_completions() {
   static const auto names = [] {
     auto result = command_names();
-    for (const auto& entry : commands)
+    for (const auto& entry : commands) {
+      result.push_back("%" + std::string(entry.name));
       result.push_back("%help " + std::string(entry.name));
+    }
     result.emplace_back("%help exit");
     result.emplace_back("%help api");
     result.emplace_back("%help api Facade");
@@ -629,9 +636,32 @@ const std::vector<std::string>& command_completions() {
       if (entry.declarations)
         result.push_back("%help " + std::string(entry.name));
     }
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
     return result;
   }();
   return names;
+}
+
+std::string command_usage(std::string_view name) {
+  for (const auto& entry : commands) {
+    if (entry.name != name) continue;
+    std::string usage(entry.usage);
+    const auto append_options = [&](string_view group, string_view options) {
+      if (entry.usage.find(group) != string_view::npos) {
+        usage += '\n';
+        usage += options;
+      }
+    };
+    append_options("STREAM OPTIONS", stream_options);
+    append_options("RESOLUTION OPTIONS", resolution_options);
+    append_options("DEPLOYMENT OPTIONS", deployment_options);
+    if (entry.usage.find("EXTRA COMPILER ARGUMENTS") != string_view::npos ||
+        entry.usage.find("RESOLUTION OPTIONS") != string_view::npos)
+      usage += " --extra-arg ARG --extra-args ARG";
+    return usage;
+  }
+  return {};
 }
 
 void print_help(std::ostream& out, const std::vector<std::string>& arguments,
