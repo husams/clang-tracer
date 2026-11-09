@@ -59,6 +59,26 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitModuleIndex(TracerCommandsParser::ModuleIndexContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitModuleBuildOption(TracerCommandsParser::ModuleBuildOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitModuleQueryOption(TracerCommandsParser::ModuleQueryOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitModuleShowOption(TracerCommandsParser::ModuleShowOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitModuleEmitOption(TracerCommandsParser::ModuleEmitOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitThreads(TracerCommandsParser::ThreadsContext *ctx) override {
     return visitChildren(ctx);
   }

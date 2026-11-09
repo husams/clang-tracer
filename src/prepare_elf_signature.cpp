@@ -44,10 +44,12 @@ struct ElfCallable {
 };
 
 ElfCallable select_symbol(const llvm::object::ELF64LEObjectFile &image,
-                          const std::string &selector, bool member) {
+                          const std::string &selector, bool member,
+                          const IndexedElfSignature *indexed) {
   auto wanted = compact(selector);
   if (wanted.starts_with("::")) wanted.erase(0, 2);
   std::optional<ElfCallable> match;
+  bool ambiguous_indexed_linkage = false;
   const auto visit = [&](const llvm::object::SymbolRef &symbol) {
     const llvm::object::ELFSymbolRef elf(symbol);
     if (elf.getELFType() != llvm::ELF::STT_FUNC || !elf.getSize())
@@ -68,14 +70,30 @@ ElfCallable select_symbol(const llvm::object::ELF64LEObjectFile &image,
     if (linkage.size() > 511 || linkage.find_first_not_of(
             "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") != linkage.npos)
       return;
+    auto address = symbol.getAddress();
+    if (!address) {
+      llvm::consumeError(address.takeError());
+      return;
+    }
+    if (indexed) {
+      if (linkage != indexed->linkage) return;
+      if (*address != indexed->address || elf.getSize() != indexed->size) {
+        ambiguous_indexed_linkage = true;
+        return;
+      }
+    }
     llvm::ItaniumPartialDemangler demangler;
-    if (demangler.partialDemangle(linkage.c_str()) || !demangler.isFunction() ||
-        demangler.isSpecialName() || demangler.isCtorOrDtor())
+    if (demangler.partialDemangle(linkage.c_str())) {
+      if (indexed && !member && linkage.rfind("_Z", 0) != 0)
+        match = ElfCallable{linkage, "", "", "", *address, elf.getSize()};
+      return;
+    }
+    if (!demangler.isFunction() || demangler.isSpecialName() || demangler.isCtorOrDtor())
       return;
     using Text = std::unique_ptr<char, decltype(&std::free)>;
     std::size_t capacity = 0;
     const Text qualified(demangler.getFunctionName(nullptr, &capacity), &std::free);
-    if (!qualified || !wanted.starts_with(compact(qualified.get()) + "("))
+    if (!qualified || (!indexed && !wanted.starts_with(compact(qualified.get()) + "(")))
       return;
     const Text params(demangler.getFunctionParameters(nullptr, &capacity), &std::free);
     const Text full(demangler.finishDemangle(nullptr, &capacity), &std::free);
@@ -84,13 +102,8 @@ ElfCallable select_symbol(const llvm::object::ELF64LEObjectFile &image,
     const std::string base = std::string(qualified.get()) + params.get();
     const std::string_view display(full.get());
     const auto start = display.find(base);
-    if (start == display.npos || compact(display.substr(start)) != wanted)
+    if (start == display.npos || (!indexed && compact(display.substr(start)) != wanted))
       return;
-    auto address = symbol.getAddress();
-    if (!address) {
-      llvm::consumeError(address.takeError());
-      return;
-    }
     if (match) {
       if (match->symbol != linkage || match->address != *address ||
           match->size != elf.getSize())
@@ -99,7 +112,7 @@ ElfCallable select_symbol(const llvm::object::ELF64LEObjectFile &image,
     }
     const Text result(demangler.getFunctionReturnType(nullptr, &capacity), &std::free);
     std::string receiver;
-    if (member || demangler.hasFunctionQualifiers()) {
+    if (member || (!indexed && demangler.hasFunctionQualifiers())) {
       const auto suffix = display.substr(start + base.size());
       if (suffix.find("const") != suffix.npos) receiver += "const ";
       if (suffix.find("volatile") != suffix.npos) receiver += "volatile ";
@@ -112,6 +125,8 @@ ElfCallable select_symbol(const llvm::object::ELF64LEObjectFile &image,
     visit(symbol);
   for (const auto &symbol : image.getDynamicSymbolIterators())
     visit(symbol);
+  if (ambiguous_indexed_linkage)
+    throw std::invalid_argument("prepared function has no unique concrete ELF symbol");
   if (!match)
     throw std::invalid_argument("no defined C++ ELF function matches the full selector");
   return std::move(*match);
@@ -140,12 +155,12 @@ void require_scalar(clang::QualType type) {
 
 ResolvedCallable resolve_elf_signature(
     const llvm::object::ELF64LEObjectFile &image, const std::string &selector,
-    const std::string &signature, bool member) {
-  if (!type_text(signature))
+    const std::string &signature, bool member, const IndexedElfSignature *indexed) {
+  if (!indexed && !type_text(signature))
     throw std::invalid_argument("--signature requires a C++ function type such as 'const int&()'");
-  const auto target = select_symbol(image, selector, member);
-  if (!type_text(target.parameters) ||
-      (!target.result.empty() && !type_text(target.result)))
+  const auto target = select_symbol(image, selector, member, indexed);
+  if (!indexed && (!type_text(target.parameters) ||
+      (!target.result.empty() && !type_text(target.result))))
     throw std::invalid_argument("ELF signature mode requires builtin types, pointers, or references");
 
   ResolvedCallable resolved;
@@ -154,6 +169,7 @@ ResolvedCallable resolve_elf_signature(
   package.set_format_version(tracer::prepared::typed_version);
   package.set_adapter_uses_default_toolchain(true);
   package.add_adapter_toolchain_options("--no-default-config");
+  if (indexed) package.add_adapter_toolchain_options("--target=x86_64-unknown-linux-gnu");
   auto arguments = tracer::prepared::toolchain_arguments(
       package, {runtime::jit_flags.begin(), runtime::jit_flags.end()});
   arguments.insert(arguments.end(), {"-std=c++23", "-x", "c++",
@@ -166,8 +182,10 @@ ResolvedCallable resolve_elf_signature(
     return unit;
   };
 
-  auto types = parse("using Supplied = " + signature + ";\nusing Encoded = void" +
-                     target.parameters + ";\n" +
+  const auto preamble = indexed ? indexed->preamble : "";
+  auto types = parse(preamble + "using Supplied = " + signature + ";\n" +
+                     (target.parameters.empty() ? "using Encoded = Supplied;\n"
+                         : "using Encoded = void" + target.parameters + ";\n") +
                      (target.result.empty() ? "" : "using EncodedResult = " + target.result + ";\n"));
   auto &ast = types->getASTContext();
   const auto *supplied = alias(ast, "Supplied")->getAs<clang::FunctionProtoType>();
@@ -184,20 +202,20 @@ ResolvedCallable resolve_elf_signature(
     throw std::invalid_argument("signature result differs from the ELF symbol");
 
   const auto result = supplied->getReturnType();
-  require_scalar(result);
+  if (!indexed) require_scalar(result);
   llvm::SHA256 identity;
   identity.update(target.symbol + ":" + target.receiver + ":" + compact(signature));
   const auto digest = identity.final();
   const auto scope = "tracer_elf_adapter_" +
       llvm::toHex(llvm::ArrayRef<std::uint8_t>(digest).take_front(16), true);
-  std::string declarations = "namespace " + scope + " {\nusing Result = " +
+  std::string declarations = preamble + "namespace " + scope + " {\nusing Result = " +
       tracer::prepared::type_name(ast, result) + ";\n";
   std::string parameters = target.receiver.empty() ? "" : target.receiver + " receiver";
   for (unsigned i = 0; i < supplied->getNumParams(); ++i) {
     const auto type = supplied->getParamType(i);
     if (!ast.hasSameType(type, encoded->getParamType(i)))
       throw std::invalid_argument("signature parameters differ from the ELF symbol");
-    require_scalar(type);
+    if (!indexed) require_scalar(type);
     const auto argument = "Arg" + std::to_string(i);
     declarations += "using " + argument + " = " + tracer::prepared::type_name(ast, type) + ";\n";
     if (!parameters.empty()) parameters += ", ";

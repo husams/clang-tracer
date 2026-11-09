@@ -1,5 +1,6 @@
 #include "controller.hpp"
 #include "../prepared_contract.hpp"
+#include "../module_index_format.hpp"
 #include "../proc_identity.hpp"
 #include "../sqlite_events.hpp"
 
@@ -24,6 +25,10 @@
 #include <cerrno>
 #include <spawn.h>
 #include <sys/wait.h>
+#ifdef __linux__
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#endif
 #include <system_error>
 
 #include <grpcpp/grpcpp.h>
@@ -655,6 +660,150 @@ api::ProbeSpec Controller::resolve_for(const SessionHandle &session,
   }
 }
 
+std::filesystem::path Controller::module_index_path(const Command &command) const {
+  namespace fs = std::filesystem;
+  if (command.has("--module-index"))
+    return probe_path(command, command.option("--module-index"));
+  if (command.has("--index")) return command.option("--index");
+  if (command.has("--module")) {
+    const auto sidecar = probe_path(command, command.option("--module")) + ".tracer.sqlite";
+    if (fs::is_regular_file(sidecar)) return sidecar;
+  }
+  if (!default_module_index_.empty()) return default_module_index_;
+  const auto conventional = probe_path(command, "module-index.sqlite");
+  if (fs::is_regular_file(conventional)) return conventional;
+  throw std::invalid_argument("no default module index; run %module index or %module use INDEX");
+}
+
+::tracer_module::ModuleIndex Controller::open_module_index(const std::filesystem::path &path) {
+  auto index = ::tracer_module::ModuleIndex::open(path.empty() ? module_index_path(Command{}) : path);
+  default_module_index_ = index.path();
+  return index;
+}
+
+::tracer_module::ModuleIndex Controller::build_module_index(const ::tracer_module::ModuleSource &source,
+    const std::filesystem::path &output, const ::tracer_module::ModuleIndexOptions &options) {
+  const auto path = output.empty()
+      ? std::filesystem::path(source.image.string() + ".tracer.sqlite") : output;
+  auto index = ::tracer_module::ModuleIndex::build(source, path, options);
+  default_module_index_ = index.path();
+  return index;
+}
+
+void Controller::module_command(const Command &command) {
+  using K = CommandKind;
+  using ::tracer_module::ModuleIndex;
+  namespace fs = std::filesystem;
+  if (command.kind == K::module_use) {
+    out_ << "module index=" << open_module_index(command.arguments.at(0)).path() << '\n';
+    return;
+  }
+  if (command.kind == K::module_index) {
+    auto image = command.option("--file");
+    const auto mapped = command.option("--module");
+    const auto mapping = command.option("--mapping");
+    if ((image.empty() == mapped.empty()) || (mapped.empty() != mapping.empty()))
+      throw std::invalid_argument("use --file ELF or --module PATH --mapping TOKEN");
+    auto options = ::tracer_module::ModuleIndexOptions{
+        command.number("--max-entries", 0),
+        static_cast<std::uint32_t>(command.number("--max-depth", 0)),
+        [] { return interrupted.load(); }};
+    if (command.number("--max-depth", 0) > UINT32_MAX)
+      throw std::invalid_argument("--max-depth must fit a 32-bit depth");
+    std::string build_id;
+    if (!mapped.empty()) {
+#ifdef __linux__
+      require_session(selected_);
+      if (server_.endpoint().empty() || endpoint_ != server_.endpoint())
+        throw std::invalid_argument("mapped module indexing requires the REPL's local server; use --file for a local ELF");
+      api::ListModulesRequest request;
+      request.set_session_id(selected_.id);
+      request.set_include_mappings(true);
+      const auto reply = unary<api::ListModulesResponse>(
+          [&](auto &context, auto &result) { return stub_->ListModules(&context, request, &result); },
+          settings_.timeout_seconds);
+      if (mapping != reply.mapping_token())
+        throw std::invalid_argument("stale module mapping token; run %modules --details");
+      struct stat file{};
+      if (::stat(mapped.c_str(), &file) != 0)
+        throw std::invalid_argument("mapped ELF is unavailable locally");
+      for (const auto &entry : reply.mappings()) {
+        if (entry.path() != mapped || entry.inode() != file.st_ino) continue;
+        const auto colon = entry.device().find(':');
+        if (colon == std::string::npos ||
+            std::stoul(entry.device().substr(0, colon), nullptr, 16) != major(file.st_dev) ||
+            std::stoul(entry.device().substr(colon + 1), nullptr, 16) != minor(file.st_dev))
+          continue;
+        build_id = entry.build_id();
+        break;
+      }
+      if (build_id.empty()) throw std::invalid_argument("cannot verify the mapped ELF build identity");
+      image = mapped;
+#else
+      throw std::invalid_argument("mapped module indexing requires Linux");
+#endif
+    }
+    auto source = ::tracer_module::ModuleSource::file(image, command.option("--debug-file"));
+    source.expected_build_id = std::move(build_id);
+    const auto index = build_module_index(source, command.option("--output"), options);
+    out_ << "module index=" << index.path() << '\n';
+    for (const auto &message : index.identity().diagnostics) out_ << message << '\n';
+    return;
+  }
+  const auto index = ModuleIndex::open(module_index_path(command));
+  const auto output = command.option("--output");
+  const auto values = [&](const std::string &key) -> std::vector<std::string> {
+    const auto found = command.options.find(key);
+    return found == command.options.end() ? std::vector<std::string>{} : found->second;
+  };
+  if (command.kind == K::module_show) {
+    const auto id = command.option("--id");
+    if (values("--type").size() + values("--symbol").size() + values("--id").size() != 1)
+      throw std::invalid_argument("select exactly one --type, --symbol, or --id");
+    if (command.has("--type")) out_ << ::tracer::module_index::format_json(index.find_type(command.option("--type")));
+    else if (command.has("--symbol")) out_ << ::tracer::module_index::format_json(index.find_symbol(command.option("--symbol")));
+    else if (!id.empty() && id[0] == 's') out_ << ::tracer::module_index::format_json(index.get_symbol(id));
+    else out_ << ::tracer::module_index::format_json(index.get_type(id));
+    out_ << '\n';
+  } else if (command.kind == K::module_emit) {
+    if (output.empty()) throw std::invalid_argument("%module emit requires --output");
+    ::tracer_module::ModuleSelection selection;
+    for (const auto &name : values("--type")) selection.types.push_back(index.find_type(name).id);
+    for (const auto &name : values("--symbol")) selection.symbols.push_back(index.find_symbol(name).id);
+    for (const auto &id : values("--id")) {
+      if (!id.empty() && id[0] == 's') selection.symbols.push_back(id);
+      else selection.types.push_back(id);
+    }
+    index.emit_headers(selection, output);
+    out_ << "generated headers=" << fs::absolute(output) << '\n';
+  } else {
+    const ::tracer_module::ModuleQuery query{command.option("--filter"), command.option("--page"),
+                                       static_cast<std::size_t>(command.number("--limit", 0))};
+    const bool json = command.has("--format");
+    if (command.kind == K::module_types) {
+      if (command.has("--exported")) throw std::invalid_argument("--exported is for module symbols");
+      const auto page = index.types(query);
+      if (json) out_ << ::tracer::module_index::format_json(page) << '\n';
+      else {
+        for (const auto &type : page.entries)
+          out_ << type.id << ' ' << type.kind << ' ' << type.name
+               << (type.size ? " size=" + std::to_string(*type.size) : "") << '\n';
+        if (!page.next_page.empty()) out_ << "next_page=" << page.next_page << '\n';
+      }
+    } else {
+      const auto page = index.symbols({query, command.has("--exported")});
+      if (json) out_ << ::tracer::module_index::format_json(page) << '\n';
+      else {
+        for (const auto &symbol : page.entries)
+          out_ << symbol.id << ' ' << symbol.kind << ' ' << symbol.selector
+               << (symbol.version.empty() ? "" : " @" + symbol.version)
+               << (symbol.exported ? " exported" : "") << '\n';
+        if (!page.next_page.empty()) out_ << "next_page=" << page.next_page << '\n';
+      }
+    }
+  }
+}
+
 void Controller::prepare(const std::string &selector, const Command &options) {
   const char *configured = std::getenv("TRACER_PREPARE_EXECUTABLE");
   std::string executable = "clang-tracer-prepare-injectors-native";
@@ -672,8 +821,14 @@ void Controller::prepare(const std::string &selector, const Command &options) {
   }
 #endif
   const bool elf_mode = options.has("--signature");
+  const bool indexed = !elf_mode && !options.has("--include");
   std::vector<std::string> arguments{executable, "--selector", selector};
-  if (elf_mode) {
+  if (indexed) {
+    arguments.insert(arguments.end(), {"--module-index", module_index_path(options).string()});
+    if (options.has("--id")) arguments.insert(arguments.end(), {"--id", options.option("--id")});
+    if (options.has("--generated")) arguments.insert(arguments.end(),
+        {"--generated", probe_path(options, options.option("--generated"))});
+  } else if (elf_mode) {
     arguments.insert(arguments.end(), {"--signature", options.option("--signature")});
     if (options.has("--member")) arguments.push_back("--member");
   } else {
@@ -693,7 +848,7 @@ void Controller::prepare(const std::string &selector, const Command &options) {
   for (const auto *key : {"--include", "--output"}) {
     const auto found = options.options.find(key);
     if (found == options.options.end()) {
-      if (elf_mode && std::string_view(key) == "--include") continue;
+      if ((elf_mode || indexed) && std::string_view(key) == "--include") continue;
       throw std::invalid_argument(std::string("preparation requires ") + key);
     }
     for (const auto &value : found->second) {
@@ -701,7 +856,7 @@ void Controller::prepare(const std::string &selector, const Command &options) {
       arguments.push_back(probe_path(options, value));
     }
   }
-  auto extra = probe_extra_arguments(options, settings_);
+  auto extra = indexed ? std::vector<std::string>{} : probe_extra_arguments(options, settings_);
   if (options.has("--cwd"))
     extra = tracer::normalize_extra_compile_arguments(extra, {}, {}, options.option("--cwd"));
   for (const auto &argument : extra) {
@@ -719,7 +874,8 @@ void Controller::prepare(const std::string &selector, const Command &options) {
   while (::waitpid(pid, &status, 0) < 0)
     if (errno != EINTR) throw std::runtime_error("cannot wait for native preparation");
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-    throw std::runtime_error(elf_mode ? "native ELF signature preparation failed"
+    throw std::runtime_error(indexed ? "indexed probe preparation failed"
+                                     : elf_mode ? "native ELF signature preparation failed"
                                       : "native header preparation failed");
   const auto output = probe_path(options, options.option("--output"));
   const auto directory = options.has("--cwd") ? std::filesystem::canonical(output)
@@ -1402,6 +1558,14 @@ bool Controller::execute(const Command &command) {
     detach(session);
     return true;
   }
+  case K::module_index:
+  case K::module_use:
+  case K::module_types:
+  case K::module_symbols:
+  case K::module_show:
+  case K::module_emit:
+    module_command(command);
+    return true;
   case K::modules: {
     require_session(selected_);
     api::ListModulesRequest request;
@@ -1828,6 +1992,15 @@ const SessionHandle &Facade::selected_session() const {
 
 SessionHandle Facade::attach(std::uint32_t pid) {
   return controller_->attach(pid);
+}
+
+::tracer_module::ModuleIndex Facade::module_index(const ::tracer_module::ModuleSource &source,
+    const std::filesystem::path &output, const ::tracer_module::ModuleIndexOptions &options) {
+  return controller_->build_module_index(source, output, options);
+}
+
+::tracer_module::ModuleIndex Facade::open_module_index(const std::filesystem::path &path) {
+  return controller_->open_module_index(path);
 }
 
 void Facade::prepare(const std::string &selector, const std::string &header,

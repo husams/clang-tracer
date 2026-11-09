@@ -50,6 +50,18 @@ const CommandTopic commands[] = {
     {"status", "%status", "Show connection details, the selected session, and retained collections."},
     {"detach", "%detach [SESSION]", "Detach the selected or named session and remove its probes."},
     {"modules", "%modules [--details]", "List application modules. Details show executable mappings, file identity, and a mapping token."},
+    {"module", "", "Index ELF modules and browse or export recovered types and symbols."},
+    {"module index", "%module index (--file ELF | --module PATH --mapping TOKEN) [--output INDEX] [--debug-file FILE] [--max-entries N] [--max-depth N]",
+     "Create a reusable module index and select it for the current REPL. File input works offline."},
+    {"module use", "%module use INDEX", "Select an existing index for module commands and probe preparation."},
+    {"module types", "%module types [--index INDEX] [--filter GLOB] [--limit N] [--page TOKEN] [--format json]",
+     "Find indexed types and report their sizes when available."},
+    {"module symbols", "%module symbols [--index INDEX] [--filter GLOB] [--exported] [--limit N] [--page TOKEN] [--format json]",
+     "Find ELF symbols and distinguish exported definitions."},
+    {"module show", "%module show [--index INDEX] (--type NAME | --symbol SELECTOR | --id ID)",
+     "Show detailed metadata for a type or symbol."},
+    {"module emit", "%module emit [--index INDEX] [--type NAME | --symbol SELECTOR | --id ID]... --output DIR",
+     "Emit recovered C++ declarations, read-only views and a manifest."},
     {"threads", "%threads", "List the selected target's thread IDs, names, and Linux start times."},
     {"symbols", "%symbols [--filter TEXT] [--module TEXT] [--limit N] [--page TOKEN]\n"
      "  [--addresses] [--mapping TOKEN] [--address PC]",
@@ -84,8 +96,11 @@ const CommandTopic commands[] = {
     {"probe prepare",
      "%probe prepare SELECTOR --include HEADER --output NEW_DIRECTORY\n"
      "  [--compdb PATH] [--translation-unit FILE] [--module ELF] [--metadata-only] [--cwd DIRECTORY] [EXTRA COMPILER ARGUMENTS]\n"
-     "  or %probe prepare SELECTOR --signature TYPE --module ELF --output NEW_DIRECTORY [--member] [--metadata-only] [--cwd DIRECTORY]",
-     "Build a reusable probe package from local source. Repeat --include for extra headers. "
+     "  or %probe prepare SELECTOR --signature TYPE --module ELF --output NEW_DIRECTORY [--member] [--metadata-only] [--cwd DIRECTORY]"
+     "\n  or %probe prepare SELECTOR [--module-index INDEX] [--module ELF] [--id ID] [--generated DIR] --output NEW_DIRECTORY",
+     "Build a reusable probe package from source, an explicit signature, or the module index. "
+     "Without headers or an explicit signature, preparation uses the default index. "
+     "Repeat --include for extra headers. "
      "Preparation uses compile_commands.json in the command's working directory by default. "
      "It prefers the first include's recorded compile command and falls back to the first source beside it. "
      "Use --module to pin the package to a specific build. "
@@ -259,6 +274,11 @@ auto state = e.state_as<app::State>();)",
      "Pass one header, a braced list, or a vector of header paths. Order the probe's declaration header first, "
      "followed by additional types used by the callback. The output directory must be new. "
      "See %help probe prepare for compilation database and module options."},
+    {"module_index", "Build an ELF and DWARF index and select it for this REPL.",
+     R"(auto index = tracer.module_index(tracer_module::ModuleSource::file("./libdemo.so"));)"},
+    {"open_module_index", "Open a saved module index and select it for this REPL.",
+     R"(auto index = tracer.open_module_index("libdemo.so.tracer.sqlite");)",
+     "Use index.find_type, index.find_symbol, index.emit_headers and index.prepare_probe."},
     {"inject", "Install a callback from a local file and return the probe ID.",
      R"example(auto probe = tracer.inject(session, "demo::compute(int)", "hook.cpp");)example",
      "Pass a prepared package directory as the fourth argument to require prepared injection."},

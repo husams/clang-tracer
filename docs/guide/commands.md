@@ -42,11 +42,26 @@ Inside the REPL, quote selectors and paths containing spaces. Commands start wit
 | `%threads` | List selected target threads, including TIDs, names, and start times. |
 | `%symbols --filter add --limit 20 --addresses` | Browse supported DWARF callables. `--filter TEXT` matches a substring and `--module TEXT` narrows module paths. `--limit N` is a page size, with 0 meaning unbounded. `--page TOKEN` continues the query. `--addresses` adds verified live entries. `--mapping TOKEN` supplies a module mapping snapshot. `--address PC --mapping TOKEN` looks up a live PC and disables paging. |
 
+## Native REPL module index commands
+
+| Command | Purpose |
+| --- | --- |
+| `%module index --file ELF [--debug-file FILE] [--output INDEX]` | Index ELF symbols and DWARF and select the index. The default output is `<ELF>.tracer.sqlite`. |
+| `%module index --module PATH --mapping TOKEN [--output INDEX]` | Index an exact mapped ELF using the REPL's local server. Get the path and token from `%modules --details`. |
+| `%module use INDEX` | Select a saved index for queries, emission and probe preparation. |
+| `%module types [--filter GLOB] [--index INDEX]` | List named types and known layout sizes. |
+| `%module symbols [--exported] [--filter GLOB] [--index INDEX]` | List symbols and their IDs. Use `--exported` to select dynamic exports. |
+| `%module show (--type NAME \| --symbol SELECTOR \| --id ID)` | Inspect a type or symbol. Add `--index INDEX` to select a saved index explicitly. |
+| `%module emit [--type NAME] [--symbol SELECTOR] [--id ID] --output DIR` | Generate declarations, read-only field views and a manifest for selected entries. |
+
+List commands accept `--format json`, `--limit N` and `--page TOKEN`.
+
 ## Native REPL probe and bulk trace commands
 
 | Command and example | Options and behavior |
 | --- | --- |
 | `%probe prepare "add(int, int)" --include add.hpp --output prepared` | Generate a reusable local package. The first `--include HEADER` supplies the declaration and additional includes supply types. `--output NEW_DIR` must be new. `--compdb PATH` selects the compilation database, defaulting to the command's directory. `--translation-unit FILE` selects an explicit command. `--module ELF` pins ELF identity. `--metadata-only` skips adapter files. Accepts extra compiler arguments and `--cwd`. |
+| `%probe prepare SELECTOR --output prepared [--module-index INDEX] [--module ELF] [--generated DIR]` | Prepare from DWARF and ELF metadata in a module index. Omit `--module-index` to use the default. Use `--id ID` to select a specific indexed symbol. |
 | `%probe resolve "add(int, int)"` | Show resolved signature, ABI and target metadata. Accepts resolution options below. |
 | `%probe validate "add(int, int)" --callback hook.cpp` | Compile and link the local callback without installing it. Accepts resolution options. |
 | `%probe inject "add(int, int)" --callback hook.cpp --stack-depth 16` | Install or replace the probe. Accepts resolution and deployment options. |

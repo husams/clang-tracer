@@ -55,6 +55,79 @@ include directories or other options. The prelude uses the build compiler's
 standard-library include roots. Installing the client alone does not install a
 Linux server or agent.
 
+
+## Prepare a probe from a binary without headers
+
+Build a module index from a Linux x86-64 ELF executable or shared library.
+Embedded DWARF and matching separate debug files provide type and signature
+information. ELF exports remain searchable in stripped modules.
+
+```text
+%module index --file ./libdemo.so
+%module types --filter "demo::*"
+%module symbols --exported --filter "demo::*"
+%module show --type demo::Packet
+%module show --symbol "demo::score(demo::Packet const&)"
+%module emit --symbol "demo::score(demo::Packet const&)" --output recovered
+%probe prepare "demo::score(demo::Packet const&)" --generated recovered --output prepared-score
+```
+
+The index defaults to `libdemo.so.tracer.sqlite`. Use `--output INDEX` to name
+it or `--debug-file FILE` to supply a matching companion. To index a live module
+using the REPL's local server, run `%modules --details` and pass its exact
+module path and token to `%module index --module PATH --mapping TOKEN`.
+
+Indexing selects the new index for the session. In another REPL,
+`%module use INDEX` selects a saved index. With no headers or explicit
+signature, preparation checks the explicit `--module-index` first, then
+the `<ELF>.tracer.sqlite` sidecar when you pass `--module ELF`, then the
+selected index, then `module-index.sqlite` in the command's working directory.
+When `--module` is omitted, it uses the ELF path recorded in the index.
+
+List commands accept glob filters, `--format json`, and optional
+`--limit N` and `--page TOKEN`. Use the full C++ signature to select an
+overload, or `--id ID` when a name is ambiguous. The index preserves missing
+type and layout information. Symbols with incomplete signatures can still be
+looked up. Supported indexed signatures use scalar, pointer and borrowed
+reference parameters and results. The generated `views.hpp` contains read-only
+accessors for supported fixed-offset fields, and the manifest lists omitted
+fields. `--generated` is optional. The preparer can regenerate the checked C++
+from the index.
+
+The prepared package embeds its declarations and accessors. A callback can
+use them directly. This example reads a scalar field from the borrowed argument.
+
+```cpp
+template <> class Interceptor<int(const demo::Packet&)> {
+public:
+  long long pre(const Call& call) {
+    return tracer_recovered::demo::PacketView::value(call.argument<0>());
+  }
+  long long post(const Call& call) { return call.result<int>(); }
+};
+```
+
+In the attached REPL, validate and inject the package.
+
+```text
+%probe validate "demo::score(demo::Packet const&)" --callback observer.cpp --prepared prepared-score --prepared-mode require
+%probe inject "demo::score(demo::Packet const&)" --callback observer.cpp --prepared prepared-score --prepared-mode require
+```
+
+The native C++ API uses the same index and preparation workflow.
+
+```cpp
+auto index = tracer.open_module_index("libdemo.so.tracer.sqlite");
+auto score = index.find_symbol("demo::score(demo::Packet const&)");
+auto packet = index.find_type("demo::Packet");
+index.prepare_probe(score.id, {}, "prepared-score");
+```
+
+Standalone C++ callers can include `<tracer/module_index.hpp>` and link
+`tracer_module_index`. Use `tracer_module::ModuleIndex::build` with
+`tracer_module::ModuleSource::file(elf_path)` to build an index or
+`ModuleIndex::open` to reuse one.
+
 ## Start and attach
 
 On Linux x86-64 with the native server and agent installed:
