@@ -30,7 +30,7 @@ constexpr string_view resolution_options =
     "--prepared DIRECTORY --prepared-mode off|prefer|require";
 constexpr string_view deployment_options =
     "--stack-depth N|full --stack-application-only true|false\n"
-    "--print-arguments --print-result";
+    "--print-arguments --print-result --snapshot-return-pointee";
 
 const CommandTopic commands[] = {
     {"server", "", "Start, connect to, inspect, or stop a tracing server."},
@@ -114,8 +114,10 @@ const CommandTopic commands[] = {
     {"probe validate", "%probe validate SELECTOR --callback FILE [RESOLUTION OPTIONS] [--cwd DIRECTORY]",
      "Check whether the callback can be deployed for the selected function."},
     {"probe inject", "%probe inject SELECTOR [--callback FILE] [RESOLUTION OPTIONS] [DEPLOYMENT OPTIONS] [--cwd DIRECTORY]",
-     "Install a probe on the selected target. Omit --callback to capture events with the built-in observer.",
-     R"example(%probe inject "demo::compute(int)" --prepared prepared)example"},
+     "Install a probe on the selected target. Omit --callback to capture events with the built-in observer. "
+     "Use --snapshot-return-pointee with a matching record layout and live, stable pointees immediately after return. "
+     "result() gives the address and result_as<T>() decodes an owned copy.",
+     R"example(%probe inject "prepared_pointee::HfwManager::createItem(int)" --prepared prepared --snapshot-return-pointee)example"},
     {"probe remove", "%probe remove ID [--cwd DIRECTORY]", "Remove a probe from the selected session and restore the original code."},
     {"probe reload", "%probe reload ID --callback FILE [--cwd DIRECTORY]",
      "Switch an active probe to a new observer generation while existing calls finish on their original generation."},

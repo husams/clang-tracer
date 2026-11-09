@@ -176,6 +176,7 @@ public:
     }
     const std::set<std::string> flags = {
         "--all", "--metadata-only", "--print-arguments", "--print-result",
+        "--snapshot-return-pointee",
         "--details", "--addresses", "--sqlite", "--member", "--exported"};
     const std::set<std::string> repeated = {"--include", "--compile-option",
                                            "--name", "--type"};

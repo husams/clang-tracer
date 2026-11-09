@@ -9,7 +9,10 @@ server=${CLANG_TRACER_SERVER:-$build/clang-tracer-server}
 agent=${CLANG_TRACER_AGENT:-$build/libclang_tracer_agent.so}
 example=prepared-injectors-target
 demo_mode=${1:-}
-if [[ $demo_mode == --methods || $demo_mode == --state ]]; then
+if [[ $demo_mode == --pointee ]]; then
+  example=prepared-pointee-target
+  shift
+elif [[ $demo_mode == --methods || $demo_mode == --state ]]; then
   example=prepared-methods-target
   shift
 fi
@@ -17,11 +20,11 @@ target=${CLANG_TRACER_PREPARED_TARGET:-$build/examples/prepared-injectors/$examp
 compdb=${CLANG_TRACER_PREPARED_COMPDB:-$build/compile_commands.json}
 
 if [[ ${1:-} == --help ]]; then
-  printf '%s\n' 'Use --methods for typed method snapshots or --state for a named event with typed state. Add --smoke for automation.'
+  printf '%s\n' 'Use --methods for typed method snapshots, --state for named event state, or --pointee for returned-record snapshots. Add --smoke for automation.'
   exit 0
 fi
 if [[ $# -gt 1 || ( $# == 1 && $1 != --smoke ) ]]; then
-  printf '%s\n' 'Usage: run-native.sh [--methods|--state] [--smoke|--help]' >&2
+  printf '%s\n' 'Usage: run-native.sh [--methods|--state|--pointee] [--smoke|--help]' >&2
   exit 2
 fi
 for required in "$repl" "$server" "$agent" "$target" "$compdb"; do
@@ -44,7 +47,50 @@ cd -- "$run"
 unset CLANG_TRACER_ENDPOINT
 
 printf 'Native C++ REPL example: %s\nTarget PID: %s\n' "$run" "$target_pid"
-if [[ $demo_mode == --state ]]; then
+if [[ $demo_mode == --pointee ]]; then
+  if [[ ${1:-} == --smoke ]]; then
+    "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60 --fail-fast <<'REPL' | tee "$run/smoke.log"
+%probe prepare "prepared_pointee::HfwManager::createItem(int)" --include demo/pointee/item.hpp --output prepared
+%probe inject "prepared_pointee::HfwManager::createItem(int)" --prepared prepared --prepared-mode require --snapshot-return-pointee
+%collect --count 4 --timeout 15 --phase POST --as captured
+auto captured = tracer.batch("captured");
+tracer.detach(session);
+unsigned nulls = 0;
+for (const auto &event : captured) { if (event.result() == "0x0") ++nulls; }
+auto event = captured.at(captured.at(0).result() == "0x0" ? 1 : 0);
+auto item = event.result_as<prepared_pointee::HfwItem>();
+auto snapshot = event.result_snapshot();
+auto manager = event.receiver_snapshot();
+bool correct = captured.size() == 4 && nulls == 2;
+correct = correct && item.id == 42 && item.label == "heap-backed HfwItem label";
+correct = correct && item.details.revision == 7 && item.details.active;
+correct = correct && snapshot.field("id").as<int>() == 42 && snapshot.field("label").as<std::string>() == item.label;
+correct = correct && snapshot.field("details").field("revision").as<int>() == 7 && snapshot.field("details").field("active").as<bool>();
+correct = correct && manager.field("manager_id").as<int>() == 11 && manager.field("name").as<std::string>() == "items manager";
+std::cout << "NATIVE_POINTEE_RESULTS=" << correct << std::endl;
+%quit
+REPL
+    grep -q '^NATIVE_POINTEE_RESULTS=1$' "$run/smoke.log"
+  else
+    cat <<'STEPS'
+Paste these commands at the native tracer prompt:
+
+%probe prepare "prepared_pointee::HfwManager::createItem(int)" --include demo/pointee/item.hpp --output prepared
+%probe inject "prepared_pointee::HfwManager::createItem(int)" --prepared prepared --prepared-mode require --snapshot-return-pointee
+%collect --count 4 --timeout 15 --phase POST --as captured
+auto captured = tracer.batch("captured");
+auto event = captured.at(captured.at(0).result() == "0x0" ? 1 : 0);
+auto item = event.result_as<prepared_pointee::HfwItem>();
+auto snapshot = event.result_snapshot();
+std::cout << item.label << " " << snapshot.field("details").field("revision").as<int>() << std::endl;
+%quit
+
+The non-null event owns a copied HfwItem value and an automatic field snapshot.
+Null returns keep the raw `0x0` result and have no pointee snapshot.
+STEPS
+    "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60
+  fi
+elif [[ $demo_mode == --state ]]; then
   if [[ ${1:-} == --smoke ]]; then
     mkdir -p application/include application/build
     cp demo/methods/account.hpp demo/methods/reading.hpp application/include/

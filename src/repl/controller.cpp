@@ -914,6 +914,7 @@ std::uint64_t Controller::inject(const SessionHandle &session,
       options.option("--stack-application-only", "true") == "false");
   spec.set_print_arguments(options.has("--print-arguments"));
   spec.set_print_result(options.has("--print-result"));
+  spec.set_snapshot_return_pointee(options.has("--snapshot-return-pointee"));
   api::AddProbeRequest request;
   request.set_session_id(session.id);
   *request.mutable_spec() = std::move(spec);

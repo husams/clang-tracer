@@ -34,7 +34,7 @@ public:
     T__114 = 115, T__115 = 116, T__116 = 117, T__117 = 118, T__118 = 119,
     T__119 = 120, UINT = 121, STRING = 122, SHELL = 123, METADATA_ONLY = 124,
     SQLITE = 125, STACK = 126, CWD = 127, SIGNATURE = 128, MEMBER = 129,
-    WORD = 130, WS = 131
+    SNAPSHOT_RETURN_POINTEE = 130, WORD = 131, WS = 132
   };
 
   enum {
@@ -463,6 +463,7 @@ public:
     ResolveOptionContext *resolveOption();
     antlr4::tree::TerminalNode *UINT();
     antlr4::tree::TerminalNode *WORD();
+    antlr4::tree::TerminalNode *SNAPSHOT_RETURN_POINTEE();
     StackFilterContext *stackFilter();
 
 

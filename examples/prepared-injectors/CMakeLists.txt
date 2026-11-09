@@ -45,3 +45,7 @@ add_executable(prepared-methods-target methods/target.cpp methods/account.cpp)
 # linkage and its typed metadata comes from account.hpp.
 target_compile_options(prepared-methods-target PRIVATE
   -g0 -O0 -fno-omit-frame-pointer -fcf-protection=none)
+
+add_executable(prepared-pointee-target pointee/target.cpp pointee/item.cpp)
+target_compile_options(prepared-pointee-target PRIVATE
+  -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
