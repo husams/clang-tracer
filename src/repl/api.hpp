@@ -16,6 +16,12 @@
 #include "event_value.hpp"
 #include "event_ranges.hpp"
 
+#if __has_include("module_index.hpp")
+#include "module_index.hpp"
+#else
+#include "../../include/tracer/module_index.hpp"
+#endif
+
 namespace tracer_repl {
 class Controller;
 struct EventData;
@@ -191,6 +197,9 @@ public:
                std::initializer_list<std::string> headers,
                const std::string &compdb, const std::string &translation_unit,
                const std::string &module, const std::string &output);
+  ::tracer_module::ModuleIndex module_index(const ::tracer_module::ModuleSource &source,
+      const std::filesystem::path &output = {}, const ::tracer_module::ModuleIndexOptions &options = {});
+  ::tracer_module::ModuleIndex open_module_index(const std::filesystem::path &path = {});
   void detach(const SessionHandle &session);
   std::uint64_t inject(const SessionHandle &session,
                        const std::string &selector,

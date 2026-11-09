@@ -2,7 +2,7 @@ grammar TracerCommands;
 
 line : '%' command EOF;
 command : server | attach | processes | sessions | use | status | detach
-        | modules | threads | symbols | probe | interceptor | events | collect | record
+        | modules | moduleIndex | threads | symbols | probe | interceptor | events | collect | record
         | cpp | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
 serverOption : ('--executable' | '--agent') value | contextEventBytes;
@@ -13,6 +13,17 @@ use : 'use' value;
 status : 'status';
 detach : 'detach' value?;
 modules : 'modules' '--details'?;
+moduleIndex : 'module' ('index' moduleBuildOption+
+            | 'use' value
+            | ('types' | 'symbols') moduleQueryOption*
+            | 'show' moduleShowOption+
+            | 'emit' moduleEmitOption+);
+moduleBuildOption : ('--file' | '--module' | '--mapping' | '--output' | '--debug-file') value
+                  | ('--max-entries' | '--max-depth') UINT;
+moduleQueryOption : ('--index' | '--filter' | '--page') value
+                  | '--limit' UINT | '--format' 'json' | '--exported';
+moduleShowOption : ('--index' | '--type' | '--symbol' | '--id') value;
+moduleEmitOption : moduleShowOption | '--output' value;
 threads : 'threads';
 symbols : 'symbols' symbolOption*;
 symbolOption : ('--filter' | '--module' | '--page' | '--address' | '--mapping') value
@@ -22,7 +33,7 @@ probe : 'probe' ('prepare' value prepareOption+
       | 'inject' value ('--callback' value)? (deployOption | cwdOption)*
       | 'validate' value '--callback' value (resolveOption | cwdOption)*
       | 'remove' UINT cwdOption?) | 'probes' cwdOption?;
-prepareOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--output') value
+prepareOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--output' | '--module-index' | '--generated' | '--id') value
               | SIGNATURE value | MEMBER | METADATA_ONLY | extraCompileOption | cwdOption;
 resolveOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--compile-option'
                 | '--prepared' | '--prepared-mode') value
@@ -60,6 +71,7 @@ bulkTraceOption : ('--module' | '--include' | '--exclude' | '--exact' | '--manif
 value : STRING | WORD | UINT | keyword;
 keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'processes' | 'sessions' | 'use' | 'detach' | 'modules' | 'threads' | 'symbols'
+        | 'module' | 'index' | 'types' | 'emit'
         | 'probe' | 'prepare' | 'resolve' | 'inject' | 'validate' | 'remove' | 'probes'
         | 'interceptor' | 'load' | 'edit' | 'show' | 'upload' | 'events'
         | 'list' | 'calls' | 'stats' | 'clear' | 'open' | 'export' | 'json'

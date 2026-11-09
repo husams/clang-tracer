@@ -58,6 +58,12 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"status", K::status},
                                         {"detach", K::detach},
                                         {"modules", K::modules},
+                                        {"module index", K::module_index},
+                                        {"module use", K::module_use},
+                                        {"module types", K::module_types},
+                                        {"module symbols", K::module_symbols},
+                                        {"module show", K::module_show},
+                                        {"module emit", K::module_emit},
                                         {"threads", K::threads},
                                         {"symbols", K::symbols},
                                         {"memory maps", K::memory_maps},
@@ -170,7 +176,7 @@ public:
     }
     const std::set<std::string> flags = {
         "--all", "--metadata-only", "--print-arguments", "--print-result",
-        "--details", "--addresses", "--sqlite", "--member"};
+        "--details", "--addresses", "--sqlite", "--member", "--exported"};
     const std::set<std::string> repeated = {"--include", "--compile-option",
                                            "--name", "--type"};
     const std::set<std::string> bulk_repeated = {"--module", "--exclude", "--exact"};
@@ -187,7 +193,9 @@ public:
       if (!profile_add && ts[i]->getType() != TracerCommandsLexer::STRING &&
           text.rfind("--", 0) == 0) {
         const bool bulk_repeat = result.kind == K::bulk_preview && bulk_repeated.count(text);
-        if (result.has(text) && !repeated.count(text) && !bulk_repeat) {
+        const bool module_repeat = result.kind == K::module_emit &&
+                                   (text == "--symbol" || text == "--id");
+        if (result.has(text) && !repeated.count(text) && !bulk_repeat && !module_repeat) {
           throw std::invalid_argument("duplicate option: " + text);
         }
         result.options[text].push_back(
@@ -282,18 +290,25 @@ Command parse_command(const std::string &input) {
   }
   if (command.kind == K::prepare) {
     const bool elf_mode = command.has("--signature");
-    for (const auto *option : {elf_mode ? "--module" : "--include", "--output"})
-      if (!command.has(option) || command.option(option).empty())
-        throw std::invalid_argument(std::string("%probe prepare requires ") + option);
-    if (elf_mode && (command.option("--signature").empty() ||
-                     command.has("--include") || command.has("--compdb") ||
-                     command.has("--translation-unit")))
-      throw std::invalid_argument("--signature requires a C++ type and no source options");
+    const bool source_mode = command.has("--include");
+    if (command.option("--output").empty())
+      throw std::invalid_argument("%probe prepare requires --output");
+    if (elf_mode && (command.option("--signature").empty() || command.option("--module").empty() ||
+                     source_mode || command.has("--compdb") || command.has("--translation-unit")))
+      throw std::invalid_argument("--signature requires a C++ type, --module and no source options");
     if (!elf_mode && command.has("--member"))
       throw std::invalid_argument("--member requires --signature");
-    for (const auto* option : {"--compdb", "--translation-unit", "--module"})
+    if ((source_mode || elf_mode) &&
+        (command.has("--module-index") || command.has("--generated") || command.has("--id")))
+      throw std::invalid_argument("indexed preparation options cannot be combined with headers or a signature");
+    if (!elf_mode && !source_mode &&
+        (command.has("--compdb") || command.has("--translation-unit") ||
+         !command.extra_compile_argument_inputs.empty()))
+      throw std::invalid_argument("source preparation requires --include");
+    for (const auto *option : {"--include", "--compdb", "--translation-unit", "--module",
+                               "--module-index", "--generated", "--id"})
       if (command.has(option) && command.option(option).empty())
-        throw std::invalid_argument(std::string(option) + " requires a path");
+        throw std::invalid_argument(std::string(option) + " requires a value");
   }
   if (command.has("--cwd") && command.option("--cwd").empty())
     throw std::invalid_argument("--cwd requires a directory");
@@ -303,11 +318,13 @@ Command parse_command(const std::string &input) {
   if (mode != "off" && command.has("--prepared") && command.option("--prepared").empty())
     throw std::invalid_argument("--prepared requires a directory");
   for (const auto &key : {"--count", "--timeout", "--after", "--probe",
-                          "--index", "--limit", "--stack-depth"}) {
+                          "--limit", "--stack-depth"}) {
     if (command.has(key)) {
       command.number(key, 0);
     }
   }
+  if ((command.kind == K::event_show || command.kind == K::event_stack) && command.has("--index"))
+    command.number("--index", 0);
   if (command.has("--context-event-bytes")) {
     const auto bytes = command.number("--context-event-bytes", 0);
     if (!bytes || bytes > UINT32_MAX)

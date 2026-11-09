@@ -45,6 +45,9 @@ class Controller {
     clangtracer::v1::PreparedInjector artifact;
   };
   std::map<std::string, PreparedPackage> prepared_packages_;
+  std::filesystem::path default_module_index_;
+  void module_command(const Command &);
+  std::filesystem::path module_index_path(const Command &) const;
   std::vector<std::string> pending_imports_;
   mutable std::vector<clangtracer::v1::PreparedInjector> pending_replay_types_;
   std::map<std::string, EventBuffer> batches_;
@@ -88,6 +91,9 @@ public:
 
   std::string prompt() const;
   void prepare(const std::string &selector, const Command &options);
+  ::tracer_module::ModuleIndex build_module_index(const ::tracer_module::ModuleSource &,
+      const std::filesystem::path &, const ::tracer_module::ModuleIndexOptions &);
+  ::tracer_module::ModuleIndex open_module_index(const std::filesystem::path &);
   std::vector<std::string> take_pending_imports();
   std::vector<clangtracer::v1::PreparedInjector> take_pending_replay_types();
   SessionHandle attach(std::uint32_t pid, std::uint64_t expected_start_time = 0,
