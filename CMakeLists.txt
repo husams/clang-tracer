@@ -247,8 +247,9 @@ if(BUILD_TESTING)
   add_test(NAME native_detour_relocation COMMAND native-detour-tests)
   set_tests_properties(native_detour_relocation PROPERTIES TIMEOUT 30)
 
-  # Exercise the unchanged fixture with PIE regardless of the driver default.
+  # Exercise a PIE probe reached through a caller with relaxed alignment.
   add_executable(trace-target-pie tests/fixtures/target.cpp)
+  target_compile_definitions(trace-target-pie PRIVATE TRACER_TEST_RELAXED_STACK_ALIGNMENT)
   set_target_properties(trace-target-pie PROPERTIES ENABLE_EXPORTS ON)
   target_link_libraries(trace-target-pie PRIVATE Threads::Threads)
   target_compile_options(trace-target-pie PRIVATE -g -O0 -fPIE

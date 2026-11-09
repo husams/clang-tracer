@@ -2534,7 +2534,9 @@ std::string make_wrapper(const tracer::Request &r,
   if (!comma) {
     code += "void";
   }
-  code += ");\nextern \"C\" ";
+  // A patched entry can have callers that relaxed stack alignment for the
+  // original callee. Realign before entering the wrapper and calling helpers.
+  code += ");\nextern \"C\" __attribute__((force_align_arg_pointer)) ";
   if (overrides)
     code += "__attribute__((sysv_abi)) ";
   code += result_sret ? result_type() + "* clangtracer_wrapper(" + result_type() +
