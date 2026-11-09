@@ -16,6 +16,17 @@ traced_work(int argument) {
   return result;
 }
 
+#if defined(TRACER_TEST_RELAXED_STACK_ALIGNMENT)
+// Model GCC's relaxed alignment for a direct call to a known leaf. The
+// argument is already in %edi. With no stack adjustment before the call,
+// traced_work enters with %rsp aligned to 16 bytes instead of %rsp + 8.
+extern "C" __attribute__((naked, noinline)) int
+call_traced_work_with_relaxed_stack(int) {
+  asm volatile("call traced_work\n\t"
+               "ret");
+}
+#endif
+
 extern "C" __attribute__((visibility("default"), noinline)) double
 traced_mixed(double left, double right) {
   volatile double result = left * 2.0 + right;
@@ -170,7 +181,11 @@ int main() {
   Fixture fixture;
   int argument = 1;
   for (;;) {
+#if defined(TRACER_TEST_RELAXED_STACK_ALIGNMENT)
+    const int free_result = call_traced_work_with_relaxed_stack(argument);
+#else
     const int free_result = traced_work(argument);
+#endif
     const double mixed_result =
         traced_mixed(static_cast<double>(argument), 0.25);
     const int method_result = fixture.overloaded(argument);
