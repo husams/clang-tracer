@@ -1,6 +1,6 @@
 # Clang Tracer developer guide
 
-Use the Python client or the native REPL facade to control a session. A callback runs inside the application, while an event is serialized and owned by the receiving client. Keep pointers, references, stack views, and context state within the lifetime of the callback. Use an event snapshot when the data needs to survive the call or travel to another process.
+Use the native REPL and its C++ facade to control a session, index modules, and analyze events. A callback runs inside the application, while an event is serialized and owned by the receiving client. Keep pointers, references, stack views, and context state within the lifetime of the callback. Use an event snapshot when the data needs to survive the call or travel to another process.
 
 | Layer | Responsibilities |
 | --- | --- |
@@ -10,156 +10,13 @@ Use the Python client or the native REPL facade to control a session. A callback
 
 See the [C++17 branch reference](cpp17.md#additional-client-and-callback-apis) for additional APIs. See the [user guide](user.md) for installation and the first callback, and the [tutorials](tutorials.md) for complete workflows.
 
-## Python client API
-
-The package exports `Client`, `EventStream`, `ServerProcess`, `ServerStatus`, `messages` (Tracer Protobuf types), and `context` (context transport Protobuf types). Operations return generated messages unless the table specifies a different type. RPC failures raise `grpc.RpcError`; argument and local storage failures raise normal Python exceptions. The client applies deadlines without automatically retrying mutations.
-
-### Connection and lifetime
-
-| Method or type | Behavior |
-| --- | --- |
-| `Client(endpoint=None, *, timeout=30, channel=None)` | Open a gRPC client. Endpoint defaults to `CLANG_TRACER_ENDPOINT` or `127.0.0.1:50051`. The default channel is insecure. A supplied gRPC channel keeps its own policy and ownership. `timeout` is the default unary deadline. |
-| `status(*, timeout=1) → ServerStatus` | Probe endpoint readiness. Read `endpoint`, `running`, `owned`, `pid`, and diagnostic `detail`. |
-| `start_server(executable="clang-tracer-server", **options) → ServerStatus` | Launch a local child and wait for its endpoint and the client channel. A child that starts but misses the client deadline can still be owned by the client. |
-| `shutdown_server(*, timeout=30)` | Request graceful stop of the owned child. On timeout it remains tracked so you can wait again. |
-| `close()`, `with Client(...) as client` | Shut down the owned server and close the owned channel. For a shared server, detach the session explicitly before closing. |
-| `ServerProcess(endpoint="127.0.0.1:50051")` | Own and manage a local server separately from a tracing client. `pid` and `running` describe the child. |
-| `ServerProcess.start(executable="clang-tracer-server", **options) → self` | Launch and wait for readiness on Linux x86-64. Refuses an endpoint that already serves a tracer. |
-| `ServerProcess.status(*, timeout=1) → ServerStatus` | Probe endpoint readiness and add child ownership information. |
-| `ServerProcess.diagnostics() → str` | Read the latest captured child diagnostics. |
-| `ServerProcess.shutdown(*, timeout=30)`, `with ServerProcess(...) as server` | Request cleanup and wait for the owned process. A timeout can be retried. |
-
-Both start methods accept `agent`, readiness `timeout=30`, native `operation_timeout=10`, `durable_directory`, `event_history_limit`, `context_history_limit`, `context_history_bytes`, `context_event_bytes`, and `context_transport_memory_bytes`. Omitted paths and budgets use native server defaults. See the [native server command](commands.md#native-server) for units.
-
-Use a private Unix endpoint to run an owned server without reserving a TCP port.
-
-```python
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
-from clang_tracer import Client, ServerProcess
-
-with TemporaryDirectory() as directory:
-    endpoint = f"unix://{Path(directory) / 'tracer.sock'}"
-    with ServerProcess(endpoint) as server:
-        server.start(event_history_limit=8192)
-        with Client(endpoint) as client:
-            print(server.pid, server.running, client.status().running)
-            print(client.list_sessions())
-        print(server.diagnostics())
-```
-
-### Attach, discover, and inspect
-
-| Method | Behavior |
-| --- | --- |
-| `attach(pid) → Session` | Attach to a positive Linux PID. Use the returned `id` for later calls. |
-| `list_sessions() → list[Session]` | List server attachments and their probes. |
-| `detach(session_id) → Session` | Restore probes and detach a session. |
-| `list_modules(session_id) → list[str]` | Return eligible mapped application paths. |
-| `list_threads(session_id) → list[TargetThread]` | Return Linux TIDs, names, and start times. |
-| `list_symbols(session_id, *, query="", module="", page_size=None, page_token="") → ListSymbolsResponse` | Match case-sensitive selector or linkage-name substrings and optionally narrow modules. A positive page size returns a continuation token. |
-| `list_memory_mappings(session_id) → ListMemoryMappingsResponse` | Return mapped ranges, permissions, and a session-bound mapping token. |
-| `read_memory(session_id, address, size, *, mapping_token) → bytes` | Read a complete readable range of 1–65,536 bytes. Refresh the token if the mappings change. |
-| `scan_memory(session_id, address, size, *, mapping_token, pattern, mask, max_matches=0) → ScanMemoryResponse` | Search a readable range of up to 1 MiB. Pattern and mask have equal length. Set each mask bit that should match and clear each wildcard bit. Zero requests the server's default result limit. |
-| `preview_function_entry(session_id, *, mapping_token, selector=None, elf_address=None, module="", abi="") → PreviewFunctionEntryResponse` | Verify and disassemble an entry. Use a selector, or provide ELF address, module and ABI together. Inspect `patch_size` and `patch_diagnostic` before installing a probe. |
-
-```python
-maps = client.list_memory_mappings(session.id)
-entry = client.preview_function_entry(
-    session.id, selector="add(int, int)", mapping_token=maps.mapping_token,
-)
-entry_bytes = client.read_memory(
-    session.id, entry.runtime_address, len(entry.entry_bytes),
-    mapping_token=maps.mapping_token,
-)
-print(entry_bytes.hex(" "), entry.patch_size, entry.patch_diagnostic)
-```
-
-### Resolve, validate, install, and restore
-
-| Method | Behavior |
-| --- | --- |
-| `resolve_probe(session_id, selector, **resolution) → ProbeSpec` | Resolve a selector using server-side DWARF. Return a spec you can inspect or extend. |
-| `validate_probe(session_id, selector, callback_source, *, level="compile", **resolution) → ValidationReport` | Check callback source without activating a probe. Use `syntax` for parsing only or `compile` for code generation and symbol checks. Inspect the returned report and diagnostics. |
-| `add_probe(session_id, spec) → Probe` | Activate an explicit resolved or ABI-described spec. |
-| `inject(session_id, selector, callback_source, **options) → Probe` | Resolve, compile, and install a callback in one call. Supports the resolution options below. |
-| `reload_probe(session_id, probe_id, callback_source) → ReloadProbeResponse` | Switch active observer generations. Calls already in progress finish with their original generation. |
-| `remove_probe(session_id, probe_id) → Probe` | Restore original target bytes and report probe status. |
-| `preview_bulk_trace(session_id, rules) → PreviewBulkTraceResponse` | List matches and report ABI eligibility and capacity before installation. |
-| `apply_bulk_trace(session_id, rules, batch_id, *, callback_source=None) → BulkTraceReport` | Install a batch with a unique caller-chosen ID and an optional observer override. Inspect the returned report for outcomes and restoration status. |
-| `remove_bulk_trace(session_id, batch_id) → BulkTraceReport` | Restore the probes belonging to the batch or retry restoration. |
-
-Resolution options are ordered `include_headers=()`, `compilation_database=""`, ordered `compile_options=()`, `module=""`, `debug_max_entries=0`, and `debug_max_depth=0`. Include and database paths refer to the server. Zero DWARF budgets are unlimited. Callback source is a string read or composed on the client.
-
-Injection also accepts `stack_depth=0` (positive integer or `"full"`), `include_internal_stack_frames=False`, `print_arguments=False`, `print_result=False`, and `callback_package_path=""` (a server path for shared-context lineage).
-
-```python
-from pathlib import Path
-from clang_tracer import Client
-
-with Client("127.0.0.1:50051") as client:
-    session = client.attach(12345)
-    try:
-        source = Path("hook.cpp").read_text()
-        report = client.validate_probe(session.id, "add(int, int)", source)
-        if not report.success:
-            raise RuntimeError(str(report))
-        probe = client.inject(session.id, "add(int, int)", source, stack_depth=16)
-        print("Press Enter in the target terminal now")
-        for event in client.collect_traces(2, session_ids=[session.id]):
-            print(event.sequence, event.function_name, event.phase)
-        client.remove_probe(session.id, probe.id)
-    finally:
-        client.detach(session.id)
-```
-
-To manage several probes together, preview a versioned rule set before applying it. Here the rules match a single selector.
-
-```python
-from uuid import uuid4
-
-from clang_tracer import messages
-
-rules = messages.BulkTraceRules(version=1, exact_selectors=["add(int, int)"])
-print(client.preview_bulk_trace(session.id, rules))
-batch_id = uuid4().hex
-try:
-    print(client.apply_bulk_trace(session.id, rules, batch_id))
-    # Trigger the target and collect events while the batch is active.
-finally:
-    print(client.remove_bulk_trace(session.id, batch_id))
-```
-
-### Read, record, and acknowledge
-
-The common filters are `session_ids=()`, `pid=0`, `names=()`, and `after_sequence=0`. Empty filters select all eligible events. Names are exact selector, linkage or custom context-event names. Matches within a filter are ORed and distinct filters are ANDed. Resume strictly after the last processed sequence from the same server lifetime.
-
-| Method or type | Behavior |
-| --- | --- |
-| `watch_events(session_ids=(), *, after_sequence=0, pid=0, names=(), timeout=None) → EventStream` | Return a cancellable live iterator. The optional deadline covers the whole stream. |
-| `EventStream(call, after_sequence=0, names=())` | Wrapper normally created by `watch_events`. Iteration yields `TraceEvent` and updates `after_sequence`. `close()` or context exit cancels the call, including blocked reads. |
-| `collect_traces(count, **filters) → list[TraceEvent]` | Collect up to a positive count in memory, with default `timeout=30`. Cancels the stream at the limit or on error. |
-| `record_traces(path, count, **filters) → int` | Stream a positive count to a new framed Protobuf file. Default `timeout=30`. A partial file remains if capture fails. |
-| `record_sqlite(path, count, **filters) → int` | Append a bounded live capture to SQLite without consuming history. Default `timeout=30`. Returns the number received. |
-| `read_events(*, limit=256, through_sequence=0, server_instance_id="", timeout=None, **filters) → ReadEventsResponse` | Read retained history without removal. Use the returned server ID and upper sequence to pin subsequent reads to the same lifetime and window. `None` uses the unary deadline. |
-| `acknowledge_events(server_instance_id, sequences, *, timeout=None) → int` | Consume exact committed event IDs from that server lifetime and return the acknowledged count. Affects other readers. |
-| `drain_traces(path, *, listen=False, count=None, timeout=None, **filters) → int` | Write and commit retained events to SQLite before acknowledging. Default drains the initial snapshot. `listen=True` follows new events. Retry storage or acknowledgement failures against the same database. |
-
-```python
-with client.watch_events([session.id], timeout=30) as stream:
-    event = next(stream)
-    print(event.sequence, event.function_name)
-    cursor = stream.after_sequence
-# The stream is closed. Supply after_sequence=cursor to resume on this server.
-```
-
 ## Native REPL C++ client API
 
 `tracer` is the installed REPL's `tracer_repl::Facade`. The built-in `session` is the current `SessionHandle`. Read `id`, `pid`, and `connection` from a handle and acquire a fresh one after reconnecting. `%help api` lists topics and `%type` shows overloads in the running interpreter.
 
 | Facade method | Behavior |
 | --- | --- |
+| `module_index(source, output={}, options={})`, `open_module_index(path={})` | Build or open an index and select it. See the [native module API](#native-c-module-index-api). |
 | `attach(pid)`, `selected_session()`, `detach(session)` | Attach and return a handle, get the selected handle, or restore and detach it. |
 | `prepare(selector, header_or_headers, output, compdb={}, translation_unit={})` | Generate a reusable package. Supply a string, vector, or braced list of headers with the declaring header first. The output directory must be new. |
 | `prepare(selector, header_or_headers, compdb, translation_unit, module, output)` | Pin a package to an ELF image using the explicit-module overload. |
@@ -204,6 +61,69 @@ auto results = live.snapshot()
     | to_vector();
 live.stop();
 ```
+
+## Native C++ module index API
+
+Use this API in the native REPL to build an index, inspect ELF and DWARF
+metadata, or prepare a probe when you have the binary and debug information.
+The index is local to the REPL. No target attachment is needed until
+injection. The [user guide](user.md#index-debug-information-and-prepare-a-probe-from-a-binary)
+shows the equivalent `%module` commands.
+
+| Method | Behavior |
+| --- | --- |
+| `ModuleSource::file(image, debug_file={})` | Select a local ELF and, optionally, its matching separate debug file. |
+| `tracer.module_index(source, output={}, options={})` | Build and select an index. An empty output path uses `<ELF>.tracer.sqlite`. |
+| `tracer.open_module_index(path={})` | Open and select a saved index. With an empty path, use the current index or `module-index.sqlite` in the working directory. |
+| `ModuleIndex::build(source, output, options={})`, `ModuleIndex::open(path)` | Build or open an index directly from C++. Direct calls leave the REPL's index selection alone. |
+| `path()`, `identity()` | Read the SQLite path or the indexed ELF path, SHA-256, build ID, debug companion, and diagnostics. |
+| `types(query={})`, `symbols(query={})` | List records and return a page of `entries` and a `next_page` token. A query has a glob `filter`, an optional `limit` (zero means all), and a continuation `page`. `SymbolQuery::exported_only()` restricts the list to dynamic exports. |
+| `find_type(name)`, `find_symbol(name)` | Resolve a type by name or a symbol by selector, name, or linkage name. Exact lookup requires a unique match. Use the full selector for overloaded functions. |
+| `get_type(id)`, `get_symbol(id)` | Read a particular entry using an ID from the same index. |
+| `emit_headers(selection, output)` | Write declarations, read-only field views, and a manifest to a new directory. Fill `ModuleSelection::symbols` and `types` with IDs. |
+| `prepare_probe(symbol_id, module, output, generated={}, metadata_only=false)` | Create a prepared package for the indexed symbol. Use an empty `module` to use the recorded ELF path. The output must be new. An optional generated bundle is checked before reuse. `metadata_only` keeps the package and skips separate adapter files. |
+
+`ModuleIndexOptions` accepts `max_entries` and `max_depth` budgets (zero means
+unlimited) and a `cancelled` function that can abort indexing. A
+`ModuleSymbol` includes its selector, linkage name, parameter type IDs, and
+ELF address. Use `%symbols --addresses` for live PCs. A `ModuleType` includes
+its kind, optional size and alignment, and known fields with optional byte or
+bit offsets.
+
+### Prepare and trace with the C++ API
+
+Compile the [first-probe target](user.md#create-a-target-and-a-basic-probe)
+and use its `hook.cpp`. Run these lines in the native REPL from that directory
+before attaching. Use new output names on subsequent runs.
+
+```cpp
+auto index = tracer.module_index(tracer_module::ModuleSource::file("./target"), "target-api.sqlite");
+tracer_module::SymbolQuery query;
+query.filter = "add*";
+auto matches = index.symbols(query);
+auto add_symbol = index.find_symbol("add(int, int)");
+auto int_type = index.find_type("int");
+std::cout << add_symbol.selector << ' ' << int_type.size.value_or(0) << '\n';
+index.emit_headers({{add_symbol.id}, {}}, "recovered-add-api");
+index.prepare_probe(add_symbol.id, {}, "prepared-add-api", "recovered-add-api");
+```
+
+Run `./target` in a second terminal and substitute its printed PID.
+The fourth argument to `tracer.inject` selects the prepared package. Press
+Enter in the target terminal while `tracer.collect` waits.
+
+```cpp
+auto indexed_target = tracer.attach(12345);
+auto indexed_probe = tracer.inject(indexed_target, add_symbol.selector, "hook.cpp", "prepared-add-api");
+auto indexed_events = tracer.collect(indexed_target, 2, 30);
+tracer.print(indexed_events.at(1));
+tracer.detach(indexed_target);
+```
+
+The POST event shows `sum=42`. For a later REPL, use
+`tracer.open_module_index("target-api.sqlite")`. A standalone C++ application
+can include `<tracer/module_index.hpp>` and link `tracer_module_index` to
+build, query, and prepare from the same index.
 
 ## Agent callback API
 
@@ -318,36 +238,15 @@ Generate bindings from `tracer.proto` and its imported `context_transport.proto`
 | `ReadEvents` | `ReadEventsRequest → ReadEventsResponse` | Read a bounded retained window without consuming it. |
 | `AcknowledgeEvents` | `AcknowledgeEventsRequest → AcknowledgeEventsResponse` | Consume exact sequences from the matching server lifetime after committing storage. |
 
-Use the generated stub when you need request fields beyond the Python convenience methods. This example lists verified runtime addresses. The mapping token binds the result to the target's current image mapping.
-
-```python
-from clang_tracer import Client, messages
-
-with Client() as client:
-    session = client.attach(12345)
-    try:
-        reply = client.stub.ListSymbols(
-            messages.ListSymbolsRequest(
-                session_id=session.id, query="add(", include_addresses=True,
-            ),
-            timeout=10,
-        )
-        print(reply)
-    finally:
-        client.detach(session.id)
-```
-
 The agent-to-collector `ContextTransport.Export` RPC is a bidirectional stream of `ProducerPacket` and `CollectorControl`. The agent uses it to deliver state descriptors and events, maintain producer identity, and process collector control. Client applications consume these events through `Tracer.WatchEvents` or retained history.
 
 ## Build and validate changes
 
-Use a fresh build directory for a different compiler or SDK. Configure native integration tests, then run the C++ and Python checks in the corresponding build environment.
+Use a fresh build directory for a different compiler or SDK. Configure and run the native integration tests.
 
 ```bash
 ./build-rhel.sh --toolchain-root /opt/llvm-21 --build-dir build-rhel --with-tests
 ctest --test-dir build-rhel --output-on-failure
-python -m pip install -e './python[dev]'
-CLANG_TRACER_NATIVE_BUILD="$PWD/build-rhel" python -m pytest python/tests
 ```
 
-See [validation](../validation.md) for detour regressions and benchmark reproduction. To regenerate the REPL grammar, follow the [ANTLR walkthrough](../native-repl.md#regenerate-the-grammar).
+For Python integration and its tests, see the [optional Python reference](python-client.md). See [validation](../validation.md) for detour regressions and benchmark reproduction. To regenerate the REPL grammar, follow the [ANTLR walkthrough](../native-repl.md#regenerate-the-grammar).

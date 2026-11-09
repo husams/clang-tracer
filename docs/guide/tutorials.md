@@ -242,31 +242,17 @@ unset CLANG_TRACER_ENDPOINT
 
 Look for `request.step` events sharing the same request ID. The worker inherits context through supported `pthread_create` propagation and reports twice the request ID. The outer call reports the worker result plus one. For an explicit scope or a durable producer/collector journal, follow [Shared context](../shared-context.md).
 
-## Automate tracing with Python
+## Trace from the native CLI
 
-Start the target from the first lab and a server listening on loopback. In the same directory as `hook.cpp`, run the [Python client example](developer.md#resolve-validate-install-and-restore) with the real PID. Trigger one target call when prompted. The script prints two events, removes the probe and detaches. Repeat with `watch_events` for a cursor-based stream or use `record_traces` to write a framed recording that the native REPL can replay.
+Use the [first-probe target](user.md#create-a-target-and-a-basic-probe).
+Start a server in a separate terminal.
 
 ```bash
 clang-tracer-server --listen 127.0.0.1:50051
 ```
 
-The [Python client walkthrough](../../python/README.md) includes launch, readiness and shutdown, console examples, and recording. Installed examples in `share/clang-tracer/examples/python` exercise the Python API end to end.
-
-## Trace from the Python console or the native CLI
-
-Use the running target and server from the previous lab. Run `clang-tracer-console --endpoint 127.0.0.1:50051`, then enter these commands. Trigger one call while collecting.
-
-```bash
-attach 12345
-symbols --filter "add("
-probe validate "add(int, int)" --callback hook.cpp
-probe inject "add(int, int)" --callback hook.cpp --print-result
-collect 2 --timeout 30
-detach
-exit
-```
-
-For explicit raw ABI mode, save this as `legacy.cpp` and attach the target again. `nm ./target` can confirm the linkage name for the example build.
+In the client terminal, set `PID` to the PID printed by the target and use
+the same loopback endpoint. Save this entry-only observer as `legacy.cpp`. `nm ./target` can confirm the linkage name for the example build.
 
 ```cpp
 extern "C" long long trace_callback(const TraceContext& context) {
@@ -276,6 +262,7 @@ extern "C" long long trace_callback(const TraceContext& context) {
 ```
 
 ```bash
+export CLANG_TRACER_ENDPOINT=127.0.0.1:50051
 clang-tracer attach "$PID"
 clang-tracer trace "$PID" --function _Z3addii --return int32 \
   --arg int32 --arg int32 --callback legacy.cpp

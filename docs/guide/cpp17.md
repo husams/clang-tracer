@@ -67,31 +67,6 @@ See the [scalar override tutorial](../native-repl.md#opt-in-to-scalar-overrides)
 
 ## Additional client and callback APIs
 
-| Python method | RPC | Behavior |
-| --- | --- | --- |
-| `allocate_memory(session_id, size)` | `AllocateMemory` | Return the allocation ID, address, and size. |
-| `free_memory(session_id, allocation_id)` | `FreeMemory` | Free the session allocation and report its state. |
-| `load_target_library(session_id, path)` | `LoadTargetLibrary` | Load a trusted library on the target host. |
-| `apply_memory_patch(request)` | `ApplyMemoryPatch` | Submit an executable patch, import redirect, or writable patch with a mapping token and expected bytes. |
-| `restore_memory_patch(session_id, patch_id)` | `RestoreMemoryPatch` | Restore and verify original bytes. |
-| `start_page_monitor(request)`, `stop_page_monitor(session_id)` | `StartPageMonitor`, `StopPageMonitor` | Arm dedicated pages, then restore them and return first touches. |
-| `start_instruction_trace(session_id, address, size, *, tid, mapping_token, **options)` | `StartInstructionTrace` | Start bounded instruction capture. Options are `max_records=256`, `timeout_seconds=5`, `registers=False`, `callback_library=""`, `memory_address=0`, `memory_size=0`, and `discover_calls=False`. |
-| `stop_instruction_trace(session_id)` | `StopInstructionTrace` | Stop and return original PCs in execution order. |
-
-Python `validate_probe` and `inject` also accept `allow_call_original` and `trace_exceptions`. Both default to false. Other opt-ins can be set in the corresponding Protobuf requests on a compatible server.
-
-```python
-allocation = client.allocate_memory(session.id, 4096)
-try:
-    mapping = client.list_memory_mappings(session.id)
-    initial = client.read_memory(
-        session.id, allocation.address, 1, mapping_token=mapping.mapping_token,
-    )
-    assert initial == b"\x00"
-finally:
-    client.free_memory(session.id, allocation.id)
-```
-
 A captured native REPL `Event::stack()` returns an owned vector of frames, including each PC, stack pointer, kind, module, module offset, function, file, line, and application-frame classification.
 
 ```cpp

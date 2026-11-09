@@ -31,7 +31,6 @@ CHAPTERS = {
         "gcc85": "docs/gcc85-compatibility.md",
         "gcc85-results": "docs/gcc85-runtime-results.md",
         "repl": "docs/native-repl.md",
-        "python": "python/README.md",
         "storage": "docs/event-storage.md",
         "context": "docs/shared-context.md",
     },
@@ -45,8 +44,12 @@ CHAPTERS = {
         "example-stack": "examples/call-stacks/README.md",
         "example-shared": "examples/shared-context/README.md",
         "example-jit": "examples/native-repl-jit/README.md",
-        "example-python": "examples/python/README.md",
         "validation": "docs/validation.md",
+    },
+    "Optional Python": {
+        "python-client": "docs/guide/python-client.md",
+        "python": "python/README.md",
+        "example-python": "examples/python/README.md",
     },
 }
 CHAPTER_IDS = {ROOT / path: key for group in CHAPTERS.values() for key, path in group.items()}

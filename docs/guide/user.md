@@ -5,9 +5,8 @@ Clang Tracer attaches to a running Linux x86-64 C++ process. A **session** ident
 | Interface | Use it for |
 | --- | --- |
 | `clang-tracer-repl` | Explore a local process, prepare and install probes, record and analyze events in C++. |
-| `clang-tracer-console` | Control a server interactively through the Python client. |
 | `clang-tracer` | Run one tracing operation at a time in a shell or script. |
-| `clang_tracer.Client` | Automate tracing from Python. See the [developer guide](developer.md). |
+| `clang-tracer-module` | Index and inspect compiled ELF files and their debug information from the shell. |
 
 Start with the first probe below, then use the [command reference](commands.md) and [tutorials](tutorials.md).
 
@@ -24,18 +23,10 @@ From the repository root, configure, build and install into a user-owned prefix.
 export PATH="$HOME/.local/clang-tracer/bin:$PATH"
 clang-tracer-server --help
 clang-tracer-repl --help
+clang-tracer-module --help
 ```
 
-For a split LLVM installation, CMake options, staging, tarball and RPM packaging, see [Build and deploy on RHEL-compatible Linux](../build-rhel.md). For GCC 8.5 SDK targets, use the [SDK compatibility build](../gcc85-compatibility.md). If you already have the native package, put its binary directory on `PATH` and run the two help commands. The server finds its matching installed agent automatically. The native REPL starts and owns a private server unless you specify an endpoint.
-
-The Python client is installed separately. Use Python 3.12 or newer. Install from the repository or replace `./python` with your distribution's wheel.
-
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install ./python
-clang-tracer-console --help
-```
+For a split LLVM installation, CMake options, staging, tarball and RPM packaging, see [Build and deploy on RHEL-compatible Linux](../build-rhel.md). For GCC 8.5 SDK targets, use the [SDK compatibility build](../gcc85-compatibility.md). If you already have the native package, put its binary directory on `PATH` and run the help commands. The server finds its matching installed agent automatically. The native REPL starts and owns a private server unless you specify an endpoint.
 
 ## Open the interactive guide
 
@@ -243,14 +234,14 @@ prepared package can be reused for injection without either file.
 See [module index commands](commands.md#native-repl-module-index-commands) for
 all options, [the native REPL walkthrough](../native-repl.md#prepare-a-probe-from-a-binary-without-headers)
 for a callback that reads recovered record fields, and the
-[Python guide](../../python/README.md#index-a-module-and-prepare-a-probe-without-application-headers)
-for the programmatic workflow.
+[native C++ module API](developer.md#native-c-module-index-api)
+for a programmatic workflow inside the REPL or a C++ application.
 
 ## Related documentation
 
 - [Command reference](commands.md)
 - [Basic and advanced tutorials](tutorials.md)
 - [Native C++ REPL walkthrough](../native-repl.md)
-- [Python console and client walkthrough](../../python/README.md)
 - [Event retention and SQLite storage](../event-storage.md)
 - [Developer guide and API reference](developer.md)
+- [Optional Python client and console](python-client.md)

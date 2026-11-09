@@ -236,43 +236,6 @@ clang-tracer --request list.textproto --output sessions.pb list
 clang-tracer --request watch.textproto --count 2 --output events.pb watch
 ```
 
-## Python console startup and server commands
-
-```bash
-clang-tracer-console --endpoint 127.0.0.1:50051 --timeout 45 --color auto
-python -m clang_tracer --help
-```
-
-`--endpoint` specifies a server and defaults to the environment or loopback. Omit it and use `server start` to create an owned server. `--timeout` sets a unary RPC deadline (default 30 seconds). `--color auto|always|never` selects a color policy. Auto respects terminal detection and `NO_COLOR`. `--help` and `-h` show startup options.
-
-| Command and example | Options and behavior |
-| --- | --- |
-| `server start --timeout 45 --event-history-limit 8192` | Start a private local server. `--executable PATH` and `--agent PATH` select binaries. `--timeout SEC` sets the readiness deadline (default 30) and `--operation-timeout SEC` sets the native deadline (default 10, range 1–300). `--durable-directory PATH` enables durable context recording. Supports the five history and transport budget flags in the native server reference. |
-| `server status` | Show endpoint readiness and ownership. |
-| `server stop --timeout 45` | Gracefully stop the owned server. The shutdown deadline defaults to 30 seconds. Retry if the child is still shutting down. |
-| `attach 12345` | Attach and select the process's session. |
-| `sessions` | List sessions and probes. |
-| `use s1` | Switch to an existing session. |
-| `modules` | List eligible application ELF paths. |
-| `symbols --filter "add(" --limit 20` | List DWARF callables. `--filter TEXT` and `--module TEXT` match case-sensitive substrings. `--limit N` sets the page size (zero is unbounded) and `--page TOKEN` resumes it. |
-| `detach s1` | Restore and detach this session. Omit the session to detach the selected one. |
-| `probe resolve "add(int, int)"` | Resolve using DWARF. Accepts Python resolution options. |
-| `probe validate "add(int, int)" --callback hook.cpp --level compile` | Compile and check a local callback for the target. `--level syntax` selects syntax-only validation. Accepts Python resolution options. |
-| `probe inject "add(int, int)" --callback hook.cpp --stack full --print-result` | Resolve and install a callback. `--stack N\|full` captures entry stacks. `--internal-frames` includes runtime and JIT frames. `--print-arguments` and `--print-result` include snapshots. `--package SERVER_PATH` selects a shared-context package lineage. Accepts Python resolution options. |
-| `probe add probe.textproto` | Install an explicit `ProbeSpec` from a local Protobuf text file. |
-| `probe remove 1` | Restore the original target entry for this probe. |
-| `events --count 2 --timeout 30` | Stream events until a count, deadline, or Ctrl+C. Accepts console stream options. |
-| `collect 2 --name "add(int, int)"` | Stream and display events. Optional positional count limits the capture. Accepts console stream options. |
-| `record capture.db 2 --sqlite` | Save a required positive count to a new framed Protobuf file or append to SQLite. Accepts console stream options. Default deadline 30 seconds. |
-| `drain capture.db --listen --count 10` | Commit to SQLite then acknowledge shared history. `--listen` includes future events. Omit it to drain the initial snapshot. `--count N` limits writes and acknowledgements. Accepts console stream options. |
-| `help probe inject` | Show help for a topic. Omit topic for the index. `help colors` describes color options. |
-| `! pwd` | Run the rest of the line in a local `/bin/sh`. Working-directory changes stay in that shell. |
-| `exit` or `quit` | Exit and stop any server this console owns. |
-
-Python resolution options are repeatable `--include HEADER` and `--compile-option ARG`, plus `--compdb PATH`, `--module TEXT`, `--debug-max-entries N`, and `--debug-max-depth N`. The headers and database are on the server. Zero DWARF budgets mean unlimited traversal.
-
-Console stream options are repeatable `--session ID` and `--name NAME`, plus `--pid PID`, `--after SEQUENCE`, and `--timeout SECONDS`. The default session filter is the selected session, or all sessions when none is selected. Names match an exact selector, linkage name or emitted context event name. Ctrl+C interrupts the stream and returns to the prompt. An expired cursor reports `OUT_OF_RANGE`.
-
 ## Offline probe preparation
 
 ```bash
@@ -327,3 +290,5 @@ The REPL starts `clang-tracer-repl-check` internally for syntax checks, completi
 | Deploy `--destdir DIR` | Stage installation under a separate filesystem root. |
 
 See [Build and deploy](../build-rhel.md) for resource headers, custom layouts, and verification.
+
+For Python scripting and console commands, see the [optional Python reference](python-client.md).
