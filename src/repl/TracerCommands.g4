@@ -3,7 +3,7 @@ grammar TracerCommands;
 line : '%' command EOF;
 command : server | attach | processes | sessions | use | status | detach
         | modules | moduleIndex | threads | symbols | probe | interceptor | events | collect | record
-        | cpp | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload;
+        | cpp | plugin | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
 serverOption : ('--executable' | '--agent') value | contextEventBytes;
 attach : 'attach' (UINT ('--start-time' UINT)?)?;
@@ -78,7 +78,7 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'import'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
         | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview' | 'apply'
-        | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | STACK;
+        | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | STACK | pluginKeyword;
 memory : 'memory' ('maps' | 'read' value '--mapping' value
                  ('--count' UINT | '--type' value)
                  | 'scan' value '--mapping' value '--count' UINT
@@ -90,6 +90,9 @@ stackFilter : '--stack-application-only' value;
 contextEventBytes : ('--context-event-bytes' | '--context-transport-memory-bytes') UINT;
 extraCompileOption : '--extra-arg' value | '--extra-args' (value | SHELL)+;
 cwdOption : CWD value;
+plugin : 'plugin' ('load' value '--as' value | 'reload' value | 'list'
+                  | 'run' value value | 'commands' value);
+pluginKeyword : 'plugin' | 'run' | 'commands';
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';

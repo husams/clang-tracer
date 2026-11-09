@@ -121,6 +121,7 @@ function(tracer_add_native_repl)
   install(TARGETS clang-tracer-prepare-injectors-native RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Runtime)
   # Each executable uses the facade it was built against, even across upgrades.
   set(_repl_facade_headers "${_repl}/api.hpp" "${_repl}/event_value.hpp"
+    "${_repl}/clang_tracer_repl_plugin.h"
     "${_repl}/event_ranges.hpp" "${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/module_index.hpp")
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_repl_facade_headers}")
   set(_repl_facade_digests "")
@@ -154,7 +155,7 @@ function(tracer_add_native_repl)
   target_link_libraries(clang-tracer-repl-check PRIVATE clang-cpp LLVM)
   set_target_properties(clang-tracer-repl-check PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
   add_executable(clang-tracer-repl "${_repl}/main.cpp" "${_repl}/interpreter.cpp" "${_repl}/completion.cpp" "${_repl}/record_mappings.cpp" "${_repl}/check_process.cpp" "${_repl}/check_session.cpp" "${_repl}/shell.cpp" "${_repl}/compiler_profile.cpp" "${_repl}/mapping_cache.cpp")
-  target_sources(clang-tracer-repl PRIVATE "${_repl}/help.cpp" "${_repl}/syntax.cpp"
+  target_sources(clang-tracer-repl PRIVATE "${_repl}/help.cpp" "${_repl}/syntax.cpp" "${_repl}/plugins.cpp"
     "${_repl}/editor.cpp" "${_repl}/editor_completion.cpp")
   add_dependencies(clang-tracer-repl clang-tracer-repl-check clang-tracer-prepare-injectors-native)
   target_include_directories(clang-tracer-repl SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
@@ -209,6 +210,10 @@ function(tracer_add_native_repl)
     add_test(NAME native_repl_cpp COMMAND repl-cpp-tests)
     set_tests_properties(native_repl_cpp PROPERTIES TIMEOUT 60)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME native_repl_plugins
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_plugins.py"
+        $<TARGET_FILE:clang-tracer-repl> "${CMAKE_CURRENT_SOURCE_DIR}/examples/jit-plugin-globals")
+    set_tests_properties(native_repl_plugins PROPERTIES TIMEOUT 90)
     add_test(NAME native_repl_checker_session
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_checker_session.py"
         $<TARGET_FILE:clang-tracer-repl-check>)

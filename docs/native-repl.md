@@ -1061,6 +1061,41 @@ guaranteed interruption. Ctrl+C also cancels tracing operations.
 Completion covers command names and local C++ declarations/members. Dynamic
 completion of remote tracing symbols remains follow-up work.
 
+## Load local C++ plugins
+
+Load a trusted C++ source file with `%plugin load FILE --as NAME`. The REPL
+compiles it with its current local C++ compiler profile, so include paths and
+defines can come from `--cpp-arg` or `%cpp options compdb`. Use `--startup` with
+a file containing the load commands to load the same plugins at startup.
+
+```text
+%plugin load examples/jit-plugin-globals/plugin_a.cpp --as a
+%plugin load examples/jit-plugin-globals/plugin_b.cpp --as b
+%plugin commands a
+%plugin run a tick
+%plugin run b tick
+%plugin reload a
+%plugin run a value
+%plugin run b value
+```
+
+The first load reports `compiled`. A later load of the same source and compiler
+inputs reports `cache hit`. The REPL preprocesses the source to check the
+effective inputs, then reuses native code generation on a hit. Cached objects
+live under `$XDG_CACHE_HOME/clang-tracer/repl/plugins` or
+`~/.cache/clang-tracer/repl/plugins` when XDG_CACHE_HOME is unset. Each load
+links into a fresh JIT scope. A successful reload resets that plugin's globals
+and leaves peer plugins active. A failed reload keeps the prior generation.
+
+The local V1 interface is declared in `clang_tracer_repl_plugin.h`, available
+on the plugin's include path. Implement `tracer_repl_plugin_v1()` to return a
+constant descriptor with named, synchronous, zero-argument commands returning
+`uint64_t`. Each source is a single translation unit and owns its globals.
+Use constant initialization and trivial destruction. The JIT scope resolves
+its own symbols, so peer globals and host libraries are unavailable for
+linking. Run plugins from trusted sources because they execute native code in
+the REPL process.
+
 ## Cleanup and scripted use
 
 ```text

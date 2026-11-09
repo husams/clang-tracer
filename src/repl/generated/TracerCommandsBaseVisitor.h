@@ -195,6 +195,14 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitPlugin(TracerCommandsParser::PluginContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitPluginKeyword(TracerCommandsParser::PluginKeywordContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
 
 };
 

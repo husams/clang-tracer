@@ -1946,6 +1946,11 @@ public:
   case K::cpp_import:
   case K::cpp_options:
   case K::cpp_generate:
+  case K::plugin_load:
+  case K::plugin_reload:
+  case K::plugin_list:
+  case K::plugin_run:
+  case K::plugin_commands:
   case K::shell:
   case K::complete:
   case K::type:

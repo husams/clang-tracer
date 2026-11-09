@@ -18,6 +18,7 @@
 #include "help.hpp"
 #include "interpreter.hpp"
 #include "compiler_profile.hpp"
+#include "plugins.hpp"
 #include "shell.hpp"
 #include "syntax.hpp"
 
@@ -198,6 +199,7 @@ int main(int argc, char **argv) {
     tr::Controller controller(settings, std::cout);
     tr::Facade facade(controller);
     tr::CppEngine cpp(facade, std::move(cpp_args));
+    tr::Plugins plugins;
     input.use_cpp(cpp);
     auto choose = [&](const std::string &prompt) {
       return input.read(prompt).value_or("");
@@ -276,6 +278,8 @@ int main(int argc, char **argv) {
         expand_extra_compile_arguments(command);
         if (command.kind == tr::CommandKind::help) {
           tr::print_help(std::cout, command.arguments, cpp, color);
+        } else if (tr::is_plugin_command(command.kind)) {
+          plugins.execute(command, cpp, std::cout);
         } else if (command.kind == tr::CommandKind::type) {
           tr::print_code(std::cout, cpp.describe_symbol(command.arguments.at(0)),
                          tr::Syntax::cpp, color);

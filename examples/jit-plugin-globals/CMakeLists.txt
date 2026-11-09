@@ -18,6 +18,9 @@ endif()
 
 add_library(plugin_a OBJECT plugin_a.cpp)
 add_library(plugin_b OBJECT plugin_b.cpp)
+foreach(plugin IN ITEMS plugin_a plugin_b)
+  target_include_directories(${plugin} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../src/repl")
+endforeach()
 set_target_properties(plugin_a plugin_b PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_custom_target(run-jit-plugin-globals

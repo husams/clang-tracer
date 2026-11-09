@@ -35,4 +35,22 @@ Addresses vary by run. Reload links A's existing object into a fresh scope and
 then removes A's original scope. The executable checks the distinct addresses,
 A's reset to zero, and B's preserved address and value before printing `PASS`.
 
+## Run in the native REPL
+
+From the worktree root, start a native REPL built from this branch and enter
+the following commands. A fresh cache reports `compiled` for both loads.
+The reload reports `cache hit`, followed by `a.value = 0` and `b.value = 10`.
+
+```text
+%plugin load examples/jit-plugin-globals/plugin_a.cpp --as a
+%plugin load examples/jit-plugin-globals/plugin_b.cpp --as b
+%plugin run a address
+%plugin run b address
+%plugin run a tick
+%plugin run b tick
+%plugin reload a
+%plugin run a value
+%plugin run b value
+```
+
 [LLVM ORC symbol resolution](https://llvm.org/docs/ORCv2.html#design-overview)
