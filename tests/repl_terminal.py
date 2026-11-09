@@ -26,6 +26,8 @@ def main():
     work = Path(workspace.name)
     headers = work / "editör headers"
     headers.mkdir()
+    changed_header = work / "changed.hpp"
+    changed_header.write_text("#pragma once\n")
     (headers / "editor-test.hpp").write_text("constexpr int terminal_header_value = 27;\n")
     (work / "file with spaces.cpp").write_text('std::cout << "snippet-loaded" << std::endl;\n')
     child = None
@@ -117,6 +119,36 @@ def main():
         until(rb"for \(int i = 0; i < 2; \+\+i\) \{")
         send('std::cout << "loop-" << i << std::endl;\t\r')
         until(rb"(?m)^loop-0\nloop-1\n.*tracer\[7\]> ")
+
+        send('#include "changed.hpp"\r')
+        until(rb"\ntracer\[7\]> ")
+        original_header = changed_header.read_bytes()
+        stamp = changed_header.stat()
+        changed_header.write_bytes(original_header + b"// changed during editing\n")
+        send("for (int x = 1; x < 2; ++x) {\rstd::cou\t")
+        until(rb"C\+\+ completion: C\+\+ header changed: [^\n]*changed.hpp;[^\n]*\n"
+              rb"tracer\[7\]> \n?for \(int x = 1; x < 2; \+\+x\) \{\n +std::cou")
+        assert b"\x1b[JC++ completion:" in transcript
+        changed_header.write_bytes(original_header)
+        os.utime(changed_header, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        send('t << "completion-input-kept" << std::endl;\r}\r')
+        until(rb"(?m)^completion-input-kept\n.*tracer\[7\]> ")
+
+        send("%probe inject \t")
+        until(rb'%probe inject "selector"')
+        send("demo::compute(int)\t")
+        until(rb"\[optional: --callback FILE or --prepared DIRECTORY\]")
+        send("--prepared prepared\t")
+        until(rb'%probe inject "demo::compute\(int\)" --prepared prepared')
+        send("\x03")
+        until(rb"\ntracer\[7\]> ")
+
+        send("%probe inject --callback\t")
+        until(rb'%probe inject "selector" --callback "file"')
+        send("demo::compute(int)\thook.cpp\t")
+        until(rb'%probe inject "demo::compute\(int\)" --callback "hook.cpp"')
+        send("\x03")
+        until(rb"\ntracer\[7\]> ")
 
         send("%probe prepare\t")
         until(rb'%probe prepare "selector" --include "header" --output "directory"')
