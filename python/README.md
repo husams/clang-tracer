@@ -72,6 +72,36 @@ Programmatic clients can supply a preconfigured gRPC channel, including a secure
 channel when connecting through a TLS endpoint. The supplied channel remains
 owned by its caller.
 
+
+## Index a module and prepare a probe without application headers
+
+Use the native Clang Tracer tools on `PATH` with the Python package. Building
+and querying an index works offline. Use a matching debug file when the ELF
+has separate DWARF.
+
+```python
+from clang_tracer import ModuleIndex, ModuleSource
+
+index = ModuleIndex.build(ModuleSource.file("./libdemo.so"), "demo.sqlite")
+packet = index.find_type("demo::Packet")
+score = index.find_symbol("demo::score(demo::Packet const&)")
+for entry in index.symbols(filter="demo::*", exported_only=True).entries:
+    print(entry.id, entry.selector)
+
+index.emit_headers(symbols=[score.id], output="recovered")
+prepared = index.prepare_probe(score.id, output="prepared-score", generated="recovered")
+```
+
+Use `ModuleIndex.open("demo.sqlite")` to reuse an index. `types()` and
+`symbols()` return typed pages. Set `limit` and pass `next_page` as
+`page` to retrieve another page. `get_type(id)` and `get_symbol(id)` resolve
+IDs within that index. With no output argument, `build()` creates the
+`<ELF>.tracer.sqlite` sidecar. With no `module` argument, `prepare_probe()`
+uses the ELF path stored in the index and verifies its identity. Pass the
+resulting directory as `prepared=prepared` to `client.validate_probe()` or
+`client.inject()` on the attached session. The client sends the package contents
+to the server.
+
 ## Programmatic tracing
 
 The repository's `examples/python/README.md` describes runnable programs for

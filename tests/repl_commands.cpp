@@ -71,6 +71,14 @@ int main() {
       "--output prepared");
   require(prepare.kind == CommandKind::prepare && !prepare.has("--compdb") &&
           !prepare.has("--translation-unit") && !prepare.has("--module"));
+  const auto indexed = parse_command(
+      "%probe prepare 'demo::score(demo::Packet const&)' --output prepared");
+  require(indexed.kind == CommandKind::prepare && !indexed.has("--module-index"));
+  require(parse_command("%module types --index 'my index.sqlite' --format json")
+              .option("--index") == "my index.sqlite");
+  require(parse_command("%module symbols --exported --limit 10").has("--exported"));
+  bad("%probe prepare f --include original.hpp --module-index types.sqlite --output prepared");
+  bad("%probe prepare f --module-index types.sqlite");
   for (const auto *probe : {"%probe prepare f --include h --output out",
                             "%probe resolve f",
                             "%probe validate f --callback hook.cpp",
