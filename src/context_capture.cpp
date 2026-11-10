@@ -148,6 +148,48 @@ bool write_truncation(BoundedProtoWriter &writer,
          writer.end_message();
 }
 
+bool write_value_snapshot(BoundedProtoWriter &writer, std::uint32_t field,
+                          const tracer::ValueSnapshot &snapshot,
+                          bool include_members) noexcept {
+  if (snapshot.descriptor_size > 4096 || snapshot.payload_size > 4096 ||
+      snapshot.container_role_count > 128 || snapshot.record_type_count > 128 ||
+      (snapshot.member_count && (!include_members || !snapshot.members ||
+                                 snapshot.member_count > tracer::kMaxSnapshotMembers)))
+    return false;
+  const auto text = [](const char *value) {
+    return value ? std::string_view(value) : std::string_view{};
+  };
+  const auto descriptor = snapshot.descriptor
+      ? std::string_view(snapshot.descriptor, snapshot.descriptor_size)
+      : std::string_view{};
+  const auto payload = snapshot.payload
+      ? std::string_view(reinterpret_cast<const char *>(snapshot.payload),
+                         snapshot.payload_size)
+      : std::string_view{};
+  if (!writer.begin_message(field) || !writer.string(1, text(snapshot.cpp_type)) ||
+      !writer.string(2, text(snapshot.root_type)) || !writer.string(3, descriptor) ||
+      !writer.string(4, payload) ||
+      !writer.u64(5, static_cast<std::uint32_t>(snapshot.status)) ||
+      !writer.string(6, text(snapshot.detail)))
+    return false;
+  for (std::size_t i = 0; i < snapshot.container_role_count; ++i)
+    if (!writer.string(7, text(snapshot.container_roles[i])))
+      return false;
+  for (std::size_t i = 0; i < snapshot.record_type_count; ++i)
+    if (!writer.string(8, text(snapshot.record_types[i])))
+      return false;
+  for (std::size_t i = 0; i < snapshot.member_count; ++i) {
+    const auto &member = snapshot.members[i];
+    if (!member.name || !member.snapshot)
+      continue;
+    if (!writer.begin_message(9) || !writer.string(1, member.name) ||
+        !write_value_snapshot(writer, 2, *member.snapshot, false) ||
+        !writer.end_message())
+      return false;
+  }
+  return writer.end_message();
+}
+
 bool write_typed_trace_value(BoundedProtoWriter &writer, std::uint32_t field,
                              const tracer::TraceValue &value) noexcept {
   if (!writer.begin_message(field) ||
@@ -173,21 +215,8 @@ bool write_typed_trace_value(BoundedProtoWriter &writer, std::uint32_t field,
   case tracer::ValueType::Void:
     break;
   }
-  if (ok && value.snapshot) {
-    const auto &snapshot = *value.snapshot;
-    const auto text = [](const char *value) { return value ? std::string_view(value) : std::string_view{}; };
-    ok = snapshot.descriptor_size <= 4096 && snapshot.payload_size <= 4096 && snapshot.container_role_count <= 128 && snapshot.record_type_count <= 128 &&
-         writer.begin_message(5) && writer.string(1, text(snapshot.cpp_type)) &&
-         writer.string(2, text(snapshot.root_type)) &&
-         writer.string(3, snapshot.descriptor ? std::string_view(snapshot.descriptor, snapshot.descriptor_size) : std::string_view{}) &&
-         writer.string(4, snapshot.payload ? std::string_view(reinterpret_cast<const char *>(snapshot.payload), snapshot.payload_size) : std::string_view{}) &&
-         writer.u64(5, static_cast<std::uint32_t>(snapshot.status)) && writer.string(6, text(snapshot.detail));
-    for (std::size_t i = 0; ok && i < snapshot.container_role_count; ++i)
-      ok = writer.string(7, text(snapshot.container_roles[i]));
-    for (std::size_t i = 0; ok && i < snapshot.record_type_count; ++i)
-      ok = writer.string(8, text(snapshot.record_types[i]));
-    ok = ok && writer.end_message();
-  }
+  if (ok && value.snapshot)
+    ok = write_value_snapshot(writer, 5, *value.snapshot, true);
   return ok && writer.end_message();
 }
 

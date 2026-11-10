@@ -1,0 +1,3 @@
+%probe prepare "HFW::Item::compare(const HFW::Item &) const" --include demo/pimpl/item.hpp --include demo/pimpl/item-impl.hpp --include demo/pimpl/snapshot-policy.hpp --output pimpl-roles
+%probe inject "HFW::Item::compare(const HFW::Item &) const" --prepared pimpl-roles --prepared-mode require
+%collect --name "HFW::Item::compare(const HFW::Item &) const" --count 6 --timeout 15 --phase POST --as captured

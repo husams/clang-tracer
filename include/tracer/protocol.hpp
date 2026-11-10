@@ -86,6 +86,13 @@ enum class CallableKind : std::uint32_t {
 enum class TracePhase : std::uint32_t { Pre = 1, Post = 2 };
 enum class LogLevel : std::uint8_t { Info, Warning, Error };
 
+struct ValueSnapshot;
+struct ValueSnapshotMember {
+  const char *name = nullptr;
+  const ValueSnapshot *snapshot = nullptr;
+};
+inline constexpr std::size_t kMaxSnapshotMembers = 128;
+
 struct ValueSnapshot {
   enum Status : std::uint32_t {
     Complete = 1,
@@ -105,6 +112,8 @@ struct ValueSnapshot {
   std::size_t container_role_count = 0;
   const char *const *record_types = nullptr;
   std::size_t record_type_count = 0;
+  const ValueSnapshotMember *members = nullptr;
+  std::size_t member_count = 0;
 };
 
 struct TraceValue {

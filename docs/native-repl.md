@@ -832,28 +832,35 @@ Read the fields with `event.result_snapshot()` or decode an owned `T` with
 `event.result_as<T>()` after importing a mapping for `T`. `event.result()`
 still shows the address, including `0x0` for null returns.
 
-If the declared pointee is a polymorphic base, use
-`%probe prepare --snapshot-return-type QUALIFIED_TYPE` to prepare the layout of
-one concrete derived type from matching headers and compiler options. Inject the prepared probe with
-`--snapshot-return-pointee`. When RTTI identifies that exact type, the agent
-copies the complete derived object using its prepared layout. Other live
-objects use the declared base layout. For typed local decoding of a polymorphic
-snapshot, supply an `EventCodec<T>` for the value you want to construct.
-
-For an `Item*` or `Item&` that exposes its implementation through a polymorphic
-raw pointer member, add `--snapshot-return-member _imp` to `%probe prepare`.
-Clang discovers concrete implementations defined in the matching preparation
-inputs, and the target uses RTTI to select the live type's field layout. Pass an
+For a polymorphic pointer return, preparation discovers eligible implementations
+from the matching source inputs. RTTI selects a prepared concrete layout during
+capture. Other live objects use the declared base layout. Pass an
 implementation's `.cpp` with `--include` if its definition is in that file.
-Add `--snapshot-return-type HFW::ItemV1` if you want to prepare one explicit type.
-For a pointer return, inject with `--snapshot-return-pointee`. Reference returns
-already capture the referenced object.
+For typed local decoding of a polymorphic snapshot, supply an `EventCodec<T>`
+for the value you want to construct.
 
-`event.result_snapshot().field("_imp_snapshot")` holds the live implementation's
-copied fields and reports its concrete type from `cpp_type()`. `_imp` holds the
-address. A null member or a type absent from the prepared package has only the
-address. To decode an owned local type with `result_as<T>()`, define an
-`EventCodec<T>` that reads the implementation snapshot.
+A reusable record policy can follow specific raw pointer fields wherever that
+record is captured as an argument, receiver, or result. Define the policy in
+a C++ header and supply it through the existing `%probe prepare --include`
+option alongside the matching application definitions.
+
+```cpp
+namespace tracer_snapshot {
+template<class Record> struct FollowPointers;
+
+template<> struct FollowPointers<HFW::Item> {
+  static constexpr const char* fields[] = {"_imp", "_other"};
+};
+}
+```
+
+Each configured field must refer to a live object with stable fields at the
+capture point. The record snapshot keeps its address field and adds an owned
+snapshot named `<field>_snapshot` for each captured pointee. For example,
+`event.result_snapshot().field("_imp_snapshot")` reports its concrete type
+from `cpp_type()`. A null member or a type absent from the prepared package
+has only the address. Pointer returns use `--snapshot-return-pointee` at
+injection. Reference returns already capture the referenced object.
 
 To choose the captured fields for one implementation, pass a C++ file with
 `--callback` to `%probe inject`. Define an overload of `tracer_snapshot::encode`

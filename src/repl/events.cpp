@@ -1,5 +1,6 @@
 #include "events.hpp"
 #include "../prepared_contract.hpp"
+#include "tracer/protocol.hpp"
 
 #include <algorithm>
 #include <array>
@@ -485,14 +486,30 @@ EventValue decode_owned_value(
   return SnapshotDecoder(payload, roles, types, context_state).decode(*value, cpp_type, wrapped);
 }
 
-EventValue decode_snapshot(const clangtracer::context::v1::ValueSnapshot &snapshot) {
+EventValue decode_snapshot(const clangtracer::context::v1::ValueSnapshot &snapshot,
+                           bool include_members = true) {
   using Snapshot = clangtracer::context::v1::ValueSnapshot;
   if (snapshot.status() != Snapshot::COMPLETE)
     throw std::runtime_error("event snapshot unavailable: " + snapshot.detail());
-  return decode_owned_value(snapshot.cpp_type(), snapshot.root_type(),
-                            snapshot.descriptor_set(), snapshot.payload(),
-                            snapshot.container_roles(), snapshot.record_types(),
-                            false, true);
+  auto value = decode_owned_value(snapshot.cpp_type(), snapshot.root_type(),
+                                 snapshot.descriptor_set(), snapshot.payload(),
+                                 snapshot.container_roles(), snapshot.record_types(),
+                                 false, true);
+  if (snapshot.members().empty())
+    return value;
+  if (!include_members ||
+      snapshot.members_size() > static_cast<int>(tracer::kMaxSnapshotMembers))
+    throw std::runtime_error("invalid event snapshot member count or depth");
+  auto fields = value.fields();
+  std::set<std::string> names;
+  for (const auto &member : snapshot.members()) {
+    if (member.name().empty() || !member.has_snapshot() ||
+        fields.count(member.name()) || !names.insert(member.name()).second)
+      throw std::runtime_error("invalid or duplicate event snapshot member");
+    if (member.snapshot().status() == Snapshot::COMPLETE)
+      fields.emplace(member.name(), decode_snapshot(member.snapshot(), false));
+  }
+  return EventValue{std::move(fields), value.cpp_type()};
 }
 
 void decoded_states(const api::TraceEvent &event, std::ostream &out) {

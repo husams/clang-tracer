@@ -233,8 +233,9 @@ Build `prepared-polymorphic-pointee-target` and start the example.
 
 The launcher prints the commands in
 [`inspect.repl`](polymorphic-pointee/inspect.repl). The target returns a
-`Base*` to a `Child` whose base subobject sits at a nonzero offset. The
-prepared probe uses the exact dynamic type to capture `Child::x` as `42`.
+`Base*` to a `Child` whose base subobject sits at a nonzero offset. Source
+preparation discovers `Child` and captures `Child::x` as `42` without a
+type-specific command option.
 The example also reads `x` through `result_as<ChildFields>()` with a local
 decoder. Add `--smoke` to check the child, base and null cases.
 
@@ -249,32 +250,33 @@ cmake --build build --target clang-tracer-repl clang-tracer-server clang_tracer_
 ./examples/prepared-injectors/run-native.sh --pimpl-reference
 ```
 
-The public [`Item` declaration](pimpl/item.hpp) keeps its `_imp` implementation
-pointer private and forward-declares its `ItemImp` pointee. The matching
-internal header defines three concrete runtime types: `HFW::ItemV1`,
-`HFW::ItemV2`, and `HFW::ItemV3`. Preparation imports both headers and names
-only `_imp`; the pointee snapshot type is inferred from those headers. The
-pointer probe opts in to pointee capture. The reference probe captures its
-referenced `Item` without that flag. Both sessions check the distinct nested
-fields for all three implementation versions, including private and nested
-fields. A fourth concrete implementation is defined only in `item.cpp`, so it
-keeps only the `_imp` address. Both return paths also exercise a null `_imp`;
-the pointer path separately checks a null outer pointer and its raw `0x0`
-result. The smoke script defines a local `EventCodec` and calls
-`result_as<LocalFields>()` to copy each implementation's version and private
-field into an owned local value. Capture reads implementation fields directly
-and does not call an application getter.
+The public [`Item` declaration](pimpl/item.hpp) keeps its pointer fields private
+and forward-declares `ItemImp`. The internal header defines `ItemV1`, `ItemV2`,
+and `ItemV3`. Preparation loads the reusable [`FollowPointers` policy](pimpl/snapshot-policy.hpp)
+with `--include`. It follows `_imp`, `_other`, and the non-polymorphic `_stamp`
+wherever the probe captures an `Item` argument, receiver, or result.
+
+The pointer probe opts in to capturing the returned `Item`. The reference probe
+captures its `Item` directly. Both sessions inspect the private and nested
+fields of all three implementations. For the fourth implementation, defined
+only in `item.cpp`, the snapshot retains the pointer address. Both sessions also
+check null members, and the pointer session checks a null outer return. The
+demo uses `result_as<LocalFields>()` to copy each implementation's version and
+private field into an owned local value.
 
 Run the automated cases with:
 
 ```bash
 ./examples/prepared-injectors/run-native.sh --pimpl-pointer --smoke
 ./examples/prepared-injectors/run-native.sh --pimpl-reference --smoke
+./examples/prepared-injectors/run-native.sh --pimpl-roles --smoke
 ```
 
 CTest registers these as `native_repl_prepared_pimpl_pointer` and
-`native_repl_prepared_pimpl_reference`. Separate sessions avoid re-importing
-the same application declarations into one REPL process.
+`native_repl_prepared_pimpl_reference`; `native_repl_prepared_pimpl_roles`
+checks that the same policy also captures arguments and receivers. Separate
+sessions avoid re-importing the same application declarations into one REPL
+process.
 
 The `--pimpl-custom` mode demonstrates a user encoder for ItemV2. It replaces
 the automatic ItemV2 fields with a single `summary` projection while preserving

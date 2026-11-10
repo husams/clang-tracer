@@ -1,4 +1,4 @@
-%probe prepare "HFW::HfwManager::createItem()" --include demo/polymorphic-pointee/item.hpp --snapshot-return-type HFW::Child --output prepared
+%probe prepare "HFW::HfwManager::createItem()" --include demo/polymorphic-pointee/item.hpp --output prepared
 %probe inject "HFW::HfwManager::createItem()" --prepared prepared --prepared-mode require --snapshot-return-pointee
 %collect --name "HFW::HfwManager::createItem()" --count 3 --timeout 15 --phase POST --as captured
 auto captured = tracer.batch("captured");

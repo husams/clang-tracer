@@ -922,8 +922,7 @@ schema_tree_bytes(const std::shared_ptr<const SchemaMessage> &root) {
     if (!m || !messages.insert(m).second) {
       return;
     }
-    total += sizeof(SchemaMessage) + m->cpp_type.size() + m->full_name.size() +
-             m->snapshot_cpp_type.size();
+    total += sizeof(SchemaMessage) + m->cpp_type.size() + m->full_name.size();
     for (const auto &f : m->fields) {
       visit_field(&f);
     }
@@ -1266,40 +1265,48 @@ render_context_codec_sources(clang::ASTContext& ast,
   return render_state_codec_sources(roots, access_policy);
 }
 
-CodecSourceResult render_pimpl_context_codec_sources(
+CodecSourceResult render_snapshot_member_accessors(
     clang::ASTContext &ast,
     ::tracer::compat::span<const clang::QualType> payload_roots,
-    clang::QualType root_type, std::string_view member_name,
+    ::tracer::compat::span<const SnapshotMemberAccessor> members,
     CodecAccess access_policy) {
   CodecSourceResult result;
-  if (access_policy != CodecAccess::snapshot_members || root_type.isNull() ||
-      member_name.empty()) {
-    result.error = "PImpl snapshot codec requires a snapshot root and member";
-    return result;
-  }
-  const auto *root = root_type->getAsCXXRecordDecl();
-  root = root ? root->getDefinition() : nullptr;
-  const clang::FieldDecl *member = nullptr;
-  if (root)
-    for (const auto *field : root->fields())
-      if (field->getNameAsString() == member_name) {
-        member = field;
-        break;
-      }
-  if (!root || !member || !member->getType()->isPointerType()) {
-    result.error = "PImpl snapshot codec member is not a direct raw pointer field";
+  if (access_policy != CodecAccess::snapshot_members || members.empty()) {
+    result.error = "followed snapshot fields require snapshot member access";
     return result;
   }
   result = render_context_codec_sources(ast, {}, payload_roots, access_policy);
   if (!result)
     return result;
-  const auto root_name = record_spelling(root);
-  result.source += "\nnamespace tracer::context_engine::snapshot_access {\n"
-                   "struct PImplMemberTag { friend constexpr auto member(PImplMemberTag); };\n"
-                   "template struct Grant<PImplMemberTag, &::" + root_name +
-                   "::" + std::string(member_name) + ">;\n"
-                   "template<class T> decltype(auto) pimpl_member(const T& value) {\n"
-                   "  return value.*member(PImplMemberTag{});\n}\n}\n";
+  result.source += "\nnamespace tracer::context_engine::snapshot_access {\n";
+  for (std::size_t i = 0; i < members.size(); ++i) {
+    const auto &accessor = members[i];
+    auto *root = accessor.root_type;
+    root = root ? root->getDefinition() : nullptr;
+    const clang::FieldDecl *field = nullptr;
+    if (root)
+      for (const auto *candidate : root->fields())
+        if (candidate->getNameAsString() == accessor.member_name) {
+          field = candidate;
+          break;
+        }
+    if (!root || !field || !field->getType()->isPointerType()) {
+      result.error = "followed snapshot field is not a direct raw pointer field";
+      result.source.clear();
+      return result;
+    }
+    const auto tag = "FollowMemberTag" + std::to_string(i);
+    const auto member = "snapshot_member_" + std::to_string(i);
+    result.source += "struct " + tag +
+                     " { friend constexpr auto member(" + tag + "); };\n"
+                     "template struct Grant<" + tag + ", &::" +
+                     record_spelling(root) + "::" + accessor.member_name +
+                     ">;\n"
+                     "template<class T> decltype(auto) " + member +
+                     "(const T& value) { return value.*member(" + tag +
+                     "{}); }\n";
+  }
+  result.source += "}\n";
   return result;
 }
 
@@ -1599,10 +1606,7 @@ SchemaResult build_payload_schema_impl(clang::ASTContext &ast,
                                        clang::QualType payload,
                                        StateFamilyKey family,
                                        SchemaLimits limits,
-                                       CodecAccess access_policy,
-                                       std::string_view pimpl_member,
-                                       clang::QualType implementation_type,
-                                       clang::QualType projection_type) {
+                                       CodecAccess access_policy) {
   SchemaResult result;
   const auto payload_type = canonical_with_template_arguments(payload);
   if (payload.isNull() || payload_type.empty()) {
@@ -1636,66 +1640,6 @@ SchemaResult build_payload_schema_impl(clang::ASTContext &ast,
   root->cpp_type = "__tracer_payload_root<" + payload_type + ">";
   root->full_name = root->cpp_type;
   auto value = b.describe(payload, "value", 1, 0);
-  if (!pimpl_member.empty()) {
-    const std::string snapshot_field = std::string(pimpl_member) + "_snapshot";
-    const auto *root_record = payload->getAsCXXRecordDecl();
-    root_record = root_record ? root_record->getDefinition() : nullptr;
-    const auto *implementation = implementation_type->getAsCXXRecordDecl();
-    implementation = implementation ? implementation->getDefinition() : nullptr;
-    if (!root_record || !implementation) {
-      result.error = "PImpl snapshot requires a record root, implementation, and non-colliding member name";
-      return result;
-    }
-    const clang::FieldDecl *member = nullptr;
-    for (const auto *field : root_record->fields())
-      if (field->getNameAsString() == pimpl_member) {
-        member = field;
-        break;
-      }
-    if (!member || !member->getType()->isPointerType() ||
-        member->getType().isVolatileQualified() ||
-        member->getType()->getPointeeType().isVolatileQualified()) {
-      result.error = "PImpl snapshot member is not a direct raw pointer field: " +
-                     std::string(pimpl_member);
-      return result;
-    }
-    const auto *member_base =
-        member->getType()->getPointeeType()->getAsCXXRecordDecl();
-    member_base = member_base ? member_base->getDefinition() : nullptr;
-    clang::CXXBasePaths paths;
-    if (!member_base || !member_base->isPolymorphic() ||
-        (implementation->getCanonicalDecl() != member_base->getCanonicalDecl() &&
-         (!implementation->isDerivedFrom(member_base, paths) ||
-          paths.isAmbiguous(ast.getCanonicalType(ast.getRecordType(member_base)))))) {
-      result.error = "PImpl implementation is not a polymorphic pointee-compatible record";
-      return result;
-    }
-    if (!value.message ||
-        std::any_of(value.message->fields.begin(), value.message->fields.end(),
-                    [&](const auto &field) { return field.name == snapshot_field; })) {
-      result.error = "PImpl snapshot field collides with an existing root field";
-      return result;
-    }
-    auto extended = std::make_shared<SchemaMessage>(*value.message);
-    extended->cpp_type += ".__tracer_pimpl_snapshot";
-    extended->full_name = extended->cpp_type;
-    extended->snapshot_cpp_type = payload_type;
-    std::uint32_t number = 1;
-    for (const auto &field : extended->fields)
-      number = std::max(number, field.number + 1);
-    auto projection = b.describe(projection_type, snapshot_field, number, 1);
-    if (projection.message) {
-      auto projected_message =
-          std::make_shared<SchemaMessage>(*projection.message);
-      projected_message->cpp_type += ".__tracer_pimpl_projection";
-      projected_message->full_name = projected_message->cpp_type;
-      projected_message->snapshot_cpp_type =
-          canonical_with_template_arguments(implementation_type);
-      projection.message = std::move(projected_message);
-    }
-    extended->fields.push_back(std::move(projection));
-    value.message = std::move(extended);
-  }
   root->fields.push_back(std::move(value));
   if (!b.error.empty()) {
     result.error = std::move(b.error);
@@ -1817,36 +1761,6 @@ SchemaResult build_payload_schema(clang::ASTContext &ast,
                                   StateFamilyKey family, SchemaLimits limits,
                                   CodecAccess access_policy) {
   return build_payload_schema_impl(ast, payload, std::move(family), limits,
-                                   access_policy, {}, {}, {});
-}
-
-SchemaResult build_pimpl_payload_schema(clang::ASTContext &ast,
-                                        clang::QualType payload,
-                                        StateFamilyKey family,
-                                        std::string_view member_name,
-                                        clang::QualType implementation_type,
-                                        SchemaLimits limits,
-                                        CodecAccess access_policy) {
-  if (member_name.empty() || implementation_type.isNull())
-    return {{}, "PImpl snapshot member and implementation type are required"};
-  return build_payload_schema_impl(ast, payload, std::move(family), limits,
-                                   access_policy, member_name,
-                                   implementation_type, implementation_type);
-}
-
-SchemaResult build_pimpl_payload_schema(clang::ASTContext &ast,
-                                        clang::QualType payload,
-                                        StateFamilyKey family,
-                                        std::string_view member_name,
-                                        clang::QualType implementation_type,
-                                        clang::QualType projection_type,
-                                        SchemaLimits limits,
-                                        CodecAccess access_policy) {
-  if (member_name.empty() || implementation_type.isNull() ||
-      projection_type.isNull())
-    return {{}, "PImpl snapshot member and projection types are required"};
-  return build_payload_schema_impl(ast, payload, std::move(family), limits,
-                                   access_policy, member_name,
-                                   implementation_type, projection_type);
+                                   access_policy);
 }
 } // namespace tracer::context_engine

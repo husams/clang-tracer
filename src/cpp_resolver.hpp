@@ -19,9 +19,7 @@ struct ResolvedCallable {
 ResolvedCallable resolve_header_callable(const std::string& selector,
                                          const clangtracer::v1::ProbeSpec& header_context,
                                          const PreparedHeaderCommand& command,
-                                         bool pointer_layouts,
-                                         const std::string& snapshot_return_type = {},
-                                         const std::string& snapshot_return_member = {});
+                                         bool pointer_layouts);
 
 void verify_prepared_adapter(const std::string &selector,
                              const clangtracer::v1::PreparedInjector &adapter,
