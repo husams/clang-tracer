@@ -6,21 +6,25 @@
 #include <functional>
 #include <iomanip>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/DeclTemplate.h>
+#include <clang/AST/Mangle.h>
 #include <clang/AST/PrettyPrinter.h>
 #include <clang/Basic/SourceManager.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Sema/Sema.h>
 #include <llvm/Config/llvm-config.h>
+#include <llvm/Support/raw_ostream.h>
 
 namespace tracer_repl {
 namespace {
 using Record = clang::CXXRecordDecl;
+using DestructorGroups = std::set<std::vector<std::string>>;
 
 struct MappedField {
   const clang::FieldDecl* field;
@@ -89,10 +93,13 @@ class Generator {
   std::map<Record*, std::string> failures_;
   std::vector<RecordMapping> ordered_;
   const std::function<bool(const std::string&)>& viable_;
+  const std::set<std::string>* external_destructors_;
+  DestructorGroups needed_destructors_;
+  std::set<Record*> waiting_for_destructors_;
 
   Record* key(Record* record) { return record->getCanonicalDecl(); }
 
-  clang::QualType record_type(Record* record) {
+  clang::QualType record_type(const Record* record) {
 #if LLVM_VERSION_MAJOR >= 22
     return ast_.getCanonicalTagType(record);
 #else
@@ -187,7 +194,8 @@ class Generator {
     return false;
   }
 
-  bool supported(clang::QualType type, std::string& reason, unsigned depth) {
+  bool supported(clang::QualType type, std::string& reason, unsigned depth,
+                 std::string& waiting_for_field) {
     if (depth > 32) {
       reason = "type nesting exceeds 32";
       return false;
@@ -245,7 +253,7 @@ class Generator {
             simple == "optional") {
           for (unsigned i = 0; i < (map ? 2U : 1U); ++i) {
             if (args.size() <= i || args[i].getKind() != clang::TemplateArgument::Type ||
-                !supported(args[i].getAsType(), reason, depth + 1)) {
+                !supported(args[i].getAsType(), reason, depth + 1, waiting_for_field)) {
               return false;
             }
           }
@@ -256,8 +264,14 @@ class Generator {
       }
     }
     if (!plan(record, depth + 1)) {
-      reason = failures_[key(record)];
-      return false;
+      auto* canonical = key(record);
+      if (!waiting_for_destructors_.count(canonical)) {
+        reason = failures_[canonical];
+        return false;
+      }
+      if (waiting_for_field.empty()) {
+        waiting_for_field = failures_[canonical];
+      }
     }
     return true;
   }
@@ -289,8 +303,10 @@ class Generator {
       }
     }
     for (const auto* method : record->methods()) {
+      const auto is_destructor = llvm::isa<clang::CXXDestructorDecl>(method);
       if (!method->isVirtual() || method->isImplicit() || method->isDeleted() ||
-          (method->isPureVirtual() && !llvm::isa<clang::CXXDestructorDecl>(method))) {
+          (method->isPureVirtual() && !is_destructor) ||
+          (external_destructors_ && is_destructor)) {
         continue;
       }
       if (!method->getDefinition()) {
@@ -354,14 +370,74 @@ class Generator {
     return true;
   }
 
+  std::vector<std::string> destructor_symbols(const clang::CXXDestructorDecl* destructor) {
+    if (!destructor->hasExternalFormalLinkage() || destructor->isInlined()) {
+      return {};
+    }
+    auto mangler = std::unique_ptr<clang::MangleContext>(ast_.createMangleContext());
+    auto* itanium = llvm::dyn_cast<clang::ItaniumMangleContext>(mangler.get());
+    if (!itanium) {
+      return {};
+    }
+    std::vector<std::string> symbols;
+    const auto append_symbol = [&](auto write) {
+      llvm::raw_string_ostream out(symbols.emplace_back());
+      write(out);
+    };
+    const auto add_destructor = [&](clang::CXXDtorType variant) {
+      append_symbol([&](auto& out) {
+        itanium->mangleName(clang::GlobalDecl(destructor, variant), out);
+      });
+    };
+    add_destructor(clang::Dtor_Complete);
+    add_destructor(clang::Dtor_Base);
+    const auto* owner = destructor->getParent();
+    const auto* key = owner->isPolymorphic() ? ast_.getCurrentKeyFunction(owner) : nullptr;
+    if (key && key->getCanonicalDecl() == destructor->getCanonicalDecl()) {
+      // The translation unit defining the key function owns the vtable and RTTI.
+      append_symbol([&](auto& out) { itanium->mangleCXXVTable(owner, out); });
+      if (owner->getNumVBases()) {
+        append_symbol([&](auto& out) { itanium->mangleCXXVTT(owner, out); });
+      }
+      if (ast_.getLangOpts().RTTI) {
+        append_symbol([&](auto& out) {
+          itanium->mangleCXXRTTI(record_type(owner).getCanonicalType(), out);
+        });
+      }
+    } else if (destructor->isVirtual() && !destructor->isPureVirtual()) {
+      // A vtable emitted by the interpreter can also reference the deleting variant.
+      add_destructor(clang::Dtor_Deleting);
+    }
+    return symbols;
+  }
+
+  const clang::CXXDestructorDecl* destructor_without_definition(Record* record) {
+    const auto* destructor = record->getDestructor();
+    return destructor && !destructor->isImplicit() && !destructor->getDefinition()
+               ? destructor
+               : nullptr;
+  }
+
   bool lifetime_available(Record* record, const std::map<Record*, bool>& bases,
-                          bool default_construct, bool needs_move, std::string& reason) {
+                          bool default_construct, bool needs_move, std::string& reason,
+                          DestructorGroups& needed, std::string& missing_destructor) {
     for (const auto& base : bases) {
-      const auto* destructor = base.first->getDestructor();
-      if (destructor && !destructor->isImplicit() && !destructor->getDefinition()) {
-        reason = "destructor definition is unavailable for local decoding: " +
-                 destructor->getQualifiedNameAsString();
-        return false;
+      if (const auto* destructor = destructor_without_definition(base.first)) {
+        auto symbols = external_destructors_ ? destructor_symbols(destructor)
+                                             : std::vector<std::string>{};
+        if (symbols.empty()) {
+          reason = "destructor definition is unavailable for local decoding: " +
+                   destructor->getQualifiedNameAsString();
+          return false;
+        }
+        if (!std::all_of(symbols.begin(), symbols.end(), [&](const auto& symbol) {
+              return external_destructors_->count(symbol) != 0;
+            })) {
+          if (missing_destructor.empty()) {
+            missing_destructor = destructor->getQualifiedNameAsString();
+          }
+          needed.insert(std::move(symbols));
+        }
       }
     }
     if (default_construct) {
@@ -478,6 +554,9 @@ class Generator {
     RecordMapping mapping{record, {}, {}};
     std::map<Record*, bool> seen;
     std::string reason;
+    DestructorGroups needed;
+    std::string missing_destructor;
+    std::string waiting_for_field;
     if (!collect_fields(record, false, seen, mapping.fields, reason)) {
       return failure(record, reason);
     }
@@ -488,7 +567,7 @@ class Generator {
       if (field->isBitField() || !identifier(field->getNameAsString())) {
         return failure(record, "bit-fields and unnamed/non-ASCII fields are unsupported");
       }
-      if (!supported(field->getType(), reason, depth + 1)) {
+      if (!supported(field->getType(), reason, depth + 1, waiting_for_field)) {
         return failure(record, field->getNameAsString() + ": " + reason);
       }
       ++field_counts[mapped.wire_name];
@@ -498,9 +577,11 @@ class Generator {
         mapped.wire_name = mapped.owner + "::" + mapped.wire_name;
       }
     }
+    const bool check_lifetime = record->getNumBases() || record->isPolymorphic() ||
+                                (external_destructors_ && destructor_without_definition(record));
     if (!can_decode(type_name, mapping) ||
-        ((record->getNumBases() || record->isPolymorphic()) &&
-         !lifetime_available(record, seen, true, true, reason))) {
+        (check_lifetime &&
+         !lifetime_available(record, seen, true, true, reason, needed, missing_destructor))) {
       if (!plan_constructor(mapping, reason)) {
         return failure(record, reason);
       }
@@ -508,9 +589,22 @@ class Generator {
         return failure(record, "inferred constructor and remaining assignable fields are not usable; "
                                "provide EventCodec factory");
       }
-      if (!lifetime_available(record, seen, false, !mapping.returns_prvalue(), reason)) {
+      needed.clear();
+      missing_destructor.clear();
+      if (!lifetime_available(record, seen, false, !mapping.returns_prvalue(), reason,
+                              needed, missing_destructor)) {
         return failure(record, reason);
       }
+    }
+    if (!needed.empty()) {
+      needed_destructors_.merge(needed);
+      waiting_for_destructors_.insert(canonical);
+      return failure(record, "destructor definition is unavailable for local decoding: " +
+                                 missing_destructor);
+    }
+    if (!waiting_for_field.empty()) {
+      waiting_for_destructors_.insert(canonical);
+      return failure(record, waiting_for_field);
     }
     state_[canonical] = 2;
     ordered_.push_back(std::move(mapping));
@@ -518,12 +612,14 @@ class Generator {
   }
 
 public:
-  Generator(clang::CompilerInstance& ci, const std::function<bool(const std::string&)>& viable)
+  Generator(clang::CompilerInstance& ci, const std::function<bool(const std::string&)>& viable,
+            const std::set<std::string>* external_destructors)
       : ci_(ci)
       , ast_(ci.getASTContext())
       , sema_(ci.getSema())
       , policy_(ci.getLangOpts())
-      , viable_(viable) {
+      , viable_(viable)
+      , external_destructors_(external_destructors) {
     policy_.SuppressTagKeyword = true;
   }
 
@@ -551,7 +647,7 @@ public:
         if (!record) {
           throw std::runtime_error("no application record found: " + requested);
         }
-        if (!plan(record)) {
+        if (!plan(record) && !waiting_for_destructors_.count(key(record))) {
           throw std::runtime_error("cannot map " + requested + ": " + failures_[key(record)]);
         }
       }
@@ -574,6 +670,13 @@ public:
       code << " none needed (built-in or existing codecs)";
     }
     code << '\n';
+    for (const auto& group : needed_destructors_) {
+      code << "// tracer-repl-needed-destructor";
+      for (const auto& symbol : group) {
+        code << ' ' << std::quoted(symbol);
+      }
+      code << '\n';
+    }
     for (const auto& mapping : ordered_) {
       const auto type = name(mapping.record);
       generated.types.push_back(type);
@@ -632,7 +735,8 @@ public:
 
 GeneratedRecordMappings
 generate_record_mappings(clang::CompilerInstance& compiler, const std::vector<std::string>& types,
-                         const std::function<bool(const std::string&)>& viable) {
-  return Generator(compiler, viable).run(types);
+                         const std::function<bool(const std::string&)>& viable,
+                         const std::set<std::string>* external_destructors) {
+  return Generator(compiler, viable, external_destructors).run(types);
 }
 } // namespace tracer_repl

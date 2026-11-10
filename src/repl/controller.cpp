@@ -828,9 +828,14 @@ ModuleList::~ModuleList() = default;
 ModuleInfo::~ModuleInfo() = default;
 
 api::ListModulesResponse Controller::module_snapshot(bool include_mappings) {
-  require_session(selected_);
+  return module_snapshot(selected_, include_mappings);
+}
+
+api::ListModulesResponse Controller::module_snapshot(const SessionHandle &session,
+                                                     bool include_mappings) {
+  require_session(session);
   api::ListModulesRequest request;
-  request.set_session_id(selected_.id);
+  request.set_session_id(session.id);
   request.set_include_mappings(include_mappings);
   auto response = unary<api::ListModulesResponse>(
       [&](auto &context, auto &result) { return stub_->ListModules(&context, request, &result); },
@@ -1089,8 +1094,19 @@ void Controller::prepare(const std::string &selector, const Command &options) {
   out_ << "prepared directory=" << directory << '\n';
 }
 
-std::vector<std::string> Controller::take_pending_imports() {
+std::vector<PendingPreparedImport> Controller::take_pending_imports() {
   return std::exchange(pending_imports_, {});
+}
+
+std::function<api::ListModulesResponse()>
+Controller::prepared_import_modules(const SessionHandle &session) {
+#if defined(__linux__) && defined(__x86_64__)
+  if (!server_.endpoint().empty() && endpoint_ == server_.endpoint())
+    return [this, session] { return module_snapshot(session, true); };
+#else
+  (void)session;
+#endif
+  return {};
 }
 
 std::vector<api::PreparedInjector> Controller::take_pending_replay_types() {
@@ -1141,7 +1157,8 @@ std::uint64_t Controller::inject(const SessionHandle &session,
   if (tracer::prepared::is_typed_version(artifact.format_version()) &&
       package != prepared_packages_.end() &&
       artifact.SerializeAsString() == package->second.artifact.SerializeAsString())
-    pending_imports_.push_back(tracer::prepared::adapter_source(package->second.artifact));
+    pending_imports_.push_back(
+        {tracer::prepared::adapter_source(package->second.artifact), session});
   out_ << "installed probe=" << result.id()
        << " session=" << result.session_id();
   if (result.jit_compile_ns() && result.patch_install_ns())

@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <set>
 #include <iomanip>
 #include <sstream>
@@ -622,7 +623,17 @@ std::string reflect_cpp_header(const std::vector<std::string> &arguments,
     include += "#include \"" + header + "\"\n";
   }
   std::vector<std::string> types;
+  std::optional<std::set<std::string>> external_destructors;
   for (std::string type; input >> std::quoted(type);) {
+    if (type == "@tracer-external-destructors") {
+      external_destructors.emplace();
+      for (std::string symbol; input >> std::quoted(symbol);) {
+        if (symbol.empty() || symbol.size() > 4096)
+          throw std::runtime_error("invalid external destructor symbol");
+        external_destructors->insert(std::move(symbol));
+      }
+      break;
+    }
     if (type.empty() || type.size() > 4096 || types.size() >= 128)
       throw std::runtime_error("invalid record selector");
     types.push_back(type);
@@ -656,7 +667,8 @@ std::string reflect_cpp_header(const std::vector<std::string> &arguments,
     }
     throw std::runtime_error("could not check record construction traits");
   };
-  auto generated = generate_record_mappings(compiler, types, viable);
+  auto generated = generate_record_mappings(compiler, types, viable,
+      external_destructors ? &*external_destructors : nullptr);
   parse(generated.source);
   std::string validation;
   for (const auto &type : generated.types)

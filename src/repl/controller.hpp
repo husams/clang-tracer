@@ -27,6 +27,11 @@ struct Settings {
   std::size_t max_events = 4096, max_bytes = 64 * 1024 * 1024;
 };
 
+struct PendingPreparedImport {
+  std::string source;
+  SessionHandle session;
+};
+
 class Controller {
   Settings settings_;
   ServerProcess server_;
@@ -53,9 +58,11 @@ class Controller {
   std::map<std::string, PreparedPackage> prepared_packages_;
   std::filesystem::path default_module_index_;
   clangtracer::v1::ListModulesResponse module_snapshot(bool include_mappings);
+  clangtracer::v1::ListModulesResponse module_snapshot(const SessionHandle &session,
+                                                       bool include_mappings);
   void module_command(const Command &);
   std::filesystem::path module_index_path(const Command &) const;
-  std::vector<std::string> pending_imports_;
+  std::vector<PendingPreparedImport> pending_imports_;
   mutable std::vector<clangtracer::v1::PreparedInjector> pending_replay_types_;
   std::map<std::string, EventBuffer> batches_;
   std::vector<std::weak_ptr<BackgroundEvents>> background_;
@@ -109,7 +116,9 @@ public:
   ::tracer_module::ModuleIndex build_module_index(const ::tracer_module::ModuleSource &,
       const std::filesystem::path &, const ::tracer_module::ModuleIndexOptions &);
   ::tracer_module::ModuleIndex open_module_index(const std::filesystem::path &);
-  std::vector<std::string> take_pending_imports();
+  std::vector<PendingPreparedImport> take_pending_imports();
+  std::function<clangtracer::v1::ListModulesResponse()>
+  prepared_import_modules(const SessionHandle &session);
   std::vector<clangtracer::v1::PreparedInjector> take_pending_replay_types();
   SessionHandle attach(std::uint32_t pid, std::uint64_t expected_start_time = 0,
                        const std::string &expected_executable = {});

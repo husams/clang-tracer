@@ -227,7 +227,8 @@ int main(int argc, char **argv) {
       // returns so the live interpreter is never re-entered.
       for (const auto &adapter : controller.take_pending_imports()) {
         try {
-          const auto imported = cpp.import_prepared_adapter(adapter);
+          const auto imported = cpp.import_prepared_adapter(
+              adapter.source, controller.prepared_import_modules(adapter.session));
           if (!imported.empty())
             std::cout << imported << '\n';
         } catch (const std::exception &error) {
