@@ -34,12 +34,14 @@ public:
                                   const clang::FunctionDecl &function,
                                   const std::vector<std::string> &headers,
                                   bool pointer_layouts,
-                                  const clang::CXXRecordDecl *snapshot_return_record = nullptr) {
+                                  const std::vector<const clang::CXXRecordDecl *> &snapshot_return_records = {},
+                                  bool numbered_snapshot_returns = false) {
     std::vector<NestedRequest> late_requests;
     for (;;) {
       const auto reserved = late_requests.size();
       AdapterEmitter pass(ast, toolchain_search, late_requests);
-      pass.emit_declarations(function, headers, pointer_layouts, snapshot_return_record);
+      pass.emit_declarations(function, headers, pointer_layouts, snapshot_return_records,
+                             numbered_snapshot_returns);
       if (!pass.first_late_dependency_)
         return {pass.forwards_ + pass.declarations_, std::move(pass.standard_headers_)};
       // Each retry must discover another dependency. Reuse the original
@@ -68,13 +70,15 @@ private:
   void emit_declarations(const clang::FunctionDecl &function,
                          const std::vector<std::string> &headers,
                          bool pointer_layouts,
-                         const clang::CXXRecordDecl *snapshot_return_record) {
+                         const std::vector<const clang::CXXRecordDecl *> &snapshot_return_records,
+                         bool numbered_snapshot_returns) {
     selected_method_ = llvm::dyn_cast<clang::CXXMethodDecl>(&function);
     const bool linkage_alias = nested_static_method(selected_method_);
     if (selected_method_ && !linkage_alias)
       register_nested(*selected_method_->getParent());
-    if (snapshot_return_record)
-      register_nested(*snapshot_return_record);
+    for (const auto *snapshot_return_record : snapshot_return_records)
+      if (snapshot_return_record)
+        register_nested(*snapshot_return_record);
     register_nested_type(function.getReturnType(), pointer_layouts);
     for (const auto *parameter : function.parameters())
       register_nested_type(parameter->getType(), pointer_layouts);
@@ -106,10 +110,15 @@ private:
           if (!llvm::isa<clang::CXXRecordDecl>(record->getDeclContext()))
             emit_record(*record);
     }
-    if (snapshot_return_record) {
+    for (std::size_t i = 0; i < snapshot_return_records.size(); ++i) {
+      const auto *snapshot_return_record = snapshot_return_records[i];
+      if (!snapshot_return_record)
+        continue;
       emit_record(*snapshot_return_record);
-      declarations_ += "namespace tracer_prepared { using SnapshotReturn = " +
-                       spelling(ast_.getRecordType(snapshot_return_record)) + "; }\n";
+      declarations_ += "namespace tracer_prepared { using " +
+          (numbered_snapshot_returns ? "SnapshotReturn" + std::to_string(i)
+                                     : "SnapshotReturn") +
+          " = " + spelling(ast_.getRecordType(snapshot_return_record)) + "; }\n";
     }
   }
 

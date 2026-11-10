@@ -91,6 +91,9 @@ struct SchemaField {
 struct SchemaMessage {
   std::string cpp_type, full_name;
   std::vector<SchemaField> fields;
+  // Optional runtime display type when a callback encodes a source record as
+  // a DTO with a distinct C++ layout.
+  std::string snapshot_cpp_type;
 };
 
 struct SchemaRecord final {
@@ -165,6 +168,14 @@ SchemaResult build_pimpl_payload_schema(clang::ASTContext &,
                                         clang::QualType implementation_type,
                                         SchemaLimits = {},
                                         CodecAccess = CodecAccess::public_members);
+SchemaResult build_pimpl_payload_schema(clang::ASTContext &,
+                                        clang::QualType payload,
+                                        StateFamilyKey,
+                                        std::string_view member_name,
+                                        clang::QualType implementation_type,
+                                        clang::QualType projection_type,
+                                        SchemaLimits,
+                                        CodecAccess);
 // Emits owner-side Codec<T> specializations from declarations. The caller
 // appends this source to the checked owner compilation unit; no user mappings.
 CodecSourceResult render_state_codec_source(const clang::CXXRecordDecl &);

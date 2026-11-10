@@ -922,7 +922,8 @@ schema_tree_bytes(const std::shared_ptr<const SchemaMessage> &root) {
     if (!m || !messages.insert(m).second) {
       return;
     }
-    total += sizeof(SchemaMessage) + m->cpp_type.size() + m->full_name.size();
+    total += sizeof(SchemaMessage) + m->cpp_type.size() + m->full_name.size() +
+             m->snapshot_cpp_type.size();
     for (const auto &f : m->fields) {
       visit_field(&f);
     }
@@ -1600,7 +1601,8 @@ SchemaResult build_payload_schema_impl(clang::ASTContext &ast,
                                        SchemaLimits limits,
                                        CodecAccess access_policy,
                                        std::string_view pimpl_member,
-                                       clang::QualType implementation_type) {
+                                       clang::QualType implementation_type,
+                                       clang::QualType projection_type) {
   SchemaResult result;
   const auto payload_type = canonical_with_template_arguments(payload);
   if (payload.isNull() || payload_type.empty()) {
@@ -1677,11 +1679,21 @@ SchemaResult build_payload_schema_impl(clang::ASTContext &ast,
     auto extended = std::make_shared<SchemaMessage>(*value.message);
     extended->cpp_type += ".__tracer_pimpl_snapshot";
     extended->full_name = extended->cpp_type;
+    extended->snapshot_cpp_type = payload_type;
     std::uint32_t number = 1;
     for (const auto &field : extended->fields)
       number = std::max(number, field.number + 1);
-    extended->fields.push_back(
-        b.describe(implementation_type, snapshot_field, number, 1));
+    auto projection = b.describe(projection_type, snapshot_field, number, 1);
+    if (projection.message) {
+      auto projected_message =
+          std::make_shared<SchemaMessage>(*projection.message);
+      projected_message->cpp_type += ".__tracer_pimpl_projection";
+      projected_message->full_name = projected_message->cpp_type;
+      projected_message->snapshot_cpp_type =
+          canonical_with_template_arguments(implementation_type);
+      projection.message = std::move(projected_message);
+    }
+    extended->fields.push_back(std::move(projection));
     value.message = std::move(extended);
   }
   root->fields.push_back(std::move(value));
@@ -1805,7 +1817,7 @@ SchemaResult build_payload_schema(clang::ASTContext &ast,
                                   StateFamilyKey family, SchemaLimits limits,
                                   CodecAccess access_policy) {
   return build_payload_schema_impl(ast, payload, std::move(family), limits,
-                                   access_policy, {}, {});
+                                   access_policy, {}, {}, {});
 }
 
 SchemaResult build_pimpl_payload_schema(clang::ASTContext &ast,
@@ -1819,6 +1831,22 @@ SchemaResult build_pimpl_payload_schema(clang::ASTContext &ast,
     return {{}, "PImpl snapshot member and implementation type are required"};
   return build_payload_schema_impl(ast, payload, std::move(family), limits,
                                    access_policy, member_name,
-                                   implementation_type);
+                                   implementation_type, implementation_type);
+}
+
+SchemaResult build_pimpl_payload_schema(clang::ASTContext &ast,
+                                        clang::QualType payload,
+                                        StateFamilyKey family,
+                                        std::string_view member_name,
+                                        clang::QualType implementation_type,
+                                        clang::QualType projection_type,
+                                        SchemaLimits limits,
+                                        CodecAccess access_policy) {
+  if (member_name.empty() || implementation_type.isNull() ||
+      projection_type.isNull())
+    return {{}, "PImpl snapshot member and projection types are required"};
+  return build_payload_schema_impl(ast, payload, std::move(family), limits,
+                                   access_policy, member_name,
+                                   implementation_type, projection_type);
 }
 } // namespace tracer::context_engine

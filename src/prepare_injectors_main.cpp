@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
         std::cout << "Native header preparation: --selector SELECTOR --include "
                      "HEADER "
                      "--compdb FILE [--translation-unit FILE] "
-                     "--output NEW_DIRECTORY [--module ELF] [--snapshot-return-member FIELD --snapshot-return-type TYPE] [--metadata-only] "
+                     "--output NEW_DIRECTORY [--module ELF] [--snapshot-return-member FIELD [--snapshot-return-type TYPE]] [--metadata-only] "
                      "[--extra-arg ARG]...\n"
                      "ELF preparation: --selector SELECTOR --signature TYPE "
                      "--module ELF --output NEW_DIRECTORY [--member] [--metadata-only]\n"
@@ -121,10 +121,6 @@ int main(int argc, char **argv) {
     const bool elf_mode = signature_option != options.end();
     const auto snapshot_type_option = options.find("--snapshot-return-type");
     const auto snapshot_member_option = options.find("--snapshot-return-member");
-    if (snapshot_member_option != options.end() &&
-        snapshot_type_option == options.end())
-      throw std::invalid_argument(
-          "--snapshot-return-member requires --snapshot-return-type");
     if (snapshot_type_option != options.end() && snapshot_type_option->second.empty())
       throw std::invalid_argument("--snapshot-return-type requires a type name");
     if (elf_mode) {

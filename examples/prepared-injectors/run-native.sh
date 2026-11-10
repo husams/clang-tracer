@@ -15,7 +15,7 @@ if [[ $demo_mode == --pointee ]]; then
 elif [[ $demo_mode == --polymorphic-pointee ]]; then
   example=prepared-polymorphic-pointee-target
   shift
-elif [[ $demo_mode == --pimpl-pointer || $demo_mode == --pimpl-reference ]]; then
+elif [[ $demo_mode == --pimpl-pointer || $demo_mode == --pimpl-reference || $demo_mode == --pimpl-custom ]]; then
   example=prepared-pimpl-target
   shift
 elif [[ $demo_mode == --methods || $demo_mode == --state ]]; then
@@ -26,11 +26,11 @@ target=${CLANG_TRACER_PREPARED_TARGET:-$build/examples/prepared-injectors/$examp
 compdb=${CLANG_TRACER_PREPARED_COMPDB:-$build/compile_commands.json}
 
 if [[ ${1:-} == --help ]]; then
-  printf '%s\n' 'Use --methods, --state, --pointee, --polymorphic-pointee, --pimpl-pointer, or --pimpl-reference to select an example. Add --smoke for automation.'
+  printf '%s\n' 'Use --methods, --state, --pointee, --polymorphic-pointee, --pimpl-pointer, --pimpl-reference, or --pimpl-custom to select an example. Add --smoke for automation.'
   exit 0
 fi
 if [[ $# -gt 1 || ( $# == 1 && $1 != --smoke ) ]]; then
-  printf '%s\n' 'Usage: run-native.sh [--methods|--state|--pointee|--polymorphic-pointee|--pimpl-pointer|--pimpl-reference] [--smoke|--help]' >&2
+  printf '%s\n' 'Usage: run-native.sh [--methods|--state|--pointee|--polymorphic-pointee|--pimpl-pointer|--pimpl-reference|--pimpl-custom] [--smoke|--help]' >&2
   exit 2
 fi
 for required in "$repl" "$server" "$agent" "$target" "$compdb"; do
@@ -96,18 +96,26 @@ Null returns keep the raw `0x0` result and have no pointee snapshot.
 STEPS
     "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60
   fi
-elif [[ $demo_mode == --pimpl-pointer || $demo_mode == --pimpl-reference ]]; then
+elif [[ $demo_mode == --pimpl-pointer || $demo_mode == --pimpl-reference || $demo_mode == --pimpl-custom ]]; then
   repl_script=demo/pimpl/pointer.repl
-  pointer_mode=true
+  inspect_source=demo/pimpl/inspect.cpp
+  check_function=check_pimpl
+  check_args=", true"
   result_label=NATIVE_PIMPL_POINTER
   if [[ $demo_mode == --pimpl-reference ]]; then
     repl_script=demo/pimpl/reference.repl
-    pointer_mode=false
+    check_args=", false"
     result_label=NATIVE_PIMPL_REFERENCE
+  elif [[ $demo_mode == --pimpl-custom ]]; then
+    repl_script=demo/pimpl/custom.repl
+    inspect_source=demo/pimpl/inspect-custom.cpp
+    check_function=check_custom_pimpl
+    check_args=
+    result_label=NATIVE_PIMPL_CUSTOM
   fi
   cat "$repl_script" > inspect.repl
-  printf '%%cpp load demo/pimpl/inspect.cpp\nbool correct = check_pimpl(tracer.batch("captured"), %s);\n' \
-    "$pointer_mode" >> inspect.repl
+  printf '%%cpp load %s\nbool correct = %s(tracer.batch("captured")%s);\n' \
+    "$inspect_source" "$check_function" "$check_args" >> inspect.repl
   printf 'std::cout << "%s=" << correct << std::endl;\n%%quit\n' "$result_label" >> inspect.repl
   if [[ ${1:-} == --smoke ]]; then
     "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60 --fail-fast < inspect.repl | tee "$run/smoke.log"

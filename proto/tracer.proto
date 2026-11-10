@@ -177,6 +177,7 @@ message PreparedInjector {
   string source_translation_unit = 17; // Optional selection hint for an explicit callback database.
   DebugInfo snapshot_return_type = 18; // Checked implementation pointee layout for source preparation.
   string snapshot_return_member = 19; // Direct raw polymorphic implementation pointer member.
+  repeated DebugInfo snapshot_return_types = 20; // Deterministically ordered discovered implementation layouts.
 }
 message ProbeSpec {
   string symbol = 1;       // Linkage name/diagnostic; export required only in raw-symbol mode.

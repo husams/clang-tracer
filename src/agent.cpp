@@ -38,6 +38,7 @@
 #include <unordered_set>
 #include <vector>
 #include "value_snapshot_codegen.hpp"
+#include "snapshot_encoder.hpp"
 #include "value_snapshot_storage.hpp"
 #include "context_paths.hpp"
 #include "prepared_types.hpp"
@@ -2928,6 +2929,7 @@ struct CallbackShape {
   bool class_mode = false;
   bool has_pre = false;
   bool has_post = false;
+  bool encoder_only = false;
   bool signature_specialization = false;
   std::string interceptor_type = "Interceptor";
   std::string specialized_signature_spelling;
@@ -3086,6 +3088,11 @@ bool inspect_callback_shape(clang::ASTContext &context, CallbackShape &shape,
     return true;
   }
   if (!legacy) {
+    if (!saw_legacy && tracer::find_snapshot_encoders(context).requested) {
+      shape.encoder_only = true;
+      shape.has_pre = shape.has_post = true;
+      return true;
+    }
     error = "callback source must define Interceptor or trace_callback";
     return false;
   }
@@ -3095,6 +3102,20 @@ bool inspect_callback_shape(clang::ASTContext &context, CallbackShape &shape,
       !is_call_reference(legacy->getParamDecl(0)->getType(),
                          "tracer::TraceContext")) {
     error = "trace_callback must be defined as long long(const TraceContext&)";
+    return false;
+  }
+  return true;
+}
+
+bool validate_snapshot_encoder(const CallbackShape &shape,
+                               const tracer::ValueSnapshotCode &snapshots,
+                               std::string &error) {
+  if (!snapshots.error.empty()) {
+    error = snapshots.error;
+    return false;
+  }
+  if (snapshots.has_custom_encoder && !shape.has_post) {
+    error = "tracer_snapshot::encode requires a POST hook when combined with an Interceptor";
     return false;
   }
   return true;
@@ -3343,6 +3364,20 @@ struct ReceiverCallbackShape {
 
 std::string make_class_bridge(const CallbackShape &shape);
 
+std::string make_invocation_bridge(const CallbackShape &shape) {
+  if (shape.class_mode)
+    return make_class_bridge(shape);
+  if (shape.encoder_only)
+    return R"CPP(
+extern "C" long long tracer_user_dispatch(const tracer::TraceContext *,
+                                          void *, bool *ran) {
+  *ran = true;
+  return 0;
+}
+)CPP";
+  return tracer::make_legacy_callback_bridge();
+}
+
 class ReceiverShapeConsumer final : public clang::ASTConsumer {
 public:
   ReceiverShapeConsumer(ReceiverCallbackShape &result,
@@ -3357,6 +3392,8 @@ public:
     if (!validate_specialized_signature(context, shape, spec_, result_.error))
       return;
     result_.snapshots = tracer::make_value_snapshot_code(context, spec_);
+    if (!validate_snapshot_encoder(shape, result_.snapshots, result_.error))
+      return;
     class Fields : public clang::RecursiveASTVisitor<Fields> {
     public:
       Fields(clang::ASTContext &c, ReceiverCallbackShape &r)
@@ -3430,11 +3467,7 @@ public:
     result_.has_post = shape.has_post;
     result_.signature_specialization = shape.signature_specialization;
     result_.interceptor_type = shape.interceptor_type;
-    if (shape.class_mode) {
-      result_.bridge = make_class_bridge(shape);
-    } else {
-      result_.bridge = tracer::make_legacy_callback_bridge();
-    }
+    result_.bridge = make_invocation_bridge(shape);
     result_.valid = true;
   }
 
@@ -4947,6 +4980,10 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
     const auto context_declarations =
         tracer::analyze_context_declarations(user_ast->getASTContext());
     if (context_declarations.requires_context) {
+      if (tracer::find_snapshot_encoders(user_ast->getASTContext()).requested) {
+        error = "tracer_snapshot::encode requires an invocation-scoped callback";
+        return false;
+      }
       std::string signature_assert;
       if (!interceptor_template_prelude(source).empty()) {
         shape_valid = inspect_callback_shape(user_ast->getASTContext(), shape,
@@ -4986,12 +5023,10 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
     if (!validate_specialized_signature(user_ast->getASTContext(), shape,
                                         specification, error))
       return false;
-    if (shape.class_mode) {
-      bridge = make_class_bridge(shape);
-    } else {
-      bridge = tracer::make_legacy_callback_bridge();
-    }
     const auto snapshots = tracer::make_value_snapshot_code(user_ast->getASTContext(), specification);
+    if (!validate_snapshot_encoder(shape, snapshots, error))
+      return false;
+    bridge = make_invocation_bridge(shape);
     const std::string generated = make_wrapper(
         p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
         shape.has_pre, shape.has_post, &specification, shape.class_mode,
