@@ -1151,6 +1151,15 @@ needs default construction, move construction, and assignable fields. Pass
 `-fno-access-control` when compiling a generated header with non-public
 members outside the REPL.
 
+Eligible derived records decode inherited fields as well as their own fields.
+Use `DeclaringType::field` for field names shared by multiple base or derived
+declarations. A shared virtual base contributes its fields once. Polymorphic
+records need locally usable construction, destruction, and virtual function
+definitions. To use definitions absent from a prepared adapter, prepare the
+package in one session, then import the application definitions and inject the
+saved package in a fresh session. Use `result_snapshot()` for field inspection
+when only the captured layout is available.
+
 If a generated decoder fails to compile (for example, a set element lacks its
 required comparison operator), the entire import is rejected without changing
 live state. Retry with `--type` to select supported roots; no partial mappings
