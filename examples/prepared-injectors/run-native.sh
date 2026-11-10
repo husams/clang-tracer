@@ -69,6 +69,7 @@ auto snapshot = event.result_snapshot();
 auto manager = event.receiver_snapshot();
 bool correct = captured.size() == 4 && nulls == 2;
 correct = correct && item.id == 42 && item.label == "heap-backed HfwItem label";
+correct = correct && item.base_id == 17 && snapshot.field("base_id").as<int>() == 17;
 correct = correct && item.details.revision == 7 && item.details.active;
 correct = correct && snapshot.field("id").as<int>() == 42 && snapshot.field("label").as<std::string>() == item.label;
 correct = correct && snapshot.field("details").field("revision").as<int>() == 7 && snapshot.field("details").field("active").as<bool>();
@@ -88,7 +89,7 @@ auto captured = tracer.batch("captured");
 auto event = captured.at(captured.at(0).result() == "0x0" ? 1 : 0);
 auto item = event.result_as<prepared_pointee::HfwItem>();
 auto snapshot = event.result_snapshot();
-std::cout << item.label << " " << snapshot.field("details").field("revision").as<int>() << std::endl;
+std::cout << item.label << " " << item.base_id << " " << snapshot.field("details").field("revision").as<int>() << std::endl;
 %quit
 
 The non-null event owns a copied HfwItem value and an automatic field snapshot.

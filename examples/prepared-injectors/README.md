@@ -206,14 +206,15 @@ auto captured = tracer.batch("captured");
 auto event = captured.at(captured.at(0).result() == "0x0" ? 1 : 0);
 auto item = event.result_as<prepared_pointee::HfwItem>();
 auto snapshot = event.result_snapshot();
-std::cout << item.label << " " << snapshot.field("details").field("revision").as<int>() << std::endl;
+std::cout << item.label << " " << item.base_id << " " << snapshot.field("details").field("revision").as<int>() << std::endl;
 %quit
 ```
 
 The target alternates between returning an `HfwItem*` and `nullptr`.
-For non-null returns, `result_snapshot()` includes `id`, `label`, and nested
-`details` fields. The prepared package imports the mapping automatically, so
-`result_as<prepared_pointee::HfwItem>()` returns an owned copy.
+For non-null returns, `result_snapshot()` includes `id`, `label`, nested
+`details`, and the protected `base_id` inherited from the polymorphic `HfwBase`.
+The prepared package imports the mapping automatically, so
+`result_as<prepared_pointee::HfwItem>()` returns an owned copy with those fields.
 `receiver_snapshot()` contains the manager's fields. Null returns display
 `0x0`. Run the same capture as a smoke test with this command.
 

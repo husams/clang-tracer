@@ -43,10 +43,20 @@ public:
 class PrivateUnassignableField { [[maybe_unused]] DeletedAssignment field; };
 struct NoDefault { explicit NoDefault(int); int number; };
 struct Constant { const int number = 1; };
-struct Base { int number = 1; };
+struct Base { int number = 1; protected: int inherited = 0; };
 struct Manual { int number = 0; };
 struct HandMapped { int number = 0; };
-struct Derived : Base { int extra = 2; };
+struct Derived : private Base { int number = 2; };
+struct VirtualBase { virtual ~VirtualBase() = default; int shared = 0; };
+struct Left : virtual VirtualBase { int left = 0; };
+struct Right : virtual VirtualBase { int right = 0; };
+struct Polymorphic : Left, Right { int leaf = 0; };
+struct AbstractBase { virtual ~AbstractBase() = default; virtual void action() = 0; int base = 0; };
+struct Concrete : AbstractBase { void action() override {} int value = 0; };
+struct UndefinedVirtual { virtual void action(); int value = 0; };
+struct RepeatedLeft : Base {};
+struct RepeatedRight : Base {};
+struct Repeated : RepeatedLeft, RepeatedRight {};
 union Union { int integer; double real; };
 }
 ''')
@@ -83,15 +93,29 @@ EventValue linked_value{EventValue::Object{{"number",EventValue{std::int64_t{24}
 if(linked_value.as<application::Linked>().number!=24) throw std::runtime_error("linkage record missing");
 if(box_value.as<application::IntBox>().value!=42 || application::header_runs!=1) throw std::runtime_error("template/reimport failure");
 std::cout << "automatic-template-and-once-ok" << std::endl;
+auto integer = [](int value) { return EventValue{std::int64_t{value}}; };
+EventValue derived_value{EventValue::Object{{"application::Base::number", integer(31)}, {"application::Derived::number", integer(32)}, {"inherited", integer(33)}}, "application::Derived"};
+auto derived = derived_value.as<application::Derived>();
+if (derived.Base::number != 31 || derived.number != 32 || derived.inherited != 33) throw std::runtime_error("inherited field conversion failed");
+EventValue poly_value{EventValue::Object{{"shared", integer(41)}, {"left", integer(42)}, {"right", integer(43)}, {"leaf", integer(44)}}, "application::Polymorphic"};
+auto poly = poly_value.as<application::Polymorphic>();
+if (poly.shared != 41 || poly.left != 42 || poly.right != 43 || poly.leaf != 44) throw std::runtime_error("virtual base conversion failed");
+EventValue concrete_value{EventValue::Object{{"base", integer(51)}, {"value", integer(52)}}, "application::Concrete"};
+auto concrete = concrete_value.as<application::Concrete>();
+if (concrete.base != 51 || concrete.value != 52) throw std::runtime_error("abstract base field conversion failed");
+std::cout << "automatic-inherited-records-ok" << std::endl;
 ''', True)
         assert good.returncode == 0, (good.stdout, good.stderr)
-        for marker in ("automatic-nested-records-ok", "automatic-template-and-once-ok"):
+        for marker in ("automatic-nested-records-ok", "automatic-template-and-once-ok",
+                       "automatic-inherited-records-ok"):
             assert marker in good.stdout, (good.stdout, good.stderr)
         assert "application::Private" in good.stdout, good.stdout
         assert "skipped application::PrivateUnassignableField" in good.stdout, good.stdout
+        for name in ("AbstractBase", "UndefinedVirtual", "Repeated", "Union"):
+            assert f"skipped application::{name}:" in good.stdout, good.stdout
         assert "city" in good.stdout, good.stdout
 
-        rejected = run(settings + '%cpp import "types.hpp"\n' + code + '''%cpp import "types.hpp" --type application::Derived
+        rejected = run(settings + '%cpp import "types.hpp"\n' + code + '''%cpp import "types.hpp" --type application::UndefinedVirtual
 %cpp import "types.hpp" --type application::NoDefault
 %cpp import "types.hpp" --type application::Constant
 %cpp import "types.hpp" --type application::Union

@@ -21,6 +21,17 @@ namespace tracer_repl {
 namespace {
 using Record = clang::CXXRecordDecl;
 
+struct MappedField {
+  const clang::FieldDecl* field;
+  std::string owner;
+  std::string wire_name;
+};
+
+struct RecordMapping {
+  Record* record;
+  std::vector<MappedField> fields;
+};
+
 std::string selector(std::string name) {
   name.erase(
       std::remove_if(name.begin(), name.end(), [](unsigned char c) { return std::isspace(c); }),
@@ -57,7 +68,7 @@ class Generator {
   std::set<Record*> defaults_, manual_, instantiated_;
   std::map<Record*, unsigned> state_;
   std::map<Record*, std::string> failures_;
-  std::vector<Record*> ordered_;
+  std::vector<RecordMapping> ordered_;
   const std::function<bool(const std::string&)>& viable_;
 
   Record* key(Record* record) { return record->getCanonicalDecl(); }
@@ -232,6 +243,130 @@ class Generator {
     return true;
   }
 
+  bool collect_fields(Record* record, bool virtual_base, std::map<Record*, bool>& seen,
+                      std::vector<MappedField>& fields, std::string& reason) {
+    record = record ? record->getDefinition() : nullptr;
+    if (!record || !record->getIdentifier()) {
+      reason = "incomplete or unnamed record in base hierarchy";
+      return false;
+    }
+    const auto [previous, inserted] = seen.emplace(record, virtual_base);
+    if (!inserted) {
+      if (virtual_base && previous->second) {
+        return true;
+      }
+      reason = "repeated non-virtual snapshot base: " + name(record);
+      return false;
+    }
+    for (auto* context = record->getDeclContext(); context; context = context->getParent()) {
+      if (auto* space = llvm::dyn_cast<clang::NamespaceDecl>(context);
+          space && space->isAnonymousNamespace()) {
+        reason = "anonymous namespace type in base hierarchy";
+        return false;
+      }
+      if (llvm::isa<clang::FunctionDecl>(context)) {
+        reason = "local class in base hierarchy";
+        return false;
+      }
+    }
+    for (const auto* method : record->methods()) {
+      if (!method->isVirtual() || method->isImplicit() || method->isDeleted() ||
+          (method->isPureVirtual() && !llvm::isa<clang::CXXDestructorDecl>(method))) {
+        continue;
+      }
+      if (!method->getDefinition()) {
+        reason = "virtual method definition is unavailable for local decoding: " +
+                 method->getQualifiedNameAsString();
+        return false;
+      }
+    }
+    for (const auto& base : record->bases()) {
+      auto* base_record = base.getType()->getAsCXXRecordDecl();
+      if (const auto* specialization = llvm::dyn_cast_or_null<clang::ClassTemplateSpecializationDecl>(base_record)) {
+        const auto primary = specialization->getSpecializedTemplate()->getQualifiedNameAsString();
+        if (primary == "tracer::state" || primary == "tracer::shared_state") {
+          continue;
+        }
+      }
+      if (!collect_fields(base_record, base.isVirtual(), seen, fields, reason)) {
+        return false;
+      }
+    }
+    const auto owner = name(record);
+    for (const auto* field : record->fields()) {
+      if (field->isUnnamedBitField()) {
+        continue;
+      }
+      if (fields.size() == 128) {
+        reason = "more than 128 fields";
+        return false;
+      }
+      fields.push_back({field, owner, field->getNameAsString()});
+    }
+    return true;
+  }
+
+  bool default_constructor_available(Record* record, std::set<Record*>& seen,
+                                     std::string& reason) {
+    record = record->getDefinition();
+    if (!seen.insert(record).second) {
+      return true;
+    }
+    for (const auto* ctor : record->ctors()) {
+      if (!ctor->isDefaultConstructor() || ctor->isImplicit()) {
+        continue;
+      }
+      if (!ctor->getDefinition()) {
+        reason = "default constructor definition is unavailable for local decoding: " +
+                 ctor->getQualifiedNameAsString();
+        return false;
+      }
+      if (!ctor->isDefaulted()) {
+        // A user-defined constructor may explicitly select other base
+        // constructors. Let its definition govern those calls.
+        return true;
+      }
+    }
+    for (const auto& base : record->bases()) {
+      if (!default_constructor_available(base.getType()->getAsCXXRecordDecl(), seen, reason)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool lifetime_available(Record* record, const std::map<Record*, bool>& bases,
+                          std::string& reason) {
+    for (const auto& base : bases) {
+      const auto* destructor = base.first->getDestructor();
+      if (destructor && !destructor->isImplicit() && !destructor->getDefinition()) {
+        reason = "destructor definition is unavailable for local decoding: " +
+                 destructor->getQualifiedNameAsString();
+        return false;
+      }
+    }
+    std::set<Record*> visited;
+    if (!default_constructor_available(record, visited, reason)) {
+      return false;
+    }
+    const auto ctors = record->ctors();
+    const bool has_move = std::any_of(ctors.begin(), ctors.end(), [](const auto* ctor) {
+      return ctor->isMoveConstructor() && !ctor->isDeleted();
+    });
+    for (const auto* ctor : ctors) {
+      unsigned qualifiers = 0;
+      const bool copy_fallback = !has_move && ctor->isCopyConstructor(qualifiers) &&
+                                 qualifiers == clang::Qualifiers::Const;
+      if ((ctor->isMoveConstructor() || copy_fallback) && !ctor->isDeleted() &&
+          !ctor->isImplicit() && !ctor->getDefinition()) {
+        reason = "copy/move constructor definition is unavailable for local decoding: " +
+                 ctor->getQualifiedNameAsString();
+        return false;
+      }
+    }
+    return true;
+  }
+
   bool plan(Record* record, unsigned depth = 0) {
     auto* canonical = key(record);
     if (manual_.count(canonical)) {
@@ -255,50 +390,55 @@ class Generator {
     if (!record || !record->getIdentifier()) {
       return failure(canonical, "unnamed record");
     }
-    for (auto* context = record->getDeclContext(); context; context = context->getParent()) {
-      if (auto* space = llvm::dyn_cast<clang::NamespaceDecl>(context)) {
-        if (space->isAnonymousNamespace()) {
-          return failure(record, "anonymous namespace type");
-        }
-      }
-      if (llvm::isa<clang::FunctionDecl>(context)) {
-        return failure(record, "local class");
-      }
+    if (record->isUnion()) {
+      return failure(record, "union snapshots require an active member discriminator");
     }
-    if (record->isUnion() || record->getNumBases() || record->isPolymorphic() ||
-        record->isAbstract()) {
-      return failure(record, "unions, inheritance and polymorphic classes "
-                             "require custom handling");
+    if (record->isAbstract()) {
+      return failure(record, "an abstract class cannot be constructed as a local value");
     }
-    unsigned fields = 0;
+    std::vector<MappedField> fields;
+    std::map<Record*, bool> seen;
+    std::string reason;
+    if (!collect_fields(record, false, seen, fields, reason)) {
+      return failure(record, reason);
+    }
     const auto type_name = "::" + name(record);
     std::string trait = "std::is_default_constructible_v<" + type_name +
                         "> && std::is_move_constructible_v<" + type_name +
                         "> && std::is_destructible_v<" + type_name + ">";
-    for (const auto* field : record->fields()) {
-      if (++fields > 128) {
-        return failure(record, "more than 128 fields");
-      }
+    std::map<std::string, unsigned> field_counts;
+    for (const auto& mapped : fields) {
+      const auto* field = mapped.field;
       if (field->isBitField() || !identifier(field->getNameAsString())) {
         return failure(record, "bit-fields and unnamed/non-ASCII fields are unsupported");
       }
       if (field->getType().isConstQualified()) {
         return failure(record, "const members require an EventCodec factory");
       }
-      std::string reason;
       if (!supported(field->getType(), reason, depth + 1)) {
         return failure(record, field->getNameAsString() + ": " + reason);
       }
-      const auto expression = "std::declval<" + type_name + "&>()." + field->getNameAsString();
-      trait +=
-          " && std::is_assignable_v<decltype((" + expression + ")), decltype(" + expression + ")>";
+      ++field_counts[mapped.wire_name];
+      const auto expression = "decltype(std::declval<" + type_name + "&>().*(&::" +
+                              mapped.owner + "::" + mapped.wire_name + "))";
+      trait += " && std::is_assignable_v<" + expression + ", std::remove_reference_t<" +
+               expression + ">>";
     }
     if (!viable_(trait)) {
       return failure(record, "accessible default/move construction, destruction and "
                              "assignable fields required; provide EventCodec factory");
     }
+    if ((record->getNumBases() || record->isPolymorphic()) &&
+        !lifetime_available(record, seen, reason)) {
+      return failure(record, reason);
+    }
+    for (auto& mapped : fields) {
+      if (field_counts[mapped.wire_name] > 1) {
+        mapped.wire_name = mapped.owner + "::" + mapped.wire_name;
+      }
+    }
     state_[canonical] = 2;
-    ordered_.push_back(record);
+    ordered_.push_back({record, std::move(fields)});
     return true;
   }
 
@@ -349,8 +489,8 @@ public:
       std::replace(text.begin(), text.end(), '\r', ' ');
       return text;
     };
-    for (auto* record : ordered_) {
-      code << " " << single_line(name(record));
+    for (const auto& mapping : ordered_) {
+      code << " " << single_line(name(mapping.record));
     }
     for (const auto& [record, reason] : failures_) {
       code << "; skipped " << single_line(name(record)) << ": " << single_line(reason);
@@ -359,20 +499,20 @@ public:
       code << " none needed (built-in or existing codecs)";
     }
     code << '\n';
-    for (auto* record : ordered_) {
-      const auto type = name(record);
+    for (const auto& mapping : ordered_) {
+      const auto type = name(mapping.record);
       generated.types.push_back(type);
       code << "template<> struct tracer_repl::EventRecord<::" << type << "> {\n"
            << "static constexpr const char* type_name=" << std::quoted(type) << ";\n"
            << "static auto fields(){return std::make_tuple(";
       bool first = true;
-      for (const auto* field : record->fields()) {
+      for (const auto& mapped : mapping.fields) {
         if (!first) {
           code << ',';
         }
         first = false;
-        code << "tracer_repl::event_member(\"" << field->getNameAsString() << "\", &::" << type
-             << "::" << field->getNameAsString() << ')';
+        code << "tracer_repl::event_member(" << std::quoted(mapped.wire_name) << ", &::"
+             << mapped.owner << "::" << mapped.field->getNameAsString() << ')';
       }
       code << ");}};\n";
     }

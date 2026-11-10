@@ -239,6 +239,8 @@ private:
       source += " = 0";
     else if (decl.isDeletedAsWritten())
       source += " = delete";
+    else if (destructor && decl.isExplicitlyDefaulted() && decl.isInlined())
+      source += " = default";
     return source + ";\n";
   }
 
@@ -637,6 +639,7 @@ private:
       source += ";\n";
     }
     bool emitted_selected = false;
+    bool emitted_default_constructor = false;
     for (const auto *method : record.methods()) {
       if (method->isImplicit())
         continue;
@@ -654,6 +657,7 @@ private:
       if ((!ctor && !destructor) ||
           (!custom && !method->isExplicitlyDefaulted() && !method->isDeletedAsWritten()))
         continue;
+      emitted_default_constructor |= ctor && ctor->getNumParams() == 0;
       source += access(method->getAccess()) + ": ";
       if (destructor)
         source += "~";
@@ -677,6 +681,12 @@ private:
         source += method->isDeletedAsWritten() ? " = delete" : " = default";
       }
       source += ";\n";
+    }
+    if ((record.isDynamicClass() || record.getNumBases()) &&
+        record.hasUserDeclaredConstructor() && !emitted_default_constructor) {
+      // Dropping application constructor bodies must not give a layout-only
+      // adapter an implicit constructor for local snapshot reconstruction.
+      source += "private: " + record.getNameAsString() + "() = delete;\n";
     }
     if (!emitted_selected && selected_method_ &&
         selected_method_->getParent()->getCanonicalDecl() == record.getCanonicalDecl() &&
