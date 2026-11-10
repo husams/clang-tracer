@@ -1054,6 +1054,22 @@ copies the complete derived object using its prepared layout. Other live
 objects use the declared base layout. For typed local decoding of a polymorphic
 snapshot, supply an `EventCodec<T>` for the value you want to construct.
 
+For an `Item*` or `Item&` that exposes its implementation through a polymorphic
+raw pointer member, add `--snapshot-return-member _imp --snapshot-return-type HFW::ItemV1`
+to `%probe prepare`. Pass matching inputs that define the wrapper, the member's
+declared pointee, and the concrete implementation. If the implementation is
+defined in a `.cpp` file, pass that file with `--include`. For a pointer return,
+inject with `--snapshot-return-pointee`. Reference returns already capture the
+referenced object.
+
+When `_imp` points to a live `HFW::ItemV1`,
+`event.result_snapshot().field("_imp_snapshot")` holds the implementation's
+copied fields and reports `HFW::ItemV1` from `cpp_type()`. The `_imp` field holds
+the address. A null member or a different dynamic type has only the address.
+Capture reads fields without invoking application getters. To decode an owned
+local type with `result_as<T>()`, define an `EventCodec<T>` that reads the
+implementation snapshot.
+
 Inspect a record without declaring a local C++ type:
 
 ```cpp

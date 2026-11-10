@@ -61,3 +61,9 @@ set_target_properties(prepared-polymorphic-pointee-target PROPERTIES
   CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 target_compile_options(prepared-polymorphic-pointee-target PRIVATE
   -g -O0 -fno-omit-frame-pointer -fcf-protection=none -fvisibility=hidden)
+
+add_executable(prepared-pimpl-target pimpl/target.cpp pimpl/item.cpp)
+set_target_properties(prepared-pimpl-target PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+target_compile_options(prepared-pimpl-target PRIVATE
+  -g -O0 -fno-omit-frame-pointer -fcf-protection=none)

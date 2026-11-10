@@ -179,7 +179,13 @@ std::string schema_bytes(const context_engine::SchemaRecord &schema,
   message = [&](const auto &value) {
     if (!visited.insert(&value).second)
       return;
-    names[message_name(value.cpp_type)] = value.cpp_type;
+    const std::string marker = ".__tracer_pimpl_snapshot";
+    auto decoded_type = value.cpp_type;
+    if (decoded_type.size() >= marker.size() &&
+        decoded_type.compare(decoded_type.size() - marker.size(), marker.size(),
+                             marker) == 0)
+      decoded_type.erase(decoded_type.size() - marker.size());
+    names[message_name(value.cpp_type)] = std::move(decoded_type);
     for (const auto &item : value.fields)
       field(item);
   };
@@ -240,6 +246,13 @@ make_value_snapshot_code(clang::ASTContext &ast,
     std::string dynamic_error;
     std::string dynamic_rtti_name;
     bool dynamic_capture = false;
+    std::string pimpl_member;
+    clang::QualType pimpl_type;
+    std::string pimpl_cpp_type;
+    std::string pimpl_rtti_name;
+    context_engine::SchemaResult pimpl_schema;
+    std::string pimpl_error;
+    bool pimpl_capture = false;
   };
   std::vector<Entry> entries;
   const auto &info = spec.debug_info();
@@ -382,6 +395,91 @@ make_value_snapshot_code(clang::ASTContext &ast,
     entry.dynamic_schema = std::move(derived.schema);
     entry.dynamic_error = std::move(derived.error);
   };
+  const auto configure_pimpl_result = [&](Entry &entry) {
+    const auto member_name = spec.prepared().snapshot_return_member();
+    const auto fail = [&](const std::string &reason) {
+      entry.pimpl_error = reason;
+    };
+    if (member_name.empty() || !spec.prepared().has_snapshot_return_type())
+      return;
+    const auto *root = entry.type->getAsCXXRecordDecl();
+    root = root ? root->getDefinition() : nullptr;
+    auto implementation_type = prepared_alias(ast, "SnapshotReturn");
+    const auto *implementation = implementation_type.isNull()
+                                     ? nullptr
+                                     : implementation_type->getAsCXXRecordDecl();
+    implementation = implementation ? implementation->getDefinition() : nullptr;
+    if (!root || !implementation || implementation->isUnion() ||
+        implementation->isAbstract()) {
+      fail("prepared PImpl snapshot requires complete record types");
+      return;
+    }
+    const clang::FieldDecl *member = nullptr;
+    for (const auto *field : root->fields())
+      if (field->getNameAsString() == member_name) {
+        member = field;
+        break;
+      }
+    if (!member || !member->getType()->isPointerType() ||
+        member->getType().isVolatileQualified() ||
+        member->getType()->getPointeeType().isVolatileQualified()) {
+      fail("prepared PImpl member is not a non-volatile direct raw pointer field");
+      return;
+    }
+    const auto *member_base =
+        member->getType()->getPointeeType()->getAsCXXRecordDecl();
+    member_base = member_base ? member_base->getDefinition() : nullptr;
+    clang::CXXBasePaths paths;
+    if (!member_base || !member_base->isPolymorphic() ||
+        (implementation->getCanonicalDecl() != member_base->getCanonicalDecl() &&
+         (!implementation->isDerivedFrom(member_base, paths) ||
+          paths.isAmbiguous(ast.getCanonicalType(ast.getRecordType(member_base)))))) {
+      fail("prepared PImpl type is not a polymorphic implementation of the member");
+      return;
+    }
+    clangtracer::v1::DebugInfo actual_layout;
+    tracer::prepared::describe_record(ast, *implementation, actual_layout);
+    const auto rtti_name = itanium_rtti_type_name(ast, implementation_type);
+    if (rtti_name.empty()) {
+      fail("cannot mangle prepared PImpl RTTI type");
+      return;
+    }
+    if (!supports_itanium_dynamic_rtti(ast))
+      return;
+
+    clang::PrintingPolicy policy(ast.getLangOpts());
+    policy.SuppressTagKeyword = true;
+    entry.pimpl_member = member_name;
+    entry.pimpl_type = implementation_type.getCanonicalType();
+    entry.pimpl_cpp_type = implementation_type.getAsString(policy);
+    entry.pimpl_rtti_name = rtti_name;
+    entry.pimpl_capture = true;
+    if (actual_layout.SerializeAsString() !=
+        spec.prepared().snapshot_return_type().SerializeAsString()) {
+      fail("prepared PImpl implementation layout does not match its metadata");
+      return;
+    }
+    std::set<const clang::CXXRecordDecl *> seen;
+    if (!codec_types_supported(implementation_type, seen)) {
+      fail("unsupported string character type in PImpl snapshot");
+      return;
+    }
+    context_engine::StateFamilyKey family;
+    family.source_lineage_id[0] = 1;
+    family.cpp_state_type = entry.type.getAsString(policy);
+    family.cpp_scope_type = "tracer::EventValueSnapshot";
+    context_engine::SchemaLimits limits;
+    limits.descriptor_bytes = 4096;
+    limits.fields = 128;
+    limits.depth = 16;
+    entry.pimpl_schema = context_engine::build_pimpl_payload_schema(
+        ast, entry.type, std::move(family), member_name,
+        implementation_type, limits, access);
+    if (!entry.pimpl_schema) {
+      fail(entry.pimpl_schema.error);
+      return;
+    }
+  };
   for (int i = 0; i < info.arguments_size() &&
                   unsigned(i) < function->getNumParams();
        ++i) {
@@ -389,12 +487,17 @@ make_value_snapshot_code(clang::ASTContext &ast,
     if (argument.is_reference() || argument.is_object_value())
       add(unsigned(i), Role::argument, function->getParamType(unsigned(i)));
   }
-  if (info.result_is_reference() || info.result_is_object_value())
+  if (info.result_is_reference() || info.result_is_object_value()) {
     add(0, Role::result, function->getReturnType());
-  else if (spec.snapshot_return_pointee() && function->getReturnType()->isPointerType()) {
+    if (!entries.empty() && entries.back().role == Role::result &&
+        entries.back().error.empty())
+      configure_pimpl_result(entries.back());
+  } else if (spec.snapshot_return_pointee() && function->getReturnType()->isPointerType()) {
     add(0, Role::result, function->getReturnType()->getPointeeType(), true);
     auto &entry = entries.back();
-    if (entry.error.empty() && spec.prepared().has_snapshot_return_type()) {
+    if (entry.error.empty() && !spec.prepared().snapshot_return_member().empty())
+      configure_pimpl_result(entry);
+    else if (entry.error.empty() && spec.prepared().has_snapshot_return_type()) {
       const auto dynamic_type = prepared_alias(ast, "SnapshotReturn");
       if (dynamic_type.isNull())
         entry.error = "prepared snapshot return projection type is unavailable";
@@ -425,15 +528,23 @@ struct Scope { std::size_t mark = tracer_snapshot_mark(); bool active=true;
 )";
   code.arguments = "tracer_snapshot_detail::Scope snapshot_scope;\n";
   std::vector<clang::QualType> types;
+  const Entry *pimpl_entry = nullptr;
   for (const auto &entry : entries)
     if (entry.error.empty()) {
       types.push_back(entry.type);
       if (entry.dynamic_capture && entry.dynamic_error.empty())
         types.push_back(entry.dynamic_type);
+      if (entry.pimpl_capture) {
+        pimpl_entry = &entry;
+        if (entry.pimpl_error.empty())
+          types.push_back(entry.pimpl_type);
+      }
     }
   if (!types.empty()) {
-    const auto codecs =
-        context_engine::render_context_codec_sources(ast, {}, types, access);
+    const auto codecs = pimpl_entry
+        ? context_engine::render_pimpl_context_codec_sources(
+              ast, types, pimpl_entry->type, pimpl_entry->pimpl_member, access)
+        : context_engine::render_context_codec_sources(ast, {}, types, access);
     if (!codecs) {
       for (auto &entry : entries)
         if (entry.error.empty())
@@ -459,7 +570,8 @@ struct Scope { std::size_t mark = tracer_snapshot_mark(); bool active=true;
   code.declarations = scope + code.declarations;
   const bool has_dynamic_capture = std::any_of(
       entries.begin(), entries.end(), [](const auto &entry) {
-        return entry.error.empty() && entry.dynamic_capture;
+        return entry.error.empty() &&
+               (entry.dynamic_capture || entry.pimpl_capture);
       });
   if (!types.empty())
     code.declarations += R"(
@@ -473,6 +585,28 @@ template<class T> void encode(tracer::ValueSnapshot& snapshot, const T& value) n
   tracer::context_engine::BoundedProtoWriter writer({storage,capacity},limits);
   tracer::context_engine::EncodeBudget budget; budget.max_items=4096;
   const bool ok=tracer::context_engine::encode_value(writer,1,value,budget);
+  auto bytes=writer.finish();
+  if(ok && writer.status()==tracer::context_engine::CaptureStatus::ok){
+    snapshot.status=tracer::ValueSnapshot::Complete; snapshot.payload=bytes.data();
+    snapshot.payload_size=bytes.size(); tracer_snapshot_commit(mark,bytes.size());
+  }else{tracer_snapshot_reset(mark); snapshot.status=tracer::ValueSnapshot::LimitExceeded; snapshot.detail="snapshot exceeds capture budget";}
+}
+template<class Root, class Impl> void encode_pimpl(tracer::ValueSnapshot& snapshot,
+    const Root& root, const Impl& implementation) noexcept {
+  const auto mark=tracer_snapshot_mark();
+  std::size_t capacity=0;
+  std::byte* storage=tracer_snapshot_storage(&capacity);
+  tracer::context_engine::CaptureLimits limits;
+  limits.bytes=capacity; limits.string_bytes=4096;
+  tracer::context_engine::BoundedProtoWriter writer({storage,capacity},limits);
+  tracer::context_engine::EncodeBudget budget; budget.max_items=4096;
+  bool ok=writer.begin_message(1);
+  std::uint32_t field_number=1;
+  if(ok) ok=tracer::context_engine::Codec<Root>::write_fields(
+      writer,root,budget,field_number);
+  if(ok) ok=tracer::context_engine::encode_value(
+      writer,field_number,implementation,budget);
+  ok=writer.end_message() && ok;
   auto bytes=writer.finish();
   if(ok && writer.status()==tracer::context_engine::CaptureStatus::ok){
     snapshot.status=tracer::ValueSnapshot::Complete; snapshot.payload=bytes.data();
@@ -530,10 +664,13 @@ template<class T> bool has_itanium_rtti(const T* object) noexcept {
     const auto emit_payload = [&](const context_engine::SchemaResult &schema,
                                   const std::string &snapshot,
                                   const std::string &value_expr,
-                                  const std::string &suffix) {
+                                  const std::string &suffix,
+                                  const std::string &cpp_type,
+                                  bool pimpl_payload = false,
+                                  const std::string &root_expr = std::string{}) {
       std::vector<std::string> record_types;
       const auto bytes = schema_bytes(*schema.record, record_types);
-      body += snapshot + ".cpp_type=" + literal(suffix.empty() ? entry.cpp_type : entry.dynamic_cpp_type) + ";\n";
+      body += snapshot + ".cpp_type=" + literal(cpp_type) + ";\n";
       body += snapshot + ".root_type=" + literal(schema.record->root_type) +
               "; " + snapshot + ".descriptor=" + literal(bytes) +
               "; " + snapshot + ".descriptor_size=" +
@@ -554,9 +691,38 @@ template<class T> bool has_itanium_rtti(const T* object) noexcept {
                 "; " + snapshot + ".record_type_count=" +
                 std::to_string(record_types.size()) + ";\n";
       }
-      body += "tracer_snapshot_detail::encode(" + snapshot + "," + value_expr + ");\n";
+      if (pimpl_payload)
+        body += "tracer_snapshot_detail::encode_pimpl(" + snapshot + "," +
+                root_expr + "," + value_expr + ");\n";
+      else
+        body += "tracer_snapshot_detail::encode(" + snapshot + "," +
+                value_expr + ");\n";
     };
-    if (entry.result_pointee && entry.dynamic_capture) {
+    if (result && entry.pimpl_capture) {
+      const std::string root_expr = entry.result_pointee
+                                        ? "*result_pointee"
+                                        : "tracer::Call(ctx).result()";
+      body += "auto pimpl_pointer=tracer::context_engine::snapshot_access::pimpl_member(" +
+              root_expr + ");\n";
+      body += "if(pimpl_pointer && tracer_snapshot_detail::has_itanium_rtti(pimpl_pointer) && "
+              "std::strcmp(typeid(*pimpl_pointer).name()," +
+              literal(entry.pimpl_rtti_name) + ")==0){\n";
+      if (!entry.pimpl_error.empty()) {
+        body += "snapshot_" + id + ".cpp_type=" + literal(entry.cpp_type) +
+                "; snapshot_" + id +
+                ".status=tracer::ValueSnapshot::Unsupported; snapshot_" + id +
+                ".detail=" + literal(entry.pimpl_error) + ";\n";
+      } else {
+        const auto complete = "dynamic_cast<const void*>(pimpl_pointer)";
+        const auto impl_expr = "*static_cast<const " + entry.pimpl_cpp_type +
+                               "*>(" + complete + ")";
+        emit_payload(entry.pimpl_schema, "snapshot_" + id, impl_expr,
+                     "_pimpl", entry.cpp_type, true, root_expr);
+      }
+      body += "}else{\n";
+      emit_payload(entry.schema, "snapshot_" + id, expr, "", entry.cpp_type);
+      body += "}\n";
+    } else if (result && entry.dynamic_capture) {
       body += "if(tracer_snapshot_detail::has_itanium_rtti(result_pointee) && "
               "std::strcmp(typeid(*result_pointee).name()," +
               literal(entry.dynamic_rtti_name) + ")==0){\n";
@@ -565,7 +731,7 @@ template<class T> bool has_itanium_rtti(const T* object) noexcept {
                                 "*>(" + complete + ")";
       if (entry.dynamic_error.empty()) {
         emit_payload(entry.dynamic_schema, "snapshot_" + id, derived_expr,
-                     "_derived");
+                     "_derived", entry.dynamic_cpp_type);
       } else {
         body += "snapshot_" + id + ".cpp_type=" +
                 literal(entry.dynamic_cpp_type) + "; snapshot_" + id +
@@ -573,10 +739,10 @@ template<class T> bool has_itanium_rtti(const T* object) noexcept {
                 ".detail=" + literal(entry.dynamic_error) + ";\n";
       }
       body += "}else{\n";
-      emit_payload(entry.schema, "snapshot_" + id, expr, "");
+      emit_payload(entry.schema, "snapshot_" + id, expr, "", entry.cpp_type);
       body += "}\n";
     } else {
-      emit_payload(entry.schema, "snapshot_" + id, expr, "");
+      emit_payload(entry.schema, "snapshot_" + id, expr, "", entry.cpp_type);
     }
     if (entry.result_pointee)
       body += "}\n";

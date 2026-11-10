@@ -238,6 +238,42 @@ prepared probe uses the exact dynamic type to capture `Child::x` as `42`.
 The example also reads `x` through `result_as<ChildFields>()` with a local
 decoder. Add `--smoke` to check the child, base and null cases.
 
+### PImpl return snapshots
+
+Build the C++17 PImpl fixture and run either return form in its own native REPL
+session:
+
+```bash
+cmake --build build --target clang-tracer-repl clang-tracer-server clang_tracer_agent prepared-pimpl-target
+./examples/prepared-injectors/run-native.sh --pimpl-pointer
+./examples/prepared-injectors/run-native.sh --pimpl-reference
+```
+
+The public [`Item` declaration](pimpl/item.hpp) keeps its `_imp` implementation
+pointer private and forward-declares its `ItemImp` pointee. The matching
+internal header defines the runtime `HFW::ItemV1` and a different `ItemV2`.
+Preparation imports both headers and names `_imp` and `HFW::ItemV1`; the pointer
+probe opts in to pointee capture. The reference probe captures its referenced
+`Item` without that flag. Each session checks the nested snapshot type and live
+fields, including a private `ItemV1` field. A different implementation type
+keeps only the `_imp` address. Both return paths also exercise a null `_imp`;
+the pointer path separately checks a null outer pointer and its raw `0x0`
+result. The smoke script defines a local `EventCodec` and calls
+`result_as<LocalFields>()` to copy the implementation version and private
+field into an owned local value. Capture reads implementation fields directly
+and does not call an application getter.
+
+Run the automated cases with:
+
+```bash
+./examples/prepared-injectors/run-native.sh --pimpl-pointer --smoke
+./examples/prepared-injectors/run-native.sh --pimpl-reference --smoke
+```
+
+CTest registers these as `native_repl_prepared_pimpl_pointer` and
+`native_repl_prepared_pimpl_reference`. Separate sessions avoid re-importing
+the same application declarations into one REPL process.
+
 ## Typed method example
 
 Build `prepared-methods-target` and launch with `--methods`. The method demo

@@ -455,15 +455,20 @@ function(tracer_add_native_repl)
             --${_example} --smoke)
         set_tests_properties(native_repl_prepared_${_example} PROPERTIES TIMEOUT 120)
       endforeach()
-      foreach(_example pointee polymorphic-pointee)
+      foreach(_example pointee polymorphic-pointee pimpl-pointer pimpl-reference)
         string(REPLACE "-" "_" _test_suffix "${_example}")
+        if(_example MATCHES "^pimpl-")
+          set(_prepared_example_target prepared-pimpl-target)
+        else()
+          set(_prepared_example_target prepared-${_example}-target)
+        endif()
         add_test(NAME native_repl_prepared_${_test_suffix}
           COMMAND "${CMAKE_COMMAND}" -E env
             "CLANG_TRACER_PREPARED_BUILD=${CMAKE_CURRENT_BINARY_DIR}"
             "CLANG_TRACER_REPL=$<TARGET_FILE:clang-tracer-repl>"
             "CLANG_TRACER_SERVER=$<TARGET_FILE:clang-tracer-server>"
             "CLANG_TRACER_AGENT=$<TARGET_FILE:clang_tracer_agent>"
-            "CLANG_TRACER_PREPARED_TARGET=$<TARGET_FILE:prepared-${_example}-target>"
+            "CLANG_TRACER_PREPARED_TARGET=$<TARGET_FILE:${_prepared_example_target}>"
             bash "${CMAKE_CURRENT_SOURCE_DIR}/examples/prepared-injectors/run-native.sh"
             --${_example} --smoke)
         set_tests_properties(native_repl_prepared_${_test_suffix} PROPERTIES TIMEOUT 120)
