@@ -1,3 +1,3 @@
-%probe prepare "HFW::HfwManager::createItem(int)" --include demo/pimpl/item.hpp --include demo/pimpl/item-impl.hpp --snapshot-return-member _imp --snapshot-return-type HFW::ItemV1 --output pimpl-pointer
+%probe prepare "HFW::HfwManager::createItem(int)" --include demo/pimpl/item.hpp --include demo/pimpl/item-impl.hpp --snapshot-return-member _imp --output pimpl-pointer
 %probe inject "HFW::HfwManager::createItem(int)" --prepared pimpl-pointer --prepared-mode require --snapshot-return-pointee
-%collect --name "HFW::HfwManager::createItem(int)" --count 4 --timeout 15 --phase POST --as captured
+%collect --name "HFW::HfwManager::createItem(int)" --count 6 --timeout 15 --phase POST --as captured

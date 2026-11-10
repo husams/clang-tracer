@@ -1055,20 +1055,40 @@ objects use the declared base layout. For typed local decoding of a polymorphic
 snapshot, supply an `EventCodec<T>` for the value you want to construct.
 
 For an `Item*` or `Item&` that exposes its implementation through a polymorphic
-raw pointer member, add `--snapshot-return-member _imp --snapshot-return-type HFW::ItemV1`
-to `%probe prepare`. Pass matching inputs that define the wrapper, the member's
-declared pointee, and the concrete implementation. If the implementation is
-defined in a `.cpp` file, pass that file with `--include`. For a pointer return,
-inject with `--snapshot-return-pointee`. Reference returns already capture the
-referenced object.
+raw pointer member, add `--snapshot-return-member _imp` to `%probe prepare`.
+Clang discovers concrete implementations defined in the matching preparation
+inputs, and the target uses RTTI to select the live type's field layout. Pass an
+implementation's `.cpp` with `--include` if its definition is in that file.
+Add `--snapshot-return-type HFW::ItemV1` if you want to prepare one explicit type.
+For a pointer return, inject with `--snapshot-return-pointee`. Reference returns
+already capture the referenced object.
 
-When `_imp` points to a live `HFW::ItemV1`,
-`event.result_snapshot().field("_imp_snapshot")` holds the implementation's
-copied fields and reports `HFW::ItemV1` from `cpp_type()`. The `_imp` field holds
-the address. A null member or a different dynamic type has only the address.
-Capture reads fields without invoking application getters. To decode an owned
-local type with `result_as<T>()`, define an `EventCodec<T>` that reads the
-implementation snapshot.
+`event.result_snapshot().field("_imp_snapshot")` holds the live implementation's
+copied fields and reports its concrete type from `cpp_type()`. `_imp` holds the
+address. A null member or a type absent from the prepared package has only the
+address. To decode an owned local type with `result_as<T>()`, define an
+`EventCodec<T>` that reads the implementation snapshot.
+
+To choose the captured fields for one implementation, pass a C++ file with
+`--callback` to `%probe inject`. Define an overload of `tracer_snapshot::encode`
+for that concrete type. The probe encodes the returned record using the same
+bounded snapshot codec and reports the original implementation type. Other
+implementations use automatic field capture.
+
+```cpp
+namespace tracer_snapshot {
+struct ItemV2Fields { int revision; };
+
+ItemV2Fields encode(const HFW::ItemV2& item) noexcept {
+  return {item.revision};
+}
+}
+```
+
+The encoder executes in the target process and takes the live implementation by
+const reference. It must be `noexcept` and return a named record by value. An
+encoder-only file can be injected directly. If the file also defines an
+invocation-scoped `Interceptor`, it needs a `post()` hook.
 
 Inspect a record without declaring a local C++ type:
 

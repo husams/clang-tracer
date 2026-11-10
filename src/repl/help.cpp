@@ -139,7 +139,7 @@ const CommandTopic commands[] = {
      "Verify and disassemble a function entry and show the copy-only detour window and bounded control flow."},
     {"probe prepare",
      "%probe prepare SELECTOR --include HEADER --output NEW_DIRECTORY\n"
-     "  [--compdb PATH] [--translation-unit FILE] [--module ELF] [--snapshot-return-member FIELD --snapshot-return-type TYPE] [--metadata-only] [--cwd DIRECTORY] [EXTRA COMPILER ARGUMENTS]\n"
+     "  [--compdb PATH] [--translation-unit FILE] [--module ELF] [--snapshot-return-member FIELD [--snapshot-return-type TYPE]] [--metadata-only] [--cwd DIRECTORY] [EXTRA COMPILER ARGUMENTS]\n"
      "  or %probe prepare SELECTOR --signature TYPE --module ELF --output NEW_DIRECTORY [--member] [--metadata-only] [--cwd DIRECTORY]"
      "\n  or %probe prepare SELECTOR [--module-index INDEX] [--module ELF] [--id ID] [--generated DIR] --output NEW_DIRECTORY",
      "Build a reusable probe package from source, an explicit signature, or the module index. "
@@ -148,11 +148,11 @@ const CommandTopic commands[] = {
      "Preparation uses compile_commands.json in the command's working directory by default. "
      "It prefers the first include's recorded compile command and falls back to the first source beside it. "
      "Use --module to pin the package to a specific build. "
-     "Use --snapshot-return-member with --snapshot-return-type to select a checked implementation pointer and its concrete layout; inject with --snapshot-return-pointee to capture it. "
+     "Use --snapshot-return-member to discover eligible implementation pointer types, or pair it with --snapshot-return-type to select one concrete layout. Use --snapshot-return-pointee when injecting a pointer-return probe. "
      "Use --metadata-only to skip the separate C++ adapter files. "
      "With --signature, supply the C++ result and explicit parameter types, for example 'const int&()'. "
      "Qualified methods receive an opaque receiver. Pass --member for an unqualified instance method.",
-     R"example(%probe prepare "HFW::Item::create()" --include item.hpp --snapshot-return-member _imp --snapshot-return-type HFW::ItemV1 --output prepared)example"},
+     R"example(%probe prepare "HFW::Item::create()" --include item.hpp --include item-impl.hpp --snapshot-return-member _imp --output prepared)example"},
     {"probe resolve", "%probe resolve SELECTOR [RESOLUTION OPTIONS] [--cwd DIRECTORY]",
      "Resolve a selector in the selected target and show the available metadata.",
      R"(%probe resolve "Calculator::multiply(int, int) const")"},
@@ -161,7 +161,7 @@ const CommandTopic commands[] = {
      "Check whether the callback can be deployed for the selected function."},
     {"probe inject", "%probe inject SELECTOR [--callback FILE] [RESOLUTION OPTIONS] [DEPLOYMENT OPTIONS] [--cwd DIRECTORY]\n"
      "  [--allow-arg-overrides] [--allow-result-override] [--allow-replacement] [--allow-call-original] [--trace-exceptions] [--reclaimable] [--snapshot-return-pointee]",
-     "Omit --callback to capture events with the built-in observer. Snapshot returned record pointees only when the live layout matches and the pointee remains stable through POST; result() gives its address and result_as<T>() copies the record.",
+     "Omit --callback to capture events with the built-in observer. For prepared implementation member snapshots, a callback file can define tracer_snapshot::encode(const Implementation&) noexcept to return a custom record by value. Snapshot returned record pointees only when the live layout matches and the pointee remains stable through POST; result() gives its address and result_as<T>() copies the record.",
      R"example(%probe inject "prepared_pointee::HfwManager::createItem(int)" --prepared prepared --snapshot-return-pointee)example"},
     {"probe remove", "%probe remove ID [--cwd DIRECTORY]", "Remove a probe from the selected session and restore the original code."},
     {"probe reload", "%probe reload ID --callback FILE [--cwd DIRECTORY] [--watch [--count N] [--timeout SECONDS]]",

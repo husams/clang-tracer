@@ -251,15 +251,17 @@ cmake --build build --target clang-tracer-repl clang-tracer-server clang_tracer_
 
 The public [`Item` declaration](pimpl/item.hpp) keeps its `_imp` implementation
 pointer private and forward-declares its `ItemImp` pointee. The matching
-internal header defines the runtime `HFW::ItemV1` and a different `ItemV2`.
-Preparation imports both headers and names `_imp` and `HFW::ItemV1`; the pointer
-probe opts in to pointee capture. The reference probe captures its referenced
-`Item` without that flag. Each session checks the nested snapshot type and live
-fields, including a private `ItemV1` field. A different implementation type
+internal header defines three concrete runtime types: `HFW::ItemV1`,
+`HFW::ItemV2`, and `HFW::ItemV3`. Preparation imports both headers and names
+only `_imp`; the pointee snapshot type is inferred from those headers. The
+pointer probe opts in to pointee capture. The reference probe captures its
+referenced `Item` without that flag. Both sessions check the distinct nested
+fields for all three implementation versions, including private and nested
+fields. A fourth concrete implementation is defined only in `item.cpp`, so it
 keeps only the `_imp` address. Both return paths also exercise a null `_imp`;
 the pointer path separately checks a null outer pointer and its raw `0x0`
 result. The smoke script defines a local `EventCodec` and calls
-`result_as<LocalFields>()` to copy the implementation version and private
+`result_as<LocalFields>()` to copy each implementation's version and private
 field into an owned local value. Capture reads implementation fields directly
 and does not call an application getter.
 
@@ -273,6 +275,18 @@ Run the automated cases with:
 CTest registers these as `native_repl_prepared_pimpl_pointer` and
 `native_repl_prepared_pimpl_reference`. Separate sessions avoid re-importing
 the same application declarations into one REPL process.
+
+The `--pimpl-custom` mode demonstrates a user encoder for ItemV2. It replaces
+the automatic ItemV2 fields with a single `summary` projection while preserving
+the `HFW::ItemV2` result type; ItemV1 and ItemV3 remain automatic. Its callback
+has no PRE or POST hook:
+
+```bash
+./examples/prepared-injectors/run-native.sh --pimpl-custom
+./examples/prepared-injectors/run-native.sh --pimpl-custom --smoke
+```
+
+CTest registers this as `native_repl_prepared_pimpl_custom`.
 
 ## Typed method example
 

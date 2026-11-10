@@ -40,8 +40,8 @@ int main() {
                 pointer == nullptr ? "null" : "item", reference.id);
     std::fflush(stdout);
 
-    pointer_kind = pointer_kind == 3 ? 0 : pointer_kind + 1;
-    reference_kind = (reference_kind + 1) % 3;
+    pointer_kind = pointer_kind == 5 ? 0 : pointer_kind + 1;
+    reference_kind = (reference_kind + 1) % 5;
     timespec delay{0, 250'000'000};
     while (running && ::nanosleep(&delay, &delay) != 0 && errno == EINTR) {
     }

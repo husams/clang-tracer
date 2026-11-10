@@ -6,6 +6,7 @@ namespace HFW {
 
 struct ItemV1;
 struct ItemV2;
+struct ItemV3;
 class ItemImp;
 
 class Item {
@@ -34,6 +35,8 @@ public:
 private:
   std::unique_ptr<Item> item_v1_;
   std::unique_ptr<Item> item_v2_;
+  std::unique_ptr<Item> item_v3_;
+  std::unique_ptr<Item> item_v4_;
   std::unique_ptr<Item> item_null_imp_;
 };
 
