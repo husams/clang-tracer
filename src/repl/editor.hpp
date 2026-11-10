@@ -27,6 +27,7 @@ class Input {
   std::vector<Field> fields_;
   std::size_t field_ = 0;
   bool selected_ = false;
+  bool continue_commands_ = false;
 
   void changed(std::string& text, int& cursor);
   void set(std::string text, std::size_t pos);
@@ -42,6 +43,6 @@ public:
   explicit Input(bool color);
   bool terminal() const { return terminal_; }
   void use_cpp(CppEngine& cpp) { cpp_ = &cpp; }
-  std::optional<std::string> read(const std::string& prompt);
+  std::optional<std::string> read(const std::string& prompt, bool continue_commands = false);
 };
 } // namespace tracer_repl

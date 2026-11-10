@@ -202,6 +202,16 @@ int main(int argc, char **argv) {
     auto choose = [&](const std::string &prompt) {
       return input.read(prompt).value_or("");
     };
+    const auto read_startup = [&]() -> std::optional<std::string> {
+      std::string line;
+      if (std::getline(startup, line)) {
+        std::cout << controller.prompt() << line << '\n';
+        return line;
+      }
+      if (!startup.eof())
+        throw std::runtime_error("cannot read REPL startup file: " + startup_path);
+      return {};
+    };
     if (pid) {
       controller.attach(pid);
     } else if (!process.empty()) {
@@ -233,18 +243,12 @@ int main(int argc, char **argv) {
           std::cerr << "recorded C++ types skipped: " << error.what() << '\n';
         }
       }
-      const auto line = [&]() -> std::optional<std::string> {
+      auto line = [&]() -> std::optional<std::string> {
         if (startup.is_open()) {
-          std::string command;
-          if (std::getline(startup, command)) {
-            std::cout << controller.prompt() << command << '\n';
-            return command;
-          }
-          if (!startup.eof())
-            throw std::runtime_error("cannot read REPL startup file: " + startup_path);
+          if (auto command = read_startup()) return command;
           startup.close();
         }
-        return input.read(controller.prompt());
+        return input.read(controller.prompt(), true);
       }();
       if (!line)
         break;
@@ -264,7 +268,21 @@ int main(int argc, char **argv) {
           }
           continue;
         }
-        auto command = tr::parse_command(*line);
+        if (!input.terminal() || startup.is_open()) {
+          auto marker = tr::command_continuation(*line);
+          while (marker != std::string_view::npos) {
+            const auto part = startup.is_open() ? read_startup() : input.read(controller.prompt());
+            if (!part)
+              throw std::invalid_argument("incomplete REPL command continuation");
+            marker = tr::command_continuation(*part);
+            // Consume the whole command even after it exceeds the parser's limit.
+            if (line->size() <= tr::max_command_size) {
+              line->push_back('\n');
+              line->append(*part, 0, tr::max_command_size + 1 - line->size());
+            }
+          }
+        }
+        auto command = tr::parse_command(std::move(*line));
         if (command.has("--cwd")) {
           auto &directory = command.options.at("--cwd").front();
           std::error_code error;

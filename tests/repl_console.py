@@ -20,6 +20,33 @@ def main():
         assert server.stdout.readline().strip() == "ready"
         with tempfile.TemporaryDirectory(prefix="tracer-repl-console-") as directory:
             root = Path(directory)
+            continued_help = "%help \\\r\n  probe \\ \t\r\n  inject\r\n"
+            continued = subprocess.run(
+                [console, "--fail-fast"], input=continued_help + "%quit\n",
+                text=True, capture_output=True, timeout=10)
+            assert continued.returncode == 0 and "Deployment options" in continued.stdout, (
+                continued.stdout, continued.stderr)
+
+            startup = root / "startup.repl"
+            startup.write_bytes(continued_help.encode())
+            continued = subprocess.run(
+                [console, "--startup", str(startup)], input="%status\n%quit\n",
+                text=True, capture_output=True, timeout=10)
+            assert continued.returncode == 0 and "Deployment options" in continued.stdout, (
+                continued.stdout, continued.stderr)
+            assert "ready=unconnected" in continued.stdout, continued.stdout
+
+            incomplete = "%status \\\n"
+            startup.write_text(incomplete)
+            for options, stdin in (([], incomplete),
+                                   (["--startup", str(startup)], "%help probe inject\n")):
+                rejected = subprocess.run([console, *options], input=stdin, text=True,
+                                          capture_output=True, timeout=10)
+                assert rejected.returncode == 1, (rejected.stdout, rejected.stderr)
+                assert "incomplete REPL command continuation" in rejected.stderr, rejected.stderr
+                assert "ready=unconnected" not in rejected.stdout, rejected.stdout
+                assert "Deployment options" not in rejected.stdout, rejected.stdout
+
             callback = root / "client only callback.cpp"
             callback.write_text("// client-only interceptor\n")
             capture = root / "capture.pb"

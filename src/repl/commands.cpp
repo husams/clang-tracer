@@ -282,10 +282,29 @@ std::uint64_t address_number(const std::string &text) {
   return address;
 }
 
-Command parse_command(const std::string &input) {
-  if (input.size() > 65536 || input.find('\0') != std::string::npos) {
+std::size_t command_continuation(std::string_view line) {
+  const auto end = line.find_last_not_of(" \t\r");
+  if (end == line.npos || line[end] != '\\') return line.npos;
+  auto begin = end;
+  while (begin > 0 && line[begin - 1] == '\\') --begin;
+  return (end - begin) % 2 == 0 ? end : line.npos;
+}
+
+void normalize_command_continuations(std::string &input) {
+  const std::string_view text(input);
+  std::size_t begin = 0;
+  for (auto end = text.find('\n'); end != text.npos; end = text.find('\n', begin)) {
+    const auto marker = command_continuation(text.substr(begin, end - begin));
+    if (marker != text.npos) input[begin + marker] = ' ';
+    begin = end + 1;
+  }
+}
+
+Command parse_command(std::string input) {
+  if (input.size() > max_command_size || input.find('\0') != std::string::npos) {
     throw std::invalid_argument("command is too large or contains a null byte");
   }
+  normalize_command_continuations(input);
   antlr4::ANTLRInputStream stream(input);
   TracerCommandsLexer lexer(&stream);
   Errors errors;

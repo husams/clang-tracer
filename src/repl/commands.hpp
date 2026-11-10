@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace tracer_repl {
@@ -110,7 +111,10 @@ struct Command {
   std::uint64_t number(const std::string &name, std::uint64_t fallback) const;
 };
 
-Command parse_command(const std::string &input);
+inline constexpr std::size_t max_command_size = 65536;
+std::size_t command_continuation(std::string_view line);
+void normalize_command_continuations(std::string &input);
+Command parse_command(std::string input);
 std::uint64_t unsigned_number(const std::string &text, const std::string &name,
                               std::uint64_t maximum = UINT64_MAX);
 std::uint64_t address_number(const std::string &text);

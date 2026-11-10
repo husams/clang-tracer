@@ -1326,6 +1326,15 @@ comment in the multiline editor. Ctrl+C discards the entire pending input;
 earlier variables and tracing sessions remain available. Ctrl+J always inserts
 a newline; `%cpp load FILE` submits a multiline source file.
 
+End a `%` command line with `\` between arguments to continue on the next
+line. The final line submits the command. The same syntax works in piped input
+and `--startup` files.
+
+```text
+%module index \
+  --file ./app
+```
+
 Every submitted C++ cell is checked in a disposable `clang-tracer-repl-check`
 process before the live interpreter parses or executes it. The checker parses
 the accepted cells in their original order without executing them, preserving
