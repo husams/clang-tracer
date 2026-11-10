@@ -1164,10 +1164,18 @@ Eligible derived records decode inherited fields as well as their own fields.
 Use `DeclaringType::field` for field names shared by multiple base or derived
 declarations. A shared virtual base contributes its fields once. Polymorphic
 records need locally usable construction, destruction, and virtual function
-definitions. To use definitions absent from a prepared adapter, prepare the
-package in one session, then import the application definitions and inject the
-saved package in a fresh session. Use `result_snapshot()` for field inspection
-when only the captured layout is available.
+definitions. With the REPL's own local Linux x86-64 server, a prepared probe
+can resolve an out-of-line destructor from a shared library already mapped
+in the target. The REPL checks the mapped ELF identity and requires one library
+exporting the required C++ ABI symbols. It loads that library into the REPL
+process and binds those symbols before generating the typed decoder. No
+additional probe options are required. Library initializers run in the REPL
+when the loader opens the library.
+
+Use `result_snapshot()` for field inspection when only the captured layout is
+available. If additional definitions are needed for a typed result, prepare
+the package in one session, then import the application definitions and
+inject the saved package in a fresh session.
 
 If a generated decoder fails to compile (for example, a set element lacks its
 required comparison operator), the entire import is rejected without changing

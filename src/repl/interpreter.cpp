@@ -40,6 +40,13 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "prepared_libraries.hpp"
+
+#if defined(__linux__) && defined(__x86_64__)
+#include <dlfcn.h>
+#include <link.h>
+#endif
+
 namespace tracer_repl {
 namespace {
 std::vector<std::string>
@@ -121,9 +128,34 @@ bool can_unload_initializer(const llvm::Module &module) {
   return call && call->getFunction()->getName().starts_with("__cxx_global_var_init") &&
          llvm::isa_and_nonnull<llvm::ReturnInst>(call->getNextNode());
 }
+
+std::vector<std::vector<std::string>> needed_destructors(const std::string &source) {
+  const std::string prefix = "// tracer-repl-needed-destructor ";
+  std::vector<std::vector<std::string>> groups;
+  std::istringstream lines(source);
+  std::string line;
+  while (std::getline(lines, line)) {
+    if (line.compare(0, prefix.size(), prefix) != 0) continue;
+    std::istringstream names(line.substr(prefix.size()));
+    std::vector<std::string> group;
+    for (std::string name; names >> std::quoted(name);)
+      group.push_back(std::move(name));
+    if (names.eof() && !group.empty())
+      groups.push_back(std::move(group));
+  }
+  return groups;
+}
 } // namespace
 struct CppEngine::Impl {
   CppCheckSession checker;
+#if defined(__linux__) && defined(__x86_64__)
+  struct CloseLibrary {
+    void operator()(void *handle) const { ::dlclose(handle); }
+  };
+  // Release handles only after the interpreter and its values are destroyed.
+  std::map<std::string, std::unique_ptr<void, CloseLibrary>> prepared_libraries;
+  std::map<std::string, void *> prepared_symbols;
+#endif
   std::unique_ptr<clang::Interpreter> interpreter;
   std::vector<std::string> arguments;
   std::string history;
@@ -142,6 +174,58 @@ struct CppEngine::Impl {
   bool user_cells = false;
   explicit Impl(const std::filesystem::path& facade)
       : facade_directory(std::filesystem::weakly_canonical(facade).parent_path()) {}
+
+  bool bind_prepared_destructor(const PreparedLibrary &candidate,
+                                const std::vector<std::string> &group) {
+#if defined(__linux__) && defined(__x86_64__)
+    auto &library = prepared_libraries[candidate.path];
+    if (!library)
+      library.reset(::dlopen(candidate.path.c_str(), RTLD_NOW | RTLD_LOCAL));
+    link_map *module = nullptr;
+    if (!library || ::dlinfo(library.get(), RTLD_DI_LINKMAP, &module) != 0 ||
+        !module || !prepared_library_build_id_matches(module->l_addr, candidate.build_id))
+      return false;
+    auto jit = interpreter->getExecutionEngine();
+    if (!jit) {
+      llvm::consumeError(jit.takeError());
+      return false;
+    }
+    llvm::orc::SymbolMap symbols;
+    std::map<std::string, void *> addresses;
+    for (const auto &name : group) {
+      auto *address = ::dlsym(library.get(), name.c_str());
+      Dl_info info{};
+      void *owner = nullptr;
+      if (!address || !::dladdr1(address, &info, &owner, RTLD_DL_LINKMAP) ||
+          owner != module)
+        return false;
+      if (const auto found = prepared_symbols.find(name); found != prepared_symbols.end()) {
+        if (found->second != address) return false;
+        continue;
+      }
+      const auto flags = llvm::StringRef(name).starts_with("_ZN")
+                             ? llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable
+                             : llvm::JITSymbolFlags::Exported;
+      symbols[jit->mangleAndIntern(name)] = {
+          llvm::orc::ExecutorAddr::fromPtr(address), flags};
+      addresses.emplace(name, address);
+    }
+    if (!symbols.empty()) {
+      if (auto error = jit->getMainJITDylib().define(
+              llvm::orc::absoluteSymbols(std::move(symbols)))) {
+        llvm::consumeError(std::move(error));
+        return false;
+      }
+      prepared_symbols.merge(addresses);
+    }
+    return true;
+#else
+    (void)candidate;
+    (void)group;
+    return false;
+#endif
+  }
+
   void verify_inputs() {
     if (std::filesystem::current_path() != directory)
       throw std::runtime_error("C++ working directory changed; restore it or "
@@ -234,7 +318,7 @@ void CppEngine::set_compiler_options(std::vector<std::string> arguments) {
 
 CppEngine::MappingHeader CppEngine::mapping_header(const std::vector<std::string> &headers,
     const std::vector<std::string> &types, const std::string &output,
-    bool standalone) {
+    bool standalone, const PreparedModules &modules) {
   if (impl_) impl_->verify_inputs();
   const bool independent = standalone || !impl_ || !impl_->user_cells;
   const auto arguments = profile_arguments(arguments_);
@@ -249,6 +333,7 @@ CppEngine::MappingHeader CppEngine::mapping_header(const std::vector<std::string
   for (const auto &argument : arguments) identity << std::quoted(argument) << '\n';
   identity << "types\n";
   for (const auto &type : types) identity << std::quoted(type) << '\n';
+  if (modules) identity << "external-destructors\n";
   for (const auto *variable : {"CPATH", "CPLUS_INCLUDE_PATH", "C_INCLUDE_PATH",
        "OBJC_INCLUDE_PATH", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET",
        "SOURCE_DATE_EPOCH", "CCC_OVERRIDE_OPTIONS"}) {
@@ -266,7 +351,7 @@ CppEngine::MappingHeader CppEngine::mapping_header(const std::vector<std::string
       if (argument.rfind(prefix, 0) == 0) return true;
     return false;
   });
-  if (!standalone && impl_ && simple_profile) {
+  if (!standalone && impl_ && simple_profile && !modules) {
     for (const auto &[request, stored_key] : impl_->mappings) {
       if (request.first != request_key ||
           (!output.empty() && request.second != std::filesystem::weakly_canonical(path))) continue;
@@ -286,8 +371,36 @@ CppEngine::MappingHeader CppEngine::mapping_header(const std::vector<std::string
   for (const auto &header : headers) request << std::quoted(header) << '\n';
   for (const auto &type : types)
     request << std::quoted(type) << '\n';
-  const auto generated =
-      run_cpp_analysis(helper.string(), "reflect", arguments, history, request.str());
+  if (modules)
+    request << std::quoted("@tracer-external-destructors") << '\n';
+  const auto reflect = [&] {
+    return run_cpp_analysis(helper.string(), "reflect", arguments, history, request.str());
+  };
+  auto generated = reflect();
+  bool target_dependent = false;
+  if (modules && generated.status == 0) {
+    const auto groups = needed_destructors(generated.output);
+    target_dependent = !groups.empty();
+    if (target_dependent) {
+      std::set<std::string> bound;
+      try {
+        const auto libraries = find_prepared_libraries(modules(), groups);
+        if (!libraries.empty()) initialize();
+        for (const auto &[group, library] : libraries)
+          if (impl_->bind_prepared_destructor(library, group))
+            bound.insert(group.begin(), group.end());
+      } catch (const std::exception &) {
+        // A module lookup failure leaves the snapshot and other mappings usable.
+      }
+      if (!bound.empty()) {
+        for (const auto &name : bound)
+          request << std::quoted(name) << '\n';
+        auto resolved = reflect();
+        if (resolved.status == 0)
+          generated = std::move(resolved);
+      }
+    }
+  }
   if (generated.status != 0)
     throw std::runtime_error(
         "automatic mapping generation failed; previous C++ state retained. "
@@ -297,7 +410,8 @@ CppEngine::MappingHeader CppEngine::mapping_header(const std::vector<std::string
   const auto first_line = generated.output.find('\n') + 1;
   const auto body = generated.output.substr(0, first_line) + prelude +
                     generated.output.substr(first_line);
-  if (!independent) {
+  // Only target-independent headers may be reused without resolving libraries.
+  if (!independent || target_dependent) {
     key = mapping_digest(key + body);
     if (output.empty()) path = mapping_cache_directory() / (key + ".hpp");
   }
@@ -318,8 +432,9 @@ std::string CppEngine::import_header(const std::string &header,
 }
 
 std::string CppEngine::import_headers(const std::vector<std::string> &headers,
-    const std::vector<std::string> &types, const std::string &output) {
-  const auto saved = mapping_header(headers, types, output, false);
+    const std::vector<std::string> &types, const std::string &output,
+    const PreparedModules &modules) {
+  const auto saved = mapping_header(headers, types, output, false, modules);
   if (!evaluate("#include \"" + saved.path + "\"\n"))
     throw std::runtime_error("application header import failed");
   impl_->mappings[{saved.request_key, std::filesystem::weakly_canonical(saved.path)}] = saved.stored_key;
@@ -327,13 +442,14 @@ std::string CppEngine::import_headers(const std::vector<std::string> &headers,
          (saved.reused ? "reused generated header: " : "saved generated header: ") + saved.path;
 }
 
-std::string CppEngine::import_prepared_adapter(const std::string &source) {
+std::string CppEngine::import_prepared_adapter(const std::string &source,
+                                               const PreparedModules &modules) {
   const auto key = mapping_digest(source);
   if (impl_ && impl_->imported_adapters.count(key))
     return {};
   const auto path = mapping_cache_directory() / ("prepared-" + key + ".hpp");
   save_mapping_header(path, key, "#pragma once\n" + source);
-  auto imported = import_headers({path.string()});
+  auto imported = import_headers({path.string()}, {}, {}, modules);
   impl_->imported_adapters.insert(key);
   return imported;
 }
