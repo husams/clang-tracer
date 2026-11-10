@@ -15,6 +15,9 @@ if [[ $demo_mode == --pointee ]]; then
 elif [[ $demo_mode == --polymorphic-pointee ]]; then
   example=prepared-polymorphic-pointee-target
   shift
+elif [[ $demo_mode == --pimpl-pointer || $demo_mode == --pimpl-reference ]]; then
+  example=prepared-pimpl-target
+  shift
 elif [[ $demo_mode == --methods || $demo_mode == --state ]]; then
   example=prepared-methods-target
   shift
@@ -23,11 +26,11 @@ target=${CLANG_TRACER_PREPARED_TARGET:-$build/examples/prepared-injectors/$examp
 compdb=${CLANG_TRACER_PREPARED_COMPDB:-$build/compile_commands.json}
 
 if [[ ${1:-} == --help ]]; then
-  printf '%s\n' 'Use --methods, --state, --pointee, or --polymorphic-pointee to select an example. Add --smoke for automation.'
+  printf '%s\n' 'Use --methods, --state, --pointee, --polymorphic-pointee, --pimpl-pointer, or --pimpl-reference to select an example. Add --smoke for automation.'
   exit 0
 fi
 if [[ $# -gt 1 || ( $# == 1 && $1 != --smoke ) ]]; then
-  printf '%s\n' 'Usage: run-native.sh [--methods|--state|--pointee|--polymorphic-pointee] [--smoke|--help]' >&2
+  printf '%s\n' 'Usage: run-native.sh [--methods|--state|--pointee|--polymorphic-pointee|--pimpl-pointer|--pimpl-reference] [--smoke|--help]' >&2
   exit 2
 fi
 for required in "$repl" "$server" "$agent" "$target" "$compdb"; do
@@ -91,6 +94,27 @@ std::cout << item.label << " " << snapshot.field("details").field("revision").as
 The non-null event owns a copied HfwItem value and an automatic field snapshot.
 Null returns keep the raw `0x0` result and have no pointee snapshot.
 STEPS
+    "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60
+  fi
+elif [[ $demo_mode == --pimpl-pointer || $demo_mode == --pimpl-reference ]]; then
+  repl_script=demo/pimpl/pointer.repl
+  pointer_mode=true
+  result_label=NATIVE_PIMPL_POINTER
+  if [[ $demo_mode == --pimpl-reference ]]; then
+    repl_script=demo/pimpl/reference.repl
+    pointer_mode=false
+    result_label=NATIVE_PIMPL_REFERENCE
+  fi
+  cat "$repl_script" > inspect.repl
+  printf '%%cpp load demo/pimpl/inspect.cpp\nbool correct = check_pimpl(tracer.batch("captured"), %s);\n' \
+    "$pointer_mode" >> inspect.repl
+  printf 'std::cout << "%s=" << correct << std::endl;\n%%quit\n' "$result_label" >> inspect.repl
+  if [[ ${1:-} == --smoke ]]; then
+    "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60 --fail-fast < inspect.repl | tee "$run/smoke.log"
+    grep -qx "$result_label=1" "$run/smoke.log"
+  else
+    printf 'Paste these commands at the native tracer prompt.\n\n'
+    cat inspect.repl
     "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60
   fi
 elif [[ $demo_mode == --polymorphic-pointee ]]; then

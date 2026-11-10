@@ -1,0 +1,3 @@
+%probe prepare "HFW::HfwManager::referenceItem(int)" --include demo/pimpl/item.hpp --include demo/pimpl/item-impl.hpp --snapshot-return-member _imp --snapshot-return-type HFW::ItemV1 --output pimpl-reference
+%probe inject "HFW::HfwManager::referenceItem(int)" --prepared pimpl-reference --prepared-mode require
+%collect --name "HFW::HfwManager::referenceItem(int)" --count 4 --timeout 15 --phase POST --as captured

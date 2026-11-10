@@ -86,7 +86,8 @@ void tracercommandsParserInitialize() {
       "'--abi'", "'--stack-application-only'", "'--context-event-bytes'",
       "'--context-transport-memory-bytes'", "'--extra-arg'", "'--extra-args'",
       "", "", "", "'--metadata-only'", "'--sqlite'", "'stack'", "'--cwd'",
-      "'--signature'", "'--member'", "'--snapshot-return-pointee'", "'--snapshot-return-type'"
+      "'--signature'", "'--member'", "'--snapshot-return-pointee'", "'--snapshot-return-type'",
+      "'--snapshot-return-member'"
     },
     std::vector<std::string>{
       "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
@@ -98,11 +99,11 @@ void tracercommandsParserInitialize() {
       "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
       "", "", "UINT", "STRING", "SHELL", "METADATA_ONLY", "SQLITE", "STACK",
       "CWD", "SIGNATURE", "MEMBER", "SNAPSHOT_RETURN_POINTEE", "SNAPSHOT_RETURN_TYPE",
-      "WORD", "WS"
+      "SNAPSHOT_RETURN_MEMBER", "WORD", "WS"
     }
   );
   static const int32_t serializedATNSegment[] = {
-    4,1,133,576,2,0,7,0,2,1,7,1,2,2,7,2,2,3,7,3,2,4,7,4,2,5,7,5,2,6,7,6,2,
+    4,1,134,576,2,0,7,0,2,1,7,1,2,2,7,2,2,3,7,3,2,4,7,4,2,5,7,5,2,6,7,6,2,
     7,7,7,2,8,7,8,2,9,7,9,2,10,7,10,2,11,7,11,2,12,7,12,2,13,7,13,2,14,7,
     14,2,15,7,15,2,16,7,16,2,17,7,17,2,18,7,18,2,19,7,19,2,20,7,20,2,21,7,
     21,2,22,7,22,2,23,7,23,2,24,7,24,2,25,7,25,2,26,7,26,2,27,7,27,2,28,7,
@@ -151,7 +152,7 @@ void tracercommandsParserInitialize() {
     36,38,40,42,44,46,48,50,52,54,56,58,60,62,64,66,68,70,72,74,76,78,80,
     82,84,86,88,0,19,1,0,7,8,1,0,20,21,1,0,24,28,1,0,29,30,2,0,12,12,31,32,
     2,0,31,31,37,39,4,0,12,12,25,26,32,32,41,41,5,0,25,25,27,27,39,39,51,
-    55,131,131,3,0,25,25,51,53,56,58,2,0,121,121,132,132,1,0,77,80,1,0,82,
+    55,131,132,3,0,25,25,51,53,56,58,2,0,121,121,133,133,1,0,77,80,1,0,82,
     83,2,0,64,64,84,85,1,0,89,90,2,0,27,27,37,37,1,0,98,99,3,0,25,25,51,51,
     103,106,16,0,2,6,9,9,11,11,13,16,18,23,35,35,40,40,43,46,48,50,62,63,
     65,65,67,76,82,83,87,102,107,112,126,126,1,0,117,118,659,0,90,1,0,0,0,
@@ -286,7 +287,7 @@ void tracercommandsParserInitialize() {
     3,72,36,0,481,479,1,0,0,0,481,482,1,0,0,0,482,486,1,0,0,0,483,484,5,49,
     0,0,484,486,3,72,36,0,485,470,1,0,0,0,485,476,1,0,0,0,485,483,1,0,0,0,
     486,69,1,0,0,0,487,488,7,16,0,0,488,489,3,72,36,0,489,71,1,0,0,0,490,
-    495,5,122,0,0,491,495,5,132,0,0,492,495,5,121,0,0,493,495,3,74,37,0,494,
+    495,5,122,0,0,491,495,5,133,0,0,492,495,5,121,0,0,493,495,3,74,37,0,494,
     490,1,0,0,0,494,491,1,0,0,0,494,492,1,0,0,0,494,493,1,0,0,0,495,73,1,
     0,0,0,496,497,7,17,0,0,497,75,1,0,0,0,498,522,5,107,0,0,499,523,5,108,
     0,0,500,501,5,109,0,0,501,502,3,72,36,0,502,503,5,26,0,0,503,508,3,72,
@@ -2141,7 +2142,7 @@ TracerCommandsParser::ProbeContext* TracerCommandsParser::probe() {
               _la = _input->LA(1);
             } while ((((_la & ~ 0x3fULL) == 0) &&
               ((1ULL << _la) & 69806344147828736) != 0) || ((((_la - 119) & ~ 0x3fULL) == 0) &&
-              ((1ULL << (_la - 119)) & 5923) != 0));
+              ((1ULL << (_la - 119)) & 14115) != 0));
             break;
           }
 
@@ -2361,6 +2362,10 @@ tree::TerminalNode* TracerCommandsParser::PrepareOptionContext::SNAPSHOT_RETURN_
   return getToken(TracerCommandsParser::SNAPSHOT_RETURN_TYPE, 0);
 }
 
+tree::TerminalNode* TracerCommandsParser::PrepareOptionContext::SNAPSHOT_RETURN_MEMBER() {
+  return getToken(TracerCommandsParser::SNAPSHOT_RETURN_MEMBER, 0);
+}
+
 tree::TerminalNode* TracerCommandsParser::PrepareOptionContext::SIGNATURE() {
   return getToken(TracerCommandsParser::SIGNATURE, 0);
 }
@@ -2418,12 +2423,15 @@ TracerCommandsParser::PrepareOptionContext* TracerCommandsParser::prepareOption(
       case TracerCommandsParser::T__52:
       case TracerCommandsParser::T__53:
       case TracerCommandsParser::T__54:
-      case TracerCommandsParser::SNAPSHOT_RETURN_TYPE: {
+      case TracerCommandsParser::SNAPSHOT_RETURN_TYPE:
+      case TracerCommandsParser::SNAPSHOT_RETURN_MEMBER: {
         enterOuterAlt(_localctx, 1);
         setState(292);
         _la = _input->LA(1);
         if (!((((_la & ~ 0x3fULL) == 0) &&
-          ((1ULL << _la) & 69806344147828736) != 0) || _la == TracerCommandsParser::SNAPSHOT_RETURN_TYPE)) {
+          ((1ULL << _la) & 69806344147828736) != 0) || _la == TracerCommandsParser::SNAPSHOT_RETURN_TYPE
+
+        || _la == TracerCommandsParser::SNAPSHOT_RETURN_MEMBER)) {
         _errHandler->recoverInline(this);
         }
         else {
