@@ -1053,10 +1053,19 @@ implementation's `.cpp` with `--include` if its definition is in that file.
 For typed local decoding of a polymorphic snapshot, supply an `EventCodec<T>`
 for the value you want to construct.
 
+For source-prepared pointer and reference returns, Clang also discovers direct
+raw pointer members whose declared pointee is polymorphic and whose concrete
+derived layout is available from the supplied source. At return, a checked RTTI
+read selects the matching layout. A field such as `_imp` holds the original
+address and `_imp_snapshot` holds the copied fields of the live implementation.
+Null pointers, unreadable records, and unknown types remain address-only. The
+target must keep the pointee and its captured data live and stable through POST.
+
 A reusable record policy can follow specific raw pointer fields wherever that
 record is captured as an argument, receiver, or result. Define the policy in
 a C++ header and supply it through the existing `%probe prepare --include`
-option alongside the matching application definitions.
+option alongside the matching application definitions. An explicit policy
+selects the member set for that record and can include non-polymorphic records.
 
 ```cpp
 namespace tracer_snapshot {

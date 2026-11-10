@@ -256,6 +256,7 @@ make_value_snapshot_code(clang::ASTContext &ast,
     std::size_t accessor_id = 0;
     std::vector<SnapshotProjection> projections;
     bool polymorphic = false;
+    bool automatic = false;
   };
   struct Entry {
     unsigned index;
@@ -473,7 +474,10 @@ make_value_snapshot_code(clang::ASTContext &ast,
           }
         }
       }
-      for (const auto &member_policy : policy.members()) {
+      const auto add_member_policy = [&](const auto &member_policy,
+                                         bool automatic) {
+        if (automatic && entry.role != Role::result)
+          return;
         const clang::FieldDecl *field = nullptr;
         for (const auto *decl : static_record->fields())
           if (decl->getNameAsString() == member_policy.field()) {
@@ -483,7 +487,7 @@ make_value_snapshot_code(clang::ASTContext &ast,
         if (!field || !field->getType()->isPointerType() ||
             field->getType().isVolatileQualified() ||
             field->getType()->getPointeeType().isVolatileQualified())
-          continue;
+          return;
         const auto output_name = member_policy.field() + "_snapshot";
         const bool name_collision = std::any_of(
             static_record->fields().begin(), static_record->fields().end(),
@@ -491,17 +495,20 @@ make_value_snapshot_code(clang::ASTContext &ast,
               return decl->getNameAsString() == output_name;
             });
         if (name_collision)
-          continue;
+          return;
         auto base_type = field->getType()->getPointeeType()
                              .getUnqualifiedType().getCanonicalType();
         const auto *base_record = base_type->getAsCXXRecordDecl();
         base_record = base_record ? base_record->getDefinition() : nullptr;
         if (!base_record)
-          continue;
+          return;
+        if (automatic && !base_record->isPolymorphic())
+          return;
         FollowedMember followed;
         followed.field = field;
         followed.name = member_policy.field();
         followed.polymorphic = base_record->isPolymorphic();
+        followed.automatic = automatic;
         for (const auto index : member_policy.dynamic_types()) {
           const auto *layout = record_metadata(index);
           if (!layout)
@@ -525,7 +532,13 @@ make_value_snapshot_code(clang::ASTContext &ast,
         }
         if (!followed.projections.empty())
           entry.members.push_back(std::move(followed));
+      };
+      for (const auto &member_policy : policy.members()) {
+        add_member_policy(member_policy, false);
       }
+      if (policy.members().empty())
+        for (const auto &member_policy : policy.automatic_members())
+          add_member_policy(member_policy, true);
       break;
     }
   };
@@ -694,9 +707,17 @@ struct Scope { std::size_t mark = tracer_snapshot_mark(); bool active=true;
                (!entry.dynamic_projections.empty() ||
                 std::any_of(entry.members.begin(), entry.members.end(),
                             [](const auto &member) {
-                              return member.polymorphic &&
+                              return member.polymorphic && !member.automatic &&
                                      !member.projections.empty();
                             }));
+      });
+  const bool has_automatic_capture = std::any_of(
+      entries.begin(), entries.end(), [](const auto &entry) {
+        return std::any_of(entry.members.begin(), entry.members.end(),
+                           [](const auto &member) {
+                             return member.automatic &&
+                                    !member.projections.empty();
+                           });
       });
   const bool has_custom_encoder = std::any_of(
       entries.begin(), entries.end(), [](const auto &entry) {
@@ -772,6 +793,12 @@ template<class T> bool has_itanium_rtti(const T* object) noexcept {
   return rtti != nullptr;
 }
 }
+)";
+  if (has_automatic_capture)
+    code.declarations += R"(
+#include <cstddef>
+extern "C" bool tracer_snapshot_read_rtti(const void*, const void**, const char**) noexcept;
+extern "C" bool tracer_snapshot_rtti_matches(const char*, const char*, std::size_t, const void*, const void*, std::size_t, std::size_t) noexcept;
 )";
   for (const auto &entry : entries) {
     const bool receiver = entry.role == Role::receiver;
@@ -931,29 +958,63 @@ template<class T> bool has_itanium_rtti(const T* object) noexcept {
                           std::to_string(member.accessor_id);
       body += "auto " + pointer + "=" + helper + "(" + root_expr + ");\n"
               "if(" + pointer + "){\n";
-      bool first = true;
-      for (std::size_t i = 0; i < member.projections.size(); ++i) {
-        const auto &projection = member.projections[i];
-        body += first ? "if(" : "else if(";
-        if (member.polymorphic && !projection.rtti_name.empty())
-          body += "tracer_snapshot_detail::has_itanium_rtti(" + pointer + ") && std::strcmp(typeid(*" +
-                  pointer + ").name()," + literal(projection.rtti_name) + ")==0){\n";
-        else
-          body += "true){\n";
-        const auto value = member.polymorphic && !projection.rtti_name.empty()
-            ? "*static_cast<const " + projection.cpp_type +
-                  "*>(dynamic_cast<const void*>(" + pointer + "))"
-            : "*" + pointer;
-        emit_projection(projection, child, value,
-                        "_member_" + std::to_string(member.accessor_id) +
-                            "_" + std::to_string(i), false);
-        if (projection.error.empty())
-          body += "if(" + child + ".status==tracer::ValueSnapshot::Complete){\n"
-                  "child_members_" + id + "[child_member_count_" + id +
-                  "]={" + literal(member.name + "_snapshot") + ",&" + child +
-                  "}; ++child_member_count_" + id + ";\n}\n";
+      const auto attach_child = [&]() {
+        body += "if(" + child + ".status==tracer::ValueSnapshot::Complete){\n"
+                "child_members_" + id + "[child_member_count_" + id +
+                "]={" + literal(member.name + "_snapshot") + ",&" + child +
+                "}; ++child_member_count_" + id + ";\n}\n";
+      };
+      if (member.automatic) {
+        const auto complete = "automatic_complete_" + id + "_" +
+                              std::to_string(m);
+        const auto type_name = "automatic_type_name_" + id + "_" +
+                               std::to_string(m);
+        body += "const void* " + complete + "=nullptr; const char* " +
+                type_name + "=nullptr;\n"
+                "if(tracer_snapshot_read_rtti(static_cast<const void*>(" +
+                pointer + "),&" + complete + ",&" + type_name + ")){\n";
+        bool first = true;
+        for (std::size_t i = 0; i < member.projections.size(); ++i) {
+          const auto &projection = member.projections[i];
+          if (projection.rtti_name.empty())
+            continue;
+          body += first ? "if(" : "else if(";
+          body += "tracer_snapshot_rtti_matches(" + type_name + "," +
+                  literal(projection.rtti_name) + "," +
+                  std::to_string(projection.rtti_name.size()) + "," + complete +
+                  ",static_cast<const void*>(" + pointer + "),sizeof(" +
+                  projection.cpp_type + "),alignof(" + projection.cpp_type +"))){\n";
+          const auto value = "*static_cast<const " + projection.cpp_type +
+                             "*>(" + complete + ")";
+          emit_projection(projection, child, value,
+                          "_member_" + std::to_string(member.accessor_id) +
+                              "_" + std::to_string(i), false);
+          attach_child();
+          body += "}\n";
+          first = false;
+        }
         body += "}\n";
-        first = false;
+      } else {
+        bool first = true;
+        for (std::size_t i = 0; i < member.projections.size(); ++i) {
+          const auto &projection = member.projections[i];
+          body += first ? "if(" : "else if(";
+          if (member.polymorphic && !projection.rtti_name.empty())
+            body += "tracer_snapshot_detail::has_itanium_rtti(" + pointer + ") && std::strcmp(typeid(*" +
+                    pointer + ").name()," + literal(projection.rtti_name) + ")==0){\n";
+          else
+            body += "true){\n";
+          const auto value = member.polymorphic && !projection.rtti_name.empty()
+              ? "*static_cast<const " + projection.cpp_type +
+                    "*>(dynamic_cast<const void*>(" + pointer + "))"
+              : "*" + pointer;
+          emit_projection(projection, child, value,
+                          "_member_" + std::to_string(member.accessor_id) +
+                              "_" + std::to_string(i), false);
+          attach_child();
+          body += "}\n";
+          first = false;
+        }
       }
       body += "}\n";
     }

@@ -1,16 +1,38 @@
 #include "item-impl.hpp"
 
+#include <cstddef>
+#include <cstdlib>
+#include <sys/mman.h>
+#include <unistd.h>
+
 namespace HFW {
 namespace {
 struct ItemV4 final : ItemImp {
   unsigned revision = 4;
   int source = 404;
 };
+
+ItemImp *unreadable_implementation() {
+  static auto *page = [] {
+    const long page_size = ::sysconf(_SC_PAGESIZE);
+    if (page_size <= 0)
+      std::abort();
+    const auto size = static_cast<std::size_t>(page_size);
+    void *memory = ::mmap(nullptr, size, PROT_NONE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (memory == MAP_FAILED)
+      std::abort();
+    return memory;
+  }();
+  // The tracer observes this address, but the target never reads or deletes it.
+  return static_cast<ItemImp *>(page);
+}
 } // namespace
 
 Item::Item(int value, ItemImp *implementation, ItemImp *other)
     : id(value), _imp(implementation), _other(other),
-      stamp_{value + 700}, _stamp(&stamp_) {}
+      _unreadable(unreadable_implementation()), stamp_{value + 700},
+      _stamp(&stamp_) {}
 
 Item::~Item() {
   delete _imp;
