@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
         std::cout << "Native header preparation: --selector SELECTOR --include "
                      "HEADER "
                      "--compdb FILE [--translation-unit FILE] "
-                     "--output NEW_DIRECTORY [--module ELF] [--metadata-only] "
+                     "--output NEW_DIRECTORY [--module ELF] [--snapshot-return-type TYPE] [--metadata-only] "
                      "[--extra-arg ARG]...\n"
                      "ELF preparation: --selector SELECTOR --signature TYPE "
                      "--module ELF --output NEW_DIRECTORY [--member] [--metadata-only]\n"
@@ -66,7 +66,7 @@ int main(int argc, char **argv) {
           option != "--include" && option != "--selector" &&
           option != "--compdb" && option != "--translation-unit" &&
           option != "--module" && option != "--output" && option != "--extra-arg" &&
-          option != "--signature")
+          option != "--signature" && option != "--snapshot-return-type")
         throw std::runtime_error("unknown option: " + option);
       if (++i == argc || std::string(argv[i]).empty())
         throw std::runtime_error("missing value for " + option);
@@ -95,7 +95,7 @@ int main(int argc, char **argv) {
     if (const auto indexed = options.find("--module-index"); indexed != options.end()) {
       if (!headers.empty() || !extra_arguments.empty() || member ||
           options.count("--compdb") || options.count("--translation-unit") ||
-          options.count("--signature"))
+          options.count("--signature") || options.count("--snapshot-return-type"))
         throw std::invalid_argument("--module-index is incompatible with source or signature options");
       const auto index = tracer_module::ModuleIndex::open(indexed->second);
       const auto &selector = options.at("--selector");
@@ -117,11 +117,15 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("--generated and --id require indexed preparation");
     const auto signature_option = options.find("--signature");
     const bool elf_mode = signature_option != options.end();
+    const auto snapshot_type_option = options.find("--snapshot-return-type");
+    if (snapshot_type_option != options.end() && snapshot_type_option->second.empty())
+      throw std::invalid_argument("--snapshot-return-type requires a type name");
     if (elf_mode) {
       if (!options.count("--module"))
         throw std::invalid_argument("--signature requires --module");
       if (!headers.empty() || options.count("--compdb") ||
-          options.count("--translation-unit") || !extra_arguments.empty())
+          options.count("--translation-unit") || !extra_arguments.empty() ||
+          snapshot_type_option != options.end())
         throw std::invalid_argument("--signature cannot be combined with source or compiler options");
     } else {
       if (member)
@@ -169,7 +173,10 @@ int main(int argc, char **argv) {
         command.arguments.push_back(cl_driver ? "/clang:" + argument : argument);
       const auto resolve_adapter = [&](bool pointer_layouts) {
         auto callable = tracer::client::resolve_header_callable(
-            options.at("--selector"), context, command, pointer_layouts);
+            options.at("--selector"), context, command, pointer_layouts,
+            snapshot_type_option == options.end()
+                ? std::string{}
+                : snapshot_type_option->second);
         auto &adapter = *callable.spec.mutable_prepared();
         tracer::client::verify_prepared_adapter(options.at("--selector"), adapter,
                                                 callable, pointer_layouts);
@@ -178,6 +185,8 @@ int main(int argc, char **argv) {
       try {
         return resolve_adapter(true);
       } catch (const std::runtime_error &error) {
+        if (snapshot_type_option != options.end())
+          throw;
         const auto original = std::current_exception();
         try {
           auto callable = resolve_adapter(false);

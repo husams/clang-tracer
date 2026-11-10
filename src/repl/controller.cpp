@@ -1037,6 +1037,9 @@ void Controller::prepare(const std::string &selector, const Command &options) {
           "compile_commands.json was not found in the current directory. Pass --compdb FILE.");
     arguments.insert(arguments.end(), {"--compdb", database});
   }
+  if (options.has("--snapshot-return-type"))
+    arguments.insert(arguments.end(), {"--snapshot-return-type",
+                                       options.option("--snapshot-return-type")});
   if (options.has("--metadata-only")) arguments.push_back("--metadata-only");
   for (const auto *key : {"--translation-unit", "--module"}) {
     if (options.has(key)) {

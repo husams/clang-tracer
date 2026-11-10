@@ -1046,6 +1046,14 @@ Read the fields with `event.result_snapshot()` or decode an owned `T` with
 `event.result_as<T>()` after importing a mapping for `T`. `event.result()`
 still shows the address, including `0x0` for null returns.
 
+If the declared pointee is a polymorphic base, use
+`%probe prepare --snapshot-return-type QUALIFIED_TYPE` to prepare the layout of
+one concrete derived type from matching headers and compiler options. Inject the prepared probe with
+`--snapshot-return-pointee`. When RTTI identifies that exact type, the agent
+copies the complete derived object using its prepared layout. Other live
+objects use the declared base layout. For typed local decoding of a polymorphic
+snapshot, supply an `EventCodec<T>` for the value you want to construct.
+
 Inspect a record without declaring a local C++ type:
 
 ```cpp

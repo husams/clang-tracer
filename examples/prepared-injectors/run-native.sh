@@ -12,6 +12,9 @@ demo_mode=${1:-}
 if [[ $demo_mode == --pointee ]]; then
   example=prepared-pointee-target
   shift
+elif [[ $demo_mode == --polymorphic-pointee ]]; then
+  example=prepared-polymorphic-pointee-target
+  shift
 elif [[ $demo_mode == --methods || $demo_mode == --state ]]; then
   example=prepared-methods-target
   shift
@@ -20,11 +23,11 @@ target=${CLANG_TRACER_PREPARED_TARGET:-$build/examples/prepared-injectors/$examp
 compdb=${CLANG_TRACER_PREPARED_COMPDB:-$build/compile_commands.json}
 
 if [[ ${1:-} == --help ]]; then
-  printf '%s\n' 'Use --methods for typed method snapshots, --state for named event state, or --pointee for returned-record snapshots. Add --smoke for automation.'
+  printf '%s\n' 'Use --methods, --state, --pointee, or --polymorphic-pointee to select an example. Add --smoke for automation.'
   exit 0
 fi
 if [[ $# -gt 1 || ( $# == 1 && $1 != --smoke ) ]]; then
-  printf '%s\n' 'Usage: run-native.sh [--methods|--state|--pointee] [--smoke|--help]' >&2
+  printf '%s\n' 'Usage: run-native.sh [--methods|--state|--pointee|--polymorphic-pointee] [--smoke|--help]' >&2
   exit 2
 fi
 for required in "$repl" "$server" "$agent" "$target" "$compdb"; do
@@ -88,6 +91,26 @@ std::cout << item.label << " " << snapshot.field("details").field("revision").as
 The non-null event owns a copied HfwItem value and an automatic field snapshot.
 Null returns keep the raw `0x0` result and have no pointee snapshot.
 STEPS
+    "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60
+  fi
+elif [[ $demo_mode == --polymorphic-pointee ]]; then
+  if [[ ${1:-} == --smoke ]]; then
+    {
+      cat demo/polymorphic-pointee/inspect.repl
+      cat <<'REPL'
+auto base = captured.at((child_index + 1) % captured.size()).result_snapshot();
+auto null_event = captured.at((child_index + 2) % captured.size());
+bool correct = captured.size() == 3 && item.x == 42 && snapshot.field("prefix").as<int>() == 12;
+correct = correct && base.cpp_type() == "HFW::Base" && base.field("id").as<int>() == 11 && null_event.result() == "0x0";
+std::cout << "NATIVE_POLYMORPHIC_RESULT=" << correct << '\n';
+%quit
+REPL
+    } | "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60 --fail-fast | tee "$run/smoke.log"
+    grep -qx 'NATIVE_POLYMORPHIC_RESULT=1' "$run/smoke.log"
+  else
+    printf 'Paste these commands at the native tracer prompt.\n\n'
+    cat demo/polymorphic-pointee/inspect.repl
+    printf '\n%%quit exits the REPL.\n'
     "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60
   fi
 elif [[ $demo_mode == --state ]]; then

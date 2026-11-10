@@ -33,12 +33,13 @@ public:
                                   const clang::HeaderSearch &toolchain_search,
                                   const clang::FunctionDecl &function,
                                   const std::vector<std::string> &headers,
-                                  bool pointer_layouts) {
+                                  bool pointer_layouts,
+                                  const clang::CXXRecordDecl *snapshot_return_record = nullptr) {
     std::vector<NestedRequest> late_requests;
     for (;;) {
       const auto reserved = late_requests.size();
       AdapterEmitter pass(ast, toolchain_search, late_requests);
-      pass.emit_declarations(function, headers, pointer_layouts);
+      pass.emit_declarations(function, headers, pointer_layouts, snapshot_return_record);
       if (!pass.first_late_dependency_)
         return {pass.forwards_ + pass.declarations_, std::move(pass.standard_headers_)};
       // Each retry must discover another dependency. Reuse the original
@@ -66,11 +67,14 @@ private:
 
   void emit_declarations(const clang::FunctionDecl &function,
                          const std::vector<std::string> &headers,
-                         bool pointer_layouts) {
+                         bool pointer_layouts,
+                         const clang::CXXRecordDecl *snapshot_return_record) {
     selected_method_ = llvm::dyn_cast<clang::CXXMethodDecl>(&function);
     const bool linkage_alias = nested_static_method(selected_method_);
     if (selected_method_ && !linkage_alias)
       register_nested(*selected_method_->getParent());
+    if (snapshot_return_record)
+      register_nested(*snapshot_return_record);
     register_nested_type(function.getReturnType(), pointer_layouts);
     for (const auto *parameter : function.parameters())
       register_nested_type(parameter->getType(), pointer_layouts);
@@ -101,6 +105,11 @@ private:
         if (const auto *record = prepared_pointer_record(parameter->getType()))
           if (!llvm::isa<clang::CXXRecordDecl>(record->getDeclContext()))
             emit_record(*record);
+    }
+    if (snapshot_return_record) {
+      emit_record(*snapshot_return_record);
+      declarations_ += "namespace tracer_prepared { using SnapshotReturn = " +
+                       spelling(ast_.getRecordType(snapshot_return_record)) + "; }\n";
     }
   }
 

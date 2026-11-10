@@ -223,6 +223,21 @@ For non-null returns, `result_snapshot()` includes `id`, `label`, and nested
 
 The corresponding CTest is `native_repl_prepared_pointee`.
 
+### Polymorphic pointer returns
+
+Build `prepared-polymorphic-pointee-target` and start the example.
+
+```bash
+./examples/prepared-injectors/run-native.sh --polymorphic-pointee
+```
+
+The launcher prints the commands in
+[`inspect.repl`](polymorphic-pointee/inspect.repl). The target returns a
+`Base*` to a `Child` whose base subobject sits at a nonzero offset. The
+prepared probe uses the exact dynamic type to capture `Child::x` as `42`.
+The example also reads `x` through `result_as<ChildFields>()` with a local
+decoder. Add `--smoke` to check the child, base and null cases.
+
 ## Typed method example
 
 Build `prepared-methods-target` and launch with `--methods`. The method demo

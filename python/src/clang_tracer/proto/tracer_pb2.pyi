@@ -264,7 +264,7 @@ class HeaderContext(_message.Message):
     def __init__(self, working_directory: _Optional[str] = ..., compiler_arguments: _Optional[_Iterable[str]] = ..., inference: _Optional[str] = ...) -> None: ...
 
 class PreparedInjector(_message.Message):
-    __slots__ = ("format_version", "module_sha256", "module_name", "selector", "symbol", "signature", "argument_names", "target_triple", "header_types", "include_headers", "header_context", "adapter_declarations", "adapter_standard_headers", "adapter_abi_options", "adapter_toolchain_options", "adapter_uses_default_toolchain", "source_translation_unit")
+    __slots__ = ("format_version", "module_sha256", "module_name", "selector", "symbol", "signature", "argument_names", "target_triple", "header_types", "include_headers", "header_context", "adapter_declarations", "adapter_standard_headers", "adapter_abi_options", "adapter_toolchain_options", "adapter_uses_default_toolchain", "source_translation_unit", "snapshot_return_type")
     FORMAT_VERSION_FIELD_NUMBER: _ClassVar[int]
     MODULE_SHA256_FIELD_NUMBER: _ClassVar[int]
     MODULE_NAME_FIELD_NUMBER: _ClassVar[int]
@@ -282,6 +282,7 @@ class PreparedInjector(_message.Message):
     ADAPTER_TOOLCHAIN_OPTIONS_FIELD_NUMBER: _ClassVar[int]
     ADAPTER_USES_DEFAULT_TOOLCHAIN_FIELD_NUMBER: _ClassVar[int]
     SOURCE_TRANSLATION_UNIT_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_RETURN_TYPE_FIELD_NUMBER: _ClassVar[int]
     format_version: int
     module_sha256: bytes
     module_name: str
@@ -299,7 +300,8 @@ class PreparedInjector(_message.Message):
     adapter_toolchain_options: _containers.RepeatedScalarFieldContainer[str]
     adapter_uses_default_toolchain: bool
     source_translation_unit: str
-    def __init__(self, format_version: _Optional[int] = ..., module_sha256: _Optional[bytes] = ..., module_name: _Optional[str] = ..., selector: _Optional[str] = ..., symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., target_triple: _Optional[str] = ..., header_types: _Optional[_Union[DebugInfo, _Mapping]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., adapter_declarations: _Optional[str] = ..., adapter_standard_headers: _Optional[_Iterable[str]] = ..., adapter_abi_options: _Optional[_Iterable[str]] = ..., adapter_toolchain_options: _Optional[_Iterable[str]] = ..., adapter_uses_default_toolchain: bool = ..., source_translation_unit: _Optional[str] = ...) -> None: ...
+    snapshot_return_type: DebugInfo
+    def __init__(self, format_version: _Optional[int] = ..., module_sha256: _Optional[bytes] = ..., module_name: _Optional[str] = ..., selector: _Optional[str] = ..., symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., target_triple: _Optional[str] = ..., header_types: _Optional[_Union[DebugInfo, _Mapping]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., adapter_declarations: _Optional[str] = ..., adapter_standard_headers: _Optional[_Iterable[str]] = ..., adapter_abi_options: _Optional[_Iterable[str]] = ..., adapter_toolchain_options: _Optional[_Iterable[str]] = ..., adapter_uses_default_toolchain: bool = ..., source_translation_unit: _Optional[str] = ..., snapshot_return_type: _Optional[_Union[DebugInfo, _Mapping]] = ...) -> None: ...
 
 class ProbeSpec(_message.Message):
     __slots__ = ("symbol", "signature", "callback_source", "receiver", "receiver_unavailable_reason", "debug_info", "argument_names", "include_headers", "header_context", "stack_depth", "include_internal_stack_frames", "print_arguments", "print_result", "callback_package_path", "compile_options", "prepared", "extra_compile_arguments", "extra_compile_arguments_checked", "allow_argument_overrides", "allow_result_override", "allow_replacement", "reclaimable", "allow_call_original", "trace_exceptions", "snapshot_return_pointee")

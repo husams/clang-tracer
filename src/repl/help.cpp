@@ -139,7 +139,7 @@ const CommandTopic commands[] = {
      "Verify and disassemble a function entry and show the copy-only detour window and bounded control flow."},
     {"probe prepare",
      "%probe prepare SELECTOR --include HEADER --output NEW_DIRECTORY\n"
-     "  [--compdb PATH] [--translation-unit FILE] [--module ELF] [--metadata-only] [--cwd DIRECTORY] [EXTRA COMPILER ARGUMENTS]\n"
+     "  [--compdb PATH] [--translation-unit FILE] [--module ELF] [--snapshot-return-type TYPE] [--metadata-only] [--cwd DIRECTORY] [EXTRA COMPILER ARGUMENTS]\n"
      "  or %probe prepare SELECTOR --signature TYPE --module ELF --output NEW_DIRECTORY [--member] [--metadata-only] [--cwd DIRECTORY]"
      "\n  or %probe prepare SELECTOR [--module-index INDEX] [--module ELF] [--id ID] [--generated DIR] --output NEW_DIRECTORY",
      "Build a reusable probe package from source, an explicit signature, or the module index. "
@@ -148,10 +148,11 @@ const CommandTopic commands[] = {
      "Preparation uses compile_commands.json in the command's working directory by default. "
      "It prefers the first include's recorded compile command and falls back to the first source beside it. "
      "Use --module to pin the package to a specific build. "
+     "Use --snapshot-return-type with source headers to select a known dynamic pointee layout; inject with --snapshot-return-pointee to capture it. "
      "Use --metadata-only to skip the separate C++ adapter files. "
      "With --signature, supply the C++ result and explicit parameter types, for example 'const int&()'. "
      "Qualified methods receive an opaque receiver. Pass --member for an unqualified instance method.",
-     R"example(%probe prepare "demo::compute(int)" --include demo.hpp --output prepared)example"},
+     R"example(%probe prepare "HFW::Factory::create()" --include demo.hpp --snapshot-return-type HFW::Child --output prepared)example"},
     {"probe resolve", "%probe resolve SELECTOR [RESOLUTION OPTIONS] [--cwd DIRECTORY]",
      "Resolve a selector in the selected target and show the available metadata.",
      R"(%probe resolve "Calculator::multiply(int, int) const")"},
