@@ -584,6 +584,7 @@ void ContextExportClient::run() noexcept {
           break;
         }
       });
+      clangtracer::context::v1::StreamReady negotiated;
       std::thread reader([&] {
         tracer::context_execution::Scope helper_mode(
             tracer::context_execution::Mode::TransportNoTrace);
@@ -647,6 +648,8 @@ void ContextExportClient::run() noexcept {
               else if (control.ready().max_epoch_schemas() > limits_.max_epoch_schemas) reason = 5;
               else if (control.ready().max_epoch_schema_bytes() > limits_.max_epoch_schema_bytes) reason = 6;
               report_export_failure("ready_negotiation_rejected", reason);
+            } else {
+              negotiated = control.ready();
             }
             setup_complete_ = ready_ && open_.profile() != clangtracer::context::v1::DURABLE;
             control_fault_ = !ready_;
@@ -671,6 +674,7 @@ void ContextExportClient::run() noexcept {
         }
         if (cancel) context.TryCancel();
       });
+      clangtracer::context::v1::StreamReady epoch_limits;
       {
         std::unique_lock lock(mutex_);
         cv_.wait_for(lock, 30s, [&] { return stopping_ || control_fault_ || setup_complete_; });
@@ -680,7 +684,10 @@ void ContextExportClient::run() noexcept {
           report_export_failure(rejected ? "export_setup_rejected"
                                          : "export_ready_timeout");
         }
-        if (!failed) last_progress = std::chrono::steady_clock::now();
+        if (!failed) {
+          epoch_limits = negotiated;
+          last_progress = std::chrono::steady_clock::now();
+        }
       }
       std::uint64_t replay_cursor = 0;
       if (journal_) {
@@ -738,27 +745,45 @@ void ContextExportClient::run() noexcept {
           is_paused = paused_;
         }
         if (is_paused) continue;
-        bool replayed = false;
+        std::uint64_t replay_position = 0;
         if (journal_ && open_.profile() == clangtracer::context::v1::DURABLE) {
           auto records = journal_->read_after(replay_cursor, 1,
               static_cast<std::size_t>(limits_.queued_bytes));
           if (!records.empty()) {
             hook_item.serialized_frame = std::move(records.front().serialized_frame);
-            replay_cursor = records.front().position;
-            replayed = true;
+            replay_position = records.front().position;
           }
         }
-        if (!replayed && has_pending_hook) {
+        if (!replay_position && has_pending_hook) {
           hook_item = std::move(pending_hook);
           pending_hook = {};
           has_pending_hook = false;
-        } else if (!replayed && !hook_ring_.try_take(hook_item)) {
+        } else if (!replay_position && !hook_ring_.try_take(hook_item)) {
           const bool pending = hook_ring_.queued_bytes() != 0;
           if (pending && !is_paused && std::chrono::steady_clock::now() - last_progress > 30s) failed = true;
           continue;
         }
         {
           using namespace clangtracer::context::v1;
+          const auto reject = [&] {
+            hook_ring_.complete(hook_item.reservation);
+            if (replay_position) {
+              // A committed position must be retried before any later one.
+              report_export_failure("durable_replay_admission_failed", replay_position);
+              failed = true;
+            } else {
+              std::lock_guard lock(mutex_);
+              ++counters_.queue_dropped;
+            }
+          };
+          const auto rotate = [&] {
+            // A replayed record is already in the journal for the next epoch.
+            if (!replay_position) {
+              pending_hook = std::move(hook_item);
+              has_pending_hook = true;
+            }
+            rotate_epoch = true;
+          };
           ContextBatch batch;
           ContextFrame single;
           std::vector<SchemaRecord> schemas_to_announce;
@@ -810,31 +835,16 @@ void ContextExportClient::run() noexcept {
             event = single.event(); has_event = true;
             *batch.mutable_event() = event;
           } else {
-            hook_ring_.complete(hook_item.reservation);
-            std::lock_guard lock(mutex_); ++counters_.queue_dropped;
+            reject();
             continue;
           }
 
-          if (journal_ && open_.profile() == DURABLE && has_event) {
-            if (event.recording_position() == 0) {
-              std::uint64_t position = 0;
-              if (!journal_->append(batch, position)) {
-                hook_ring_.complete(hook_item.reservation);
-                std::lock_guard lock(mutex_); ++counters_.journal_dropped;
-                continue;
-              }
-              event.set_recording_position(position);
-              batch.mutable_event()->set_recording_position(position);
-              if (!batch.SerializeToString(&hook_item.serialized_frame)) {
-                hook_ring_.complete(hook_item.reservation);
-                std::lock_guard lock(mutex_); ++counters_.journal_dropped;
-                continue;
-              }
-              replay_cursor = position;
-            } else {
-              replay_cursor = event.recording_position();
-            }
-          }
+          const bool journaled = journal_ && open_.profile() == DURABLE && has_event;
+          const bool new_record = journaled && event.recording_position() == 0;
+          if ((replay_position && (!has_event || event.recording_position() != replay_position)) ||
+              (journaled && !replay_position && event.recording_position() > replay_cursor) ||
+              (has_event && event.effective_max_items() > 4096))
+            malformed = true;
 
           std::unordered_map<std::string, SchemaRecord> candidate_schemas;
           std::unordered_map<std::string, std::string> complete_schema_definitions;
@@ -873,37 +883,29 @@ void ContextExportClient::run() noexcept {
             }
           }
           if (malformed) {
-            hook_ring_.complete(hook_item.reservation);
-            std::lock_guard lock(mutex_); ++counters_.queue_dropped;
+            reject();
             continue;
           }
 
-          const bool fits_empty = complete_schema_definitions.size() <= limits_.max_epoch_schemas &&
-              complete_schema_bytes <= limits_.max_epoch_schema_bytes;
-          const bool fits_current = candidate_schemas.size() <= limits_.max_epoch_schemas - epoch_schema_ids.size() &&
-              required_schema_bytes <= limits_.max_epoch_schema_bytes - epoch_schema_bytes;
+          const bool fits_empty = complete_schema_definitions.size() <= epoch_limits.max_epoch_schemas() &&
+              complete_schema_bytes <= epoch_limits.max_epoch_schema_bytes();
+          const bool fits_current = candidate_schemas.size() <= epoch_limits.max_epoch_schemas() - epoch_schema_ids.size() &&
+              required_schema_bytes <= epoch_limits.max_epoch_schema_bytes() - epoch_schema_bytes;
           if (!fits_current) {
             if (fits_empty && !epoch_schema_ids.empty()) {
-              pending_hook = std::move(hook_item);
-              has_pending_hook = true;
-              rotate_epoch = true;
+              rotate();
               break;
             }
-            hook_ring_.complete(hook_item.reservation);
-            std::lock_guard lock(mutex_); ++counters_.queue_dropped;
+            reject();
             continue;
           }
           if (candidate_schemas.size() >
               epoch_schema_charges.size() - epoch_schema_charge_count) {
             if (!epoch_schema_ids.empty()) {
-              pending_hook = std::move(hook_item);
-              has_pending_hook = true;
-              rotate_epoch = true;
+              rotate();
               break;
             }
-            hook_ring_.complete(hook_item.reservation);
-            std::lock_guard lock(mutex_);
-            ++counters_.queue_dropped;
+            reject();
             continue;
           }
 
@@ -926,17 +928,25 @@ void ContextExportClient::run() noexcept {
           }
           if (staging_admission_failed) {
             if (!epoch_schema_ids.empty()) {
-              pending_hook = std::move(hook_item);
-              has_pending_hook = true;
-              rotate_epoch = true;
+              rotate();
               break;
             }
-            hook_ring_.complete(hook_item.reservation);
-            std::lock_guard lock(mutex_);
-            ++counters_.queue_dropped;
+            reject();
             continue;
           }
 
+          if (new_record) {
+            // Size the actual wire event, including the position varint.
+            // Only this worker appends. Concurrent ACKs preserve the prefix.
+            const auto prefix = journal_->committed_prefix();
+            if (prefix == std::numeric_limits<std::uint64_t>::max()) {
+              hook_ring_.complete(hook_item.reservation);
+              std::lock_guard lock(mutex_);
+              ++counters_.journal_dropped;
+              continue;
+            }
+            event.set_recording_position(prefix + 1);
+          }
           std::vector<ProducerPacket> outbound_packets;
           outbound_packets.reserve(candidate_schemas.size() + (has_event ? 1 : 0));
           std::unordered_map<std::string, std::uint64_t> proposed_ids;
@@ -950,9 +960,17 @@ void ContextExportClient::run() noexcept {
             proposed_ids.emplace(identity, schema_id);
             ProducerPacket packet;
             *packet.mutable_data()->mutable_schema() = schema;
-            if (packet.ByteSizeLong() > limits_.max_packet_bytes) { admission_failed = true; break; }
+            if (packet.ByteSizeLong() > epoch_limits.max_packet_bytes()) { admission_failed = true; break; }
             proposed_schema_bytes += schema.ByteSizeLong();
             outbound_packets.push_back(std::move(packet));
+          }
+          if (!admission_failed &&
+              proposed_schema_bytes > epoch_limits.max_epoch_schema_bytes() - epoch_schema_bytes) {
+            if (fits_empty && !epoch_schema_ids.empty()) {
+              rotate();
+              break;
+            }
+            admission_failed = true;
           }
           if (!admission_failed && has_event) {
             for (auto &state : *event.mutable_states()) {
@@ -965,16 +983,35 @@ void ContextExportClient::run() noexcept {
             if (!admission_failed) {
               ProducerPacket packet;
               *packet.mutable_data()->mutable_event() = event;
-              if (packet.ByteSizeLong() > limits_.max_packet_bytes ||
-                  packet.data().event().ByteSizeLong() > limits_.max_event_bytes)
+              if (packet.ByteSizeLong() > epoch_limits.max_packet_bytes() ||
+                  packet.data().event().ByteSizeLong() > epoch_limits.max_event_bytes())
                 admission_failed = true;
               else outbound_packets.push_back(std::move(packet));
             }
           }
           if (admission_failed) {
-            hook_ring_.complete(hook_item.reservation);
-            std::lock_guard lock(mutex_); ++counters_.queue_dropped;
+            // Smaller epoch schema IDs or an empty schema budget can make
+            // the same journal record admissible on a fresh stream.
+            if (replay_position && !epoch_schema_ids.empty()) {
+              rotate();
+              break;
+            }
+            reject();
             continue;
+          }
+
+          if (new_record) {
+            batch.mutable_event()->set_recording_position(event.recording_position());
+            std::uint64_t position = 0;
+            if (!journal_->append(batch, position, limits_.queued_bytes)) {
+              hook_ring_.complete(hook_item.reservation);
+              std::lock_guard lock(mutex_);
+              ++counters_.journal_dropped;
+              continue;
+            }
+            replay_cursor = position;
+          } else if (replay_position) {
+            replay_cursor = replay_position;
           }
 
           for (const auto &[identity, schema_id] : proposed_ids) epoch_schema_ids.emplace(identity, schema_id);
@@ -1002,8 +1039,6 @@ void ContextExportClient::run() noexcept {
             last_progress = std::chrono::steady_clock::now();
           }
           if (write_failed) failed = true;
-          const bool journaled = journal_ &&
-              open_.profile() == clangtracer::context::v1::DURABLE && has_event;
           if (write_failed && !event_write_attempted && !journaled) {
             // Schema writes may have succeeded, but the event was never handed
             // to gRPC. Retain the original batch for fresh-epoch ID remapping.
