@@ -64,6 +64,9 @@ profile_arguments(const std::vector<std::string> &user) {
   for (const auto *argument : repl_compiler_arguments)
     result.emplace_back(argument);
   result.insert(result.end(), user.begin(), user.end());
+  // Use the same access rules for entered code, mapping generation, and the
+  // syntax checker, including when a compilation database enables checking.
+  result.emplace_back("-fno-access-control");
   return result;
 }
 std::string api_header() {

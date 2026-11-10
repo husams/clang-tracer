@@ -264,15 +264,6 @@ class Generator {
       if (llvm::isa<clang::FunctionDecl>(context)) {
         return failure(record, "local class");
       }
-      if (const auto* parent = llvm::dyn_cast<Record>(context)) {
-        if (parent->getAccess() == clang::AS_private ||
-            parent->getAccess() == clang::AS_protected) {
-          return failure(record, "enclosing type is private/protected");
-        }
-      }
-    }
-    if (record->getAccess() == clang::AS_private || record->getAccess() == clang::AS_protected) {
-      return failure(record, "nested type is private/protected");
     }
     if (record->isUnion() || record->getNumBases() || record->isPolymorphic() ||
         record->isAbstract()) {
@@ -287,9 +278,6 @@ class Generator {
     for (const auto* field : record->fields()) {
       if (++fields > 128) {
         return failure(record, "more than 128 fields");
-      }
-      if (field->getAccess() != clang::AS_public) {
-        return failure(record, "private/protected fields cannot be captured automatically");
       }
       if (field->isBitField() || !identifier(field->getNameAsString())) {
         return failure(record, "bit-fields and unnamed/non-ASCII fields are unsupported");

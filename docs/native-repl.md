@@ -1144,6 +1144,13 @@ before entering the live interpreter. Header/generation errors retain previous
 variables and tracing sessions. An accepted header has normal C++ semantics,
 including execution of its static initializers.
 
+The native REPL applies Clang's `-fno-access-control` to all local C++ input,
+checking, and mapping generation. This lets you inspect private and protected
+members directly and lets generated decoders include them. The decoder still
+needs default construction, move construction, and assignable fields. Pass
+`-fno-access-control` when compiling a generated header with non-public
+members outside the REPL.
+
 If a generated decoder fails to compile (for example, a set element lacks its
 required comparison operator), the entire import is rejected without changing
 live state. Retry with `--type` to select supported roots; no partial mappings
@@ -1281,10 +1288,11 @@ and numeric ranges. For classes with constructor-only/const members, specialize
 `EventCodec<T>` with `static T decode(const EventValue&)` and return an object
 from your constructor or factory. This custom conversion runs locally.
 
-Automatic target capture supports complete ABI-validated records with public
-serializable fields, including nested records and supported STL members.
-Private/protected fields, unions, bit-fields, volatile data, arbitrary raw
-pointees and wide/custom-character strings are explicitly unavailable.
+Automatic target capture uses complete ABI-validated layouts and serializable
+fields, including nested records and supported STL members. Prepared layouts
+can include private and protected fields. Unions, bit-fields, volatile data,
+arbitrary raw pointees and wide/custom-character strings are unavailable for
+general automatic record capture.
 There is a 4-KiB payload limit per value, a 16-KiB thread-local capture arena,
 and bounded schema/item/depth limits. Missing, unsupported, truncated, malformed
 or over-budget snapshots throw; partial objects are never returned as complete.

@@ -27,7 +27,20 @@ class Order { public: Address address; std::vector<Address> history; };
 template<class T> struct Box { T value{}; };
 using IntBox = Box<int>;
 extern "C++" { struct Linked { int number = 0; }; }
-class Private { [[maybe_unused]] int secret = 1; };
+class Private {
+    struct Hidden { int number = 0; };
+    Private() = default;
+    int secret = 1;
+    Hidden hidden;
+protected:
+    std::string label;
+};
+class DeletedAssignment {
+    [[maybe_unused]] int number = 0;
+public:
+    DeletedAssignment& operator=(const DeletedAssignment&) = delete;
+};
+class PrivateUnassignableField { [[maybe_unused]] DeletedAssignment field; };
 struct NoDefault { explicit NoDefault(int); int number; };
 struct Constant { const int number = 1; };
 struct Base { int number = 1; };
@@ -75,10 +88,10 @@ std::cout << "automatic-template-and-once-ok" << std::endl;
         for marker in ("automatic-nested-records-ok", "automatic-template-and-once-ok"):
             assert marker in good.stdout, (good.stdout, good.stderr)
         assert "application::Private" in good.stdout, good.stdout
+        assert "skipped application::PrivateUnassignableField" in good.stdout, good.stdout
         assert "city" in good.stdout, good.stdout
 
-        rejected = run(settings + '%cpp import "types.hpp"\n' + code + '''%cpp import "types.hpp" --type application::Private
-%cpp import "types.hpp" --type application::Derived
+        rejected = run(settings + '%cpp import "types.hpp"\n' + code + '''%cpp import "types.hpp" --type application::Derived
 %cpp import "types.hpp" --type application::NoDefault
 %cpp import "types.hpp" --type application::Constant
 %cpp import "types.hpp" --type application::Union
@@ -90,6 +103,21 @@ std::cout << "failed-import-state-retained" << std::endl;
         assert rejected.returncode != 0, (rejected.stdout, rejected.stderr)
         assert "failed-import-state-retained" in rejected.stdout, (rejected.stdout, rejected.stderr)
         assert "options are locked" in rejected.stderr, rejected.stderr
+        private_mapping = Path(directory) / "private-mapping.hpp"
+        private = run(settings + f'''%cpp generate "types.hpp" --type application::Private --output "{private_mapping}"
+#include "{private_mapping}"
+''' + '''using tracer_repl::EventValue;
+EventValue hidden{EventValue::Object{{"number", EventValue{std::int64_t{17}}}}, "application::Private::Hidden"};
+EventValue private_value{EventValue::Object{{"secret", EventValue{std::int64_t{42}}}, {"hidden", hidden}, {"label", EventValue{std::string("owned label")}}}, "application::Private"};
+auto private_record = private_value.as<application::Private>();
+if (private_record.secret != 42 || private_record.hidden.number != 17 || private_record.label != "owned label") throw std::runtime_error("private/protected field decoding failed");
+%complete "private_record."
+std::cout << "automatic-private-record-ok" << std::endl;
+''', True, ("-faccess-control",))
+        assert private.returncode == 0, (private.stdout, private.stderr)
+        assert "automatic-private-record-ok" in private.stdout, private.stdout
+        completions = {line.strip() for line in private.stdout.splitlines()}
+        assert {"hidden", "label", "secret"} <= completions, private.stdout
 
         selected = run(settings + '''%cpp import "types.hpp" --type application::Order --type application::Linked
 ''' + code, True)

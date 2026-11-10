@@ -143,9 +143,9 @@ int main(int argc, char **argv) {
             "multiline cursor positions use the final line and identifier");
     members = cpp.complete("data.at(0).");
     require(contains(members, "result_as") && contains(members, "describe") &&
-                !contains(members, "data_"),
-            "chained expression completion uses return types and hides private "
-            "members");
+                contains(members, "data_"),
+            "chained expression completion uses return types and includes "
+            "private members");
     require(contains(cpp.complete("data.at(0).argument_snapshot(0).cpp_t"), "cpp_type") &&
                 contains(cpp.complete("data.at(0).argument_snapshot(0).ele"), "elements"),
             "completion follows the owned complex-value API");

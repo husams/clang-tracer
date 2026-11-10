@@ -182,13 +182,15 @@ public:
                                   clang::CodeCompletionResult *results,
                                   unsigned count) override {
     out_.prefix = sema.getPreprocessor().getCodeCompletionFilter().str();
+    const bool check_access = sema.getLangOpts().AccessControl;
     for (unsigned i = 0; i < count; ++i) {
       const auto &result = results[i];
       std::string name;
       if (result.Kind == clang::CodeCompletionResult::RK_Declaration &&
           !result.Hidden && result.Declaration->getIdentifier() &&
-          result.Declaration->getAccess() != clang::AS_private &&
-          result.Declaration->getAccess() != clang::AS_protected)
+          (!check_access ||
+           (result.Declaration->getAccess() != clang::AS_private &&
+            result.Declaration->getAccess() != clang::AS_protected)))
         name = result.Declaration->getNameAsString();
       else if (result.Kind == clang::CodeCompletionResult::RK_Keyword &&
                context.getBaseType().isNull())
