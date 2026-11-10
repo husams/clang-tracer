@@ -170,7 +170,12 @@ public:
 struct SnapshotRoot {
   const clang::CXXRecordDecl *record = nullptr;
   std::vector<const clang::CXXRecordDecl *> dynamic_types;
-  std::vector<std::pair<std::string, std::vector<const clang::CXXRecordDecl *>>> members;
+  struct Member {
+    std::string field;
+    std::vector<const clang::CXXRecordDecl *> dynamic_types;
+    bool automatic = false;
+  };
+  std::vector<Member> members;
 };
 
 struct PreparedSnapshots {
@@ -332,6 +337,9 @@ PreparedSnapshots prepare_snapshot_roots(
   for (const auto *parameter : function.parameters())
     add(parameter->getType());
   add(function.getReturnType());
+  const auto result_type = function.getReturnType();
+  const bool result_root = result_type->isPointerType() || result_type->isReferenceType();
+  const auto *result_record = result_root ? snapshot_record_type(result_type) : nullptr;
   const auto *dynamic_result_root = function.getReturnType()->isPointerType()
       ? snapshot_record_type(function.getReturnType()) : nullptr;
   const auto policies = find_follow_pointers_policies(ast);
@@ -386,7 +394,23 @@ PreparedSnapshots prepare_snapshot_roots(
           throw std::invalid_argument(
               "FollowPointers polymorphic pointee has no eligible concrete type in prepare inputs: " +
               field_name);
-        policy.members.emplace_back(field_name, member_types);
+        policy.members.push_back({field_name, std::move(member_types), false});
+      }
+    } else if (result_record &&
+               result_record->getCanonicalDecl() == root->getCanonicalDecl()) {
+      for (const auto *field : root->fields()) {
+        const auto field_type = field->getType();
+        if (field_type.isVolatileQualified() || !field_type->isPointerType() ||
+            field_type->getPointeeType().isVolatileQualified())
+          continue;
+        const auto *pointee = field_type->getPointeeType()->getAsCXXRecordDecl();
+        pointee = pointee ? pointee->getDefinition() : nullptr;
+        if (!pointee || !pointee->isPolymorphic())
+          continue;
+        auto member_types = discover_dynamic_types(ast, pointee, definitions, false);
+        if (!member_types.empty())
+          policy.members.push_back(
+              {field->getNameAsString(), std::move(member_types), true});
       }
     }
     for (const auto *dynamic_type : policy.dynamic_types) {
@@ -402,7 +426,8 @@ PreparedSnapshots prepare_snapshot_roots(
     policy_types.insert(policy_types.end(), root.dynamic_types.begin(),
                         root.dynamic_types.end());
     for (const auto &member : root.members)
-      policy_types.insert(policy_types.end(), member.second.begin(), member.second.end());
+      policy_types.insert(policy_types.end(), member.dynamic_types.begin(),
+                          member.dynamic_types.end());
   }
   std::sort(policy_types.begin(), policy_types.end(), [&](const auto *left, const auto *right) {
     return tracer::prepared::type_name(ast, ast.getRecordType(left)) <
@@ -438,9 +463,10 @@ PreparedSnapshots prepare_snapshot_roots(
     for (const auto *dynamic_type : root.dynamic_types)
       record.add_dynamic_types(index_of(dynamic_type));
     for (const auto &member : root.members) {
-      auto &prepared_member = *record.add_members();
-      prepared_member.set_field(member.first);
-      for (const auto *dynamic_type : member.second)
+      auto &prepared_member = member.automatic
+          ? *record.add_automatic_members() : *record.add_members();
+      prepared_member.set_field(member.field);
+      for (const auto *dynamic_type : member.dynamic_types)
         prepared_member.add_dynamic_types(index_of(dynamic_type));
     }
     prepared.records.push_back(std::move(record));
@@ -589,6 +615,7 @@ struct Candidate {
   bool is_const = false;
   bool is_volatile = false;
   clang::RefQualifierKind ref_qualifier = clang::RQ_None;
+  std::string snapshot_result_root;
   api::ProbeSpec spec;
   std::string unsupported_reason;
   bool selected_by_type = false;
@@ -755,6 +782,13 @@ public:
     const auto* method = llvm::dyn_cast<clang::CXXMethodDecl>(declaration);
 
     Candidate candidate;
+    if (!invocation_.adapter_symbol.empty()) {
+      const auto result_type = declaration->getReturnType();
+      if (result_type->isPointerType() || result_type->isReferenceType())
+        if (const auto *record = snapshot_record_type(result_type))
+          candidate.snapshot_result_root = tracer::prepared::type_name(
+              *context_, context_->getRecordType(record));
+    }
     candidate.name = selected_by_type ? qualified_name_ : declaration->getQualifiedNameAsString();
     candidate.selected_by_type = selected_by_type;
     candidate.requires_typed_adapter = tracer::prepared::template_instance(*declaration) ||
@@ -1569,6 +1603,7 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
         }))
       throw std::runtime_error("prepared snapshot policy has an incompatible dynamic type index");
   };
+  std::vector<std::uint32_t> automatic_snapshot_roots;
   for (const auto &policy : adapter.snapshot_records()) {
     if (policy.type_index() >= snapshot_types.size() ||
         !snapshot_roots.insert(policy.type_index()).second)
@@ -1578,7 +1613,8 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
       throw std::runtime_error("prepared dynamic snapshot root is not polymorphic");
     for (const auto type_index : policy.dynamic_types())
       validate_dynamic_edge(root, type_index, true);
-    for (const auto &member : policy.members()) {
+    const auto validate_member = [&](const api::PreparedSnapshotMember &member,
+                                     bool automatic) {
       if (member.field().empty())
         throw std::runtime_error("prepared snapshot member has an empty field name");
       const clang::FieldDecl *field = nullptr;
@@ -1597,14 +1633,29 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
         throw std::runtime_error("prepared snapshot member pointee is incomplete");
       if (member.dynamic_types().empty())
         throw std::runtime_error("prepared snapshot member has no admitted pointee layouts");
+      if (automatic && !base->isPolymorphic())
+        throw std::runtime_error("automatic snapshot member pointee must be polymorphic");
       for (const auto type_index : member.dynamic_types()) {
         validate_dynamic_edge(base, type_index, base->isPolymorphic());
+        if (automatic &&
+            snapshot_types[type_index]->getCanonicalDecl() == base->getCanonicalDecl())
+          throw std::runtime_error(
+              "automatic snapshot member must have a concrete derived pointee layout");
         if (!base->isPolymorphic() &&
             snapshot_types[type_index]->getCanonicalDecl() != base->getCanonicalDecl())
           throw std::runtime_error(
               "non-polymorphic snapshot member must use its exact pointee type");
       }
+    };
+    if (!policy.automatic_members().empty()) {
+      if (!policy.members().empty())
+        throw std::runtime_error("prepared snapshot record mixes automatic and explicit members");
+      automatic_snapshot_roots.push_back(policy.type_index());
     }
+    for (const auto &member : policy.members())
+      validate_member(member, false);
+    for (const auto &member : policy.automatic_members())
+      validate_member(member, true);
   }
   FrozenInvocation invocation;
   std::vector<Candidate> candidates;
@@ -1623,6 +1674,15 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
   const std::string failure = "generated prepared adapter does not reproduce the target ABI and layout";
   if (candidate == candidates.end())
     throw std::runtime_error(failure + " for '" + name + "'");
+  if (!automatic_snapshot_roots.empty()) {
+    if (candidate->snapshot_result_root.empty())
+      throw std::runtime_error("automatic snapshot members require a pointer or reference result record");
+    for (const auto type_index : automatic_snapshot_roots)
+      if (adapter.snapshot_types(static_cast<int>(type_index)).record_name() !=
+          candidate->snapshot_result_root)
+        throw std::runtime_error(
+            "automatic prepared snapshot member is not on the result root record");
+  }
   const auto &expected = original.spec.debug_info();
   const auto &actual = candidate->spec.debug_info();
   const auto &expected_signature = original.spec.signature();

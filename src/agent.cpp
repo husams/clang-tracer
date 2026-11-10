@@ -4432,6 +4432,8 @@ bool bind_probe_symbols(clang::Interpreter &interpreter,
   bind("tracer_stack_leave", &tracer_stack_leave);
   bind("tracer_capture_stack", &tracer_capture_stack);
   bind("tracer_snapshot_mark", &tracer_snapshot_mark);
+  bind("tracer_snapshot_read_rtti", &tracer_snapshot_read_rtti);
+  bind("tracer_snapshot_rtti_matches", &tracer_snapshot_rtti_matches);
   bind("tracer_snapshot_reset", &tracer_snapshot_reset);
   bind("tracer_snapshot_storage", &tracer_snapshot_storage);
   bind("tracer_snapshot_commit", &tracer_snapshot_commit);

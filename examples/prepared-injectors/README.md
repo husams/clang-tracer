@@ -252,17 +252,23 @@ cmake --build build --target clang-tracer-repl clang-tracer-server clang_tracer_
 
 The public [`Item` declaration](pimpl/item.hpp) keeps its pointer fields private
 and forward-declares `ItemImp`. The internal header defines `ItemV1`, `ItemV2`,
-and `ItemV3`. Preparation loads the reusable [`FollowPointers` policy](pimpl/snapshot-policy.hpp)
-with `--include`. It follows `_imp`, `_other`, and the non-polymorphic `_stamp`
-wherever the probe captures an `Item` argument, receiver, or result.
+and `ItemV3`. The pointer and reference demos prepare from the two application
+headers without a pointer policy; source discovery follows the polymorphic
+`_imp` and `_other` members and captures each concrete implementation. The
+complete non-polymorphic `_stamp` record remains address-only without an
+explicit policy. The pointer probe uses the existing
+`--snapshot-return-pointee` opt-in, while the reference probe captures its
+`Item` directly.
 
-The pointer probe opts in to capturing the returned `Item`. The reference probe
-captures its `Item` directly. Both sessions inspect the private and nested
-fields of all three implementations. For the fourth implementation, defined
-only in `item.cpp`, the snapshot retains the pointer address. Both sessions also
-check null members, and the pointer session checks a null outer return. The
-demo uses `result_as<LocalFields>()` to copy each implementation's version and
-private field into an owned local value.
+Both sessions inspect private and nested fields for all three known
+implementations and use `result_as<LocalFields>()` to read an owned typed value.
+The fourth implementation is defined only in `item.cpp`, so the snapshot keeps
+its `_imp` address. An `_unreadable` member points to a `PROT_NONE` page and the
+guarded lookup leaves its address in the snapshot. Both sessions check null
+members. Pointer mode also checks a null outer result. The `--pimpl-custom`
+and `--pimpl-roles` examples use the explicit
+[`FollowPointers` policy](pimpl/snapshot-policy.hpp) to cover `_stamp`,
+arguments, and receivers.
 
 Run the automated cases with:
 

@@ -26,6 +26,7 @@ public:
 private:
   ItemImp *_imp;
   ItemImp *_other;
+  ItemImp *_unreadable;
   ItemStamp stamp_;
   ItemStamp *_stamp;
 };

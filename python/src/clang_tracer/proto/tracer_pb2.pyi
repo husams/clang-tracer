@@ -270,14 +270,16 @@ class PreparedSnapshotMember(_message.Message):
     def __init__(self, field: _Optional[str] = ..., dynamic_types: _Optional[_Iterable[int]] = ...) -> None: ...
 
 class PreparedSnapshotRecord(_message.Message):
-    __slots__ = ("type_index", "dynamic_types", "members")
+    __slots__ = ("type_index", "dynamic_types", "members", "automatic_members")
     TYPE_INDEX_FIELD_NUMBER: _ClassVar[int]
     DYNAMIC_TYPES_FIELD_NUMBER: _ClassVar[int]
     MEMBERS_FIELD_NUMBER: _ClassVar[int]
+    AUTOMATIC_MEMBERS_FIELD_NUMBER: _ClassVar[int]
     type_index: int
     dynamic_types: _containers.RepeatedScalarFieldContainer[int]
     members: _containers.RepeatedCompositeFieldContainer[PreparedSnapshotMember]
-    def __init__(self, type_index: _Optional[int] = ..., dynamic_types: _Optional[_Iterable[int]] = ..., members: _Optional[_Iterable[_Union[PreparedSnapshotMember, _Mapping]]] = ...) -> None: ...
+    automatic_members: _containers.RepeatedCompositeFieldContainer[PreparedSnapshotMember]
+    def __init__(self, type_index: _Optional[int] = ..., dynamic_types: _Optional[_Iterable[int]] = ..., members: _Optional[_Iterable[_Union[PreparedSnapshotMember, _Mapping]]] = ..., automatic_members: _Optional[_Iterable[_Union[PreparedSnapshotMember, _Mapping]]] = ...) -> None: ...
 
 class PreparedInjector(_message.Message):
     __slots__ = ("format_version", "module_sha256", "module_name", "selector", "symbol", "signature", "argument_names", "target_triple", "header_types", "include_headers", "header_context", "adapter_declarations", "adapter_standard_headers", "adapter_abi_options", "adapter_toolchain_options", "adapter_uses_default_toolchain", "source_translation_unit", "snapshot_return_type", "snapshot_return_member", "snapshot_return_types", "snapshot_types", "snapshot_records")

@@ -98,8 +98,8 @@ STEPS
   fi
 elif [[ $demo_mode == --pimpl-pointer || $demo_mode == --pimpl-reference || $demo_mode == --pimpl-custom || $demo_mode == --pimpl-roles ]]; then
   repl_script=demo/pimpl/pointer.repl
-  inspect_source=demo/pimpl/inspect.cpp
-  check_function=check_pimpl
+  inspect_source=demo/pimpl/inspect-auto.cpp
+  check_function=check_auto_pimpl
   check_args=", true"
   result_label=NATIVE_PIMPL_POINTER
   if [[ $demo_mode == --pimpl-reference ]]; then
@@ -114,6 +114,7 @@ elif [[ $demo_mode == --pimpl-pointer || $demo_mode == --pimpl-reference || $dem
     result_label=NATIVE_PIMPL_CUSTOM
   elif [[ $demo_mode == --pimpl-roles ]]; then
     repl_script=demo/pimpl/roles.repl
+    inspect_source=demo/pimpl/inspect.cpp
     check_function=check_item_roles
     check_args=
     result_label=NATIVE_PIMPL_ROLES
