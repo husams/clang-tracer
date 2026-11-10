@@ -103,30 +103,6 @@ std::string compact(std::string_view value) {
   return result;
 }
 
-bool valid_qualified_record_name(std::string_view name) {
-  if (name.substr(0, 2) == "::")
-    name.remove_prefix(2);
-  if (name.empty())
-    return false;
-  bool expect_identifier = true;
-  for (std::size_t i = 0; i < name.size(); ++i) {
-    const auto c = static_cast<unsigned char>(name[i]);
-    if (expect_identifier) {
-      if (!std::isalpha(c) && c != '_')
-        return false;
-      expect_identifier = false;
-    } else if (std::isalnum(c) || c == '_') {
-      continue;
-    } else if (name[i] == ':' && i + 1 < name.size() && name[i + 1] == ':') {
-      ++i;
-      expect_identifier = true;
-    } else {
-      return false;
-    }
-  }
-  return !expect_identifier;
-}
-
 class TypeAliasFinder final
     : public clang::RecursiveASTVisitor<TypeAliasFinder> {
 public:
@@ -181,106 +157,6 @@ void validate_snapshot_candidate(const clang::CXXRecordDecl *snapshot_record) {
   }
 }
 
-void validate_snapshot_return_type(clang::ASTContext &ast,
-                                   const clang::FunctionDecl &function,
-                                   const clang::CXXRecordDecl *snapshot_record) {
-  validate_snapshot_environment(ast);
-  validate_snapshot_candidate(snapshot_record);
-  const auto result_type = function.getReturnType();
-  if (!result_type->isPointerType())
-    throw std::invalid_argument("snapshot return type requires a raw pointer result");
-  const auto pointee_type = result_type->getPointeeType();
-  if (pointee_type.isVolatileQualified())
-    throw std::invalid_argument("snapshot return type does not support volatile base pointers");
-  const auto *base = pointee_type->getAsCXXRecordDecl();
-  if (!base || !base->isPolymorphic())
-    throw std::invalid_argument(
-        "snapshot return type requires a pointer to a polymorphic base record");
-  clang::CXXBasePaths paths;
-  if (!snapshot_record->isDerivedFrom(base, paths))
-    throw std::invalid_argument("snapshot return type must derive from the returned base record");
-  if (paths.isAmbiguous(ast.getCanonicalType(ast.getRecordType(base))))
-    throw std::invalid_argument("snapshot return type has an ambiguous base conversion");
-  if (std::none_of(paths.begin(), paths.end(), [](const auto &path) {
-        return path.Access == clang::AS_public;
-      }))
-    throw std::invalid_argument("snapshot return type must have a public base conversion");
-}
-
-const clang::CXXRecordDecl *snapshot_member_base(
-    const clang::FunctionDecl &function, std::string_view member_name) {
-  clang::QualType root_type = function.getReturnType();
-  if (root_type->isPointerType())
-    root_type = root_type->getPointeeType();
-  else if (root_type->isReferenceType())
-    root_type = root_type.getNonReferenceType();
-  else
-    throw std::invalid_argument(
-        "snapshot return member requires a raw pointer or reference to a record");
-  if (root_type.isVolatileQualified())
-    throw std::invalid_argument("snapshot return member does not support volatile result objects");
-  const auto *root = root_type->getAsCXXRecordDecl();
-  root = root ? root->getDefinition() : nullptr;
-  if (!root)
-    throw std::invalid_argument(
-        "snapshot return member requires a complete result record definition");
-
-  const clang::FieldDecl *field = nullptr;
-  for (const auto *candidate : root->fields())
-    if (candidate->getNameAsString() == std::string(member_name)) {
-      field = candidate;
-      break;
-    }
-  if (!field)
-    throw std::invalid_argument("snapshot return member is not a direct field of the result record");
-  const auto field_type = field->getType();
-  if (field_type.isVolatileQualified() || !field_type->isPointerType() ||
-      field_type->getPointeeType().isVolatileQualified())
-    throw std::invalid_argument(
-        "snapshot return member must be a direct non-volatile raw pointer field");
-  const auto *base = field_type->getPointeeType()->getAsCXXRecordDecl();
-  base = base ? base->getDefinition() : nullptr;
-  if (!base || !base->isPolymorphic())
-    throw std::invalid_argument(
-        "snapshot return member pointee must be a complete polymorphic base record");
-  return base;
-}
-
-void validate_snapshot_member_candidate(clang::ASTContext &ast,
-                                        const clang::CXXRecordDecl *snapshot_record,
-                                        const clang::CXXRecordDecl *declared_base);
-
-void validate_snapshot_return_member(clang::ASTContext &ast,
-                                     const clang::FunctionDecl &function,
-                                     const clang::CXXRecordDecl *snapshot_record,
-                                     std::string_view member_name) {
-  const auto *declared_base = snapshot_member_base(function, member_name);
-  validate_snapshot_environment(ast);
-  validate_snapshot_member_candidate(ast, snapshot_record, declared_base);
-}
-
-void validate_snapshot_member_candidate(clang::ASTContext &ast,
-                                        const clang::CXXRecordDecl *snapshot_record,
-                                        const clang::CXXRecordDecl *declared_base) {
-  validate_snapshot_candidate(snapshot_record);
-
-  clang::CXXBasePaths paths;
-  if (snapshot_record->getCanonicalDecl() != declared_base->getCanonicalDecl() &&
-      !snapshot_record->isDerivedFrom(declared_base, paths))
-    throw std::invalid_argument(
-        "snapshot return type must derive from the implementation member pointee");
-  if (snapshot_record->getCanonicalDecl() != declared_base->getCanonicalDecl() &&
-      paths.isAmbiguous(ast.getCanonicalType(ast.getRecordType(declared_base))))
-    throw std::invalid_argument(
-        "snapshot return type has an ambiguous implementation base conversion");
-  if (snapshot_record->getCanonicalDecl() != declared_base->getCanonicalDecl() &&
-      std::none_of(paths.begin(), paths.end(), [](const auto &path) {
-        return path.Access == clang::AS_public;
-      }))
-    throw std::invalid_argument(
-        "snapshot return type must have a public implementation base conversion");
-}
-
 class RecordDefinitions final : public clang::RecursiveASTVisitor<RecordDefinitions> {
 public:
   bool VisitCXXRecordDecl(clang::CXXRecordDecl *record) {
@@ -291,17 +167,42 @@ public:
   std::vector<const clang::CXXRecordDecl *> records;
 };
 
-std::vector<const clang::CXXRecordDecl *> discover_snapshot_return_types(
-    clang::ASTContext &ast, const clang::FunctionDecl &function,
-    std::string_view member_name) {
-  const auto *base = snapshot_member_base(function, member_name);
-  validate_snapshot_environment(ast);
-  RecordDefinitions finder;
-  finder.TraverseDecl(ast.getTranslationUnitDecl());
+struct SnapshotRoot {
+  const clang::CXXRecordDecl *record = nullptr;
+  std::vector<const clang::CXXRecordDecl *> dynamic_types;
+  std::vector<std::pair<std::string, std::vector<const clang::CXXRecordDecl *>>> members;
+};
+
+struct PreparedSnapshots {
+  std::vector<const clang::CXXRecordDecl *> types;
+  std::vector<api::PreparedSnapshotRecord> records;
+};
+
+const clang::CXXRecordDecl *snapshot_record_type(clang::QualType type) {
+  type = type.getNonReferenceType();
+  if (type->isPointerType())
+    type = type->getPointeeType();
+  const auto *record = type->getAsCXXRecordDecl();
+  return record ? record->getDefinition() : nullptr;
+}
+
+std::vector<const clang::CXXRecordDecl *> discover_dynamic_types(
+    clang::ASTContext &ast, const clang::CXXRecordDecl *base,
+    const std::vector<const clang::CXXRecordDecl *> &definitions,
+    bool include_base) {
+  if (!base || !base->isPolymorphic())
+    return {};
+  try {
+    validate_snapshot_environment(ast);
+  } catch (const std::invalid_argument &) {
+    return {};
+  }
   std::map<std::string, const clang::CXXRecordDecl *> eligible;
   std::set<const clang::CXXRecordDecl *> seen;
-  for (const auto *record : finder.records) {
+  for (const auto *record : definitions) {
     if (!record || !seen.insert(record->getCanonicalDecl()).second)
+      continue;
+    if (!include_base && record->getCanonicalDecl() == base->getCanonicalDecl())
       continue;
     clang::CXXBasePaths paths;
     if (record != base &&
@@ -314,23 +215,238 @@ std::vector<const clang::CXXRecordDecl *> discover_snapshot_return_types(
     try {
       validate_snapshot_candidate(record);
     } catch (const std::invalid_argument &) {
-      // Ineligible records are omitted; a later candidate may still be usable.
       continue;
     }
     const auto identity = tracer::prepared::type_name(ast, ast.getRecordType(record));
     if (!eligible.emplace(identity, record).second)
-      throw std::invalid_argument(
-          "ambiguous snapshot implementation type identity: " + identity);
+      throw std::invalid_argument("ambiguous snapshot type identity: " + identity);
   }
-  if (eligible.empty())
-    throw std::invalid_argument(
-        "no eligible concrete implementation types found for snapshot return member; "
-        "provide --snapshot-return-type explicitly or include implementation definitions");
-  std::vector<const clang::CXXRecordDecl *> records;
-  records.reserve(eligible.size());
+  std::vector<const clang::CXXRecordDecl *> result;
+  result.reserve(eligible.size());
   for (const auto &candidate : eligible)
-    records.push_back(candidate.second);
-  return records;
+    result.push_back(candidate.second);
+  return result;
+}
+
+class FollowPointersFinder final
+    : public clang::RecursiveASTVisitor<FollowPointersFinder> {
+public:
+  bool VisitClassTemplateSpecializationDecl(
+      clang::ClassTemplateSpecializationDecl *specialization) {
+    if (!specialization->isThisDeclarationADefinition() ||
+        !visited.insert(specialization->getCanonicalDecl()).second)
+      return true;
+    const auto *templ = specialization->getSpecializedTemplate();
+    if (!templ || templ->getQualifiedNameAsString() != "tracer_snapshot::FollowPointers")
+      return true;
+    const auto &args = specialization->getTemplateArgs();
+    if (args.size() != 1 || args[0].getKind() != clang::TemplateArgument::Type)
+      throw std::invalid_argument("FollowPointers specialization requires one record type");
+    const auto *record = args[0].getAsType()->getAsCXXRecordDecl();
+    record = record ? record->getDefinition() : nullptr;
+    if (!record)
+      throw std::invalid_argument("FollowPointers policy record must be complete in prepare inputs");
+    const clang::VarDecl *fields = nullptr;
+    if (const auto *definition = specialization->getDefinition())
+      for (const auto *decl : definition->decls())
+        if (const auto *variable = llvm::dyn_cast<clang::VarDecl>(decl);
+            variable && variable->getName() == "fields") {
+          if (fields)
+            throw std::invalid_argument("FollowPointers policy has multiple fields arrays");
+          fields = variable;
+        }
+    if (!fields || !fields->isStaticDataMember() || !fields->isConstexpr() ||
+        !fields->hasInit())
+      throw std::invalid_argument(
+          "FollowPointers policy must define static constexpr const char* fields[]");
+    const auto *array_type = llvm::dyn_cast<clang::ConstantArrayType>(
+        fields->getType().getTypePtr());
+    const auto element_type = array_type
+        ? array_type->getElementType().getUnqualifiedType() : clang::QualType{};
+    if (element_type.isNull() || !element_type->isPointerType() ||
+        !element_type->getPointeeType()->isCharType() ||
+        !element_type->getPointeeType().isConstQualified())
+      throw std::invalid_argument(
+          "FollowPointers fields must have type static constexpr const char*[]");
+    const auto *initializer = llvm::dyn_cast<clang::InitListExpr>(
+        fields->getInit()->IgnoreParenImpCasts());
+    if (!initializer)
+      throw std::invalid_argument("FollowPointers fields must be a literal initializer list");
+    std::vector<std::string> names;
+    for (const auto *element : initializer->inits()) {
+      const auto *literal = llvm::dyn_cast<clang::StringLiteral>(
+          element->IgnoreParenImpCasts());
+      if (!literal || literal->getString().empty())
+        throw std::invalid_argument("FollowPointers fields must contain nonempty string literals");
+      const auto name = literal->getString().str();
+      if (!(std::isalpha(static_cast<unsigned char>(name.front())) || name.front() == '_') ||
+          !std::all_of(name.begin() + 1, name.end(), [](unsigned char c) {
+            return std::isalnum(c) || c == '_';
+          }))
+        throw std::invalid_argument("FollowPointers entry is not a field identifier: " + name);
+      if (std::find(names.begin(), names.end(), name) != names.end())
+        throw std::invalid_argument("FollowPointers field is duplicated: " + name);
+      names.push_back(name);
+    }
+    if (names.empty())
+      throw std::invalid_argument("FollowPointers fields array cannot be empty");
+    const auto key = record->getCanonicalDecl();
+    if (!policies.emplace(key, std::move(names)).second)
+      throw std::invalid_argument("duplicate FollowPointers specialization for " +
+                                  record->getQualifiedNameAsString());
+    return true;
+  }
+  std::map<const clang::CXXRecordDecl *, std::vector<std::string>> policies;
+  std::set<const clang::CXXRecordDecl *> visited;
+};
+
+std::map<const clang::CXXRecordDecl *, std::vector<std::string>>
+find_follow_pointers_policies(clang::ASTContext &ast) {
+  FollowPointersFinder finder;
+  finder.TraverseDecl(ast.getTranslationUnitDecl());
+  return std::move(finder.policies);
+}
+
+std::vector<const clang::CXXRecordDecl *> discover_member_types(
+    clang::ASTContext &ast, const clang::CXXRecordDecl *base,
+    const std::vector<const clang::CXXRecordDecl *> &definitions) {
+  if (!base || !base->isCompleteDefinition())
+    throw std::invalid_argument("FollowPointers member pointee must be complete in prepare inputs");
+  if (!base->isPolymorphic()) {
+    validate_snapshot_candidate(base);
+    return {base};
+  }
+  return discover_dynamic_types(ast, base, definitions, true);
+}
+
+PreparedSnapshots prepare_snapshot_roots(
+    clang::ASTContext &ast, const clang::FunctionDecl &function,
+    const clang::CXXMethodDecl *method) {
+  std::vector<const clang::CXXRecordDecl *> roots;
+  const auto add = [&](clang::QualType type) {
+    if (const auto *record = snapshot_record_type(type))
+      roots.push_back(record);
+  };
+  if (method && !method->isStatic())
+    roots.push_back(method->getParent()->getDefinition());
+  for (const auto *parameter : function.parameters())
+    add(parameter->getType());
+  add(function.getReturnType());
+  const auto *dynamic_result_root = function.getReturnType()->isPointerType()
+      ? snapshot_record_type(function.getReturnType()) : nullptr;
+  const auto policies = find_follow_pointers_policies(ast);
+  RecordDefinitions record_finder;
+  record_finder.TraverseDecl(ast.getTranslationUnitDecl());
+  const auto &definitions = record_finder.records;
+  std::sort(roots.begin(), roots.end(), [&](const auto *left, const auto *right) {
+    return tracer::prepared::type_name(ast, ast.getRecordType(left)) <
+           tracer::prepared::type_name(ast, ast.getRecordType(right));
+  });
+  roots.erase(std::unique(roots.begin(), roots.end(), [](const auto *left, const auto *right) {
+    return left->getCanonicalDecl() == right->getCanonicalDecl();
+  }), roots.end());
+
+  std::set<const clang::CXXRecordDecl *> roots_seen;
+  std::vector<const clang::CXXRecordDecl *> pending = roots;
+  std::vector<SnapshotRoot> root_policies;
+  while (!pending.empty()) {
+    const auto *root = pending.back();
+    pending.pop_back();
+    if (!root || !roots_seen.insert(root->getCanonicalDecl()).second)
+      continue;
+    SnapshotRoot policy;
+    policy.record = root;
+    if (dynamic_result_root &&
+        root->getCanonicalDecl() == dynamic_result_root->getCanonicalDecl())
+      policy.dynamic_types = discover_dynamic_types(ast, root, definitions, false);
+    const auto policy_fields = policies.find(root->getCanonicalDecl());
+    if (policy_fields != policies.end()) {
+      for (const auto &field_name : policy_fields->second) {
+        const clang::FieldDecl *field = nullptr;
+        for (const auto *candidate : root->fields())
+          if (candidate->getNameAsString() == field_name) {
+            field = candidate;
+            break;
+          }
+        if (!field)
+          throw std::invalid_argument("FollowPointers field is not a direct member of " +
+              root->getQualifiedNameAsString() + ": " + field_name);
+        const auto field_type = field->getType();
+        if (field_type.isVolatileQualified() || !field_type->isPointerType() ||
+            field_type->getPointeeType().isVolatileQualified())
+          throw std::invalid_argument("FollowPointers field must be a non-volatile raw record pointer: " +
+                                      field_name);
+        const auto *pointee = field_type->getPointeeType()->getAsCXXRecordDecl();
+        pointee = pointee ? pointee->getDefinition() : nullptr;
+        if (!pointee)
+          throw std::invalid_argument("FollowPointers pointee is incomplete in prepare inputs: " +
+                                      field_name);
+        auto member_types = discover_member_types(ast, pointee, definitions);
+        if (pointee->isPolymorphic() && member_types.empty())
+          throw std::invalid_argument(
+              "FollowPointers polymorphic pointee has no eligible concrete type in prepare inputs: " +
+              field_name);
+        policy.members.emplace_back(field_name, member_types);
+      }
+    }
+    for (const auto *dynamic_type : policy.dynamic_types) {
+      if (!roots_seen.count(dynamic_type->getCanonicalDecl()))
+        pending.push_back(dynamic_type);
+    }
+    if (!policy.dynamic_types.empty() || !policy.members.empty())
+      root_policies.push_back(std::move(policy));
+  }
+  std::vector<const clang::CXXRecordDecl *> policy_types;
+  for (const auto &root : root_policies) {
+    policy_types.push_back(root.record);
+    policy_types.insert(policy_types.end(), root.dynamic_types.begin(),
+                        root.dynamic_types.end());
+    for (const auto &member : root.members)
+      policy_types.insert(policy_types.end(), member.second.begin(), member.second.end());
+  }
+  std::sort(policy_types.begin(), policy_types.end(), [&](const auto *left, const auto *right) {
+    return tracer::prepared::type_name(ast, ast.getRecordType(left)) <
+           tracer::prepared::type_name(ast, ast.getRecordType(right));
+  });
+  std::vector<const clang::CXXRecordDecl *> types;
+  std::map<std::string, const clang::CXXRecordDecl *> identities;
+  for (const auto *record : policy_types) {
+    if (!types.empty() &&
+        types.back()->getCanonicalDecl() == record->getCanonicalDecl())
+      continue;
+    const auto identity = tracer::prepared::type_name(ast, ast.getRecordType(record));
+    if (!identities.emplace(identity, record->getCanonicalDecl()).second)
+      throw std::invalid_argument("ambiguous snapshot type identity: " + identity);
+    types.push_back(record);
+  }
+  const auto index_of = [&](const clang::CXXRecordDecl *record) -> std::uint32_t {
+    const auto found = std::find_if(types.begin(), types.end(), [&](const auto *candidate) {
+      return candidate->getCanonicalDecl() == record->getCanonicalDecl();
+    });
+    if (found == types.end())
+      throw std::logic_error("prepared snapshot type registry is incomplete");
+    return static_cast<std::uint32_t>(std::distance(types.begin(), found));
+  };
+  PreparedSnapshots prepared;
+  std::sort(root_policies.begin(), root_policies.end(), [&](const auto &left, const auto &right) {
+    return tracer::prepared::type_name(ast, ast.getRecordType(left.record)) <
+           tracer::prepared::type_name(ast, ast.getRecordType(right.record));
+  });
+  for (const auto &root : root_policies) {
+    api::PreparedSnapshotRecord record;
+    record.set_type_index(index_of(root.record));
+    for (const auto *dynamic_type : root.dynamic_types)
+      record.add_dynamic_types(index_of(dynamic_type));
+    for (const auto &member : root.members) {
+      auto &prepared_member = *record.add_members();
+      prepared_member.set_field(member.first);
+      for (const auto *dynamic_type : member.second)
+        prepared_member.add_dynamic_types(index_of(dynamic_type));
+    }
+    prepared.records.push_back(std::move(record));
+  }
+  prepared.types = std::move(types);
+  return prepared;
 }
 
 struct Selector {
@@ -486,10 +602,6 @@ struct FrozenInvocation {
   std::vector<std::string> prepared_headers;
   api::PreparedInjector prepared_profile;
   std::string adapter_symbol;
-  std::string snapshot_return_type;
-  std::string snapshot_return_member;
-  const clang::CXXRecordDecl *snapshot_return_record = nullptr;
-  std::vector<const clang::CXXRecordDecl *> snapshot_return_records;
   bool select_template = false;
   bool pointer_layouts = true;
 };
@@ -641,9 +753,6 @@ public:
       return true;
     }
     const auto* method = llvm::dyn_cast<clang::CXXMethodDecl>(declaration);
-    auto snapshot_return_records = invocation_.snapshot_return_records;
-    if (invocation_.snapshot_return_record)
-      snapshot_return_records = {invocation_.snapshot_return_record};
 
     Candidate candidate;
     candidate.name = selected_by_type ? qualified_name_ : declaration->getQualifiedNameAsString();
@@ -704,11 +813,6 @@ public:
     }
 
     try {
-      if (!invocation_.snapshot_return_member.empty() &&
-          invocation_.snapshot_return_type.empty() &&
-          snapshot_return_records.empty())
-        snapshot_return_records = discover_snapshot_return_types(
-            *context_, *declaration, invocation_.snapshot_return_member);
       if (declaration->getDeclContext()->isDependentContext() ||
           declaration->getType()->isDependentType()) {
         throw std::runtime_error("dependent callable types are unsupported");
@@ -755,37 +859,22 @@ public:
       candidate.spec.mutable_signature()->set_kind(method && !method->isStatic() ? api::METHOD
                                                                                  : api::FUNCTION);
       if (sema_) {
-        for (const auto *snapshot_record : snapshot_return_records) {
-          if (invocation_.snapshot_return_member.empty())
-            validate_snapshot_return_type(*context_, *declaration,
-                                          snapshot_record);
-          else
-            validate_snapshot_return_member(*context_, *declaration,
-                snapshot_record,
-                invocation_.snapshot_return_member);
-        }
         tracer::prepared::describe_prepared_callable(*context_, *declaration, method,
             candidate.spec, sema_, nullptr, invocation_.pointer_layouts);
         if (!invocation_.prepared_headers.empty()) {
+          const auto snapshots = prepare_snapshot_roots(*context_, *declaration, method);
           auto adapter = tracer::prepared::AdapterEmitter::emit(*context_, *header_search_,
               *declaration, invocation_.prepared_headers, invocation_.pointer_layouts,
-              snapshot_return_records,
-              invocation_.snapshot_return_type.empty() &&
-                  !invocation_.snapshot_return_member.empty());
+              snapshots.types);
           auto &package = *candidate.spec.mutable_prepared();
           package = invocation_.prepared_profile;
           package.set_target_triple(context_->getTargetInfo().getTriple().str());
           package.set_adapter_declarations(std::move(adapter.source));
-          if (!invocation_.snapshot_return_member.empty())
-            package.set_snapshot_return_member(invocation_.snapshot_return_member);
-          if (invocation_.snapshot_return_record)
-            tracer::prepared::describe_record(*context_,
-                *invocation_.snapshot_return_record,
-                *package.mutable_snapshot_return_type());
-          else
-            for (const auto *snapshot_record : snapshot_return_records)
-              tracer::prepared::describe_record(*context_, *snapshot_record,
-                  *package.add_snapshot_return_types());
+          for (const auto *snapshot_type : snapshots.types)
+            tracer::prepared::describe_record(*context_, *snapshot_type,
+                *package.add_snapshot_types());
+          for (const auto &record : snapshots.records)
+            *package.add_snapshot_records() = record;
           for (const auto &header : adapter.standard_headers)
             package.add_adapter_standard_headers(header);
         }
@@ -827,12 +916,6 @@ public:
           clang::tooling::getClangStripDependencyFileAdjuster(), {}, &diagnostics);
       if (!toolchain || diagnostics.had_error() || toolchain->getDiagnostics().hasErrorOccurred())
         throw std::invalid_argument("Clang could not resolve the prepared toolchain headers");
-    }
-    if (!invocation_.snapshot_return_type.empty()) {
-      invocation_.snapshot_return_record = record_alias(
-          context, "tracer_prepared_selection::SnapshotReturn");
-      if (!invocation_.snapshot_return_record)
-        throw std::invalid_argument("snapshot return type must name a complete C++ record");
     }
     set_context(context, sema, toolchain ? &toolchain->getPreprocessor().getHeaderSearchInfo() : nullptr);
     TraverseDecl(context.getTranslationUnitDecl());
@@ -1302,22 +1385,10 @@ ResolvedCallable resolve_cpp_callable(const std::string& name,
 ResolvedCallable resolve_header_callable(const std::string& name,
                                          const api::ProbeSpec& headers,
                                          const PreparedHeaderCommand& command,
-                                         bool pointer_layouts,
-                                         const std::string& snapshot_return_type,
-                                         const std::string& snapshot_return_member) {
+                                         bool pointer_layouts) {
   const auto selector = parse_selector(name);
   if (!selector.has_parameters || headers.include_headers().empty())
     throw std::runtime_error("prepared generation requires an explicit selector and header context");
-  if (!snapshot_return_type.empty() &&
-      !valid_qualified_record_name(snapshot_return_type))
-    throw std::invalid_argument("snapshot return type must be a qualified record name");
-  if (!snapshot_return_member.empty()) {
-    if (!(std::isalpha(static_cast<unsigned char>(snapshot_return_member.front())) ||
-          snapshot_return_member.front() == '_') ||
-        !std::all_of(snapshot_return_member.begin() + 1, snapshot_return_member.end(),
-            [](unsigned char c) { return std::isalnum(c) || c == '_'; }))
-      throw std::invalid_argument("snapshot return member must be a field identifier");
-  }
   // Use the SDK fallback unless the database names a different installed
   // compiler by path or explicitly selects a toolchain.
   std::vector<std::string> arguments{"--no-default-config"};
@@ -1328,11 +1399,6 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   const bool alternate_driver = installed_driver &&
       !fs::equivalent(command.driver, TRACER_PREPARE_BUILD_CXX, path_error) && !path_error;
   FrozenInvocation invocation;
-  if (!snapshot_return_type.empty()) {
-    invocation.snapshot_return_type = snapshot_return_type.rfind("::", 0) == 0
-        ? snapshot_return_type : "::" + snapshot_return_type;
-  }
-  invocation.snapshot_return_member = snapshot_return_member;
   auto &profile = invocation.prepared_profile;
   profile.set_format_version(tracer::prepared::typed_version);
   profile.add_adapter_toolchain_options("--no-default-config");
@@ -1418,9 +1484,6 @@ ResolvedCallable resolve_header_callable(const std::string& name,
             "using Selected = decltype(select(&" + qualified + "));\n}\n";
     arguments.push_back(clang_cl ? "/clang:-fno-access-control" : "-fno-access-control");
   }
-  if (!invocation.snapshot_return_type.empty())
-    code += "\nnamespace tracer_prepared_selection { using SnapshotReturn = " +
-            invocation.snapshot_return_type + "; }\n";
   clang::tooling::FixedCompilationDatabase database(command.directory, arguments);
   clang::DiagnosticOptions diagnostic_options;
   PrepareDiagnostics diagnostics(diagnostic_options);
@@ -1473,45 +1536,80 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
   if (!unit)
     throw std::runtime_error("generated prepared adapter does not compile independently");
   tracer::prepared::check_toolchain_headers(unit->getPreprocessor().getHeaderSearchInfo(), adapter);
-  const clang::CXXRecordDecl *adapter_snapshot_record = nullptr;
-  FrozenInvocation invocation;
-  if (adapter.has_snapshot_return_type()) {
-    adapter_snapshot_record = record_alias(
-        unit->getASTContext(), "tracer_prepared::SnapshotReturn");
-    if (!adapter_snapshot_record)
-      throw std::runtime_error("prepared adapter is missing its SnapshotReturn record alias");
-    api::DebugInfo actual_snapshot_type;
-    tracer::prepared::describe_record(unit->getASTContext(), *adapter_snapshot_record,
-                                      actual_snapshot_type);
-    if (actual_snapshot_type.SerializeAsString() !=
-        adapter.snapshot_return_type().SerializeAsString())
+  std::vector<const clang::CXXRecordDecl *> snapshot_types;
+  for (int i = 0; i < adapter.snapshot_types_size(); ++i) {
+    const auto alias_name = "tracer_prepared::SnapshotType" + std::to_string(i);
+    const auto *record = record_alias(unit->getASTContext(), alias_name);
+    if (!record)
+      throw std::runtime_error("prepared adapter is missing snapshot alias " + alias_name);
+    api::DebugInfo actual;
+    tracer::prepared::describe_record(unit->getASTContext(), *record, actual);
+    if (actual.SerializeAsString() != adapter.snapshot_types(i).SerializeAsString())
       throw std::runtime_error(
-          "generated prepared adapter does not reproduce the snapshot return record layout");
-  } else if (adapter.snapshot_return_types_size() > 0) {
-    if (adapter.snapshot_return_member().empty())
-      throw std::runtime_error(
-          "prepared adapter has discovered implementation types without a snapshot return member");
-    for (int i = 0; i < adapter.snapshot_return_types_size(); ++i) {
-      const auto alias_name = "tracer_prepared::SnapshotReturn" + std::to_string(i);
-      const auto *record = record_alias(unit->getASTContext(), alias_name);
-      if (!record)
-        throw std::runtime_error("prepared adapter is missing discovered alias " + alias_name);
-      api::DebugInfo actual;
-      tracer::prepared::describe_record(unit->getASTContext(), *record, actual);
-      if (actual.SerializeAsString() != adapter.snapshot_return_types(i).SerializeAsString())
-        throw std::runtime_error(
-            "generated prepared adapter does not reproduce a discovered snapshot return layout");
-      invocation.snapshot_return_records.push_back(record);
-    }
-  } else if (!adapter.snapshot_return_member().empty()) {
-    throw std::runtime_error(
-        "prepared adapter has a snapshot return member without its implementation type");
+          "generated prepared adapter does not reproduce snapshot layout " + alias_name);
+    snapshot_types.push_back(record);
   }
+  std::set<std::uint32_t> snapshot_roots;
+  const auto validate_dynamic_edge = [&](const clang::CXXRecordDecl *base,
+                                         std::uint32_t type_index,
+                                         bool require_polymorphic) {
+    if (type_index >= snapshot_types.size())
+      throw std::runtime_error("prepared snapshot policy has an out-of-range type index");
+    const auto *candidate = snapshot_types[type_index];
+    if (require_polymorphic && !base->isPolymorphic())
+      throw std::runtime_error("prepared dynamic snapshot root is not polymorphic");
+    if (candidate->getCanonicalDecl() == base->getCanonicalDecl())
+      return;
+    clang::CXXBasePaths paths;
+    if (!candidate->isDerivedFrom(base, paths) ||
+        paths.isAmbiguous(unit->getASTContext().getCanonicalType(
+            unit->getASTContext().getRecordType(base))) ||
+        std::none_of(paths.begin(), paths.end(), [](const auto &path) {
+          return path.Access == clang::AS_public;
+        }))
+      throw std::runtime_error("prepared snapshot policy has an incompatible dynamic type index");
+  };
+  for (const auto &policy : adapter.snapshot_records()) {
+    if (policy.type_index() >= snapshot_types.size() ||
+        !snapshot_roots.insert(policy.type_index()).second)
+      throw std::runtime_error("prepared snapshot root index is invalid or duplicated");
+    const auto *root = snapshot_types[policy.type_index()];
+    if (!policy.dynamic_types().empty() && !root->isPolymorphic())
+      throw std::runtime_error("prepared dynamic snapshot root is not polymorphic");
+    for (const auto type_index : policy.dynamic_types())
+      validate_dynamic_edge(root, type_index, true);
+    for (const auto &member : policy.members()) {
+      if (member.field().empty())
+        throw std::runtime_error("prepared snapshot member has an empty field name");
+      const clang::FieldDecl *field = nullptr;
+      for (const auto *candidate : root->fields())
+        if (candidate->getNameAsString() == member.field()) {
+          field = candidate;
+          break;
+        }
+      if (!field || field->getType().isVolatileQualified() ||
+          !field->getType()->isPointerType() ||
+          field->getType()->getPointeeType().isVolatileQualified())
+        throw std::runtime_error("prepared snapshot member is not a direct raw record pointer");
+      const auto *base = field->getType()->getPointeeType()->getAsCXXRecordDecl();
+      base = base ? base->getDefinition() : nullptr;
+      if (!base)
+        throw std::runtime_error("prepared snapshot member pointee is incomplete");
+      if (member.dynamic_types().empty())
+        throw std::runtime_error("prepared snapshot member has no admitted pointee layouts");
+      for (const auto type_index : member.dynamic_types()) {
+        validate_dynamic_edge(base, type_index, base->isPolymorphic());
+        if (!base->isPolymorphic() &&
+            snapshot_types[type_index]->getCanonicalDecl() != base->getCanonicalDecl())
+          throw std::runtime_error(
+              "non-polymorphic snapshot member must use its exact pointee type");
+      }
+    }
+  }
+  FrozenInvocation invocation;
   std::vector<Candidate> candidates;
   invocation.adapter_symbol = original.spec.symbol();
   invocation.pointer_layouts = pointer_layouts;
-  invocation.snapshot_return_record = adapter_snapshot_record;
-  invocation.snapshot_return_member = adapter.snapshot_return_member();
   Collector visitor(candidates, selector.qualified_name, std::move(invocation), "", "",
                     &unit->getSema());
   visitor.set_context(unit->getASTContext(), &unit->getSema());

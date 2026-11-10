@@ -91,9 +91,6 @@ struct SchemaField {
 struct SchemaMessage {
   std::string cpp_type, full_name;
   std::vector<SchemaField> fields;
-  // Optional runtime display type when a callback encodes a source record as
-  // a DTO with a distinct C++ layout.
-  std::string snapshot_cpp_type;
 };
 
 struct SchemaRecord final {
@@ -157,25 +154,6 @@ enum class CodecAccess { public_members, snapshot_members };
 SchemaResult build_payload_schema(clang::ASTContext &, clang::QualType payload,
                                   StateFamilyKey, SchemaLimits = {},
                                   CodecAccess = CodecAccess::public_members);
-// Like build_payload_schema, with an additional synthetic `_imp_snapshot`
-// field after the root's declared fields. The raw pointer member itself stays
-// in the payload as an address, while the appended message describes its
-// explicitly prepared implementation type.
-SchemaResult build_pimpl_payload_schema(clang::ASTContext &,
-                                        clang::QualType payload,
-                                        StateFamilyKey,
-                                        std::string_view member_name,
-                                        clang::QualType implementation_type,
-                                        SchemaLimits = {},
-                                        CodecAccess = CodecAccess::public_members);
-SchemaResult build_pimpl_payload_schema(clang::ASTContext &,
-                                        clang::QualType payload,
-                                        StateFamilyKey,
-                                        std::string_view member_name,
-                                        clang::QualType implementation_type,
-                                        clang::QualType projection_type,
-                                        SchemaLimits,
-                                        CodecAccess);
 // Emits owner-side Codec<T> specializations from declarations. The caller
 // appends this source to the checked owner compilation unit; no user mappings.
 CodecSourceResult render_state_codec_source(const clang::CXXRecordDecl &);
@@ -189,10 +167,14 @@ render_context_codec_sources(clang::ASTContext&,
                              ::tracer::compat::span<const clang::CXXRecordDecl* const> state_roots,
                              ::tracer::compat::span<const clang::QualType> payload_roots,
                              CodecAccess = CodecAccess::public_members);
-CodecSourceResult render_pimpl_context_codec_sources(
+struct SnapshotMemberAccessor {
+  const clang::CXXRecordDecl *root_type = nullptr;
+  std::string member_name;
+};
+CodecSourceResult render_snapshot_member_accessors(
     clang::ASTContext &,
     ::tracer::compat::span<const clang::QualType> payload_roots,
-    clang::QualType root_type, std::string_view member_name,
+    ::tracer::compat::span<const SnapshotMemberAccessor> members,
     CodecAccess = CodecAccess::snapshot_members);
 // Emits any required user-record codecs plus a root call that encodes payload
 // as field 1; builtin/string/container roots use encode_value directly.

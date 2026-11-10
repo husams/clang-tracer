@@ -5179,30 +5179,47 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   return true;
 }
 
+void copy_value_snapshot(const tracer::ValueSnapshot &in,
+                         clangtracer::context::v1::ValueSnapshot &out,
+                         bool include_members) {
+  using Snapshot = clangtracer::context::v1::ValueSnapshot;
+  out.set_status(static_cast<Snapshot::Status>(in.status));
+  if (in.cpp_type) out.set_cpp_type(in.cpp_type);
+  if (in.detail) out.set_detail(in.detail);
+  if (in.status != tracer::ValueSnapshot::Complete)
+    return;
+  if (!in.descriptor || !in.root_type || in.descriptor_size > 4096 ||
+      in.payload_size > 4096 || (!in.payload && in.payload_size != 0) ||
+      in.container_role_count > 128 || in.record_type_count > 128 ||
+      (in.member_count && (!include_members || !in.members ||
+                           in.member_count > tracer::kMaxSnapshotMembers))) {
+    out.set_status(Snapshot::FAILED);
+    out.set_detail("invalid snapshot storage or capture bounds");
+    return;
+  }
+  out.set_root_type(in.root_type);
+  out.set_descriptor_set(in.descriptor, in.descriptor_size);
+  if (in.payload_size)
+    out.set_payload(in.payload, in.payload_size);
+  for (std::size_t i = 0; i < in.container_role_count; ++i)
+    out.add_container_roles(in.container_roles[i]);
+  for (std::size_t i = 0; i < in.record_type_count; ++i)
+    out.add_record_types(in.record_types[i]);
+  for (std::size_t i = 0; i < in.member_count; ++i) {
+    const auto &member = in.members[i];
+    if (!member.name || !member.snapshot)
+      continue;
+    auto &encoded = *out.add_members();
+    encoded.set_name(member.name);
+    copy_value_snapshot(*member.snapshot, *encoded.mutable_snapshot(), false);
+  }
+}
+
 clangtracer::v1::Value to_proto_value(const tracer::TraceValue &v) {
   clangtracer::v1::Value out;
   out.set_type(static_cast<clangtracer::v1::ValueType>(v.type));
-  if (v.snapshot) {
-    const auto &in = *v.snapshot;
-    auto *snapshot = out.mutable_snapshot();
-    snapshot->set_status(static_cast<clangtracer::context::v1::ValueSnapshot::Status>(in.status));
-    if (in.cpp_type) snapshot->set_cpp_type(in.cpp_type);
-    if (in.detail) snapshot->set_detail(in.detail);
-    if (in.status == tracer::ValueSnapshot::Complete && in.descriptor &&
-        in.root_type && in.descriptor_size <= 4096 && in.payload_size <= 4096 &&
-        (in.payload || in.payload_size == 0) && in.container_role_count <= 128 && in.record_type_count <= 128) {
-      snapshot->set_root_type(in.root_type);
-      snapshot->set_descriptor_set(in.descriptor, in.descriptor_size);
-      snapshot->set_payload(in.payload, in.payload_size);
-      for (std::size_t i = 0; i < in.container_role_count; ++i)
-        snapshot->add_container_roles(in.container_roles[i]);
-      for (std::size_t i = 0; i < in.record_type_count; ++i)
-        snapshot->add_record_types(in.record_types[i]);
-    } else if (in.status == tracer::ValueSnapshot::Complete) {
-      snapshot->set_status(clangtracer::context::v1::ValueSnapshot::FAILED);
-      snapshot->set_detail("invalid snapshot storage or capture bounds");
-    }
-  }
+  if (v.snapshot)
+    copy_value_snapshot(*v.snapshot, *out.mutable_snapshot(), true);
   switch (v.type) {
   case tracer::ValueType::Int32:
   case tracer::ValueType::Bool:
@@ -5417,26 +5434,59 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
         p->delivery.dropped.load(std::memory_order_relaxed));
     // Preserve the event when positional/named snapshot duplication exceeds
     // the native packet budget; the typed getter reports explicit truncation.
+    auto size = event.ByteSizeLong();
+    const auto exceeds_packet = [&] {
+      return size > tracer::EventTransport::kInlineEventBytes;
+    };
+    const auto sync_named_argument = [&](int index) {
+      for (auto &named : *event.mutable_named_arguments())
+        if (named.argument_index() == static_cast<unsigned>(index))
+          *named.mutable_value() = event.arguments(index);
+    };
+    // Dropping followed members first keeps the original record fields and
+    // the pointer addresses available within the existing event budget.
+    for (int i = 0; i < event.arguments_size() && exceeds_packet(); ++i) {
+      auto &value = *event.mutable_arguments(i);
+      if (value.has_snapshot() && !value.snapshot().members().empty()) {
+        value.mutable_snapshot()->clear_members();
+        sync_named_argument(i);
+        size = event.ByteSizeLong();
+      }
+    }
+    if (exceeds_packet() && event.has_result() &&
+        !event.result().snapshot().members().empty()) {
+      event.mutable_result()->mutable_snapshot()->clear_members();
+      size = event.ByteSizeLong();
+    }
+    if (exceeds_packet() && !event.receiver_snapshot().members().empty()) {
+      event.mutable_receiver_snapshot()->clear_members();
+      size = event.ByteSizeLong();
+    }
     const auto discard_snapshot = [](clangtracer::context::v1::ValueSnapshot *snapshot) {
       snapshot->Clear();
       snapshot->set_status(clangtracer::context::v1::ValueSnapshot::LIMIT_EXCEEDED);
       snapshot->set_detail("snapshot exceeds native event packet budget");
     };
-    for (int i = 0; i < event.arguments_size() && event.ByteSizeLong() > tracer::EventTransport::kInlineEventBytes; ++i) {
+    for (int i = 0; i < event.arguments_size() && exceeds_packet(); ++i) {
       auto &value = *event.mutable_arguments(i);
       if (!value.has_snapshot()) continue;
       discard_snapshot(value.mutable_snapshot());
-      for (auto &named : *event.mutable_named_arguments())
-        if (named.argument_index() == static_cast<unsigned>(i)) *named.mutable_value() = value;
+      sync_named_argument(i);
+      size = event.ByteSizeLong();
     }
-    if (event.ByteSizeLong() > tracer::EventTransport::kInlineEventBytes && event.has_result() && event.result().has_snapshot())
+    if (exceeds_packet() && event.has_result() && event.result().has_snapshot()) {
       discard_snapshot(event.mutable_result()->mutable_snapshot());
-    if (event.ByteSizeLong() > tracer::EventTransport::kInlineEventBytes && event.has_receiver_snapshot())
+      size = event.ByteSizeLong();
+    }
+    if (exceeds_packet() && event.has_receiver_snapshot()) {
       discard_snapshot(event.mutable_receiver_snapshot());
-    const bool base_fits = event.ByteSizeLong() <= tracer::EventTransport::kInlineEventBytes;
-    if (ctx->stack.status != tracer::StackStatus::Disabled)
+      size = event.ByteSizeLong();
+    }
+    const bool base_fits = !exceeds_packet();
+    if (ctx->stack.status != tracer::StackStatus::Disabled) {
       tracer::serialize_native_stack(ctx->stack, *event.mutable_stack());
-    const auto size = event.ByteSizeLong();
+      size = event.ByteSizeLong();
+    }
     if (base_fits && size <= static_cast<std::size_t>(std::numeric_limits<int>::max())) {
       packet->bytes.resize(size);
       valid =

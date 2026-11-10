@@ -9,10 +9,15 @@ struct ItemV2;
 struct ItemV3;
 class ItemImp;
 
+struct ItemStamp {
+  int serial;
+};
+
 class Item {
 public:
-  Item(int id, ItemImp *implementation);
+  Item(int id, ItemImp *implementation, ItemImp *other);
   ~Item();
+  int compare(const Item &other) const;
   Item(const Item &) = delete;
   Item &operator=(const Item &) = delete;
 
@@ -20,6 +25,9 @@ public:
 
 private:
   ItemImp *_imp;
+  ItemImp *_other;
+  ItemStamp stamp_;
+  ItemStamp *_stamp;
 };
 
 class HfwManager {
@@ -38,6 +46,7 @@ private:
   std::unique_ptr<Item> item_v3_;
   std::unique_ptr<Item> item_v4_;
   std::unique_ptr<Item> item_null_imp_;
+  std::unique_ptr<Item> item_null_other_;
 };
 
 } // namespace HFW

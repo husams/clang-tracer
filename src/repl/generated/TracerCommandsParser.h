@@ -44,8 +44,7 @@ public:
     T__164 = 165, T__165 = 166, T__166 = 167, T__167 = 168, T__168 = 169,
     T__169 = 170, T__170 = 171, UINT = 172, STRING = 173, SHELL = 174, METADATA_ONLY = 175,
     SQLITE = 176, STACK = 177, CWD = 178, SIGNATURE = 179, MEMBER = 180,
-    SNAPSHOT_RETURN_POINTEE = 181, SNAPSHOT_RETURN_TYPE = 182, SNAPSHOT_RETURN_MEMBER = 183,
-    WORD = 184, WS = 185
+    SNAPSHOT_RETURN_POINTEE = 181, WORD = 182, WS = 183
   };
 
   enum {
@@ -466,8 +465,6 @@ public:
     PrepareOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
     ValueContext *value();
-    antlr4::tree::TerminalNode *SNAPSHOT_RETURN_TYPE();
-    antlr4::tree::TerminalNode *SNAPSHOT_RETURN_MEMBER();
     antlr4::tree::TerminalNode *SIGNATURE();
     antlr4::tree::TerminalNode *MEMBER();
     antlr4::tree::TerminalNode *METADATA_ONLY();

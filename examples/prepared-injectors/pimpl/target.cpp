@@ -36,12 +36,15 @@ int main() {
   while (running) {
     auto *pointer = manager.createItem(pointer_kind);
     auto &reference = manager.referenceItem(reference_kind);
+    auto &argument = manager.referenceItem((reference_kind + 1) % 6);
+    const auto comparison = reference.compare(argument);
     std::printf("CALL pointer=%s reference=%d\n",
                 pointer == nullptr ? "null" : "item", reference.id);
+    (void)comparison;
     std::fflush(stdout);
 
-    pointer_kind = pointer_kind == 5 ? 0 : pointer_kind + 1;
-    reference_kind = (reference_kind + 1) % 5;
+    pointer_kind = pointer_kind == 6 ? 0 : pointer_kind + 1;
+    reference_kind = (reference_kind + 1) % 6;
     timespec delay{0, 250'000'000};
     while (running && ::nanosleep(&delay, &delay) != 0 && errno == EINTR) {
     }

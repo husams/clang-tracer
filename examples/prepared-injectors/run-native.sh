@@ -15,7 +15,7 @@ if [[ $demo_mode == --pointee ]]; then
 elif [[ $demo_mode == --polymorphic-pointee ]]; then
   example=prepared-polymorphic-pointee-target
   shift
-elif [[ $demo_mode == --pimpl-pointer || $demo_mode == --pimpl-reference || $demo_mode == --pimpl-custom ]]; then
+elif [[ $demo_mode == --pimpl-pointer || $demo_mode == --pimpl-reference || $demo_mode == --pimpl-custom || $demo_mode == --pimpl-roles ]]; then
   example=prepared-pimpl-target
   shift
 elif [[ $demo_mode == --methods || $demo_mode == --state ]]; then
@@ -26,11 +26,11 @@ target=${CLANG_TRACER_PREPARED_TARGET:-$build/examples/prepared-injectors/$examp
 compdb=${CLANG_TRACER_PREPARED_COMPDB:-$build/compile_commands.json}
 
 if [[ ${1:-} == --help ]]; then
-  printf '%s\n' 'Use --methods, --state, --pointee, --polymorphic-pointee, --pimpl-pointer, --pimpl-reference, or --pimpl-custom to select an example. Add --smoke for automation.'
+  printf '%s\n' 'Use --methods, --state, --pointee, --polymorphic-pointee, --pimpl-pointer, --pimpl-reference, --pimpl-custom, or --pimpl-roles to select an example. Add --smoke for automation.'
   exit 0
 fi
 if [[ $# -gt 1 || ( $# == 1 && $1 != --smoke ) ]]; then
-  printf '%s\n' 'Usage: run-native.sh [--methods|--state|--pointee|--polymorphic-pointee|--pimpl-pointer|--pimpl-reference|--pimpl-custom] [--smoke|--help]' >&2
+  printf '%s\n' 'Usage: run-native.sh [--methods|--state|--pointee|--polymorphic-pointee|--pimpl-pointer|--pimpl-reference|--pimpl-custom|--pimpl-roles] [--smoke|--help]' >&2
   exit 2
 fi
 for required in "$repl" "$server" "$agent" "$target" "$compdb"; do
@@ -96,7 +96,7 @@ Null returns keep the raw `0x0` result and have no pointee snapshot.
 STEPS
     "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60
   fi
-elif [[ $demo_mode == --pimpl-pointer || $demo_mode == --pimpl-reference || $demo_mode == --pimpl-custom ]]; then
+elif [[ $demo_mode == --pimpl-pointer || $demo_mode == --pimpl-reference || $demo_mode == --pimpl-custom || $demo_mode == --pimpl-roles ]]; then
   repl_script=demo/pimpl/pointer.repl
   inspect_source=demo/pimpl/inspect.cpp
   check_function=check_pimpl
@@ -112,6 +112,11 @@ elif [[ $demo_mode == --pimpl-pointer || $demo_mode == --pimpl-reference || $dem
     check_function=check_custom_pimpl
     check_args=
     result_label=NATIVE_PIMPL_CUSTOM
+  elif [[ $demo_mode == --pimpl-roles ]]; then
+    repl_script=demo/pimpl/roles.repl
+    check_function=check_item_roles
+    check_args=
+    result_label=NATIVE_PIMPL_ROLES
   fi
   cat "$repl_script" > inspect.repl
   printf '%%cpp load %s\nbool correct = %s(tracer.batch("captured")%s);\n' \
