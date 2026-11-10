@@ -890,6 +890,7 @@ void symbolize_stack(tracer::NativeStackStorage &storage,
         frame.function = metadata->function.c_str();
         frame.module = metadata->module.c_str();
         frame.file = metadata->file.c_str();
+        frame.line = metadata->line;
         frame.application_frame = metadata->application;
       } catch (...) {
         // Unknown names do not invalidate recovered native frames.
