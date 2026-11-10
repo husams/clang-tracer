@@ -75,6 +75,21 @@ struct AmbiguousConstructor {
     explicit AmbiguousConstructor(const int& input) : value(input) {}
     int value;
 };
+struct DefaultArgumentOverload {
+    explicit DefaultArgumentOverload(const int& input) : value(input) {}
+    explicit DefaultArgumentOverload(int&& input = 0) : value(input + 99) {}
+    const int value;
+};
+struct InheritedArgumentBase {
+    InheritedArgumentBase() = default;
+    explicit InheritedArgumentBase(int&& input) : base(input + 99) {}
+    int base;
+};
+struct InheritedArgumentOverload : InheritedArgumentBase {
+    using InheritedArgumentBase::InheritedArgumentBase;
+    explicit InheritedArgumentOverload(const int& input) : InheritedArgumentBase(), value(input) {}
+    const int value = 77;
+};
 struct Borrowed { explicit Borrowed(int* input) : address(input) {} int* address; };
 union Union { int integer; double real; };
 }
@@ -135,7 +150,8 @@ std::cout << "automatic-constructor-factory-ok" << std::endl;
         assert "application::Private" in good.stdout, good.stdout
         assert "skipped application::PrivateUnassignableField" in good.stdout, good.stdout
         for name in ("AbstractBase", "UndefinedVirtual", "Repeated", "Union", "ChangedValue",
-                     "AmbiguousConstructor", "Borrowed"):
+                     "AmbiguousConstructor", "DefaultArgumentOverload", "InheritedArgumentOverload",
+                     "Borrowed"):
             assert f"skipped application::{name}:" in good.stdout, good.stdout
         assert "city" in good.stdout, good.stdout
 

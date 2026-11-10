@@ -160,6 +160,8 @@ inline bool simple_default(const clang::Expr &expression) {
 }
 
 inline const clang::CXXConstructorDecl *candidate(const clang::CXXRecordDecl &record) {
+  if (record.hasInheritedConstructor())
+    return nullptr;
   for (const auto *decl : record.decls()) {
     if (const auto *templ = llvm::dyn_cast<clang::FunctionTemplateDecl>(decl);
         templ && llvm::isa<clang::CXXConstructorDecl>(templ->getTemplatedDecl()))
@@ -167,6 +169,10 @@ inline const clang::CXXConstructorDecl *candidate(const clang::CXXRecordDecl &re
   }
   const clang::CXXConstructorDecl *selected = nullptr;
   for (const auto *ctor : record.ctors()) {
+    // A default constructor with parameters can still compete with the
+    // inferred overload when the decoder supplies its captured arguments.
+    if (ctor->isDefaultConstructor() && ctor->getNumParams())
+      return nullptr;
     if (ctor->isImplicit() || ctor->isDefaultConstructor() || ctor->isCopyOrMoveConstructor())
       continue;
     if (selected || ctor->isDeleted() || ctor->isVariadic() ||
