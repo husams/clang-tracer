@@ -2,6 +2,7 @@
 
 #include "prepared_types.hpp"
 #include "prepared_header_discovery.hpp"
+#include "record_factory.hpp"
 
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/Expr.h>
@@ -163,6 +164,51 @@ private:
     visit(decl.getReturnType(), complete);
     for (const auto *parameter : decl.parameters())
       visit(parameter->getType(), complete);
+  }
+
+  std::string emit_factory_constructor(const record_factory::Recipe &recipe) {
+    const auto &ctor = *recipe.constructor;
+    const auto argument_name = [](unsigned index) {
+      return "__tracer_ctor_arg" + std::to_string(index);
+    };
+    std::string source = access(ctor.getAccess()) + ": ";
+    if (ctor.isExplicit())
+      source += "explicit ";
+    source += ctor.getParent()->getNameAsString() + "(";
+    for (unsigned index = 0; index < ctor.getNumParams(); ++index) {
+      if (index)
+        source += ", ";
+      const auto type = ctor.getParamDecl(index)->getType();
+      visit(type);
+      source += spelling(type, argument_name(index));
+    }
+    source += ")";
+    const auto *prototype = ctor.getType()->castAs<clang::FunctionProtoType>();
+    if (!clang::isUnresolvedExceptionSpec(prototype->getExceptionSpecType()) &&
+        prototype->isNothrow())
+      source += " noexcept";
+    bool first = true;
+    for (const auto &initializer : recipe.initializers) {
+      source += first ? " : " : ", ";
+      first = false;
+      source += initializer.field ? initializer.field->getNameAsString()
+                                  : spelling(initializer.base);
+      source += "(";
+      for (std::size_t index = 0; index < initializer.arguments.size(); ++index) {
+        if (index)
+          source += ", ";
+        const auto &argument = initializer.arguments[index];
+        const auto name = argument_name(argument.index);
+        if (argument.move) {
+          standard_headers_.insert("utility");
+          source += "::std::move(" + name + ")";
+        } else {
+          source += name;
+        }
+      }
+      source += ")";
+    }
+    return source + " {}\n";
   }
 
   // Reserve direct signature dependencies before additional headers or another
@@ -682,8 +728,10 @@ private:
       }
       source += ";\n";
     }
-    if ((record.isDynamicClass() || record.getNumBases()) &&
-        record.hasUserDeclaredConstructor() && !emitted_default_constructor) {
+    if (const auto recipe = record_factory::infer(record)) {
+      source += emit_factory_constructor(*recipe);
+    } else if (record.hasUserDeclaredConstructor() && !emitted_default_constructor &&
+               (!record.hasDefaultConstructor() || record.isDynamicClass() || record.getNumBases())) {
       // Dropping application constructor bodies must not give a layout-only
       // adapter an implicit constructor for local snapshot reconstruction.
       source += "private: " + record.getNameAsString() + "() = delete;\n";

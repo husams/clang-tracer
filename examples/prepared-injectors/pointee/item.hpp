@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <utility>
 
 namespace prepared_pointee {
 
@@ -10,18 +11,20 @@ struct HfwDetails {
 };
 
 struct HfwBase {
+  explicit HfwBase(int value) : base_id(value) {}
   virtual ~HfwBase() = default;
 
 protected:
-  int base_id = 0;
+  const int base_id;
 };
 
 struct HfwItem : HfwBase {
+  HfwItem(int base, int value, std::string text, HfwDetails state)
+      : HfwBase(base), id(value), label(std::move(text)), details(state) {}
+
   int id;
   std::string label;
   HfwDetails details;
-
-  void set_base_id(int value) { base_id = value; }
 };
 
 struct HfwManager {

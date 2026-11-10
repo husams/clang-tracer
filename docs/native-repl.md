@@ -1146,10 +1146,19 @@ including execution of its static initializers.
 
 The native REPL applies Clang's `-fno-access-control` to all local C++ input,
 checking, and mapping generation. This lets you inspect private and protected
-members directly and lets generated decoders include them. The decoder still
-needs default construction, move construction, and assignable fields. Pass
+members directly and lets generated decoders include them. Pass
 `-fno-access-control` when compiling a generated header with non-public
 members outside the REPL.
+
+The REPL can generate a factory when Clang can map every argument of a unique
+constructor to a captured field. It recognizes direct member initialization
+and forwarding through supported base constructors. The factory constructs
+the value and copies any remaining assignable fields. This also covers const
+fields initialized by the constructor. A prepared adapter can retain the
+verified initializer list. Constructor code that transforms values or depends
+on application state needs a custom `EventCodec<T>`. The factory requires
+usable local lifetime definitions and does not reconstruct raw-pointer
+ownership from captured addresses.
 
 Eligible derived records decode inherited fields as well as their own fields.
 Use `DeclaringType::field` for field names shared by multiple base or derived

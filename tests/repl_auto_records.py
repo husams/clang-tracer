@@ -57,6 +57,40 @@ struct UndefinedVirtual { virtual void action(); int value = 0; };
 struct RepeatedLeft : Base {};
 struct RepeatedRight : Base {};
 struct Repeated : RepeatedLeft, RepeatedRight {};
+struct ConstructorBase {
+    explicit ConstructorBase(int input) : key(input) {}
+    virtual ~ConstructorBase() = default;
+    const int key;
+};
+class Constructed : public ConstructorBase {
+public:
+    Constructed(int input, std::string text) : ConstructorBase(input), label(std::move(text)) {}
+private:
+    std::string label;
+    int extra;
+};
+struct ChangedValue { explicit ChangedValue(int input) : value(input + 1) {} int value; };
+struct AmbiguousConstructor {
+    explicit AmbiguousConstructor(int input) : value(input) {}
+    explicit AmbiguousConstructor(const int& input) : value(input) {}
+    int value;
+};
+struct DefaultArgumentOverload {
+    explicit DefaultArgumentOverload(const int& input) : value(input) {}
+    explicit DefaultArgumentOverload(int&& input = 0) : value(input + 99) {}
+    const int value;
+};
+struct InheritedArgumentBase {
+    InheritedArgumentBase() = default;
+    explicit InheritedArgumentBase(int&& input) : base(input + 99) {}
+    int base;
+};
+struct InheritedArgumentOverload : InheritedArgumentBase {
+    using InheritedArgumentBase::InheritedArgumentBase;
+    explicit InheritedArgumentOverload(const int& input) : InheritedArgumentBase(), value(input) {}
+    const int value = 77;
+};
+struct Borrowed { explicit Borrowed(int* input) : address(input) {} int* address; };
 union Union { int integer; double real; };
 }
 ''')
@@ -104,14 +138,20 @@ EventValue concrete_value{EventValue::Object{{"base", integer(51)}, {"value", in
 auto concrete = concrete_value.as<application::Concrete>();
 if (concrete.base != 51 || concrete.value != 52) throw std::runtime_error("abstract base field conversion failed");
 std::cout << "automatic-inherited-records-ok" << std::endl;
+EventValue constructed_value{EventValue::Object{{"key", integer(61)}, {"label", EventValue{std::string("constructor input")}}, {"extra", integer(62)}}, "application::Constructed"};
+auto constructed = constructed_value.as<application::Constructed>();
+if (constructed.key != 61 || constructed.label != "constructor input" || constructed.extra != 62) throw std::runtime_error("constructor factory conversion failed");
+std::cout << "automatic-constructor-factory-ok" << std::endl;
 ''', True)
         assert good.returncode == 0, (good.stdout, good.stderr)
         for marker in ("automatic-nested-records-ok", "automatic-template-and-once-ok",
-                       "automatic-inherited-records-ok"):
+                       "automatic-inherited-records-ok", "automatic-constructor-factory-ok"):
             assert marker in good.stdout, (good.stdout, good.stderr)
         assert "application::Private" in good.stdout, good.stdout
         assert "skipped application::PrivateUnassignableField" in good.stdout, good.stdout
-        for name in ("AbstractBase", "UndefinedVirtual", "Repeated", "Union"):
+        for name in ("AbstractBase", "UndefinedVirtual", "Repeated", "Union", "ChangedValue",
+                     "AmbiguousConstructor", "DefaultArgumentOverload", "InheritedArgumentOverload",
+                     "Borrowed"):
             assert f"skipped application::{name}:" in good.stdout, good.stdout
         assert "city" in good.stdout, good.stdout
 
