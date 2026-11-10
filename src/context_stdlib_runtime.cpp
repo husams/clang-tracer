@@ -2,6 +2,7 @@
 // It retains the toolchain's ordinary standard object layouts/default
 // allocator types; only private runtime entry-point binding is changed.
 #include <any>
+#include <climits>
 #include <exception>
 #include <map>
 #include <memory>
@@ -12,6 +13,8 @@
 #include <vector>
 
 #include <pthread.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
 #include <unwind.h>
 
 #include "context_stdlib_abi.hpp"
@@ -350,6 +353,40 @@ extern "C" char __libc_single_threaded =
     0; // Always use the synchronized shared_ptr path.
 extern "C" void *__dso_handle = &__dso_handle;
 namespace {
+// The sealed Linux x86-64 image has no libc dependency. FUTEX_WAIT checks
+// the low word before sleeping, so publication before the wait cannot lose
+// a wakeup. Both once states fit in that word.
+void once_futex(const void *address, int operation, int value) noexcept {
+  long number = SYS_futex;
+  register long timeout asm("r10") = 0;
+  asm volatile("syscall"
+               : "+a"(number)
+               : "D"(address), "S"(operation), "d"(value), "r"(timeout)
+               : "rcx", "r11", "memory");
+}
+
+template <typename Word>
+bool acquire_once(Word *word, Word running, Word done) noexcept {
+  auto state = __atomic_load_n(word, __ATOMIC_ACQUIRE);
+  while (state != done) {
+    if (state == 0) {
+      if (__atomic_compare_exchange_n(word, &state, running, false,
+                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return true;
+    } else {
+      once_futex(word, FUTEX_WAIT_PRIVATE, static_cast<int>(state));
+      state = __atomic_load_n(word, __ATOMIC_ACQUIRE);
+    }
+  }
+  return false;
+}
+
+template <typename Word>
+void publish_once(Word *word, Word state) noexcept {
+  __atomic_store_n(word, state, __ATOMIC_RELEASE);
+  once_futex(word, FUTEX_WAKE_PRIVATE, INT_MAX);
+}
+
 struct Finalizer {
   void (*function)(void *);
   void *argument;
@@ -357,39 +394,56 @@ struct Finalizer {
 };
 Finalizer finalizers[128]{};
 unsigned finalizer_count = 0;
+bool finalizers_locked = false;
+
+struct FinalizerLock {
+  FinalizerLock() noexcept {
+    while (__atomic_test_and_set(&finalizers_locked, __ATOMIC_ACQUIRE))
+      __builtin_ia32_pause();
+  }
+  ~FinalizerLock() { __atomic_clear(&finalizers_locked, __ATOMIC_RELEASE); }
+};
 } // namespace
 extern "C" int __cxa_atexit(void (*function)(void *), void *argument,
                             void *dso) noexcept {
+  const FinalizerLock lock;
   if (finalizer_count == 128)
     return -1;
   finalizers[finalizer_count++] = {function, argument, dso};
   return 0;
 }
 extern "C" void __cxa_finalize(void *dso) noexcept {
-  for (unsigned i = finalizer_count; i; --i) {
-    auto &item = finalizers[i - 1];
-    if (item.function && (!dso || item.dso == dso)) {
-      auto function = item.function;
-      item.function = nullptr;
-      function(item.argument);
+  unsigned next;
+  {
+    const FinalizerLock lock;
+    next = finalizer_count;
+  }
+  while (next) {
+    Finalizer item{};
+    {
+      const FinalizerLock lock;
+      while (next) {
+        auto &candidate = finalizers[--next];
+        if (candidate.function && (!dso || candidate.dso == dso)) {
+          item = candidate;
+          candidate.function = nullptr;
+          break;
+        }
+      }
     }
+    if (item.function)
+      item.function(item.argument);
   }
 }
 extern "C" int __cxa_guard_acquire(std::uint64_t *guard) noexcept {
-  auto value = __atomic_load_n(guard, __ATOMIC_ACQUIRE);
-  if (value & 1)
-    return 0;
-  std::uint64_t expected = 0;
-  if (!__atomic_compare_exchange_n(guard, &expected, 2, false, __ATOMIC_ACQ_REL,
-                                   __ATOMIC_ACQUIRE))
-    fail(9);
-  return 1;
+  // The compiler checks byte zero before calling the guard routine.
+  return acquire_once(guard, std::uint64_t{0x100}, std::uint64_t{1});
 }
 extern "C" void __cxa_guard_release(std::uint64_t *guard) noexcept {
-  __atomic_store_n(guard, 1, __ATOMIC_RELEASE);
+  publish_once(guard, std::uint64_t{1});
 }
 extern "C" void __cxa_guard_abort(std::uint64_t *guard) noexcept {
-  __atomic_store_n(guard, 0, __ATOMIC_RELEASE);
+  publish_once(guard, std::uint64_t{0});
 }
 
 #define UNWIND_RETURN(Name, Index, Return, Parameters, Arguments)              \
@@ -491,15 +545,10 @@ extern "C" std::size_t __clang_tracer_unwind_strlen(const char *text) noexcept {
 }
 extern "C" int
 __clang_tracer_unwind_pthread_once(int *once, void (*initialize)()) noexcept {
-  const auto value = __atomic_load_n(once, __ATOMIC_ACQUIRE);
-  if (value == 2)
-    return 0;
-  int expected = 0;
-  if (!__atomic_compare_exchange_n(once, &expected, 1, false, __ATOMIC_ACQ_REL,
-                                   __ATOMIC_ACQUIRE))
-    fail(10);
-  initialize();
-  __atomic_store_n(once, 2, __ATOMIC_RELEASE);
+  if (acquire_once(once, 1, 2)) {
+    initialize();
+    publish_once(once, 2);
+  }
   return 0;
 }
 
