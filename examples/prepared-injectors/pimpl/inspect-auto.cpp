@@ -119,13 +119,19 @@ bool check_auto_pimpl(const tracer_repl::Collection &captured,
     const auto &type = implementation.cpp_type();
     if (type == "HFW::ItemV1") {
       ++versions[0];
-      correct = correct && local.version == 1 && local.private_value == 808;
+      const auto item = implementation.as<HFW::ItemV1>();
+      correct = correct && local.version == 1 && local.private_value == 808 &&
+          item.version == local.version && item.private_code == local.private_value;
     } else if (type == "HFW::ItemV2") {
       ++versions[1];
-      correct = correct && local.version == 2 && local.private_value == 909;
+      const auto item = implementation.as<HFW::ItemV2>();
+      correct = correct && local.version == 2 && local.private_value == 909 &&
+          item.generation == 2 && item.private_tag == local.private_value;
     } else if (type == "HFW::ItemV3") {
       ++versions[2];
-      correct = correct && local.version == 3 && local.private_value == 1;
+      const auto item = implementation.as<HFW::ItemV3>();
+      correct = correct && local.version == 3 && local.private_value == 1 &&
+          item.schema == local.version && item.private_trusted;
     } else {
       correct = false;
     }

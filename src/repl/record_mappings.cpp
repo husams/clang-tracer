@@ -1,4 +1,5 @@
 #include "record_mappings.hpp"
+#include "../record_factory.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -27,10 +28,28 @@ struct MappedField {
   std::string wire_name;
 };
 
+struct ConstructorArgument {
+  std::string wire_name;
+  std::string value_type;
+};
+
 struct RecordMapping {
   Record* record;
   std::vector<MappedField> fields;
+  std::vector<ConstructorArgument> constructor_arguments;
+
+  bool returns_prvalue() const {
+    return !constructor_arguments.empty() && fields.empty();
+  }
 };
+
+std::string member_pointer(const MappedField& mapped) {
+  return "&::" + mapped.owner + "::" + mapped.field->getNameAsString();
+}
+
+std::string field_reference(const std::string& type, const MappedField& mapped) {
+  return "decltype(std::declval<" + type + "&>().*(" + member_pointer(mapped) + "))";
+}
 
 std::string selector(std::string name) {
   name.erase(
@@ -336,7 +355,7 @@ class Generator {
   }
 
   bool lifetime_available(Record* record, const std::map<Record*, bool>& bases,
-                          std::string& reason) {
+                          bool default_construct, bool needs_move, std::string& reason) {
     for (const auto& base : bases) {
       const auto* destructor = base.first->getDestructor();
       if (destructor && !destructor->isImplicit() && !destructor->getDefinition()) {
@@ -345,9 +364,14 @@ class Generator {
         return false;
       }
     }
-    std::set<Record*> visited;
-    if (!default_constructor_available(record, visited, reason)) {
-      return false;
+    if (default_construct) {
+      std::set<Record*> visited;
+      if (!default_constructor_available(record, visited, reason)) {
+        return false;
+      }
+    }
+    if (!needs_move) {
+      return true;
     }
     const auto ctors = record->ctors();
     const bool has_move = std::any_of(ctors.begin(), ctors.end(), [](const auto* ctor) {
@@ -364,6 +388,61 @@ class Generator {
         return false;
       }
     }
+    return true;
+  }
+
+  bool can_decode(const std::string& type, const RecordMapping& mapping) {
+    std::string trait;
+    if (mapping.constructor_arguments.empty()) {
+      trait = "std::is_default_constructible_v<" + type + ">";
+    } else {
+      trait = "std::is_constructible_v<" + type;
+      for (const auto& arg : mapping.constructor_arguments) {
+        trait += ", " + arg.value_type;
+      }
+      trait += '>';
+    }
+    trait += " && std::is_destructible_v<" + type + ">";
+    if (!mapping.returns_prvalue()) {
+      trait += " && std::is_move_constructible_v<" + type + ">";
+    }
+    for (const auto& mapped : mapping.fields) {
+      if (mapped.field->getType().isConstQualified()) {
+        return false;
+      }
+      const auto reference = field_reference(type, mapped);
+      trait += " && std::is_assignable_v<" + reference + ", std::remove_reference_t<" +
+               reference + ">>";
+    }
+    return viable_(trait);
+  }
+
+  bool plan_constructor(RecordMapping& mapping, std::string& reason) {
+    const auto recipe = tracer::record_factory::infer(*mapping.record);
+    if (!recipe) {
+      if (reason.empty()) {
+        reason = "no usable default decoding or inferable field constructor; provide EventCodec factory";
+      }
+      return false;
+    }
+    auto type_policy = policy_;
+    type_policy.FullyQualifiedName = true;
+    std::set<const clang::FieldDecl*> initialized;
+    for (unsigned i = 0; i < recipe->fields_by_parameter.size(); ++i) {
+      const auto* field = recipe->fields_by_parameter[i];
+      const auto mapped = std::find_if(mapping.fields.begin(), mapping.fields.end(),
+                                       [field](const auto& entry) { return entry.field == field; });
+      if (mapped == mapping.fields.end() || !initialized.insert(field).second) {
+        reason = "constructor parameter needs an unambiguous captured field";
+        return false;
+      }
+      const auto value_type = recipe->constructor->getParamDecl(i)->getType()
+                                  .getCanonicalType().getNonReferenceType().getUnqualifiedType();
+      mapping.constructor_arguments.push_back({mapped->wire_name, value_type.getAsString(type_policy)});
+    }
+    mapping.fields.erase(std::remove_if(mapping.fields.begin(), mapping.fields.end(),
+                                       [&](const auto& entry) { return initialized.count(entry.field); }),
+                         mapping.fields.end());
     return true;
   }
 
@@ -396,49 +475,45 @@ class Generator {
     if (record->isAbstract()) {
       return failure(record, "an abstract class cannot be constructed as a local value");
     }
-    std::vector<MappedField> fields;
+    RecordMapping mapping{record, {}, {}};
     std::map<Record*, bool> seen;
     std::string reason;
-    if (!collect_fields(record, false, seen, fields, reason)) {
+    if (!collect_fields(record, false, seen, mapping.fields, reason)) {
       return failure(record, reason);
     }
     const auto type_name = "::" + name(record);
-    std::string trait = "std::is_default_constructible_v<" + type_name +
-                        "> && std::is_move_constructible_v<" + type_name +
-                        "> && std::is_destructible_v<" + type_name + ">";
     std::map<std::string, unsigned> field_counts;
-    for (const auto& mapped : fields) {
+    for (const auto& mapped : mapping.fields) {
       const auto* field = mapped.field;
       if (field->isBitField() || !identifier(field->getNameAsString())) {
         return failure(record, "bit-fields and unnamed/non-ASCII fields are unsupported");
-      }
-      if (field->getType().isConstQualified()) {
-        return failure(record, "const members require an EventCodec factory");
       }
       if (!supported(field->getType(), reason, depth + 1)) {
         return failure(record, field->getNameAsString() + ": " + reason);
       }
       ++field_counts[mapped.wire_name];
-      const auto expression = "decltype(std::declval<" + type_name + "&>().*(&::" +
-                              mapped.owner + "::" + mapped.wire_name + "))";
-      trait += " && std::is_assignable_v<" + expression + ", std::remove_reference_t<" +
-               expression + ">>";
     }
-    if (!viable_(trait)) {
-      return failure(record, "accessible default/move construction, destruction and "
-                             "assignable fields required; provide EventCodec factory");
-    }
-    if ((record->getNumBases() || record->isPolymorphic()) &&
-        !lifetime_available(record, seen, reason)) {
-      return failure(record, reason);
-    }
-    for (auto& mapped : fields) {
+    for (auto& mapped : mapping.fields) {
       if (field_counts[mapped.wire_name] > 1) {
         mapped.wire_name = mapped.owner + "::" + mapped.wire_name;
       }
     }
+    if (!can_decode(type_name, mapping) ||
+        ((record->getNumBases() || record->isPolymorphic()) &&
+         !lifetime_available(record, seen, true, true, reason))) {
+      if (!plan_constructor(mapping, reason)) {
+        return failure(record, reason);
+      }
+      if (!can_decode(type_name, mapping)) {
+        return failure(record, "inferred constructor and remaining assignable fields are not usable; "
+                               "provide EventCodec factory");
+      }
+      if (!lifetime_available(record, seen, false, !mapping.returns_prvalue(), reason)) {
+        return failure(record, reason);
+      }
+    }
     state_[canonical] = 2;
-    ordered_.push_back({record, std::move(fields)});
+    ordered_.push_back(std::move(mapping));
     return true;
   }
 
@@ -502,6 +577,36 @@ public:
     for (const auto& mapping : ordered_) {
       const auto type = name(mapping.record);
       generated.types.push_back(type);
+      if (!mapping.constructor_arguments.empty()) {
+        code << "template<> struct tracer_repl::EventCodec<::" << type << "> {\n"
+             << "static ::" << type << " decode(const EventValue& value) {\n"
+             << "if (!value.matches_record_type(" << std::quoted(type) << ")) "
+             << "throw std::invalid_argument(\"event record type mismatch: \" + value.cpp_type());\n";
+        if (mapping.returns_prvalue()) {
+          code << "return ::" << type << '(';
+        } else {
+          code << "::" << type << " result(";
+        }
+        bool first = true;
+        for (const auto& arg : mapping.constructor_arguments) {
+          if (!first) {
+            code << ',';
+          }
+          first = false;
+          code << "value.field(" << std::quoted(arg.wire_name) << ").as<" << arg.value_type << ">()";
+        }
+        code << ");\n";
+        for (const auto& mapped : mapping.fields) {
+          const auto member = "result.*(" + member_pointer(mapped) + ")";
+          code << member << " = value.field(" << std::quoted(mapped.wire_name)
+               << ").as<std::remove_reference_t<decltype(" << member << ")>>();\n";
+        }
+        if (!mapping.returns_prvalue()) {
+          code << "return result;\n";
+        }
+        code << "}};\n";
+        continue;
+      }
       code << "template<> struct tracer_repl::EventRecord<::" << type << "> {\n"
            << "static constexpr const char* type_name=" << std::quoted(type) << ";\n"
            << "static auto fields(){return std::make_tuple(";
@@ -511,8 +616,8 @@ public:
           code << ',';
         }
         first = false;
-        code << "tracer_repl::event_member(" << std::quoted(mapped.wire_name) << ", &::"
-             << mapped.owner << "::" << mapped.field->getNameAsString() << ')';
+        code << "tracer_repl::event_member(" << std::quoted(mapped.wire_name) << ", "
+             << member_pointer(mapped) << ')';
       }
       code << ");}};\n";
     }

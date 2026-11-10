@@ -213,8 +213,9 @@ std::cout << item.label << " " << item.base_id << " " << snapshot.field("details
 The target alternates between returning an `HfwItem*` and `nullptr`.
 For non-null returns, `result_snapshot()` includes `id`, `label`, nested
 `details`, and the protected `base_id` inherited from the polymorphic `HfwBase`.
-The prepared package imports the mapping automatically, so
-`result_as<prepared_pointee::HfwItem>()` returns an owned copy with those fields.
+The prepared package imports the mapping automatically. Clang identifies the
+constructor arguments, including the protected const `base_id` forwarded to
+`HfwBase`, so `result_as<prepared_pointee::HfwItem>()` constructs an owned copy.
 `receiver_snapshot()` contains the manager's fields. Null returns display
 `0x0`. Run the same capture as a smoke test with this command.
 
@@ -262,7 +263,10 @@ explicit policy. The pointer probe uses the existing
 `Item` directly.
 
 Both sessions inspect private and nested fields for all three known
-implementations and use `result_as<LocalFields>()` to read an owned typed value.
+implementations. For example, call
+`event.result_snapshot().field("_imp_snapshot").as<HFW::ItemV1>()` on an event
+with an `ItemV1` implementation. The generated factory builds the concrete
+value. The demos also exercise a custom projection with `result_as<LocalFields>()`.
 The fourth implementation is defined only in `item.cpp`, so the snapshot keeps
 its `_imp` address. An `_unreadable` member points to a `PROT_NONE` page and the
 guarded lookup leaves its address in the snapshot. Both sessions check null

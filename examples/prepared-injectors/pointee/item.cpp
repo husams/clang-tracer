@@ -2,14 +2,7 @@
 
 namespace prepared_pointee {
 namespace {
-HfwItem item = [] {
-  HfwItem result;
-  result.set_base_id(17);
-  result.id = 42;
-  result.label = "heap-backed HfwItem label";
-  result.details = {7, true};
-  return result;
-}();
+HfwItem item{17, 42, "heap-backed HfwItem label", {7, true}};
 } // namespace
 
 __attribute__((noinline)) HfwItem *HfwManager::createItem(int id) {
