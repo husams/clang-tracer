@@ -1,6 +1,6 @@
 ---
 name: clang-tracer-native-repl
-description: Use clang-tracer-repl for native C++ tracing, prepared probes, bulk tracing, observer reload, read-only target inspection, typed SQLite recording and offline replay, and reusable .repl scripts. Use for native tracing and replay unless the user requests the Python client.
+description: Use clang-tracer-repl for native C++ tracing, prepared probes, return snapshots, bulk tracing, observer reload, read-only target inspection, typed SQLite recording and offline replay, and reusable .repl scripts. Use for native tracing and replay unless the user requests the Python client.
 ---
 
 # Clang Tracer native REPL
@@ -149,8 +149,9 @@ for the installed syntax.
   Read `argument_snapshot()` and `result_snapshot()` for field inspection,
   or `argument_as<T>()` and `result_as<T>()` for supported C++ values.
   Use snapshots for records with application-defined copy, move, or destruction.
-  For a raw pointer, inspect its address or capture an owned field payload in
-  the callback while the pointee is valid.
+  For a raw pointer return, use `--snapshot-return-pointee` at injection to
+  capture fields when the pointee layout is available. See the workflow below
+  for polymorphic implementation members of a returned record.
   `receiver_snapshot()` captures entry-time fields across access levels and
   base classes. Qualify hidden field names. Owning pointer snapshots can expose
   an owned pointee under `value`, weak pointers expose `expired`, and variants
@@ -169,6 +170,52 @@ for the installed syntax.
   background range. Inspect `snapshot()` and `error()` and call `stop()` when
   done. For named collections, use `%events stats NAME` to check for loss and
   incomplete captures.
+
+### Capture polymorphic implementation fields from a return
+
+1. Use `%probe prepare` with the function declaration header first and include
+   the matching source that defines the polymorphic base and concrete classes.
+   Clang discovers eligible direct raw pointer members such as `_imp` and the
+   derived layouts visible during preparation. RTTI selects a layout at POST.
+2. Inject with `--prepared DIRECTORY --prepared-mode require`. Add
+   `--snapshot-return-pointee` for `Item*`. An `Item&` return captures its record
+   directly. Keep the pointees and captured data live and stable through POST.
+3. Collect POST and read `event.result_snapshot()` or
+   `event.result_as<tracer_repl::EventValue>()`. The root holds `_imp` as an
+   address. Check `root.fields().count("_imp_snapshot")` before inspecting
+   `root.field("_imp_snapshot")`. Use `cpp_type()` for the concrete type and
+   `field("name").as<T>()` for a field. Skip null outer pointer results.
+   Null, unreadable, and unknown member pointees remain address-only.
+
+These steps use automatic capture. `result_as<T>()` decodes the root snapshot.
+For `HFW::Item` returns the concrete `ItemV1`, `ItemV2`, and `ItemV3` records
+are nested and lack generated class decoders. Use `EventValue` for field
+inspection, or choose the hook that matches the requested customization.
+
+- **Select which members to follow.** Include a header specializing
+  `tracer_snapshot::FollowPointers<Record>` during preparation. Its member
+  list replaces the inferred list and can include supported non-polymorphic
+  pointers. The policy applies when capturing that record as a result,
+  receiver, or argument.
+- **Project a concrete type during capture.** In `%probe inject`, put
+  `--callback FILE` immediately after the selector and before `--prepared`.
+  Define a `tracer_snapshot::encode(const Concrete&) noexcept` overload
+  returning a named snapshot-compatible record by value. For either PImpl demo,
+  keep the usual preparation and inject with `--callback demo/pimpl/encoder.cpp`
+  to replace `ItemV2` fields with `summary` while retaining its `cpp_type()`.
+  An encoder-only file needs no interceptor hooks.
+- **Construct a local typed value.** Specialize `tracer_repl::EventCodec<T>`.
+  Decode the nested implementation with `impl.as<T>()` or define a decoder
+  that reads `_imp_snapshot` from the root for `event.result_as<T>()`.
+
+Use the matching revision's [PImpl demos](../../../examples/prepared-injectors/README.md#pimpl-return-snapshots).
+Run `./examples/prepared-injectors/run-native.sh --pimpl-pointer` and
+`./examples/prepared-injectors/run-native.sh --pimpl-reference` in separate
+sessions and paste the printed commands. With `--smoke`, verify
+`NATIVE_PIMPL_POINTER=1` and `NATIVE_PIMPL_REFERENCE=1`. For installed validation,
+point `CLANG_TRACER_REPL`, `CLANG_TRACER_SERVER`, `CLANG_TRACER_AGENT`, and
+`TRACER_PREPARE_EXECUTABLE` at the same installed release. Set
+`CLANG_TRACER_PREPARED_BUILD` to the matching fixture build.
 
 ### Prepare with multiple headers in C++
 
