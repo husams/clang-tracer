@@ -33,7 +33,7 @@ probe : 'probe' ('prepare' value prepareOption+
       | 'inject' value ('--callback' value)? (deployOption | cwdOption)*
       | 'validate' value '--callback' value (resolveOption | cwdOption)*
       | 'remove' UINT cwdOption?) | 'probes' cwdOption?;
-prepareOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--output' | '--module-index' | '--generated' | '--id') value
+prepareOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--output' | '--module-index' | '--generated' | '--id' | SNAPSHOT_RETURN_TYPE) value
               | SIGNATURE value | MEMBER | METADATA_ONLY | extraCompileOption | cwdOption;
 resolveOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--compile-option'
                 | '--prepared' | '--prepared-mode') value
@@ -101,5 +101,6 @@ CWD : '--cwd';
 SIGNATURE : '--signature';
 MEMBER : '--member';
 SNAPSHOT_RETURN_POINTEE : '--snapshot-return-pointee';
+SNAPSHOT_RETURN_TYPE : '--snapshot-return-type';
 WORD : ~[ \t\r\n"'\\%`]+;
 WS : [ \t\r\n]+ -> skip;

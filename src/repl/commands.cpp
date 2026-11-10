@@ -307,9 +307,13 @@ Command parse_command(const std::string &input) {
          !command.extra_compile_argument_inputs.empty()))
       throw std::invalid_argument("source preparation requires --include");
     for (const auto *option : {"--include", "--compdb", "--translation-unit", "--module",
-                               "--module-index", "--generated", "--id"})
+                               "--module-index", "--generated", "--id", "--snapshot-return-type"})
       if (command.has(option) && command.option(option).empty())
         throw std::invalid_argument(std::string(option) + " requires a value");
+    if (command.has("--snapshot-return-type") &&
+        (elf_mode || !source_mode || command.has("--module-index") ||
+         command.has("--generated") || command.has("--id")))
+      throw std::invalid_argument("--snapshot-return-type requires source preparation with --include");
   }
   if (command.has("--cwd") && command.option("--cwd").empty())
     throw std::invalid_argument("--cwd requires a directory");

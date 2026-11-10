@@ -175,6 +175,7 @@ message PreparedInjector {
   repeated string adapter_toolchain_options = 15; // v5 safe Clang driver options, without app includes.
   bool adapter_uses_default_toolchain = 16; // The donor relied on the configured runtime profile.
   string source_translation_unit = 17; // Optional selection hint for an explicit callback database.
+  DebugInfo snapshot_return_type = 18; // Explicit dynamic pointee layout for source preparation.
 }
 message ProbeSpec {
   string symbol = 1;       // Linkage name/diagnostic; export required only in raw-symbol mode.

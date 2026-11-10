@@ -49,3 +49,10 @@ target_compile_options(prepared-methods-target PRIVATE
 add_executable(prepared-pointee-target pointee/target.cpp pointee/item.cpp)
 target_compile_options(prepared-pointee-target PRIVATE
   -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
+
+add_executable(prepared-polymorphic-pointee-target
+  polymorphic-pointee/target.cpp polymorphic-pointee/item.cpp)
+set_target_properties(prepared-polymorphic-pointee-target PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+target_compile_options(prepared-polymorphic-pointee-target PRIVATE
+  -g -O0 -fno-omit-frame-pointer -fcf-protection=none -fvisibility=hidden)

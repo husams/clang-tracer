@@ -34,7 +34,8 @@ public:
     T__114 = 115, T__115 = 116, T__116 = 117, T__117 = 118, T__118 = 119,
     T__119 = 120, UINT = 121, STRING = 122, SHELL = 123, METADATA_ONLY = 124,
     SQLITE = 125, STACK = 126, CWD = 127, SIGNATURE = 128, MEMBER = 129,
-    SNAPSHOT_RETURN_POINTEE = 130, WORD = 131, WS = 132
+    SNAPSHOT_RETURN_POINTEE = 130, SNAPSHOT_RETURN_TYPE = 131, WORD = 132,
+    WS = 133
   };
 
   explicit TracerCommandsLexer(antlr4::CharStream *input);

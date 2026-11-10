@@ -29,6 +29,7 @@
 
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/Attr.h>
+#include <clang/AST/CXXInheritance.h>
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/DeclTemplate.h>
 #include <clang/AST/Expr.h>
@@ -99,6 +100,102 @@ std::string compact(std::string_view value) {
     i = next - 1;
   }
   return result;
+}
+
+bool valid_qualified_record_name(std::string_view name) {
+  if (name.substr(0, 2) == "::")
+    name.remove_prefix(2);
+  if (name.empty())
+    return false;
+  bool expect_identifier = true;
+  for (std::size_t i = 0; i < name.size(); ++i) {
+    const auto c = static_cast<unsigned char>(name[i]);
+    if (expect_identifier) {
+      if (!std::isalpha(c) && c != '_')
+        return false;
+      expect_identifier = false;
+    } else if (std::isalnum(c) || c == '_') {
+      continue;
+    } else if (name[i] == ':' && i + 1 < name.size() && name[i + 1] == ':') {
+      ++i;
+      expect_identifier = true;
+    } else {
+      return false;
+    }
+  }
+  return !expect_identifier;
+}
+
+class TypeAliasFinder final
+    : public clang::RecursiveASTVisitor<TypeAliasFinder> {
+public:
+  explicit TypeAliasFinder(std::string qualified_name)
+      : qualified_name_(std::move(qualified_name)) {}
+
+  bool VisitTypeAliasDecl(clang::TypeAliasDecl *alias) {
+    if (alias->getQualifiedNameAsString() == qualified_name_)
+      result_ = alias;
+    return true;
+  }
+
+  const clang::TypeAliasDecl *result() const { return result_; }
+
+private:
+  std::string qualified_name_;
+  const clang::TypeAliasDecl *result_ = nullptr;
+};
+
+const clang::CXXRecordDecl *record_alias(clang::ASTContext &ast,
+                                         std::string qualified_name) {
+  TypeAliasFinder finder(std::move(qualified_name));
+  finder.TraverseDecl(ast.getTranslationUnitDecl());
+  const auto *alias = finder.result();
+  const auto *record = alias ? alias->getUnderlyingType()->getAsCXXRecordDecl() : nullptr;
+  return record ? record->getDefinition() : nullptr;
+}
+
+void validate_snapshot_return_type(clang::ASTContext &ast,
+                                   const clang::FunctionDecl &function,
+                                   const clang::CXXRecordDecl *snapshot_record) {
+  if (!snapshot_record || !snapshot_record->isCompleteDefinition() ||
+      snapshot_record->isUnion() || snapshot_record->isDependentType() ||
+      snapshot_record->isAbstract() || !snapshot_record->getIdentifier() ||
+      snapshot_record->getQualifiedNameAsString().empty() ||
+      snapshot_record->getFormalLinkage() != clang::Linkage::External)
+    throw std::invalid_argument(
+        "snapshot return type must name a complete, concrete, externally visible record");
+  for (auto *record = snapshot_record; record;
+       record = llvm::dyn_cast<clang::CXXRecordDecl>(record->getDeclContext())) {
+    const auto access = record->getAccess();
+    if (access != clang::AS_none && access != clang::AS_public)
+      throw std::invalid_argument("snapshot return type must be publicly nameable");
+  }
+  if (!ast.getLangOpts().RTTI)
+    throw std::invalid_argument("snapshot return type requires RTTI-enabled source flags");
+  const auto *vtable = llvm::dyn_cast<clang::ItaniumVTableContext>(
+      ast.getVTableContext());
+  if (!vtable || vtable->isRelativeLayout())
+    throw std::invalid_argument(
+        "snapshot return type requires pointer-sized Itanium vtable entries");
+  const auto result_type = function.getReturnType();
+  if (!result_type->isPointerType())
+    throw std::invalid_argument("snapshot return type requires a raw pointer result");
+  const auto pointee_type = result_type->getPointeeType();
+  if (pointee_type.isVolatileQualified())
+    throw std::invalid_argument("snapshot return type does not support volatile base pointers");
+  const auto *base = pointee_type->getAsCXXRecordDecl();
+  if (!base || !base->isPolymorphic())
+    throw std::invalid_argument(
+        "snapshot return type requires a pointer to a polymorphic base record");
+  clang::CXXBasePaths paths;
+  if (!snapshot_record->isDerivedFrom(base, paths))
+    throw std::invalid_argument("snapshot return type must derive from the returned base record");
+  if (paths.isAmbiguous(ast.getCanonicalType(ast.getRecordType(base))))
+    throw std::invalid_argument("snapshot return type has an ambiguous base conversion");
+  if (std::none_of(paths.begin(), paths.end(), [](const auto &path) {
+        return path.Access == clang::AS_public;
+      }))
+    throw std::invalid_argument("snapshot return type must have a public base conversion");
 }
 
 struct Selector {
@@ -254,6 +351,8 @@ struct FrozenInvocation {
   std::vector<std::string> prepared_headers;
   api::PreparedInjector prepared_profile;
   std::string adapter_symbol;
+  std::string snapshot_return_type;
+  const clang::CXXRecordDecl *snapshot_return_record = nullptr;
   bool select_template = false;
   bool pointer_layouts = true;
 };
@@ -511,15 +610,23 @@ public:
       candidate.spec.mutable_signature()->set_kind(method && !method->isStatic() ? api::METHOD
                                                                                  : api::FUNCTION);
       if (sema_) {
+        if (invocation_.snapshot_return_record)
+          validate_snapshot_return_type(*context_, *declaration,
+                                        invocation_.snapshot_return_record);
         tracer::prepared::describe_prepared_callable(*context_, *declaration, method,
             candidate.spec, sema_, nullptr, invocation_.pointer_layouts);
         if (!invocation_.prepared_headers.empty()) {
           auto adapter = tracer::prepared::AdapterEmitter::emit(*context_, *header_search_,
-              *declaration, invocation_.prepared_headers, invocation_.pointer_layouts);
+              *declaration, invocation_.prepared_headers, invocation_.pointer_layouts,
+              invocation_.snapshot_return_record);
           auto &package = *candidate.spec.mutable_prepared();
           package = invocation_.prepared_profile;
           package.set_target_triple(context_->getTargetInfo().getTriple().str());
           package.set_adapter_declarations(std::move(adapter.source));
+          if (invocation_.snapshot_return_record)
+            tracer::prepared::describe_record(*context_,
+                *invocation_.snapshot_return_record,
+                *package.mutable_snapshot_return_type());
           for (const auto &header : adapter.standard_headers)
             package.add_adapter_standard_headers(header);
         }
@@ -561,6 +668,12 @@ public:
           clang::tooling::getClangStripDependencyFileAdjuster(), {}, &diagnostics);
       if (!toolchain || diagnostics.had_error() || toolchain->getDiagnostics().hasErrorOccurred())
         throw std::invalid_argument("Clang could not resolve the prepared toolchain headers");
+    }
+    if (!invocation_.snapshot_return_type.empty()) {
+      invocation_.snapshot_return_record = record_alias(
+          context, "tracer_prepared_selection::SnapshotReturn");
+      if (!invocation_.snapshot_return_record)
+        throw std::invalid_argument("snapshot return type must name a complete C++ record");
     }
     set_context(context, sema, toolchain ? &toolchain->getPreprocessor().getHeaderSearchInfo() : nullptr);
     TraverseDecl(context.getTranslationUnitDecl());
@@ -1030,10 +1143,14 @@ ResolvedCallable resolve_cpp_callable(const std::string& name,
 ResolvedCallable resolve_header_callable(const std::string& name,
                                          const api::ProbeSpec& headers,
                                          const PreparedHeaderCommand& command,
-                                         bool pointer_layouts) {
+                                         bool pointer_layouts,
+                                         const std::string& snapshot_return_type) {
   const auto selector = parse_selector(name);
   if (!selector.has_parameters || headers.include_headers().empty())
     throw std::runtime_error("prepared generation requires an explicit selector and header context");
+  if (!snapshot_return_type.empty() &&
+      !valid_qualified_record_name(snapshot_return_type))
+    throw std::invalid_argument("snapshot return type must be a qualified record name");
   // Use the SDK fallback unless the database names a different installed
   // compiler by path or explicitly selects a toolchain.
   std::vector<std::string> arguments{"--no-default-config"};
@@ -1044,6 +1161,10 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   const bool alternate_driver = installed_driver &&
       !fs::equivalent(command.driver, TRACER_PREPARE_BUILD_CXX, path_error) && !path_error;
   FrozenInvocation invocation;
+  if (!snapshot_return_type.empty()) {
+    invocation.snapshot_return_type = snapshot_return_type.rfind("::", 0) == 0
+        ? snapshot_return_type : "::" + snapshot_return_type;
+  }
   auto &profile = invocation.prepared_profile;
   profile.set_format_version(tracer::prepared::typed_version);
   profile.add_adapter_toolchain_options("--no-default-config");
@@ -1129,6 +1250,9 @@ ResolvedCallable resolve_header_callable(const std::string& name,
             "using Selected = decltype(select(&" + qualified + "));\n}\n";
     arguments.push_back(clang_cl ? "/clang:-fno-access-control" : "-fno-access-control");
   }
+  if (!invocation.snapshot_return_type.empty())
+    code += "\nnamespace tracer_prepared_selection { using SnapshotReturn = " +
+            invocation.snapshot_return_type + "; }\n";
   clang::tooling::FixedCompilationDatabase database(command.directory, arguments);
   clang::DiagnosticOptions diagnostic_options;
   PrepareDiagnostics diagnostics(diagnostic_options);
@@ -1181,6 +1305,19 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
   if (!unit)
     throw std::runtime_error("generated prepared adapter does not compile independently");
   tracer::prepared::check_toolchain_headers(unit->getPreprocessor().getHeaderSearchInfo(), adapter);
+  if (adapter.has_snapshot_return_type()) {
+    const auto *snapshot_record = record_alias(
+        unit->getASTContext(), "tracer_prepared::SnapshotReturn");
+    if (!snapshot_record)
+      throw std::runtime_error("prepared adapter is missing its SnapshotReturn record alias");
+    api::DebugInfo actual_snapshot_type;
+    tracer::prepared::describe_record(unit->getASTContext(), *snapshot_record,
+                                      actual_snapshot_type);
+    if (actual_snapshot_type.SerializeAsString() !=
+        adapter.snapshot_return_type().SerializeAsString())
+      throw std::runtime_error(
+          "generated prepared adapter does not reproduce the snapshot return record layout");
+  }
   std::vector<Candidate> candidates;
   FrozenInvocation invocation;
   invocation.adapter_symbol = original.spec.symbol();
