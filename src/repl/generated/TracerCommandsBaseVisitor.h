@@ -99,6 +99,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitLimitOption(TracerCommandsParser::LimitOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitResolveOption(TracerCommandsParser::ResolveOptionContext *ctx) override {
     return visitChildren(ctx);
   }

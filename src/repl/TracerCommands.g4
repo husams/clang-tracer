@@ -38,11 +38,15 @@ probe : 'probe' ('prepare' value prepareOption+
       | 'validate' value '--callback' value (validateOption | cwdOption)*
       | 'remove' UINT cwdOption?) | 'probes' cwdOption?;
 prepareOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--output' | '--module-index' | '--generated' | '--id') value
-              | SIGNATURE value | MEMBER | METADATA_ONLY | extraCompileOption | cwdOption;
+              | SIGNATURE value | MEMBER | METADATA_ONLY | '--no-automatic-members' | limitOption
+              | extraCompileOption | cwdOption;
+limitOption : ('--follow-depth' | '--follow-members' | '--record-members' | '--nested-depth'
+              | '--string-bytes' | '--vector-elements' | '--checked-reads' | '--snapshot-reserve'
+              | '--snapshot-arena' | '--snapshot-slice') (UINT | WORD);
 resolveOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | '--compile-option'
                 | '--prepared' | '--prepared-mode') value
               | extraCompileOption;
-validateOption : resolveOption | '--allow-arg-overrides' | '--allow-result-override' | '--allow-replacement'
+validateOption : resolveOption | limitOption | '--allow-arg-overrides' | '--allow-result-override' | '--allow-replacement'
                | '--reclaimable' | '--allow-call-original' | '--trace-exceptions';
 deployOption : validateOption | '--stack-depth' (UINT | WORD)
              | '--print-arguments' | '--print-result' | SNAPSHOT_RETURN_POINTEE | stackFilter;

@@ -331,12 +331,12 @@ CppEngine::MappingHeader CppEngine::mapping_header(const std::vector<std::string
   identity << std::quoted(std::filesystem::current_path().string()) << '\n'
            << std::quoted(api) << '\n' << mapping_file_digest(helper) << '\n';
   for (const auto &argument : arguments) identity << std::quoted(argument) << '\n';
-  identity << "types\n";
+  identity << "format " << mapping_format << "\n" << "types\n";
   for (const auto &type : types) identity << std::quoted(type) << '\n';
   if (modules) identity << "external-destructors\n";
   for (const auto *variable : {"CPATH", "CPLUS_INCLUDE_PATH", "C_INCLUDE_PATH",
        "OBJC_INCLUDE_PATH", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET",
-       "SOURCE_DATE_EPOCH", "CCC_OVERRIDE_OPTIONS"}) {
+       "SOURCE_DATE_EPOCH", "CCC_OVERRIDE_OPTIONS", "TRACER_REPL_DERIVED_CANDIDATES"}) {
     const auto *value = std::getenv(variable);
     identity << variable << '=' << std::quoted(value ? value : "") << '\n';
   }
@@ -392,13 +392,14 @@ CppEngine::MappingHeader CppEngine::mapping_header(const std::vector<std::string
       } catch (const std::exception &) {
         // A module lookup failure leaves the snapshot and other mappings usable.
       }
-      if (!bound.empty()) {
-        for (const auto &name : bound)
-          request << std::quoted(name) << '\n';
-        auto resolved = reflect();
-        if (resolved.status == 0)
-          generated = std::move(resolved);
-      }
+      // Run the final pass even when nothing bound: records whose destructors
+      // stay unavailable are then rebuilt field by field instead of skipped.
+      for (const auto &name : bound)
+        request << std::quoted(name) << '\n';
+      request << std::quoted("@tracer-destructors-final") << '\n';
+      auto resolved = reflect();
+      if (resolved.status == 0)
+        generated = std::move(resolved);
     }
   }
   if (generated.status != 0)

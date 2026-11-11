@@ -238,6 +238,10 @@ function(tracer_add_native_repl)
     add_executable(repl-command-tests tests/repl_commands.cpp)
     target_link_libraries(repl-command-tests PRIVATE tracer_repl_commands)
     add_test(NAME native_repl_commands COMMAND repl-command-tests)
+    add_executable(snapshot-limits-tests tests/snapshot_limits_tests.cpp)
+    target_include_directories(snapshot-limits-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(snapshot-limits-tests PRIVATE tracer_proto)
+    add_test(NAME native_snapshot_limits COMMAND snapshot-limits-tests)
     add_executable(repl-profile-tests tests/repl_profile.cpp "${_repl}/shell.cpp")
     target_link_libraries(repl-profile-tests PRIVATE tracer_repl_client)
     add_test(NAME native_repl_profile COMMAND repl-profile-tests)
@@ -408,6 +412,14 @@ function(tracer_add_native_repl)
           --preparer $<TARGET_FILE:clang-tracer-prepare-injectors-native>
           --compiler "${CMAKE_CXX_COMPILER}")
       set_tests_properties(native_repl_prepared_factory_library PROPERTIES TIMEOUT 180)
+      add_test(NAME native_repl_prepared_handle_return
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_prepared_handle_return.py"
+          --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+          --agent $<TARGET_FILE:clang_tracer_agent>
+          --preparer $<TARGET_FILE:clang-tracer-prepare-injectors-native>
+          --compiler "${CMAKE_CXX_COMPILER}"
+          --example "${CMAKE_CURRENT_SOURCE_DIR}/examples/prepared-injectors/handle")
+      set_tests_properties(native_repl_prepared_handle_return PROPERTIES TIMEOUT 900)
       add_executable(repl-headerless-templates-target tests/fixtures/repl_headerless_templates.cpp)
       target_compile_options(repl-headerless-templates-target PRIVATE -g -O0
         -fno-omit-frame-pointer -fcf-protection=none)

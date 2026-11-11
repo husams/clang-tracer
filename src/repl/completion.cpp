@@ -624,10 +624,15 @@ std::string reflect_cpp_header(const std::vector<std::string> &arguments,
   }
   std::vector<std::string> types;
   std::optional<std::set<std::string>> external_destructors;
+  bool destructors_final = false;
   for (std::string type; input >> std::quoted(type);) {
     if (type == "@tracer-external-destructors") {
       external_destructors.emplace();
       for (std::string symbol; input >> std::quoted(symbol);) {
+        if (symbol == "@tracer-destructors-final") {
+          destructors_final = true;
+          continue;
+        }
         if (symbol.empty() || symbol.size() > 4096)
           throw std::runtime_error("invalid external destructor symbol");
         external_destructors->insert(std::move(symbol));
@@ -668,7 +673,7 @@ std::string reflect_cpp_header(const std::vector<std::string> &arguments,
     throw std::runtime_error("could not check record construction traits");
   };
   auto generated = generate_record_mappings(compiler, types, viable,
-      external_destructors ? &*external_destructors : nullptr);
+      external_destructors ? &*external_destructors : nullptr, destructors_final);
   parse(generated.source);
   std::string validation;
   for (const auto &type : generated.types)

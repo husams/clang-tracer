@@ -25,6 +25,7 @@
 #include <vector>
 #include "value_snapshot_codegen.hpp"
 #include "snapshot_encoder.hpp"
+#include "snapshot_runtime_limits.hpp"
 #include "value_snapshot_storage.hpp"
 #include "context_paths.hpp"
 #include "prepared_types.hpp"
@@ -3248,6 +3249,8 @@ struct ReceiverCallbackShape {
   std::vector<std::pair<unsigned, std::string>> inferred_fields;
   std::vector<std::string> argument_names;
   tracer::ValueSnapshotCode snapshots;
+  // The same capture without followed members, for when that code does not compile.
+  tracer::ValueSnapshotCode snapshots_plain;
 };
 
 std::string make_class_bridge(const CallbackShape &shape);
@@ -3282,6 +3285,8 @@ public:
     result_.snapshots = tracer::make_value_snapshot_code(context, spec_);
     if (!validate_snapshot_encoder(shape, result_.snapshots, result_.error))
       return;
+    if (result_.snapshots.has_followed_members)
+      result_.snapshots_plain = tracer::make_value_snapshot_code(context, spec_, false);
     class Fields : public clang::RecursiveASTVisitor<Fields> {
     public:
       Fields(clang::ASTContext &c, ReceiverCallbackShape &r)
@@ -4115,7 +4120,8 @@ bool compile_shared_probe(Probe &p,
                           std::string &error, bool run_initializers,
                           clangtracer::v1::ValidationReport *report,
                           bool result_sret, bool syntax_only,
-                          const tracer::ValueSnapshotCode &snapshots) {
+                          const tracer::ValueSnapshotCode &snapshots,
+                          const tracer::ValueSnapshotCode *plain_snapshots = nullptr) {
   tracer::ContextActivationRequest activation;
   const auto [callback_includes, callback_body] =
       split_callback_includes(specification.callback_source());
@@ -4144,6 +4150,52 @@ bool compile_shared_probe(Probe &p,
       callback_includes + requested_header_source +
       (has_real_headers ? std::string() : recovered_record_declarations(specification)) +
       receiver_alias + argument_aliases(specification);
+  // Followed members must never turn a probe that worked into one that does not
+  // compile: when the wrapper fails to compile with them, it is built without.
+  const bool can_fall_back = snapshots.has_followed_members && plain_snapshots;
+  const auto fall_back_note = [&] {
+    if (!report)
+      return;
+    auto *note = report->add_diagnostics();
+    note->set_stage("snapshot");
+    note->set_severity("note");
+    note->set_message("followed pointer and reference members were disabled because the "
+                      "generated capture code did not compile");
+  };
+  const auto plain_wrapper = [&] {
+    return wrapper_prelude + wrapper_types +
+           make_wrapper(p.request, reinterpret_cast<std::uintptr_t>(p.trampoline), true, true,
+                        &specification, false, true, result_sret,
+                        plain_snapshots->arguments.empty() ? nullptr : plain_snapshots);
+  };
+  const auto syntax_ok = [&](const std::string &source, DiagnosticCapture &capture) {
+    auto syntax_arguments = arguments;
+    syntax_arguments.push_back("-fsyntax-only");
+    auto ast = clang::tooling::buildASTFromCodeWithArgs(
+        source, tracer::clang_driver_arguments(std::move(syntax_arguments)),
+        "clang-tracer-shared-wrapper.cc",
+        "clang-tracer", std::make_shared<clang::PCHContainerOperations>(),
+        clang::tooling::getClangStripOutputAdjuster(), {}, &capture);
+    return ast && !capture.had_error();
+  };
+  // A failed parse leaves partial declarations in the interpreter, so a retry
+  // there fails on conflicts. Installing therefore checks the wrapper on a
+  // throwaway AST first; only probes that follow members pay for it.
+  bool use_plain = false;
+  if (can_fall_back && !syntax_only) {
+    DiagnosticCapture capture(nullptr);
+    if (!syntax_ok(wrapper_prelude + wrapper_types +
+                       make_wrapper(p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
+                                    true, true, &specification, false, true, result_sret,
+                                    wrapper_snapshots),
+                   capture)) {
+      use_plain = true;
+      fall_back_note();
+    }
+  }
+  const auto *effective_snapshots =
+      use_plain ? (plain_snapshots->arguments.empty() ? nullptr : plain_snapshots)
+                : wrapper_snapshots;
   activation.compiler_arguments = arguments;
   if (!specification.callback_package_path().empty())
     activation.file_name = specification.callback_package_path();
@@ -4159,20 +4211,21 @@ bool compile_shared_probe(Probe &p,
     const auto generated_wrapper =
         make_wrapper(p.request,
                      reinterpret_cast<std::uintptr_t>(p.trampoline), true,
-                     true, &specification, false, true, result_sret, wrapper_snapshots);
+                     true, &specification, false, true, result_sret, effective_snapshots);
     const auto complete_source = wrapper_prelude + wrapper_types + generated_wrapper;
     if (syntax_only) {
-      auto syntax_arguments = arguments;
-      syntax_arguments.push_back("-fsyntax-only");
       DiagnosticCapture capture(nullptr);
-      auto ast = clang::tooling::buildASTFromCodeWithArgs(
-          complete_source, tracer::clang_driver_arguments(std::move(syntax_arguments)),
-          "clang-tracer-shared-wrapper.cc",
-          "clang-tracer", std::make_shared<clang::PCHContainerOperations>(),
-          clang::tooling::getClangStripOutputAdjuster(), {}, &capture);
+      const bool ok = syntax_ok(complete_source, capture);
+      if (!ok && can_fall_back) {
+        DiagnosticCapture retry(nullptr);
+        if (syntax_ok(plain_wrapper(), retry)) {
+          fall_back_note();
+          return true;
+        }
+      }
       if (report)
         append_diagnostics(*report, capture, "syntax");
-      if (!ast || capture.had_error()) {
+      if (!ok) {
         error = capture.message().empty()
                     ? "shared callback wrapper failed syntax validation"
                     : capture.message();
@@ -4254,7 +4307,7 @@ bool compile_shared_probe(Probe &p,
   p.request.context_required = true;
   const auto generated_wrapper =
       make_wrapper(p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
-                   true, true, &specification, false, true, result_sret, wrapper_snapshots);
+                   true, true, &specification, false, true, result_sret, effective_snapshots);
   if (!parse_and_materialize(p, *p.interpreter,
                              wrapper_prelude + wrapper_types + generated_wrapper, error)) {
     return false;
@@ -4329,6 +4382,12 @@ bool bind_probe_symbols(clang::Interpreter &interpreter,
   bind("tracer_snapshot_mark", &tracer_snapshot_mark);
   bind("tracer_snapshot_read_rtti", &tracer_snapshot_read_rtti);
   bind("tracer_snapshot_rtti_matches", &tracer_snapshot_rtti_matches);
+  bind("tracer_snapshot_readable", &tracer_snapshot_readable);
+  bind("tracer_snapshot_configure", &tracer_snapshot_configure);
+  bind("tracer_snapshot_read_cstring", &tracer_snapshot_read_cstring);
+  bind("tracer_snapshot_copy_bytes", &tracer_snapshot_copy_bytes);
+  bind("tracer_snapshot_is_scratch", &tracer_snapshot_is_scratch);
+  bind("tracer_snapshot_storage_limited", &tracer_snapshot_storage_limited);
   bind("tracer_snapshot_reset", &tracer_snapshot_reset);
   bind("tracer_snapshot_storage", &tracer_snapshot_storage);
   bind("tracer_snapshot_commit", &tracer_snapshot_commit);
@@ -4906,13 +4965,16 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
         signature_assert = specialized_signature_assert(
             user_ast->getASTContext(), shape);
       }
+      const auto plain_snapshots =
+          tracer::make_value_snapshot_code(user_ast->getASTContext(), specification, false);
       return compile_shared_probe(
           p, specification, compiler_arguments,
           forced_include_source + prelude + context_prelude +
               tracer::kEmbeddedCallbackHeader,
           forced_include_source, receiver_alias,
           signature_assert, error, run_initializers, report, result_sret,
-          syntax_only, tracer::make_value_snapshot_code(user_ast->getASTContext(), specification));
+          syntax_only, tracer::make_value_snapshot_code(user_ast->getASTContext(), specification),
+          &plain_snapshots);
     }
     shape_valid = inspect_callback_shape(user_ast->getASTContext(), shape,
                                          baseline_error);
@@ -4924,6 +4986,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   }
 
   bool baseline_preflight_succeeded = false;
+  bool followed_members_disabled = false;
   DiagnosticCapture complete_capture(nullptr);
   if (shape_valid) {
     if (overrides &&
@@ -4942,18 +5005,45 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
     if (!validate_snapshot_encoder(shape, snapshots, error))
       return false;
     bridge = make_invocation_bridge(shape);
-    const std::string generated = make_wrapper(
-        p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
-        shape.has_pre, shape.has_post, &specification, shape.class_mode,
-        false, result_sret, &snapshots);
-    complete_source = user_source + "\n" +
-                      specialized_signature_assert(user_ast->getASTContext(),
-                                                   shape) +
-                      bridge + "\n" + generated;
-    auto complete_ast = build_callback_ast(
-        complete_source, "clang-tracer-callback.cc", complete_capture);
-    baseline_preflight_succeeded =
-        complete_ast && !complete_capture.had_error();
+    const auto build_complete = [&](const tracer::ValueSnapshotCode &code,
+                                    DiagnosticCapture &capture) {
+      const std::string generated = make_wrapper(
+          p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
+          shape.has_pre, shape.has_post, &specification, shape.class_mode,
+          false, result_sret, &code);
+      complete_source = user_source + "\n" +
+                        specialized_signature_assert(user_ast->getASTContext(),
+                                                     shape) +
+                        bridge + "\n" + generated;
+      auto ast = build_callback_ast(complete_source, "clang-tracer-callback.cc", capture);
+      return ast && !capture.had_error();
+    };
+    baseline_preflight_succeeded = build_complete(snapshots, complete_capture);
+    if (!baseline_preflight_succeeded && snapshots.has_followed_members) {
+      // Followed pointer and reference members must never turn a probe that
+      // worked into one that does not compile: capture without them instead.
+      const auto fallback = tracer::make_value_snapshot_code(
+          user_ast->getASTContext(), specification, false);
+      DiagnosticCapture retry_capture(nullptr);
+      std::string ignored;
+      if (validate_snapshot_encoder(shape, fallback, ignored) &&
+          build_complete(fallback, retry_capture)) {
+        if (report) {
+          // The failed attempt's errors are kept as notes: the probe was built.
+          const int first = report->diagnostics_size();
+          append_diagnostics(*report, complete_capture, "snapshot");
+          for (int i = first; i < report->diagnostics_size(); ++i)
+            report->mutable_diagnostics(i)->set_severity("note");
+          auto *note = report->add_diagnostics();
+          note->set_stage("snapshot");
+          note->set_severity("note");
+          note->set_message("followed pointer and reference members were disabled because the "
+                            "generated capture code did not compile");
+        }
+        followed_members_disabled = true;
+        baseline_preflight_succeeded = true;
+      }
+    }
     if (!baseline_preflight_succeeded) {
       baseline_error = complete_capture.message();
       if (baseline_error.empty()) {
@@ -4962,7 +5052,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
     }
   }
 
-  if (baseline_preflight_succeeded && report) {
+  if (baseline_preflight_succeeded && report && !followed_members_disabled) {
     append_diagnostics(*report, complete_capture, "wrapper");
   }
 
@@ -5097,14 +5187,17 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
     shape.has_pre = receiver_shape.has_pre;
     shape.has_post = receiver_shape.has_post;
     bridge = receiver_shape.bridge;
-    const std::string generated = make_wrapper(
-        p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
-        shape.has_pre, shape.has_post, &specification, shape.class_mode,
-        false, result_sret, &receiver_shape.snapshots);
-    complete_source = typed_user_source + "\n" +
-                      specialized_signature_assert(user_ast->getASTContext(),
-                                                   shape) +
-                      bridge + "\n" + generated;
+    const auto assemble = [&](const tracer::ValueSnapshotCode &code) {
+      const std::string generated = make_wrapper(
+          p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
+          shape.has_pre, shape.has_post, &specification, shape.class_mode,
+          false, result_sret, &code);
+      complete_source = typed_user_source + "\n" +
+                        specialized_signature_assert(user_ast->getASTContext(),
+                                                     shape) +
+                        bridge + "\n" + generated;
+    };
+    assemble(receiver_shape.snapshots);
     import_error.clear();
     ReceiverCallbackShape final_shape;
     const auto make_final_action =
@@ -5117,10 +5210,26 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
           receiver_record, final_shape, &specification.receiver(),
           receiver_record, &import_error, &p.debug_records, &specification);
     };
-    const bool complete_syntax_ok =
+    bool complete_syntax_ok =
         run_callback_tool(make_final_action, complete_source, [&] {
           return final_shape.valid && import_error.empty();
         });
+    if ((!complete_syntax_ok || !final_shape.valid || !import_error.empty()) &&
+        receiver_shape.snapshots.has_followed_members) {
+      // Followed members must never turn a probe that worked into one that
+      // does not compile: capture without them instead.
+      assemble(receiver_shape.snapshots_plain);
+      complete_syntax_ok = run_callback_tool(make_final_action, complete_source, [&] {
+        return final_shape.valid && import_error.empty();
+      });
+      if (complete_syntax_ok && final_shape.valid && import_error.empty() && report) {
+        auto *note = report->add_diagnostics();
+        note->set_stage("snapshot");
+        note->set_severity("note");
+        note->set_message("followed pointer and reference members were disabled because the "
+                          "generated capture code did not compile");
+      }
+    }
     if (!complete_syntax_ok || !final_shape.valid || !import_error.empty()) {
       error = import_error.empty() ? final_shape.error : import_error;
       if (error.empty()) {
@@ -5183,7 +5292,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
 
 void copy_value_snapshot(const tracer::ValueSnapshot &in,
                          clangtracer::context::v1::ValueSnapshot &out,
-                         bool include_members) {
+                         unsigned member_depth) {
   using Snapshot = clangtracer::context::v1::ValueSnapshot;
   out.set_status(static_cast<Snapshot::Status>(in.status));
   if (in.cpp_type) out.set_cpp_type(in.cpp_type);
@@ -5191,10 +5300,11 @@ void copy_value_snapshot(const tracer::ValueSnapshot &in,
   if (in.status != tracer::ValueSnapshot::Complete)
     return;
   if (!in.descriptor || !in.root_type || in.descriptor_size > 4096 ||
-      in.payload_size > 4096 || (!in.payload && in.payload_size != 0) ||
+      in.payload_size > tracer::snapshot_slice_request().load() ||
+      (!in.payload && in.payload_size != 0) ||
       in.container_role_count > 128 || in.record_type_count > 128 ||
-      (in.member_count && (!include_members || !in.members ||
-                           in.member_count > tracer::kMaxSnapshotMembers))) {
+      (in.member_count && (!member_depth || !in.members ||
+                           in.member_count > tracer::snapshot_member_request().load()))) {
     out.set_status(Snapshot::FAILED);
     out.set_detail("invalid snapshot storage or capture bounds");
     return;
@@ -5213,7 +5323,7 @@ void copy_value_snapshot(const tracer::ValueSnapshot &in,
       continue;
     auto &encoded = *out.add_members();
     encoded.set_name(member.name);
-    copy_value_snapshot(*member.snapshot, *encoded.mutable_snapshot(), false);
+    copy_value_snapshot(*member.snapshot, *encoded.mutable_snapshot(), member_depth - 1);
   }
 }
 
@@ -5221,7 +5331,7 @@ clangtracer::v1::Value to_proto_value(const tracer::TraceValue &v) {
   clangtracer::v1::Value out;
   out.set_type(static_cast<clangtracer::v1::ValueType>(v.type));
   if (v.snapshot)
-    copy_value_snapshot(*v.snapshot, *out.mutable_snapshot(), true);
+    copy_value_snapshot(*v.snapshot, *out.mutable_snapshot(), tracer::snapshot_depth_request().load());
   switch (v.type) {
   case tracer::ValueType::Int32:
   case tracer::ValueType::Bool:

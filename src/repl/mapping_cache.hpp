@@ -3,6 +3,9 @@
 #include <string>
 
 namespace tracer_repl {
+// Bump when generated mapping code changes meaning, so that headers cached by
+// an older build are never reused.
+inline constexpr const char *mapping_format = "mapping-v2";
 std::string mapping_digest(const std::string &text);
 std::string mapping_file_digest(const std::filesystem::path &path);
 std::string mapping_search_root(const std::filesystem::path &path);

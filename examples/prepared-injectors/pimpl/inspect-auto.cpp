@@ -67,7 +67,8 @@ bool check_auto_item(const tracer_repl::EventValue &root) {
   const int id = root.field("id").as<int>();
   if (id < 101 || id > 606 ||
       root.field("_stamp").as<std::uint64_t>() == 0 ||
-      root.fields().count("_stamp_snapshot") != 0)
+      root.fields().count("_stamp_snapshot") != 1 ||
+      root.field("_stamp_snapshot").field("serial").as<int>() != id + 700)
     return false;
   if (root.field("_unreadable").as<std::uint64_t>() == 0 ||
       root.fields().count("_unreadable_snapshot") != 0)

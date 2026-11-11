@@ -30,6 +30,28 @@ struct EncodeBudget {
   using Truncation = bool (*)(void*, ::tracer::compat::span<const PathStep>, std::uint64_t,
                               std::uint64_t) noexcept;
   std::size_t max_items = 100, items = 0, visits = 0, depth = 0, path_size = 0;
+  // Set only while a followed member is encoded: the object came from a
+  // pointer the target may have left stale, so out-of-line storage is read
+  // through these checked primitives instead of being dereferenced.
+  const char *(*copy)(const void *, std::size_t) noexcept = nullptr;
+  bool (*readable)(const void *, std::size_t, std::size_t) noexcept = nullptr;
+  bool (*in_scratch)(const void *, std::size_t) noexcept = nullptr;
+  // Checked reads are system calls: one followed member may spend this many.
+  std::size_t max_checks = 0, checks = 0;
+  bool spend() noexcept {
+    if (!max_checks || ++checks <= max_checks)
+      return true;
+    cut = "the checked reads of a followed member ran out: raise --checked-reads";
+    return false;
+  }
+  // The most elements of one container (4096 for events; --vector-elements for
+  // a followed member) and, in checked mode, the most bytes of one string
+  // (--string-bytes). Set by the caller from the user's limits.
+  std::size_t item_cap = 4096, string_cap = 0;
+  // Why part of a followed member was left out or shortened; a static text
+  // that names the option to raise.
+  const char *cut = nullptr;
+  bool truncated = false;
   CaptureLimits limits{};
   std::array<PathStep, 32> path{};
   Truncation truncation = nullptr;
@@ -50,9 +72,9 @@ struct EncodeBudget {
   void pop(std::size_t saved) noexcept { path_size = saved; }
   bool container(std::uint32_t field, std::size_t n,
                  std::size_t &selected) noexcept {
-    if (max_items > 4096)
+    if (max_items > item_cap)
       return false;
-    selected = std::min<std::size_t>({n, max_items, 4096});
+    selected = std::min<std::size_t>({n, max_items, item_cap});
     if (selected > limits.items - std::min(items, limits.items))
       return false;
     items += selected;
@@ -140,15 +162,48 @@ template <class T> struct Codec {
       return w.u64(f, static_cast<std::uint64_t>(v));
   }
 };
+// The bytes of a string in checked mode: copied out with a checked read.
+inline bool checked_text(EncodeBudget &b, const char *data, std::size_t size,
+                         std::string_view &text) noexcept {
+  if (!size) {
+    text = {};
+    return true;
+  }
+  // Checked mode always has a cap (--string-bytes); 0 keeps no bytes of a string.
+  if (size > b.string_cap) {
+    size = b.string_cap;
+    b.cut = "a string was shortened: raise --string-bytes (and --snapshot-slice, which also bounds it)";
+    b.truncated = true;
+  }
+  if (b.in_scratch && b.in_scratch(data, size)) {
+    text = std::string_view(data, size);
+    return true;
+  }
+  if (!b.spend())
+    return false;
+  const char *copy = b.copy(data, size);
+  if (!copy)
+    return false;
+  text = std::string_view(copy, size);
+  return true;
+}
 template <> struct Codec<std::string> {
   static bool write(BoundedProtoWriter &w, std::uint32_t f,
-                    const std::string &v, EncodeBudget &) noexcept {
+                    const std::string &v, EncodeBudget &b) noexcept {
+    if (b.copy) {
+      std::string_view text;
+      return checked_text(b, v.data(), v.size(), text) && w.string(f, text);
+    }
     return w.string(f, v);
   }
 };
 template <> struct Codec<std::string_view> {
   static bool write(BoundedProtoWriter &w, std::uint32_t f,
-                    std::string_view v, EncodeBudget &) noexcept {
+                    std::string_view v, EncodeBudget &b) noexcept {
+    if (b.copy) {
+      std::string_view text;
+      return checked_text(b, v.data(), v.size(), text) && w.string(f, text);
+    }
     return w.string(f, v);
   }
 };
@@ -264,8 +319,12 @@ bool encode_snapshot_pointer(BoundedProtoWriter &w, std::uint32_t field,
     return false;
   bool ok = w.u64(1, reinterpret_cast<std::uintptr_t>(pointer));
   if constexpr (CanSnapshotPointee<T>::value)
-    if (ok && owned && pointer)
-      ok = encode_present_value(w, 2, *pointer, budget);
+    if (ok && owned && pointer) {
+      // A pointee that is not wholly readable is left out, not dereferenced.
+      if (!budget.readable ||
+          (budget.spend() && budget.readable(pointer, sizeof(T), alignof(T))))
+        ok = encode_present_value(w, 2, *pointer, budget);
+    }
   return w.end_message() && ok;
 }
 
@@ -279,13 +338,19 @@ template <class T> struct Codec<std::unique_ptr<T>> {
 template <class T> struct Codec<std::shared_ptr<T>> {
   static bool write(BoundedProtoWriter &w, std::uint32_t field,
                     const std::shared_ptr<T> &value, EncodeBudget &budget) noexcept {
-    return encode_snapshot_pointer<T>(w, field, value.get(), value.use_count() != 0, budget);
+    // The control block is not read in checked mode; the pointee is checked.
+    return encode_snapshot_pointer<T>(w, field, value.get(),
+                                      budget.readable ? true : value.use_count() != 0, budget);
   }
 };
 
 template <class T> struct Codec<std::weak_ptr<T>> {
   static bool write(BoundedProtoWriter &w, std::uint32_t field,
-                    const std::weak_ptr<T> &value, EncodeBudget &) noexcept {
+                    const std::weak_ptr<T> &value, EncodeBudget &b) noexcept {
+    // In checked mode the control block is not read: the pointer is reported
+    // as expired, never as alive.
+    if (b.readable)
+      return w.begin_message(field) && w.boolean(1, true) && w.end_message();
     return w.begin_message(field) && w.boolean(1, value.expired()) && w.end_message();
   }
 };
@@ -339,6 +404,21 @@ template <class T, std::size_t N> struct Codec<std::array<T, N>> {
 template <class T, class A> struct Codec<std::vector<T, A>> {
   static bool write(BoundedProtoWriter &w, std::uint32_t f,
                     const std::vector<T, A> &v, EncodeBudget &b) noexcept {
+    if (b.readable) {
+      // Bit storage cannot be verified; a size no real vector has, or storage
+      // that is misaligned, is garbage, and is rejected before any read.
+      if constexpr (std::is_same_v<T, bool>)
+        return false;
+      else if (!v.empty()) {
+        if (v.size() > b.max_items) {
+          b.cut = "a vector was left out because it is larger than the limit: raise --vector-elements";
+          return false;
+        }
+        if (reinterpret_cast<std::uintptr_t>(v.data()) % alignof(T) != 0 || !b.spend() ||
+            !b.readable(v.data(), v.size() * sizeof(T), alignof(T)))
+          return false;
+      }
+    }
     return encode_sequence(w, f, v, b);
   }
 };

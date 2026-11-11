@@ -13,6 +13,8 @@
 #include "controller.hpp"
 #include "events.hpp"
 #include "interpreter.hpp"
+#include "mapping_cache.hpp"
+#include "prepared_libraries.hpp"
 
 using namespace tracer_repl;
 
@@ -24,6 +26,74 @@ void require(bool value, const char *message) {
 bool contains(const CppCompletions &results, const std::string &name) {
   return std::find(results.items.begin(), results.items.end(), name) !=
          results.items.end();
+}
+clangtracer::v1::ModuleMapping module_mapping(std::uint64_t begin, std::uint64_t end,
+                                              std::uint64_t offset, const std::string &device,
+                                              std::uint64_t inode, const std::string &path) {
+  clangtracer::v1::ModuleMapping mapping;
+  mapping.set_begin_address(begin);
+  mapping.set_end_address(end);
+  mapping.set_file_offset(offset);
+  mapping.set_device(device);
+  mapping.set_inode(inode);
+  mapping.set_path(path);
+  return mapping;
+}
+std::size_t confirmed_count(const clangtracer::v1::ModuleMapping &mapping,
+                            const std::string &maps) {
+  clangtracer::v1::ListModulesResponse modules;
+  modules.set_mapping_token("token");
+  *modules.add_mappings() = mapping;
+  std::istringstream input(maps);
+  const auto confirmed = confirmed_local_mappings(modules, input);
+  require(confirmed.mapping_token() == "token", "confirmation keeps other response fields");
+  return static_cast<std::size_t>(confirmed.mappings_size());
+}
+void check_confirmed_local_mappings() {
+#if defined(__linux__) && defined(__x86_64__)
+  const std::string maps =
+      "7f0000001000-7f0000003000 r-xp 00001000 fd:01 1234 /lib/libx.so\n"
+      "7f0000005000-7f0000006000 r--p 00000000 08:11 55 /opt/with space/liby.so\n"
+      "7f0000007000-7f0000008000 rw-p 00000000 00:00 0 \n"
+      "7f0000009000-7f000000a000 rw-p 00000000 00:00 0\n"
+      "not a maps line\n"
+      "7f000000b000-zz r--p 00000000 08:11 55 /bad/range.so\n";
+  const auto exact = module_mapping(0x7f0000001000, 0x7f0000003000, 0x1000, "fd:01", 1234, "/lib/libx.so");
+  require(confirmed_count(exact, maps) == 1, "exact mapping is confirmed");
+  require(confirmed_count(module_mapping(0x7f0000001000, 0x7f0000003000, 0x1000, "fd:01", 1234,
+                                         "/lib/libx.so"), "") == 0,
+          "empty maps confirm nothing");
+  require(confirmed_count(module_mapping(0x7f0000001001, 0x7f0000003000, 0x1000, "fd:01", 1234,
+                                         "/lib/libx.so"), maps) == 0, "begin must match");
+  require(confirmed_count(module_mapping(0x7f0000001000, 0x7f0000003001, 0x1000, "fd:01", 1234,
+                                         "/lib/libx.so"), maps) == 0, "end must match");
+  require(confirmed_count(module_mapping(0x7f0000001000, 0x7f0000003000, 0x2000, "fd:01", 1234,
+                                         "/lib/libx.so"), maps) == 0, "offset must match");
+  require(confirmed_count(module_mapping(0x7f0000001000, 0x7f0000003000, 0x1000, "fd:02", 1234,
+                                         "/lib/libx.so"), maps) == 0, "device must match");
+  require(confirmed_count(module_mapping(0x7f0000001000, 0x7f0000003000, 0x1000, "fd:01", 1235,
+                                         "/lib/libx.so"), maps) == 0, "inode must match");
+  require(confirmed_count(module_mapping(0x7f0000001000, 0x7f0000003000, 0x1000, "fd:01", 1234,
+                                         "/lib/liby.so"), maps) == 0, "path must match");
+  require(confirmed_count(module_mapping(0x7f0000001000, 0x7f0000003000, 0x1000, "fd:01", 1234,
+                                         "/other/libx.so"), maps) == 0,
+          "a different path is rejected when the rest matches");
+  require(confirmed_count(module_mapping(0x7f0000005000, 0x7f0000006000, 0, "08:11", 55,
+                                         "/opt/with space/liby.so"), maps) == 1,
+          "paths with spaces are confirmed");
+  require(confirmed_count(module_mapping(0x7f0000007000, 0x7f0000008000, 0, "00:00", 0, ""), maps) == 0,
+          "anonymous mappings are never confirmed");
+  require(confirmed_count(module_mapping(0x7f0000009000, 0x7f000000a000, 0, "00:00", 0, ""), maps) == 0,
+          "anonymous mappings without a path column are never confirmed");
+  require(confirmed_count(module_mapping(0x7f000000b000, 0x7f000000c000, 0, "08:11", 55,
+                                         "/bad/range.so"), maps) == 0,
+          "malformed lines are ignored");
+#else
+  require(confirmed_count(module_mapping(1, 2, 0, "fd:01", 3, "/lib/libx.so"),
+                          "1-2 r-xp 00000000 fd:01 3 /lib/libx.so\n") == 0,
+          "unsupported hosts confirm nothing");
+#endif
+  std::cout << "confirmed mapping checks passed\n";
 }
 struct TemporaryDirectory {
   std::filesystem::path path;
@@ -41,6 +111,28 @@ struct TemporaryDirectory {
 };
 } // namespace
 
+// A header cached by an older mapping format must never be reused.
+void check_mapping_cache_format() {
+  TemporaryDirectory directory;
+  const auto dependency = directory.path / "dependency.hpp";
+  std::ofstream(dependency) << "// dependency\n";
+  const auto header = directory.path / "mapping.hpp";
+  const std::string body = "// tracer-repl-dependency " + mapping_file_digest(dependency) +
+                           " " + std::string(1, '"') + dependency.string() + '"' + "\n";
+  save_mapping_header(header, "key", body);
+  require(valid_mapping_header(header, "key"), "a header of the current format is reused");
+  std::ifstream input(header);
+  std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+  const auto format = text.find(mapping_format);
+  require(format != std::string::npos, "the header records its format");
+  text.replace(format, std::string(mapping_format).size(), "mapping-v1");
+  std::ofstream(header) << text;
+  require(!valid_mapping_header(header, "key"), "a header of an older format is not reused");
+  save_mapping_header(header, "key", body);
+  require(valid_mapping_header(header, "key"), "an older header can be regenerated in place");
+  std::cout << "mapping cache format checks passed\n";
+}
+
 int main(int argc, char **argv) {
   if (argc > 1 && std::string(argv[1]) == "wait-checker") {
     for (;;)
@@ -53,6 +145,8 @@ int main(int argc, char **argv) {
       ::pause();
   }
   try {
+    check_mapping_cache_format();
+    check_confirmed_local_mappings();
     std::ostringstream output;
     Controller controller(Settings{}, output);
     Facade facade(controller);

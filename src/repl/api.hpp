@@ -111,15 +111,33 @@ public:
   // Owned state from a named Context event, in the event's state order.
   EventValue state_snapshot(std::size_t index = 0) const;
 
-  template <class T> T state_as(std::size_t index = 0) const {
+  template <class T, std::enable_if_t<!detail::reconstructed_codec<std::remove_cv_t<T>>::value, int> = 0>
+  T state_as(std::size_t index = 0) const {
     return state_snapshot(index).template as<T>();
   }
 
-  template <class T> T argument_as(std::size_t index) const {
+  template <class T, std::enable_if_t<detail::reconstructed_codec<std::remove_cv_t<T>>::value, int> = 0>
+  Reconstructed<std::remove_cv_t<T>> state_as(std::size_t index = 0) const {
+    return state_snapshot(index).template as<T>();
+  }
+
+  template <class T, std::enable_if_t<!detail::reconstructed_codec<std::remove_cv_t<T>>::value, int> = 0>
+  T argument_as(std::size_t index) const {
     return argument_snapshot(index).template as<T>();
   }
 
-  template <class T> T result_as() const {
+  template <class T, std::enable_if_t<detail::reconstructed_codec<std::remove_cv_t<T>>::value, int> = 0>
+  Reconstructed<std::remove_cv_t<T>> argument_as(std::size_t index) const {
+    return argument_snapshot(index).template as<T>();
+  }
+
+  template <class T, std::enable_if_t<!detail::reconstructed_codec<std::remove_cv_t<T>>::value, int> = 0>
+  T result_as() const {
+    return result_snapshot().template as<T>();
+  }
+
+  template <class T, std::enable_if_t<detail::reconstructed_codec<std::remove_cv_t<T>>::value, int> = 0>
+  Reconstructed<std::remove_cv_t<T>> result_as() const {
     return result_snapshot().template as<T>();
   }
 

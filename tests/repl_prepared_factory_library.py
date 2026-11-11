@@ -7,6 +7,7 @@ from pathlib import Path
 import select
 import subprocess
 import tempfile
+import time
 
 
 HEADER = r'''#pragma once
@@ -104,7 +105,21 @@ def build(compiler, root):
     ]))
 
 
-def check_return(args, root, target, env, kind, selector, inject_options, expect_factory):
+def start_external_server(args, root, env):
+    socket = root / "external.sock"
+    server = subprocess.Popen(
+        [args.server, "--listen", f"unix://{socket}", "--agent", args.agent, "--timeout", "60"],
+        cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 10
+    while not socket.exists():
+        assert server.poll() is None, "external server exited"
+        assert time.monotonic() < deadline, "external server did not listen"
+        time.sleep(0.05)
+    return server, f"unix://{socket}"
+
+
+def check_return(args, root, target, env, kind, selector, inject_options, expect_factory,
+                 endpoint=None):
     marker = root / f"destruction-{kind}.log"
     console_env = {**env, "TRACER_FIXTURE_DESTRUCTION_LOG": str(marker)}
     source = f'''%probe prepare "{selector}" --include item.hpp --output prepared_{kind}
@@ -121,14 +136,21 @@ if (snapshot.field("base_id").as<int>() != 53 || snapshot.field("label").as<std:
         source += '''void verify_item(const tracer_repl::Event& event) { auto item = event.result_as<HFW::HfwItem>(); if (item.base_id != 53 || item.label != "library-backed HfwItem" || item.revision != 827) throw std::runtime_error("wrong typed fields"); }
 verify_item(event);
 '''
+    else:
+        # Without a usable destructor library the record is rebuilt field by field.
+        source += '''void verify_reconstructed(const tracer_repl::Event& event) { auto item = event.result_as<HFW::HfwItem>(); if (item->base_id != 53 || item->label != "library-backed HfwItem" || item->revision != 827) throw std::runtime_error("wrong reconstructed fields"); }
+verify_reconstructed(event);
+'''
     success = f"FACTORY_LIBRARY_{kind.upper()}=1"
     source += f'''std::cout << "{success}" << std::endl;
 %quit
 '''
+    connection = (["--endpoint", endpoint] if endpoint
+                  else ["--server", args.server, "--agent", args.agent])
     with (root / f"{kind}.log").open("w+") as transcript:
         console = subprocess.Popen(
-            [args.repl, "--server", args.server, "--agent", args.agent, "--attach",
-             str(target.pid), "--timeout", "60", "--fail-fast"],
+            [args.repl, *connection, "--attach", str(target.pid), "--timeout", "60",
+             "--fail-fast"],
             cwd=root, env=console_env, stdin=subprocess.PIPE, stdout=transcript,
             stderr=subprocess.STDOUT, text=True,
         )
@@ -149,10 +171,8 @@ verify_item(event);
             destructor_calls, output,
         )
     else:
-        assert any(
-            "skipped HFW::HfwItem:" in line and "ngd::HeapObject::~HeapObject" in line
-            for line in output.splitlines()
-        ), output
+        assert any("reconstructed HFW::HfwItem" in line for line in output.splitlines()), output
+        assert not any("skipped HFW::HfwItem" in line for line in output.splitlines()), output
         assert not marker.exists(), output
     print(success)
 
@@ -173,14 +193,29 @@ def main():
             ("target", "pointer", "HFW::createItem(int)", " --snapshot-return-pointee", True),
             ("target", "reference", "HFW::referenceItem(int)", "", True),
             ("target_hidden", "hidden", "HFW::createItem(int)", " --snapshot-return-pointee", False),
+            ("target", "external", "HFW::referenceItem(int)", "", True),
         ):
             with subprocess.Popen([root / binary], cwd=root, env=env, stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT, text=True) as target:
                 try:
                     assert select.select([target.stdout], [], [], 10)[0], "target did not start"
                     assert target.stdout.readline().strip() == "ready", "target failed to start"
-                    check_return(args, root, target, env, kind, selector, inject_options,
-                                 expect_factory)
+                    if kind == "external":
+                        server, endpoint = start_external_server(args, root, env)
+                        try:
+                            check_return(args, root, target, env, kind, selector,
+                                         inject_options, expect_factory, endpoint)
+                        finally:
+                            if server.poll() is None:
+                                server.terminate()
+                                try:
+                                    server.wait(timeout=10)
+                                except subprocess.TimeoutExpired:
+                                    server.kill()
+                                    server.wait()
+                    else:
+                        check_return(args, root, target, env, kind, selector, inject_options,
+                                     expect_factory)
                 finally:
                     if target.poll() is None:
                         target.terminate()

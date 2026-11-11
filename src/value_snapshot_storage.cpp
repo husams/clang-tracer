@@ -1,5 +1,7 @@
 #include "value_snapshot_storage.hpp"
 #include "linux_syscalls.hpp"
+#include "snapshot_runtime_limits.hpp"
+#include <sys/mman.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -10,8 +12,36 @@
 
 namespace {
 constexpr std::size_t invalid_mark = std::numeric_limits<std::size_t>::max();
-thread_local std::array<std::byte, 16 * 1024> storage;
+// The per-thread storage starts as this array and moves to a mapping when a
+// probe asks for more (--snapshot-arena), but only while nothing is in use.
+constexpr std::size_t default_arena = tracer::kDefaultArenaBytes;
+thread_local std::array<std::byte, default_arena> default_storage;
+struct Arena {
+  std::byte *data = default_storage.data();
+  std::size_t size = default_arena;
+  ~Arena() {
+    if (data != default_storage.data())
+      ::munmap(data, size);
+  }
+};
+thread_local Arena arena;
 thread_local std::atomic<std::size_t> used{0};
+void ensure_arena() noexcept {
+  const std::size_t wanted = tracer::snapshot_arena_request().load(std::memory_order_relaxed);
+  if (wanted <= arena.size || used.load(std::memory_order_relaxed) != 0)
+    return;
+  void *mapping = ::mmap(nullptr, wanted, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mapping == MAP_FAILED)
+    return;
+  if (arena.data != default_storage.data())
+    ::munmap(arena.data, arena.size);
+  arena.data = static_cast<std::byte *>(mapping);
+  arena.size = wanted;
+}
+void ensure_scratch() noexcept;
+std::size_t slice_bytes() noexcept {
+  return tracer::snapshot_slice_request().load(std::memory_order_relaxed);
+}
 thread_local std::atomic<bool> updating{false};
 static_assert(std::atomic<std::size_t>::is_always_lock_free &&
                   std::atomic<bool>::is_always_lock_free,
@@ -65,7 +95,23 @@ bool readable_object(std::uintptr_t address, std::size_t size) noexcept {
 }
 } // namespace
 
+extern "C" void tracer_snapshot_configure(unsigned arena_bytes, unsigned slice, unsigned members,
+                                          unsigned depth) noexcept {
+  // The largest request of any installed probe wins.
+  auto raise = [](std::atomic<std::uint32_t> &target, std::uint32_t value) {
+    auto current = target.load(std::memory_order_relaxed);
+    while (current < value && !target.compare_exchange_weak(current, value)) {
+    }
+  };
+  raise(tracer::snapshot_arena_request(), arena_bytes);
+  raise(tracer::snapshot_slice_request(), slice);
+  raise(tracer::snapshot_text_request(), slice);
+  raise(tracer::snapshot_member_request(), members);
+  raise(tracer::snapshot_depth_request(), depth);
+}
 extern "C" std::size_t tracer_snapshot_mark() noexcept {
+  ensure_arena();
+  ensure_scratch();
   return updating.load(std::memory_order_acquire)
              ? invalid_mark
              : used.load(std::memory_order_relaxed);
@@ -81,13 +127,13 @@ extern "C" void tracer_snapshot_reset(std::size_t mark) noexcept {
 extern "C" std::byte *tracer_snapshot_storage(std::size_t *capacity) noexcept {
   if (updating.exchange(true, std::memory_order_acquire)) {
     *capacity = 0;
-    return storage.data() + storage.size();
+    return arena.data + arena.size;
   }
   const auto begin = used.load(std::memory_order_relaxed);
-  *capacity = std::min<std::size_t>(4096, storage.size() - begin);
+  *capacity = std::min<std::size_t>(slice_bytes(), arena.size - begin);
   used.store(begin + *capacity, std::memory_order_relaxed);
   updating.store(false, std::memory_order_release);
-  return storage.data() + begin;
+  return arena.data + begin;
 }
 extern "C" void tracer_snapshot_commit(std::size_t mark,
                                        std::size_t bytes) noexcept {
@@ -168,4 +214,102 @@ extern "C" bool tracer_snapshot_rtti_matches(
   char end = '\0';
   return read_snapshot_memory(name + expected_len, &end, sizeof(end)) &&
          end == '\0' && readable_object(address, object_size);
+}
+
+extern "C" bool tracer_snapshot_readable(const void *object, std::size_t size,
+                                         std::size_t alignment) noexcept {
+  const PreserveErrno preserve_errno;
+  const auto address = reinterpret_cast<std::uintptr_t>(object);
+  return address && size && alignment && address % alignment == 0 &&
+         readable_object(address, size);
+}
+
+namespace {
+// Text copied out of the target is staged here, not on the caller's stack.
+thread_local std::array<char, tracer::kDefaultSliceBytes> default_scratch;
+struct Scratch {
+  char *data = default_scratch.data();
+  std::size_t size = default_scratch.size();
+  ~Scratch() {
+    if (data != default_scratch.data())
+      ::munmap(data, size);
+  }
+};
+thread_local Scratch text_scratch;
+// Grows to hold the longest string a probe may capture (--string-bytes).
+void ensure_scratch() noexcept {
+  const std::size_t wanted = tracer::snapshot_text_request().load(std::memory_order_relaxed) + 1;
+  if (wanted <= text_scratch.size)
+    return;
+  void *mapping = ::mmap(nullptr, wanted, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mapping == MAP_FAILED)
+    return;
+  if (text_scratch.data != default_scratch.data())
+    ::munmap(text_scratch.data, text_scratch.size);
+  text_scratch.data = static_cast<char *>(mapping);
+  text_scratch.size = wanted;
+}
+} // namespace
+
+extern "C" const char *tracer_snapshot_copy_bytes(const void *source,
+                                                  std::size_t size) noexcept {
+  const PreserveErrno preserve_errno;
+  if (!size || size > text_scratch.size)
+    return size ? nullptr : text_scratch.data;
+  return read_snapshot_memory(reinterpret_cast<std::uintptr_t>(source),
+                              text_scratch.data, size)
+             ? text_scratch.data
+             : nullptr;
+}
+
+extern "C" bool tracer_snapshot_is_scratch(const void *address, std::size_t size) noexcept {
+  const auto begin = reinterpret_cast<std::uintptr_t>(text_scratch.data);
+  const auto value = reinterpret_cast<std::uintptr_t>(address);
+  return value >= begin && size <= text_scratch.size &&
+         value - begin <= text_scratch.size - size;
+}
+
+extern "C" const char *tracer_snapshot_read_cstring(const char *text,
+                                                    std::size_t capacity,
+                                                    std::size_t *length) noexcept {
+  const PreserveErrno preserve_errno;
+  auto address = reinterpret_cast<std::uintptr_t>(text);
+  const auto system_page_size = ::getpagesize();
+  capacity = std::min(capacity, text_scratch.size);
+  if (!address || !length || !capacity || system_page_size <= 0)
+    return nullptr;
+  const auto page = static_cast<std::uintptr_t>(system_page_size);
+  std::size_t used = 0;
+  while (used < capacity) {
+    // Read up to the next page boundary so a string ending at an unmapped
+    // page is read without touching that page.
+    const auto chunk = std::min<std::size_t>(
+        {static_cast<std::size_t>(page - address % page), capacity - used, 256});
+    if (!read_snapshot_memory(address, text_scratch.data + used, chunk))
+      return nullptr;
+    if (const void *end = std::memchr(text_scratch.data + used, 0, chunk)) {
+      *length = static_cast<std::size_t>(static_cast<const char *>(end) - text_scratch.data);
+      return text_scratch.data;
+    }
+    used += chunk;
+    address += chunk;
+  }
+  *length = capacity;
+  return text_scratch.data;
+}
+
+// Like tracer_snapshot_storage, but leaves `reserve` bytes of the thread's
+// storage for the roots that are still to be encoded.
+extern "C" std::byte *tracer_snapshot_storage_limited(std::size_t *capacity,
+                                                      std::size_t reserve) noexcept {
+  if (updating.exchange(true, std::memory_order_acquire)) {
+    *capacity = 0;
+    return arena.data + arena.size;
+  }
+  const auto begin = used.load(std::memory_order_relaxed);
+  const auto left = arena.size - begin;
+  *capacity = left > reserve ? std::min<std::size_t>(slice_bytes(), left - reserve) : 0;
+  used.store(begin + *capacity, std::memory_order_relaxed);
+  updating.store(false, std::memory_order_release);
+  return arena.data + begin;
 }
