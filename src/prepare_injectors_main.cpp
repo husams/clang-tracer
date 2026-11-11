@@ -3,10 +3,12 @@
 #include "module_index_internal.hpp"
 #include "tracer/module_index.hpp"
 #include "header_context.hpp"
+#include "snapshot_limits.hpp"
 #include "prepare_elf_signature.hpp"
 #include "prepared_contract.hpp"
 #include "tracer/compiler_options.hpp"
 
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -14,6 +16,7 @@
 #include <map>
 #include <optional>
 #include <stdexcept>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -38,6 +41,9 @@ int main(int argc, char **argv) {
     std::vector<std::string> extra_arguments;
     bool metadata_only = false;
     bool member = false;
+    bool no_automatic_members = false;
+    clangtracer::v1::SnapshotLimits limits;
+    std::set<std::string> limit_given;
     for (int i = 1; i < argc; ++i) {
       const std::string option = argv[i];
       if (option == "--help") {
@@ -45,7 +51,10 @@ int main(int argc, char **argv) {
                      "HEADER "
                      "--compdb FILE [--translation-unit FILE] "
                      "--output NEW_DIRECTORY [--module ELF] [--metadata-only] "
-                     "[--extra-arg ARG]...\n"
+                     "[--no-automatic-members] [--follow-depth N] [--follow-members N] "
+                     "[--record-members N] [--nested-depth N] [--string-bytes N] "
+                     "[--vector-elements N] [--checked-reads N] [--snapshot-reserve N] "
+                     "[--snapshot-arena N] [--snapshot-slice N] [--extra-arg ARG]...\n"
                      "ELF preparation: --selector SELECTOR --signature TYPE "
                      "--module ELF --output NEW_DIRECTORY [--member] [--metadata-only]\n"
                      "Indexed preparation: --selector SELECTOR --module-index INDEX "
@@ -55,11 +64,21 @@ int main(int argc, char **argv) {
                      "--module pins the package to an ELF image.\n";
         return 0;
       }
-      if (option == "--metadata-only" || option == "--member") {
-        auto &flag = option == "--metadata-only" ? metadata_only : member;
+      if (option == "--metadata-only" || option == "--member" ||
+          option == "--no-automatic-members") {
+        auto &flag = option == "--metadata-only" ? metadata_only
+                     : option == "--member" ? member : no_automatic_members;
         if (flag)
           throw std::runtime_error("duplicate option: " + option);
         flag = true;
+        continue;
+      }
+      if (option.rfind("--", 0) == 0 && tracer::find_limit(option.substr(2))) {
+        if (++i == argc || std::string(argv[i]).empty())
+          throw std::runtime_error("missing value for " + option);
+        if (!limit_given.insert(option).second)
+          throw std::runtime_error("duplicate option: " + option);
+        tracer::set_limit(limits, option.substr(2), argv[i]);
         continue;
       }
       if (option != "--module-index" && option != "--generated" && option != "--id" &&
@@ -77,6 +96,20 @@ int main(int argc, char **argv) {
       else if (!options.emplace(option, argv[i]).second)
         throw std::runtime_error("duplicate option: " + option);
     }
+    // Every limit may also come from the environment.
+    for (const auto &spec : tracer::kLimitSpecs)
+      if (!limit_given.count(std::string("--") + spec.name))
+        if (const char *text = std::getenv(spec.env); text && *text) {
+          try {
+            tracer::set_limit(limits, spec.name, text);
+          } catch (const std::invalid_argument &error) {
+            throw std::invalid_argument(std::string(error.what()) + " (from " + spec.env + ")");
+          }
+        }
+    // The environment carries the opt-out where the REPL command line cannot.
+    if (const char *setting = std::getenv("TRACER_PREPARE_AUTOMATIC_MEMBERS");
+        setting && std::string(setting) == "off")
+      no_automatic_members = true;
     for (const auto *option : {"--selector", "--output"})
       if (!options.count(option))
         throw std::runtime_error(std::string("missing required option: ") +
@@ -167,26 +200,42 @@ int main(int argc, char **argv) {
           extra_arguments, command.arguments, command.directory);
       for (const auto &argument : supplemental)
         command.arguments.push_back(cl_driver ? "/clang:" + argument : argument);
-      const auto resolve_adapter = [&](bool pointer_layouts) {
+      const auto resolve_adapter = [&](bool pointer_layouts, int member_level) {
         auto callable = tracer::client::resolve_header_callable(
-            options.at("--selector"), context, command, pointer_layouts);
+            options.at("--selector"), context, command, pointer_layouts, member_level, limits);
         auto &adapter = *callable.spec.mutable_prepared();
         tracer::client::verify_prepared_adapter(options.at("--selector"), adapter,
                                                 callable, pointer_layouts);
         return callable;
       };
-      try {
-        return resolve_adapter(true);
-      } catch (const std::runtime_error &error) {
-        const auto original = std::current_exception();
+      struct Step {
+        bool pointer_layouts;
+        int member_level;
+        const char *what;
+      };
+      // Each step captures less than the one before, so a package that cannot
+      // be built with the fuller captures still gets the narrower ones.
+      const std::vector<Step> steps = no_automatic_members
+          ? std::vector<Step>{{true, 0, "no automatic member captures"},
+                              {false, 0, "address-only pointers"}}
+          : std::vector<Step>{{true, 3, "automatic member captures"},
+                              {true, 2, "opaque implementation pointer captures"},
+                              {true, 1, "derived-class member captures"},
+                              {false, 1, "address-only pointers"}};
+      std::vector<std::string> failures;
+      for (const auto &step : steps) {
         try {
-          auto callable = resolve_adapter(false);
-          std::cerr << "prepare: retaining address-only pointers: " << error.what() << '\n';
+          auto callable = resolve_adapter(step.pointer_layouts, step.member_level);
+          for (std::size_t i = 0; i < failures.size(); ++i)
+            std::cerr << "prepare: without " << steps[i].what << ": " << failures[i] << '\n';
+          if (!failures.empty())
+            std::cerr << "prepare: retaining " << step.what << '\n';
           return callable;
-        } catch (const std::runtime_error &) {
-          std::rethrow_exception(original);
+        } catch (const std::runtime_error &error) {
+          failures.emplace_back(error.what());
         }
       }
+      throw std::runtime_error(failures.front());
     }();
     const auto prepared = tracer::client::write_prepared_package(
         resolved, options.at("--selector"), module, digest, output, metadata_only,

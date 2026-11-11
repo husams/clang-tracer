@@ -1,4 +1,5 @@
 #include "context_schema.hpp"
+#include "snapshot_members.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -325,9 +326,10 @@ struct Builder {
       out.kind = SchemaKind::float64;
       return out;
     }
-    if (snapshot && t->isPointerType()) {
+    if (snapshot && (t->isPointerType() || t->isReferenceType())) {
+      // A reference member is captured as the address it stores.
       out.kind = SchemaKind::unsigned_integer;
-      out.bit_width = ast.getTypeSize(t);
+      out.bit_width = ast.getTypeSize(ast.VoidPtrTy);
       return out;
     }
     if (snapshot) {
@@ -1106,6 +1108,14 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
               "    const auto sign = std::uint64_t(1) << (width-1);\n"
               "    return static_cast<T>(static_cast<std::int64_t>((bits ^ sign) - sign));\n"
               "  } else { return static_cast<T>(bits); }\n"
+              "}\n"
+              "inline std::uint64_t reference_address(const void* object, std::size_t offset) {\n"
+              "  std::uint64_t address = 0;\n"
+              "  __builtin_memcpy(&address, static_cast<const unsigned char*>(object) + offset, sizeof(address));\n"
+              "  return address;\n"
+              "}\n"
+              "template<class T> const T* reference_target(const void* object, std::size_t offset) {\n"
+              "  return reinterpret_cast<const T*>(static_cast<std::uintptr_t>(reference_address(object, offset)));\n"
               "}\n}\n";
   }
   for (const auto *record : records) {
@@ -1157,6 +1167,11 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
                        ">(__builtin_addressof(" + object + "), " +
                        std::to_string(ast.getASTRecordLayout(r).getFieldOffset(field->getFieldIndex())) +
                        ", " + std::to_string(width) + ")";
+        } else if (snapshot && field->getType()->isReferenceType()) {
+          auto &ast = r->getASTContext();
+          expression = "snapshot_access::reference_address(__builtin_addressof(" + object + "), " +
+                       std::to_string(ast.getASTRecordLayout(r).getFieldOffset(field->getFieldIndex()) /
+                                      ast.getCharWidth()) + ")";
         } else if (access != clang::AS_public) {
           if (!snapshot || field->getType()->isReferenceType()) {
             result.error = "non-public member cannot be automatically serialized: " + name;
@@ -1187,7 +1202,7 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
            << " static bool write(BoundedProtoWriter& w, std::uint32_t field, "
               "const ::"
            << type_name << "& value, EncodeBudget& budget) noexcept {\n"
-           << "  if (budget.max_items > 4096 || !w.begin_message(field)) "
+           << "  if (budget.max_items > budget.item_cap || !w.begin_message(field)) "
               "return false; std::uint32_t field_number=1; const bool "
               "ok=write_fields(w,value,budget,field_number); return "
               "w.end_message() && ok;\n }\n};\n";
@@ -1281,30 +1296,55 @@ CodecSourceResult render_snapshot_member_accessors(
   result.source += "\nnamespace tracer::context_engine::snapshot_access {\n";
   for (std::size_t i = 0; i < members.size(); ++i) {
     const auto &accessor = members[i];
-    auto *root = accessor.root_type;
-    root = root ? root->getDefinition() : nullptr;
-    const clang::FieldDecl *field = nullptr;
-    if (root)
-      for (const auto *candidate : root->fields())
-        if (candidate->getNameAsString() == accessor.member_name) {
-          field = candidate;
-          break;
-        }
-    if (!root || !field || !field->getType()->isPointerType()) {
-      result.error = "followed snapshot field is not a direct raw pointer field";
+    std::vector<::tracer::snapshot_members::Step> steps;
+    if (!::tracer::snapshot_members::resolve(accessor.root_type, accessor.member_name, steps)) {
+      result.error = "followed snapshot field is not a raw pointer or reference member path";
       result.source.clear();
       return result;
     }
-    const auto tag = "FollowMemberTag" + std::to_string(i);
-    const auto member = "snapshot_member_" + std::to_string(i);
-    result.source += "struct " + tag +
-                     " { friend constexpr auto member(" + tag + "); };\n"
-                     "template struct Grant<" + tag + ", &::" +
-                     record_spelling(root) + "::" + accessor.member_name +
-                     ">;\n"
-                     "template<class T> decltype(auto) " + member +
-                     "(const T& value) { return value.*member(" + tag +
-                     "{}); }\n";
+    const auto *final_field = steps.back().field;
+    const auto referent = ::tracer::snapshot_members::referent(final_field->getType())
+                              .getUnqualifiedType().getCanonicalType();
+    const auto *referent_record = ::tracer::snapshot_members::referent_record(final_field->getType());
+    const auto referent_name = referent_record ? "::" + record_spelling(referent_record)
+                                                   : referent.getAsString(clang::PrintingPolicy(ast.getLangOpts()));
+    // Each hop reads one member through the same private-member grant used by
+    // the field codecs. The cast ignores base access.
+    std::string body, current = "value";
+    for (std::size_t k = 0; k < steps.size(); ++k) {
+      const auto *field = steps[k].field;
+      const auto *owner = llvm::cast<clang::CXXRecordDecl>(field->getParent());
+      const auto object = "((const ::" + record_spelling(owner) + "&)" + current + ")";
+      const auto hop = std::to_string(i) + "_" + std::to_string(k);
+      if (field->getType()->isReferenceType()) {
+        auto &context = owner->getASTContext();
+        body += "  return reference_target<" + referent_name + ">(__builtin_addressof(" + object +
+                "), " +
+                std::to_string(context.getASTRecordLayout(owner).getFieldOffset(field->getFieldIndex()) /
+                               context.getCharWidth()) + ");\n";
+        break;
+      }
+      const auto tag = "FollowMemberTag" + hop;
+      result.source += "struct " + tag + " { friend constexpr auto member(" + tag + "); };\n"
+                       "template struct Grant<" + tag + ", &::" + record_spelling(owner) + "::" +
+                       field->getNameAsString() + ">;\n";
+      const auto value = "hop" + hop;
+      body += "  auto&& " + value + " = " + object + ".*member(" + tag + "{});\n";
+      if (k + 1 == steps.size()) {
+        body += "  return static_cast<const " + referent_name + "*>(" + value + ");\n";
+      } else if (steps[k].deref) {
+        const auto pointer = "owned" + hop;
+        body += "  const auto* " + pointer + " = " + value + ".get();\n"
+                "  if (!" + pointer + " || !tracer_snapshot_readable(" + pointer + ", sizeof(*" +
+                pointer + "), alignof(std::remove_reference_t<decltype(*" + pointer +
+                ")>))) return nullptr;\n";
+        current = "(*" + pointer + ")";
+      } else {
+        current = value;
+      }
+    }
+    result.source += "template<class T> const " + referent_name + "* snapshot_member_" +
+                     std::to_string(i) + "(const T& value) {\n" + body + "}\n";
   }
   result.source += "}\n";
   return result;

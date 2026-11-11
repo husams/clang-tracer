@@ -42,9 +42,12 @@ public:
     T__154 = 155, T__155 = 156, T__156 = 157, T__157 = 158, T__158 = 159,
     T__159 = 160, T__160 = 161, T__161 = 162, T__162 = 163, T__163 = 164,
     T__164 = 165, T__165 = 166, T__166 = 167, T__167 = 168, T__168 = 169,
-    T__169 = 170, T__170 = 171, UINT = 172, STRING = 173, SHELL = 174, METADATA_ONLY = 175,
-    SQLITE = 176, STACK = 177, CWD = 178, SIGNATURE = 179, MEMBER = 180,
-    SNAPSHOT_RETURN_POINTEE = 181, WORD = 182, WS = 183
+    T__169 = 170, T__170 = 171, T__171 = 172, T__172 = 173, T__173 = 174,
+    T__174 = 175, T__175 = 176, T__176 = 177, T__177 = 178, T__178 = 179,
+    T__179 = 180, T__180 = 181, T__181 = 182, UINT = 183, STRING = 184,
+    SHELL = 185, METADATA_ONLY = 186, SQLITE = 187, STACK = 188, CWD = 189,
+    SIGNATURE = 190, MEMBER = 191, SNAPSHOT_RETURN_POINTEE = 192, WORD = 193,
+    WS = 194
   };
 
   enum {
@@ -53,16 +56,16 @@ public:
     RuleDetach = 9, RuleModules = 10, RuleModuleIndex = 11, RuleModuleBuildOption = 12,
     RuleModuleQueryOption = 13, RuleModuleShowOption = 14, RuleModuleEmitOption = 15,
     RuleThreads = 16, RuleSymbols = 17, RuleSymbolOption = 18, RuleProbe = 19,
-    RulePrepareOption = 20, RuleResolveOption = 21, RuleValidateOption = 22,
-    RuleDeployOption = 23, RuleInterceptor = 24, RuleEvents = 25, RuleCollect = 26,
-    RuleRecord = 27, RuleStreamOption = 28, RuleCpp = 29, RuleShell = 30,
-    RuleComplete = 31, RuleType = 32, RuleHelp = 33, RuleQuit = 34, RuleBulkTrace = 35,
-    RuleBulkTraceOption = 36, RuleValue = 37, RuleKeyword = 38, RuleMemory = 39,
-    RuleProbeEntry = 40, RuleProbeReload = 41, RuleTargetLaunch = 42, RuleLaunchOption = 43,
-    RuleChildList = 44, RuleTargetCall = 45, RuleLocalPerf = 46, RuleTargetLibrary = 47,
-    RuleInstructions = 48, RuleInstructionOption = 49, RuleWatchpoint = 50,
-    RuleStackFilter = 51, RuleContextEventBytes = 52, RuleExtraCompileOption = 53,
-    RuleCwdOption = 54
+    RulePrepareOption = 20, RuleLimitOption = 21, RuleResolveOption = 22,
+    RuleValidateOption = 23, RuleDeployOption = 24, RuleInterceptor = 25,
+    RuleEvents = 26, RuleCollect = 27, RuleRecord = 28, RuleStreamOption = 29,
+    RuleCpp = 30, RuleShell = 31, RuleComplete = 32, RuleType = 33, RuleHelp = 34,
+    RuleQuit = 35, RuleBulkTrace = 36, RuleBulkTraceOption = 37, RuleValue = 38,
+    RuleKeyword = 39, RuleMemory = 40, RuleProbeEntry = 41, RuleProbeReload = 42,
+    RuleTargetLaunch = 43, RuleLaunchOption = 44, RuleChildList = 45, RuleTargetCall = 46,
+    RuleLocalPerf = 47, RuleTargetLibrary = 48, RuleInstructions = 49, RuleInstructionOption = 50,
+    RuleWatchpoint = 51, RuleStackFilter = 52, RuleContextEventBytes = 53,
+    RuleExtraCompileOption = 54, RuleCwdOption = 55
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -103,6 +106,7 @@ public:
   class SymbolOptionContext;
   class ProbeContext;
   class PrepareOptionContext;
+  class LimitOptionContext;
   class ResolveOptionContext;
   class ValidateOptionContext;
   class DeployOptionContext;
@@ -468,6 +472,7 @@ public:
     antlr4::tree::TerminalNode *SIGNATURE();
     antlr4::tree::TerminalNode *MEMBER();
     antlr4::tree::TerminalNode *METADATA_ONLY();
+    LimitOptionContext *limitOption();
     ExtraCompileOptionContext *extraCompileOption();
     CwdOptionContext *cwdOption();
 
@@ -477,6 +482,20 @@ public:
   };
 
   PrepareOptionContext* prepareOption();
+
+  class  LimitOptionContext : public antlr4::ParserRuleContext {
+  public:
+    LimitOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    antlr4::tree::TerminalNode *UINT();
+    antlr4::tree::TerminalNode *WORD();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  LimitOptionContext* limitOption();
 
   class  ResolveOptionContext : public antlr4::ParserRuleContext {
   public:
@@ -497,6 +516,7 @@ public:
     ValidateOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
     ResolveOptionContext *resolveOption();
+    LimitOptionContext *limitOption();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;

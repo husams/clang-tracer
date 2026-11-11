@@ -3,11 +3,15 @@
 
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <list>
 #include <map>
+#include <memory>
+#include <new>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -28,6 +32,23 @@ using ScalarValue = std::variant<bool, std::int64_t, std::uint64_t, double>;
 // EventCodec<T>::decode for classes requiring a constructor/factory.
 template <class T> struct EventRecord;
 template <class T, class Enable = void> struct EventCodec;
+class EventValue;
+template <class T> class Reconstructed;
+
+namespace detail {
+// True when EventCodec<T> decodes into Reconstructed<T> rather than T.
+template <class T, class = void>
+struct reconstructed_codec_impl : std::false_type {};
+template <class T>
+struct reconstructed_codec_impl<
+    T, std::void_t<decltype(EventCodec<T>::decode(std::declval<const EventValue &>()))>>
+    : std::is_same<decltype(EventCodec<T>::decode(std::declval<const EventValue &>())),
+                   Reconstructed<T>> {};
+template <class T, bool = std::is_class_v<T>>
+struct reconstructed_codec : std::false_type {};
+template <class T>
+struct reconstructed_codec<T, true> : reconstructed_codec_impl<T> {};
+} // namespace detail
 
 template <class Class, class Member> struct EventMember {
   const char *name;
@@ -108,6 +129,7 @@ public:
         descriptor_type_(std::move(descriptor_type)) {}
   bool matches_record_type(std::string_view name) const;
   const std::string &cpp_type() const { return type_; }
+  const std::string &descriptor_type() const { return descriptor_type_; }
   const Data &data() const { return data_; }
   bool is_null() const { return std::holds_alternative<std::monostate>(data_); }
   const EventValue &field(const std::string &name) const {
@@ -139,7 +161,8 @@ public:
       return text->size();
     throw std::invalid_argument("event scalar has no size");
   }
-  template <class T> T as() const {
+  template <class T, std::enable_if_t<!detail::reconstructed_codec<std::remove_cv_t<T>>::value, int> = 0>
+  T as() const {
     static_assert(!std::is_reference_v<T> && !std::is_pointer_v<T>,
                   "event conversion returns owning values, not target "
                   "references/pointers");
@@ -165,6 +188,198 @@ public:
       return EventCodec<std::remove_cv_t<T>>::decode(*this);
     }
   }
+  template <class T, std::enable_if_t<detail::reconstructed_codec<std::remove_cv_t<T>>::value, int> = 0>
+  Reconstructed<std::remove_cv_t<T>> as() const {
+    return EventCodec<std::remove_cv_t<T>>::decode(*this);
+  }
+};
+
+namespace detail {
+template <class T> T *pointee_address(Reconstructed<T> &value) {
+  return value.get();
+}
+template <class T> T *pointee_address(T &value) { return std::addressof(value); }
+} // namespace detail
+
+// Specialize with static Reconstructed<T> decode(const EventValue &) to
+// rebuild a record that cannot be constructed locally. Generated mappings also
+// provide fill(), which rebuilds the record in place over existing storage.
+template <class T> struct ReconstructedRecord;
+
+// A record rebuilt field by field for inspection. No constructor or destructor
+// of T runs and its vptr is null, so read fields and call non-virtual members only.
+template <class T> class Reconstructed {
+public:
+  Reconstructed() {
+    constexpr std::size_t alignment =
+        alignof(T) > sizeof(void *) ? alignof(T) : sizeof(void *);
+    constexpr std::size_t size =
+        (sizeof(T) + alignment - 1) / alignment * alignment;
+    storage_ = std::aligned_alloc(alignment, size);
+    if (!storage_)
+      throw std::bad_alloc();
+    for (std::size_t i = 0; i < size; ++i)
+      static_cast<unsigned char *>(storage_)[i] = 0;
+    owner_ = true;
+  }
+  Reconstructed(const Reconstructed &) = delete;
+  Reconstructed &operator=(const Reconstructed &) = delete;
+  Reconstructed &operator=(Reconstructed &&) = delete;
+  Reconstructed(Reconstructed &&other) noexcept
+      : storage_(std::exchange(other.storage_, nullptr)),
+        owner_(std::exchange(other.owner_, false)),
+        cleanup_(std::move(other.cleanup_)) {
+    other.cleanup_.clear();
+  }
+  ~Reconstructed() {
+    if (!owner_)
+      return;
+    for (auto cleanup = cleanup_.rbegin(); cleanup != cleanup_.rend(); ++cleanup)
+      cleanup->first(cleanup->second);
+    std::free(storage_);
+  }
+
+  T &operator*() const { return *get(); }
+  T *operator->() const { return get(); }
+  T *get() const { return static_cast<T *>(storage_); }
+
+  // Move-construct one member from its decoded value.
+  template <class C, class M>
+  void decode(M C::*member, const EventValue &source) {
+    using Value = std::remove_cv_t<M>;
+    list().reserve(list().size() + 1);
+    void *address = slot(member);
+    ::new (address) Value(source.template as<Value>());
+    if constexpr (!std::is_trivially_destructible_v<Value>) {
+      void (*destroy)(void *) = [](void *object) {
+        static_cast<Value *>(object)->~Value();
+      };
+      list().emplace_back(destroy, address);
+    }
+  }
+
+  // Rebuild a member whose record is itself reconstructed, in place.
+  template <class Nested, class C, class M>
+  void fill_nested(M C::*member, const EventValue &source) {
+    Reconstructed<Nested> part(static_cast<Nested *>(slot(member)), &list());
+    ReconstructedRecord<Nested>::fill(part, source);
+  }
+
+  // Point a raw pointer member at a decoded pointee when `owner` has
+  // `<name>_snapshot` whose record type is `type_name`; otherwise leave it null.
+  template <class Pointee, class C, class M>
+  bool follow(M C::*member, const EventValue &owner, const char *name,
+              const char *type_name) {
+    using Slot = std::remove_cv_t<M>;
+    static_assert(std::is_pointer_v<Slot>, "only raw pointer members can follow");
+    Pointee *pointee = hold<Pointee>(owner, name, type_name);
+    if (!pointee)
+      return false;
+    ::new (slot(member)) Slot(pointee);
+    return true;
+  }
+
+  // Like follow() for a reference member of type `Declared &` stored at
+  // `offset`, which no member pointer can name.
+  template <class Declared, class Pointee>
+  bool follow_reference(std::size_t offset, const EventValue &owner,
+                        const char *name, const char *type_name) {
+    Pointee *pointee = hold<Pointee>(owner, name, type_name);
+    if (!pointee)
+      return false;
+    Declared *reference = pointee;
+    ::new (static_cast<unsigned char *>(storage_) + offset) Declared *(reference);
+    return true;
+  }
+
+  // A char pointer member whose snapshot holds the string; it points at a copy
+  // owned by this object. The member stays null when no string was captured.
+  template <class C, class M>
+  void follow_text(M C::*member, const EventValue &owner, const char *name) {
+    const auto &fields = owner.fields();
+    const auto found = fields.find(std::string(name) + "_snapshot");
+    if (found == fields.end() || found->second.is_null())
+      return;
+    const std::string *text = hold_value<std::string>(found->second);
+    ::new (slot(member)) std::remove_cv_t<M>(
+        reinterpret_cast<std::remove_cv_t<M>>(const_cast<char *>(text->c_str())));
+  }
+
+  // A pointer member to an arithmetic or enum value whose snapshot holds one
+  // copy of that value.
+  template <class C, class M>
+  void follow_scalar(M C::*member, const EventValue &owner, const char *name) {
+    using Slot = std::remove_cv_t<M>;
+    using Element = std::remove_cv_t<std::remove_pointer_t<Slot>>;
+    const auto &fields = owner.fields();
+    const auto found = fields.find(std::string(name) + "_snapshot");
+    if (found == fields.end() || found->second.is_null())
+      return;
+    ::new (slot(member)) Slot(hold_value<Element>(found->second));
+  }
+
+  // A std::unique_ptr member to a reconstructed record. The pointee is held by
+  // this object, so the member is a non-owning view that is never destroyed.
+  template <class C, class P>
+  void adopt(P C::*member, const EventValue &source) {
+    using Element = typename P::element_type;
+    const auto &fields = source.fields();
+    const auto found = fields.find("value");
+    if (found == fields.end() || found->second.is_null())
+      return;
+    ::new (slot(member)) P(hold_value<std::remove_cv_t<Element>>(found->second));
+  }
+
+private:
+  template <class U> friend class Reconstructed;
+
+  // A view over storage that its parent owns; cleanups join the parent's list.
+  Reconstructed(T *storage,
+                std::vector<std::pair<void (*)(void *), void *>> *shared)
+      : storage_(storage), shared_(shared) {}
+
+  std::vector<std::pair<void (*)(void *), void *>> &list() {
+    return shared_ ? *shared_ : cleanup_;
+  }
+
+  template <class Pointee>
+  Pointee *hold(const EventValue &owner, const char *name, const char *type_name) {
+    const auto &fields = owner.fields();
+    const auto found = fields.find(std::string(name) + "_snapshot");
+    if (found == fields.end() || !found->second.matches_record_type(type_name))
+      return nullptr;
+    return hold_value<std::remove_cv_t<Pointee>>(found->second);
+  }
+
+  // Decode `snapshot` into a heap object that lives as long as this record.
+  template <class Pointee> Pointee *hold_value(const EventValue &snapshot) {
+    using Held = decltype(snapshot.template as<Pointee>());
+    Held *holder = new Held(snapshot.template as<Pointee>());
+    Pointee *pointee = nullptr;
+    void (*destroy)(void *) = [](void *object) {
+      delete static_cast<Held *>(object);
+    };
+    try {
+      pointee = detail::pointee_address(*holder);
+      list().reserve(list().size() + 1);
+      list().emplace_back(destroy, holder);
+    } catch (...) {
+      delete holder;
+      throw;
+    }
+    return pointee;
+  }
+
+  template <class C, class M> void *slot(M C::*member) const {
+    auto &field = (**this).*member;
+    return const_cast<void *>(
+        static_cast<const volatile void *>(std::addressof(field)));
+  }
+
+  void *storage_ = nullptr;
+  bool owner_ = false;
+  std::vector<std::pair<void (*)(void *), void *>> *shared_ = nullptr;
+  std::vector<std::pair<void (*)(void *), void *>> cleanup_;
 };
 
 template <class T, class Enable> struct EventCodec {
@@ -193,6 +408,22 @@ struct EventCodec<T, std::void_t<decltype(EventRecord<T>::fields()),
         },
         EventRecord<T>::fields());
     return result;
+  }
+};
+
+namespace detail {
+template <class T, class = void>
+struct has_reconstructed_record : std::false_type {};
+template <class T>
+struct has_reconstructed_record<
+    T, std::void_t<decltype(ReconstructedRecord<T>::decode(
+           std::declval<const EventValue &>()))>> : std::true_type {};
+} // namespace detail
+
+template <class T>
+struct EventCodec<T, std::enable_if_t<detail::has_reconstructed_record<T>::value>> {
+  static Reconstructed<T> decode(const EventValue &value) {
+    return ReconstructedRecord<T>::decode(value);
   }
 };
 
@@ -319,6 +550,39 @@ struct EventCodec<std::unordered_set<T, Hash, Equal, Allocator>> {
         throw std::invalid_argument("duplicate event set member");
     return result;
   }
+};
+
+// Smart pointers carry their address and, when the pointee could be read, an
+// inline copy of it. A copy cannot own the live target object, so a pointer
+// without a captured pointee decodes as empty.
+template <class T> struct EventCodec<std::unique_ptr<T, std::default_delete<T>>> {
+  static std::unique_ptr<T> decode(const EventValue &value) {
+    static_assert(!detail::reconstructed_codec<std::remove_cv_t<T>>::value,
+                  "a reconstructed record cannot be owned by a decoded unique_ptr");
+    const auto &fields = value.fields();
+    const auto found = fields.find("value");
+    if (found == fields.end() || found->second.is_null())
+      return nullptr;
+    return std::unique_ptr<T>(new T(found->second.template as<T>()));
+  }
+};
+template <class T> struct EventCodec<std::shared_ptr<T>> {
+  static std::shared_ptr<T> decode(const EventValue &value) {
+    const auto &fields = value.fields();
+    const auto found = fields.find("value");
+    if (found == fields.end() || found->second.is_null())
+      return nullptr;
+    if constexpr (detail::reconstructed_codec<std::remove_cv_t<T>>::value) {
+      auto holder = std::make_shared<Reconstructed<std::remove_cv_t<T>>>(
+          found->second.template as<std::remove_cv_t<T>>());
+      return std::shared_ptr<T>(holder, holder->get());
+    } else {
+      return std::shared_ptr<T>(new T(found->second.template as<T>()));
+    }
+  }
+};
+template <class T> struct EventCodec<std::weak_ptr<T>> {
+  static std::weak_ptr<T> decode(const EventValue &) { return {}; }
 };
 } // namespace tracer_repl
 

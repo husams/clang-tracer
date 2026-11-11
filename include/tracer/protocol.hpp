@@ -91,7 +91,9 @@ struct ValueSnapshotMember {
   const char *name = nullptr;
   const ValueSnapshot *snapshot = nullptr;
 };
-inline constexpr std::size_t kMaxSnapshotMembers = 128;
+// The followed members one snapshot may carry and how deep they nest are the
+// options --follow-members and --follow-depth (snapshot_limits.hpp); the
+// agent learns them from the probes it installs (snapshot_runtime_limits.hpp).
 
 struct ValueSnapshot {
   enum Status : std::uint32_t {

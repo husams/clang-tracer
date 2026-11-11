@@ -276,7 +276,9 @@ private:
       if (method->getRefQualifier() == clang::RQ_LValue) name += " &";
       if (method->getRefQualifier() == clang::RQ_RValue) name += " &&";
     }
-    if (decl.getType()->castAs<clang::FunctionProtoType>()->isNothrow())
+    const auto *prototype = decl.getType()->castAs<clang::FunctionProtoType>();
+    if (!clang::isUnresolvedExceptionSpec(prototype->getExceptionSpecType()) &&
+        prototype->isNothrow())
       name += " noexcept";
     source += (destructor || conversion) ? name : spelling(decl.getReturnType(), name);
     if (!symbol.empty())

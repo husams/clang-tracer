@@ -257,8 +257,8 @@ and forward-declares `ItemImp`. The internal header defines `ItemV1`, `ItemV2`,
 and `ItemV3`. The pointer and reference demos prepare from the two application
 headers without a pointer policy; source discovery follows the polymorphic
 `_imp` and `_other` members and captures each concrete implementation. The
-complete non-polymorphic `_stamp` record remains address-only without an
-explicit policy. The pointer probe uses the existing
+complete non-polymorphic `_stamp` record is captured by its exact static type
+after a readability check, so it needs no policy either. The pointer probe uses the existing
 `--snapshot-return-pointee` opt-in, while the reference probe captures its
 `Item` directly.
 
@@ -272,8 +272,8 @@ its `_imp` address. An `_unreadable` member points to a `PROT_NONE` page and the
 guarded lookup leaves its address in the snapshot. Both sessions check null
 members. Pointer mode also checks a null outer result. The `--pimpl-custom`
 and `--pimpl-roles` examples use the explicit
-[`FollowPointers` policy](pimpl/snapshot-policy.hpp) to cover `_stamp`,
-arguments, and receivers.
+[`FollowPointers` policy](pimpl/snapshot-policy.hpp) to select the followed
+members of the record.
 
 Run the automated cases with:
 
@@ -300,6 +300,70 @@ has no PRE or POST hook:
 ```
 
 CTest registers this as `native_repl_prepared_pimpl_custom`.
+
+## Handle return with a private implementation pointer
+
+The [`handle` example](handle/) returns `HFW::HfwItem &`, whose only data member
+is a private `HfwItemImpl *_impl`. The base class `ngd::HeapObject` defines its
+destructor in a shared library, and the implementation class is complete only in
+`item-impl.hpp`. The record cannot be constructed locally, so
+`result_as<HFW::HfwItem>()` rebuilds it field by field as a
+`Reconstructed<HFW::HfwItem>` whose `_impl` points at the locally decoded
+implementation. The implementation is also readable from the `_impl_snapshot`
+field. Build the REPL tools, then run it with the REPL's own server or with a
+server started separately:
+
+```bash
+./examples/prepared-injectors/handle/run.sh build
+./examples/prepared-injectors/handle/run.sh build --external-server
+```
+
+Add `--plain` to build a non-polymorphic implementation. It needs no policy: the
+pointee's static type is exact, so it is captured after a readability check
+(the target must keep it valid). Both modes should print:
+
+```text
+ROOT type=HFW::HfwItem fields=2
+IMPL type=HFW::HfwItemImpl revision=827 label=implementation label
+TYPED revision=827 label=implementation label
+HANDLE revision=827 label=implementation label
+```
+
+`item.hpp` can instead hold the implementation through a reference
+(`HANDLE_REFERENCE`), a `std::unique_ptr` (`HANDLE_UNIQUE`), a
+`std::shared_ptr` (`HANDLE_SHARED`), or a pointer declared by a base class
+(`HANDLE_BASE_MEMBER`). `HfwManager::makeItem` returns the record by value and
+`HfwManager::inspectItem` takes it as an argument. `HANDLE_DEEP` adds a C string
+member, a pointer to an `int`, a pointer inside a nested record, a ring of
+nodes, a second level (`_impl` to a detail record that points back), a pointer
+to a `std::string` and a pointer to unmapped memory: the ring stops at the
+depth bound, the back link is cut because its target is already captured, and
+the `std::` and unmapped pointers stay address-only. `HANDLE_BUDGET` adds a
+function whose four large arguments fill the snapshot storage; every root keeps
+its snapshot. CTest builds each variant and captures it as a result, a by-value
+result, and an argument in `native_repl_prepared_handle_return`; the [`FollowPointers`
+policy](handle/snapshot-policy.hpp) remains available to restrict or select the
+followed members.
+
+`HANDLE_LIMITS` adds a chain of 64 nodes, a vector and a few strings to show the
+capture limits at work. How far members are followed, how long a `char *` is
+kept and the rest are options, not constants; the table of every option, its
+environment variable, default and range is in
+[Followed-member limits](../../docs/native-repl.md#followed-member-limits). With
+the defaults the chain is captured to three levels and a `next_snapshot_cut`
+field beside the third names `--follow-depth`. To follow five levels, prepare with
+a deeper limit; to keep a longer `char *`, raise the string and the slice when
+injecting:
+
+```text
+%probe prepare "HFW::HfwManager::getItem(int)" --include item.hpp --include item-impl.hpp --output prepared --follow-depth 5
+%probe inject "HFW::HfwManager::getItem(int)" --prepared prepared --prepared-mode require --string-bytes 6000 --snapshot-slice 8192 --snapshot-arena 65536
+```
+
+`TRACER_PREPARE_FOLLOW_DEPTH=5` in the environment does the same as
+`--follow-depth 5`. `native_repl_prepared_handle_return` runs each option in both
+directions (for example `depth_default`, `depth_five`, `string_default`,
+`string_raised`).
 
 ## Typed method example
 

@@ -13,7 +13,7 @@
 
 namespace tracer_repl {
 namespace {
-const std::string prefix = "// tracer-repl-mapping-v1 ";
+const std::string prefix = std::string("// tracer-repl-") + mapping_format + " ";
 const std::string dependency = "// tracer-repl-dependency ";
 std::string read_header(const std::filesystem::path &path) {
   if (std::filesystem::file_size(path) > 4 * 1024 * 1024)
@@ -155,7 +155,8 @@ void save_mapping_header(const std::filesystem::path &requested,
     const auto previous = read_header(path);
     if (previous == content)
       return;
-    if (previous.rfind(prefix, 0))
+    // A header from an older format may be replaced.
+    if (previous.rfind("// tracer-repl-mapping-", 0))
       throw std::runtime_error(
           "output exists and is not a generated mapping header: " +
           path.string());

@@ -61,6 +61,8 @@ public:
 
     virtual std::any visitPrepareOption(TracerCommandsParser::PrepareOptionContext *context) = 0;
 
+    virtual std::any visitLimitOption(TracerCommandsParser::LimitOptionContext *context) = 0;
+
     virtual std::any visitResolveOption(TracerCommandsParser::ResolveOptionContext *context) = 0;
 
     virtual std::any visitValidateOption(TracerCommandsParser::ValidateOptionContext *context) = 0;

@@ -203,7 +203,8 @@ public:
         "--all", "--metadata-only", "--print-arguments", "--print-result",
         "--details", "--addresses", "--sqlite", "--member", "--exported", "--allow-arg-overrides", "--allow-result-override",
         "--registers", "--discover", "--watch", "--supervise", "--gate-children", "--allow-replacement", "--allow-call-original",
-        "--trace-exceptions", "--reclaimable", "--snapshot-return-pointee"};
+        "--trace-exceptions", "--reclaimable", "--snapshot-return-pointee",
+        "--no-automatic-members"};
     const std::set<std::string> repeated = {"--include", "--compile-option",
                                            "--name", "--type", "--arg", "--env"};
     const std::set<std::string> bulk_repeated = {"--module", "--exclude", "--exact"};

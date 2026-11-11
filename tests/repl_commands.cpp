@@ -138,6 +138,24 @@ int main() {
   require(inject.option("--prepared-mode") == "require" && !inject.has("--prepared"));
   bad("%probe inject f --callback h --prepared-mode require --prepared \"\"");
   bad("%probe inject f --callback h --prepared d --prepared-mode typo");
+  // Followed-member limits: every option of the table parses at prepare and inject.
+  const auto limited_prepare = parse_command(
+      "%probe prepare f --include api.hpp --output prepared --no-automatic-members "
+      "--follow-depth 5 --follow-members unlimited --record-members 7 --nested-depth off "
+      "--string-bytes 6000 --vector-elements 10 --checked-reads 9 --snapshot-reserve 0 "
+      "--snapshot-arena 65536 --snapshot-slice 8192");
+  require(limited_prepare.has("--no-automatic-members") &&
+          limited_prepare.option("--follow-depth") == "5" &&
+          limited_prepare.option("--follow-members") == "unlimited" &&
+          limited_prepare.option("--nested-depth") == "off" &&
+          limited_prepare.option("--snapshot-slice") == "8192");
+  const auto limited_inject = parse_command(
+      "%probe inject f --prepared d --string-bytes 6000 --follow-depth 2 --snapshot-arena unlimited");
+  require(limited_inject.option("--string-bytes") == "6000" &&
+          limited_inject.option("--follow-depth") == "2" &&
+          limited_inject.option("--snapshot-arena") == "unlimited");
+  bad("%probe inject f --prepared d --follow-depth");
+  bad("%probe inject f --prepared d --follow-depth 2 --follow-depth 3");
   auto p = parse_command(
       "%probe inject \"Calculator::multiply(int, int) const\" --callback 'my "
       "callback.cpp' --stack-depth 16");

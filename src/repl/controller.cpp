@@ -2,6 +2,7 @@
 #include "local_perf.hpp"
 #include "tracer/instruction_trace.h"
 #include "../prepared_contract.hpp"
+#include "../snapshot_limits.hpp"
 #include "../module_index_format.hpp"
 #include "../proc_identity.hpp"
 #include "../sqlite_events.hpp"
@@ -40,6 +41,7 @@
 #include <unistd.h>
 
 #include "background_events.hpp"
+#include "prepared_libraries.hpp"
 #include "tracer/compiler_options.hpp"
 
 extern char **environ;
@@ -1043,6 +1045,12 @@ void Controller::prepare(const std::string &selector, const Command &options) {
     arguments.insert(arguments.end(), {"--compdb", database});
   }
   if (options.has("--metadata-only")) arguments.push_back("--metadata-only");
+  if (options.has("--no-automatic-members")) arguments.push_back("--no-automatic-members");
+  // Limits are validated by the prepare tool, which also reads the environment.
+  for (const auto &limit : tracer::kLimitSpecs) {
+    const auto key = std::string("--") + limit.name;
+    if (options.has(key)) arguments.insert(arguments.end(), {key, options.option(key)});
+  }
   for (const auto *key : {"--translation-unit", "--module"}) {
     if (options.has(key)) {
       arguments.emplace_back(key);
@@ -1103,6 +1111,37 @@ Controller::prepared_import_modules(const SessionHandle &session) {
 #if defined(__linux__) && defined(__x86_64__)
   if (!server_.endpoint().empty() && endpoint_ == server_.endpoint())
     return [this, session] { return module_snapshot(session, true); };
+  // Another server's mappings count only when this host's kernel confirms them
+  // for a process owned by the REPL's user.
+  return [this, session] {
+    auto modules = module_snapshot(session, true);
+    std::string text;
+    bool readable = false;
+    if (session.pid) {
+      const auto path = "/proc/" + std::to_string(session.pid) + "/maps";
+      const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+      if (fd >= 0) {
+        struct stat status{};
+        readable = ::fstat(fd, &status) == 0 && status.st_uid == ::geteuid();
+        // The kernel bounds the file by the process's mapping count (vm.max_map_count).
+        char buffer[65536];
+        while (readable) {
+          const auto count = ::read(fd, buffer, sizeof(buffer));
+          if (count < 0 && errno == EINTR) continue;
+          if (count < 0) readable = false;
+          if (count <= 0) break;
+          text.append(buffer, static_cast<std::size_t>(count));
+        }
+        ::close(fd);
+      }
+    }
+    if (!readable) {
+      modules.clear_mappings();
+      return modules;
+    }
+    std::istringstream maps(text);
+    return tracer_repl::confirmed_local_mappings(std::move(modules), maps);
+  };
 #else
   (void)session;
 #endif
@@ -1141,6 +1180,10 @@ std::uint64_t Controller::inject(const SessionHandle &session,
   spec.set_trace_exceptions(options.has("--trace-exceptions"));
   spec.set_reclaimable(options.has("--reclaimable"));
   spec.set_snapshot_return_pointee(options.has("--snapshot-return-pointee"));
+  for (const auto &limit : tracer::kLimitSpecs) {
+    const auto key = std::string("--") + limit.name;
+    if (options.has(key)) tracer::set_limit(*spec.mutable_snapshot_limits(), limit.name, options.option(key));
+  }
   api::AddProbeRequest request;
   request.set_session_id(session.id);
   *request.mutable_spec() = std::move(spec);

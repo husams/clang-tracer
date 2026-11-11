@@ -21,6 +21,10 @@ enum class CaptureStatus {
   incomplete_message,
   work_exceeded
 };
+// Messages that may be open at once. An event nests the envelope and the record
+// in 32 of them and each level of followed members in two more (kMaxFollowDepth).
+inline constexpr std::size_t kMaxMessageDepth = 128;
+
 struct CaptureLimits {
   std::size_t bytes = 256 * 1024;
   std::size_t string_bytes = 64 * 1024;
@@ -41,6 +45,7 @@ public:
   BoundedProtoWriter(BoundedProtoWriter &&) = delete;
   BoundedProtoWriter &operator=(BoundedProtoWriter &&) = delete;
   CaptureStatus status() const noexcept { return status_; }
+  std::size_t remaining() const noexcept { return storage_.size() - used_; }
 
   // Fixed-format metadata has no generated codec traversal. Each field
   // consumes a byte, so the remaining storage also bounds its field visits.
@@ -75,6 +80,6 @@ private:
   CaptureLimits limits_;
   CaptureStatus status_ = CaptureStatus::ok;
   std::size_t used_ = 0, visits_ = 0, items_ = 0, depth_ = 0, work_ = 0;
-  std::array<Message, 32> messages_{};
+  std::array<Message, kMaxMessageDepth> messages_{};
 };
 } // namespace tracer::context_engine

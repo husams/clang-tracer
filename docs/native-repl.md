@@ -1053,15 +1053,70 @@ implementation's `.cpp` with `--include` if its definition is in that file.
 For typed local decoding of a polymorphic snapshot, supply an `EventCodec<T>`
 for the value you want to construct.
 
-For source-prepared pointer and reference returns, Clang also discovers direct
-raw pointer members whose declared pointee is polymorphic and whose concrete
-derived layout is available from the supplied source. At return, a checked RTTI
-read selects the matching layout. A field such as `_imp` holds the original
-address and `_imp_snapshot` holds the copied fields of the live implementation.
-Null pointers, unreadable records, and unknown types remain address-only. The
-target must keep the pointee and its captured data live and stable through POST.
+For source-prepared probes, Clang also discovers the raw pointer and reference
+members of every captured record (arguments, receivers, and results, including
+members declared by public non-virtual bases) and follows them. A field such as
+`_imp` holds the original address and `_imp_snapshot` holds the copied fields
+of the live pointee; a reference member is captured the same way. For a
+polymorphic pointee the admitted layouts are the declared class, when it is
+concrete, and concrete derived classes available from the supplied source, and
+a checked RTTI read selects the matching layout. A non-polymorphic pointee is
+captured by its exact static type, so no policy is needed, provided everything
+the capture must read is checkable: scalars, enums, arrays, strings, `vector`,
+`array`, `optional`, `pair`, `tuple`, `variant`, smart pointers to such types,
+and records of those. A pointee holding anything else (`list`, `map`, `set`,
+`unordered_*`, `deque`, `std::any`, `std::function`, `weak_ptr`) is followed
+automatically only when it is polymorphic and its RTTI matches a derived class,
+or the declared class of an owner-held implementation pointer; otherwise it
+stays address-only unless a `FollowPointers` policy names it. Because there is
+no RTTI to check, only the pointer's alignment and the readability of the whole
+object are verified, and the target must keep the pointee valid and stable
+through POST. A `char` pointer is captured as a bounded (`--string-bytes`,
+longer text is truncated), readability-checked C string and a pointer to an
+arithmetic or enum value as one element; both are stored as `<field>_snapshot`.
+The same rules apply to the pointer and reference members of every captured
+pointee, of records held by value inside a captured record, and of the pointees
+of `std::unique_ptr` and `std::shared_ptr` members, to `--follow-depth` levels.
+A link back to an object that is already captured above it is not followed
+again, and a link cut by the depth bound stays address-only. Null, unreadable,
+unmapped, abstract, incomplete, `std::` and function pointees remain
+address-only, and pointers stored inside standard containers are not followed.
+All roots are encoded before any followed member, shallowest members first, so
+a member that does not fit the per-thread snapshot storage is dropped and never
+displaces a root. Smart pointer members (`std::unique_ptr`, `std::shared_ptr`)
+are captured inline as their address plus a copy of the pointee. Pass
+`--no-automatic-members` to `%probe prepare` or to
+`clang-tracer-prepare-injectors-native`, or set
+`TRACER_PREPARE_AUTOMATIC_MEMBERS=off` in the environment of the prepare tool,
+to follow no members automatically. If a package cannot be built with the fuller
+captures, preparation falls back to narrower ones and reports each step on
+stderr. The agent, the REPL, and the prepare tool must come from the same
+build: an older REPL cannot read nested member snapshots and an older agent
+lacks the readability checks a newer package calls. Followed members are
+encoded in a checked mode: strings are copied out with a checked read, a
+vector's storage and a smart pointer's pointee must be wholly readable first,
+and a shared pointer's control block is never read, so a pointer the target
+left stale makes that member address-only instead of crashing the target. This
+relies on `process_vm_readv`; a seccomp filter that kills that call would kill
+the target. Policy-named members get the same checks, but a `FollowPointers`
+policy on a type the checks cannot cover (node-based containers, `std::any`,
+`std::function`, virtual bases, custom encoders) is your own assertion that the
+pointee is valid. Records with virtual bases, pairs and tuples with reference
+elements, `vector<bool>` and `weak_ptr` are never followed automatically. A
+pointee that needs a custom `tracer_snapshot::encode` is followed automatically
+only when its RTTI matches. Every limit on this capture is an option
+(see [Followed-member limits](#followed-member-limits)); none is hard-coded. A
+pointer or reference to a private nested implementation class
+(`class Widget { class Impl; Impl *impl_; };`) is followed too, because the
+prepared adapter republishes nested class names. If the capture code that
+follows members does not compile, the probe is built without them and the
+validation report says so; setting `TRACER_TEST_BREAK_FOLLOWED_MEMBERS` in the
+target's environment forces that fallback for testing. In a followed member a
+`weak_ptr` is always recorded as expired, and a smart pointer whose pointee was
+left out by the checks or the read budget looks the same as one with no
+pointee.
 
-A reusable record policy can follow specific raw pointer fields wherever that
+A reusable record policy can follow specific raw pointer or reference fields wherever that
 record is captured as an argument, receiver, or result. Define the policy in
 a C++ header and supply it through the existing `%probe prepare --include`
 option alongside the matching application definitions. An explicit policy
@@ -1084,6 +1139,90 @@ snapshot named `<field>_snapshot` for each captured pointee. For example,
 from `cpp_type()`. A null member or a type absent from the prepared package
 has only the address. Pointer returns use `--snapshot-return-pointee` at
 injection. Reference returns already capture the referenced object.
+
+#### Followed-member limits
+
+Every bound on followed-member capture is an option. Nothing is hard-coded: the
+defaults below live in one place (`SnapshotLimits` in `src/snapshot_limits.hpp`),
+each option is validated against the same table, and when a limit cuts something
+the event or the prepare output says which option to raise.
+
+| Option | Environment variable | Set with | Default | Range | Meaning |
+| --- | --- | --- | --- | --- | --- |
+| `--follow-depth` | `TRACER_PREPARE_FOLLOW_DEPTH` | prepare tool, `%probe prepare`, `%probe inject` | 3 | 0-40 | Levels of pointees followed below a captured record; `0` follows none. |
+| `--follow-members` | `TRACER_PREPARE_FOLLOW_MEMBERS` | prepare tool, `%probe prepare`, `%probe inject` | 48 | 0-4294967295 | Followed members per probe, policy-named ones first. Each adds about 160 bytes of stack to the generated wrapper. |
+| `--record-members` | `TRACER_PREPARE_RECORD_MEMBERS` | prepare tool, `%probe prepare` | 32 | 0-4294967295 | Pointer members discovered automatically per record. |
+| `--nested-depth` | `TRACER_PREPARE_NESTED_DEPTH` | prepare tool, `%probe prepare` | 2 | 0-4294967295 | Levels of by-value records and smart pointers searched for pointer members. |
+| `--string-bytes` | `TRACER_PREPARE_STRING_BYTES` | prepare tool, `%probe prepare`, `%probe inject` | 4000 | 0-65536 | Bytes kept of one string (`char *` or `std::string`) in a followed member. At most the slice minus 96 bytes of framing. |
+| `--vector-elements` | `TRACER_PREPARE_VECTOR_ELEMENTS` | prepare tool, `%probe prepare`, `%probe inject` | 4096 | 0-4294967295 | Elements of a `std::vector` in a followed member; a larger vector is left out. The captured bytes must also fit `--snapshot-slice` (5000 `int` elements need `--vector-elements 5000 --snapshot-slice 32768`). |
+| `--checked-reads` | `TRACER_PREPARE_CHECKED_READS` | prepare tool, `%probe prepare`, `%probe inject` | 256 | 1-4294967295 | Checked memory reads (system calls) one followed member may spend. |
+| `--snapshot-reserve` | `TRACER_PREPARE_SNAPSHOT_RESERVE` | prepare tool, `%probe prepare`, `%probe inject` | 8192 | 0-4294967295 | Bytes of the per-thread storage that members captured at entry leave for the roots encoded later (a result, nested calls). |
+| `--snapshot-arena` | `TRACER_PREPARE_SNAPSHOT_ARENA` | prepare tool, `%probe prepare`, `%probe inject` | 16384 | 16384-4294967295 | Per-thread storage for all snapshots of a call. Never shrinks: the largest request of any installed probe wins. At least one slice. |
+| `--snapshot-slice` | `TRACER_PREPARE_SNAPSHOT_SLICE` | prepare tool, `%probe prepare`, `%probe inject` | 4096 | 4096-65536 | Bytes of one snapshot payload. Never shrinks: the largest request wins. |
+
+Besides these, `--no-automatic-members` (prepare tool flag, `%probe prepare`
+option, or `TRACER_PREPARE_AUTOMATIC_MEMBERS=off`) follows no member
+automatically, and `TRACER_REPL_DERIVED_CANDIDATES` (environment of the REPL,
+default 15) sets how many derived records are tried per polymorphic pointer
+when the REPL builds its local mappings; a pointer with more candidates is
+reported in the mapping notes.
+
+A value is a number, `unlimited` (the largest value in the Range column) or,
+where the range starts at 0, `off` (0). A value outside the range is refused
+with the range, for example `--follow-depth must be between 0 and 40 (or
+unlimited): 99`. A prepare-time option shapes the package, so `%probe inject`
+can only lower what the package discovered; the other options can be given at
+either step, and the one given at `%probe inject` wins. The three maxima that are
+not "as large as the option holds" are forced by something else:
+
+- `--snapshot-slice` 65536 and, through it, `--string-bytes`: a payload is one
+  string field of the event, which the event writer bounds at 64 KiB
+  (`limits.string_bytes` in `src/context_capture.cpp`). The whole event is also
+  bounded by the server's `--context-event-bytes` (default 256 KiB).
+- `--follow-depth` 40: every followed level nests two protobuf messages in the
+  event, and the protobuf parser refuses more than 100 levels when the server
+  and the REPL read it. Measured end to end, a chain arrives up to 49 levels in
+  a result and 48 in an argument and the event is lost beyond that; 40 keeps
+  eight levels of slack for the receiver and state roots that were not measured.
+- `--snapshot-arena` and `--snapshot-slice` have the built-in sizes as their
+  minimum because the per-thread storage only grows.
+- `--snapshot-arena` accepts up to 4294967295 bytes, but the storage is one
+  anonymous mapping per thread of the target, so `unlimited` asks every thread
+  for 4 GiB of address space. If a mapping fails the storage keeps its size and
+  the capture reports `no snapshot storage was left for a followed member`.
+
+Tune them where the data lives. The depth and the `char *` size, for the
+handle example (`examples/prepared-injectors/handle`):
+
+```text
+%probe prepare "HFW::HfwManager::getItem(int)" --include item.hpp --include item-impl.hpp --output prepared --follow-depth 5
+%probe inject "HFW::HfwManager::getItem(int)" --prepared prepared --prepared-mode require --string-bytes 6000 --snapshot-slice 8192 --snapshot-arena 65536
+```
+
+or `TRACER_PREPARE_FOLLOW_DEPTH=5` in the environment of the REPL or of
+`clang-tracer-prepare-injectors-native`.
+
+What you see when a limit cuts something:
+
+| Cut | Where | Text |
+| --- | --- | --- |
+| Pointer members of a record are beyond `--follow-depth` (prepare) | prepare stderr, once per record | `prepare: pointer members of NAME are address-only: it is N levels below a captured record (--follow-depth, TRACER_PREPARE_FOLLOW_DEPTH)` |
+| More pointer members than `--record-members` (prepare) | prepare stderr, once per record | `prepare: NAME has more followable members than --record-members (N); the rest stay address-only` |
+| Pointer members nested deeper than `--nested-depth` (prepare) | prepare stderr, once per record | `prepare: NAME has pointer members nested more than --nested-depth (N) levels inside it; they stay address-only` |
+| Derived records beyond `TRACER_REPL_DERIVED_CANDIDATES` | mapping notes of the REPL | `derived records of NAME beyond N are not tried (TRACER_REPL_DERIVED_CANDIDATES)` |
+| A member's own pointer members were not followed (`--follow-depth`) | field `<field>_snapshot_cut` of the parent | `its pointer members were not followed: raise --follow-depth` |
+| Members dropped by `--follow-members` below a member | field `<field>_snapshot_cut` of the parent | `some of its pointer members were not followed: raise --follow-members` |
+| Members dropped by `--follow-members` at a root | field `snapshot_cut` of the root | `N pointer members were not followed: raise --follow-members` |
+| String shortened (`--string-bytes`, or the slice bounds it) | field `<field>_snapshot_cut` | `a C string was shortened: raise --string-bytes (and --snapshot-slice, which also bounds it)` (`a string was ...` for a `std::string`) |
+| Vector larger than `--vector-elements` | field `<field>_snapshot_cut` | `a vector was left out because it is larger than the limit: raise --vector-elements` |
+| Checked reads ran out | field `<field>_snapshot_cut` | `the checked reads of a followed member ran out: raise --checked-reads` |
+| Member does not fit the slice | field `<field>_snapshot_cut` | `a followed member does not fit the snapshot payload: raise --snapshot-slice or --snapshot-arena` |
+| No storage left for a member | field `<field>_snapshot_cut` | `no snapshot storage was left for a followed member: raise --snapshot-arena or lower --snapshot-reserve` |
+| Member does not fit the event (shared-context events) | field `<field>_snapshot_cut` | `the followed member did not fit the event: raise --context-event-bytes of the server` |
+
+`<field>_snapshot_cut` is a string field next to `<field>_snapshot`, so
+`event.result_snapshot().field("_chain_snapshot_cut")` reads it; a cut inside a
+nested member sits in that member's record.
 
 To choose the captured fields for one implementation, pass a C++ file with
 `--callback` to `%probe inject`. Define an overload of `tracer_snapshot::encode`
@@ -1165,12 +1304,39 @@ Use `DeclaringType::field` for field names shared by multiple base or derived
 declarations. A shared virtual base contributes its fields once. Polymorphic
 records need locally usable construction, destruction, and virtual function
 definitions. With the REPL's own local Linux x86-64 server, a prepared probe
-can resolve an out-of-line destructor from a shared library already mapped
-in the target. The REPL checks the mapped ELF identity and requires one library
-exporting the required C++ ABI symbols. It loads that library into the REPL
-process and binds those symbols before generating the typed decoder. No
+can resolve an out-of-line destructor from a shared library already mapped in
+the target. With a server the REPL did not start, the library is used only when
+the target is a process on this host, owned by the REPL's user, whose
+`/proc/PID/maps` confirms the reported mappings; otherwise the record is
+rebuilt field by field, as described below. The REPL checks the mapped ELF identity and requires one
+library exporting the required C++ ABI symbols. It loads that library into the
+REPL process and binds those symbols before generating the typed decoder. No
 additional probe options are required. Library initializers run in the REPL
 when the loader opens the library.
+
+A record that cannot be constructed locally is decoded as
+`tracer_repl::Reconstructed<T>`; use `->` to reach the record. This covers
+records with raw pointer or reference members, records whose constructor,
+virtual functions, or destructor are unavailable or cannot be inferred, and
+records that contain such a record by value or through a `std::unique_ptr`.
+Records that map normally keep doing so. A reconstructed record's fields are
+rebuilt without running its constructors or destructor and its vptr is null, so
+read fields and call non-virtual members only. A pointer member refers to a
+local copy of its captured pointee, which is itself rebuilt the same way, so a
+captured chain of pointers can be followed with `->`. It is null when the
+pointee was not captured or its captured type is neither the declared pointee
+nor one of the imported application records derived from it (at most 15 derived
+records are considered); a captured pointee that fails to decode raises the
+decode error. A `char` pointer points at a copy of the captured string and a
+pointer to a scalar at a copy of the value. A reference member needs its
+referent: decoding throws `std::runtime_error` naming the record and field when
+it was not captured. Smart pointer members point at the local copy of the
+pointee, or are empty when it was not captured. Other raw pointers are null. Do
+not move, copy, assign or destroy the reconstructed record itself; it owns the
+pointees, so do not move from, reset or assign its `std::unique_ptr` members
+either, because those only view the copies. Records with virtual bases cannot
+be reconstructed. Define your own `EventCodec<T>` before first use to replace
+the generated reconstruction.
 
 Use `result_snapshot()` for field inspection when only the captured layout is
 available. If additional definitions are needed for a typed result, prepare

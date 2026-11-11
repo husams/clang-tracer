@@ -1,4 +1,5 @@
 #include "context_capture.hpp"
+#include "snapshot_runtime_limits.hpp"
 
 #include <algorithm>
 #include <array>
@@ -95,6 +96,9 @@ static_assert(sizeof(TruncationLog) + sizeof(EncodeBudget) +
                   sizeof(BoundedProtoWriter) <=
               64 * 1024);
 
+static_assert(tracer::kEventBaseDepth + 2 * (tracer::kMaxFollowDepth + 1) <= kMaxMessageDepth,
+              "the event writer must hold the deepest followed members");
+
 bool record_truncation(void* opaque, ::tracer::compat::span<const CapturePathStep> path,
                        std::uint64_t total, std::uint64_t captured) noexcept {
   auto &log = *static_cast<TruncationLog *>(opaque);
@@ -148,13 +152,31 @@ bool write_truncation(BoundedProtoWriter &writer,
          writer.end_message();
 }
 
+// An upper bound of the bytes write_value_snapshot adds for a snapshot.
+std::size_t snapshot_size_bound(const tracer::ValueSnapshot &snapshot, unsigned depth) noexcept {
+  const auto length = [](const char *text) { return text ? std::strlen(text) : std::size_t{0}; };
+  std::size_t bound = 64 + length(snapshot.cpp_type) + length(snapshot.root_type) +
+                      length(snapshot.detail) + snapshot.descriptor_size + snapshot.payload_size;
+  for (std::size_t i = 0; i < snapshot.container_role_count; ++i)
+    bound += 8 + length(snapshot.container_roles[i]);
+  for (std::size_t i = 0; i < snapshot.record_type_count; ++i)
+    bound += 8 + length(snapshot.record_types[i]);
+  if (depth)
+    for (std::size_t i = 0; i < snapshot.member_count && snapshot.members; ++i)
+      if (snapshot.members[i].snapshot)
+        bound += 16 + length(snapshot.members[i].name) +
+                 snapshot_size_bound(*snapshot.members[i].snapshot, depth - 1);
+  return bound;
+}
+
 bool write_value_snapshot(BoundedProtoWriter &writer, std::uint32_t field,
                           const tracer::ValueSnapshot &snapshot,
-                          bool include_members) noexcept {
-  if (snapshot.descriptor_size > 4096 || snapshot.payload_size > 4096 ||
+                          unsigned member_depth) noexcept {
+  if (snapshot.descriptor_size > 4096 ||
+      snapshot.payload_size > tracer::snapshot_slice_request().load() ||
       snapshot.container_role_count > 128 || snapshot.record_type_count > 128 ||
-      (snapshot.member_count && (!include_members || !snapshot.members ||
-                                 snapshot.member_count > tracer::kMaxSnapshotMembers)))
+      (snapshot.member_count && (!member_depth || !snapshot.members ||
+                                 snapshot.member_count > tracer::snapshot_member_request().load())))
     return false;
   const auto text = [](const char *value) {
     return value ? std::string_view(value) : std::string_view{};
@@ -182,8 +204,21 @@ bool write_value_snapshot(BoundedProtoWriter &writer, std::uint32_t field,
     const auto &member = snapshot.members[i];
     if (!member.name || !member.snapshot)
       continue;
+    // A member that does not fit is replaced by a note saying so (or left out when
+    // even the note does not fit); it must not fail the root.
+    if (snapshot_size_bound(*member.snapshot, member_depth - 1) + 16 > writer.remaining()) {
+      tracer::ValueSnapshot cut{};
+      cut.status = tracer::ValueSnapshot::LimitExceeded;
+      cut.detail = "the followed member did not fit the event: raise --context-event-bytes of the server";
+      if (snapshot_size_bound(cut, 0) + 16 + std::strlen(member.name) > writer.remaining())
+        continue;
+      if (!writer.begin_message(9) || !writer.string(1, member.name) ||
+          !write_value_snapshot(writer, 2, cut, 0) || !writer.end_message())
+        return false;
+      continue;
+    }
     if (!writer.begin_message(9) || !writer.string(1, member.name) ||
-        !write_value_snapshot(writer, 2, *member.snapshot, false) ||
+        !write_value_snapshot(writer, 2, *member.snapshot, member_depth - 1) ||
         !writer.end_message())
       return false;
   }
@@ -216,7 +251,7 @@ bool write_typed_trace_value(BoundedProtoWriter &writer, std::uint32_t field,
     break;
   }
   if (ok && value.snapshot)
-    ok = write_value_snapshot(writer, 5, *value.snapshot, true);
+    ok = write_value_snapshot(writer, 5, *value.snapshot, tracer::snapshot_depth_request().load());
   return ok && writer.end_message();
 }
 
@@ -452,7 +487,8 @@ ContextCapturePool::Lease::capture(const CaptureEventMetadata& event,
   limits.string_bytes = 64 * 1024;
   limits.visits = 8192; // The codec budget accounts for the other 8192.
   limits.items = 4096;
-  limits.depth = 32;
+  // Each level of followed members nests two more messages in the event.
+  limits.depth = tracer::kEventBaseDepth + 2 * tracer::snapshot_depth_request().load();
   BoundedProtoWriter writer(slot_state_->buffer(), limits);
   if (!writer.string(1, event.event_id) || !writer.string(2, event.source_id) ||
       !writer.u64(3, event.source_sequence) ||
@@ -464,6 +500,7 @@ ContextCapturePool::Lease::capture(const CaptureEventMetadata& event,
   budget.max_items = event.effective_max_items;
   budget.limits = limits;
   budget.limits.visits = 8192;
+  budget.limits.depth = tracer::kEventBaseDepth; // Record nesting only; followed members nest in the writer.
   budget.limits.byte_work = CaptureLimits{}.byte_work;
   TruncationLog truncations;
   budget.truncation = record_truncation;

@@ -3,11 +3,14 @@
 #include "commands.hpp"
 #include "interpreter.hpp"
 #include "syntax.hpp"
+#include "../snapshot_limits.hpp"
 
 #include <algorithm>
 #include <iomanip>
 #include <ostream>
 #include <stdexcept>
+#include <sstream>
+#include <string>
 #include <string_view>
 
 namespace tracer_repl {
@@ -31,6 +34,40 @@ constexpr string_view resolution_options =
 constexpr string_view deployment_options =
     "--stack-depth N|full --stack-application-only true|false\n"
     "--print-arguments --print-result --snapshot-return-pointee";
+
+// One line per option, from the table the prepare tool and the agent validate against.
+std::string limit_options_text() {
+  std::ostringstream text;
+  for (const auto &spec : tracer::kLimitSpecs) {
+    text << "--" << spec.name << " N (default " << tracer::default_limit(spec.name);
+    text << ", " << spec.minimum << "-";
+    if (spec.maximum == tracer::kUnlimited) text << "unlimited";
+    else text << spec.maximum;
+    text << (spec.prepare_time ? ", prepare" : ", run time") << "): " << spec.meaning << "; ";
+  }
+  return text.str();
+}
+const std::string limit_summary =
+    "Pointer and reference members are followed automatically; --no-automatic-members follows none. "
+    "Capture limits, each visible in the event when it cuts something: " + limit_options_text() +
+    "'unlimited' selects the largest value (for --follow-depth, --string-bytes and --snapshot-slice that is a fixed maximum the tracer imposes), 'off' selects 0 where 0 is allowed. "
+    "Prepare-time options shape the package; %probe inject accepts all of them and its value wins, but members that were not discovered at prepare time cannot be added. "
+    "Each option is also read from the environment variable TRACER_PREPARE_<NAME> by the prepare tool; docs/native-repl.md lists them. ";
+
+const std::string prepare_summary =
+    std::string(
+        "Build a reusable probe package from source, an explicit signature, or the module index. "
+        "Without headers or an explicit signature, preparation uses the default index. "
+        "Repeat --include for extra headers. "
+        "Preparation uses compile_commands.json in the command's working directory by default. "
+        "It prefers the first include's recorded compile command and falls back to the first source beside it. "
+        "Use --module to pin the package to a specific build. "
+        "Prepared headers can declare tracer_snapshot::FollowPointers<Record> specializations listing direct raw pointer fields to follow; pointee types and polymorphic implementations are discovered from the included source inputs. This policy applies to prepared argument, receiver and result records. "
+        "Use --snapshot-return-pointee when injecting a raw pointer-return probe. "
+        "Use --metadata-only to skip the separate C++ adapter files. ") +
+    limit_summary +
+    "With --signature, supply the C++ result and explicit parameter types, for example 'const int&()'. "
+    "Qualified methods receive an opaque receiver. Pass --member for an unqualified instance method.";
 
 const CommandTopic commands[] = {
     {"server", "", "Start, connect to, inspect, or stop a tracing server."},
@@ -139,20 +176,12 @@ const CommandTopic commands[] = {
      "Verify and disassemble a function entry and show the copy-only detour window and bounded control flow."},
     {"probe prepare",
      "%probe prepare SELECTOR --include HEADER --output NEW_DIRECTORY\n"
-     "  [--compdb PATH] [--translation-unit FILE] [--module ELF] [--metadata-only] [--cwd DIRECTORY] [EXTRA COMPILER ARGUMENTS]\n"
+     "  [--compdb PATH] [--translation-unit FILE] [--module ELF] [--metadata-only] [--no-automatic-members] [--cwd DIRECTORY] [EXTRA COMPILER ARGUMENTS]\n"
+     "  [--follow-depth N] [--follow-members N] [--record-members N] [--nested-depth N]\n"
+     "  [--string-bytes N] [--vector-elements N] [--checked-reads N] [--snapshot-reserve N] [--snapshot-arena N] [--snapshot-slice N]\n"
      "  or %probe prepare SELECTOR --signature TYPE --module ELF --output NEW_DIRECTORY [--member] [--metadata-only] [--cwd DIRECTORY]"
      "\n  or %probe prepare SELECTOR [--module-index INDEX] [--module ELF] [--id ID] [--generated DIR] --output NEW_DIRECTORY",
-     "Build a reusable probe package from source, an explicit signature, or the module index. "
-     "Without headers or an explicit signature, preparation uses the default index. "
-     "Repeat --include for extra headers. "
-     "Preparation uses compile_commands.json in the command's working directory by default. "
-     "It prefers the first include's recorded compile command and falls back to the first source beside it. "
-     "Use --module to pin the package to a specific build. "
-     "Prepared headers can declare tracer_snapshot::FollowPointers<Record> specializations listing direct raw pointer fields to follow; pointee types and polymorphic implementations are discovered from the included source inputs. This policy applies to prepared argument, receiver and result records. "
-     "Use --snapshot-return-pointee when injecting a raw pointer-return probe. "
-     "Use --metadata-only to skip the separate C++ adapter files. "
-     "With --signature, supply the C++ result and explicit parameter types, for example 'const int&()'. "
-     "Qualified methods receive an opaque receiver. Pass --member for an unqualified instance method.",
+     prepare_summary,
      R"example(%probe prepare "HFW::Item::create()" --include item.hpp --include item-impl.hpp --include item-snapshot-policy.hpp --output prepared)example"},
     {"probe resolve", "%probe resolve SELECTOR [RESOLUTION OPTIONS] [--cwd DIRECTORY]",
      "Resolve a selector in the selected target and show the available metadata.",
@@ -161,7 +190,9 @@ const CommandTopic commands[] = {
      "  [--allow-arg-overrides] [--allow-result-override] [--allow-replacement] [--allow-call-original] [--trace-exceptions] [--reclaimable]",
      "Check whether the callback can be deployed for the selected function."},
     {"probe inject", "%probe inject SELECTOR [--callback FILE] [RESOLUTION OPTIONS] [DEPLOYMENT OPTIONS] [--cwd DIRECTORY]\n"
-     "  [--allow-arg-overrides] [--allow-result-override] [--allow-replacement] [--allow-call-original] [--trace-exceptions] [--reclaimable] [--snapshot-return-pointee]",
+     "  [--allow-arg-overrides] [--allow-result-override] [--allow-replacement] [--allow-call-original] [--trace-exceptions] [--reclaimable] [--snapshot-return-pointee]\n"
+     "  [--follow-depth N] [--follow-members N] [--record-members N] [--nested-depth N]\n"
+     "  [--string-bytes N] [--vector-elements N] [--checked-reads N] [--snapshot-reserve N] [--snapshot-arena N] [--snapshot-slice N]",
      "Omit --callback to capture events with the built-in observer. For prepared implementation member snapshots, a callback file can define tracer_snapshot::encode(const Implementation&) noexcept to return a custom record by value. Snapshot returned record pointees only when the live layout matches and the pointee remains stable through POST; result() gives its address and result_as<T>() copies the record.",
      R"example(%probe inject "prepared_pointee::HfwManager::createItem(int)" --prepared prepared --snapshot-return-pointee)example"},
     {"probe remove", "%probe remove ID [--cwd DIRECTORY]", "Remove a probe from the selected session and restore the original code."},
@@ -307,7 +338,7 @@ auto input = e.argument_as<int>(0);)",
      R"(auto e = tracer.batch("results").at(0);
 for (const auto& frame : e.stack()) { std::cout << frame.pc << ' ' << frame.function << '\n'; })",
      "An event with no stored frames returns an empty vector."},
-    {"Event::result_as", "Decode a captured return value as an owned C++ value.",
+    {"Event::result_as", "Decode a captured return value as an owned C++ value (a Reconstructed<T> for records that cannot be constructed locally, such as handles holding pointers or references; do not move, copy or destroy it or reset its unique_ptr members).",
      R"(auto e = tracer.batch("results").at(0);
 if (e.phase() == "POST" && e.has_result()) {
   auto result = e.result_as<int>();

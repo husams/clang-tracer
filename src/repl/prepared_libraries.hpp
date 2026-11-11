@@ -1,8 +1,10 @@
 #pragma once
 
 #include "tracer.pb.h"
+#include "../mapped_path.hpp"
 
 #include <cstdint>
+#include <istream>
 #include <map>
 #include <string>
 #include <vector>
@@ -12,7 +14,9 @@
 #include <charconv>
 #include <cstring>
 #include <set>
+#include <sstream>
 #include <string_view>
+#include <tuple>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -187,6 +191,55 @@ inline std::map<std::vector<std::string>, PreparedLibrary> find_prepared_librari
   (void)groups;
 #endif
   return matches;
+}
+
+// Keeps only mappings that the local kernel also reports for the process, so
+// a server cannot steer the REPL to load a library the process never mapped.
+inline clangtracer::v1::ListModulesResponse confirmed_local_mappings(
+    clangtracer::v1::ListModulesResponse modules, std::istream &process_maps) {
+#if defined(__linux__) && defined(__x86_64__)
+  using Key = std::tuple<std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::string>;
+  const auto number = [](const std::string &text, int base, std::uint64_t &value) {
+    const auto end = text.data() + text.size();
+    const auto parsed = std::from_chars(text.data(), end, value, base);
+    return !text.empty() && parsed.ec == std::errc{} && parsed.ptr == end;
+  };
+  // The server reports canonical paths, so a line may match by raw or resolved path.
+  std::map<Key, std::vector<std::string>> local;
+  std::string text;
+  while (std::getline(process_maps, text)) {
+    std::istringstream row(text);
+    std::string range, permissions, offset, device, inode, path;
+    if (!(row >> range >> permissions >> offset >> device >> inode)) continue;
+    std::getline(row >> std::ws, path);
+    const auto dash = range.find('-');
+    std::uint64_t begin = 0, end = 0, file_offset = 0, file_inode = 0;
+    if (path.empty() || path.front() != '/' || dash == range.npos ||
+        !number(range.substr(0, dash), 16, begin) || !number(range.substr(dash + 1), 16, end) ||
+        !number(offset, 16, file_offset) || !number(inode, 10, file_inode))
+      continue;
+    local[Key{begin, end, file_offset, file_inode, std::move(device)}].push_back(std::move(path));
+  }
+  std::vector<clangtracer::v1::ModuleMapping> kept;
+  for (const auto &entry : modules.mappings()) {
+    if (entry.path().empty() || entry.inode() == 0) continue;
+    const auto candidates = local.find(Key{entry.begin_address(), entry.end_address(),
+                                           entry.file_offset(), entry.inode(), entry.device()});
+    if (candidates == local.end()) continue;
+    const auto &raw = candidates->second;
+    if (std::find(raw.begin(), raw.end(), entry.path()) != raw.end() ||
+        std::any_of(raw.begin(), raw.end(), [&](const std::string &path) {
+          return tracer::detail::canonical_mapped_path(path) == entry.path();
+        }))
+      kept.push_back(entry);
+  }
+  modules.clear_mappings();
+  for (auto &entry : kept) *modules.add_mappings() = std::move(entry);
+#else
+  (void)process_maps;
+  modules.clear_mappings();
+#endif
+  return modules;
 }
 
 inline bool prepared_library_build_id_matches(std::uintptr_t load_address,
