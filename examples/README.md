@@ -5,6 +5,7 @@ commands; start with basic callbacks, then shared context.
 
 | Concept | What to try |
 | --- | --- |
+| [Lessons](lessons/README.md) | Follow the user guide and tutorials section by section with ready-made projects. |
 | [Basic callbacks](basic-callbacks/README.md) | Read one argument in PRE and the original result in POST. |
 | [C++ objects](cpp-interceptors/README.md) | Trace functions and methods; read arguments and object fields. |
 | [Object arguments](order-arguments/README.md) | Read an Order passed by reference, pointer or value. |
