@@ -183,7 +183,11 @@ int main() {
 }
 ```
 
-Use these commands in the native REPL with its private Linux x86-64 server.
+Use these commands in the native REPL on Linux x86-64. With the REPL's private
+server, only that server may attach to the launched application. With any other
+endpoint, including `CLANG_TRACER_ENDPOINT`, the server must run on the same
+host as the REPL, and the launched application accepts any tracer the host's
+tracing policy allows.
 `%launch` selects the attached session and holds the application at the
 checkpoint while you install probes.
 

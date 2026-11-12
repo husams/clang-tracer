@@ -44,6 +44,9 @@ public:
   OwnedTarget(const OwnedTarget &) = delete;
   OwnedTarget &operator=(const OwnedTarget &) = delete;
 
+  // Passed as tracer_pid when the server's PID is unknown (a server this REPL
+  // did not start): the target then accepts any tracer the host policy allows.
+  static constexpr int any_tracer = -1;
   static std::unique_ptr<OwnedTarget> start(const LaunchOptions &options, int tracer_pid);
   bool running();
   void wait_ready(unsigned seconds, const std::atomic<bool> &cancelled);

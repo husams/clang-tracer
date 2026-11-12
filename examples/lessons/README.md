@@ -19,6 +19,7 @@ run the section's commands without typing the sources first.
 | [11-typed-values](11-typed-values/README.md) | [Decode objects, containers, and method receivers](../../docs/guide/tutorials.md#decode-objects-containers-and-method-receivers) |
 | [12-shared-context](12-shared-context/README.md) | [Observe shared context and thread propagation](../../docs/guide/tutorials.md#observe-shared-context-and-thread-propagation) |
 | [13-native-cli](13-native-cli/README.md) | [Trace from the native CLI](../../docs/guide/tutorials.md#trace-from-the-native-cli) |
+| [14-launch](14-launch/README.md) | [Launch a local application](../../docs/native-repl.md#launch-a-local-application) (REPL walkthrough) |
 
 The remaining sections need no project. "Install and check the tools" and
 "Open the interactive guide" only run installed commands, and "Run the

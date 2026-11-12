@@ -620,8 +620,10 @@ void Controller::launch(const Command &command) {
   if (owned_targets_.size() >= 16)
     throw std::runtime_error("owned target limit reached");
   ensure_connected();
-  if (!server_.running() || endpoint_ != server_.endpoint())
-    throw std::runtime_error("%launch requires a private local server owned by this REPL");
+  // An owned server is authorized by PID. Any other endpoint is assumed to be
+  // a server on this host, so the child accepts any permitted tracer.
+  const bool owned_server = server_.running() && endpoint_ == server_.endpoint();
+  const int tracer_pid = owned_server ? server_.pid() : OwnedTarget::any_tracer;
 
   LaunchOptions options;
   options.executable = command.arguments.at(0);
@@ -637,7 +639,7 @@ void Controller::launch(const Command &command) {
   if (command.has("--env"))
     options.environment = command.options.at("--env");
 
-  auto target = OwnedTarget::start(options, server_.pid());
+  auto target = OwnedTarget::start(options, tracer_pid);
   const auto pid = target->pid();
   auto &owned = owned_targets_.emplace(pid, OwnedLaunch{std::move(target), {}}).first->second;
   auto &process = *owned.process;
