@@ -1,4 +1,5 @@
 #include "native_entry.hpp"
+#include "native_detour.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -106,7 +107,7 @@ bool make_decoder(Decoder &d, std::string &error) {
   return true;
 }
 
-bool safe_instruction(const llvm::MCInst &inst, const llvm::MCInstrInfo &ins,
+bool entry_instruction(const llvm::MCInst &inst, const llvm::MCInstrInfo &ins,
                       const llvm::MCRegisterInfo &regs, bool allow_rip = false) {
   const auto &desc = ins.get(inst.getOpcode());
   if (desc.isBranch() || desc.isCall() || desc.isReturn() ||
@@ -148,6 +149,55 @@ bool safe_instruction(const llvm::MCInst &inst, const llvm::MCInstrInfo &ins,
   return true;
 }
 
+#if defined(__x86_64__)
+bool integer_division(llvm::StringRef opcode) {
+  if (opcode.consume_front("IDIV") || opcode.consume_front("DIV")) {
+    if (!opcode.consume_back("r") && !opcode.consume_back("m"))
+      return false;
+    return opcode == "8" || opcode == "16" || opcode == "32" || opcode == "64";
+  }
+  return false;
+}
+
+bool copyable_instruction(const llvm::MCInst &inst, const Decoder &decoder,
+                          bool changes_stack, bool locked, bool verified_store,
+                          bool allow_rip) {
+  const auto &desc = decoder.ins->get(inst.getOpcode());
+  const auto opcode = decoder.ins->getName(inst.getOpcode());
+  if (desc.isPseudo() || desc.isMetaInstruction() || desc.isTrap() ||
+      desc.isTerminator() || desc.mayAffectControlFlow(inst, *decoder.regs) ||
+      (locked && !verified_store))
+    return false;
+  if (opcode == "ENDBR64")
+    return !locked;
+  // LLVM marks integer division as having side effects because it can trap.
+  // The cache restores the original PC for a synchronous divide fault.
+  if ((desc.hasUnmodeledSideEffects() && !integer_division(opcode)) ||
+      opcode == "STD" || opcode.starts_with("POPF"))
+    return false;
+  if (changes_stack && opcode != "LEAVE64" &&
+      !entry_instruction(inst, *decoder.ins, *decoder.regs))
+    return false;
+  const auto restricted_register = [&](llvm::MCRegister reg) {
+    if (!reg)
+      return false;
+    const llvm::StringRef name = decoder.regs->getName(reg);
+    // x87 records the current instruction address. Segment and system
+    // registers can affect control flow or the meaning of later operands.
+    return (!allow_rip && name == "RIP") || name == "EIP" || name == "IP" ||
+           name == "CS" || name == "DS" || name == "ES" || name == "FS" ||
+           name == "GS" || name == "SS" || name.starts_with("ST") ||
+           name.starts_with("FP") || name.starts_with("MM") ||
+           name.starts_with("CR") || name.starts_with("DR");
+  };
+  for (const auto &operand : inst)
+    if (operand.isReg() && restricted_register(operand.getReg()))
+      return false;
+  return std::none_of(desc.implicit_defs().begin(), desc.implicit_defs().end(), restricted_register) &&
+         std::none_of(desc.implicit_uses().begin(), desc.implicit_uses().end(), restricted_register);
+}
+#endif
+
 bool integer_arithmetic(llvm::StringRef opcode, llvm::StringRef suffix) {
   for (const llvm::StringRef op : {"ADD32", "SUB32", "AND32", "OR32", "XOR32", "INC32", "DEC32",
                                   "NEG32", "NOT32", "SHL32", "SHR32", "SAR32"})
@@ -181,7 +231,7 @@ std::size_t patch_window(const Decoder &decoder, std::uint64_t address,
     llvm::MCInst instruction;
     std::uint64_t size = 0;
     if (!decode(decoder, instruction, size, address + used, bytes.substr(used)) ||
-        !safe_instruction(instruction, *decoder.ins, *decoder.regs)) {
+        !entry_instruction(instruction, *decoder.ins, *decoder.regs)) {
       error = "target entry contains an unsupported or PC-relative instruction";
       return 0;
     }
@@ -392,27 +442,20 @@ Preview inspect(std::uint64_t address, std::string_view bytes, bool entry) {
     const bool entry_copyable = (opcode == "ADR" || opcode == "ADRP") &&
         !changes_receiver && !changes_stack;
     const bool may_store = desc.mayStore() && !architectural_hint;
+    const bool rip_relative = false;
 #else
-    const bool arithmetic = !lock && (integer_arithmetic(opcode, "r") || integer_arithmetic(opcode, "rm") ||
-        integer_arithmetic(opcode, "rr") || integer_arithmetic(opcode, "ri") ||
-        integer_arithmetic(opcode, "ri8") ||
-        (store && store->kind == ScalarStore::Kind::rmw));
-    const auto register_named = [&](std::string_view name) {
-      for (unsigned i = 0; i != instruction.getNumOperands(); ++i) {
-        const auto &operand = instruction.getOperand(i);
-        if (operand.isReg() && operand.getReg() && decoder.regs->getName(operand.getReg()) == name)
-          return true;
-      }
-      return false;
-    };
-    const bool copyable = lock ? store.has_value() && !register_named("RIP") && !register_named("EIP") :
-        safe_instruction(instruction, *decoder.ins, *decoder.regs) ||
-        (arithmetic && !register_named("RIP") && !register_named("EIP")) ||
-        opcode == "INC64r" || opcode == "INC32r" || opcode == "DEC64r" ||
-        opcode == "DEC32r" || opcode == "SETCCr" || opcode == "LEAVE64" ||
-        opcode == "ENDBR64" || opcode == "CMP32ri8" || opcode == "CMP32ri" ||
-        opcode == "CMOV32rr" || opcode == "CMOV64rr";
+    const bool has_rip = std::any_of(instruction.begin(), instruction.end(), [&](const auto &operand) {
+      return operand.isReg() && operand.getReg() &&
+             llvm::StringRef(decoder.regs->getName(operand.getReg())) == "RIP";
+    });
+    const bool copyable = !has_rip &&
+        copyable_instruction(instruction, decoder, changes_stack, lock, store.has_value(), false);
+    const bool rip_relative = has_rip && !lock &&
+        (entry_instruction(instruction, *decoder.ins, *decoder.regs, true) ||
+         native_detour::scalar_fp_load_width(opcode)) &&
+        copyable_instruction(instruction, decoder, changes_stack, false, false, true);
     const bool entry_copyable = copyable && !desc.mayLoad() && !desc.mayStore() &&
+        !desc.mayRaiseFPException() && !integer_division(opcode) &&
         opcode != "ENDBR64" && opcode != "LEAVE64";
     const bool may_store = desc.mayStore();
 #endif
@@ -425,8 +468,7 @@ Preview inspect(std::uint64_t address, std::string_view bytes, bool entry) {
                                    changes_receiver, changes_stack,
                                    entry_copyable,
                                    opcode == "CALL64r" || opcode == "CALL64m",
-                                   !copyable && !lock &&
-                                       safe_instruction(instruction, *decoder.ins, *decoder.regs, true)});
+                                   rip_relative});
   }
   std::sort(result.instructions.begin(), result.instructions.end(),
             [](const auto &a, const auto &b) { return a.address < b.address; });

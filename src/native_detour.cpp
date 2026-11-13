@@ -131,7 +131,8 @@ bool allowed_instruction(const llvm::MCInst &inst,
 }
 
 std::optional<std::size_t> memory_access_size(const llvm::MCInst &inst,
-                                              const llvm::MCInstrInfo &ins) {
+                                              const llvm::MCInstrInfo &ins,
+                                              bool code_cache) {
   const auto &desc = ins.get(inst.getOpcode());
   // LEA and memory-form NOP do not access the computed memory address.
   if (!desc.mayLoad() && !desc.mayStore())
@@ -150,6 +151,8 @@ std::optional<std::size_t> memory_access_size(const llvm::MCInst &inst,
   for (auto width : widths)
     if (compat::starts_with(name, width.prefix))
       return width.bytes;
+  if (const auto width = code_cache ? scalar_fp_load_width(name) : 0)
+    return width;
   return std::nullopt;
 }
 
@@ -157,7 +160,8 @@ std::optional<std::size_t> memory_access_size(const llvm::MCInst &inst,
 // with an immediate have additional bytes after the RIP displacement.
 bool record_relocation(Decoder &d, llvm::MCInst inst,
                        compat::span<const std::uint8_t> bytes, std::size_t offset,
-                       std::size_t size, Patch &patch, std::string &error) {
+                       std::size_t size, Patch &patch, std::string &error,
+                       bool code_cache = false) {
   std::optional<unsigned> rip;
   for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
     if (!inst.getOperand(i).isReg() || !inst.getOperand(i).getReg()) {
@@ -178,7 +182,7 @@ bool record_relocation(Decoder &d, llvm::MCInst inst,
   if (!rip) {
     return true;
   }
-  const auto access_size = memory_access_size(inst, *d.ins);
+  const auto access_size = memory_access_size(inst, *d.ins, code_cache);
   if (!access_size)
     return fail(error, "target RIP-relative memory width is unsupported");
   // X86 MC memory operands are base, scale, index, displacement, segment.
@@ -523,7 +527,7 @@ bool create_getter_copy(std::string_view bytes, std::uintptr_t caller,
 }
 
 bool prepare_call_relay(std::uintptr_t caller, void *copy, std::size_t size,
-                        const void *wrapper, std::span<std::uint8_t> output,
+                        const void *wrapper, compat::span<std::uint8_t> output,
                         std::uintptr_t &relay, std::string &error) {
   Patch placement;
   placement.entry = caller;
@@ -537,7 +541,7 @@ bool prepare_call_relay(std::uintptr_t caller, void *copy, std::size_t size,
 
 bool allocate_code_cache(std::uintptr_t caller, std::size_t bytes,
                          void *&address, std::size_t &size, std::string &error,
-                         std::span<const RipRelocation> relocations) {
+                         compat::span<const RipRelocation> relocations) {
   const auto page = ::sysconf(_SC_PAGESIZE);
   if (page <= 0 || !bytes || bytes > static_cast<std::size_t>(INT32_MAX))
     return fail(error, "invalid code-cache allocation bounds");
@@ -554,7 +558,21 @@ bool allocate_code_cache(std::uintptr_t caller, std::size_t bytes,
   return true;
 }
 
-bool code_cache_rip_relocation(std::span<const std::uint8_t> bytes,
+std::size_t scalar_fp_load_width(std::string_view opcode) {
+  // LLVM distinguishes the intrinsic form of legacy scalar SSE operations.
+  if (opcode.ends_with("_Int"))
+    opcode.remove_suffix(4);
+  if (opcode.size() != 7 || !opcode.ends_with("rm"))
+    return 0;
+  const auto operation = opcode.substr(0, 3);
+  if (operation != "ADD" && operation != "SUB" && operation != "MUL" &&
+      operation != "DIV" && operation != "MIN" && operation != "MAX")
+    return 0;
+  const auto precision = opcode.substr(3, 2);
+  return precision == "SD" ? 8 : precision == "SS" ? 4 : 0;
+}
+
+bool code_cache_rip_relocation(compat::span<const std::uint8_t> bytes,
                                std::uintptr_t pc, RipRelocation &relocation,
                                std::string &error) {
   Decoder decoder;
@@ -566,9 +584,11 @@ bool code_cache_rip_relocation(std::span<const std::uint8_t> bytes,
   patch.entry = pc;
   if (decoder.dis->getInstruction(inst, size, {bytes.data(), bytes.size()}, pc,
                                   llvm::nulls()) != llvm::MCDisassembler::Success ||
-      size != bytes.size() || !allowed_instruction(inst, *decoder.ins))
+      size != bytes.size() ||
+      (!allowed_instruction(inst, *decoder.ins) &&
+       !scalar_fp_load_width(decoder.ins->getName(inst.getOpcode()))))
     return fail(error, "unsupported RIP-relative code-cache instruction");
-  if (!record_relocation(decoder, inst, bytes, 0, size, patch, error))
+  if (!record_relocation(decoder, inst, bytes, 0, size, patch, error, true))
     return false;
   if (patch.relocations.size() != 1)
     return fail(error, "expected one verified RIP-relative operand");

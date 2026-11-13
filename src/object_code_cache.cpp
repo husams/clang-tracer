@@ -105,7 +105,7 @@ std::vector<Instruction> verify_function(const object_watch::Plan &plan, Address
   const auto bytes = plan.code(start).substr(0, size);
   if (bytes.size() != size)
     throw std::runtime_error("cannot verify a complete code-cache function");
-  return decode_leaf(start, bytes, boundary == Boundary::construct,
+  return decode_leaf(start, bytes, !boundary || boundary == Boundary::construct,
       [&](const native_entry::Instruction &inst, Instruction &out) {
         if (inst.flow == NativeFlow::ordinary) {
           if (boundary && inst.changes_receiver)

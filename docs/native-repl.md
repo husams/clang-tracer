@@ -765,9 +765,9 @@ standalone leaf. Its entry must have a verified overwrite window.
 store instructions, and event drops. The store count includes failed
 compare-and-exchanges and stores to untracked addresses.
 
-Events use the original application PC. For a synchronous SIGSEGV or
-SIGBUS on a copied instruction, a chained application handler sees that PC
-and can retry or skip the instruction. Keep fault signal dispositions
+Events use the original application PC. For a synchronous SIGSEGV, SIGBUS,
+SIGFPE, or SIGILL on a copied instruction, a chained application handler
+sees that PC and can retry or skip the instruction. Keep fault signal dispositions
 stable during tracing. Use `--async-signal N` for a signal with an existing
 application handler. At a copied application instruction the handler sees
 the original PC and can resume or select another original instruction.
