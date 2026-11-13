@@ -776,8 +776,14 @@ function(tracer_add_native_repl)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_unpadded.py"
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-unpadded-O2-target>
-          xy --backend code-cache --reject-tail)
+          xy --backend code-cache --rejection "unverified tail caller")
       set_tests_properties(native_repl_object_lifetime_tail_callers PROPERTIES TIMEOUT 120)
+      add_test(NAME native_repl_object_hidden_writer_call
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_unpadded.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-unpadded-O2-target>
+          h --backend code-cache --rejection "cannot verify a potential code-cache call or branch")
+      set_tests_properties(native_repl_object_hidden_writer_call PROPERTIES TIMEOUT 120)
       foreach(_optimization O0 O2)
         set(_string_target repl-object-string-lifetime-${_optimization}-target)
         add_executable(${_string_target} tests/fixtures/object_lifetime/unpadded.cpp

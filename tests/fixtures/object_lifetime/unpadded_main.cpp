@@ -36,6 +36,12 @@ void exercise_callback() {
   write_callback(object, 13);
 }
 
+void exercise_hidden_writer() {
+  life::Callback object(7);
+  write_hidden(object, 11);
+  hidden_writer_call(object, 13);
+}
+
 [[gnu::noinline]] void exercise_text() {
   auto *heap = new life::Text(7);
   write_text(*heap, 13);
@@ -101,6 +107,9 @@ int main() {
       break;
     case 'c':
       exercise_callback();
+      break;
+    case 'h':
+      exercise_hidden_writer();
       break;
     case 't':
       exercise_text();

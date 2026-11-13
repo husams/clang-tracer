@@ -35,6 +35,7 @@
 #include <llvm/Object/BuildID.h>
 #include <llvm/Object/ELFObjectFile.h>
 #include <llvm/TargetParser/Host.h>
+#include <llvm/Support/DataExtractor.h>
 
 namespace tracer::object_watch {
 namespace {
@@ -1161,6 +1162,54 @@ std::string writer_module(std::uint32_t pid, const std::string &executable,
     throw std::runtime_error("--module must identify one live ELF by path or basename");
   return candidates.front();
 }
+// Read the call-site table used by the Itanium C++ unwinder on ELF. The
+// common GCC and Clang form uses the FDE entry as LPStart and ULEB128 or
+// fixed-width unsigned call-site offsets. Leave other encodings unverified.
+std::vector<std::uint64_t> landing_pad_offsets(llvm::StringRef lsda, std::uint64_t function_size) {
+  const llvm::DataExtractor header(lsda, true, 8);
+  llvm::DataExtractor::Cursor position(0);
+  const auto base_encoding = header.getU8(position);
+  if (header.getU8(position) != dw::DW_EH_PE_omit)
+    header.getULEB128(position); // Type table offset.
+  const auto encoding = header.getU8(position);
+  const auto size = header.getULEB128(position);
+  if (auto error = position.takeError()) {
+    llvm::consumeError(std::move(error));
+    return {};
+  }
+  if (base_encoding != dw::DW_EH_PE_omit || size > lsda.size() - position.tell())
+    return {};
+  unsigned width = 0;
+  switch (encoding) {
+  case dw::DW_EH_PE_uleb128: break;
+  case dw::DW_EH_PE_udata2: width = 2; break;
+  case dw::DW_EH_PE_udata4: width = 4; break;
+  case dw::DW_EH_PE_udata8: width = 8; break;
+  default: return {};
+  }
+
+  const llvm::DataExtractor table(lsda.substr(position.tell(), size), true, 8);
+  llvm::DataExtractor::Cursor entry(0);
+  const auto read_offset = [&] {
+    return width ? table.getUnsigned(entry, width) : table.getULEB128(entry);
+  };
+  std::vector<std::uint64_t> offsets;
+  while (entry.tell() < size) {
+    const auto start = read_offset();
+    const auto length = read_offset();
+    const auto pad = read_offset();
+    table.getULEB128(entry); // Action index.
+    if (auto error = entry.takeError()) {
+      llvm::consumeError(std::move(error));
+      return {};
+    }
+    if (start > function_size || length > function_size - start || pad >= function_size)
+      return {};
+    if (pad)
+      offsets.push_back(pad);
+  }
+  return offsets;
+}
 } // namespace
 
 struct Plan::Image {
@@ -1176,6 +1225,59 @@ struct Plan::Image {
   std::set<Range> functions;
   std::vector<Symbol> symbols;
   mutable std::optional<std::set<std::uint64_t>> delete_plt;
+  mutable std::optional<std::map<std::uint64_t, std::set<std::uint64_t>>> exception_entries;
+
+  void index_exception_entries() const {
+    exception_entries.emplace();
+    const auto &object = llvm::cast<ObjectFile>(*executable.getBinary());
+    for (const auto &section : object.sections()) {
+      auto name = section.getName();
+      if (!name) {
+        llvm::consumeError(name.takeError());
+        continue;
+      }
+      if (*name != ".gcc_except_table")
+        continue;
+      auto table = section.getContents();
+      if (!table) {
+        llvm::consumeError(table.takeError());
+        continue;
+      }
+      // A separate debug file may not carry the executable's .eh_frame.
+      auto unwind = debug.getBinary() ? llvm::DWARFContext::create(object) : nullptr;
+      auto frames = (unwind ? *unwind : *dwarf).getEHFrame();
+      if (!frames) {
+        llvm::consumeError(frames.takeError());
+        return;
+      }
+      if (!*frames)
+        return;
+      for (const auto &entry : (*frames)->entries()) {
+        const auto *fde = llvm::dyn_cast<dw::FDE>(&entry);
+        if (!fde || !fde->getLSDAAddress())
+          continue;
+        const auto lsda = *fde->getLSDAAddress();
+        const auto base = section.getAddress();
+        if (lsda < base || lsda - base >= table->size())
+          continue;
+        const auto start = fde->getInitialLocation();
+        for (const auto offset : landing_pad_offsets(table->substr(lsda - base), fde->getAddressRange()))
+          if (offset <= std::numeric_limits<std::uint64_t>::max() - start)
+            (*exception_entries)[start].insert(start + offset);
+      }
+    }
+  }
+
+  std::vector<std::uint64_t> landing_pads(std::uint64_t start, std::size_t size) const {
+    if (!exception_entries)
+      index_exception_entries();
+    std::vector<std::uint64_t> entries;
+    if (const auto found = exception_entries->find(start - *bias); found != exception_entries->end())
+      for (const auto address : found->second)
+        if (address - found->first < size)
+          entries.push_back(*bias + address);
+    return entries;
+  }
 
   bool is_delete_target(std::uint64_t address) const {
     if (std::ranges::any_of(symbols, [&](const auto &symbol) {
@@ -1603,7 +1705,9 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       if (site.boundary == Boundary::construct &&
           (site.uncertain_complete || delegating_constructor_tails.count(pc)))
         aliases.push_back(pc);
-    for (const auto &[entry, calls] : direct_redirects(aliases, true)) {
+    // This lookup only adds evidence for ambiguous constructors. It does
+    // not install redirects or require callers to be exhaustively known.
+    for (const auto &[entry, calls] : direct_redirects(aliases, true, false)) {
       for (const auto call : calls) {
         const auto *image = image_for(call);
         const auto address = call - *image->bias;
@@ -1853,7 +1957,8 @@ namespace {
 using Redirects = std::map<std::uint64_t, std::vector<std::uint64_t>>;
 enum class DirectEdges { redirects, calls, branches };
 
-void find_direct_redirects(const auto &callers, Redirects &result, DirectEdges edges) {
+void find_direct_redirects(const auto &callers, Redirects &result, DirectEdges edges,
+                           bool require_complete = true) {
   if (result.empty() || !callers.bias)
     return;
   for (const auto &[address, size] : callers.functions) {
@@ -1861,11 +1966,15 @@ void find_direct_redirects(const auto &callers, Redirects &result, DirectEdges e
     const auto bytes = callers.code(start);
     if (size > bytes.size())
       continue;
-    // Only decode symbols with a possible matching direct edge. The decoder
-    // must confirm a reachable instruction boundary and exact target.
-    bool candidate = false;
+    // Keep the raw matches until after decoding. A matching opcode outside
+    // the decoded graph could be a call in a switch arm or an EH landing pad.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> candidates;
+    const auto record_candidate = [&](std::size_t offset, std::uint64_t target, bool call) {
+      if ((call ? edges != DirectEdges::branches : edges != DirectEdges::calls) && result.count(target))
+        candidates.emplace_back(start + offset, target);
+    };
 #if defined(__aarch64__)
-    for (std::size_t i = 0; i + 4 <= size && !candidate; i += 4) {
+    for (std::size_t i = 0; i + 4 <= size; i += 4) {
       std::uint32_t word;
       std::memcpy(&word, bytes.data() + i, sizeof(word));
       unsigned bits = 0, shift = 5;
@@ -1881,30 +1990,62 @@ void find_direct_redirects(const auto &callers, Redirects &result, DirectEdges e
       if (bits) {
         const auto sign = std::int64_t{1} << (bits - 1);
         const auto offset = (word >> shift) & (2 * sign - 1);
-        candidate = result.count(start + i + 4 * ((offset ^ sign) - sign));
+        const bool call = (word & 0xfc000000U) == 0x94000000U;
+        record_candidate(i, start + i + 4 * ((offset ^ sign) - sign), call);
       }
     }
 #else
-    for (std::size_t i = 0; i + 2 <= size && !candidate; ++i) {
+    for (std::size_t i = 0; i + 2 <= size; ++i) {
       const auto opcode = static_cast<unsigned char>(bytes[i]);
       const auto second = static_cast<unsigned char>(bytes[i + 1]);
       if (opcode == 0xeb || (opcode >= 0x70 && opcode <= 0x7f) ||
           (opcode >= 0xe0 && opcode <= 0xe3)) {
-        candidate = result.count(start + i + 2 + static_cast<std::int8_t>(second));
+        record_candidate(i, start + i + 2 + static_cast<std::int8_t>(second), false);
       } else {
         const bool near_cond = opcode == 0x0f && second >= 0x80 && second <= 0x8f;
         const auto end = i + (near_cond ? 6 : 5);
         if (end <= size && (near_cond || opcode == 0xe8 || opcode == 0xe9)) {
           std::int32_t displacement;
           std::memcpy(&displacement, bytes.data() + end - 4, sizeof(displacement));
-          candidate = result.count(start + end + displacement);
+          record_candidate(i, start + end + displacement, opcode == 0xe8);
         }
       }
     }
 #endif
-    if (!candidate)
+    if (candidates.empty())
       continue;
-    const auto decoded = native_entry::scan(start, bytes.substr(0, size));
+    auto decoded = native_entry::scan(start, bytes.substr(0, size));
+    if (require_complete) {
+      const auto unverified_site = [&]() -> std::optional<std::uint64_t> {
+        auto inst = decoded.instructions.begin();
+        for (const auto &[pc, target] : candidates) {
+          while (inst != decoded.instructions.end() && inst->address + inst->size <= pc)
+            ++inst;
+          // An opcode embedded in a verified instruction is not a call site.
+          if (inst == decoded.instructions.end() || inst->address > pc ||
+              (inst->address == pc && inst->target != target))
+            return pc;
+        }
+        return std::nullopt;
+      };
+      auto unverified = unverified_site();
+      if (unverified) {
+        const auto landing_pads = callers.landing_pads(start, size);
+        if (!landing_pads.empty()) {
+          decoded = native_entry::scan(start, bytes.substr(0, size), landing_pads);
+          unverified = unverified_site();
+        }
+      }
+      if (unverified) {
+        const auto function = callers.source(start).function;
+        std::ostringstream message;
+        message << "cannot verify a potential code-cache call or branch at ELF address 0x"
+                << std::hex << *unverified - *callers.bias;
+        if (!function.empty())
+          message << " in " << function;
+        throw std::runtime_error(message.str());
+      }
+    }
     std::uint64_t previous_end = 0;
     for (const auto &inst : decoded.instructions) {
       if (inst.address < previous_end)
@@ -1938,14 +2079,15 @@ void find_direct_redirects(const auto &callers, Redirects &result, DirectEdges e
 }
 
 std::map<std::uint64_t, std::vector<std::uint64_t>>
-Plan::direct_redirects(const std::vector<std::uint64_t> &entries, bool calls_only) const {
+Plan::direct_redirects(const std::vector<std::uint64_t> &entries, bool calls_only,
+                       bool require_complete) const {
   Redirects result;
   for (auto entry : entries)
     result.try_emplace(entry);
   const auto edges = calls_only ? DirectEdges::calls : DirectEdges::redirects;
-  find_direct_redirects(*image_, result, edges);
+  find_direct_redirects(*image_, result, edges, require_complete);
   if (main_)
-    find_direct_redirects(*main_, result, edges);
+    find_direct_redirects(*main_, result, edges, require_complete);
   for (auto &[entry, sites] : result) {
     std::sort(sites.begin(), sites.end());
     sites.erase(std::unique(sites.begin(), sites.end()), sites.end());
@@ -2084,6 +2226,11 @@ std::uint64_t Plan::constructor_tail_target(std::uint64_t pc) const {
     pc = next->second;
   }
   return 0;
+}
+
+std::vector<std::uint64_t> Plan::landing_pads(std::uint64_t start, std::size_t size) const {
+  const auto *image = image_for(start);
+  return image ? image->landing_pads(start, size) : std::vector<std::uint64_t>{};
 }
 
 std::vector<std::uint64_t> Plan::lifetime_return_callers(std::uint64_t pc, bool constructor) const {

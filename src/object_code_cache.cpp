@@ -1249,11 +1249,16 @@ struct Watch::Impl {
       for (const auto call : callers) {
         const auto next = call + 5;
         const auto [caller, length] = plan.containing_function(call);
-        const auto caller_body = native_entry::scan(caller, plan.code(caller).substr(0, length));
+        const auto pads = plan.landing_pads(caller, length);
+        const auto caller_body = native_entry::scan(caller, plan.code(caller).substr(0, length), pads);
         auto fragment = straight_fragment(plan, caller_body, next, leave, false, true);
         if (fragment.empty() || overlaps_entry(fragment) ||
             overlaps_fragment(fragment.front().pc, fragment.back().pc + fragment.back().size))
           throw std::runtime_error("lifetime return continuation has no disjoint native redirect");
+        const auto end = fragment.back().pc + fragment.back().size;
+        if (std::ranges::any_of(pads, [&](const auto pad) { return pad >= next && pad < end; }) ||
+            !check_interior(next, end))
+          throw std::runtime_error("an application edge enters the lifetime return continuation");
         fragment.front().boundary_pc = pc;
         fragment.front().successor_return = true;
         returns.push_back({std::move(fragment)});

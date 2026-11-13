@@ -757,8 +757,12 @@ absolute path. A shared leaf that uses an entry redirect needs a verified
 nonfaulting overwrite window.
 Native watches capture virtual destruction at the destructor entry, including
 deleting destructors that inline the complete destructor. A watch fails to
-start if its virtual destructor has no verified redirect. The diagnostic
-backend rejects writers with an unresolved indirect branch, such as a jump table.
+start if its virtual destructor has no verified redirect. When code-cache
+capture relies on direct calls or return continuations, preview and start
+reject unverified call sites, including sites behind unresolved jump tables.
+Supported ELF exception tables let the planner verify calls in cleanup
+blocks. The diagnostic backend rejects writers with an unresolved indirect
+branch, such as a jump table.
 Inlined lifetimes, forked children, and unadmitted store instructions are
 outside coverage.
 

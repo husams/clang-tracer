@@ -111,6 +111,7 @@ public:
 #endif
   bool is_delete_target(std::uint64_t pc) const;
   std::uint64_t constructor_tail_target(std::uint64_t pc) const;
+  std::vector<std::uint64_t> landing_pads(std::uint64_t start, std::size_t size) const;
   std::vector<std::uint64_t> lifetime_return_callers(std::uint64_t pc, bool constructor) const;
   Source source(std::uint64_t pc) const;
   void describe_origin(std::uint64_t pc, const Source &source,
@@ -128,7 +129,8 @@ public:
       std::uint32_t pid, const std::string &selector) const;
   std::pair<std::uint64_t, std::size_t> containing_function(std::uint64_t pc) const;
   std::map<std::uint64_t, std::vector<std::uint64_t>>
-  direct_redirects(const std::vector<std::uint64_t> &entries, bool calls_only = false) const;
+  direct_redirects(const std::vector<std::uint64_t> &entries, bool calls_only = false,
+                   bool require_complete = true) const;
   std::string runtime_scope_code(const std::string &path,
       std::uint64_t bias, std::uint64_t start, const std::array<std::uint8_t, 32> &sha256,
       std::size_t width,
