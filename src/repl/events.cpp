@@ -876,6 +876,7 @@ void EventBuffer::push(const api::TraceEvent &event) {
   }
   bytes_ += size;
   events_.push_back(std::move(item));
+  ++appended;
 }
 
 Collection EventBuffer::snapshot() const {

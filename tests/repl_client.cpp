@@ -519,7 +519,7 @@ int main(int argc, char **argv) {
         require(live.running(), "collector remains active between REPL inputs");
         auto first_event = live | take(1) | first();
         require(first_event && first_event->sequence() == 3,
-                "adaptors inspect a background snapshot without blocking");
+                "a limit ends iteration without waiting for a further event");
         auto post_event = live | filter([](const auto &e) { return e.phase() == "POST"; }) | take(1) | first();
         require(post_event && post_event->sequence() == 4,
                 "event predicates compose with limits");
@@ -571,8 +571,7 @@ int main(int argc, char **argv) {
           (void)event;
           ++count;
         }
-        require(count == 0 && quiet.running(), "empty iteration does not wait");
-        wait_for([&] { return !quiet.running(); });
+        require(count == 0 && !quiet.running(), "iteration waits for the stream to end");
         require(quiet.snapshot().timed_out && quiet.error().empty(),
                 "quiet stream deadline is reported");
       }
@@ -589,6 +588,18 @@ int main(int argc, char **argv) {
                 "worker reports RPC errors without throwing on another input");
       }
       service.watch_mode = 3;
+      {
+        auto waiting = tracer.events_async(session);
+        std::thread cancel([] {
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          interrupted = true;
+        });
+        const bool empty = !(waiting | first());
+        cancel.join();
+        interrupted = false;
+        require(empty && waiting.running(), "Ctrl+C ends a waiting iteration, not the collector");
+      }
+      wait_for([&] { return service.active_watches == 0; });
       auto quiet = tracer.events_async(session);
       wait_for([&] { return service.active_watches == 1; });
       tracer.detach(session);

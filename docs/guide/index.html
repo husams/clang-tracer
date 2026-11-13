@@ -174,7 +174,7 @@ span.linenos.special { color: #e6edf3; background-color: #6e7681; padding-left: 
   <div class="nav-group"><h2>Get started</h2><ul><li><details><summary>Clang Tracer user guide</summary><div class="subnav"><a href="#user">Overview</a><a href="#user--install-and-check-the-tools">Install and check the tools</a><a href="#user--open-the-interactive-guide">Open the interactive guide</a><a href="#user--create-a-target-and-a-basic-probe">Create a target and a basic probe</a><a href="#user--index-debug-information-and-prepare-a-probe-from-a-binary">Index debug information and prepare a probe from a binary</a><a href="#user--related-documentation">Related documentation</a></div></details></li><li><details><summary>Clang Tracer tutorials</summary><div class="subnav"><a href="#tutorials">Overview</a><a href="#tutorials--inspect-a-process-and-a-function-entry">Inspect a process and a function entry</a><a href="#tutorials--edit-validate-reload-and-restore">Edit, validate, reload, and restore</a><a href="#tutorials--trace-a-function-template-instantiation">Trace a function template instantiation</a><a href="#tutorials--preview-and-apply-bulk-tracing">Preview and apply bulk tracing</a><a href="#tutorials--capture-and-inspect-complete-native-stacks">Capture and inspect complete native stacks</a><a href="#tutorials--capture-in-the-background-and-query-in-c">Capture in the background and query in C++</a><a href="#tutorials--record-and-replay-offline">Record and replay offline</a><a href="#tutorials--prepare-a-reusable-probe">Prepare a reusable probe</a><a href="#tutorials--decode-objects-containers-and-method-receivers">Decode objects, containers, and method receivers</a><a href="#tutorials--observe-shared-context-and-thread-propagation">Observe shared context and thread propagation</a><a href="#tutorials--trace-from-the-native-cli">Trace from the native CLI</a><a href="#tutorials--run-the-installed-end-to-end-jit-demo">Run the installed end-to-end JIT demo</a></div></details></li></ul></div>
 <div class="nav-group"><h2>Reference</h2><ul><li><details><summary>Command reference</summary><div class="subnav"><a href="#commands">Overview</a><a href="#commands--native-repl-startup">Native REPL startup</a><a href="#commands--native-repl-session-and-discovery-commands">Native REPL session and discovery commands</a><a href="#commands--native-repl-module-index-commands">Native REPL module index commands</a><a href="#commands--standalone-module-index-cli">Standalone module index CLI</a><a href="#commands--native-repl-probe-and-bulk-trace-commands">Native REPL probe and bulk trace commands</a><a href="#commands--native-repl-memory-and-c-commands">Native REPL memory and C++ commands</a><a href="#commands--native-repl-capture-and-recording-commands">Native REPL capture and recording commands</a><a href="#commands--native-server">Native server</a><a href="#commands--native-command-line-client">Native command-line client</a><a href="#commands--offline-probe-preparation">Offline probe preparation</a><a href="#commands--build-and-deployment-scripts">Build and deployment scripts</a></div></details></li><li><details><summary>Clang Tracer developer guide</summary><div class="subnav"><a href="#developer">Overview</a><a href="#developer--native-repl-c-client-api">Native REPL C++ client API</a><a href="#developer--native-c-module-index-api">Native C++ module index API</a><a href="#developer--agent-callback-api">Agent callback API</a><a href="#developer--grpc-control-api">gRPC control API</a><a href="#developer--build-and-validate-changes">Build and validate changes</a></div></details></li><li><details><summary>C++17 branch reference</summary><div class="subnav"><a href="#cpp17">Overview</a><a href="#cpp17--launch-control-and-profile-a-target">Launch, control, and profile a target</a><a href="#cpp17--inspect-and-change-target-memory">Inspect and change target memory</a><a href="#cpp17--capture-instructions-and-replay-them">Capture instructions and replay them</a><a href="#cpp17--probe-options-and-callback-methods">Probe options and callback methods</a><a href="#cpp17--additional-client-and-callback-apis">Additional client and callback APIs</a></div></details></li></ul></div>
 <div class="nav-group"><h2>Walkthroughs</h2><ul><li><details><summary>Build and deploy on RHEL-compatible Linux</summary><div class="subnav"><a href="#install">Overview</a><a href="#install--dependencies">Dependencies</a><a href="#install--select-the-compiler-and-llvm-installation">Select the compiler and LLVM installation</a><a href="#install--installation-layout">Installation layout</a><a href="#install--archives-and-rpms">Archives and RPMs</a><a href="#install--verification">Verification</a></div></details></li><li><details><summary>GCC 8.5 SDK compatibility build</summary><div class="subnav"><a href="#gcc85">Overview</a><a href="#gcc85--build">Build</a><a href="#gcc85--tests">Tests</a><a href="#gcc85--compatibility-details">Compatibility details</a></div></details></li><li><details><summary>GCC 8.5 runtime compatibility validation — 2026-11-02</summary><div class="subnav"><a href="#gcc85-results">Overview</a><a href="#gcc85-results--build-and-application-validation">Build and application validation</a><a href="#gcc85-results--benchmark-comparison-and-limits">Benchmark comparison and limits</a><a href="#gcc85-results--measured-overhead">Measured overhead</a><a href="#gcc85-results--evidence-and-reproduction">Evidence and reproduction</a><a href="#gcc85-results--external-machine-failure-follow-up">External-machine failure follow-up</a><a href="#gcc85-results--session-fixed-binary-policy">Session-fixed binary policy</a><a href="#gcc85-results--blocked-main-attach-backport">Blocked-main attach backport</a></div></details></li><li><details><summary>Native C++17 REPL</summary><div class="subnav"><a href="#repl">Overview</a><a href="#repl--build">Build</a><a href="#repl--prepare-a-probe-from-a-binary-without-headers">Prepare a probe from a binary without headers</a><a href="#repl--start-and-attach">Start and attach</a><a href="#repl--browse-a-local-c-target">Browse a local C++ target</a><a href="#repl--capture-local-syscalls-or-cpu-samples">Capture local syscalls or CPU samples</a><a href="#repl--preview-a-bulk-trace">Preview a bulk trace</a><a href="#repl--apply-and-remove-a-bulk-trace">Apply and remove a bulk trace</a><a href="#repl--read-and-scan-mapped-memory">Read and scan mapped memory</a><a href="#repl--preview-a-verified-function-entry">Preview a verified function entry</a><a href="#repl--interceptor-upload">Interceptor upload</a><a href="#repl--collect-and-inspect">Collect and inspect</a><a href="#repl--analyze-in-c">Analyze in C++</a><a href="#repl--cleanup-and-scripted-use">Cleanup and scripted use</a><a href="#repl--regenerate-the-grammar">Regenerate the grammar</a><a href="#repl--validation">Validation</a></div></details></li><li><details><summary>Event retention and SQLite storage</summary><div class="subnav"><a href="#storage">Overview</a><a href="#storage--configure-retained-history">Configure retained history</a><a href="#storage--save-or-drain">Save or drain</a><a href="#storage--sqlite-format-and-failure-handling">SQLite format and failure handling</a><a href="#storage--verification">Verification</a></div></details></li><li><details><summary>Shared context</summary><div class="subnav"><a href="#context">Overview</a><a href="#context--declare-and-use-state">Declare and use state</a><a href="#context--thread-propagation">Thread propagation</a><a href="#context--events-and-field-queries">Events and field queries</a><a href="#context--package-lineage">Package lineage</a><a href="#context--build-and-recording">Build and recording</a><a href="#context--acceptance-source">Acceptance source</a></div></details></li></ul></div>
-<div class="nav-group"><h2>Runnable examples</h2><ul><li><details><summary>Basic PRE and POST callbacks</summary><div class="subnav"><a href="#example-callback">Overview</a></div></details></li><li><details><summary>Legacy entry-only callback</summary><div class="subnav"><a href="#example-legacy">Overview</a></div></details></li><li><details><summary>Complete native C++ interceptor example</summary><div class="subnav"><a href="#example-interceptor">Overview</a><a href="#example-interceptor--targetcpp">target.cpp</a><a href="#example-interceptor--methodcpp">method.cpp</a><a href="#example-interceptor--free_functioncpp">free_function.cpp</a><a href="#example-interceptor--run-the-normal-cli">Run the normal CLI</a><a href="#example-interceptor--recorded-normal-cli-run">Recorded normal CLI run</a></div></details></li><li><details><summary>DWARF-typed class-instance arguments</summary><div class="subnav"><a href="#example-arguments">Overview</a><a href="#example-arguments--orderhpp-target-owned-optional-for-tracing">order.hpp (target-owned, optional for tracing)</a><a href="#example-arguments--targetcpp">target.cpp</a><a href="#example-arguments--interceptorcpp">interceptor.cpp</a><a href="#example-arguments--pointercpp">pointer.cpp</a><a href="#example-arguments--run-using-the-normal-cli">Run using the normal CLI</a><a href="#example-arguments--optional-headers-and-compile_commandsjson">Optional headers and compile_commands.json</a><a href="#example-arguments--supported-boundary">Supported boundary</a></div></details></li><li><details><summary>Generate and inject from the native C++ REPL</summary><div class="subnav"><a href="#example-prepared">Overview</a><a href="#example-prepared--1-generate-the-package-from-the-header">1. Generate the package from the header</a><a href="#example-prepared--2-validate-against-the-running-application">2. Validate against the running application</a><a href="#example-prepared--3-inject-and-collect">3. Inject and collect</a><a href="#example-prepared--4-restore-and-exit">4. Restore and exit</a><a href="#example-prepared--equivalent-native-c-api">Equivalent native C++ API</a><a href="#example-prepared--modes-and-scope-of-this-draft">Modes and scope of this draft</a><a href="#example-prepared--typed-method-example">Typed method example</a><a href="#example-prepared--typed-custom-event">Typed custom event</a></div></details></li><li><details><summary>Typed values in the native C++17 REPL</summary><div class="subnav"><a href="#example-values">Overview</a><a href="#example-values--1-user-defined-structs-and-classes">1. User-defined structs and classes</a><a href="#example-values--2-scalars-and-simple-standard-types">2. Scalars and simple standard types</a><a href="#example-values--3-sequence-containers-and-nested-records">3. Sequence containers and nested records</a><a href="#example-values--4-associative-containers">4. Associative containers</a><a href="#example-values--capture-boundaries">Capture boundaries</a></div></details></li><li><details><summary>Capture native C++ call stacks</summary><div class="subnav"><a href="#example-stack">Overview</a><a href="#example-stack--measured-overhead">Measured overhead</a><a href="#example-stack--optional-pre-arguments-and-post-return-value">Optional PRE arguments and POST return value</a><a href="#example-stack--read-names-modules-and-source-lines-inside-both-hooks">Read names, modules and source lines inside both hooks</a></div></details></li><li><details><summary>Shared context: one request, two probes, one worker</summary><div class="subnav"><a href="#example-shared">Overview</a><a href="#example-shared--run-manually">Run manually</a></div></details></li><li><details><summary>Local JIT tracing in the native REPL</summary><div class="subnav"><a href="#example-jit">Overview</a><a href="#example-jit--inspect-and-reload-interactively">Inspect and reload interactively</a></div></details></li><li><details><summary>Validation and benchmark notes</summary><div class="subnav"><a href="#validation">Overview</a><a href="#validation--reproduce-the-checks">Reproduce the checks</a><a href="#validation--pie-detour-regression-checks">PIE detour regression checks</a><a href="#validation--measured-tracing-overhead">Measured tracing overhead</a></div></details></li></ul></div>
+<div class="nav-group"><h2>Runnable examples</h2><ul><li><details><summary>Basic PRE and POST callbacks</summary><div class="subnav"><a href="#example-callback">Overview</a></div></details></li><li><details><summary>Legacy entry-only callback</summary><div class="subnav"><a href="#example-legacy">Overview</a></div></details></li><li><details><summary>Complete native C++ interceptor example</summary><div class="subnav"><a href="#example-interceptor">Overview</a><a href="#example-interceptor--targetcpp">target.cpp</a><a href="#example-interceptor--methodcpp">method.cpp</a><a href="#example-interceptor--free_functioncpp">free_function.cpp</a><a href="#example-interceptor--run-the-normal-cli">Run the normal CLI</a><a href="#example-interceptor--recorded-normal-cli-run">Recorded normal CLI run</a></div></details></li><li><details><summary>DWARF-typed class-instance arguments</summary><div class="subnav"><a href="#example-arguments">Overview</a><a href="#example-arguments--orderhpp-target-owned-optional-for-tracing">order.hpp (target-owned, optional for tracing)</a><a href="#example-arguments--targetcpp">target.cpp</a><a href="#example-arguments--interceptorcpp">interceptor.cpp</a><a href="#example-arguments--pointercpp">pointer.cpp</a><a href="#example-arguments--run-using-the-normal-cli">Run using the normal CLI</a><a href="#example-arguments--optional-headers-and-compile_commandsjson">Optional headers and compile_commands.json</a><a href="#example-arguments--supported-boundary">Supported boundary</a></div></details></li><li><details><summary>Generate and inject from the native C++ REPL</summary><div class="subnav"><a href="#example-prepared">Overview</a><a href="#example-prepared--1-generate-the-package-from-the-header">1. Generate the package from the header</a><a href="#example-prepared--2-validate-against-the-running-application">2. Validate against the running application</a><a href="#example-prepared--3-inject-and-collect">3. Inject and collect</a><a href="#example-prepared--4-restore-and-exit">4. Restore and exit</a><a href="#example-prepared--equivalent-native-c-api">Equivalent native C++ API</a><a href="#example-prepared--modes-and-scope-of-this-draft">Modes and scope of this draft</a><a href="#example-prepared--automatic-snapshots-for-returned-pointers">Automatic snapshots for returned pointers</a><a href="#example-prepared--handle-return-with-a-private-implementation-pointer">Handle return with a private implementation pointer</a><a href="#example-prepared--typed-method-example">Typed method example</a><a href="#example-prepared--typed-custom-event">Typed custom event</a></div></details></li><li><details><summary>Typed values in the native C++17 REPL</summary><div class="subnav"><a href="#example-values">Overview</a><a href="#example-values--1-user-defined-structs-and-classes">1. User-defined structs and classes</a><a href="#example-values--2-scalars-and-simple-standard-types">2. Scalars and simple standard types</a><a href="#example-values--3-sequence-containers-and-nested-records">3. Sequence containers and nested records</a><a href="#example-values--4-associative-containers">4. Associative containers</a><a href="#example-values--capture-boundaries">Capture boundaries</a></div></details></li><li><details><summary>Capture native C++ call stacks</summary><div class="subnav"><a href="#example-stack">Overview</a><a href="#example-stack--measured-overhead">Measured overhead</a><a href="#example-stack--optional-pre-arguments-and-post-return-value">Optional PRE arguments and POST return value</a><a href="#example-stack--read-names-modules-and-source-lines-inside-both-hooks">Read names, modules and source lines inside both hooks</a></div></details></li><li><details><summary>Shared context: one request, two probes, one worker</summary><div class="subnav"><a href="#example-shared">Overview</a><a href="#example-shared--run-manually">Run manually</a></div></details></li><li><details><summary>Local JIT tracing in the native REPL</summary><div class="subnav"><a href="#example-jit">Overview</a><a href="#example-jit--inspect-and-reload-interactively">Inspect and reload interactively</a></div></details></li><li><details><summary>Validation and benchmark notes</summary><div class="subnav"><a href="#validation">Overview</a><a href="#validation--reproduce-the-checks">Reproduce the checks</a><a href="#validation--pie-detour-regression-checks">PIE detour regression checks</a><a href="#validation--measured-tracing-overhead">Measured tracing overhead</a></div></details></li></ul></div>
 <div class="nav-group"><h2>Optional Python</h2><ul><li><details><summary>Optional Python client and console</summary><div class="subnav"><a href="#python-client">Overview</a><a href="#python-client--install-the-python-client">Install the Python client</a><a href="#python-client--python-client-api">Python client API</a><a href="#python-client--python-console-startup-and-server-commands">Python console startup and server commands</a><a href="#python-client--automate-tracing-with-python">Automate tracing with Python</a><a href="#python-client--trace-from-the-python-console">Trace from the Python console</a><a href="#python-client--use-the-generated-python-grpc-stub">Use the generated Python gRPC stub</a><a href="#python-client--test-the-python-client">Test the Python client</a><a href="#python-client--c17-branch-python-extensions">C++17 branch Python extensions</a></div></details></li><li><details><summary>Clang Tracer Python client</summary><div class="subnav"><a href="#python">Overview</a><a href="#python--install-and-open-the-console">Install and open the console</a><a href="#python--index-a-module-and-prepare-a-probe-without-application-headers">Index a module and prepare a probe without application headers</a><a href="#python--programmatic-tracing">Programmatic tracing</a><a href="#python--discover-functions-and-methods">Discover functions and methods</a><a href="#python--receiving-and-recording-traces">Receiving and recording traces</a><a href="#python--launch-status-and-shutdown">Launch, status and shutdown</a><a href="#python--console-commands">Console commands</a><a href="#python--development">Development</a></div></details></li><li><details><summary>Python API examples</summary><div class="subnav"><a href="#example-python">Overview</a><a href="#example-python--run-the-installed-examples">Run the installed examples</a><a href="#example-python--run-from-a-source-checkout">Run from a source checkout</a></div></details></li></ul></div>
   </nav>
 </aside>
@@ -466,19 +466,17 @@ for a programmatic workflow inside the REPL or a C++ application.</p>
 </code></pre></div>
 <p>Trigger one call. The stack shows the entry and available caller frames, with native PC, function/module, and source location where recovered. Both phases describe the entry stack. <code>full</code> follows the supported unwind chain and can report a partial unwind. If a deep stack exceeds shared transport capacity, raise the managed server's <code>--context-event-bytes</code> and, if needed, <code>--context-transport-memory-bytes</code> before starting a new session. See the <a href="https://github.com/husams/clang-tracer/tree/c++17/examples/call-stacks">stack lab sources</a> for application-only filtering and callback-side symbolization.</p>
 <h3 id="tutorials--capture-in-the-background-and-query-in-c">Capture in the background and query in C++</h3>
-<p>Use the probe with <code>--print-result</code> from the stack lab. Start a background range, trigger two target calls, and examine a stable snapshot. The predicate and transformation run in the REPL.</p>
+<p>Use the probe with <code>--print-result</code> from the stack lab. Start a background range, which returns immediately, then iterate it. Iteration waits for events and yields each one as the agent streams it, so trigger the two target calls while the loop runs. The predicate and transformation run in the REPL.</p>
 <div class="code-block"><div class="code-bar"><span>cpp</span><button class="copy" type="button">Copy</button></div><pre><code><span class="k">using</span><span class="w"> </span><span class="k">namespace</span><span class="w"> </span><span class="nn">tracer_repl</span><span class="p">;</span>
 <span class="k">auto</span><span class="w"> </span><span class="n">range</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tracer</span><span class="p">.</span><span class="n">events_async</span><span class="p">(</span><span class="n">session</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="mi">60</span><span class="p">);</span>
 </code></pre></div>
-<div class="code-block"><div class="code-bar"><span>cpp</span><button class="copy" type="button">Copy</button></div><pre><code><span class="k">auto</span><span class="w"> </span><span class="n">snapshot</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">range</span><span class="p">.</span><span class="n">snapshot</span><span class="p">();</span>
-<span class="k">auto</span><span class="w"> </span><span class="n">sums</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">snapshot</span>
+<div class="code-block"><div class="code-bar"><span>cpp</span><button class="copy" type="button">Copy</button></div><pre><code><span class="k">auto</span><span class="w"> </span><span class="n">sums</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">range</span>
 <span class="w">    </span><span class="o">|</span><span class="w"> </span><span class="n">filter</span><span class="p">([](</span><span class="k">const</span><span class="w"> </span><span class="n">Event</span><span class="o">&amp;</span><span class="w"> </span><span class="n">event</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">event</span><span class="p">.</span><span class="n">phase</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s">&quot;POST&quot;</span><span class="p">;</span><span class="w"> </span><span class="p">})</span>
-<span class="w">    </span><span class="o">|</span><span class="w"> </span><span class="n">transform</span><span class="p">([](</span><span class="k">const</span><span class="w"> </span><span class="n">Event</span><span class="o">&amp;</span><span class="w"> </span><span class="n">event</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">event</span><span class="p">.</span><span class="n">result_as</span><span class="o">&lt;</span><span class="kt">int</span><span class="o">&gt;</span><span class="p">();</span><span class="w"> </span><span class="p">})</span>
-<span class="w">    </span><span class="o">|</span><span class="w"> </span><span class="n">to_vector</span><span class="p">();</span>
+<span class="w">    </span><span class="o">|</span><span class="w"> </span><span class="n">transform</span><span class="p">([](</span><span class="k">const</span><span class="w"> </span><span class="n">Event</span><span class="o">&amp;</span><span class="w"> </span><span class="n">event</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">event</span><span class="p">.</span><span class="n">result_as</span><span class="o">&lt;</span><span class="kt">int</span><span class="o">&gt;</span><span class="p">();</span><span class="w"> </span><span class="p">});</span>
 <span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="k">auto</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="n">sums</span><span class="p">)</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">cout</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="sc">&#39;\n&#39;</span><span class="p">;</span>
 <span class="n">range</span><span class="p">.</span><span class="n">stop</span><span class="p">();</span>
 </code></pre></div>
-<p>Expect two values of 42 when both calls have finished. Try <code>first()</code> to get the first optional match, <code>take(1)</code> to limit iteration, or <code>enumerate()</code> to pair each retained event with an index. <code>%cpp load analysis.cpp</code> can run an analysis script and <code>%cpp reset</code> resets only the interpreter and its capture handles. See <a href="#repl--c17-event-ranges">event ranges and adaptors</a> for further examples.</p>
+<p>Each 42 prints as its call returns. The loop ends after the four requested events, at the 60-second timeout, on <code>range.stop()</code>, or on Ctrl+C, which leaves the collector running. <code>range.snapshot()</code> returns the events retained so far without waiting. Try <code>first()</code> to get the first optional match, <code>take(1)</code> to limit iteration, or <code>enumerate()</code> to pair each retained event with an index. <code>%cpp load analysis.cpp</code> can run an analysis script and <code>%cpp reset</code> resets only the interpreter and its capture handles. See <a href="#repl--c17-event-ranges">event ranges and adaptors</a> for further examples.</p>
 <h3 id="tutorials--record-and-replay-offline">Record and replay offline</h3>
 <p>Keep the probe with <code>--print-result</code> active. For each recording command, trigger one new call while it waits, or read available history starting from the requested cursor. Use <code>--after</code> with the previous recording's last sequence to start a fresh window.</p>
 <div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%record<span class="w"> </span>calls.pb<span class="w"> </span>--count<span class="w"> </span><span class="m">2</span><span class="w"> </span>--timeout<span class="w"> </span><span class="m">30</span>
@@ -833,7 +831,7 @@ file paths and prints JSON for index metadata and queries.</p>
 <tbody>
 <tr>
 <td><code>%probe prepare &quot;add(int, int)&quot; --include add.hpp --output prepared</code></td>
-<td>Generate a reusable local package. The first <code>--include HEADER</code> supplies the declaration and additional includes supply types. <code>--output NEW_DIR</code> must be new. <code>--compdb PATH</code> selects the compilation database, defaulting to the command's directory. <code>--translation-unit FILE</code> selects an explicit command. <code>--module ELF</code> pins ELF identity. <code>--metadata-only</code> skips adapter files. Accepts extra compiler arguments and <code>--cwd</code>.</td>
+<td>Generate a reusable local package. The first <code>--include HEADER</code> supplies the declaration and additional includes supply types. <code>--output NEW_DIR</code> must be new. <code>--compdb PATH</code> selects the compilation database, defaulting to the command's directory. <code>--translation-unit FILE</code> selects an explicit command. <code>--module ELF</code> pins ELF identity. <code>--metadata-only</code> skips adapter files. <code>--no-automatic-members</code> follows no pointer member. <code>--follow-depth</code>, <code>--follow-members</code>, <code>--string-bytes</code> and the other followed-member limits are listed with defaults and ranges in <a href="#repl--followed-member-limits">Followed-member limits</a>. Accepts extra compiler arguments and <code>--cwd</code>.</td>
 </tr>
 <tr>
 <td><code>%probe prepare &quot;add(int, int)&quot; --module-index target.sqlite --output prepared-add</code></td>
@@ -1483,7 +1481,7 @@ clang-tracer<span class="w"> </span>--request<span class="w"> </span>watch.textp
 </tr>
 <tr>
 <td><code>events_async(session, count=0, timeout_seconds=0)</code></td>
-<td>Return an <code>EventRange</code> immediately. Zero leaves that limit open.</td>
+<td>Return an <code>EventRange</code> immediately and receive in the background. Iterating it waits for events. Zero leaves that limit open.</td>
 </tr>
 <tr>
 <td><code>record(path, options={})</code></td>
@@ -1519,7 +1517,7 @@ clang-tracer<span class="w"> </span>--request<span class="w"> </span>watch.textp
 </tr>
 <tr>
 <td><code>EventRange::snapshot(), running(), error(), stop(), begin(), end()</code></td>
-<td>Copy a stable bounded collection, check the producer or error text, stop it while retaining data, or iterate a point-in-time snapshot. Release all range copies to release its capture reservation.</td>
+<td>Copy the currently retained events without waiting, check the producer or error text, stop it while retaining data, or iterate from the oldest retained event, waiting for later ones until the range finishes or Ctrl+C. Release all range copies to release its capture reservation.</td>
 </tr>
 <tr>
 <td><code>Event::sequence(), probe_id(), call_id(), phase(), function_name()</code></td>
@@ -1563,8 +1561,8 @@ clang-tracer<span class="w"> </span>--request<span class="w"> </span>watch.textp
 <div class="code-block"><div class="code-bar"><span>cpp</span><button class="copy" type="button">Copy</button></div><pre><code><span class="c1">// Install the probe with --print-result before collecting.</span>
 <span class="k">using</span><span class="w"> </span><span class="k">namespace</span><span class="w"> </span><span class="nn">tracer_repl</span><span class="p">;</span>
 <span class="k">auto</span><span class="w"> </span><span class="n">live</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tracer</span><span class="p">.</span><span class="n">events_async</span><span class="p">(</span><span class="n">session</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="mi">30</span><span class="p">);</span>
-<span class="c1">// Trigger two calls in the target terminal and wait for the range to finish.</span>
-<span class="k">auto</span><span class="w"> </span><span class="n">results</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">live</span><span class="p">.</span><span class="n">snapshot</span><span class="p">()</span>
+<span class="c1">// Trigger two calls in the target terminal. Iteration waits until the range finishes.</span>
+<span class="k">auto</span><span class="w"> </span><span class="n">results</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">live</span>
 <span class="w">    </span><span class="o">|</span><span class="w"> </span><span class="n">filter</span><span class="p">([](</span><span class="k">const</span><span class="w"> </span><span class="n">Event</span><span class="o">&amp;</span><span class="w"> </span><span class="n">e</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">e</span><span class="p">.</span><span class="n">phase</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s">&quot;POST&quot;</span><span class="p">;</span><span class="w"> </span><span class="p">})</span>
 <span class="w">    </span><span class="o">|</span><span class="w"> </span><span class="n">transform</span><span class="p">([](</span><span class="k">const</span><span class="w"> </span><span class="n">Event</span><span class="o">&amp;</span><span class="w"> </span><span class="n">e</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">e</span><span class="p">.</span><span class="n">result_as</span><span class="o">&lt;</span><span class="kt">int</span><span class="o">&gt;</span><span class="p">();</span><span class="w"> </span><span class="p">})</span>
 <span class="w">    </span><span class="o">|</span><span class="w"> </span><span class="n">to_vector</span><span class="p">();</span>
@@ -2945,7 +2943,11 @@ failed checkpoint as a startup failure.</p>
 <span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="n">run_application</span><span class="p">();</span>
 <span class="p">}</span>
 </code></pre></div>
-<p>Use these commands in the native REPL with its private Linux x86-64 server.
+<p>Use these commands in the native REPL on Linux x86-64. With the REPL's private
+server, only that server may attach to the launched application. With any other
+endpoint, including <code>CLANG_TRACER_ENDPOINT</code>, the server must run on the same
+host as the REPL, and the launched application accepts any tracer the host's
+tracing policy allows.
 <code>%launch</code> selects the attached session and holds the application at the
 checkpoint while you install probes.</p>
 <div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%launch<span class="w"> </span>./app<span class="w"> </span>--arg<span class="w"> </span><span class="s2">&quot;example input&quot;</span><span class="w"> </span>--env<span class="w"> </span><span class="nv">MODE</span><span class="o">=</span><span class="nb">test</span><span class="w"> </span>--cwd<span class="w"> </span>./work<span class="w"> </span>--stdin<span class="w"> </span>./input.txt<span class="w"> </span>--timeout<span class="w"> </span><span class="m">5</span>
@@ -3318,17 +3320,22 @@ or Ctrl+C, then returns an iterable snapshot range:</p>
 <span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="k">auto</span><span class="w"> </span><span class="o">&amp;</span><span class="n">event</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="n">captured</span><span class="p">)</span><span class="w"> </span><span class="n">tracer</span><span class="p">.</span><span class="n">print</span><span class="p">(</span><span class="n">event</span><span class="p">);</span>
 </code></pre></div>
 <p>Background collection returns immediately so the prompt remains usable:</p>
-<div class="code-block"><div class="code-bar"><span>cpp</span><button class="copy" type="button">Copy</button></div><pre><code><span class="k">auto</span><span class="w"> </span><span class="n">live</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tracer</span><span class="p">.</span><span class="n">events_async</span><span class="p">(</span><span class="n">session</span><span class="p">);</span>
+<div class="code-block"><div class="code-bar"><span>cpp</span><button class="copy" type="button">Copy</button></div><pre><code><span class="k">auto</span><span class="w"> </span><span class="n">live</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tracer</span><span class="p">.</span><span class="n">events_async</span><span class="p">(</span><span class="n">session</span><span class="p">,</span><span class="w"> </span><span class="mi">100</span><span class="p">,</span><span class="w"> </span><span class="mi">10</span><span class="p">);</span>
 <span class="c1">// Enter other REPL commands while collection continues.</span>
-<span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="k">auto</span><span class="w"> </span><span class="o">&amp;</span><span class="n">event</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="n">live</span><span class="p">)</span><span class="w"> </span><span class="n">tracer</span><span class="p">.</span><span class="n">print</span><span class="p">(</span><span class="n">event</span><span class="p">);</span>
 <span class="k">auto</span><span class="w"> </span><span class="n">data</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">live</span><span class="p">.</span><span class="n">snapshot</span><span class="p">();</span>
+<span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="k">auto</span><span class="w"> </span><span class="o">&amp;</span><span class="n">event</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="n">live</span><span class="p">)</span><span class="w"> </span><span class="n">tracer</span><span class="p">.</span><span class="n">print</span><span class="p">(</span><span class="n">event</span><span class="p">);</span>
 <span class="n">live</span><span class="p">.</span><span class="n">running</span><span class="p">();</span>
 <span class="n">live</span><span class="p">.</span><span class="n">error</span><span class="p">();</span>
 <span class="n">live</span><span class="p">.</span><span class="n">stop</span><span class="p">();</span>
 </code></pre></div>
-<p>Each loop visits a stable snapshot of currently retained events, without waiting
-for new arrivals or consuming them. Later loops can include the same events.
-<code>snapshot()</code> returns a <code>Collection</code> with received/evicted counters and completion,
+<p>Iteration streams. Each loop starts at the oldest retained event, then waits
+for later ones and yields each as the agent sends it. The loop ends when the
+collector finishes (count, timeout, <code>stop()</code> or a stream error) or on Ctrl+C,
+which leaves the collector running. Iterating a finished range visits its
+retained events without waiting, and no loop consumes events, so later loops
+can include the same ones. A range with neither count nor timeout is iterated
+until Ctrl+C or <code>stop()</code>. <code>snapshot()</code> never waits; it returns a <code>Collection</code>
+of the currently retained events with received/evicted counters and completion,
 cancellation and timeout flags. Stream failures appear in <code>error()</code> in either
 mode; partial results remain inspectable. <code>events_async(session, 100, 10)</code> stops
 at 100 events or 10 seconds; zero count/timeout means no corresponding limit.
@@ -3395,10 +3402,12 @@ can be piped into further adaptors. Exceptions from predicates/projections
 propagate on the foreground thread.</p>
 <p>Views own their input: lvalue collections are copied and temporaries are moved,
 so stored pipelines remain valid. An event-range view retains its collector
-handle and takes a fresh, non-consuming snapshot at each loop's start. Thus
-<code>live | take(10)</code> inspects up to ten <strong>currently retained</strong> events; it does not
-wait for ten new arrivals or limit background collection. Use
-<code>tracer.events_async(session, 10, 5)</code> to limit collection itself. Other C++ code
+handle and streams from the oldest retained event at each loop's start, without
+consuming events. Thus <code>live | take(10)</code> yields ten events, waiting for those
+that have not arrived yet, and returns as soon as the tenth is read; it does
+not limit background collection. Use <code>live.snapshot() | take(10)</code> to inspect
+only <strong>currently retained</strong> events, and <code>tracer.events_async(session, 10, 5)</code>
+to limit collection itself. Other C++ code
 can include <code>event_ranges.hpp</code> and use the <code>tracer_repl</code> namespace explicitly.</p>
 <h4 id="repl--console-commands">Console commands</h4>
 <div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%events
@@ -3630,6 +3639,334 @@ owned strings, preserving empty strings, embedded NUL and arbitrary bytes.
 Reference/value arguments are snapshotted at entry; POST events retain that
 entry snapshot even if the function mutates or frees the original contents.
 Return objects are captured at return, before leaving their valid lifetime.</p>
+<p>For a raw pointer to a record with layout metadata, add
+<code>--snapshot-return-pointee</code> to <code>%probe inject</code>. The built-in observer copies
+the fields immediately after the function returns. Use a type declaration that
+matches the target build and ensure each non-null pointer refers to a live
+object whose fields are stable during capture.
+Read the fields with <code>event.result_snapshot()</code> or decode an owned <code>T</code> with
+<code>event.result_as&lt;T&gt;()</code> after importing a mapping for <code>T</code>. <code>event.result()</code>
+still shows the address, including <code>0x0</code> for null returns.</p>
+<p>For a polymorphic pointer return, preparation discovers eligible implementations
+from the matching source inputs. RTTI selects a prepared concrete layout during
+capture. Other live objects use the declared base layout. Pass an
+implementation's <code>.cpp</code> with <code>--include</code> if its definition is in that file.
+For typed local decoding of a polymorphic snapshot, supply an <code>EventCodec&lt;T&gt;</code>
+for the value you want to construct.</p>
+<p>For source-prepared probes, Clang also discovers the raw pointer and reference
+members of every captured record (arguments, receivers, and results, including
+members declared by public non-virtual bases) and follows them. A field such as
+<code>_imp</code> holds the original address and <code>_imp_snapshot</code> holds the copied fields
+of the live pointee; a reference member is captured the same way. For a
+polymorphic pointee the admitted layouts are the declared class, when it is
+concrete, and concrete derived classes available from the supplied source, and
+a checked RTTI read selects the matching layout. A non-polymorphic pointee is
+captured by its exact static type, so no policy is needed, provided everything
+the capture must read is checkable: scalars, enums, arrays, strings, <code>vector</code>,
+<code>array</code>, <code>optional</code>, <code>pair</code>, <code>tuple</code>, <code>variant</code>, smart pointers to such types,
+and records of those. A pointee holding anything else (<code>list</code>, <code>map</code>, <code>set</code>,
+<code>unordered_*</code>, <code>deque</code>, <code>std::any</code>, <code>std::function</code>, <code>weak_ptr</code>) is followed
+automatically only when it is polymorphic and its RTTI matches a derived class,
+or the declared class of an owner-held implementation pointer; otherwise it
+stays address-only unless a <code>FollowPointers</code> policy names it. Because there is
+no RTTI to check, only the pointer's alignment and the readability of the whole
+object are verified, and the target must keep the pointee valid and stable
+through POST. A <code>char</code> pointer is captured as a bounded (<code>--string-bytes</code>,
+longer text is truncated), readability-checked C string and a pointer to an
+arithmetic or enum value as one element; both are stored as <code>&lt;field&gt;_snapshot</code>.
+The same rules apply to the pointer and reference members of every captured
+pointee, of records held by value inside a captured record, and of the pointees
+of <code>std::unique_ptr</code> and <code>std::shared_ptr</code> members, to <code>--follow-depth</code> levels.
+A link back to an object that is already captured above it is not followed
+again, and a link cut by the depth bound stays address-only. Null, unreadable,
+unmapped, abstract, incomplete, <code>std::</code> and function pointees remain
+address-only, and pointers stored inside standard containers are not followed.
+All roots are encoded before any followed member, shallowest members first, so
+a member that does not fit the per-thread snapshot storage is dropped and never
+displaces a root. Smart pointer members (<code>std::unique_ptr</code>, <code>std::shared_ptr</code>)
+are captured inline as their address plus a copy of the pointee. Pass
+<code>--no-automatic-members</code> to <code>%probe prepare</code> or to
+<code>clang-tracer-prepare-injectors-native</code>, or set
+<code>TRACER_PREPARE_AUTOMATIC_MEMBERS=off</code> in the environment of the prepare tool,
+to follow no members automatically. If a package cannot be built with the fuller
+captures, preparation falls back to narrower ones and reports each step on
+stderr. The agent, the REPL, and the prepare tool must come from the same
+build: an older REPL cannot read nested member snapshots and an older agent
+lacks the readability checks a newer package calls. Followed members are
+encoded in a checked mode: strings are copied out with a checked read, a
+vector's storage and a smart pointer's pointee must be wholly readable first,
+and a shared pointer's control block is never read, so a pointer the target
+left stale makes that member address-only instead of crashing the target. This
+relies on <code>process_vm_readv</code>; a seccomp filter that kills that call would kill
+the target. Policy-named members get the same checks, but a <code>FollowPointers</code>
+policy on a type the checks cannot cover (node-based containers, <code>std::any</code>,
+<code>std::function</code>, virtual bases, custom encoders) is your own assertion that the
+pointee is valid. Records with virtual bases, pairs and tuples with reference
+elements, <code>vector&lt;bool&gt;</code> and <code>weak_ptr</code> are never followed automatically. A
+pointee that needs a custom <code>tracer_snapshot::encode</code> is followed automatically
+only when its RTTI matches. Every limit on this capture is an option
+(see <a href="#repl--followed-member-limits">Followed-member limits</a>); none is hard-coded. A
+pointer or reference to a private nested implementation class
+(<code>class Widget { class Impl; Impl *impl_; };</code>) is followed too, because the
+prepared adapter republishes nested class names. If the capture code that
+follows members does not compile, the probe is built without them and the
+validation report says so; setting <code>TRACER_TEST_BREAK_FOLLOWED_MEMBERS</code> in the
+target's environment forces that fallback for testing. In a followed member a
+<code>weak_ptr</code> is always recorded as expired, and a smart pointer whose pointee was
+left out by the checks or the read budget looks the same as one with no
+pointee.</p>
+<p>A reusable record policy can follow specific raw pointer or reference fields wherever that
+record is captured as an argument, receiver, or result. Define the policy in
+a C++ header and supply it through the existing <code>%probe prepare --include</code>
+option alongside the matching application definitions. An explicit policy
+selects the member set for that record and can include non-polymorphic records.</p>
+<div class="code-block"><div class="code-bar"><span>cpp</span><button class="copy" type="button">Copy</button></div><pre><code><span class="k">namespace</span><span class="w"> </span><span class="nn">tracer_snapshot</span><span class="w"> </span><span class="p">{</span>
+<span class="k">template</span><span class="o">&lt;</span><span class="k">class</span><span class="w"> </span><span class="nc">Record</span><span class="o">&gt;</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">FollowPointers</span><span class="p">;</span>
+
+<span class="k">template</span><span class="o">&lt;&gt;</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">FollowPointers</span><span class="o">&lt;</span><span class="n">HFW</span><span class="o">::</span><span class="n">Item</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">static</span><span class="w"> </span><span class="k">constexpr</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">fields</span><span class="p">[]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="s">&quot;_imp&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;_other&quot;</span><span class="p">};</span>
+<span class="p">};</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Each configured field must refer to a live object with stable fields at the
+capture point. The record snapshot keeps its address field and adds an owned
+snapshot named <code>&lt;field&gt;_snapshot</code> for each captured pointee. For example,
+<code>event.result_snapshot().field(&quot;_imp_snapshot&quot;)</code> reports its concrete type
+from <code>cpp_type()</code>. A null member or a type absent from the prepared package
+has only the address. Pointer returns use <code>--snapshot-return-pointee</code> at
+injection. Reference returns already capture the referenced object.</p>
+<h5 id="repl--followed-member-limits">Followed-member limits</h5>
+<p>Every bound on followed-member capture is an option. Nothing is hard-coded: the
+defaults below live in one place (<code>SnapshotLimits</code> in <code>src/snapshot_limits.hpp</code>),
+each option is validated against the same table, and when a limit cuts something
+the event or the prepare output says which option to raise.</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Environment variable</th>
+<th>Set with</th>
+<th>Default</th>
+<th>Range</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--follow-depth</code></td>
+<td><code>TRACER_PREPARE_FOLLOW_DEPTH</code></td>
+<td>prepare tool, <code>%probe prepare</code>, <code>%probe inject</code></td>
+<td>3</td>
+<td>0-40</td>
+<td>Levels of pointees followed below a captured record; <code>0</code> follows none.</td>
+</tr>
+<tr>
+<td><code>--follow-members</code></td>
+<td><code>TRACER_PREPARE_FOLLOW_MEMBERS</code></td>
+<td>prepare tool, <code>%probe prepare</code>, <code>%probe inject</code></td>
+<td>48</td>
+<td>0-4294967295</td>
+<td>Followed members per probe, policy-named ones first. Each adds about 160 bytes of stack to the generated wrapper.</td>
+</tr>
+<tr>
+<td><code>--record-members</code></td>
+<td><code>TRACER_PREPARE_RECORD_MEMBERS</code></td>
+<td>prepare tool, <code>%probe prepare</code></td>
+<td>32</td>
+<td>0-4294967295</td>
+<td>Pointer members discovered automatically per record.</td>
+</tr>
+<tr>
+<td><code>--nested-depth</code></td>
+<td><code>TRACER_PREPARE_NESTED_DEPTH</code></td>
+<td>prepare tool, <code>%probe prepare</code></td>
+<td>2</td>
+<td>0-4294967295</td>
+<td>Levels of by-value records and smart pointers searched for pointer members.</td>
+</tr>
+<tr>
+<td><code>--string-bytes</code></td>
+<td><code>TRACER_PREPARE_STRING_BYTES</code></td>
+<td>prepare tool, <code>%probe prepare</code>, <code>%probe inject</code></td>
+<td>4000</td>
+<td>0-65536</td>
+<td>Bytes kept of one string (<code>char *</code> or <code>std::string</code>) in a followed member. At most the slice minus 96 bytes of framing.</td>
+</tr>
+<tr>
+<td><code>--vector-elements</code></td>
+<td><code>TRACER_PREPARE_VECTOR_ELEMENTS</code></td>
+<td>prepare tool, <code>%probe prepare</code>, <code>%probe inject</code></td>
+<td>4096</td>
+<td>0-4294967295</td>
+<td>Elements of a <code>std::vector</code> in a followed member; a larger vector is left out. The captured bytes must also fit <code>--snapshot-slice</code> (5000 <code>int</code> elements need <code>--vector-elements 5000 --snapshot-slice 32768</code>).</td>
+</tr>
+<tr>
+<td><code>--checked-reads</code></td>
+<td><code>TRACER_PREPARE_CHECKED_READS</code></td>
+<td>prepare tool, <code>%probe prepare</code>, <code>%probe inject</code></td>
+<td>256</td>
+<td>1-4294967295</td>
+<td>Checked memory reads (system calls) one followed member may spend.</td>
+</tr>
+<tr>
+<td><code>--snapshot-reserve</code></td>
+<td><code>TRACER_PREPARE_SNAPSHOT_RESERVE</code></td>
+<td>prepare tool, <code>%probe prepare</code>, <code>%probe inject</code></td>
+<td>8192</td>
+<td>0-4294967295</td>
+<td>Bytes of the per-thread storage that members captured at entry leave for the roots encoded later (a result, nested calls).</td>
+</tr>
+<tr>
+<td><code>--snapshot-arena</code></td>
+<td><code>TRACER_PREPARE_SNAPSHOT_ARENA</code></td>
+<td>prepare tool, <code>%probe prepare</code>, <code>%probe inject</code></td>
+<td>16384</td>
+<td>16384-4294967295</td>
+<td>Per-thread storage for all snapshots of a call. Never shrinks: the largest request of any installed probe wins. At least one slice.</td>
+</tr>
+<tr>
+<td><code>--snapshot-slice</code></td>
+<td><code>TRACER_PREPARE_SNAPSHOT_SLICE</code></td>
+<td>prepare tool, <code>%probe prepare</code>, <code>%probe inject</code></td>
+<td>4096</td>
+<td>4096-65536</td>
+<td>Bytes of one snapshot payload. Never shrinks: the largest request wins.</td>
+</tr>
+</tbody>
+</table>
+<p>Besides these, <code>--no-automatic-members</code> (prepare tool flag, <code>%probe prepare</code>
+option, or <code>TRACER_PREPARE_AUTOMATIC_MEMBERS=off</code>) follows no member
+automatically, and <code>TRACER_REPL_DERIVED_CANDIDATES</code> (environment of the REPL,
+default 15) sets how many derived records are tried per polymorphic pointer
+when the REPL builds its local mappings; a pointer with more candidates is
+reported in the mapping notes.</p>
+<p>A value is a number, <code>unlimited</code> (the largest value in the Range column) or,
+where the range starts at 0, <code>off</code> (0). A value outside the range is refused
+with the range, for example <code>--follow-depth must be between 0 and 40 (or unlimited): 99</code>. A prepare-time option shapes the package, so <code>%probe inject</code>
+can only lower what the package discovered; the other options can be given at
+either step, and the one given at <code>%probe inject</code> wins. The three maxima that are
+not &quot;as large as the option holds&quot; are forced by something else:</p>
+<ul>
+<li><code>--snapshot-slice</code> 65536 and, through it, <code>--string-bytes</code>: a payload is one
+string field of the event, which the event writer bounds at 64 KiB
+(<code>limits.string_bytes</code> in <code>src/context_capture.cpp</code>). The whole event is also
+bounded by the server's <code>--context-event-bytes</code> (default 256 KiB).</li>
+<li><code>--follow-depth</code> 40: every followed level nests two protobuf messages in the
+event, and the protobuf parser refuses more than 100 levels when the server
+and the REPL read it. Measured end to end, a chain arrives up to 49 levels in
+a result and 48 in an argument and the event is lost beyond that; 40 keeps
+eight levels of slack for the receiver and state roots that were not measured.</li>
+<li><code>--snapshot-arena</code> and <code>--snapshot-slice</code> have the built-in sizes as their
+minimum because the per-thread storage only grows.</li>
+<li><code>--snapshot-arena</code> accepts up to 4294967295 bytes, but the storage is one
+anonymous mapping per thread of the target, so <code>unlimited</code> asks every thread
+for 4 GiB of address space. If a mapping fails the storage keeps its size and
+the capture reports <code>no snapshot storage was left for a followed member</code>.</li>
+</ul>
+<p>Tune them where the data lives. The depth and the <code>char *</code> size, for the
+handle example (<code>examples/prepared-injectors/handle</code>):</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%probe<span class="w"> </span>prepare<span class="w"> </span><span class="s2">&quot;HFW::HfwManager::getItem(int)&quot;</span><span class="w"> </span>--include<span class="w"> </span>item.hpp<span class="w"> </span>--include<span class="w"> </span>item-impl.hpp<span class="w"> </span>--output<span class="w"> </span>prepared<span class="w"> </span>--follow-depth<span class="w"> </span><span class="m">5</span>
+%probe<span class="w"> </span>inject<span class="w"> </span><span class="s2">&quot;HFW::HfwManager::getItem(int)&quot;</span><span class="w"> </span>--prepared<span class="w"> </span>prepared<span class="w"> </span>--prepared-mode<span class="w"> </span>require<span class="w"> </span>--string-bytes<span class="w"> </span><span class="m">6000</span><span class="w"> </span>--snapshot-slice<span class="w"> </span><span class="m">8192</span><span class="w"> </span>--snapshot-arena<span class="w"> </span><span class="m">65536</span>
+</code></pre></div>
+<p>or <code>TRACER_PREPARE_FOLLOW_DEPTH=5</code> in the environment of the REPL or of
+<code>clang-tracer-prepare-injectors-native</code>.</p>
+<p>What you see when a limit cuts something:</p>
+<table>
+<thead>
+<tr>
+<th>Cut</th>
+<th>Where</th>
+<th>Text</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pointer members of a record are beyond <code>--follow-depth</code> (prepare)</td>
+<td>prepare stderr, once per record</td>
+<td><code>prepare: pointer members of NAME are address-only: it is N levels below a captured record (--follow-depth, TRACER_PREPARE_FOLLOW_DEPTH)</code></td>
+</tr>
+<tr>
+<td>More pointer members than <code>--record-members</code> (prepare)</td>
+<td>prepare stderr, once per record</td>
+<td><code>prepare: NAME has more followable members than --record-members (N); the rest stay address-only</code></td>
+</tr>
+<tr>
+<td>Pointer members nested deeper than <code>--nested-depth</code> (prepare)</td>
+<td>prepare stderr, once per record</td>
+<td><code>prepare: NAME has pointer members nested more than --nested-depth (N) levels inside it; they stay address-only</code></td>
+</tr>
+<tr>
+<td>Derived records beyond <code>TRACER_REPL_DERIVED_CANDIDATES</code></td>
+<td>mapping notes of the REPL</td>
+<td><code>derived records of NAME beyond N are not tried (TRACER_REPL_DERIVED_CANDIDATES)</code></td>
+</tr>
+<tr>
+<td>A member's own pointer members were not followed (<code>--follow-depth</code>)</td>
+<td>field <code>&lt;field&gt;_snapshot_cut</code> of the parent</td>
+<td><code>its pointer members were not followed: raise --follow-depth</code></td>
+</tr>
+<tr>
+<td>Members dropped by <code>--follow-members</code> below a member</td>
+<td>field <code>&lt;field&gt;_snapshot_cut</code> of the parent</td>
+<td><code>some of its pointer members were not followed: raise --follow-members</code></td>
+</tr>
+<tr>
+<td>Members dropped by <code>--follow-members</code> at a root</td>
+<td>field <code>snapshot_cut</code> of the root</td>
+<td><code>N pointer members were not followed: raise --follow-members</code></td>
+</tr>
+<tr>
+<td>String shortened (<code>--string-bytes</code>, or the slice bounds it)</td>
+<td>field <code>&lt;field&gt;_snapshot_cut</code></td>
+<td><code>a C string was shortened: raise --string-bytes (and --snapshot-slice, which also bounds it)</code> (<code>a string was ...</code> for a <code>std::string</code>)</td>
+</tr>
+<tr>
+<td>Vector larger than <code>--vector-elements</code></td>
+<td>field <code>&lt;field&gt;_snapshot_cut</code></td>
+<td><code>a vector was left out because it is larger than the limit: raise --vector-elements</code></td>
+</tr>
+<tr>
+<td>Checked reads ran out</td>
+<td>field <code>&lt;field&gt;_snapshot_cut</code></td>
+<td><code>the checked reads of a followed member ran out: raise --checked-reads</code></td>
+</tr>
+<tr>
+<td>Member does not fit the slice</td>
+<td>field <code>&lt;field&gt;_snapshot_cut</code></td>
+<td><code>a followed member does not fit the snapshot payload: raise --snapshot-slice or --snapshot-arena</code></td>
+</tr>
+<tr>
+<td>No storage left for a member</td>
+<td>field <code>&lt;field&gt;_snapshot_cut</code></td>
+<td><code>no snapshot storage was left for a followed member: raise --snapshot-arena or lower --snapshot-reserve</code></td>
+</tr>
+<tr>
+<td>Member does not fit the event (shared-context events)</td>
+<td>field <code>&lt;field&gt;_snapshot_cut</code></td>
+<td><code>the followed member did not fit the event: raise --context-event-bytes of the server</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>&lt;field&gt;_snapshot_cut</code> is a string field next to <code>&lt;field&gt;_snapshot</code>, so
+<code>event.result_snapshot().field(&quot;_chain_snapshot_cut&quot;)</code> reads it; a cut inside a
+nested member sits in that member's record.</p>
+<p>To choose the captured fields for one implementation, pass a C++ file with
+<code>--callback</code> to <code>%probe inject</code>. Define an overload of <code>tracer_snapshot::encode</code>
+for that concrete type. The probe encodes the returned record using the same
+bounded snapshot codec and reports the original implementation type. Other
+implementations use automatic field capture.</p>
+<div class="code-block"><div class="code-bar"><span>cpp</span><button class="copy" type="button">Copy</button></div><pre><code><span class="k">namespace</span><span class="w"> </span><span class="nn">tracer_snapshot</span><span class="w"> </span><span class="p">{</span>
+<span class="k">struct</span><span class="w"> </span><span class="nc">ItemV2Fields</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">revision</span><span class="p">;</span><span class="w"> </span><span class="p">};</span>
+
+<span class="n">ItemV2Fields</span><span class="w"> </span><span class="nf">encode</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">HFW</span><span class="o">::</span><span class="n">ItemV2</span><span class="o">&amp;</span><span class="w"> </span><span class="n">item</span><span class="p">)</span><span class="w"> </span><span class="k">noexcept</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="p">{</span><span class="n">item</span><span class="p">.</span><span class="n">revision</span><span class="p">};</span>
+<span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The encoder executes in the target process and takes the live implementation by
+const reference. It must be <code>noexcept</code> and return a named record by value. An
+encoder-only file can be injected directly. If the file also defines an
+invocation-scoped <code>Interceptor</code>, it needs a <code>post()</code> hook.</p>
 <p>Inspect a record without declaring a local C++ type:</p>
 <div class="code-block"><div class="code-bar"><span>cpp</span><button class="copy" type="button">Copy</button></div><pre><code><span class="k">auto</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">event</span><span class="p">.</span><span class="n">argument_snapshot</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
 <span class="n">value</span><span class="p">.</span><span class="n">cpp_type</span><span class="p">()</span>
@@ -3660,6 +3997,61 @@ selected unsupported type rejects the import. Generated conversions are checked 
 before entering the live interpreter. Header/generation errors retain previous
 variables and tracing sessions. An accepted header has normal C++ semantics,
 including execution of its static initializers.</p>
+<p>The native REPL applies Clang's <code>-fno-access-control</code> to all local C++ input,
+checking, and mapping generation. This lets you inspect private and protected
+members directly and lets generated decoders include them. Pass
+<code>-fno-access-control</code> when compiling a generated header with non-public
+members outside the REPL.</p>
+<p>The REPL can generate a factory when Clang can map every argument of a unique
+constructor to a captured field. It recognizes direct member initialization
+and forwarding through supported base constructors. The factory constructs
+the value and copies any remaining assignable fields. This also covers const
+fields initialized by the constructor. A prepared adapter can retain the
+verified initializer list. Constructor code that transforms values or depends
+on application state needs a custom <code>EventCodec&lt;T&gt;</code>. The factory requires
+usable local lifetime definitions and does not reconstruct raw-pointer
+ownership from captured addresses.</p>
+<p>Eligible derived records decode inherited fields as well as their own fields.
+Use <code>DeclaringType::field</code> for field names shared by multiple base or derived
+declarations. A shared virtual base contributes its fields once. Polymorphic
+records need locally usable construction, destruction, and virtual function
+definitions. With the REPL's own local Linux x86-64 server, a prepared probe
+can resolve an out-of-line destructor from a shared library already mapped in
+the target. With a server the REPL did not start, the library is used only when
+the target is a process on this host, owned by the REPL's user, whose
+<code>/proc/PID/maps</code> confirms the reported mappings; otherwise the record is
+rebuilt field by field, as described below. The REPL checks the mapped ELF identity and requires one
+library exporting the required C++ ABI symbols. It loads that library into the
+REPL process and binds those symbols before generating the typed decoder. No
+additional probe options are required. Library initializers run in the REPL
+when the loader opens the library.</p>
+<p>A record that cannot be constructed locally is decoded as
+<code>tracer_repl::Reconstructed&lt;T&gt;</code>; use <code>-&gt;</code> to reach the record. This covers
+records with raw pointer or reference members, records whose constructor,
+virtual functions, or destructor are unavailable or cannot be inferred, and
+records that contain such a record by value or through a <code>std::unique_ptr</code>.
+Records that map normally keep doing so. A reconstructed record's fields are
+rebuilt without running its constructors or destructor and its vptr is null, so
+read fields and call non-virtual members only. A pointer member refers to a
+local copy of its captured pointee, which is itself rebuilt the same way, so a
+captured chain of pointers can be followed with <code>-&gt;</code>. It is null when the
+pointee was not captured or its captured type is neither the declared pointee
+nor one of the imported application records derived from it (at most 15 derived
+records are considered); a captured pointee that fails to decode raises the
+decode error. A <code>char</code> pointer points at a copy of the captured string and a
+pointer to a scalar at a copy of the value. A reference member needs its
+referent: decoding throws <code>std::runtime_error</code> naming the record and field when
+it was not captured. Smart pointer members point at the local copy of the
+pointee, or are empty when it was not captured. Other raw pointers are null. Do
+not move, copy, assign or destroy the reconstructed record itself; it owns the
+pointees, so do not move from, reset or assign its <code>std::unique_ptr</code> members
+either, because those only view the copies. Records with virtual bases cannot
+be reconstructed. Define your own <code>EventCodec&lt;T&gt;</code> before first use to replace
+the generated reconstruction.</p>
+<p>Use <code>result_snapshot()</code> for field inspection when only the captured layout is
+available. If additional definitions are needed for a typed result, prepare
+the package in one session, then import the application definitions and
+inject the saved package in a fresh session.</p>
 <p>If a generated decoder fails to compile (for example, a set element lacks its
 required comparison operator), the entire import is rejected without changing
 live state. Retry with <code>--type</code> to select supported roots; no partial mappings
@@ -3773,10 +4165,11 @@ select fewer roots with <code>--type</code> when necessary. Use <code>%help cpp<
 and numeric ranges. For classes with constructor-only/const members, specialize
 <code>EventCodec&lt;T&gt;</code> with <code>static T decode(const EventValue&amp;)</code> and return an object
 from your constructor or factory. This custom conversion runs locally.</p>
-<p>Automatic target capture supports complete ABI-validated records with public
-serializable fields, including nested records and supported STL members.
-Private/protected fields, unions, bit-fields, volatile data, arbitrary raw
-pointees and wide/custom-character strings are explicitly unavailable.
+<p>Automatic target capture uses complete ABI-validated layouts and serializable
+fields, including nested records and supported STL members. Prepared layouts
+can include private and protected fields. Unions, bit-fields, volatile data,
+arbitrary raw pointees and wide/custom-character strings are unavailable for
+general automatic record capture.
 There is a 4-KiB payload limit per value, a 16-KiB thread-local capture arena,
 and bounded schema/item/depth limits. Missing, unsupported, truncated, malformed
 or over-budget snapshots throw; partial objects are never returned as complete.
@@ -3805,6 +4198,12 @@ container and mapped record snapshots as described above.</p>
 comment in the multiline editor. Ctrl+C discards the entire pending input;
 earlier variables and tracing sessions remain available. Ctrl+J always inserts
 a newline; <code>%cpp load FILE</code> submits a multiline source file.</p>
+<p>End a <code>%</code> command line with <code>\</code> between arguments to continue on the next
+line. The final line submits the command. The same syntax works in piped input
+and <code>--startup</code> files.</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%module<span class="w"> </span>index<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--file<span class="w"> </span>./app
+</code></pre></div>
 <p>Every submitted C++ cell is checked in a disposable <code>clang-tracer-repl-check</code>
 process before the live interpreter parses or executes it. The checker parses
 the accepted cells in their original order without executing them, preserving
@@ -4693,6 +5092,143 @@ capture the pointer address.</p>
 <p>Expect <code>NATIVE_EVENT_COUNT=4</code>, <code>NATIVE_RESULTS=1</code>, and <code>detached session=...</code>.
 This variant restores its hook by detaching through <code>tracer.detach(session)</code>.</p>
 <p>Set <code>CLANG_TRACER_PREPARED_BUILD</code> to use a different CMake build directory.</p>
+<h3 id="example-prepared--automatic-snapshots-for-returned-pointers">Automatic snapshots for returned pointers</h3>
+<p>Build and run the Linux x86-64 pointee example:</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>cmake<span class="w"> </span>--build<span class="w"> </span>build<span class="w"> </span>--target<span class="w"> </span>clang-tracer-repl<span class="w"> </span>clang-tracer-server<span class="w"> </span>clang_tracer_agent<span class="w"> </span>prepared-pointee-target
+./examples/prepared-injectors/run-native.sh<span class="w"> </span>--pointee
+</code></pre></div>
+<p>At the native prompt, prepare the declared return type and inject with the
+opt-in pointee snapshot flag:</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%probe<span class="w"> </span>prepare<span class="w"> </span><span class="s2">&quot;prepared_pointee::HfwManager::createItem(int)&quot;</span><span class="w"> </span>--include<span class="w"> </span>demo/pointee/item.hpp<span class="w"> </span>--output<span class="w"> </span>prepared
+%probe<span class="w"> </span>inject<span class="w"> </span><span class="s2">&quot;prepared_pointee::HfwManager::createItem(int)&quot;</span><span class="w"> </span>--prepared<span class="w"> </span>prepared<span class="w"> </span>--prepared-mode<span class="w"> </span>require<span class="w"> </span>--snapshot-return-pointee
+%collect<span class="w"> </span>--count<span class="w"> </span><span class="m">4</span><span class="w"> </span>--timeout<span class="w"> </span><span class="m">15</span><span class="w"> </span>--phase<span class="w"> </span>POST<span class="w"> </span>--as<span class="w"> </span>captured
+auto<span class="w"> </span><span class="nv">captured</span><span class="w"> </span><span class="o">=</span><span class="w"> </span>tracer.batch<span class="o">(</span><span class="s2">&quot;captured&quot;</span><span class="o">)</span><span class="p">;</span>
+auto<span class="w"> </span><span class="nv">event</span><span class="w"> </span><span class="o">=</span><span class="w"> </span>captured.at<span class="o">(</span>captured.at<span class="o">(</span><span class="m">0</span><span class="o">)</span>.result<span class="o">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s2">&quot;0x0&quot;</span><span class="w"> </span>?<span class="w"> </span><span class="m">1</span><span class="w"> </span>:<span class="w"> </span><span class="m">0</span><span class="o">)</span><span class="p">;</span>
+auto<span class="w"> </span><span class="nv">item</span><span class="w"> </span><span class="o">=</span><span class="w"> </span>event.result_as&lt;prepared_pointee::HfwItem&gt;<span class="o">()</span><span class="p">;</span>
+auto<span class="w"> </span><span class="nv">snapshot</span><span class="w"> </span><span class="o">=</span><span class="w"> </span>event.result_snapshot<span class="o">()</span><span class="p">;</span>
+std::cout<span class="w"> </span><span class="s">&lt;&lt; item.label &lt;&lt; &quot; &quot; &lt;&lt; item</span>.base_id<span class="w"> </span>&lt;&lt;<span class="w"> </span><span class="s2">&quot; &quot;</span><span class="w"> </span><span class="s">&lt;&lt; snaps</span>hot.field<span class="o">(</span><span class="s2">&quot;details&quot;</span><span class="o">)</span>.field<span class="o">(</span><span class="s2">&quot;revision&quot;</span><span class="o">)</span>.as&lt;int&gt;<span class="o">()</span><span class="w"> </span>&lt;&lt;<span class="w"> </span>std::endl<span class="p">;</span>
+%quit
+</code></pre></div>
+<p>The target alternates between returning an <code>HfwItem*</code> and <code>nullptr</code>.
+For non-null returns, <code>result_snapshot()</code> includes <code>id</code>, <code>label</code>, nested
+<code>details</code>, and the protected <code>base_id</code> inherited from the polymorphic <code>HfwBase</code>.
+The prepared package imports the mapping automatically. Clang identifies the
+constructor arguments, including the protected const <code>base_id</code> forwarded to
+<code>HfwBase</code>, so <code>result_as&lt;prepared_pointee::HfwItem&gt;()</code> constructs an owned copy.
+<code>receiver_snapshot()</code> contains the manager's fields. Null returns display
+<code>0x0</code>. Run the same capture as a smoke test with this command.</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>./examples/prepared-injectors/run-native.sh<span class="w"> </span>--pointee<span class="w"> </span>--smoke
+</code></pre></div>
+<p>The corresponding CTest is <code>native_repl_prepared_pointee</code>.</p>
+<h4 id="example-prepared--polymorphic-pointer-returns">Polymorphic pointer returns</h4>
+<p>Build <code>prepared-polymorphic-pointee-target</code> and start the example.</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>./examples/prepared-injectors/run-native.sh<span class="w"> </span>--polymorphic-pointee
+</code></pre></div>
+<p>The launcher prints the commands in
+<a href="https://github.com/husams/clang-tracer/blob/c++17/examples/prepared-injectors/polymorphic-pointee/inspect.repl"><code>inspect.repl</code></a>. The target returns a
+<code>Base*</code> to a <code>Child</code> whose base subobject sits at a nonzero offset. Source
+preparation discovers <code>Child</code> and captures <code>Child::x</code> as <code>42</code> without a
+type-specific command option.
+The example also reads <code>x</code> through <code>result_as&lt;ChildFields&gt;()</code> with a local
+decoder. Add <code>--smoke</code> to check the child, base and null cases.</p>
+<h4 id="example-prepared--pimpl-return-snapshots">PImpl return snapshots</h4>
+<p>Build the C++17 PImpl fixture and run either return form in its own native REPL
+session:</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>cmake<span class="w"> </span>--build<span class="w"> </span>build<span class="w"> </span>--target<span class="w"> </span>clang-tracer-repl<span class="w"> </span>clang-tracer-server<span class="w"> </span>clang_tracer_agent<span class="w"> </span>prepared-pimpl-target
+./examples/prepared-injectors/run-native.sh<span class="w"> </span>--pimpl-pointer
+./examples/prepared-injectors/run-native.sh<span class="w"> </span>--pimpl-reference
+</code></pre></div>
+<p>The public <a href="https://github.com/husams/clang-tracer/blob/c++17/examples/prepared-injectors/pimpl/item.hpp"><code>Item</code> declaration</a> keeps its pointer fields private
+and forward-declares <code>ItemImp</code>. The internal header defines <code>ItemV1</code>, <code>ItemV2</code>,
+and <code>ItemV3</code>. The pointer and reference demos prepare from the two application
+headers without a pointer policy; source discovery follows the polymorphic
+<code>_imp</code> and <code>_other</code> members and captures each concrete implementation. The
+complete non-polymorphic <code>_stamp</code> record is captured by its exact static type
+after a readability check, so it needs no policy either. The pointer probe uses the existing
+<code>--snapshot-return-pointee</code> opt-in, while the reference probe captures its
+<code>Item</code> directly.</p>
+<p>Both sessions inspect private and nested fields for all three known
+implementations. For example, call
+<code>event.result_snapshot().field(&quot;_imp_snapshot&quot;).as&lt;HFW::ItemV1&gt;()</code> on an event
+with an <code>ItemV1</code> implementation. The generated factory builds the concrete
+value. The demos also exercise a custom projection with <code>result_as&lt;LocalFields&gt;()</code>.
+The fourth implementation is defined only in <code>item.cpp</code>, so the snapshot keeps
+its <code>_imp</code> address. An <code>_unreadable</code> member points to a <code>PROT_NONE</code> page and the
+guarded lookup leaves its address in the snapshot. Both sessions check null
+members. Pointer mode also checks a null outer result. The <code>--pimpl-custom</code>
+and <code>--pimpl-roles</code> examples use the explicit
+<a href="https://github.com/husams/clang-tracer/blob/c++17/examples/prepared-injectors/pimpl/snapshot-policy.hpp"><code>FollowPointers</code> policy</a> to select the followed
+members of the record.</p>
+<p>Run the automated cases with:</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>./examples/prepared-injectors/run-native.sh<span class="w"> </span>--pimpl-pointer<span class="w"> </span>--smoke
+./examples/prepared-injectors/run-native.sh<span class="w"> </span>--pimpl-reference<span class="w"> </span>--smoke
+./examples/prepared-injectors/run-native.sh<span class="w"> </span>--pimpl-roles<span class="w"> </span>--smoke
+</code></pre></div>
+<p>CTest registers these as <code>native_repl_prepared_pimpl_pointer</code> and
+<code>native_repl_prepared_pimpl_reference</code>; <code>native_repl_prepared_pimpl_roles</code>
+checks that the same policy also captures arguments and receivers. Separate
+sessions avoid re-importing the same application declarations into one REPL
+process.</p>
+<p>The <code>--pimpl-custom</code> mode demonstrates a user encoder for ItemV2. It replaces
+the automatic ItemV2 fields with a single <code>summary</code> projection while preserving
+the <code>HFW::ItemV2</code> result type; ItemV1 and ItemV3 remain automatic. Its callback
+has no PRE or POST hook:</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>./examples/prepared-injectors/run-native.sh<span class="w"> </span>--pimpl-custom
+./examples/prepared-injectors/run-native.sh<span class="w"> </span>--pimpl-custom<span class="w"> </span>--smoke
+</code></pre></div>
+<p>CTest registers this as <code>native_repl_prepared_pimpl_custom</code>.</p>
+<h3 id="example-prepared--handle-return-with-a-private-implementation-pointer">Handle return with a private implementation pointer</h3>
+<p>The <a href="https://github.com/husams/clang-tracer/blob/c++17/examples/prepared-injectors/handle"><code>handle</code> example</a> returns <code>HFW::HfwItem &amp;</code>, whose only data member
+is a private <code>HfwItemImpl *_impl</code>. The base class <code>ngd::HeapObject</code> defines its
+destructor in a shared library, and the implementation class is complete only in
+<code>item-impl.hpp</code>. The record cannot be constructed locally, so
+<code>result_as&lt;HFW::HfwItem&gt;()</code> rebuilds it field by field as a
+<code>Reconstructed&lt;HFW::HfwItem&gt;</code> whose <code>_impl</code> points at the locally decoded
+implementation. The implementation is also readable from the <code>_impl_snapshot</code>
+field. Build the REPL tools, then run it with the REPL's own server or with a
+server started separately:</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>./examples/prepared-injectors/handle/run.sh<span class="w"> </span>build
+./examples/prepared-injectors/handle/run.sh<span class="w"> </span>build<span class="w"> </span>--external-server
+</code></pre></div>
+<p>Add <code>--plain</code> to build a non-polymorphic implementation. It needs no policy: the
+pointee's static type is exact, so it is captured after a readability check
+(the target must keep it valid). Both modes should print:</p>
+<div class="code-block"><div class="code-bar"><span>text</span><button class="copy" type="button">Copy</button></div><pre><code>ROOT type=HFW::HfwItem fields=2
+IMPL type=HFW::HfwItemImpl revision=827 label=implementation label
+TYPED revision=827 label=implementation label
+HANDLE revision=827 label=implementation label
+</code></pre></div>
+<p><code>item.hpp</code> can instead hold the implementation through a reference
+(<code>HANDLE_REFERENCE</code>), a <code>std::unique_ptr</code> (<code>HANDLE_UNIQUE</code>), a
+<code>std::shared_ptr</code> (<code>HANDLE_SHARED</code>), or a pointer declared by a base class
+(<code>HANDLE_BASE_MEMBER</code>). <code>HfwManager::makeItem</code> returns the record by value and
+<code>HfwManager::inspectItem</code> takes it as an argument. <code>HANDLE_DEEP</code> adds a C string
+member, a pointer to an <code>int</code>, a pointer inside a nested record, a ring of
+nodes, a second level (<code>_impl</code> to a detail record that points back), a pointer
+to a <code>std::string</code> and a pointer to unmapped memory: the ring stops at the
+depth bound, the back link is cut because its target is already captured, and
+the <code>std::</code> and unmapped pointers stay address-only. <code>HANDLE_BUDGET</code> adds a
+function whose four large arguments fill the snapshot storage; every root keeps
+its snapshot. CTest builds each variant and captures it as a result, a by-value
+result, and an argument in <code>native_repl_prepared_handle_return</code>; the <a href="https://github.com/husams/clang-tracer/blob/c++17/examples/prepared-injectors/handle/snapshot-policy.hpp"><code>FollowPointers</code>
+policy</a> remains available to restrict or select the
+followed members.</p>
+<p><code>HANDLE_LIMITS</code> adds a chain of 64 nodes, a vector and a few strings to show the
+capture limits at work. How far members are followed, how long a <code>char *</code> is
+kept and the rest are options, not constants; the table of every option, its
+environment variable, default and range is in
+<a href="#repl--followed-member-limits">Followed-member limits</a>. With
+the defaults the chain is captured to three levels and a <code>next_snapshot_cut</code>
+field beside the third names <code>--follow-depth</code>. To follow five levels, prepare with
+a deeper limit; to keep a longer <code>char *</code>, raise the string and the slice when
+injecting:</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%probe<span class="w"> </span>prepare<span class="w"> </span><span class="s2">&quot;HFW::HfwManager::getItem(int)&quot;</span><span class="w"> </span>--include<span class="w"> </span>item.hpp<span class="w"> </span>--include<span class="w"> </span>item-impl.hpp<span class="w"> </span>--output<span class="w"> </span>prepared<span class="w"> </span>--follow-depth<span class="w"> </span><span class="m">5</span>
+%probe<span class="w"> </span>inject<span class="w"> </span><span class="s2">&quot;HFW::HfwManager::getItem(int)&quot;</span><span class="w"> </span>--prepared<span class="w"> </span>prepared<span class="w"> </span>--prepared-mode<span class="w"> </span>require<span class="w"> </span>--string-bytes<span class="w"> </span><span class="m">6000</span><span class="w"> </span>--snapshot-slice<span class="w"> </span><span class="m">8192</span><span class="w"> </span>--snapshot-arena<span class="w"> </span><span class="m">65536</span>
+</code></pre></div>
+<p><code>TRACER_PREPARE_FOLLOW_DEPTH=5</code> in the environment does the same as
+<code>--follow-depth 5</code>. <code>native_repl_prepared_handle_return</code> runs each option in both
+directions (for example <code>depth_default</code>, <code>depth_five</code>, <code>string_default</code>,
+<code>string_raised</code>).</p>
 <h3 id="example-prepared--typed-method-example">Typed method example</h3>
 <p>Build <code>prepared-methods-target</code> and launch with <code>--methods</code>. The method demo
 target has no DWARF. The launcher prints the commands and full selector from

@@ -116,7 +116,7 @@ Trigger one call. The stack shows the entry and available caller frames, with na
 
 ## Capture in the background and query in C++
 
-Use the probe with `--print-result` from the stack lab. Start a background range, trigger two target calls, and examine a stable snapshot. The predicate and transformation run in the REPL.
+Use the probe with `--print-result` from the stack lab. Start a background range, which returns immediately, then iterate it. Iteration waits for events and yields each one as the agent streams it, so trigger the two target calls while the loop runs. The predicate and transformation run in the REPL.
 
 ```cpp
 using namespace tracer_repl;
@@ -124,16 +124,14 @@ auto range = tracer.events_async(session, 4, 60);
 ```
 
 ```cpp
-auto snapshot = range.snapshot();
-auto sums = snapshot
+auto sums = range
     | filter([](const Event& event) { return event.phase() == "POST"; })
-    | transform([](const Event& event) { return event.result_as<int>(); })
-    | to_vector();
+    | transform([](const Event& event) { return event.result_as<int>(); });
 for (auto value : sums) std::cout << value << '\n';
 range.stop();
 ```
 
-Expect two values of 42 when both calls have finished. Try `first()` to get the first optional match, `take(1)` to limit iteration, or `enumerate()` to pair each retained event with an index. `%cpp load analysis.cpp` can run an analysis script and `%cpp reset` resets only the interpreter and its capture handles. See [event ranges and adaptors](../native-repl.md#c17-event-ranges) for further examples.
+Each 42 prints as its call returns. The loop ends after the four requested events, at the 60-second timeout, on `range.stop()`, or on Ctrl+C, which leaves the collector running. `range.snapshot()` returns the events retained so far without waiting. Try `first()` to get the first optional match, `take(1)` to limit iteration, or `enumerate()` to pair each retained event with an index. `%cpp load analysis.cpp` can run an analysis script and `%cpp reset` resets only the interpreter and its capture handles. See [event ranges and adaptors](../native-repl.md#c17-event-ranges) for further examples.
 
 ## Record and replay offline
 

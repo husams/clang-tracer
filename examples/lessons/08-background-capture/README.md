@@ -5,7 +5,7 @@ Guide section: [Capture in the background and query in C++](../../../docs/guide/
 | File | Purpose |
 | --- | --- |
 | `target.cpp`, `hook.cpp` | The first lesson's target and observer. |
-| `analysis.cpp` | The snapshot query from the guide, for `%cpp load analysis.cpp`. |
+| `analysis.cpp` | The streaming query from the guide, for `%cpp load analysis.cpp`. |
 
 Run `make`, start `./target`, then start `clang-tracer-repl` in this directory.
 
@@ -19,15 +19,14 @@ using namespace tracer_repl;
 auto range = tracer.events_async(session, 4, 60);
 ```
 
-Press Enter twice in the target terminal, then query the snapshot. Either
-type the block below or run `%cpp load analysis.cpp`, which contains it.
+The range returns immediately and collects in the background. Either type
+the block below or run `%cpp load analysis.cpp`, which contains it. The loop
+waits for events, so press Enter twice in the target terminal while it runs.
 
 ```cpp
-auto snapshot = range.snapshot();
-auto sums = snapshot
+auto sums = range
     | filter([](const Event& event) { return event.phase() == "POST"; })
-    | transform([](const Event& event) { return event.result_as<int>(); })
-    | to_vector();
+    | transform([](const Event& event) { return event.result_as<int>(); });
 for (auto value : sums) std::cout << value << '\n';
 range.stop();
 ```
@@ -36,6 +35,7 @@ range.stop();
 %detach
 ```
 
-Expected: two lines of `42`. Do not run `%collect` while the background range
+Expected: two lines of `42`, each printed as its call returns. The loop ends
+after four events or 60 seconds; Ctrl+C ends it early. Do not run `%collect` while the background range
 is active; it reports that collection storage is full until the range is
 stopped.
