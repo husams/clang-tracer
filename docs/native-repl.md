@@ -410,6 +410,8 @@ Snapshot deltas describe the interval between a method's entry and return. Field
 
 For method snapshots, `--max-instances` limits receivers with an outstanding sample. Completed calls release their receiver slots. The watch detects overlapping calls on a receiver and relies on the declared synchronization policy across separate invocations.
 
+For constructor-based watches, `--max-instances` limits live observed objects. Retirement releases the slot. The watch retains each observed address's generation counter until the watch ends so that address reuse remains distinguishable in replay.
+
 A compatible rebuilt ELF can reuse a prepared method watch when DWARF confirms the receiver layout and the original void, scalar, or pointer signature. Pass `--module` to preview and start if the rebuilt image has a new name.
 
 On AArch64 the native agent samples the receiver at a verified entry and at each verified return instruction. The original method executes in its application mapping, and CFI stack capture starts at its original entry. An exception that leaves the method can produce a missing-return gap when the watch retires.

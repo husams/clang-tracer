@@ -483,6 +483,8 @@ public:
     std::shared_ptr<SnapshotWatch> watch;
     api::ObjectObservation origin;
     std::map<std::pair<std::uint32_t, std::uint64_t>, api::TraceEvent> pending;
+    // The receiver owns this sample until it reacquires mutex_ after comparison.
+    const api::TraceEvent *comparing;
   };
 
 private:
@@ -1131,6 +1133,9 @@ private:
       forget_snapshot_locked(*found->second.watch, event);
       publish_snapshot_locked(found->second, event, {"receiver", "method return unavailable at retirement", true});
     }
+    if (found->second.comparing)
+      publish_snapshot_locked(found->second, *found->second.comparing,
+          {"receiver", "probe retired before snapshot comparison completed", true});
     snapshot_probes_.erase(found);
   }
 
@@ -1197,21 +1202,26 @@ private:
         before.object_address() != event.object_address()) {
       publish_snapshot_locked(binding, before, {"receiver", "matching receiver samples unavailable", true});
     } else {
-      SnapshotBinding publication{binding.watch, binding.origin, {}};
+      SnapshotBinding publication{binding.watch, binding.origin, {}, nullptr};
+      binding.comparing = &before;
       lock.unlock();
       std::vector<tracer_repl::SnapshotChange> changes;
+      bool failed = false;
       try {
         changes = tracer_repl::compare_snapshots(before.receiver_snapshot(),
             event.receiver_snapshot(), publication.watch->keys, publication.watch->fields);
       } catch (const std::exception &) {
-        lock.lock();
-        if (::tracer::compat::contains(snapshot_probes_, std::make_pair(before.session_id(), before.probe_id())))
-          publish_snapshot_locked(publication, before, {"receiver", "snapshot comparison failed", true});
-        return;
+        failed = true;
       }
       lock.lock();
-      if (!::tracer::compat::contains(snapshot_probes_, std::make_pair(before.session_id(), before.probe_id())))
+      const auto registered = snapshot_probes_.find({before.session_id(), before.probe_id()});
+      if (registered == snapshot_probes_.end())
         return;
+      registered->second.comparing = nullptr;
+      if (failed) {
+        publish_snapshot_locked(publication, before, {"receiver", "snapshot comparison failed", true});
+        return;
+      }
       for (const auto &change : changes)
         publish_snapshot_locked(publication, before, change);
     }
@@ -2762,7 +2772,7 @@ public:
       std::uint64_t id = 0;
       api::Probe probe;
       const auto result = install_probe(session, method.spec, {}, id, &probe, 0, {},
-          EventHub::SnapshotBinding{group->events, std::move(method.origin), {}});
+          EventHub::SnapshotBinding{group->events, std::move(method.origin), {}, nullptr});
       if (!result.ok()) {
         const auto latest = session->snapshot();
         if (std::any_of(latest.probes().begin(), latest.probes().end(),

@@ -171,7 +171,7 @@ def run(repl, server, agent, fixture, phase, no_values):
         assert watch[1], watch.string
         redirects = read_redirects(control, out, watch, "code-cache", target.pid, (), live_read=read,
                                    runtime_calls=dispatch)
-        count = (4 if ARM else 6) if phase == "tail" else 2
+        count = 6 if phase == "tail" else 2
         record = f"%record trace.db --sqlite --probe {watch[1]} --count {count} --timeout 20"
         if phase == "tail":
             # Record before warmup so replay distinguishes its write from
@@ -218,10 +218,10 @@ def run(repl, server, agent, fixture, phase, no_values):
         events = json.loads((root / "trace.json").read_text())
         item = events[-1]["objectObservation"]
         if phase == "tail":
-            writes = [event["objectObservation"] for event in events
-                      if event["objectObservation"]["kind"] in ("FIELD_WRITTEN", "FIELD_CHANGED")]
-            assert len(writes) == 2, events
-            item = writes[-1]
+            observed = [event["objectObservation"] for event in events]
+            write = "FIELD_WRITTEN" if no_values else "FIELD_CHANGED"
+            assert [entry["kind"] for entry in observed] == [
+                "CREATED", write, "DESTROY_BEGIN", "TEARDOWN_END", "CREATED", write], observed
         if phase == "after":
             assert item["kind"] == "COVERAGE_GAP" and "after the application store" in item["diagnostic"]
             assert not VALUE_FIELDS.intersection(item)
