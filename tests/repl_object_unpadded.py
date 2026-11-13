@@ -18,13 +18,17 @@ def run(args):
     fixture = Path(args.fixture).resolve()
     digest = hashlib.sha256(fixture.read_bytes()).digest()
     source_root = Path(__file__).resolve().parent / "fixtures" / "object_lifetime"
-    sources = {path: hashlib.sha256(path.read_bytes()).digest()
-               for path in source_root.glob("unpadded*.*")}
+    sources = list(source_root.glob("unpadded*.*"))
+    if args.preserved_strings:
+        sources += [*fixture.parent.glob("*.cpp"), *fixture.parent.glob("*.hpp")]
+    sources = {path: hashlib.sha256(path.read_bytes()).digest() for path in sources}
     cases = {
         "v": ("Virtual", "virtual", [(7, 13), (7, 13), (17, 23)]),
         "i": ("Inline", "inline", [(7, 13)]),
         "d": ("Delegating", "delegating", [(7, 13)]),
         "c": ("Callback", "callback", [(7, 13)]),
+        "t": ("Text", "text", [(7, 13), (17, 23)]),
+        "p": ("Plain", "plain", [(7, 13), (17, 23)]),
     }
     with tempfile.TemporaryDirectory(prefix="ct-object-unpadded-") as directory, ExitStack() as cleanup:
         root = Path(directory)
@@ -35,7 +39,8 @@ def run(args):
             cleanup.callback(stop, child)
             return child, Output(child.stdout, 20)
 
-        target, app = launch(fixture)
+        target_args = [args.preserved_strings, "test"] if args.preserved_strings else []
+        target, app = launch(fixture, *target_args)
         app.expect(r"^READY$")
         repl, out = launch(args.repl, "--server", args.server, "--agent", args.agent,
                            "--attach", str(target.pid), "--fail-fast")
@@ -47,7 +52,13 @@ def run(args):
 
         for command in args.cases:
             record, writer, values = cases[command]
-            options = (f"--type life::{record} --field value --code write_{writer} "
+            namespace = "life"
+            selector = f"write_{writer}"
+            if args.preserved_strings:
+                namespace = "vd"
+                selector = f'"vd::poke_{writer}(vd::{record} &, int)"'
+                values = [(value, value + 10) for value in range(1, 5)]
+            options = (f"--type {namespace}::{record} --field value --code {selector} "
                        f"--backend {args.backend}")
             if args.no_values:
                 options += " --no-values"
@@ -59,11 +70,20 @@ def run(args):
             redirects = read_redirects(repl, out, watch, args.backend, target.pid, (), live_read=read)
             count = 4 * len(values)
             send(repl, f"%record {writer}.db --sqlite --probe {watch[1]} --count {count} --timeout 15")
-            send(target, command)
+            if args.preserved_strings:
+                (root / "go-test.now").touch()
+            else:
+                send(target, command)
             app.expect(r"^DONE$")
             out.expect(rf"^received={count} .*complete=true")
-            send(repl, f"%object stop {watch[1]}")
-            out.expect(rf"^watch={watch[1]} active=no .*observations={count} .*restoration_pending=no ")
+            if args.preserved_strings:
+                send(repl, f"%object status {watch[1]}")
+                out.expect(rf"^watch={watch[1]} active=yes .*observations={count} .*dropped=0 ")
+                send(repl, "%detach")
+                out.expect(r"^detached session=")
+            else:
+                send(repl, f"%object stop {watch[1]}")
+                out.expect(rf"^watch={watch[1]} active=no .*observations={count} .*restoration_pending=no ")
             verify_restored_redirects(repl, out, None, target.pid, redirects, live_read=read)
             send(repl, f"%events open {writer}.db --as events_{writer}")
             out.expect(rf"^opened events={count} retained={count} evicted=0$")
@@ -79,22 +99,31 @@ def run(args):
                 assert len({event["lifetimeId"] for event in series}) == 1, series
                 assert series[3]["closureReason"] == "DESTRUCTOR_RETURN", series
                 write = series[1]
-                assert write["function"] == f"write_{writer}" and int(write["elfPc"]) > 0, write
-                assert Path(write["file"]).name == "unpadded.cpp" and write["line"] > 0, write
+                expected_function = f"vd::poke_{writer}(vd::{record}&, int)" if args.preserved_strings else selector
+                assert write["function"] == expected_function and int(write["elfPc"]) > 0, write
+                assert Path(write["file"]).name == ("vd.cpp" if args.preserved_strings else "unpadded.cpp")
+                assert write["line"] > 0, write
+                if args.preserved_strings:
+                    assert write["line"] == (15 if command == "t" else 16), write
                 assert write["locationKind"] == "STORE", write
                 if args.no_values:
                     assert all("oldInteger" not in event and "newInteger" not in event for event in series)
                 else:
                     assert (series[0]["newInteger"], write["oldInteger"], write["newInteger"]) == (old, old, new)
-            if command == "v":
-                assert events[4]["objectAddress"] == events[8]["objectAddress"]
-                assert int(events[8]["objectObservation"]["generation"]) == 2
+            if command == "v" or args.preserved_strings:
+                earlier, later = events[-8], events[-4]
+                assert earlier["objectAddress"] == later["objectAddress"]
+                assert int(later["objectObservation"]["generation"]) == 2
 
-        send(repl, "%detach")
-        out.expect(r"^detached session=")
+        if not args.preserved_strings:
+            send(repl, "%detach")
+            out.expect(r"^detached session=")
         send(repl, "%quit")
         assert repl.wait(timeout=10) == 0
-        send(target, "q")
+        if args.preserved_strings:
+            (root / "stop-test.now").touch()
+        else:
+            send(target, "q")
         assert target.wait(timeout=10) == 0
     assert hashlib.sha256(fixture.read_bytes()).digest() == digest
     assert all(hashlib.sha256(path.read_bytes()).digest() == value for path, value in sources.items())
@@ -106,4 +135,8 @@ if __name__ == "__main__":
         parser.add_argument(name)
     parser.add_argument("--backend", choices=("ptrace", "code-cache"), default="ptrace")
     parser.add_argument("--no-values", action="store_true")
-    run(parser.parse_args())
+    parser.add_argument("--preserved-strings", choices=("text", "plain"))
+    args = parser.parse_args()
+    if args.preserved_strings:
+        args.cases = args.preserved_strings[0]
+    run(args)

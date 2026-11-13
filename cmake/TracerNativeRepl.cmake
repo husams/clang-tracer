@@ -769,6 +769,31 @@ function(tracer_add_native_repl)
           set_tests_properties(${_test} PROPERTIES TIMEOUT 120)
         endforeach()
       endforeach()
+      foreach(_optimization O0 O2)
+        set(_string_target repl-object-string-lifetime-${_optimization}-target)
+        add_executable(${_string_target} tests/fixtures/object_lifetime/unpadded.cpp
+          tests/fixtures/object_lifetime/unpadded_main.cpp)
+        set_target_properties(${_string_target} PROPERTIES CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_compile_options(${_string_target} PRIVATE -g -${_optimization} -falign-functions=1
+          -fno-sized-deallocation -fPIE -fcf-protection=none)
+        target_link_options(${_string_target} PRIVATE -pie "LINKER:--build-id=sha1")
+        add_test(NAME native_repl_object_string_lifetime_${_optimization}
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_unpadded.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:${_string_target}> tp --backend code-cache)
+        set_tests_properties(native_repl_object_string_lifetime_${_optimization} PROPERTIES TIMEOUT 120)
+      endforeach()
+      add_executable(repl-object-follow-lifetime-target tests/fixtures/object_lifetime/follow_main.cpp
+        tests/fixtures/object_lifetime/follow_order.cpp)
+      set_target_properties(repl-object-follow-lifetime-target PROPERTIES
+        CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
+      target_compile_options(repl-object-follow-lifetime-target PRIVATE -g -O2 -fPIE -fcf-protection=none)
+      target_link_options(repl-object-follow-lifetime-target PRIVATE -pie "LINKER:--build-id=sha1")
+      add_test(NAME native_repl_object_follow_lifetime
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_follow_lifetime.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-follow-lifetime-target>)
+      set_tests_properties(native_repl_object_follow_lifetime PROPERTIES TIMEOUT 120)
       foreach(_indirect_target repl-object-indirect-target repl-object-multi-indirect-target)
         add_executable(${_indirect_target}
           tests/fixtures/object_plan/record.cpp tests/fixtures/object_plan/indirect.cpp)

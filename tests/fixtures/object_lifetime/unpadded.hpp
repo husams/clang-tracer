@@ -1,6 +1,22 @@
 #pragma once
 
+#include <string>
+
 namespace life {
+struct Text {
+  int value;
+  std::string label;
+  explicit Text(int initial);
+  virtual ~Text();
+};
+
+struct Plain {
+  int value;
+  std::string label;
+  explicit Plain(int initial);
+  ~Plain();
+};
+
 struct Virtual {
   int value;
   explicit Virtual(int initial);
@@ -35,3 +51,7 @@ extern "C" void write_virtual(life::Virtual &, int);
 extern "C" void write_inline(life::Inline &, int);
 extern "C" void write_delegating(life::Delegating &, int);
 extern "C" void write_callback(life::Callback &, int);
+extern "C" void write_text(life::Text &, int);
+extern "C" void write_plain(life::Plain &, int);
+extern "C" void delete_text(life::Text *);
+extern "C" void destroy_text(life::Text *);

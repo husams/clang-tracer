@@ -35,6 +35,23 @@ void exercise_callback() {
   life::Callback object(7);
   write_callback(object, 13);
 }
+
+[[gnu::noinline]] void exercise_text() {
+  auto *heap = new life::Text(7);
+  write_text(*heap, 13);
+  delete_text(heap);
+  alignas(life::Text) unsigned char storage[sizeof(life::Text)];
+  auto *placed = new (storage) life::Text(17);
+  write_text(*placed, 23);
+  destroy_text(placed);
+}
+
+[[gnu::noinline]] void exercise_plain() {
+  for (int initial : {7, 17}) {
+    life::Plain object(initial);
+    write_plain(object, initial + 6);
+  }
+}
 } // namespace
 
 int main() {
@@ -65,6 +82,12 @@ int main() {
       break;
     case 'c':
       exercise_callback();
+      break;
+    case 't':
+      exercise_text();
+      break;
+    case 'p':
+      exercise_plain();
       break;
     case 'q':
       return 0;
