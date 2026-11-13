@@ -1,6 +1,10 @@
 #include "background_events.hpp"
 
+#include "controller.hpp"
+
+#include <algorithm>
 #include <chrono>
+#include <stdexcept>
 #include <utility>
 
 namespace tracer_repl {
@@ -35,16 +39,19 @@ void BackgroundEvents::run(const std::string& endpoint, std::uint64_t count) noe
     api::TraceEvent event;
     std::uint64_t received = 0;
     while ((!count || received < count) && reader->Read(&event)) {
-      std::lock_guard<std::mutex> lock(mutex_);
-      buffer_.push(event);
-      ++received;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        buffer_.push(event);
+        ++received;
+      }
+      changed_.notify_all();
     }
     const bool complete = count && received == count;
     if (complete) {
       context_.TryCancel();
     }
     const auto status = reader->Finish();
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     buffer_.complete = complete;
     buffer_.timed_out = status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED;
     buffer_.cancelled =
@@ -55,11 +62,34 @@ void BackgroundEvents::run(const std::string& endpoint, std::uint64_t count) noe
       error_ = "event stream ended early; partial results retained";
     }
     running_ = false;
+    lock.unlock();
+    changed_.notify_all();
   } catch (const std::exception& error) {
     context_.TryCancel();
-    std::lock_guard<std::mutex> lock(mutex_);
-    error_ = error.what();
-    running_ = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      error_ = error.what();
+      running_ = false;
+    }
+    changed_.notify_all();
+  }
+}
+
+std::shared_ptr<const EventData> BackgroundEvents::next(std::uint64_t& cursor) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  for (;;) {
+    const auto& events = buffer_.events();
+    cursor = std::max(cursor, buffer_.appended - events.size());
+    if (cursor < buffer_.appended) {
+      const auto index = events.size() - (buffer_.appended - cursor);
+      ++cursor;
+      return events[index];
+    }
+    if (!running_ || interrupted.load()) {
+      return nullptr;
+    }
+    // A signal handler cannot notify, so poll for Ctrl+C between arrivals.
+    changed_.wait_for(lock, std::chrono::milliseconds(20));
   }
 }
 
@@ -103,5 +133,27 @@ std::string EventRange::error() const {
 
 void EventRange::stop() {
   state_->stop();
+}
+
+bool EventRange::Iterator::load() const {
+  if (!current_) {
+    if (auto data = state_->next(cursor_)) {
+      current_.emplace(std::move(data));
+    }
+  }
+  return current_.has_value();
+}
+
+const Event& EventRange::Iterator::operator*() const {
+  if (!load()) {
+    throw std::out_of_range("event range iterator is at the end");
+  }
+  return *current_;
+}
+
+EventRange::Iterator& EventRange::Iterator::operator++() {
+  load();
+  current_.reset();
+  return *this;
 }
 } // namespace tracer_repl

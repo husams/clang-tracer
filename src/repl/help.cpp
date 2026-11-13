@@ -299,11 +299,12 @@ if (data.size()) tracer.print(data.at(0));)",
      "complete, cancelled, and timed_out describe how the capture ended.", "Collection"},
     {"EventRange", "A synchronous or background capture handle that can be iterated in C++17.",
      R"(auto live = tracer.events_async(session, 10, 30);
+for (const auto& e : live) tracer.print(e);
 auto data = live.snapshot();
-for (const auto& e : data) tracer.print(e);
 if (live.running()) live.stop();
 std::cout << live.error() << '\n';)",
-     "Iteration reads a stable snapshot of currently retained events. Later snapshots may include new arrivals. "
+     "Iteration starts at the oldest retained event and waits for later ones until the count, timeout, stop() or Ctrl+C. "
+     "snapshot() returns the currently retained events without waiting. "
      "stop() preserves retained events. Release all copies of the range to free its capture reservation.", "EventRange"},
     {"EventValue", "An owned snapshot of a scalar, string, object, or container from a captured event.",
      R"(auto e = tracer.batch("results").at(0);

@@ -206,8 +206,8 @@ std::string log_directory() {
 
 std::unique_ptr<OwnedTarget> OwnedTarget::start(const LaunchOptions &options, int tracer_pid) {
 #if defined(__linux__) && defined(__x86_64__)
-  if (tracer_pid <= 0)
-    throw std::invalid_argument("launch requires a local server owned by this REPL");
+  if (tracer_pid <= 0 && tracer_pid != any_tracer)
+    throw std::invalid_argument("launch requires a server PID or any_tracer");
   const auto valid = [](const std::string &text) { return text.find('\0') == std::string::npos; };
   if (options.executable.empty() || !valid(options.executable) || !valid(options.cwd) ||
       !valid(options.input) || !valid(options.output) || !valid(options.error) ||
@@ -295,6 +295,7 @@ std::unique_ptr<OwnedTarget> OwnedTarget::start(const LaunchOptions &options, in
       child_error(child.value, isolate, errno);
     if (::getppid() != parent_pid)
       ::_exit(126);
+    // any_tracer (-1) widens to PR_SET_PTRACER_ANY.
     if (::syscall(SYS_prctl, PR_SET_PTRACER, static_cast<long>(tracer_pid), 0L, 0L, 0L) == -1 &&
         errno != EINVAL)
       child_error(child.value, authorize, errno);

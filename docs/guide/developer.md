@@ -24,7 +24,7 @@ See the [C++17 branch reference](cpp17.md#additional-client-and-callback-apis) f
 | `inject(session, selector, callback_file, prepared_directory, prepared_mode="require")` | Install through a package. Modes are `off`, `prefer`, and `require`. |
 | `collect(session, count, timeout_seconds=30)` | Wait and return a bounded `Collection`. |
 | `events(session, count, timeout_seconds=30)` | Wait and return an iterable `EventRange`. Check `error()` and `snapshot()` after a failed stream. |
-| `events_async(session, count=0, timeout_seconds=0)` | Return an `EventRange` immediately. Zero leaves that limit open. |
+| `events_async(session, count=0, timeout_seconds=0)` | Return an `EventRange` immediately and receive in the background. Iterating it waits for events. Zero leaves that limit open. |
 | `record(path, options={})` | Write SQLite with compatible prepared type metadata. Returns `RecordResult`. |
 | `replay(path, query={})` | Read framed Protobuf or SQLite offline into a `Collection`. Loads compatible recorded C++ mappings from SQLite. |
 | `batch(name)` | Fetch a named retained collection. |
@@ -37,7 +37,7 @@ See the [C++17 branch reference](cpp17.md#additional-client-and-callback-apis) f
 | Type and methods | Behavior |
 | --- | --- |
 | `Collection::size(), at(index), begin(), end()` | Count retained events, index with bounds checking, or iterate. Fields `events`, `received`, `evicted`, `complete`, `cancelled`, and `timed_out` expose capture state. |
-| `EventRange::snapshot(), running(), error(), stop(), begin(), end()` | Copy a stable bounded collection, check the producer or error text, stop it while retaining data, or iterate a point-in-time snapshot. Release all range copies to release its capture reservation. |
+| `EventRange::snapshot(), running(), error(), stop(), begin(), end()` | Copy the currently retained events without waiting, check the producer or error text, stop it while retaining data, or iterate from the oldest retained event, waiting for later ones until the range finishes or Ctrl+C. Release all range copies to release its capture reservation. |
 | `Event::sequence(), probe_id(), call_id(), phase(), function_name()` | Read the event cursor, emitting probe, call identity, phase, and name. |
 | `Event::has_result(), argument_value(index), result_value()` | Check return presence or decode a scalar into `ScalarValue` (bool, signed or unsigned 64-bit integer, or double). Void is present but has no scalar value. |
 | `Event::stack()` | Return an owned `std::vector<tracer_repl::StackFrame>` in capture order. Empty when the event has no stored frames. |
@@ -54,8 +54,8 @@ Pipe an `EventRange` or `Collection` through `tracer_repl::take(n)`, `drop(n)`, 
 // Install the probe with --print-result before collecting.
 using namespace tracer_repl;
 auto live = tracer.events_async(session, 4, 30);
-// Trigger two calls in the target terminal and wait for the range to finish.
-auto results = live.snapshot()
+// Trigger two calls in the target terminal. Iteration waits until the range finishes.
+auto results = live
     | filter([](const Event& e) { return e.phase() == "POST"; })
     | transform([](const Event& e) { return e.result_as<int>(); })
     | to_vector();

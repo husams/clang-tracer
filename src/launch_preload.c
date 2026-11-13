@@ -54,7 +54,9 @@ static void child_checkpoint(const char *path) {
   char *end;
   errno = 0;
   const long tracer = strtol(server, &end, 10);
-  if (errno || end == server || *end || tracer <= 0 || tracer > INT_MAX)
+  // -1 means the launching REPL does not know the server PID: accept any
+  // tracer, since (unsigned long)-1 is PR_SET_PTRACER_ANY.
+  if (errno || end == server || *end || (tracer <= 0 && tracer != -1) || tracer > INT_MAX)
     _exit(126);
   if (prctl(PR_SET_PTRACER, (unsigned long)tracer, 0UL, 0UL, 0UL) != 0 && errno != EINVAL)
     _exit(126);

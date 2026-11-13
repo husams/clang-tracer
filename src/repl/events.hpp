@@ -17,6 +17,9 @@ class EventBuffer {
 
 public:
   std::uint64_t received = 0, evicted = 0;
+  // Events that entered the retained window; the oldest retained one has
+  // position appended - events().size().
+  std::uint64_t appended = 0;
   bool complete = false, cancelled = false, timed_out = false;
   std::vector<clangtracer::v1::PreparedInjector> replay_types;
   explicit EventBuffer(std::size_t max_events = 4096,

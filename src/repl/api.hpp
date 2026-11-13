@@ -204,8 +204,11 @@ struct RecordResult {
   bool timed_out = false;
 };
 
-// Iteration visits a stable snapshot of the events retained at begin().
-// It never waits for new events; collection continues independently.
+// Iteration streams: each loop starts at the oldest retained event, then
+// blocks for later ones as the agent sends them. It ends when the collector
+// finishes (count, timeout, stop() or a stream error) or on Ctrl+C. A finished
+// range therefore iterates its retained events without waiting. snapshot()
+// never blocks.
 class EventRange {
   std::shared_ptr<BackgroundEvents> state_;
   explicit EventRange(std::shared_ptr<BackgroundEvents> state);
@@ -215,21 +218,20 @@ public:
   struct Sentinel {};
 
   class Iterator {
-    std::shared_ptr<const Collection> snapshot_;
-    std::size_t index_ = 0;
+    std::shared_ptr<BackgroundEvents> state_;
+    // The next event is fetched lazily so that adaptors such as take(n) stop
+    // without waiting for an event they will not yield.
+    mutable std::uint64_t cursor_ = 0;
+    mutable std::optional<Event> current_;
+    bool load() const;
 
   public:
-    explicit Iterator(Collection snapshot)
-        : snapshot_(std::make_shared<const Collection>(std::move(snapshot))) {}
+    explicit Iterator(std::shared_ptr<BackgroundEvents> state) : state_(std::move(state)) {}
 
-    const Event& operator*() const { return snapshot_->at(index_); }
+    const Event& operator*() const;
+    Iterator& operator++();
 
-    Iterator& operator++() {
-      ++index_;
-      return *this;
-    }
-
-    bool operator!=(Sentinel) const { return index_ < snapshot_->size(); }
+    bool operator!=(Sentinel) const { return load(); }
   };
 
   Collection snapshot() const;
@@ -237,7 +239,7 @@ public:
   std::string error() const;
   void stop();
 
-  Iterator begin() const { return Iterator(snapshot()); }
+  Iterator begin() const { return Iterator(state_); }
 
   Sentinel end() const { return {}; }
 };

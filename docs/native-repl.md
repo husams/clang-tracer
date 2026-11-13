@@ -183,7 +183,11 @@ int main() {
 }
 ```
 
-Use these commands in the native REPL with its private Linux x86-64 server.
+Use these commands in the native REPL on Linux x86-64. With the REPL's private
+server, only that server may attach to the launched application. With any other
+endpoint, including `CLANG_TRACER_ENDPOINT`, the server must run on the same
+host as the REPL, and the launched application accepts any tracer the host's
+tracing policy allows.
 `%launch` selects the attached session and holds the application at the
 checkpoint while you install probes.
 
@@ -659,18 +663,23 @@ for (const auto &event : captured) tracer.print(event);
 Background collection returns immediately so the prompt remains usable:
 
 ```cpp
-auto live = tracer.events_async(session);
+auto live = tracer.events_async(session, 100, 10);
 // Enter other REPL commands while collection continues.
-for (const auto &event : live) tracer.print(event);
 auto data = live.snapshot();
+for (const auto &event : live) tracer.print(event);
 live.running();
 live.error();
 live.stop();
 ```
 
-Each loop visits a stable snapshot of currently retained events, without waiting
-for new arrivals or consuming them. Later loops can include the same events.
-`snapshot()` returns a `Collection` with received/evicted counters and completion,
+Iteration streams. Each loop starts at the oldest retained event, then waits
+for later ones and yields each as the agent sends it. The loop ends when the
+collector finishes (count, timeout, `stop()` or a stream error) or on Ctrl+C,
+which leaves the collector running. Iterating a finished range visits its
+retained events without waiting, and no loop consumes events, so later loops
+can include the same ones. A range with neither count nor timeout is iterated
+until Ctrl+C or `stop()`. `snapshot()` never waits; it returns a `Collection`
+of the currently retained events with received/evicted counters and completion,
 cancellation and timeout flags. Stream failures appear in `error()` in either
 mode; partial results remain inspectable. `events_async(session, 100, 10)` stops
 at 100 events or 10 seconds; zero count/timeout means no corresponding limit.
@@ -748,10 +757,12 @@ propagate on the foreground thread.
 
 Views own their input: lvalue collections are copied and temporaries are moved,
 so stored pipelines remain valid. An event-range view retains its collector
-handle and takes a fresh, non-consuming snapshot at each loop's start. Thus
-`live | take(10)` inspects up to ten **currently retained** events; it does not
-wait for ten new arrivals or limit background collection. Use
-`tracer.events_async(session, 10, 5)` to limit collection itself. Other C++ code
+handle and streams from the oldest retained event at each loop's start, without
+consuming events. Thus `live | take(10)` yields ten events, waiting for those
+that have not arrived yet, and returns as soon as the tenth is read; it does
+not limit background collection. Use `live.snapshot() | take(10)` to inspect
+only **currently retained** events, and `tracer.events_async(session, 10, 5)`
+to limit collection itself. Other C++ code
 can include `event_ranges.hpp` and use the `tracer_repl` namespace explicitly.
 
 ### Console commands

@@ -1,0 +1,14 @@
+# Outputs created while following the lessons.
+target
+target-split
+*.debug
+*.sqlite
+*.db
+*.db-*
+*.pb
+*.json
+*.textproto
+recovered-*/
+prepared*/
+mappings.hpp
+build/
