@@ -483,4 +483,83 @@ Preview preview(std::uint64_t address, std::string_view bytes) {
 Preview scan(std::uint64_t address, std::string_view bytes) {
   return inspect(address, bytes, false);
 }
+
+#if defined(__x86_64__)
+std::size_t nop_prefix(std::uint64_t address, std::string_view bytes, std::size_t minimum) {
+  Decoder decoder;
+  std::string error;
+  if (!make_decoder(decoder, error))
+    return 0;
+  std::size_t used = 0;
+  while (used < minimum && used < bytes.size()) {
+    llvm::MCInst inst;
+    std::uint64_t size = 0;
+    if (!decode(decoder, inst, size, address + used, bytes.substr(used)) ||
+        !decoder.ins->getName(inst.getOpcode()).starts_with("NOOP"))
+      return 0;
+    used += size;
+  }
+  return used >= minimum ? used : 0;
+}
+
+bool forwards_receiver(std::uint64_t address, std::string_view prefix) {
+  Decoder decoder;
+  std::string error;
+  if (!make_decoder(decoder, error))
+    return false;
+  // Track the entry receiver through register copies and a conventional
+  // RBP-relative spill/reload before the first call. Reject other writes.
+  std::set<std::string_view> receiver{"RDI"};
+  std::set<std::int64_t> spills;
+  bool pushed_rbp = false, frame = false;
+  std::int64_t stack_size = 0;
+  while (!prefix.empty()) {
+    llvm::MCInst inst;
+    std::uint64_t size = 0;
+    if (!decode(decoder, inst, size, address, prefix))
+      return false;
+    address += size;
+    prefix.remove_prefix(size);
+    const auto opcode = decoder.ins->getName(inst.getOpcode());
+    const auto reg = [&](unsigned i) -> std::string_view {
+      return inst.getOperand(i).isReg() ? decoder.regs->getName(inst.getOperand(i).getReg()) : "";
+    };
+    const auto slot = [&](unsigned i) -> std::optional<std::int64_t> {
+      if (reg(i) != "RBP" || inst.getOperand(i + 1).getImm() != 1 ||
+          inst.getOperand(i + 2).getReg() || inst.getOperand(i + 4).getReg() ||
+          !inst.getOperand(i + 3).isImm())
+        return std::nullopt;
+      const auto displacement = inst.getOperand(i + 3).getImm();
+      if (displacement < -stack_size || displacement > -8 || displacement % 8 != 0)
+        return std::nullopt;
+      return displacement;
+    };
+    if (opcode == "ENDBR64" || opcode.starts_with("NOOP"))
+      continue;
+    if (opcode == "PUSH64r" && reg(0) == "RBP" && !pushed_rbp) {
+      pushed_rbp = true;
+    } else if (opcode == "MOV64rr" && reg(0) == "RBP" && reg(1) == "RSP" && pushed_rbp && !frame) {
+      frame = true;
+    } else if ((opcode == "SUB64ri8" || opcode == "SUB64ri32") && reg(0) == "RSP" &&
+               reg(1) == "RSP" && frame && !stack_size && inst.getOperand(2).getImm() > 0) {
+      stack_size = inst.getOperand(2).getImm();
+    } else if (opcode == "MOV64rr" && reg(0) != "RBP" && reg(0) != "RSP") {
+      if (receiver.contains(reg(1)))
+        receiver.insert(reg(0));
+      else
+        receiver.erase(reg(0));
+    } else if (opcode == "MOV64mr" && frame && slot(0) && receiver.contains(reg(5))) {
+      spills.insert(*slot(0));
+    } else if (opcode == "MOV64rm" && frame && slot(1) && reg(0) != "RBP" && reg(0) != "RSP") {
+      if (spills.contains(*slot(1)))
+        receiver.insert(reg(0));
+      else
+        receiver.erase(reg(0));
+    } else {
+      return false;
+    }
+  }
+  return receiver.contains("RDI");
+}
+#endif
 } // namespace tracer::native_entry

@@ -55,4 +55,8 @@ struct Preview {
 
 Preview preview(std::uint64_t address, std::string_view bytes);
 Preview scan(std::uint64_t address, std::string_view bytes);
+#if defined(__x86_64__)
+std::size_t nop_prefix(std::uint64_t address, std::string_view bytes, std::size_t minimum);
+bool forwards_receiver(std::uint64_t address, std::string_view prefix);
+#endif
 } // namespace tracer::native_entry
