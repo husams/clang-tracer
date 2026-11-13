@@ -455,7 +455,6 @@ class EventHub final {
 public:
   struct SnapshotWatch {
     struct Receiver {
-      std::uint32_t first_thread = 0;
       std::uint32_t active_thread = 0;
       std::size_t pending = 0;
       bool violated = false;
@@ -1115,9 +1114,9 @@ private:
   void forget_snapshot_locked(SnapshotWatch &watch, const api::TraceEvent &event) {
     --pending_snapshots_;
     pending_snapshot_bytes_ -= event.ByteSizeLong();
-    auto &receiver = watch.receivers.at(event.object_address());
-    if (!--receiver.pending)
-      receiver.active_thread = 0;
+    const auto receiver = watch.receivers.find(event.object_address());
+    if (!--receiver->second.pending)
+      watch.receivers.erase(receiver);
   }
 
   void flush_snapshot_probe_locked(const std::pair<std::string, std::uint64_t> &key) {
@@ -1132,7 +1131,7 @@ private:
     snapshot_probes_.erase(found);
   }
 
-  void sample_snapshot_locked(SnapshotBinding &binding, api::TraceEvent event) {
+  void sample_snapshot(std::unique_lock<std::mutex> &lock, SnapshotBinding &binding, api::TraceEvent event) {
     auto &watch = *binding.watch;
     if (!watch.armed)
       return;
@@ -1167,9 +1166,7 @@ private:
         found = watch.receivers.emplace(event.object_address(), SnapshotWatch::Receiver{event.tid()}).first;
       }
       auto &receiver = found->second;
-      if ((watch.synchronization == api::ObjectWatchRequest::THREAD_CONFINED &&
-           receiver.first_thread != event.tid()) ||
-          (receiver.active_thread && receiver.active_thread != event.tid()))
+      if (receiver.active_thread && receiver.active_thread != event.tid())
         receiver.violated = true;
       if (receiver.violated) {
         publish_snapshot_locked(binding, event, {"receiver", "declared snapshot synchronization was violated", true});
@@ -1186,21 +1183,35 @@ private:
       publish_snapshot_locked(binding, event, {"receiver", "method entry sample unavailable", true});
       return;
     }
-    auto &before = existing->second;
+    auto before = std::move(existing->second);
+    binding.pending.erase(existing);
+    const bool overlap = watch.receivers.at(before.object_address()).violated;
     forget_snapshot_locked(watch, before);
-    if (watch.receivers.at(before.object_address()).violated) {
+    if (overlap) {
       publish_snapshot_locked(binding, before, {"receiver", "overlapping observation has no stable receiver", true});
     } else if (!event.receiver_sampled_at_return() || !event.has_receiver_snapshot() ||
         !before.has_receiver_snapshot() || !event.object_address() ||
         before.object_address() != event.object_address()) {
       publish_snapshot_locked(binding, before, {"receiver", "matching receiver samples unavailable", true});
     } else {
-      const auto changes = tracer_repl::compare_snapshots(before.receiver_snapshot(),
-          event.receiver_snapshot(), binding.watch->keys, binding.watch->fields);
+      SnapshotBinding publication{binding.watch, binding.origin, {}};
+      lock.unlock();
+      std::vector<tracer_repl::SnapshotChange> changes;
+      try {
+        changes = tracer_repl::compare_snapshots(before.receiver_snapshot(),
+            event.receiver_snapshot(), publication.watch->keys, publication.watch->fields);
+      } catch (const std::exception &) {
+        lock.lock();
+        if (::tracer::compat::contains(snapshot_probes_, std::make_pair(before.session_id(), before.probe_id())))
+          publish_snapshot_locked(publication, before, {"receiver", "snapshot comparison failed", true});
+        return;
+      }
+      lock.lock();
+      if (!::tracer::compat::contains(snapshot_probes_, std::make_pair(before.session_id(), before.probe_id())))
+        return;
       for (const auto &change : changes)
-        publish_snapshot_locked(binding, before, change);
+        publish_snapshot_locked(publication, before, change);
     }
-    binding.pending.erase(existing);
   }
 
   void append_native_locked(clangtracer::v1::TraceEvent event) {
@@ -1451,9 +1462,9 @@ private:
       // Function names are assigned by the server from the registered ProbeSpec.
       if (!event.function_name().empty())
         continue;
-      std::lock_guard lock(mutex_);
-      const auto active =
-          active_probes_.find({event.session_id(), event.probe_id()});
+      std::unique_lock lock(mutex_);
+      const auto key = std::make_pair(event.session_id(), event.probe_id());
+      const auto active = active_probes_.find(key);
       if (active == active_probes_.end() || active->second.pid != event.pid())
         continue;
       // Function identity comes from the registered probe, not the agent packet.
@@ -1461,12 +1472,13 @@ private:
       event.clear_replay_types();
       event.clear_object_observation();
       event.set_function_name(active->second.function_name);
-      ++received_[active->first];
-      const auto snapshot = snapshot_probes_.find(active->first);
+      const auto snapshot = snapshot_probes_.find(key);
       if (snapshot == snapshot_probes_.end()) {
+        ++received_[key];
         append_native_locked(std::move(event));
       } else {
-        sample_snapshot_locked(snapshot->second, std::move(event));
+        sample_snapshot(lock, snapshot->second, std::move(event));
+        ++received_[key];
         changed_.notify_all();
       }
     }
@@ -2692,6 +2704,8 @@ private:
         !request.element_key_field().empty() || !request.mutation_symbol().empty() ||
         !request.additional_mutation_symbols().empty() ||
         !request.owner_type().empty() || !request.collection().empty() ||
+        !request.owner_add().empty() || !request.owner_get().empty() ||
+        !request.owner_remove().empty() || !request.owner_snapshot().empty() ||
         !request.code_symbol().empty() || !request.code_module().empty() ||
         !request.additional_code_symbols().empty() || request.syscall_output() || request.cfi_stack() ||
         request.serialize_wait_us() || request.follow_calls() || request.runtime_limit() ||
@@ -2875,10 +2889,6 @@ public:
     group->events->max_events = request.max_events();
     group->events->timeout = std::chrono::seconds(request.timeout_seconds());
     group->probes.reserve(methods.size());
-    {
-      std::lock_guard lock(mutex_);
-      snapshot_groups_[session->id()] = group;
-    }
     for (auto &method : methods) {
       std::uint64_t id = 0;
       api::Probe probe;
@@ -2891,12 +2901,18 @@ public:
           group->probes.push_back(id);
         snapshot_watch_status(session, *group, api::ObjectWatchRequest::STOP, response);
         if (response.restoration_pending()) {
+          const std::lock_guard lock(mutex_);
+          snapshot_groups_[session->id()] = group;
           response.set_diagnostic(result.error_message() + response.diagnostic());
           return grpc::Status::OK;
         }
         return result;
       }
       group->probes.push_back(probe.id());
+    }
+    {
+      const std::lock_guard lock(mutex_);
+      snapshot_groups_[session->id()] = group;
     }
     events_.activate_snapshot_watch(*group->events);
     return snapshot_watch_status(session, *group, api::ObjectWatchRequest::STATUS, response);

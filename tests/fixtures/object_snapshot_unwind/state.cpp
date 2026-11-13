@@ -8,6 +8,8 @@ __attribute__((noinline)) void snapshot_unwind::State::fail() {
   throw 42;
 }
 
+__attribute__((noinline)) void snapshot_unwind::State::write(int value) { value_ = value; }
+
 int main(int argc, char **argv) {
   snapshot_unwind::State state;
   std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -18,6 +20,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   std::puts("READY");
+  state.write(7);
   while (::access("throw.now", F_OK))
     ::usleep(1000);
   try {

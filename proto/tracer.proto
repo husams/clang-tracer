@@ -893,6 +893,10 @@ message ObjectWatchRequest {
   uint32 runtime_limit = 53; // Maximum retained runtime translations, zero selects the default.
   string shared_file = 54; // Server-local regular file backing watched shared storage.
   string pointee_field = 55; // DWARF-verified data-member path, separated by -> for pointer hops.
+  string owner_add = 56;
+  string owner_get = 57;
+  string owner_remove = 58;
+  string owner_snapshot = 59;
 }
 
 message ObjectWatchPlan {

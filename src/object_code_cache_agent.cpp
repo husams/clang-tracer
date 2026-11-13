@@ -42,6 +42,7 @@
 #include <linux/futex.h>
 #include <signal.h>
 #include <sys/auxv.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -537,6 +538,41 @@ bool read_self(Address address, T &value) noexcept {
 }
 
 std::optional<std::uint64_t> shared_file_offset(const State &watch, Address destination) noexcept {
+  // Linux 6.11 /proc/PID/maps ioctl. Keep the wire layout available to
+  // binaries built against older kernel headers.
+  struct MappingQuery {
+    std::uint64_t size, flags, address, begin, end, permissions, page_size, offset, inode;
+    std::uint32_t device_major, device_minor, name_size, build_id_size;
+    std::uint64_t name_address, build_id_address;
+  };
+  static_assert(sizeof(MappingQuery) == 104);
+  constexpr auto query_mapping = _IOWR('f', 17, MappingQuery);
+  constexpr std::uint64_t required = 0x01 | 0x02 | 0x08; // readable, writable, shared
+  static thread_local bool query_unavailable = false;
+  if (!query_unavailable) {
+    const int fd = ::open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+      MappingQuery query{};
+      query.size = sizeof(query);
+      query.flags = required | 0x20; // file-backed VMA
+      query.address = destination;
+      const int result = ::ioctl(fd, query_mapping, &query);
+      const int error = errno;
+      ::close(fd);
+      if (result == 0) {
+        if (query.begin <= destination && destination < query.end &&
+            query.end - destination >= sizeof(std::int32_t) &&
+            query.inode == watch.shared_file.inode &&
+            makedev(query.device_major, query.device_minor) == watch.shared_file.device &&
+            destination - query.begin <= UINT64_MAX - query.offset)
+          return query.offset + (destination - query.begin);
+        return std::nullopt;
+      }
+      if (error == ENOENT)
+        return std::nullopt;
+      query_unavailable = error == ENOTTY || error == ENOSYS || error == EPERM;
+    }
+  }
   try {
     std::ifstream maps("/proc/self/maps");
     for (std::string line; std::getline(maps, line);) {
@@ -1198,7 +1234,7 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
       }
       auto &life = watch.lifetimes[object];
       if (life.id)
-        return;
+        emit_boundary(watch, site, object, life, Hook::lifetime_reused);
       life = {++watch.next_id, life.generation + 1, 0};
       emit_boundary(watch, site, object, life, kind);
       return;
@@ -1221,7 +1257,7 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
       }
       auto &item = watch.lifetimes[object];
       if (item.id)
-        return;
+        emit_boundary(watch, site, object, item, Hook::lifetime_reused);
       life = {++watch.next_id, ++item.generation};
       item.id = life.id;
     } else {
@@ -1290,6 +1326,15 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
         std::none_of(lifecycle_frames.begin(), lifecycle_frames.end(), [&](const auto &frame) {
           return frame.watch == &watch && frame.constructor && frame.event.object == object;
         });
+    if (constructor && outer && !inst.uncertain_construct) {
+      const std::lock_guard lock(watch.mutex);
+      const auto prior = watch.lifetimes.find(object);
+      if (prior != watch.lifetimes.end() && prior->second.id) {
+        emit_boundary(watch, site, object, prior->second, Hook::lifetime_reused);
+        prior->second.id = 0;
+        prior->second.owner = 0;
+      }
+    }
     lifecycle_frames.push_back({&watch, sp, return_pc, constructor, outer,
                                 inst.uncertain_construct, event});
     return;

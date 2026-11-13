@@ -934,8 +934,11 @@ template<class T> void encode(tracer::ValueSnapshot& snapshot, const T& value) n
   limits.depth=snapshot_depth; limits.items=snapshot_items;
   tracer::context_engine::BoundedProtoWriter writer({storage,capacity},limits);
   tracer::context_engine::EncodeBudget budget;
-  tracer::context_engine::EncodeBudget::PointerGraph pointer_graph;
-  budget.pointer_graph=&pointer_graph;
+)";
+    if (report_unavailable)
+      code.declarations += "  tracer::context_engine::EncodeBudget::PointerGraph pointer_graph{{},snapshot_items};\n"
+                           "  budget.pointer_graph=&pointer_graph;\n";
+    code.declarations += R"(
   budget.max_items=snapshot_items; budget.limits=limits;
   const bool ok=tracer::context_engine::encode_value(writer,1,value,budget);
   auto bytes=writer.finish();

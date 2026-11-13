@@ -180,6 +180,7 @@ const CommandTopic commands[] = {
      "Use --writer-entry for all entries into an admitted standalone leaf. "
      "Use --vector with --element-key FIELD=UINT32 or --map with --map-key KEY to track collection storage generations. "
      "Select a verified --mutation SYMBOL and declare --synchronization for native collection capture. "
+     "Use --owner-add, --owner-get, --owner-remove and --owner-snapshot to select ownership boundaries. "
      "Use --no-values to record every completed write and omit field samples. "
      "Record observations with %record FILE --sqlite --name object.trace."},
     {"object status", "%object status [WATCH_ID]", "Show admitted store sites, observations and restoration status."},

@@ -75,6 +75,12 @@ def run_case(repl, server, agent, fixture, root, backend):
         cleanup.callback(stop, console)
         output = Transcript(console.stdout)
         output.expect(rf"^attached session=\S+ pid={target.pid}$")
+        if backend == "entry":
+            send(console, '%probe inject "demo::Circle::get_branchy() const" --backend entry')
+            entry_error = output.expect(r"^error: .+")[0]
+            send(console, '%probe inject "demo::Circle::get_branchy() const" --backend auto')
+            assert output.expect(r"^error: .+")[0] == entry_error
+            assert "unsupported or PC-relative instruction" in entry_error, entry_error
         name = "get_roomy" if backend == "entry" else "get_radius"
         if blocked:
             assert_no_relay(target.pid, call)
@@ -119,7 +125,7 @@ def run_case(repl, server, agent, fixture, root, backend):
         output.expect(rf"^opened events={count} retained={count}")
         send(console, f"%events export saved --format json --output {capture}")
         send(console, "%quit")
-        assert console.wait(timeout=15) == 0, "".join(output.seen)
+        assert console.wait(timeout=15) == int(backend == "entry"), "".join(output.seen)
         events = json.loads(capture.read_text())
         assert len(events) == count
         assert [int(event["result"]["signedValue"]) for event in events] == [10] * count

@@ -40,12 +40,18 @@ public:
   explicit Circle(int value) : radius(value) {}
   OUT_OF_LINE int get_radius() const;
   OUT_OF_LINE int get_roomy() const;
+  OUT_OF_LINE int get_branchy() const;
 };
 
 int Circle::get_radius() const { return radius; }
 
 int Circle::get_roomy() const {
   asm volatile(".rept 16\nnop\n.endr");
+  return radius;
+}
+
+int Circle::get_branchy() const {
+  asm volatile("jmp 1f\n.rept 80\nnop\n.endr\n1:");
   return radius;
 }
 
@@ -134,7 +140,7 @@ int main(int argc, char **argv) {
       // out-of-line accessors only read this object.
       asm volatile("" : : "r"(&circle) : "memory");
       if (demo::call_radius(circle) != 17 || demo::other_radius(circle) != 8 ||
-          circle.get_roomy() != 10)
+          circle.get_roomy() != 10 || circle.get_branchy() != 10)
         return 5;
     }
     std::printf("CALLS direct=17 alternate=8 getter=10 foreign_trap=%d\n",

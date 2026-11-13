@@ -57,12 +57,16 @@ struct EncodeBudget {
   Truncation truncation = nullptr;
   void *truncation_context = nullptr;
   struct PointerGraph {
-    std::array<std::uintptr_t, 128> seen{};
-    std::size_t size = 0;
+    std::vector<std::uintptr_t> seen;
+    std::size_t limit;
     bool admit(std::uintptr_t address) noexcept {
-      if (size == seen.size() || std::find(seen.begin(), seen.begin() + size, address) != seen.begin() + size)
+      if (seen.size() >= limit || std::find(seen.begin(), seen.end(), address) != seen.end())
         return false;
-      seen[size++] = address;
+      try {
+        seen.push_back(address);
+      } catch (...) {
+        return false;
+      }
       return true;
     }
   };

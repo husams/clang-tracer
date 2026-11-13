@@ -38,6 +38,8 @@ api::ObjectWatchStatus preview_snapshots(const api::ObjectWatchRequest &request,
       request.cfi_stack() || request.serialize_wait_us() || !request.shared_file().empty() ||
       request.backend() != Request::PTRACE || request.overflow_policy() != Request::DROP_NEW ||
       !request.application_rendezvous().empty() ||
+      !request.owner_add().empty() || !request.owner_get().empty() ||
+      !request.owner_remove().empty() || !request.owner_snapshot().empty() ||
       !request.base_type().empty() || !request.owner_type().empty() || !request.code_symbol().empty() ||
       !request.collection().empty() || !request.vector_field().empty() || !request.map_field().empty() ||
       !request.pointee_field().empty() || !request.async_signals().empty() ||

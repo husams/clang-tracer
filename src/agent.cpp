@@ -2545,15 +2545,19 @@ std::optional<DirectCaller> verified_direct_caller(
   return result;
 }
 
-bool prepare_getter_fallback(Probe &probe, const clangtracer::v1::ProbeSpec &spec,
-                             std::string &error) {
+bool prepare_getter_fallback(Probe &probe, const clangtracer::v1::ProbeSpec &spec) {
   namespace api = clangtracer::v1;
   auto &request = probe.request;
   if (!spec.has_debug_info() || spec.signature().kind() != api::METHOD ||
-      spec.signature().result() != api::INT32 || spec.signature().arguments_size())
+      spec.signature().result() != api::INT32 || spec.signature().arguments_size() ||
+      spec.debug_info().entry_size() > tracer::kMaxPatchBytes)
     return false;
-  const auto code = tracer::client::verified_function_code(
-      ::getpid(), spec.debug_info(), tracer::kMaxPatchBytes);
+  std::string code, error;
+  try {
+    code = tracer::client::verified_function_code(::getpid(), spec.debug_info(), tracer::kMaxPatchBytes);
+  } catch (const std::exception &) {
+    return false;
+  }
   std::size_t trap_offset = 0;
   if (!tracer::native_detour::decode_getter(code, trap_offset, error))
     return false;
@@ -6230,7 +6234,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     if (!entry_decoded || !tracer::native_detour::create_trampoline(
                               target_patch, p->trampoline, p->mapping_size, error)) {
       if (replaced || specification.native_backend() != "auto" ||
-          !prepare_getter_fallback(*p, specification, error)) {
+          !prepare_getter_fallback(*p, specification)) {
         set_error(request, error.c_str());
         return operation.finish(-1);
       }

@@ -9,13 +9,25 @@
 #include "rendezvous.hpp"
 #endif
 
+#if defined(TRACE_TEST_OWNER_SELECTORS)
+#define OWNER_ADD insert
+#define OWNER_GET at
+#define OWNER_REMOVE erase
+#define OWNER_SNAPSHOT describe
+#else
+#define OWNER_ADD add
+#define OWNER_GET get
+#define OWNER_REMOVE remove
+#define OWNER_SNAPSHOT set_description
+#endif
+
 namespace ownership_test {
 class Shape {
   std::string description_;
 
 public:
   virtual ~Shape();
-  void set_description(const std::string &description);
+  void OWNER_SNAPSHOT(const std::string &description);
 };
 
 #if defined(TRACE_TEST_SECONDARY_BASE)
@@ -42,21 +54,21 @@ class Image {
   std::vector<std::unique_ptr<Shape>> shapes_;
 
 public:
-  void add(std::unique_ptr<Shape> shape);
-  Shape *get();
-  bool remove();
+  void OWNER_ADD(std::unique_ptr<Shape> shape);
+  Shape *OWNER_GET();
+  bool OWNER_REMOVE();
   std::unique_ptr<Shape> take();
 };
 
 Shape::~Shape() = default;
-void Shape::set_description(const std::string &description) { description_ = description; }
+void Shape::OWNER_SNAPSHOT(const std::string &description) { description_ = description; }
 Circle::Circle(int radius) : radius_(radius) {}
 Circle::~Circle() = default;
 void Circle::set_radius(int radius) { radius_ = radius; }
 
-void Image::add(std::unique_ptr<Shape> shape) { shapes_.push_back(std::move(shape)); }
-Shape *Image::get() { return shapes_.front().get(); }
-bool Image::remove() {
+void Image::OWNER_ADD(std::unique_ptr<Shape> shape) { shapes_.push_back(std::move(shape)); }
+Shape *Image::OWNER_GET() { return shapes_.front().get(); }
+bool Image::OWNER_REMOVE() {
   if (shapes_.empty())
     return false;
   shapes_.erase(shapes_.begin());
@@ -80,11 +92,11 @@ int main() {
 #endif
   while (::access("transfer.now", F_OK))
     ::usleep(1000);
-  first.add(std::make_unique<Circle>(40));
-  auto *before = static_cast<Circle *>(first.get());
+  first.OWNER_ADD(std::make_unique<Circle>(40));
+  auto *before = static_cast<Circle *>(first.OWNER_GET());
   before->set_radius(41);
-  second.add(first.take());
-  auto *after = static_cast<Circle *>(second.get());
+  second.OWNER_ADD(first.take());
+  auto *after = static_cast<Circle *>(second.OWNER_GET());
   after->set_radius(42);
 #if defined(TRACE_TEST_SECONDARY_BASE)
   if (static_cast<void *>(static_cast<Shape *>(after)) == static_cast<void *>(after))
@@ -92,7 +104,7 @@ int main() {
 #endif
   std::printf("OWNERS first=%p second=%p circle=%p\n", static_cast<void *>(&first),
               static_cast<void *>(&second), static_cast<void *>(after));
-  if (before != after || after->radius() != 42 || !second.remove() || first.remove())
+  if (before != after || after->radius() != 42 || !second.OWNER_REMOVE() || first.OWNER_REMOVE())
     return 2;
   while (::access("stop.now", F_OK))
     ::usleep(1000);

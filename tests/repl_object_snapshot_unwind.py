@@ -33,7 +33,8 @@ def run(args):
 
         target, app = start([root / "fixture"])
         app.expect(r"^READY$")
-        repl, out = start([args.repl, "--server", args.server, "--agent", args.agent, "--fail-fast"])
+        command = [args.repl, "--server", args.server, "--agent", args.agent]
+        repl, out = start(command if args.check_failed_start else [*command, "--fail-fast"])
         send(repl, '%object prepare snapshot_unwind::State --on "snapshot_unwind::State::fail()" '
                    '--include state.hpp --compdb compile_commands.json --translation-unit state.cpp '
                    '--field value_ --synchronization thread-confined --module fixture --output watch')
@@ -52,6 +53,17 @@ def run(args):
             return read_code(repl, out, pc, maps(repl, out), len(before))
 
         assert read_entry() == before
+        if args.check_failed_start:
+            send(repl, '%object start --type snapshot_unwind::State --field value_ '
+                       '--code "snapshot_unwind::State::write(int)" --first-seen')
+            write = out.expect(r"^watch=(\d+) active=yes .*|^error:")
+            assert write[1], write.string
+            send(repl, "%object start --plan watch")
+            out.expect(r"^error: .*stop the (active )?object watch")
+            send(repl, "%object status")
+            out.expect(rf"^watch={write[1]} active=yes ")
+            send(repl, "%object stop")
+            out.expect(rf"^watch={write[1]} active=no .*restoration_pending=no ")
         send(repl, "%object start --plan watch")
         watch = out.expect(r"^watch=(\d+) active=yes .*|^error:")
         assert watch[1], watch.string
@@ -87,7 +99,7 @@ def run(args):
         out.expect(r"^opened events=1 retained=1 evicted=0$")
         send(repl, "%events export saved --format json --output unwind.json")
         send(repl, "%quit")
-        assert repl.wait(timeout=10) == 0
+        assert repl.wait(timeout=10) == int(args.check_failed_start)
         [event] = json.loads((root / "unwind.json").read_text())
         observation = event["objectObservation"]
         assert observation["kind"] == "COVERAGE_GAP"
@@ -107,4 +119,5 @@ if __name__ == "__main__":
     for name in ("repl", "server", "agent", "fixture_dir"):
         parser.add_argument(name, type=lambda value: Path(value).resolve())
     parser.add_argument("--reexec", action="store_true")
+    parser.add_argument("--check-failed-start", action="store_true")
     run(parser.parse_args())

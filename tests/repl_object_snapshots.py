@@ -51,7 +51,7 @@ def run(args):
         assert prepared.string.startswith("object package="), prepared.string
         send(repl, f"%attach {target.pid}")
         out.expect(rf"^attached session=\S+ pid={target.pid}$")
-        send(repl, "%object start --plan watch")
+        send(repl, "%object start --plan watch --max-instances 1")
         watch = out.expect(r"^watch=(\d+) active=yes .*|^error:")
         assert watch[1], watch.string
         probes = {out.expect(r"^method_probe=(\d+) active=yes restored=no$")[1] for _ in method_names}
@@ -89,6 +89,7 @@ def run(args):
         send(repl, "%quit")
         assert repl.wait(timeout=10) == 0
         records = [event["objectObservation"] for event in json.loads((root / "complex.json").read_text())]
+        assert not any("receiver admission limit" in item.get("diagnostic", "") for item in records)
         assert all("::rehash_only()" not in item["function"] or item["kind"] == "COVERAGE_GAP"
                    for item in records), records
         mutate = {(item["field"], item["diagnostic"]): item for item in records

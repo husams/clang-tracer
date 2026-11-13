@@ -317,7 +317,9 @@ function(tracer_add_native_repl)
           set(_snapshot_options --registered-any)
         elseif(TARGET clang_tracer_object_cache_arm)
           target_link_options(${_snapshot_target} PRIVATE "LINKER:--build-id=none")
-          set(_snapshot_options --reexec)
+          set(_snapshot_options --reexec --check-failed-start)
+        else()
+          set(_snapshot_options --check-failed-start)
         endif()
         file(GENERATE OUTPUT "${_snapshot_dir}/compile_commands.json" CONTENT
           "[{\"directory\":\"${_snapshot_dir}\",\"file\":\"state.cpp\",\"arguments\":[\"${CMAKE_CXX_COMPILER}\",\"-std=c++17\",\"-pthread\",\"-g\",\"-O0\",\"-c\",\"state.cpp\"]}]\n")
@@ -732,8 +734,13 @@ function(tracer_add_native_repl)
       add_test(NAME native_repl_object_lifetime
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_lifetime.py"
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
-          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-lifetime-target>)
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-lifetime-target> --check-reuse)
       set_tests_properties(native_repl_object_lifetime PROPERTIES TIMEOUT 120)
+      add_test(NAME native_repl_object_lifetime_native
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_lifetime.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-lifetime-target> --check-reuse --backend code-cache)
+      set_tests_properties(native_repl_object_lifetime_native PROPERTIES TIMEOUT 120)
       foreach(_indirect_target repl-object-indirect-target repl-object-multi-indirect-target)
         add_executable(${_indirect_target}
           tests/fixtures/object_plan/record.cpp tests/fixtures/object_plan/indirect.cpp)

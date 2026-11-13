@@ -1,4 +1,5 @@
 #include "object_watch.hpp"
+#include "ptrace_wait.hpp"
 
 #include "debug_resolver.hpp"
 #include "linux_syscalls.hpp"
@@ -213,6 +214,7 @@ struct Watch::Worker {
       abandon = true;
     }
     changed.notify_all();
+    injector::PtraceWait::wake();
     thread.join();
   }
 
@@ -220,6 +222,7 @@ struct Watch::Worker {
     std::unique_lock lock(mutex);
     if (!changed.wait_for(lock, timeout, [&] { return ready; })) {
       stopping = true;
+      injector::PtraceWait::wake();
       report.set_restoration_pending(true);
       report.set_diagnostic("restoration pending: timed out starting the watch");
       changed.notify_all();
@@ -235,6 +238,7 @@ struct Watch::Worker {
     if (!stopping && detaching)
       stop_reason = Observation::WATCH_DETACHED;
     stopping = true;
+    injector::PtraceWait::wake();
     changed.notify_all();
     if (!changed.wait_for(lock, timeout, [&] { return finished || failed_attempt == attempt; })) {
       report.set_restoration_pending(true);
@@ -693,10 +697,14 @@ struct Watch::Worker {
     } else
       observation.set_source_unavailable(true);
     fill(observation);
+    const bool gap = kind == Observation::COVERAGE_GAP ||
+        (kind == Observation::OBSERVATION_ENDED &&
+         observation.closure_reason() == Observation::SCOPE_CHANGED &&
+         observation.diagnostic() == "receiver storage reused without an observed destructor");
     publish(std::move(event));
     std::lock_guard lock(mutex);
     report.set_observations(sequence);
-    if (kind == Observation::COVERAGE_GAP)
+    if (gap)
       report.set_coverage_gaps(report.coverage_gaps() + 1);
     if (request.max_events() && sequence == request.max_events()) {
       report.set_capture_limit("max-events");
@@ -900,6 +908,14 @@ struct Watch::Worker {
             return pending.role == Boundary::construct && pending.receiver == receiver;
           });
       frame.uncertain_complete = plan->sites.at(pc).uncertain_complete;
+      if (frame.outer_constructor && !frame.uncertain_complete && found != live.end()) {
+        const auto prior = found->second;
+        live.erase(found);
+        emit(tid, Observation::OBSERVATION_ENDED, prior, pc, regs, [](auto &out) {
+          out.set_closure_reason(Observation::SCOPE_CHANGED);
+          out.set_diagnostic("receiver storage reused without an observed destructor");
+        });
+      }
     }
     stack(frame.entry_stack, pc, regs);
     if (role == Boundary::writer_scope) {
@@ -1344,6 +1360,7 @@ struct Watch::Worker {
   }
 
   void trace() {
+    bool notifications = injector::PtraceWait::enable();
     if (launch_argv.empty())
       seize_threads(Clock::now() + timeout);
     else
@@ -1412,8 +1429,15 @@ struct Watch::Worker {
       for (auto &[tid, task] : tasks)
         if (task.stopped)
           resume(tid, task, task.listen ? PTRACE_LISTEN : PTRACE_CONT);
-      if (receive() <= 0)
-        pause(Clock::time_point::max());
+      const auto generation = injector::PtraceWait::generation();
+      if (receive() <= 0) {
+        if (notifications) {
+          if (!stopping)
+            notifications = injector::PtraceWait::wait(generation, cutoff);
+        } else {
+          pause(Clock::time_point::max());
+        }
+      }
     }
     if (lifecycle_stop && !stopping && (image_replaced || tasks.contains(pid)))
       gap(pid, 0, {}, "object watch ended at a thread/process lifecycle event");

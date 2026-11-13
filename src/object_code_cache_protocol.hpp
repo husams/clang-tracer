@@ -25,7 +25,8 @@ enum class Hook : std::uint8_t {
   constructor_enter, constructor_return, destructor_enter, destructor_return,
   construction_aborted, construction_uncertain, owner_add_enter, owner_add_return,
   owner_get_enter, owner_get_return, owner_remove_enter, owner_remove_return, owner_gap,
-  dispatch_gap, shared_mapping_gap, post_store_signal, scope_signal, snapshot_entry, snapshot_return
+  dispatch_gap, shared_mapping_gap, post_store_signal, scope_signal, snapshot_entry, snapshot_return,
+  lifetime_reused
 };
 enum class Flow : std::uint8_t { copy, jump, conditional, runtime_call, runtime_tail };
 

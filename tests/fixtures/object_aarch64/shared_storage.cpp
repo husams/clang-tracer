@@ -49,9 +49,6 @@ int main(int argc, char **argv) {
     return 2;
   void *shared = ::mmap(nullptr, page, PROT_READ | PROT_WRITE, MAP_SHARED, file, page);
   void *private_copy = ::mmap(nullptr, page, PROT_READ | PROT_WRITE, MAP_PRIVATE, file, page);
-#if !defined(TRACE_TEST_SHARED_SCALAR)
-  ::close(file);
-#endif
   if (shared == MAP_FAILED || private_copy == MAP_FAILED)
     return 3;
   std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -69,6 +66,14 @@ int main(int argc, char **argv) {
     ::usleep(1000);
   if (shared_test::increment_shared(*private_counter) != 0)
     return 4;
+  // The same address and inode no longer refer to shared storage. A cached
+  // positive lookup would incorrectly record this write before the 64 below.
+  if (::mmap(shared, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, file, page) != shared)
+    return 7;
+  if (shared_test::increment_shared(*counter) < 0)
+    return 8;
+  if (::mmap(shared, page, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, file, page) != shared)
+    return 9;
   unsigned checksum = 0;
   for (unsigned i = 0; i != 64; ++i) {
 #if defined(TRACE_TEST_SHARED_SCALAR)
@@ -87,7 +92,5 @@ int main(int argc, char **argv) {
   private_counter->~Counter();
   ::munmap(private_copy, page);
   ::munmap(shared, page);
-#if defined(TRACE_TEST_SHARED_SCALAR)
   ::close(file);
-#endif
 }
