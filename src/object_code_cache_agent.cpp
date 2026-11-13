@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <bit>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -269,10 +270,28 @@ struct State {
   State *previous = nullptr;
   std::mutex mutex;
   std::map<Address, Lifetime> lifetimes;
-  std::map<Address, std::atomic<std::uint64_t>> write_windows;
+  struct AddressHistory {
+    std::uint64_t generation = 0;
+    std::atomic<std::uint64_t> write_window{0};
+  };
+  // Retain address generations and stable write-window storage for in-flight stores.
+  std::map<Address, AddressHistory> generations;
   std::map<Address, pid_t> active_collections;
   std::uint64_t next_id = 0;
   std::uint64_t next_borrow = 0;
+
+  // Call with mutex held and no current lifetime at this address.
+  Lifetime *admit_lifetime(Address object) {
+    if (max_instances && lifetimes.size() >= max_instances) {
+      channel->dropped.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+    auto &history = generations[object];
+    auto [entry, inserted] = lifetimes.try_emplace(object);
+    if (inserted)
+      entry->second = {++next_id, ++history.generation};
+    return &entry->second;
+  }
 
   ~State() {
     if (module_pin)
@@ -537,6 +556,61 @@ bool read_self(Address address, T &value) noexcept {
   return read_self_memory(address, &value, sizeof(T));
 }
 
+std::optional<std::uint64_t> shared_file_offset_from_maps(int fd, const SharedFileIdentity &file,
+                                                        Address destination) noexcept {
+  // All numeric fields and permissions fit in this prefix. Paths can span reads.
+  std::array<char, 160> prefix;
+  std::size_t used = 0;
+  std::array<char, 4096> buffer;
+  for (;;) {
+    const auto count = ::read(fd, buffer.data(), buffer.size());
+    if (count < 0 && errno == EINTR)
+      continue;
+    if (count <= 0)
+      return std::nullopt;
+    const auto *end = buffer.data() + count;
+    for (const char *part = buffer.data(); part != end;) {
+      const auto *line_end = static_cast<const char *>(std::memchr(part, '\n', end - part));
+      const auto *next = line_end ? line_end : end;
+      const auto copy = std::min<std::size_t>(next - part, prefix.size() - used);
+      std::memcpy(prefix.data() + used, part, copy);
+      used += copy;
+      if (!line_end)
+        break;
+      part = line_end + 1;
+      const char *cursor = prefix.data();
+      const auto *limit = cursor + used;
+      used = 0;
+      const auto number = [&](auto &value, int base, char delimiter) {
+        const auto result = std::from_chars(cursor, limit, value, base);
+        if (result.ec != std::errc{} || result.ptr == limit || *result.ptr != delimiter)
+          return false;
+        cursor = result.ptr + 1;
+        return true;
+      };
+      Address begin = 0, finish = 0;
+      if (!number(begin, 16, '-') || !number(finish, 16, ' '))
+        continue;
+      if (destination < begin)
+        return std::nullopt;
+      if (destination >= finish)
+        continue;
+      if (finish - destination < sizeof(std::int32_t) || limit - cursor < 5 ||
+          cursor[0] != 'r' || cursor[1] != 'w' || cursor[3] != 's' || cursor[4] != ' ')
+        return std::nullopt;
+      cursor += 5;
+      std::uint64_t offset = 0, inode = 0;
+      unsigned major_id = 0, minor_id = 0;
+      if (!number(offset, 16, ' ') || !number(major_id, 16, ':') ||
+          !number(minor_id, 16, ' ') || !number(inode, 10, ' ') ||
+          inode != file.inode || makedev(major_id, minor_id) != file.device ||
+          destination - begin > UINT64_MAX - offset)
+        return std::nullopt;
+      return offset + (destination - begin);
+    }
+  }
+}
+
 std::optional<std::uint64_t> shared_file_offset(const State &watch, Address destination) noexcept {
   // Linux 6.11 /proc/PID/maps ioctl. Keep the wire layout available to
   // binaries built against older kernel headers.
@@ -548,56 +622,33 @@ std::optional<std::uint64_t> shared_file_offset(const State &watch, Address dest
   static_assert(sizeof(MappingQuery) == 104);
   constexpr auto query_mapping = _IOWR('f', 17, MappingQuery);
   constexpr std::uint64_t required = 0x01 | 0x02 | 0x08; // readable, writable, shared
+  const int fd = ::open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
+    return std::nullopt;
+  struct CloseMaps {
+    int fd;
+    ~CloseMaps() { ::close(fd); }
+  } close_maps{fd};
   static thread_local bool query_unavailable = false;
   if (!query_unavailable) {
-    const int fd = ::open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
-    if (fd >= 0) {
-      MappingQuery query{};
-      query.size = sizeof(query);
-      query.flags = required | 0x20; // file-backed VMA
-      query.address = destination;
-      const int result = ::ioctl(fd, query_mapping, &query);
-      const int error = errno;
-      ::close(fd);
-      if (result == 0) {
-        if (query.begin <= destination && destination < query.end &&
-            query.end - destination >= sizeof(std::int32_t) &&
-            query.inode == watch.shared_file.inode &&
-            makedev(query.device_major, query.device_minor) == watch.shared_file.device &&
-            destination - query.begin <= UINT64_MAX - query.offset)
-          return query.offset + (destination - query.begin);
-        return std::nullopt;
-      }
-      if (error == ENOENT)
-        return std::nullopt;
-      query_unavailable = error == ENOTTY || error == ENOSYS || error == EPERM;
+    MappingQuery query{};
+    query.size = sizeof(query);
+    query.flags = required | 0x20; // file-backed VMA
+    query.address = destination;
+    if (::ioctl(fd, query_mapping, &query) == 0) {
+      if (query.begin <= destination && destination < query.end &&
+          query.end - destination >= sizeof(std::int32_t) &&
+          query.inode == watch.shared_file.inode &&
+          makedev(query.device_major, query.device_minor) == watch.shared_file.device &&
+          destination - query.begin <= UINT64_MAX - query.offset)
+        return query.offset + (destination - query.begin);
+      return std::nullopt;
     }
+    if (errno == ENOENT)
+      return std::nullopt;
+    query_unavailable = errno == ENOTTY || errno == ENOSYS || errno == EPERM;
   }
-  try {
-    std::ifstream maps("/proc/self/maps");
-    for (std::string line; std::getline(maps, line);) {
-      unsigned long long begin = 0, end = 0, offset = 0, inode = 0;
-      unsigned device_major = 0, device_minor = 0;
-      char permissions[5]{};
-      if (std::sscanf(line.c_str(), "%llx-%llx %4s %llx %x:%x %llu",
-                      &begin, &end, permissions, &offset, &device_major, &device_minor, &inode) != 7)
-        continue;
-      if (destination < begin)
-        break;
-      if (destination >= end)
-        continue;
-      if (end - destination < sizeof(std::int32_t) || permissions[0] != 'r' ||
-          permissions[1] != 'w' || permissions[3] != 's' ||
-          inode != watch.shared_file.inode ||
-          makedev(device_major, device_minor) != watch.shared_file.device ||
-          destination - begin > UINT64_MAX - offset)
-        break;
-      return offset + (destination - begin);
-    }
-  } catch (...) {
-    // A missing procfs observation cannot verify any storage identity.
-  }
-  return std::nullopt;
+  return shared_file_offset_from_maps(fd, watch.shared_file, destination);
 }
 
 bool application_return(const Registers &regs, Address &pc) noexcept {
@@ -1025,8 +1076,7 @@ void retire_owned(State &watch, const Site &site, Address object) {
   if (found == watch.lifetimes.end() || !found->second.id)
     return; // A deleting destructor may enter the complete destructor next.
   const auto life = found->second;
-  found->second.id = 0;
-  found->second.owner = 0;
+  watch.lifetimes.erase(found);
   emit_boundary(watch, site, object, life, Hook::destroy_begin);
   if (life.owner && contains(watch, life.owner, object) == false)
     emit_boundary(watch, site, object, life, Hook::owner_remove);
@@ -1227,16 +1277,12 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
       if (!matches_type(object, watch.borrow.typeinfo, watch.borrow.base_offset))
         return;
       const std::lock_guard lock(watch.mutex);
-      if (watch.max_instances && watch.lifetimes.size() >= watch.max_instances &&
-          !watch.lifetimes.count(object)) {
-        watch.channel->dropped.fetch_add(1, std::memory_order_relaxed);
-        return;
+      if (const auto prior = watch.lifetimes.find(object); prior != watch.lifetimes.end()) {
+        emit_boundary(watch, site, object, prior->second, Hook::lifetime_reused);
+        watch.lifetimes.erase(prior);
       }
-      auto &life = watch.lifetimes[object];
-      if (life.id)
-        emit_boundary(watch, site, object, life, Hook::lifetime_reused);
-      life = {++watch.next_id, life.generation + 1, 0};
-      emit_boundary(watch, site, object, life, kind);
+      if (const auto *life = watch.admit_lifetime(object))
+        emit_boundary(watch, site, object, *life, kind);
       return;
     }
   }
@@ -1250,23 +1296,21 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
   } else {
     const std::lock_guard lock(watch.mutex);
     if (kind == Hook::create) {
-      if (watch.max_instances && watch.lifetimes.size() >= watch.max_instances &&
-          !watch.lifetimes.count(object)) {
-        watch.channel->dropped.fetch_add(1, std::memory_order_relaxed);
-        return;
+      if (const auto prior = watch.lifetimes.find(object); prior != watch.lifetimes.end()) {
+        emit_boundary(watch, site, object, prior->second, Hook::lifetime_reused);
+        watch.lifetimes.erase(prior);
       }
-      auto &item = watch.lifetimes[object];
-      if (item.id)
-        emit_boundary(watch, site, object, item, Hook::lifetime_reused);
-      life = {++watch.next_id, ++item.generation};
-      item.id = life.id;
+      const auto *item = watch.admit_lifetime(object);
+      if (!item)
+        return;
+      life = *item;
     } else {
       destroying = {};
       const auto found = watch.lifetimes.find(object);
       if (found == watch.lifetimes.end() || !found->second.id)
         return;
       life = found->second;
-      found->second.id = 0;
+      watch.lifetimes.erase(found);
       destroying = {&site, regs.value(rsp), object, life};
     }
   }
@@ -1317,8 +1361,7 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
       event.id = item->second.id;
       event.generation = item->second.generation;
       event.owner = item->second.owner;
-      item->second.id = 0;
-      item->second.owner = 0;
+      watch.lifetimes.erase(item);
       event.hook = Hook::destroy_begin;
       emit(watch, event);
     }
@@ -1331,8 +1374,7 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
       const auto prior = watch.lifetimes.find(object);
       if (prior != watch.lifetimes.end() && prior->second.id) {
         emit_boundary(watch, site, object, prior->second, Hook::lifetime_reused);
-        prior->second.id = 0;
-        prior->second.owner = 0;
+        watch.lifetimes.erase(prior);
       }
     }
     lifecycle_frames.push_back({&watch, sp, return_pc, constructor, outer,
@@ -1372,20 +1414,16 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
     return;
   }
   const std::lock_guard lock(watch.mutex);
-  if (watch.max_instances && watch.lifetimes.size() >= watch.max_instances &&
-      !watch.lifetimes.count(event.object)) {
-    watch.channel->dropped.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
-  auto &life = watch.lifetimes[event.object];
-  if (life.id) {
+  if (watch.lifetimes.contains(event.object)) {
     event.hook = Hook::construction_uncertain;
     emit(watch, event);
     return;
   }
-  life.id = ++watch.next_id;
-  event.id = life.id;
-  event.generation = ++life.generation;
+  const auto *life = watch.admit_lifetime(event.object);
+  if (!life)
+    return;
+  event.id = life->id;
+  event.generation = life->generation;
   event.hook = Hook::create;
   if (!watch.no_values && !watch.shared_file.inode &&
       read_self(event.object + watch.offset, event.new_value)) {
@@ -1610,7 +1648,7 @@ void before(const Site *site, const Registers *regs) noexcept {
                                            life.owner != active_borrow.owner))
         return;
       if (watch.serialize_wait_us || (!watch.no_values && !watch.atomic))
-        window = &watch.write_windows.try_emplace(destination, 0).first->second;
+        window = &watch.generations.at(destination - watch.offset).write_window;
     }
     Sample sample{site, regs->value(rsp), destination, life};
     if (watch.shared_file.inode) {

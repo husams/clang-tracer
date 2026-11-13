@@ -936,7 +936,7 @@ template<class T> void encode(tracer::ValueSnapshot& snapshot, const T& value) n
   tracer::context_engine::EncodeBudget budget;
 )";
     if (report_unavailable)
-      code.declarations += "  tracer::context_engine::EncodeBudget::PointerGraph pointer_graph{{},snapshot_items};\n"
+      code.declarations += "  tracer::context_engine::EncodeBudget::PointerGraph pointer_graph(snapshot_items);\n"
                            "  budget.pointer_graph=&pointer_graph;\n";
     code.declarations += R"(
   budget.max_items=snapshot_items; budget.limits=limits;

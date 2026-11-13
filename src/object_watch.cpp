@@ -1008,8 +1008,7 @@ struct Watch::Worker {
       }
       if (found != live.end() || !rtti(receiver))
         throw std::runtime_error("complete constructor returned with an unexpected type or a live generation");
-      if (request.max_instances() && generations.size() >= request.max_instances() &&
-          !generations.contains(receiver))
+      if (request.max_instances() && live.size() >= request.max_instances())
         throw std::runtime_error("receiver admission limit reached");
       std::optional<std::int32_t> initial;
       if (!request.no_values() && !plan->layout.logical_collection())

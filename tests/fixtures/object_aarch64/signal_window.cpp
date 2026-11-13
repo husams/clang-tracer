@@ -18,7 +18,7 @@ struct Record {
 };
 
 __attribute__((noinline, noipa)) Record::Record() : value(17) {}
-__attribute__((noinline, noipa)) Record::~Record() { asm volatile("" ::: "memory"); }
+__attribute__((noinline, noipa)) Record::~Record() { asm volatile("nop" : : "r"(this) : "memory"); }
 
 extern "C" int signal_window_write(Record &, int);
 extern "C" void signal_window_successor();

@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -66,7 +67,19 @@ Circle::Circle(int radius) : radius_(radius) {}
 Circle::~Circle() = default;
 void Circle::set_radius(int radius) { radius_ = radius; }
 
-void Image::OWNER_ADD(std::unique_ptr<Shape> shape) { shapes_.push_back(std::move(shape)); }
+#if defined(TRACE_TEST_OWNER_CLONES)
+__attribute__((noinline, noclone, optimize("O2")))
+#endif
+void Image::OWNER_ADD(std::unique_ptr<Shape> shape) {
+#if defined(TRACE_TEST_OWNER_CLONES)
+  if (!shape)
+    throw std::invalid_argument("shape required");
+#endif
+  shapes_.push_back(std::move(shape));
+#if defined(TRACE_TEST_OWNER_CLONES)
+  asm volatile("" ::: "memory");
+#endif
+}
 Shape *Image::OWNER_GET() { return shapes_.front().get(); }
 bool Image::OWNER_REMOVE() {
   if (shapes_.empty())

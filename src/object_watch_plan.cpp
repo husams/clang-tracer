@@ -1154,7 +1154,8 @@ struct Plan::Image {
         functions.insert(symbol.range);
   }
 
-  Range function(std::uint32_t pid, std::string selector, bool allow_virtual = false) const {
+  Range function(std::uint32_t pid, std::string selector, bool allow_virtual = false,
+                 bool exclude_clones = false) const {
 #if defined(__aarch64__)
     constexpr bool use_elf_selector = true;
 #else
@@ -1170,8 +1171,12 @@ struct Plan::Image {
       };
       const auto normalized = compact(selector);
       return select(symbols, selector, llvm::ELF::STT_FUNC, [&](const auto &s) {
+        if (s.linkage == selector)
+          return true;
+        if (exclude_clones && s.linkage.find('.') != std::string::npos)
+          return false;
         const auto symbol = compact(s.demangled);
-        return s.linkage == selector || symbol == normalized ||
+        return symbol == normalized ||
             (normalized.find('(') == std::string::npos && symbol.starts_with(normalized + "("));
       });
     }
@@ -1356,7 +1361,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   const auto ownership_boundary = [&](Boundary role, const std::string &selector, const char *default_name) {
     const auto receiver = role == Boundary::snapshot ? request.base_type() : owner;
     const auto name = selector.empty() ? receiver + "::" + default_name : selector;
-    const auto range = lifetime.function(0, name);
+    const auto range = lifetime.function(0, name, false, true);
     auto function = lifetime.dwarf->getDIEsForAddress(range.first).FunctionDIE;
     while (function && function.getTag() != dw::DW_TAG_subprogram)
       function = function.getParent();

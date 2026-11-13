@@ -7,6 +7,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <new>
 #include <optional>
 #include <set>
 #include <string>
@@ -57,18 +58,43 @@ struct EncodeBudget {
   Truncation truncation = nullptr;
   void *truncation_context = nullptr;
   struct PointerGraph {
-    std::vector<std::uintptr_t> seen;
-    std::size_t limit;
+    explicit PointerGraph(std::size_t limit) noexcept : limit(std::min<std::size_t>(limit, 4096)) {}
+
     bool admit(std::uintptr_t address) noexcept {
-      if (seen.size() >= limit || std::find(seen.begin(), seen.end(), address) != seen.end())
+      if (!address || size >= limit)
         return false;
-      try {
-        seen.push_back(address);
-      } catch (...) {
+      if (!seen && !allocate())
         return false;
+      // Mix aligned addresses before indexing a table kept at most half full.
+      std::uint64_t hash = address;
+      hash = (hash ^ (hash >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+      hash = (hash ^ (hash >> 27)) * UINT64_C(0x94d049bb133111eb);
+      auto index = static_cast<std::size_t>(hash ^ (hash >> 31)) & mask;
+      while (seen[index]) {
+        if (seen[index] == address)
+          return false;
+        index = (index + 1) & mask;
       }
+      seen[index] = address;
+      ++size;
       return true;
     }
+
+  private:
+    bool allocate() noexcept {
+      if (mask)
+        return false;
+      std::size_t slots = 2;
+      while (slots / 2 < limit)
+        slots *= 2;
+      mask = slots - 1;
+      seen.reset(new (std::nothrow) std::uintptr_t[slots]{});
+      return bool(seen);
+    }
+
+    std::unique_ptr<std::uintptr_t[]> seen;
+    const std::size_t limit;
+    std::size_t size = 0, mask = 0;
   };
   PointerGraph *pointer_graph = nullptr;
   bool enter() noexcept {

@@ -41,12 +41,13 @@ def run(args):
             verify_restored_redirects(repl, out, token, target.pid, redirects, live_read=live_read)
 
         options = f"--backend {args.backend}" + (" --no-values" if args.no_values else "")
-        definition = '--type life::Record --field value_ --code "life::Record::write(int)" --stack-depth 8 ' + options
-        send(repl, f"%object preview {definition}")
+        definition = ('--type life::Record --field value_ --code "life::Record::write(int)" '
+                      '--stack-depth 8 ' + options)
+        send(repl, f"%object preview {definition} --max-instances 4")
         out.expect(r"^watch=0 active=no stores=[1-9][0-9]* ")
         for _ in range(4):
             out.expect(r'^site role="construct" ')
-        send(repl, f"%object start {definition}")
+        send(repl, f"%object start {definition} --max-instances 4")
         watch = out.expect(r"^watch=(\d+) active=yes stores=[1-9][0-9]* .*|^error:")
         assert watch[1], watch.string
         redirects = read_redirects(repl, out, watch, args.backend, target.pid, (), live_read=live_read)
@@ -98,7 +99,7 @@ def run(args):
         assert sum(generations == {1, 2} for generations in addresses.values()) == 1, addresses
 
         if args.check_reuse:
-            send(repl, f"%object start {definition}")
+            send(repl, f"%object start {definition} --max-instances 1")
             watch = out.expect(r"^watch=(\d+) active=yes .*|^error:")
             assert watch[1], watch.string
             redirects = read_redirects(repl, out, watch, args.backend, target.pid, (), live_read=live_read)
