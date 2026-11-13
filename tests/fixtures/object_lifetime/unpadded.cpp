@@ -45,6 +45,24 @@ void write_callback(life::Callback &object, int value) {
 }
 void write_tail_ctor(life::TailCtor &object, int value) { object.value = value; }
 void write_tail_dtor(life::TailDtor &object, int value) { object.value = value; }
+void write_hidden(life::Callback &object, int value) { object.value = value; }
+
+// The indirect dispatch reaches a block with a direct writer call. An
+// entry-based scan cannot see that block, even when it sees other callers.
+asm(R"(
+  .text
+  .globl hidden_writer_call
+  .type hidden_writer_call,@function
+hidden_writer_call:
+  leaq .Lhidden_writer(%rip),%rax
+  jmp *%rax
+.Lhidden_writer:
+  subq $8,%rsp
+  call write_hidden
+  addq $8,%rsp
+  ret
+  .size hidden_writer_call,.-hidden_writer_call
+)");
 
 // Model the optimized early return after a conditional branch. Neither the
 // one-byte return nor its predecessor can host an independent near redirect.

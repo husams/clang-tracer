@@ -346,7 +346,8 @@ std::optional<ScalarStore> store32(const Decoder &decoder, const llvm::MCInst &i
 #endif
 }
 
-Preview inspect(std::uint64_t address, std::string_view bytes, bool entry) {
+Preview inspect(std::uint64_t address, std::string_view bytes, bool entry,
+                std::span<const std::uint64_t> additional_entries = {}) {
   Preview result;
   Decoder decoder;
   if (!make_decoder(decoder, result.diagnostic))
@@ -358,6 +359,9 @@ Preview inspect(std::uint64_t address, std::string_view bytes, bool entry) {
   // Explore direct branches within the verified byte window. Calls retain
   // their return-site edge and their target is reported without following it.
   std::set<std::uint64_t> pending{address};
+  for (const auto pc : additional_entries)
+    if (pc >= address && pc - address < bytes.size())
+      pending.insert(pc);
   std::set<std::uint64_t> visited;
   while (!pending.empty()) {
     const auto pc = *pending.begin();
@@ -490,8 +494,9 @@ Preview preview(std::uint64_t address, std::string_view bytes) {
   return inspect(address, bytes, true);
 }
 
-Preview scan(std::uint64_t address, std::string_view bytes) {
-  return inspect(address, bytes, false);
+Preview scan(std::uint64_t address, std::string_view bytes,
+             std::span<const std::uint64_t> additional_entries) {
+  return inspect(address, bytes, false, additional_entries);
 }
 
 #if defined(__x86_64__)

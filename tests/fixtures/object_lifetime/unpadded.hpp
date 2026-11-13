@@ -71,3 +71,5 @@ extern "C" void make_tail_ctor(life::TailCtor *, int);
 extern "C" void destroy_tail_dtor(life::TailDtor *);
 extern "C" void write_tail_ctor(life::TailCtor &, int);
 extern "C" void write_tail_dtor(life::TailDtor &, int);
+extern "C" void hidden_writer_call(life::Callback &, int);
+extern "C" void write_hidden(life::Callback &, int);
