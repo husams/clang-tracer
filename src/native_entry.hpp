@@ -13,7 +13,7 @@ inline constexpr std::size_t preview_bytes = 64;
 enum class Flow { ordinary, branch, call, returns };
 
 struct ScalarStore {
-  enum class Kind { move, exchange_add, compare_exchange };
+  enum class Kind { move, exchange_add, compare_exchange, rmw };
   std::string base;
   std::string index;
   unsigned scale;
@@ -22,6 +22,10 @@ struct ScalarStore {
   std::string value_register;
   std::optional<std::uint32_t> immediate;
   std::string result_register; // Previous value returned by an AArch64 LSE operation.
+
+  bool supports(bool atomic) const {
+    return kind == Kind::move || (atomic ? kind != Kind::rmw : kind == Kind::rmw);
+  }
 };
 
 struct Instruction {

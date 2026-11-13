@@ -5,10 +5,11 @@
 #include <cstdint>
 
 #include "object_code_cache_protocol.hpp"
+#include "value_snapshot_storage.hpp"
 
 namespace tracer::arm_snapshot {
 inline constexpr unsigned slots = 64;
-inline constexpr unsigned payload_limit = 65536;
+inline constexpr unsigned payload_limit = max_snapshot_wire_bytes;
 
 struct Sample {
   std::uint64_t receiver = 0, method = 0, stack = 0, time = 0;

@@ -16,6 +16,11 @@ constexpr std::size_t default_runtime_limit = 1024;
 constexpr std::size_t max_runtime_limit = 65536;
 constexpr std::size_t stack_limit = 64;
 constexpr std::uint64_t enabled = 1ULL << 63;
+#if defined(__aarch64__)
+inline constexpr std::size_t direct_call_width = 4;
+#else
+inline constexpr std::size_t direct_call_width = 5;
+#endif
 static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
 
 enum class Hook : std::uint8_t {
@@ -26,8 +31,11 @@ enum class Hook : std::uint8_t {
   construction_aborted, construction_uncertain, owner_add_enter, owner_add_return,
   owner_get_enter, owner_get_return, owner_remove_enter, owner_remove_return, owner_gap,
   dispatch_gap, shared_mapping_gap, post_store_signal, scope_signal, snapshot_entry, snapshot_return,
-  lifetime_reused
+  lifetime_reused, admission_gap, rmw
 };
+inline bool writer(Hook hook) noexcept {
+  return hook == Hook::move || hook == Hook::xadd || hook == Hook::cas || hook == Hook::rmw;
+}
 enum class Flow : std::uint8_t { copy, jump, conditional, runtime_call, runtime_tail };
 
 struct Instruction {
@@ -86,6 +94,8 @@ struct SharedFileIdentity {
   std::uint64_t inode = 0;
 };
 
+struct ConstructorReturn { Address entry, return_pc; };
+
 struct Init {
   char path[4096]{};
   char module[4096]{};
@@ -113,6 +123,8 @@ struct Init {
   bool stop_on_overflow = false;
   bool cfi_stack = false;
   bool permanent_startup_module = false;
+  const ConstructorReturn *complete_constructor_returns = nullptr;
+  std::size_t complete_constructor_return_count = 0;
 };
 
 struct Observation {

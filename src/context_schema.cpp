@@ -1365,7 +1365,10 @@ CodecSourceResult render_payload_codec_source(clang::ASTContext &ast,
     result.error = "generic payload type has no canonical spelling";
     return result;
   }
-  Builder validator{ast, SchemaLimits{}};
+  SchemaLimits limits;
+  if (access_policy == CodecAccess::snapshot_members)
+    limits.depth = max_capture_depth;
+  Builder validator{ast, limits};
   validator.snapshot = access_policy == CodecAccess::snapshot_members;
   (void)validator.describe(payload, "value", 1, 0);
   if (!validator.error.empty()) {

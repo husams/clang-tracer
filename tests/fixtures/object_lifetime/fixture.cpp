@@ -22,6 +22,7 @@ public:
   Record(Record &&source);
   virtual ~Record();
   void write(int value);
+  void adjust(int amount);
 };
 
 Record::Record() : Record(7) {
@@ -44,6 +45,7 @@ Record::Record(Record &&source) : value_(source.value_) {
 }
 Record::~Record() { asm volatile("nop; nop; nop; nop; nop"); }
 void Record::write(int value) { value_ = value; }
+void Record::adjust(int amount) { value_ -= amount; }
 
 class Base {
   int value_ = 5;
@@ -102,6 +104,20 @@ void reuse() {
 void alias() {
   Derived value;
   value.write(11);
+  Base complete;
+  complete.write(12);
+}
+
+void capacity() {
+  Record first(80);
+  Record skipped(90);
+  skipped.write(91);
+  first.write(81);
+}
+
+void arithmetic() {
+  Record value(9);
+  value.adjust(2);
 }
 } // namespace life
 
@@ -136,6 +152,14 @@ int main() {
     case 'b':
       life::alias();
       std::puts("alias done");
+      break;
+    case 'c':
+      life::capacity();
+      std::puts("capacity done");
+      break;
+    case 'a':
+      life::arithmetic();
+      std::puts("arithmetic done");
       break;
     case 'q':
       return 0;

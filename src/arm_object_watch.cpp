@@ -7,6 +7,8 @@
 #include "object_watch_plan.hpp"
 #include "prepared_contract.hpp"
 #include "proc_identity.hpp"
+#include "bounded_proto.hpp"
+#include "value_snapshot_storage.hpp"
 
 #include <algorithm>
 #include <array>
@@ -30,9 +32,9 @@ api::ObjectWatchStatus preview_snapshots(const api::ObjectWatchRequest &request,
   using Request = api::ObjectWatchRequest;
   if (request.methods().empty() || request.methods_size() > 16 || request.concrete_type().empty() ||
       request.no_values() || request.stack_depth() > 64 || request.snapshot_fields_size() > 128 ||
-      request.snapshot_keys_size() > 128 || request.snapshot_max_depth() > 32 ||
-      request.snapshot_max_bytes() > 4096 || request.max_instances() > 65536 ||
-      request.max_elements() > 65536 || request.max_string_bytes() > 65536 ||
+      request.snapshot_keys_size() > 128 || request.snapshot_max_depth() > context_engine::max_capture_depth ||
+      request.snapshot_max_bytes() > max_snapshot_bytes || request.max_instances() > 65536 ||
+      request.max_elements() > context_engine::max_capture_items || request.max_string_bytes() > max_snapshot_bytes ||
       request.writer_tid() || request.writer_entry() || request.first_seen() || request.follow_calls() ||
       request.runtime_limit() || request.event_buffer() || request.syscall_output() ||
       request.cfi_stack() || request.serialize_wait_us() || !request.shared_file().empty() ||

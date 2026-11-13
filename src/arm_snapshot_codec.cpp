@@ -37,7 +37,7 @@ bool copy_snapshot(const ValueSnapshot &source, Snapshot &result, bool members) 
   if (source.status != ValueSnapshot::Complete)
     return true;
   if (!source.descriptor || !source.root_type || source.descriptor_size > 4096 ||
-      source.payload_size > 4096 || (!source.payload && source.payload_size) ||
+      source.payload_size > max_snapshot_bytes || (!source.payload && source.payload_size) ||
       source.container_role_count > 128 || source.record_type_count > 128 ||
       (source.member_count && (!members || !source.members || source.member_count > kMaxSnapshotMembers)))
     return false;
@@ -64,7 +64,7 @@ bool copy_snapshot(const ValueSnapshot &source, Snapshot &result, bool members) 
 bool encode_snapshot(const ValueSnapshot &source, std::string &bytes) noexcept {
   try {
     Snapshot result;
-    return copy_snapshot(source, result, true) && result.ByteSizeLong() <= 65536 &&
+    return copy_snapshot(source, result, true) && result.ByteSizeLong() <= max_snapshot_wire_bytes &&
         result.SerializeToString(&bytes);
   } catch (...) {
     return false;
@@ -118,7 +118,7 @@ Codec compile(const clangtracer::v1::ProbeSpec &spec) {
   };
   bind("std::size_t tracer_snapshot_mark() noexcept", "tracer_snapshot_mark", "", &tracer_snapshot_mark);
   bind("void tracer_snapshot_reset(std::size_t mark) noexcept", "tracer_snapshot_reset", "mark", &tracer_snapshot_reset);
-  bind("std::byte* tracer_snapshot_storage(std::size_t* size) noexcept", "tracer_snapshot_storage", "size", &tracer_snapshot_storage);
+  bind("std::byte* tracer_snapshot_storage(std::size_t* size, std::size_t requested) noexcept", "tracer_snapshot_storage", "size,requested", &tracer_snapshot_storage);
   bind("void tracer_snapshot_commit(std::size_t mark, std::size_t size) noexcept", "tracer_snapshot_commit", "mark, size", &tracer_snapshot_commit);
   bind("bool tracer_snapshot_readable(const void* ptr, std::size_t size, std::size_t align) noexcept",
        "tracer_snapshot_readable", "ptr, size, align", &tracer_snapshot_readable);

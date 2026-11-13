@@ -54,11 +54,11 @@ struct EncodeBudget {
   const char *cut = nullptr;
   bool truncated = false;
   CaptureLimits limits{};
-  std::array<PathStep, 32> path{};
+  std::array<PathStep, max_capture_depth> path{};
   Truncation truncation = nullptr;
   void *truncation_context = nullptr;
   struct PointerGraph {
-    explicit PointerGraph(std::size_t limit) noexcept : limit(std::min<std::size_t>(limit, 4096)) {}
+    explicit PointerGraph(std::size_t limit) noexcept : limit(std::min(limit, max_capture_items)) {}
 
     bool admit(std::uintptr_t address) noexcept {
       if (!address || size >= limit)

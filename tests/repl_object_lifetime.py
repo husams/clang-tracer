@@ -134,6 +134,43 @@ def run(args):
             assert records[0]["lifetimeId"] != records[3]["lifetimeId"] == records[4]["lifetimeId"]
             assert int(records[3]["generation"]) == int(records[0]["generation"]) + 1
 
+        send(repl, f"%object start {definition} --max-instances 1")
+        watch = out.expect(r"^watch=(\d+) active=yes .*|^error:")
+        assert watch[1], watch.string
+        redirects = read_redirects(repl, out, watch, args.backend, target.pid, (), live_read=live_read)
+        send(repl, f"%record capacity.db --sqlite --probe {watch[1]} --count 5 --timeout 15")
+        send(target, "c")
+        app.expect(r"^capacity done$")
+        out.expect(r"^received=5 .*complete=true")
+        send(repl, "%object stop")
+        out.expect(rf"^watch={watch[1]} active=no .*restoration_pending=no .*")
+        verify_restored(redirects)
+        send(repl, "%events open capacity.db --as capacity")
+        out.expect(r"^opened events=5 retained=5 evicted=0$")
+        send(repl, "%events show capacity --index 1")
+        out.expect(r"^  kind: COVERAGE_GAP$")
+        out.expect(r'^  diagnostic: "receiver admission limit reached"$')
+
+        if platform.machine() == "x86_64":
+            send(repl, f"%object start {definition.replace('::write(', '::adjust(')}")
+            watch = out.expect(r"^watch=(\d+) active=yes .*|^error:")
+            assert watch[1], watch.string
+            redirects = read_redirects(repl, out, watch, args.backend, target.pid, ())
+            send(repl, f"%record arithmetic.db --sqlite --probe {watch[1]} --count 4 --timeout 15")
+            send(target, "a")
+            app.expect(r"^arithmetic done$")
+            out.expect(r"^received=4 .*complete=true")
+            send(repl, "%object stop")
+            out.expect(rf"^watch={watch[1]} active=no .*restoration_pending=no ")
+            verify_restored(redirects)
+            send(repl, "%events open arithmetic.db --as arithmetic")
+            out.expect(r"^opened events=4 retained=4 evicted=0$")
+            send(repl, "%events show arithmetic --index 1")
+            out.expect(rf"^  kind: {write_kind}$")
+            if not args.no_values:
+                out.expect(r"^  old_integer: 9$")
+                out.expect(r"^  new_integer: 7$")
+
         alias = '--type life::Base --field value_ --code "life::Base::write(int)" ' + options
         send(repl, f"%object preview {alias}")
         out.expect(r'^site role="construct \(complete/base alias\)" ')
@@ -141,18 +178,22 @@ def run(args):
         watch = out.expect(r"^watch=(\d+) active=yes stores=[1-9][0-9]* .*|^error:")
         assert watch[1], watch.string
         redirects = read_redirects(repl, out, watch, args.backend, target.pid, (), live_read=live_read)
-        send(repl, f"%record alias.db --sqlite --probe {watch[1]} --count 1 --timeout 15")
+        send(repl, f"%record alias.db --sqlite --probe {watch[1]} --count 5 --timeout 15")
         send(target, "b")
         app.expect(r"^alias done$")
-        out.expect(r"^received=1 .*complete=true")
+        out.expect(r"^received=5 .*complete=true")
         send(repl, f"%object stop {watch[1]}")
-        out.expect(rf"^watch={watch[1]} active=no .*observations=1 .*restoration_pending=no ")
+        out.expect(rf"^watch={watch[1]} active=no .*observations=5 .*restoration_pending=no ")
         verify_restored(redirects)
         send(repl, "%events open alias.db --as alias")
-        out.expect(r"^opened events=1 retained=1 evicted=0$")
-        send(repl, "%events show alias --index 0")
-        out.expect(r"^  kind: LIFETIME_UNCERTAIN$")
-        out.expect(r'^  diagnostic: "complete and base constructors share the same entry"$')
+        out.expect(r"^opened events=5 retained=5 evicted=0$")
+        send(repl, "%events export alias --format json --output alias.json")
+        send(repl, "%events list alias")
+        out.expect(r"^4 ")
+        alias_records = [event["objectObservation"] for event in json.loads((root / "alias.json").read_text())]
+        assert [event["kind"] for event in alias_records] == [
+            "LIFETIME_UNCERTAIN", "CREATED", write_kind, "DESTROY_BEGIN", "TEARDOWN_END"], alias_records
+        assert alias_records[0]["diagnostic"] == "complete and base constructors share the same entry"
         send(repl, "%detach")
         out.expect(r"^detached session=")
         send(target, "q")

@@ -2,6 +2,7 @@
 
 #include <any>
 #include <map>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <variant>
@@ -32,6 +33,8 @@ struct Registered {
   int value;
 };
 class State {
+  std::vector<std::unique_ptr<int>> items_;
+  std::vector<int> large_ = std::vector<int>(4300, 21);
   std::vector<std::vector<int>> nested_{{3, 4}, {7, 8}};
   std::map<int, int> map_{{7, 10}, {9, 20}};
   std::unordered_map<int, int> hash_{{1, 10}, {2, 20}, {3, 30}};

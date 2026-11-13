@@ -907,7 +907,8 @@ struct Watch::Worker {
           [&](const auto &pending) {
             return pending.role == Boundary::construct && pending.receiver == receiver;
           });
-      frame.uncertain_complete = plan->sites.at(pc).uncertain_complete;
+      frame.uncertain_complete = plan->sites.at(pc).uncertain_complete &&
+          !plan->complete_constructor_returns.contains({pc, frame.return_pc});
       if (frame.outer_constructor && !frame.uncertain_complete && found != live.end()) {
         const auto prior = found->second;
         live.erase(found);
@@ -1398,7 +1399,7 @@ struct Watch::Worker {
 #else
       report.set_diagnostic(plan->layout.atomic
           ? "partial coverage: admitted threads, selected ELF function, atomic MOV/XADD/CMPXCHG"
-          : "partial coverage: admitted threads, selected ELF function, scalar mov stores");
+          : "partial coverage: admitted threads, selected ELF function, scalar MOV and arithmetic stores");
 #endif
       ready = true;
     }

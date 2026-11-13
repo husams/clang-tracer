@@ -27,6 +27,7 @@
 #include <llvm/DebugInfo/DWARF/DWARFDie.h>
 #include <llvm/DebugInfo/DWARF/DWARFLocationExpression.h>
 #include <llvm/ADT/StringExtras.h>
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/Demangle/Demangle.h>
 #include <llvm/Object/BuildID.h>
 #include <llvm/Object/ELFObjectFile.h>
@@ -1437,6 +1438,36 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         ownership_boundary(Boundary::snapshot, request.owner_snapshot(), "set_description");
     }
   }
+  if (known_derived) {
+    std::vector<std::uint64_t> aliases;
+    for (const auto &[pc, site] : sites)
+      if (site.boundary == Boundary::construct && site.uncertain_complete)
+        aliases.push_back(pc);
+    for (const auto &[entry, calls] : direct_redirects(aliases, true)) {
+      for (const auto call : calls) {
+        const auto *image = image_for(call);
+        const auto address = call - *image->bias;
+        const auto debug = image->dwarf->getDIEsForAddress(address);
+        if (!debug.CompileUnit)
+          continue;
+        llvm::SmallVector<DWARFDie, 4> chain;
+        debug.CompileUnit->getInlinedChainForAddress(address, chain);
+        // Exclude constructor/destructor frames, including inlined ones, and
+        // require DWARF evidence throughout the chain. A call outside these
+        // frames uses the complete-object constructor ABI.
+        if (chain.empty() || std::ranges::any_of(chain, [](const auto die) {
+              const auto *linkage = die.getName(llvm::DINameKind::LinkageName);
+              if (!linkage)
+                return true;
+              llvm::ItaniumPartialDemangler parsed;
+              return parsed.partialDemangle(linkage) ? std::string_view(linkage).starts_with("_Z") :
+                  parsed.isCtorOrDtor();
+            }))
+          continue;
+        complete_constructor_returns.emplace(entry, call + object_cache::direct_call_width);
+      }
+    }
+  }
   if (request.first_seen()) {
     if (!writer_receiver(writer_debug.FunctionDIE, writer.first, concrete))
       throw std::runtime_error("first-seen writer requires a DWARF-proven receiver in the first argument");
@@ -1535,8 +1566,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       if (instruction.address < previous_end)
         throw std::runtime_error("overlapping instruction boundaries in writer function");
       previous_end = instruction.address + instruction.size;
-      if (!instruction.store32 ||
-          (!layout.atomic && instruction.store32->kind != native_entry::ScalarStore::Kind::move)) {
+      if (!instruction.store32 || !instruction.store32->supports(layout.atomic)) {
         if (instruction.may_store && instruction.flow == native_entry::Flow::ordinary)
           ++unsupported;
         continue;
@@ -2066,6 +2096,10 @@ void Plan::verify_live(std::uint32_t pid) const {
     check(caller_start, caller_bytes);
   for (const auto &[pc, size] : boundaries)
     check(pc, code(pc).substr(0, size));
+  for (const auto &[entry, return_pc] : complete_constructor_returns) {
+    const auto call = return_pc - object_cache::direct_call_width;
+    check(call, code(call).substr(0, object_cache::direct_call_width));
+  }
 }
 
 std::string compare_prepared(const clangtracer::v1::ObjectWatchPlan &prepared,

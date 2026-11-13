@@ -68,7 +68,7 @@ struct SharedFile {
 }
 
 std::uintptr_t load_agent(injector::Process &process, const std::string &path) {
-  constexpr char export_name[] = "tracer_agent_object_cache_v33";
+  constexpr char export_name[] = "tracer_agent_object_cache_v34";
   const auto size = std::max(path.size() + 1, sizeof(export_name));
   const auto memory = process.remote_allocate(size);
   std::uintptr_t entry = 0;
@@ -130,10 +130,6 @@ std::vector<Instruction> verify_function(const object_watch::Plan &plan, Address
         if (boundary == Boundary::destroy && inst.address == start && out.hook == Hook::none)
           out.hook = Hook::destroy_begin;
       });
-}
-
-bool writer(Hook kind) {
-  return kind == Hook::move || kind == Hook::xadd || kind == Hook::cas;
 }
 
 void inline_mutation_anchor(Instruction &instruction, const object_watch::InlineMutation &mutation) {
@@ -1121,7 +1117,8 @@ struct Watch::Impl {
     else if (sample.hook == Hook::collection_gap || sample.hook == Hook::async_gap ||
              sample.hook == Hook::store_fault || sample.hook == Hook::owner_gap ||
              sample.hook == Hook::dispatch_gap || sample.hook == Hook::shared_mapping_gap ||
-             sample.hook == Hook::post_store_signal || sample.hook == Hook::scope_signal)
+             sample.hook == Hook::post_store_signal || sample.hook == Hook::scope_signal ||
+             sample.hook == Hook::admission_gap)
       item.set_kind(Observation::COVERAGE_GAP);
     else
       item.set_kind(request.no_values() || (writer(sample.hook) && sample.gap) ?
@@ -1195,6 +1192,8 @@ struct Watch::Impl {
     }
     if (sample.hook == Hook::owner_gap)
       item.set_diagnostic("owner membership could not be verified at the original method boundary");
+    if (sample.hook == Hook::admission_gap)
+      item.set_diagnostic("receiver admission limit reached");
     if (sample.hook == Hook::owner_remove && sample.gap)
       item.set_diagnostic("previous membership absent at transfer boundary");
     if (plan.layout.logical_collection() || plan.layout.union_tag_offset || shared_file.identity.inode)
@@ -1229,6 +1228,8 @@ struct Watch::Impl {
     if (writer(sample.hook) && sample.gap) {
       if (sample.gap == 2)
         item.set_diagnostic("field changed between observed stores; old value unavailable");
+      else if (sample.gap == 3)
+        item.set_diagnostic("read-modify-write values could not be verified");
       else
         item.set_diagnostic(request.serialize_wait_us() ? "observed write ordering unavailable" :
                             "overlapping observed writes; old value unavailable");
@@ -1308,6 +1309,7 @@ struct Watch::Impl {
         sample.hook == Hook::store_fault || sample.hook == Hook::owner_gap ||
         sample.hook == Hook::shared_mapping_gap || sample.hook == Hook::post_store_signal ||
         sample.hook == Hook::scope_signal || sample.hook == Hook::lifetime_reused ||
+        sample.hook == Hook::admission_gap ||
         (writer(sample.hook) && sample.gap))
       coverage_gaps.fetch_add(1, std::memory_order_relaxed);
   }
@@ -1640,7 +1642,11 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
   const auto table_size = translated.size() * sizeof(Function);
   const std::vector<Address> static_scopes(p.plan.static_call_scopes.begin(), p.plan.static_call_scopes.end());
   const auto scopes_size = static_scopes.size() * sizeof(Address);
-  std::size_t size = sizeof(init) + table_size + scopes_size;
+  std::vector<ConstructorReturn> constructor_returns;
+  for (const auto &[entry, pc] : p.plan.complete_constructor_returns)
+    constructor_returns.push_back({entry, pc});
+  const auto returns_size = constructor_returns.size() * sizeof(ConstructorReturn);
+  std::size_t size = sizeof(init) + table_size + scopes_size + returns_size;
   for (const auto &function : p.functions) {
     if (function.size() > (SIZE_MAX - size) / sizeof(Instruction))
       throw std::runtime_error("code-cache request size overflows");
@@ -1655,6 +1661,12 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
       init.static_scope_count = static_scopes.size();
       process.remote_write(address, static_scopes.data(), scopes_size);
       address += scopes_size;
+    }
+    if (!constructor_returns.empty()) {
+      init.complete_constructor_returns = reinterpret_cast<const ConstructorReturn *>(address);
+      init.complete_constructor_return_count = constructor_returns.size();
+      process.remote_write(address, constructor_returns.data(), returns_size);
+      address += returns_size;
     }
     for (std::size_t index = 0; index < p.functions.size(); ++index) {
       const auto &function = p.functions[index];

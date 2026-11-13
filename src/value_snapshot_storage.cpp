@@ -124,13 +124,13 @@ extern "C" void tracer_snapshot_reset(std::size_t mark) noexcept {
     used.store(mark, std::memory_order_relaxed);
   updating.store(false, std::memory_order_release);
 }
-extern "C" std::byte *tracer_snapshot_storage(std::size_t *capacity) noexcept {
+extern "C" std::byte *tracer_snapshot_storage(std::size_t *capacity, std::size_t requested) noexcept {
   if (updating.exchange(true, std::memory_order_acquire)) {
     *capacity = 0;
     return arena.data + arena.size;
   }
   const auto begin = used.load(std::memory_order_relaxed);
-  *capacity = std::min<std::size_t>(slice_bytes(), arena.size - begin);
+  *capacity = std::min({requested, slice_bytes(), arena.size - begin});
   used.store(begin + *capacity, std::memory_order_relaxed);
   updating.store(false, std::memory_order_release);
   return arena.data + begin;

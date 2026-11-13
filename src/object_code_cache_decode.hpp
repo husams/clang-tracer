@@ -75,7 +75,8 @@ inline unsigned register_index(std::string_view name, bool address) {
 inline void instrument_store(Instruction &out, const native_entry::ScalarStore &store) {
   using Kind = native_entry::ScalarStore::Kind;
   out.hook = store.kind == Kind::move ? Hook::move :
-      store.kind == Kind::exchange_add ? Hook::xadd : Hook::cas;
+      store.kind == Kind::exchange_add ? Hook::xadd :
+      store.kind == Kind::compare_exchange ? Hook::cas : Hook::rmw;
   out.base = register_index(store.base, true);
   out.index = register_index(store.index, true);
   out.value = register_index(store.value_register, false);
