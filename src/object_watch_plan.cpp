@@ -24,6 +24,7 @@
 
 #include <llvm/DebugInfo/DWARF/DWARFCompileUnit.h>
 #include <llvm/DebugInfo/DWARF/DWARFContext.h>
+#include <llvm/DebugInfo/DWARF/DWARFDebugFrame.h>
 #include <llvm/DebugInfo/DWARF/DWARFDie.h>
 #include <llvm/DebugInfo/DWARF/DWARFLocationExpression.h>
 #include <llvm/ADT/StringExtras.h>
@@ -139,6 +140,17 @@ struct DerivedTypes {
   bool present = false;
   bool may_construct_base_directly = false;
 };
+
+bool has_virtual_bases(DWARFDie die, std::set<DWARFDie> &seen) {
+  if (!die || !seen.insert(die).second)
+    return false;
+  for (const auto base : die.children())
+    if (base.getTag() == dw::DW_TAG_inheritance &&
+        (number(base, dw::DW_AT_virtuality).value_or(dw::DW_VIRTUALITY_none) != dw::DW_VIRTUALITY_none ||
+         has_virtual_bases(type(base), seen)))
+      return true;
+  return false;
+}
 
 bool has_virtual_members_or_bases(DWARFDie die, std::set<DWARFDie> &seen) {
   if (!die || !seen.insert(die).second)
@@ -1333,7 +1345,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     return std::ranges::any_of(image.symbols, [&](const auto &symbol) {
       return symbol.kind == llvm::ELF::STT_FUNC &&
           symbol.demangled.starts_with(concrete + "::" + leaf + "(") &&
-          symbol.linkage.find("C1E") != std::string::npos;
+          (symbol.linkage.contains("C1E") || symbol.linkage.contains("C2E"));
     });
   };
   const bool standalone_shared = main_ && request.borrow_caller().empty() &&
@@ -1342,17 +1354,22 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   auto &lifetime = main_ && !shared_lifetime ? *main_ : *image_;
   llvm::DWARFUnit *layout_unit = writer_debug.CompileUnit;
   if (!layout_unit) {
-    std::set<llvm::DWARFUnit *> constructor_units;
-    for (const auto &symbol : image_->symbols) {
-      if (symbol.kind != llvm::ELF::STT_FUNC ||
-          !symbol.demangled.starts_with(concrete + "::" + leaf + "(") ||
-          symbol.linkage.find("C1E") == std::string::npos)
-        continue;
-      if (const auto entry = image_->dwarf->getDIEsForAddress(symbol.range.first); entry.CompileUnit)
-        constructor_units.insert(entry.CompileUnit);
+    for (const auto variant : {"C1E", "C2E"}) {
+      std::set<llvm::DWARFUnit *> constructor_units;
+      for (const auto &symbol : image_->symbols) {
+        if (symbol.kind != llvm::ELF::STT_FUNC ||
+            !symbol.demangled.starts_with(concrete + "::" + leaf + "(") ||
+            !symbol.linkage.contains(variant))
+          continue;
+        if (const auto entry = image_->dwarf->getDIEsForAddress(symbol.range.first); entry.CompileUnit)
+          constructor_units.insert(entry.CompileUnit);
+      }
+      if (!constructor_units.empty()) {
+        if (constructor_units.size() == 1)
+          layout_unit = *constructor_units.begin();
+        break;
+      }
     }
-    if (constructor_units.size() == 1)
-      layout_unit = *constructor_units.begin();
   }
   // Standalone shared code can reach the field through an alias without
   // defining the record. The executable establishes its lifetime and layout.
@@ -1426,15 +1443,35 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       return symbol.kind == llvm::ELF::STT_FUNC && symbol.demangled.starts_with(prefix + "(") &&
           symbol.linkage.find('.') == std::string::npos;
     };
+    const auto base_variant = variant == "C1E" ? "C2E" : variant == "D1Ev" ? "D2Ev" : "";
     std::set<Range> ranges, base_aliases;
+    std::set<std::string_view> complete_overloads;
     for (const auto &symbol : boundary_image.symbols) {
       if (!matches_prefix(symbol))
         continue;
-      if (variant.empty() || symbol.linkage.find(variant) != std::string::npos)
+      if (variant.empty() || symbol.linkage.contains(variant)) {
         ranges.insert(symbol.range);
+        complete_overloads.insert(symbol.demangled);
+      }
       if (known_derived && role == Boundary::construct &&
           symbol.linkage.find("C2E") != std::string::npos)
         base_aliases.insert(symbol.range);
+    }
+    if (*base_variant) {
+      // Clang may emit only the base variant for an inline definition. It
+      // has the complete-object ABI only when there is no virtual base/VTT.
+      const auto missing_complete = [&](const Symbol &symbol) {
+        return matches_prefix(symbol) && symbol.linkage.contains(base_variant) &&
+            !complete_overloads.contains(symbol.demangled);
+      };
+      if (std::ranges::any_of(boundary_image.symbols, missing_complete)) {
+        std::set<DWARFDie> seen;
+        auto *unit = &boundary_image == image_.get() ? layout_unit : nullptr;
+        if (!has_virtual_bases(find_record(*boundary_image.dwarf, concrete, unit), seen))
+          for (const auto &symbol : boundary_image.symbols)
+            if (missing_complete(symbol))
+              ranges.insert(symbol.range);
+      }
     }
     if ((required && ranges.empty()) || (role != Boundary::construct && ranges.size() > 1))
       throw std::runtime_error("object watch boundary is missing or ambiguous: " + prefix);
@@ -1541,7 +1578,19 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       continue;
     // A straight-line delegate preserves the receiver and original return
     // context. A call to the thunk supplies the return PC at its target.
-    if (std::all_of(body.instructions.begin(), std::prev(body.instructions.end()), [](const auto &inst) {
+    auto begin = body.instructions.begin();
+    auto end = std::prev(body.instructions.end());
+#if defined(__x86_64__)
+    // Clang can wrap the argument setup in a frame-pointer prologue and
+    // matching pop. The tail still inherits the caller's stack and return PC.
+    if (end - begin >= 3 && code(begin->address).substr(0, begin->size) == "\x55" &&
+        code((begin + 1)->address).substr(0, (begin + 1)->size) == "\x48\x89\xe5" &&
+        code((end - 1)->address).substr(0, (end - 1)->size) == "\x5d") {
+      begin += 2;
+      --end;
+    }
+#endif
+    if (std::all_of(begin, end, [](const auto &inst) {
           return inst.flow == native_entry::Flow::ordinary && inst.falls_through &&
               inst.cache_copyable && !inst.changes_receiver && !inst.changes_stack && !inst.may_store;
         }))
@@ -1673,14 +1722,30 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     if (decoded.decode_failed || !decoded.diagnostic.empty())
       throw std::runtime_error("cannot decode the selected writer function");
     auto previous_end = start;
+    const auto indirect = std::ranges::find_if(decoded.instructions, [](const auto &instruction) {
+      return instruction.flow == native_entry::Flow::branch && !instruction.target;
+    });
+    const bool has_indirect = indirect != decoded.instructions.end();
+    bool unclassified_bytes = false;
+    const auto is_padding = [&](std::uint64_t begin, std::uint64_t end) {
+      if (begin == end)
+        return true;
+#if defined(__x86_64__)
+      const auto size = end - begin;
+      return native_entry::nop_prefix(begin, bytes.substr(begin - start, size), size) == size;
+#else
+      constexpr std::string_view nop{"\x1f\x20\x03\xd5", 4};
+      for (; begin < end && bytes.substr(begin - start, 4) == nop; begin += 4) {}
+      return begin == end;
+#endif
+    };
     const auto prior_count = stores;
     for (const auto &instruction : decoded.instructions) {
       if (instruction.address < previous_end)
         throw std::runtime_error("overlapping instruction boundaries in writer function");
+      if (has_indirect && request.backend() == Request::PTRACE && !unclassified_bytes)
+        unclassified_bytes = !is_padding(previous_end, instruction.address);
       previous_end = instruction.address + instruction.size;
-      if (instruction.flow == native_entry::Flow::branch && !instruction.target)
-        throw std::runtime_error("object watch cannot verify an indirect branch in " +
-                                 source(start).function + ": " + instruction.text);
       if (!instruction.store32 || !instruction.store32->supports(layout.atomic)) {
         if (instruction.may_store && instruction.flow == native_entry::Flow::ordinary)
           ++unsupported;
@@ -1698,6 +1763,12 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       }
       ++stores;
     }
+    // Ptrace leaves the indirect transfer in place. Unreached bytes must be
+    // verified alignment NOPs so that a jump table cannot hide writer blocks.
+    if (has_indirect && (request.backend() != Request::PTRACE || unclassified_bytes ||
+                         !is_padding(previous_end, start + length)))
+      throw std::runtime_error("object watch cannot verify an indirect branch in " +
+                               source(start).function + ": " + indirect->text);
     if (stores == prior_count && !request.follow_calls())
       throw std::runtime_error("no supported 32-bit store in " + source(start).function);
   };
@@ -1905,6 +1976,71 @@ std::string_view Plan::code(std::uint64_t pc) const {
   const auto *image = image_for(pc);
   return image ? image->code(pc) : std::string_view{};
 }
+
+#if defined(__x86_64__)
+std::size_t Plan::lifetime_padding(std::uint64_t function_start, std::uint64_t patch,
+                                  std::uint64_t end) const {
+  const auto *image = image_for(function_start);
+  if (!image || image_for(end) != image || end - patch >= 5)
+    return 0;
+  const auto minimum = 5 - (end - patch);
+  const auto elf_end = end - *image->bias;
+  auto available = std::min<std::size_t>(image->code(end).size(), minimum + 14);
+  // Include labels and zero-sized symbols, which aren't in Image::symbols.
+  const auto constrain = [&](const ObjectFile &object) {
+    for (const auto &symbol : object.symbols()) {
+      auto address = symbol.getAddress();
+      if (!address) {
+        llvm::consumeError(address.takeError());
+        continue;
+      }
+      const auto size = llvm::object::ELFSymbolRef(symbol).getSize();
+      if (*address >= elf_end)
+        available = std::min<std::uint64_t>(available, *address - elf_end);
+      else if (size > elf_end - *address)
+        available = 0;
+    }
+  };
+  const auto &elf = llvm::cast<ObjectFile>(*image->executable.getBinary());
+  constrain(elf);
+  if (image->debug.getBinary())
+    constrain(llvm::cast<ObjectFile>(*image->debug.getBinary()));
+  auto unwind = llvm::DWARFContext::create(elf);
+  auto frames = unwind->getEHFrame();
+  if (!frames) {
+    llvm::consumeError(frames.takeError());
+    return 0;
+  }
+  if (!*frames)
+    return 0;
+  bool function_end = false;
+  for (const auto &entry : (*frames)->entries()) {
+    const auto *fde = llvm::dyn_cast<llvm::dwarf::FDE>(&entry);
+    if (!fde)
+      continue;
+    const auto start = fde->getInitialLocation();
+    if (start >= elf_end)
+      available = std::min<std::uint64_t>(available, start - elf_end);
+    else if (fde->getAddressRange() > elf_end - start)
+      return 0;
+    else if (fde->getAddressRange() == elf_end - start && start + *image->bias == function_start)
+      function_end = true;
+  }
+  if (!function_end || available < minimum)
+    return 0;
+  const auto padding = native_entry::nop_prefix(end, image->code(end).substr(0, available), minimum);
+  if (!padding)
+    return 0;
+  std::vector<std::uint64_t> addresses;
+  for (auto pc = patch + 1; pc < end + padding; ++pc)
+    addresses.push_back(pc);
+  if (std::ranges::any_of(direct_redirects(addresses), [](const auto &entry) {
+        return !entry.second.empty();
+      }))
+    return 0;
+  return padding;
+}
+#endif
 
 std::pair<std::uint64_t, std::size_t> Plan::containing_function(std::uint64_t pc) const {
   const auto *image = image_for(pc);

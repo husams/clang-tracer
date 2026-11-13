@@ -741,6 +741,34 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-lifetime-target> --check-reuse --backend code-cache)
       set_tests_properties(native_repl_object_lifetime_native PROPERTIES TIMEOUT 120)
+      foreach(_optimization O0 O2)
+        set(_unpadded_target repl-object-unpadded-${_optimization}-target)
+        add_executable(${_unpadded_target} tests/fixtures/object_lifetime/unpadded.cpp
+          tests/fixtures/object_lifetime/unpadded_main.cpp)
+        set_target_properties(${_unpadded_target} PROPERTIES
+          CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_compile_options(${_unpadded_target} PRIVATE -g -${_optimization} -fno-inline
+          -falign-functions=16 -fno-omit-frame-pointer -fPIE -fcf-protection=none)
+        target_link_options(${_unpadded_target} PRIVATE -pie "LINKER:--build-id=sha1")
+        if(_optimization STREQUAL "O0")
+          set(_unpadded_cases vi)
+        else()
+          set(_unpadded_cases vd)
+        endif()
+        foreach(_backend ptrace code-cache)
+          set(_cases ${_unpadded_cases})
+          if(_optimization STREQUAL "O2" AND _backend STREQUAL "ptrace")
+            string(APPEND _cases c)
+          endif()
+          set(_test native_repl_object_unpadded_${_optimization}_${_backend})
+          add_test(NAME ${_test}
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_unpadded.py"
+              $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+              $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:${_unpadded_target}>
+              ${_cases} --backend ${_backend})
+          set_tests_properties(${_test} PROPERTIES TIMEOUT 120)
+        endforeach()
+      endforeach()
       foreach(_indirect_target repl-object-indirect-target repl-object-multi-indirect-target)
         add_executable(${_indirect_target}
           tests/fixtures/object_plan/record.cpp tests/fixtures/object_plan/indirect.cpp)

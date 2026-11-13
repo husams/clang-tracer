@@ -239,7 +239,7 @@ std::vector<Instruction> verify_retirement_prefix(Address pc, std::string_view b
 
 std::vector<Instruction> straight_fragment(const object_watch::Plan &plan,
     const native_entry::Preview &body, Address start, Hook hook, bool terminal = false,
-    bool conditional_exit = false, std::optional<Address> tail_exit = {}) {
+    bool conditional_exit = false, std::optional<Address> tail_exit = {}, bool short_return = false) {
   if (body.decode_failed || !body.diagnostic.empty())
     throw std::runtime_error("cannot verify code around object watch fragment");
   const auto entry = std::find_if(body.instructions.begin(), body.instructions.end(),
@@ -304,7 +304,7 @@ std::vector<Instruction> straight_fragment(const object_watch::Plan &plan,
     if (returned || (!terminal && next - start >= 5))
       break;
   }
-  if (next - start < 5 || (terminal && !returned))
+  if ((next - start < 5 && !(short_return && returned)) || (terminal && !returned))
     return {};
   return result;
 }
@@ -480,14 +480,18 @@ struct Watch::Impl {
               throw;
             // Virtual calls and short delegating jumps can bypass or lack a
             // direct call redirect. Patch the entire leaf in those cases.
-            auto leaf = needs_entry ?
-                decode_leaf(pc, plan.code(pc).substr(0, size), true, [](const auto &, Instruction &) {}) :
-                verify_function(plan, pc, size, {});
+            const auto fragment_error = std::current_exception();
+            std::vector<Instruction> leaf;
+            try {
+              leaf = decode_leaf(pc, plan.code(pc).substr(0, size), true,
+                                 [](const auto &, Instruction &) {});
+            } catch (const std::runtime_error &) {
+              std::rethrow_exception(fragment_error);
+            }
             if (needs_entry) {
-              const auto start = plan.code(pc).starts_with("\xf3\x0f\x1e\xfa") ? pc + 4 : pc;
-              if (start != pc)
+              if (plan.code(pc).starts_with("\xf3\x0f\x1e\xfa"))
                 leaf.erase(leaf.begin());
-              if (leaf.size() < 2 || leaf.back().pc + leaf.back().size - start < 5 ||
+              if (leaf.empty() ||
                   std::ranges::any_of(leaf, [](const auto &inst) { return inst.flow != Flow::copy; }))
                 throw std::runtime_error(constructor ? "delegating constructor target has no verified entry redirect" :
                     "virtual destructor has no verified entry redirect; indirect destruction would be missed");
@@ -511,7 +515,13 @@ struct Watch::Impl {
             }
             leaf.front().boundary_pc = pc;
             if (needs_entry) {
-              add_fragment(std::move(leaf), true);
+              const auto end = leaf.back().pc + leaf.back().size;
+              const auto padding = end - leaf.front().pc < 5 && end == pc + size ?
+                  plan.lifetime_padding(pc, leaf.front().pc, end) : 0;
+              if (end - leaf.front().pc + padding < 5)
+                throw std::runtime_error(constructor ? "delegating constructor target has no verified entry redirect" :
+                    "virtual destructor has no verified entry redirect; indirect destruction would be missed");
+              add_fragment(std::move(leaf), true, padding);
               continue;
             }
             functions.push_back(std::move(leaf));
@@ -653,11 +663,11 @@ struct Watch::Impl {
     });
   }
 
-  void add_fragment(std::vector<Instruction> fragment, bool terminal) {
+  void add_fragment(std::vector<Instruction> fragment, bool terminal, std::size_t padding = 0) {
     if (fragment.empty())
       throw std::runtime_error("cannot admit a disjoint native object watch fragment");
     const auto start = fragment.front().pc;
-    const auto end = fragment.back().pc + fragment.back().size;
+    const auto end = fragment.back().pc + fragment.back().size + padding;
     if (overlaps_fragment(start, end))
       throw std::runtime_error("native object watch fragment overlaps another redirect");
     entry_windows.emplace(start, end - start);
@@ -879,6 +889,17 @@ struct Watch::Impl {
     const auto body = native_entry::scan(pc, bytes);
     const auto &code = body.instructions;
     if (!body.decode_failed && body.diagnostic.empty() && !code.empty()) {
+      const auto first_call = std::ranges::find_if(code, [](const auto &inst) {
+        return inst.flow != NativeFlow::ordinary || !inst.falls_through;
+      });
+      // A D0 that directly forwards its receiver to a watched D1 needs
+      // neither its own retirement nor a redirect after deallocation.
+      if (first_call != code.end() && first_call->flow == NativeFlow::call && first_call->target &&
+          plan.boundaries.count(*first_call->target) &&
+          plan.sites.at(*first_call->target).boundary == Boundary::destroy &&
+          !plan.sites.at(*first_call->target).deleting_destructor &&
+          native_entry::forwards_receiver(pc, bytes.substr(0, first_call->address - pc)))
+        return;
       const auto &tail = code.back();
       const auto start = bytes.starts_with("\xf3\x0f\x1e\xfa") ? pc + 4 : pc;
       // An inlined D1 followed by a tail jump to operator delete is done
@@ -890,22 +911,8 @@ struct Watch::Impl {
                 (!inst.target || *inst.target < pc || *inst.target - pc >= size);
           })) {
         auto entry = straight_fragment(plan, body, start, Hook::destructor_enter, false, false, tail.target);
-        if (entry.empty()) {
-          // A straight-line D0 that calls the watched D1 on its original
-          // receiver necessarily retires the object through D1 before delete.
-          const auto call = std::ranges::find_if(code, [](const auto &inst) {
-            return inst.flow == NativeFlow::call;
-          });
-          if (call != code.end() && call->target &&
-              plan.boundaries.count(*call->target) &&
-              plan.sites.at(*call->target).boundary == Boundary::destroy &&
-              !plan.sites.at(*call->target).deleting_destructor &&
-              std::all_of(code.begin(), call, [](const auto &inst) {
-                return inst.flow == NativeFlow::ordinary && inst.falls_through && !inst.changes_receiver;
-              }))
-            return;
+        if (entry.empty())
           throw std::runtime_error("deleting destructor entry is too short for a native redirect");
-        }
         entry.front().boundary_pc = pc;
         if (entry.back().pc == tail.address) {
           if (entry.size() == 1) {
@@ -1068,10 +1075,22 @@ struct Watch::Impl {
                                   bool uncertain) {
     const auto bytes = plan.code(pc).substr(0, size);
     const auto body = native_entry::scan(pc, bytes);
+    const auto exits_function = [&](const auto &inst) {
+      return inst.flow == NativeFlow::branch && inst.target &&
+          (*inst.target < pc || *inst.target - pc >= size);
+    };
+    const bool constructor = enter == Hook::constructor_enter;
+    const bool destructor = enter == Hook::destructor_enter;
     if (body.decode_failed || !body.diagnostic.empty() ||
         std::any_of(body.instructions.begin(), body.instructions.end(), [&](const auto &inst) {
-          return inst.flow == NativeFlow::branch &&
-              (!inst.target || *inst.target < pc || *inst.target - pc >= size);
+          if (inst.flow != NativeFlow::branch)
+            return false;
+          if (!inst.target)
+            return true;
+          if (!exits_function(inst))
+            return false;
+          return inst.falls_through || (!constructor &&
+              (!destructor || !plan.is_delete_target(*inst.target)));
         }))
       throw std::runtime_error("cannot verify native lifetime instruction boundaries");
     const auto start = bytes.starts_with("\xf3\x0f\x1e\xfa") ? pc + 4 : pc;
@@ -1080,23 +1099,38 @@ struct Watch::Impl {
       throw std::runtime_error("lifetime entry is too short for a native redirect");
     entry.front().boundary_pc = pc;
     entry.front().uncertain_construct = uncertain;
-    std::vector<std::vector<Instruction>> returns;
-    bool need_successors = false;
+    std::vector<std::pair<std::vector<Instruction>, std::size_t>> returns;
+    const bool constructor_tail = constructor && std::ranges::any_of(body.instructions, exits_function);
+    bool need_successors = constructor_tail;
     const auto overlaps_entry = [&](const auto &fragment) {
       return fragment.front().pc < entry.back().pc + entry.back().size &&
              entry.front().pc < fragment.back().pc + fragment.back().size;
     };
     for (const auto &inst : body.instructions) {
-      if (inst.flow != NativeFlow::returns)
+      if (need_successors)
+        break;
+      const bool tail = exits_function(inst);
+      if (inst.flow != NativeFlow::returns && !tail)
         continue;
       std::vector<Instruction> terminal;
+      std::size_t padding = 0;
       for (const auto &candidate : body.instructions) {
-        if (candidate.address >= inst.address || inst.address - candidate.address > 15)
+        if (candidate.address > inst.address || inst.address - candidate.address > 15)
           continue;
-        auto trial = straight_fragment(plan, body, candidate.address, Hook::none, true);
-        if (!trial.empty() && trial.back().pc == inst.address &&
-            !overlaps_entry(trial) && !overlaps_fragment(trial.front().pc, inst.address + inst.size))
+        auto trial = straight_fragment(plan, body, candidate.address, Hook::none, !tail,
+                                       false, tail ? inst.target : std::nullopt, true);
+        const auto end = inst.address + inst.size;
+        const auto width = end - candidate.address;
+        std::size_t extension = 0;
+#if defined(__x86_64__)
+        if (!trial.empty() && width < 5 && end == pc + size)
+          extension = plan.lifetime_padding(pc, candidate.address, end);
+#endif
+        if (!trial.empty() && trial.back().pc == inst.address && width + extension >= 5 &&
+            !overlaps_entry(trial) && !overlaps_fragment(trial.front().pc, end + extension)) {
           terminal = std::move(trial);
+          padding = extension;
+        }
       }
       if (terminal.empty()) {
         need_successors = true;
@@ -1104,13 +1138,15 @@ struct Watch::Impl {
       }
       terminal.back().hook = leave;
       terminal.back().boundary_pc = pc;
-      returns.push_back(std::move(terminal));
+      returns.emplace_back(std::move(terminal), padding);
     }
     if (returns.empty() || need_successors) {
       if (enter == Hook::destructor_enter && plan.virtual_destructor)
         throw std::runtime_error("virtual destructor requires verified returns for indirect calls");
       returns.clear();
       auto callers = plan.direct_redirects({pc}, true).at(pc);
+      if (constructor_tail && plan.direct_redirects({pc}).at(pc) != callers)
+        throw std::runtime_error("native constructor has an unverified tail caller");
       if (enter == Hook::constructor_enter) {
         const auto calls = plan.constructor_tail_callers(pc);
         callers.insert(callers.end(), calls.begin(), calls.end());
@@ -1125,15 +1161,15 @@ struct Watch::Impl {
           throw std::runtime_error("lifetime return continuation has no disjoint native redirect");
         fragment.front().boundary_pc = pc;
         fragment.front().successor_return = true;
-        returns.push_back(std::move(fragment));
+        returns.emplace_back(std::move(fragment), 0);
       }
     }
     if (returns.empty())
       throw std::runtime_error("lifetime boundary has no verified native return or direct continuation");
     add_fragment(std::move(entry), false);
-    for (auto &fragment : returns) {
+    for (auto &[fragment, padding] : returns) {
       const auto terminal = !fragment.front().successor_return;
-      add_fragment(std::move(fragment), terminal);
+      add_fragment(std::move(fragment), terminal, padding);
     }
   }
 

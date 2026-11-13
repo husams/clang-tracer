@@ -105,6 +105,10 @@ public:
   google::protobuf::RepeatedPtrField<clangtracer::v1::ObjectWatchRequest::SourceWriter> source_writers;
 
   std::string_view code(std::uint64_t pc) const;
+#if defined(__x86_64__)
+  std::size_t lifetime_padding(std::uint64_t function_start, std::uint64_t patch,
+                               std::uint64_t end) const;
+#endif
   bool is_delete_target(std::uint64_t pc) const;
   std::uint64_t constructor_tail_target(std::uint64_t pc) const;
   std::vector<std::uint64_t> constructor_tail_callers(std::uint64_t pc) const;
