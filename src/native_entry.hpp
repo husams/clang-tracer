@@ -44,6 +44,7 @@ struct Instruction {
   bool cache_entry_copyable;
   bool indirect_near_call;
   bool cache_rip_relative;
+  bool frame_store = false;
 };
 
 struct Preview {

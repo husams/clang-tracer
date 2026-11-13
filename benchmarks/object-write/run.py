@@ -112,6 +112,7 @@ def read_redirects(control, output, watch, backend, pid, tids, *, live_read=None
     count = int(re.search(r"redirects=(\d+)", watch.string)[1])
     assert bool(count) == (backend == "code-cache")
     redirects = {}
+    short_relays = []
     for _ in range(count):
         found = output.expect(r"^redirect=(0x[0-9a-f]+) translated=(0x[0-9a-f]+) "
                               r"original=([0-9a-f]+) installed=([0-9a-f]+)$")
@@ -125,18 +126,36 @@ def read_redirects(control, output, watch, backend, pid, tids, *, live_read=None
             displacement = (branch & 0x1ffffff) - (branch & 0x2000000)
             assert pc + 4 * displacement == translated
         else:
-            assert len(armed) >= 5
-            if runtime_calls and len(armed) >= 10 and armed[0] == 0xe9 and armed[-5] == 0xe8:
+            if len(armed) < 5:
+                assert len(armed) >= 2 and armed[0] == 0xeb and armed[2:] == b"\x90" * (len(armed) - 2)
+                short_relays.append((pc + 2 + int.from_bytes(armed[1:2], "little", signed=True), translated))
+            elif runtime_calls and len(armed) >= 10 and armed[0] == 0xe9 and armed[-5] == 0xe8:
                 assert armed[5:-5] == b"\x90" * (len(armed) - 10)
                 gateway = pc + len(armed) + int.from_bytes(armed[-4:], "little", signed=True)
                 assert_anonymous_rx(pid, gateway)
             else:
                 assert ((len(armed) == 5 and original[0] == armed[0] == 0xe8) or
-                        (armed[0] == 0xe9 and armed[5:] == b"\x90" * (len(armed) - 5)))
-            assert pc + 5 + int.from_bytes(armed[1:5], "little", signed=True) == translated
+                        armed[0] == 0xe9)
+            if len(armed) >= 5:
+                assert pc + 5 + int.from_bytes(armed[1:5], "little", signed=True) == translated
         assert pc not in redirects
         redirects[pc] = original, armed, translated
         assert_anonymous_rx(pid, translated)
+    if platform.machine() != "aarch64":
+        for pc, (_, armed, _) in redirects.items():
+            if len(armed) < 5:
+                continue
+            has_gateway = runtime_calls and len(armed) >= 10 and armed[0] == 0xe9 and armed[-5] == 0xe8
+            tail = bytearray(armed[5:-5] if has_gateway else armed[5:])
+            for relay, translated in short_relays:
+                if pc + 5 <= relay and relay + 5 <= pc + 5 + len(tail):
+                    offset = relay - pc - 5
+                    assert tail[offset] == 0xe9
+                    assert relay + 5 + int.from_bytes(tail[offset + 1:offset + 5], "little", signed=True) == translated
+                    tail[offset:offset + 5] = b"\x90" * 5
+            assert tail == b"\x90" * len(tail)
+        assert all(any(pc + 5 <= relay and relay + 5 <= pc + len(armed)
+                       for pc, (_, armed, _) in redirects.items()) for relay, _ in short_relays)
     if redirects:
         if live_read is None:
             token = maps(control, output)

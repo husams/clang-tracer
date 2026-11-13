@@ -428,6 +428,7 @@ Preview inspect(std::uint64_t address, std::string_view bytes, bool entry) {
       check_definition(reg);
     auto store = store32(decoder, instruction, bytes.substr(offset, size));
 #if defined(__aarch64__)
+    const bool frame_store = false;
     const bool architectural_hint = printed == "nop" || printed.starts_with("bti") ||
         printed == "paciasp" || printed == "pacibsp" || printed == "autiasp" || printed == "autibsp";
     const bool copyable = store.has_value() || opcode == "RET" || opcode == "RETAA" || opcode == "RETAB" ||
@@ -458,6 +459,15 @@ Preview inspect(std::uint64_t address, std::string_view bytes, bool entry) {
         !desc.mayRaiseFPException() && !integer_division(opcode) &&
         opcode != "ENDBR64" && opcode != "LEAVE64";
     const bool may_store = desc.mayStore();
+    const auto register_name = [&](unsigned i) -> std::string_view {
+      const auto &operand = instruction.getOperand(i);
+      return operand.isReg() && operand.getReg() ? decoder.regs->getName(operand.getReg()) : "";
+    };
+    const bool frame_store = (opcode == "MOV64mr" || opcode == "MOV32mr") &&
+        instruction.getNumOperands() == 6 && register_name(0) == "RBP" &&
+        register_name(2).empty() && register_name(4).empty() &&
+        instruction.getOperand(3).isImm() && instruction.getOperand(3).getImm() <=
+            (opcode == "MOV64mr" ? -8 : -4);
 #endif
     result.instructions.push_back({pc, static_cast<std::size_t>(size),
                                    text_prefix + printed.str(),
@@ -468,7 +478,7 @@ Preview inspect(std::uint64_t address, std::string_view bytes, bool entry) {
                                    changes_receiver, changes_stack,
                                    entry_copyable,
                                    opcode == "CALL64r" || opcode == "CALL64m",
-                                   rip_relative});
+                                   rip_relative, frame_store});
   }
   std::sort(result.instructions.begin(), result.instructions.end(),
             [](const auto &a, const auto &b) { return a.address < b.address; });

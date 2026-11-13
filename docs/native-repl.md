@@ -387,7 +387,7 @@ Stop restores the verified instruction bytes. Check `active=no` and `restoration
 
 - Review the resolved fields, writer sites, and binding status in preview. Preview is read-only. A same-build restart resolves fresh live addresses. A compatible rebuild requires verifiable field and code bindings. Missing or mismatched evidence can prevent a watch from starting.
 - Lifecycle events require observable, unambiguous construction and teardown. An out-of-line copy of an inline constructor or destructor can provide the boundary if its ABI is verified. A fully inlined or optimized-away call can leave a partial timeline. `--first-seen` can scope a supported standalone write watch to one verified writer invocation when construction is unavailable.
-- On x86-64, a short lifetime boundary can use verified alignment NOPs after the function for a native redirect. If the mapped ELF does not provide a safe redirect for every required entry or exit, use `--backend ptrace` for the lifetime trace.
+- On x86-64, a short lifetime boundary can use verified alignment NOPs after the function. A short destructor return can also jump through the relocated entry window. If the mapped ELF lacks a safe redirect for a required entry or exit, use `--backend ptrace` for the lifetime trace.
 - Ptrace can observe stores in a writer that ends in an indirect call or jump when every block in the writer is decoded and any gaps contain only alignment NOPs. It observes the selected writer's stores. An indirect jump with unverified blocks, such as an unresolved jump table, is refused.
 - When the complete and base constructors share an entry, a verified direct call from outside constructor and destructor frames can identify a complete construction. When a known derived type can initialize its base as an aggregate, these shared entries remain uncertain unless stronger evidence is available.
 - On x86-64, scalar watches admit verified 32-bit integer arithmetic, bitwise and shift updates. For locked atomic instructions without a returned old value, code-cache records the write and reports that the values could not be verified. Ptrace can sample the values while target peers are parked.
@@ -677,7 +677,7 @@ preserve SME streaming state, ZA, TPIDR2 and, on SME2, ZT0.
 
 The selected executable or mapped shared-library scope supplies the call sites. A verified direct
 or indirect call enters a native gateway with its original return
-address. Verified direct edges can extend the selected scope to nested
+address. Calls already covered by lifetime boundaries retain those redirects. Verified direct edges can extend the selected scope to nested
 functions in the same image that keep executing at their original PCs. A runtime
 gateway checks live targets against their ELF bytes and translates
 supported leaf instructions and tail calls. For a discovered nonleaf

@@ -3573,6 +3573,23 @@ std::unique_ptr<Mapping> translate(std::span<Site> sites, Function &function,
       out.bytes({0xff, 0x64, 0x24, 0xf8}); // jmp *-8(%rsp)
       continue;
     }
+    const bool conditional_teardown = inst.flow == Flow::conditional && inst.hook == Hook::destructor_return;
+    if (conditional_teardown) {
+      // Run the hook only on the taken deallocation edge. The inverse
+      // branch skips the hook and the jump with the original flags intact.
+      out.bytes({0x0f, static_cast<std::uint8_t>(0x80 | (inst.condition ^ 1))});
+      const auto skip = out.code.size();
+      out.immediate(0U);
+      out.hook(site, before, xstate, Emitter::Result::ignored,
+               site.watch->mask_async_signals ? &site.before_signals : nullptr);
+      site.native = site.label;
+      out.bytes({0xe9});
+      branches.emplace_back(out.code.size(), inst.target);
+      out.immediate(0U);
+      const auto delta = static_cast<std::int32_t>(out.code.size() - skip - sizeof(std::int32_t));
+      std::memcpy(out.code.data() + skip, &delta, sizeof(delta));
+      continue;
+    }
     site.before_hook = inst.hook != Hook::none || inst.dispatch_entry || inst.scope_entry ||
                        inst.collection_resume || inst.inline_mutation_entry;
     if (site.before_hook)
@@ -4247,11 +4264,27 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
         }
         block->scope_index = first_slot;
       } else {
+        auto first = decoded.instructions.begin();
+        if (first != decoded.instructions.end() && first->text == "endbr64")
+          ++first;
+        const auto encoding = [&](const auto &inst) {
+          return std::string_view(block->bytes).substr(inst.address - target, inst.size);
+        };
+        const bool frame_pointer = decoded.instructions.end() - first >= 2 &&
+            encoding(*first) == "\x55" && encoding(*(first + 1)) == "\x48\x89\xe5";
+        auto spill = frame_pointer ? first + 2 : decoded.instructions.end();
+        while (spill != decoded.instructions.end() && spill->frame_store &&
+               (spill - 1)->address + (spill - 1)->size == spill->address)
+          ++spill;
         const auto code = decode_leaf(target, block->bytes, true,
           [&](const native_entry::Instruction &inst, Instruction &out) {
             if (inst.store32 && inst.store32->supports(watch.atomic))
               instrument_store(out, *inst.store32);
-            else if (inst.may_store && inst.flow == NativeFlow::ordinary)
+            // Parameter spills in the usual frame-pointer leaf do not write
+            // the receiver. The decoder verifies the base and displacement.
+            else if (inst.may_store && inst.flow == NativeFlow::ordinary &&
+                     !(frame_pointer && inst.address < (spill - 1)->address + (spill - 1)->size &&
+                       inst.address >= first->address))
               throw std::runtime_error("runtime callee has an unsupported memory write");
           }, true);
         for (const auto &instruction : code) {
