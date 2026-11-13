@@ -28,9 +28,23 @@ def run(args):
 
         target, app = start([args.fixture])
         app.expect(r"^READY$")
-        repl, out = start([args.repl, "--server", args.server, "--agent", args.agent,
-                           "--attach", str(target.pid), "--fail-fast"])
-        out.expect(rf"^attached session=\S+ pid={target.pid}$")
+        def attach(*extra):
+            repl, out = start([args.repl, "--server", args.server, "--agent", args.agent,
+                               "--attach", str(target.pid), *extra])
+            out.expect(rf"^attached session=\S+ pid={target.pid}$")
+            return repl, out
+
+        options = f"--backend {args.backend}" + (" --no-values" if args.no_values else "")
+        if platform.machine() == "x86_64":
+            repl, out = attach()
+            for action in ("preview", "start"):
+                send(repl, f"%object {action} --type life::Widget --field value --code jump_table_writer {options}")
+                out.expect(r"^error: .*(indirect branch|verified in-function branch)")
+            send(repl, "%detach")
+            out.expect(r"^detached session=")
+            send(repl, "%quit")
+            repl.wait(timeout=10)
+        repl, out = attach("--fail-fast")
         live_read = None
         if platform.machine() == "aarch64":
             memory = cleanup.enter_context(Path(f"/proc/{target.pid}/mem").open("rb", buffering=0))
@@ -40,7 +54,6 @@ def run(args):
             token = maps(repl, out) if redirects and live_read is None else None
             verify_restored_redirects(repl, out, token, target.pid, redirects, live_read=live_read)
 
-        options = f"--backend {args.backend}" + (" --no-values" if args.no_values else "")
         definition = ('--type life::Record --field value_ --code "life::Record::write(int)" '
                       '--stack-depth 8 ' + options)
         send(repl, f"%object preview {definition} --max-instances 4")
@@ -200,6 +213,32 @@ def run(args):
             "LIFETIME_UNCERTAIN", "LIFETIME_UNCERTAIN", "CREATED",
             write_kind, "DESTROY_BEGIN", "TEARDOWN_END"], alias_records
         assert alias_records[0]["diagnostic"] == "complete and base constructors share the same entry"
+
+        send(repl, f"%object start {alias}")
+        watch = out.expect(r"^watch=(\d+) active=yes .*|^error:")
+        assert watch[1], watch.string
+        redirects = read_redirects(repl, out, watch, args.backend, target.pid, (), live_read=live_read)
+        send(repl, f"%record virtual.db --sqlite --probe {watch[1]} --count 9 --timeout 15")
+        send(target, "v")
+        app.expect(r"^virtual done$")
+        out.expect(r"^received=9 .*complete=true")
+        send(repl, "%object stop")
+        out.expect(rf"^watch={watch[1]} active=no .*observations=9 .*restoration_pending=no ")
+        verify_restored(redirects)
+        send(repl, "%events open virtual.db --as virtual")
+        out.expect(r"^opened events=9 retained=9 evicted=0$")
+        send(repl, "%events export virtual --format json --output virtual.json")
+        send(repl, "%events list virtual")
+        out.expect(r"^8 ")
+        virtual = [event["objectObservation"] for event in json.loads((root / "virtual.json").read_text())]
+        assert [event["kind"] for event in virtual] == [
+            "CREATED", write_kind, "DESTROY_BEGIN", "TEARDOWN_END",
+            "CREATED", write_kind, "DESTROY_BEGIN", "TEARDOWN_END", "LIFETIME_UNCERTAIN"], virtual
+        for begin, end in ((2, 3), (6, 7)):
+            assert virtual[begin]["lifetimeId"] == virtual[end]["lifetimeId"]
+        if not args.no_values:
+            assert (virtual[1]["newInteger"], virtual[5]["newInteger"]) == (17, 19), virtual
+
         send(repl, '%object start --type life::Widget --field value '
                    f'--code "life::poke(life::Widget&, int)" {options}')
         watch = out.expect(r"^watch=(\d+) active=yes .*|^error:")

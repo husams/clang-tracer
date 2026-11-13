@@ -3078,8 +3078,12 @@ std::unique_ptr<Mapping> translate(std::span<Site> sites, Function &function, co
       }
       continue;
     }
-    if (inst.flow != Flow::copy)
+    if (inst.flow == Flow::jump && inst.hook == Hook::destructor_return) {
+      outgoing = inst.target;
+      outgoing_offset = out.size();
+    } else if (inst.flow != Flow::copy) {
       branches.emplace_back(out.code.size(), inst.target);
+    }
     out.code.push_back(original);
     if (writer(inst.hook)) {
       site.after_label = out.size();

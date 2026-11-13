@@ -25,6 +25,7 @@ struct Site {
   std::optional<native_entry::ScalarStore> store;
   bool uncertain_complete = false;
   std::uint64_t inline_mutation = 0;
+  bool deleting_destructor = false;
 };
 struct InlineMutation {
   using Range = std::pair<std::uint64_t, std::uint64_t>;
@@ -97,11 +98,16 @@ public:
   std::map<std::uint64_t, Site> sites;
   std::map<std::uint64_t, std::size_t> boundaries;
   std::set<std::pair<std::uint64_t, std::uint64_t>> complete_constructor_returns;
+  std::map<std::uint64_t, std::uint64_t> delegating_constructor_tails;
+  bool virtual_destructor = false;
   std::map<std::uint64_t, InlineMutation> inline_mutations;
   unsigned stores = 0, unsupported = 0;
   google::protobuf::RepeatedPtrField<clangtracer::v1::ObjectWatchRequest::SourceWriter> source_writers;
 
   std::string_view code(std::uint64_t pc) const;
+  bool is_delete_target(std::uint64_t pc) const;
+  std::uint64_t constructor_tail_target(std::uint64_t pc) const;
+  std::vector<std::uint64_t> constructor_tail_callers(std::uint64_t pc) const;
   Source source(std::uint64_t pc) const;
   void describe_origin(std::uint64_t pc, const Source &source,
                        clangtracer::v1::ObjectObservation &event) const;
