@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <sys/mman.h>
 
 namespace {
 constexpr std::size_t invalid_mark = std::numeric_limits<std::size_t>::max();

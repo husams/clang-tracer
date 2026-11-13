@@ -22,9 +22,10 @@ struct ScalarStore {
   std::string value_register;
   std::optional<std::uint32_t> immediate;
   std::string result_register; // Previous value returned by an AArch64 LSE operation.
+  bool locked = false;
 
   bool supports(bool atomic) const {
-    return kind == Kind::move || (atomic ? kind != Kind::rmw : kind == Kind::rmw);
+    return kind == Kind::move || (kind == Kind::rmw ? atomic == locked : atomic);
   }
 };
 

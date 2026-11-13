@@ -99,6 +99,7 @@ def run(args):
                   if item["function"].endswith("::mutate()")}
         assert ("items_[350].value", "350 -> 700") in mutate, mutate
         assert ("large_[4200]", "21 -> 45") in mutate, mutate
+        assert not any(item["field"].startswith("unselected_") for item in records), records
         assert ("nested_[1][0]", "7 -> 15") in mutate, mutate
         assert mutate["map_[7]", "removed"]["snapshotBefore"]["signedValue"] == "10", mutate
         assert mutate["map_[12]", "added"]["snapshotAfter"]["signedValue"] == "30", mutate

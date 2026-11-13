@@ -132,7 +132,13 @@ DWARFDie find_record(llvm::DWARFContext &dwarf, const std::string &wanted,
   return result;
 }
 
-bool has_known_derived(llvm::DWARFContext &dwarf, const std::string &concrete) {
+struct DerivedTypes {
+  bool present = false;
+  bool may_construct_base_directly = false;
+};
+
+DerivedTypes derived_types(llvm::DWARFContext &dwarf, const std::string &concrete) {
+  DerivedTypes result;
   std::vector<DWARFDie> pending;
   for (const auto &unit : dwarf.compile_units())
     pending.push_back(unit->getUnitDIE(false));
@@ -140,13 +146,22 @@ bool has_known_derived(llvm::DWARFContext &dwarf, const std::string &concrete) {
     const auto die = pending.back();
     pending.pop_back();
     for (const auto child : die.children()) {
-      if (child.getTag() == dw::DW_TAG_inheritance && qualified(type(child)) == concrete)
-        return true;
+      if (child.getTag() == dw::DW_TAG_inheritance && qualified(type(child)) == concrete) {
+        result.present = true;
+        const auto derived = child.getParent();
+        const auto class_name = name(derived);
+        const auto members = derived.children();
+        if (std::none_of(members.begin(), members.end(), [&](const auto member) {
+              return member.getTag() == dw::DW_TAG_subprogram && name(member) == class_name &&
+                     !member.find(dw::DW_AT_artificial);
+            }))
+          result.may_construct_base_directly = true;
+      }
       if (record(child) || (child.getTag() == dw::DW_TAG_namespace && name(child) != "std"))
         pending.push_back(child);
     }
   }
-  return false;
+  return result;
 }
 
 std::string storage_spelling(std::string_view type, unsigned depth = 0) {
@@ -1313,8 +1328,9 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     typeinfo = bias + rtti.first;
   }
 
-  const bool known_derived = has_known_derived(*image_->dwarf, concrete) ||
-      (main_ && has_known_derived(*main_->dwarf, concrete));
+  const auto writer_derived = derived_types(*image_->dwarf, concrete);
+  const auto main_derived = main_ ? derived_types(*main_->dwarf, concrete) : DerivedTypes{};
+  const bool known_derived = writer_derived.present || main_derived.present;
   const auto &owner = request.owner_type();
   for (const auto *selector : {&request.owner_add(), &request.owner_get(), &request.owner_remove(),
                                &request.owner_snapshot()})
@@ -1438,7 +1454,8 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         ownership_boundary(Boundary::snapshot, request.owner_snapshot(), "set_description");
     }
   }
-  if (known_derived) {
+  if (known_derived && !writer_derived.may_construct_base_directly &&
+      !main_derived.may_construct_base_directly) {
     std::vector<std::uint64_t> aliases;
     for (const auto &[pc, site] : sites)
       if (site.boundary == Boundary::construct && site.uncertain_complete)
@@ -1452,9 +1469,8 @@ Plan::Plan(std::uint32_t pid, std::string executable,
           continue;
         llvm::SmallVector<DWARFDie, 4> chain;
         debug.CompileUnit->getInlinedChainForAddress(address, chain);
-        // Exclude constructor/destructor frames, including inlined ones, and
-        // require DWARF evidence throughout the chain. A call outside these
-        // frames uses the complete-object constructor ABI.
+        // Aggregate initialization can call a base constructor directly. Only
+        // classify callers when DWARF also rules out known aggregate candidates.
         if (chain.empty() || std::ranges::any_of(chain, [](const auto die) {
               const auto *linkage = die.getName(llvm::DINameKind::LinkageName);
               if (!linkage)

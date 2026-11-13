@@ -29,6 +29,7 @@ void State::update_registered() { std::any_cast<Registered &>(extension_).value 
 void State::mutate() {
   *items_[350] = 700;
   large_[4200] = 45;
+  unselected_[39000] = 8;
   nested_[1][0] = 15;
   map_.erase(7);
   map_.at(9) = 21;

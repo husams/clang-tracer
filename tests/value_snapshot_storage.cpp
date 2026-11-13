@@ -50,6 +50,9 @@ int main() {
     tracer_snapshot_reset(outer);
     (void)tracer_snapshot_storage(&capacity, tracer::max_snapshot_bytes);
     require(capacity == tracer::max_snapshot_bytes, "large configured capture reserves its extent");
+    auto *large_nested = tracer_snapshot_storage(&capacity, tracer::max_snapshot_bytes);
+    require(large_nested && capacity == tracer::max_snapshot_bytes,
+            "two full reservations fit without moving the first");
     tracer_snapshot_reset(outer);
     require(tracer_snapshot_mark() == outer,
             "cleanup restores storage after exhaustion");

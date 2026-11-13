@@ -57,6 +57,7 @@ struct EncodeBudget {
   std::array<PathStep, max_capture_depth> path{};
   Truncation truncation = nullptr;
   void *truncation_context = nullptr;
+  const char *failure = nullptr;
   struct PointerGraph {
     explicit PointerGraph(std::size_t limit) noexcept : limit(std::min(limit, max_capture_items)) {}
 
@@ -98,7 +99,15 @@ struct EncodeBudget {
   };
   PointerGraph *pointer_graph = nullptr;
   bool enter() noexcept {
-    return ++visits <= limits.visits && ++depth <= limits.depth;
+    if (++visits > limits.visits) {
+      failure = "snapshot exceeds traversal budget";
+      return false;
+    }
+    if (++depth > limits.depth) {
+      failure = "snapshot exceeds depth budget";
+      return false;
+    }
+    return true;
   }
   void leave() noexcept {
     if (depth)
@@ -115,9 +124,11 @@ struct EncodeBudget {
                  std::size_t &selected) noexcept {
     if (max_items > item_cap)
       return false;
-    selected = std::min<std::size_t>({n, max_items, item_cap});
-    if (selected > limits.items - std::min(items, limits.items))
+    selected = std::min(n, max_items);
+    if (selected > limits.items - std::min(items, limits.items)) {
+      failure = "snapshot exceeds element budget";
       return false;
+    }
     items += selected;
     ++visits;
     const auto saved = path_size;
@@ -129,6 +140,7 @@ struct EncodeBudget {
     if (n > selected &&
         (!truncation || !truncation(truncation_context,
                                     {path.data(), path_size}, n, selected))) {
+      failure = "snapshot exceeds element budget";
       pop(saved);
       return false;
     }

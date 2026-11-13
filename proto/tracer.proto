@@ -284,6 +284,7 @@ message ProbeSpec {
     uint64 end = 2;
   }
   repeated SnapshotRttiRange snapshot_rtti_ranges = 45;
+  repeated string snapshot_receiver_fields = 46; // Receiver fields used by object watch comparison.
 }
 message AttachRequest {
   uint32 pid = 1;

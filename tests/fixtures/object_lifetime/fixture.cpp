@@ -69,6 +69,21 @@ public:
 Derived::Derived() { asm volatile("nop; nop; nop; nop; nop"); }
 Derived::~Derived() { asm volatile("nop; nop; nop; nop; nop"); }
 
+struct Widget {
+  int value;
+  Widget(int);
+  ~Widget();
+};
+Widget::Widget(int initial) : value(initial) {}
+Widget::~Widget() { asm volatile("" : : "r"(this) : "memory"); }
+struct Plain : Widget { int extra; };
+void poke(Widget &widget, int value) { widget.value = value; }
+
+void aggregate() {
+  Plain value{{3}, 30};
+  poke(value, 13);
+}
+
 void variants() {
   try {
     Record failed(-1);
@@ -160,6 +175,10 @@ int main() {
     case 'a':
       life::arithmetic();
       std::puts("arithmetic done");
+      break;
+    case 'p':
+      life::aggregate();
+      std::puts("aggregate done");
       break;
     case 'q':
       return 0;
