@@ -408,6 +408,8 @@ Prepare from the original headers and compile command. The package contains the 
 
 Snapshot deltas describe the interval between a method's entry and return. Fields select the reported paths. The generated receiver codec reads the receiver and the pointees authorized by the preparation policy. A failed sample yields a coverage gap. A missing return yields a coverage gap when the probe retires. Set `--max-elements`, `--max-string-bytes`, `--max-depth`, `--max-snapshot-bytes`, and `--max-instances` to bound capture and observation.
 
+For method snapshots, `--max-instances` limits receivers with an outstanding sample. Completed calls release their receiver slots. The watch detects overlapping calls on a receiver and relies on the declared synchronization policy across separate invocations.
+
 A compatible rebuilt ELF can reuse a prepared method watch when DWARF confirms the receiver layout and the original void, scalar, or pointer signature. Pass `--module` to preview and start if the rebuilt image has a new name.
 
 On AArch64 the native agent samples the receiver at a verified entry and at each verified return instruction. The original method executes in its application mapping, and CFI stack capture starts at its original entry. An exception that leaves the method can produce a missing-return gap when the watch retires.
@@ -468,7 +470,10 @@ It verifies the mapped build ID, live instruction bytes, DWARF layouts and
 RTTI. The supported layout uses a verified fixed base offset, an `int32`
 field, the libstdc++ C++11 string ABI and a vector of default-sized unique
 pointers. The remove boundary checks the watched entries against the verified
-membership after return.
+membership after return. Use `--owner-add`, `--owner-get`, `--owner-remove`, and
+`--owner-snapshot` to select differently named methods with the supported ABI.
+The default selectors use `add`, `get`, `remove`, and `set_description` on the
+declared owner or base. Preview verifies the receiver and callable shape.
 
 The server owns the breakpoints until stop or detach. It parks peers while
 the writer steps each admitted instruction. The effective destination must

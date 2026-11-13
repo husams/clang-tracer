@@ -1740,6 +1740,10 @@ bool Controller::execute(const Command &command) {
         }
         request.set_base_type(command.option("--base"));
         request.set_owner_type(command.option("--owner"));
+        request.set_owner_add(command.option("--owner-add"));
+        request.set_owner_get(command.option("--owner-get"));
+        request.set_owner_remove(command.option("--owner-remove"));
+        request.set_owner_snapshot(command.option("--owner-snapshot"));
         request.set_field(command.option("--field"));
         request.set_collection(command.option("--collection"));
         request.set_snapshot_field(command.option("--snapshot-field"));

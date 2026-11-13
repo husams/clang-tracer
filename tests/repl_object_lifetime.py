@@ -4,7 +4,10 @@ import argparse
 from collections import defaultdict
 from contextlib import ExitStack
 import json
+import os
 from pathlib import Path
+import platform
+import signal
 import subprocess
 import sys
 import tempfile
@@ -28,6 +31,15 @@ def run(args):
         repl, out = start([args.repl, "--server", args.server, "--agent", args.agent,
                            "--attach", str(target.pid), "--fail-fast"])
         out.expect(rf"^attached session=\S+ pid={target.pid}$")
+        live_read = None
+        if platform.machine() == "aarch64":
+            memory = cleanup.enter_context(Path(f"/proc/{target.pid}/mem").open("rb", buffering=0))
+            live_read = lambda pc, size: os.pread(memory.fileno(), size, pc)
+
+        def verify_restored(redirects):
+            token = maps(repl, out) if redirects and live_read is None else None
+            verify_restored_redirects(repl, out, token, target.pid, redirects, live_read=live_read)
+
         options = f"--backend {args.backend}" + (" --no-values" if args.no_values else "")
         definition = '--type life::Record --field value_ --code "life::Record::write(int)" --stack-depth 8 ' + options
         send(repl, f"%object preview {definition}")
@@ -37,7 +49,7 @@ def run(args):
         send(repl, f"%object start {definition}")
         watch = out.expect(r"^watch=(\d+) active=yes stores=[1-9][0-9]* .*|^error:")
         assert watch[1], watch.string
-        redirects = read_redirects(repl, out, watch, args.backend, target.pid, ())
+        redirects = read_redirects(repl, out, watch, args.backend, target.pid, (), live_read=live_read)
         send(repl, f"%record variants.db --sqlite --probe {watch[1]} --count 25 --timeout 20")
         send(target, "g")
         app.expect(r"^caught$")
@@ -45,7 +57,7 @@ def run(args):
         out.expect(r"^received=25 .*complete=true")
         send(repl, f"%object stop {watch[1]}")
         out.expect(rf"^watch={watch[1]} active=no .*restoration_pending=no ")
-        verify_restored_redirects(repl, out, maps(repl, out), target.pid, redirects)
+        verify_restored(redirects)
         send(repl, "%events open variants.db --as variants")
         out.expect(r"^opened events=25 retained=25 evicted=0$")
         send(repl, "%events export variants --format json --output variants.json")
@@ -85,20 +97,56 @@ def run(args):
             assert transitions == {(8, 10), (10, 20), (20, 30), (40, 41), (50, 51), (60, 61)}, transitions
         assert sum(generations == {1, 2} for generations in addresses.values()) == 1, addresses
 
+        if args.check_reuse:
+            send(repl, f"%object start {definition}")
+            watch = out.expect(r"^watch=(\d+) active=yes .*|^error:")
+            assert watch[1], watch.string
+            redirects = read_redirects(repl, out, watch, args.backend, target.pid, (), live_read=live_read)
+            send(repl, f"%record reuse.db --sqlite --probe {watch[1]} --count 7 --timeout 20")
+            send(target, "r")
+            app.expect(r"^reuse done$")
+            out.expect(r"^received=7 .*complete=true")
+            if args.backend == "code-cache":
+                target.send_signal(signal.SIGSTOP)
+                _, status = os.waitpid(target.pid, os.WUNTRACED)
+                assert os.WIFSTOPPED(status)
+            send(repl, "%object stop")
+            out.expect(rf"^watch={watch[1]} active=no .*restoration_pending=no ")
+            verify_restored(redirects)
+            if args.backend == "code-cache":
+                for task in Path(f"/proc/{target.pid}/task").iterdir():
+                    state = next(line for line in (task / "status").read_text().splitlines()
+                                 if line.startswith("State:"))
+                    assert state.split()[1] == "T", state
+                target.send_signal(signal.SIGCONT)
+            send(repl, "%events open reuse.db --as reuse")
+            out.expect(r"^opened events=7 retained=7 evicted=0$")
+            send(repl, "%events export reuse --format json --output reuse.json")
+            send(repl, "%events list reuse")
+            out.expect(r"^6 ")
+            records = [event["objectObservation"] for event in json.loads((root / "reuse.json").read_text())]
+            assert [event["kind"] for event in records] == [
+                "CREATED", write_kind, "OBSERVATION_ENDED", "CREATED", write_kind,
+                "DESTROY_BEGIN", "TEARDOWN_END"], records
+            assert records[2]["closureReason"] == "SCOPE_CHANGED"
+            assert records[0]["lifetimeId"] == records[1]["lifetimeId"] == records[2]["lifetimeId"]
+            assert records[0]["lifetimeId"] != records[3]["lifetimeId"] == records[4]["lifetimeId"]
+            assert int(records[3]["generation"]) == int(records[0]["generation"]) + 1
+
         alias = '--type life::Base --field value_ --code "life::Base::write(int)" ' + options
         send(repl, f"%object preview {alias}")
         out.expect(r'^site role="construct \(complete/base alias\)" ')
         send(repl, f"%object start {alias}")
         watch = out.expect(r"^watch=(\d+) active=yes stores=[1-9][0-9]* .*|^error:")
         assert watch[1], watch.string
-        redirects = read_redirects(repl, out, watch, args.backend, target.pid, ())
+        redirects = read_redirects(repl, out, watch, args.backend, target.pid, (), live_read=live_read)
         send(repl, f"%record alias.db --sqlite --probe {watch[1]} --count 1 --timeout 15")
         send(target, "b")
         app.expect(r"^alias done$")
         out.expect(r"^received=1 .*complete=true")
         send(repl, f"%object stop {watch[1]}")
         out.expect(rf"^watch={watch[1]} active=no .*observations=1 .*restoration_pending=no ")
-        verify_restored_redirects(repl, out, maps(repl, out), target.pid, redirects)
+        verify_restored(redirects)
         send(repl, "%events open alias.db --as alias")
         out.expect(r"^opened events=1 retained=1 evicted=0$")
         send(repl, "%events show alias --index 0")
@@ -120,6 +168,7 @@ def main():
         parser.add_argument(name, type=lambda value: str(Path(value).resolve()))
     parser.add_argument("--backend", choices=("ptrace", "code-cache"), default="ptrace")
     parser.add_argument("--no-values", action="store_true")
+    parser.add_argument("--check-reuse", action="store_true")
     run(parser.parse_args())
 
 

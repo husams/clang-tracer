@@ -1116,7 +1116,7 @@ struct Watch::Impl {
       item.set_kind(Observation::RANGE_BOUND);
     else if (sample.hook == Hook::collection_suspend)
       item.set_kind(Observation::RANGE_SUSPENDED);
-    else if (sample.hook == Hook::collection_end)
+    else if (sample.hook == Hook::collection_end || sample.hook == Hook::lifetime_reused)
       item.set_kind(Observation::OBSERVATION_ENDED);
     else if (sample.hook == Hook::collection_gap || sample.hook == Hook::async_gap ||
              sample.hook == Hook::store_fault || sample.hook == Hook::owner_gap ||
@@ -1160,6 +1160,9 @@ struct Watch::Impl {
                                       "constructor returned with an unverified receiver");
     } else if (sample.hook == Hook::destroy_end) {
       item.set_closure_reason(Observation::DESTRUCTOR_RETURN);
+    } else if (sample.hook == Hook::lifetime_reused) {
+      item.set_closure_reason(Observation::SCOPE_CHANGED);
+      item.set_diagnostic("receiver storage reused without an observed destructor");
     }
     if (sample.hook == Hook::async_gap)
       item.set_diagnostic("asynchronous signal " + std::to_string(sample.gap) +
@@ -1304,7 +1307,7 @@ struct Watch::Impl {
         sample.hook == Hook::dispatch_gap ||
         sample.hook == Hook::store_fault || sample.hook == Hook::owner_gap ||
         sample.hook == Hook::shared_mapping_gap || sample.hook == Hook::post_store_signal ||
-        sample.hook == Hook::scope_signal ||
+        sample.hook == Hook::scope_signal || sample.hook == Hook::lifetime_reused ||
         (writer(sample.hook) && sample.gap))
       coverage_gaps.fetch_add(1, std::memory_order_relaxed);
   }

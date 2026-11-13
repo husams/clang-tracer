@@ -68,7 +68,10 @@ def run(repl, server, agent, fixture, no_values, caller_lock):
             out.expect(r"^received=65 .*complete=true")
             send(control, f"%object stop {watch}")
             status = out.expect(rf"^watch={watch} active=no .*restoration_pending=no .*")
-            assert "dropped=0 " in status.string and "coverage=partial" in status.string
+            # Stop adds one observation ending the live lifetime.
+            assert "observations=66 " in status.string and "executed_stores=66 " in status.string, status.string
+            assert "dropped=0 " in status.string, status.string
+            assert "coverage=partial" in status.string, status.string
             verify_restored_redirects(control, out, None, target.pid, redirects, live_read=read)
             send(control, "%detach")
             out.expect(r"^detached session=")

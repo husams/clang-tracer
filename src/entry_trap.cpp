@@ -3,6 +3,7 @@
 #include "injector.hpp"
 #include "linux_syscalls.hpp"
 #include "proc_identity.hpp"
+#include "ptrace_wait.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -86,6 +87,7 @@ struct EntryTrap::Worker {
       stop_requested = true;
     }
     changed.notify_all();
+    PtraceWait::wake();
     thread.join();
   }
 
@@ -93,6 +95,7 @@ struct EntryTrap::Worker {
     std::unique_lock lock(mutex);
     if (!changed.wait_for(lock, timeout, [&] { return ready; })) {
       stop_requested = true;
+      PtraceWait::wake();
       restore_error = "timed out waiting for entry trap installation or cleanup";
       changed.notify_all();
     }
@@ -105,6 +108,7 @@ struct EntryTrap::Worker {
     std::unique_lock lock(mutex);
     const auto attempt = ++retry;
     stop_requested = true;
+    PtraceWait::wake();
     changed.notify_all();
     if (!changed.wait_for(lock, timeout, [&] { return done || failed_retry == attempt; }))
       return "timed out waiting for entry trap restoration";
@@ -300,6 +304,7 @@ struct EntryTrap::Worker {
 
   void trace() {
     const auto deadline = Clock::now() + timeout;
+    bool notifications = PtraceWait::enable();
     seize_all(deadline);
     verify_wrapper_owner();
     require_code(pid, false);
@@ -319,6 +324,7 @@ struct EntryTrap::Worker {
       changed.notify_all();
     }
     while (!stop_requested && !tasks.empty()) {
+      const auto generation = PtraceWait::generation();
       const auto tid = receive();
       if (tid > 0) {
         const auto found = tasks.find(tid);
@@ -328,6 +334,9 @@ struct EntryTrap::Worker {
         }
         if (found != tasks.end() && !stop_requested)
           resume(tid, found->second);
+      } else if (notifications) {
+        if (!stop_requested)
+          notifications = PtraceWait::wait(generation, Clock::time_point::max());
       } else {
         pause(Clock::time_point::max());
       }

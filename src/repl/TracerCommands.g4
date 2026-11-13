@@ -86,6 +86,7 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
 objectWatch : 'object' ('prepare' value? objectOption+ | ('start' | 'preview') objectOption+
                         | ('stop' | 'status') UINT?);
 objectOption : ('--type' | '--base' | '--owner' | '--field' | '--collection'
+                 | '--owner-add' | '--owner-get' | '--owner-remove' | '--owner-snapshot'
                  | '--snapshot-field' | '--code' | '--backend' | '--module' | '--caller'
                  | '--plan' | '--output' | '--executable' | '--mode'
                  | '--include' | '--policy' | '--compdb' | '--translation-unit'

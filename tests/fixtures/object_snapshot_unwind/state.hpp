@@ -6,6 +6,7 @@ class State {
 
 public:
   void fail();
+  void write(int value);
   int value() const { return value_; }
 };
 }

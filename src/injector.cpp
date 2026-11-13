@@ -803,7 +803,7 @@ struct Process::PeerFreeze {
             throw_errno("PTRACE_INTERRUPT peer thread");
           }
           try {
-            wait_peer(peers.back(), deadline, process.process_id_);
+            wait_peer(peers.back(), deadline, process.process_id_, process.patch_only_);
           } catch (...) {
             update_signal(tid, peers.back().pending_signal);
             throw;
@@ -916,7 +916,7 @@ struct Process::PeerFreeze {
               ::ptrace(PTRACE_INTERRUPT, it->tid, nullptr, nullptr) == 0) {
             try {
               wait_peer(*it, std::chrono::steady_clock::now() + kStopTimeout,
-                        process.process_id_);
+                        process.process_id_, process.patch_only_);
             } catch (...) {
             }
             update_signal(it->tid, it->pending_signal);
@@ -979,7 +979,7 @@ private:
 
   static void wait_peer(Peer &peer,
                         std::chrono::steady_clock::time_point deadline,
-                        pid_t process_id) {
+                        pid_t process_id, bool patch_only) {
     for (;;) {
       int status = 0;
       const pid_t result = ::waitpid(peer.tid, &status, __WALL | WNOHANG);
@@ -993,7 +993,7 @@ private:
         }
         const unsigned int event = static_cast<unsigned int>(status) >> 16;
         const int signal = WSTOPSIG(status);
-        if (event == PTRACE_EVENT_STOP && signal == SIGTRAP) {
+        if (event == PTRACE_EVENT_STOP && (signal == SIGTRAP || patch_only)) {
           peer.stopped = true;
           return;
         }
@@ -1285,7 +1285,7 @@ void Process::attach_impl(pid_t process_id,
     stopped = true;
     tracee_stopped_ = true;
     const unsigned int event = static_cast<unsigned int>(status) >> 16;
-    if (event == PTRACE_EVENT_STOP && WSTOPSIG(status) != SIGTRAP) {
+    if (event == PTRACE_EVENT_STOP && WSTOPSIG(status) != SIGTRAP && !patch_only) {
       pending_signal_ = WSTOPSIG(status);
       throw IdlePointUnavailable(
           "target leader is in a job-control group stop; refusing injection");

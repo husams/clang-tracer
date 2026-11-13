@@ -104,8 +104,17 @@ struct MethodWatch::Impl {
     api::StackTrace stack;
   };
   std::map<std::tuple<unsigned, Address, Address>, Pending> pending;
-  struct Receiver { unsigned first = 0, active = 0, depth = 0; bool violated = false; };
+  struct Receiver { unsigned active = 0, depth = 0; bool violated = false; };
   std::map<Address, Receiver> receivers;
+
+  bool release_receiver(Address address) {
+    const auto receiver = receivers.find(address);
+    const bool violated = receiver->second.violated;
+    if (!--receiver->second.depth)
+      receivers.erase(receiver);
+    report.set_admitted_receivers(receivers.size());
+    return violated;
+  }
 
   Impl(const api::ObjectWatchRequest &spec, std::uint64_t id, const api::Session &target,
        const api::ObjectWatchStatus &preview, const std::string &directory, const std::string &library,
@@ -234,8 +243,7 @@ struct MethodWatch::Impl {
         }
         emit(tid, sample.time, it->second.id, method, it->second.receiver,
              {"receiver", "method return unavailable before next invocation", true}, &it->second.stack);
-        if (auto &receiver = receivers.at(it->second.receiver); !--receiver.depth)
-          receiver.active = 0;
+        release_receiver(it->second.receiver);
         it = pending.erase(it);
       }
       if (!sample.receiver || pending.size() >= 1024) {
@@ -249,12 +257,12 @@ struct MethodWatch::Impl {
           gap("receiver admission limit reached");
           return;
         }
-        receiver = receivers.emplace(sample.receiver, Receiver{sample.tid}).first;
+        receiver = receivers.try_emplace(sample.receiver).first;
       }
       auto &state = receiver->second;
-      state.violated |= (state.active && state.active != sample.tid) ||
-          (request.synchronization() == api::ObjectWatchRequest::THREAD_CONFINED && state.first != sample.tid);
-      state.active = sample.tid;
+      state.violated |= state.active && state.active != sample.tid;
+      if (!state.active)
+        state.active = sample.tid;
       ++state.depth;
       if (sample.size && (sample.size > sample.bytes.size() || !decoded.ParseFromArray(sample.bytes.data(), sample.size)))
         decoded.Clear();
@@ -291,10 +299,7 @@ struct MethodWatch::Impl {
     }
     auto previous = std::move(found->second);
     pending.erase(found);
-    auto &state = receivers.at(previous.receiver);
-    if (!--state.depth)
-      state.active = 0;
-    if (state.violated || sample.receiver != previous.receiver || !sample.size || sample.size > sample.bytes.size() ||
+    if (release_receiver(previous.receiver) || sample.receiver != previous.receiver || !sample.size || sample.size > sample.bytes.size() ||
         !decoded.ParseFromArray(sample.bytes.data(), sample.size) || !previous.snapshot.status()) {
       emit(sample.tid, sample.time, previous.id, sample.method, previous.receiver,
            {"receiver", "matching synchronized receiver samples unavailable", true}, &previous.stack);
@@ -316,11 +321,8 @@ struct MethodWatch::Impl {
         // The missing sample can change receiver ownership or pairing.
         // Re-establish both from a later complete invocation.
         pending.clear();
-        for (auto &[address, receiver] : receivers) {
-          (void)address;
-          receiver.active = 0;
-          receiver.depth = 0;
-        }
+        receivers.clear();
+        report.set_admitted_receivers(0);
         drop_barrier = queue.tail.load(std::memory_order_acquire);
       }
       auto &slot = queue.records[cursor % arm_snapshot::slots];
@@ -664,6 +666,8 @@ api::ObjectWatchStatus MethodWatch::stop() {
              {"receiver", "method return unavailable at retirement", true}, &call.stack);
     }
     p.pending.clear();
+    p.receivers.clear();
+    p.report.set_admitted_receivers(0);
     p.draining = false;
   }
   return status();

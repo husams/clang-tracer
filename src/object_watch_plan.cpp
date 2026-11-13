@@ -513,7 +513,7 @@ bool writer_receiver(DWARFDie function, std::uint64_t entry, const std::string &
   if (const auto value = function.findRecursively({dw::DW_AT_type})) {
     const auto result = function.getAttributeValueAsReferencedDie(*value);
     const auto encoding = storage_type(result);
-    if (!scalar_result || !(encoding == "signed32" || encoding == "unsigned32" ||
+    if (!scalar_result || !(encoding == "bool" || encoding == "signed32" || encoding == "unsigned32" ||
                            encoding == "signed64" || encoding == "unsigned64" ||
                            encoding.starts_with("*") || encoding.starts_with("&")))
       return false; // A hidden result argument can change the receiver register.
@@ -1309,6 +1309,14 @@ Plan::Plan(std::uint32_t pid, std::string executable,
 
   const bool known_derived = has_known_derived(*image_->dwarf, concrete) ||
       (main_ && has_known_derived(*main_->dwarf, concrete));
+  const auto &owner = request.owner_type();
+  for (const auto *selector : {&request.owner_add(), &request.owner_get(), &request.owner_remove(),
+                               &request.owner_snapshot()})
+    if (!selector->empty() && (owner.empty() || selector->size() > 512 || selector->find('\0') != selector->npos))
+      throw std::invalid_argument("ownership selectors require an owner and a valid callable selector");
+  if ((!request.owner_snapshot().empty() && request.snapshot_field().empty()) ||
+      (!request.owner_remove().empty() && !request.borrow_caller().empty()))
+    throw std::invalid_argument("ownership selector has no enabled boundary in this watch");
   const auto install_boundary = [&](Image &boundary_image, Boundary role, const Range &range,
                                     const std::string &prefix, bool uncertain) {
     const auto pc = boundary_image.bind(pid, range);
@@ -1345,12 +1353,67 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     for (const auto &range : ranges)
       install_boundary(boundary_image, role, range, prefix, base_aliases.count(range) != 0);
   };
+  const auto ownership_boundary = [&](Boundary role, const std::string &selector, const char *default_name) {
+    const auto receiver = role == Boundary::snapshot ? request.base_type() : owner;
+    const auto name = selector.empty() ? receiver + "::" + default_name : selector;
+    const auto range = lifetime.function(0, name);
+    auto function = lifetime.dwarf->getDIEsForAddress(range.first).FunctionDIE;
+    while (function && function.getTag() != dw::DW_TAG_subprogram)
+      function = function.getParent();
+    const auto referenced_type = [](DWARFDie die) {
+      const auto value = die.findRecursively({dw::DW_AT_type});
+      auto result = value ? die.getAttributeValueAsReferencedDie(*value) : DWARFDie{};
+      while (result && (result.getTag() == dw::DW_TAG_const_type || result.getTag() == dw::DW_TAG_typedef))
+        result = type(result);
+      return result;
+    };
+    const auto refers_to = [&](DWARFDie die, const std::string &record_name) {
+      return die && (pointer(die) || die.getTag() == dw::DW_TAG_reference_type ||
+          die.getTag() == dw::DW_TAG_rvalue_reference_type) && qualified(type(die)) == record_name;
+    };
+    const auto result = referenced_type(function);
+    const auto result_is_base = refers_to(result, request.base_type());
+    bool valid = writer_receiver(function, range.first, receiver, role != Boundary::snapshot);
+    const auto convention = function.findRecursively({dw::DW_AT_calling_convention});
+    valid &= !convention || convention->getAsUnsignedConstant() == dw::DW_CC_normal;
+    if (role == Boundary::get)
+      valid &= result_is_base;
+    if (role == Boundary::remove)
+      valid &= storage_type(result) == "bool";
+    if (role == Boundary::add) {
+      valid &= !result || result_is_base;
+      unsigned index = 0;
+      bool ownership_argument = false;
+      for (const auto parameter : function.children()) {
+        if (parameter.getTag() != dw::DW_TAG_formal_parameter || ++index != 2)
+          continue;
+        auto argument = referenced_type(parameter);
+        ownership_argument = pointer(argument) && refers_to(argument, request.base_type()) &&
+            request.backend() == Request::CODE_CACHE;
+        if (argument && (argument.getTag() == dw::DW_TAG_reference_type ||
+                         argument.getTag() == dw::DW_TAG_rvalue_reference_type))
+          argument = type(argument);
+        if (record(argument) && qualified(argument).starts_with("std::unique_ptr<")) {
+          std::set<std::uint64_t> offsets;
+          find_pointee(argument, request.base_type(), 0, offsets, 32);
+          ownership_argument |= offsets == std::set<std::uint64_t>{layout.pointee} &&
+              size_of(argument) == sizeof(std::uint64_t) &&
+              number(argument, dw::DW_AT_calling_convention) != dw::DW_CC_pass_by_value;
+        }
+        break;
+      }
+      valid &= ownership_argument;
+    }
+    if (!valid)
+      throw std::runtime_error("ownership boundary has an incompatible receiver or callable ABI: " + name);
+    install_boundary(lifetime, role, range, name, false);
+  };
   if (!request.borrow_caller().empty()) {
     add_boundary(*image_, Boundary::construct, concrete + "::" + leaf, "C1E");
     add_boundary(*image_, Boundary::destroy, concrete + "::~" + leaf, "D1Ev");
     add_boundary(*image_, Boundary::destroy, concrete + "::~" + leaf, "D0Ev");
-    add_boundary(lifetime, Boundary::add, request.owner_type() + "::add");
-    add_boundary(lifetime, Boundary::get, request.owner_type() + "::get");
+    ownership_boundary(Boundary::add, request.owner_add(), "add");
+    ownership_boundary(Boundary::get, request.owner_get(), "get");
     const auto caller = lifetime.function(pid, request.borrow_caller());
     caller_start = lifetime.bind(pid, caller);
     caller_bytes = code(caller_start).substr(0, caller.second);
@@ -1362,11 +1425,11 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     if (request.backend() == clangtracer::v1::ObjectWatchRequest::PTRACE)
       add_boundary(lifetime, Boundary::destroy, concrete + "::~" + leaf, "D0Ev", false);
     if (!request.owner_type().empty()) {
-      add_boundary(lifetime, Boundary::add, request.owner_type() + "::add");
-      add_boundary(lifetime, Boundary::get, request.owner_type() + "::get");
-      add_boundary(lifetime, Boundary::remove, request.owner_type() + "::remove");
+      ownership_boundary(Boundary::add, request.owner_add(), "add");
+      ownership_boundary(Boundary::get, request.owner_get(), "get");
+      ownership_boundary(Boundary::remove, request.owner_remove(), "remove");
       if (!request.no_values() && !request.snapshot_field().empty())
-        add_boundary(lifetime, Boundary::snapshot, request.base_type() + "::set_description");
+        ownership_boundary(Boundary::snapshot, request.owner_snapshot(), "set_description");
     }
   }
   if (request.first_seen()) {

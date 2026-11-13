@@ -24,16 +24,25 @@ public:
   void write(int value);
 };
 
-Record::Record() : Record(7) { value_ = 8; }
+Record::Record() : Record(7) {
+  value_ = 8;
+  asm volatile("nop; nop; nop; nop; nop");
+}
 
 Record::Record(int value) : value_(value) {
   if (value < 0)
     throw std::runtime_error("fixture constructor rejected value");
+  asm volatile("nop; nop; nop; nop; nop");
 }
 
-Record::Record(const Record &source) : value_(source.value_) {}
-Record::Record(Record &&source) : value_(source.value_) {}
-Record::~Record() = default;
+// Leave room for separate entry and return redirects with Clang and GCC.
+Record::Record(const Record &source) : value_(source.value_) {
+  asm volatile("nop; nop; nop; nop; nop");
+}
+Record::Record(Record &&source) : value_(source.value_) {
+  asm volatile("nop; nop; nop; nop; nop");
+}
+Record::~Record() { asm volatile("nop; nop; nop; nop; nop"); }
 void Record::write(int value) { value_ = value; }
 
 class Base {
@@ -45,8 +54,8 @@ public:
   void write(int value);
 };
 
-Base::Base() = default;
-Base::~Base() = default;
+Base::Base() { asm volatile("nop; nop; nop; nop; nop"); }
+Base::~Base() { asm volatile("nop; nop; nop; nop; nop"); }
 void Base::write(int value) { value_ = value; }
 
 class Derived final : public Base {
@@ -55,8 +64,8 @@ public:
   ~Derived() override;
 };
 
-Derived::Derived() = default;
-Derived::~Derived() = default;
+Derived::Derived() { asm volatile("nop; nop; nop; nop; nop"); }
+Derived::~Derived() { asm volatile("nop; nop; nop; nop; nop"); }
 
 void variants() {
   try {
@@ -79,6 +88,20 @@ void variants() {
   auto *heap = new Record(60);
   heap->write(61);
   delete heap;
+}
+
+void reuse() {
+  alignas(Record) unsigned char storage[sizeof(Record)];
+  auto *prior = new (storage) Record(40);
+  prior->write(41);
+  auto *next = new (storage) Record(50);
+  next->write(51);
+  next->Record::~Record();
+}
+
+void alias() {
+  Derived value;
+  value.write(11);
 }
 } // namespace life
 
@@ -106,12 +129,14 @@ int main() {
       life::variants();
       std::puts("variants done");
       break;
-    case 'b': {
-      life::Derived value;
-      value.write(11);
+    case 'r':
+      life::reuse();
+      std::puts("reuse done");
+      break;
+    case 'b':
+      life::alias();
       std::puts("alias done");
       break;
-    }
     case 'q':
       return 0;
     }

@@ -54,9 +54,12 @@ int main() {
   if (static_cast<void *>(&known) == static_cast<void *>(static_cast<snapshot_test::Secondary *>(&known)))
     return 2;
   snapshot_test::State state(known);
+  snapshot_test::Known another;
+  snapshot_test::State other(another);
   std::puts("READY");
   while (::access("mutate.now", F_OK) != 0)
     ::usleep(1000);
+  other.rehash_only();
   state.rehash_only();
   state.update_registered();
   state.mutate();

@@ -780,8 +780,11 @@ template<class T> void encode(tracer::ValueSnapshot& snapshot, const T& value) n
   limits.depth=snapshot_depth; limits.items=snapshot_items;
   tracer::context_engine::BoundedProtoWriter writer({storage,capacity},limits);
   tracer::context_engine::EncodeBudget budget;
-  tracer::context_engine::EncodeBudget::PointerGraph pointer_graph;
-  budget.pointer_graph=&pointer_graph;
+)";
+    if (report_unavailable)
+      code.declarations += "  tracer::context_engine::EncodeBudget::PointerGraph pointer_graph{{},snapshot_items};\n"
+                           "  budget.pointer_graph=&pointer_graph;\n";
+    code.declarations += R"(
   budget.max_items=snapshot_items; budget.limits=limits;
   const bool ok=tracer::context_engine::encode_value(writer,1,value,budget);
   auto bytes=writer.finish();
@@ -881,7 +884,8 @@ inline bool verified_vtable(const void* address) noexcept {
               std::to_string(entry.members.size()) + "]{};\n"
               "std::size_t child_member_count_" + id + "=0;\n";
     if (report_unavailable && !entry.members.empty() && entry.error.empty())
-      body += "tracer::context_engine::EncodeBudget::PointerGraph child_graph_" + id + ";\n";
+      body += "tracer::context_engine::EncodeBudget::PointerGraph child_graph_" + id +
+              "{{},tracer_snapshot_detail::snapshot_items};\n";
     if (entry.result_pointee)
       body += "if (auto *result_pointee=tracer::Call(ctx).result()) {\n";
     body += slot + "=&snapshot_" + id + ";\n";

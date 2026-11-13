@@ -47,6 +47,11 @@ def run(args, no_values):
                       '--field radius_ --code "ownership_test::Circle::set_radius(int)"')
         definition += (' --backend code-cache --synchronization thread-confined'
                        if args.backend == "code-cache" else ' --snapshot-field description_')
+        if args.owner_selectors:
+            definition += (' --owner-add "ownership_test::Image::insert" '
+                           '--owner-get "ownership_test::Image::at" --owner-remove "ownership_test::Image::erase"')
+            if args.backend == "ptrace" and not no_values:
+                definition += ' --owner-snapshot "ownership_test::Shape::describe"'
         rendezvous = " --rendezvous arm_rendezvous" if args.arm and args.backend == "code-cache" else ""
         if no_values:
             definition += " --no-values"
@@ -112,5 +117,6 @@ if __name__ == "__main__":
     parser.add_argument("--backend", choices=("ptrace", "code-cache"), default="ptrace")
     parser.add_argument("--no-values", action="store_true")
     parser.add_argument("--arm", action="store_true")
+    parser.add_argument("--owner-selectors", action="store_true")
     args = parser.parse_args()
     run(args, args.no_values)
