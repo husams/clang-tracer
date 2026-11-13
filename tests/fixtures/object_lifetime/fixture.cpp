@@ -7,6 +7,23 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#if defined(__x86_64__)
+#include <signal.h>
+#include <ucontext.h>
+
+extern "C" char object_watch_divide_pc;
+static volatile sig_atomic_t divide_faults = 0;
+
+static void repair_divide(int sig, siginfo_t *info, void *context) {
+  auto &registers = static_cast<ucontext_t *>(context)->uc_mcontext.gregs;
+  if (sig != SIGFPE || info->si_code != FPE_INTDIV || info->si_addr != &object_watch_divide_pc ||
+      registers[REG_RIP] != reinterpret_cast<greg_t>(&object_watch_divide_pc))
+    _exit(4);
+  divide_faults = 1;
+  registers[REG_RSI] = 4;
+}
+#endif
+
 #if defined(TRACE_ARM_TEST_RENDEZVOUS)
 #include "rendezvous.hpp"
 #endif
@@ -23,6 +40,10 @@ public:
   virtual ~Record();
   void write(int value);
   void adjust(int amount);
+#if defined(__x86_64__)
+  void divide(int divisor);
+  void scale();
+#endif
 };
 
 Record::Record() : Record(7) {
@@ -47,6 +68,32 @@ Record::~Record() { asm volatile("nop; nop; nop; nop; nop"); }
 void Record::write(int value) { value_ = value; }
 void Record::adjust(int amount) { value_ -= amount; }
 
+#if defined(__x86_64__)
+void Record::divide(int divisor) {
+  int quotient = value_;
+  int remainder;
+  asm volatile("cdq\n"
+               ".globl object_watch_divide_pc\n"
+               "object_watch_divide_pc:\n"
+               "idivl %%esi\n"
+               : "+a"(quotient), "=&d"(remainder) : "S"(divisor) : "cc");
+  value_ = remainder;
+}
+
+void Record::scale() { value_ = static_cast<int>(value_ * 1.5); }
+
+bool divide() {
+  Record value(9);
+  value.divide(0);
+  return divide_faults == 1;
+}
+
+void scale() {
+  Record value(9);
+  value.scale();
+}
+#endif
+
 class Base {
   int value_ = 5;
 
@@ -68,6 +115,27 @@ public:
 
 Derived::Derived() { asm volatile("nop; nop; nop; nop; nop"); }
 Derived::~Derived() { asm volatile("nop; nop; nop; nop; nop"); }
+struct Implicit : Base { int tag = 0; };
+
+struct TemplateBase {
+  int value;
+  TemplateBase(int);
+  ~TemplateBase();
+};
+TemplateBase::TemplateBase(int initial) : value(initial) {}
+TemplateBase::~TemplateBase() { asm volatile("nop; nop; nop; nop; nop" : : "r"(this) : "memory"); }
+template <class T> struct Typed : TemplateBase {
+  T item;
+  explicit Typed(T initial) : TemplateBase(3), item(initial) {}
+};
+void update_template(TemplateBase &object, int value) { object.value = value; }
+
+void template_base() {
+  Typed<int> derived(2);
+  update_template(derived, 13);
+  TemplateBase complete(5);
+  update_template(complete, 15);
+}
 
 struct Widget {
   int value;
@@ -119,6 +187,8 @@ void reuse() {
 void alias() {
   Derived value;
   value.write(11);
+  Implicit implicit;
+  implicit.write(14);
   Base complete;
   complete.write(12);
 }
@@ -140,6 +210,14 @@ int main() {
   if (::fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK))
     return 2;
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+#if defined(__x86_64__)
+  struct sigaction action{};
+  action.sa_sigaction = repair_divide;
+  action.sa_flags = SA_SIGINFO;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGFPE, &action, nullptr))
+    return 5;
+#endif
   std::puts("READY");
 #if defined(TRACE_ARM_TEST_RENDEZVOUS)
   arm_rendezvous();
@@ -176,9 +254,24 @@ int main() {
       life::arithmetic();
       std::puts("arithmetic done");
       break;
+#if defined(__x86_64__)
+    case 'd':
+      if (!life::divide())
+        return 6;
+      std::puts("division done");
+      break;
+    case 's':
+      life::scale();
+      std::puts("scale done");
+      break;
+#endif
     case 'p':
       life::aggregate();
       std::puts("aggregate done");
+      break;
+    case 't':
+      life::template_base();
+      std::puts("template done");
       break;
     case 'q':
       return 0;

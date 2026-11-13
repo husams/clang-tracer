@@ -2204,6 +2204,10 @@ bool restore_dispatch(const Site &site, Address pc, greg_t *machine,
 }
 #endif
 
+bool synchronous_fault_signal(int sig) noexcept {
+  return sig == SIGSEGV || sig == SIGBUS || sig == SIGFPE || sig == SIGILL;
+}
+
 void fault(int sig, siginfo_t *info, void *context) {
 #if defined(__aarch64__)
   auto &machine = static_cast<ucontext_t *>(context)->uc_mcontext;
@@ -2217,7 +2221,7 @@ void fault(int sig, siginfo_t *info, void *context) {
   auto &sp = registers[REG_RSP];
 #endif
   const auto interrupted = static_cast<Address>(pc);
-  const bool async = sig != SIGSEGV && sig != SIGBUS;
+  const bool async = info->si_code <= 0 || !synchronous_fault_signal(sig);
   const auto selected = [&](const State &watch) {
     return !async || (watch.async_signals & (1ULL << (sig - 1)));
   };
@@ -2406,8 +2410,14 @@ void fault(int sig, siginfo_t *info, void *context) {
     }
     return;
   }
+  auto application_info = *info;
+  // These hardware signals report the address of the faulting instruction.
+  // SIGSEGV and SIGBUS instead report the inaccessible data address.
+  if (faulting && !async && (sig == SIGFPE || sig == SIGILL) &&
+      reinterpret_cast<Address>(info->si_addr) == interrupted)
+    application_info.si_addr = reinterpret_cast<void *>(original_pc);
   if (previous.sa_flags & SA_SIGINFO)
-    previous.sa_sigaction(sig, info, context);
+    previous.sa_sigaction(sig, &application_info, context);
   else
     previous.sa_handler(sig);
   if (dispatching) {
@@ -2464,9 +2474,9 @@ void fault(int sig, siginfo_t *info, void *context) {
 }
 
 void install_bridge(std::uint64_t async_signals) {
-  std::vector<int> signals{SIGSEGV, SIGBUS};
+  std::vector<int> signals{SIGSEGV, SIGBUS, SIGFPE, SIGILL};
   for (int sig = 1; sig < NSIG && sig <= 64; ++sig)
-    if (async_signals & (1ULL << (sig - 1)))
+    if (!synchronous_fault_signal(sig) && (async_signals & (1ULL << (sig - 1))))
       signals.push_back(sig);
   std::vector<int> missing;
   for (const auto sig : signals) {
@@ -2479,7 +2489,7 @@ void install_bridge(std::uint64_t async_signals) {
     } else {
       if (current.sa_flags & SA_RESETHAND)
         throw std::runtime_error("code cache cannot chain one-shot signal handlers");
-      if (sig != SIGSEGV && sig != SIGBUS &&
+      if ((async_signals & (1ULL << (sig - 1))) &&
           (current.sa_handler == SIG_DFL || current.sa_handler == SIG_IGN))
         throw std::runtime_error("asynchronous signal needs an existing application handler");
       previous_actions[sig] = current;

@@ -137,6 +137,40 @@ struct DerivedTypes {
   bool may_construct_base_directly = false;
 };
 
+bool has_virtual_members_or_bases(DWARFDie die, std::set<DWARFDie> &seen) {
+  if (!die || !seen.insert(die).second)
+    return false;
+  for (const auto member : die.children()) {
+    const auto tag = member.getTag();
+    if ((tag == dw::DW_TAG_subprogram || tag == dw::DW_TAG_inheritance) &&
+        number(member, dw::DW_AT_virtuality).value_or(dw::DW_VIRTUALITY_none) != dw::DW_VIRTUALITY_none)
+      return true;
+    if (tag == dw::DW_TAG_inheritance && has_virtual_members_or_bases(type(member), seen))
+      return true;
+  }
+  return false;
+}
+
+bool may_aggregate_initialize_base(DWARFDie derived) {
+  const auto class_name = name(derived);
+  const auto constructor = class_name.substr(0, class_name.find('<'));
+  const auto default_access = derived.getTag() == dw::DW_TAG_class_type ?
+      dw::DW_ACCESS_private : dw::DW_ACCESS_public;
+  for (const auto member : derived.children()) {
+    const auto tag = member.getTag();
+    if (tag == dw::DW_TAG_subprogram && name(member) == constructor &&
+        !member.findRecursively({dw::DW_AT_artificial}) &&
+        number(member, dw::DW_AT_defaulted) != dw::DW_DEFAULTED_in_class)
+      return false;
+    const bool instance_member = tag == dw::DW_TAG_member && !member.find(dw::DW_AT_external);
+    if ((tag == dw::DW_TAG_inheritance || instance_member) &&
+        number(member, dw::DW_AT_accessibility).value_or(default_access) != dw::DW_ACCESS_public)
+      return false;
+  }
+  std::set<DWARFDie> seen;
+  return !has_virtual_members_or_bases(derived, seen);
+}
+
 DerivedTypes derived_types(llvm::DWARFContext &dwarf, const std::string &concrete) {
   DerivedTypes result;
   std::vector<DWARFDie> pending;
@@ -148,13 +182,7 @@ DerivedTypes derived_types(llvm::DWARFContext &dwarf, const std::string &concret
     for (const auto child : die.children()) {
       if (child.getTag() == dw::DW_TAG_inheritance && qualified(type(child)) == concrete) {
         result.present = true;
-        const auto derived = child.getParent();
-        const auto class_name = name(derived);
-        const auto members = derived.children();
-        if (std::none_of(members.begin(), members.end(), [&](const auto member) {
-              return member.getTag() == dw::DW_TAG_subprogram && name(member) == class_name &&
-                     !member.find(dw::DW_AT_artificial);
-            }))
+        if (!result.may_construct_base_directly && may_aggregate_initialize_base(die))
           result.may_construct_base_directly = true;
       }
       if (record(child) || (child.getTag() == dw::DW_TAG_namespace && name(child) != "std"))

@@ -211,6 +211,17 @@ XDG_CACHE_HOME=$(mktemp -d /tmp/ct-object-cache.XXXXXX) \
   ctest --test-dir build -j 2 --output-on-failure
 ```
 
+## Re-review of `eb84587`
+
+- Review threads `4562116181`, `4562116637`, `4562116876`, and `4562117111` confirmed the short lifetime, snapshot budget, aggregate uncertainty, and TLS improvements from the previous round.
+- Thread `4562116437` is addressed. The x86-64 cache now uses [LLVM instruction properties](https://llvm.org/doxygen/classllvm_1_1MCInstrDesc.html) to admit ordinary instructions. Control flow, stack changes, and RIP-relative operands retain separate checks. Scalar SSE arithmetic can use a verified RIP-relative constant. Unsupported stores still follow the existing coverage rules.
+- GCC 8.5 compiled the clamp, integer division, modulo, variable shift, double multiply, and four-iteration loop at `-O0` and `-O2`. Both backends recorded the expected values and lifecycle events. The code cache restored 18 redirects at `-O0` and 30 at `-O2`. See `object-round5-gcc85-writers.log` on linux-dev.
+- The live divide regression verified that the handler received the original faulting PC in both `ucontext_t` and `siginfo_t`. It repaired the divisor, retried the instruction, and recorded 9 → 1. See `object-round5-gcc85-sigfpe.log` on linux-dev.
+- Thread `4562117385` is addressed. Lifecycle planning checks inherited virtual functions, virtual bases, access, and constructor names without template arguments when evaluating [C++17 aggregate eligibility](https://timsong-cpp.github.io/cppwp/n4659/dcl.init.aggr). The regression covers a true aggregate, an implicit derived constructor with an inherited virtual destructor, and a templated derived constructor. A shared constructor entry can still produce an uncertain observation when the calling context cannot establish the complete object.
+- Both backends passed the lifecycle regression with GCC 8.5 at `-O0` and `-O2` on x86-64, and with GCC on AArch64. The optimized GCC 8.5 fixture disables sibling-call optimization and IPA folding to preserve the constructor and destructor call boundaries the test inspects. See `object-round5-gcc85-lifetime.log` on linux-dev.
+- Both backends passed the optimized GCC 8.5 lifecycle run with value capture disabled. See `object-round5-gcc85-no-values.log` on linux-dev.
+- The final focused CTest runs passed 27 tests on x86-64 and 16 on AArch64. See `object-claude-round5-delivery-final-ctest.log` on linux-dev and `arm-claude-round5-delivery-final-ctest.log` on the AArch64 VM.
+
 ## Verified runtime scope and remaining signal coverage
 
 - The native cache follows verified direct and indirect calls into runtime-discovered leaf, tail and nonleaf scopes, including alternate namespaces. It keeps original nonleaf continuations and releases retired translated bodies after active executions drain.

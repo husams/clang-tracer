@@ -53,6 +53,8 @@ bool prepare_call_relay(std::uintptr_t caller, void *copy, std::size_t size,
 bool allocate_code_cache(std::uintptr_t caller, std::size_t bytes,
                          void *&address, std::size_t &size, std::string &error,
                          std::span<const RipRelocation> relocations = {});
+// Width of a scalar SSE arithmetic memory operand accepted by the code cache.
+std::size_t scalar_fp_load_width(std::string_view opcode);
 bool code_cache_rip_relocation(std::span<const std::uint8_t> bytes,
                                std::uintptr_t pc, RipRelocation &relocation,
                                std::string &error);
