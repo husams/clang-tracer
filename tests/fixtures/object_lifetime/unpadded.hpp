@@ -43,6 +43,18 @@ struct Callback {
   explicit Callback(int initial);
   ~Callback();
 };
+
+struct TailCtor {
+  int value, spare;
+  explicit TailCtor(int initial);
+  ~TailCtor();
+};
+
+struct TailDtor {
+  int value, spare;
+  explicit TailDtor(int initial);
+  ~TailDtor();
+};
 } // namespace life
 
 extern "C" void delete_virtual(life::Virtual *);
@@ -55,3 +67,7 @@ extern "C" void write_text(life::Text &, int);
 extern "C" void write_plain(life::Plain &, int);
 extern "C" void delete_text(life::Text *);
 extern "C" void destroy_text(life::Text *);
+extern "C" void make_tail_ctor(life::TailCtor *, int);
+extern "C" void destroy_tail_dtor(life::TailDtor *);
+extern "C" void write_tail_ctor(life::TailCtor &, int);
+extern "C" void write_tail_dtor(life::TailDtor &, int);

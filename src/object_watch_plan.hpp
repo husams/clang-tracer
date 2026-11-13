@@ -111,7 +111,7 @@ public:
 #endif
   bool is_delete_target(std::uint64_t pc) const;
   std::uint64_t constructor_tail_target(std::uint64_t pc) const;
-  std::vector<std::uint64_t> constructor_tail_callers(std::uint64_t pc) const;
+  std::vector<std::uint64_t> lifetime_return_callers(std::uint64_t pc, bool constructor) const;
   Source source(std::uint64_t pc) const;
   void describe_origin(std::uint64_t pc, const Source &source,
                        clangtracer::v1::ObjectObservation &event) const;

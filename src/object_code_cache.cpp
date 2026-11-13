@@ -1242,13 +1242,10 @@ struct Watch::Impl {
         throw std::runtime_error("virtual destructor requires verified returns for indirect calls");
       entry = original_entry;
       returns.clear();
-      auto callers = plan.direct_redirects({pc}, true).at(pc);
-      if (constructor_tail && plan.direct_redirects({pc}).at(pc) != callers)
-        throw std::runtime_error("native constructor has an unverified tail caller");
-      if (enter == Hook::constructor_enter) {
-        const auto calls = plan.constructor_tail_callers(pc);
-        callers.insert(callers.end(), calls.begin(), calls.end());
-      }
+      // A tail jump inherits its caller's return PC and never executes a
+      // local continuation. Reject incoming branches unless the plan has
+      // already proven them to be constructor delegates.
+      const auto callers = plan.lifetime_return_callers(pc, constructor);
       for (const auto call : callers) {
         const auto next = call + 5;
         const auto [caller, length] = plan.containing_function(call);

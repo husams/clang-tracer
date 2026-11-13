@@ -1851,8 +1851,9 @@ Plan::~Plan() = default;
 
 namespace {
 using Redirects = std::map<std::uint64_t, std::vector<std::uint64_t>>;
+enum class DirectEdges { redirects, calls, branches };
 
-void find_direct_redirects(const auto &callers, Redirects &result, bool calls_only) {
+void find_direct_redirects(const auto &callers, Redirects &result, DirectEdges edges) {
   if (result.empty() || !callers.bias)
     return;
   for (const auto &[address, size] : callers.functions) {
@@ -1911,7 +1912,12 @@ void find_direct_redirects(const auto &callers, Redirects &result, bool calls_on
       previous_end = inst.address + inst.size;
       if (!inst.target || !result.count(*inst.target))
         continue;
-      if (calls_only && inst.flow != native_entry::Flow::call)
+      if (edges == DirectEdges::branches) {
+        if (inst.flow == native_entry::Flow::branch)
+          result.at(*inst.target).push_back(inst.address);
+        continue;
+      }
+      if (edges == DirectEdges::calls && inst.flow != native_entry::Flow::call)
         continue;
       if (inst.flow == native_entry::Flow::branch && *inst.target == start)
         continue; // A back edge within the selected function is translated.
@@ -1936,9 +1942,10 @@ Plan::direct_redirects(const std::vector<std::uint64_t> &entries, bool calls_onl
   Redirects result;
   for (auto entry : entries)
     result.try_emplace(entry);
-  find_direct_redirects(*image_, result, calls_only);
+  const auto edges = calls_only ? DirectEdges::calls : DirectEdges::redirects;
+  find_direct_redirects(*image_, result, edges);
   if (main_)
-    find_direct_redirects(*main_, result, calls_only);
+    find_direct_redirects(*main_, result, edges);
   for (auto &[entry, sites] : result) {
     std::sort(sites.begin(), sites.end());
     sites.erase(std::unique(sites.begin(), sites.end()), sites.end());
@@ -1966,7 +1973,7 @@ std::string Plan::runtime_scope_code(const std::string &path,
   const auto original = runtime.code(start).substr(0, range.second);
   for (const auto pc : inspect(original))
     entries.try_emplace(pc);
-  find_direct_redirects(runtime, entries, false);
+  find_direct_redirects(runtime, entries, DirectEdges::redirects);
   if (std::ranges::any_of(entries, [](const auto &item) { return !item.second.empty(); }))
     throw std::runtime_error("an application edge enters a runtime scope redirect");
   return std::string(original);
@@ -2079,14 +2086,38 @@ std::uint64_t Plan::constructor_tail_target(std::uint64_t pc) const {
   return 0;
 }
 
-std::vector<std::uint64_t> Plan::constructor_tail_callers(std::uint64_t pc) const {
-  std::vector<std::uint64_t> callers;
-  for (const auto &[delegate, _] : delegating_constructor_tails)
-    if (constructor_tail_target(delegate) == pc) {
-      auto edges = direct_redirects({delegate}, true).at(delegate);
-      callers.insert(callers.end(), edges.begin(), edges.end());
+std::vector<std::uint64_t> Plan::lifetime_return_callers(std::uint64_t pc, bool constructor) const {
+  std::vector<std::uint64_t> entries{pc};
+  if (constructor)
+    for (const auto &[delegate, _] : delegating_constructor_tails)
+      if (constructor_tail_target(delegate) == pc)
+        entries.push_back(delegate);
+
+  Redirects branches;
+  for (const auto entry : entries)
+    branches.try_emplace(entry);
+  find_direct_redirects(*image_, branches, DirectEdges::branches);
+  if (main_)
+    find_direct_redirects(*main_, branches, DirectEdges::branches);
+  for (const auto &[target, sources] : branches)
+    for (const auto source : sources) {
+      const auto [caller, size] = containing_function(source);
+      const auto delegate = delegating_constructor_tails.find(caller);
+      if (constructor && delegate != delegating_constructor_tails.end() &&
+          delegate->second == target && constructor_tail_target(caller) == pc) {
+        const auto body = native_entry::scan(caller, code(caller).substr(0, size));
+        if (!body.decode_failed && body.diagnostic.empty() && !body.instructions.empty() &&
+            body.instructions.back().address == source)
+          continue;
+      }
+      throw std::runtime_error("native lifetime return continuation has an unverified tail caller: " +
+                               this->source(source).function);
     }
-  return callers;
+
+  std::set<std::uint64_t> callers;
+  for (const auto &[entry, calls] : direct_redirects(entries, true))
+    callers.insert(calls.begin(), calls.end());
+  return {callers.begin(), callers.end()};
 }
 
 const std::string &Plan::module_at(std::uint64_t pc) const {
