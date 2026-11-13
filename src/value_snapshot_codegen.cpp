@@ -5,6 +5,8 @@
 #include "prepared_contract.hpp"
 #include "prepared_types.hpp"
 #include "snapshot_encoder.hpp"
+#include "bounded_proto.hpp"
+#include "value_snapshot_storage.hpp"
 
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/CXXInheritance.h>
@@ -290,7 +292,7 @@ make_value_snapshot_code(clang::ASTContext &ast,
     context_engine::SchemaLimits limits;
     limits.descriptor_bytes = 4096;
     limits.fields = 128;
-    limits.depth = 16;
+    limits.depth = report_unavailable ? context_engine::max_capture_depth : 16;
     entry.schema = context_engine::build_payload_schema(
         ast, type, std::move(family), limits, access);
     const auto codec =
@@ -665,7 +667,7 @@ make_value_snapshot_code(clang::ASTContext &ast,
   const std::string scope = R"(
 extern "C" std::size_t tracer_snapshot_mark() noexcept;
 extern "C" void tracer_snapshot_reset(std::size_t) noexcept;
-extern "C" std::byte* tracer_snapshot_storage(std::size_t*) noexcept;
+extern "C" std::byte* tracer_snapshot_storage(std::size_t*, std::size_t) noexcept;
 extern "C" void tracer_snapshot_commit(std::size_t,std::size_t) noexcept;
 namespace tracer_snapshot_detail {
 struct Scope { std::size_t mark = tracer_snapshot_mark(); bool active=true;
@@ -759,25 +761,25 @@ struct Scope { std::size_t mark = tracer_snapshot_mark(); bool active=true;
                             }));
       });
   if (!types.empty()) {
-    const auto bound = [](std::uint32_t value, unsigned fallback) {
-      return std::to_string(value ? std::min(value, fallback) : fallback);
+    const auto bound = [](std::uint32_t value, std::size_t fallback, std::size_t limit) {
+      return std::to_string(value ? std::min<std::size_t>(value, limit) : fallback);
     };
     code.declarations += "\nnamespace tracer_snapshot_detail {\n"
-        "constexpr std::size_t snapshot_items=" + bound(spec.snapshot_max_items(), 4096) + ";\n"
-        "constexpr std::size_t snapshot_strings=" + bound(spec.snapshot_max_string_bytes(), 4096) + ";\n"
-        "constexpr std::size_t snapshot_depth=" + bound(spec.snapshot_max_depth(), 32) + ";\n"
-        "constexpr std::size_t snapshot_bytes=" + bound(spec.snapshot_max_bytes(), 4096) + ";\n"
+        "constexpr std::size_t snapshot_items=" + bound(spec.snapshot_max_items(), 4096, context_engine::max_capture_items) + ";\n"
+        "constexpr std::size_t snapshot_strings=" + bound(spec.snapshot_max_string_bytes(), 4096, max_snapshot_bytes) + ";\n"
+        "constexpr std::size_t snapshot_depth=" + bound(spec.snapshot_max_depth(), 32, context_engine::max_capture_depth) + ";\n"
+        "constexpr std::size_t snapshot_bytes=" + bound(spec.snapshot_max_bytes(), 4096, max_snapshot_bytes) + ";\n"
         "}\n";
     code.declarations += R"(
 namespace tracer_snapshot_detail {
 template<class T> void encode(tracer::ValueSnapshot& snapshot, const T& value) noexcept {
   const auto mark=tracer_snapshot_mark();
   std::size_t capacity = 0;
-  std::byte* storage = tracer_snapshot_storage(&capacity);
-  capacity=std::min(capacity,snapshot_bytes);
+  std::byte* storage = tracer_snapshot_storage(&capacity,snapshot_bytes);
   tracer::context_engine::CaptureLimits limits;
   limits.bytes=capacity; limits.string_bytes=snapshot_strings;
-  limits.depth=snapshot_depth; limits.items=snapshot_items;
+  limits.depth=snapshot_depth; limits.items=snapshot_items; limits.item_cap=snapshot_items;
+  limits.visits=std::max(limits.visits,capacity);
   tracer::context_engine::BoundedProtoWriter writer({storage,capacity},limits);
   tracer::context_engine::EncodeBudget budget;
 )";

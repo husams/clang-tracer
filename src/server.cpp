@@ -4,6 +4,8 @@
 #include "proc_identity.hpp"
 #include "process_memory.hpp"
 #include "object_snapshot.hpp"
+#include "bounded_proto.hpp"
+#include "value_snapshot_storage.hpp"
 #include "object_watch_plan.hpp"
 
 #include <algorithm>
@@ -484,7 +486,7 @@ public:
     api::ObjectObservation origin;
     std::map<std::pair<std::uint32_t, std::uint64_t>, api::TraceEvent> pending;
     // The receiver owns this sample until it reacquires mutex_ after comparison.
-    const api::TraceEvent *comparing;
+    const api::TraceEvent *comparing = nullptr;
   };
 
 private:
@@ -524,7 +526,7 @@ public:
   void set_probe(const std::string &session_id, std::uint64_t probe_id,
                  std::uint32_t pid, std::string function_name, bool active,
                  const clangtracer::v1::PreparedInjector *prepared = nullptr,
-                 SnapshotBinding snapshot = {}) {
+                 SnapshotBinding snapshot = {{}, {}, {}, nullptr}) {
     std::shared_ptr<const clangtracer::v1::PreparedInjector> replay_types;
     if (prepared && tracer::prepared::is_typed_version(prepared->format_version()) &&
         !prepared->adapter_declarations().empty() &&
@@ -1210,7 +1212,7 @@ private:
       try {
         changes = tracer_repl::compare_snapshots(before.receiver_snapshot(),
             event.receiver_snapshot(), publication.watch->keys, publication.watch->fields);
-      } catch (const std::exception &) {
+      } catch (...) {
         failed = true;
       }
       lock.lock();
@@ -2592,10 +2594,10 @@ private:
         request.overflow_policy() != api::ObjectWatchRequest::DROP_NEW ||
         !request.borrow_caller().empty() || !request.snapshot_field().empty() ||
         request.backend() != api::ObjectWatchRequest::PTRACE ||
-        !request.max_elements() || request.max_elements() > 4096 ||
-        !request.max_string_bytes() || request.max_string_bytes() > 4096 ||
-        !request.snapshot_max_bytes() || request.snapshot_max_bytes() > 4096 ||
-        !request.snapshot_max_depth() || request.snapshot_max_depth() > 32 ||
+        !request.max_elements() || request.max_elements() > context_engine::max_capture_items ||
+        !request.max_string_bytes() || request.max_string_bytes() > max_snapshot_bytes ||
+        !request.snapshot_max_bytes() || request.snapshot_max_bytes() > max_snapshot_bytes ||
+        !request.snapshot_max_depth() || request.snapshot_max_depth() > context_engine::max_capture_depth ||
         !request.max_instances() || request.max_instances() > 65536)
       throw std::invalid_argument("snapshot watches require 1 to 16 prepared methods and a concrete receiver type");
     if (request.snapshot_module().size() > 4096 ||
@@ -2749,12 +2751,14 @@ public:
     if (request.action() != api::ObjectWatchRequest::START &&
         request.action() != api::ObjectWatchRequest::PREVIEW)
       return {grpc::StatusCode::INVALID_ARGUMENT, "invalid snapshot watch action"};
+    if (request.action() == api::ObjectWatchRequest::START) {
+      if (const auto previous = snapshot_group(session->id()); previous &&
+          snapshot_group_active(*previous, current))
+        return {grpc::StatusCode::ALREADY_EXISTS, "a snapshot watch is already active"};
+    }
     auto methods = prepare_snapshot_watch(request, session.get(), response);
     if (request.action() == api::ObjectWatchRequest::PREVIEW)
       return grpc::Status::OK;
-    if (const auto previous = snapshot_group(session->id()); previous &&
-        snapshot_group_active(*previous, current))
-      return {grpc::StatusCode::ALREADY_EXISTS, "a snapshot watch is already active"};
     auto group = std::make_shared<SnapshotGroup>();
     group->events = std::make_shared<EventHub::SnapshotWatch>();
     do {

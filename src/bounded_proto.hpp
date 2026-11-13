@@ -9,6 +9,9 @@
 
 namespace tracer::context_engine {
 
+inline constexpr std::size_t max_capture_depth = 64;
+inline constexpr std::size_t max_capture_items = 65536;
+
 enum class CaptureStatus {
   ok,
   bytes_exceeded,
@@ -28,6 +31,7 @@ struct CaptureLimits {
   std::size_t items = 4096;
   std::size_t depth = 32;
   std::size_t byte_work = 8 * 1024 * 1024;
+  std::size_t item_cap = 4096;
 };
 
 // Native capture primitive for generated codecs. All memory is supplied before
@@ -75,6 +79,6 @@ private:
   CaptureLimits limits_;
   CaptureStatus status_ = CaptureStatus::ok;
   std::size_t used_ = 0, visits_ = 0, items_ = 0, depth_ = 0, work_ = 0;
-  std::array<Message, 32> messages_{};
+  std::array<Message, max_capture_depth> messages_{};
 };
 } // namespace tracer::context_engine

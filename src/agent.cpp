@@ -312,6 +312,7 @@ struct Probe {
   bool has_pre = false;
   bool has_post = false;
   bool receiver_sampled_at_return = false;
+  bool object_snapshot = false;
   bool transport_active = false;
   bool scheduler_counted = false;
   void *wrapper = nullptr;
@@ -5375,7 +5376,7 @@ void copy_value_snapshot(const tracer::ValueSnapshot &in,
   if (in.status != tracer::ValueSnapshot::Complete)
     return;
   if (!in.descriptor || !in.root_type || in.descriptor_size > 4096 ||
-      in.payload_size > 4096 || (!in.payload && in.payload_size != 0) ||
+      in.payload_size > tracer::max_snapshot_bytes || (!in.payload && in.payload_size != 0) ||
       in.container_role_count > 128 || in.record_type_count > 128 ||
       (in.member_count && (!include_members || !in.members ||
                            in.member_count > tracer::kMaxSnapshotMembers))) {
@@ -5611,7 +5612,8 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
     // the native packet budget; the typed getter reports explicit truncation.
     auto size = event.ByteSizeLong();
     const auto exceeds_packet = [&] {
-      return size > tracer::EventTransport::kInlineEventBytes;
+      return size > (p->object_snapshot ? tracer::max_snapshot_wire_bytes :
+                                          tracer::EventTransport::kInlineEventBytes);
     };
     const auto sync_named_argument = [&](int index) {
       for (auto &named : *event.mutable_named_arguments())
@@ -5818,6 +5820,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       return operation.finish(-1);
     }
     p->receiver_sampled_at_return = specification.snapshot_receiver_at_return();
+    p->object_snapshot = specification.snapshot_report_unavailable();
     // Named tracing uses the target's own independently re-read DWARF and ELF
     // mappings. No dynamic symbol lookup is involved, including for local and
     // hidden functions. Raw-symbol requests retain their explicit dlsym path.

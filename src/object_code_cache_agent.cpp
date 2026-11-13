@@ -258,6 +258,7 @@ struct State {
   std::atomic<bool> static_retired{false};
   std::vector<Site> sites;
   std::vector<Address> static_scopes;
+  std::vector<ConstructorReturn> complete_constructor_returns;
   std::mutex runtime_mutex;
   std::uint32_t runtime_limit = 0, runtime_count = 0;
   std::uint32_t runtime_modules = 0;
@@ -282,10 +283,8 @@ struct State {
 
   // Call with mutex held and no current lifetime at this address.
   Lifetime *admit_lifetime(Address object) {
-    if (max_instances && lifetimes.size() >= max_instances) {
-      channel->dropped.fetch_add(1, std::memory_order_relaxed);
+    if (max_instances && lifetimes.size() >= max_instances)
       return nullptr;
-    }
     auto &history = generations[object];
     auto [entry, inserted] = lifetimes.try_emplace(object);
     if (inserted)
@@ -1283,6 +1282,8 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
       }
       if (const auto *life = watch.admit_lifetime(object))
         emit_boundary(watch, site, object, *life, kind);
+      else
+        emit_boundary(watch, site, object, {}, Hook::admission_gap);
       return;
     }
   }
@@ -1301,8 +1302,10 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
         watch.lifetimes.erase(prior);
       }
       const auto *item = watch.admit_lifetime(object);
-      if (!item)
+      if (!item) {
+        emit_boundary(watch, site, object, {}, Hook::admission_gap);
         return;
+      }
       life = *item;
     } else {
       destroying = {};
@@ -1369,7 +1372,11 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
         std::none_of(lifecycle_frames.begin(), lifecycle_frames.end(), [&](const auto &frame) {
           return frame.watch == &watch && frame.constructor && frame.event.object == object;
         });
-    if (constructor && outer && !inst.uncertain_construct) {
+    const auto call = std::pair{inst.boundary_pc, return_pc};
+    const bool uncertain = inst.uncertain_construct &&
+        !std::ranges::binary_search(watch.complete_constructor_returns, call, {},
+            [](const auto &site) { return std::pair{site.entry, site.return_pc}; });
+    if (constructor && outer && !uncertain) {
       const std::lock_guard lock(watch.mutex);
       const auto prior = watch.lifetimes.find(object);
       if (prior != watch.lifetimes.end() && prior->second.id) {
@@ -1377,8 +1384,7 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
         watch.lifetimes.erase(prior);
       }
     }
-    lifecycle_frames.push_back({&watch, sp, return_pc, constructor, outer,
-                                inst.uncertain_construct, event});
+    lifecycle_frames.push_back({&watch, sp, return_pc, constructor, outer, uncertain, event});
     return;
   }
 
@@ -1420,8 +1426,11 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
     return;
   }
   const auto *life = watch.admit_lifetime(event.object);
-  if (!life)
+  if (!life) {
+    event.hook = Hook::admission_gap;
+    emit(watch, event);
     return;
+  }
   event.id = life->id;
   event.generation = life->generation;
   event.hook = Hook::create;
@@ -1539,7 +1548,7 @@ void before(const Site *site, const Registers *regs) noexcept {
       return;
     }
 #endif
-    const bool store = inst.hook == Hook::move || inst.hook == Hook::xadd || inst.hook == Hook::cas;
+    const bool store = writer(inst.hook);
     if (watch.writer_tid && (store || watch.first_seen) &&
         static_cast<std::uint32_t>(::syscall(SYS_gettid)) != watch.writer_tid)
       return;
@@ -1687,8 +1696,14 @@ void complete(const Site *site, const Registers *regs) {
   auto &watch = *site->watch;
   const auto sample = pending;
   pending = {};
+  const auto &inst = site->instruction;
   const bool ordered = sample.write_window && sample.site->watch->serialize_wait_us;
   const ReleaseOrderedWrite release{sample, ordered};
+  const bool rmw = inst.hook == Hook::rmw;
+  auto input = sample.input;
+  const bool readable = watch.no_values || !rmw ||
+      (sample.site == site && sample.stack == regs->value(rsp) && sample.has_old &&
+       read_self(sample.destination, input));
   const bool overlapping = ordered ?
       sample.overlapping || sample.write_window->load(std::memory_order_acquire) /
           write_epoch_increment != sample.write_epoch ||
@@ -1696,7 +1711,6 @@ void complete(const Site *site, const Registers *regs) {
       release_write(sample);
   if (sample.site != site || sample.stack != regs->value(rsp))
     return;
-  const auto &inst = site->instruction;
   if (inst.hook == Hook::cas) {
     const auto succeeded = inst.result ? static_cast<std::uint32_t>(regs->value(inst.result)) == sample.expected
                                       : (regs->flags & (1 << 6)) != 0;
@@ -1704,6 +1718,7 @@ void complete(const Site *site, const Registers *regs) {
       return;
   }
   const auto object = sample.collection_owner ? sample.collection_owner : sample.destination - watch.offset;
+  const bool new_value_available = readable && (!rmw || watch.no_values || !overlapping);
   std::unique_lock lock(watch.mutex);
   bool drift = false;
   if (sample.collection_owner) {
@@ -1721,11 +1736,11 @@ void complete(const Site *site, const Registers *regs) {
       return;
     if (ordered && !watch.no_values) {
       auto &last = found->second.last_ordered_value;
-      if (overlapping || !sample.has_old) {
+      if (overlapping || !sample.has_old || !new_value_available) {
         last.reset();
       } else {
         drift = last && *last != sample.old;
-        last = std::bit_cast<std::int32_t>(sample.input);
+        last = std::bit_cast<std::int32_t>(input);
       }
     }
   }
@@ -1753,8 +1768,7 @@ void complete(const Site *site, const Registers *regs) {
     event.has_shared_file_offset = true;
     event.shared_file_offset = *sample.shared_file_offset;
   }
-  if (!watch.no_values) {
-    auto input = sample.input;
+  if (!watch.no_values && new_value_available) {
     auto old = sample.old;
     bool has_old = sample.has_old && !overlapping && !drift;
     if (inst.hook == Hook::xadd) {
@@ -1783,6 +1797,8 @@ void complete(const Site *site, const Registers *regs) {
   }
   if (drift)
     event.gap = 2;
+  else if (!new_value_available)
+    event.gap = 3;
   else if (overlapping || (ordered && !watch.no_values && !sample.has_old))
     event.gap = 1;
   stack(watch, event, *regs, &pending_cfi_registers);
@@ -2307,8 +2323,7 @@ void fault(int sig, siginfo_t *info, void *context) {
   }
   const bool resample_store = async && faulting && part != Part::after_store &&
       part != Part::entry_gate && part != Part::exit_gate &&
-      (faulting->instruction.hook == Hook::move || faulting->instruction.hook == Hook::xadd ||
-       faulting->instruction.hook == Hook::cas);
+      writer(faulting->instruction.hook);
   const bool scope_sample = resample_store && callback_finished &&
       (faulting->instruction.scope_entry || faulting->instruction.collection_resume ||
        faulting->instruction.inline_mutation_entry || faulting->instruction.dispatch_entry);
@@ -3054,7 +3069,7 @@ std::unique_ptr<Mapping> translate(std::span<Site> sites, Function &function, co
     if (inst.flow != Flow::copy)
       branches.emplace_back(out.code.size(), inst.target);
     out.code.push_back(original);
-    if (inst.hook == Hook::move || inst.hook == Hook::xadd || inst.hook == Hook::cas) {
+    if (writer(inst.hook)) {
       site.after_label = out.size();
       out.hook(site, after, xstate, Emitter::Result::ignored,
                site.watch->async_signals ? &site.after_signals : nullptr);
@@ -3574,7 +3589,7 @@ std::unique_ptr<Mapping> translate(std::span<Site> sites, Function &function,
       branches.emplace_back(out.code.size(), inst.target);
       out.immediate(0U);
     }
-    if (inst.hook == Hook::move || inst.hook == Hook::xadd || inst.hook == Hook::cas) {
+    if (writer(inst.hook)) {
       site.after_label = out.code.size();
       out.hook(site, after, xstate, Emitter::Result::ignored,
                site.watch->mask_async_signals ? &site.after_signals : nullptr);
@@ -3909,7 +3924,7 @@ void prepare_runtime_scope(RuntimeBlock &block, State &watch, Address start,
     return out;
   };
   const auto store = [&](const native_entry::Instruction &inst) {
-    return inst.store32 && (watch.atomic || inst.store32->kind == native_entry::ScalarStore::Kind::move);
+    return inst.store32 && inst.store32->supports(watch.atomic);
   };
   std::set<Address> covered_stores;
   for (auto it = body.instructions.begin(); it != body.instructions.end(); ++it) {
@@ -4218,8 +4233,7 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
       } else {
         const auto code = decode_leaf(target, block->bytes, true,
           [&](const native_entry::Instruction &inst, Instruction &out) {
-            if (inst.store32 && (watch.atomic ||
-                inst.store32->kind == native_entry::ScalarStore::Kind::move))
+            if (inst.store32 && inst.store32->supports(watch.atomic))
               instrument_store(out, *inst.store32);
             else if (inst.may_store && inst.flow == NativeFlow::ordinary)
               throw std::runtime_error("runtime callee has an unsupported memory write");
@@ -4392,6 +4406,9 @@ void initialize(Init &init
   watch->collection = init.collection;
   if (init.static_scope_count)
     watch->static_scopes.assign(init.static_scopes, init.static_scopes + init.static_scope_count);
+  if (init.complete_constructor_return_count)
+    watch->complete_constructor_returns.assign(init.complete_constructor_returns,
+        init.complete_constructor_returns + init.complete_constructor_return_count);
   if (init.collection.map_key_size > init.collection.map_key.size() ||
       init.collection.pointer_hops > init.collection.pointer_offsets.size())
     throw std::runtime_error("code-cache range description exceeds its verified bound");
@@ -4430,7 +4447,7 @@ void initialize(Init &init
 } // namespace
 } // namespace tracer::object_cache
 
-extern "C" int tracer_agent_object_cache_v33(tracer::object_cache::Init *request) {
+extern "C" int tracer_agent_object_cache_v34(tracer::object_cache::Init *request) {
   try {
     tracer::object_cache::initialize(*request);
     return 0;
@@ -4441,7 +4458,7 @@ extern "C" int tracer_agent_object_cache_v33(tracer::object_cache::Init *request
 }
 
 #if defined(__aarch64__)
-extern "C" int tracer_agent_arm_snapshot_v1(tracer::arm_snapshot::Init *request) {
+extern "C" int tracer_agent_arm_snapshot_v2(tracer::arm_snapshot::Init *request) {
   try {
     tracer::object_cache::initialize(request->code, request);
     return 0;

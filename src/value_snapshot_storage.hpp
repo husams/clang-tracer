@@ -1,10 +1,15 @@
 #pragma once
 #include <cstddef>
 
+namespace tracer {
+inline constexpr std::size_t max_snapshot_bytes = 65536;
+inline constexpr std::size_t max_snapshot_wire_bytes = 256 * 1024;
+}
+
 extern "C" std::size_t tracer_snapshot_mark() noexcept;
 extern "C" void tracer_snapshot_reset(std::size_t) noexcept;
-// Reserves the returned extent before an encoder may write into it.
-extern "C" std::byte *tracer_snapshot_storage(std::size_t *) noexcept;
+// Reserves up to the requested extent before encoding.
+extern "C" std::byte *tracer_snapshot_storage(std::size_t *, std::size_t requested = 4096) noexcept;
 extern "C" void tracer_snapshot_commit(std::size_t mark,
                                        std::size_t bytes) noexcept;
 

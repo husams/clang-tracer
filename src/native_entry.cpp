@@ -147,6 +147,13 @@ bool safe_instruction(const llvm::MCInst &inst, const llvm::MCInstrInfo &ins,
   return true;
 }
 
+bool integer_arithmetic(llvm::StringRef opcode, llvm::StringRef suffix) {
+  for (const llvm::StringRef op : {"ADD32", "SUB32", "AND32", "OR32", "XOR32", "INC32", "DEC32"})
+    if (opcode.starts_with(op) && opcode.drop_front(op.size()) == suffix)
+      return true;
+  return false;
+}
+
 bool decode(const Decoder &decoder, llvm::MCInst &instruction,
             std::uint64_t &size, std::uint64_t address, std::string_view bytes) {
   return decoder.dis->getInstruction(
@@ -246,6 +253,10 @@ std::optional<ScalarStore> store32(const Decoder &decoder, const llvm::MCInst &i
   } else if (locked && bytes.starts_with("\x0f\xb1") && opcode == "CMPXCHG32rm" &&
              inst.getNumOperands() == 6) {
     kind = Kind::compare_exchange;
+  } else if (!locked && ((inst.getNumOperands() == 5 && integer_arithmetic(opcode, "m")) ||
+                         (inst.getNumOperands() == 6 && (integer_arithmetic(opcode, "mr") ||
+                          integer_arithmetic(opcode, "mi") || integer_arithmetic(opcode, "mi8"))))) {
+    kind = Kind::rmw;
   } else if (locked || bytes.empty() || inst.getNumOperands() != 6 ||
              !((bytes.front() == '\x89' && opcode == "MOV32mr") ||
                (bytes.front() == '\xc7' && opcode == "MOV32mi"))) {
@@ -256,7 +267,6 @@ std::optional<ScalarStore> store32(const Decoder &decoder, const llvm::MCInst &i
   const auto &index = inst.getOperand(memory + 2);
   const auto &disp = inst.getOperand(memory + 3);
   const auto &segment = inst.getOperand(memory + 4);
-  const auto &input = inst.getOperand(value);
   if (!base.isReg() || !scale.isImm() || !index.isReg() || !disp.isImm() ||
       !segment.isReg() || segment.getReg() ||
       (scale.getImm() != 1 && scale.getImm() != 2 &&
@@ -268,6 +278,9 @@ std::optional<ScalarStore> store32(const Decoder &decoder, const llvm::MCInst &i
   ScalarStore store{register_name(base), register_name(index),
                     static_cast<unsigned>(scale.getImm()), disp.getImm(),
                     kind, {}, std::nullopt, {}};
+  if (kind == Kind::rmw)
+    return store;
+  const auto &input = inst.getOperand(value);
   if (input.isReg() && input.getReg())
     store.value_register = register_name(input);
   else if (kind == Kind::move && input.isImm())
@@ -375,8 +388,21 @@ Preview inspect(std::uint64_t address, std::string_view bytes, bool entry) {
         !changes_receiver && !changes_stack;
     const bool may_store = desc.mayStore() && !architectural_hint;
 #else
+    const bool arithmetic = !lock && (integer_arithmetic(opcode, "rm") ||
+        integer_arithmetic(opcode, "rr") || integer_arithmetic(opcode, "ri") ||
+        integer_arithmetic(opcode, "ri8") ||
+        (store && store->kind == ScalarStore::Kind::rmw));
+    const auto register_named = [&](std::string_view name) {
+      for (unsigned i = 0; i != instruction.getNumOperands(); ++i) {
+        const auto &operand = instruction.getOperand(i);
+        if (operand.isReg() && operand.getReg() && decoder.regs->getName(operand.getReg()) == name)
+          return true;
+      }
+      return false;
+    };
     const bool copyable = lock ? store.has_value() :
         safe_instruction(instruction, *decoder.ins, *decoder.regs) ||
+        (arithmetic && !register_named("RIP") && !register_named("EIP")) ||
         opcode == "INC64r" || opcode == "INC32r" || opcode == "DEC64r" ||
         opcode == "DEC32r" || opcode == "SETCCr" || opcode == "LEAVE64" ||
         opcode == "ENDBR64" || opcode == "CMP32ri8" || opcode == "CMP32ri" ||

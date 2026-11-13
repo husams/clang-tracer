@@ -1,4 +1,5 @@
 #include "context_schema.hpp"
+#include "bounded_proto.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -1193,7 +1194,7 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
            << " static bool write(BoundedProtoWriter& w, std::uint32_t field, "
               "const ::"
            << type_name << "& value, EncodeBudget& budget) noexcept {\n"
-           << "  if (budget.max_items > 4096 || !w.begin_message(field)) "
+           << "  if (budget.max_items > std::min(budget.limits.item_cap, max_capture_items) || !w.begin_message(field)) "
               "return false; std::uint32_t field_number=1; const bool "
               "ok=write_fields(w,value,budget,field_number); return "
               "w.end_message() && ok;\n }\n};\n";
@@ -1327,7 +1328,10 @@ CodecSourceResult render_payload_codec_source(clang::ASTContext &ast,
     result.error = "generic payload type has no canonical spelling";
     return result;
   }
-  Builder validator{ast, SchemaLimits{}};
+  SchemaLimits limits;
+  if (access_policy == CodecAccess::snapshot_members)
+    limits.depth = max_capture_depth;
+  Builder validator{ast, limits};
   validator.snapshot = access_policy == CodecAccess::snapshot_members;
   (void)validator.describe(payload, "value", 1, 0);
   if (!validator.error.empty()) {

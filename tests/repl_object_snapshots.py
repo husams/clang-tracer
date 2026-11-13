@@ -34,8 +34,8 @@ def run(args):
 
         target, app = start([root / "fixture"])
         app.expect(r"^READY$")
-        repl, out = start([args.repl, "--server", args.server, "--agent", args.agent, "--fail-fast"])
-        field_names = ["nested_", "map_", "hash_", "note_", "extension_", "child__snapshot"]
+        repl, out = start([args.repl, "--server", args.server, "--agent", args.agent])
+        field_names = ["items_", "large_", "nested_", "map_", "hash_", "note_", "extension_", "child__snapshot"]
         method_names = ["rehash_only", "mutate", "make_valueless", "replace_child"]
         if args.registered_any:
             field_names.extend(("extension__snapshot", "alias__snapshot"))
@@ -51,7 +51,8 @@ def run(args):
         assert prepared.string.startswith("object package="), prepared.string
         send(repl, f"%attach {target.pid}")
         out.expect(rf"^attached session=\S+ pid={target.pid}$")
-        send(repl, "%object start --plan watch --max-instances 1")
+        start_watch = "%object start --plan watch --max-instances 1 --max-snapshot-bytes 65536 --max-depth 64 --max-elements 5000"
+        send(repl, start_watch)
         watch = out.expect(r"^watch=(\d+) active=yes .*|^error:")
         assert watch[1], watch.string
         probes = {out.expect(r"^method_probe=(\d+) active=yes restored=no$")[1] for _ in method_names}
@@ -71,6 +72,8 @@ def run(args):
                 before, armed = bytes.fromhex(row[2]), bytes.fromhex(row[3])
                 assert pc not in redirects and before != armed and live_bytes(pc, len(armed)) == armed
                 redirects[pc] = before
+        send(repl, start_watch)
+        out.expect(r"^error: RPC 6: a snapshot watch is already active$")
         send(repl, f"%record complex.db --sqlite --probe {watch[1]} --name object.trace --count 32 --timeout 5")
         (root / "mutate.now").touch()
         try:
@@ -87,13 +90,15 @@ def run(args):
         out.expect(rf"^opened events={count} retained={count} evicted=0$")
         send(repl, "%events export saved --format json --output complex.json")
         send(repl, "%quit")
-        assert repl.wait(timeout=10) == 0
+        assert repl.wait(timeout=10) == 1
         records = [event["objectObservation"] for event in json.loads((root / "complex.json").read_text())]
         assert not any("receiver admission limit" in item.get("diagnostic", "") for item in records)
         assert all("::rehash_only()" not in item["function"] or item["kind"] == "COVERAGE_GAP"
                    for item in records), records
         mutate = {(item["field"], item["diagnostic"]): item for item in records
                   if item["function"].endswith("::mutate()")}
+        assert ("items_[350].value", "350 -> 700") in mutate, mutate
+        assert ("large_[4200]", "21 -> 45") in mutate, mutate
         assert ("nested_[1][0]", "7 -> 15") in mutate, mutate
         assert mutate["map_[7]", "removed"]["snapshotBefore"]["signedValue"] == "10", mutate
         assert mutate["map_[12]", "added"]["snapshotAfter"]["signedValue"] == "30", mutate

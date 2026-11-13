@@ -261,13 +261,16 @@ public:
       const auto pid = session->info.pid();
       const auto &executable = session->info.executable();
       if (request.mode() == Request::SNAPSHOTS) {
+        if (request.action() == Request::START && (current.active() || current.restoration_pending())) {
+          if (session->methods)
+            return {grpc::StatusCode::ALREADY_EXISTS, "a snapshot watch is already active"};
+          return {grpc::StatusCode::FAILED_PRECONDITION, "stop the active object watch first"};
+        }
         auto preview = arm::preview_snapshots(request, pid, executable);
         if (request.action() == Request::PREVIEW) {
           *response = std::move(preview);
           return grpc::Status::OK;
         }
-        if (current.active() || current.restoration_pending())
-          return {grpc::StatusCode::FAILED_PRECONDITION, "stop the active object watch first"};
         if (session->native)
           session->native->stop(api::ObjectObservation::WATCH_STOPPED);
         session->native.reset();

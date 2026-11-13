@@ -1,5 +1,6 @@
 #include "object_snapshot.hpp"
 #include "tracer/protocol.hpp"
+#include "bounded_proto.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -88,7 +89,7 @@ class SnapshotDecoder {
   void validate(const google::protobuf::Descriptor &type,
                 std::string_view bytes, const std::string &path, bool wrapper,
                 bool map_entry, unsigned depth) {
-    if (depth > 32 || ++visited_ > 16384)
+    if (depth > tracer::context_engine::max_capture_depth || ++visited_ > 65536)
       throw std::runtime_error("event snapshot exceeds validation limits");
     using Wire = google::protobuf::internal::WireFormatLite;
     google::protobuf::io::CodedInputStream input(
@@ -182,7 +183,7 @@ class SnapshotDecoder {
   EventValue item(const google::protobuf::Message &message,
                   const Descriptor &field, int index, const std::string &path,
                   unsigned depth) {
-    if (depth > 32 || ++visited_ > 16384)
+    if (depth > tracer::context_engine::max_capture_depth || ++visited_ > 65536)
       throw std::runtime_error("event snapshot exceeds decoding limits");
     const auto *r = message.GetReflection();
     const bool repeated = index >= 0;
@@ -270,7 +271,7 @@ class SnapshotDecoder {
     if (!field.is_repeated())
       return item(message, field, -1, path, depth);
     const auto count = message.GetReflection()->FieldSize(message, &field);
-    if (count > 4096)
+    if (count > tracer::context_engine::max_capture_items)
       throw std::runtime_error("event container exceeds decoding limit");
     EventValue::Array values;
     values.reserve(static_cast<std::size_t>(count));

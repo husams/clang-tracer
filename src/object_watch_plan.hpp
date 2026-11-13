@@ -96,6 +96,7 @@ public:
   Layout layout{};
   std::map<std::uint64_t, Site> sites;
   std::map<std::uint64_t, std::size_t> boundaries;
+  std::set<std::pair<std::uint64_t, std::uint64_t>> complete_constructor_returns;
   std::map<std::uint64_t, InlineMutation> inline_mutations;
   unsigned stores = 0, unsupported = 0;
   google::protobuf::RepeatedPtrField<clangtracer::v1::ObjectWatchRequest::SourceWriter> source_writers;

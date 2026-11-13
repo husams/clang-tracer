@@ -32,11 +32,11 @@ struct EncodeBudget {
                               std::uint64_t) noexcept;
   std::size_t max_items = 100, items = 0, visits = 0, depth = 0, path_size = 0;
   CaptureLimits limits{};
-  std::array<PathStep, 32> path{};
+  std::array<PathStep, max_capture_depth> path{};
   Truncation truncation = nullptr;
   void *truncation_context = nullptr;
   struct PointerGraph {
-    explicit PointerGraph(std::size_t limit) noexcept : limit(std::min<std::size_t>(limit, 4096)) {}
+    explicit PointerGraph(std::size_t limit) noexcept : limit(std::min(limit, max_capture_items)) {}
 
     bool admit(std::uintptr_t address) noexcept {
       if (!address || size >= limit)
@@ -91,9 +91,9 @@ struct EncodeBudget {
   void pop(std::size_t saved) noexcept { path_size = saved; }
   bool container(std::uint32_t field, std::size_t n,
                  std::size_t &selected) noexcept {
-    if (max_items > 4096)
+    if (max_items > std::min(limits.item_cap, max_capture_items))
       return false;
-    selected = std::min<std::size_t>({n, max_items, 4096});
+    selected = std::min(n, max_items);
     if (selected > limits.items - std::min(items, limits.items))
       return false;
     items += selected;

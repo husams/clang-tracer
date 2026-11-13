@@ -15,7 +15,10 @@ MoveBomb &MoveBomb::operator=(MoveBomb &&) { throw 7; }
 struct Opaque { int value; };
 struct Hidden final : Primary, Secondary { int hidden = 19; };
 
-State::State(Secondary &child) : child_(&child), alias_(&child) {}
+State::State(Secondary &child) : child_(&child), alias_(&child) {
+  for (int i = 0; i != 400; ++i)
+    items_.push_back(std::make_unique<int>(i));
+}
 void State::rehash_only() {
   const auto previous = hash_.bucket_count();
   hash_.rehash(previous * 3 + 1);
@@ -24,6 +27,8 @@ void State::rehash_only() {
 }
 void State::update_registered() { std::any_cast<Registered &>(extension_).value = 18; }
 void State::mutate() {
+  *items_[350] = 700;
+  large_[4200] = 45;
   nested_[1][0] = 15;
   map_.erase(7);
   map_.at(9) = 21;

@@ -469,7 +469,7 @@ void MethodWatch::start() {
   for (std::size_t index = 0; index != read_only.size(); ++index)
     init.read_only[index] = {read_only[index].first, read_only[index].second};
   const auto spec = bound.SerializeAsString();
-  constexpr char entry_name[] = "tracer_agent_arm_snapshot_v1";
+  constexpr char entry_name[] = "tracer_agent_arm_snapshot_v2";
   const auto count = p.redirects.size();
   const auto table_size = count * sizeof(Function);
   const auto code_size = count * sizeof(Instruction);

@@ -3,6 +3,8 @@
 #include "../module_index_format.hpp"
 #include "../proc_identity.hpp"
 #include "../sqlite_events.hpp"
+#include "../bounded_proto.hpp"
+#include "../value_snapshot_storage.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1885,9 +1887,11 @@ bool Controller::execute(const Command &command) {
           request.max_string_bytes() ? request.max_string_bytes() : 4096, 65536));
       if (request.mode() == api::ObjectWatchRequest::SNAPSHOTS) {
         request.set_snapshot_max_depth(number("--max-depth",
-            request.snapshot_max_depth() ? request.snapshot_max_depth() : 32, 32));
+            request.snapshot_max_depth() ? request.snapshot_max_depth() : 32,
+            tracer::context_engine::max_capture_depth));
         request.set_snapshot_max_bytes(number("--max-snapshot-bytes",
-            request.snapshot_max_bytes() ? request.snapshot_max_bytes() : 4096, 4096));
+            request.snapshot_max_bytes() ? request.snapshot_max_bytes() : 4096,
+            tracer::max_snapshot_bytes));
       } else if (command.has("--max-depth") || command.has("--max-snapshot-bytes")) {
         throw std::invalid_argument("snapshot bounds require a snapshot watch");
       }

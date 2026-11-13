@@ -10,7 +10,7 @@
 
 namespace {
 constexpr std::size_t invalid_mark = std::numeric_limits<std::size_t>::max();
-thread_local std::array<std::byte, 16 * 1024> storage;
+thread_local std::array<std::byte, 2 * tracer::max_snapshot_bytes> storage;
 thread_local std::atomic<std::size_t> used{0};
 thread_local std::atomic<bool> updating{false};
 static_assert(std::atomic<std::size_t>::is_always_lock_free &&
@@ -78,13 +78,13 @@ extern "C" void tracer_snapshot_reset(std::size_t mark) noexcept {
     used.store(mark, std::memory_order_relaxed);
   updating.store(false, std::memory_order_release);
 }
-extern "C" std::byte *tracer_snapshot_storage(std::size_t *capacity) noexcept {
+extern "C" std::byte *tracer_snapshot_storage(std::size_t *capacity, std::size_t requested) noexcept {
   if (updating.exchange(true, std::memory_order_acquire)) {
     *capacity = 0;
     return storage.data() + storage.size();
   }
   const auto begin = used.load(std::memory_order_relaxed);
-  *capacity = std::min<std::size_t>(4096, storage.size() - begin);
+  *capacity = std::min({requested, tracer::max_snapshot_bytes, storage.size() - begin});
   used.store(begin + *capacity, std::memory_order_relaxed);
   updating.store(false, std::memory_order_release);
   return storage.data() + begin;
