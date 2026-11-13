@@ -94,11 +94,13 @@ std::string itanium_rtti_type_name(clang::ASTContext &ast,
   return {};
 }
 bool codec_types_supported(clang::QualType type,
-                           std::set<const clang::CXXRecordDecl *> &seen) {
+                           std::set<const clang::CXXRecordDecl *> &seen,
+                           const context_engine::SnapshotFieldSelection &selection,
+                           const clang::CXXRecordDecl *root = nullptr) {
   if (type.getNonReferenceType().isVolatileQualified())
     return false;
   if (const auto *array = type->getAsArrayTypeUnsafe())
-    return codec_types_supported(array->getElementType(), seen);
+    return codec_types_supported(array->getElementType(), seen, selection);
   const auto *record = type.getNonReferenceType()->getAsCXXRecordDecl();
   if (!record || !seen.insert(record->getCanonicalDecl()).second)
     return true;
@@ -144,7 +146,7 @@ bool codec_types_supported(clang::QualType type,
       if (primary == "weak_ptr" || !pointee->isObjectType() || pointee->isArrayType() ||
           pointee->isIncompleteType() || pointee.isVolatileQualified())
         return true;
-      return codec_types_supported(pointee, seen);
+      return codec_types_supported(pointee, seen, selection);
     }
     if (name.rfind("std::", 0) == 0) {
       const auto supported = [&](auto &&check, const clang::TemplateArgument &argument) -> bool {
@@ -152,7 +154,7 @@ bool codec_types_supported(clang::QualType type,
           return std::all_of(argument.pack_begin(), argument.pack_end(),
                              [&](const auto &item) { return check(check, item); });
         return argument.getKind() != clang::TemplateArgument::Type ||
-               codec_types_supported(argument.getAsType(), seen);
+               codec_types_supported(argument.getAsType(), seen, selection);
       };
       for (const auto &argument : args.asArray())
         if (!supported(supported, argument))
@@ -163,11 +165,13 @@ bool codec_types_supported(clang::QualType type,
   record = record->getDefinition();
   if (!record)
     return false;
+  if (!root)
+    root = record;
   for (const auto *member : record->fields())
-    if (!codec_types_supported(member->getType(), seen))
+    if (selection.includes(root, *member) && !codec_types_supported(member->getType(), seen, selection))
       return false;
   for (const auto &base : record->bases())
-    if (!codec_types_supported(base.getType(), seen))
+    if (!codec_types_supported(base.getType(), seen, selection, root))
       return false;
   return true;
 }
@@ -275,6 +279,17 @@ make_value_snapshot_code(clang::ASTContext &ast,
   std::vector<Entry> entries;
   const auto &info = spec.debug_info();
   const bool report_unavailable = spec.snapshot_report_unavailable();
+  context_engine::SnapshotFieldSelection selection;
+  if (report_unavailable && !spec.snapshot_receiver_fields().empty()) {
+    const auto receiver = tracer_alias(ast, "ResolvedTarget");
+    selection.record = receiver.isNull() ? nullptr : receiver->getAsCXXRecordDecl();
+    for (const auto &path : spec.snapshot_receiver_fields()) {
+      auto name = std::string_view(path).substr(0, path.find_first_of(".["));
+      if (const auto qualifier = name.rfind("::"); qualifier != std::string_view::npos)
+        name.remove_prefix(qualifier + 2);
+      selection.names.emplace_back(name);
+    }
+  }
   const auto access = tracer::prepared::is_typed_version(spec.prepared().format_version())
       ? context_engine::CodecAccess::snapshot_members
       : context_engine::CodecAccess::public_members;
@@ -294,15 +309,15 @@ make_value_snapshot_code(clang::ASTContext &ast,
     limits.fields = 128;
     limits.depth = report_unavailable ? context_engine::max_capture_depth : 16;
     entry.schema = context_engine::build_payload_schema(
-        ast, type, std::move(family), limits, access);
+        ast, type, std::move(family), limits, access, selection);
     const auto codec =
-        context_engine::render_payload_codec_source(ast, type, access);
+        context_engine::render_payload_codec_source(ast, type, access, selection);
     if (!entry.schema)
       entry.error = entry.schema.error;
     else if (!codec)
       entry.error = codec.error;
     std::set<const clang::CXXRecordDecl *> seen;
-    if (!codec_types_supported(type, seen))
+    if (!codec_types_supported(type, seen, selection))
       entry.error = "unsupported string character type in " +
                     error_subject.str();
     if (is_volatile)
@@ -428,7 +443,7 @@ make_value_snapshot_code(clang::ASTContext &ast,
       }
     }
     std::set<const clang::CXXRecordDecl *> seen;
-    if (!codec_types_supported(projection.payload_type, seen)) {
+    if (!codec_types_supported(projection.payload_type, seen, selection)) {
       projection.error = "unsupported type in prepared snapshot payload";
       return projection;
     }
@@ -644,6 +659,13 @@ make_value_snapshot_code(clang::ASTContext &ast,
   for (auto &entry : entries) {
     if (entry.error.empty()) {
       configure_record_policy(entry);
+    if (entry.role == Role::receiver && selection.record) {
+        std::erase_if(entry.members, [&](const auto &member) {
+          const auto projection = member.name + "_snapshot";
+          return std::find(selection.names.begin(), selection.names.end(), member.name) == selection.names.end() &&
+                 std::find(selection.names.begin(), selection.names.end(), projection) == selection.names.end();
+        });
+      }
       if (entry.result_pointee) {
         if (entry.dynamic_projections.empty() &&
             spec.prepared().has_snapshot_return_type())
@@ -695,9 +717,9 @@ struct Scope { std::size_t mark = tracer_snapshot_mark(); bool active=true;
     }
   if (!types.empty()) {
     const auto codecs = member_accessors.empty()
-        ? context_engine::render_context_codec_sources(ast, {}, types, access)
+        ? context_engine::render_context_codec_sources(ast, {}, types, access, selection)
         : context_engine::render_snapshot_member_accessors(
-              ast, types, member_accessors, access);
+              ast, types, member_accessors, access, selection);
     if (!codecs) {
       for (auto &entry : entries)
         if (entry.error.empty())
@@ -793,7 +815,20 @@ template<class T> void encode(tracer::ValueSnapshot& snapshot, const T& value) n
   if(ok && writer.status()==tracer::context_engine::CaptureStatus::ok){
     snapshot.status=tracer::ValueSnapshot::Complete; snapshot.payload=bytes.data();
     snapshot.payload_size=bytes.size(); tracer_snapshot_commit(mark,bytes.size());
-  }else{tracer_snapshot_reset(mark); snapshot.status=tracer::ValueSnapshot::LimitExceeded; snapshot.detail="snapshot exceeds capture budget";}
+  }else{
+    tracer_snapshot_reset(mark);
+    snapshot.status=tracer::ValueSnapshot::LimitExceeded;
+    using Status=tracer::context_engine::CaptureStatus;
+    switch(writer.status()){
+    case Status::bytes_exceeded: snapshot.detail="snapshot exceeds byte budget"; break;
+    case Status::items_exceeded: snapshot.detail="snapshot exceeds element budget"; break;
+    case Status::string_exceeded: snapshot.detail="snapshot exceeds string budget"; break;
+    case Status::depth_exceeded: snapshot.detail="snapshot exceeds depth budget"; break;
+    case Status::visits_exceeded: snapshot.detail="snapshot exceeds traversal budget"; break;
+    case Status::work_exceeded: snapshot.detail="snapshot exceeds encoding work budget"; break;
+    default: snapshot.detail=budget.failure ? budget.failure : "snapshot exceeds capture budget"; break;
+    }
+  }
 }
 
 }

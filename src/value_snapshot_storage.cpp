@@ -7,10 +7,16 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <sys/mman.h>
 
 namespace {
 constexpr std::size_t invalid_mark = std::numeric_limits<std::size_t>::max();
-thread_local std::array<std::byte, 2 * tracer::max_snapshot_bytes> storage;
+constexpr auto storage_size = 2 * tracer::max_snapshot_bytes;
+struct Arena {
+  std::byte *data = nullptr;
+  ~Arena() { if (data) ::munmap(data, storage_size); }
+};
+thread_local Arena arena;
 thread_local std::atomic<std::size_t> used{0};
 thread_local std::atomic<bool> updating{false};
 static_assert(std::atomic<std::size_t>::is_always_lock_free &&
@@ -81,13 +87,24 @@ extern "C" void tracer_snapshot_reset(std::size_t mark) noexcept {
 extern "C" std::byte *tracer_snapshot_storage(std::size_t *capacity, std::size_t requested) noexcept {
   if (updating.exchange(true, std::memory_order_acquire)) {
     *capacity = 0;
-    return storage.data() + storage.size();
+    return nullptr;
+  }
+  if (!arena.data) {
+    const PreserveErrno preserve;
+    void *mapping = ::mmap(nullptr, storage_size, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) {
+      *capacity = 0;
+      updating.store(false, std::memory_order_release);
+      return nullptr;
+    }
+    arena.data = static_cast<std::byte *>(mapping);
   }
   const auto begin = used.load(std::memory_order_relaxed);
-  *capacity = std::min({requested, tracer::max_snapshot_bytes, storage.size() - begin});
+  *capacity = std::min({requested, tracer::max_snapshot_bytes, storage_size - begin});
   used.store(begin + *capacity, std::memory_order_relaxed);
   updating.store(false, std::memory_order_release);
-  return storage.data() + begin;
+  return arena.data + begin;
 }
 extern "C" void tracer_snapshot_commit(std::size_t mark,
                                        std::size_t bytes) noexcept {

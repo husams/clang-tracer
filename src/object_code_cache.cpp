@@ -449,10 +449,38 @@ struct Watch::Impl {
           continue;
         if (fragmented_lifecycle && (boundary == Boundary::construct || boundary == Boundary::destroy)) {
           const bool constructor = boundary == Boundary::construct;
-          prepare_boundary_fragments(pc, size,
-              constructor ? Hook::constructor_enter : Hook::destructor_enter,
-              constructor ? Hook::constructor_return : Hook::destructor_return,
-              site.uncertain_complete);
+          const auto enter = constructor ? Hook::constructor_enter : Hook::destructor_enter;
+          const auto leave = constructor ? Hook::constructor_return : Hook::destructor_return;
+          const auto fragment_count = functions.size();
+          try {
+            prepare_boundary_fragments(pc, size, enter, leave, site.uncertain_complete);
+          } catch (const std::runtime_error &) {
+            if (functions.size() != fragment_count)
+              throw;
+            // A complete leaf can use the application's direct call redirects
+            // even when its entry and return have no independent patch windows.
+            auto leaf = verify_function(plan, pc, size, {});
+            if (plan.direct_redirects({pc}).at(pc) != plan.direct_redirects({pc}, true).at(pc))
+              throw std::runtime_error("native lifetime leaf has a tail caller with no distinct return PC");
+            if (leaf.size() == 1 && !constructor && leaf.front().bytes[0] == 0xc3) {
+              leaf.front().hook = Hook::destroy_both;
+            } else {
+              if (leaf.size() < 2 || std::ranges::any_of(leaf, [&](const auto &inst) {
+                    return inst.flow != Flow::copy && inst.target == pc;
+                  }))
+                throw;
+              leaf.front().hook = enter;
+              leaf.front().uncertain_construct = site.uncertain_complete;
+              for (auto &inst : leaf)
+                if (inst.size == 1 && inst.bytes[0] == 0xc3) {
+                  inst.hook = leave;
+                  inst.boundary_pc = pc;
+                }
+            }
+            leaf.front().boundary_pc = pc;
+            functions.push_back(std::move(leaf));
+            entries.push_back(pc);
+          }
           continue;
         }
         if (!plan.caller_start && !request.owner_type().empty()) {
@@ -1763,7 +1791,7 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
   try {
     if (!process.patch_code_batch(p.patches(false), [&] {
           p.verify_mappings();
-          if (!p.entry_windows.empty() || !p.runtime_calls.empty())
+          if (!p.entry_windows.empty() || !p.runtime_calls.empty() || p.fragmented_lifecycle)
             p.verify_live(process);
         }))
       throw std::runtime_error("a target thread occupies a code-cache redirect");

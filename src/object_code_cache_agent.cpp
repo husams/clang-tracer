@@ -1701,9 +1701,11 @@ void complete(const Site *site, const Registers *regs) {
   const ReleaseOrderedWrite release{sample, ordered};
   const bool rmw = inst.hook == Hook::rmw;
   auto input = sample.input;
-  const bool readable = watch.no_values || !rmw ||
+  // Locked instructions without a returned old value cannot establish values
+  // in the presence of uninstrumented atomic writers. Ptrace can park peers.
+  const bool readable = watch.no_values || !rmw || (!watch.atomic &&
       (sample.site == site && sample.stack == regs->value(rsp) && sample.has_old &&
-       read_self(sample.destination, input));
+       read_self(sample.destination, input)));
   const bool overlapping = ordered ?
       sample.overlapping || sample.write_window->load(std::memory_order_acquire) /
           write_epoch_increment != sample.write_epoch ||
@@ -4360,6 +4362,7 @@ void initialize(Init &init
       *spec.mutable_signature() = prepared.signature();
       *spec.mutable_debug_info() = prepared.header_types();
       spec.set_snapshot_report_unavailable(true);
+      *spec.mutable_snapshot_receiver_fields() = specification.snapshot_fields();
       spec.set_snapshot_max_items(specification.max_elements());
       spec.set_snapshot_max_bytes(specification.snapshot_max_bytes());
       spec.set_snapshot_max_string_bytes(specification.max_string_bytes());

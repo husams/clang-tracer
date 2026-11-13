@@ -194,6 +194,22 @@ def run(args):
         assert [event["kind"] for event in alias_records] == [
             "LIFETIME_UNCERTAIN", "CREATED", write_kind, "DESTROY_BEGIN", "TEARDOWN_END"], alias_records
         assert alias_records[0]["diagnostic"] == "complete and base constructors share the same entry"
+        send(repl, '%object start --type life::Widget --field value '
+                   f'--code "life::poke(life::Widget&, int)" {options}')
+        watch = out.expect(r"^watch=(\d+) active=yes .*|^error:")
+        assert watch[1], watch.string
+        redirects = read_redirects(repl, out, watch, args.backend, target.pid, (), live_read=live_read)
+        send(repl, f"%record aggregate.db --sqlite --probe {watch[1]} --count 1 --timeout 15")
+        send(target, "p")
+        app.expect(r"^aggregate done$")
+        out.expect(r"^received=1 .*complete=true")
+        send(repl, "%object stop")
+        out.expect(rf"^watch={watch[1]} active=no .*observations=1 .*restoration_pending=no ")
+        verify_restored(redirects)
+        send(repl, "%events open aggregate.db --as aggregate")
+        out.expect(r"^opened events=1 retained=1 evicted=0$")
+        send(repl, "%events show aggregate --index 0")
+        out.expect(r"^  kind: LIFETIME_UNCERTAIN$")
         send(repl, "%detach")
         out.expect(r"^detached session=")
         send(target, "q")

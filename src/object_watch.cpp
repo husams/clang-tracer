@@ -1183,7 +1183,7 @@ struct Watch::Worker {
     }
     if (!pending.life.id)
       return std::nullopt;
-    if (!request.no_values() && !plan->layout.atomic)
+    if (!request.no_values() && (!plan->layout.atomic || s.kind == native_entry::ScalarStore::Kind::rmw))
       pending.old = read<std::int32_t>(pid, destination);
     pending.old_tag = union_tag(pending.life.address);
     return pending;
@@ -1208,7 +1208,7 @@ struct Watch::Worker {
     std::optional<std::int32_t> value;
     std::optional<std::uint32_t> next_tag;
     if (!request.no_values()) {
-      if (plan->layout.atomic) {
+      if (plan->layout.atomic && store.kind != Kind::rmw) {
         auto input = store.immediate ? *store.immediate :
             static_cast<std::uint32_t>(reg(before, store.value_register, 0));
         if (store.kind == Kind::exchange_add) {

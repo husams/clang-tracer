@@ -2692,6 +2692,7 @@ public:
         spec.set_snapshot_max_depth(request.snapshot_max_depth());
         spec.set_snapshot_max_bytes(request.snapshot_max_bytes());
         spec.set_snapshot_report_unavailable(true);
+        *spec.mutable_snapshot_receiver_fields() = request.snapshot_fields();
         for (const auto &[begin, end] : memory::readonly_image_data(*session, module, timeout_)) {
           auto &range = *spec.add_snapshot_rtti_ranges();
           range.set_begin(begin);
