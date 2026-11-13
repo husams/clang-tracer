@@ -29,8 +29,11 @@
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Demangle/Demangle.h>
+#include <llvm/MC/MCSubtargetInfo.h>
+#include <llvm/MC/TargetRegistry.h>
 #include <llvm/Object/BuildID.h>
 #include <llvm/Object/ELFObjectFile.h>
+#include <llvm/TargetParser/Host.h>
 
 namespace tracer::object_watch {
 namespace {
@@ -1089,6 +1092,11 @@ struct Symbol {
   unsigned kind;
 };
 
+bool operator_delete_name(std::string_view linkage) {
+  const auto name = llvm::demangle(linkage);
+  return name.starts_with("operator delete(") || name.find("::operator delete(") != std::string::npos;
+}
+
 void append_symbols(const ObjectFile &object, std::vector<Symbol> &symbols) {
   const auto visit = [&](const auto &symbol) {
     const llvm::object::ELFSymbolRef elf(symbol);
@@ -1155,6 +1163,35 @@ struct Plan::Image {
   std::vector<std::pair<std::uint64_t, std::string_view>> text;
   std::set<Range> functions;
   std::vector<Symbol> symbols;
+  mutable std::optional<std::set<std::uint64_t>> delete_plt;
+
+  bool is_delete_target(std::uint64_t address) const {
+    if (std::ranges::any_of(symbols, [&](const auto &symbol) {
+          return symbol.kind == llvm::ELF::STT_FUNC && symbol.range.first == address &&
+              operator_delete_name(symbol.linkage);
+        }))
+      return true;
+    if (!delete_plt) {
+      delete_plt.emplace();
+      const auto triple = llvm::sys::getDefaultTargetTriple();
+      std::string error;
+      if (const auto *target = llvm::TargetRegistry::lookupTarget(triple, error)) {
+        const std::unique_ptr<llvm::MCSubtargetInfo> sub(target->createMCSubtargetInfo(triple, "generic", ""));
+        const auto &object = llvm::cast<llvm::object::ELFObjectFileBase>(*executable.getBinary());
+        if (sub)
+          for (const auto &entry : object.getPltEntries(*sub)) {
+            if (!entry.Symbol)
+              continue;
+            auto name = llvm::object::SymbolRef(*entry.Symbol, &object).getName();
+            if (name && operator_delete_name(*name))
+              delete_plt->insert(entry.Address);
+            if (!name)
+              llvm::consumeError(name.takeError());
+          }
+      }
+    }
+    return delete_plt->count(address) != 0;
+  }
 
   Image(std::uint32_t pid, const std::string &module, bool main, bool require_build_id = true)
       : path(module), primary(main), offline_bias(main ? 0 : (1ULL << 48)),
@@ -1372,7 +1409,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     const auto pc = boundary_image.bind(pid, range);
     if (const auto prior = boundaries.find(pc); prior != boundaries.end()) {
       if (prior->second == range.second && sites.at(pc).boundary == role)
-        return;
+        return pc;
       throw std::runtime_error("conflicting object watch boundaries share an ELF entry");
     }
     boundaries.emplace(pc, range.second);
@@ -1381,6 +1418,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         !sites.try_emplace(pc, Site{std::string(code(pc).substr(0, decoded.instructions.front().size)),
                                    role, std::nullopt, uncertain}).second)
       throw std::runtime_error("cannot admit object watch boundary: " + prefix);
+    return pc;
   };
   const auto add_boundary = [&](Image &boundary_image, Boundary role, const std::string &prefix,
                                 std::string_view variant = {}, bool required = true) {
@@ -1400,8 +1438,13 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     }
     if ((required && ranges.empty()) || (role != Boundary::construct && ranges.size() > 1))
       throw std::runtime_error("object watch boundary is missing or ambiguous: " + prefix);
-    for (const auto &range : ranges)
-      install_boundary(boundary_image, role, range, prefix, base_aliases.count(range) != 0);
+    for (const auto &range : ranges) {
+      const auto pc = install_boundary(boundary_image, role, range, prefix, base_aliases.count(range) != 0);
+      if (variant == "D0Ev") {
+        virtual_destructor = true;
+        sites.at(pc).deleting_destructor = true;
+      }
+    }
   };
   const auto ownership_boundary = [&](Boundary role, const std::string &selector, const char *default_name) {
     const auto receiver = role == Boundary::snapshot ? request.base_type() : owner;
@@ -1472,8 +1515,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   } else if (!request.first_seen() || request.backend() == clangtracer::v1::ObjectWatchRequest::PTRACE) {
     add_boundary(lifetime, Boundary::construct, concrete + "::" + leaf, "C1E", !request.first_seen());
     add_boundary(lifetime, Boundary::destroy, concrete + "::~" + leaf, "D1Ev", !request.first_seen());
-    if (request.backend() == clangtracer::v1::ObjectWatchRequest::PTRACE)
-      add_boundary(lifetime, Boundary::destroy, concrete + "::~" + leaf, "D0Ev", false);
+    add_boundary(lifetime, Boundary::destroy, concrete + "::~" + leaf, "D0Ev", false);
     if (!request.owner_type().empty()) {
       ownership_boundary(Boundary::add, request.owner_add(), "add");
       ownership_boundary(Boundary::get, request.owner_get(), "get");
@@ -1482,11 +1524,35 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         ownership_boundary(Boundary::snapshot, request.owner_snapshot(), "set_description");
     }
   }
+  for (const auto &[pc, size] : boundaries) {
+    if (sites.at(pc).boundary != Boundary::construct)
+      continue;
+    const auto body = native_entry::scan(pc, code(pc).substr(0, size));
+    if (body.decode_failed || !body.diagnostic.empty() || body.instructions.empty())
+      continue;
+    const auto &tail = body.instructions.back();
+    if (tail.flow != native_entry::Flow::branch || tail.falls_through ||
+        !tail.target || *tail.target == pc)
+      continue;
+    const auto target = sites.find(*tail.target);
+    if (target == sites.end() || target->second.boundary != Boundary::construct)
+      continue;
+    if (sites.at(pc).uncertain_complete && !target->second.uncertain_complete)
+      continue;
+    // A straight-line delegate preserves the receiver and original return
+    // context. A call to the thunk supplies the return PC at its target.
+    if (std::all_of(body.instructions.begin(), std::prev(body.instructions.end()), [](const auto &inst) {
+          return inst.flow == native_entry::Flow::ordinary && inst.falls_through &&
+              inst.cache_copyable && !inst.changes_receiver && !inst.changes_stack && !inst.may_store;
+        }))
+      delegating_constructor_tails.emplace(pc, *tail.target);
+  }
   if (known_derived && !writer_derived.may_construct_base_directly &&
       !main_derived.may_construct_base_directly) {
     std::vector<std::uint64_t> aliases;
     for (const auto &[pc, site] : sites)
-      if (site.boundary == Boundary::construct && site.uncertain_complete)
+      if (site.boundary == Boundary::construct &&
+          (site.uncertain_complete || delegating_constructor_tails.count(pc)))
         aliases.push_back(pc);
     for (const auto &[entry, calls] : direct_redirects(aliases, true)) {
       for (const auto call : calls) {
@@ -1508,6 +1574,8 @@ Plan::Plan(std::uint32_t pid, std::string executable,
                   parsed.isCtorOrDtor();
             }))
           continue;
+        if (const auto target = constructor_tail_target(entry))
+          complete_constructor_returns.emplace(target, call + object_cache::direct_call_width);
         complete_constructor_returns.emplace(entry, call + object_cache::direct_call_width);
       }
     }
@@ -1610,6 +1678,9 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       if (instruction.address < previous_end)
         throw std::runtime_error("overlapping instruction boundaries in writer function");
       previous_end = instruction.address + instruction.size;
+      if (instruction.flow == native_entry::Flow::branch && !instruction.target)
+        throw std::runtime_error("object watch cannot verify an indirect branch in " +
+                                 source(start).function + ": " + instruction.text);
       if (!instruction.store32 || !instruction.store32->supports(layout.atomic)) {
         if (instruction.may_store && instruction.flow == native_entry::Flow::ordinary)
           ++unsupported;
@@ -1855,6 +1926,31 @@ const Plan::Image *Plan::image_for(std::uint64_t pc) const {
   if (!image_->code(pc).empty())
     return image_.get();
   return main_ && !main_->code(pc).empty() ? main_.get() : nullptr;
+}
+
+bool Plan::is_delete_target(std::uint64_t pc) const {
+  const auto *image = image_for(pc);
+  return image && image->bias && image->is_delete_target(pc - *image->bias);
+}
+
+std::uint64_t Plan::constructor_tail_target(std::uint64_t pc) const {
+  for (std::size_t i = 0; i <= delegating_constructor_tails.size(); ++i) {
+    const auto next = delegating_constructor_tails.find(pc);
+    if (next == delegating_constructor_tails.end())
+      return pc;
+    pc = next->second;
+  }
+  return 0;
+}
+
+std::vector<std::uint64_t> Plan::constructor_tail_callers(std::uint64_t pc) const {
+  std::vector<std::uint64_t> callers;
+  for (const auto &[delegate, _] : delegating_constructor_tails)
+    if (constructor_tail_target(delegate) == pc) {
+      auto edges = direct_redirects({delegate}, true).at(delegate);
+      callers.insert(callers.end(), edges.begin(), edges.end());
+    }
+  return callers;
 }
 
 const std::string &Plan::module_at(std::uint64_t pc) const {
@@ -2114,6 +2210,7 @@ clangtracer::v1::ObjectWatchPlan Plan::describe(bool live) const {
                                     "writer scope", "container mutation"};
     add(pc, code(pc).substr(0, boundaries.at(pc)),
         site.uncertain_complete ? "construct (complete/base alias)" :
+        site.deleting_destructor ? "destroy (deleting)" :
                                   roles[static_cast<unsigned>(*site.boundary)]);
   }
   return plan;
@@ -2162,15 +2259,28 @@ std::string compare_prepared(const clangtracer::v1::ObjectWatchPlan &prepared,
       !std::equal(prepared.pointee_offsets().begin(), prepared.pointee_offsets().end(),
                   live.pointee_offsets().begin()))
     throw std::runtime_error("prepared pointee path disagrees with the verified live layout");
-  const auto keys = [no_values](const auto &bindings) {
+  const auto keys = [no_values](const auto &bindings, bool include_deleting) {
     std::multiset<std::tuple<std::string, std::string, std::uint64_t, std::string>> result;
-    for (const auto &binding : bindings)
-      if (!no_values || binding.role() != "snapshot")
-        result.emplace(binding.role(), binding.module_build_id(), binding.elf_pc(), binding.original());
+    for (const auto &binding : bindings) {
+      if ((no_values && binding.role() == "snapshot") ||
+          (!include_deleting && binding.role() == "destroy (deleting)"))
+        continue;
+      auto role = binding.role();
+      if (role == "destroy (deleting)")
+        role = "destroy";
+      result.emplace(std::move(role), binding.module_build_id(), binding.elf_pc(), binding.original());
+    }
     return result;
   };
+  const auto expected = keys(prepared.bindings(), true);
+  const bool legacy = std::ranges::none_of(prepared.bindings(), [](const auto &binding) {
+    return binding.role() == "destroy (deleting)";
+  });
+  // Older packages recorded D0 as a generic destructor or omitted it.
+  // The current plan still verifies the live D0 before applying any patch.
   if (prepared.field_offset() != live.field_offset() ||
-      keys(prepared.bindings()) != keys(live.bindings()))
+      (expected != keys(live.bindings(), true) &&
+       !(legacy && expected == keys(live.bindings(), false))))
     throw std::runtime_error("same-build bindings disagree with the prepared package");
   return "same-build";
 }

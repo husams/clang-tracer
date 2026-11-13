@@ -152,6 +152,24 @@ void aggregate() {
   poke(value, 13);
 }
 
+#if defined(__x86_64__)
+extern "C" void jump_table_writer(Widget &widget, unsigned index) {
+  // Keep distinct stores behind the indirect jump, even under optimization.
+  unsigned long slot = index;
+  asm volatile("leaq 0f(%%rip), %%rax\n"
+               "andq $1, %[slot]\n"
+               "movslq (%%rax,%[slot],4), %%rdx\n"
+               "addq %%rax, %%rdx\n"
+               "jmp *%%rdx\n"
+               "0: .long 1f-0b, 2f-0b\n"
+               "1: movl $11, (%[object]); jmp 3f\n"
+               "2: movl $22, (%[object])\n"
+               "3:\n"
+               : [slot] "+&r"(slot)
+               : [object] "r"(&widget) : "rax", "rdx", "cc", "memory");
+}
+#endif
+
 void variants() {
   try {
     Record failed(-1);
@@ -200,6 +218,23 @@ void capacity() {
   first.write(81);
 }
 
+void destroy_base(Base *object) { object->~Base(); }
+void delete_base(Base *object) { delete object; }
+
+void virtual_destruction() {
+  auto *heap = new Base;
+  heap->write(17);
+  delete_base(heap);
+
+  alignas(Implicit) unsigned char storage[sizeof(Implicit)];
+  auto *placed = new (storage) Base;
+  placed->write(19);
+  destroy_base(placed);
+  auto *derived = new (storage) Implicit;
+  derived->write(20);
+  destroy_base(derived);
+}
+
 void arithmetic() {
   Record value(9);
   value.adjust(2);
@@ -245,6 +280,10 @@ int main() {
     case 'b':
       life::alias();
       std::puts("alias done");
+      break;
+    case 'v':
+      life::virtual_destruction();
+      std::puts("virtual done");
       break;
     case 'c':
       life::capacity();

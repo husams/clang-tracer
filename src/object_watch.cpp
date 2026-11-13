@@ -1270,8 +1270,12 @@ struct Watch::Worker {
             sp == pending.return_sp - object_target::return_stack_delta &&
             object_target::return_pc(regs, [&](Address address) { return read<Address>(pid, address); }) !=
                 pending.return_pc;
+        const bool delegated_constructor = pending.role == Boundary::construct &&
+            plan->delegating_constructor_tails.count(pending.entry) &&
+            plan->delegating_constructor_tails.at(pending.entry) == pc;
         const bool epilogue = sp == pending.return_sp && pc != pending.return_pc &&
-            pc >= pending.entry && pc - pending.entry < plan->boundaries.at(pending.entry);
+            (delegated_constructor || (pc >= pending.entry &&
+             pc - pending.entry < plan->boundaries.at(pending.entry)));
         if ((sp < pending.return_sp || epilogue) && !new_call_at_same_depth)
           break;
         const bool matched = sp == pending.return_sp && pc == pending.return_pc;

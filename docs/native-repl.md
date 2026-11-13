@@ -752,6 +752,10 @@ function pointers to multiple verified leaf writers.
 For a shared writer, `--module` takes a unique mapped ELF basename or
 absolute path. A shared leaf that uses an entry redirect needs a verified
 nonfaulting overwrite window.
+Native watches capture virtual destruction at the destructor entry, including
+deleting destructors that inline the complete destructor. A watch fails to
+start if its virtual destructor has no verified redirect. The diagnostic
+backend rejects writers with an unresolved indirect branch, such as a jump table.
 Inlined lifetimes, forked children, and unadmitted store instructions are
 outside coverage.
 
