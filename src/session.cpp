@@ -26,8 +26,12 @@
 #include <llvm/Support/Error.h>
 
 #include "agent_runtime_profile.hpp"
+#include "entry_trap.hpp"
 #include "injector.hpp"
 #include "linux_syscalls.hpp"
+#include "object_code_cache.hpp"
+#include "object_watch.hpp"
+#include "object_watch_plan.hpp"
 #include "proc_identity.hpp"
 #include "tracer/compat.hpp"
 
@@ -170,6 +174,184 @@ Session::Session(std::string id, std::uint32_t pid, std::uint64_t process_start,
       operation_timeout_(operation_timeout),
       context_budget_(context_budget) {}
 
+Session::~Session() = default;
+
+void Session::require_probe_control_locked(std::uint64_t removing) const {
+  if (entry_trap_ && removing != trap_probe_id_)
+    throw std::runtime_error("remove the entry trap before changing other native probes");
+  if (object_watch_) {
+    const auto status = object_watch_->status();
+    if (status.active() || status.restoration_pending())
+      throw std::runtime_error("stop the object watch before changing native probes");
+  }
+  if (object_cache_) {
+    const auto status = object_cache_->status();
+    if (status.active() || status.restoration_pending())
+      throw std::runtime_error("stop the object watch before changing native probes");
+  }
+}
+
+clangtracer::v1::ObjectWatchStatus Session::prepare_object_watch(
+    const clangtracer::v1::ObjectWatchRequest &request) {
+  if (request.executable_file().empty() || request.executable_file().front() != '/' ||
+      request.has_prepared_bindings())
+    throw std::invalid_argument("offline preparation requires an absolute executable path");
+  return object_watch::preview(request, 0, std::filesystem::canonical(request.executable_file()).string());
+}
+
+clangtracer::v1::ObjectWatchStatus Session::object_watch(
+    const clangtracer::v1::ObjectWatchRequest &request, std::uint64_t id,
+    std::function<void(clangtracer::v1::TraceEvent)> publish) {
+  using Request = clangtracer::v1::ObjectWatchRequest;
+  std::lock_guard lock(mutex_);
+  if (request.action() == Request::STATUS || request.action() == Request::STOP) {
+    if (object_cache_) {
+      if (request.watch_id() && request.watch_id() != object_cache_->status().watch_id())
+        throw std::invalid_argument("no matching object watch in this session");
+      if (request.action() == Request::STATUS && state_ == clangtracer::v1::Session::ATTACHED) {
+        try {
+          check_identity_locked();
+        } catch (...) {
+          if (state_ != clangtracer::v1::Session::EXITED)
+            throw;
+        }
+        if (state_ == clangtracer::v1::Session::ATTACHED)
+          retire_changed_object_cache_locked(std::chrono::steady_clock::now() + operation_timeout_);
+      }
+      if (request.action() == Request::STOP || state_ == clangtracer::v1::Session::EXITED)
+        stop_object_cache_locked();
+      return object_cache_->status();
+    }
+    if (!object_watch_ ||
+        (request.watch_id() && request.watch_id() != object_watch_->status().watch_id()))
+      throw std::invalid_argument("no matching object watch in this session");
+    return request.action() == Request::STATUS ? object_watch_->status() : object_watch_->stop();
+  }
+  if (request.action() != Request::START && request.action() != Request::PREVIEW)
+    throw std::invalid_argument("unknown object watch action");
+  check_identity_locked();
+  if (state_ != clangtracer::v1::Session::ATTACHED || unsafe_target_)
+    throw std::runtime_error("object watch requires a live attached session");
+  if (request.action() == Request::PREVIEW)
+    return object_watch::preview(request, pid_, executable_);
+  std::string binding_status;
+  if (request.has_prepared_bindings())
+    binding_status = object_watch::preview(request, pid_, executable_).binding_status();
+  require_probe_control_locked();
+  if (pthread_create_patch_committed_ ||
+      std::any_of(probes_.begin(), probes_.end(), [](const auto &item) {
+        return item.second.patch_committed || item.second.value.active() ||
+               item.second.value.draining() || item.second.remote_request;
+      }))
+    throw std::runtime_error("remove the session's native probes before starting an object watch");
+  if (request.backend() == Request::CODE_CACHE) {
+    if (!object_cache_address_)
+      throw std::runtime_error("the loaded agent does not export the code-cache backend");
+    auto prepared = std::make_unique<object_cache::Watch>(
+        request, id, pid_, executable_, event_path_, std::move(publish));
+    injector::Process process;
+    attach_process(process, std::chrono::steady_clock::now() + operation_timeout_);
+    try {
+      prepared->install(process, object_cache_address_);
+      object_cache_ = std::move(prepared);
+      object_watch_.reset();
+      process.detach();
+    } catch (const std::exception &error) {
+      if (process.unsafe()) {
+        unsafe_target_ = true;
+        set_failed_locked(error.what());
+        if (prepared)
+          object_cache_ = std::move(prepared);
+      }
+      throw;
+    }
+    auto result = object_cache_->status();
+    result.set_binding_status(binding_status);
+    return result;
+  }
+  if (request.backend() != Request::PTRACE)
+    throw std::invalid_argument("unknown object watch backend");
+  object_watch_ = std::make_unique<object_watch::Watch>(
+      request, id, pid_, process_start_, executable_, operation_timeout_, std::move(publish));
+  object_cache_.reset();
+  auto result = object_watch_->status();
+  result.set_binding_status(binding_status);
+  return result;
+}
+
+void Session::stop_object_watch_locked() {
+  if (object_cache_) {
+    stop_object_cache_locked(true);
+    return;
+  }
+  if (!object_watch_)
+    return;
+  const auto status = object_watch_->stop(true);
+  if (status.restoration_pending())
+    throw std::runtime_error(status.diagnostic());
+}
+
+bool Session::retire_changed_object_cache_locked(std::chrono::steady_clock::time_point deadline) {
+  if (!object_cache_->retire_if_mapping_changed(deadline))
+    return false;
+  state_ = clangtracer::v1::Session::EXITED;
+  application_modules_.clear();
+  error_ = "target execution changed; attach again to the current image";
+  return true;
+}
+
+void Session::stop_object_cache_locked(bool detaching) {
+  using Observation = clangtracer::v1::ObjectObservation;
+  const auto reason = detaching ? Observation::WATCH_DETACHED : Observation::WATCH_STOPPED;
+  const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
+  try {
+    check_identity_locked();
+  } catch (const std::runtime_error &) {
+    if (state_ != clangtracer::v1::Session::EXITED)
+      throw;
+    object_cache_->finish(deadline, Observation::TARGET_EXITED);
+    return;
+  }
+  const auto status = object_cache_->status();
+  if (!status.active() && !status.restoration_pending())
+    return;
+  if (!status.active()) {
+    object_cache_->finish(deadline, reason);
+    return;
+  }
+  if (unsafe_target_)
+    throw std::runtime_error(error_);
+  if (retire_changed_object_cache_locked(deadline))
+    return;
+  object_cache_->stop_runtime_admissions();
+  injector::Process process;
+  try {
+    for (;;) {
+      check_identity_locked();
+      process.attach_for_patch(static_cast<pid_t>(pid_));
+      check_identity_locked();
+      if (retire_changed_object_cache_locked(deadline)) {
+        process.detach();
+        return;
+      }
+      const bool restored = object_cache_->restore(process);
+      process.detach();
+      if (restored)
+        break;
+      if (std::chrono::steady_clock::now() >= deadline)
+        throw std::runtime_error("timed out restoring code-cache redirects");
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  } catch (const std::exception &error) {
+    if (process.unsafe()) {
+      unsafe_target_ = true;
+      set_failed_locked(error.what());
+    }
+    throw;
+  }
+  object_cache_->finish(deadline, reason);
+}
+
 std::uint64_t Session::ProcessStartTime(std::uint32_t pid) {
   return proc::start_time(proc::directory(pid) / "stat");
 }
@@ -253,8 +435,9 @@ void Session::attach(const std::string &expected_executable) {
   std::uintptr_t scratch = 0;
   // Each synchronous loader call has finished using its string before the
   // scratch buffer is reused for another symbol name or the profile.
-  const auto scratch_size =
-      std::max(agent_path_.size() + 1, sizeof(AgentRuntimeProfile));
+  const auto scratch_size = std::max(
+      {agent_path_.size() + 1, sizeof(AgentRuntimeProfile),
+       sizeof("tracer_agent_object_cache_v33")});
   try {
     scratch = process.remote_allocate(scratch_size);
     process.remote_write(scratch, agent_path_.c_str(), agent_path_.size() + 1);
@@ -286,6 +469,7 @@ void Session::attach(const std::string &expected_executable) {
     const auto stop = agent_symbol("tracer_agent_stop");
     const auto validate = agent_symbol("tracer_agent_validate");
     const auto capacity = agent_symbol("tracer_agent_capacity_v1");
+    const auto object_cache = agent_symbol("tracer_agent_object_cache_v33");
     const auto pthread_detour =
         agent_symbol("tracer_context_pthread_create_detour");
     if (!start || !stop) {
@@ -299,6 +483,7 @@ void Session::attach(const std::string &expected_executable) {
     stop_address_ = stop;
     validate_address_ = validate;
     capacity_address_ = capacity;
+    object_cache_address_ = object_cache;
     pthread_detour_address_ = pthread_detour;
   } catch (...) {
     if (process.unsafe()) {
@@ -321,6 +506,7 @@ Session::validate_probe(const clangtracer::v1::ProbeSpec &spec,
                         const std::string &source_directory,
                         clangtracer::v1::ValidateProbeRequest::Level level) {
   std::lock_guard lock(mutex_);
+  require_probe_control_locked();
   check_identity_locked();
   if (state_ != clangtracer::v1::Session::ATTACHED) {
     throw std::runtime_error("session is not attached");
@@ -400,6 +586,7 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
                    const std::string &bulk_batch_id, std::uint64_t reload_probe_id,
                    const std::function<bool()> &cancelled) {
   std::lock_guard lock(mutex_);
+  require_probe_control_locked();
   check_identity_locked();
   if (state_ != clangtracer::v1::Session::ATTACHED) {
     throw std::runtime_error("session is not attached");
@@ -573,9 +760,35 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     process.remote_read(remote_request, &response, sizeof(response));
     it->second.value.set_callback_address(response.callback_address);
     it->second.value.set_entry_address(response.original_entry);
-    if (!response.patch_size || response.patch_size > kMaxPatchBytes) {
+    if (!response.patch_address || !response.patch_size ||
+        response.patch_size > kMaxPatchBytes ||
+        response.patch_size > UINT64_MAX - response.patch_address ||
+        !std::memchr(response.patch_reason, '\0', sizeof(response.patch_reason))) {
       throw std::runtime_error("agent returned invalid patch metadata");
     }
+    const bool trap = response.patch_backend == NativePatch::Trap;
+    const bool call_site = response.patch_backend == NativePatch::CallSite;
+    if (trap || call_site) {
+      if (!response.original_entry || !response.wrapper_address ||
+          !response.verified_size || response.verified_size > kMaxPatchBytes ||
+          response.verified_size > UINT64_MAX - response.original_entry ||
+          (call_site && (response.patch_size != 5 || !response.relay_address ||
+                        response.original[0] != 0xe8 || response.installed[0] != 0xe8)) ||
+          (trap && (response.patch_size != 1 || response.installed[0] != 0xcc ||
+                    response.patch_address < response.original_entry ||
+                    response.patch_address - response.original_entry >= response.verified_size ||
+                    response.original[0] != response.verified_bytes[
+                        response.patch_address - response.original_entry]))) {
+        throw std::runtime_error("agent returned invalid getter fallback metadata");
+      }
+    } else if (response.patch_backend != NativePatch::Entry ||
+               response.patch_address != response.original_entry) {
+      throw std::runtime_error("agent returned invalid entry detour metadata");
+    }
+    it->second.value.set_backend(trap ? "trap" : call_site ? "call-site" : "entry");
+    it->second.value.set_backend_reason(response.patch_reason);
+    it->second.value.set_patch_address(response.patch_address);
+    it->second.value.set_relay_address(response.relay_address);
     if (!std::memcmp(response.original, response.installed,
                      response.patch_size))
       throw std::runtime_error("agent returned identical patch byte sequences");
@@ -661,6 +874,41 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     }
 
     const auto patch_started = std::chrono::steady_clock::now();
+    if (trap) {
+      if (scheduler_patch || pthread_create_patch_committed_ || previous ||
+          std::any_of(probes_.begin(), probes_.end(), [&](const auto &other) {
+            return other.first != probe_id &&
+                (other.second.patch_committed || other.second.remote_request);
+          })) {
+        discard_prepared();
+        throw std::runtime_error("entry trap requires exclusive probe control of the session");
+      }
+      process.detach();
+      try {
+        entry_trap_ = std::make_unique<injector::EntryTrap>(
+            pid_, process_start_, response, remote_request, operation_timeout_);
+      } catch (const std::exception &) {
+        discard_prepared();
+        throw;
+      }
+      trap_probe_id_ = probe_id;
+      it->second.patch_committed = true;
+      if (!entry_trap_->armed())
+        throw std::runtime_error("entry trap requires cleanup: " + entry_trap_->diagnostic());
+      it->second.value.set_jit_compile_ns(response.jit_compile_ns);
+      it->second.value.set_patch_install_ns(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - patch_started).count());
+      return it->second.value;
+    }
+    if (call_site) {
+      std::array<unsigned char, kMaxPatchBytes> live{};
+      process.remote_read(response.original_entry, live.data(), response.verified_size);
+      if (std::memcmp(live.data(), response.verified_bytes, response.verified_size) != 0) {
+        discard_prepared();
+        throw std::runtime_error("getter bytes changed before call-site installation");
+      }
+    }
     constexpr unsigned kPatchAttempts = 12;
     bool committed = false;
     unsigned patch_attempts = 0;
@@ -674,7 +922,7 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
       bool patch_applied = false;
       try {
         const injector::CodePatch target_patch{
-            response.original_entry, previous ? previous_patch.installed : response.original,
+            response.patch_address, previous ? previous_patch.installed : response.original,
             response.installed,
             response.patch_size};
         if (scheduler_patch && !pthread_create_patch_committed_) {
@@ -829,6 +1077,8 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
 clangtracer::v1::ProbeSpec Session::reload_spec(std::uint64_t probe_id, std::string source) {
   std::lock_guard lock(mutex_);
   const auto &probe = find_probe_locked(probe_id);
+  if (probe.value.backend() == "trap" || probe.value.backend() == "call-site")
+    throw std::runtime_error("remove the getter fallback before replacing it");
   if (state_ != clangtracer::v1::Session::ATTACHED || !probe.value.active() ||
       !probe.patch_committed)
     throw std::runtime_error("reload requires the active probe that owns the entry");
@@ -846,6 +1096,24 @@ bool Session::stop_probe_locked(
   const auto operation_deadline =
       std::chrono::steady_clock::now() + operation_timeout_;
   const auto deadline = std::min(operation_deadline, shutdown_deadline);
+  if (entry_trap_ && trap_probe_id_ == probe.value.id()) {
+    const auto failure = entry_trap_->stop();
+    if (!failure.empty())
+      throw std::runtime_error("entry trap restoration pending: " + failure);
+    const bool image_replaced = entry_trap_->image_replaced();
+    entry_trap_.reset();
+    trap_probe_id_ = 0;
+    probe.patch_committed = false;
+    if (image_replaced) {
+      probe.remote_request = 0;
+      probe.value.set_active(false);
+      probe.value.set_draining(false);
+      probe.value.set_backend_reason("target executed a different image");
+      state_ = clangtracer::v1::Session::EXITED;
+      application_modules_.clear();
+      return true;
+    }
+  }
   const bool last_active_probe = std::none_of(
       probes_.begin(), probes_.end(), [&](const auto &entry) {
         return entry.first != probe.value.id() &&
@@ -878,7 +1146,7 @@ bool Session::stop_probe_locked(
         if (std::chrono::steady_clock::now() >= deadline)
           break;
         try {
-          if (process.patch_code(patch.original_entry, patch.installed,
+          if (process.patch_code(patch.patch_address, patch.installed,
                                  patch.original, patch.patch_size)) {
             restored = true;
             break;
@@ -1052,7 +1320,8 @@ bool Session::stop_probe_locked(
       pthread_create_patch_committed_ = false;
       pthread_create_patch_.reset();
     }
-    if (!response.patch_size || response.patch_size > kMaxPatchBytes) {
+    if (!response.patch_size || response.patch_size > kMaxPatchBytes ||
+        response.patch_address != probe.value.patch_address()) {
       process.mark_unsafe();
       unsafe_target_ = true;
       set_failed_locked("agent returned invalid original patch metadata; "
@@ -1062,7 +1331,7 @@ bool Session::stop_probe_locked(
     if (!probe.value.draining()) {
       std::array<std::uint8_t, kMaxPatchBytes> bytes{};
       try {
-        process.remote_read(response.original_entry, bytes.data(),
+        process.remote_read(response.patch_address, bytes.data(),
                             response.patch_size);
       } catch (const std::exception &error) {
         process.mark_unsafe();
@@ -1161,6 +1430,7 @@ std::uint64_t Session::events_sent(std::uint64_t probe_id) const {
 
 clangtracer::v1::Probe Session::remove_probe(std::uint64_t probe_id) {
   std::lock_guard lock(mutex_);
+  require_probe_control_locked(probe_id);
   if (unsafe_target_) {
     throw std::runtime_error(error_.empty() ? "session is in failed state"
                                             : error_);
@@ -1176,6 +1446,7 @@ clangtracer::v1::Probe Session::remove_probe(std::uint64_t probe_id) {
 
 void Session::detach() {
   std::lock_guard lock(mutex_);
+  stop_object_watch_locked();
   if (state_ == clangtracer::v1::Session::DETACHED ||
       state_ == clangtracer::v1::Session::EXITED)
     return;
@@ -1199,6 +1470,12 @@ void Session::detach() {
 
 void Session::shutdown() noexcept {
   std::lock_guard lock(mutex_);
+  try {
+    stop_object_watch_locked();
+  } catch (const std::exception &error) {
+    set_failed_locked(error.what());
+    return;
+  }
   if (state_ == clangtracer::v1::Session::DETACHED ||
       state_ == clangtracer::v1::Session::EXITED || unsafe_target_)
     return;
@@ -1285,8 +1562,13 @@ clangtracer::v1::Session Session::snapshot() const {
     result.add_application_modules(path);
   }
   for (const auto &[id, probe] : probes_) {
-    (void)id;
-    result.add_probes()->CopyFrom(probe.value);
+    auto &current = *result.add_probes();
+    current.CopyFrom(probe.value);
+    if (id == trap_probe_id_ && entry_trap_ && !entry_trap_->armed()) {
+      current.set_active(false);
+      current.set_draining(true);
+      current.set_backend_reason(entry_trap_->diagnostic());
+    }
   }
   return result;
 }

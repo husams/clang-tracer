@@ -74,7 +74,11 @@ bool make_decoder(Decoder &d, std::string &error) {
   llvm::Triple parsed(triple);
   d.regs.reset(target->createMCRegInfo(triple));
   d.ins.reset(target->createMCInstrInfo());
+#if defined(__aarch64__)
+  d.sub.reset(target->createMCSubtargetInfo(triple, "generic", "+lse,+pauth,+bti,+sve,+sve2,+sme,+sme2"));
+#else
   d.sub.reset(target->createMCSubtargetInfo(triple, "generic", ""));
+#endif
   if (!d.regs || !d.ins || !d.sub) {
     error = "LLVM MC metadata unavailable";
     return false;
@@ -103,7 +107,7 @@ bool make_decoder(Decoder &d, std::string &error) {
 }
 
 bool safe_instruction(const llvm::MCInst &inst, const llvm::MCInstrInfo &ins,
-                      const llvm::MCRegisterInfo &regs) {
+                      const llvm::MCRegisterInfo &regs, bool allow_rip = false) {
   const auto &desc = ins.get(inst.getOpcode());
   if (desc.isBranch() || desc.isCall() || desc.isReturn() ||
       desc.isIndirectBranch()) {
@@ -112,10 +116,10 @@ bool safe_instruction(const llvm::MCInst &inst, const llvm::MCInstrInfo &ins,
   const std::string name = ins.getName(inst.getOpcode()).str();
   static constexpr std::string_view allowed[] = {
       "PUSH64r",   "POP64r",    "MOV64rr",    "MOV32rr",   "MOV16rr",
-      "MOV8rr",    "MOV32ri",   "MOV64rm",    "MOV32rm",   "MOV16rm",
+      "MOV8rr",    "MOV32ri",   "MOV64ri",    "MOV64rm",   "MOV32rm", "MOV16rm",
       "MOV8rm",    "MOV64mr",   "MOV32mr",    "MOV16mr",   "MOV8mr",
       "MOVSS",     "MOVSD",     "MOVAPS",     "MOVUPS",    "LEA64r",
-      "LEA32r",    "SUB64ri8",  "SUB64ri32",  "ADD64ri8",  "ADD64ri32",
+      "LEA32r",    "LEA64_32r", "SUB64ri8",  "SUB64ri32",  "ADD64ri8",  "ADD64ri32",
       "ADD32ri8",  "ADD32ri",   "ADD32rr",    "IMUL32rri8", "IMUL32rri", "IMUL32rmi8",
       "IMUL32rmi", "XOR64rr",   "XOR32rr",    "TEST64rr",  "TEST32rr",
       "CMP64rr",   "CMP32rr",   "AND8i8",     "AND8ri",    "AND64ri8",
@@ -135,7 +139,7 @@ bool safe_instruction(const llvm::MCInst &inst, const llvm::MCInstrInfo &ins,
     if (inst.getOperand(i).isReg()) {
       auto r = inst.getOperand(i).getReg();
       const char *n = r ? regs.getName(r) : nullptr;
-      if (n && (!std::strcmp(n, "RIP") || !std::strcmp(n, "EIP"))) {
+      if (n && ((!allow_rip && !std::strcmp(n, "RIP")) || !std::strcmp(n, "EIP"))) {
         return false;
       }
     }
@@ -178,13 +182,111 @@ std::size_t patch_window(const Decoder &decoder, std::uint64_t address,
 }
 } // namespace
 
-Preview preview(std::uint64_t address, std::string_view bytes) {
+namespace {
+std::optional<ScalarStore> store32(const Decoder &decoder, const llvm::MCInst &inst,
+                                   std::string_view bytes) {
+  using Kind = ScalarStore::Kind;
+  const auto opcode = decoder.ins->getName(inst.getOpcode());
+#if defined(__aarch64__)
+  const auto reg = [&](unsigned operand) -> std::string {
+    if (operand >= inst.getNumOperands() || !inst.getOperand(operand).isReg())
+      return {};
+    return decoder.regs->getName(inst.getOperand(operand).getReg());
+  };
+  if ((opcode == "STRWui" || opcode == "STURWi") &&
+      inst.getNumOperands() == 3 && !reg(0).empty() && !reg(1).empty() &&
+      inst.getOperand(2).isImm())
+    return ScalarStore{reg(1), {}, 1,
+                       inst.getOperand(2).getImm() * (opcode == "STRWui" ? 4 : 1), Kind::move,
+                       reg(0), std::nullopt, {}};
+  if ((opcode == "STRWpre" || opcode == "STRWpost") && bytes.size() == 4 &&
+      inst.getNumOperands() == 4 && !reg(0).empty() && reg(0) == reg(2) &&
+      !reg(1).empty() && inst.getOperand(3).isImm()) {
+    const auto first = static_cast<unsigned char>(bytes[0]);
+    const auto base = (first >> 5) | ((static_cast<unsigned char>(bytes[1]) & 3) << 3);
+    if (base == (first & 31) && base != 31)
+      return std::nullopt; // Store/writeback overlap is constrained unpredictable.
+    return ScalarStore{reg(2), {}, 1,
+        opcode == "STRWpre" ? inst.getOperand(3).getImm() : 0,
+        Kind::move, reg(1), std::nullopt, {}};
+  }
+  if (opcode == "STRWroX" && inst.getNumOperands() == 5 &&
+      !reg(0).empty() && !reg(1).empty() && !reg(2).empty() &&
+      inst.getOperand(3).isImm() && inst.getOperand(4).isImm() &&
+      (inst.getOperand(4).getImm() == 0 || inst.getOperand(4).getImm() == 1))
+    return ScalarStore{reg(1), reg(2), inst.getOperand(4).getImm() ? 4U : 1U,
+                       0, Kind::move, reg(0), std::nullopt, {}};
+  if (opcode == "STLRW" && inst.getNumOperands() == 2 && !reg(0).empty() && !reg(1).empty())
+    return ScalarStore{reg(1), {}, 1, 0, Kind::move, reg(0), std::nullopt, {}};
+  const auto usable_result = !reg(0).empty() && reg(0) != "WZR";
+  if ((opcode == "LDADDW" || opcode == "LDADDAW" || opcode == "LDADDLW" || opcode == "LDADDALW") &&
+      inst.getNumOperands() == 3 && usable_result && !reg(1).empty() && !reg(2).empty())
+    return ScalarStore{reg(2), {}, 1, 0, Kind::exchange_add, reg(1), std::nullopt, reg(0)};
+  if ((opcode == "CASW" || opcode == "CASAW" || opcode == "CASLW" || opcode == "CASALW") &&
+      inst.getNumOperands() == 4 && usable_result && reg(0) == reg(1) &&
+      !reg(2).empty() && !reg(3).empty())
+    return ScalarStore{reg(3), {}, 1, 0, Kind::compare_exchange, reg(2), std::nullopt, reg(0)};
+  return std::nullopt;
+#else
+  const bool locked = !bytes.empty() && bytes.front() == '\xf0';
+  if (locked)
+    bytes.remove_prefix(1);
+  if (!bytes.empty() && (static_cast<unsigned char>(bytes.front()) & 0xf0) == 0x40)
+    bytes.remove_prefix(1);
+  Kind kind = Kind::move;
+  unsigned memory = 0;
+  unsigned value = 5;
+  if (locked && bytes.starts_with("\x0f\xc1") && opcode == "XADD32rm" &&
+      inst.getNumOperands() == 7 && inst.getOperand(0).isReg() &&
+      inst.getOperand(1).isReg() &&
+      inst.getOperand(0).getReg() == inst.getOperand(1).getReg()) {
+    kind = Kind::exchange_add;
+    memory = 2;
+    value = 0;
+  } else if (locked && bytes.starts_with("\x0f\xb1") && opcode == "CMPXCHG32rm" &&
+             inst.getNumOperands() == 6) {
+    kind = Kind::compare_exchange;
+  } else if (locked || bytes.empty() || inst.getNumOperands() != 6 ||
+             !((bytes.front() == '\x89' && opcode == "MOV32mr") ||
+               (bytes.front() == '\xc7' && opcode == "MOV32mi"))) {
+    return std::nullopt;
+  }
+  const auto &base = inst.getOperand(memory);
+  const auto &scale = inst.getOperand(memory + 1);
+  const auto &index = inst.getOperand(memory + 2);
+  const auto &disp = inst.getOperand(memory + 3);
+  const auto &segment = inst.getOperand(memory + 4);
+  const auto &input = inst.getOperand(value);
+  if (!base.isReg() || !scale.isImm() || !index.isReg() || !disp.isImm() ||
+      !segment.isReg() || segment.getReg() ||
+      (scale.getImm() != 1 && scale.getImm() != 2 &&
+       scale.getImm() != 4 && scale.getImm() != 8))
+    return std::nullopt;
+  auto register_name = [&](const auto &operand) -> std::string {
+    return operand.getReg() ? decoder.regs->getName(operand.getReg()) : "";
+  };
+  ScalarStore store{register_name(base), register_name(index),
+                    static_cast<unsigned>(scale.getImm()), disp.getImm(),
+                    kind, {}, std::nullopt, {}};
+  if (input.isReg() && input.getReg())
+    store.value_register = register_name(input);
+  else if (kind == Kind::move && input.isImm())
+    store.immediate = static_cast<std::uint32_t>(input.getImm());
+  else
+    return std::nullopt;
+  return store;
+#endif
+}
+
+Preview inspect(std::uint64_t address, std::string_view bytes, bool entry) {
   Preview result;
   Decoder decoder;
   if (!make_decoder(decoder, result.diagnostic))
     return result;
-  bytes = bytes.substr(0, preview_bytes);
-  result.patch_size = patch_window(decoder, address, bytes, result.diagnostic);
+  if (entry) {
+    bytes = bytes.substr(0, preview_bytes);
+    result.patch_size = patch_window(decoder, address, bytes, result.diagnostic);
+  }
   // Explore direct branches within the verified byte window. Calls retain
   // their return-site edge and their target is reported without following it.
   std::set<std::uint64_t> pending{address};
@@ -200,6 +302,19 @@ Preview preview(std::uint64_t address, std::string_view bytes) {
     if (!decode(decoder, instruction, size, pc, bytes.substr(offset))) {
       result.decode_failed = true;
       continue;
+    }
+    const bool lock = decoder.ins->getName(instruction.getOpcode()) == "LOCK_PREFIX";
+    if (lock) {
+      // LLVM MC emits LOCK as a separate pseudo-instruction. The hardware
+      // executes it with the following opcode, at the prefix's original PC.
+      std::uint64_t body_size = 0;
+      if (size != 1 || !decode(decoder, instruction, body_size, pc + size,
+                               bytes.substr(offset + size)) ||
+          decoder.ins->getName(instruction.getOpcode()) == "LOCK_PREFIX") {
+        result.decode_failed = true;
+        continue;
+      }
+      size += body_size;
     }
 
     const auto &analysis = *decoder.analysis;
@@ -223,14 +338,76 @@ Preview preview(std::uint64_t address, std::string_view bytes) {
     std::string text;
     llvm::raw_string_ostream assembly(text);
     decoder.printer->printInst(&instruction, pc + size, "", *decoder.sub, assembly);
+    const auto printed = llvm::StringRef(assembly.str()).trim();
+    const auto text_prefix = lock ? "lock " : "";
+    const auto &desc = decoder.ins->get(instruction.getOpcode());
+    const auto opcode = decoder.ins->getName(instruction.getOpcode());
+    bool changes_receiver = false, changes_stack = false;
+    const auto check_definition = [&](unsigned reg) {
+      const std::string_view name = decoder.regs->getName(reg);
+#if defined(__aarch64__)
+      changes_receiver |= name == "X0" || name == "W0";
+      changes_stack |= name == "SP" || name == "WSP";
+#else
+      changes_receiver |= name == "RDI" || name == "EDI" || name == "DI" || name == "DIL";
+      changes_stack |= name == "RSP" || name == "ESP" || name == "SP" || name == "SPL";
+#endif
+    };
+    for (unsigned i = 0; i < std::min(desc.getNumDefs(), instruction.getNumOperands()); ++i)
+      if (instruction.getOperand(i).isReg() && instruction.getOperand(i).getReg())
+        check_definition(instruction.getOperand(i).getReg());
+    for (auto reg : desc.implicit_defs())
+      check_definition(reg);
+    auto store = store32(decoder, instruction, bytes.substr(offset, size));
+#if defined(__aarch64__)
+    const bool architectural_hint = printed == "nop" || printed.starts_with("bti") ||
+        printed == "paciasp" || printed == "pacibsp" || printed == "autiasp" || printed == "autibsp";
+    const bool copyable = store.has_value() || opcode == "RET" || opcode == "RETAA" || opcode == "RETAB" ||
+        opcode == "STPXpre" || opcode == "STPXi" ||
+        opcode == "STRXpre" || opcode == "STRXui" || opcode == "STRWui" || opcode == "STURWi" ||
+        opcode == "LDRXui" || opcode == "LDURXi" || opcode == "LDRWui" || opcode == "LDURWi" ||
+        opcode == "LDPXi" || opcode == "STURXi" || opcode == "STPWpre" || opcode == "STPWi" ||
+        opcode == "ADDXri" || opcode == "ADDWri" || opcode == "SUBXri" ||
+        opcode == "ORRXrs" || opcode == "ORRWrs" ||
+        opcode == "MOVZWi" || opcode == "MOVZXi" || opcode == "MOVNWi" || opcode == "MOVNXi" ||
+        architectural_hint;
+    const bool entry_copyable = (opcode == "ADR" || opcode == "ADRP") &&
+        !changes_receiver && !changes_stack;
+    const bool may_store = desc.mayStore() && !architectural_hint;
+#else
+    const bool copyable = lock ? store.has_value() :
+        safe_instruction(instruction, *decoder.ins, *decoder.regs) ||
+        opcode == "INC64r" || opcode == "INC32r" || opcode == "DEC64r" ||
+        opcode == "DEC32r" || opcode == "SETCCr" || opcode == "LEAVE64" ||
+        opcode == "ENDBR64" || opcode == "CMP32ri8" || opcode == "CMP32ri" ||
+        opcode == "CMOV32rr" || opcode == "CMOV64rr";
+    const bool entry_copyable = copyable && !desc.mayLoad() && !desc.mayStore() &&
+        opcode != "ENDBR64" && opcode != "LEAVE64";
+    const bool may_store = desc.mayStore();
+#endif
     result.instructions.push_back({pc, static_cast<std::size_t>(size),
-                                   llvm::StringRef(assembly.str()).trim().str(),
+                                   text_prefix + printed.str(),
                                    is_call ? Flow::call : is_branch ? Flow::branch
                                              : returns ? Flow::returns : Flow::ordinary,
-                                   target, falls_through});
+                                   target, falls_through,
+                                   may_store, std::move(store), copyable,
+                                   changes_receiver, changes_stack,
+                                   entry_copyable,
+                                   opcode == "CALL64r" || opcode == "CALL64m",
+                                   !copyable && !lock &&
+                                       safe_instruction(instruction, *decoder.ins, *decoder.regs, true)});
   }
   std::sort(result.instructions.begin(), result.instructions.end(),
             [](const auto &a, const auto &b) { return a.address < b.address; });
   return result;
+}
+} // namespace
+
+Preview preview(std::uint64_t address, std::string_view bytes) {
+  return inspect(address, bytes, true);
+}
+
+Preview scan(std::uint64_t address, std::string_view bytes) {
+  return inspect(address, bytes, false);
 }
 } // namespace tracer::native_entry

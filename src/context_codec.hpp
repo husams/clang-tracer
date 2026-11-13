@@ -34,6 +34,17 @@ struct EncodeBudget {
   std::array<PathStep, 32> path{};
   Truncation truncation = nullptr;
   void *truncation_context = nullptr;
+  struct PointerGraph {
+    std::array<std::uintptr_t, 128> seen{};
+    std::size_t size = 0;
+    bool admit(std::uintptr_t address) noexcept {
+      if (size == seen.size() || std::find(seen.begin(), seen.begin() + size, address) != seen.begin() + size)
+        return false;
+      seen[size++] = address;
+      return true;
+    }
+  };
+  PointerGraph *pointer_graph = nullptr;
   bool enter() noexcept {
     return ++visits <= limits.visits && ++depth <= limits.depth;
   }
@@ -262,9 +273,12 @@ bool encode_snapshot_pointer(BoundedProtoWriter &w, std::uint32_t field,
                              EncodeBudget &budget) noexcept {
   if (!w.begin_message(field))
     return false;
-  bool ok = w.u64(1, reinterpret_cast<std::uintptr_t>(pointer));
+  const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+  const bool suppressed = owned && pointer && budget.pointer_graph &&
+                          !budget.pointer_graph->admit(address);
+  bool ok = w.u64(1, address) && w.boolean(3, suppressed);
   if constexpr (CanSnapshotPointee<T>::value)
-    if (ok && owned && pointer)
+    if (ok && owned && pointer && !suppressed)
       ok = encode_present_value(w, 2, *pointer, budget);
   return w.end_message() && ok;
 }

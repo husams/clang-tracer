@@ -17,6 +17,7 @@
 #include <clang/Basic/SourceManager.h>
 #include <google/protobuf/descriptor.pb.h>
 #include <llvm/ADT/SmallString.h>
+#include <llvm/Config/llvm-config.h>
 #include <llvm/Support/FileSystem.h>
 
 #include "tracer/compat.hpp"
@@ -31,7 +32,11 @@ using FDS = google::protobuf::FileDescriptorSet;
 std::string record_spelling(const clang::CXXRecordDecl *record) {
   clang::PrintingPolicy policy(record->getASTContext().getLangOpts());
   policy.SuppressTagKeyword = true;
+#if LLVM_VERSION_MAJOR >= 22
+  return clang::QualType(record->getASTContext().getCanonicalTagType(record).getTypePtr(), 0)
+#else
   return clang::QualType(record->getTypeForDecl(), 0)
+#endif
       .getCanonicalType().getAsString(policy);
 }
 
@@ -390,6 +395,7 @@ struct Builder {
         record->fields.push_back(snapshot_scalar("address", 1, SchemaKind::unsigned_integer, 64));
         if (snapshot_pointee(arg(s, 0)))
           add_optional(arg(s, 0), "value");
+        record->fields.push_back(snapshot_scalar("suppressed", 3, SchemaKind::boolean, 1));
       }
       out.kind = SchemaKind::message;
       out.message = std::move(record);
@@ -1290,8 +1296,10 @@ CodecSourceResult render_snapshot_member_accessors(
           field = candidate;
           break;
         }
-    if (!root || !field || !field->getType()->isPointerType()) {
-      result.error = "followed snapshot field is not a direct raw pointer field";
+    const auto *erased = field ? field->getType()->getAsCXXRecordDecl() : nullptr;
+    if (!root || !field || (!field->getType()->isPointerType() &&
+        (!erased || erased->getQualifiedNameAsString() != "std::any"))) {
+      result.error = "snapshot projection requires a direct raw pointer or std::any field";
       result.source.clear();
       return result;
     }

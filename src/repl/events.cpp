@@ -1,5 +1,6 @@
 #include "events.hpp"
 #include "../prepared_contract.hpp"
+#include "../object_snapshot.hpp"
 #include "tracer/protocol.hpp"
 
 #include <algorithm>
@@ -21,6 +22,7 @@
 #include <google/protobuf/descriptor.pb.h>
 #include <google/protobuf/dynamic_message.h>
 #include <google/protobuf/io/coded_stream.h>
+#include <google/protobuf/stubs/strutil.h>
 #include <google/protobuf/util/json_util.h>
 #include <google/protobuf/wire_format_lite.h>
 #include <sqlite3.h>
@@ -127,389 +129,6 @@ ScalarValue typed_scalar(const Value &value, unsigned type) {
   }
   throw std::invalid_argument(
       "event scalar has a missing, invalid, or mismatched payload");
-}
-
-using Descriptor = google::protobuf::FieldDescriptor;
-
-template <class Options>
-std::string snapshot_option(const Options &options, const char *name) {
-  for (const auto &option : options.uninterpreted_option())
-    if (option.name_size() == 1 && option.name(0).name_part() == name &&
-        option.has_string_value())
-      return option.string_value();
-  return {};
-}
-
-// Shared-context schemas name messages using the canonical C++ type.
-std::string context_descriptor_type(std::string_view cpp_type) {
-  std::uint64_t hash = 1469598103934665603ULL;
-  for (unsigned char byte : cpp_type) {
-    hash ^= byte;
-    hash *= 1099511628211ULL;
-  }
-  std::ostringstream name;
-  name << "tracer.generated.state.M_" << std::hex << hash;
-  return name.str();
-}
-
-std::string field_path(const std::string &parent, int number) {
-  return (parent.empty() ? "" : parent + ".") + std::to_string(number);
-}
-
-class SnapshotDecoder {
-  std::map<std::string, std::string> roles_;
-  std::map<std::string, std::string> types_;
-  std::size_t visited_ = 0;
-  const std::string &payload_;
-  bool context_state_;
-  static std::uint64_t
-  read_integer(google::protobuf::io::CodedInputStream &input,
-               std::string_view bytes, int end) {
-    const int begin = input.CurrentPosition();
-    std::uint64_t value = 0;
-    if (!input.ReadVarint64(&value) || input.CurrentPosition() > end)
-      throw std::runtime_error("invalid snapshot integer payload");
-    const int count = input.CurrentPosition() - begin;
-    if (count < 1 || count > 10 ||
-        (count == 10 && static_cast<unsigned char>(
-                            bytes[static_cast<std::size_t>(begin + 9)]) > 1))
-      throw std::runtime_error("snapshot varint exceeds 64 bits");
-    return value;
-  }
-  static void validate_integer(const Descriptor &field, std::uint64_t value) {
-    if ((field.type() == Descriptor::TYPE_BOOL && value > 1) ||
-        ((field.type() == Descriptor::TYPE_SINT32 ||
-          field.type() == Descriptor::TYPE_UINT32) &&
-         value > std::numeric_limits<std::uint32_t>::max()) ||
-        ((field.type() == Descriptor::TYPE_INT32 ||
-          field.type() == Descriptor::TYPE_ENUM) &&
-         value > std::numeric_limits<std::int32_t>::max() &&
-         value < std::numeric_limits<std::uint64_t>::max() -
-                     std::numeric_limits<std::int32_t>::max()))
-      throw std::runtime_error(
-          "snapshot integer payload is outside its schema range");
-  }
-
-  void validate(const google::protobuf::Descriptor &type,
-                std::string_view bytes, const std::string &path, bool wrapper,
-                bool map_entry, unsigned depth) {
-    if (depth > 32 || ++visited_ > 16384)
-      throw std::runtime_error("event snapshot exceeds validation limits");
-    using Wire = google::protobuf::internal::WireFormatLite;
-    google::protobuf::io::CodedInputStream input(
-        reinterpret_cast<const std::uint8_t *>(bytes.data()),
-        static_cast<int>(bytes.size()));
-    std::set<int> present;
-    const auto wire_path = [&](int number) {
-      if (map_entry)
-        return path + (number == 1 ? "/key" : "/value");
-      return wrapper && number == 1 ? path
-                                    : field_path(path, number);
-    };
-    for (std::uint32_t tag; (tag = input.ReadTag()) != 0;) {
-      const auto *field = type.FindFieldByNumber(static_cast<int>(tag >> 3));
-      if (!field) {
-        if (!Wire::SkipField(&input, tag))
-          throw std::runtime_error("invalid snapshot wire data");
-        continue;
-      }
-      const auto wire = tag & 7;
-      const auto expected = Wire::WireTypeForFieldType(
-          static_cast<Wire::FieldType>(field->type()));
-      if (wire != static_cast<unsigned>(expected) &&
-          !(field->is_repeated() && field->is_packable() &&
-            wire == Wire::WIRETYPE_LENGTH_DELIMITED))
-        throw std::runtime_error("snapshot field has the wrong wire type");
-      if (!field->is_repeated() && !present.insert(field->number()).second)
-        throw std::runtime_error("duplicate singular snapshot field");
-      present.insert(field->number());
-      if (field->cpp_type() == Descriptor::CPPTYPE_MESSAGE) {
-        std::uint32_t length = 0;
-        if (!input.ReadVarint32(&length) ||
-            length > bytes.size() -
-                         static_cast<std::size_t>(input.CurrentPosition()))
-          throw std::runtime_error("truncated snapshot message");
-        const auto body = bytes.substr(
-            static_cast<std::size_t>(input.CurrentPosition()), length);
-        if (!input.Skip(static_cast<int>(length)))
-          throw std::runtime_error("invalid snapshot message length");
-        auto child = wire_path(field->number());
-        const auto role = roles_.find(child);
-        const bool child_map =
-            field->is_repeated() && role != roles_.end() &&
-            (role->second == "map" || role->second == "unordered_map");
-        if (field->is_repeated() && !child_map)
-          child += "/value";
-        const auto child_role = roles_.find(child);
-        bool child_wrapper = false;
-        if (!child_map && child_role != roles_.end()) {
-          if (child_role->second == "optional") {
-            child += "/value";
-            child_wrapper = true;
-          } else if (field->message_type()->field_count() == 1 &&
-                     field->message_type()->field(0)->is_repeated())
-            child_wrapper = true;
-        }
-        validate(*field->message_type(), body, child, child_wrapper, child_map,
-                 depth + 1);
-      } else if (wire == Wire::WIRETYPE_VARINT) {
-        const auto value =
-            read_integer(input, bytes, static_cast<int>(bytes.size()));
-        validate_integer(*field, value);
-      } else if (wire == Wire::WIRETYPE_LENGTH_DELIMITED &&
-                 expected == Wire::WIRETYPE_VARINT) {
-        std::uint32_t length = 0;
-        if (!input.ReadVarint32(&length) ||
-            length > bytes.size() -
-                         static_cast<std::size_t>(input.CurrentPosition()))
-          throw std::runtime_error("invalid packed snapshot length");
-        const int end = input.CurrentPosition() + static_cast<int>(length);
-        while (input.CurrentPosition() < end) {
-          const auto value = read_integer(input, bytes, end);
-          validate_integer(*field, value);
-        }
-      } else if (!Wire::SkipField(&input, tag))
-        throw std::runtime_error("invalid snapshot scalar payload");
-    }
-    if (!input.ConsumedEntireMessage())
-      throw std::runtime_error("invalid snapshot wire ending");
-    for (int i = 0; i < type.field_count(); ++i) {
-      const auto *field = type.field(i);
-      const auto role = roles_.find(wire_path(field->number()));
-      if (!field->is_repeated() &&
-          (role == roles_.end() || role->second != "optional") &&
-          !present.count(field->number()))
-        throw std::runtime_error("event snapshot is missing field: " +
-                                 std::string(field->name()));
-    }
-  }
-
-  EventValue item(const google::protobuf::Message &message,
-                  const Descriptor &field, int index, const std::string &path,
-                  unsigned depth) {
-    if (depth > 32 || ++visited_ > 16384)
-      throw std::runtime_error("event snapshot exceeds decoding limits");
-    const auto *r = message.GetReflection();
-    const bool repeated = index >= 0;
-    switch (field.cpp_type()) {
-    case Descriptor::CPPTYPE_BOOL:
-      return EventValue{repeated ? r->GetRepeatedBool(message, &field, index)
-                                 : r->GetBool(message, &field)};
-    case Descriptor::CPPTYPE_INT32:
-      return EventValue{
-          std::int64_t(repeated ? r->GetRepeatedInt32(message, &field, index)
-                                : r->GetInt32(message, &field))};
-    case Descriptor::CPPTYPE_INT64:
-      return EventValue{
-          std::int64_t(repeated ? r->GetRepeatedInt64(message, &field, index)
-                                : r->GetInt64(message, &field))};
-    case Descriptor::CPPTYPE_UINT32:
-      return EventValue{
-          std::uint64_t(repeated ? r->GetRepeatedUInt32(message, &field, index)
-                                 : r->GetUInt32(message, &field))};
-    case Descriptor::CPPTYPE_UINT64:
-      return EventValue{
-          std::uint64_t(repeated ? r->GetRepeatedUInt64(message, &field, index)
-                                 : r->GetUInt64(message, &field))};
-    case Descriptor::CPPTYPE_FLOAT:
-      return EventValue{double(repeated
-                                   ? r->GetRepeatedFloat(message, &field, index)
-                                   : r->GetFloat(message, &field))};
-    case Descriptor::CPPTYPE_DOUBLE:
-      return EventValue{repeated ? r->GetRepeatedDouble(message, &field, index)
-                                 : r->GetDouble(message, &field)};
-    case Descriptor::CPPTYPE_ENUM:
-      return EventValue{std::int64_t(
-          repeated ? r->GetRepeatedEnumValue(message, &field, index)
-                   : r->GetEnumValue(message, &field))};
-    case Descriptor::CPPTYPE_STRING:
-      return EventValue{repeated ? r->GetRepeatedString(message, &field, index)
-                                 : r->GetString(message, &field)};
-    case Descriptor::CPPTYPE_MESSAGE: {
-      const auto &nested = repeated
-                               ? r->GetRepeatedMessage(message, &field, index)
-                               : r->GetMessage(message, &field);
-      const auto *type = nested.GetDescriptor();
-      const auto parent_path =
-          path.size() >= 6 && path.compare(path.size() - 6, 6, "/value") == 0
-              ? path.substr(0, path.size() - 6)
-              : std::string();
-      const auto parent_role = roles_.find(parent_path);
-      if (repeated && parent_role != roles_.end() &&
-          (parent_role->second == "map" ||
-           parent_role->second == "unordered_map")) {
-        const auto *key = type->FindFieldByNumber(1),
-                   *value = type->FindFieldByNumber(2);
-        if (!key || !value)
-          throw std::runtime_error("invalid event map schema");
-        return EventValue{EventValue::Object{
-            {"key",
-             decode_field(nested, *key, parent_path + "/key", depth + 1)},
-            {"value",
-             decode_field(nested, *value, parent_path + "/value", depth + 1)}}};
-      }
-      const auto role = roles_.find(path);
-      if (role != roles_.end() && role->second == "optional") {
-        if (!repeated && !r->HasField(message, &field))
-          return {};
-        const auto *value = type->FindFieldByNumber(1);
-        if (!value)
-          throw std::runtime_error("invalid optional snapshot schema");
-        return decode_field(nested, *value, path + "/value", depth + 1);
-      }
-      if (role != roles_.end() && role->second != "optional" &&
-          type->field_count() == 1 && type->field(0)->is_repeated())
-        return decode_field(nested, *type->field(0), path, depth + 1);
-      const auto mapped = types_.find(std::string(type->full_name()));
-      return EventValue{
-          record_fields(nested, path, depth),
-          mapped == types_.end() ? std::string() : mapped->second,
-          context_state_ ? std::string(type->full_name()) : std::string()};
-    }
-    }
-    throw std::runtime_error("unsupported snapshot field");
-  }
-  EventValue decode_field(const google::protobuf::Message &message,
-                          const Descriptor &field, const std::string &path,
-                          unsigned depth) {
-    if (!field.is_repeated())
-      return item(message, field, -1, path, depth);
-    const auto count = message.GetReflection()->FieldSize(message, &field);
-    if (count > 4096)
-      throw std::runtime_error("event container exceeds decoding limit");
-    EventValue::Array values;
-    values.reserve(static_cast<std::size_t>(count));
-    for (int i = 0; i < count; ++i)
-      values.push_back(item(message, field, i, path + "/value", depth + 1));
-    return EventValue{std::move(values)};
-  }
-
-  EventValue::Object record_fields(const google::protobuf::Message &message,
-                                   const std::string &path, unsigned depth) {
-    EventValue::Object fields;
-    const auto *type = message.GetDescriptor();
-    for (int i = 0; i < type->field_count(); ++i) {
-      const auto &member = *type->field(i);
-      auto name = snapshot_option(member.options(), "tracer_cpp_field_name");
-      if (name.empty())
-        name = member.has_json_name() ? member.json_name() : member.name();
-      fields.emplace(std::move(name),
-                     decode_field(message, member, field_path(path, member.number()),
-                                  depth + 1));
-    }
-    return fields;
-  }
-
-public:
-  SnapshotDecoder(const std::string &payload,
-                  const google::protobuf::RepeatedPtrField<std::string> &roles,
-                  const google::protobuf::RepeatedPtrField<std::string> &types,
-                  bool context_state)
-      : payload_(payload), context_state_(context_state) {
-    for (const auto &type : types) {
-      const auto split = type.find('=');
-      if (split == std::string::npos ||
-          !types_.emplace(type.substr(0, split), type.substr(split + 1)).second)
-        throw std::runtime_error("invalid snapshot record types");
-    }
-    for (const auto &role : roles) {
-      const auto split = role.find('=');
-      if (split == std::string::npos ||
-          !roles_.emplace(role.substr(0, split), role.substr(split + 1)).second)
-        throw std::runtime_error("invalid snapshot container roles");
-    }
-  }
-
-  EventValue decode(const google::protobuf::Message &message,
-                    const std::string &type, bool wrapped) {
-    if (!wrapped) {
-      validate(*message.GetDescriptor(), payload_, "", false, false, 0);
-      return EventValue{record_fields(message, "", 0), type};
-    }
-    validate(*message.GetDescriptor(), payload_, "1", true, false, 0);
-    const auto *field = message.GetDescriptor()->FindFieldByNumber(1);
-    if (!field || message.GetDescriptor()->field_count() != 1)
-      throw std::runtime_error("invalid snapshot root schema");
-    auto result = decode_field(message, *field, "1", 0);
-    return EventValue{result.data(), type};
-  }
-};
-
-EventValue decode_owned_value(
-    const std::string &cpp_type, const std::string &root_type,
-    const std::string &descriptors, const std::string &payload,
-    const google::protobuf::RepeatedPtrField<std::string> &roles,
-    const google::protobuf::RepeatedPtrField<std::string> &types,
-    bool context_state, bool wrapped) {
-  const auto descriptor_limit = context_state ? 1024 * 1024 : 16384;
-  const auto payload_limit = context_state ? 256 * 1024 : 65536;
-  if (cpp_type.empty() || root_type.empty() ||
-      descriptors.size() > static_cast<std::size_t>(descriptor_limit) ||
-      payload.size() > static_cast<std::size_t>(payload_limit))
-    throw std::runtime_error("invalid or oversized event snapshot");
-  google::protobuf::FileDescriptorSet files;
-  if (!files.ParseFromString(descriptors) ||
-      files.file_size() > 16)
-    throw std::runtime_error("invalid event snapshot descriptors");
-  google::protobuf::DescriptorPool pool;
-  std::vector<bool> built(static_cast<std::size_t>(files.file_size()));
-  std::size_t remaining = built.size();
-  while (remaining) {
-    bool progress = false;
-    for (int i = 0; i < files.file_size(); ++i) {
-      if (built[static_cast<std::size_t>(i)])
-        continue;
-      bool ready = true;
-      for (const auto &dependency : files.file(i).dependency())
-        ready &= pool.FindFileByName(dependency) != nullptr;
-      if (ready) {
-        if (!pool.BuildFile(files.file(i)))
-          throw std::runtime_error("invalid event snapshot schema");
-        built[static_cast<std::size_t>(i)] = true;
-        --remaining;
-        progress = true;
-      }
-    }
-    if (!progress)
-      throw std::runtime_error("unresolved snapshot schema dependencies");
-  }
-  const auto *root = pool.FindMessageTypeByName(root_type);
-  if (!root)
-    throw std::runtime_error("snapshot root type not found");
-  google::protobuf::DynamicMessageFactory factory(&pool);
-  const auto *prototype = factory.GetPrototype(root);
-  if (!prototype)
-    throw std::runtime_error("invalid snapshot root prototype");
-  std::unique_ptr<google::protobuf::Message> value(prototype->New());
-  if (!value->ParseFromString(payload))
-    throw std::runtime_error("invalid event snapshot payload");
-  return SnapshotDecoder(payload, roles, types, context_state).decode(*value, cpp_type, wrapped);
-}
-
-EventValue decode_snapshot(const clangtracer::context::v1::ValueSnapshot &snapshot,
-                           bool include_members = true) {
-  using Snapshot = clangtracer::context::v1::ValueSnapshot;
-  if (snapshot.status() != Snapshot::COMPLETE)
-    throw std::runtime_error("event snapshot unavailable: " + snapshot.detail());
-  auto value = decode_owned_value(snapshot.cpp_type(), snapshot.root_type(),
-                                 snapshot.descriptor_set(), snapshot.payload(),
-                                 snapshot.container_roles(), snapshot.record_types(),
-                                 false, true);
-  if (snapshot.members().empty())
-    return value;
-  if (!include_members ||
-      snapshot.members_size() > static_cast<int>(tracer::kMaxSnapshotMembers))
-    throw std::runtime_error("invalid event snapshot member count or depth");
-  auto fields = value.fields();
-  std::set<std::string> names;
-  for (const auto &member : snapshot.members()) {
-    if (member.name().empty() || !member.has_snapshot() ||
-        fields.count(member.name()) || !names.insert(member.name()).second)
-      throw std::runtime_error("invalid or duplicate event snapshot member");
-    if (member.snapshot().status() == Snapshot::COMPLETE)
-      fields.emplace(member.name(), decode_snapshot(member.snapshot(), false));
-  }
-  return EventValue{std::move(fields), value.cpp_type()};
 }
 
 void decoded_states(const api::TraceEvent &event, std::ostream &out) {
@@ -637,16 +256,6 @@ ScalarValue Event::result_value() const {
   return typed_scalar(event.result(), event.result().type());
 }
 
-// The native REPL JIT needs a stable destructor for snapshot temporaries.
-EventValue::~EventValue() = default;
-
-bool EventValue::matches_record_type(std::string_view name) const {
-  if (!type_.empty())
-    return std::string_view(type_) == name;
-  return !descriptor_type_.empty() && descriptor_type_ == context_descriptor_type(name);
-}
-
-
 EventValue Event::argument_snapshot(std::size_t index) const {
   const auto &event = data_->message;
   if (event.has_context()) {
@@ -705,6 +314,33 @@ EventValue Event::receiver_snapshot() const {
   return decode_snapshot(event.receiver_snapshot());
 }
 
+void print_receiver_delta(const api::TraceEvent &before, const api::TraceEvent &after,
+                          const std::vector<std::string> &keys, std::ostream &out) {
+  if (before.phase() != api::PRE || after.phase() != api::POST ||
+      !after.receiver_sampled_at_return() || !before.call_id() ||
+      before.call_id() != after.call_id() || before.session_id() != after.session_id() ||
+      before.server_instance_id() != after.server_instance_id() ||
+      before.probe_id() != after.probe_id() || before.pid() != after.pid() ||
+      before.tid() != after.tid() || !before.object_address() ||
+      before.object_address() != after.object_address() || before.sequence() >= after.sequence())
+    throw std::invalid_argument("diff requires independently sampled entry and return for one invocation");
+  validate_snapshot_keys(keys);
+  out << "snapshot_window call=" << before.call_id()
+      << " function=" << std::quoted(before.function_name()) << '\n';
+  if (!before.has_receiver_snapshot() || !after.has_receiver_snapshot()) {
+    out << "coverage_gap receiver missing sample\n";
+    return;
+  }
+  const auto changes = compare_snapshots(before.receiver_snapshot(), after.receiver_snapshot(), keys);
+  std::size_t gaps = 0;
+  for (const auto &change : changes) {
+    gaps += change.gap;
+    out << (change.gap ? "coverage_gap " : "snapshot_delta ")
+        << change.path << ' ' << change.detail << '\n';
+  }
+  out << "snapshot_changes=" << changes.size() - gaps << " gaps=" << gaps << '\n';
+}
+
 EventValue Event::result_snapshot() const {
   const auto &event = data_->message;
   if (event.has_context() && event.context().event().has_result()) {
@@ -759,6 +395,84 @@ std::string value_text(const api::Value &value) {
 
 std::string event_summary(const api::TraceEvent &event) {
   std::ostringstream out;
+  if (event.has_object_observation()) {
+    const auto &object = event.object_observation();
+    out << "cursor=" << event.sequence() << " watch=" << event.probe_id()
+        << " tid=" << event.tid() << " " << api::ObjectObservation::Kind_Name(object.kind());
+    if (object.lifetime_id())
+      out << " " << object.concrete_type() << "#" << object.lifetime_id()
+          << " generation=" << object.generation() << " address=0x" << std::hex
+          << event.object_address() << std::dec;
+    if (object.borrow_id())
+      out << " borrow=" << object.borrow_id();
+    if (object.runtime_module_generation())
+      out << " module_generation=" << object.runtime_module_generation();
+    if (object.has_shared_storage()) {
+      const auto &storage = object.shared_storage();
+      out << " shared_storage=" << storage.device() << ':' << storage.inode()
+          << ':' << storage.file_offset();
+    }
+    if (object.external_write_order_unknown())
+      out << " external_order=unknown";
+    if (object.owner_address())
+      out << " owner=0x" << std::hex << object.owner_address() << std::dec;
+    if (object.has_owner_index())
+      out << " slot=" << object.owner_index();
+    if (!object.field().empty())
+      out << " " << object.field();
+    if (object.has_old_integer())
+      out << " " << object.old_integer() << " ->";
+    else if (object.kind() == api::ObjectObservation::FIELD_CHANGED && object.has_new_integer())
+      out << " old=unavailable ->";
+    if (object.has_new_integer())
+      out << " " << object.new_integer();
+    if (object.has_old_string())
+      out << " \"" << google::protobuf::CEscape(object.old_string()) << "\" ->";
+    if (object.has_new_string())
+      out << " \"" << google::protobuf::CEscape(object.new_string()) << '"';
+    const auto union_sample = [&](std::uint32_t tag, const std::string &member,
+                                  const api::ObjectObservation::SnapshotValue &value) {
+      out << " tag=" << tag;
+      if (member.empty())
+        return;
+      out << ' ' << member << '=';
+      if (value.has_signed_value())
+        out << value.signed_value();
+      else if (value.has_unsigned_value())
+        out << value.unsigned_value();
+      else if (value.has_real_value())
+        out << value.real_value();
+    };
+    if (object.has_old_union_tag()) {
+      union_sample(object.old_union_tag(), object.old_union_member(), object.snapshot_before());
+      out << " ->";
+    }
+    if (object.has_new_union_tag())
+      union_sample(object.new_union_tag(), object.new_union_member(), object.snapshot_after());
+    const auto raw_bytes = [&](const std::string &bytes) {
+      std::ostringstream encoded;
+      encoded << std::hex << std::setfill('0');
+      for (unsigned char byte : bytes)
+        encoded << std::setw(2) << unsigned(byte);
+      return encoded.str();
+    };
+    if (object.has_old_bytes())
+      out << " bytes=" << raw_bytes(object.old_bytes()) << " ->";
+    if (object.has_new_bytes())
+      out << " bytes=" << raw_bytes(object.new_bytes());
+    if (object.destination())
+      out << " destination=0x" << std::hex << object.destination() << std::dec;
+    if (object.pc())
+      out << " pc=0x" << std::hex << object.pc() << std::dec;
+    if (!object.function().empty())
+      out << " function=" << std::quoted(object.function())
+          << " module=" << std::quoted(object.module());
+    if (!object.file().empty())
+      out << " " << object.file() << ":" << object.line();
+    if (!object.diagnostic().empty())
+      out << " | " << object.diagnostic();
+    return out.str();
+  }
   out << "cursor=" << event.sequence() << " session=" << event.session_id()
       << " pid=" << event.pid() << " tid=" << event.tid()
       << " probe=" << event.probe_id()

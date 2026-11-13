@@ -3,6 +3,8 @@
 #include "probe_extra_arguments.hpp"
 #include "proc_identity.hpp"
 #include "process_memory.hpp"
+#include "object_snapshot.hpp"
+#include "object_watch_plan.hpp"
 
 #include <algorithm>
 #include <array>
@@ -453,6 +455,38 @@ bool decode_symbol_page_token(
 }
 
 class EventHub final {
+public:
+  struct SnapshotWatch {
+    struct Receiver {
+      std::uint32_t first_thread = 0;
+      std::uint32_t active_thread = 0;
+      std::size_t pending = 0;
+      bool violated = false;
+    };
+    std::uint64_t id = 0;
+    std::string type;
+    std::vector<std::string> fields;
+    std::vector<std::string> keys;
+    std::uint64_t observations = 0;
+    std::uint64_t gaps = 0;
+    std::uint64_t dropped = 0;
+    api::ObjectWatchRequest::Synchronization synchronization =
+        api::ObjectWatchRequest::SYNCHRONIZATION_UNSPECIFIED;
+    std::size_t max_instances = 0;
+    std::uint64_t max_events = 0;
+    std::chrono::seconds timeout{};
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max();
+    std::map<std::uint64_t, Receiver> receivers;
+    bool armed = false;
+  };
+
+  struct SnapshotBinding {
+    std::shared_ptr<SnapshotWatch> watch;
+    api::ObjectObservation origin;
+    std::map<std::pair<std::uint32_t, std::uint64_t>, api::TraceEvent> pending;
+  };
+
+private:
   struct ProbeIdentity {
     std::uint32_t pid = 0;
     std::string function_name;
@@ -488,7 +522,8 @@ public:
 
   void set_probe(const std::string &session_id, std::uint64_t probe_id,
                  std::uint32_t pid, std::string function_name, bool active,
-                 const clangtracer::v1::PreparedInjector *prepared = nullptr) {
+                 const clangtracer::v1::PreparedInjector *prepared = nullptr,
+                 SnapshotBinding snapshot = {}) {
     std::shared_ptr<const clangtracer::v1::PreparedInjector> replay_types;
     if (prepared && tracer::prepared::is_typed_version(prepared->format_version()) &&
         !prepared->adapter_declarations().empty() &&
@@ -502,6 +537,8 @@ public:
     std::lock_guard lock(mutex_);
     const auto key = std::make_pair(session_id, probe_id);
     if (active) {
+      if (snapshot.watch)
+        snapshot_probes_.emplace(key, std::move(snapshot));
       const auto existing = active_probes_.find(key);
       if (existing != active_probes_.end()) {
         function_name = existing->second.function_name;
@@ -530,11 +567,33 @@ public:
         known_probes_[key] = std::move(identity);
       received_.try_emplace(key, 0);
     } else {
+      flush_snapshot_probe_locked(key);
       active_probes_.erase(key);
       const auto found = received_.find(key);
       if (found != received_.end() && found->second == 0)
         received_.erase(found);
     }
+  }
+
+  void snapshot_status(const SnapshotWatch &watch, api::ObjectWatchStatus &status) {
+    std::lock_guard lock(mutex_);
+    status.set_observations(watch.observations);
+    status.set_dropped(watch.dropped);
+    status.set_coverage_gaps(watch.gaps);
+    status.set_admitted_receivers(watch.receivers.size());
+    status.set_capture_limit(snapshot_limit(watch));
+  }
+
+  void activate_snapshot_watch(SnapshotWatch &watch) {
+    std::lock_guard lock(mutex_);
+    watch.armed = true;
+    if (watch.timeout.count())
+      watch.deadline = std::chrono::steady_clock::now() + watch.timeout;
+  }
+
+  void publish_object_observation(clangtracer::v1::TraceEvent event) {
+    std::lock_guard lock(mutex_);
+    append_native_locked(std::move(event));
   }
 
   bool publish_context(
@@ -796,6 +855,7 @@ public:
           return (found == received_.end() ? 0 : found->second) >= expected;
         }))
       return false;
+    flush_snapshot_probe_locked(key);
     active_probes_.erase(key);
     // Retain the count like Session's inactive ProbeRecord: detach and retries
     // may retire the same probe again after an earlier successful remove.
@@ -987,11 +1047,181 @@ private:
   std::map<std::pair<std::string, std::uint64_t>, ProbeIdentity> active_probes_;
   std::map<std::pair<std::string, std::uint64_t>, ProbeIdentity> known_probes_;
   std::map<std::pair<std::string, std::uint64_t>, std::uint64_t> received_;
+  std::map<std::pair<std::string, std::uint64_t>, SnapshotBinding> snapshot_probes_;
+  std::size_t pending_snapshots_ = 0;
+  std::size_t pending_snapshot_bytes_ = 0;
   std::deque<clangtracer::v1::TraceEvent> history_;
   std::size_t context_bytes_ = 0;
   std::size_t context_event_count_ = 0;
   std::uint64_t next_sequence_ = 1;
   std::uint64_t dropped_ = 0;
+
+  static const char *snapshot_limit(const SnapshotWatch &watch) {
+    if (watch.max_events && watch.observations >= watch.max_events)
+      return "max-events";
+    if (std::chrono::steady_clock::now() >= watch.deadline)
+      return "timeout";
+    return "";
+  }
+
+  void publish_snapshot_locked(const SnapshotBinding &binding, const api::TraceEvent &anchor,
+                               const tracer_repl::SnapshotChange &change) {
+    if (*snapshot_limit(*binding.watch))
+      return;
+    api::TraceEvent event;
+    event.set_protocol_version(anchor.protocol_version());
+    event.set_session_id(anchor.session_id());
+    event.set_probe_id(binding.watch->id);
+    event.set_pid(anchor.pid());
+    event.set_tid(anchor.tid());
+    event.set_call_id(anchor.call_id());
+    event.set_object_address(anchor.object_address());
+    event.set_monotonic_time_ns(anchor.monotonic_time_ns());
+    event.set_agent_dropped_events(anchor.agent_dropped_events());
+    event.set_function_name("object.trace");
+    if (anchor.has_stack())
+      *event.mutable_stack() = anchor.stack();
+    auto &observation = *event.mutable_object_observation();
+    observation = binding.origin;
+    observation.set_boundary_probe_id(anchor.probe_id());
+    observation.set_kind(change.gap ? api::ObjectObservation::COVERAGE_GAP
+                                    : api::ObjectObservation::SNAPSHOT_DELTA);
+    observation.set_concrete_type(binding.watch->type);
+    observation.set_field(change.path);
+    observation.set_diagnostic(change.detail);
+    observation.set_synchronization(binding.watch->synchronization);
+    const auto set_snapshot_value = [](const tracer_repl::EventValue &value,
+                                       api::ObjectObservation::SnapshotValue &out) {
+      const auto &data = value.data();
+      if (value.is_null())
+        out.set_null_value(true);
+      else if (const auto *boolean = std::get_if<bool>(&data))
+        out.set_boolean_value(*boolean);
+      else if (const auto *integer = std::get_if<std::int64_t>(&data))
+        out.set_signed_value(*integer);
+      else if (const auto *integer = std::get_if<std::uint64_t>(&data))
+        out.set_unsigned_value(*integer);
+      else if (const auto *real = std::get_if<double>(&data))
+        out.set_real_value(*real);
+      else if (const auto *text = std::get_if<std::string>(&data))
+        out.set_string_value(*text);
+    };
+    if (change.before)
+      set_snapshot_value(*change.before, *observation.mutable_snapshot_before());
+    if (change.after)
+      set_snapshot_value(*change.after, *observation.mutable_snapshot_after());
+    ++binding.watch->observations;
+    binding.watch->gaps += change.gap;
+    append_native_locked(std::move(event));
+  }
+
+  void forget_snapshot_locked(SnapshotWatch &watch, const api::TraceEvent &event) {
+    --pending_snapshots_;
+    pending_snapshot_bytes_ -= event.ByteSizeLong();
+    auto &receiver = watch.receivers.at(event.object_address());
+    if (!--receiver.pending)
+      receiver.active_thread = 0;
+  }
+
+  void flush_snapshot_probe_locked(const std::pair<std::string, std::uint64_t> &key) {
+    const auto found = snapshot_probes_.find(key);
+    if (found == snapshot_probes_.end())
+      return;
+    for (const auto &entry : found->second.pending) {
+      const auto &event = entry.second;
+      forget_snapshot_locked(*found->second.watch, event);
+      publish_snapshot_locked(found->second, event, {"receiver", "method return unavailable at retirement", true});
+    }
+    snapshot_probes_.erase(found);
+  }
+
+  void sample_snapshot_locked(SnapshotBinding &binding, api::TraceEvent event) {
+    auto &watch = *binding.watch;
+    if (!watch.armed)
+      return;
+    const auto key = std::make_pair(event.tid(), event.call_id());
+    const auto existing = binding.pending.find(key);
+    if (event.phase() == api::PRE) {
+      if (*snapshot_limit(watch))
+        return;
+      if (existing != binding.pending.end()) {
+        publish_snapshot_locked(binding, event, {"receiver", "duplicate method entry", true});
+        forget_snapshot_locked(watch, existing->second);
+        binding.pending.erase(existing);
+        return;
+      }
+      const auto bytes = event.ByteSizeLong();
+      if (pending_snapshots_ >= limits_.events ||
+          bytes > limits_.context_bytes - pending_snapshot_bytes_) {
+        ++watch.dropped;
+        publish_snapshot_locked(binding, event, {"receiver", "method entry sample buffer exhausted", true});
+        return;
+      }
+      if (!event.object_address()) {
+        publish_snapshot_locked(binding, event, {"receiver", "method entry receiver unavailable", true});
+        return;
+      }
+      auto found = watch.receivers.find(event.object_address());
+      if (found == watch.receivers.end()) {
+        if (watch.receivers.size() >= watch.max_instances) {
+          publish_snapshot_locked(binding, event, {"receiver", "receiver admission limit reached", true});
+          return;
+        }
+        found = watch.receivers.emplace(event.object_address(), SnapshotWatch::Receiver{event.tid()}).first;
+      }
+      auto &receiver = found->second;
+      if ((watch.synchronization == api::ObjectWatchRequest::THREAD_CONFINED &&
+           receiver.first_thread != event.tid()) ||
+          (receiver.active_thread && receiver.active_thread != event.tid()))
+        receiver.violated = true;
+      if (receiver.violated) {
+        publish_snapshot_locked(binding, event, {"receiver", "declared snapshot synchronization was violated", true});
+        return;
+      }
+      receiver.active_thread = event.tid();
+      ++receiver.pending;
+      pending_snapshot_bytes_ += bytes;
+      ++pending_snapshots_;
+      binding.pending.emplace(key, std::move(event));
+      return;
+    }
+    if (existing == binding.pending.end()) {
+      publish_snapshot_locked(binding, event, {"receiver", "method entry sample unavailable", true});
+      return;
+    }
+    auto &before = existing->second;
+    forget_snapshot_locked(watch, before);
+    if (watch.receivers.at(before.object_address()).violated) {
+      publish_snapshot_locked(binding, before, {"receiver", "overlapping observation has no stable receiver", true});
+    } else if (!event.receiver_sampled_at_return() || !event.has_receiver_snapshot() ||
+        !before.has_receiver_snapshot() || !event.object_address() ||
+        before.object_address() != event.object_address()) {
+      publish_snapshot_locked(binding, before, {"receiver", "matching receiver samples unavailable", true});
+    } else {
+      const auto changes = tracer_repl::compare_snapshots(before.receiver_snapshot(),
+          event.receiver_snapshot(), binding.watch->keys, binding.watch->fields);
+      for (const auto &change : changes)
+        publish_snapshot_locked(binding, before, change);
+    }
+    binding.pending.erase(existing);
+  }
+
+  void append_native_locked(clangtracer::v1::TraceEvent event) {
+    event.set_sequence(next_sequence_++);
+    event.set_server_instance_id(instance_id_);
+    if (history_.size() == limits_.events) {
+      if (history_.front().has_context()) {
+        context_bytes_ -= history_.front().ByteSizeLong();
+        --context_event_count_;
+      }
+      evicted_through_ = std::max(evicted_through_, history_.front().sequence());
+      history_.pop_front();
+      ++dropped_;
+    }
+    event.set_server_dropped_events(dropped_);
+    history_.push_back(std::move(event));
+    changed_.notify_all();
+  }
 
   const clangtracer::v1::PreparedInjector *
   recording_types(const clangtracer::v1::TraceEvent &event,
@@ -1231,23 +1461,16 @@ private:
       // Function identity comes from the registered probe, not the agent packet.
       event.clear_function_name();
       event.clear_replay_types();
+      event.clear_object_observation();
       event.set_function_name(active->second.function_name);
       ++received_[active->first];
-      event.set_sequence(next_sequence_++);
-      event.set_server_instance_id(instance_id_);
-      if (history_.size() == limits_.events) {
-        if (history_.front().has_context()) {
-          context_bytes_ -= history_.front().ByteSizeLong();
-          --context_event_count_;
-        }
-        evicted_through_ =
-            std::max(evicted_through_, history_.front().sequence());
-        history_.pop_front();
-        ++dropped_;
+      const auto snapshot = snapshot_probes_.find(active->first);
+      if (snapshot == snapshot_probes_.end()) {
+        append_native_locked(std::move(event));
+      } else {
+        sample_snapshot_locked(snapshot->second, std::move(event));
+        changed_.notify_all();
       }
-      event.set_server_dropped_events(dropped_);
-      history_.push_back(std::move(event));
-      changed_.notify_all();
     }
   }
 };
@@ -1674,6 +1897,144 @@ public:
     if (!session)
       return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
     return memory::scan(*context, *session, timeout_, *request, *response);
+  }
+
+  grpc::Status ObjectWatch(grpc::ServerContext *, const api::ObjectWatchRequest *request,
+                           api::ObjectWatchStatus *response) override {
+    const bool prepare = request->action() == api::ObjectWatchRequest::PREPARE;
+    auto session = find_session(request->session_id());
+    if (!prepare && !session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    try {
+      if (prepare && request->mode() == api::ObjectWatchRequest::SNAPSHOTS) {
+        (void)prepare_snapshot_watch(*request, nullptr, *response);
+        return grpc::Status::OK;
+      }
+      std::unique_lock<std::mutex> operation_lock;
+      if (!prepare) {
+        operation_lock = std::unique_lock<std::mutex>(session->operation_mutex());
+        const auto group = snapshot_group(session->id());
+        const bool existing = request->action() == api::ObjectWatchRequest::STATUS ||
+                              request->action() == api::ObjectWatchRequest::STOP;
+        if (existing && group &&
+            (!request->watch_id() || request->watch_id() == group->events->id))
+          return snapshot_watch_status(session, *group, request->action(), *response);
+        if (request->mode() == api::ObjectWatchRequest::SNAPSHOTS && !existing)
+          return start_snapshot_watch(session, *request, *response);
+        if (request->action() == api::ObjectWatchRequest::START && group &&
+            snapshot_group_active(*group, session->snapshot()))
+          return {grpc::StatusCode::FAILED_PRECONDITION, "stop the active snapshot watch first"};
+      }
+      if (request->mode() != api::ObjectWatchRequest::WRITES)
+        return {grpc::StatusCode::INVALID_ARGUMENT, "invalid object watch mode"};
+      if (!request->application_rendezvous().empty())
+        return {grpc::StatusCode::INVALID_ARGUMENT, "--rendezvous requires the AArch64 object server"};
+      std::uint64_t id = 0;
+      if (prepare || request->action() == api::ObjectWatchRequest::START ||
+          request->action() == api::ObjectWatchRequest::PREVIEW) {
+        if (request->writer_tid() && (prepare || !session ||
+            !std::filesystem::exists(proc::directory(session->pid()) / "task" /
+                                    std::to_string(request->writer_tid()))))
+          throw std::invalid_argument("selected writer thread is not live in the target");
+        for (const auto *value : {&request->concrete_type(), &request->base_type(),
+                                 &request->owner_type(), &request->field(),
+                                 &request->collection(), &request->snapshot_field(),
+                                 &request->code_symbol(), &request->code_module(),
+                                 &request->borrow_caller(), &request->vector_field(),
+                                 &request->element_key_field(), &request->mutation_symbol(),
+                                 &request->map_field(), &request->map_key(), &request->pointee_field(),
+                                 &request->union_tag()}) {
+          if (value->size() > 512 || value->find('\0') != std::string::npos)
+            throw std::invalid_argument("object watch requires valid type, field and code selectors");
+        }
+        if (request->concrete_type().empty() || request->field().empty() ||
+            request->code_symbol().empty())
+          throw std::invalid_argument("object watch requires --type, --field and --code");
+        const bool ownership = !request->owner_type().empty();
+        const bool cache = request->backend() == api::ObjectWatchRequest::CODE_CACHE;
+        if (!request->async_signals().empty() && !cache)
+          throw std::invalid_argument("--async-signal requires native code-cache capture");
+        std::set<unsigned> signal_numbers;
+        for (const auto sig : request->async_signals())
+          if (!sig || sig > 64 || sig == SIGKILL || sig == SIGSTOP || sig == SIGSEGV ||
+              sig == SIGBUS || !signal_numbers.insert(sig).second)
+            throw std::invalid_argument("invalid or duplicate asynchronous signal number");
+        if (request->event_buffer() &&
+            (!cache || request->event_buffer() < 2 || request->event_buffer() > 65536))
+          throw std::invalid_argument("--event-buffer requires code-cache and 2 to 65536 slots");
+        if (request->overflow_policy() != api::ObjectWatchRequest::DROP_NEW &&
+            (!cache || request->overflow_policy() != api::ObjectWatchRequest::STOP_CAPTURE))
+          throw std::invalid_argument("invalid code-cache overflow policy");
+        if (request->cfi_stack() && (!cache || !request->stack_depth()))
+          throw std::invalid_argument("native CFI requires code-cache and a positive stack depth");
+        const bool vector = !request->vector_field().empty();
+        const bool map = !request->map_field().empty();
+        const bool pointee = !request->pointee_field().empty();
+        const bool logical_range = vector || map || pointee;
+        const bool tagged_union = !request->union_tag().empty();
+        if (tagged_union != !request->union_cases().empty() ||
+            request->union_cases_size() > 128 || (tagged_union && (ownership || logical_range)))
+          throw std::invalid_argument("a standalone tagged union requires --union-tag and --union-case");
+        if (tagged_union &&
+            request->synchronization() != api::ObjectWatchRequest::THREAD_CONFINED &&
+            request->synchronization() != api::ObjectWatchRequest::CALLER_LOCK)
+          throw std::invalid_argument("tagged union capture requires a declared synchronization policy");
+        if (request->writer_entry() && (!cache || ownership))
+          throw std::invalid_argument("--writer-entry requires a standalone code-cache watch");
+        if (vector != !request->element_key_field().empty() || vector != request->has_element_key() ||
+            logical_range != !request->mutation_symbol().empty() ||
+            (request->first_seen() && (ownership || !request->code_module().empty())) ||
+            (logical_range && !request->first_seen()) || (map && vector) ||
+            (pointee && (map || vector)) ||
+            (!map && !request->map_key().empty()))
+          throw std::invalid_argument(
+              "first-seen scopes require a standalone watch; "
+              "a logical collection requires a verified mutation and a supported key");
+        if (cache && logical_range &&
+            request->synchronization() != api::ObjectWatchRequest::THREAD_CONFINED &&
+            request->synchronization() != api::ObjectWatchRequest::CALLER_LOCK)
+          throw std::invalid_argument("native collection capture requires a declared synchronization policy");
+        if (ownership != !request->base_type().empty() ||
+            ownership != !request->collection().empty())
+          throw std::invalid_argument("--owner, --base and --collection must be supplied together");
+        if (cache) {
+          if ((!ownership && !request->borrow_caller().empty()) || !request->snapshot_field().empty())
+            throw std::invalid_argument("--caller requires ownership; code-cache ownership supports scalar fields");
+          if (ownership && request->borrow_caller().empty() &&
+              request->synchronization() != api::ObjectWatchRequest::THREAD_CONFINED &&
+              request->synchronization() != api::ObjectWatchRequest::CALLER_LOCK)
+            throw std::invalid_argument("native ownership capture requires a declared synchronization policy");
+        } else if (ownership != !request->snapshot_field().empty() ||
+                   !request->code_module().empty() || !request->borrow_caller().empty()) {
+          throw std::invalid_argument("ptrace ownership requires --snapshot-field; --module and --caller require code-cache");
+        }
+        if (request->stack_depth() > 64 || !request->max_elements() ||
+            request->max_elements() > 65536 || !request->max_string_bytes() ||
+            request->max_string_bytes() > 65536 || request->max_instances() > 65536)
+          throw std::invalid_argument("object watch limits exceed the supported range");
+        if (request->backend() != api::ObjectWatchRequest::CODE_CACHE &&
+            request->backend() != api::ObjectWatchRequest::PTRACE)
+          throw std::invalid_argument("unknown object watch backend");
+        if (request->action() == api::ObjectWatchRequest::START)
+          do {
+            id = next_probe_id_.fetch_add(1);
+          } while (!id);
+      }
+      if (prepare) {
+        *response = Session::prepare_object_watch(*request);
+        return grpc::Status::OK;
+      }
+      *response = session->object_watch(*request, id, [this](auto event) {
+        events_.publish_object_observation(std::move(event));
+      });
+      if (request->action() == api::ObjectWatchRequest::START) {
+        std::lock_guard lock(mutex_);
+        snapshot_groups_.erase(session->id());
+      }
+      return grpc::Status::OK;
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
   }
 
   grpc::Status PreviewFunctionEntry(grpc::ServerContext *context,
@@ -2141,6 +2502,14 @@ public:
   }
 
 private:
+  struct SnapshotGroup {
+    std::shared_ptr<EventHub::SnapshotWatch> events;
+    std::vector<std::uint64_t> probes;
+  };
+  struct SnapshotMethod {
+    api::ProbeSpec spec;
+    api::ObjectObservation origin;
+  };
   std::string agent_path_;
   std::string event_path_;
   std::string source_directory_;
@@ -2154,6 +2523,7 @@ private:
   std::atomic<std::uint64_t> next_probe_id_;
   std::mutex mutex_;
   std::map<std::string, std::shared_ptr<Session>> sessions_;
+  std::map<std::string, std::shared_ptr<SnapshotGroup>> snapshot_groups_;
   std::map<std::uint32_t, std::string> active_by_pid_;
   std::set<std::uint32_t> pending_pids_;
 
@@ -2161,6 +2531,244 @@ private:
     std::lock_guard lock(mutex_);
     const auto found = sessions_.find(id);
     return found == sessions_.end() ? nullptr : found->second;
+  }
+
+  std::shared_ptr<SnapshotGroup> snapshot_group(const std::string &id) {
+    std::lock_guard lock(mutex_);
+    const auto found = snapshot_groups_.find(id);
+    return found == snapshot_groups_.end() ? nullptr : found->second;
+  }
+
+  static bool snapshot_group_active(const SnapshotGroup &group, const api::Session &session) {
+    return std::any_of(session.probes().begin(), session.probes().end(), [&](const auto &probe) {
+      return (probe.active() || probe.draining()) &&
+          std::find(group.probes.begin(), group.probes.end(), probe.id()) != group.probes.end();
+    });
+  }
+
+  std::vector<SnapshotMethod> prepare_snapshot_watch(const api::ObjectWatchRequest &request,
+                                                     Session *session,
+                                                     api::ObjectWatchStatus &response) {
+    if (request.methods().empty() || request.methods_size() > 16 ||
+        request.concrete_type().empty() || request.concrete_type().size() > 512 ||
+        request.stack_depth() > 64 || request.no_values() || !request.base_type().empty() ||
+        request.first_seen() || request.writer_entry() || request.writer_tid() || request.event_buffer() ||
+        !request.vector_field().empty() ||
+        request.has_element_key() || !request.map_field().empty() || !request.map_key().empty() ||
+        !request.pointee_field().empty() ||
+        !request.union_tag().empty() || !request.union_cases().empty() ||
+        !request.async_signals().empty() ||
+        !request.element_key_field().empty() || !request.mutation_symbol().empty() ||
+        !request.additional_mutation_symbols().empty() ||
+        !request.owner_type().empty() || !request.collection().empty() ||
+        !request.code_symbol().empty() || !request.code_module().empty() ||
+        !request.additional_code_symbols().empty() || request.syscall_output() || request.cfi_stack() ||
+        request.serialize_wait_us() || request.follow_calls() || request.runtime_limit() ||
+        !request.shared_file().empty() ||
+        request.overflow_policy() != api::ObjectWatchRequest::DROP_NEW ||
+        !request.borrow_caller().empty() || !request.snapshot_field().empty() ||
+        request.backend() != api::ObjectWatchRequest::PTRACE ||
+        !request.max_elements() || request.max_elements() > 4096 ||
+        !request.max_string_bytes() || request.max_string_bytes() > 4096 ||
+        !request.snapshot_max_bytes() || request.snapshot_max_bytes() > 4096 ||
+        !request.snapshot_max_depth() || request.snapshot_max_depth() > 32 ||
+        !request.max_instances() || request.max_instances() > 65536)
+      throw std::invalid_argument("snapshot watches require 1 to 16 prepared methods and a concrete receiver type");
+    if (request.snapshot_module().size() > 4096 ||
+        request.snapshot_module().find('\0') != std::string::npos ||
+        (!session && !request.snapshot_module().empty()))
+      throw std::invalid_argument("snapshot module must select a live mapped ELF");
+    if (request.synchronization() != api::ObjectWatchRequest::THREAD_CONFINED &&
+        request.synchronization() != api::ObjectWatchRequest::CALLER_LOCK &&
+        request.synchronization() != api::ObjectWatchRequest::STABLE_AT_BOUNDARIES)
+      throw std::invalid_argument("snapshot watch requires a declared receiver synchronization policy");
+    if (request.snapshot_fields_size() > 128 || request.snapshot_keys_size() > 128)
+      throw std::invalid_argument("too many selected snapshot paths or identity rules");
+    std::set<std::string> fields;
+    for (const auto &field : request.snapshot_fields())
+      if (field.empty() || field.size() > 512 || field.find('\0') != std::string::npos ||
+          !fields.insert(field).second)
+        throw std::invalid_argument("snapshot field paths must be nonempty and unique");
+    std::vector<std::string> keys(request.snapshot_keys().begin(), request.snapshot_keys().end());
+    for (const auto &key : keys)
+      if (key.size() > 512 || key.find('\0') != std::string::npos)
+        throw std::invalid_argument("invalid snapshot identity rule");
+    tracer_repl::validate_snapshot_keys(keys);
+    response.set_mode(api::ObjectWatchRequest::SNAPSHOTS);
+    auto &plan = *response.mutable_plan();
+    plan.set_field_encoding("typed receiver");
+    std::vector<SnapshotMethod> methods;
+    std::set<std::uint64_t> entries;
+    for (const auto &prepared : request.methods()) {
+      std::string_view receiver = prepared.header_types().record_name();
+      if (receiver.starts_with("::"))
+        receiver.remove_prefix(2);
+      std::string_view type = request.concrete_type();
+      if (type.starts_with("::"))
+        type.remove_prefix(2);
+      if (prepared.ByteSizeLong() > 65536 || prepared.module_sha256().size() != 32 ||
+          !tracer::prepared::is_typed_version(prepared.format_version()) ||
+          prepared.signature().kind() != api::METHOD || receiver != type)
+        throw std::invalid_argument("snapshot method requires a pinned typed adapter for the selected receiver");
+      api::ProbeSpec spec;
+      std::string module = request.executable_file();
+      if (session) {
+        client::DebugLookupOptions lookup;
+        lookup.module = request.snapshot_module();
+        try {
+          spec = client::bind_prepared_callable(session->pid(), prepared, lookup).spec;
+        } catch (const std::runtime_error &error) {
+          if (!std::string_view(error.what()).starts_with("PREPARED_MODULE_MISMATCH"))
+            throw;
+          std::vector<std::string> candidates;
+          const auto wanted = lookup.module.empty() ? prepared.module_name() : lookup.module;
+          for (const auto &path : client::list_debug_modules(session->pid()))
+            if (path == wanted || std::filesystem::path(path).filename() == wanted)
+              candidates.push_back(path);
+          if (candidates.size() != 1)
+            throw std::runtime_error("compatible snapshot rebinding needs one mapped module");
+          auto compatible = object_watch::Plan::method_boundary(candidates.front(), prepared, nullptr, true);
+          auto updated = prepared;
+          updated.set_module_sha256(std::move(compatible.file_sha256));
+          updated.set_module_name(std::filesystem::path(candidates.front()).filename().string());
+          lookup.module = candidates.front();
+          spec = client::bind_prepared_callable(session->pid(), updated, lookup).spec;
+        }
+        module = spec.debug_info().module();
+      }
+      const auto &bound_adapter = session ? spec.prepared() : prepared;
+      auto boundary = object_watch::Plan::method_boundary(module, bound_adapter,
+          session ? &spec.debug_info() : nullptr);
+      if (!entries.insert(boundary.binding.elf_pc()).second)
+        throw std::invalid_argument("duplicate or aliased method entry in snapshot plan");
+      if (plan.binary_sha256().empty()) {
+        plan.set_binary_sha256(boundary.origin.module_sha256());
+        plan.set_writer_build_id(boundary.binding.module_build_id());
+        plan.set_executable_build_id(boundary.binding.module_build_id());
+      } else if (plan.binary_sha256() != boundary.origin.module_sha256()) {
+        throw std::invalid_argument("all snapshot methods must belong to the same prepared ELF");
+      }
+      *plan.add_bindings() = std::move(boundary.binding);
+      if (session) {
+        const auto &info = spec.debug_info();
+        (void)client::verified_function_code(session->pid(), info, 1ULL << 20, bound_adapter.module_sha256());
+        spec.set_callback_source(R"cpp(
+template <> class Interceptor<tracer::ResolvedSignature> {
+public:
+  void pre(const Call &) {}
+  void post(const Call &) {}
+};
+)cpp");
+        spec.set_native_backend("entry");
+        spec.set_snapshot_receiver_at_return(true);
+        spec.set_snapshot_max_items(request.max_elements());
+        spec.set_snapshot_max_string_bytes(request.max_string_bytes());
+        spec.set_snapshot_max_depth(request.snapshot_max_depth());
+        spec.set_snapshot_max_bytes(request.snapshot_max_bytes());
+        spec.set_snapshot_report_unavailable(true);
+        for (const auto &[begin, end] : memory::readonly_image_data(*session, module, timeout_)) {
+          auto &range = *spec.add_snapshot_rtti_ranges();
+          range.set_begin(begin);
+          range.set_end(end);
+        }
+        spec.set_stack_depth(request.stack_depth());
+        const auto valid = validate_probe(spec);
+        if (!valid.ok())
+          throw std::invalid_argument(valid.error_message());
+      }
+      methods.push_back({std::move(spec), std::move(boundary.origin)});
+    }
+    if (session) {
+      if (!request.has_prepared_bindings())
+        throw std::invalid_argument("snapshot watch requires prepared ELF bindings");
+      response.set_binding_status(object_watch::compare_prepared(request.prepared_bindings(), plan, false));
+    } else {
+      response.set_binding_status("offline");
+    }
+    response.set_diagnostic("typed method boundaries; receiver lifetime and thread safety require separate evidence");
+    return methods;
+  }
+
+  grpc::Status snapshot_watch_status(const std::shared_ptr<Session> &session,
+      const SnapshotGroup &group, api::ObjectWatchRequest::Action action,
+      api::ObjectWatchStatus &response) {
+    session->refresh_process_state();
+    auto current = session->snapshot();
+    if (action == api::ObjectWatchRequest::STOP && current.state() == api::Session::ATTACHED) {
+      for (const auto id : group.probes) {
+        api::Probe restored;
+        const auto result = remove_probe(session, id, &restored);
+        if (!result.ok()) {
+          response.set_restoration_pending(true);
+          response.set_diagnostic(response.diagnostic() + " " + result.error_message());
+        }
+      }
+      current = session->snapshot();
+    }
+    sync_event_probes(session);
+    response.set_mode(api::ObjectWatchRequest::SNAPSHOTS);
+    response.set_watch_id(group.events->id);
+    response.set_active(snapshot_group_active(group, current));
+    for (const auto &probe : current.probes())
+      if (std::find(group.probes.begin(), group.probes.end(), probe.id()) != group.probes.end())
+        *response.add_method_probes() = probe;
+    events_.snapshot_status(*group.events, response);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status start_snapshot_watch(const std::shared_ptr<Session> &session,
+      const api::ObjectWatchRequest &request, api::ObjectWatchStatus &response) {
+    session->refresh_process_state();
+    const auto current = session->snapshot();
+    if (current.state() != api::Session::ATTACHED)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "session is not attached"};
+    if (request.action() != api::ObjectWatchRequest::START &&
+        request.action() != api::ObjectWatchRequest::PREVIEW)
+      return {grpc::StatusCode::INVALID_ARGUMENT, "invalid snapshot watch action"};
+    auto methods = prepare_snapshot_watch(request, session.get(), response);
+    if (request.action() == api::ObjectWatchRequest::PREVIEW)
+      return grpc::Status::OK;
+    if (const auto previous = snapshot_group(session->id()); previous &&
+        snapshot_group_active(*previous, current))
+      return {grpc::StatusCode::ALREADY_EXISTS, "a snapshot watch is already active"};
+    auto group = std::make_shared<SnapshotGroup>();
+    group->events = std::make_shared<EventHub::SnapshotWatch>();
+    do {
+      group->events->id = next_probe_id_.fetch_add(1);
+    } while (!group->events->id);
+    group->events->type = request.concrete_type();
+    group->events->fields.assign(request.snapshot_fields().begin(), request.snapshot_fields().end());
+    group->events->keys.assign(request.snapshot_keys().begin(), request.snapshot_keys().end());
+    group->events->synchronization = request.synchronization();
+    group->events->max_instances = request.max_instances();
+    group->events->max_events = request.max_events();
+    group->events->timeout = std::chrono::seconds(request.timeout_seconds());
+    group->probes.reserve(methods.size());
+    {
+      std::lock_guard lock(mutex_);
+      snapshot_groups_[session->id()] = group;
+    }
+    for (auto &method : methods) {
+      std::uint64_t id = 0;
+      api::Probe probe;
+      const auto result = install_probe(session, method.spec, {}, id, &probe, 0, {},
+          EventHub::SnapshotBinding{group->events, std::move(method.origin), {}});
+      if (!result.ok()) {
+        const auto latest = session->snapshot();
+        if (std::any_of(latest.probes().begin(), latest.probes().end(),
+                        [&](const auto &item) { return item.id() == id; }))
+          group->probes.push_back(id);
+        snapshot_watch_status(session, *group, api::ObjectWatchRequest::STOP, response);
+        if (response.restoration_pending()) {
+          response.set_diagnostic(result.error_message() + response.diagnostic());
+          return grpc::Status::OK;
+        }
+        return result;
+      }
+      group->probes.push_back(probe.id());
+    }
+    events_.activate_snapshot_watch(*group->events);
+    return snapshot_watch_status(session, *group, api::ObjectWatchRequest::STATUS, response);
   }
 
   void erase_active_pid_if_inactive(const std::shared_ptr<Session> &session) {
@@ -2203,7 +2811,8 @@ private:
                              const api::ProbeSpec &spec, const std::string &batch_id,
                              std::uint64_t &pending_probe_id, api::Probe *response,
                              std::uint64_t reload_probe_id = 0,
-                             const std::function<bool()> &cancelled = {}) {
+                             const std::function<bool()> &cancelled = {},
+                             EventHub::SnapshotBinding snapshot = {}) {
     pending_probe_id = 0;
     try {
       pending_probe_id = next_probe_id_.fetch_add(1);
@@ -2216,7 +2825,7 @@ private:
               ? selector
               : spec.symbol();
       events_.set_probe(session->id(), pending_probe_id, session->pid(),
-                        function_name, true, &spec.prepared());
+                        function_name, true, &spec.prepared(), std::move(snapshot));
       const auto lineage = admit_probe_package(spec);
       if (!lineage.retained) {
         std::cerr << "clang-tracer: shared-context source lineage isolated: "
@@ -2330,6 +2939,13 @@ private:
   }
 
   grpc::Status validate_probe(const clangtracer::v1::ProbeSpec &spec) const {
+    if ((!spec.native_backend().empty() && spec.native_backend() != "auto" &&
+         spec.native_backend() != "entry") ||
+        (!spec.direct_caller().empty() &&
+         (spec.native_backend() != "auto" || spec.direct_caller().size() > 4096 ||
+          spec.direct_caller().find('\0') != std::string::npos))) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "invalid native probe backend or caller"};
+    }
     if (spec.has_prepared() && !spec.has_debug_info())
       return {grpc::StatusCode::INVALID_ARGUMENT, "prepared probe requires a live binding"};
     const bool typed_prepared = tracer::prepared::is_typed_version(spec.prepared().format_version());

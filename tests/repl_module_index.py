@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import tempfile
 
+from elf_split_fixture import link_split_fixture
+
 
 HEADER = """namespace demo {
 struct Packet { int value; int samples[2]; };
@@ -63,7 +65,7 @@ SELECTOR = "demo::score(demo::Packet const&)"
 
 def main():
     parser = argparse.ArgumentParser()
-    for name in ("repl", "server", "agent", "module-tool", "compiler", "objcopy"):
+    for name in ("repl", "server", "agent", "module-tool", "compiler"):
         parser.add_argument("--" + name, required=True)
     args = parser.parse_args()
     env = dict(os.environ)
@@ -92,10 +94,9 @@ def main():
         (root / "module.cpp").write_text(MODULE)
         (root / "target.cpp").write_text(TARGET)
         flags = ["-std=c++17", "-g", "-O0", "-fno-omit-frame-pointer", "-fcf-protection=none"]
-        run([args.compiler, *flags, "-shared", "-fPIC", "-Wl,--build-id", "module.cpp", "-o", "libdemo.so"])
+        link_split_fixture(args.compiler, "module.cpp", root, "libdemo.so", "libdemo.debug",
+                           [*flags, "-fPIC"], ["-shared"])
         run([args.compiler, *flags, "target.cpp", "-L.", "-ldemo", "-Wl,-rpath,$ORIGIN", "-o", "target"])
-        run([args.objcopy, "--only-keep-debug", "libdemo.so", "libdemo.debug"])
-        run([args.objcopy, "--strip-debug", "--add-gnu-debuglink=libdemo.debug", "libdemo.so"])
         for source in ("packet.hpp", "module.cpp", "target.cpp"):
             (root / source).unlink()
 

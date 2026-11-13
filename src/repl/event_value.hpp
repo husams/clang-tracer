@@ -94,6 +94,7 @@ private:
   Data data_;
   std::string type_;
   std::string descriptor_type_;
+  std::string container_role_;
 
 public:
   EventValue() = default;
@@ -103,12 +104,13 @@ public:
   EventValue &operator=(EventValue &&) noexcept = default;
   ~EventValue();
   explicit EventValue(Data data, std::string cpp_type = {},
-                      std::string descriptor_type = {})
+                      std::string descriptor_type = {}, std::string container_role = {})
       : data_(std::move(data)), type_(std::move(cpp_type)),
-        descriptor_type_(std::move(descriptor_type)) {}
+        descriptor_type_(std::move(descriptor_type)), container_role_(std::move(container_role)) {}
   bool matches_record_type(std::string_view name) const;
   const std::string &cpp_type() const { return type_; }
   const Data &data() const { return data_; }
+  const std::string &container_role() const { return container_role_; }
   bool is_null() const { return std::holds_alternative<std::monostate>(data_); }
   const EventValue &field(const std::string &name) const {
     const auto *object = std::get_if<Object>(&data_);

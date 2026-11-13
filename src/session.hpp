@@ -20,6 +20,13 @@
 namespace tracer {
 namespace injector {
 class Process;
+class EntryTrap;
+}
+namespace object_watch {
+class Watch;
+}
+namespace object_cache {
+class Watch;
 }
 
 class AgentRuntimeIncompatible final : public std::runtime_error {
@@ -34,6 +41,7 @@ public:
           std::string context_endpoint, std::string context_durable_directory,
           std::chrono::seconds operation_timeout,
           ContextTransportBudget context_budget = {});
+  ~Session();
 
   void attach(const std::string &expected_executable);
   clangtracer::v1::Probe add_probe(const clangtracer::v1::ProbeSpec &spec,
@@ -50,6 +58,11 @@ public:
                  clangtracer::v1::ValidateProbeRequest::Level level);
   clangtracer::v1::Probe remove_probe(std::uint64_t probe_id);
   void detach();
+  clangtracer::v1::ObjectWatchStatus object_watch(
+      const clangtracer::v1::ObjectWatchRequest &request, std::uint64_t id,
+      std::function<void(clangtracer::v1::TraceEvent)> publish);
+  static clangtracer::v1::ObjectWatchStatus prepare_object_watch(
+      const clangtracer::v1::ObjectWatchRequest &request);
   void shutdown() noexcept;
   void record_failure(const std::string &message);
   void refresh_process_state() noexcept;
@@ -106,14 +119,23 @@ private:
   std::uintptr_t stop_address_ = 0;
   std::uintptr_t validate_address_ = 0;
   std::uintptr_t capacity_address_ = 0;
+  std::uintptr_t object_cache_address_ = 0;
   std::uintptr_t pthread_detour_address_ = 0;
   std::map<std::uint64_t, ProbeRecord> probes_;
+  std::unique_ptr<object_watch::Watch> object_watch_;
+  std::unique_ptr<object_cache::Watch> object_cache_;
+  std::unique_ptr<injector::EntryTrap> entry_trap_;
+  std::uint64_t trap_probe_id_ = 0;
   std::optional<PthreadCreatePatch> pthread_create_patch_;
   bool pthread_create_patch_committed_ = false;
 
   void attach_process(tracer::injector::Process &process,
                       std::chrono::steady_clock::time_point deadline);
   void check_identity_locked();
+  void require_probe_control_locked(std::uint64_t removing = 0) const;
+  void stop_object_watch_locked();
+  void stop_object_cache_locked(bool detaching = false);
+  bool retire_changed_object_cache_locked(std::chrono::steady_clock::time_point deadline);
   void set_failed_locked(const std::string &message);
   ProbeRecord &find_probe_locked(std::uint64_t probe_id);
   void release_request_locked(ProbeRecord &probe,

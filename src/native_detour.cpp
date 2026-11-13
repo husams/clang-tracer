@@ -481,4 +481,97 @@ bool prepare_entry_jump(const Patch &patch, void *trampoline,
   std::fill(output.begin() + patch.jump_size, output.begin() + patch.size, 0x90);
   return true;
 }
+
+bool decode_getter(std::string_view bytes, std::size_t &trap_offset, std::string &error) {
+  trap_offset = bytes.starts_with("\xf3\x0f\x1e\xfa") ? 4 : 0;
+  bytes.remove_prefix(trap_offset);
+  // MOV r/m32,EAX with RDI as the base, followed by a plain near RET.
+  if ((bytes.size() == 3 || bytes.size() == 4 || bytes.size() == 7) &&
+      bytes.front() == '\x8b' && bytes.back() == '\xc3') {
+    const auto operand = static_cast<unsigned char>(bytes[1]);
+    if ((bytes.size() == 3 && operand == 0x07) ||
+        (bytes.size() == 4 && operand == 0x47) ||
+        (bytes.size() == 7 && operand == 0x87))
+      return true;
+  }
+  return fail(error, "entry fallback requires a complete 32-bit receiver load and return");
+}
+
+bool create_getter_copy(std::string_view bytes, std::uintptr_t caller,
+                        void *&address, std::size_t &size, std::string &error) {
+  const long page = ::sysconf(_SC_PAGESIZE);
+  if (page < static_cast<long>(kRelayOffset + kJumpBytes) || bytes.size() > kRelayOffset)
+    return fail(error, "invalid getter copy allocation bounds");
+  Patch placement;
+  placement.entry = caller;
+  placement.jump_size = caller ? kRelativeJumpBytes : kJumpBytes;
+  void *memory = allocate(placement, static_cast<std::size_t>(page), error);
+  if (memory == MAP_FAILED) {
+    if (!caller)
+      fail(error, "could not allocate executable getter copy");
+    return false;
+  }
+  std::memcpy(memory, bytes.data(), bytes.size());
+  if (::mprotect(memory, page, PROT_READ | PROT_EXEC) != 0) {
+    ::munmap(memory, page);
+    return fail(error, "could not make getter copy executable");
+  }
+  address = memory;
+  size = page;
+  return true;
+}
+
+bool prepare_call_relay(std::uintptr_t caller, void *copy, std::size_t size,
+                        const void *wrapper, std::span<std::uint8_t> output,
+                        std::uintptr_t &relay, std::string &error) {
+  Patch placement;
+  placement.entry = caller;
+  placement.jump_size = placement.size = kRelativeJumpBytes;
+  if (!prepare_entry_jump(placement, copy, size, wrapper, output, error))
+    return false;
+  output[0] = 0xe8;
+  relay = reinterpret_cast<std::uintptr_t>(copy) + kRelayOffset;
+  return true;
+}
+
+bool allocate_code_cache(std::uintptr_t caller, std::size_t bytes,
+                         void *&address, std::size_t &size, std::string &error,
+                         std::span<const RipRelocation> relocations) {
+  const auto page = ::sysconf(_SC_PAGESIZE);
+  if (page <= 0 || !bytes || bytes > static_cast<std::size_t>(INT32_MAX))
+    return fail(error, "invalid code-cache allocation bounds");
+  const auto aligned = (bytes + page - 1) / page * page;
+  Patch placement;
+  placement.entry = caller;
+  placement.jump_size = kRelativeJumpBytes;
+  placement.relocations.assign(relocations.begin(), relocations.end());
+  auto *memory = allocate(placement, aligned, error);
+  if (memory == MAP_FAILED)
+    return false;
+  address = memory;
+  size = aligned;
+  return true;
+}
+
+bool code_cache_rip_relocation(std::span<const std::uint8_t> bytes,
+                               std::uintptr_t pc, RipRelocation &relocation,
+                               std::string &error) {
+  Decoder decoder;
+  if (!make_decoder(decoder, error))
+    return false;
+  llvm::MCInst inst;
+  std::uint64_t size = 0;
+  Patch patch;
+  patch.entry = pc;
+  if (decoder.dis->getInstruction(inst, size, {bytes.data(), bytes.size()}, pc,
+                                  llvm::nulls()) != llvm::MCDisassembler::Success ||
+      size != bytes.size() || !allowed_instruction(inst, *decoder.ins))
+    return fail(error, "unsupported RIP-relative code-cache instruction");
+  if (!record_relocation(decoder, inst, bytes, 0, size, patch, error))
+    return false;
+  if (patch.relocations.size() != 1)
+    return fail(error, "expected one verified RIP-relative operand");
+  relocation = patch.relocations.front();
+  return true;
+}
 } // namespace tracer::native_detour

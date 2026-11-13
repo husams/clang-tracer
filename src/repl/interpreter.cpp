@@ -18,6 +18,8 @@
 #if defined(__linux__) && defined(__x86_64__)
 #include <llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h>
 #include <llvm/ExecutionEngine/SectionMemoryManager.h>
+#elif defined(__linux__) && defined(__aarch64__)
+#include <llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h>
 #endif
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
@@ -122,6 +124,36 @@ bool can_unload_initializer(const llvm::Module &module) {
   return call && call->getFunction()->getName().starts_with("__cxx_global_var_init") &&
          llvm::isa_and_nonnull<llvm::ReturnInst>(call->getNextNode());
 }
+
+#if defined(__linux__) && defined(__aarch64__)
+class LocalPersonalityReferences : public llvm::orc::ObjectLinkingLayer::Plugin {
+public:
+  void modifyPassConfig(llvm::orc::MaterializationResponsibility &,
+                        llvm::jitlink::LinkGraph &graph,
+                        llvm::jitlink::PassConfiguration &) override {
+    // Keep the compiler's indirect EH personality cell with its own CIE.
+    // Undo may release that cell while other incremental objects are live.
+    for (auto *symbol : graph.defined_symbols()) {
+      if (symbol->hasName() && (*symbol->getName()).starts_with("DW.ref.") &&
+          symbol->getScope() == llvm::jitlink::Scope::Hidden &&
+          symbol->getLinkage() == llvm::jitlink::Linkage::Weak) {
+        symbol->setLinkage(llvm::jitlink::Linkage::Strong);
+        symbol->setScope(llvm::jitlink::Scope::Local);
+      }
+    }
+  }
+
+  llvm::Error notifyFailed(llvm::orc::MaterializationResponsibility &) override {
+    return llvm::Error::success();
+  }
+  llvm::Error notifyRemovingResources(llvm::orc::JITDylib &,
+                                      llvm::orc::ResourceKey) override {
+    return llvm::Error::success();
+  }
+  void notifyTransferringResources(llvm::orc::JITDylib &, llvm::orc::ResourceKey,
+                                   llvm::orc::ResourceKey) override {}
+};
+#endif
 } // namespace
 struct CppEngine::Impl {
   CppCheckSession checker;
@@ -378,6 +410,10 @@ void CppEngine::initialize() {
     llvm::sys::DynamicLibrary::LoadLibraryPermanently(nullptr);
   });
   auto args = profile_arguments(arguments_);
+#if defined(__linux__) && defined(__aarch64__)
+  // The in-process JIT cannot resolve compiler runtime outline-atomic helpers.
+  args.emplace_back("-mno-outline-atomics");
+#endif
   std::vector<const char *> argv;
   for (const auto &arg : args) {
     argv.push_back(arg.c_str());
@@ -399,6 +435,14 @@ void CppEngine::initialize() {
               return std::make_unique<llvm::SectionMemoryManager>();
             });
       });
+#elif defined(__linux__) && defined(__aarch64__)
+  builder->setPrePlatformSetup([](llvm::orc::LLJIT &jit) -> llvm::Error {
+    auto *layer = llvm::dyn_cast<llvm::orc::ObjectLinkingLayer>(&jit.getObjLinkingLayer());
+    if (!layer)
+      return llvm::createStringError("AArch64 interpreter requires the JITLink object layer");
+    layer->addPlugin(std::make_unique<LocalPersonalityReferences>());
+    return llvm::Error::success();
+  });
 #endif
   auto jit = std::make_shared<llvm::orc::LLJIT *>(nullptr);
   builder->setNotifyCreatedCallback([jit](llvm::orc::LLJIT &created) {

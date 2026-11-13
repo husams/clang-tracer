@@ -16,7 +16,8 @@ inline constexpr std::uint32_t kProtocolVersion = 2;
 // Version 26 replaces the inline callback stack array with an invocation view.
 // Version 27 configures the shared-context event budget in the bootstrap.
 // Version 28 also carries the shared transport memory budget.
-inline constexpr std::uint32_t kBootstrapVersion = 28;
+// Version 29 describes entry, call-site, and trap patch ownership separately.
+inline constexpr std::uint32_t kBootstrapVersion = 29;
 inline constexpr std::uint32_t kDefaultContextEventBytes = 256 * 1024;
 inline constexpr std::uint64_t kDefaultContextTransportMemoryBytes = 64ull * 1024 * 1024;
 struct ContextTransportBudget {
@@ -181,6 +182,8 @@ struct TraceContext {
   mutable NativeStackStorage *stack_storage = nullptr;
 };
 
+enum class NativePatch : std::uint32_t { Entry = 0, CallSite = 1, Trap = 2 };
+
 struct Request {
   std::uint32_t version = kBootstrapVersion;
   CallableKind kind = CallableKind::Unspecified;
@@ -231,6 +234,12 @@ struct Request {
   bool reject_replacement = false;
   std::uint64_t expected_replaced_probe_id = 0;
   ContextTransportBudget context_budget{};
+  NativePatch patch_backend = NativePatch::Entry;
+  std::uint64_t patch_address = 0;
+  std::uint64_t relay_address = 0;
+  std::uint32_t verified_size = 0;
+  std::uint8_t verified_bytes[kMaxPatchBytes]{};
+  char patch_reason[128]{};
 };
 
 // Side-effect-free callback preparation request. The agent reads a serialized

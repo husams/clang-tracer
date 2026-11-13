@@ -59,7 +59,8 @@ function(tracer_add_native_repl)
     "${_generated}/tracer.grpc.pb.cc" "${_generated}/context_transport.pb.cc")
   target_include_directories(tracer_repl_rpc PUBLIC "${_generated}")
   target_link_libraries(tracer_repl_rpc PUBLIC gRPC::grpc++ protobuf::libprotobuf)
-  add_library(tracer_repl_client STATIC "${_repl}/controller.cpp" "${_repl}/server_process.cpp" "${_repl}/events.cpp" "${_repl}/background_events.cpp")
+  add_library(tracer_repl_client STATIC "${_repl}/controller.cpp" "${_repl}/server_process.cpp"
+    "${_repl}/events.cpp" "${_repl}/../object_snapshot.cpp" "${_repl}/background_events.cpp")
   target_include_directories(tracer_repl_client PUBLIC "${_repl}"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
   target_link_libraries(tracer_repl_client PUBLIC tracer_repl_rpc tracer_repl_commands Threads::Threads
@@ -229,12 +230,306 @@ function(tracer_add_native_repl)
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_header_reuse.py"
         $<TARGET_FILE:clang-tracer-repl>)
     set_tests_properties(native_repl_header_reuse PROPERTIES TIMEOUT 240)
-    if(NOT TRACER_REPL_ONLY)
+    if(NOT TRACER_REPL_ONLY AND (TARGET clang_tracer_agent OR TARGET clang_tracer_object_cache_arm))
+      if(TARGET clang_tracer_object_cache_arm)
+        set(_object_cache_agent clang_tracer_object_cache_arm)
+        set(_object_test_rendezvous --rendezvous arm_rendezvous)
+        set(_object_test_arch_flags)
+      else()
+        set(_object_cache_agent clang_tracer_agent)
+        set(_object_test_rendezvous)
+        set(_object_test_arch_flags -fcf-protection=none)
+      endif()
+      foreach(_snapshot_case object_snapshots object_snapshot_unwind)
+        set(_snapshot_target repl-${_snapshot_case}-target)
+        set(_snapshot_source "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/${_snapshot_case}")
+        set(_snapshot_dir "${CMAKE_CURRENT_BINARY_DIR}/${_snapshot_case}/$<CONFIG>")
+        set(_snapshot_options)
+        add_executable(${_snapshot_target} "${_snapshot_source}/state.cpp")
+        set_target_properties(${_snapshot_target} PROPERTIES CXX_STANDARD 17 OUTPUT_NAME fixture
+          RUNTIME_OUTPUT_DIRECTORY "${_snapshot_dir}" INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_compile_options(${_snapshot_target} PRIVATE -g -O0 -pthread -fno-omit-frame-pointer
+          ${_object_test_arch_flags})
+        target_link_libraries(${_snapshot_target} PRIVATE Threads::Threads)
+        foreach(_snapshot_file state.cpp state.hpp)
+          file(GENERATE OUTPUT "${_snapshot_dir}/${_snapshot_file}"
+            INPUT "${_snapshot_source}/${_snapshot_file}")
+        endforeach()
+        if(_snapshot_case STREQUAL "object_snapshots")
+          file(GENERATE OUTPUT "${_snapshot_dir}/policy.hpp" INPUT "${_snapshot_source}/policy.hpp")
+          set(_snapshot_options --registered-any)
+        elseif(TARGET clang_tracer_object_cache_arm)
+          target_link_options(${_snapshot_target} PRIVATE "LINKER:--build-id=none")
+          set(_snapshot_options --reexec)
+        endif()
+        file(GENERATE OUTPUT "${_snapshot_dir}/compile_commands.json" CONTENT
+          "[{\"directory\":\"${_snapshot_dir}\",\"file\":\"state.cpp\",\"arguments\":[\"${CMAKE_CXX_COMPILER}\",\"-std=c++17\",\"-pthread\",\"-g\",\"-O0\",\"-c\",\"state.cpp\"]}]\n")
+        add_test(NAME native_repl_${_snapshot_case}
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_${_snapshot_case}.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:${_object_cache_agent}> "${_snapshot_dir}" ${_snapshot_options})
+        set_tests_properties(native_repl_${_snapshot_case} PROPERTIES TIMEOUT 150)
+      endforeach()
+      if(TARGET clang_tracer_object_cache_arm)
+        set(_runtime_call_arch_flags -mbranch-protection=standard)
+      else()
+        set(_runtime_call_arch_flags -fcf-protection=none)
+      endif()
+      foreach(_plugin_value 19 23)
+        set(_runtime_plugin repl-object-runtime-plugin-${_plugin_value})
+        add_library(${_runtime_plugin} SHARED tests/fixtures/object_plan/runtime_plugin.cpp)
+        target_compile_options(${_runtime_plugin} PRIVATE -g -O2 ${_runtime_call_arch_flags})
+        target_compile_definitions(${_runtime_plugin} PRIVATE TRACE_TEST_PLUGIN_VALUE=${_plugin_value})
+      endforeach()
+      foreach(_dispatch direct indirect shared tail nested namespace selected_dso discovered_nonleaf discovered_dso discovered_namespace)
+        set(_runtime_fixture repl-object-runtime-${_dispatch}-target)
+        add_executable(${_runtime_fixture}
+          tests/fixtures/object_plan/record.cpp tests/fixtures/object_plan/indirect.cpp)
+        set_target_properties(${_runtime_fixture} PROPERTIES
+          CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_compile_options(${_runtime_fixture} PRIVATE -g -O2 -fPIE -fomit-frame-pointer
+          -fno-optimize-sibling-calls ${_runtime_call_arch_flags})
+        target_link_options(${_runtime_fixture} PRIVATE -pie "LINKER:--build-id=sha1")
+        set(_runtime_plugin_args)
+        set(_runtime_mode ${_dispatch})
+        if(_dispatch STREQUAL "direct")
+          target_compile_definitions(${_runtime_fixture} PRIVATE TRACE_TEST_RUNTIME_DIRECT)
+        elseif(_dispatch STREQUAL "indirect")
+          target_compile_definitions(${_runtime_fixture} PRIVATE TRACE_TEST_MULTI_INDIRECT)
+        elseif(_dispatch STREQUAL "tail")
+          target_compile_definitions(${_runtime_fixture} PRIVATE TRACE_TEST_RUNTIME_TAIL)
+        elseif(_dispatch STREQUAL "nested")
+          target_compile_definitions(${_runtime_fixture} PRIVATE TRACE_TEST_RUNTIME_NESTED)
+        elseif(_dispatch STREQUAL "discovered_nonleaf")
+          target_compile_definitions(${_runtime_fixture} PRIVATE TRACE_TEST_RUNTIME_DISCOVERED_NONLEAF)
+        else()
+          target_compile_definitions(${_runtime_fixture} PRIVATE TRACE_TEST_RUNTIME_DSO)
+          if(_dispatch STREQUAL "namespace")
+            target_compile_definitions(${_runtime_fixture} PRIVATE TRACE_TEST_RUNTIME_NAMESPACE)
+            set(_runtime_mode shared)
+          endif()
+          target_link_libraries(${_runtime_fixture} PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+          set(_runtime_plugin_args --plugin $<TARGET_FILE:repl-object-runtime-plugin-23>)
+          if(_dispatch STREQUAL "selected_dso")
+            target_compile_definitions(${_runtime_fixture} PRIVATE TRACE_TEST_RUNTIME_SELECTED_DSO)
+          elseif(_dispatch MATCHES "^discovered_(dso|namespace)$")
+            target_compile_definitions(${_runtime_fixture} PRIVATE TRACE_TEST_RUNTIME_DISCOVERED_DSO)
+            set(_runtime_mode discovered_dso)
+            if(_dispatch STREQUAL "discovered_namespace")
+              target_compile_definitions(${_runtime_fixture} PRIVATE TRACE_TEST_RUNTIME_NAMESPACE)
+            endif()
+          else()
+            list(APPEND _runtime_plugin_args --plugin $<TARGET_FILE:repl-object-runtime-plugin-19>)
+          endif()
+        endif()
+        add_test(NAME native_repl_object_runtime_${_dispatch}
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_indirect.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:${_runtime_fixture}>
+            --runtime ${_runtime_mode} --cfi ${_runtime_plugin_args})
+        set_tests_properties(native_repl_object_runtime_${_dispatch} PROPERTIES TIMEOUT 120)
+      endforeach()
+      add_test(NAME native_repl_object_runtime_limit
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_indirect.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-runtime-indirect-target>
+          --runtime indirect --bounded --cfi)
+      set_tests_properties(native_repl_object_runtime_limit PROPERTIES TIMEOUT 120)
+      add_test(NAME native_repl_object_runtime_tail_limit
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_indirect.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-runtime-tail-target>
+          --runtime tail --bounded --cfi)
+      set_tests_properties(native_repl_object_runtime_tail_limit PROPERTIES TIMEOUT 120)
+      foreach(_inline_region collection disjoint)
+        set(_inline_target repl-object-inline-${_inline_region}-target)
+        set(_inline_args)
+        add_executable(${_inline_target} tests/fixtures/object_aarch64/collection.cpp)
+        set_target_properties(${_inline_target} PROPERTIES CXX_STANDARD 17
+          INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_compile_options(${_inline_target} PRIVATE -g -O2 -fPIE
+          -fno-optimize-sibling-calls ${_object_test_arch_flags})
+        target_compile_definitions(${_inline_target} PRIVATE TRACE_TEST_INLINE_MUTATION)
+        target_link_options(${_inline_target} PRIVATE -pie "LINKER:--build-id=sha1")
+        if(_inline_region STREQUAL "disjoint")
+          target_compile_definitions(${_inline_target} PRIVATE TRACE_TEST_DISJOINT_MUTATION)
+          set(_inline_args --disjoint)
+        endif()
+        add_test(NAME native_repl_inline_${_inline_region}
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_inline_collection.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:${_inline_target}> ${_inline_args})
+        set_tests_properties(native_repl_inline_${_inline_region} PROPERTIES TIMEOUT 180)
+      endforeach()
+      foreach(_pointee raw unique shared)
+        set(_pointee_target repl-object-pointee-target)
+        set(_pointee_test native_repl_object_pointee)
+        if(NOT _pointee STREQUAL "raw")
+          set(_pointee_target repl-object-pointee-${_pointee}-target)
+          string(APPEND _pointee_test "_${_pointee}")
+        endif()
+        add_executable(${_pointee_target} tests/fixtures/object_aarch64/pointee.cpp)
+        set_target_properties(${_pointee_target} PROPERTIES CXX_STANDARD 17
+          INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_compile_options(${_pointee_target} PRIVATE -g -O2 -fPIE
+          -fno-optimize-sibling-calls ${_object_test_arch_flags})
+        target_link_options(${_pointee_target} PRIVATE -pie "LINKER:--build-id=sha1")
+        if(NOT _pointee STREQUAL "raw")
+          string(TOUPPER "${_pointee}" _pointee_kind)
+          target_compile_definitions(${_pointee_target} PRIVATE TRACE_TEST_${_pointee_kind}_POINTEE)
+        endif()
+        add_test(NAME ${_pointee_test}
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_pointee.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:${_pointee_target}>)
+        set_tests_properties(${_pointee_test} PROPERTIES TIMEOUT 180)
+      endforeach()
+      add_executable(repl-object-signal-window-target tests/fixtures/object_aarch64/signal_window.cpp)
+      set_target_properties(repl-object-signal-window-target PROPERTIES CXX_STANDARD 17
+        INTERPROCEDURAL_OPTIMIZATION OFF)
+      target_compile_options(repl-object-signal-window-target PRIVATE -g -O2 -fPIE
+        -fno-optimize-sibling-calls ${_object_test_arch_flags})
+      target_link_options(repl-object-signal-window-target PRIVATE -pie "LINKER:--build-id=sha1")
+      add_test(NAME native_repl_object_signal_window
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_signal_window.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-signal-window-target>)
+      set_tests_properties(native_repl_object_signal_window PROPERTIES TIMEOUT 180)
+      foreach(_shared_kind storage scalar)
+        set(_shared_fixture repl-object-shared-${_shared_kind}-target)
+        set(_shared_args)
+        add_executable(${_shared_fixture} tests/fixtures/object_aarch64/shared_storage.cpp)
+        set_target_properties(${_shared_fixture} PROPERTIES CXX_STANDARD 17
+          INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_compile_options(${_shared_fixture} PRIVATE -g -O2 -fPIE
+          -fno-optimize-sibling-calls ${_object_test_arch_flags})
+        if(_shared_kind STREQUAL "scalar")
+          target_compile_definitions(${_shared_fixture} PRIVATE TRACE_TEST_SHARED_SCALAR)
+          set(_shared_args --caller-lock)
+        elseif(TARGET clang_tracer_object_cache_arm)
+          target_compile_options(${_shared_fixture} PRIVATE -march=armv8.1-a+lse)
+        endif()
+        target_link_options(${_shared_fixture} PRIVATE -pie "LINKER:--build-id=sha1")
+        add_test(NAME native_repl_object_shared_${_shared_kind}
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_shared_storage.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:${_shared_fixture}> ${_shared_args})
+        set_tests_properties(native_repl_object_shared_${_shared_kind} PROPERTIES TIMEOUT 180)
+      endforeach()
+      if(TARGET clang_tracer_object_cache_arm)
+        add_executable(repl-object-arm-parked-fault-target tests/fixtures/object_aarch64/fault.cpp)
+        set_target_properties(repl-object-arm-parked-fault-target PROPERTIES CXX_STANDARD 17
+          INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_compile_definitions(repl-object-arm-parked-fault-target PRIVATE TRACE_ARM_TEST_RENDEZVOUS)
+        target_compile_options(repl-object-arm-parked-fault-target PRIVATE -g -O2 -fPIE
+          -fno-optimize-sibling-calls)
+        target_link_options(repl-object-arm-parked-fault-target PRIVATE -pie "LINKER:--build-id=sha1")
+        add_test(NAME native_repl_object_static_active_reclaim
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_runtime_prefix_detach.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-arm-parked-fault-target> --arm-static)
+        set_tests_properties(native_repl_object_static_active_reclaim PROPERTIES TIMEOUT 120)
+      endif()
+      if(TARGET clang_tracer_agent)
+        foreach(_call_fixture repl-object-runtime-prefix-target repl-object-runtime-memory-target)
+          add_executable(${_call_fixture}
+            tests/fixtures/object_plan/record.cpp tests/fixtures/object_plan/runtime_prefix.cpp)
+          target_compile_options(${_call_fixture} PRIVATE -g -O2 -fPIE -fcf-protection=none)
+          target_link_options(${_call_fixture} PRIVATE -pie "LINKER:--build-id=sha1")
+          target_link_libraries(${_call_fixture} PRIVATE Threads::Threads)
+        endforeach()
+        target_compile_definitions(repl-object-runtime-memory-target PRIVATE TRACE_TEST_RUNTIME_MEMORY)
+        add_test(NAME native_repl_object_runtime_prefix_detach
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_runtime_prefix_detach.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-runtime-prefix-target>)
+        set_tests_properties(native_repl_object_runtime_prefix_detach PROPERTIES TIMEOUT 120)
+        add_test(NAME native_repl_object_static_active_reclaim
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_runtime_prefix_detach.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-runtime-prefix-target> --static)
+        set_tests_properties(native_repl_object_static_active_reclaim PROPERTIES TIMEOUT 120)
+        add_test(NAME native_repl_object_runtime_active_reclaim
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_runtime_prefix_detach.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-runtime-prefix-target> --callee)
+        set_tests_properties(native_repl_object_runtime_active_reclaim PROPERTIES TIMEOUT 120)
+        add_test(NAME native_repl_object_runtime_memory_detach
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_runtime_prefix_detach.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-runtime-memory-target>)
+        set_tests_properties(native_repl_object_runtime_memory_detach PROPERTIES TIMEOUT 120)
+      endif()
+      add_executable(repl-object-reexec-target
+        tests/fixtures/object_plan/reexec.cpp tests/fixtures/object_plan/record.cpp)
+      set_target_properties(repl-object-reexec-target PROPERTIES CXX_STANDARD 17
+        INTERPROCEDURAL_OPTIMIZATION OFF)
+      target_compile_options(repl-object-reexec-target PRIVATE -g -O2 -fPIE
+        -fno-optimize-sibling-calls ${_object_test_arch_flags})
+      target_link_options(repl-object-reexec-target PRIVATE -pie)
+      set(_object_reexec_args)
+      if(TARGET clang_tracer_object_cache_arm)
+        set(_object_reexec_args --object-watch $<TARGET_FILE:clang-tracer-object-watch>)
+      endif()
+      add_test(NAME native_repl_code_cache_reexec
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_reexec.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-reexec-target> ${_object_reexec_args})
+      set_tests_properties(native_repl_code_cache_reexec PROPERTIES TIMEOUT 100)
+      set(_object_overlap_cases ordered external)
+      if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+        list(APPEND _object_overlap_cases idle_attach worker_attach sve_state sme_state)
+      endif()
+      foreach(_object_case IN LISTS _object_overlap_cases)
+        set(_object_overlap_args --${_object_case} ${_object_test_rendezvous})
+        if(_object_case STREQUAL "external")
+          set(_object_source tests/fixtures/object_overlap/external.cpp)
+        else()
+          set(_object_source tests/fixtures/object_overlap/fixture.cpp)
+        endif()
+        set(_object_target repl-object-${_object_case}-target)
+        set(_object_fixture_dir "${CMAKE_CURRENT_BINARY_DIR}/object-${_object_case}-fixture/$<CONFIG>")
+        file(GENERATE OUTPUT "${_object_fixture_dir}/fixture.cpp"
+          INPUT "${CMAKE_CURRENT_SOURCE_DIR}/${_object_source}")
+        add_executable(${_object_target} "${_object_source}")
+        set_target_properties(${_object_target} PROPERTIES CXX_STANDARD 17 OUTPUT_NAME fixture
+          RUNTIME_OUTPUT_DIRECTORY "${_object_fixture_dir}")
+        target_compile_options(${_object_target} PRIVATE -g -O2 -fno-inline
+          ${_object_test_arch_flags})
+        if(_object_case MATCHES "^(idle_attach|worker_attach|sve_state|sme_state)$")
+          target_compile_definitions(${_object_target} PRIVATE TRACE_TEST_IDLE_ATTACH)
+          set(_object_overlap_args --ordered)
+          if(_object_case STREQUAL "worker_attach")
+            target_compile_definitions(${_object_target} PRIVATE TRACE_TEST_WORKER_ATTACH)
+            list(APPEND _object_overlap_args --worker-attach)
+          elseif(_object_case STREQUAL "sve_state")
+            target_compile_definitions(${_object_target} PRIVATE TRACE_TEST_SVE_STATE)
+            target_compile_options(${_object_target} PRIVATE -march=armv8.2-a+sve)
+            list(APPEND _object_overlap_args --sve-state)
+          elseif(_object_case STREQUAL "sme_state")
+            target_compile_definitions(${_object_target} PRIVATE TRACE_TEST_SME_STATE)
+            target_compile_options(${_object_target} PRIVATE -march=armv9-a+sme2)
+            list(APPEND _object_overlap_args --sme-state)
+          endif()
+        endif()
+        target_link_libraries(${_object_target} PRIVATE Threads::Threads)
+        add_test(NAME native_repl_code_cache_${_object_case}
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_overlap.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE_DIR:${_object_target}>
+            ${_object_overlap_args})
+        set_tests_properties(native_repl_code_cache_${_object_case} PROPERTIES TIMEOUT 100)
+        if(_object_case MATCHES "^(sve_state|sme_state)$")
+          set_tests_properties(native_repl_code_cache_${_object_case} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+        endif()
+      endforeach()
+    endif()
+    if(NOT TRACER_REPL_ONLY AND TARGET clang_tracer_agent)
       add_test(NAME native_repl_module_index
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_module_index.py"
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
           --agent $<TARGET_FILE:clang_tracer_agent> --module-tool $<TARGET_FILE:clang-tracer-module>
-          --compiler "${CMAKE_CXX_COMPILER}" --objcopy "${CMAKE_OBJCOPY}")
+          --compiler "${CMAKE_CXX_COMPILER}")
       set_tests_properties(native_repl_module_index PROPERTIES TIMEOUT 240)
       add_executable(repl-browser-target tests/fixtures/repl_browser.cpp)
       target_link_libraries(repl-browser-target PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
@@ -250,14 +545,170 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:repl-memory-target>)
       set_tests_properties(native_repl_memory_integration PROPERTIES TIMEOUT 100)
-      add_executable(repl-entry-target tests/fixtures/repl_entry.cpp)
-      target_compile_options(repl-entry-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none -fPIE)
-      target_link_options(repl-entry-target PRIVATE -pie "LINKER:--build-id=sha1")
+      foreach(_entry_target repl-entry-target repl-entry-stripped-target)
+        add_executable(${_entry_target} tests/fixtures/repl_entry.cpp)
+        target_compile_options(${_entry_target} PRIVATE -g -O0 -fno-omit-frame-pointer
+          -fcf-protection=none -fPIE)
+        target_link_options(${_entry_target} PRIVATE -pie "LINKER:--build-id=sha1")
+      endforeach()
+      target_link_options(repl-entry-stripped-target PRIVATE "LINKER:--strip-all")
       add_test(NAME native_repl_entry_integration
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_entry_integration.py"
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
-          $<TARGET_FILE:repl-entry-target> "${CMAKE_OBJCOPY}" "${CMAKE_NM}")
+          $<TARGET_FILE:repl-entry-target> $<TARGET_FILE:repl-entry-stripped-target> "${CMAKE_NM}")
       set_tests_properties(native_repl_entry_integration PROPERTIES TIMEOUT 100)
+      add_executable(repl-object-watch-target tests/fixtures/repl_object_watch.cpp)
+      set_target_properties(repl-object-watch-target PROPERTIES CXX_STANDARD 17)
+      target_compile_options(repl-object-watch-target PRIVATE -g -O2 -fno-omit-frame-pointer -fcf-protection=none -fPIE)
+      target_link_options(repl-object-watch-target PRIVATE -pie "LINKER:--build-id=sha1")
+      target_link_libraries(repl-object-watch-target PRIVATE Threads::Threads)
+      add_test(NAME native_repl_object_watch
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_watch.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-watch-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/repl_object_watch.cpp")
+      set_tests_properties(native_repl_object_watch PROPERTIES TIMEOUT 100)
+      add_executable(repl-small-getter-target tests/fixtures/repl_small_getter.cpp)
+      set_target_properties(repl-small-getter-target PROPERTIES CXX_STANDARD 17)
+      target_compile_options(repl-small-getter-target PRIVATE -g -O2 -fno-omit-frame-pointer
+        -momit-leaf-frame-pointer -fno-optimize-sibling-calls -fcf-protection=none -fno-pie)
+      target_link_options(repl-small-getter-target PRIVATE -no-pie "LINKER:--build-id=sha1")
+      add_test(NAME native_repl_small_getter
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_small_getter.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-small-getter-target>)
+      set_tests_properties(native_repl_small_getter PROPERTIES TIMEOUT 120)
+      add_executable(repl-person-target tests/fixtures/person/person.cpp tests/fixtures/person/driver.cpp)
+      set_target_properties(repl-person-target PROPERTIES CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
+      target_compile_options(repl-person-target PRIVATE -g -O2 -fno-omit-frame-pointer -fcf-protection=none -fno-pie)
+      target_link_options(repl-person-target PRIVATE -no-pie "LINKER:--build-id=sha1")
+      add_test(NAME native_repl_person_store
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_person_store.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-person-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/person/person.cpp")
+      set_tests_properties(native_repl_person_store PROPERTIES TIMEOUT 100)
+      foreach(_record_variant repl-object-plan-target repl-object-plan-rebuilt-target repl-object-union-target)
+        add_executable(${_record_variant}
+          tests/fixtures/object_plan/record.cpp tests/fixtures/object_plan/driver.cpp)
+        set_target_properties(${_record_variant} PROPERTIES
+          CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_compile_options(${_record_variant} PRIVATE
+          -g -O2 -fPIE -fno-optimize-sibling-calls -fcf-protection=none)
+        target_link_options(${_record_variant} PRIVATE -pie "LINKER:--build-id=sha1")
+        target_link_libraries(${_record_variant} PRIVATE Threads::Threads)
+      endforeach()
+      target_compile_definitions(repl-object-plan-rebuilt-target PRIVATE OBJECT_PLAN_PADDED)
+      target_compile_definitions(repl-object-union-target PRIVATE OBJECT_PLAN_UNION)
+      add_test(NAME native_repl_object_plan
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_plan.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-plan-target>
+          $<TARGET_FILE:repl-object-plan-rebuilt-target>)
+      set_tests_properties(native_repl_object_plan PROPERTIES TIMEOUT 120)
+      add_test(NAME native_repl_object_union
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_union.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-union-target>)
+      set_tests_properties(native_repl_object_union PROPERTIES TIMEOUT 120)
+      add_executable(repl-object-lifetime-target tests/fixtures/object_lifetime/fixture.cpp)
+      set_target_properties(repl-object-lifetime-target PROPERTIES
+        CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
+      target_compile_options(repl-object-lifetime-target PRIVATE
+        -g -O0 -fno-omit-frame-pointer -fPIE -fcf-protection=none)
+      target_link_options(repl-object-lifetime-target PRIVATE -pie "LINKER:--build-id=sha1")
+      add_test(NAME native_repl_object_lifetime
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_lifetime.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-lifetime-target>)
+      set_tests_properties(native_repl_object_lifetime PROPERTIES TIMEOUT 120)
+      foreach(_indirect_target repl-object-indirect-target repl-object-multi-indirect-target)
+        add_executable(${_indirect_target}
+          tests/fixtures/object_plan/record.cpp tests/fixtures/object_plan/indirect.cpp)
+        set_target_properties(${_indirect_target} PROPERTIES
+          CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_compile_options(${_indirect_target} PRIVATE
+          -g -O2 -fPIE -fomit-frame-pointer -fno-optimize-sibling-calls -fcf-protection=none)
+        target_link_options(${_indirect_target} PRIVATE -pie "LINKER:--build-id=sha1")
+      endforeach()
+      target_compile_definitions(repl-object-multi-indirect-target PRIVATE TRACE_TEST_MULTI_INDIRECT)
+      add_test(NAME native_repl_object_indirect
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_indirect.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-indirect-target>)
+      set_tests_properties(native_repl_object_indirect PROPERTIES TIMEOUT 120)
+      add_test(NAME native_repl_object_multi_indirect
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_indirect.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-multi-indirect-target>
+          --entry-multi)
+      set_tests_properties(native_repl_object_multi_indirect PROPERTIES TIMEOUT 120)
+      add_executable(repl-object-origin-target tests/fixtures/object_origin/main.cpp
+        tests/fixtures/object_origin/record.cpp tests/fixtures/object_origin/opaque.cpp)
+      set_target_properties(repl-object-origin-target PROPERTIES
+        CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
+      target_compile_options(repl-object-origin-target PRIVATE
+        -g -O2 -fPIE -fno-optimize-sibling-calls -fcf-protection=none)
+      target_link_options(repl-object-origin-target PRIVATE -pie "LINKER:--build-id=sha1")
+      set_source_files_properties(tests/fixtures/object_origin/opaque.cpp
+        PROPERTIES COMPILE_OPTIONS "-g0")
+      add_test(NAME native_repl_object_origin
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_origin.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-origin-target> --limits)
+      set_tests_properties(native_repl_object_origin PROPERTIES TIMEOUT 120)
+      add_test(NAME native_repl_code_cache_faults
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_person_store.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-person-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/person/person.cpp" --backend code-cache --faults)
+      set_tests_properties(native_repl_code_cache_faults PROPERTIES TIMEOUT 120)
+      add_library(repl-shared-shapes-library SHARED tests/fixtures/shared_shapes/library.cpp)
+      add_executable(repl-shared-shapes-target tests/fixtures/shared_shapes/driver.cpp)
+      set_target_properties(repl-shared-shapes-library repl-shared-shapes-target
+        PROPERTIES CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
+      target_compile_options(repl-shared-shapes-library PRIVATE
+        -g -O2 -fno-optimize-sibling-calls -fcf-protection=none)
+      target_compile_options(repl-shared-shapes-target PRIVATE
+        -g -O2 -fno-pie -fno-optimize-sibling-calls -fcf-protection=none)
+      target_link_options(repl-shared-shapes-library PRIVATE "LINKER:--build-id=sha1")
+      target_link_options(repl-shared-shapes-target PRIVATE -no-pie "LINKER:--build-id=sha1")
+      target_link_libraries(repl-shared-shapes-target PRIVATE ${CMAKE_DL_LIBS})
+      add_test(NAME native_repl_code_cache_shared
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_shared_object_cache.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-shared-shapes-target>
+          $<TARGET_FILE:repl-shared-shapes-library>)
+      set_tests_properties(native_repl_code_cache_shared PROPERTIES TIMEOUT 120)
+      add_executable(repl-atomic-person-target
+        tests/fixtures/atomic_person/operations.cpp tests/fixtures/atomic_person/driver.cpp)
+      set_target_properties(repl-atomic-person-target PROPERTIES CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
+      target_compile_options(repl-atomic-person-target PRIVATE -g -O2 -fno-omit-frame-pointer -fcf-protection=none -fno-pie)
+      target_link_options(repl-atomic-person-target PRIVATE -no-pie "LINKER:--build-id=sha1")
+      target_link_libraries(repl-atomic-person-target PRIVATE Threads::Threads)
+      add_test(NAME native_repl_atomic_store
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_atomic_store.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-atomic-person-target>)
+      set_tests_properties(native_repl_atomic_store PROPERTIES TIMEOUT 120)
+      add_test(NAME native_repl_atomic_live_detach
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_atomic_store.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-atomic-person-target>
+          --detach --iterations 1000 --trials 2)
+      set_tests_properties(native_repl_atomic_live_detach PROPERTIES TIMEOUT 120)
+      add_test(NAME native_repl_code_cache_atomic
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_atomic_store.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-atomic-person-target>
+          --backend code-cache)
+      add_test(NAME native_repl_code_cache_live_detach
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_atomic_store.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-atomic-person-target>
+          --backend code-cache --detach --iterations 1000 --trials 2)
+      set_tests_properties(native_repl_code_cache_atomic native_repl_code_cache_live_detach
+        PROPERTIES TIMEOUT 120)
       add_executable(repl-reload-target tests/fixtures/repl_reload.cpp)
       target_compile_options(repl-reload-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
       target_link_libraries(repl-reload-target PRIVATE Threads::Threads)
@@ -273,9 +724,9 @@ function(tracer_add_native_repl)
       add_test(NAME native_repl_bulk_preview
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_bulk_preview.py"
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
-          $<TARGET_FILE:cpp-name-fixture> $<TARGET_FILE:repl-bulk-concrete-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp_name_fixture.cpp" $<TARGET_FILE:repl-bulk-concrete-target>
           $<TARGET_FILE:repl-browser-target> $<TARGET_FILE:call-stacks-calculator>
-          "${CMAKE_OBJCOPY}")
+          "${CMAKE_CXX_COMPILER}")
       set_tests_properties(native_repl_bulk_preview PROPERTIES TIMEOUT 120)
       add_test(NAME native_repl_bulk_apply
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_bulk_apply.py"
@@ -292,9 +743,12 @@ function(tracer_add_native_repl)
           --compdb "${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json"
           --compiler "${CMAKE_CXX_COMPILER}")
       set_tests_properties(native_repl_prepared_integration PROPERTIES TIMEOUT 240)
-      add_executable(repl-headerless-templates-target tests/fixtures/repl_headerless_templates.cpp)
-      target_compile_options(repl-headerless-templates-target PRIVATE -g -O0
-        -fno-omit-frame-pointer -fcf-protection=none)
+      foreach(_templates_target repl-headerless-templates-target repl-elf-signature-target)
+        add_executable(${_templates_target} tests/fixtures/repl_headerless_templates.cpp)
+        target_compile_options(${_templates_target} PRIVATE -g -O0
+          -fno-omit-frame-pointer -fcf-protection=none)
+      endforeach()
+      target_link_options(repl-elf-signature-target PRIVATE "LINKER:--strip-debug")
       add_test(NAME native_repl_headerless_templates
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_headerless_templates.sh"
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
@@ -303,8 +757,7 @@ function(tracer_add_native_repl)
       add_test(NAME native_repl_elf_signature
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_elf_signature.sh"
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
-          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-headerless-templates-target>
-          "${CMAKE_OBJCOPY}")
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-elf-signature-target>)
       set_tests_properties(native_repl_elf_signature PROPERTIES TIMEOUT 180)
       add_test(NAME native_repl_prepared_concrete
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_prepared_concrete.sh"
