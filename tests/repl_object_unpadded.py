@@ -29,6 +29,8 @@ def run(args):
         "c": ("Callback", "callback", [(7, 13)]),
         "t": ("Text", "text", [(7, 13), (17, 23)]),
         "p": ("Plain", "plain", [(7, 13), (17, 23)]),
+        "x": ("TailCtor", "tail_ctor", []),
+        "y": ("TailDtor", "tail_dtor", []),
     }
     with tempfile.TemporaryDirectory(prefix="ct-object-unpadded-") as directory, ExitStack() as cleanup:
         root = Path(directory)
@@ -43,7 +45,7 @@ def run(args):
         target, app = launch(fixture, *target_args)
         app.expect(r"^READY$")
         repl, out = launch(args.repl, "--server", args.server, "--agent", args.agent,
-                           "--attach", str(target.pid), "--fail-fast")
+                           "--attach", str(target.pid), *([] if args.reject_tail else ["--fail-fast"]))
         out.expect(rf"^attached session=\S+ pid={target.pid}$")
         memory = cleanup.enter_context(Path(f"/proc/{target.pid}/mem").open("rb", buffering=0))
 
@@ -62,6 +64,13 @@ def run(args):
                        f"--backend {args.backend}")
             if args.no_values:
                 options += " --no-values"
+            if args.reject_tail:
+                for action in ("preview", "start"):
+                    send(repl, f"%object {action} {options}")
+                    out.expect(r"^error: .*unverified tail caller")
+                send(target, command)
+                app.expect(r"^DONE$")
+                continue
             send(repl, f"%object preview {options}")
             out.expect(r"^watch=0 active=no stores=[1-9][0-9]* ")
             send(repl, f"%object start {options}")
@@ -119,7 +128,7 @@ def run(args):
             send(repl, "%detach")
             out.expect(r"^detached session=")
         send(repl, "%quit")
-        assert repl.wait(timeout=10) == 0
+        assert repl.wait(timeout=10) == (1 if args.reject_tail else 0)
         if args.preserved_strings:
             (root / "stop-test.now").touch()
         else:
@@ -136,6 +145,7 @@ if __name__ == "__main__":
     parser.add_argument("--backend", choices=("ptrace", "code-cache"), default="ptrace")
     parser.add_argument("--no-values", action="store_true")
     parser.add_argument("--preserved-strings", choices=("text", "plain"))
+    parser.add_argument("--reject-tail", action="store_true")
     args = parser.parse_args()
     if args.preserved_strings:
         args.cases = args.preserved_strings[0]

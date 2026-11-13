@@ -637,6 +637,9 @@ function(tracer_add_native_repl)
           CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
         target_compile_options(${_unpadded_target} PRIVATE -g -${_optimization} -fno-inline
           -falign-functions=16 -fno-omit-frame-pointer -fPIE -fcf-protection=none)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+          target_compile_options(${_unpadded_target} PRIVATE -fstandalone-debug)
+        endif()
         target_link_options(${_unpadded_target} PRIVATE -pie "LINKER:--build-id=sha1")
         if(_optimization STREQUAL "O0")
           set(_unpadded_cases vi)
@@ -657,6 +660,12 @@ function(tracer_add_native_repl)
           set_tests_properties(${_test} PROPERTIES TIMEOUT 120)
         endforeach()
       endforeach()
+      add_test(NAME native_repl_object_lifetime_tail_callers
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_unpadded.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-unpadded-O2-target>
+          xy --backend code-cache --reject-tail)
+      set_tests_properties(native_repl_object_lifetime_tail_callers PROPERTIES TIMEOUT 120)
       foreach(_optimization O0 O2)
         set(_string_target repl-object-string-lifetime-${_optimization}-target)
         add_executable(${_string_target} tests/fixtures/object_lifetime/unpadded.cpp

@@ -52,6 +52,25 @@ void exercise_callback() {
     write_plain(object, initial + 6);
   }
 }
+
+void exercise_tail_ctor() {
+  life::TailCtor direct(7);
+  write_tail_ctor(direct, 13);
+  alignas(life::TailCtor) unsigned char storage[sizeof(life::TailCtor)];
+  auto *object = reinterpret_cast<life::TailCtor *>(storage);
+  make_tail_ctor(object, 17);
+  write_tail_ctor(*object, 23);
+  object->~TailCtor();
+}
+
+void exercise_tail_dtor() {
+  life::TailDtor direct(7);
+  write_tail_dtor(direct, 13);
+  alignas(life::TailDtor) unsigned char storage[sizeof(life::TailDtor)];
+  auto *object = new (storage) life::TailDtor(17);
+  write_tail_dtor(*object, 23);
+  destroy_tail_dtor(object);
+}
 } // namespace
 
 int main() {
@@ -88,6 +107,12 @@ int main() {
       break;
     case 'p':
       exercise_plain();
+      break;
+    case 'x':
+      exercise_tail_ctor();
+      break;
+    case 'y':
+      exercise_tail_dtor();
       break;
     case 'q':
       return 0;
