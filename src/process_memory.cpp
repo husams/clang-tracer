@@ -634,6 +634,33 @@ void find_matches(const Target &target, std::string_view bytes, std::uint64_t ad
 }
 } // namespace
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>>
+readonly_image_data(Session &session, const std::string &image, std::chrono::seconds timeout) {
+  struct stat info{};
+  if (::stat(image.c_str(), &info) != 0)
+    throw std::runtime_error("cannot verify the RTTI provider file");
+  grpc::ServerContext context;
+  const Target target(context, session, std::chrono::steady_clock::now() + timeout);
+  const auto maps = target.maps();
+  const auto snapshot = parse_mappings(maps, target);
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+  for (const auto &mapping : snapshot.mappings()) {
+    if (mapping.path() != image || mapping.inode() != info.st_ino ||
+        (mapping.permissions() != "r--p" && mapping.permissions() != "r-xp"))
+      continue;
+    const std::string_view device = mapping.device();
+    const auto separator = device.find(':');
+    if (separator != std::string_view::npos &&
+        parse_number(device.substr(0, separator), 16) == major(info.st_dev) &&
+        parse_number(device.substr(separator + 1), 16) == minor(info.st_dev))
+      ranges.emplace_back(mapping.begin_address(), mapping.end_address());
+  }
+  if (target.maps() != maps)
+    throw std::runtime_error("target changed mappings during RTTI provider verification");
+  target.verify_live();
+  return ranges;
+}
+
 grpc::Status list_mappings(grpc::ServerContext &context, Session &session,
                            std::chrono::seconds timeout,
                            api::ListMemoryMappingsResponse &response) {
@@ -866,6 +893,7 @@ grpc::Status preview_entry(grpc::ServerContext &context, Session &session,
       lookup.module = request.module();
       lookup.max_entries = 1000000;
       lookup.max_depth = 256;
+      lookup.allow_virtual_entry = true;
       lookup.is_cancelled = [&] {
         target.checkpoint();
         return false;

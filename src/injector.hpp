@@ -1,7 +1,9 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstddef>
+#include <functional>
 #include <cstdint>
 #include <functional>
 #include <stdexcept>
@@ -15,6 +17,8 @@
 #include "tracer/compat.hpp"
 #include "tracer/reclaim.h"
 
+namespace tracer::object_launch { class Child; }
+
 namespace tracer::injector {
 
 struct CodePatch {
@@ -23,6 +27,10 @@ struct CodePatch {
   const void *replacement = nullptr;
   std::size_t size = 0;
 };
+
+// The caller owns the ptrace stop and has excluded other executing threads.
+// Used by the object watch for a one-byte, word-preserving breakpoint patch.
+void write_stopped_code_byte(pid_t tid, std::uintptr_t address, unsigned char value);
 
 class IdlePointUnavailable : public std::runtime_error {
 public:
@@ -50,6 +58,13 @@ public:
   void attach(pid_t process_id,
               ::tracer::compat::span<const ApplicationModule> application_modules = {},
               pid_t excluded_tid = 0, pid_t required_tid = 0);
+  // A stopped task suffices for code restoration. This mode cannot run
+  // remote calls or syscalls, and does not require a loader rendezvous.
+  void attach_for_patch(pid_t process_id);
+  void attach_at_application_point(pid_t process_id, std::uintptr_t entry, std::size_t size);
+  void adopt_executable_entry(object_launch::Child &child,
+                              std::chrono::steady_clock::time_point deadline,
+                              bool loader_ready = false, std::string_view startup_module = {});
   void detach();
 
   // Prevent normal detach/resume after the caller detects an unsafe target
@@ -78,9 +93,11 @@ public:
   // Validates and commits the complete disjoint patch set while all target
   // threads are stopped. A precondition/active-instruction failure changes no
   // bytes; a write failure rolls back every range before resuming threads.
-  [[nodiscard]] bool patch_code_batch(
-      ::tracer::compat::span<const CodePatch> patches,
-      const std::function<void()> &verify = {});
+  // The optional commit hook runs after verification and before peers resume.
+  // It must not throw.
+  [[nodiscard]] bool patch_code_batch(::tracer::compat::span<const CodePatch> patches,
+                                     const std::function<void()> &validate_mappings = {},
+                                     const std::function<void()> &on_commit = {});
   [[nodiscard]] bool retired_code_quiescent(const TracerRetiredCode &code);
   [[nodiscard]] std::uintptr_t remote_map_file(std::string_view path, std::size_t size);
   void remote_free(std::uintptr_t address, std::size_t size,
@@ -106,7 +123,12 @@ private:
   std::size_t call_page_size_ = 0;
   bool poisoned_ = false;
   bool tracee_stopped_ = false;
+  bool patch_only_ = false;
 
+  void attach_impl(pid_t process_id,
+                   ::tracer::compat::span<const ApplicationModule> application_modules,
+                   bool patch_only, std::uintptr_t rendezvous = 0, std::size_t rendezvous_size = 0,
+                   pid_t excluded_tid = 0, pid_t required_tid = 0);
   void ensure_attached() const;
   void ensure_usable() const;
   void poison_process() noexcept;

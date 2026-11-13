@@ -149,6 +149,19 @@ extern "C" void tracer_snapshot_commit(std::size_t mark,
 extern "C" bool tracer_snapshot_read_rtti(const void *base,
                                           const void **complete,
                                           const char **type_name) noexcept {
+  const void *type_info = nullptr, *vtable = nullptr;
+  return tracer_snapshot_read_rtti_provider(base, complete, type_name, &type_info, &vtable);
+}
+
+extern "C" bool tracer_snapshot_readable(const void *pointer, std::size_t size,
+                                           std::size_t alignment) noexcept {
+  const PreserveErrno preserve_errno;
+  const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+  return address && size && alignment && address % alignment == 0 && readable_object(address, size);
+}
+
+extern "C" bool tracer_snapshot_read_rtti_provider(const void *base, const void **complete,
+    const char **type_name, const void **type_info, const void **table) noexcept {
   const PreserveErrno preserve_errno;
   const auto address = reinterpret_cast<std::uintptr_t>(base);
   struct VTablePrefix {
@@ -161,7 +174,7 @@ extern "C" bool tracer_snapshot_read_rtti(const void *base,
   } type{};
   static_assert(sizeof(VTablePrefix) == 2 * sizeof(std::uintptr_t));
   std::uintptr_t vtable = 0;
-  if (!complete || !type_name ||
+  if (!complete || !type_name || !type_info || !table ||
       !read_snapshot_memory(address, &vtable, sizeof(vtable)) ||
       vtable < sizeof(prefix) || vtable % alignof(std::uintptr_t) != 0 ||
       !read_snapshot_memory(vtable - sizeof(prefix), &prefix, sizeof(prefix)) ||
@@ -176,6 +189,8 @@ extern "C" bool tracer_snapshot_read_rtti(const void *base,
     return false;
   *complete = reinterpret_cast<const void *>(address - distance);
   *type_name = reinterpret_cast<const char *>(type.name);
+  *type_info = reinterpret_cast<const void *>(prefix.type_info);
+  *table = reinterpret_cast<const void *>(vtable);
   return true;
 }
 

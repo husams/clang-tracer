@@ -41,13 +41,10 @@ public:
     T__149 = 150, T__150 = 151, T__151 = 152, T__152 = 153, T__153 = 154,
     T__154 = 155, T__155 = 156, T__156 = 157, T__157 = 158, T__158 = 159,
     T__159 = 160, T__160 = 161, T__161 = 162, T__162 = 163, T__163 = 164,
-    T__164 = 165, T__165 = 166, T__166 = 167, T__167 = 168, T__168 = 169,
-    T__169 = 170, T__170 = 171, T__171 = 172, T__172 = 173, T__173 = 174,
-    T__174 = 175, T__175 = 176, T__176 = 177, T__177 = 178, T__178 = 179,
-    T__179 = 180, T__180 = 181, T__181 = 182, UINT = 183, STRING = 184,
-    SHELL = 185, METADATA_ONLY = 186, SQLITE = 187, STACK = 188, CWD = 189,
-    SIGNATURE = 190, MEMBER = 191, SNAPSHOT_RETURN_POINTEE = 192, WORD = 193,
-    WS = 194
+    T__164 = 165, T__165 = 166, T__166 = 167, T__167 = 168, UINT = 169,
+    STRING = 170, SHELL = 171, METADATA_ONLY = 172, SQLITE = 173, STACK = 174,
+    CWD = 175, SIGNATURE = 176, MEMBER = 177, SNAPSHOT_RETURN_POINTEE = 178,
+    WORD = 179, WS = 180
   };
 
   explicit TracerCommandsLexer(antlr4::CharStream *input);

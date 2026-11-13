@@ -158,6 +158,32 @@ const CommandTopic commands[] = {
      "Find masked byte patterns in a readable range up to 1 MiB. Use ? for wildcard nibbles. "
      "The default result limit is 64 and the maximum is 1024.",
      R"(%memory scan 0xADDRESS --mapping TOKEN --count 4096 --pattern "48 8? ?? ff")"},
+    {"object", "", "Watch object lifetimes, ownership, method snapshots and stores on Linux."},
+    {"object prepare", "%object prepare TYPE --module ELF --field FIELD --code SELECTOR --output DIRECTORY",
+     "Save a reusable object definition and verified ELF bindings without attaching. "
+     "Use --on METHOD, --include HEADER, and --synchronization for a typed method watch."},
+    {"object preview", "%object preview --plan DIRECTORY",
+     "Resolve the plan against the selected process and check live code bytes without installing patches."},
+    {"object start", "%object start --type TYPE --field FIELD --code SELECTOR "
+     "[--base BASE --owner OWNER --collection FIELD] [--snapshot-field FIELD] "
+     "[--module MODULE] [--caller SELECTOR] [--rendezvous SYMBOL] "
+     "[--backend ptrace|code-cache] [--no-values] [--stack-depth N] [--max-elements N] [--max-string-bytes N]",
+     "Start a native watch with matching DWARF. Ptrace is the diagnostic default. "
+     "Code cache translates supported writers and lifecycle fragments. "
+     "Repeat --code to select multiple writers for a standalone main-image field. "
+     "Use --follow-calls to resolve callees at runtime from the selected scope, with --runtime-limit N to bound translations. "
+     "Use --shared-file PATH to correlate shared storage across live processes. "
+     "Use --pointee PATH with a verified --mutation to follow a DWARF-resolved pointer path. "
+     "On AArch64, --rendezvous selects an existing single-threaded userspace checkpoint. "
+     "On x86-64, use --module for a shared writer and "
+     "--caller to verify an Image::get borrow followed by an indirect call. "
+     "Use --writer-entry for all entries into an admitted standalone leaf. "
+     "Use --vector with --element-key FIELD=UINT32 or --map with --map-key KEY to track collection storage generations. "
+     "Select a verified --mutation SYMBOL and declare --synchronization for native collection capture. "
+     "Use --no-values to record every completed write and omit field samples. "
+     "Record observations with %record FILE --sqlite --name object.trace."},
+    {"object status", "%object status [WATCH_ID]", "Show admitted store sites, observations and restoration status."},
+    {"object stop", "%object stop [WATCH_ID]", "Restore the watch's patches and release execution control."},
 
     {"trace", "", "Preview, apply, or remove a bulk C++ trace."},
     {"trace preview", "%trace preview [--module GLOB] [--include GLOB] [--exclude GLOB] [--exact SIGNATURE]\n"
@@ -190,7 +216,7 @@ const CommandTopic commands[] = {
      "  [--allow-arg-overrides] [--allow-result-override] [--allow-replacement] [--allow-call-original] [--trace-exceptions] [--reclaimable]",
      "Check whether the callback can be deployed for the selected function."},
     {"probe inject", "%probe inject SELECTOR [--callback FILE] [RESOLUTION OPTIONS] [DEPLOYMENT OPTIONS] [--cwd DIRECTORY]\n"
-     "  [--allow-arg-overrides] [--allow-result-override] [--allow-replacement] [--allow-call-original] [--trace-exceptions] [--reclaimable] [--snapshot-return-pointee]\n"
+     "  [--allow-arg-overrides] [--allow-result-override] [--allow-replacement] [--allow-call-original] [--trace-exceptions] [--reclaimable] [--snapshot-return-pointee] [--backend auto|entry] [--caller SELECTOR]\n"
      "  [--follow-depth N] [--follow-members N] [--record-members N] [--nested-depth N]\n"
      "  [--string-bytes N] [--vector-elements N] [--checked-reads N] [--snapshot-reserve N] [--snapshot-arena N] [--snapshot-slice N]",
      "Omit --callback to capture events with the built-in observer. For prepared implementation member snapshots, a callback file can define tracer_snapshot::encode(const Implementation&) noexcept to return a custom record by value. Snapshot returned record pointees only when the live layout matches and the pointee remains stable through POST; result() gives its address and result_as<T>() copies the record.",
@@ -214,6 +240,8 @@ const CommandTopic commands[] = {
      "%events --count 5 --phase POST"},
     {"events list", "%events list NAME [--limit N]", "List retained events with their zero-based indexes. The default limit is 20."},
     {"events show", "%events show NAME --index N", "Print one retained event and its captured values.", "%events show batch --index 0"},
+    {"events diff", "%events diff NAME --pre N --post N [--key PATH=MEMBER]...",
+     "Compare owned receiver snapshots for one call. Use --key for a verified element identity."},
     {"events stack", "%events stack NAME --index N",
      "Print all captured stack frames for one retained event.",
      "%events stack fullstack --index 0"},

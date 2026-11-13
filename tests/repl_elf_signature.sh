@@ -5,7 +5,6 @@ repl=$1
 server=$2
 agent=$3
 target=$4
-objcopy=$5
 unset CLANG_TRACER_ENDPOINT
 
 run=$(mktemp -d)
@@ -20,7 +19,7 @@ cleanup() {
 trap cleanup EXIT
 cd "$run"
 
-"$objcopy" --strip-debug "$target" target
+cp "$target" target
 if "$repl" --fail-fast > rejected.log 2>&1 <<'REPL'
 %probe prepare "Configuration<int>::get() const" --signature "const int&(int)" --module target --output wrong
 REPL

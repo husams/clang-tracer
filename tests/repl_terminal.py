@@ -138,7 +138,7 @@ def main():
         changed_header.write_bytes(original_header + b"// changed during editing\n")
         send("for (int x = 1; x < 2; ++x) {\rstd::cou\t")
         until(rb"C\+\+ completion: C\+\+ header changed: [^\n]*changed.hpp;[^\n]*\n"
-              rb"tracer\[7\]> \n?for \(int x = 1; x < 2; \+\+x\) \{\n +std::cou")
+              rb"tracer\[7\]> (?:f)?\n?for \(int x = 1; x < 2; \+\+x\) \{\n +std::cou")
         assert b"\x1b[JC++ completion:" in transcript
         changed_header.write_bytes(original_header)
         os.utime(changed_header, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))

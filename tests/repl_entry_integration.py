@@ -6,16 +6,13 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
-import tempfile
 
 from repl_browser_integration import Transcript, stop
 
 
-def main(repl, server, fixture, objcopy, nm):
-    with tempfile.TemporaryDirectory(prefix="ct-entry-") as directory, ExitStack() as stack:
-        stripped = Path(directory) / "stripped"
-        subprocess.run([objcopy, "--strip-all", fixture, stripped], check=True)
-        stripped.chmod(Path(fixture).stat().st_mode & 0o777)
+def main(repl, server, fixture, stripped_fixture, nm):
+    with ExitStack() as stack:
+        stripped = Path(stripped_fixture).resolve()
         symbols = {}
         wanted = {"verified_entry", "indirect_entry", "direct_entry"}
         listing = subprocess.check_output([nm, "--defined-only", fixture], text=True)

@@ -21,7 +21,8 @@ ResolvedCallable resolve_header_callable(const std::string& selector,
                                          const PreparedHeaderCommand& command,
                                          bool pointer_layouts,
                                          int member_level = 3,
-                                         const clangtracer::v1::SnapshotLimits &limits = {});
+                                         const clangtracer::v1::SnapshotLimits &limits = {},
+                                         bool receiver_storage = false);
 
 void verify_prepared_adapter(const std::string &selector,
                              const clangtracer::v1::PreparedInjector &adapter,
@@ -34,5 +35,9 @@ void verify_prepared_adapter(const std::string &selector,
 ResolvedCallable resolve_cpp_callable(const std::string& name,
                                       const std::string& compilation_database,
                                       const std::vector<std::string>& sources);
+
+std::vector<clangtracer::v1::ObjectWatchRequest::SourceWriter> discover_object_writers(
+    const std::string &type, const std::string &field, const std::string &database,
+    const std::vector<std::string> &sources);
 
 } // namespace tracer::client

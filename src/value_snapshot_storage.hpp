@@ -13,6 +13,10 @@ extern "C" void tracer_snapshot_commit(std::size_t mark,
 extern "C" bool tracer_snapshot_read_rtti(const void *base,
                                           const void **complete,
                                           const char **type_name) noexcept;
+extern "C" bool tracer_snapshot_read_rtti_provider(const void *base, const void **complete,
+    const char **type_name, const void **type_info, const void **vtable) noexcept;
+extern "C" bool tracer_snapshot_readable(const void *address, std::size_t size,
+                                           std::size_t alignment) noexcept;
 extern "C" bool tracer_snapshot_rtti_matches(
     const char *type_name, const char *expected, std::size_t expected_len,
     const void *complete, const void *base, std::size_t object_size,

@@ -114,7 +114,7 @@ private:
         continue;
       emit_record(*snapshot_type);
       declarations_ += "namespace tracer_prepared { using SnapshotType" +
-          std::to_string(i) + " = " + spelling(ast_.getRecordType(snapshot_type)) + "; }\n";
+          std::to_string(i) + " = " + spelling(record_type(ast_, snapshot_type)) + "; }\n";
     }
   }
 
@@ -308,7 +308,7 @@ private:
       if (const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(decl);
           record && record->isCompleteDefinition() && !record->isImplicit() &&
           record->getIdentifier() && !record->getDescribedClassTemplate() &&
-          !is_follow_pointers_specialization(record))
+          !is_snapshot_policy_specialization(record))
         emit_record(*record);
       if (const auto *enumeration = llvm::dyn_cast<clang::EnumDecl>(decl);
           enumeration && enumeration->isCompleteDefinition() && enumeration->getIdentifier())
@@ -318,12 +318,14 @@ private:
     }
   }
 
-  static bool is_follow_pointers_specialization(const clang::CXXRecordDecl *record) {
+  static bool is_snapshot_policy_specialization(const clang::CXXRecordDecl *record) {
     const auto *specialization =
         llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record);
     const auto *templ = specialization ? specialization->getSpecializedTemplate() : nullptr;
-    return templ &&
-           templ->getQualifiedNameAsString() == "tracer_snapshot::FollowPointers";
+    if (!templ)
+      return false;
+    const auto name = templ->getQualifiedNameAsString();
+    return name == "tracer_snapshot::FollowPointers" || name == "tracer_snapshot::AnyPayloads";
   }
 
   void emit_alias(const clang::TypedefNameDecl &alias) {
@@ -697,6 +699,14 @@ private:
         visit_signature(*method, selected);
         source += access(method->getAccess()) + ": " + callable(*method, selected);
         emitted_selected |= selected;
+        continue;
+      }
+      if (method->isCopyAssignmentOperator() || method->isMoveAssignmentOperator()) {
+        visit_signature(*method);
+        auto declaration = callable(*method);
+        if (method->isExplicitlyDefaulted() && !method->isDeletedAsWritten())
+          declaration.insert(declaration.rfind(';'), " = default");
+        source += access(method->getAccess()) + ": " + declaration;
         continue;
       }
       const auto *ctor = llvm::dyn_cast<clang::CXXConstructorDecl>(method);

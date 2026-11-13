@@ -112,7 +112,9 @@ public:
   std::string prompt() const;
   ModuleList modules(const std::string &filter);
   ModuleInfo module_info(const std::string &name);
+  PreparedPackage prepare_package(const std::string &selector, const Command &options);
   void prepare(const std::string &selector, const Command &options);
+  void prepare_object_methods(const Command &command, clangtracer::v1::ObjectWatchRequest &request);
   ::tracer_module::ModuleIndex build_module_index(const ::tracer_module::ModuleSource &,
       const std::filesystem::path &, const ::tracer_module::ModuleIndexOptions &);
   ::tracer_module::ModuleIndex open_module_index(const std::filesystem::path &);

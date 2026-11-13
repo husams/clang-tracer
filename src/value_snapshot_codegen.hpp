@@ -12,6 +12,7 @@ namespace tracer {
 struct ValueSnapshotCode {
   std::string declarations;
   std::string arguments;
+  std::string receiver;
   std::string result;
   std::string error;
   bool has_custom_encoder = false;

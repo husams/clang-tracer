@@ -75,7 +75,7 @@ bool supports_itanium_dynamic_rtti(clang::ASTContext &ast) {
   const auto *vtable = llvm::dyn_cast<clang::ItaniumVTableContext>(
       ast.getVTableContext());
   return ast.getLangOpts().RTTI &&
-         target.getTriple().getArch() == llvm::Triple::x86_64 &&
+         (target.getTriple().getArch() == llvm::Triple::x86_64 || target.getTriple().isAArch64()) &&
          target.getTriple().isOSLinux() && target.isLittleEndian() &&
          target.getPointerWidth(clang::LangAS::Default) == 64 &&
          target.getLongWidth() == 64 && target.getCXXABI().isItaniumFamily() &&
@@ -261,6 +261,7 @@ make_value_snapshot_code(clang::ASTContext &ast,
     bool polymorphic = false;
     bool automatic = false;
     snapshot_members::Referent kind = snapshot_members::Referent::record;
+    bool erased_any = false;
   };
   struct Entry {
     unsigned index;
@@ -275,6 +276,7 @@ make_value_snapshot_code(clang::ASTContext &ast,
   };
   std::vector<Entry> entries;
   const auto &info = spec.debug_info();
+  const bool report_unavailable = spec.snapshot_report_unavailable();
   const auto access = tracer::prepared::is_typed_version(spec.prepared().format_version())
       ? context_engine::CodecAccess::snapshot_members
       : context_engine::CodecAccess::public_members;
@@ -386,7 +388,7 @@ make_value_snapshot_code(clang::ASTContext &ast,
       }
       clang::CXXBasePaths paths;
       if (!record->isDerivedFrom(base, paths) ||
-          paths.isAmbiguous(ast.getCanonicalType(ast.getRecordType(base)))) {
+          paths.isAmbiguous(ast.getCanonicalType(tracer::prepared::record_type(ast, base)))) {
         projection.error = "prepared snapshot type is not an unambiguous derived pointee";
         return projection;
       }
@@ -910,17 +912,31 @@ struct Scope { std::size_t mark = (tracer_snapshot_configure(@ARENA@u, @SLICE@u,
                              return p.error.empty() && p.custom_encoder;
                            });
       });
-  if (!types.empty())
+  if (!types.empty()) {
+    const auto bound = [](std::uint32_t value, unsigned fallback) {
+      return std::to_string(value ? std::min(value, fallback) : fallback);
+    };
+    code.declarations += "\nnamespace tracer_snapshot_detail {\n"
+        "constexpr std::size_t snapshot_items=" + bound(spec.snapshot_max_items(), 4096) + ";\n"
+        "constexpr std::size_t snapshot_strings=" + bound(spec.snapshot_max_string_bytes(), 4096) + ";\n"
+        "constexpr std::size_t snapshot_depth=" + bound(spec.snapshot_max_depth(), 32) + ";\n"
+        "constexpr std::size_t snapshot_bytes=" + bound(spec.snapshot_max_bytes(), 4096) + ";\n"
+        "}\n";
     code.declarations += R"(
 namespace tracer_snapshot_detail {
 template<class T> void encode(tracer::ValueSnapshot& snapshot, const T& value) noexcept {
   const auto mark=tracer_snapshot_mark();
   std::size_t capacity = 0;
   std::byte* storage = tracer_snapshot_storage(&capacity);
+  capacity=std::min(capacity,snapshot_bytes);
   tracer::context_engine::CaptureLimits limits;
-  limits.bytes=capacity; limits.string_bytes=4096;
+  limits.bytes=capacity; limits.string_bytes=snapshot_strings;
+  limits.depth=snapshot_depth; limits.items=snapshot_items;
   tracer::context_engine::BoundedProtoWriter writer({storage,capacity},limits);
-  tracer::context_engine::EncodeBudget budget; budget.max_items=4096;
+  tracer::context_engine::EncodeBudget budget;
+  tracer::context_engine::EncodeBudget::PointerGraph pointer_graph;
+  budget.pointer_graph=&pointer_graph;
+  budget.max_items=snapshot_items; budget.limits=limits;
   const bool ok=tracer::context_engine::encode_value(writer,1,value,budget);
   auto bytes=writer.finish();
   if(ok && writer.status()==tracer::context_engine::CaptureStatus::ok){
@@ -963,6 +979,7 @@ template<class T> void encode_member(tracer::ValueSnapshot& snapshot, const T& v
 
 }
 )";
+  }
   if (has_custom_encoder)
     code.declarations += R"(
 #include <cerrno>
@@ -1269,7 +1286,7 @@ extern "C" bool tracer_snapshot_rtti_matches(const char*, const char*, std::size
     const auto slot = receiver ? "ctx.receiver_snapshot"
                                : result ? "ctx.result.snapshot"
                                         : "ctx.arguments[" + std::to_string(entry.index) + "].snapshot";
-    auto &body = result ? code.result : code.arguments;
+    auto &body = receiver ? code.receiver : result ? code.result : code.arguments;
     body += "tracer::ValueSnapshot snapshot_" + id + ";\n";
     if (top_members.count(entry_index))
       body += "tracer::ValueSnapshot child_snapshots_" + id + "[" +
@@ -1364,6 +1381,11 @@ extern "C" bool tracer_snapshot_rtti_matches(const char*, const char*, std::size
       link_members(body, own, &entry);
       link_roots(body, entry_index);
       body += "}\n";
+      if (report_unavailable)
+        body += "if(!" + child + ".detail && " + child +
+                ".status!=tracer::ValueSnapshot::Complete) " + child +
+                ".detail=\"pointee type, provider or readable storage unavailable\";\n";
+      attach_child();
     }
   }
   // Every root has its share of the thread's snapshot storage before any

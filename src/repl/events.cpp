@@ -1,5 +1,6 @@
 #include "events.hpp"
 #include "../prepared_contract.hpp"
+#include "../object_snapshot.hpp"
 #include "tracer/protocol.hpp"
 
 #include <algorithm>
@@ -21,6 +22,7 @@
 #include <google/protobuf/descriptor.pb.h>
 #include <google/protobuf/dynamic_message.h>
 #include <google/protobuf/io/coded_stream.h>
+#include <google/protobuf/stubs/strutil.h>
 #include <google/protobuf/util/json_util.h>
 #include <google/protobuf/wire_format_lite.h>
 #include <sqlite3.h>
@@ -682,16 +684,6 @@ ScalarValue Event::result_value() const {
   return typed_scalar(event.result(), event.result().type());
 }
 
-// The native REPL JIT needs a stable destructor for snapshot temporaries.
-EventValue::~EventValue() = default;
-
-bool EventValue::matches_record_type(std::string_view name) const {
-  if (!type_.empty())
-    return std::string_view(type_) == name;
-  return !descriptor_type_.empty() && descriptor_type_ == context_descriptor_type(name);
-}
-
-
 EventValue Event::argument_snapshot(std::size_t index) const {
   const auto &event = data_->message;
   if (event.has_context()) {
@@ -750,6 +742,33 @@ EventValue Event::receiver_snapshot() const {
   return decode_snapshot(event.receiver_snapshot());
 }
 
+void print_receiver_delta(const api::TraceEvent &before, const api::TraceEvent &after,
+                          const std::vector<std::string> &keys, std::ostream &out) {
+  if (before.phase() != api::PRE || after.phase() != api::POST ||
+      !after.receiver_sampled_at_return() || !before.call_id() ||
+      before.call_id() != after.call_id() || before.session_id() != after.session_id() ||
+      before.server_instance_id() != after.server_instance_id() ||
+      before.probe_id() != after.probe_id() || before.pid() != after.pid() ||
+      before.tid() != after.tid() || !before.object_address() ||
+      before.object_address() != after.object_address() || before.sequence() >= after.sequence())
+    throw std::invalid_argument("diff requires independently sampled entry and return for one invocation");
+  validate_snapshot_keys(keys);
+  out << "snapshot_window call=" << before.call_id()
+      << " function=" << std::quoted(before.function_name()) << '\n';
+  if (!before.has_receiver_snapshot() || !after.has_receiver_snapshot()) {
+    out << "coverage_gap receiver missing sample\n";
+    return;
+  }
+  const auto changes = compare_snapshots(before.receiver_snapshot(), after.receiver_snapshot(), keys);
+  std::size_t gaps = 0;
+  for (const auto &change : changes) {
+    gaps += change.gap;
+    out << (change.gap ? "coverage_gap " : "snapshot_delta ")
+        << change.path << ' ' << change.detail << '\n';
+  }
+  out << "snapshot_changes=" << changes.size() - gaps << " gaps=" << gaps << '\n';
+}
+
 EventValue Event::result_snapshot() const {
   const auto &event = data_->message;
   if (event.has_context() && event.context().event().has_result()) {
@@ -804,6 +823,84 @@ std::string value_text(const api::Value &value) {
 
 std::string event_summary(const api::TraceEvent &event) {
   std::ostringstream out;
+  if (event.has_object_observation()) {
+    const auto &object = event.object_observation();
+    out << "cursor=" << event.sequence() << " watch=" << event.probe_id()
+        << " tid=" << event.tid() << " " << api::ObjectObservation::Kind_Name(object.kind());
+    if (object.lifetime_id())
+      out << " " << object.concrete_type() << "#" << object.lifetime_id()
+          << " generation=" << object.generation() << " address=0x" << std::hex
+          << event.object_address() << std::dec;
+    if (object.borrow_id())
+      out << " borrow=" << object.borrow_id();
+    if (object.runtime_module_generation())
+      out << " module_generation=" << object.runtime_module_generation();
+    if (object.has_shared_storage()) {
+      const auto &storage = object.shared_storage();
+      out << " shared_storage=" << storage.device() << ':' << storage.inode()
+          << ':' << storage.file_offset();
+    }
+    if (object.external_write_order_unknown())
+      out << " external_order=unknown";
+    if (object.owner_address())
+      out << " owner=0x" << std::hex << object.owner_address() << std::dec;
+    if (object.has_owner_index())
+      out << " slot=" << object.owner_index();
+    if (!object.field().empty())
+      out << " " << object.field();
+    if (object.has_old_integer())
+      out << " " << object.old_integer() << " ->";
+    else if (object.kind() == api::ObjectObservation::FIELD_CHANGED && object.has_new_integer())
+      out << " old=unavailable ->";
+    if (object.has_new_integer())
+      out << " " << object.new_integer();
+    if (object.has_old_string())
+      out << " \"" << google::protobuf::CEscape(object.old_string()) << "\" ->";
+    if (object.has_new_string())
+      out << " \"" << google::protobuf::CEscape(object.new_string()) << '"';
+    const auto union_sample = [&](std::uint32_t tag, const std::string &member,
+                                  const api::ObjectObservation::SnapshotValue &value) {
+      out << " tag=" << tag;
+      if (member.empty())
+        return;
+      out << ' ' << member << '=';
+      if (value.has_signed_value())
+        out << value.signed_value();
+      else if (value.has_unsigned_value())
+        out << value.unsigned_value();
+      else if (value.has_real_value())
+        out << value.real_value();
+    };
+    if (object.has_old_union_tag()) {
+      union_sample(object.old_union_tag(), object.old_union_member(), object.snapshot_before());
+      out << " ->";
+    }
+    if (object.has_new_union_tag())
+      union_sample(object.new_union_tag(), object.new_union_member(), object.snapshot_after());
+    const auto raw_bytes = [&](const std::string &bytes) {
+      std::ostringstream encoded;
+      encoded << std::hex << std::setfill('0');
+      for (unsigned char byte : bytes)
+        encoded << std::setw(2) << unsigned(byte);
+      return encoded.str();
+    };
+    if (object.has_old_bytes())
+      out << " bytes=" << raw_bytes(object.old_bytes()) << " ->";
+    if (object.has_new_bytes())
+      out << " bytes=" << raw_bytes(object.new_bytes());
+    if (object.destination())
+      out << " destination=0x" << std::hex << object.destination() << std::dec;
+    if (object.pc())
+      out << " pc=0x" << std::hex << object.pc() << std::dec;
+    if (!object.function().empty())
+      out << " function=" << std::quoted(object.function())
+          << " module=" << std::quoted(object.module());
+    if (!object.file().empty())
+      out << " " << object.file() << ":" << object.line();
+    if (!object.diagnostic().empty())
+      out << " | " << object.diagnostic();
+    return out.str();
+  }
   out << "cursor=" << event.sequence() << " session=" << event.session_id()
       << " pid=" << event.pid() << " tid=" << event.tid()
       << " probe=" << event.probe_id()

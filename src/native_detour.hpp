@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "tracer/compat.hpp"
@@ -42,5 +43,18 @@ bool create_trampoline(const Patch &patch, void *&address,
 // Completes a new trampoline's relay, if needed, and encodes the entry patch.
 bool prepare_entry_jump(const Patch &patch, void *trampoline,
                         std::size_t mapping_size, const void *destination,
-                        compat::span<std::uint8_t> output, std::string &error);
+                        std::span<std::uint8_t> output, std::string &error);
+// A complete integer getter uses only the SysV receiver and returns directly.
+bool decode_getter(std::string_view bytes, std::size_t &trap_offset, std::string &error);
+bool create_getter_copy(std::string_view bytes, std::uintptr_t caller,
+                        void *&address, std::size_t &size, std::string &error);
+bool prepare_call_relay(std::uintptr_t caller, void *copy, std::size_t size,
+                        const void *wrapper, std::span<std::uint8_t> output,
+                        std::uintptr_t &relay, std::string &error);
+bool allocate_code_cache(std::uintptr_t caller, std::size_t bytes,
+                         void *&address, std::size_t &size, std::string &error,
+                         std::span<const RipRelocation> relocations = {});
+bool code_cache_rip_relocation(std::span<const std::uint8_t> bytes,
+                               std::uintptr_t pc, RipRelocation &relocation,
+                               std::string &error);
 } // namespace tracer::native_detour
