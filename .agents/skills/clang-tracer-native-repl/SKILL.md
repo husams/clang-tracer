@@ -1,6 +1,6 @@
 ---
 name: clang-tracer-native-repl
-description: Use clang-tracer-repl for native C++ tracing, prepared probes, return snapshots, bulk tracing, observer reload, read-only target inspection, typed SQLite recording and offline replay, and reusable .repl scripts. Use for native tracing and replay unless the user requests the Python client.
+description: Use clang-tracer-repl for native C++ tracing, prebuilt object lifetimes and field writes, method and return snapshots, prepared probes, bulk tracing, observer reload, read-only inspection, typed SQLite replay, and reusable .repl scripts. Use unless the user requests the Python client.
 ---
 
 # Clang Tracer native REPL
@@ -233,6 +233,14 @@ in the same order. To override the compile flags in C++, pass the compilation
 database and translation unit after the output directory. Use
 `%help api tracer.prepare` for an example and `%type tracer.prepare` for the
 installed overloads.
+
+## Trace object lifetimes and state
+
+Use the matching Linux x86-64 or AArch64 REPL, server, and agent with the existing ELF and matching DWARF. For individual writes, use `%object prepare TYPE --module ELF --field FIELD --code SELECTOR --backend code-cache --output DIRECTORY`. Choose `ptrace` for diagnostic single-stepping. The backend is saved in the plan. For net method changes, prepare with `--on METHOD`, the original `--include` and compile command, and a verified `--synchronization` policy.
+
+Attach, run `%object preview --plan DIRECTORY`, and check the binding and admitted sites. Use `%object start --plan DIRECTORY` to arm the watch. Writes capture values by default. Add `--no-values` to a write watch to record completed stores, including same-value stores, without samples. Record while the workload runs with `%record capture.db --sqlite --name object.trace --probe WATCH_ID --count N --timeout SECONDS`. Check `%object status WATCH_ID`, then stop with `%object stop WATCH_ID` and confirm restoration before `%detach`. Open the recording with `%events open capture.db --as saved` and inspect it with `%events list saved` or `%events show saved --index 0`.
+
+Report gaps and drops as partial evidence. Lifecycle and ownership require verified boundaries, and unadmitted writers, unsafe reads, generated helper windows, and external writers can limit what the trace establishes. Follow the [runnable example and coverage limits in the native REPL guide](../../../docs/native-repl.md#trace-object-lifetimes-and-state-in-a-prebuilt-binary) for detailed commands and collection, union, and shared-library cases.
 
 ## Record and replay events
 

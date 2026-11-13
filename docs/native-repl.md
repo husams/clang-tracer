@@ -494,9 +494,65 @@ stays in place and selects the trap path. The trap owns execution control for it
 restores its byte at stop, detach, or a thread or process creation stop.
 Remove a fallback probe before replacing it.
 
+## Trace object lifetimes and state in a prebuilt binary
+
+Use the full Linux build on x86-64 or AArch64, with the REPL, server, and agent from the same build. Supply the existing ELF and its matching DWARF, either embedded or in a matching separate debug file. The watch installs patches in process memory. The application executable and source files stay intact.
+
+The plan records the capture mode you select during preparation.
+
+- **Individual writes.** Select one `--field` and a writer with `--code`. Use `--backend code-cache` to run supported stores in the target without a ptrace stop for every write. `--backend ptrace` is the default and steps verified stores for diagnostic runs. By default, the watch samples values and reports changes. Start a saved write plan with `--no-values` to record `FIELD_WRITTEN` for each completed admitted store, including same-value stores, without field samples. The backend is part of the saved plan.
+- **Method snapshots.** Use `--on` with the original header and compile command to compare the receiver at verified entry and return boundaries. A snapshot delta describes the net change during one call. Supply the synchronization policy that protects the sampled state. See [method snapshots](#prepare-an-object-watch-for-method-snapshots).
+
+### Run a scalar write watch on x86-64
+
+From the repository root on Linux x86-64, use a full build in `build` with tests enabled. Build the demonstration fixture once and start it in the first terminal. It prints its PID and waits for input.
+
+```sh
+cmake --build build --target repl-object-plan-target
+sh -c 'printf "PID=%s\n" "$$"; exec "$1"' _ ./build/repl-object-plan-target
+```
+
+From the same directory in a second terminal, open the REPL. Use a fresh package directory and SQLite path for each run.
+
+```sh
+./build/clang-tracer-repl --server ./build/clang-tracer-server --agent ./build/libclang_tracer_agent.so --fail-fast
+```
+
+Prepare the plan before attaching. Then replace `PID` with the printed PID and check that preview reports `binding=same-build` and a verified store site. Start installs the redirects and prints the watch ID.
+
+```text
+%object prepare demo::PlanRecord --module ./build/repl-object-plan-target --field value --code "demo::write_value(demo::PlanRecord &)" --backend code-cache --output ./record-watch
+%attach PID
+%object preview --plan ./record-watch
+%object start --plan ./record-watch --stack-depth 4
+%record object-writes.db --sqlite --name object.trace --probe WATCH_ID --count 2 --timeout 30
+```
+
+Replace `WATCH_ID` with the ID printed by start. While `%record` is waiting, enter `g` in the first terminal. The fixture prints `value=23`. The recorder should report `received=2` and `complete=true` for the creation and the write from 17 to 23.
+
+```text
+%object status WATCH_ID
+%object stop WATCH_ID
+%detach
+%events open object-writes.db --as saved
+%events list saved
+%events show saved --index 1
+%events stack saved --index 1
+```
+
+Stop restores the verified instruction bytes. Check `active=no` and `restoration_pending=no` before detaching. If restoration is pending, retry stop using the same ID. Replay works after detach, including in a fresh REPL. Enter `q` in the first terminal to exit the fixture. To repeat with `--no-values`, restart the fixture, reuse the write plan, add the flag to `%object start`, and use a fresh recording path. The two events are still creation and a store, with the store shown as `FIELD_WRITTEN`.
+
+### Read coverage and cleanup status
+
+- Review the resolved fields, writer sites, and binding status in preview. Preview is read-only. A same-build restart resolves fresh live addresses. A compatible rebuild requires verifiable field and code bindings. Missing or mismatched evidence can prevent a watch from starting.
+- Lifecycle events require observable, unambiguous construction and teardown. Optimized-away boundaries, unverified tail entries, and some ownership mutations can leave partial timelines. `--first-seen` can scope a supported standalone write watch to one verified writer invocation when construction is unavailable.
+- Collection and pointee watches require verified mutation boundaries and supported identities. Unverified inline paths can leave coverage gaps. Tagged-union decoding requires a verified unsigned 32-bit discriminator and supported 32-bit alternatives. Untagged union observations carry storage bytes.
+- Native capture covers admitted code and threads. Generated helper windows can leave signal or stack gaps, including AArch64 scalable signal records that exceed the fixed Linux signal frame. Shared-file identity correlates recordings across processes, where ordering can remain partial.
+- Use `%object status` to check drops, unsupported sites, coverage gaps, and capture limits. Use `%object stop` or `%detach` to retire the watch and restore patches. See the [verification record](../object-watch-progress.md) for the exercised cases and limits.
+
 ## Prepare an object watch for method snapshots
 
-Prepare from the original headers and compile command. The package contains the generated adapter and the verified ELF entry. Declare the synchronization that protects the receiver and any storage the adapter follows. Use `thread-confined` when that graph is accessed from a single thread. Use `caller-lock` when the caller holds the application's lock over the method and both samples. Use `stable-at-boundaries` when the application establishes safe entry and return samples, for example by joining a child writer before return.
+Prepare from the original headers and compile command. The package contains the generated adapter and the verified ELF entry. Declare the synchronization that protects the receiver and any storage the adapter follows. Use `thread-confined` when that graph is accessed from a single thread. Use `caller-lock` when the caller holds the application's lock over the method and both samples. Use `stable-at-boundaries` when the application establishes safe entry and return samples, for example by joining a child writer before return. For the Portfolio commands below, run the rebalance while `%record` is waiting and substitute the PID and watch ID from your run.
 
 ```text
 %object prepare demo::Portfolio --module ./portfolio --include ./portfolio.hpp --policy ./snapshot-policy.hpp --compdb ./compile_commands.json --translation-unit ./portfolio.cpp --on "demo::Portfolio::rebalance()" --field legs --field risk --key legs=id --key risk=key --synchronization thread-confined --output ./portfolio-watch --emit-source ./generated
@@ -505,6 +561,7 @@ Prepare from the original headers and compile command. The package contains the 
 %object start --plan ./portfolio-watch --stack-depth 8
 %record portfolio.db --sqlite --name object.trace --probe WATCH_ID --count 2 --timeout 30
 %object stop WATCH_ID
+%detach
 %events open portfolio.db --as saved
 ```
 
