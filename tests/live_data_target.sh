@@ -22,7 +22,8 @@ sources=("$root"/src/live_data{,_scan,_jit,_command}.cpp
   "$common"/live_{compile,jit}.cpp "$root/tests/live_data_target.cpp"
   "$root/tests/fixtures/live_data/model.cpp")
 "$cxx" "${flags[@]}" -Wl,--build-id=sha1 -rdynamic "${sources[@]}" "$resolver" \
-  "$baseline/libtracer_proto.a" -L"$llvm_lib" -Wl,-rpath,"$llvm_lib" \
+  "$baseline/libtracer_proto.a" "$baseline/libtracer_context_transport_proto.a" \
+  -L"$llvm_lib" -Wl,-rpath,"$llvm_lib" \
   -lclang-cpp -lLLVM -lprotobuf -ldl -pthread -o "$output/live_data_target"
 build_id=$(readelf -n "$output/live_data_target" | awk '/Build ID/ {print $3}')
 "$output/live_data_target" "$root/tests/fixtures/live_data" "$root/include" "$build_id"
