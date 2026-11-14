@@ -587,6 +587,35 @@ SessionHandle Controller::attach(std::uint32_t pid,
   return selected_;
 }
 
+namespace {
+// Finds a session by exact ID, or by ID prefix when allowed. Returns null when
+// nothing matches; throws when a prefix is ambiguous.
+const api::Session *find_session(const api::ListSessionsResponse &listed,
+                                 const std::string &text, bool allow_prefix) {
+  const api::Session *prefix = nullptr;
+  bool ambiguous = false;
+  for (const auto &s : listed.sessions()) {
+    if (s.id() == text)
+      return &s;
+    if (allow_prefix && !text.empty() && s.id().compare(0, text.size(), text) == 0) {
+      ambiguous = prefix != nullptr;
+      prefix = &s;
+    }
+  }
+  if (ambiguous)
+    throw std::runtime_error("ambiguous session prefix: " + text);
+  return prefix;
+}
+
+const api::Session &match_session(const api::ListSessionsResponse &listed,
+                                  const std::string &text) {
+  const auto *found = find_session(listed, text, true);
+  if (!found)
+    throw std::runtime_error("unknown session: " + text + "; list IDs with %sessions");
+  return *found;
+}
+} // namespace
+
 void Controller::detach(const SessionHandle &session) {
   if (!stub_ || session.id.empty() || session.connection != connection_) {
     throw std::runtime_error("invalid session handle");
@@ -1628,26 +1657,35 @@ bool Controller::execute(const Command &command) {
     api::ListSessionsRequest request;
     const auto response = unary<api::ListSessionsResponse>(
         [&](auto &c, auto &r) { return stub_->ListSessions(&c, request, &r); });
-    for (const auto &s : response.sessions()) {
-      if (command.kind == K::use && s.id() == args.at(0)) {
-        if (s.state() != api::Session::ATTACHED) {
-          throw std::runtime_error("session is not attached");
-        }
-        selected_ = {s.id(), s.pid(), connection_};
-        out_ << "selected session=" << s.id() << '\n';
-        return true;
+    if (command.kind == K::use) {
+      const auto &s = match_session(response, args.at(0));
+      if (s.state() != api::Session::ATTACHED) {
+        throw std::runtime_error("session " + s.id() + " is " +
+                                 api::Session::State_Name(s.state()) +
+                                 "; only an ATTACHED session can be selected");
       }
+      selected_ = {s.id(), s.pid(), connection_};
+      out_ << "selected session=" << s.id() << '\n';
+      return true;
+    }
+    if (command.kind == K::sessions && response.sessions().empty())
+      out_ << "no sessions\n";
+    for (const auto &s : response.sessions()) {
       if (command.kind == K::sessions) {
-        out_ << s.ShortDebugString() << '\n';
+        out_ << (s.id() == selected_.id ? "* " : "  ") << s.id() << " pid=" << s.pid()
+             << " state=" << api::Session::State_Name(s.state())
+             << " probes=" << s.probes_size();
+        if (!s.executable().empty())
+          out_ << " executable=" << s.executable();
+        if (!s.error().empty())
+          out_ << " error=\"" << s.error() << '"';
+        out_ << '\n';
       }
       if (command.kind == K::probes && s.id() == selected_.id) {
         for (const auto &probe : s.probes()) {
           out_ << probe.ShortDebugString() << '\n';
         }
       }
-    }
-    if (command.kind == K::use) {
-      throw std::runtime_error("unknown session: " + args.at(0));
     }
     return true;
   }
@@ -1657,6 +1695,25 @@ bool Controller::execute(const Command &command) {
       ensure_connected();
       session.id = args[0];
       session.connection = connection_;
+      // Accept a unique ID prefix. An ID the listing does not know is still
+      // sent as typed so recovery of a late-published session keeps working.
+      api::ListSessionsRequest request;
+      api::ListSessionsResponse listed;
+      bool listed_ok = true;
+      try {
+        listed = unary<api::ListSessionsResponse>(
+            [&](auto &c, auto &r) { return stub_->ListSessions(&c, request, &r); });
+      } catch (const std::runtime_error &) {
+        listed_ok = false;
+      }
+      if (listed_ok && find_session(listed, args[0], true)) {
+        const auto &s = match_session(listed, args[0]);
+        if (s.state() == api::Session::DETACHED || s.state() == api::Session::EXITED) {
+          out_ << "note: session " << s.id() << " is already "
+               << api::Session::State_Name(s.state()) << '\n';
+        }
+        session.id = s.id();
+      }
     }
     detach(session);
     return true;
