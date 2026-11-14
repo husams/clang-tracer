@@ -18,6 +18,8 @@
 
 #include <dlfcn.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
 #include <unordered_set>
@@ -35,10 +37,16 @@ void checked(llvm::Error error) {
     throw std::runtime_error(llvm::toString(std::move(error)));
 }
 
+[[noreturn]] void glibcxx_assert_fail(const char *file, int line, const char *function,
+                                      const char *condition) noexcept {
+  std::fprintf(stderr, "%s:%d: %s: assertion '%s' failed\n", file, line, function, condition);
+  std::abort();
+}
+
 std::uintptr_t runtime_import(llvm::StringRef name) {
   const auto is_c = llvm::StringSwitch<bool>(name)
       .Cases("malloc", "calloc", "free", "realloc", true)
-      .Cases("memcpy", "memset", "memmove", "memcmp", "bcmp", true)
+      .Cases("memcpy", "memset", "memmove", "memcmp", "bcmp", "memchr", true)
       .Cases("strlen", "strcmp", "abort", "puts", true)
       .Cases("pthread_mutex_lock", "pthread_mutex_unlock", "__libc_single_threaded", true)
       .Default(false);
@@ -63,6 +71,10 @@ std::uintptr_t runtime_import(llvm::StringRef name) {
   if (!handle)
     return 0;
   void *address = ::dlsym(handle.get(), symbol.c_str());
+  // Red Hat's GCC toolset supplies this assertion handler in a static
+  // libstdc++ supplement. Keep the same fail-stop ABI in generated code.
+  if (!address && name == "_ZSt21__glibcxx_assert_failPKciS0_S0_")
+    return reinterpret_cast<std::uintptr_t>(&glibcxx_assert_fail);
   Dl_info info{};
   if (!address || !::dladdr(address, &info) || !info.dli_fname)
     return 0;
