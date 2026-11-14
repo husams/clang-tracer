@@ -243,9 +243,9 @@ Use a native REPL method watch to compare a live receiver before and after
 a call in a prebuilt executable. Select private members, strings, nested
 records, or containers with `--field`. Pair vector elements by a stable ID
 and map entries by key using `--key`, then inspect the typed changes from
-the SQLite recording. Supported integer write watches identify the actual
-store instruction, including writes to fields inside a selected vector
-element, map entry, or pointee. See the [native REPL object watch walkthrough](../native-repl.md#prepare-an-object-watch-for-method-snapshots).
+the SQLite recording. Individual write watches identify the actual store
+instruction for supported typed fields inside a selected vector element,
+ordered or unordered map entry, or pointee. See the [native REPL object watch walkthrough](../native-repl.md#prepare-an-object-watch-for-method-snapshots).
 
 ## Related documentation
 

@@ -56,6 +56,7 @@ struct Instruction {
   bool rip_relative = false;
   bool indirect_memory = false;
   bool successor_return = false;
+  bool sample_store_memory = false;
   std::array<std::uint8_t, 15> bytes{};
 };
 
@@ -105,6 +106,7 @@ struct Init {
   const Address *static_scopes = nullptr;
   std::size_t static_scope_count = 0;
   std::uint64_t scalar = 0;
+  unsigned field_width = 4;
   std::uint64_t union_tag_offset = 0;
   std::uint64_t async_signals = 0;
   Address receiver_typeinfo = 0;
@@ -140,7 +142,7 @@ struct Observation {
   std::uint8_t values, depth, stack_status;
   std::uint8_t gap;
   bool has_shared_file_offset;
-  std::int32_t old_value, new_value;
+  std::uint64_t old_value, new_value;
   std::uint32_t old_tag, new_tag;
   std::array<Address, stack_limit> frames, stack_pointers;
 };
