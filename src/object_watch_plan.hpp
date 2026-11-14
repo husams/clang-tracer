@@ -106,7 +106,8 @@ public:
 
   std::string_view code(std::uint64_t pc) const;
 #if defined(__x86_64__)
-  std::size_t lifetime_padding(std::uint64_t function_start, std::uint64_t patch,
+  bool writer_address_taken(std::uint64_t pc) const;
+  std::size_t redirect_padding(std::uint64_t function_start, std::uint64_t patch,
                                std::uint64_t end) const;
 #endif
   bool is_delete_target(std::uint64_t pc) const;

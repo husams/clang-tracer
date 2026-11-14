@@ -591,8 +591,14 @@ alternatives. Unknown or unreadable tags retain raw storage bytes.
 functions or independently verified writer fragments into executable
 memory in the target. Standalone signed 32-bit fields and `std::atomic<int>` use
 complete constructor and destructor boundaries in the main executable.
-On x86-64, repeat `--code` with `--writer-entry` to cover calls through
-function pointers to multiple verified leaf writers.
+On x86-64, a standalone leaf writer with a visible function pointer or
+virtual entry uses a verified entry redirect. This covers direct calls,
+function pointers, and vtable dispatch into that writer. Use
+`--writer-entry` to require this coverage for every selected leaf, including
+with repeated `--code`. An entry redirect needs a verified overwrite
+window. Short leaves can use verified alignment padding. When the watch
+uses direct writer call sites alone, preview and status report partial
+coverage.
 For a shared writer, `--module` takes a unique mapped ELF basename or
 absolute path. A shared leaf that uses an entry redirect needs a verified
 nonfaulting overwrite window.
@@ -611,8 +617,6 @@ Application threads run the original store encoding once in the translated
 function. The agent reads the effective address and operands around that
 instruction and publishes to a shared event queue. `--no-values` skips
 value sampling and still checks the outcome of compare-and-exchange.
-Use `--writer-entry` to admit direct and indirect calls into the selected
-standalone leaf. Its entry must have a verified overwrite window.
 `%object status` reports each redirect, the number of completed translated
 store instructions, and event drops. The store count includes failed
 compare-and-exchanges and stores to untracked addresses.

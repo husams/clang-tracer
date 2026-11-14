@@ -2127,7 +2127,105 @@ std::string_view Plan::code(std::uint64_t pc) const {
 }
 
 #if defined(__x86_64__)
-std::size_t Plan::lifetime_padding(std::uint64_t function_start, std::uint64_t patch,
+bool Plan::writer_address_taken(std::uint64_t pc) const {
+  const auto *image = image_for(pc);
+  if (!image)
+    return false;
+  const auto address = pc - *image->bias;
+  const auto function = image->dwarf->getDIEsForAddress(address).FunctionDIE;
+  if (function) {
+    const auto virtuality = function.findRecursively({dw::DW_AT_virtuality});
+    if (virtuality && virtuality->getAsUnsignedConstant().value_or(0))
+      return true;
+  }
+
+  const auto &elf = llvm::cast<llvm::object::ELF64LEObjectFile>(*image->executable.getBinary());
+  // Exported entry points may also be obtained by another image or dlsym.
+  for (const auto &symbol : elf.getDynamicSymbolIterators()) {
+    auto value = symbol.getAddress();
+    auto flags = symbol.getFlags();
+    const bool exported = value && flags && *value == address &&
+        !(*flags & llvm::object::SymbolRef::SF_Undefined) &&
+        (*flags & llvm::object::SymbolRef::SF_Exported);
+    if (!value)
+      llvm::consumeError(value.takeError());
+    if (!flags)
+      llvm::consumeError(flags.takeError());
+    if (exported)
+      return true;
+  }
+
+  // In an executable with fixed addresses, the linker can resolve pointer
+  // constants completely (including immediates and read-only vtable slots).
+  const auto pointer = std::string_view(reinterpret_cast<const char *>(&address), sizeof(address));
+  const auto &object = static_cast<const llvm::object::ELFObjectFileBase &>(elf);
+  const bool fixed = object.getEType() == llvm::ELF::ET_EXEC;
+  for (const auto &[start, bytes] : image->text) {
+    if (fixed && bytes.find(pointer) != bytes.npos)
+      return true;
+    // An absolute MOV immediate or a RIP-relative LEA can materialize
+    // the entry address. A byte match only selects a verified entry patch
+    // or refusal. It never authorizes patching the apparent reference.
+    for (std::size_t i = 0; i + 5 <= bytes.size(); ++i) {
+      const auto opcode = static_cast<unsigned char>(bytes[i]);
+      const auto operand = static_cast<unsigned char>(bytes[i + 1]);
+      if (fixed && address <= UINT32_MAX) {
+        if (opcode >= 0xb8 && opcode <= 0xbf && bytes.substr(i + 1, 4) == pointer.substr(0, 4))
+          return true;
+        if (opcode == 0xc7 && (operand & 0xf8) == 0xc0 &&
+            i + 6 <= bytes.size() && bytes.substr(i + 2, 4) == pointer.substr(0, 4))
+          return true;
+      }
+      if (opcode == 0x8d && (operand & 0xc7) == 0x05 && i + 6 <= bytes.size()) {
+        std::int32_t displacement;
+        std::memcpy(&displacement, bytes.data() + i + 2, sizeof(displacement));
+        if (start + i + 6 + displacement == address)
+          return true;
+      }
+    }
+  }
+
+  for (const auto &section : elf.sections()) {
+    const llvm::object::ELFSectionRef metadata(section);
+    if (!(metadata.getFlags() & llvm::ELF::SHF_ALLOC))
+      continue;
+    if (metadata.getType() == llvm::ELF::SHT_RELA) {
+      for (const auto &relocation : section.relocations()) {
+        const auto kind = relocation.getType();
+        if (kind != llvm::ELF::R_X86_64_RELATIVE && kind != llvm::ELF::R_X86_64_64)
+          continue;
+        auto addend = llvm::object::ELFRelocationRef(relocation).getAddend();
+        if (!addend) {
+          llvm::consumeError(addend.takeError());
+          continue;
+        }
+        std::uint64_t target = *addend;
+        if (kind == llvm::ELF::R_X86_64_64) {
+          const auto symbol = relocation.getSymbol();
+          if (symbol == elf.symbol_end())
+            continue;
+          auto value = symbol->getAddress();
+          if (!value) {
+            llvm::consumeError(value.takeError());
+            continue;
+          }
+          target += *value;
+        }
+        if (target == address)
+          return true;
+      }
+    } else if (metadata.getType() == llvm::ELF::SHT_PROGBITS && !section.isText()) {
+      auto bytes = section.getContents();
+      if (!bytes)
+        llvm::consumeError(bytes.takeError());
+      else if (std::string_view(bytes->data(), bytes->size()).find(pointer) != std::string_view::npos)
+        return true; // Fixed pointers and in-place addends for packed relative relocations.
+    }
+  }
+  return false;
+}
+
+std::size_t Plan::redirect_padding(std::uint64_t function_start, std::uint64_t patch,
                                   std::uint64_t end) const {
   const auto *image = image_for(function_start);
   if (!image || image_for(end) != image || end - patch >= 5)
