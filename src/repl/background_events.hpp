@@ -4,6 +4,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 #include <grpcpp/grpcpp.h>
 
@@ -30,6 +31,9 @@ public:
                    unsigned timeout, std::size_t max_events, std::size_t max_bytes);
   ~BackgroundEvents();
   Collection snapshot() const;
+  // Events and bytes charged to the shared collection storage: the whole
+  // limit while receiving, and only what was retained once finished.
+  std::pair<std::size_t, std::size_t> reserved() const;
   // Blocks until an event at or after cursor is retained, then returns it and
   // advances cursor past it. Positions already evicted are skipped. Returns
   // null once the stream has ended, or on Ctrl+C, with nothing left to read.
