@@ -9,6 +9,7 @@ struct Cell {
 void poke(Cell &cell, int value);
 using Writer = void (*)(Cell &, int);
 Writer chosen();
+void select_writer(Writer &writer);
 void apply(Cell &cell, int value, Writer writer);
 
 struct Knob {

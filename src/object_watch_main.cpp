@@ -183,7 +183,7 @@ int run_native_launch(const api::ObjectWatchRequest &request, std::vector<std::s
         print_json(event);
       });
   try {
-    watch.install(process, tracer::object_cache::load_agent(process, agent_file), loader_ready);
+    watch.install(process, tracer::object_cache::load_agent(process, agent_file), deadline, loader_ready);
     {
       const std::lock_guard lock(output);
       std::cout << "{\"coverageStart\":\"" << (loader_ready ? "loader-ready" : "executable-entry")

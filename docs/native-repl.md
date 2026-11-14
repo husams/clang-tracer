@@ -755,9 +755,9 @@ virtual entry uses a verified entry redirect. This covers direct calls,
 function pointers, and vtable dispatch into that writer. Use
 `--writer-entry` to require this coverage for every selected leaf, including
 with repeated `--code`. An entry redirect needs a verified overwrite
-window. Short leaves can use verified alignment padding. When the watch
-uses direct writer call sites alone, preview and status report partial
-coverage.
+window. Short leaves can use verified alignment padding. A symbol export
+alone allows a fallback to direct call sites when no entry window verifies.
+Preview and status report partial coverage for direct call sites alone.
 For a shared writer, `--module` takes a unique mapped ELF basename or
 absolute path. A shared leaf that uses an entry redirect needs a verified
 nonfaulting overwrite window.
@@ -767,8 +767,9 @@ start if its virtual destructor has no verified redirect. When code-cache
 capture relies on direct calls or return continuations, preview and start
 reject unverified call sites, including sites behind unresolved jump tables.
 Supported ELF exception tables let the planner verify calls in cleanup
-blocks. The diagnostic backend rejects writers with an unresolved indirect
-branch, such as a jump table.
+blocks, including direct branches into a matching cold partition. The
+diagnostic backend rejects writers with an unresolved indirect branch,
+such as a jump table.
 Inlined lifetimes, forked children, and unadmitted store instructions are
 outside coverage.
 

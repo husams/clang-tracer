@@ -107,12 +107,13 @@ public:
   std::string_view code(std::uint64_t pc) const;
 #if defined(__x86_64__)
   bool writer_address_taken(std::uint64_t pc) const;
+  bool writer_exported(std::uint64_t pc) const;
   std::size_t redirect_padding(std::uint64_t function_start, std::uint64_t patch,
                                std::uint64_t end) const;
 #endif
   bool is_delete_target(std::uint64_t pc) const;
   std::uint64_t constructor_tail_target(std::uint64_t pc) const;
-  std::vector<std::uint64_t> landing_pads(std::uint64_t start, std::size_t size) const;
+  std::vector<std::uint64_t> exception_roots(std::uint64_t start, std::size_t size) const;
   std::vector<std::uint64_t> lifetime_return_callers(std::uint64_t pc, bool constructor) const;
   Source source(std::uint64_t pc) const;
   void describe_origin(std::uint64_t pc, const Source &source,

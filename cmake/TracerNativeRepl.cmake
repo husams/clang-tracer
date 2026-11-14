@@ -334,23 +334,43 @@ function(tracer_add_native_repl)
       else()
         set(_runtime_call_arch_flags -fcf-protection=none)
       endif()
-      add_executable(repl-object-writer-entry-target
-        tests/fixtures/object_writer_entry/writer.cpp
-        tests/fixtures/object_writer_entry/dispatch.cpp
-        tests/fixtures/object_writer_entry/main.cpp)
-      set_target_properties(repl-object-writer-entry-target PROPERTIES
-        CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
-      target_compile_options(repl-object-writer-entry-target PRIVATE
-        -g -O2 -falign-functions=16 -fPIE ${_runtime_call_arch_flags})
-      if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        target_compile_options(repl-object-writer-entry-target PRIVATE -fstandalone-debug)
+      set(_writer_entry_cases writer_entry)
+      if(TARGET clang_tracer_agent)
+        include(CheckLinkerFlag)
+        check_linker_flag(CXX "LINKER:-z,ibtplt" TRACER_HAS_IBT_PLT)
+        list(APPEND _writer_entry_cases stored_writer)
       endif()
-      target_link_options(repl-object-writer-entry-target PRIVATE -pie "LINKER:--build-id=sha1")
-      add_test(NAME native_repl_object_writer_entry
-        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_writer_entry.py"
-          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
-          $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-writer-entry-target>)
-      set_tests_properties(native_repl_object_writer_entry PROPERTIES TIMEOUT 120)
+      foreach(_case IN LISTS _writer_entry_cases)
+        string(REPLACE "_" "-" _target_suffix "${_case}")
+        set(_fixture repl-object-${_target_suffix}-target)
+        add_executable(${_fixture}
+          tests/fixtures/object_writer_entry/writer.cpp
+          tests/fixtures/object_writer_entry/dispatch.cpp
+          tests/fixtures/object_writer_entry/main.cpp)
+        set_target_properties(${_fixture} PROPERTIES CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_compile_options(${_fixture} PRIVATE -g -O2 -falign-functions=16)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+          target_compile_options(${_fixture} PRIVATE -fstandalone-debug)
+        endif()
+        target_link_options(${_fixture} PRIVATE "LINKER:--build-id=sha1")
+        if(_case STREQUAL "stored_writer")
+          target_compile_definitions(${_fixture} PRIVATE TRACE_STORED_WRITER)
+          target_compile_options(${_fixture} PRIVATE -fno-pie)
+          target_link_options(${_fixture} PRIVATE -no-pie)
+          if(TRACER_HAS_IBT_PLT)
+            target_compile_options(${_fixture} PRIVATE -fcf-protection=branch)
+            target_link_options(${_fixture} PRIVATE "LINKER:-z,ibtplt")
+          endif()
+        else()
+          target_compile_options(${_fixture} PRIVATE -fPIE ${_runtime_call_arch_flags})
+          target_link_options(${_fixture} PRIVATE -pie)
+        endif()
+        add_test(NAME native_repl_object_${_case}
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_writer_entry.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:${_fixture}>)
+        set_tests_properties(native_repl_object_${_case} PROPERTIES TIMEOUT 120)
+      endforeach()
       foreach(_plugin_value 19 23)
         set(_runtime_plugin repl-object-runtime-plugin-${_plugin_value})
         add_library(${_runtime_plugin} SHARED tests/fixtures/object_plan/runtime_plugin.cpp)

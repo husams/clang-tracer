@@ -34,7 +34,12 @@ int main() {
   {
     Cell cell(1);
     poke(cell, 11);
+#if defined(TRACE_STORED_WRITER)
+    Writer writer;
+    select_writer(writer);
+#else
     const auto writer = chosen();
+#endif
     writer(cell, 12);
     apply(cell, 13, writer);
     if (cell.value != 13)

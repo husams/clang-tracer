@@ -23,7 +23,7 @@ public:
         std::function<void(clangtracer::v1::TraceEvent)> publish);
   ~Watch();
   void install(injector::Process &process, std::uintptr_t agent_entry,
-               bool permanent_startup_module = false);
+               std::chrono::steady_clock::time_point deadline, bool permanent_startup_module = false);
   void stop_runtime_admissions();
   bool restore(injector::Process &process);
   bool retire_if_mapping_changed(std::chrono::steady_clock::time_point deadline);
