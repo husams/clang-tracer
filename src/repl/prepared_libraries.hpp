@@ -99,7 +99,7 @@ inline std::set<std::string> verified_exports(
     return {};
   }
   for (const auto &entry : *entries)
-    if (entry.d_tag == DT_FLAGS_1 && (entry.d_un.d_val & llvm::ELF::DF_1_PIE))
+    if (entry.d_tag == DT_FLAGS_1 && (entry.d_un.d_val & DF_1_PIE))
       return {};
 
   llvm::ArrayRef<llvm::object::ELF64LE::Versym> versions;
