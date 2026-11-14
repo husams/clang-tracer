@@ -1773,14 +1773,18 @@ bool Controller::execute(const Command &command) {
       const auto preview = perform();
       print(preview);
       if (preview.state() != api::LiveUpdateStatus::PLANNED || interrupted)
-        return;
+        return preview.state() == api::LiveUpdateStatus::UNCHANGED;
       request.set_preview_revision(preview.active_revision());
       request.set_action(api::LiveUpdateRequest::UPDATE);
-      print(perform());
+      const auto applied = perform();
+      print(applied);
+      return applied.state() == api::LiveUpdateStatus::APPLIED ||
+             applied.state() == api::LiveUpdateStatus::UNCHANGED;
     };
     if (command.kind == K::live_watch) {
       out_ << "Watching " << watched.size() << " live source files. Press Ctrl-C to stop.\n";
       out_.flush();
+      std::map<std::string, std::string> pending;
       while (!interrupted) {
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
         request.clear_sources();
@@ -1797,20 +1801,22 @@ bool Controller::execute(const Command &command) {
         }
         if (saved.empty() || interrupted)
           continue;
-        for (const auto &[path, contents] : saved) {
+        for (auto &[path, contents] : saved) {
+          watched.at(path) = contents;
+          pending.insert_or_assign(path, std::move(contents));
+        }
+        for (const auto &[path, contents] : pending) {
           auto *source = request.add_sources();
           source->set_path(path);
           source->set_contents(contents);
         }
         try {
-          preview_and_apply();
+          if (preview_and_apply())
+            pending.clear();
         } catch (const std::exception &) {
           if (!interrupted)
             throw;
         }
-        watched.merge(saved);
-        for (auto &[path, contents] : saved)
-          watched.at(path) = std::move(contents);
       }
       out_ << "Live watch stopped.\n";
       out_.flush();

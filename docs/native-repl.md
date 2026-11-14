@@ -94,6 +94,32 @@ rebuild. Revisions keep JIT code mapped for escaped pointers and active calls.
 including reverted generations. Reconnect to the same server to inspect
 the active revision.
 
+```text
+%live mock "ProductStore::load(int)" --file product_fixture.cpp --function load_fixture --fixture products.txt
+%live update-data shared.cpp --discover-file discover.cpp --discover-function discover
+%live scan-heap --type example::Cache --type example::Account
+%live update update.hpp --after-file after.cpp --after-function fixture::after --for-each Cache
+```
+
+Live mocks use exact signatures. `--bind "ALIAS=SIGNATURE"` binds a verified
+application callable. `%live revert` restores the previous dispatch.
+
+Object callbacks use a discovery function with `clang_tracer::ObjectSink`
+from `<clang_tracer/live.hpp>`. A callback may take shared owners, borrowed
+pointers, or per-type reference overloads. Discovery supplies each object's
+existing owner or guarded borrow. Heap scans report candidates and their
+evidence. To select `--from-scan ID ...` for a write, provide an owner discovery
+function at scan time. The updater reacquires each candidate's original owner.
+
+Managed migration requires application storage using
+`<tracer/live_migration.hpp>` and an exported
+`extern "C" tracer::live::managed::Registry* clang_tracer_managed_registry_v1() noexcept`.
+Submit a C++ recipe that exports `clang_tracer_managed_update_v1`, with the
+after hook in its own file if needed. Use `%live update update.hpp --managed true`
+for a recipe with no hook. A recipe can include new helper translation units.
+Changing existing application files and publishing their native replacements
+with a layout migration requires a rebuild in this profile.
+
 ## Prepare a probe from a binary without headers
 
 Build a module index from a Linux x86-64 ELF executable or shared library.

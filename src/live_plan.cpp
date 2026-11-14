@@ -367,8 +367,14 @@ ExtensionSources extension_sources(std::uint32_t pid, const std::string &module,
     throw std::runtime_error("no exact ELF code range for live object identity");
   const auto bias = client::bind_live_executable(pid, module, image.elf, anchor->address, anchor->size);
   result.build_id = llvm::toHex(llvm::object::getBuildID(&image.elf), true);
-  if (!registry.empty())
-    result.entry = bind_native_entry(pid, module, registry, {}, false).address;
+  if (!registry.empty()) {
+    try {
+      result.entry = bind_native_entry(pid, module, registry, {}, false).address;
+    } catch (const std::exception &error) {
+      throw std::runtime_error("rebuild required: managed registry entry could not be bound: " +
+                               std::string(error.what()));
+    }
+  }
   if (paths.empty())
     return result;
   result.jit = build.baseline;
@@ -400,12 +406,15 @@ ExtensionSources extension_sources(std::uint32_t pid, const std::string &module,
         [&](const SourceFile &file) { return file.path == path; });
     if (snapshot == result.jit.files.end())
       result.jit.files.push_back({path, std::move(content)});
-    else
+    else if (snapshot->contents != content) {
+      if (!registry.empty())
+        throw std::runtime_error("rebuild required: a managed recipe cannot replace baseline application "
+                                 "files in the same transaction: " + path);
       snapshot->contents = std::move(content);
-    const auto extension = fs::path(path).extension();
-    if (extension == ".cpp" || extension == ".cc" || extension == ".cxx" || extension == ".C") {
-      result.jit.translation_units.push_back({path, directory, arguments});
     }
+    const auto extension = fs::path(path).extension();
+    if (extension == ".cpp" || extension == ".cc" || extension == ".cxx" || extension == ".C")
+      result.jit.translation_units.push_back({path, directory, arguments});
   }
 
   // Admit only requested references into the exact loaded image.

@@ -201,6 +201,11 @@ def migration(args, folder):
     with ExitStack() as cleanup:
         app, repl, app_line, _ = attach(args, target, cleanup)
         app("old", r"^old 0$")
+        main = folder / "main.cpp"
+        main.write_text(MANAGED_MAIN.replace('ready', 'changed'))
+        repl("%live update update.hpp main.cpp --managed true",
+             r"^live BLOCKED revision=0 .*cannot replace baseline application files")
+        main.write_text(MANAGED_MAIN)
         options = " --after-function fixture::after --for-each Cache"
         repl("%live update update.hpp --after-file reject.cpp" + options,
              r"^live BLOCKED revision=0 .*second hook failed")
@@ -210,6 +215,12 @@ def migration(args, folder):
         app("new", r"^new 700 4796 1$")
         app_line(r"^new 1400 1656 1$")
         app_line(r"^new 0 1024 1$")
+        repl("%live revert", r"^live REVERTED revision=0")
+        app("old", r"^old 0$")
+        repl("%live update update.hpp --managed true", r"^live APPLIED revision=2 .*instances=3")
+        app("new", r"^new 700 1024 0$")
+        app_line(r"^new 1400 1024 0$")
+        app_line(r"^new 0 1024 0$")
         repl("%live revert", r"^live REVERTED revision=0")
         app("old", r"^old 0$")
 
