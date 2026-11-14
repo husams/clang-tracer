@@ -61,6 +61,10 @@ struct Snapshot {
     }
     auto& unit = request.translation_units.front();
     arguments = unit.compiler_arguments;
+    // Entry padding and inlining controls affect emitted code, not this AST.
+    std::erase_if(arguments, [](const std::string &argument) {
+      return argument == "-fno-inline" || argument.starts_with("-fpatchable-function-entry=");
+    });
     std::string unsupported;
     if (!std::filesystem::path(unit.directory).is_absolute() ||
         !safe_preflight_compiler_arguments(arguments.begin(), arguments.end(), true,

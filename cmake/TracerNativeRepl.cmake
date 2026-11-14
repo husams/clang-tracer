@@ -59,7 +59,7 @@ function(tracer_add_native_repl)
     "${_generated}/tracer.grpc.pb.cc" "${_generated}/context_transport.pb.cc")
   target_include_directories(tracer_repl_rpc PUBLIC "${_generated}")
   target_link_libraries(tracer_repl_rpc PUBLIC gRPC::grpc++ protobuf::libprotobuf)
-  add_library(tracer_repl_client STATIC "${_repl}/controller.cpp" "${_repl}/server_process.cpp"
+  add_library(tracer_repl_client STATIC "${CMAKE_CURRENT_SOURCE_DIR}/src/live_mock_command.cpp" "${_repl}/controller.cpp" "${_repl}/server_process.cpp"
     "${_repl}/events.cpp" "${_repl}/../object_snapshot.cpp" "${_repl}/background_events.cpp")
   target_include_directories(tracer_repl_client PUBLIC "${_repl}"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -941,6 +941,11 @@ function(tracer_add_native_repl)
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
           --agent $<TARGET_FILE:clang_tracer_agent>)
       set_tests_properties(native_repl_live_update PROPERTIES TIMEOUT 240)
+      add_test(NAME native_repl_live_mock
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_live_mock.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> "${CMAKE_CXX_COMPILER}")
+      set_tests_properties(native_repl_live_mock PROPERTIES TIMEOUT 300)
       add_test(NAME native_repl_integration
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_native_integration.py"
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>

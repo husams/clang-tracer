@@ -85,12 +85,13 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | 'object'
         | 'live' | 'update' | 'revert' | 'mock' | 'update-data' | 'scan-heap' | STACK;
 liveUpdate : 'live' (('update' | 'preview') (value | liveOption)+ | 'status' | 'revert' UINT?
-                   | 'mock' value liveOption+ | 'update-data' value liveOption*
+                   | 'mock' value liveOption+ | 'update-data' value (liveOption | liveScanSelection)*
                    | 'scan-heap' liveOption+);
+liveScanSelection : '--from-scan' value+;
 liveOption : ('--build' | '--compdb' | '--file' | '--function' | '--fixture' | '--bind'
               | '--recursion' | '--discover-file' | '--discover-function' | '--module'
-              | '--address' | '--from-scan' | '--type'
-              | '--after-file' | '--after-function' | '--for-each') value
+              | '--address' | '--type'
+              | '--after-file' | '--after-function' | '--for-each' | '--managed') value
            | '--retention-limit' UINT;
 objectWatch : 'object' ('prepare' value? objectOption+ | ('start' | 'preview') objectOption+
                         | ('stop' | 'status') UINT?);

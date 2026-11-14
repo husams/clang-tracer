@@ -2,6 +2,8 @@
 
 #include "injector.hpp"
 #include "live_agent_protocol.hpp"
+#include "live_extension_plan.hpp"
+#include "live_mock_plan.hpp"
 #include "live_plan.hpp"
 #include "native_detour.hpp"
 #include "proc_identity.hpp"
@@ -12,6 +14,7 @@
 #include <filesystem>
 #include <memory>
 #include <set>
+#include <thread>
 
 namespace tracer {
 namespace {
@@ -53,10 +56,13 @@ std::string payload(const live::JitRequest &request) {
 }
 
 AgentRequest invoke(injector::Process &process, std::uintptr_t entry, AgentRequest request,
-                    const std::string &input = {}) {
+                    const std::string &input = {}, std::string *output = nullptr) {
   if (!entry)
     throw std::runtime_error("attached agent has no live JIT service");
-  const auto size = sizeof(request) + input.size();
+  const auto capacity = output ? request.output_capacity : 0;
+  if (capacity > live::max_payload_bytes)
+    throw std::runtime_error("live extension response exceeds the transport budget");
+  const auto size = sizeof(request) + input.size() + capacity;
   const auto remote = process.remote_allocate(size);
   try {
     if (!input.empty()) {
@@ -64,6 +70,8 @@ AgentRequest invoke(injector::Process &process, std::uintptr_t entry, AgentReque
       request.input_size = input.size();
       process.remote_write(request.input, input.data(), input.size());
     }
+    if (output)
+      request.output = remote + sizeof(request) + input.size();
     process.remote_write(remote, &request, sizeof(request));
     const auto returned = process.remote_call(entry, {remote}, 1);
     process.remote_read(remote, &request, sizeof(request));
@@ -71,6 +79,12 @@ AgentRequest invoke(injector::Process &process, std::uintptr_t entry, AgentReque
       throw std::runtime_error("invalid response from the live JIT service");
     if (returned)
       throw std::runtime_error(request.error[0] ? request.error : "live JIT service failed");
+    if (output && request.ready) {
+      if (!request.output_size || request.output_size > capacity)
+        throw std::runtime_error("agent returned an invalid live report size");
+      output->resize(request.output_size);
+      process.remote_read(remote + sizeof(request) + input.size(), output->data(), output->size());
+    }
   } catch (...) {
     if (!process.unsafe()) {
       try { process.remote_free(remote, size); } catch (...) {}
@@ -151,6 +165,106 @@ bool publish(std::uint32_t pid, std::uint64_t process_start,
 }
 } // namespace
 
+Status Session::run_live_extension_locked(api::LiveAgentExtension input) {
+  injector::Process process;
+  const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
+  input.set_deadline_nanoseconds(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      deadline.time_since_epoch()).count());
+  const auto bytes = input.SerializeAsString();
+  if (bytes.size() > live::max_payload_bytes)
+    throw std::runtime_error("live extension snapshots exceed the transport budget");
+  try {
+    attach_process(process, deadline);
+    AgentRequest start;
+    start.action = AgentRequest::Action::launch;
+    const auto launch = invoke(process, live_address_, start, bytes);
+    if (!launch.token)
+      throw std::runtime_error("agent did not start the live operation");
+    live_.pending_extension = launch.token;
+    process.detach();
+
+    AgentRequest poll;
+    poll.action = AgentRequest::Action::poll;
+    poll.token = launch.token;
+    for (;;) {
+      // Reattach briefly to check progress. Application code runs between
+      // polls, including on the thread used to invoke the agent entry.
+      attach_process(process, deadline);
+      const auto response = invoke(process, live_address_, poll);
+      if (response.output_size) {
+        std::string serialized;
+        poll.output_capacity = response.output_size;
+        const auto filled = invoke(process, live_address_, poll, {}, &serialized);
+        if (!filled.ready)
+          throw std::runtime_error("live agent response changed during retrieval");
+        Status output;
+        if (!output.ParseFromString(serialized))
+          throw std::runtime_error("cannot decode live agent response");
+        process.detach();
+        live_.pending_extension = 0;
+        report_revision(output, live_);
+        if (output.state() == Status::RESTORATION_REQUIRED) {
+          unsafe_target_ = true;
+          set_failed_locked(output.diagnostic());
+        }
+        output.set_operation_token(launch.token);
+        return output;
+      }
+      process.detach();
+      if (std::chrono::steady_clock::now() >= deadline)
+        throw std::runtime_error("live operation is still running in the target");
+      std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+  } catch (...) {
+    if (process.unsafe()) {
+      unsafe_target_ = true;
+      set_failed_locked("live extension rendezvous could not safely restore the target");
+    }
+    throw;
+  }
+}
+
+Status Session::apply_live_extension_locked(const Action &request, Status result,
+                                             const std::function<bool()> &cancelled) {
+  const auto planned = live::plan_extension(pid_, process_start_, id_, executable_, request);
+  if (planned.validate)
+    planned.validate();
+  if (cancelled && cancelled())
+    throw live::Stale("live extension cancelled before launch");
+  const auto managed = planned.input.action() == api::LiveAgentExtension::MANAGED_UPDATE;
+  if (managed && request.action() == Action::PREVIEW) {
+    result.set_state(Status::PLANNED);
+    result.set_diagnostic("managed layout, instances and hook will be validated in the target");
+    return result;
+  }
+  if (!managed)
+    return run_live_extension_locked(planned.input);
+
+  const auto previous = live_.active;
+  const auto next_id = live_.last_committed + 1;
+  if (!next_id)
+    throw std::runtime_error("live revision identifiers exhausted");
+  const auto [record, inserted] = live_.revisions.emplace(next_id, live_.revisions.at(previous));
+  if (!inserted)
+    throw std::runtime_error("duplicate managed live revision");
+  record->second.parent = previous;
+  record->second.managed = 0;
+  try {
+    result = run_live_extension_locked(planned.input);
+  } catch (...) {
+    live_.revisions.erase(record);
+    throw;
+  }
+  if (result.state() == Status::APPLIED) {
+    record->second.managed = result.operation_token();
+    live_.active = live_.last_committed = next_id;
+    report_revision(result, live_);
+  } else {
+    live_.revisions.erase(record);
+  }
+  return result;
+}
+
 clangtracer::v1::LiveUpdateStatus Session::live_update(
     const clangtracer::v1::LiveUpdateRequest &request, const std::function<bool()> &cancelled) {
   std::lock_guard lock(mutex_);
@@ -165,6 +279,8 @@ clangtracer::v1::LiveUpdateStatus Session::live_update(
     check_identity_locked();
     if (state_ != api::Session::ATTACHED)
       throw std::runtime_error("select an attached target for live update");
+    if (live_.pending_extension)
+      throw std::runtime_error("a live extension outcome is unresolved; inspect the target before further updates");
     if (request.action() == Action::STATUS) {
       result.set_state(Status::CURRENT);
       for (const auto &[address, active] : live_.revisions.at(live_.active).entries) {
@@ -186,11 +302,21 @@ clangtracer::v1::LiveUpdateStatus Session::live_update(
     if (request.action() == Action::REVERT)
       return revert_live_locked(request.has_exact_revision() ? request.revision() :
                                     live_.revisions.at(live_.active).parent);
-    if (request.action() != Action::UPDATE && request.action() != Action::PREVIEW)
-      throw std::runtime_error("this server has no handler for the requested live extension");
-    if (!request.options().empty())
-      throw std::runtime_error("managed migration options require the live migration handler");
     const auto expected_revision = live_.active;
+    if (request.action() == Action::MOCK) {
+      const auto plan = live::plan_live_mock(pid_, executable_, request,
+                                             live_.revisions.at(expected_revision), cancelled);
+      for (const auto &candidate : plan.candidates)
+        result.add_candidates()->CopyFrom(candidate);
+      return activate_live_locked(plan, expected_revision, request.retention_limit(),
+                                  cancelled, std::move(result));
+    }
+    if (request.action() == Action::SCAN_HEAP || request.action() == Action::UPDATE_DATA ||
+        ((request.action() == Action::UPDATE || request.action() == Action::PREVIEW) &&
+         !request.options().empty()))
+      return apply_live_extension_locked(request, std::move(result), cancelled);
+    if (request.action() != Action::UPDATE && request.action() != Action::PREVIEW)
+      throw std::runtime_error("unknown live update action");
     if (request.has_preview_revision() && request.preview_revision() != expected_revision)
       throw live::Stale("active revision changed after preview; rediscover the update");
     auto plan = live::plan_sources(pid_, executable_, request, live_.revisions.at(expected_revision), cancelled);
@@ -216,7 +342,8 @@ clangtracer::v1::LiveUpdateStatus Session::live_update(
     return activate_live_locked(plan, expected_revision, request.retention_limit(),
                                 cancelled, std::move(result));
   } catch (const std::exception &error) {
-    result.set_state(dynamic_cast<const live::Stale *>(&error) ? Status::STALE : Status::BLOCKED);
+    result.set_state(unsafe_target_ || live_.pending_extension ? Status::RESTORATION_REQUIRED :
+                     dynamic_cast<const live::Stale *>(&error) ? Status::STALE : Status::BLOCKED);
     result.set_diagnostic(error.what());
   }
   return result;
@@ -251,6 +378,7 @@ clangtracer::v1::LiveUpdateStatus Session::activate_live_locked(
 
     auto next = live_.revisions.at(expected_revision);
     next.parent = expected_revision;
+    next.managed = 0;
     next.safe_point = plan.safe_point;
     for (const auto &source : plan.accepted_sources)
       next.sources[source.path] = source;
@@ -335,6 +463,28 @@ clangtracer::v1::LiveUpdateStatus Session::revert_live_locked(std::uint64_t revi
       result.set_state(Status::UNCHANGED);
     } else {
       const auto previous = live_.active;
+      const auto &current = live_.revisions.at(previous);
+      if (current.managed) {
+        if (revision != current.parent)
+          throw std::runtime_error("revert managed layout revisions in reverse application order");
+        api::LiveAgentExtension input;
+        input.set_action(api::LiveAgentExtension::MANAGED_REVERT);
+        input.set_revision(current.managed);
+        result = run_live_extension_locked(std::move(input));
+        if (result.state() == Status::APPLIED) {
+          live_.active = revision;
+          result.set_state(Status::REVERTED);
+          report_revision(result, live_);
+        }
+        return result;
+      }
+      for (auto cursor = previous; cursor && cursor != revision;
+           cursor = live_.revisions.at(cursor).parent) {
+        if (live_.revisions.at(cursor).managed)
+          throw std::runtime_error("revert managed layout revisions in reverse application order");
+      }
+      if (live_.revisions.at(revision).managed && revision != current.parent)
+        throw std::runtime_error("managed layout revisions cannot be reapplied by revision number");
       if (!publish(pid_, process_start_, process, live_.revisions.at(previous),
                    live_.revisions.at(revision), {}, [&] {
                      live_.active = revision;
@@ -345,7 +495,7 @@ clangtracer::v1::LiveUpdateStatus Session::revert_live_locked(std::uint64_t revi
     }
   } catch (const std::exception &error) {
     result.set_diagnostic(error.what());
-    if (process.unsafe()) {
+    if (process.unsafe() || live_.pending_extension) {
       unsafe_target_ = true;
       set_failed_locked(result.diagnostic());
       result.set_state(Status::RESTORATION_REQUIRED);

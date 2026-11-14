@@ -347,6 +347,101 @@ BuildInputs open_native_build(const std::string &executable,
   return result;
 }
 
+ExtensionSources extension_sources(std::uint32_t pid, const std::string &module,
+    const api::LiveUpdateRequest &request, const std::vector<std::string> &paths,
+    const std::string &registry) {
+  ExtensionSources result;
+  const auto build = paths.empty() ? BuildInputs{} : open_native_build(module, request);
+  // bind_live_executable checks the actual loaded build ID, not just the
+  // pathname. For source execution the selected executable provides main.
+  const Image image(module, {});
+  const Symbol *anchor = image.find("main");
+  if (!anchor) {
+    // Advisory scans also accept shared libraries without main.
+    const auto found = std::find_if(image.symbols.begin(), image.symbols.end(),
+        [](const Symbol &symbol) { return symbol.type == llvm::ELF::STT_FUNC && symbol.size; });
+    if (found != image.symbols.end())
+      anchor = &*found;
+  }
+  if (!anchor)
+    throw std::runtime_error("no exact ELF code range for live object identity");
+  const auto bias = client::bind_live_executable(pid, module, image.elf, anchor->address, anchor->size);
+  result.build_id = llvm::toHex(llvm::object::getBuildID(&image.elf), true);
+  if (!registry.empty())
+    result.entry = bind_native_entry(pid, module, registry, {}, false).address;
+  if (paths.empty())
+    return result;
+  result.jit = build.baseline;
+  result.jit.translation_units.clear();
+
+  auto arguments = build.baseline.translation_units.front().compiler_arguments;
+  const auto directory = build.baseline.translation_units.front().directory;
+  // A callback outside the compilation database may use the target's
+  // common profile. Reject conflicting ABI options instead of guessing.
+  for (const auto &unit : build.baseline.translation_units)
+    if (unit.directory != directory || unit.compiler_arguments != arguments)
+      throw std::runtime_error("live callbacks require one unambiguous recorded target compile profile");
+  const auto sdk = fs::path(TRACER_LIVE_SDK_DIR);
+  const auto sdk_dir = fs::exists(sdk / "clang_tracer/live.hpp")
+      ? sdk.string() : TRACER_LIVE_BUILD_SDK_DIR;
+  arguments.insert(arguments.end(), {"-I", sdk_dir});
+  result.jit.compiler_arguments = arguments;
+
+  std::map<std::string, std::string> submitted;
+  for (const auto &path : paths) {
+    auto content = read_file(path);
+    const auto original = std::find_if(request.sources().begin(), request.sources().end(),
+        [&](const auto &item) { return item.path() == path; });
+    if (original != request.sources().end() && original->contents() != content)
+      throw Stale("saved source changed after submission: " + path);
+    if (!submitted.emplace(path, content).second)
+      throw std::runtime_error("duplicate live source path: " + path);
+    auto snapshot = std::find_if(result.jit.files.begin(), result.jit.files.end(),
+        [&](const SourceFile &file) { return file.path == path; });
+    if (snapshot == result.jit.files.end())
+      result.jit.files.push_back({path, std::move(content)});
+    else
+      snapshot->contents = std::move(content);
+    const auto extension = fs::path(path).extension();
+    if (extension == ".cpp" || extension == ".cc" || extension == ".cxx" || extension == ".C") {
+      result.jit.translation_units.push_back({path, directory, arguments});
+    }
+  }
+
+  // Admit only requested references into the exact loaded image.
+  // Link-time relocations stay target-native, including external data.
+  for (const auto &unit : result.jit.translation_units) {
+    const auto compiled = compile_unit(result.jit, unit);
+    const auto add_import = [&](const auto &value, unsigned type) {
+      if (!value.isDeclaration() || value.getName().empty())
+        return;
+      const auto name = value.getName().str();
+      const auto *symbol = image.find(name);
+      if (symbol && symbol->type == type && symbol->address <= UINTPTR_MAX - bias)
+        result.jit.imports.emplace(name, bias + symbol->address);
+    };
+    for (const auto &function : *compiled.module)
+      add_import(function, llvm::ELF::STT_FUNC);
+    for (const auto &global : compiled.module->globals())
+      if (!global.isThreadLocal())
+        add_import(global, llvm::ELF::STT_OBJECT);
+    for (const auto &dependency : compiled.inputs) {
+      if (within(build.source_root, dependency) &&
+          std::none_of(result.jit.files.begin(), result.jit.files.end(), [&](const auto &file) {
+            return file.path == dependency;
+          }))
+        throw std::runtime_error("unrecorded project dependency: " + dependency);
+    }
+  }
+  result.validate = [submitted = std::move(submitted), validate_build = build.revalidate] {
+    validate_build();
+    for (const auto &[path, contents] : submitted)
+      if (read_file(path) != contents)
+        throw Stale("newer source save invalidated the staged snapshot: " + path);
+  };
+  return result;
+}
+
 void validate_entry(std::uint32_t pid, const Entry &entry) {
   auto binary = Image::open(entry.module);
   const auto &elf = Image::as_elf(*binary.getBinary());

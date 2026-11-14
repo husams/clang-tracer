@@ -4,6 +4,7 @@
 #include "../proc_identity.hpp"
 #include "../sqlite_events.hpp"
 #include "../bounded_proto.hpp"
+#include "../live_mock.hpp"
 #include "../value_snapshot_storage.hpp"
 
 #include <algorithm>
@@ -1685,19 +1686,15 @@ bool Controller::execute(const Command &command) {
       request.set_revision(unsigned_number(args.front(), "revision"));
       request.set_has_exact_revision(true);
     }
+    if (command.has("--retention-limit")) {
+      const auto limit = command.number("--retention-limit", 0);
+      if (!limit)
+        throw std::invalid_argument("retention limit must be positive");
+      request.set_retention_limit(limit);
+    }
     if (command.kind == K::live_update || command.kind == K::live_preview) {
       if (args.empty())
         throw std::invalid_argument("provide at least one source or header");
-      request.set_build_manifest(std::filesystem::absolute(
-          command.option("--build", "clang-tracer-live.textproto")).string());
-      request.set_compilation_database(std::filesystem::absolute(
-          command.option("--compdb", "compile_commands.json")).string());
-      if (command.has("--retention-limit")) {
-        const auto limit = command.number("--retention-limit", 0);
-        if (!limit)
-          throw std::invalid_argument("retention limit must be positive");
-        request.set_retention_limit(limit);
-      }
       for (const auto &arg : args) {
         const auto path = std::filesystem::canonical(arg);
         std::ifstream input(path, std::ios::binary);
@@ -1711,9 +1708,14 @@ bool Controller::execute(const Command &command) {
       for (const auto &arg : args)
         request.add_arguments(arg);
     }
+    if (command.kind != K::live_status && command.kind != K::live_revert) {
+      request.set_build_manifest(std::filesystem::absolute(
+          command.option("--build", "clang-tracer-live.textproto")).string());
+      request.set_compilation_database(std::filesystem::absolute(
+          command.option("--compdb", "compile_commands.json")).string());
+    }
     for (const auto &[name, options] : command.options) {
-      if ((command.kind == K::live_update || command.kind == K::live_preview) &&
-          (name == "--compdb" || name == "--build" || name == "--retention-limit"))
+      if (name == "--compdb" || name == "--build" || name == "--retention-limit")
         continue;
       for (const auto &value : options) {
         auto *option = request.add_options();
@@ -1721,6 +1723,8 @@ bool Controller::execute(const Command &command) {
         option->set_value(value);
       }
     }
+    if (command.kind == K::live_mock)
+      tracer::live::snapshot_live_mock(request);
     const auto print = [&](const api::LiveUpdateStatus &response) {
       out_ << "live " << api::LiveUpdateStatus::State_Name(response.state())
            << " revision=" << response.active_revision()
@@ -1728,6 +1732,8 @@ bool Controller::execute(const Command &command) {
       if (!response.diagnostic().empty())
         out_ << " " << response.diagnostic();
       out_ << '\n';
+      for (const auto &note : response.notes())
+        out_ << "  " << note << '\n';
       for (const auto &entry : response.candidates()) {
         out_ << "  " << api::LiveUpdateStatus::State_Name(entry.state())
              << ' ' << entry.signature() << " [" << entry.symbol() << "] "

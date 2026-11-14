@@ -1,5 +1,5 @@
 
-// Generated from src/repl/TracerCommands.g4 by ANTLR 4.13.2
+// Generated from TracerCommands.g4 by ANTLR 4.13.2
 
 #pragma once
 
@@ -96,6 +96,8 @@ public:
     virtual std::any visitKeyword(TracerCommandsParser::KeywordContext *context) = 0;
 
     virtual std::any visitLiveUpdate(TracerCommandsParser::LiveUpdateContext *context) = 0;
+
+    virtual std::any visitLiveScanSelection(TracerCommandsParser::LiveScanSelectionContext *context) = 0;
 
     virtual std::any visitLiveOption(TracerCommandsParser::LiveOptionContext *context) = 0;
 

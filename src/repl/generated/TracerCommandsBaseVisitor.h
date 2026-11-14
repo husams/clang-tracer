@@ -1,5 +1,5 @@
 
-// Generated from src/repl/TracerCommands.g4 by ANTLR 4.13.2
+// Generated from TracerCommands.g4 by ANTLR 4.13.2
 
 #pragma once
 
@@ -168,6 +168,10 @@ public:
   }
 
   virtual std::any visitLiveUpdate(TracerCommandsParser::LiveUpdateContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitLiveScanSelection(TracerCommandsParser::LiveScanSelectionContext *ctx) override {
     return visitChildren(ctx);
   }
 

@@ -1,5 +1,5 @@
 
-// Generated from src/repl/TracerCommands.g4 by ANTLR 4.13.2
+// Generated from TracerCommands.g4 by ANTLR 4.13.2
 
 #pragma once
 
@@ -46,9 +46,9 @@ public:
     T__174 = 175, T__175 = 176, T__176 = 177, T__177 = 178, T__178 = 179,
     T__179 = 180, T__180 = 181, T__181 = 182, T__182 = 183, T__183 = 184,
     T__184 = 185, T__185 = 186, T__186 = 187, T__187 = 188, T__188 = 189,
-    T__189 = 190, UINT = 191, STRING = 192, SHELL = 193, METADATA_ONLY = 194,
-    SQLITE = 195, STACK = 196, CWD = 197, SIGNATURE = 198, MEMBER = 199,
-    SNAPSHOT_RETURN_POINTEE = 200, WORD = 201, WS = 202
+    T__189 = 190, T__190 = 191, UINT = 192, STRING = 193, SHELL = 194, METADATA_ONLY = 195,
+    SQLITE = 196, STACK = 197, CWD = 198, SIGNATURE = 199, MEMBER = 200,
+    SNAPSHOT_RETURN_POINTEE = 201, WORD = 202, WS = 203
   };
 
   enum {
@@ -61,10 +61,10 @@ public:
     RuleInterceptor = 23, RuleEvents = 24, RuleCollect = 25, RuleRecord = 26,
     RuleStreamOption = 27, RuleCpp = 28, RuleShell = 29, RuleComplete = 30,
     RuleType = 31, RuleHelp = 32, RuleQuit = 33, RuleBulkTrace = 34, RuleBulkTraceOption = 35,
-    RuleValue = 36, RuleKeyword = 37, RuleLiveUpdate = 38, RuleLiveOption = 39,
-    RuleObjectWatch = 40, RuleObjectOption = 41, RuleMemory = 42, RuleProbeEntry = 43,
-    RuleProbeReload = 44, RuleStackFilter = 45, RuleContextEventBytes = 46,
-    RuleExtraCompileOption = 47, RuleCwdOption = 48
+    RuleValue = 36, RuleKeyword = 37, RuleLiveUpdate = 38, RuleLiveScanSelection = 39,
+    RuleLiveOption = 40, RuleObjectWatch = 41, RuleObjectOption = 42, RuleMemory = 43,
+    RuleProbeEntry = 44, RuleProbeReload = 45, RuleStackFilter = 46, RuleContextEventBytes = 47,
+    RuleExtraCompileOption = 48, RuleCwdOption = 49
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -123,6 +123,7 @@ public:
   class ValueContext;
   class KeywordContext;
   class LiveUpdateContext;
+  class LiveScanSelectionContext;
   class LiveOptionContext;
   class ObjectWatchContext;
   class ObjectOptionContext;
@@ -725,6 +726,8 @@ public:
     std::vector<LiveOptionContext *> liveOption();
     LiveOptionContext* liveOption(size_t i);
     antlr4::tree::TerminalNode *UINT();
+    std::vector<LiveScanSelectionContext *> liveScanSelection();
+    LiveScanSelectionContext* liveScanSelection(size_t i);
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -732,6 +735,20 @@ public:
   };
 
   LiveUpdateContext* liveUpdate();
+
+  class  LiveScanSelectionContext : public antlr4::ParserRuleContext {
+  public:
+    LiveScanSelectionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    std::vector<ValueContext *> value();
+    ValueContext* value(size_t i);
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  LiveScanSelectionContext* liveScanSelection();
 
   class  LiveOptionContext : public antlr4::ParserRuleContext {
   public:

@@ -1,4 +1,6 @@
 #include "live_agent_protocol.hpp"
+#include "live_agent_extension.hpp"
+#include "live_mock_recursion.hpp"
 #include "live_update.hpp"
 #include "tracer.pb.h"
 
@@ -37,12 +39,11 @@ std::pair<std::uintptr_t, std::size_t> executable_mapping(std::uintptr_t address
   throw std::runtime_error("ORC address lacks an executable target mapping");
 }
 
-JitRequest jit_input(const AgentRequest &request) {
-  clangtracer::v1::LiveJitInput input;
-  if (!request.input || !request.input_size || request.input_size > max_payload_bytes ||
-      !input.ParseFromArray(reinterpret_cast<const void *>(request.input), request.input_size))
-    throw std::runtime_error("invalid live JIT source payload");
+} // namespace
+
+JitRequest decode_jit(const clangtracer::v1::LiveJitInput &input) {
   JitRequest result;
+  result.compiler_arguments.assign(input.compiler_arguments().begin(), input.compiler_arguments().end());
   for (const auto &source : input.sources())
     result.files.push_back({source.path(), source.contents()});
   for (const auto &unit : input.units())
@@ -51,6 +52,18 @@ JitRequest jit_input(const AgentRequest &request) {
   for (const auto &[name, address] : input.imports())
     result.imports.emplace(name, address);
   result.entry_symbols.assign(input.entry_symbols().begin(), input.entry_symbols().end());
+  return result;
+}
+
+namespace {
+JitRequest jit_input(const AgentRequest &request) {
+  clangtracer::v1::LiveJitInput input;
+  if (!request.input || !request.input_size || request.input_size > max_payload_bytes ||
+      !input.ParseFromArray(reinterpret_cast<const void *>(request.input), request.input_size))
+    throw std::runtime_error("invalid live JIT source payload");
+  auto result = decode_jit(input);
+  result.imports.emplace("clangtracer_live_mock_top_v1",
+                         reinterpret_cast<std::uintptr_t>(&clangtracer_live_mock_top_v1));
   if (result.entry_symbols.empty() || result.entry_symbols.size() > max_entries)
     throw std::runtime_error("invalid live JIT entry count");
   return result;
@@ -63,11 +76,19 @@ extern "C" int tracer_agent_live_v1(tracer::live::AgentRequest *request) noexcep
   if (!request || request->version != agent_magic)
     return -1;
   try {
+    if (request->action == AgentRequest::Action::launch ||
+        request->action == AgentRequest::Action::poll) {
+      execute_extension(*request);
+      return 0;
+    }
     auto &state = images();
     std::lock_guard lock(state.mutex);
     request->error[0] = '\0';
     request->retained = state.retained.size();
     switch (request->action) {
+    case AgentRequest::Action::launch:
+    case AgentRequest::Action::poll:
+      break;
     case AgentRequest::Action::status:
       return 0;
     case AgentRequest::Action::discard:

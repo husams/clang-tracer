@@ -1464,8 +1464,10 @@ void Session::detach() {
                                             : error_);
   }
   check_identity_locked();
-  if (live_.active) {
-    const auto result = revert_live_locked(0);
+  if (live_.pending_extension)
+    throw std::runtime_error("live operation outcome remains unresolved");
+  while (live_.active) {
+    const auto result = revert_live_locked(live_.revisions.at(live_.active).parent);
     if (result.state() != clangtracer::v1::LiveUpdateStatus::REVERTED)
       throw std::runtime_error("live restoration incomplete: " + result.diagnostic());
   }
@@ -1493,8 +1495,12 @@ void Session::shutdown() noexcept {
   if (state_ == clangtracer::v1::Session::DETACHED ||
       state_ == clangtracer::v1::Session::EXITED || unsafe_target_)
     return;
-  if (live_.active) {
-    const auto result = revert_live_locked(0);
+  if (live_.pending_extension) {
+    set_failed_locked("live operation outcome remains unresolved during shutdown");
+    return;
+  }
+  while (live_.active) {
+    const auto result = revert_live_locked(live_.revisions.at(live_.active).parent);
     if (result.state() != clangtracer::v1::LiveUpdateStatus::REVERTED) {
       set_failed_locked("live restoration incomplete: " + result.diagnostic());
       return;

@@ -206,6 +206,11 @@ public:
         continue;
       }
       const auto text = ts[i]->getText();
+      if (result.kind == K::live_update_data && text == "--from-scan") {
+        while (i + 2 < ts.size() && !ts[i + 1]->getText().starts_with("--"))
+          result.options[text].push_back(decode(ts[++i]->getText()));
+        continue;
+      }
       const bool profile_add = result.kind == K::cpp_options &&
                                !result.arguments.empty() && result.arguments.front() == "add";
       if (!profile_add && ts[i]->getType() != TracerCommandsLexer::STRING &&

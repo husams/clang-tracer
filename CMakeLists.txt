@@ -95,6 +95,8 @@ target_link_libraries(tracer_grpc PUBLIC tracer_proto gRPC::grpc++)
 
 add_library(clang_tracer_agent SHARED src/agent.cpp src/native_detour.cpp src/native_entry.cpp
   src/object_code_cache_agent.cpp src/live_compile.cpp src/live_jit.cpp src/live_agent.cpp
+  src/live_agent_extension.cpp src/live_data.cpp src/live_data_jit.cpp src/live_data_scan.cpp
+  src/live_migration.cpp src/live_mock_recursion.cpp
   src/value_snapshot_codegen.cpp src/value_snapshot_storage.cpp src/snapshot_encoder.cpp src/callback_pch.cpp
   src/debug_resolver.cpp src/native_stack.cpp src/event_transport.cpp
   src/context_agent_delivery.cpp src/agent_runtime_profile.cpp)
@@ -119,9 +121,18 @@ add_custom_command(TARGET clang_tracer_agent POST_BUILD
 add_executable(clang-tracer-server src/main.cpp src/server.cpp src/session.cpp src/injector.cpp src/admission.cpp
   src/debug_resolver.cpp src/header_context.cpp src/process_memory.cpp src/native_entry.cpp src/native_detour.cpp
   src/object_watch.cpp src/object_watch_plan.cpp src/object_snapshot.cpp src/object_launch.cpp
-  src/object_code_cache.cpp src/entry_trap.cpp src/live_compile.cpp src/live_plan.cpp src/live_session.cpp)
+  src/object_code_cache.cpp src/entry_trap.cpp src/live_compile.cpp src/live_plan.cpp src/live_session.cpp
+  src/live_data_command.cpp src/live_extension_plan.cpp src/live_mock.cpp src/live_mock_command.cpp
+  src/live_mock_plan.cpp src/live_mock_types.cpp)
 target_include_directories(clang-tracer-server PRIVATE include ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
-target_compile_definitions(clang-tracer-server PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
+target_compile_definitions(clang-tracer-server PRIVATE
+  TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}"
+  TRACER_LIVE_SDK_DIR="${CMAKE_INSTALL_FULL_INCLUDEDIR}"
+  TRACER_LIVE_BUILD_SDK_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include")
+install(FILES include/clang_tracer/live.hpp
+  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/clang_tracer" COMPONENT Runtime)
+install(FILES include/tracer/live_migration.hpp
+  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/tracer" COMPONENT Runtime)
 target_link_libraries(clang-tracer-server PRIVATE tracer_grpc tracer_context_collector
   tracer_context_analysis clang-cpp LLVM ${CMAKE_DL_LIBS} Threads::Threads)
 target_compile_options(clang-tracer-server PRIVATE -Wall -Wextra -Wpedantic)

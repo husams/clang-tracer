@@ -16,6 +16,7 @@ struct ActiveEntry {
 
 struct Revision {
   std::uint64_t parent = 0;
+  std::uint64_t managed = 0;
   std::map<std::uintptr_t, ActiveEntry> entries;
   std::map<std::string, SourceFile> sources;
   SafePoint safe_point = SafePoint::independent_entry;
@@ -23,6 +24,7 @@ struct Revision {
 
 struct Transaction {
   std::uint64_t active = 0;
+  std::uint64_t pending_extension = 0;
   std::uint64_t last_committed = 0;
   std::uint64_t retained = 0;
   std::uint64_t limit = 16;

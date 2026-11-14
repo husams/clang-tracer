@@ -995,6 +995,8 @@ message LiveUpdateStatus {
   uint64 retention_limit = 4;
   repeated Candidate candidates = 5;
   string diagnostic = 6;
+  repeated string notes = 7;
+  uint64 operation_token = 8;
 }
 
 // Private payload for the versioned target agent entry.
@@ -1008,6 +1010,33 @@ message LiveJitInput {
   repeated CompileUnit units = 2;
   map<string, uint64> imports = 3;
   repeated string entry_symbols = 4;
+  repeated string compiler_arguments = 5;
+}
+
+message LiveAgentExtension {
+  enum Action {
+    DATA_UPDATE = 0;
+    HEAP_SCAN = 1;
+    MANAGED_UPDATE = 2;
+    MANAGED_REVERT = 3;
+  }
+  Action action = 1;
+  string session = 2;
+  uint64 process_start = 3;
+  string module = 4;
+  string build_id = 5;
+  LiveJitInput update = 6;
+  LiveJitInput discovery = 7;
+  string discovery_function = 8;
+  uint64 address = 9;
+  repeated string scan_ids = 10;
+  repeated string types = 11;
+  uint64 registry = 12;
+  string hook_file = 13;
+  string hook_function = 14;
+  string hook_type = 15;
+  uint64 revision = 16;
+  int64 deadline_nanoseconds = 17;
 }
 
 message LiveBuildManifest {

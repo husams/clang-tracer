@@ -40,6 +40,17 @@ BuildInputs open_native_build(const std::string &executable,
 Entry bind_native_entry(std::uint32_t pid, const std::string &module,
                         const std::string &linkage, const Revision &active, bool overwrite = true);
 
+struct ExtensionSources {
+  JitRequest jit;
+  std::string build_id;
+  std::uintptr_t entry = 0;
+  std::function<void()> validate;
+};
+
+ExtensionSources extension_sources(std::uint32_t pid, const std::string &module,
+    const clangtracer::v1::LiveUpdateRequest &request, const std::vector<std::string> &paths,
+    const std::string &registry);
+
 void validate_entry(std::uint32_t pid, const Entry &entry);
 
 } // namespace tracer::live

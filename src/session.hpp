@@ -141,6 +141,10 @@ private:
   clangtracer::v1::LiveUpdateStatus activate_live_locked(
       const live::Plan &plan, std::uint64_t expected_revision, std::uint64_t retention_limit,
       const std::function<bool()> &cancelled, clangtracer::v1::LiveUpdateStatus result);
+  clangtracer::v1::LiveUpdateStatus run_live_extension_locked(clangtracer::v1::LiveAgentExtension input);
+  clangtracer::v1::LiveUpdateStatus apply_live_extension_locked(
+      const clangtracer::v1::LiveUpdateRequest &request, clangtracer::v1::LiveUpdateStatus result,
+      const std::function<bool()> &cancelled);
   clangtracer::v1::LiveUpdateStatus revert_live_locked(std::uint64_t revision);
   void check_identity_locked();
   void require_probe_control_locked(std::uint64_t removing = 0) const;
