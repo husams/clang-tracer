@@ -446,8 +446,10 @@ bool reserved_native_identity(std::string_view name) {
 class NativeDeclarationGuard final
     : public clang::RecursiveASTVisitor<NativeDeclarationGuard> {
 public:
-  explicit NativeDeclarationGuard(clang::SourceManager &sources)
-      : sources_(sources) {}
+  NativeDeclarationGuard(clang::SourceManager &sources,
+                         const PreparedAdapterRegion *adapter)
+      : sources_(sources),
+        adapter_(adapter && adapter->size != 0 ? adapter : nullptr) {}
 
   bool VisitDecl(clang::Decl *decl) {
     if (!decl || !user_source_location(sources_, decl->getLocation()))
@@ -457,6 +459,7 @@ public:
       if (spelling == "asm" || spelling == "alias" || spelling == "ifunc" ||
           spelling == "section" || spelling == "target" ||
           spelling == "target_clones") {
+        if (admitted_adapter_label(decl, attribute)) continue;
         error_ = "unsupported_context_native_declaration: user " + std::string(spelling) +
                  " attribute is not admitted at " + decl->getLocation().printToString(sources_);
         return true;
@@ -494,7 +497,29 @@ public:
   const std::string &error() const noexcept { return error_; }
 
 private:
+  // Admits only the generated adapter's label for the probe's own symbol: a
+  // function declaration whose declarator and attribute are both written in the
+  // main file inside the adapter region (macro expansions are not admitted).
+  bool admitted_adapter_label(const clang::Decl *decl,
+                              const clang::Attr *attribute) const {
+    if (!adapter_ || !llvm::isa<clang::FunctionDecl>(decl)) return false;
+    const auto *label = llvm::dyn_cast<clang::AsmLabelAttr>(attribute);
+    if (!label || label->getLabel() != adapter_->symbol) return false;
+    return in_adapter_region(decl->getLocation()) &&
+           in_adapter_region(attribute->getLocation());
+  }
+
+  bool in_adapter_region(clang::SourceLocation location) const {
+    if (!location.isValid() || !location.isFileID() ||
+        sources_.getFileID(location) != sources_.getMainFileID())
+      return false;
+    const auto offset = sources_.getFileOffset(location);
+    return offset >= adapter_->offset &&
+           offset - adapter_->offset < adapter_->size;
+  }
+
   clang::SourceManager &sources_;
+  const PreparedAdapterRegion *adapter_;
   std::string error_;
 };
 
@@ -536,11 +561,13 @@ private:
   std::vector<const clang::CXXRecordDecl *> &out_;
 };
 
-std::string validate(clang::ASTUnit &unit) {
+std::string validate(clang::ASTUnit &unit,
+                     const PreparedAdapterRegion *adapter) {
   auto &context = unit.getASTContext();
   const auto declarations = analyze_context_declarations(context);
   if (!declarations.error.empty()) return declarations.error;
-  NativeDeclarationGuard native_declarations(context.getSourceManager());
+  NativeDeclarationGuard native_declarations(context.getSourceManager(),
+                                             adapter);
   native_declarations.TraverseDecl(context.getTranslationUnitDecl());
   if (!native_declarations.error().empty()) return native_declarations.error();
   std::vector<const clang::FunctionDecl *> functions;
@@ -718,7 +745,8 @@ bool context_source_is_trusted_support(const clang::SourceManager &sources,
   return location.isValid() && !user_source_location(sources, location);
 }
 
-std::string validate_context_support_effects(clang::ASTUnit &unit) {
-  return validate(unit);
+std::string validate_context_support_effects(
+    clang::ASTUnit &unit, const PreparedAdapterRegion *adapter) {
+  return validate(unit, adapter);
 }
 } // namespace tracer
