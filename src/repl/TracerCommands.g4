@@ -84,7 +84,7 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview' | 'apply'
         | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | 'object'
         | 'live' | 'update' | 'revert' | 'mock' | 'update-data' | 'scan-heap' | STACK;
-liveUpdate : 'live' (('update' | 'preview') (value | liveOption)+ | 'status' | 'revert' UINT?
+liveUpdate : 'live' (('update' | 'preview' | 'watch') (value | liveOption)+ | 'status' | 'revert' UINT?
                    | 'mock' value liveOption+ | 'update-data' value (liveOption | liveScanSelection)*
                    | 'scan-heap' liveOption+);
 liveScanSelection : '--from-scan' value+;

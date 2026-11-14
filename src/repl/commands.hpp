@@ -30,6 +30,7 @@ enum class CommandKind {
   memory_scan,
   live_update,
   live_preview,
+  live_watch,
   live_status,
   live_revert,
   live_mock,

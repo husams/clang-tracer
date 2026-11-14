@@ -152,7 +152,7 @@ TranslationUnit profile(const clang::tooling::CompileCommand &command, const std
     throw std::runtime_error("empty compile profile: " + path);
   const auto driver = fs::path(arguments.front()).filename().string();
   if (!driver.starts_with("clang++") && driver != "g++" && !driver.starts_with("g++-") &&
-      driver != "c++")
+      !driver.ends_with("-linux-gnu-g++") && driver != "c++")
     throw std::runtime_error("unverified C++ compiler profile: " + driver);
   arguments.erase(arguments.begin());
   std::string optimization = "-O0";

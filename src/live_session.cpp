@@ -314,14 +314,14 @@ clangtracer::v1::LiveUpdateStatus Session::live_update(
       return activate_live_locked(plan, expected_revision, request.retention_limit(),
                                   cancelled, std::move(result));
     }
+    if (request.has_preview_revision() && request.preview_revision() != expected_revision)
+      throw live::Stale("active revision changed after preview; rediscover the update");
     if (request.action() == Action::SCAN_HEAP || request.action() == Action::UPDATE_DATA ||
         ((request.action() == Action::UPDATE || request.action() == Action::PREVIEW) &&
          !request.options().empty()))
       return apply_live_extension_locked(request, std::move(result), cancelled);
     if (request.action() != Action::UPDATE && request.action() != Action::PREVIEW)
       throw std::runtime_error("unknown live update action");
-    if (request.has_preview_revision() && request.preview_revision() != expected_revision)
-      throw live::Stale("active revision changed after preview; rediscover the update");
     auto plan = live::plan_sources(pid_, executable_, request, live_.revisions.at(expected_revision), cancelled);
     bool blocked = false;
     for (const auto &candidate : plan.candidates) {

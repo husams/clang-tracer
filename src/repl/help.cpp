@@ -73,6 +73,8 @@ const CommandTopic commands[] = {
     {"live preview", "%live preview FILE... [--compdb FILE] [--build MANIFEST]",
      "Show the exact native entries and blockers for a saved source snapshot."},
     {"live status", "%live status", "List the active revision and retained JIT generation count."},
+    {"live watch", "%live watch FILE [FILE ...] [--build FILE] [--compdb FILE]",
+     "Watch saved files and automatically preview and apply eligible changes. Press Ctrl-C to stop watching."},
     {"live mock", "%live mock SIGNATURE --file FILE --function FUNCTION [--fixture FILE] [--bind ALIAS=SIGNATURE]",
      "Compile a typed replacement into the target and activate it as a live revision."},
     {"live update-data", "%live update-data FILE [--discover-file FILE --discover-function NAME] [--address ADDRESS] [--from-scan ID ...]",

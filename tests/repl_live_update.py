@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -25,6 +26,10 @@ MAIN = """#include "price.hpp"
 #include <cstdio>
 #include <sys/prctl.h>
 #include <unistd.h>
+#ifndef PR_SET_PTRACER
+#define PR_SET_PTRACER 0x59616d61
+#define PR_SET_PTRACER_ANY ((unsigned long)-1)
+#endif
 
 __attribute__((noinline)) int direct(const Pricer &p) { return p.Pricer::quote(10); }
 __attribute__((noinline)) int indirect(const Base &p) { return p.quote(10); }
@@ -139,6 +144,14 @@ def verify(args, root, cleanup):
     console.expect(r"^live REVERTED revision=0 retained=1/1")
     call(6000, 12)
     assert sha(executable) == before
+    (source / "price.cpp").write_text(ORIGINAL)
+    send(repl, "%live watch source/price.cpp --retention-limit 2")
+    console.expect(r"^Watching 1 live source files")
+    (source / "price.cpp").write_text(ORIGINAL.replace("return cents;", "return cents - 40;"))
+    console.expect(r"^live APPLIED revision=2 retained=2/2")
+    call(5960, 12)
+    repl.send_signal(signal.SIGINT)
+    console.expect(r"^Live watch stopped")
     send(repl, "%detach")
     console.expect(r"^detached session=")
 

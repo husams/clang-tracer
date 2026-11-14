@@ -1664,6 +1664,7 @@ bool Controller::execute(const Command &command) {
   }
   case K::live_update:
   case K::live_preview:
+  case K::live_watch:
   case K::live_status:
   case K::live_revert:
   case K::live_mock:
@@ -1674,7 +1675,8 @@ bool Controller::execute(const Command &command) {
     request.set_session_id(selected_.id);
     switch (command.kind) {
     case K::live_update: request.set_action(api::LiveUpdateRequest::UPDATE); break;
-    case K::live_preview: request.set_action(api::LiveUpdateRequest::PREVIEW); break;
+    case K::live_preview:
+    case K::live_watch: request.set_action(api::LiveUpdateRequest::PREVIEW); break;
     case K::live_status: request.set_action(api::LiveUpdateRequest::STATUS); break;
     case K::live_revert: request.set_action(api::LiveUpdateRequest::REVERT); break;
     case K::live_mock: request.set_action(api::LiveUpdateRequest::MOCK); break;
@@ -1692,17 +1694,28 @@ bool Controller::execute(const Command &command) {
         throw std::invalid_argument("retention limit must be positive");
       request.set_retention_limit(limit);
     }
-    if (command.kind == K::live_update || command.kind == K::live_preview) {
+    const auto snapshot = [](const std::filesystem::path &path) {
+      std::ifstream input(path, std::ios::binary);
+      if (!input)
+        throw std::runtime_error("cannot read saved source " + path.string());
+      return std::string(std::istreambuf_iterator<char>(input), {});
+    };
+    std::map<std::string, std::string> watched;
+    if (command.kind == K::live_update || command.kind == K::live_preview ||
+        command.kind == K::live_watch) {
       if (args.empty())
         throw std::invalid_argument("provide at least one source or header");
       for (const auto &arg : args) {
-        const auto path = std::filesystem::canonical(arg);
-        std::ifstream input(path, std::ios::binary);
-        if (!input)
-          throw std::runtime_error("cannot read saved source " + path.string());
-        auto *source = request.add_sources();
-        source->set_path(path.string());
-        source->set_contents(std::string(std::istreambuf_iterator<char>(input), {}));
+        const auto path = std::filesystem::canonical(arg).string();
+        auto contents = snapshot(path);
+        if (command.kind == K::live_watch) {
+          if (!watched.emplace(path, std::move(contents)).second)
+            throw std::invalid_argument("duplicate live watch file: " + path);
+        } else {
+          auto *source = request.add_sources();
+          source->set_path(path);
+          source->set_contents(std::move(contents));
+        }
       }
     } else if (command.kind != K::live_status && command.kind != K::live_revert) {
       for (const auto &arg : args)
@@ -1748,19 +1761,64 @@ bool Controller::execute(const Command &command) {
     };
     const auto perform = [&] {
       return unary<api::LiveUpdateStatus>(
-          [&](auto &context, auto &response) { return stub_->LiveUpdate(&context, request, &response); },
+          [&](auto &context, auto &response) {
+            Cancellation cancel(context);
+            return stub_->LiveUpdate(&context, request, &response);
+          },
           settings_.timeout_seconds);
     };
-    if (command.kind == K::live_update) {
+    const auto preview_and_apply = [&] {
+      request.clear_preview_revision();
       request.set_action(api::LiveUpdateRequest::PREVIEW);
       const auto preview = perform();
       print(preview);
-      if (preview.state() != api::LiveUpdateStatus::PLANNED)
-        return true;
+      if (preview.state() != api::LiveUpdateStatus::PLANNED || interrupted)
+        return;
       request.set_preview_revision(preview.active_revision());
       request.set_action(api::LiveUpdateRequest::UPDATE);
+      print(perform());
+    };
+    if (command.kind == K::live_watch) {
+      out_ << "Watching " << watched.size() << " live source files. Press Ctrl-C to stop.\n";
+      out_.flush();
+      while (!interrupted) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        request.clear_sources();
+        std::map<std::string, std::string> saved;
+        try {
+          for (const auto &[path, before] : watched) {
+            auto contents = snapshot(path);
+            if (contents != before)
+              saved.emplace(path, std::move(contents));
+          }
+        } catch (const std::exception &) {
+          // Editors may temporarily remove a path while replacing its contents.
+          continue;
+        }
+        if (saved.empty() || interrupted)
+          continue;
+        for (const auto &[path, contents] : saved) {
+          auto *source = request.add_sources();
+          source->set_path(path);
+          source->set_contents(contents);
+        }
+        try {
+          preview_and_apply();
+        } catch (const std::exception &) {
+          if (!interrupted)
+            throw;
+        }
+        watched.merge(saved);
+        for (auto &[path, contents] : saved)
+          watched.at(path) = std::move(contents);
+      }
+      out_ << "Live watch stopped.\n";
+      out_.flush();
+    } else if (command.kind == K::live_update) {
+      preview_and_apply();
+    } else {
+      print(perform());
     }
-    print(perform());
     return true;
   }
   case K::object_start:

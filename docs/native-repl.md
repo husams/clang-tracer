@@ -61,7 +61,9 @@ Linux server or agent.
 Use `%live preview FILE...` to inspect the exact native entries. `%live update FILE...`
 previews the same saved snapshot and automatically applies an admitted group.
 `%live status` lists active entries. `%live revert` restores the parent revision,
-and `%live revert 0` restores the build's original entries.
+and `%live revert 0` restores the build's original entries. Run
+`%live watch source/checkout.cpp source/pricer.cpp` to preview and apply saved
+edits as you test. Press Ctrl-C to return to the prompt.
 
 At build time preserve the original project files under a separate snapshot root.
 Record their relative paths and SHA-256 hashes alongside the executable and exact
