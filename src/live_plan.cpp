@@ -277,6 +277,70 @@ Entry bind(std::uint32_t pid, const Image &image, const Symbol &symbol,
 bool thunk_for(const std::string &symbol, const std::string &demangled) {
   return symbol.starts_with("_ZT") && llvm::demangle(symbol).ends_with(" thunk to " + demangled);
 }
+
+bool forwards_to_body(const Image &image, const Symbol &thunk, const Symbol &body,
+                      const std::string &callable, std::set<std::uint64_t> &chain) {
+  using native_entry::Flow;
+  if (!chain.insert(thunk.address).second)
+    return false;
+  const auto decoded = native_entry::scan(thunk.address, image.code(thunk));
+  if (decoded.decode_failed || decoded.instructions.empty())
+    return false;
+  const auto forwards = [&](std::uint64_t address) {
+    if (address == body.address)
+      return true;
+    const auto next = std::ranges::find_if(image.symbols, [&](const Symbol &symbol) {
+      return symbol.address == address && symbol.size && symbol.type == llvm::ELF::STT_FUNC &&
+             thunk_for(symbol.name, callable);
+    });
+    if (next == image.symbols.end())
+      return false;
+    auto path = chain;
+    return forwards_to_body(image, *next, body, callable, path);
+  };
+
+  // Every returning path must call the body or a verified forwarding
+  // thunk. An external unconditional jump may also forward the call.
+  std::set<std::pair<std::uint64_t, bool>> pending{{thunk.address, false}};
+  bool reached_body = false;
+  while (!pending.empty()) {
+    auto [pc, forwarded] = *pending.begin();
+    pending.erase(pending.begin());
+    const auto current = std::ranges::lower_bound(decoded.instructions, pc, {},
+                                                   &native_entry::Instruction::address);
+    if (current == decoded.instructions.end() || current->address != pc)
+      return false;
+    if (current->flow == Flow::returns) {
+      if (!forwarded)
+        return false;
+      continue;
+    }
+    if (current->flow == Flow::call) {
+      if (!current->target || !forwards(*current->target))
+        return false;
+      reached_body = forwarded = true;
+    } else if (current->flow == Flow::branch) {
+      if (!current->target)
+        return false;
+      const auto destination = *current->target;
+      if (destination >= thunk.address && destination - thunk.address < thunk.size) {
+        if (destination <= pc)
+          return false;
+        pending.emplace(destination, forwarded);
+      } else {
+        if (current->falls_through || !forwards(destination))
+          return false;
+        reached_body = true;
+        continue;
+      }
+    }
+    if (current->falls_through)
+      pending.emplace(pc + current->size, forwarded);
+    else if (current->flow != Flow::branch)
+      return false;
+  }
+  return reached_body;
+}
 } // namespace
 
 Entry bind_native_entry(std::uint32_t pid, const std::string &module,
@@ -599,6 +663,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       if (!old.has_source_abi || !old.supported_abi || next == new_bodies.end() || body.inconsistent || next->second.inconsistent ||
           old.abi != next->second.definition.abi || !next->second.definition.supported_abi)
         throw std::runtime_error("rebuild required: emitted implementations or callable ABI differ");
+      const auto callable = llvm::demangle(name);
       for (const auto &alias : image.symbols) {
         if (alias.name == name || alias.type != llvm::ELF::STT_FUNC)
           continue;
@@ -613,10 +678,9 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         }
         if (alias.address > symbol->address && alias.address - symbol->address < symbol->size)
           throw std::runtime_error("rebuild required: overlapping callable entry " + alias.name);
-        if (thunk_for(alias.name, llvm::demangle(name))) {
-          const auto thunk = native_entry::scan(alias.address, image.code(alias));
-          if (!thunk.decode_failed && std::ranges::any_of(thunk.instructions,
-                [&](const auto &instruction) { return instruction.target == symbol->address; }))
+        if (thunk_for(alias.name, callable)) {
+          std::set<std::uint64_t> chain;
+          if (forwards_to_body(image, alias, *symbol, callable, chain))
             continue;
           const auto previous_thunk = old_bodies.find(alias.name);
           const auto updated_thunk = new_bodies.find(alias.name);
