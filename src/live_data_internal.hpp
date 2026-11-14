@@ -59,6 +59,8 @@ public:
 
   Scan scan(const std::vector<std::string>& types) const;
   bool matches(const Candidate&) const;
+  // Visit build-matched std::atomic<std::shared_ptr<T>> roots.
+  void discover_owners(const std::vector<std::string>& types, clang_tracer::ObjectSink&) const;
 
 private:
   struct Image;

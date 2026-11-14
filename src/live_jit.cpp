@@ -174,8 +174,7 @@ void isolate_definitions(llvm::Module &module, const JitRequest &request) {
     }
     if (function.isDeclaration())
       continue;
-    if (function.getCallingConv() != llvm::CallingConv::C || function.isVarArg() ||
-        function.hasFnAttribute(llvm::Attribute::Naked) ||
+    if (!supported_entry_abi(function) ||
         (function.hasFnAttribute("target-features") &&
          function.getFnAttribute("target-features").getValueAsString().contains("+shstk")))
       throw std::runtime_error("unsupported native calling convention: " + function.getName().str());

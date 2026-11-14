@@ -12,6 +12,7 @@ namespace clang { class ASTContext; }
 namespace llvm {
 class LLVMContext;
 class Module;
+class Function;
 }
 
 namespace tracer::live {
@@ -34,10 +35,12 @@ struct Definition {
   std::string path;
   std::string type;
   unsigned line = 0;
+  std::string alias_target;
   bool has_source_abi = false;
   bool supported_abi = false;
 };
 
+bool supported_entry_abi(const llvm::Function &function);
 std::map<std::string, Definition> definitions(const CompiledUnit &unit);
 
 } // namespace tracer::live

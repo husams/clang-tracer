@@ -13,19 +13,18 @@ using data::ObjectView;
 enum class Scope { all, selected };
 
 struct DiscoveryRun {
-  const data::DiscoveryProgram& program;
+  std::string_view fallback;
   std::function<void(const ObjectView&, const std::string&)> registration;
 
   static void emit(void* context, const ObjectView& object) {
     auto& run = *static_cast<DiscoveryRun*>(context);
-    run.registration(object, std::string(object.root.empty() ? std::string_view(run.program.root)
-                                                             : object.root));
+    run.registration(object, std::string(object.root.empty() ? run.fallback : object.root));
   }
 
-  std::string run() {
+  std::string run(const std::function<void(clang_tracer::ObjectSink&)>& discover) {
     clang_tracer::ObjectSink sink(this, &emit);
     try {
-      program.invoke(sink);
+      discover(sink);
     } catch (const std::exception& error) {
       return *error.what() ? error.what() : "exception with no message";
     } catch (...) {
@@ -76,7 +75,8 @@ struct UpdateRun {
     } else if (callback->second.requires_owner && object.owner == nullptr) {
       result.detail = "update requires an acquired shared owner";
     } else if (!target.verified_layout(object) || object.size != callback->second.size ||
-               object.alignment != callback->second.alignment) {
+               (object.alignment && object.alignment != callback->second.alignment) ||
+               address % callback->second.alignment) {
       result.detail = "type layout differs from the callback or build-matched DWARF";
     } else {
       auto [position, inserted] =
@@ -214,24 +214,30 @@ LiveDataReport LiveDataSession::update_data(const LiveDataTarget& selection_targ
   const auto discover =
       discovery ? std::make_shared<data::DiscoveryProgram>(data::compile_discovery(*discovery))
                 : (scope == Scope::selected && same_scan_target ? state_->scan_discovery : nullptr);
-  if (discover) {
-    data::retain(program.image);
-    if (discovery) {
-      data::retain(discover->image);
-    }
-    run.report.roots.push_back(discover->root);
-    target.verify();
-    DiscoveryRun execute{*discover, [&](const auto& object, const auto& root) {
-                           run.register_object(object, root);
-                         }};
-    auto failure = execute.run();
-    if (!failure.empty()) {
-      run.report.objects.push_back(
-          {LiveObjectOutcome::failed, {}, {}, discover->root, "discovery failed: " + failure, 0});
-    }
-  } else {
-    run.report.limitations.push_back("No verified discovery root is available for this request.");
+  data::retain(program.image);
+  if (discovery)
+    data::retain(discover->image);
+  const std::string name = discover ? discover->root : "DWARF atomic shared owners";
+  target.verify();
+  std::vector<std::string> types;
+  for (const auto& [type, callback] : program.callbacks) {
+    (void)callback;
+    types.push_back(type);
   }
+  DiscoveryRun execute{name, [&](const auto& object, const auto& root) {
+                         run.register_object(object, root);
+                       }};
+  auto failure = execute.run([&](clang_tracer::ObjectSink& sink) {
+    if (discover)
+      discover->invoke(sink);
+    else
+      target.discover_owners(types, sink);
+  });
+  if (!failure.empty())
+    run.report.objects.push_back(
+        {LiveObjectOutcome::failed, {}, {}, name, "discovery failed: " + failure, 0});
+  if (run.report.roots.empty())
+    run.report.limitations.push_back("No verified discovery root is available for this request.");
   run.finish();
   return std::move(run.report);
 }
@@ -254,10 +260,12 @@ LiveHeapReport LiveDataSession::scan_heap(const LiveDataTarget& selection_target
   std::map<std::pair<std::string, std::uintptr_t>, std::weak_ptr<void>> owners;
   std::map<std::pair<std::string, std::uintptr_t>, std::string> roots;
   std::set<std::pair<std::string, std::uintptr_t>> ambiguous;
-  if (program) {
-    data::retain(program->image);
+  {
+    if (program)
+      data::retain(program->image);
     target.verify();
-    DiscoveryRun execute{*program, [&](const auto& object, const auto& root) {
+    DiscoveryRun execute{program ? std::string_view(program->root) : "DWARF atomic shared owners",
+                         [&](const auto& object, const auto& root) {
                            if (!object.owner || !target.verified_layout(object)) {
                              return;
                            }
@@ -271,7 +279,12 @@ LiveHeapReport LiveDataSession::scan_heap(const LiveDataTarget& selection_target
                              ambiguous.insert(key);
                            }
                          }};
-    auto failure = execute.run();
+    auto failure = execute.run([&](clang_tracer::ObjectSink& sink) {
+      if (program)
+        program->invoke(sink);
+      else
+        target.discover_owners(types, sink);
+    });
     if (!failure.empty()) {
       scan.limitations.push_back("owner discovery failed: " + failure);
     }

@@ -16,13 +16,18 @@
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/IR/DebugInfoMetadata.h>
 #include <llvm/IR/Function.h>
+#include <llvm/IR/GlobalAlias.h>
+#include <llvm/Demangle/Demangle.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/VirtualFileSystem.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/IR/DebugInfo.h>
 
 #include <filesystem>
+#include <tuple>
 #include <stdexcept>
 
 namespace tracer::live {
@@ -270,8 +275,17 @@ CompiledUnit compile_unit(const JitRequest &request, const TranslationUnit &unit
   return result;
 }
 
+bool supported_entry_abi(const llvm::Function &function) {
+  const auto convention = function.getCallingConv();
+  return (convention == llvm::CallingConv::C || convention == llvm::CallingConv::X86_64_SysV ||
+          (convention == llvm::CallingConv::Win64 && !function.isVarArg())) &&
+         !function.hasFnAttribute(llvm::Attribute::Naked);
+}
+
 std::map<std::string, Definition> definitions(const CompiledUnit &unit) {
   const auto &module = *unit.module;
+  auto normalized = llvm::CloneModule(module);
+  llvm::StripDebugInfo(*normalized);
   std::map<std::string, Definition> result;
   for (const auto &function : module.functions()) {
     if (function.isDeclaration() || function.isIntrinsic())
@@ -294,25 +308,63 @@ std::map<std::string, Definition> definitions(const CompiledUnit &unit) {
       abi << " source=" << info->second.second;
       item.has_source_abi = true;
     }
-    item.supported_abi = function.getCallingConv() == llvm::CallingConv::C &&
-        !function.isVarArg() && !function.hasFnAttribute(llvm::Attribute::Naked);
+    item.supported_abi = supported_entry_abi(function);
     // Parameter lowering can include opaque pointers. Compare the bodies only
     // after independently checking the native declaration and LLVM ABI.
     std::string ir;
     llvm::raw_string_ostream implementation(ir);
-    function.print(implementation, nullptr, false, true);
+    normalized->getFunction(function.getName())->print(implementation, nullptr, false, true);
     llvm::SmallVector<llvm::StringRef, 32> lines;
     llvm::StringRef(ir).split(lines, '\n');
     for (const auto line : lines) {
       if (line.trim().starts_with("#dbg_") || line.starts_with("; Function Attrs:"))
         continue;
       auto body = line.split(", !dbg !").first.split(" !dbg !").first;
+      // Debug instrumentation gives implicit members unstable metadata IDs
+      // even when their code is unchanged.
+      body = body.split(", !DIAssignID !").first;
       if (body.starts_with("define "))
         body = body.split(" #").first;
       item.implementation += body.str();
       item.implementation += '\n';
     }
     result.emplace(function.getName().str(), std::move(item));
+  }
+  // Clang may emit the complete and base lifecycle variants as an alias
+  // and one physical implementation. Include both in affected-entry checks.
+  for (const auto &alias : module.aliases()) {
+    const auto *target = llvm::dyn_cast_or_null<llvm::Function>(alias.getAliaseeObject());
+    const auto typed = unit.types.find(alias.getName().str());
+    if (!target || typed == unit.types.end() || alias.getValueType() != target->getValueType())
+      continue;
+    const auto body = result.find(target->getName().str());
+    if (body == result.end() || !body->second.has_source_abi)
+      continue;
+    auto item = body->second;
+    item.alias_target = body->first;
+    item.abi += " alias " + item.alias_target + " source=" + typed->second.second;
+    result.emplace(alias.getName().str(), std::move(item));
+  }
+  for (auto &[symbol, item] : result) {
+    if (item.has_source_abi || !std::string_view(symbol).starts_with("_ZT"))
+      continue;
+    const auto description = llvm::demangle(symbol);
+    const auto delimiter = description.find(" thunk to ");
+    if (delimiter == std::string::npos)
+      continue;
+    const auto callable = description.substr(delimiter + sizeof(" thunk to ") - 1);
+    std::set<std::tuple<std::string, std::string, unsigned>> evidence;
+    for (const auto &[body_symbol, body] : result)
+      if (body.has_source_abi && llvm::demangle(body_symbol) == callable)
+        evidence.emplace(body.abi, body.path, body.line);
+    if (evidence.size() == 1) {
+      const auto &[abi, path, line] = *evidence.begin();
+      item.abi += " thunk " + symbol + " for " + abi;
+      item.type = description;
+      item.path = path;
+      item.line = line;
+      item.has_source_abi = true;
+    }
   }
   return result;
 }

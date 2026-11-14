@@ -7,6 +7,8 @@
 #include <string_view>
 #include <type_traits>
 
+namespace tracer::live::data { class TargetImage; }
+
 namespace clang_tracer {
 namespace live_detail {
 template <class T>
@@ -95,6 +97,12 @@ public:
   }
 
 private:
+  friend class tracer::live::data::TargetImage;
+
+  void register_verified(const live_detail::ObjectView& value) {
+    emit_(context_, value);
+  }
+
   template <class T>
   static live_detail::ObjectView view(std::string_view root) {
     static_assert(std::is_class_v<T> && !std::is_const_v<T> && !std::is_volatile_v<T>,

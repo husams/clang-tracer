@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -117,7 +118,7 @@ std::string jump_to(std::size_t size, std::uintptr_t address) {
 bool publish(std::uint32_t pid, std::uint64_t process_start,
              injector::Process &process, const live::Revision &from,
              const live::Revision &to, const std::function<void()> &before_write,
-             const std::function<void()> &committed) {
+             const std::function<void()> &committed, bool registry_gated = false) {
   std::set<std::uintptr_t> addresses;
   for (const auto &[address, value] : from.entries) {
     (void)value;
@@ -141,7 +142,8 @@ bool publish(std::uint32_t pid, std::uint64_t process_start,
       throw live::Stale("overwrite window changed for " + entry.symbol);
     patches.push_back({address, expected.data(), installed.data(), expected.size()});
     bindings.push_back(&entry);
-    if (from.safe_point == live::SafePoint::drained_stack || to.safe_point == live::SafePoint::drained_stack) {
+    if (!registry_gated && (from.safe_point == live::SafePoint::drained_stack ||
+                            to.safe_point == live::SafePoint::drained_stack)) {
       drained.push_back({entry.address, nullptr, nullptr, entry.function_size});
       if (old != from.entries.end())
         drained.push_back({old->second.mapping_begin, nullptr, nullptr, old->second.mapping_size});
@@ -166,9 +168,44 @@ bool publish(std::uint32_t pid, std::uint64_t process_start,
   process.detach();
   return true;
 }
+void read_entries(live::Revision &next, const std::vector<live::Entry> &entries,
+                  const AgentRequest &response) {
+  if (response.count != entries.size() || entries.size() > live::max_entries)
+    throw std::runtime_error("live JIT service returned incomplete entry addresses");
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    const auto &entry = entries[i];
+    if (!response.mapping_begin[i] || !response.mapping_size[i] ||
+        response.addresses[i] < response.mapping_begin[i] ||
+        response.addresses[i] - response.mapping_begin[i] >= response.mapping_size[i])
+      throw std::runtime_error("agent returned an unverified JIT executable mapping");
+    next.entries[entry.address] = {
+        entry, jump_to(entry.original_bytes.size(), response.addresses[i]),
+        response.addresses[i], response.mapping_begin[i], response.mapping_size[i]};
+  }
+}
+
+void publish_managed(AgentRequest &request, std::uint32_t pid, std::uint64_t start,
+                     const live::Revision &before, const live::Revision &after,
+                     const std::function<void()> &validate) {
+  using Outcome = AgentRequest::CodeOutcome;
+  injector::Process process;
+  bool written = false;
+  try {
+    if (!publish(pid, start, process, before, after, validate, [&] { written = true; }, true))
+      throw std::runtime_error("managed native entry or affected frame is still active");
+    request.code_outcome = Outcome::installed;
+  } catch (const live::Stale &error) {
+    request.code_outcome = Outcome::stale;
+    std::snprintf(request.error, sizeof(request.error), "%s", error.what());
+  } catch (const std::exception &error) {
+    request.code_outcome = written || process.unsafe() ? Outcome::uncertain : Outcome::unchanged;
+    std::snprintf(request.error, sizeof(request.error), "%s", error.what());
+  }
+}
 } // namespace
 
-Status Session::run_live_extension_locked(api::LiveAgentExtension input) {
+Status Session::run_live_extension_locked(api::LiveAgentExtension input,
+    const std::function<void(AgentRequest &)> &publication) {
   injector::Process process;
   const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
   input.set_deadline_nanoseconds(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -189,11 +226,29 @@ Status Session::run_live_extension_locked(api::LiveAgentExtension input) {
     AgentRequest poll;
     poll.action = AgentRequest::Action::poll;
     poll.token = launch.token;
+    const auto report_deadline = deadline + std::chrono::seconds(5);
     for (;;) {
       // Reattach briefly to check progress. Application code runs between
       // polls, including on the thread used to invoke the agent entry.
-      attach_process(process, deadline);
+      attach_process(process, report_deadline);
       const auto response = invoke(process, live_address_, poll);
+      if (response.publication != AgentRequest::Publication::none) {
+        process.detach();
+        auto acknowledgement = response;
+        acknowledgement.action = AgentRequest::Action::publication_result;
+        try {
+          if (!publication)
+            throw std::runtime_error("unexpected managed code publication request");
+          publication(acknowledgement);
+        } catch (const std::exception &error) {
+          acknowledgement.code_outcome = AgentRequest::CodeOutcome::unchanged;
+          std::snprintf(acknowledgement.error, sizeof(acknowledgement.error), "%s", error.what());
+        }
+        attach_process(process, report_deadline);
+        invoke(process, live_address_, acknowledgement);
+        process.detach();
+        continue;
+      }
       if (response.output_size) {
         std::string serialized;
         poll.output_capacity = response.output_size;
@@ -205,6 +260,7 @@ Status Session::run_live_extension_locked(api::LiveAgentExtension input) {
           throw std::runtime_error("cannot decode live agent response");
         process.detach();
         live_.pending_extension = 0;
+        live_.retained = filled.retained;
         report_revision(output, live_);
         if (output.state() == Status::RESTORATION_REQUIRED) {
           unsafe_target_ = true;
@@ -214,7 +270,7 @@ Status Session::run_live_extension_locked(api::LiveAgentExtension input) {
         return output;
       }
       process.detach();
-      if (std::chrono::steady_clock::now() >= deadline)
+      if (std::chrono::steady_clock::now() >= report_deadline)
         throw std::runtime_error("live operation is still running in the target");
       std::this_thread::sleep_for(std::chrono::milliseconds(15));
     }
@@ -229,7 +285,18 @@ Status Session::run_live_extension_locked(api::LiveAgentExtension input) {
 
 Status Session::apply_live_extension_locked(const Action &request, Status result,
                                              const std::function<bool()> &cancelled) {
-  const auto planned = live::plan_extension(pid_, process_start_, id_, executable_, request);
+  const auto previous = live_.active;
+  const auto &before = live_.revisions.at(previous);
+  auto planned = live::plan_extension(pid_, process_start_, id_, executable_, request, before, cancelled);
+  for (const auto &candidate : planned.native.candidates) {
+    *result.add_candidates() = candidate;
+    if (candidate.state() == Status::BLOCKED)
+      result.set_state(Status::BLOCKED);
+  }
+  if (result.state() == Status::BLOCKED) {
+    result.set_diagnostic("managed update has an incompatible native entry");
+    return result;
+  }
   if (planned.validate)
     planned.validate();
   if (cancelled && cancelled())
@@ -243,7 +310,6 @@ Status Session::apply_live_extension_locked(const Action &request, Status result
   if (!managed)
     return run_live_extension_locked(planned.input);
 
-  const auto previous = live_.active;
   const auto next_id = live_.last_committed + 1;
   if (!next_id)
     throw std::runtime_error("live revision identifiers exhausted");
@@ -252,8 +318,27 @@ Status Session::apply_live_extension_locked(const Action &request, Status result
     throw std::runtime_error("duplicate managed live revision");
   record->second.parent = previous;
   record->second.managed = 0;
+  auto &next = record->second;
+  next.managed_native = !planned.native.entries.empty();
+  if (!planned.native.entries.empty())
+    next.safe_point = planned.native.safe_point;
+  for (const auto &source : planned.native.accepted_sources)
+    next.sources[source.path] = source;
+  const auto limit = request.retention_limit() ? request.retention_limit() : live_.limit;
+  planned.input.set_retention_limit(limit);
   try {
-    result = run_live_extension_locked(planned.input);
+    result = run_live_extension_locked(planned.input, [&](AgentRequest &phase) {
+      if (phase.publication == AgentRequest::Publication::install) {
+        read_entries(next, planned.native.entries, phase);
+        publish_managed(phase, pid_, process_start_, before, next, [&] {
+          if (cancelled && cancelled())
+            throw live::Stale("managed update cancelled before publication");
+          planned.validate();
+        });
+      } else {
+        publish_managed(phase, pid_, process_start_, next, before, {});
+      }
+    });
   } catch (...) {
     live_.revisions.erase(record);
     throw;
@@ -261,9 +346,15 @@ Status Session::apply_live_extension_locked(const Action &request, Status result
   if (result.state() == Status::APPLIED) {
     record->second.managed = result.operation_token();
     live_.active = live_.last_committed = next_id;
+    if (!planned.native.entries.empty())
+      live_.limit = limit;
     report_revision(result, live_);
-  } else {
+  } else if (result.state() != Status::RESTORATION_REQUIRED) {
     live_.revisions.erase(record);
+  }
+  for (auto candidate : planned.native.candidates) {
+    candidate.set_state(result.state());
+    *result.add_candidates() = std::move(candidate);
   }
   return result;
 }
@@ -376,25 +467,17 @@ clangtracer::v1::LiveUpdateStatus Session::activate_live_locked(
     staged_token = response.token;
     live_.retained = response.retained;
     process.detach();
-    if (!staged_token || response.count != plan.entries.size())
-      throw std::runtime_error("live JIT service returned incomplete entry addresses");
+    if (!staged_token)
+      throw std::runtime_error("live JIT service did not retain the native image");
 
     auto next = live_.revisions.at(expected_revision);
     next.parent = expected_revision;
     next.managed = 0;
+    next.managed_native = false;
     next.safe_point = plan.safe_point;
     for (const auto &source : plan.accepted_sources)
       next.sources[source.path] = source;
-    for (std::size_t i = 0; i < plan.entries.size(); ++i) {
-      const auto &entry = plan.entries[i];
-      if (!response.mapping_begin[i] || !response.mapping_size[i] ||
-          response.addresses[i] < response.mapping_begin[i] ||
-          response.addresses[i] - response.mapping_begin[i] >= response.mapping_size[i])
-        throw std::runtime_error("agent returned an unverified JIT executable mapping");
-      next.entries[entry.address] = {
-          entry, jump_to(entry.original_bytes.size(), response.addresses[i]),
-          response.addresses[i], response.mapping_begin[i], response.mapping_size[i]};
-    }
+    read_entries(next, plan.entries, response);
 
     const auto next_id = live_.last_committed + 1;
     if (!next_id)
@@ -473,7 +556,14 @@ clangtracer::v1::LiveUpdateStatus Session::revert_live_locked(std::uint64_t revi
         api::LiveAgentExtension input;
         input.set_action(api::LiveAgentExtension::MANAGED_REVERT);
         input.set_revision(current.managed);
-        result = run_live_extension_locked(std::move(input));
+        const auto &parent = live_.revisions.at(revision);
+        input.set_publish_native(current.managed_native);
+        result = run_live_extension_locked(std::move(input), [&](AgentRequest &phase) {
+          if (phase.publication == AgentRequest::Publication::install)
+            publish_managed(phase, pid_, process_start_, current, parent, {});
+          else
+            publish_managed(phase, pid_, process_start_, parent, current, {});
+        });
         if (result.state() == Status::APPLIED) {
           live_.active = revision;
           result.set_state(Status::REVERTED);

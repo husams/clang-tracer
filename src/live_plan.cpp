@@ -406,12 +406,8 @@ ExtensionSources extension_sources(std::uint32_t pid, const std::string &module,
         [&](const SourceFile &file) { return file.path == path; });
     if (snapshot == result.jit.files.end())
       result.jit.files.push_back({path, std::move(content)});
-    else if (snapshot->contents != content) {
-      if (!registry.empty())
-        throw std::runtime_error("rebuild required: a managed recipe cannot replace baseline application "
-                                 "files in the same transaction: " + path);
+    else
       snapshot->contents = std::move(content);
-    }
     const auto extension = fs::path(path).extension();
     if (extension == ".cpp" || extension == ".cc" || extension == ".cxx" || extension == ".C")
       result.jit.translation_units.push_back({path, directory, arguments});
@@ -508,7 +504,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
   JitRequest baseline;
   baseline.files = sources.baseline;
   std::map<std::string, Body> old_bodies, new_bodies;
-  std::set<std::string> covered, referenced;
+  std::set<std::string> covered, referenced, affected;
   for (const auto &[path, unit] : profiles) {
     if (cancelled && cancelled())
       throw Stale("live source compilation cancelled");
@@ -522,18 +518,26 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         throw std::runtime_error("unrecorded project dependency: " + dependency);
       covered.insert(dependency);
     }
+    const auto uses_saved_edit = [&](const CompiledUnit &compiled) {
+      return std::ranges::any_of(compiled.inputs,
+          [&](const auto &input) { return sources.submitted.count(input); });
+    };
+    bool changed = sources.submitted.count(path) || uses_saved_edit(after);
     const bool existing = sources.saved.count(path) || active.sources.count(path);
     if (existing) {
       auto before = compile_unit(baseline, unit);
+      changed |= uses_saved_edit(before);
+      if (changed)
+        for (const auto &[name, definition] : definitions(before)) {
+          (void)definition;
+          affected.insert(name);
+        }
       collect(old_bodies, before);
       covered.insert(before.inputs.begin(), before.inputs.end());
     }
     collect(new_bodies, after);
     // Link only affected units. All other references must bind to the exact
     // existing ELF symbol or the allowed target runtime.
-    const bool changed = sources.submitted.count(path) ||
-        std::any_of(after.inputs.begin(), after.inputs.end(),
-                     [&](const auto &input) { return sources.submitted.count(input); });
     if (changed) {
       current.translation_units.push_back(unit);
       for (const auto &function : *after.module)
@@ -556,8 +560,17 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     if (sources.submitted.count(file.path))
       result.accepted_sources.push_back(file);
   std::set<std::string> replaced;
-  std::set<std::uintptr_t> entries;
+  std::map<std::uintptr_t, std::string> entries;
+  const auto physical_body = [](const std::string &name, const auto &definitions) {
+    const auto item = definitions.find(name);
+    if (item == definitions.end())
+      return std::string{};
+    return item->second.definition.alias_target.empty()
+        ? name : item->second.definition.alias_target;
+  };
   for (const auto &[name, body] : old_bodies) {
+    if (!affected.contains(name))
+      continue;
     const auto next = new_bodies.find(name);
     const auto &old = body.definition;
     if (next != new_bodies.end() && old.implementation == next->second.definition.implementation &&
@@ -588,23 +601,45 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       for (const auto &alias : image.symbols) {
         if (alias.name == name || alias.type != llvm::ELF::STT_FUNC)
           continue;
-        if (alias.address == symbol->address ||
-            (alias.address > symbol->address && alias.address - symbol->address < symbol->size))
-          throw std::runtime_error("rebuild required: overlapping callable entry or folded alias " + alias.name);
+        if (alias.address == symbol->address) {
+          const auto prior = physical_body(name, old_bodies);
+          const auto updated = physical_body(name, new_bodies);
+          if (alias.size != symbol->size || prior.empty() || updated.empty() ||
+              physical_body(alias.name, old_bodies) != prior ||
+              physical_body(alias.name, new_bodies) != updated)
+            throw std::runtime_error("rebuild required: unverified folded alias " + alias.name);
+          continue;
+        }
+        if (alias.address > symbol->address && alias.address - symbol->address < symbol->size)
+          throw std::runtime_error("rebuild required: overlapping callable entry " + alias.name);
         if (thunk_for(alias.name, llvm::demangle(name))) {
           const auto thunk = native_entry::scan(alias.address, image.code(alias));
-          if (thunk.decode_failed || std::none_of(thunk.instructions.begin(), thunk.instructions.end(),
-                    [&](const auto &instruction) { return instruction.target == symbol->address; }))
-            throw std::runtime_error("rebuild required: standalone or unresolved thunk " + alias.name);
+          if (!thunk.decode_failed && std::ranges::any_of(thunk.instructions,
+                [&](const auto &instruction) { return instruction.target == symbol->address; }))
+            continue;
+          const auto previous_thunk = old_bodies.find(alias.name);
+          const auto updated_thunk = new_bodies.find(alias.name);
+          if (previous_thunk == old_bodies.end() || updated_thunk == new_bodies.end() ||
+              !previous_thunk->second.definition.has_source_abi ||
+              previous_thunk->second.definition.abi != updated_thunk->second.definition.abi ||
+              previous_thunk->second.definition.implementation ==
+                  updated_thunk->second.definition.implementation)
+            throw std::runtime_error("rebuild required: standalone thunk needs an emitted replacement " +
+                                     alias.name);
         }
       }
+      const auto canonical = physical_body(name, new_bodies);
       auto binding = bind(pid, image, *symbol, old, active);
-      if (!entries.insert(binding.address).second)
-        throw std::runtime_error("rebuild required: multiple definitions name one native entry");
       candidate.set_address(binding.address);
       candidate.set_state(api::LiveUpdateStatus::PLANNED);
-      result.entries.push_back(std::move(binding));
+      if (entries.emplace(binding.address, canonical).second) {
+        binding.symbol = canonical;
+        result.entries.push_back(std::move(binding));
+      } else if (entries.at(binding.address) != canonical) {
+        throw std::runtime_error("rebuild required: multiple definitions name one native entry");
+      }
       replaced.insert(name);
+      replaced.insert(canonical);
     } catch (const std::exception &failure) {
       candidate.set_state(api::LiveUpdateStatus::BLOCKED);
       candidate.set_diagnostic(failure.what());

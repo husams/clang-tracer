@@ -19,6 +19,7 @@
 #include "tracer/protocol.hpp"
 
 namespace tracer {
+namespace live { struct AgentRequest; }
 namespace injector {
 class Process;
 class EntryTrap;
@@ -141,7 +142,9 @@ private:
   clangtracer::v1::LiveUpdateStatus activate_live_locked(
       const live::Plan &plan, std::uint64_t expected_revision, std::uint64_t retention_limit,
       const std::function<bool()> &cancelled, clangtracer::v1::LiveUpdateStatus result);
-  clangtracer::v1::LiveUpdateStatus run_live_extension_locked(clangtracer::v1::LiveAgentExtension input);
+  clangtracer::v1::LiveUpdateStatus run_live_extension_locked(
+      clangtracer::v1::LiveAgentExtension input,
+      const std::function<void(live::AgentRequest &)> &publication = {});
   clangtracer::v1::LiveUpdateStatus apply_live_extension_locked(
       const clangtracer::v1::LiveUpdateRequest &request, clangtracer::v1::LiveUpdateStatus result,
       const std::function<bool()> &cancelled);

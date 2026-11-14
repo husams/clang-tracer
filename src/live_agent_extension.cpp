@@ -18,9 +18,14 @@ namespace {
 namespace api = clangtracer::v1;
 using Status = api::LiveUpdateStatus;
 using Extension = api::LiveAgentExtension;
+using Phase = AgentRequest::Publication;
+using Outcome = AgentRequest::CodeOutcome;
 
 struct LiveWorker {
   std::mutex mutex;
+  Phase phase = Phase::none;
+  managed::CodeResult outcome{managed::CodeState::unchanged, {}};
+  std::vector<EntryImage> entries;
   std::uint64_t last = 0;
   std::uint64_t token = 0;
   std::future<Status> pending;
@@ -47,6 +52,22 @@ void migration_result(Status &output, const managed::Result &result) {
   output.set_diagnostic(result.detail + " instances=" + std::to_string(result.instances));
 }
 
+managed::CodeResult request_publication(Phase phase, std::vector<EntryImage> entries = {}) {
+  auto &state = worker();
+  std::unique_lock lock(state.mutex);
+  state.entries = std::move(entries);
+  state.phase = phase;
+  // Once the server may have started writing, keep managed access gated
+  // until it reports the verified outcome (even after the hook deadline).
+  while (state.phase != Phase::none) {
+    lock.unlock();
+    // Supply a rendezvous even when every application thread is gated.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    lock.lock();
+  }
+  return std::move(state.outcome);
+}
+
 Status execute(const Extension &input, std::uint64_t token) {
   Status output;
   try {
@@ -62,10 +83,27 @@ Status execute(const Extension &input, std::uint64_t token) {
       auto *storage = registry ? registry() : nullptr;
       if (!storage)
         throw managed::RebuildRequired("rebuild required: missing application-owned registry");
-      auto revision = managed::stage(*storage, decode_jit(input.update()),
+      auto jit = decode_jit(input.update());
+      if (jit.entry_symbols.size() > max_entries ||
+          input.publish_native() != !jit.entry_symbols.empty())
+        throw std::runtime_error("invalid managed native entry count");
+      auto revision = managed::stage(*storage, jit,
           {input.hook_file(), input.hook_function(), input.hook_type()});
+      managed::Publication publication;
+      if (input.publish_native()) {
+        std::vector<EntryImage> entries;
+        for (const auto &symbol : jit.entry_symbols)
+          entries.push_back(describe_entry(*revision->image(), symbol));
+        // A hook can throw after a native entry has been visible. Keep its
+        // image resident even when the transaction restores the old bytes.
+        retain_image(revision->image(), input.retention_limit());
+        publication.install = [entries = std::move(entries)] {
+          return request_publication(Phase::install, entries);
+        };
+        publication.restore = [] { return request_publication(Phase::restore); };
+      }
       auto item = state.managed.emplace(token, std::move(revision)).first;
-      const auto result = item->second->apply(deadline);
+      const auto result = item->second->apply(deadline, publication);
       if (result.status != managed::Status::applied &&
           result.status != managed::Status::restoration_required)
         state.managed.erase(item);
@@ -76,7 +114,12 @@ Status execute(const Extension &input, std::uint64_t token) {
       auto item = state.managed.find(input.revision());
       if (item == state.managed.end())
         throw std::runtime_error("unknown managed layout revision");
-      const auto result = item->second->revert(deadline);
+      managed::Publication publication;
+      if (input.publish_native()) {
+        publication.install = [] { return request_publication(Phase::install); };
+        publication.restore = [] { return request_publication(Phase::restore); };
+      }
+      const auto result = item->second->revert(deadline, publication);
       if (result.status == managed::Status::applied)
         state.managed.erase(item);
       migration_result(output, result);
@@ -161,9 +204,7 @@ Status execute(const Extension &input, std::uint64_t token) {
 
 void execute_extension(AgentRequest &request) {
   auto &state = worker();
-  std::unique_lock lock(state.mutex, std::try_to_lock);
-  if (!lock)
-    throw std::runtime_error("live extension service is busy");
+  std::lock_guard lock(state.mutex);
   if (request.action == AgentRequest::Action::launch) {
     if (state.pending.valid() || state.response)
       throw std::runtime_error("a live extension is still active or awaiting its result");
@@ -187,8 +228,35 @@ void execute_extension(AgentRequest &request) {
   }
   if ((!state.pending.valid() && !state.response) || request.token != state.token)
     throw std::runtime_error("unknown live extension operation");
+  if (request.action == AgentRequest::Action::publication_result) {
+    if (state.phase == Phase::none || request.publication != state.phase ||
+        !std::memchr(request.error, 0, sizeof(request.error)))
+      throw std::runtime_error("invalid managed publication acknowledgement");
+    auto code = managed::CodeState::restoration_required;
+    switch (request.code_outcome) {
+    case Outcome::installed: code = managed::CodeState::installed; break;
+    case Outcome::unchanged: code = managed::CodeState::unchanged; break;
+    case Outcome::stale: code = managed::CodeState::stale; break;
+    case Outcome::uncertain: break;
+    }
+    state.outcome = {code, request.error};
+    state.phase = Phase::none;
+    state.entries.clear();
+    return;
+  }
+  if (state.phase != Phase::none) {
+    request.publication = state.phase;
+    request.count = state.entries.size();
+    for (std::size_t i = 0; i < state.entries.size(); ++i) {
+      request.addresses[i] = state.entries[i].address;
+      request.mapping_begin[i] = state.entries[i].mapping_begin;
+      request.mapping_size[i] = state.entries[i].mapping_size;
+    }
+    return;
+  }
   if (!state.response && state.pending.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
     return;
+  request.retained = retained_image_count();
   if (!state.response)
     state.response = state.pending.get();
   auto size = state.response->ByteSizeLong();

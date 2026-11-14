@@ -47,8 +47,63 @@ template <typename T>
 [[gnu::always_inline]] inline int folded(T) { return 5; }
 """
 
+ABI_HEADER = """#pragma once
+#include <optional>
+
+struct Lifecycle {
+  explicit Lifecycle(int);
+  virtual ~Lifecycle();
+  int value;
+};
+
+struct Left { virtual ~Left(); };
+struct Right { virtual Right* self(); };
+struct Joined : Left, Right {
+  ~Joined() override;
+  Joined* self() override;
+};
+struct Product {
+  int cents;
+  ~Product() noexcept;
+};
+std::optional<Product> product(int);
+extern int destroyed;
+extern int product_destructions;
+extern "C" __attribute__((ms_abi)) int foreign_abi(int, int);
+extern "C" int vararg_total(int, ...);
+"""
+ABI_SOURCE = """#include "abi.hpp"
+#include <cstdarg>
+
+int destroyed = 0;
+int product_destructions = 0;
+Lifecycle::Lifecycle(int initial) : value(initial + 1) {
+  if (initial < 0) throw initial;
+}
+Lifecycle::~Lifecycle() { destroyed += value; }
+Left::~Left() = default;
+Right* Right::self() { return this; }
+Joined::~Joined() = default;
+Joined* Joined::self() { return this; }
+Product::~Product() noexcept { ++product_destructions; }
+std::optional<Product> product(int id) {
+  if (id < 0) return {};
+  return Product{id + 5};
+}
+extern "C" __attribute__((ms_abi)) int foreign_abi(int a, int b) { return a + b; }
+extern "C" int vararg_total(int count, ...) {
+  va_list args;
+  va_start(args, count);
+  int total = 0;
+  for (int i = 0; i < count; ++i) total += va_arg(args, int);
+  va_end(args);
+  return total;
+}
+"""
+
 MAIN = """#include "price.hpp"
 #include "templates.hpp"
+#include "abi.hpp"
 #include <cstdio>
 #include <sys/prctl.h>
 #include <unistd.h>
@@ -60,6 +115,28 @@ MAIN = """#include "price.hpp"
 __attribute__((noinline)) int direct(const Pricer &p) { return p.Pricer::quote(10); }
 __attribute__((noinline)) int indirect(const Base &p) { return p.quote(10); }
 __attribute__((noinline)) int inline_caller() { return folded(1); }
+__attribute__((noinline)) Right* through_secondary(Right& value) { return value.self(); }
+__attribute__((noinline)) void release(Lifecycle* value) { delete value; }
+
+void exercise_abi() {
+  int caught = 0;
+  try {
+    release(new Lifecycle(-7));
+  } catch (int value) {
+    caught = value;
+  }
+  auto* object = new Lifecycle(10);
+  const int initialized = object->value;
+  release(object);
+  Joined joined;
+  Right& secondary = joined;
+  const bool returns_secondary = through_secondary(secondary) == &secondary;
+  auto present = product(11);
+  auto empty = product(-1);
+  std::printf("abi %d %d %d %d %d %d %d %d\\n", initialized, caught, destroyed,
+      returns_secondary, present->cents, !empty, foreign_abi(7, 4), vararg_total(2, 7, 5));
+}
+
 
 int main() {
   if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)) return 1;
@@ -69,6 +146,11 @@ int main() {
   std::fflush(stdout);
   while (true) {
     usleep(3000);
+    if (access("abi", F_OK) == 0) {
+      unlink("abi");
+      exercise_abi();
+      std::fflush(stdout);
+    }
     if (access("templates", F_OK) == 0) {
       unlink("templates");
       int i = 1;
@@ -107,7 +189,8 @@ def verify(args, root, cleanup):
     source.mkdir()
     baseline.mkdir()
     for name, contents in {"main.cpp": MAIN, "price.hpp": HEADER, "price.cpp": ORIGINAL,
-                           "templates.hpp": TEMPLATES}.items():
+                           "templates.hpp": TEMPLATES, "abi.hpp": ABI_HEADER,
+                           "abi.cpp": ABI_SOURCE}.items():
         (source / name).write_text(contents)
         (baseline / name).write_text(contents)
     executable = root / "target"
@@ -115,11 +198,11 @@ def verify(args, root, cleanup):
              "-fcf-protection=none", "-fpatchable-function-entry=16,0"]
     compiler = str(Path(args.compiler).absolute())
     subprocess.run([compiler, *flags, "-Wl,--build-id=sha1", source / "main.cpp",
-                    source / "price.cpp", "-o", executable], check=True)
+                    source / "price.cpp", source / "abi.cpp", "-o", executable], check=True)
     # The verified profile also records how a future TU should be compiled.
     commands = [{"directory": str(source), "file": str(source / name),
                  "arguments": [compiler, *flags, "-c", str(source / name), "-o", name + ".o"]}
-                for name in ("main.cpp", "price.cpp", "discount.cpp")]
+                for name in ("main.cpp", "price.cpp", "discount.cpp", "abi.cpp")]
     database = root / "compile_commands.json"
     database.write_text(json.dumps(commands))
     manifest = root / "clang-tracer-live.textproto"
@@ -206,6 +289,25 @@ def verify(args, root, cleanup):
     console.expect(r"^live REVERTED revision=0")
     (root / "templates").touch()
     app.expect(r"^templates 6 150 64 256 256 0 5$")
+    (root / "abi").touch()
+    app.expect(r"^abi 11 -7 11 1 16 1 11 12$")
+    (source / "abi.cpp").write_text(
+        ABI_SOURCE.replace("initial + 1", "initial + 2")
+                  .replace("throw initial;", "throw initial - 100;")
+                  .replace("destroyed += value;", "destroyed += value * 2;")
+                  .replace("Joined::self() { return this; }", "Joined::self() { return nullptr; }")
+                  .replace("id + 5", "id + 10").replace("return a + b;", "return a - b;")
+                  .replace("int total = 0;", "int total = 10;"))
+    send(repl, "%live update source/abi.cpp --retention-limit 4")
+    outcome = console.expect(r"^live (APPLIED|BLOCKED|STALE|RESTORATION_REQUIRED) revision=([0-9]+)(.*)$")
+    assert outcome[1] == "APPLIED" and outcome[2] == "4" and "retained=4/4" in outcome[3], (
+        "".join(console.seen[-25:]))
+    (root / "abi").touch()
+    app.expect(r"^abi 12 -107 35 0 21 1 3 22$")
+    send(repl, "%live revert")
+    console.expect(r"^live REVERTED revision=0")
+    (root / "abi").touch()
+    app.expect(r"^abi 11 -7 46 1 16 1 11 12$")
     send(repl, "%detach")
     console.expect(r"^detached session=")
 

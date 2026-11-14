@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -11,6 +12,8 @@
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/DebugInfo/DWARF/DWARFContext.h>
 #include <llvm/DebugInfo/DWARF/DWARFDie.h>
+#include <llvm/DebugInfo/DWARF/DWARFUnit.h>
+#include <llvm/Support/DataExtractor.h>
 #include <llvm/Demangle/Demangle.h>
 #include <llvm/Object/BuildID.h>
 #include <llvm/Object/ELFObjectFile.h>
@@ -134,6 +137,82 @@ void read_layouts(llvm::DWARFDie current, const std::string& scope, Layouts& lay
   }
 }
 
+struct AtomicRoot {
+  std::string name, type;
+  Address offset;
+};
+
+llvm::DWARFDie type_of(llvm::DWARFDie die) {
+  auto type = die.getAttributeValueAsReferencedDie(dw::DW_AT_type);
+  while (type && type.getTag() == dw::DW_TAG_typedef)
+    type = type.getAttributeValueAsReferencedDie(dw::DW_AT_type);
+  return type;
+}
+
+llvm::DWARFDie template_type(llvm::DWARFDie die) {
+  for (const auto child : die.children())
+    if (child.getTag() == dw::DW_TAG_template_type_parameter)
+      return type_of(child);
+  return {};
+}
+
+std::string qualified_name(llvm::DWARFDie die) {
+  std::string name;
+  while (die && die.getTag() != dw::DW_TAG_compile_unit) {
+    if (const auto *part = die.getShortName())
+      name = name.empty() ? part : part + ("::" + name);
+    die = die.getParent();
+  }
+  return name;
+}
+
+std::optional<Address> static_address(llvm::DWARFDie die) {
+  const auto location = die.find(dw::DW_AT_location);
+  const auto bytes = location ? location->getAsBlock() : std::nullopt;
+  if (!bytes || bytes->empty())
+    return std::nullopt;
+  const llvm::DataExtractor expression(*bytes, true, sizeof(Address));
+  llvm::DataExtractor::Cursor cursor(1);
+  if (bytes->front() == dw::DW_OP_addr) {
+    const auto address = expression.getAddress(cursor);
+    if (cursor && cursor.tell() == bytes->size())
+      return address;
+  } else if (bytes->front() == dw::DW_OP_addrx || bytes->front() == dw::DW_OP_GNU_addr_index) {
+    const auto index = expression.getULEB128(cursor);
+    if (cursor && cursor.tell() == bytes->size() && index <= UINT32_MAX)
+      if (const auto address = die.getDwarfUnit()->getAddrOffsetSectionItem(index))
+        return address->Address;
+  }
+  llvm::consumeError(cursor.takeError());
+  return std::nullopt;
+}
+
+void read_atomic_roots(llvm::DWARFDie scope, std::vector<AtomicRoot>& roots) {
+  for (const auto item : scope.children()) {
+    const auto tag = item.getTag();
+    if (tag == dw::DW_TAG_namespace || record(tag)) {
+      const auto *name = item.getShortName();
+      if (!name || (std::string_view(name) != "std" && std::string_view(name) != "__gnu_cxx"))
+        read_atomic_roots(item, roots);
+    }
+    if (tag != dw::DW_TAG_variable)
+      continue;
+    const auto atomic = type_of(item);
+    if (!atomic || !qualified_name(atomic).starts_with("std::atomic<") ||
+        number(atomic, dw::DW_AT_byte_size) != sizeof(std::atomic<std::shared_ptr<void>>))
+      continue;
+    const auto shared = template_type(atomic);
+    if (!shared || !qualified_name(shared).starts_with("std::shared_ptr<") ||
+        number(shared, dw::DW_AT_byte_size) != sizeof(std::shared_ptr<void>))
+      continue;
+    const auto pointee = template_type(shared);
+    if (!pointee || !record(pointee.getTag()))
+      continue;
+    if (const auto offset = static_address(item); offset && *offset)
+      roots.push_back({qualified_name(item), qualified_name(pointee), *offset});
+  }
+}
+
 struct TypeEvidence {
   std::string name;
   Layout layout;
@@ -218,6 +297,7 @@ struct TargetImage::Image {
   std::unique_ptr<void, decltype(&::dlclose)> loader{nullptr, &::dlclose};
   Address bias = 0, text = 0;
   mutable std::optional<Layouts> layouts;
+  mutable std::vector<AtomicRoot> roots;
 
   explicit Image(const LiveDataTarget& selection)
       : target(selection)
@@ -273,7 +353,9 @@ struct TargetImage::Image {
       const auto dwarf = llvm::DWARFContext::create(*debug);
       layouts.emplace();
       for (const auto& unit : dwarf->compile_units()) {
-        read_layouts(unit->getUnitDIE(false), "", *layouts);
+        const auto tree = unit->getUnitDIE(false);
+        read_layouts(tree, "", *layouts);
+        read_atomic_roots(tree, roots);
       }
     }
     return *layouts;
@@ -299,7 +381,7 @@ bool TargetImage::verified_layout(const ObjectView& object) const {
   const auto record = records.find(object.type);
   return record != records.end() && record->second && record->second->size == object.size &&
          (!record->second->alignment || record->second->alignment == object.alignment) &&
-         reinterpret_cast<Address>(object.object) % object.alignment == 0;
+         (!object.alignment || reinterpret_cast<Address>(object.object) % object.alignment == 0);
 }
 
 Scan TargetImage::scan(const std::vector<std::string>& types) const {
@@ -377,6 +459,57 @@ Scan TargetImage::scan(const std::vector<std::string>& types) const {
   }
   verify();
   return report;
+}
+
+void TargetImage::discover_owners(const std::vector<std::string>& types,
+                                  clang_tracer::ObjectSink& sink) const {
+#if defined(__GLIBCXX__)
+  const auto& records = image_->records();
+  const auto maps = mappings();
+  using AtomicOwner = std::atomic<std::shared_ptr<void>>;
+  std::set<Address> storage;
+  for (const auto symbol : image_->elf.symbols()) {
+    const llvm::object::ELFSymbolRef entry(symbol);
+    if (entry.getELFType() != STT_OBJECT || entry.getSize() != sizeof(AtomicOwner))
+      continue;
+    auto value = entry.getValue();
+    if (value)
+      storage.insert(*value);
+    else
+      llvm::consumeError(value.takeError());
+  }
+  std::set<Address> visited;
+  for (const auto& root : image_->roots) {
+    if (!storage.contains(root.offset) || std::ranges::find(types, root.type) == types.end())
+      continue;
+    const auto layout = records.find(root.type);
+    if (layout == records.end() || !layout->second)
+      continue;
+    const auto address = checked_add(image_->bias, root.offset);
+    if (address % alignof(AtomicOwner) || !visited.insert(address).second ||
+        !std::ranges::any_of(maps, [&](const Mapping& map) {
+          return map.permissions[1] == 'w' && map.name == image_->target.module &&
+                 map.contains(address, sizeof(AtomicOwner));
+        }))
+      continue;
+    // libstdc++ atomic shared_ptr operations are type-erased at the control
+    // block. Require the identified specialization and storage above rather
+    // than interpreting ordinary shared_ptr bytes or an untyped heap word.
+    const auto owner = reinterpret_cast<const AtomicOwner*>(address)->load();
+    if (!owner)
+      continue;
+    // This recognized make_shared control block must own the exact object,
+    // rather than an alias to an unrelated allocation or a no-op deleter.
+    const auto allocated = std::get_deleter<std::_Sp_make_shared_tag>(owner);
+    if (static_cast<const void*>(allocated) != owner.get())
+      continue;
+    sink.register_verified({root.type, root.name, owner.get(), &owner, nullptr,
+                            layout->second->size, layout->second->alignment, false});
+  }
+#else
+  (void)types;
+  (void)sink;
+#endif
 }
 
 bool TargetImage::matches(const Candidate& candidate) const {

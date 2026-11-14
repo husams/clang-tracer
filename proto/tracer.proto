@@ -1041,6 +1041,8 @@ message LiveAgentExtension {
   string hook_type = 15;
   uint64 revision = 16;
   int64 deadline_nanoseconds = 17;
+  uint64 retention_limit = 18;
+  bool publish_native = 19;
 }
 
 message LiveBuildManifest {

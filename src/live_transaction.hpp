@@ -17,6 +17,7 @@ struct ActiveEntry {
 struct Revision {
   std::uint64_t parent = 0;
   std::uint64_t managed = 0;
+  bool managed_native = false;
   std::map<std::uintptr_t, ActiveEntry> entries;
   std::map<std::string, SourceFile> sources;
   SafePoint safe_point = SafePoint::independent_entry;

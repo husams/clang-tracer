@@ -12,7 +12,8 @@ from tempfile import TemporaryDirectory
 from repl_browser_integration import Transcript, stop
 
 ROOT = Path(__file__).resolve().parent
-FLAGS = ["-std=c++23", "-O0", "-g", "-fno-inline", "-fno-omit-frame-pointer"]
+FLAGS = ["-std=c++23", "-O0", "-g", "-fno-inline", "-fno-omit-frame-pointer",
+         "-fpatchable-function-entry=16,0"]
 
 
 def build_target(args, root, sources, headers):
@@ -71,12 +72,16 @@ def attach(args, target, cleanup):
 
 DATA_MAIN = r"""
 #include "model.hpp"
+#include <atomic>
 #include <cstdio>
 #include <iostream>
 #include <string>
 #include <poll.h>
 #include <sys/prctl.h>
 #include <unistd.h>
+std::atomic<std::shared_ptr<example::Cache>> auto_cache;
+std::atomic<std::shared_ptr<example::Account>> auto_account;
+std::atomic<std::shared_ptr<example::Account>> auto_alias;
 int main() {
   if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)) return 1;
   using namespace example;
@@ -85,6 +90,9 @@ int main() {
   g_active_account = std::make_shared<Account>(1);
   accounts = {std::make_shared<Account>(2), std::make_shared<Account>(3)};
   auto unowned = std::make_unique<Account>(7);
+  auto_cache.store(std::dynamic_pointer_cast<Cache>(g_primary_cache));
+  auto_account.store(g_active_account);
+  auto_alias.store(std::shared_ptr<Account>(g_active_account, unowned.get()));
   std::cout << "ready" << std::endl;
   for (std::string input;;) {
     usleep(2000);
@@ -93,7 +101,10 @@ int main() {
       continue;
     if (!std::getline(std::cin, input))
       break;
-    if (input == "addresses") {
+    if (input == "clear") {
+      auto_account.store({});
+      std::puts("cleared");
+    } else if (input == "addresses") {
       std::printf("known cache=0x%lx account=0x%lx unowned=0x%lx\n",
           reinterpret_cast<unsigned long>(g_primary_cache.get()),
           reinterpret_cast<unsigned long>(g_active_account.get()),
@@ -133,6 +144,18 @@ def live_data(args, folder):
         repl("%live update-data raw.cpp --from-scan " + " ".join(ids),
              r"^live APPLIED .*updated=2 skipped=1 failed=0")
         app("status", r"^cache=999/2 other=999/1 account=5000/2 unowned=200/0$")
+        repl("%live scan-heap --type example::Cache --type example::Account", r"^live CURRENT")
+        roots = dict(zip(addresses.groups(), ("auto_cache", "auto_account", None)))
+        ids = []
+        for address in sorted(roots, key=lambda value: int(value, 16)):
+            root = roots[address]
+            evidence = f"shared owner observed under {root}" if root else "ownership unknown"
+            ids.append(result_line(rf"\[(H\d+)\].*address={address}\b.*{evidence}")[1])
+        app("clear", r"^cleared$")
+        repl("%live update-data raw.cpp --from-scan " + " ".join(ids),
+             r"^live APPLIED .*updated=1 skipped=2 failed=0")
+        app("status", r"^cache=999/3 other=999/1 account=5000/2 unowned=200/0$")
+
 
 
 MANAGED_MAIN = r"""
@@ -147,7 +170,10 @@ namespace managed = tracer::live::managed;
 using namespace fixture;
 managed::Registry registry;
 extern "C" managed::Registry* clang_tracer_managed_registry_v1() noexcept { return &registry; }
-extern "C" void fixture_hook_observe(int) {}
+extern "C" int cache_code();
+extern "C" void fixture_hook_observe(int) {
+  if (cache_code() != 27) throw std::runtime_error("hook saw the old code");
+}
 
 int main() {
   if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)) return 1;
@@ -174,6 +200,7 @@ int main() {
     if (!std::getline(std::cin, command))
       break;
     auto access = registry.access();
+    std::printf("code %d\n", cache_code());
     for (auto id : ids) {
       if (command == "old")
         access.with<CacheV1>("Cache", id, "cache.1", [](const auto& c) {
@@ -195,28 +222,29 @@ def migration(args, folder):
     for name in ("state.hpp", "update.hpp", "after.cpp"):
         shutil.copyfile(ROOT / "live_migration" / name, folder / name)
     (folder / "main.cpp").write_text(MANAGED_MAIN)
-    target = build_target(args, folder, ["main.cpp"], ["state.hpp"])
+    patch_source = folder / "cache_code.cpp"
+    patch_source.write_text('extern "C" int cache_code() { return 1; }\n')
+    target = build_target(args, folder, ["main.cpp", "cache_code.cpp"], ["state.hpp"])
     source = (folder / "after.cpp").read_text()
     (folder / "reject.cpp").write_text("#define FAIL_HOOK\n" + source)
     with ExitStack() as cleanup:
         app, repl, app_line, _ = attach(args, target, cleanup)
         app("old", r"^old 0$")
-        main = folder / "main.cpp"
-        main.write_text(MANAGED_MAIN.replace('ready', 'changed'))
-        repl("%live update update.hpp main.cpp --managed true",
-             r"^live BLOCKED revision=0 .*cannot replace baseline application files")
-        main.write_text(MANAGED_MAIN)
+        patch_source.write_text('extern "C" int cache_code() { return 27; }\n')
         options = " --after-function fixture::after --for-each Cache"
-        repl("%live update update.hpp --after-file reject.cpp" + options,
+        repl("%live update update.hpp cache_code.cpp --after-file reject.cpp" + options,
              r"^live BLOCKED revision=0 .*second hook failed")
-        app("old", r"^old 0$")
-        repl("%live update update.hpp --after-file after.cpp" + options,
+        app("old", r"^code 1$")
+        app_line(r"^old 0$")
+        repl("%live update update.hpp cache_code.cpp --after-file after.cpp" + options,
              r"^live APPLIED revision=1 .*instances=3")
-        app("new", r"^new 700 4796 1$")
+        app("new", r"^code 27$")
+        app_line(r"^new 700 4796 1$")
         app_line(r"^new 1400 1656 1$")
         app_line(r"^new 0 1024 1$")
         repl("%live revert", r"^live REVERTED revision=0")
-        app("old", r"^old 0$")
+        app("old", r"^code 1$")
+        app_line(r"^old 0$")
         repl("%live update update.hpp --managed true", r"^live APPLIED revision=2 .*instances=3")
         app("new", r"^new 700 1024 0$")
         app_line(r"^new 1400 1024 0$")

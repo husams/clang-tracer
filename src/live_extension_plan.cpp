@@ -79,7 +79,8 @@ api::LiveJitInput encode(const JitRequest &request, const std::vector<std::strin
 } // namespace
 
 ExtensionPlan plan_extension(std::uint32_t pid, std::uint64_t process_start,
-    const std::string &session, const std::string &executable, const Action &request) {
+    const std::string &session, const std::string &executable, const Action &request,
+    const Revision &active, const std::function<bool()> &cancelled) {
   ExtensionPlan result;
   auto &input = result.input;
   input.set_session(session);
@@ -148,6 +149,46 @@ ExtensionPlan plan_extension(std::uint32_t pid, std::uint64_t process_start,
     paths.push_back(input.hook_file());
 
   auto sources = extension_sources(pid, module, request, paths, registry);
+  if (!registry.empty()) {
+    const auto build = open_native_build(module, request);
+    auto native = request;
+    native.clear_sources();
+    for (const auto &source : request.sources()) {
+      const auto known = std::ranges::any_of(build.baseline.files, [&](const SourceFile &file) {
+        return file.path == source.path();
+      });
+      if (known || active.sources.contains(source.path()))
+        *native.add_sources() = source;
+    }
+    if (!native.sources().empty()) {
+      result.native = plan_sources(pid, module, native, active, cancelled);
+      // Native code sharing the migrated state must enter under the
+      // application's registry gate. Its checked layout contract is stable.
+      auto &jit = result.native.jit;
+      for (const auto &file : jit.files) {
+        const auto found = std::ranges::find(sources.jit.files, file.path, &SourceFile::path);
+        if (found == sources.jit.files.end())
+          sources.jit.files.push_back(file);
+        else
+          found->contents = file.contents;
+      }
+      for (const auto &unit : jit.translation_units) {
+        const auto found = std::ranges::find(sources.jit.translation_units, unit.path,
+                                             &TranslationUnit::path);
+        if (found == sources.jit.translation_units.end())
+          sources.jit.translation_units.push_back(unit);
+        else
+          *found = unit;
+        if (std::ranges::find(update_paths, unit.path) == update_paths.end())
+          update_paths.push_back(unit.path);
+      }
+      for (const auto &[name, address] : jit.imports)
+        sources.jit.imports.insert_or_assign(name, address);
+      for (const auto &name : jit.entry_symbols)
+        sources.jit.imports.erase(name);
+      sources.jit.entry_symbols = jit.entry_symbols;
+    }
+  }
   input.set_build_id(sources.build_id);
   input.set_registry(sources.entry);
   if (!input.hook_file().empty())
@@ -155,8 +196,21 @@ ExtensionPlan plan_extension(std::uint32_t pid, std::uint64_t process_start,
   if (!update_paths.empty()) {
     auto *update = input.mutable_update();
     *update = encode(sources.jit, update_paths);
-    if (!registry.empty() && std::none_of(update->units().begin(), update->units().end(),
-          [&](const auto &unit) { return unit.path() != input.hook_file(); })) {
+    for (const auto &symbol : sources.jit.entry_symbols)
+      update->add_entry_symbols(symbol);
+    input.set_publish_native(!sources.jit.entry_symbols.empty());
+    std::vector<std::string> recipe_headers;
+    if (!registry.empty()) {
+      for (const auto &path : update_paths) {
+        const auto suffix = fs::path(path).extension();
+        const bool header = suffix == ".h" || suffix == ".hpp" || suffix == ".hh" || suffix == ".hxx";
+        if (header && path != input.hook_file() &&
+            std::ranges::none_of(result.native.accepted_sources,
+                [&](const SourceFile &file) { return file.path == path; }))
+          recipe_headers.push_back(path);
+      }
+    }
+    if (!recipe_headers.empty()) {
       const auto wrapper = (fs::path(update_paths.front()).parent_path() /
           ".clang-tracer-managed-recipe.cpp").string();
       auto *unit = update->add_units();
@@ -167,9 +221,7 @@ ExtensionPlan plan_extension(std::uint32_t pid, std::uint64_t process_start,
       auto *file = update->add_sources();
       file->set_path(wrapper);
       std::string content;
-      for (const auto &path : update_paths) {
-        if (path == input.hook_file())
-          continue;
+      for (const auto &path : recipe_headers) {
         if (path.find_first_of("\\\"\r\n") != std::string::npos)
           throw std::runtime_error("invalid path for generated migration input");
         content += "#include \"" + path + "\"\n";
@@ -179,7 +231,12 @@ ExtensionPlan plan_extension(std::uint32_t pid, std::uint64_t process_start,
   }
   if (!discovery.empty())
     *input.mutable_discovery() = encode(sources.jit, {discovery});
-  result.validate = std::move(sources.validate);
+  result.validate = [validate = std::move(sources.validate), native = result.native.validate_sources] {
+    if (validate)
+      validate();
+    if (native)
+      native();
+  };
   return result;
 }
 

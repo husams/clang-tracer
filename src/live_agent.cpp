@@ -41,6 +41,31 @@ std::pair<std::uintptr_t, std::size_t> executable_mapping(std::uintptr_t address
 
 } // namespace
 
+EntryImage describe_entry(JitImage &image, std::string_view symbol) {
+  const auto address = image.lookup(symbol);
+  const auto [begin, size] = executable_mapping(address);
+  return {address, begin, size};
+}
+
+std::uint64_t retain_image(std::shared_ptr<JitImage> image, std::uint64_t limit) {
+  auto &state = images();
+  std::lock_guard lock(state.mutex);
+  if (!limit || state.retained.size() >= limit)
+    throw std::runtime_error("live JIT retained generation limit reached");
+  if (state.last_token == UINT64_MAX)
+    throw std::runtime_error("live JIT generation identifiers exhausted");
+  const auto token = state.last_token + 1;
+  state.retained.emplace(token, std::move(image));
+  state.last_token = token;
+  return token;
+}
+
+std::uint64_t retained_image_count() {
+  auto &state = images();
+  std::lock_guard lock(state.mutex);
+  return state.retained.size();
+}
+
 JitRequest decode_jit(const clangtracer::v1::LiveJitInput &input) {
   JitRequest result;
   result.compiler_arguments.assign(input.compiler_arguments().begin(), input.compiler_arguments().end());
@@ -78,42 +103,41 @@ extern "C" int tracer_agent_live_v1(tracer::live::AgentRequest *request) noexcep
     return -1;
   try {
     if (request->action == AgentRequest::Action::launch ||
-        request->action == AgentRequest::Action::poll) {
+        request->action == AgentRequest::Action::poll ||
+        request->action == AgentRequest::Action::publication_result) {
       execute_extension(*request);
       return 0;
     }
-    auto &state = images();
-    std::lock_guard lock(state.mutex);
     request->error[0] = '\0';
-    request->retained = state.retained.size();
+    request->retained = retained_image_count();
     switch (request->action) {
     case AgentRequest::Action::launch:
     case AgentRequest::Action::poll:
+    case AgentRequest::Action::publication_result:
       break;
     case AgentRequest::Action::status:
       return 0;
-    case AgentRequest::Action::discard:
+    case AgentRequest::Action::discard: {
+      auto &state = images();
+      std::lock_guard lock(state.mutex);
       state.retained.erase(request->token);
       request->retained = state.retained.size();
       return 0;
+    }
     case AgentRequest::Action::stage: {
-      if (!request->limit || state.retained.size() >= request->limit)
+      if (!request->limit || request->retained >= request->limit)
         throw std::runtime_error("live JIT retained generation limit reached");
       auto input = jit_input(*request);
       auto image = compile_in_target(input);
       request->count = input.entry_symbols.size();
       for (std::size_t i = 0; i < input.entry_symbols.size(); ++i) {
-        request->addresses[i] = image->lookup(input.entry_symbols[i]);
-        const auto [begin, size] = executable_mapping(request->addresses[i]);
-        request->mapping_begin[i] = begin;
-        request->mapping_size[i] = size;
+        const auto entry = describe_entry(*image, input.entry_symbols[i]);
+        request->addresses[i] = entry.address;
+        request->mapping_begin[i] = entry.mapping_begin;
+        request->mapping_size[i] = entry.mapping_size;
       }
-      const auto token = state.last_token + 1;
-      if (!token)
-        throw std::runtime_error("live JIT generation identifiers exhausted");
-      state.retained.emplace(token, std::move(image));
-      state.last_token = request->token = token;
-      request->retained = state.retained.size();
+      request->token = retain_image(std::move(image), request->limit);
+      request->retained = retained_image_count();
       return 0;
     }
     }
