@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "native_detour.hpp"
 
 #include <algorithm>
@@ -488,7 +489,7 @@ bool prepare_entry_jump(const Patch &patch, void *trampoline,
 }
 
 bool decode_getter(std::string_view bytes, std::size_t &trap_offset, std::string &error) {
-  trap_offset = bytes.starts_with("\xf3\x0f\x1e\xfa") ? 4 : 0;
+  trap_offset = ::tracer::compat::starts_with(bytes, "\xf3\x0f\x1e\xfa") ? 4 : 0;
   bytes.remove_prefix(trap_offset);
   // MOV r/m32,EAX with RDI as the base, followed by a plain near RET.
   if ((bytes.size() == 3 || bytes.size() == 4 || bytes.size() == 7) &&
@@ -560,9 +561,9 @@ bool allocate_code_cache(std::uintptr_t caller, std::size_t bytes,
 
 std::size_t scalar_fp_load_width(std::string_view opcode) {
   // LLVM distinguishes the intrinsic form of legacy scalar SSE operations.
-  if (opcode.ends_with("_Int"))
+  if (::tracer::compat::ends_with(opcode, "_Int"))
     opcode.remove_suffix(4);
-  if (opcode.size() != 7 || !opcode.ends_with("rm"))
+  if (opcode.size() != 7 || !::tracer::compat::ends_with(opcode, "rm"))
     return 0;
   const auto operation = opcode.substr(0, 3);
   if (operation != "ADD" && operation != "SUB" && operation != "MUL" &&

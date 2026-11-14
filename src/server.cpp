@@ -2053,6 +2053,11 @@ public:
       return grpc::Status::OK;
     } catch (const std::invalid_argument &error) {
       return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
+  }
+
   grpc::Status ObjectWatch(grpc::ServerContext *, const api::ObjectWatchRequest *request,
                            api::ObjectWatchStatus *response) override {
     const bool prepare = request->action() == api::ObjectWatchRequest::PREPARE;
@@ -2758,10 +2763,10 @@ private:
     std::set<std::uint64_t> entries;
     for (const auto &prepared : request.methods()) {
       std::string_view receiver = prepared.header_types().record_name();
-      if (receiver.starts_with("::"))
+      if (::tracer::compat::starts_with(receiver, "::"))
         receiver.remove_prefix(2);
       std::string_view type = request.concrete_type();
-      if (type.starts_with("::"))
+      if (::tracer::compat::starts_with(type, "::"))
         type.remove_prefix(2);
       if (prepared.ByteSizeLong() > 65536 || prepared.module_sha256().size() != 32 ||
           !tracer::prepared::is_typed_version(prepared.format_version()) ||
@@ -2775,7 +2780,7 @@ private:
         try {
           spec = client::bind_prepared_callable(session->pid(), prepared, lookup).spec;
         } catch (const std::runtime_error &error) {
-          if (!std::string_view(error.what()).starts_with("PREPARED_MODULE_MISMATCH"))
+          if (!::tracer::compat::starts_with(std::string_view(error.what()), "PREPARED_MODULE_MISMATCH"))
             throw;
           std::vector<std::string> candidates;
           const auto wanted = lookup.module.empty() ? prepared.module_name() : lookup.module;

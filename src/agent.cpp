@@ -1,3 +1,4 @@
+#include "native_detour.hpp"
 #include "native_entry.hpp"
 #include <algorithm>
 #include <array>

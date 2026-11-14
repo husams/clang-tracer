@@ -1,9 +1,9 @@
 #pragma once
+#include "tracer/compat.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -57,8 +57,9 @@ struct Preview {
 
 Preview preview(std::uint64_t address, std::string_view bytes);
 Preview scan(std::uint64_t address, std::string_view bytes,
-             std::span<const std::uint64_t> additional_entries = {});
+             ::tracer::compat::span<const std::uint64_t> additional_entries = {});
 #if defined(__x86_64__)
+bool compatible_patch(std::uint64_t address, std::string_view before, std::string_view after);
 std::size_t nop_prefix(std::uint64_t address, std::string_view bytes, std::size_t minimum);
 bool forwards_receiver(std::uint64_t address, std::string_view prefix);
 #endif

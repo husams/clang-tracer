@@ -969,7 +969,7 @@ extern "C" void tracer_stack_leave(tracer::TraceContext *ctx) noexcept {
 
 namespace tracer {
 NativeCodeStack capture_native_code_stack(const NativeCodeRegisters &registers,
-    std::span<std::uint64_t> pcs, std::span<std::uint64_t> stack_pointers) noexcept {
+    ::tracer::compat::span<std::uint64_t> pcs, ::tracer::compat::span<std::uint64_t> stack_pointers) noexcept {
   NativeCodeStack result;
   const auto depth = std::min(pcs.size(), stack_pointers.size());
   if (!depth || !registers[native_pc])
@@ -980,7 +980,7 @@ NativeCodeStack capture_native_code_stack(const NativeCodeRegisters &registers,
   try {
     const auto process = ::getpid();
     const auto maps = mappings(registers[native_sp], process);
-    const auto stack = std::ranges::find_if(maps, [&](const auto &mapping) {
+    const auto stack = std::find_if(std::begin(maps), std::end(maps), [&](const auto &mapping) {
       return mapping.readable && registers[native_sp] >= mapping.begin && registers[native_sp] < mapping.end;
     });
     if (stack == maps.end())

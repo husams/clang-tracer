@@ -42,10 +42,22 @@ public:
     T__154 = 155, T__155 = 156, T__156 = 157, T__157 = 158, T__158 = 159,
     T__159 = 160, T__160 = 161, T__161 = 162, T__162 = 163, T__163 = 164,
     T__164 = 165, T__165 = 166, T__166 = 167, T__167 = 168, T__168 = 169,
-    T__169 = 170, T__170 = 171, T__171 = 172, UINT = 173, STRING = 174,
-    SHELL = 175, METADATA_ONLY = 176, SQLITE = 177, STACK = 178, CWD = 179,
-    SIGNATURE = 180, MEMBER = 181, SNAPSHOT_RETURN_POINTEE = 182, WORD = 183,
-    WS = 184
+    T__169 = 170, T__170 = 171, T__171 = 172, T__172 = 173, T__173 = 174,
+    T__174 = 175, T__175 = 176, T__176 = 177, T__177 = 178, T__178 = 179,
+    T__179 = 180, T__180 = 181, T__181 = 182, T__182 = 183, T__183 = 184,
+    T__184 = 185, T__185 = 186, T__186 = 187, T__187 = 188, T__188 = 189,
+    T__189 = 190, T__190 = 191, T__191 = 192, T__192 = 193, T__193 = 194,
+    T__194 = 195, T__195 = 196, T__196 = 197, T__197 = 198, T__198 = 199,
+    T__199 = 200, T__200 = 201, T__201 = 202, T__202 = 203, T__203 = 204,
+    T__204 = 205, T__205 = 206, T__206 = 207, T__207 = 208, T__208 = 209,
+    T__209 = 210, T__210 = 211, T__211 = 212, T__212 = 213, T__213 = 214,
+    T__214 = 215, T__215 = 216, T__216 = 217, T__217 = 218, T__218 = 219,
+    T__219 = 220, T__220 = 221, T__221 = 222, T__222 = 223, T__223 = 224,
+    T__224 = 225, T__225 = 226, T__226 = 227, T__227 = 228, T__228 = 229,
+    T__229 = 230, T__230 = 231, T__231 = 232, T__232 = 233, UINT = 234,
+    STRING = 235, SHELL = 236, METADATA_ONLY = 237, SQLITE = 238, STACK = 239,
+    CWD = 240, SIGNATURE = 241, MEMBER = 242, SNAPSHOT_RETURN_POINTEE = 243,
+    WORD = 244, WS = 245
   };
 
   enum {
@@ -54,13 +66,17 @@ public:
     RuleDetach = 9, RuleModules = 10, RuleModuleIndex = 11, RuleModuleBuildOption = 12,
     RuleModuleQueryOption = 13, RuleModuleShowOption = 14, RuleModuleEmitOption = 15,
     RuleThreads = 16, RuleSymbols = 17, RuleSymbolOption = 18, RuleProbe = 19,
-    RulePrepareOption = 20, RuleResolveOption = 21, RuleDeployOption = 22,
-    RuleInterceptor = 23, RuleEvents = 24, RuleCollect = 25, RuleRecord = 26,
-    RuleStreamOption = 27, RuleCpp = 28, RuleShell = 29, RuleComplete = 30,
-    RuleType = 31, RuleHelp = 32, RuleQuit = 33, RuleBulkTrace = 34, RuleBulkTraceOption = 35,
-    RuleValue = 36, RuleKeyword = 37, RuleObjectWatch = 38, RuleObjectOption = 39,
-    RuleMemory = 40, RuleProbeEntry = 41, RuleProbeReload = 42, RuleStackFilter = 43,
-    RuleContextEventBytes = 44, RuleExtraCompileOption = 45, RuleCwdOption = 46
+    RulePrepareOption = 20, RuleLimitOption = 21, RuleResolveOption = 22,
+    RuleValidateOption = 23, RuleDeployOption = 24, RuleInterceptor = 25,
+    RuleEvents = 26, RuleCollect = 27, RuleRecord = 28, RuleStreamOption = 29,
+    RuleCpp = 30, RuleShell = 31, RuleComplete = 32, RuleType = 33, RuleHelp = 34,
+    RuleQuit = 35, RuleBulkTrace = 36, RuleBulkTraceOption = 37, RuleValue = 38,
+    RuleKeyword = 39, RuleObjectWatch = 40, RuleObjectOption = 41, RuleMemory = 42,
+    RuleProbeEntry = 43, RuleProbeReload = 44, RuleTargetLaunch = 45, RuleLaunchOption = 46,
+    RuleChildList = 47, RuleTargetCall = 48, RuleLocalPerf = 49, RuleTargetLibrary = 50,
+    RuleInstructions = 51, RuleInstructionOption = 52, RuleWatchpoint = 53,
+    RuleStackFilter = 54, RuleContextEventBytes = 55, RuleExtraCompileOption = 56,
+    RuleCwdOption = 57
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -101,7 +117,9 @@ public:
   class SymbolOptionContext;
   class ProbeContext;
   class PrepareOptionContext;
+  class LimitOptionContext;
   class ResolveOptionContext;
+  class ValidateOptionContext;
   class DeployOptionContext;
   class InterceptorContext;
   class EventsContext;
@@ -123,6 +141,15 @@ public:
   class MemoryContext;
   class ProbeEntryContext;
   class ProbeReloadContext;
+  class TargetLaunchContext;
+  class LaunchOptionContext;
+  class ChildListContext;
+  class TargetCallContext;
+  class LocalPerfContext;
+  class TargetLibraryContext;
+  class InstructionsContext;
+  class InstructionOptionContext;
+  class WatchpointContext;
   class StackFilterContext;
   class ContextEventBytesContext;
   class ExtraCompileOptionContext;
@@ -172,6 +199,13 @@ public:
     MemoryContext *memory();
     ProbeEntryContext *probeEntry();
     ProbeReloadContext *probeReload();
+    TargetLaunchContext *targetLaunch();
+    TargetCallContext *targetCall();
+    LocalPerfContext *localPerf();
+    InstructionsContext *instructions();
+    WatchpointContext *watchpoint();
+    TargetLibraryContext *targetLibrary();
+    ChildListContext *childList();
     ObjectWatchContext *objectWatch();
 
 
@@ -291,6 +325,10 @@ public:
   public:
     ModulesContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
+    std::vector<ValueContext *> value();
+    ValueContext* value(size_t i);
+    std::vector<antlr4::tree::TerminalNode *> UINT();
+    antlr4::tree::TerminalNode* UINT(size_t i);
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -430,6 +468,8 @@ public:
     CwdOptionContext* cwdOption(size_t i);
     std::vector<DeployOptionContext *> deployOption();
     DeployOptionContext* deployOption(size_t i);
+    std::vector<ValidateOptionContext *> validateOption();
+    ValidateOptionContext* validateOption(size_t i);
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -446,6 +486,7 @@ public:
     antlr4::tree::TerminalNode *SIGNATURE();
     antlr4::tree::TerminalNode *MEMBER();
     antlr4::tree::TerminalNode *METADATA_ONLY();
+    LimitOptionContext *limitOption();
     ExtraCompileOptionContext *extraCompileOption();
     CwdOptionContext *cwdOption();
 
@@ -455,6 +496,20 @@ public:
   };
 
   PrepareOptionContext* prepareOption();
+
+  class  LimitOptionContext : public antlr4::ParserRuleContext {
+  public:
+    LimitOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    antlr4::tree::TerminalNode *UINT();
+    antlr4::tree::TerminalNode *WORD();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  LimitOptionContext* limitOption();
 
   class  ResolveOptionContext : public antlr4::ParserRuleContext {
   public:
@@ -470,11 +525,25 @@ public:
 
   ResolveOptionContext* resolveOption();
 
+  class  ValidateOptionContext : public antlr4::ParserRuleContext {
+  public:
+    ValidateOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ResolveOptionContext *resolveOption();
+    LimitOptionContext *limitOption();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  ValidateOptionContext* validateOption();
+
   class  DeployOptionContext : public antlr4::ParserRuleContext {
   public:
     DeployOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
-    ResolveOptionContext *resolveOption();
+    ValidateOptionContext *validateOption();
     antlr4::tree::TerminalNode *UINT();
     antlr4::tree::TerminalNode *WORD();
     antlr4::tree::TerminalNode *SNAPSHOT_RETURN_POINTEE();
@@ -494,8 +563,8 @@ public:
     virtual size_t getRuleIndex() const override;
     std::vector<ValueContext *> value();
     ValueContext* value(size_t i);
-    std::vector<ResolveOptionContext *> resolveOption();
-    ResolveOptionContext* resolveOption(size_t i);
+    std::vector<ValidateOptionContext *> validateOption();
+    ValidateOptionContext* validateOption(size_t i);
     std::vector<DeployOptionContext *> deployOption();
     DeployOptionContext* deployOption(size_t i);
 
@@ -774,9 +843,11 @@ public:
   public:
     ProbeReloadContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
-    antlr4::tree::TerminalNode *UINT();
+    std::vector<antlr4::tree::TerminalNode *> UINT();
+    antlr4::tree::TerminalNode* UINT(size_t i);
     ValueContext *value();
-    CwdOptionContext *cwdOption();
+    std::vector<CwdOptionContext *> cwdOption();
+    CwdOptionContext* cwdOption(size_t i);
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -784,6 +855,137 @@ public:
   };
 
   ProbeReloadContext* probeReload();
+
+  class  TargetLaunchContext : public antlr4::ParserRuleContext {
+  public:
+    TargetLaunchContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+    std::vector<LaunchOptionContext *> launchOption();
+    LaunchOptionContext* launchOption(size_t i);
+    antlr4::tree::TerminalNode *UINT();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  TargetLaunchContext* targetLaunch();
+
+  class  LaunchOptionContext : public antlr4::ParserRuleContext {
+  public:
+    LaunchOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+    antlr4::tree::TerminalNode *CWD();
+    antlr4::tree::TerminalNode *UINT();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  LaunchOptionContext* launchOption();
+
+  class  ChildListContext : public antlr4::ParserRuleContext {
+  public:
+    ChildListContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  ChildListContext* childList();
+
+  class  TargetCallContext : public antlr4::ParserRuleContext {
+  public:
+    TargetCallContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    std::vector<ValueContext *> value();
+    ValueContext* value(size_t i);
+    std::vector<antlr4::tree::TerminalNode *> UINT();
+    antlr4::tree::TerminalNode* UINT(size_t i);
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  TargetCallContext* targetCall();
+
+  class  LocalPerfContext : public antlr4::ParserRuleContext {
+  public:
+    LocalPerfContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    std::vector<antlr4::tree::TerminalNode *> UINT();
+    antlr4::tree::TerminalNode* UINT(size_t i);
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  LocalPerfContext* localPerf();
+
+  class  TargetLibraryContext : public antlr4::ParserRuleContext {
+  public:
+    TargetLibraryContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  TargetLibraryContext* targetLibrary();
+
+  class  InstructionsContext : public antlr4::ParserRuleContext {
+  public:
+    InstructionsContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+    std::vector<InstructionOptionContext *> instructionOption();
+    InstructionOptionContext* instructionOption(size_t i);
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  InstructionsContext* instructions();
+
+  class  InstructionOptionContext : public antlr4::ParserRuleContext {
+  public:
+    InstructionOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    antlr4::tree::TerminalNode *UINT();
+    ValueContext *value();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  InstructionOptionContext* instructionOption();
+
+  class  WatchpointContext : public antlr4::ParserRuleContext {
+  public:
+    WatchpointContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    std::vector<antlr4::tree::TerminalNode *> UINT();
+    antlr4::tree::TerminalNode* UINT(size_t i);
+    std::vector<ValueContext *> value();
+    ValueContext* value(size_t i);
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  WatchpointContext* watchpoint();
 
   class  StackFilterContext : public antlr4::ParserRuleContext {
   public:

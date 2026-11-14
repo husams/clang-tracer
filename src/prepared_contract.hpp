@@ -1,4 +1,5 @@
 #pragma once
+#include "tracer/compat.hpp"
 
 #include "tracer.pb.h"
 
@@ -86,8 +87,8 @@ inline std::vector<std::string> toolchain_arguments(
       continue;
     const auto target = option.substr(std::min(option.size(), std::string_view("--target=").size()));
     const bool aarch64_snapshot = !package.receiver_storage().empty() &&
-        package.target_triple().starts_with("aarch64-") && target.starts_with("aarch64-");
-    if (option.substr(0, 9) == "--target=" && (target.starts_with("x86_64-") || aarch64_snapshot) &&
+        ::tracer::compat::starts_with(package.target_triple(), "aarch64-") && ::tracer::compat::starts_with(target, "aarch64-");
+    if (option.substr(0, 9) == "--target=" && (::tracer::compat::starts_with(target, "x86_64-") || aarch64_snapshot) &&
         target.find("-linux") != target.npos && target.size() <= 128 &&
         target.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_-") == target.npos)
       continue;

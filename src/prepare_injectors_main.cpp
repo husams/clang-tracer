@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "cpp_resolver.hpp"
 #include "prepare_package.hpp"
 #include "module_index_internal.hpp"
@@ -127,7 +128,7 @@ int main(int argc, char **argv) {
       for (auto &source : translation_units)
         source = fs::canonical(source).string();
       auto type = writer->second.substr(0, separator);
-      if (type.starts_with("::"))
+      if (::tracer::compat::starts_with(type, "::"))
         type.erase(0, 2);
       const auto candidates = tracer::client::discover_object_writers(type,
           writer->second.substr(separator + 2), options.at("--compdb"), translation_units);

@@ -1,3 +1,4 @@
+#include <clang/Basic/Version.h>
 #include "record_mappings.hpp"
 #include "../record_factory.hpp"
 #include "../snapshot_members.hpp"
@@ -143,7 +144,11 @@ class Generator {
 #if LLVM_VERSION_MAJOR >= 22
     return ast_.getCanonicalTagType(record);
 #else
+#if CLANG_VERSION_MAJOR >= 22
+    return clang::QualType(ast_.getCanonicalTagType(record).getTypePtr(), 0);
+#else
     return ast_.getRecordType(record);
+#endif
 #endif
   }
 

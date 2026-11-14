@@ -498,6 +498,8 @@ Remove a fallback probe before replacing it.
 
 Use the full Linux build on x86-64 or AArch64, with the REPL, server, and agent from the same build. Supply the existing ELF and its matching DWARF, either embedded or in a matching separate debug file. The watch installs patches in process memory. The application executable and source files stay intact.
 
+On `c++17`, use that branch's preparation tools to generate typed adapters and object watch plans from the existing binary and its original compile commands. Regenerate typed adapters created on `main` before preparing a watch on `c++17`.
+
 The plan records the capture mode you select during preparation.
 
 - **Individual writes.** Select one `--field` and a writer with `--code`. Use `--backend code-cache` to run supported stores in the target without a ptrace stop for every write. `--backend ptrace` is the default and steps verified stores for diagnostic runs. By default, the watch samples values and reports changes. Start a saved write plan with `--no-values` to record `FIELD_WRITTEN` for each completed admitted store, including same-value stores, without field samples. The backend is part of the saved plan.

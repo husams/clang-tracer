@@ -225,7 +225,10 @@ inline bool checked_safe(clang::QualType type) {
 enum class Referent { record, text, scalar, other };
 
 inline Referent classify(clang::QualType type) {
-  const auto pointee = referent(type).getUnqualifiedType().getCanonicalType();
+  const auto target = referent(type);
+  if (target.isNull())
+    return Referent::other;
+  const auto pointee = target.getUnqualifiedType().getCanonicalType();
   if (referent_record(type))
     return Referent::record;
   if (type->isPointerType() && pointee->isCharType() &&

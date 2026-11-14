@@ -3,6 +3,7 @@
 #include "context_paths.hpp"
 #include "prepared_contract.hpp"
 #include "prepared_header_search.hpp"
+#include "snapshot_runtime_limits.hpp"
 #include "tracer/compiler_options.hpp"
 #include "tracer/protocol.hpp"
 #include "tracer_runtime_config.hpp"
@@ -28,7 +29,7 @@ namespace tracer::arm_snapshot {
 namespace {
 using Snapshot = clangtracer::context::v1::ValueSnapshot;
 
-bool copy_snapshot(const ValueSnapshot &source, Snapshot &result, bool members) {
+bool copy_snapshot(const ValueSnapshot &source, Snapshot &result, unsigned member_depth) {
   result.set_status(static_cast<Snapshot::Status>(source.status));
   if (source.cpp_type)
     result.set_cpp_type(source.cpp_type);
@@ -39,7 +40,8 @@ bool copy_snapshot(const ValueSnapshot &source, Snapshot &result, bool members) 
   if (!source.descriptor || !source.root_type || source.descriptor_size > 4096 ||
       source.payload_size > max_snapshot_bytes || (!source.payload && source.payload_size) ||
       source.container_role_count > 128 || source.record_type_count > 128 ||
-      (source.member_count && (!members || !source.members || source.member_count > kMaxSnapshotMembers)))
+      (source.member_count && (!member_depth || !source.members ||
+                               source.member_count > snapshot_member_request().load())))
     return false;
   result.set_root_type(source.root_type);
   result.set_descriptor_set(source.descriptor, source.descriptor_size);
@@ -55,7 +57,7 @@ bool copy_snapshot(const ValueSnapshot &source, Snapshot &result, bool members) 
       continue;
     auto &child = *result.add_members();
     child.set_name(member.name);
-    if (!copy_snapshot(*member.snapshot, *child.mutable_snapshot(), false))
+    if (!copy_snapshot(*member.snapshot, *child.mutable_snapshot(), member_depth - 1))
       return false;
   }
   return true;
@@ -64,7 +66,7 @@ bool copy_snapshot(const ValueSnapshot &source, Snapshot &result, bool members) 
 bool encode_snapshot(const ValueSnapshot &source, std::string &bytes) noexcept {
   try {
     Snapshot result;
-    return copy_snapshot(source, result, true) && result.ByteSizeLong() <= max_snapshot_wire_bytes &&
+    return copy_snapshot(source, result, snapshot_depth_request().load()) && result.ByteSizeLong() <= max_snapshot_wire_bytes &&
         result.SerializeToString(&bytes);
   } catch (...) {
     return false;
@@ -117,11 +119,21 @@ Codec compile(const clangtracer::v1::ProbeSpec &spec) {
         std::string(arguments) + "); }\n";
   };
   bind("std::size_t tracer_snapshot_mark() noexcept", "tracer_snapshot_mark", "", &tracer_snapshot_mark);
+  bind("void tracer_snapshot_configure(unsigned arena, unsigned slice, unsigned members, unsigned depth) noexcept",
+       "tracer_snapshot_configure", "arena, slice, members, depth", &tracer_snapshot_configure);
   bind("void tracer_snapshot_reset(std::size_t mark) noexcept", "tracer_snapshot_reset", "mark", &tracer_snapshot_reset);
   bind("std::byte* tracer_snapshot_storage(std::size_t* size, std::size_t requested) noexcept", "tracer_snapshot_storage", "size,requested", &tracer_snapshot_storage);
+  bind("std::byte* tracer_snapshot_storage_limited(std::size_t* size, std::size_t reserve) noexcept",
+       "tracer_snapshot_storage_limited", "size, reserve", &tracer_snapshot_storage_limited);
   bind("void tracer_snapshot_commit(std::size_t mark, std::size_t size) noexcept", "tracer_snapshot_commit", "mark, size", &tracer_snapshot_commit);
   bind("bool tracer_snapshot_readable(const void* ptr, std::size_t size, std::size_t align) noexcept",
        "tracer_snapshot_readable", "ptr, size, align", &tracer_snapshot_readable);
+  bind("const char* tracer_snapshot_read_cstring(const char* ptr, std::size_t size, std::size_t* length) noexcept",
+       "tracer_snapshot_read_cstring", "ptr, size, length", &tracer_snapshot_read_cstring);
+  bind("const char* tracer_snapshot_copy_bytes(const void* ptr, std::size_t size) noexcept",
+       "tracer_snapshot_copy_bytes", "ptr, size", &tracer_snapshot_copy_bytes);
+  bind("bool tracer_snapshot_is_scratch(const void* ptr, std::size_t size) noexcept",
+       "tracer_snapshot_is_scratch", "ptr, size", &tracer_snapshot_is_scratch);
   bind("bool tracer_snapshot_read_rtti(const void* ptr, const void** object, const char** name) noexcept",
        "tracer_snapshot_read_rtti", "ptr, object, name", &tracer_snapshot_read_rtti);
   bind("bool tracer_snapshot_read_rtti_provider(const void* ptr, const void** object, const char** name, const void** type, const void** table) noexcept",

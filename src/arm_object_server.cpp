@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "arm_object_watch.hpp"
 #include "arm_method_watch.hpp"
 #include "debug_resolver.hpp"
@@ -85,9 +86,9 @@ grpc::Status status_for(const std::exception &error) {
 
 bool matches(const api::WatchEventsRequest &filter, const api::TraceEvent &event) {
   return (!filter.pid() || filter.pid() == event.pid()) &&
-      (filter.session_ids().empty() || std::ranges::find(filter.session_ids(), event.session_id()) !=
+      (filter.session_ids().empty() || std::find(std::begin(filter.session_ids()), std::end(filter.session_ids()), event.session_id()) !=
                                          filter.session_ids().end()) &&
-      (filter.names().empty() || std::ranges::find(filter.names(), event.function_name()) !=
+      (filter.names().empty() || std::find(std::begin(filter.names()), std::end(filter.names()), event.function_name()) !=
                                    filter.names().end());
 }
 
@@ -382,9 +383,11 @@ public:
     if (request->server_instance_id() != instance_ || request->sequences_size() > 256)
       return {grpc::StatusCode::INVALID_ARGUMENT, "matching server instance and at most 256 sequences required"};
     const std::lock_guard lock(events_mutex_);
-    response->set_removed(std::erase_if(events_, [&](const auto &event) {
-      return std::ranges::find(request->sequences(), event.sequence()) != request->sequences().end();
-    }));
+    const auto end = std::remove_if(events_.begin(), events_.end(), [&](const auto &event) {
+      return std::find(std::begin(request->sequences()), std::end(request->sequences()), event.sequence()) != request->sequences().end();
+    });
+    response->set_removed(std::distance(end, events_.end()));
+    events_.erase(end, events_.end());
     return grpc::Status::OK;
   }
 
@@ -454,7 +457,7 @@ int main(int argc, char **argv) {
     Directory directory;
     if (endpoint.empty())
       endpoint = "unix://" + directory.path + "/control.sock";
-    if (!endpoint.starts_with("unix:///"))
+    if (!::tracer::compat::starts_with(endpoint, "unix:///"))
       throw std::invalid_argument("AArch64 server requires an absolute Unix socket endpoint");
     const fs::path socket = endpoint.substr(7);
     struct stat parent{};

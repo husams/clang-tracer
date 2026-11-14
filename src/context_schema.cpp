@@ -1,5 +1,6 @@
 #include "context_schema.hpp"
 #include "snapshot_members.hpp"
+#include "bounded_proto.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -1318,6 +1319,24 @@ CodecSourceResult render_snapshot_member_accessors(
   result.source += "\nnamespace tracer::context_engine::snapshot_access {\n";
   for (std::size_t i = 0; i < members.size(); ++i) {
     const auto &accessor = members[i];
+    if (accessor.erased_any) {
+      const auto *field = ::tracer::snapshot_members::find(accessor.root_type, accessor.member_name);
+      const auto *record = field ? field->getType()->getAsCXXRecordDecl() : nullptr;
+      if (!record || record->getQualifiedNameAsString() != "std::any") {
+        result.error = "erased snapshot member is not std::any";
+        result.source.clear();
+        return result;
+      }
+      const auto id = std::to_string(i);
+      const auto owner = record_spelling(llvm::cast<clang::CXXRecordDecl>(field->getParent()));
+      const auto tag = "AnyMemberTag" + id;
+      result.source += "struct " + tag + " { friend constexpr auto member(" + tag + "); };\n"
+          "template struct Grant<" + tag + ", &::" + owner + "::" +
+          field->getNameAsString() + ">;\n"
+          "template<class T> const auto& snapshot_member_" + id +
+          "(const T& value) { return ((const ::" + owner + "&)value).*member(" + tag + "{}); }\n";
+      continue;
+    }
     std::vector<::tracer::snapshot_members::Step> steps;
     if (!::tracer::snapshot_members::resolve(accessor.root_type, accessor.member_name, steps)) {
       result.error = "followed snapshot field is not a raw pointer or reference member path";

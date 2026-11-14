@@ -1,4 +1,5 @@
 #include "injector.hpp"
+#include "ptrace_wait.hpp"
 
 #include <algorithm>
 #include <array>
@@ -57,9 +58,6 @@
 
 // glibc exposes the seize requests even with this SDK's older kernel headers.
 // The running kernel must still support the existing seize/interrupt protocol.
-#ifndef PTRACE_EVENT_STOP
-#define PTRACE_EVENT_STOP 128
-#endif
 
 namespace tracer::injector {
 namespace {
@@ -993,11 +991,11 @@ private:
         }
         const unsigned int event = static_cast<unsigned int>(status) >> 16;
         const int signal = WSTOPSIG(status);
-        if (event == PTRACE_EVENT_STOP && (signal == SIGTRAP || patch_only)) {
+        if (event == tracer::injector::ptrace_event_stop && (signal == SIGTRAP || patch_only)) {
           peer.stopped = true;
           return;
         }
-        if (event == PTRACE_EVENT_STOP) {
+        if (event == tracer::injector::ptrace_event_stop) {
           peer.pending_signal = signal;
           throw IdlePointUnavailable(
               "peer thread is in a job-control group stop; refusing to thaw "
@@ -1287,12 +1285,12 @@ void Process::attach_impl(pid_t process_id,
     stopped = true;
     tracee_stopped_ = true;
     const unsigned int event = static_cast<unsigned int>(status) >> 16;
-    if (event == PTRACE_EVENT_STOP && WSTOPSIG(status) != SIGTRAP && !patch_only) {
+    if (event == tracer::injector::ptrace_event_stop && WSTOPSIG(status) != SIGTRAP && !patch_only) {
       pending_signal_ = WSTOPSIG(status);
       throw IdlePointUnavailable(
           "target leader is in a job-control group stop; refusing injection");
     }
-    if (event != PTRACE_EVENT_STOP) {
+    if (event != tracer::injector::ptrace_event_stop) {
       // Preserve a genuine signal-delivery stop if one raced with interrupt.
       pending_signal_ = WSTOPSIG(status);
     }
@@ -1361,7 +1359,7 @@ void Process::attach_impl(pid_t process_id,
         throw IdlePointUnavailable("AArch64 idle sleep did not reach its return instruction");
       stopped = tracee_stopped_ = true;
       const bool stepped = completed_sleep_step(status);
-      if (!stepped && ((static_cast<unsigned int>(status) >> 16) != PTRACE_EVENT_STOP ||
+      if (!stepped && ((static_cast<unsigned int>(status) >> 16) != tracer::injector::ptrace_event_stop ||
                        WSTOPSIG(status) != SIGTRAP))
         pending_signal_ = WSTOPSIG(status);
       if (!stepped || register_ip(object_target::read_registers(tid_)) != *admitted_pc + svc.size())
@@ -1473,7 +1471,7 @@ void Process::attach_impl(pid_t process_id,
           !(stepping_sleep && completed_sleep_step(recovery_status)) &&
 #endif
           ((static_cast<unsigned int>(recovery_status) >> 16) !=
-                          PTRACE_EVENT_STOP ||
+                          tracer::injector::ptrace_event_stop ||
                       WSTOPSIG(recovery_status) != SIGTRAP)) {
         pending_signal_ = WSTOPSIG(recovery_status);
       }
@@ -1828,9 +1826,9 @@ bool Process::retired_code_quiescent(const TracerRetiredCode &code) {
       return false;
     const auto registers = read_registers(tid);
     if (references(&registers.general, sizeof(registers.general)) ||
-        references(registers.xstate.data(), registers.xstate_size))
+        references(registers.xstate.data(), registers.xstate.size()))
       return false;
-    const auto sp = static_cast<std::uintptr_t>(registers.general.rsp) & ~std::uintptr_t{7};
+    const auto sp = static_cast<std::uintptr_t>(object_target::sp(registers.general)) & ~std::uintptr_t{7};
     const auto map = std::find_if(readable.begin(), readable.end(), [&](const auto &range) {
       return range.first <= sp && sp < range.second;
     });
@@ -2250,6 +2248,134 @@ std::uintptr_t Process::resolve_remote_symbol(std::string_view name, const CodeP
     throw std::invalid_argument(
         "symbol name must be nonempty and contain no NUL byte");
   }
+#if defined(__aarch64__)
+  std::string symbol_name(name);
+  const auto remote_maps = read_maps(process_id_);
+  ::dlerror();
+  void *local_address = ::dlsym(RTLD_DEFAULT, symbol_name.c_str());
+  if (const char *error = ::dlerror()) {
+    throw std::runtime_error("local dlsym(" + symbol_name +
+                             ") failed: " + error);
+  }
+  if (local_address == nullptr) {
+    throw std::runtime_error("local dlsym(" + symbol_name + ") returned null");
+  }
+
+  Dl_info info{};
+  if (::dladdr(local_address, &info) == 0 || info.dli_fname == nullptr ||
+      info.dli_fbase == nullptr) {
+    throw std::runtime_error("dladdr could not identify the local module for " +
+                             symbol_name);
+  }
+  auto module_path = tracer::detail::canonical_mapped_path(info.dli_fname);
+  if (module_path.empty()) {
+    throw std::runtime_error("cannot resolve local symbol module path");
+  }
+  // Before glibc 2.34, an otherwise ordinary application need not map libdl.
+  // Bootstrap through libc's loader entry points in that case. These are
+  // admitted through the same session path, mapped range and live-entry checks
+  // below. Runtime files remain fixed for the duration of the session.
+  const bool mapped =
+      std::any_of(remote_maps.begin(), remote_maps.end(),
+                  [&](const MapEntry& entry) { return same_module_path(entry, module_path); });
+  if (!mapped && (name == "dlopen" || name == "dlsym" || name == "__errno_location")) {
+    const char* bootstrap = name == "dlopen"  ? "__libc_dlopen_mode"
+                            : name == "dlsym" ? "__libc_dlsym"
+                                              : "__errno_location";
+    // Old libpthread also exports errno_location; a single-threaded target
+    // legitimately uses libc's implementation without mapping libpthread yet.
+    void* libc_handle = name == "__errno_location"
+                            ? ::dlopen("libc.so.6", RTLD_NOLOAD | RTLD_LAZY | RTLD_LOCAL)
+                            : nullptr;
+    ::dlerror();
+    auto* candidate = ::dlsym(libc_handle ? libc_handle : RTLD_DEFAULT, bootstrap);
+    const auto* lookup_error = ::dlerror();
+    Dl_info bootstrap_info{};
+    if (!lookup_error && candidate && tracer::runtime::has_soname(candidate, "libc.so.6") &&
+        ::dladdr(candidate, &bootstrap_info) && bootstrap_info.dli_fname &&
+        bootstrap_info.dli_fbase &&
+        std::any_of(remote_maps.begin(), remote_maps.end(),
+                    [&](const MapEntry& entry) {
+                      return same_module_path(entry, tracer::detail::canonical_mapped_path(
+                                                         bootstrap_info.dli_fname));
+                    })) {
+      local_address = candidate;
+      info = bootstrap_info;
+      module_path = tracer::detail::canonical_mapped_path(info.dli_fname);
+      symbol_name = bootstrap;
+    }
+    if (libc_handle) {
+      ::dlclose(libc_handle);
+    }
+  }
+  const auto local_maps = read_maps(::getpid());
+  const auto local_bias = map_load_bias(local_maps, module_path);
+  std::uintptr_t remote_bias = 0;
+  try {
+    remote_bias = map_load_bias(remote_maps, module_path);
+  } catch (const std::exception& error) {
+    throw std::runtime_error("cannot translate " + symbol_name + " from " + info.dli_fname + ": " +
+                             error.what());
+  }
+  const auto actual_local_base =
+      reinterpret_cast<std::uintptr_t>(info.dli_fbase);
+  if (local_bias != actual_local_base) {
+    throw std::runtime_error(
+        "local module mapping identity/base is inconsistent for " +
+        symbol_name);
+  }
+  const auto symbol = reinterpret_cast<std::uintptr_t>(local_address);
+  if (symbol < local_bias ||
+      symbol - local_bias > std::numeric_limits<std::uintptr_t>::max() - remote_bias) {
+    throw std::runtime_error("runtime symbol address translation overflows");
+  }
+  const auto remote_symbol = remote_bias + (symbol - local_bias);
+  {
+    // Verify the instructions involved in runtime calls and owned detours.
+    // Filesystem identities and rebuild polling are not part of this check.
+    if ((name != "dlopen" && name != "dlsym" && name != "__errno_location" &&
+         name != "pthread_create") ||
+        (!tracer::runtime::has_soname(local_address, "libc.so.6") &&
+         !tracer::runtime::has_soname(local_address, "libdl.so.2") &&
+         !tracer::runtime::has_soname(local_address, "libpthread.so.0"))) {
+      throw std::runtime_error("runtime loader identity is unavailable for " + symbol_name);
+    }
+    constexpr std::size_t bytes = 32;
+    auto contains_entry = [&](const auto& maps, std::uintptr_t address) {
+      return std::any_of(maps.begin(), maps.end(), [&](const MapEntry& entry) {
+        return same_module_path(entry, module_path) && entry.readable && entry.executable &&
+               address >= entry.start && address < entry.end && bytes <= entry.end - address;
+      });
+    };
+    std::array<std::uint8_t, bytes> remote_entry{};
+    if (!contains_entry(local_maps, symbol) || !contains_entry(remote_maps, remote_symbol)) {
+      throw std::runtime_error("loader entry is outside its verified executable mapping");
+    }
+    remote_read(remote_symbol, remote_entry.data(), remote_entry.size());
+    if (owned_patch) {
+      // A second shared probe sees this session's already-installed pthread
+      // adapter. Verify its complete live bytes, then compare its original
+      // entry to the exact local ELF, without exempting any other patch.
+      if (name != "pthread_create" || !owned_patch->expected || !owned_patch->replacement ||
+          owned_patch->address < remote_symbol || owned_patch->address - remote_symbol > 4 ||
+          !owned_patch->size ||
+          owned_patch->size > bytes - (owned_patch->address - remote_symbol)) {
+        throw std::runtime_error("invalid owned runtime patch identity");
+      }
+      std::array<std::uint8_t, bytes> installed{};
+      remote_read(owned_patch->address, installed.data(), owned_patch->size);
+      if (std::memcmp(installed.data(), owned_patch->replacement, owned_patch->size) != 0) {
+        throw std::runtime_error("owned runtime patch bytes changed");
+      }
+      std::memcpy(remote_entry.data() + (owned_patch->address - remote_symbol),
+                  owned_patch->expected, owned_patch->size);
+    }
+    if (std::memcmp(local_address, remote_entry.data(), bytes) != 0) {
+      throw std::runtime_error("runtime entry instructions do not match");
+    }
+  }
+  return remote_symbol;
+#else
   const auto entry = target_runtime_entry(process_id_, name);
   decltype(entry.bytes) live{};
   remote_read(entry.address, live.data(), live.size());
@@ -2272,6 +2398,7 @@ std::uintptr_t Process::resolve_remote_symbol(std::string_view name, const CodeP
     throw std::runtime_error("runtime entry instructions do not match");
   }
   return entry.address;
+#endif
 }
 
 } // namespace tracer::injector

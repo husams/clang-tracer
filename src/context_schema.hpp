@@ -180,6 +180,7 @@ render_context_codec_sources(clang::ASTContext&,
 struct SnapshotMemberAccessor {
   const clang::CXXRecordDecl *root_type = nullptr;
   std::string member_name;
+  bool erased_any = false;
 };
 CodecSourceResult render_snapshot_member_accessors(
     clang::ASTContext &,

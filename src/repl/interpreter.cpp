@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "interpreter.hpp"
 #include "check_process.hpp"
 #include "completion.hpp"
@@ -238,7 +239,7 @@ struct CppEngine::Impl {
         if (found->second != address) return false;
         continue;
       }
-      const auto flags = llvm::StringRef(name).starts_with("_ZN")
+      const auto flags = ::tracer::compat::starts_with(llvm::StringRef(name), "_ZN")
                              ? llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable
                              : llvm::JITSymbolFlags::Exported;
       symbols[jit->mangleAndIntern(name)] = {
@@ -595,7 +596,7 @@ void CppEngine::initialize() {
     if (!entry.isFile())
       continue;
     const auto buffer = entry.getFile().getContentCache().getBufferIfLoaded();
-    if (buffer && buffer->getBufferIdentifier().starts_with("input_line_"))
+    if (buffer && ::tracer::compat::starts_with(buffer->getBufferIdentifier(), "input_line_"))
       initial_cells.push_back(buffer->getBuffer().str());
   }
 #if LLVM_VERSION_MAJOR == 21

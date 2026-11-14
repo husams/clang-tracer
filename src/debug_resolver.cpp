@@ -1176,10 +1176,10 @@ void verify_rebound_method_signature(DWARFDie function, const api::PreparedInjec
   const auto &expected = prepared.signature();
   const auto &types = prepared.header_types();
   auto receiver = types.record_name();
-  if (receiver.starts_with("::"))
+  if (::tracer::compat::starts_with(receiver, "::"))
     receiver.erase(0, 2);
   const auto spelling = [](std::string value) {
-    if (value.starts_with("::"))
+    if (::tracer::compat::starts_with(value, "::"))
       value.erase(0, 2);
     return compact(value);
   };
@@ -1296,8 +1296,8 @@ std::string verified_function_code(std::uint32_t pid, const api::DebugInfo &info
 }
 
 api::ListModulesResponse list_debug_module_mappings(std::uint32_t pid,
-                                                   const std::string &elf_path) {
-  const auto paths = modules(pid);
+                                                   const std::string &elf_path, bool include_runtime) {
+  const auto paths = modules(pid, include_runtime);
   const auto mappings = read_executable_mappings(pid, paths);
   const auto fingerprint = mapping_fingerprint(paths, mappings);
   api::ListModulesResponse result;

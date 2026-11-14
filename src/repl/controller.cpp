@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "controller.hpp"
 #include "local_perf.hpp"
 #include "tracer/instruction_trace.h"
@@ -2368,7 +2369,7 @@ bool Controller::execute(const Command &command) {
         out_ << std::dec << " bytes=" << binding.original().size()
              << " module=" << std::quoted(binding.module())
              << " function=" << std::quoted(binding.function());
-        if (binding.role() == "store" || binding.role().starts_with("inline mutation "))
+        if (binding.role() == "store" || ::tracer::compat::starts_with(binding.role(), "inline mutation "))
           out_ << " original=" << hex(binding.original());
         if (binding.role() == "method")
           out_ << " patch_bytes=" << binding.patch_size() << " original=" << hex(binding.original());

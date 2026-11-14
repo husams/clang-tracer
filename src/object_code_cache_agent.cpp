@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "object_code_cache_protocol.hpp"
 
 #include "object_code_cache_decode.hpp"
@@ -12,7 +13,6 @@
 #include <llvm/Support/SHA256.h>
 
 #include <algorithm>
-#include <bit>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -24,8 +24,8 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
-#include <span>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -39,6 +39,7 @@
 #endif
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <link.h>
 #include <linux/futex.h>
 #include <signal.h>
@@ -160,7 +161,7 @@ struct Site {
   Address gate = 0;
   Address after_label = 0;
   std::uint32_t runtime_module = 0;
-  std::span<const Site> runtime_sites{};
+  ::tracer::compat::span<const Site> runtime_sites{};
   bool runtime_prefix = false, native_scope = false;
   bool before_hook = false;
   bool reclaimable = false;
@@ -386,6 +387,27 @@ void reclaim_code(State *watch) noexcept {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     ::dlclose(std::exchange(watch->module_pin, nullptr));
   }
+}
+
+void start_recycler(State &watch) {
+  // Legacy glibc may load libpthread after libstdc++'s weak reference to
+  // pthread_create was bound. A direct dependency resolves the active entry.
+  pthread_attr_t attributes;
+  int error = ::pthread_attr_init(&attributes);
+  if (error)
+    throw std::system_error(error, std::generic_category(), "initialize recycler attributes");
+  error = ::pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+  if (!error) {
+    pthread_t thread;
+    error = ::pthread_create(&thread, &attributes, +[](void *state) -> void * {
+      reclaim_code(static_cast<State *>(state));
+      return nullptr;
+    }, &watch);
+  }
+  ::pthread_attr_destroy(&attributes);
+  if (error)
+    throw std::system_error(error, std::generic_category(), "start code-cache recycler");
+  watch.recycler_started = true;
 }
 
 bool enter_static_code(State &watch) noexcept {
@@ -706,8 +728,8 @@ void stack(State &watch, Observation &event, const Registers &regs,
   if (watch.cfi_stack) {
     const auto original = before_store ? *before_store : application_registers(regs, event.pc);
     const auto depth = std::min<std::size_t>(watch.stack_depth, stack_limit);
-    const auto capture = capture_native_code_stack(original, std::span(event.frames).first(depth),
-                                                    std::span(event.stack_pointers).first(depth));
+    const auto capture = capture_native_code_stack(original, ::tracer::compat::span(event.frames).first(depth),
+                                                    ::tracer::compat::span(event.stack_pointers).first(depth));
     event.depth = capture.count;
     event.stack_status = static_cast<std::uint8_t>(capture.status);
     return;
@@ -801,7 +823,7 @@ bool collection_header(State &watch, const CollectionScope &scope,
   const auto &plan = watch.collection;
   if (plan.pointer_hops)
     return object_watch::read_pointee_chain(scope.owner,
-        std::span(plan.pointer_offsets).first(plan.pointer_hops), header, read_self<Address>);
+        ::tracer::compat::span(plan.pointer_offsets).first(plan.pointer_hops), header, read_self<Address>);
   if (plan.is_map) {
     header[2] = scope.owner + plan.map.header;
     return read_self(scope.owner + plan.map.root, header[0]) &&
@@ -933,7 +955,7 @@ void collection_boundary(State &watch, const Site &site, const Registers &regs, 
       scope.mutation_stack = regs.value(rsp);
     } else {
       Address return_pc;
-      if (!application_return(regs, return_pc) || !std::ranges::any_of(watch.sites, [&](const auto &successor) {
+      if (!application_return(regs, return_pc) || !std::any_of(std::begin(watch.sites), std::end(watch.sites), [&](const auto &successor) {
             return successor.instruction.collection_resume &&
                    successor.instruction.boundary_pc == instruction.boundary_pc &&
                    successor.instruction.pc == return_pc;
@@ -1374,8 +1396,10 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
         });
     const auto call = std::pair{inst.boundary_pc, return_pc};
     const bool uncertain = inst.uncertain_construct &&
-        !std::ranges::binary_search(watch.complete_constructor_returns, call, {},
-            [](const auto &site) { return std::pair{site.entry, site.return_pc}; });
+        !std::binary_search(watch.complete_constructor_returns.begin(), watch.complete_constructor_returns.end(),
+                            ConstructorReturn{call.first, call.second}, [](const auto &a, const auto &b) {
+                              return std::tie(a.entry, a.return_pc) < std::tie(b.entry, b.return_pc);
+                            });
     if (constructor && outer && !uncertain) {
       const std::lock_guard lock(watch.mutex);
       const auto prior = watch.lifetimes.find(object);
@@ -1420,7 +1444,7 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
     return;
   }
   const std::lock_guard lock(watch.mutex);
-  if (watch.lifetimes.contains(event.object)) {
+  if (watch.lifetimes.count(event.object)) {
     event.hook = Hook::construction_uncertain;
     emit(watch, event);
     return;
@@ -1460,10 +1484,10 @@ void snapshot_boundary(const Site &site, const Registers &regs) {
   const bool entry = site.instruction.hook == Hook::snapshot_entry;
   Address receiver = regs.value(rdi);
   if (entry) {
-    std::erase_if(snapshot_calls, [&](const auto &call) {
+    snapshot_calls.erase(std::remove_if(snapshot_calls.begin(), snapshot_calls.end(), [&](const auto &call) {
       return call.watch == &watch ? call.stack >= sp :
           call.watch->channel->reclaim_request.load(std::memory_order_acquire) != 0;
-    });
+    }), snapshot_calls.end());
     if (snapshot_calls.size() >= 64) {
       queue.drops.fetch_add(1, std::memory_order_relaxed);
       return;
@@ -1742,7 +1766,7 @@ void complete(const Site *site, const Registers *regs) {
         last.reset();
       } else {
         drift = last && *last != sample.old;
-        last = std::bit_cast<std::int32_t>(input);
+        last = ::tracer::compat::bit_cast<std::int32_t>(input);
       }
     }
   }
@@ -1775,14 +1799,14 @@ void complete(const Site *site, const Registers *regs) {
     bool has_old = sample.has_old && !overlapping && !drift;
     if (inst.hook == Hook::xadd) {
       const auto returned = static_cast<std::uint32_t>(regs->value(inst.result ? inst.result : inst.value));
-      old = std::bit_cast<std::int32_t>(returned);
+      old = ::tracer::compat::bit_cast<std::int32_t>(returned);
       has_old = true;
       input += returned;
     } else if (inst.hook == Hook::cas) {
-      old = std::bit_cast<std::int32_t>(sample.expected);
+      old = ::tracer::compat::bit_cast<std::int32_t>(sample.expected);
       has_old = true;
     }
-    event.new_value = std::bit_cast<std::int32_t>(input);
+    event.new_value = ::tracer::compat::bit_cast<std::int32_t>(input);
     const auto next_tag = overlapping ? std::nullopt : union_tag(watch, object);
     if (!watch.atomic && has_old && old == event.new_value && sample.old_tag == next_tag)
       return;
@@ -2243,7 +2267,7 @@ void fault(int sig, siginfo_t *info, void *context) {
     if (!selected(*watch))
       continue;
     const bool static_retired = watch->static_retired.load(std::memory_order_acquire);
-    const auto scan_sites = [&](std::span<const Site> sites) {
+    const auto scan_sites = [&](::tracer::compat::span<const Site> sites) {
       for (const auto &site : sites) {
         if (async && restore_dispatch(site, interrupted, signal_registers, destination)) {
           dispatching = &site;
@@ -2294,7 +2318,7 @@ void fault(int sig, siginfo_t *info, void *context) {
         return;
       }
     };
-    const auto find_helper = [&](const Mapping &mapping, std::span<const Site> sites) {
+    const auto find_helper = [&](const Mapping &mapping, ::tracer::compat::span<const Site> sites) {
       if (async && !faulting && !synthetic) {
         const auto base = reinterpret_cast<Address>(mapping.address);
         if (interrupted < base || interrupted - base >= mapping.size)
@@ -2458,7 +2482,7 @@ void fault(int sig, siginfo_t *info, void *context) {
     // A handler can retry, skip, or branch to another original instruction.
     // Start at the corresponding hook boundary, discarding any failed sample.
     const auto resume_sites = faulting->runtime_sites.empty() ?
-        std::span<const Site>(faulting->watch->sites) : faulting->runtime_sites;
+        ::tracer::compat::span<const Site>(faulting->watch->sites) : faulting->runtime_sites;
     const bool holds_static = faulting->reclaimable &&
         ((part != Part::entry_gate && part != Part::exit_gate) || gate_reference);
     for (const auto &site : resume_sites)
@@ -3033,7 +3057,7 @@ std::unique_ptr<Mapping> make_tail_gate(Site &site, const XState &xstate) {
   return gate;
 }
 
-std::unique_ptr<Mapping> translate(std::span<Site> sites, Function &function, const XState &xstate,
+std::unique_ptr<Mapping> translate(::tracer::compat::span<Site> sites, Function &function, const XState &xstate,
                                    const StaticLink *links = nullptr, Address *tail_entry = nullptr) {
   Emitter out;
   std::map<Address, std::size_t> labels;
@@ -3152,7 +3176,7 @@ std::unique_ptr<Mapping> translate(std::span<Site> sites, Function &function, co
   return map;
 }
 
-void install_static_fragment(State &watch, std::span<Site> sites, Function &function,
+void install_static_fragment(State &watch, ::tracer::compat::span<Site> sites, Function &function,
                              const XState &xstate, RuntimeBlock *scope = nullptr) {
   auto &gates = scope ? scope->tail_gates : watch.mappings;
   auto &bodies = scope ? scope->scope_bodies : watch.static_bodies;
@@ -3514,7 +3538,7 @@ std::unique_ptr<Mapping> make_tail_gate(Site &site, const XState &xstate) {
   return mapping;
 }
 
-std::unique_ptr<Mapping> translate(std::span<Site> sites, Function &function,
+std::unique_ptr<Mapping> translate(::tracer::compat::span<Site> sites, Function &function,
                                    const XState &xstate, const StaticLink *links = nullptr,
                                    Address *tail_entry = nullptr) {
   Emitter out;
@@ -3701,11 +3725,11 @@ std::unique_ptr<Mapping> translate(std::span<Site> sites, Function &function,
   return map;
 }
 
-void install_static_fragment(State &watch, std::span<Site> sites, Function &function,
+void install_static_fragment(State &watch, ::tracer::compat::span<Site> sites, Function &function,
                              const XState &xstate, RuntimeBlock *scope = nullptr) {
   auto &gates = scope ? scope->tail_gates : watch.mappings;
   auto &bodies = scope ? scope->scope_bodies : watch.static_bodies;
-  if (std::ranges::any_of(sites, [](const auto &site) {
+  if (std::any_of(std::begin(sites), std::end(sites), [](const auto &site) {
         return site.instruction.flow == Flow::runtime_call || site.instruction.flow == Flow::runtime_tail;
       })) {
     auto mapping = translate(sites, function, xstate);
@@ -3731,7 +3755,7 @@ void install_static_fragment(State &watch, std::span<Site> sites, Function &func
     if (inst.size == 1 && inst.bytes[0] == 0xc3)
       add_exit(inst.pc, true);
     if (inst.flow != Flow::copy &&
-        std::ranges::none_of(sites, [&](const auto &other) { return other.instruction.pc == inst.target; }))
+        std::none_of(std::begin(sites), std::end(sites), [&](const auto &other) { return other.instruction.pc == inst.target; }))
       add_exit(inst.target);
   }
   std::string error;
@@ -3774,7 +3798,7 @@ RuntimeLocation locate_runtime_target(Address target) {
       continue;
     if (permissions[0] != 'r' || permissions[2] != 'x' || permissions[1] == 'w' ||
         !inode || line.size() <= static_cast<std::size_t>(path_offset) || line[path_offset] != '/' ||
-        line.ends_with(" (deleted)") || target - begin > UINT64_MAX - offset)
+        ::tracer::compat::ends_with(line, " (deleted)") || target - begin > UINT64_MAX - offset)
       break;
     location.end = end;
     location.offset = offset + target - begin;
@@ -3799,7 +3823,7 @@ RuntimeLocation locate_runtime_target(Address target) {
     if (query.target < info->dlpi_addr)
       return 0;
     const auto address = query.target - info->dlpi_addr;
-    for (const auto &segment : std::span(info->dlpi_phdr, info->dlpi_phnum)) {
+    for (const auto &segment : ::tracer::compat::span(info->dlpi_phdr, info->dlpi_phnum)) {
       if (segment.p_type != PT_LOAD || !(segment.p_flags & PF_X) || address < segment.p_vaddr)
         continue;
       const auto delta = address - segment.p_vaddr;
@@ -4011,7 +4035,7 @@ void prepare_runtime_scope(RuntimeBlock &block, State &watch, Address start,
           const auto interior = targets.upper_bound(start);
           if (end - start < 10 || end - start > RuntimePatch{}.original.size() ||
               (interior != targets.end() && *interior < end) ||
-              std::ranges::any_of(fragments, [&](const auto &prior) {
+              std::any_of(std::begin(fragments), std::end(fragments), [&](const auto &prior) {
                 return prior.code.front().pc < end &&
                     start < prior.code.back().pc + prior.code.back().size;
               }))
@@ -4029,7 +4053,7 @@ void prepare_runtime_scope(RuntimeBlock &block, State &watch, Address start,
     } else if (store(inst) && !covered_stores.count(inst.address)) {
       Fragment fragment;
       const auto overlaps = [&](Address begin, Address end) {
-        return std::ranges::any_of(fragments, [&](const auto &prior) {
+        return std::any_of(std::begin(fragments), std::end(fragments), [&](const auto &prior) {
           return prior.code.front().pc < end && begin < prior.code.back().pc + prior.code.back().size;
         });
       };
@@ -4066,8 +4090,8 @@ void prepare_runtime_scope(RuntimeBlock &block, State &watch, Address start,
         block.partial = true;
         continue;
       }
-      auto decoded = std::ranges::lower_bound(body.instructions, fragment.code.front().pc, {},
-                                              &native_entry::Instruction::address);
+      auto decoded = std::lower_bound(body.instructions.begin(), body.instructions.end(), fragment.code.front().pc,
+          [](const auto &inst, Address address) { return inst.address < address; });
       for (auto &out : fragment.code) {
         if (store(*decoded)) {
           instrument_store(out, *decoded->store32);
@@ -4077,7 +4101,7 @@ void prepare_runtime_scope(RuntimeBlock &block, State &watch, Address start,
       }
       fragments.push_back(std::move(fragment));
     } else if (inst.flow == NativeFlow::ordinary && inst.may_store && !store(inst) &&
-               !inst.changes_stack && !inst.text.starts_with("push")) {
+               !inst.changes_stack && !::tracer::compat::starts_with(inst.text, "push")) {
       block.partial = true;
     } else if (inst.flow == NativeFlow::branch && inst.target && !targets.count(*inst.target)) {
       block.partial = true;
@@ -4099,7 +4123,7 @@ void prepare_runtime_scope(RuntimeBlock &block, State &watch, Address start,
   for (const auto &fragment : fragments) {
     const auto pc = fragment.code.front().pc;
     const auto size = fragment.code.back().pc + fragment.code.back().size - pc;
-    auto sites = std::span(block.sites).subspan(offset, fragment.code.size());
+    auto sites = ::tracer::compat::span(block.sites).subspan(offset, fragment.code.size());
     for (auto &site : sites)
       site.runtime_sites = sites;
     Function function{nullptr, fragment.code.size(), pc, 0, fragment.resume};
@@ -4192,7 +4216,7 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
     return fallback;
   if (watch.channel->reclaim_request.load(std::memory_order_acquire))
     return fallback;
-  if (std::ranges::binary_search(watch.static_scopes, target))
+  if (std::binary_search(watch.static_scopes.begin(), watch.static_scopes.end(), target))
     return fallback;
   std::uint8_t gap = 1;
   if (!inside_helper) {
@@ -4256,7 +4280,7 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
         throw std::runtime_error("runtime callee bytes disagree with the mapped ELF");
       const auto decoded = native_entry::scan(target, block->bytes);
       const bool nonleaf = !decoded.decode_failed && decoded.diagnostic.empty() &&
-          std::ranges::any_of(decoded.instructions, [](const auto &inst) {
+          std::any_of(std::begin(decoded.instructions), std::end(decoded.instructions), [](const auto &inst) {
             return inst.flow == NativeFlow::call;
           });
       const auto module_index = fresh ? watch.runtime_modules + 1 : image.module_index;
@@ -4310,8 +4334,7 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
         block->mapping = translate(block->sites, function, xstate, nullptr, &block->tail_entry);
       }
       if (!watch.recycler_started) {
-        std::thread(reclaim_code, &watch).detach();
-        watch.recycler_started = true;
+        start_recycler(watch);
       }
       if (fresh) {
         auto *module = watch.channel->module(watch.event_buffer, module_index - 1);
@@ -4423,7 +4446,7 @@ void initialize(Init &init
       spec.set_snapshot_max_bytes(specification.snapshot_max_bytes());
       spec.set_snapshot_max_string_bytes(specification.max_string_bytes());
       spec.set_snapshot_max_depth(specification.snapshot_max_depth());
-      for (const auto &source : std::span(snapshot->read_only).first(snapshot->read_only_count)) {
+      for (const auto &source : ::tracer::compat::span(snapshot->read_only).first(snapshot->read_only_count)) {
         auto &range = *spec.add_snapshot_rtti_ranges();
         range.set_begin(source.begin);
         range.set_end(source.end);
@@ -4480,7 +4503,7 @@ void initialize(Init &init
         !module || module->l_addr != init.module_bias)
       throw std::runtime_error("cannot pin the verified shared image at its live load bias");
   }
-  const std::span functions(init.functions, init.function_count);
+  const ::tracer::compat::span functions(init.functions, init.function_count);
   for (const auto &function : functions)
     for (std::size_t i = 0; i < function.count; ++i)
       watch->sites.push_back({function.instructions[i], watch.get(), function.instructions[0].pc});
@@ -4489,7 +4512,7 @@ void initialize(Init &init
   for (auto &function : functions) {
     if (!function.count)
       continue;
-    auto sites = std::span(watch->sites).subspan(first, function.count);
+    auto sites = ::tracer::compat::span(watch->sites).subspan(first, function.count);
     install_static_fragment(*watch, sites, function, xstate);
     first += function.count;
   }
@@ -4497,8 +4520,7 @@ void initialize(Init &init
   if (!watch->static_bodies.empty())
     watch->channel->static_fragments.store(watch->static_bodies.size(), std::memory_order_release);
   if (!watch->static_bodies.empty() || (watch->module_pin && watch->runtime_limit)) {
-    std::thread(reclaim_code, watch.get()).detach();
-    watch->recycler_started = true;
+    start_recycler(*watch);
   }
   watch->previous = retained.load(std::memory_order_relaxed);
   retained.store(watch.release(), std::memory_order_release);

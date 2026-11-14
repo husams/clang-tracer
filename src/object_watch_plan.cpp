@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "object_watch_plan.hpp"
 #include "object_code_cache_protocol.hpp"
 #include <llvm/Support/SHA256.h>
@@ -9,7 +10,6 @@
 #include "native_detour.hpp"
 
 #include <algorithm>
-#include <bit>
 #include <cctype>
 #include <cstring>
 #include <filesystem>
@@ -216,15 +216,15 @@ std::string storage_spelling(std::string_view type, unsigned depth = 0) {
     return "?";
   type = type.substr(first, type.find_last_not_of(" \t") - first + 1);
   for (const std::string_view qualifier : {"const ", "volatile ", "class ", "struct "})
-    if (type.starts_with(qualifier))
+    if (::tracer::compat::starts_with(type, qualifier))
       return storage_spelling(type.substr(qualifier.size()), depth + 1);
   for (const std::string_view qualifier : {" const", " volatile"})
-    if (type.ends_with(qualifier))
+    if (::tracer::compat::ends_with(type, qualifier))
       return storage_spelling(type.substr(0, type.size() - qualifier.size()), depth + 1);
-  if (type.ends_with("*"))
+  if (::tracer::compat::ends_with(type, "*"))
     return "*" + storage_spelling(type.substr(0, type.size() - 1), depth + 1);
   const auto angle = type.find('<');
-  if (angle != std::string_view::npos && type.ends_with(">")) {
+  if (angle != std::string_view::npos && ::tracer::compat::ends_with(type, ">")) {
     std::string result(type.substr(0, angle));
     const auto args = type.substr(angle + 1, type.size() - angle - 2);
     std::size_t start = 0;
@@ -266,7 +266,7 @@ std::string storage_spelling(std::string_view type, unsigned depth = 0) {
         return std::isdigit(c) != 0;
       }))
     return "#" + std::string(type);
-  return std::string(type.starts_with("::") ? type.substr(2) : type);
+  return std::string(::tracer::compat::starts_with(type, "::") ? type.substr(2) : type);
 }
 
 std::string storage_type(DWARFDie die, unsigned depth = 0) {
@@ -575,7 +575,7 @@ bool writer_receiver(DWARFDie function, std::uint64_t entry, const std::string &
     const auto encoding = storage_type(result);
     if (!scalar_result || !(encoding == "bool" || encoding == "signed32" || encoding == "unsigned32" ||
                            encoding == "signed64" || encoding == "unsigned64" ||
-                           encoding.starts_with("*") || encoding.starts_with("&")))
+                           ::tracer::compat::starts_with(encoding, "*") || ::tracer::compat::starts_with(encoding, "&")))
       return false; // A hidden result argument can change the receiver register.
   }
   for (const auto parameter : function.children()) {
@@ -656,11 +656,11 @@ struct InlineAnchors {
 };
 
 std::optional<InlineAnchors> verified_inline_region(const native_entry::Preview &body,
-    std::span<const InlineMutation::Range> ranges) {
+    ::tracer::compat::span<const InlineMutation::Range> ranges) {
   if (ranges.empty() || body.instructions.empty() || body.decode_failed || !body.diagnostic.empty())
     return std::nullopt;
   const auto containing = [&](std::uint64_t pc) {
-    return std::ranges::find_if(ranges, [&](const auto &range) {
+    return std::find_if(std::begin(ranges), std::end(ranges), [&](const auto &range) {
       return range.first <= pc && pc < range.second;
     });
   };
@@ -697,8 +697,8 @@ std::optional<InlineAnchors> verified_inline_region(const native_entry::Preview 
       edge(*inst.target);
   }
   if (entries.size() != 1 || exits.empty() ||
-      !std::ranges::includes(instructions, exits) ||
-      std::ranges::any_of(ranges, [&](const auto &range) {
+      !std::includes(instructions.begin(), instructions.end(), exits.begin(), exits.end()) ||
+      std::any_of(std::begin(ranges), std::end(ranges), [&](const auto &range) {
         return !instructions.count(range.first) || !boundaries.count(range.second);
       }))
     return std::nullopt;
@@ -761,7 +761,7 @@ std::vector<InlineMutation> inline_mutations_in(DWARFDie writer, std::uint64_t b
         }
         if (ranges->empty())
           throw std::runtime_error("inlined collection mutation has no verified code range");
-        std::ranges::sort(*ranges, {}, &llvm::DWARFAddressRange::LowPC);
+        std::sort(ranges->begin(), ranges->end(), [](const auto &a, const auto &b) { return a.LowPC < b.LowPC; });
         std::vector<InlineMutation::Range> code;
         for (const auto &range : *ranges) {
           if (range.LowPC >= range.HighPC || range.HighPC > UINT64_MAX - bias ||
@@ -783,7 +783,7 @@ std::vector<InlineMutation> inline_mutations_in(DWARFDie writer, std::uint64_t b
         if (!anchors || !receiver)
           throw std::runtime_error("inlined collection mutation requires a verified receiver and continuation");
         const auto begin = anchors->begin;
-        const auto span = std::ranges::find_if(code, [&](const auto &range) {
+        const auto span = std::find_if(std::begin(code), std::end(code), [&](const auto &range) {
           return range.first <= begin && begin < range.second;
         });
         result.push_back({begin, span->second, receiver->first, receiver->second,
@@ -800,7 +800,7 @@ std::vector<InlineMutation> inline_mutations_in(DWARFDie writer, std::uint64_t b
 
 Layout inspect_vector(DWARFDie owner, const clangtracer::v1::ObjectWatchRequest &request) {
   const auto vector = member(owner, request.vector_field());
-  if (!qualified(vector.type).starts_with("std::vector<"))
+  if (!::tracer::compat::starts_with(qualified(vector.type), "std::vector<"))
     throw std::runtime_error("logical element capture requires a libstdc++ vector");
   const auto implementation = member(vector.type, "_M_impl");
   const auto begin = member(implementation.type, "_M_start");
@@ -848,13 +848,13 @@ Member pointee_storage(DWARFDie wrapper) {
     return {type(wrapper), 0};
   const auto identity = qualified(wrapper);
   const auto target = named_type(wrapper, "_Tp");
-  if (target && identity.starts_with("std::shared_ptr<")) {
+  if (target && ::tracer::compat::starts_with(identity, "std::shared_ptr<")) {
     const auto data = member(wrapper, "_M_ptr");
     if (pointer(data.type) && qualified(type(data.type)) == qualified(target))
       return {target, data.offset};
-  } else if (target && identity.starts_with("std::unique_ptr<") && size_of(wrapper) == 8) {
+  } else if (target && ::tracer::compat::starts_with(identity, "std::unique_ptr<") && size_of(wrapper) == 8) {
     const auto deleter = named_type(wrapper, "_Dp");
-    if (qualified(deleter).starts_with("std::default_delete<") &&
+    if (::tracer::compat::starts_with(qualified(deleter), "std::default_delete<") &&
         qualified(named_type(deleter, "_Tp")) == qualified(target)) {
       std::set<std::uint64_t> candidates;
       find_pointee(wrapper, qualified(target), 0, candidates, 32);
@@ -867,7 +867,7 @@ Member pointee_storage(DWARFDie wrapper) {
 
 Layout inspect_map(DWARFDie owner, const clangtracer::v1::ObjectWatchRequest &request) {
   const auto map = member(owner, request.map_field());
-  if (!qualified(map.type).starts_with("std::map<"))
+  if (!::tracer::compat::starts_with(qualified(map.type), "std::map<"))
     throw std::runtime_error("logical map capture requires a libstdc++ map");
   const auto tree = member(map.type, "_M_t");
   const auto implementation = member(tree.type, "_M_impl");
@@ -881,8 +881,8 @@ Layout inspect_map(DWARFDie owner, const clangtracer::v1::ObjectWatchRequest &re
   const auto pair = named_type(tree.type, "_Val");
   const auto comparator = named_type(tree.type, "_Compare");
   if (!pointer(link) || !record(node) || !record(pair) ||
-      !qualified(node).starts_with("std::_Rb_tree_node<") || !qualified(pair).starts_with("std::pair<") ||
-      !qualified(comparator).starts_with("std::less<") ||
+      !::tracer::compat::starts_with(qualified(node), "std::_Rb_tree_node<") || !::tracer::compat::starts_with(qualified(pair), "std::pair<") ||
+      !::tracer::compat::starts_with(qualified(comparator), "std::less<") ||
       !pointer(parent.type) || !pointer(left.type) || !pointer(right.type) ||
       storage_type(count.type) != "unsigned64")
     throw std::runtime_error("cannot verify the libstdc++ map tree, comparator or node layout");
@@ -898,7 +898,7 @@ Layout inspect_map(DWARFDie owner, const clangtracer::v1::ObjectWatchRequest &re
   bool opaque_union = false;
   const auto scalar = nested_member(value.type, request.field(), opaque_union);
   if (!fixed_base || size_of(storage.type) != size_of(pair) ||
-      !qualified(key.type).starts_with("std::__cxx11::basic_string<char") ||
+      !::tracer::compat::starts_with(qualified(key.type), "std::__cxx11::basic_string<char") ||
       qualified(named_type(key.type, "_Traits")) != "std::char_traits<char>" ||
       qualified(named_type(key.type, "_Alloc")) != "std::allocator<char>" ||
       qualified(named_type(comparator, "_Tp")) != qualified(key.type) ||
@@ -1025,7 +1025,7 @@ Layout inspect_layout(llvm::DWARFContext &dwarf,
       if (child.getTag() == dw::DW_TAG_subprogram)
         virtual_member |= number(child, dw::DW_AT_virtuality).value_or(0) != 0;
       if (child.getTag() == dw::DW_TAG_member && child.find(dw::DW_AT_artificial) &&
-          (name(child).starts_with("_vptr.") || name(child).starts_with("_vptr$")) &&
+          (::tracer::compat::starts_with(name(child), "_vptr.") || ::tracer::compat::starts_with(name(child), "_vptr$")) &&
           number(child, dw::DW_AT_data_member_location) == 0 &&
           pointer(type(child)))
         primary_vptr = true;
@@ -1059,7 +1059,7 @@ Layout inspect_layout(llvm::DWARFContext &dwarf,
   if (!request.snapshot_field().empty()) {
     const auto string = member(base, request.snapshot_field());
     const auto string_name = qualified(string.type);
-    if (!string_name.starts_with("std::__cxx11::basic_string<char,") &&
+    if (!::tracer::compat::starts_with(string_name, "std::__cxx11::basic_string<char,") &&
         string_name != "std::__cxx11::basic_string<char>")
       throw std::runtime_error("snapshot field must use the libstdc++ C++11 std::string ABI");
     const auto data = member(string.type, "_M_dataplus");
@@ -1075,7 +1075,7 @@ Layout inspect_layout(llvm::DWARFContext &dwarf,
   }
 
   const auto vector = member(owner, request.collection());
-  if (!qualified(vector.type).starts_with("std::vector<"))
+  if (!::tracer::compat::starts_with(qualified(vector.type), "std::vector<"))
     throw std::runtime_error("owner field must be a libstdc++ vector");
   const auto implementation = member(vector.type, "_M_impl");
   const auto begin = member(implementation.type, "_M_start");
@@ -1083,7 +1083,7 @@ Layout inspect_layout(llvm::DWARFContext &dwarf,
   const auto capacity = member(implementation.type, "_M_end_of_storage");
   const auto element = type(begin.type);
   if (!pointer(begin.type) || begin.type != end.type || begin.type != capacity.type ||
-      !qualified(element).starts_with("std::unique_ptr<"))
+      !::tracer::compat::starts_with(qualified(element), "std::unique_ptr<"))
     throw std::runtime_error("owner field must be a vector of libstdc++ unique_ptr");
   const auto stride = number(element, dw::DW_AT_byte_size);
   std::set<std::uint64_t> pointee;
@@ -1107,7 +1107,7 @@ struct Symbol {
 
 bool operator_delete_name(std::string_view linkage) {
   const auto name = llvm::demangle(linkage);
-  return name.starts_with("operator delete(") || name.find("::operator delete(") != std::string::npos;
+  return ::tracer::compat::starts_with(name, "operator delete(") || name.find("::operator delete(") != std::string::npos;
 }
 
 void append_symbols(const ObjectFile &object, std::vector<Symbol> &symbols) {
@@ -1279,7 +1279,7 @@ struct Plan::Image {
         continue;
       const auto number = name.substr(suffix + 5);
       if (number.empty() || (number.size() > 1 && number.front() == '.' &&
-          std::ranges::all_of(number.substr(1), [](char ch) { return ch >= '0' && ch <= '9'; })))
+          std::all_of(std::begin(number.substr(1)), std::end(number.substr(1)), [](char ch) { return ch >= '0' && ch <= '9'; })))
         hot_names.insert(name.substr(0, suffix));
     }
     if (hot_names.empty())
@@ -1379,10 +1379,10 @@ struct Plan::Image {
       // stubs. Match their GOT slots by relocation, independent of order.
       for (std::size_t offset = 0; offset + 16 <= contents->size(); offset += 16) {
         const auto stub = contents->substr(offset, 16);
-        if (!stub.starts_with("\xf3\x0f\x1e\xfa"))
+        if (!::tracer::compat::starts_with(stub, "\xf3\x0f\x1e\xfa"))
           continue;
         const auto jump = stub[4] == '\xf2' ? 5 : 4; // Optional BND prefix.
-        if (!stub.substr(jump).starts_with("\xff\x25"))
+        if (!::tracer::compat::starts_with(stub.substr(jump), "\xff\x25"))
           continue;
         std::int32_t displacement;
         std::memcpy(&displacement, stub.data() + jump + 2, sizeof(displacement));
@@ -1395,7 +1395,7 @@ struct Plan::Image {
 #endif
 
   bool is_delete_target(std::uint64_t address) const {
-    if (std::ranges::any_of(symbols, [&](const auto &symbol) {
+    if (std::any_of(std::begin(symbols), std::end(symbols), [&](const auto &symbol) {
           return symbol.kind == llvm::ELF::STT_FUNC && symbol.range.first == address &&
               operator_delete_name(symbol.linkage);
         }))
@@ -1490,7 +1490,7 @@ struct Plan::Image {
           return false;
         const auto symbol = compact(s.demangled);
         return symbol == normalized ||
-            (normalized.find('(') == std::string::npos && symbol.starts_with(normalized + "("));
+            (normalized.find('(') == std::string::npos && ::tracer::compat::starts_with(symbol, normalized + "("));
       });
     }
     if (selector.find('(') != std::string::npos || selector.find("::") != std::string::npos) {
@@ -1562,10 +1562,10 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   const auto &concrete = request.concrete_type();
   const auto leaf = leaf_name(concrete);
   const auto owns_lifetime = [&](const Image &image) {
-    return std::ranges::any_of(image.symbols, [&](const auto &symbol) {
+    return std::any_of(std::begin(image.symbols), std::end(image.symbols), [&](const auto &symbol) {
       return symbol.kind == llvm::ELF::STT_FUNC &&
-          symbol.demangled.starts_with(concrete + "::" + leaf + "(") &&
-          (symbol.linkage.contains("C1E") || symbol.linkage.contains("C2E"));
+          ::tracer::compat::starts_with(symbol.demangled, concrete + "::" + leaf + "(") &&
+          ((symbol.linkage.find("C1E") != std::string::npos) || (symbol.linkage.find("C2E") != std::string::npos));
     });
   };
   const bool standalone_shared = main_ && request.borrow_caller().empty() &&
@@ -1578,8 +1578,8 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       std::set<llvm::DWARFUnit *> constructor_units;
       for (const auto &symbol : image_->symbols) {
         if (symbol.kind != llvm::ELF::STT_FUNC ||
-            !symbol.demangled.starts_with(concrete + "::" + leaf + "(") ||
-            !symbol.linkage.contains(variant))
+            !::tracer::compat::starts_with(symbol.demangled, concrete + "::" + leaf + "(") ||
+            symbol.linkage.find(variant) == std::string::npos)
           continue;
         if (const auto entry = image_->dwarf->getDIEsForAddress(symbol.range.first); entry.CompileUnit)
           constructor_units.insert(entry.CompileUnit);
@@ -1660,7 +1660,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   const auto add_boundary = [&](Image &boundary_image, Boundary role, const std::string &prefix,
                                 std::string_view variant = {}, bool required = true) {
     const auto matches_prefix = [&](const Symbol &symbol) {
-      return symbol.kind == llvm::ELF::STT_FUNC && symbol.demangled.starts_with(prefix + "(") &&
+      return symbol.kind == llvm::ELF::STT_FUNC && ::tracer::compat::starts_with(symbol.demangled, prefix + "(") &&
           symbol.linkage.find('.') == std::string::npos;
     };
     const auto base_variant = variant == "C1E" ? "C2E" : variant == "D1Ev" ? "D2Ev" : "";
@@ -1669,7 +1669,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     for (const auto &symbol : boundary_image.symbols) {
       if (!matches_prefix(symbol))
         continue;
-      if (variant.empty() || symbol.linkage.contains(variant)) {
+      if (variant.empty() || symbol.linkage.find(variant) != std::string::npos) {
         ranges.insert(symbol.range);
         complete_overloads.insert(symbol.demangled);
       }
@@ -1681,10 +1681,10 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       // Clang may emit only the base variant for an inline definition. It
       // has the complete-object ABI only when there is no virtual base/VTT.
       const auto missing_complete = [&](const Symbol &symbol) {
-        return matches_prefix(symbol) && symbol.linkage.contains(base_variant) &&
-            !complete_overloads.contains(symbol.demangled);
+        return matches_prefix(symbol) && symbol.linkage.find(base_variant) != std::string::npos &&
+            !complete_overloads.count(symbol.demangled);
       };
-      if (std::ranges::any_of(boundary_image.symbols, missing_complete)) {
+      if (std::any_of(std::begin(boundary_image.symbols), std::end(boundary_image.symbols), missing_complete)) {
         std::set<DWARFDie> seen;
         auto *unit = &boundary_image == image_.get() ? layout_unit : nullptr;
         if (!has_virtual_bases(find_record(*boundary_image.dwarf, concrete, unit), seen))
@@ -1743,7 +1743,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         if (argument && (argument.getTag() == dw::DW_TAG_reference_type ||
                          argument.getTag() == dw::DW_TAG_rvalue_reference_type))
           argument = type(argument);
-        if (record(argument) && qualified(argument).starts_with("std::unique_ptr<")) {
+        if (record(argument) && ::tracer::compat::starts_with(qualified(argument), "std::unique_ptr<")) {
           std::set<std::uint64_t> offsets;
           find_pointee(argument, request.base_type(), 0, offsets, 32);
           ownership_argument |= offsets == std::set<std::uint64_t>{layout.pointee} &&
@@ -1836,12 +1836,12 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         debug.CompileUnit->getInlinedChainForAddress(address, chain);
         // Aggregate initialization can call a base constructor directly. Only
         // classify callers when DWARF also rules out known aggregate candidates.
-        if (chain.empty() || std::ranges::any_of(chain, [](const auto die) {
+        if (chain.empty() || std::any_of(std::begin(chain), std::end(chain), [](const auto die) {
               const auto *linkage = die.getName(llvm::DINameKind::LinkageName);
               if (!linkage)
                 return true;
               llvm::ItaniumPartialDemangler parsed;
-              return parsed.partialDemangle(linkage) ? std::string_view(linkage).starts_with("_Z") :
+              return parsed.partialDemangle(linkage) ? ::tracer::compat::starts_with(std::string_view(linkage), "_Z") :
                   parsed.isCtorOrDtor();
             }))
           continue;
@@ -1873,26 +1873,26 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         } catch (const std::runtime_error &) {
           // A selected mutation may exist only as DWARF inline instances.
         }
-        const bool direct = mutation && std::ranges::any_of(writer_body.instructions, [&](const auto &inst) {
+        const bool direct = mutation && std::any_of(std::begin(writer_body.instructions), std::end(writer_body.instructions), [&](const auto &inst) {
           return inst.flow == native_entry::Flow::call && inst.target == bias + mutation->first;
         });
         if (!direct) {
           const auto inlined = inline_mutations_in(writer_debug.FunctionDIE, bias, selector,
                                                    container_name, writer_body);
           for (const auto &region : inlined) {
-            if (std::ranges::any_of(inline_mutations, [&](const auto &prior) {
+            if (std::any_of(std::begin(inline_mutations), std::end(inline_mutations), [&](const auto &prior) {
                   const auto &other = prior.second;
                   const auto reaches = [](const auto &range, const auto &continuations) {
-                    const auto next = std::ranges::lower_bound(continuations, range.first);
+                    const auto next = std::lower_bound(continuations.begin(), continuations.end(), range.first);
                     return next != continuations.end() && *next < range.second;
                   };
-                  return std::ranges::any_of(region.continuations, [&](const auto pc) {
-                    return std::ranges::binary_search(other.continuations, pc);
-                  }) || std::ranges::any_of(other.ranges, [&](const auto &previous) {
+                  return std::any_of(std::begin(region.continuations), std::end(region.continuations), [&](const auto pc) {
+                    return std::binary_search(other.continuations.begin(), other.continuations.end(), pc);
+                  }) || std::any_of(std::begin(other.ranges), std::end(other.ranges), [&](const auto &previous) {
                     return reaches(previous, region.continuations);
-                  }) || std::ranges::any_of(region.ranges, [&](const auto &range) {
+                  }) || std::any_of(std::begin(region.ranges), std::end(region.ranges), [&](const auto &range) {
                     return reaches(range, other.continuations) ||
-                        std::ranges::any_of(other.ranges, [&](const auto &previous) {
+                        std::any_of(std::begin(other.ranges), std::end(other.ranges), [&](const auto &previous) {
                           return range.first < previous.second && previous.first < range.second;
                         });
                   });
@@ -1900,7 +1900,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
               throw std::runtime_error("inlined collection mutation boundaries overlap");
             inline_mutations.emplace(region.begin, region);
             const auto install_anchor = [&](std::uint64_t pc) {
-              const auto inst = std::ranges::find_if(writer_body.instructions, [&](const auto &candidate) {
+              const auto inst = std::find_if(std::begin(writer_body.instructions), std::end(writer_body.instructions), [&](const auto &candidate) {
                 return candidate.address == pc;
               });
               auto &site = sites.try_emplace(pc, Site{std::string(code(pc).substr(0, inst->size)),
@@ -1935,7 +1935,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     const auto bytes = code(start).substr(0, length);
     if (bytes.size() != length || length > UINT64_MAX - start)
       throw std::runtime_error("writer function exceeds its ELF text section");
-    if (std::ranges::any_of(writer_ranges, [&](const auto &prior) {
+    if (std::any_of(std::begin(writer_ranges), std::end(writer_ranges), [&](const auto &prior) {
           return prior.first < start + length && start < prior.first + prior.second.size();
         }))
       throw std::invalid_argument("selected writer functions overlap");
@@ -1944,7 +1944,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     if (decoded.decode_failed || !decoded.diagnostic.empty())
       throw std::runtime_error("cannot decode the selected writer function");
     auto previous_end = start;
-    const auto indirect = std::ranges::find_if(decoded.instructions, [](const auto &instruction) {
+    const auto indirect = std::find_if(std::begin(decoded.instructions), std::end(decoded.instructions), [](const auto &instruction) {
       return instruction.flow == native_entry::Flow::branch && !instruction.target;
     });
     const bool has_indirect = indirect != decoded.instructions.end();
@@ -2035,9 +2035,9 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         const auto overlaps = [&](std::uint64_t pc, std::size_t width) {
           return pc < callee + size && callee < pc + width;
         };
-        if (std::ranges::any_of(boundaries, [&](const auto &item) {
+        if (std::any_of(std::begin(boundaries), std::end(boundaries), [&](const auto &item) {
               return overlaps(item.first, item.second);
-            }) || std::ranges::any_of(writer_ranges, [&](const auto &item) {
+            }) || std::any_of(std::begin(writer_ranges), std::end(writer_ranges), [&](const auto &item) {
               return overlaps(item.first, item.second.size());
             }))
           continue;
@@ -2046,9 +2046,9 @@ Plan::Plan(std::uint32_t pid, std::string executable,
           continue;
         const auto child = native_entry::scan(callee, callee_bytes);
         if (child.decode_failed || !child.diagnostic.empty() ||
-            std::ranges::any_of(child.instructions, [](const auto &inst) {
+            std::any_of(std::begin(child.instructions), std::end(child.instructions), [](const auto &inst) {
               return inst.flow == Flow::branch && !inst.target;
-            }) || std::ranges::none_of(child.instructions, [](const auto &inst) {
+            }) || std::none_of(std::begin(child.instructions), std::end(child.instructions), [](const auto &inst) {
               return inst.flow == Flow::call;
             }))
           continue;
@@ -2234,7 +2234,7 @@ std::string Plan::runtime_scope_code(const std::string &path,
   for (const auto pc : inspect(original))
     entries.try_emplace(pc);
   find_direct_redirects(runtime, entries, DirectEdges::redirects);
-  if (std::ranges::any_of(entries, [](const auto &item) { return !item.second.empty(); }))
+  if (std::any_of(std::begin(entries), std::end(entries), [](const auto &item) { return !item.second.empty(); }))
     throw std::runtime_error("an application edge enters a runtime scope redirect");
   return std::string(original);
 }
@@ -2397,7 +2397,8 @@ std::size_t Plan::redirect_padding(std::uint64_t function_start, std::uint64_t p
   std::vector<std::uint64_t> addresses;
   for (auto pc = patch + 1; pc < end + padding; ++pc)
     addresses.push_back(pc);
-  if (std::ranges::any_of(direct_redirects(addresses), [](const auto &entry) {
+  const auto redirects = direct_redirects(addresses);
+  if (std::any_of(redirects.begin(), redirects.end(), [](const auto &entry) {
         return !entry.second.empty();
       }))
     return 0;
@@ -2619,7 +2620,7 @@ Plan::MethodBoundary Plan::method_boundary(const std::string &module,
   Image image(0, module, primary, false);
   const auto &object = *image.executable.getBinary();
 #if defined(__aarch64__)
-  if (!prepared.target_triple().starts_with("aarch64-") ||
+  if (!::tracer::compat::starts_with(prepared.target_triple(), "aarch64-") ||
       prepared.target_triple().find("linux") == std::string::npos ||
       llvm::cast<ObjectFile>(object).getArch() != llvm::Triple::aarch64)
     throw std::runtime_error("snapshot method requires an AArch64 Linux ELF and receiver ABI");
@@ -2656,7 +2657,7 @@ Plan::MethodBoundary Plan::method_boundary(const std::string &module,
   const auto decoded = native_entry::scan(pc, code);
   if (decoded.decode_failed || !decoded.diagnostic.empty() || decoded.instructions.empty())
     throw std::runtime_error("snapshot method has no verified AArch64 instruction boundaries");
-  const auto entry_index = decoded.instructions.front().text.starts_with("bti") ? 1U : 0U;
+  const auto entry_index = ::tracer::compat::starts_with(decoded.instructions.front().text, "bti") ? 1U : 0U;
   if (entry_index >= decoded.instructions.size())
     throw std::runtime_error("snapshot method has no instruction after its AArch64 landing pad");
   const auto &entry = decoded.instructions[entry_index];
@@ -2667,7 +2668,7 @@ Plan::MethodBoundary Plan::method_boundary(const std::string &module,
     throw std::runtime_error("snapshot method has no relocatable AArch64 entry instruction");
   const auto patch_offset = entry.address - pc;
 #else
-  const std::span<const std::uint8_t> bytes_at_entry{
+  const ::tracer::compat::span<const std::uint8_t> bytes_at_entry{
       reinterpret_cast<const std::uint8_t *>(code.data()), code.size()};
   native_detour::Patch patch;
   std::string error;
@@ -2801,7 +2802,7 @@ std::string compare_prepared(const clangtracer::v1::ObjectWatchPlan &prepared,
     return result;
   };
   const auto expected = keys(prepared.bindings(), true);
-  const bool legacy = std::ranges::none_of(prepared.bindings(), [](const auto &binding) {
+  const bool legacy = std::none_of(std::begin(prepared.bindings()), std::end(prepared.bindings()), [](const auto &binding) {
     return binding.role() == "destroy (deleting)";
   });
   // Older packages recorded D0 as a generic destructor or omitted it.
@@ -2875,7 +2876,7 @@ void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &
       value.set_unsigned_value(static_cast<std::uint32_t>(*sample.value));
       break;
     case UnionCase::Type::real:
-      value.set_real_value(std::bit_cast<float>(*sample.value));
+      value.set_real_value(::tracer::compat::bit_cast<float>(*sample.value));
       break;
     }
   };

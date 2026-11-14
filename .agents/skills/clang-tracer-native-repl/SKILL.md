@@ -236,6 +236,8 @@ installed overloads.
 
 ## Trace object lifetimes and state
 
+On `c++17`, prepare typed adapters and object watch plans with the matching build. Regenerate adapters created on `main` using the original ELF and compile commands.
+
 Use the matching Linux x86-64 or AArch64 REPL, server, and agent with the existing ELF and matching DWARF. For individual writes, use `%object prepare TYPE --module ELF --field FIELD --code SELECTOR --backend code-cache --output DIRECTORY`. Choose `ptrace` for diagnostic single-stepping. The backend is saved in the plan. For net method changes, prepare with `--on METHOD`, the original `--include` and compile command, and a verified `--synchronization` policy.
 
 Attach, run `%object preview --plan DIRECTORY`, and check the binding and admitted sites. Use `%object start --plan DIRECTORY` to arm the watch. Writes capture values by default. Add `--no-values` to a write watch to record completed stores, including same-value stores, without samples. Record while the workload runs with `%record capture.db --sqlite --name object.trace --probe WATCH_ID --count N --timeout SECONDS`. Check `%object status WATCH_ID`, then stop with `%object stop WATCH_ID` and confirm restoration before `%detach`. Open the recording with `%events open capture.db --as saved` and inspect it with `%events list saved` or `%events show saved --index 0`.

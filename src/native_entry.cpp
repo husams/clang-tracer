@@ -108,7 +108,8 @@ bool make_decoder(Decoder &d, std::string &error) {
 }
 
 bool entry_instruction(const llvm::MCInst &inst, const llvm::MCInstrInfo &ins,
-                      const llvm::MCRegisterInfo &regs, bool allow_rip = false) {
+                      const llvm::MCRegisterInfo &regs, bool allow_rip = false,
+                      bool allow_extended = true) {
   const auto &desc = ins.get(inst.getOpcode());
   if (desc.isBranch() || desc.isCall() || desc.isReturn() ||
       desc.isIndirectBranch()) {
@@ -117,26 +118,25 @@ bool entry_instruction(const llvm::MCInst &inst, const llvm::MCInstrInfo &ins,
   const std::string name = ins.getName(inst.getOpcode()).str();
   static constexpr std::string_view allowed[] = {
       "PUSH64r",   "POP64r",    "MOV64rr",    "MOV32rr",   "MOV16rr",
-      "MOV8rr",    "MOV32ri",   "MOV64ri",    "MOV64rm",   "MOV32rm", "MOV16rm",
+      "MOV8rr",    "MOV32ri",   "MOV64rm",   "MOV32rm",   "MOV16rm",
       "MOV8rm",    "MOV64mr",   "MOV32mr",    "MOV16mr",   "MOV8mr",
       "MOVSS",     "MOVSD",     "MOVAPS",     "MOVUPS",    "LEA64r",
-      "LEA32r",    "LEA64_32r", "SUB64ri8",  "SUB64ri32",  "ADD64ri8",  "ADD64ri32",
+      "LEA32r",    "SUB64ri8",  "SUB64ri32",  "ADD64ri8",  "ADD64ri32",
       "ADD32ri8",  "ADD32ri",   "ADD32rr",    "IMUL32rri8", "IMUL32rri", "IMUL32rmi8",
-      "IMUL32rmi", "IMUL32rm", "IMUL32rr", "MOVSX64rm32", "MOVSX64rr32", "PXORrr",
+      "IMUL32rmi",
       "XOR64rr",   "XOR32rr",    "TEST64rr",  "TEST32rr",
       "CMP64rr",   "CMP32rr",   "AND8i8",     "AND8ri",    "AND64ri8",
       "AND64ri32", "XOR8i8",    "XOR8ri",     "NOP",
       "NOOP",      "MOV64mi32", "MOV32mi",    "MOV16mi",   "MOV8mi"};
-  bool known = name == "CMP64mi8";
-  for (auto p : allowed) {
-    if (name == p || (name.size() > p.size() && ::tracer::compat::starts_with(name, p))) {
-      known = true;
-      break;
-    }
-  }
-  if (!known) {
+  static constexpr std::string_view extended[] = {
+      "MOV64ri", "LEA64_32r", "IMUL32rm", "IMUL32rr", "MOVSX64rm32", "MOVSX64rr32", "PXORrr"};
+  const auto matches = [&](std::string_view prefix) {
+    return ::tracer::compat::starts_with(name, prefix);
+  };
+  if (name != "CMP64mi8" &&
+      !std::any_of(std::begin(allowed), std::end(allowed), matches) &&
+      (!allow_extended || !std::any_of(std::begin(extended), std::end(extended), matches)))
     return false;
-  }
   for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
     if (inst.getOperand(i).isReg()) {
       auto r = inst.getOperand(i).getReg();
@@ -173,7 +173,7 @@ bool copyable_instruction(const llvm::MCInst &inst, const Decoder &decoder,
   // LLVM marks integer division as having side effects because it can trap.
   // The cache restores the original PC for a synchronous divide fault.
   if ((desc.hasUnmodeledSideEffects() && !integer_division(opcode)) ||
-      opcode == "STD" || opcode.starts_with("POPF"))
+      opcode == "STD" || ::tracer::compat::starts_with(opcode, "POPF"))
     return false;
   if (changes_stack && opcode != "LEAVE64" &&
       !entry_instruction(inst, *decoder.ins, *decoder.regs))
@@ -186,9 +186,9 @@ bool copyable_instruction(const llvm::MCInst &inst, const Decoder &decoder,
     // registers can affect control flow or the meaning of later operands.
     return (!allow_rip && name == "RIP") || name == "EIP" || name == "IP" ||
            name == "CS" || name == "DS" || name == "ES" || name == "FS" ||
-           name == "GS" || name == "SS" || name.starts_with("ST") ||
-           name.starts_with("FP") || name.starts_with("MM") ||
-           name.starts_with("CR") || name.starts_with("DR");
+           name == "GS" || name == "SS" || ::tracer::compat::starts_with(name, "ST") ||
+           ::tracer::compat::starts_with(name, "FP") || ::tracer::compat::starts_with(name, "MM") ||
+           ::tracer::compat::starts_with(name, "CR") || ::tracer::compat::starts_with(name, "DR");
   };
   for (const auto &operand : inst)
     if (operand.isReg() && restricted_register(operand.getReg()))
@@ -201,7 +201,7 @@ bool copyable_instruction(const llvm::MCInst &inst, const Decoder &decoder,
 bool integer_arithmetic(llvm::StringRef opcode, llvm::StringRef suffix) {
   for (const llvm::StringRef op : {"ADD32", "SUB32", "AND32", "OR32", "XOR32", "INC32", "DEC32",
                                   "NEG32", "NOT32", "SHL32", "SHR32", "SAR32"})
-    if (opcode.starts_with(op) && opcode.drop_front(op.size()) == suffix)
+    if (::tracer::compat::starts_with(opcode, op) && opcode.drop_front(op.size()) == suffix)
       return true;
   return false;
 }
@@ -295,14 +295,14 @@ std::optional<ScalarStore> store32(const Decoder &decoder, const llvm::MCInst &i
   Kind kind = Kind::move;
   unsigned memory = 0;
   unsigned value = 5;
-  if (locked && bytes.starts_with("\x0f\xc1") && opcode == "XADD32rm" &&
+  if (locked && ::tracer::compat::starts_with(bytes, "\x0f\xc1") && opcode == "XADD32rm" &&
       inst.getNumOperands() == 7 && inst.getOperand(0).isReg() &&
       inst.getOperand(1).isReg() &&
       inst.getOperand(0).getReg() == inst.getOperand(1).getReg()) {
     kind = Kind::exchange_add;
     memory = 2;
     value = 0;
-  } else if (locked && bytes.starts_with("\x0f\xb1") && opcode == "CMPXCHG32rm" &&
+  } else if (locked && ::tracer::compat::starts_with(bytes, "\x0f\xb1") && opcode == "CMPXCHG32rm" &&
              inst.getNumOperands() == 6) {
     kind = Kind::compare_exchange;
   } else if ((inst.getNumOperands() == 5 && (integer_arithmetic(opcode, "m") ||
@@ -347,7 +347,7 @@ std::optional<ScalarStore> store32(const Decoder &decoder, const llvm::MCInst &i
 }
 
 Preview inspect(std::uint64_t address, std::string_view bytes, bool entry,
-                std::span<const std::uint64_t> additional_entries = {}) {
+                ::tracer::compat::span<const std::uint64_t> additional_entries = {}) {
   Preview result;
   Decoder decoder;
   if (!make_decoder(decoder, result.diagnostic))
@@ -433,7 +433,7 @@ Preview inspect(std::uint64_t address, std::string_view bytes, bool entry,
     auto store = store32(decoder, instruction, bytes.substr(offset, size));
 #if defined(__aarch64__)
     const bool frame_store = false;
-    const bool architectural_hint = printed == "nop" || printed.starts_with("bti") ||
+    const bool architectural_hint = printed == "nop" || ::tracer::compat::starts_with(printed, "bti") ||
         printed == "paciasp" || printed == "pacibsp" || printed == "autiasp" || printed == "autibsp";
     const bool copyable = store.has_value() || opcode == "RET" || opcode == "RETAA" || opcode == "RETAB" ||
         opcode == "STPXpre" || opcode == "STPXi" ||
@@ -495,11 +495,35 @@ Preview preview(std::uint64_t address, std::string_view bytes) {
 }
 
 Preview scan(std::uint64_t address, std::string_view bytes,
-             std::span<const std::uint64_t> additional_entries) {
+             ::tracer::compat::span<const std::uint64_t> additional_entries) {
   return inspect(address, bytes, false, additional_entries);
 }
 
 #if defined(__x86_64__)
+bool compatible_patch(std::uint64_t address, std::string_view before, std::string_view after) {
+  std::string error;
+  Decoder decoder;
+  if (!make_decoder(decoder, error))
+    throw std::runtime_error(error);
+  if (before.empty() || before.size() != after.size())
+    return false;
+  for (std::size_t offset = 0; offset < before.size();) {
+    const auto width = [&](std::string_view bytes) -> std::uint64_t {
+      llvm::MCInst instruction;
+      std::uint64_t size = 0;
+      if (!decode(decoder, instruction, size, address + offset, bytes.substr(offset)) ||
+          !entry_instruction(instruction, *decoder.ins, *decoder.regs, false, false))
+        return 0;
+      return size;
+    };
+    const auto size = width(before);
+    if (!size || width(after) != size)
+      return false;
+    offset += size;
+  }
+  return true;
+}
+
 std::size_t nop_prefix(std::uint64_t address, std::string_view bytes, std::size_t minimum) {
   Decoder decoder;
   std::string error;
@@ -549,7 +573,7 @@ bool forwards_receiver(std::uint64_t address, std::string_view prefix) {
         return std::nullopt;
       return displacement;
     };
-    if (opcode == "ENDBR64" || opcode.starts_with("NOOP"))
+    if (opcode == "ENDBR64" || ::tracer::compat::starts_with(opcode, "NOOP"))
       continue;
     if (opcode == "PUSH64r" && reg(0) == "RBP" && !pushed_rbp) {
       pushed_rbp = true;
@@ -559,14 +583,14 @@ bool forwards_receiver(std::uint64_t address, std::string_view prefix) {
                reg(1) == "RSP" && frame && !stack_size && inst.getOperand(2).getImm() > 0) {
       stack_size = inst.getOperand(2).getImm();
     } else if (opcode == "MOV64rr" && reg(0) != "RBP" && reg(0) != "RSP") {
-      if (receiver.contains(reg(1)))
+      if (receiver.count(reg(1)))
         receiver.insert(reg(0));
       else
         receiver.erase(reg(0));
-    } else if (opcode == "MOV64mr" && frame && slot(0) && receiver.contains(reg(5))) {
+    } else if (opcode == "MOV64mr" && frame && slot(0) && receiver.count(reg(5))) {
       spills.insert(*slot(0));
     } else if (opcode == "MOV64rm" && frame && slot(1) && reg(0) != "RBP" && reg(0) != "RSP") {
-      if (spills.contains(*slot(1)))
+      if (spills.count(*slot(1)))
         receiver.insert(reg(0));
       else
         receiver.erase(reg(0));
@@ -574,7 +598,7 @@ bool forwards_receiver(std::uint64_t address, std::string_view prefix) {
       return false;
     }
   }
-  return receiver.contains("RDI");
+  return receiver.count("RDI");
 }
 #endif
 } // namespace tracer::native_entry

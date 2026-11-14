@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "object_snapshot.hpp"
 #include "tracer/protocol.hpp"
 #include "bounded_proto.hpp"
@@ -46,7 +47,6 @@ std::string context_descriptor_type(std::string_view cpp_type) {
   name << "tracer.generated.state.M_" << std::hex << hash;
   return name.str();
 }
-
 namespace {
 std::string field_path(const std::string &parent, int number) {
   return (parent.empty() ? "" : parent + ".") + std::to_string(number);
@@ -57,6 +57,9 @@ class SnapshotDecoder {
   std::map<std::string, std::string> types_;
   std::size_t visited_ = 0;
   const std::string &payload_;
+  // Every visited value or element takes at least a byte of the payload, which
+  // is itself bounded (--snapshot-slice), so the payload size bounds the work.
+  std::size_t visit_limit() const { return std::max<std::size_t>(16384, payload_.size()); }
   bool context_state_;
   static std::uint64_t
   read_integer(google::protobuf::io::CodedInputStream &input,
@@ -89,7 +92,7 @@ class SnapshotDecoder {
   void validate(const google::protobuf::Descriptor &type,
                 std::string_view bytes, const std::string &path, bool wrapper,
                 bool map_entry, unsigned depth) {
-    if (depth > tracer::context_engine::max_capture_depth || ++visited_ > 65536)
+    if (depth > tracer::context_engine::max_capture_depth || ++visited_ > visit_limit())
       throw std::runtime_error("event snapshot exceeds validation limits");
     using Wire = google::protobuf::internal::WireFormatLite;
     google::protobuf::io::CodedInputStream input(
@@ -183,7 +186,7 @@ class SnapshotDecoder {
   EventValue item(const google::protobuf::Message &message,
                   const Descriptor &field, int index, const std::string &path,
                   unsigned depth) {
-    if (depth > tracer::context_engine::max_capture_depth || ++visited_ > 65536)
+    if (depth > tracer::context_engine::max_capture_depth || ++visited_ > visit_limit())
       throw std::runtime_error("event snapshot exceeds decoding limits");
     const auto *r = message.GetReflection();
     const bool repeated = index >= 0;
@@ -271,7 +274,7 @@ class SnapshotDecoder {
     if (!field.is_repeated())
       return item(message, field, -1, path, depth);
     const auto count = message.GetReflection()->FieldSize(message, &field);
-    if (count > tracer::context_engine::max_capture_items)
+    if (count < 0 || static_cast<std::size_t>(count) > std::max<std::size_t>(4096, payload_.size()))
       throw std::runtime_error("event container exceeds decoding limit");
     EventValue::Array values;
     values.reserve(static_cast<std::size_t>(count));
@@ -334,7 +337,6 @@ public:
 };
 
 } // namespace
-
 EventValue decode_owned_value(
     const std::string &cpp_type, const std::string &root_type,
     const std::string &descriptors, const std::string &payload,
@@ -386,8 +388,30 @@ EventValue decode_owned_value(
   return SnapshotDecoder(payload, roles, types, context_state).decode(*value, cpp_type, wrapped);
 }
 
+// Places `child` at a dotted path of nested records, such as
+// "details.owner_snapshot" or "single.value.impl_snapshot".
+// Returns false, leaving the member out, when it has no enclosing record or
+// would replace a field of the record: a followed member is optional.
+bool insert_member(EventValue::Object &fields, const std::string &path, EventValue child) {
+  const auto dot = path.find('.');
+  if (dot == std::string::npos)
+    return fields.emplace(path, std::move(child)).second;
+  const auto found = fields.find(path.substr(0, dot));
+  if (found == fields.end() ||
+      !std::holds_alternative<EventValue::Object>(found->second.data()))
+    return false;
+  auto nested = std::get<EventValue::Object>(found->second.data());
+  if (!insert_member(nested, path.substr(dot + 1), std::move(child)))
+    return false;
+  found->second = EventValue{std::move(nested), found->second.cpp_type(),
+                             found->second.descriptor_type(), found->second.container_role()};
+  return true;
+}
+
+// Followed members nest as deep as --follow-depth allowed when the probe was
+// installed; the protobuf parser, which read this message, bounds the nesting.
 EventValue decode_snapshot(const clangtracer::context::v1::ValueSnapshot &snapshot,
-                           bool include_members) {
+                           bool root) {
   using Snapshot = clangtracer::context::v1::ValueSnapshot;
   if (snapshot.status() != Snapshot::COMPLETE)
     throw std::runtime_error("event snapshot unavailable: " + snapshot.detail());
@@ -395,21 +419,29 @@ EventValue decode_snapshot(const clangtracer::context::v1::ValueSnapshot &snapsh
                                  snapshot.descriptor_set(), snapshot.payload(),
                                  snapshot.container_roles(), snapshot.record_types(),
                                  false, true);
-  if (snapshot.members().empty())
+  // A root that carries a note had members left out by a limit.
+  const bool noted = root && !snapshot.detail().empty() &&
+                     std::holds_alternative<EventValue::Object>(value.data());
+  if (snapshot.members().empty() && !noted)
     return value;
-  if (!include_members ||
-      snapshot.members_size() > static_cast<int>(tracer::kMaxSnapshotMembers))
-    throw std::runtime_error("invalid event snapshot member count or depth");
   auto fields = value.fields();
   std::set<std::string> names;
   for (const auto &member : snapshot.members()) {
     if (member.name().empty() || !member.has_snapshot() ||
-        fields.count(member.name()) || !names.insert(member.name()).second)
+        !names.insert(member.name()).second)
       throw std::runtime_error("invalid or duplicate event snapshot member");
     if (member.snapshot().status() == Snapshot::COMPLETE)
-      fields.emplace(member.name(), decode_snapshot(member.snapshot(), false));
+      (void)insert_member(fields, member.name(), decode_snapshot(member.snapshot(), false));
+    // A limit that left part of a followed member out says which option to raise.
+    if (!member.snapshot().detail().empty()) {
+      const std::string note = member.name() + "_cut";
+      (void)insert_member(fields, note, EventValue{member.snapshot().detail()});
+    }
   }
-  return EventValue{std::move(fields), value.cpp_type()};
+  if (noted)
+    (void)insert_member(fields, "snapshot_cut", EventValue{snapshot.detail()});
+  return EventValue{std::move(fields), value.cpp_type(), value.descriptor_type(),
+                    value.container_role()};
 }
 
 namespace {
@@ -519,7 +551,7 @@ class ReceiverDelta {
 
   bool compare_tagged(const std::string &path, const EventValue &before, const EventValue &after) {
     const auto &type = before.cpp_type();
-    if (type.starts_with("std::variant<") || type.starts_with("::std::variant<")) {
+    if (::tracer::compat::starts_with(type, "std::variant<") || ::tracer::compat::starts_with(type, "::std::variant<")) {
       const auto &old = before.field("index");
       const auto &next = after.field("index");
       const auto old_index = old.as<std::uint64_t>(), next_index = next.as<std::uint64_t>();
@@ -550,8 +582,8 @@ class ReceiverDelta {
     }
     const auto *old = std::get_if<EventValue::Object>(&before.data());
     const auto *next = std::get_if<EventValue::Object>(&after.data());
-    const bool owning_pointer = type.starts_with("std::shared_ptr<") || type.starts_with("std::unique_ptr<") ||
-        type.starts_with("::std::shared_ptr<") || type.starts_with("::std::unique_ptr<");
+    const bool owning_pointer = ::tracer::compat::starts_with(type, "std::shared_ptr<") || ::tracer::compat::starts_with(type, "std::unique_ptr<") ||
+        ::tracer::compat::starts_with(type, "::std::shared_ptr<") || ::tracer::compat::starts_with(type, "::std::unique_ptr<");
     if (owning_pointer && old && next && old->count("suppressed") && next->count("suppressed") &&
         (before.field("suppressed").as<bool>() || after.field("suppressed").as<bool>())) {
       compare(path + ".address", before.field("address"), after.field("address"));

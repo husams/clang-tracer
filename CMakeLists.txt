@@ -160,7 +160,7 @@ add_subdirectory(examples/prepared-injectors)
 add_executable(trace-target tests/fixtures/target.cpp)
 target_link_libraries(trace-target PRIVATE Threads::Threads)
 set_target_properties(trace-target PROPERTIES ENABLE_EXPORTS ON)
-target_compile_options(trace-target PRIVATE -O0 -fno-omit-frame-pointer -fcf-protection=none)
+target_compile_options(trace-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
 
 add_executable(cpp-interceptors-target examples/cpp-interceptors/target.cpp)
 target_compile_options(cpp-interceptors-target PRIVATE -g -O0 -fno-omit-frame-pointer
@@ -242,6 +242,9 @@ foreach(stack_target trace-stack-a trace-stack-b)
   target_compile_options(${stack_target} PRIVATE -O2 -fomit-frame-pointer
     -fno-optimize-sibling-calls -fasynchronous-unwind-tables -fcf-protection=none)
 endforeach()
+if(BUILD_TESTING)
+  target_compile_options(trace-stack-b PRIVATE -g)
+endif()
 set_target_properties(trace-threaded-target PROPERTIES ENABLE_EXPORTS ON)
 target_link_libraries(trace-threaded-target PRIVATE Threads::Threads trace-stack-a trace-stack-b)
 target_compile_options(trace-threaded-target PRIVATE -O0 -fno-omit-frame-pointer
@@ -285,7 +288,7 @@ if(BUILD_TESTING)
     tests/fixtures/dependency_collision.cpp)
   set_target_properties(trace-collision-target PROPERTIES ENABLE_EXPORTS ON)
   target_link_libraries(trace-collision-target PRIVATE Threads::Threads)
-  target_compile_options(trace-collision-target PRIVATE -O0 -fno-omit-frame-pointer
+  target_compile_options(trace-collision-target PRIVATE -g -O0 -fno-omit-frame-pointer
     -fcf-protection=none)
   add_test(NAME grpc_agent_dependency_collision
     COMMAND server-integration
@@ -438,7 +441,7 @@ if(BUILD_TESTING)
   set_tests_properties(grpc_class_interceptor_integration PROPERTIES TIMEOUT 360)
   add_executable(typed-this-fixture tests/typed_this_fixture.cpp)
   set_target_properties(typed-this-fixture PROPERTIES ENABLE_EXPORTS ON)
-  target_compile_options(typed-this-fixture PRIVATE -O0 -fno-omit-frame-pointer
+  target_compile_options(typed-this-fixture PRIVATE -g -O0 -fno-omit-frame-pointer
     -fcf-protection=none)
   add_test(NAME grpc_typed_this_integration
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/typed_this_integration.py

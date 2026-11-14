@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "arm_object_watch.hpp"
 
 #include "debug_resolver.hpp"
@@ -67,10 +68,10 @@ api::ObjectWatchStatus preview_snapshots(const api::ObjectWatchRequest &request,
   std::set<std::uint64_t> entries;
   for (const auto &method : request.methods()) {
     auto receiver = std::string_view(method.header_types().record_name());
-    if (receiver.starts_with("::"))
+    if (::tracer::compat::starts_with(receiver, "::"))
       receiver.remove_prefix(2);
     auto selected = std::string_view(request.concrete_type());
-    if (selected.starts_with("::"))
+    if (::tracer::compat::starts_with(selected, "::"))
       selected.remove_prefix(2);
     if (!prepared::is_typed_version(method.format_version()) || method.ByteSizeLong() > 65536 ||
         method.module_sha256().size() != 32 || method.signature().kind() != api::METHOD ||

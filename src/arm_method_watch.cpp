@@ -91,7 +91,8 @@ struct MethodWatch::Impl {
   std::map<Address, Address> method_probes;
   std::vector<std::string> keys, fields;
   mutable std::mutex mutex;
-  std::jthread reader;
+  std::thread reader;
+  std::atomic<bool> stop_reader{false};
   std::uint64_t cursor = 0, next_call = 1;
   std::uint64_t seen_drops = 0, drop_barrier = 0;
   Clock::time_point deadline = Clock::time_point::max();
@@ -162,7 +163,7 @@ struct MethodWatch::Impl {
         return false;
       if (inode == control.identity.st_ino && makedev(device_major, device_minor) == control.identity.st_dev)
         return false;
-      if (std::ranges::any_of(redirects, [&](const auto &patch) {
+      if (std::any_of(std::begin(redirects), std::end(redirects), [&](const auto &patch) {
             return patch.gateway >= begin && patch.gateway < end;
           }))
         return false;
@@ -176,7 +177,7 @@ struct MethodWatch::Impl {
       iovec remote{reinterpret_cast<void *>(patch.instruction.pc), sizeof(code)};
       const auto length = linux_api::process_vm_readv(session.pid(), &local, 1, &remote, 1, 0);
       if (length == sizeof(code) ? code == patch.replacement :
-          length != -1 || errno != EFAULT || std::ranges::any_of(ranges, [&](const auto &range) {
+          length != -1 || errno != EFAULT || std::any_of(std::begin(ranges), std::end(ranges), [&](const auto &range) {
             return patch.instruction.pc >= range.first && patch.instruction.pc < range.second;
           }))
         return false;
@@ -411,7 +412,8 @@ void MethodWatch::start() {
     }
     verified.emplace_back(pc, std::move(boundary.body));
   }
-  std::ranges::sort(p.redirects, {}, [](const auto &r) { return r.instruction.pc; });
+  std::sort(p.redirects.begin(), p.redirects.end(),
+      [](const auto &a, const auto &b) { return a.instruction.pc < b.instruction.pc; });
   for (std::size_t i = 1; i < p.redirects.size(); ++i)
     if (p.redirects[i - 1].instruction.pc == p.redirects[i].instruction.pc)
       throw std::runtime_error("snapshot method redirect overlaps another method");
@@ -529,8 +531,8 @@ void MethodWatch::start() {
   process.remote_free(remote, size);
   if (p.request.timeout_seconds())
     p.deadline = Clock::now() + std::chrono::seconds(p.request.timeout_seconds());
-  p.reader = std::jthread([&p](std::stop_token stop) {
-    while (!stop.stop_requested()) {
+  p.reader = std::thread([&p] {
+    while (!p.stop_reader.load(std::memory_order_acquire)) {
       {
         const std::lock_guard lock(p.mutex);
         p.drain();
@@ -562,7 +564,7 @@ void MethodWatch::start() {
     p.pending_restore = process.unsafe();
     if (!p.installed && !p.pending_restore) {
       p.reclaim();
-      p.reader.request_stop();
+      p.stop_reader.store(true, std::memory_order_release);
       p.reader.join();
     }
     throw;
@@ -619,11 +621,11 @@ api::ObjectWatchStatus MethodWatch::stop() {
         break;
       }
       auto patches = p.patches(true);
-      std::erase_if(patches, [&](const auto &patch) {
+      patches.erase(std::remove_if(patches.begin(), patches.end(), [&](const auto &patch) {
         std::uint32_t actual;
         process.remote_read(patch.address, &actual, sizeof(actual));
         return !std::memcmp(&actual, patch.replacement, sizeof(actual));
-      });
+      }), patches.end());
       const auto restored = process.patch_code_batch(patches, [&] {
         if (!p.alive() || !p.has_control_mapping())
           throw std::runtime_error("target mappings changed during method snapshot restoration");
@@ -649,7 +651,7 @@ api::ObjectWatchStatus MethodWatch::stop() {
     std::this_thread::sleep_for(1ms);
   if (!replaced && p.alive() && p.channel.activity.load(std::memory_order_acquire))
     throw std::runtime_error("timed out draining active method snapshot callbacks");
-  p.reader.request_stop();
+  p.stop_reader.store(true, std::memory_order_release);
   if (p.reader.joinable())
     p.reader.join();
   {

@@ -460,7 +460,7 @@ PreparedSnapshots prepare_snapshot_roots(
               // only with evidence that it is a live object: a polymorphic
               // pointee whose RTTI matches a derived class, or the declared
               // class of an owner-held implementation pointer.
-              const bool safe = snapshot_members::checked_safe(ast.getRecordType(pointee));
+              const bool safe = snapshot_members::checked_safe(tracer::prepared::record_type(ast, pointee));
               std::vector<const clang::CXXRecordDecl *> member_types;
               if (pointee->isPolymorphic()) {
                 const bool opaque = ast.getSourceManager().isBeforeInTranslationUnit(
@@ -1083,13 +1083,6 @@ public:
     const auto* method = llvm::dyn_cast<clang::CXXMethodDecl>(declaration);
 
     Candidate candidate;
-    if (!invocation_.adapter_symbol.empty()) {
-      const auto result_type = declaration->getReturnType();
-      if (result_type->isPointerType() || result_type->isReferenceType())
-        if (const auto *record = snapshot_record_type(result_type))
-          candidate.snapshot_result_root = tracer::prepared::type_name(
-              *context_, tracer::prepared::record_type(*context_, record));
-    }
     candidate.name = selected_by_type ? qualified_name_ : declaration->getQualifiedNameAsString();
     candidate.selected_by_type = selected_by_type;
     candidate.requires_typed_adapter = tracer::prepared::template_instance(*declaration) ||
@@ -1805,8 +1798,8 @@ std::vector<api::ObjectWatchRequest::SourceWriter> discover_object_writers(
       const auto *method = operation->getMethodDecl();
       if (method) {
         const auto name = method->getNameAsString();
-        if (name == "store" || name == "exchange" || name.starts_with("fetch_") ||
-            name.starts_with("compare_exchange_"))
+        if (name == "store" || name == "exchange" || ::tracer::compat::starts_with(name, "fetch_") ||
+            ::tracer::compat::starts_with(name, "compare_exchange_"))
           record(operation->getImplicitObjectArgument());
       }
       return true;
@@ -2043,9 +2036,22 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
       validate_dynamic_edge(root, type_index, true);
     const auto validate_member = [&](const api::PreparedSnapshotMember &member,
                                      bool automatic) {
-      (void)automatic;
       if (member.field().empty())
         throw std::runtime_error("prepared snapshot member has an empty field name");
+      if (member.erased_any()) {
+        const auto *field = snapshot_members::find(root, member.field());
+        const auto *erased = field ? field->getType()->getAsCXXRecordDecl() : nullptr;
+        if (automatic || !erased || erased->getQualifiedNameAsString() != "std::any" ||
+            field->getType().isVolatileQualified() || member.dynamic_types().empty())
+          throw std::runtime_error("prepared erased snapshot requires a std::any member and payloads");
+        std::set<std::uint32_t> unique;
+        for (const auto index : member.dynamic_types()) {
+          if (index >= snapshot_types.size() || !unique.insert(index).second)
+            throw std::runtime_error("prepared std::any payload index is invalid or duplicated");
+          validate_snapshot_candidate(snapshot_types[index]);
+        }
+        return;
+      }
       std::vector<snapshot_members::Step> steps;
       if (!snapshot_members::resolve(root, member.field(), steps))
         throw std::runtime_error("prepared snapshot member is not a raw pointer or reference path");

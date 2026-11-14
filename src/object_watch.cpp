@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "object_watch.hpp"
 #include "ptrace_wait.hpp"
 
@@ -12,7 +13,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -326,7 +326,7 @@ struct Watch::Worker {
     }
     if (task.child)
       lifecycle_stop = true;
-    if (stop.event() == PTRACE_EVENT_STOP) {
+    if (stop.event() == tracer::injector::ptrace_event_stop) {
       task.listen = stop.signal() != SIGTRAP && !task.child;
       return;
     }
@@ -392,7 +392,7 @@ struct Watch::Worker {
       bool added = false;
       for (const auto &entry : std::filesystem::directory_iterator(directory)) {
         const auto tid = static_cast<pid_t>(std::stol(entry.path().filename().string()));
-        if (tasks.contains(tid))
+        if (tasks.count(tid))
           continue;
         if (::ptrace(PTRACE_SEIZE, tid, nullptr, nullptr) == -1) {
           if (errno == ESRCH)
@@ -407,7 +407,7 @@ struct Watch::Worker {
         break;
       await_stops(deadline);
     }
-    if (!tasks.contains(pid) || proc::start_time(proc::directory(pid) / "stat") != process_start)
+    if (!tasks.count(pid) || proc::start_time(proc::directory(pid) / "stat") != process_start)
       throw std::runtime_error("object watch target identity changed");
     for (const auto &[tid, task] : tasks) {
       if (!std::filesystem::exists(directory / std::to_string(tid)))
@@ -432,7 +432,7 @@ struct Watch::Worker {
   void verify_bytes(Address pc, std::string_view expected, bool armed) const {
     auto actual = read_bytes(pid, pc, expected.size());
     const auto trap = object_target::trap;
-    if (actual.size() < trap.size() || (armed && !actual.starts_with(trap)))
+    if (actual.size() < trap.size() || (armed && !::tracer::compat::starts_with(actual, trap)))
       throw std::runtime_error("object watch breakpoint ownership changed");
     if (armed)
       actual.replace(0, trap.size(), expected.substr(0, trap.size()));
@@ -442,7 +442,7 @@ struct Watch::Worker {
 
   void install(Address pc, std::string_view expected) {
     const auto trap = object_target::trap;
-    if (expected.size() < trap.size() || expected.starts_with(trap) || pc % trap.size())
+    if (expected.size() < trap.size() || ::tracer::compat::starts_with(expected, trap) || pc % trap.size())
       throw std::runtime_error("cannot own an existing breakpoint or unmapped return address");
     const auto existing = patches.find(pc);
     if (existing != patches.end() && existing->second.armed) {
@@ -461,7 +461,7 @@ struct Watch::Worker {
     if (actual == patch.bytes)
       return;
     const auto trap = object_target::trap;
-    if (!actual.starts_with(trap) || actual.substr(trap.size()) != patch.bytes.substr(trap.size()))
+    if (!::tracer::compat::starts_with(actual, trap) || actual.substr(trap.size()) != patch.bytes.substr(trap.size()))
       throw std::runtime_error("object watch code changed while a breakpoint was owned");
     object_target::write_stopped_code(target, pc, std::string_view(patch.bytes).substr(0, trap.size()));
     if (read_bytes(target, pc, patch.bytes.size()) != patch.bytes)
@@ -790,7 +790,7 @@ struct Watch::Worker {
       }
       if (event.module().empty()) {
         try {
-          const auto mappings = client::list_debug_module_mappings(pid, true);
+          const auto mappings = client::list_debug_module_mappings(pid, {}, true);
           for (const auto &mapping : mappings.mappings())
             if (sample.pc >= mapping.begin_address() && sample.pc < mapping.end_address()) {
               event.set_module(mapping.path());
@@ -908,7 +908,7 @@ struct Watch::Worker {
             return pending.role == Boundary::construct && pending.receiver == receiver;
           });
       frame.uncertain_complete = plan->sites.at(pc).uncertain_complete &&
-          !plan->complete_constructor_returns.contains({pc, frame.return_pc});
+          !plan->complete_constructor_returns.count({pc, frame.return_pc});
       if (frame.outer_constructor && !frame.uncertain_complete && found != live.end()) {
         const auto prior = found->second;
         live.erase(found);
@@ -955,7 +955,7 @@ struct Watch::Worker {
       if (role == Boundary::add) {
         frame.incoming_view = read<Address>(pid, add(object_target::argument(regs, 1), plan->layout.pointee));
         const auto complete = complete_from_base(frame.incoming_view);
-        if (!complete || !live.contains(*complete))
+        if (!complete || !live.count(*complete))
           return;
         frame.incoming = *complete;
       } else {
@@ -1214,12 +1214,12 @@ struct Watch::Worker {
         if (store.kind == Kind::exchange_add) {
           const auto &result = store.result_register.empty() ? store.value_register : store.result_register;
           const auto returned = static_cast<std::uint32_t>(reg(after, result, 0));
-          old = std::bit_cast<std::int32_t>(returned);
+          old = ::tracer::compat::bit_cast<std::int32_t>(returned);
           input += returned;
         } else if (store.kind == Kind::compare_exchange) {
-          old = std::bit_cast<std::int32_t>(expected);
+          old = ::tracer::compat::bit_cast<std::int32_t>(expected);
         }
-        value = std::bit_cast<std::int32_t>(input);
+        value = ::tracer::compat::bit_cast<std::int32_t>(input);
       } else {
         value = read<std::int32_t>(pid, sample.destination);
         next_tag = union_tag(sample.life.address);
@@ -1239,7 +1239,7 @@ struct Watch::Worker {
   }
 
   bool needs_breakpoint(Address pc) const {
-    return plan->sites.contains(pc) ||
+    return plan->sites.count(pc) ||
         std::any_of(tasks.begin(), tasks.end(), [&](const auto &item) {
       const auto &task = item.second;
       return task.breakpoint_pc == pc ||
@@ -1321,7 +1321,7 @@ struct Watch::Worker {
       await_stops(deadline);
       const auto current = tasks.find(tid);
       if (lifecycle_stop || current == tasks.end() ||
-          current->second.stop.event() != PTRACE_EVENT_STOP ||
+          current->second.stop.event() != tracer::injector::ptrace_event_stop ||
           current->second.stop.signal() != SIGTRAP || object_target::pc(registers(tid)) != pc)
         break;
       // An interrupt requested before a peer's breakpoint stop was reaped can
@@ -1443,10 +1443,10 @@ struct Watch::Worker {
         }
       }
     }
-    if (lifecycle_stop && !stopping && (image_replaced || tasks.contains(pid)))
+    if (lifecycle_stop && !stopping && (image_replaced || tasks.count(pid)))
       gap(pid, 0, {}, "object watch ended at a thread/process lifecycle event");
     const auto reason = image_replaced ? Observation::MAPPING_CHANGED :
-        !tasks.contains(pid) ? Observation::TARGET_EXITED :
+        !tasks.count(pid) ? Observation::TARGET_EXITED :
         stopping ? stop_reason.load() : Observation::SCOPE_CHANGED;
     for (const auto &[tid, task] : tasks)
       for (const auto &frame : task.frames)
@@ -1464,7 +1464,7 @@ struct Watch::Worker {
       trace();
     } catch (const std::exception &error) {
       failure = error.what();
-      if (!ready && !launch_argv.empty() && tasks.contains(pid)) {
+      if (!ready && !launch_argv.empty() && tasks.count(pid)) {
         ::kill(pid, SIGKILL);
         while (::waitpid(pid, nullptr, __WALL) == -1 && errno == EINTR) {}
         tasks.clear();

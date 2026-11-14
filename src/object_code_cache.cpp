@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "object_code_cache.hpp"
 
 #include <algorithm>
@@ -205,7 +206,7 @@ Dispatch verify_dispatch(const object_watch::Plan &plan, Address getter) {
 std::pair<Address, std::size_t> entry_patch_window(Address entry, std::string_view bytes) {
   const auto decoded = native_entry::scan(entry, bytes);
   auto start = entry;
-  if (bytes.starts_with("\xf3\x0f\x1e\xfa"))
+  if (::tracer::compat::starts_with(bytes, "\xf3\x0f\x1e\xfa"))
     start += 4; // Preserve the landing instruction for an indirect caller.
   std::size_t size = 0;
   for (const auto &inst : decoded.instructions) {
@@ -354,8 +355,10 @@ struct Watch::Impl {
   std::atomic<std::uint64_t> head{0}, publish_errors{0}, coverage_gaps{0};
   std::map<std::uint64_t, api::TraceEvent> open_lifetimes;
   std::uint64_t final_observations = 0;
-  std::jthread pump;
-  std::jthread admissions;
+  std::thread pump;
+  std::atomic<bool> stop_pump{false};
+  std::thread admissions;
+  std::atomic<bool> stop_admissions{false};
   mutable std::mutex admission_mutex;
   std::string admission_failure;
   std::string admission_diagnostic;
@@ -397,7 +400,7 @@ struct Watch::Impl {
         const bool fragments = !request.first_seen() &&
             (!plan.shared_writer() || request.follow_calls()) &&
             !plan.caller_start && !request.writer_entry() &&
-            std::ranges::any_of(body.instructions, [](const auto &inst) {
+            std::any_of(std::begin(body.instructions), std::end(body.instructions), [](const auto &inst) {
               return inst.flow == NativeFlow::call;
             });
         fragmented_writer |= fragments;
@@ -405,7 +408,7 @@ struct Watch::Impl {
           admitted_stores += prepare_writer_fragments(body);
         } else {
           auto function = verify_function(plan, start, bytes.size(), {});
-          admitted_stores += std::ranges::count_if(function, [](const auto &inst) {
+          admitted_stores += std::count_if(std::begin(function), std::end(function), [](const auto &inst) {
             return writer(inst.hook);
           });
           functions.push_back(std::move(function));
@@ -486,7 +489,7 @@ struct Watch::Impl {
           const auto enter = constructor ? Hook::constructor_enter : Hook::destructor_enter;
           const auto leave = constructor ? Hook::constructor_return : Hook::destructor_return;
           const bool needs_entry = constructor ?
-              std::ranges::any_of(plan.delegating_constructor_tails,
+              std::any_of(plan.delegating_constructor_tails.begin(), plan.delegating_constructor_tails.end(),
                   [&](const auto &tail) { return tail.second == pc; }) : plan.virtual_destructor;
           const auto fragment_count = functions.size();
           try {
@@ -505,10 +508,10 @@ struct Watch::Impl {
               std::rethrow_exception(fragment_error);
             }
             if (needs_entry) {
-              if (plan.code(pc).starts_with("\xf3\x0f\x1e\xfa"))
+              if (::tracer::compat::starts_with(plan.code(pc), "\xf3\x0f\x1e\xfa"))
                 leaf.erase(leaf.begin());
               if (leaf.empty() ||
-                  std::ranges::any_of(leaf, [](const auto &inst) { return inst.flow != Flow::copy; }))
+                  std::any_of(std::begin(leaf), std::end(leaf), [](const auto &inst) { return inst.flow != Flow::copy; }))
                 throw std::runtime_error(constructor ? "delegating constructor target has no verified entry redirect" :
                     "virtual destructor has no verified entry redirect; indirect destruction would be missed");
             } else if (plan.direct_redirects({pc}).at(pc) != plan.direct_redirects({pc}, true).at(pc)) {
@@ -517,7 +520,7 @@ struct Watch::Impl {
             if (leaf.size() == 1 && !constructor && leaf.front().bytes[0] == 0xc3) {
               leaf.front().hook = Hook::destroy_both;
             } else {
-              if (leaf.size() < 2 || std::ranges::any_of(leaf, [&](const auto &inst) {
+              if (leaf.size() < 2 || std::any_of(std::begin(leaf), std::end(leaf), [&](const auto &inst) {
                     return inst.flow != Flow::copy && inst.target == pc;
                   }))
                 throw;
@@ -709,10 +712,10 @@ struct Watch::Impl {
     // verify_function has already verified the entire leaf, including faulting
     // instructions. The jump can replace those instructions because the
     // translated body executes them with their original application PCs.
-    const auto &leaf = *std::ranges::find_if(functions, [&](const auto &function) {
+    const auto &leaf = *std::find_if(std::begin(functions), std::end(functions), [&](const auto &function) {
       return function.front().pc == start;
     });
-    const auto patch = bytes.starts_with("\xf3\x0f\x1e\xfa") ? start + 4 : start;
+    const auto patch = ::tracer::compat::starts_with(bytes, "\xf3\x0f\x1e\xfa") ? start + 4 : start;
     auto end = patch;
     for (const auto &inst : leaf) {
       if (inst.pc < patch)
@@ -731,12 +734,13 @@ struct Watch::Impl {
       std::vector<Address> interior;
       for (auto pc = patch + 1; pc < end; ++pc)
         interior.push_back(pc);
-      if (std::ranges::any_of(plan.direct_redirects(interior), [](const auto &edge) {
+      const auto edges = plan.direct_redirects(interior);
+      if (std::any_of(edges.begin(), edges.end(), [](const auto &edge) {
             return !edge.second.empty();
           }))
         throw std::runtime_error("an application edge enters the code-cache writer redirect");
     }
-    if (std::ranges::any_of(leaf, [&](const auto &inst) {
+    if (std::any_of(std::begin(leaf), std::end(leaf), [&](const auto &inst) {
           return inst.flow != Flow::copy && inst.target > patch && inst.target < end;
         }))
       throw std::runtime_error("an application edge enters the code-cache writer redirect");
@@ -775,14 +779,14 @@ struct Watch::Impl {
       const auto body = native_entry::scan(plan.writer_start, plan.writer_bytes);
       for (const auto &[entry, mutation] : plan.inline_mutations) {
         const auto add_anchor = [&](Address pc) {
-          const auto existing = std::ranges::find_if(functions, [&](const auto &fragment) {
+          const auto existing = std::find_if(std::begin(functions), std::end(functions), [&](const auto &fragment) {
             return fragment.front().pc == pc;
           });
           if (existing != functions.end()) {
             inline_mutation_anchor(existing->front(), mutation);
             return;
           }
-          const auto anchor = std::ranges::find_if(body.instructions, [&](const auto &candidate) {
+          const auto anchor = std::find_if(std::begin(body.instructions), std::end(body.instructions), [&](const auto &candidate) {
             return candidate.address == pc;
           });
           if (anchor == body.instructions.end() || anchor->flow != NativeFlow::ordinary ||
@@ -837,14 +841,14 @@ struct Watch::Impl {
       const auto body = native_entry::scan(pc, plan.code(pc).substr(0, size));
       if (body.decode_failed || !body.diagnostic.empty() || body.instructions.empty())
         throw std::runtime_error("cannot verify AArch64 lifetime instructions");
-      const auto external_tail = std::ranges::count_if(body.instructions, [&](const auto &candidate) {
+      const auto external_tail = std::count_if(std::begin(body.instructions), std::end(body.instructions), [&](const auto &candidate) {
         return candidate.flow == NativeFlow::branch && candidate.target &&
             (*candidate.target < pc || *candidate.target - pc >= size);
       });
       if (external_tail && (!site.deleting_destructor || external_tail != 1))
         throw std::runtime_error("AArch64 lifetime boundary has an unverified outgoing branch");
       auto entry = body.instructions.begin();
-      if (entry->text.starts_with("bti"))
+      if (::tracer::compat::starts_with(entry->text, "bti"))
         ++entry;
       if (entry != body.instructions.end() &&
           (entry->text == "paciasp" || entry->text == "pacibsp"))
@@ -870,7 +874,7 @@ struct Watch::Impl {
       if (entry == body.instructions.end() || !entry->cache_copyable ||
           entry->flow != NativeFlow::ordinary)
         throw std::runtime_error("AArch64 lifetime entry cannot be safely relocated");
-      const auto existing = std::ranges::find_if(functions, [&](const auto &fragment) {
+      const auto existing = std::find_if(std::begin(functions), std::end(functions), [&](const auto &fragment) {
         return fragment.front().pc == entry->address;
       });
       if (enter == Hook::collection_enter && existing != functions.end() && writer(existing->front().hook)) {
@@ -886,13 +890,13 @@ struct Watch::Impl {
         const auto writer_body = native_entry::scan(plan.writer_start, plan.writer_bytes);
         const auto successors = mutation_successors(writer_body, pc);
         for (const auto next : successors) {
-          const auto successor = std::ranges::find_if(writer_body.instructions, [&](const auto &inst) {
+          const auto successor = std::find_if(std::begin(writer_body.instructions), std::end(writer_body.instructions), [&](const auto &inst) {
             return inst.address == next;
           });
           if (successor == writer_body.instructions.end() || !successor->cache_copyable ||
               successor->flow != NativeFlow::ordinary)
             throw std::runtime_error("collection mutation has no relocatable original successor");
-          const auto patch = std::ranges::find_if(functions, [&](const auto &fragment) {
+          const auto patch = std::find_if(std::begin(functions), std::end(functions), [&](const auto &fragment) {
             return fragment.front().pc == next && writer(fragment.front().hook);
           });
           if (patch != functions.end()) {
@@ -959,7 +963,7 @@ struct Watch::Impl {
     const auto body = native_entry::scan(pc, bytes);
     const auto &code = body.instructions;
     if (!body.decode_failed && body.diagnostic.empty() && !code.empty()) {
-      const auto first_call = std::ranges::find_if(code, [](const auto &inst) {
+      const auto first_call = std::find_if(std::begin(code), std::end(code), [](const auto &inst) {
         return inst.flow != NativeFlow::ordinary || !inst.falls_through;
       });
       // A D0 that directly forwards its receiver to a watched D1 needs
@@ -971,12 +975,12 @@ struct Watch::Impl {
           native_entry::forwards_receiver(pc, bytes.substr(0, first_call->address - pc)))
         return;
       const auto &tail = code.back();
-      const auto start = bytes.starts_with("\xf3\x0f\x1e\xfa") ? pc + 4 : pc;
+      const auto start = ::tracer::compat::starts_with(bytes, "\xf3\x0f\x1e\xfa") ? pc + 4 : pc;
       // An inlined D1 followed by a tail jump to operator delete is done
       // destroying the object by the time execution reaches that jump.
       if (tail.flow == NativeFlow::branch && !tail.falls_through && tail.target &&
           plan.is_delete_target(*tail.target) &&
-          std::ranges::none_of(code, [&](const auto &inst) {
+          std::none_of(std::begin(code), std::end(code), [&](const auto &inst) {
             return inst.address != tail.address && inst.flow == NativeFlow::branch &&
                 (!inst.target || *inst.target < pc || *inst.target - pc >= size);
           })) {
@@ -1111,7 +1115,7 @@ struct Watch::Impl {
             if (end - start >= 10)
               break;
           }
-          if (end - start < 10 || std::ranges::any_of(body.instructions, [&](const auto &inst) {
+          if (end - start < 10 || std::any_of(std::begin(body.instructions), std::end(body.instructions), [&](const auto &inst) {
                 return inst.target && *inst.target > start && *inst.target < end;
               }))
             prefix.clear();
@@ -1119,8 +1123,8 @@ struct Watch::Impl {
         }
       }
       const auto start = prefix.empty() ? call.address : prefix.front().pc;
-      const bool overlaps = std::ranges::any_of(incoming, [&](const auto &redirects) {
-        return std::ranges::any_of(redirects.second, [&](Address pc) {
+      const bool overlaps = std::any_of(std::begin(incoming), std::end(incoming), [&](const auto &redirects) {
+        return std::any_of(std::begin(redirects.second), std::end(redirects.second), [&](Address pc) {
           return pc < end && start < pc + patch_size(pc);
         });
       });
@@ -1171,7 +1175,7 @@ struct Watch::Impl {
           return inst.falls_through || !constructor;
         }))
       throw std::runtime_error("cannot verify native lifetime instruction boundaries");
-    const auto start = bytes.starts_with("\xf3\x0f\x1e\xfa") ? pc + 4 : pc;
+    const auto start = ::tracer::compat::starts_with(bytes, "\xf3\x0f\x1e\xfa") ? pc + 4 : pc;
     auto entry = straight_fragment(plan, body, start, enter);
     if (entry.empty())
       throw std::runtime_error("lifetime entry is too short for a native redirect");
@@ -1185,7 +1189,7 @@ struct Watch::Impl {
     std::vector<ExitFragment> returns;
     const auto original_entry = entry;
     Address next_relay = start + 5;
-    const bool constructor_tail = constructor && std::ranges::any_of(body.instructions, exits_function);
+    const bool constructor_tail = constructor && std::any_of(std::begin(body.instructions), std::end(body.instructions), exits_function);
     bool need_successors = constructor_tail;
     const auto overlaps_entry = [&](const auto &fragment) {
       return fragment.front().pc < entry.back().pc + entry.back().size &&
@@ -1197,11 +1201,12 @@ struct Watch::Impl {
         interior.push_back(byte);
       // Check the original graph as well. The direct-edge index deliberately
       // ignores a function's own back edge to its entry.
-      if (std::ranges::any_of(body.instructions, [&](const auto &candidate) {
+      if (std::any_of(std::begin(body.instructions), std::end(body.instructions), [&](const auto &candidate) {
             return candidate.target && *candidate.target > begin && *candidate.target < end;
           }))
         return false;
-      return std::ranges::all_of(plan.direct_redirects(interior), [](const auto &edge) {
+      const auto edges = plan.direct_redirects(interior);
+      return std::all_of(edges.begin(), edges.end(), [](const auto &edge) {
         return edge.second.empty();
       });
     };
@@ -1211,7 +1216,7 @@ struct Watch::Impl {
       const bool tail = exits_function(inst);
       if (inst.flow != NativeFlow::returns && !tail)
         continue;
-      if (std::ranges::any_of(returns, [&](const auto &exit) {
+      if (std::any_of(std::begin(returns), std::end(returns), [&](const auto &exit) {
             return exit.code.back().pc == inst.address;
           }))
         continue;
@@ -1276,7 +1281,7 @@ struct Watch::Impl {
           continue;
         const auto entry_end = expanded.back().pc + expanded.back().size;
         if (entry_end > candidate.address || overlaps_fragment(start, entry_end) ||
-            std::ranges::any_of(returns, [&](const auto &exit) {
+            std::any_of(std::begin(returns), std::end(returns), [&](const auto &exit) {
               return exit.code.front().pc < entry_end;
             }) || !check_interior(start, entry_end) || !check_interior(candidate.address, end))
           continue;
@@ -1318,7 +1323,7 @@ struct Watch::Impl {
             overlaps_fragment(fragment.front().pc, fragment.back().pc + fragment.back().size))
           throw std::runtime_error("lifetime return continuation has no disjoint native redirect");
         const auto end = fragment.back().pc + fragment.back().size;
-        if (std::ranges::any_of(roots, [&](const auto root) { return root >= next && root < end; }) ||
+        if (std::any_of(std::begin(roots), std::end(roots), [&](const auto root) { return root >= next && root < end; }) ||
             !check_interior(next, end))
           throw std::runtime_error("an application edge enters the lifetime return continuation");
         fragment.front().boundary_pc = pc;
@@ -1344,7 +1349,7 @@ struct Watch::Impl {
       add_fragment(std::move(fragment), terminal);
     };
     const auto past_endbr = [&](Address pc) {
-      return plan.code(pc).starts_with("\xf3\x0f\x1e\xfa") ? pc + 4 : pc;
+      return ::tracer::compat::starts_with(plan.code(pc), "\xf3\x0f\x1e\xfa") ? pc + 4 : pc;
     };
     add(straight_fragment(plan, writer_body, past_endbr(plan.writer_start), Hook::collection_enter), false);
     std::set<Address> covered_returns;
@@ -1416,7 +1421,7 @@ struct Watch::Impl {
     }
     admitted_stores = 0;
     for (const auto &fragment : functions)
-      admitted_stores += std::ranges::count_if(fragment, [](const auto &inst) {
+      admitted_stores += std::count_if(std::begin(fragment), std::end(fragment), [](const auto &inst) {
         return writer(inst.hook);
       });
     if (!admitted_stores)
@@ -1429,14 +1434,24 @@ struct Watch::Impl {
     return window == entry_windows.end() ? 5 : window->second;
   }
 
+  void stop_workers(bool collect_events) {
+    stop_admissions.store(true, std::memory_order_release);
+    if (admissions.joinable())
+      admissions.join();
+    if (collect_events) {
+      stop_pump.store(true, std::memory_order_release);
+      if (pump.joinable())
+        pump.join();
+    }
+  }
+
   ~Impl() {
     if (!channel)
       return;
     channel->activity.fetch_and(~enabled, std::memory_order_acq_rel);
     if (!installed && !draining)
       request_reclaim(*channel);
-    admissions = {};
-    pump = {};
+    stop_workers(true);
     ::munmap(channel, Channel::mapping_size(event_buffer, runtime_limit));
     ::unlink(path.c_str());
   }
@@ -1679,12 +1694,12 @@ struct Watch::Impl {
       coverage_gaps.fetch_add(1, std::memory_order_relaxed);
   }
 
-  void collect(std::stop_token stop) noexcept {
+  void collect() noexcept {
     std::uint64_t next = 0;
     for (;;) {
       auto &slot = *channel->slot(next % event_buffer);
       if (slot.turn.load(std::memory_order_acquire) != next + 1) {
-        if (stop.stop_requested())
+        if (stop_pump.load(std::memory_order_acquire))
           return;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         continue;
@@ -1753,8 +1768,8 @@ struct Watch::Impl {
               throw std::runtime_error("runtime scope instructions could not be verified");
             std::vector<Address> interior;
             for (const auto &patch : requested) {
-              const auto instruction = std::ranges::lower_bound(body.instructions, patch.pc, {},
-                                                               &native_entry::Instruction::address);
+              const auto instruction = std::lower_bound(body.instructions.begin(), body.instructions.end(), patch.pc,
+                  [](const auto &inst, Address address) { return inst.address < address; });
               if (instruction == body.instructions.end() || instruction->address != patch.pc ||
                   patch.size == 0 || patch.size > patch.original.size() ||
                   patch.size > width - (patch.pc - start) || !patch.gateway ||
@@ -1763,7 +1778,7 @@ struct Watch::Impl {
                    (instruction->flow != NativeFlow::call || instruction->size != patch.size)) ||
                   (patch.dispatch && (!patch.call || patch.size < 10 || patch.dispatch >= (Address{1} << 63))) ||
                   !windows.emplace(patch.pc, patch.size).second ||
-                  std::ranges::any_of(redirects, [&](const auto &owned) {
+                  std::any_of(std::begin(redirects), std::end(redirects), [&](const auto &owned) {
                     return owned.pc() < patch.pc + patch.size &&
                            patch.pc < owned.pc() + owned.original().size();
                   }))
@@ -1863,7 +1878,7 @@ struct Watch::Impl {
           throw std::runtime_error("runtime scope mapping changed before the redirects could be committed");
         const auto modules = client::list_debug_module_mappings(pid);
         for (const auto destination : destinations)
-          if (std::ranges::none_of(gateways, [&](const auto &range) {
+          if (std::none_of(std::begin(gateways), std::end(gateways), [&](const auto &range) {
                 return range.first <= destination && destination < range.second;
               }))
             throw std::runtime_error("runtime scope gateway is outside private executable memory");
@@ -2113,7 +2128,7 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
       for (const auto &[exit, relay] : p.short_lifetime_relays) {
         if (relay <= caller || relay + 5 > caller + bytes.size())
           continue;
-        const auto destination = std::ranges::find_if(p.functions, [&](const auto &function) {
+        const auto destination = std::find_if(std::begin(p.functions), std::end(p.functions), [&](const auto &function) {
           return function.front().pc == exit;
         });
         if (destination == p.functions.end())
@@ -2127,10 +2142,10 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
     }
   }
 
-  p.pump = std::jthread([&p](std::stop_token stop) { p.collect(stop); });
+  p.pump = std::thread([&p] { p.collect(); });
   if (p.runtime_limit) {
-    p.admissions = std::jthread([&p](std::stop_token stop) {
-      while (!stop.stop_requested()) {
+    p.admissions = std::thread([&p] {
+      while (!p.stop_admissions.load(std::memory_order_acquire)) {
         if (p.channel->admission.phase.load(std::memory_order_acquire) == RuntimeAdmission::ready)
           p.admit_runtime_scope();
         else
@@ -2194,7 +2209,7 @@ void Watch::stop_runtime_admissions() {
       throw std::runtime_error(p.admission_failure);
     p.reply_to_admission(RuntimeAdmission::disabled);
   }
-  p.admissions = {};
+  p.stop_workers(false);
 }
 
 bool Watch::restore(injector::Process &process) {
@@ -2203,7 +2218,8 @@ bool Watch::restore(injector::Process &process) {
     return true;
   p.draining = true;
   try {
-    if (!process.patch_code_batch(p.patches(true), [&] {
+    const auto patches = p.patches(true);
+    if (!process.patch_code_batch(patches, [&] {
           p.verify_mappings();
           if (p.channel->runtime_prefix_gate.load(std::memory_order_acquire) & ~enabled)
             throw RuntimePrefixBusy{};
@@ -2248,7 +2264,7 @@ bool Watch::retire_if_mapping_changed(std::chrono::steady_clock::time_point dead
     if (inode == p.channel_identity.st_ino && dev_major == major(p.channel_identity.st_dev) &&
         dev_minor == minor(p.channel_identity.st_dev))
       return false;
-    if (permissions[2] == 'x' && std::ranges::any_of(p.redirects, [&](const auto &redirect) {
+    if (permissions[2] == 'x' && std::any_of(std::begin(p.redirects), std::end(p.redirects), [&](const auto &redirect) {
           return redirect.translated_pc() >= begin && redirect.translated_pc() < end;
         }))
       return false;
@@ -2271,7 +2287,7 @@ bool Watch::retire_if_mapping_changed(std::chrono::steady_clock::time_point dead
       if (std::string_view(bytes.data(), size) == redirect.installed())
         return false;
     } else if (amount != -1 || errno != EFAULT ||
-               std::ranges::any_of(live_ranges, [&](const auto &range) {
+               std::any_of(std::begin(live_ranges), std::end(live_ranges), [&](const auto &range) {
                  return redirect.pc() < range.second &&
                         redirect.pc() + size > range.first;
                })) {
@@ -2294,7 +2310,7 @@ void Watch::finish(std::chrono::steady_clock::time_point deadline,
     const std::lock_guard lock(p.admission_mutex);
     p.reply_to_admission(RuntimeAdmission::disabled);
   }
-  p.admissions = {};
+  p.stop_workers(false);
   p.channel->activity.fetch_and(~enabled, std::memory_order_acq_rel);
   if (!process_exited && !mappings_changed &&
       p.channel->capture_limit.load(std::memory_order_acquire) == Channel::overflow)
@@ -2307,7 +2323,7 @@ void Watch::finish(std::chrono::steady_clock::time_point deadline,
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }
-  p.pump = {};
+  p.stop_workers(true);
   const auto emit_final = [&](api::TraceEvent &event, Observation::Kind kind) {
     const auto sequence = p.head.load(std::memory_order_acquire) + p.final_observations;
     if (p.request.max_events() && sequence >= p.request.max_events())

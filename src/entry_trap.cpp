@@ -212,7 +212,7 @@ struct EntryTrap::Worker {
       stop_requested = true;
       return;
     }
-    if (event == PTRACE_EVENT_STOP) {
+    if (event == tracer::injector::ptrace_event_stop) {
       task.listening = signal != SIGTRAP && !task.child;
       return;
     }
@@ -262,7 +262,7 @@ struct EntryTrap::Worker {
       bool found = false;
       for (const auto &entry : std::filesystem::directory_iterator(proc_dir / "task")) {
         const auto tid = static_cast<pid_t>(std::stol(entry.path().filename().string()));
-        if (tasks.contains(tid))
+        if (tasks.count(tid))
           continue;
         if (::ptrace(PTRACE_SEIZE, tid, nullptr, nullptr) == -1) {
           if (errno == ESRCH)
@@ -278,7 +278,7 @@ struct EntryTrap::Worker {
       await_stops(deadline);
     }
     verify_process();
-    if (!tasks.contains(pid))
+    if (!tasks.count(pid))
       throw std::runtime_error("entry trap leader exited during admission");
     for (const auto &[tid, task] : tasks) {
       if (!std::filesystem::exists(proc_dir / "task" / std::to_string(tid)))
