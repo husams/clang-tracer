@@ -1883,7 +1883,7 @@ python<span class="w"> </span>-m<span class="w"> </span>clang_tracer<span class=
 </tr>
 <tr>
 <td><code>EventRange::snapshot(), running(), error(), stop(), begin(), end()</code></td>
-<td>Copy a stable bounded collection, check the producer or error text, stop it while retaining data, or iterate a point-in-time snapshot. Release all range copies to release its capture reservation.</td>
+<td>Copy a stable bounded collection, check the producer or error text, stop it while retaining data, or iterate a point-in-time snapshot. A running range reserves the remaining collection storage; once it finishes or is stopped it keeps only the room its retained events use. Release all range copies to release that too.</td>
 </tr>
 <tr>
 <td><code>Event::sequence(), probe_id(), call_id(), phase(), function_name()</code></td>

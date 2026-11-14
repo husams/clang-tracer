@@ -575,7 +575,16 @@ int main(int argc, char **argv) {
         wait_for([&] { return !quiet.running(); });
         require(quiet.snapshot().timed_out && quiet.error().empty(),
                 "quiet stream deadline is reported");
+        // The finished range is still in scope but retained nothing, so it
+        // no longer holds the storage a new range needs.
+        auto next = tracer.events_async(session);
+        try {
+          (void)tracer.events_async(session);
+          throw std::logic_error("a running range shared its storage reservation");
+        } catch (const std::runtime_error&) {
+        }
       }
+      wait_for([&] { return service.active_watches == 0; });
       {
         auto abandoned = tracer.events_async(session);
         wait_for([&] { return service.active_watches == 1; });

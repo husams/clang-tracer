@@ -68,6 +68,14 @@ Collection BackgroundEvents::snapshot() const {
   return buffer_.snapshot();
 }
 
+std::pair<std::size_t, std::size_t> BackgroundEvents::reserved() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (running_) {
+    return {max_events, max_bytes};
+  }
+  return {buffer_.events().size(), buffer_.bytes()};
+}
+
 bool BackgroundEvents::running() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return running_;
