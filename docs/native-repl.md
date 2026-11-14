@@ -2097,6 +2097,12 @@ and `--startup` files.
   --file ./app
 ```
 
+In an interactive terminal the editor history persists in
+`$HOME/.clang-tracer-history` (mode 0600) and reloads at startup. Each accepted
+entry is merged into the file as it is entered, so concurrent REPLs share it and
+a crash loses nothing; a multiline cell stays one entry. Piped input and an
+unset or empty `HOME` leave history in memory only.
+
 Every submitted C++ cell is checked in a disposable `clang-tracer-repl-check`
 process before the live interpreter parses or executes it. The checker parses
 the accepted cells in their original order without executing them, preserving
