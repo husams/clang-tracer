@@ -11,7 +11,7 @@ set_target_properties(tracer_context_analysis PROPERTIES POSITION_INDEPENDENT_CO
 # The importer and memory-manager translation units derive from LLVM/Clang
 # classes. Keep state/runtime RTTI enabled for std::any/exception contracts.
 if(NOT LLVM_ENABLE_RTTI)
-  set_property(SOURCE src/context_binding.cpp src/agent.cpp src/callback_pch.cpp
+  set_property(SOURCE src/context_binding.cpp src/context_activation.cpp src/agent.cpp src/callback_pch.cpp
     APPEND PROPERTY COMPILE_OPTIONS -fno-rtti)
 endif()
 target_compile_features(tracer_context_analysis PUBLIC cxx_std_20)

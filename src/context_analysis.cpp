@@ -22,7 +22,11 @@ std::string context_class_type_name(const clang::CXXRecordDecl &record) {
   policy.SuppressTagKeyword = true;
   policy.SuppressDefaultTemplateArgs = false;
   policy.SuppressInlineNamespace = false;
+#if CLANG_VERSION_MAJOR >= 22
+  return context.getCanonicalTagType(&record).getAsString(policy);
+#else
   return context.getRecordType(&record).getAsString(policy);
+#endif
 }
 
 namespace {

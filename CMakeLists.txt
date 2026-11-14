@@ -31,6 +31,17 @@ if(TRACER_CONTEXT_ENGINE_ONLY)
   return()
 endif()
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+  include(CTest)
+  include(cmake/TracerArmObjectWatch.cmake)
+  include(cmake/TracerObjectDiagnosticsTests.cmake)
+  if(TRACER_BUILD_REPL)
+    include(cmake/TracerNativeRepl.cmake)
+    tracer_add_native_repl()
+  endif()
+  return()
+endif()
+
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
    NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
   message(FATAL_ERROR "The native tracing backend requires Linux x86_64")
@@ -86,7 +97,8 @@ target_link_libraries(tracer_proto PUBLIC protobuf::libprotobuf tracer_context_t
 add_library(tracer_grpc STATIC ${TRACER_PROTO_DIR}/tracer.grpc.pb.cc)
 target_link_libraries(tracer_grpc PUBLIC tracer_proto gRPC::grpc++)
 
-add_library(clang_tracer_agent SHARED src/agent.cpp src/native_detour.cpp src/page_monitor_agent.cpp
+add_library(clang_tracer_agent SHARED src/agent.cpp src/native_detour.cpp src/native_entry.cpp src/page_monitor_agent.cpp
+  src/object_code_cache_agent.cpp
   src/value_snapshot_codegen.cpp src/value_snapshot_storage.cpp src/snapshot_encoder.cpp src/callback_pch.cpp
   src/debug_resolver.cpp src/native_stack.cpp src/event_transport.cpp
   src/context_agent_delivery.cpp src/agent_runtime_profile.cpp)
@@ -109,13 +121,22 @@ add_custom_command(TARGET clang_tracer_agent POST_BUILD
   VERBATIM)
 
 add_executable(clang-tracer-server src/main.cpp src/server.cpp src/session.cpp src/injector.cpp src/admission.cpp src/memory_patch.cpp src/page_monitor.cpp
-  src/debug_resolver.cpp src/header_context.cpp src/process_memory.cpp src/native_entry.cpp
-  src/instruction_trace.cpp)
+  src/debug_resolver.cpp src/header_context.cpp src/process_memory.cpp src/native_entry.cpp src/native_detour.cpp
+  src/object_watch.cpp src/object_watch_plan.cpp src/object_snapshot.cpp src/object_launch.cpp
+  src/object_code_cache.cpp src/entry_trap.cpp src/instruction_trace.cpp)
 target_include_directories(clang-tracer-server PRIVATE include ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_compile_definitions(clang-tracer-server PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
 target_link_libraries(clang-tracer-server PRIVATE tracer_grpc tracer_context_collector
   tracer_context_analysis clang-cpp LLVM ${CMAKE_DL_LIBS} Threads::Threads)
 target_compile_options(clang-tracer-server PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(clang-tracer-object-watch src/object_watch_main.cpp src/object_watch.cpp
+  src/object_watch_plan.cpp src/native_entry.cpp src/native_detour.cpp src/debug_resolver.cpp
+  src/object_launch.cpp src/object_code_cache.cpp src/injector.cpp src/admission.cpp src/runtime_identity.cpp)
+target_include_directories(clang-tracer-object-watch PRIVATE include ${LLVM_INCLUDE_DIRS})
+target_link_libraries(clang-tracer-object-watch PRIVATE tracer_proto LLVM Threads::Threads ${CMAKE_DL_LIBS})
+install(TARGETS clang-tracer-object-watch RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Runtime)
+include(cmake/TracerObjectDiagnosticsTests.cmake)
 
 add_executable(clang-tracer src/client.cpp src/debug_resolver.cpp src/header_context.cpp)
 target_include_directories(clang-tracer PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
@@ -139,7 +160,7 @@ add_subdirectory(examples/prepared-injectors)
 add_executable(trace-target tests/fixtures/target.cpp)
 target_link_libraries(trace-target PRIVATE Threads::Threads)
 set_target_properties(trace-target PROPERTIES ENABLE_EXPORTS ON)
-target_compile_options(trace-target PRIVATE -O0 -fno-omit-frame-pointer -fcf-protection=none)
+target_compile_options(trace-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
 
 add_executable(cpp-interceptors-target examples/cpp-interceptors/target.cpp)
 target_compile_options(cpp-interceptors-target PRIVATE -g -O0 -fno-omit-frame-pointer
@@ -221,9 +242,12 @@ foreach(stack_target trace-stack-a trace-stack-b)
   target_compile_options(${stack_target} PRIVATE -O2 -fomit-frame-pointer
     -fno-optimize-sibling-calls -fasynchronous-unwind-tables -fcf-protection=none)
 endforeach()
+if(BUILD_TESTING)
+  target_compile_options(trace-stack-b PRIVATE -g)
+endif()
 set_target_properties(trace-threaded-target PROPERTIES ENABLE_EXPORTS ON)
 target_link_libraries(trace-threaded-target PRIVATE Threads::Threads trace-stack-a trace-stack-b)
-target_compile_options(trace-threaded-target PRIVATE -O0 -fno-omit-frame-pointer
+target_compile_options(trace-threaded-target PRIVATE -g -O0 -fno-omit-frame-pointer
   -fno-optimize-sibling-calls -fcf-protection=none)
 
 endif()
@@ -264,7 +288,7 @@ if(BUILD_TESTING)
     tests/fixtures/dependency_collision.cpp)
   set_target_properties(trace-collision-target PROPERTIES ENABLE_EXPORTS ON)
   target_link_libraries(trace-collision-target PRIVATE Threads::Threads)
-  target_compile_options(trace-collision-target PRIVATE -O0 -fno-omit-frame-pointer
+  target_compile_options(trace-collision-target PRIVATE -g -O0 -fno-omit-frame-pointer
     -fcf-protection=none)
   add_test(NAME grpc_agent_dependency_collision
     COMMAND server-integration
@@ -417,7 +441,7 @@ if(BUILD_TESTING)
   set_tests_properties(grpc_class_interceptor_integration PROPERTIES TIMEOUT 360)
   add_executable(typed-this-fixture tests/typed_this_fixture.cpp)
   set_target_properties(typed-this-fixture PROPERTIES ENABLE_EXPORTS ON)
-  target_compile_options(typed-this-fixture PRIVATE -O0 -fno-omit-frame-pointer
+  target_compile_options(typed-this-fixture PRIVATE -g -O0 -fno-omit-frame-pointer
     -fcf-protection=none)
   add_test(NAME grpc_typed_this_integration
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/typed_this_integration.py

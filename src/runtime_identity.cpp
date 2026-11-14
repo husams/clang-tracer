@@ -1,6 +1,6 @@
 #include "runtime_identity.hpp"
 
-#if defined(__linux__) && defined(__x86_64__)
+#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
 #include <cstddef>
 
 #include <dlfcn.h>

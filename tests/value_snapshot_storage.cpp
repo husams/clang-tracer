@@ -46,7 +46,15 @@ int main() {
             "capture storage and cursors are thread-local");
     while (capacity)
       (void)tracer_snapshot_storage(&capacity);
-    require(tracer_snapshot_mark() == 16 * 1024, "arena exhaustion is bounded");
+    require(tracer_snapshot_mark() == 16 * 1024, "default arena exhaustion is bounded");
+    tracer_snapshot_reset(outer);
+    tracer_snapshot_configure(2 * tracer::max_snapshot_bytes, tracer::max_snapshot_bytes, 128, 3);
+    require(tracer_snapshot_mark() == outer, "resize an empty arena");
+    (void)tracer_snapshot_storage(&capacity, tracer::max_snapshot_bytes);
+    require(capacity == tracer::max_snapshot_bytes, "large configured capture reserves its extent");
+    auto *large_nested = tracer_snapshot_storage(&capacity, tracer::max_snapshot_bytes);
+    require(large_nested && capacity == tracer::max_snapshot_bytes,
+            "two full reservations fit without moving the first");
     tracer_snapshot_reset(outer);
     require(tracer_snapshot_mark() == outer,
             "cleanup restores storage after exhaustion");

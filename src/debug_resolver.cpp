@@ -68,7 +68,8 @@ std::string qualified(DWARFDie d) {
   for (; d; d = d.getParent()) {
     const auto tag = d.getTag();
     if (tag == dw::DW_TAG_namespace || tag == dw::DW_TAG_class_type ||
-        tag == dw::DW_TAG_structure_type || tag == dw::DW_TAG_subprogram) {
+        tag == dw::DW_TAG_structure_type || tag == dw::DW_TAG_union_type ||
+        tag == dw::DW_TAG_subprogram) {
       if (name(d).empty()) {
         return {};
       }
@@ -152,6 +153,7 @@ Type read_type(DWARFDie d, unsigned depth = 0) {
   }
   case dw::DW_TAG_class_type:
   case dw::DW_TAG_structure_type:
+  case dw::DW_TAG_union_type:
     return {qualified(d), number(d, dw::DW_AT_byte_size), api::OBJECT, d, false};
   case dw::DW_TAG_base_type:
     break;
@@ -609,7 +611,9 @@ std::optional<bool> matches_mapped_build_id(
 }
 
 void describe_record(DWARFDie record, api::DebugInfo& info) {
-  if (record.getTag() != dw::DW_TAG_class_type && record.getTag() != dw::DW_TAG_structure_type) {
+  const bool is_union = record.getTag() == dw::DW_TAG_union_type;
+  if (record.getTag() != dw::DW_TAG_class_type && record.getTag() != dw::DW_TAG_structure_type &&
+      !is_union) {
     throw std::runtime_error("unsupported debug receiver");
   }
   info.set_record_name(qualified(record));
@@ -632,6 +636,11 @@ void describe_record(DWARFDie record, api::DebugInfo& info) {
   info.set_receiver_volatile(false);
   if (info.record_name().empty())
     throw std::runtime_error("incomplete debug record identity");
+  if (is_union) {
+    info.set_record_is_opaque(true);
+    info.set_record_alignment(number(record, dw::DW_AT_alignment));
+    return;
+  }
   bool opaque = !info.record_size();
   for (auto member : record.children()) {
     if (member.getTag() == dw::DW_TAG_inheritance) {
@@ -840,14 +849,14 @@ struct CallableShape {
 };
 
 CallableShape describe_callable(DWARFDie die, DWARFDie decl,
-                                const PreviewName &display = {}) {
+                                const PreviewName &display = {}, bool allow_virtual_entry = false) {
   if (::tracer::compat::starts_with(name(decl), "~") || name(decl) == name(decl.getParent())) {
     throw std::runtime_error("debug constructors/destructors are unsupported");
   }
   if (number(decl, dw::DW_AT_calling_convention, dw::DW_CC_normal) != dw::DW_CC_normal) {
     throw std::runtime_error("nondefault debug calling convention is unsupported");
   }
-  if (number(decl, dw::DW_AT_virtuality)) {
+  if (!allow_virtual_entry && number(decl, dw::DW_AT_virtuality)) {
     throw std::runtime_error("virtual debug methods are unsupported");
   }
 
@@ -1110,6 +1119,10 @@ std::optional<std::string> separate_debug_file(
       build_id.push_back(digits[byte & 0x0f]);
     }
     candidates.emplace_back(
+        (module_path.parent_path() / ".debug" /
+         (module_path.filename().string() + ".debug")).string(),
+        true);
+    candidates.emplace_back(
         "/usr/lib/debug/.build-id/" + build_id.substr(0, 2) + "/" +
             build_id.substr(2) + ".debug",
         true);
@@ -1137,7 +1150,7 @@ std::optional<std::string> separate_debug_file(
     const auto *debug_object = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(
         debug_binary->getBinary());
     if (!debug_object || !debug_object->isELF() ||
-        debug_object->getArch() != llvm::Triple::x86_64 ||
+        debug_object->getArch() != object.getArch() ||
         !debug_object->isLittleEndian())
       continue;
     const auto debug_build_id = llvm::object::getBuildID(debug_object);
@@ -1153,13 +1166,138 @@ std::optional<std::string> separate_debug_file(
 }
 } // namespace
 
+void verify_rebound_method_signature(DWARFDie function, const api::PreparedInjector &prepared) {
+  while (function && function.getTag() != dw::DW_TAG_subprogram)
+    function = function.getParent();
+  const auto decl = declaration(function);
+  if (!decl)
+    throw std::runtime_error("compatible method rebinding needs a concrete DWARF subprogram");
+  const auto shape = describe_callable(function, decl, {}, true);
+  const auto &expected = prepared.signature();
+  const auto &types = prepared.header_types();
+  auto receiver = types.record_name();
+  if (::tracer::compat::starts_with(receiver, "::"))
+    receiver.erase(0, 2);
+  const auto spelling = [](std::string value) {
+    if (::tracer::compat::starts_with(value, "::"))
+      value.erase(0, 2);
+    return compact(value);
+  };
+  const auto matches = [&](api::ValueType kind, const std::string &actual, const std::string &wanted) {
+    return kind != api::OBJECT && spelling(actual) == spelling(wanted);
+  };
+  if (!shape.receiver || qualified(shape.receiver) != receiver || shape.receiver_volatile ||
+      types.receiver_volatile() || shape.signature.kind() != expected.kind() ||
+      shape.signature.result() != expected.result() ||
+      !matches(expected.result(), shape.result_spelling, types.result_cpp_type()) ||
+      shape.signature.arguments_size() != expected.arguments_size() ||
+      types.arguments_size() != expected.arguments_size())
+    throw std::runtime_error("compatible method rebinding requires a verified receiver and callable ABI");
+  for (int index = 0; index < expected.arguments_size(); ++index)
+    if (shape.signature.arguments(index) != expected.arguments(index) ||
+        !matches(expected.arguments(index), shape.arguments[index].cpp_type(), types.arguments(index).cpp_type()))
+      throw std::runtime_error("compatible method rebinding found a different argument ABI");
+}
+
 std::vector<std::string> list_debug_modules(std::uint32_t pid) {
   return modules(pid);
 }
 
+std::uint64_t bind_live_executable(std::uint32_t pid, const std::string &path,
+                                  const llvm::object::ObjectFile &object,
+                                  std::uint64_t entry, std::uint64_t size,
+                                  bool allow_main_without_build_id) {
+  const auto *elf = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(&object);
+#if defined(__aarch64__)
+  constexpr auto native_arch = llvm::Triple::aarch64;
+#else
+  constexpr auto native_arch = llvm::Triple::x86_64;
+#endif
+  if (!elf || elf->getArch() != native_arch || !size ||
+      size > std::numeric_limits<std::uint64_t>::max() - entry)
+    throw std::invalid_argument("object watch requires an ELF code range for the native Linux architecture");
+  api::DebugInfo info;
+  info.set_module(path);
+  info.set_file_size(object.getMemoryBufferRef().getBufferSize());
+  std::uint64_t offset = 0;
+  const auto live = runtime_entry(pid, *elf, info, entry, entry + size, &offset);
+  if (live < entry)
+    throw std::runtime_error("cannot verify the mapped executable build ID");
+  if (const auto build_id = matches_mapped_build_id(pid, *elf, live - entry)) {
+    if (!*build_id)
+      throw std::runtime_error("mapped executable build ID differs from ELF");
+  } else {
+    struct stat executable{};
+    const auto image = "/proc/" + std::to_string(pid) + "/exe";
+    if (!allow_main_without_build_id || ::stat(image.c_str(), &executable) != 0)
+      throw std::runtime_error("cannot verify the mapped executable build ID");
+    const auto mappings = read_executable_mappings(pid, {path});
+    if (std::none_of(mappings.begin(), mappings.end(), [&](const auto &map) {
+          return map.matches(executable) && live >= map.begin && live < map.end &&
+                 size <= map.end - live && offset >= map.offset &&
+                 offset - map.offset == live - map.begin;
+        }))
+      throw std::runtime_error("cannot verify the primary ELF mapping identity");
+  }
+  return live - entry;
+}
+
+std::optional<std::string> find_matching_debug_file(
+    const std::string &path, const llvm::object::ObjectFile &object) {
+  const auto *elf = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(&object);
+  return elf ? separate_debug_file(path, *elf) : std::nullopt;
+}
+
+std::string verified_function_code(std::uint32_t pid, const api::DebugInfo &info,
+                                   std::uint64_t max_bytes, std::string_view expected_image_sha256) {
+  const auto size = info.entry_size();
+  const auto entry = info.entry_virtual_address();
+  if (!size || size > max_bytes || size > UINT64_MAX - entry)
+    throw std::runtime_error("function exceeds the verified code size limit");
+  struct stat before{};
+  if (!expected_image_sha256.empty() && ::stat(info.module().c_str(), &before) != 0)
+    throw std::runtime_error("cannot identify the prepared image");
+  auto binary = llvm::object::createBinary(info.module());
+  if (!binary)
+    throw std::runtime_error(llvm::toString(binary.takeError()));
+  const auto *elf = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(binary->getBinary());
+  if (!elf)
+    throw std::runtime_error("function image is not a Linux x86-64 ELF");
+  std::uint64_t offset = 0;
+  const auto live = runtime_entry(pid, *elf, info, entry, entry + size, &offset);
+  const auto image = elf->getMemoryBufferRef().getBuffer();
+  if (!expected_image_sha256.empty()) {
+    const auto digest = llvm::SHA256::hash(llvm::ArrayRef<std::uint8_t>(
+        reinterpret_cast<const std::uint8_t *>(image.data()), image.size()));
+    if (std::string_view(reinterpret_cast<const char *>(digest.data()), digest.size()) !=
+        expected_image_sha256)
+      throw std::runtime_error("verified function image digest changed before patching");
+    const auto mappings = read_executable_mappings(pid, {info.module()});
+    const bool mapped = std::any_of(mappings.begin(), mappings.end(), [&](const auto &map) {
+      return map.matches(before) && live >= map.begin && live < map.end &&
+          size <= map.end - live && offset >= map.offset && offset - map.offset == live - map.begin;
+    });
+    struct stat after{};
+    if (!mapped || ::stat(info.module().c_str(), &after) != 0 ||
+        before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
+        before.st_size != after.st_size || before.st_ctim.tv_sec != after.st_ctim.tv_sec ||
+        before.st_ctim.tv_nsec != after.st_ctim.tv_nsec)
+      throw std::runtime_error("prepared image no longer identifies the live mapping");
+  }
+  const bool digest_only = !expected_image_sha256.empty() && llvm::object::getBuildID(elf).empty();
+  if (live != info.runtime_entry() || live < entry ||
+      (!digest_only && !matches_mapped_build_id(pid, *elf, live - entry).value_or(false)) ||
+      offset > image.size() || size > image.size() - offset)
+    throw std::runtime_error("function image identity changed before patching");
+  const std::string code(image.substr(offset, size).str());
+  if (!matches_process_bytes(pid, live, code))
+    throw std::runtime_error("verified function code differs from the live image");
+  return code;
+}
+
 api::ListModulesResponse list_debug_module_mappings(std::uint32_t pid,
-                                                   const std::string &elf_path) {
-  const auto paths = modules(pid);
+                                                   const std::string &elf_path, bool include_runtime) {
+  const auto paths = modules(pid, include_runtime);
   const auto mappings = read_executable_mappings(pid, paths);
   const auto fingerprint = mapping_fingerprint(paths, mappings);
   api::ListModulesResponse result;
@@ -1232,7 +1370,7 @@ api::ListModulesResponse list_debug_module_mappings(std::uint32_t pid,
         mapping.matches(file))
       entry.set_build_id(id->second);
   }
-  const auto current = modules(pid);
+  const auto current = modules(pid, include_runtime);
   if (mapping_fingerprint(current, read_executable_mappings(pid, current)) !=
       fingerprint)
     throw std::invalid_argument("mapped images changed during discovery; restart listing");
@@ -1691,6 +1829,18 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
       visit(symbol);
     for (const auto &symbol : object->getDynamicSymbolIterators())
       visit(symbol);
+    if (ranges.empty()) {
+      if (const auto debug_path = separate_debug_file(path, *object)) {
+        auto debug = llvm::object::createBinary(*debug_path);
+        if (!debug) {
+          llvm::consumeError(debug.takeError());
+        } else if (const auto *debug_object =
+                       llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(debug->getBinary())) {
+          for (const auto &symbol : debug_object->symbols())
+            visit(symbol);
+        }
+      }
+    }
     if (ranges.empty() && source_only)
       continue;
     if (ranges.size() != 1)
@@ -1857,11 +2007,8 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
             if (number(decl, dw::DW_AT_calling_convention, dw::DW_CC_normal) != dw::DW_CC_normal) {
               throw std::runtime_error("nondefault debug calling convention is unsupported");
             }
-            if (number(decl, dw::DW_AT_virtuality)) {
-              throw std::runtime_error("virtual debug methods are unsupported");
-            }
             ResolvedCallable found;
-            const auto shape = describe_callable(die, decl, display);
+            const auto shape = describe_callable(die, decl, display, options.allow_virtual_entry);
             const bool bare_name = selected == dwarf_name ||
                                    selected == name(decl) || selected == symbol_name;
             if (!bare_name && compact(shape.selector) != selected &&

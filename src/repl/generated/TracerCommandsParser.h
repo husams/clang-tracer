@@ -44,10 +44,20 @@ public:
     T__164 = 165, T__165 = 166, T__166 = 167, T__167 = 168, T__168 = 169,
     T__169 = 170, T__170 = 171, T__171 = 172, T__172 = 173, T__173 = 174,
     T__174 = 175, T__175 = 176, T__176 = 177, T__177 = 178, T__178 = 179,
-    T__179 = 180, T__180 = 181, T__181 = 182, UINT = 183, STRING = 184,
-    SHELL = 185, METADATA_ONLY = 186, SQLITE = 187, STACK = 188, CWD = 189,
-    SIGNATURE = 190, MEMBER = 191, SNAPSHOT_RETURN_POINTEE = 192, WORD = 193,
-    WS = 194
+    T__179 = 180, T__180 = 181, T__181 = 182, T__182 = 183, T__183 = 184,
+    T__184 = 185, T__185 = 186, T__186 = 187, T__187 = 188, T__188 = 189,
+    T__189 = 190, T__190 = 191, T__191 = 192, T__192 = 193, T__193 = 194,
+    T__194 = 195, T__195 = 196, T__196 = 197, T__197 = 198, T__198 = 199,
+    T__199 = 200, T__200 = 201, T__201 = 202, T__202 = 203, T__203 = 204,
+    T__204 = 205, T__205 = 206, T__206 = 207, T__207 = 208, T__208 = 209,
+    T__209 = 210, T__210 = 211, T__211 = 212, T__212 = 213, T__213 = 214,
+    T__214 = 215, T__215 = 216, T__216 = 217, T__217 = 218, T__218 = 219,
+    T__219 = 220, T__220 = 221, T__221 = 222, T__222 = 223, T__223 = 224,
+    T__224 = 225, T__225 = 226, T__226 = 227, T__227 = 228, T__228 = 229,
+    T__229 = 230, T__230 = 231, T__231 = 232, T__232 = 233, UINT = 234,
+    STRING = 235, SHELL = 236, METADATA_ONLY = 237, SQLITE = 238, STACK = 239,
+    CWD = 240, SIGNATURE = 241, MEMBER = 242, SNAPSHOT_RETURN_POINTEE = 243,
+    WORD = 244, WS = 245
   };
 
   enum {
@@ -61,11 +71,12 @@ public:
     RuleEvents = 26, RuleCollect = 27, RuleRecord = 28, RuleStreamOption = 29,
     RuleCpp = 30, RuleShell = 31, RuleComplete = 32, RuleType = 33, RuleHelp = 34,
     RuleQuit = 35, RuleBulkTrace = 36, RuleBulkTraceOption = 37, RuleValue = 38,
-    RuleKeyword = 39, RuleMemory = 40, RuleProbeEntry = 41, RuleProbeReload = 42,
-    RuleTargetLaunch = 43, RuleLaunchOption = 44, RuleChildList = 45, RuleTargetCall = 46,
-    RuleLocalPerf = 47, RuleTargetLibrary = 48, RuleInstructions = 49, RuleInstructionOption = 50,
-    RuleWatchpoint = 51, RuleStackFilter = 52, RuleContextEventBytes = 53,
-    RuleExtraCompileOption = 54, RuleCwdOption = 55
+    RuleKeyword = 39, RuleObjectWatch = 40, RuleObjectOption = 41, RuleMemory = 42,
+    RuleProbeEntry = 43, RuleProbeReload = 44, RuleTargetLaunch = 45, RuleLaunchOption = 46,
+    RuleChildList = 47, RuleTargetCall = 48, RuleLocalPerf = 49, RuleTargetLibrary = 50,
+    RuleInstructions = 51, RuleInstructionOption = 52, RuleWatchpoint = 53,
+    RuleStackFilter = 54, RuleContextEventBytes = 55, RuleExtraCompileOption = 56,
+    RuleCwdOption = 57
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -125,6 +136,8 @@ public:
   class BulkTraceOptionContext;
   class ValueContext;
   class KeywordContext;
+  class ObjectWatchContext;
+  class ObjectOptionContext;
   class MemoryContext;
   class ProbeEntryContext;
   class ProbeReloadContext;
@@ -193,6 +206,7 @@ public:
     WatchpointContext *watchpoint();
     TargetLibraryContext *targetLibrary();
     ChildListContext *childList();
+    ObjectWatchContext *objectWatch();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -534,6 +548,7 @@ public:
     antlr4::tree::TerminalNode *WORD();
     antlr4::tree::TerminalNode *SNAPSHOT_RETURN_POINTEE();
     StackFilterContext *stackFilter();
+    ValueContext *value();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -566,7 +581,8 @@ public:
     virtual size_t getRuleIndex() const override;
     std::vector<ValueContext *> value();
     ValueContext* value(size_t i);
-    antlr4::tree::TerminalNode *UINT();
+    std::vector<antlr4::tree::TerminalNode *> UINT();
+    antlr4::tree::TerminalNode* UINT(size_t i);
     antlr4::tree::TerminalNode *STACK();
     std::vector<StreamOptionContext *> streamOption();
     StreamOptionContext* streamOption(size_t i);
@@ -761,6 +777,36 @@ public:
   };
 
   KeywordContext* keyword();
+
+  class  ObjectWatchContext : public antlr4::ParserRuleContext {
+  public:
+    ObjectWatchContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+    std::vector<ObjectOptionContext *> objectOption();
+    ObjectOptionContext* objectOption(size_t i);
+    antlr4::tree::TerminalNode *UINT();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  ObjectWatchContext* objectWatch();
+
+  class  ObjectOptionContext : public antlr4::ParserRuleContext {
+  public:
+    ObjectOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+    antlr4::tree::TerminalNode *UINT();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  ObjectOptionContext* objectOption();
 
   class  MemoryContext : public antlr4::ParserRuleContext {
   public:

@@ -28,6 +28,7 @@ service Tracer {
   rpc StartInstructionTrace(StartInstructionTraceRequest) returns (InstructionTrace);
   rpc StopInstructionTrace(StopInstructionTraceRequest) returns (InstructionTrace);
   rpc PreviewFunctionEntry(PreviewFunctionEntryRequest) returns (PreviewFunctionEntryResponse);
+  rpc ObjectWatch(ObjectWatchRequest) returns (ObjectWatchStatus);
   rpc ListThreads(ListThreadsRequest) returns (ListThreadsResponse);
   rpc ListSymbols(ListSymbolsRequest) returns (ListSymbolsResponse);
   rpc PreviewBulkTrace(PreviewBulkTraceRequest) returns (PreviewBulkTraceResponse);
@@ -170,6 +171,7 @@ message HeaderContext {
 message PreparedSnapshotMember {
   string field = 1;
   repeated uint32 dynamic_types = 2;
+  bool erased_any = 3;
 }
 message PreparedSnapshotRecord {
   uint32 type_index = 1;
@@ -195,6 +197,20 @@ message SnapshotLimits {
   optional uint32 arena_bytes = 9;
   optional uint32 slice_bytes = 10;
 }
+
+message PreparedStorageRecord {
+  string name = 1;
+  uint64 bytes = 2;
+  message Member {
+    string name = 1;
+    uint64 offset_bits = 2;
+    uint64 bytes = 3;
+    string type = 4;
+    bool base = 5;
+    bool needs_dynamic_location = 6;
+  }
+  repeated Member members = 3;
+}
 message PreparedInjector {
   uint32 format_version = 1; // 1/2 are scalar, 4/5 carry standalone typed adapters.
   bytes module_sha256 = 2; // Required for pinned packages, empty otherwise.
@@ -219,6 +235,7 @@ message PreparedInjector {
   repeated DebugInfo snapshot_types = 21; // Generic prepared snapshot type registry; aliases SnapshotTypeN.
   repeated PreparedSnapshotRecord snapshot_records = 22; // Type and pointer-field snapshot policy.
   SnapshotLimits snapshot_limits = 23; // Limits chosen at prepare time.
+  repeated PreparedStorageRecord receiver_storage = 24; // Donor layout evidence for object watches.
 }
 message ProbeSpec {
   string symbol = 1;       // Linkage name/diagnostic; export required only in raw-symbol mode.
@@ -253,6 +270,21 @@ message ProbeSpec {
   bool trace_exceptions = 24;
   bool snapshot_return_pointee = 27; // Opt-in: callback may snapshot a live raw returned record.
   SnapshotLimits snapshot_limits = 28; // Run-time overrides of the prepared limits.
+  // Omitted retains the existing entry-only behavior for older callers.
+  string native_backend = 37; // "auto" or "entry".
+  string direct_caller = 38; // Optional named caller for an auto call-site patch.
+  bool snapshot_receiver_at_return = 39; // Opt-in, for methods with a stable receiver at return.
+  uint32 snapshot_max_items = 40;
+  uint32 snapshot_max_string_bytes = 41;
+  uint32 snapshot_max_depth = 42;
+  uint32 snapshot_max_bytes = 43;
+  bool snapshot_report_unavailable = 44;
+  message SnapshotRttiRange {
+    uint64 begin = 1;
+    uint64 end = 2;
+  }
+  repeated SnapshotRttiRange snapshot_rtti_ranges = 45;
+  repeated string snapshot_receiver_fields = 46; // Receiver fields used by object watch comparison.
 }
 message AttachRequest {
   uint32 pid = 1;
@@ -374,6 +406,10 @@ message Probe {
   bool reclaimed = 20;
   bool allow_call_original = 21;
   bool trace_exceptions = 22;
+  string backend = 23;
+  string backend_reason = 24;
+  uint64 patch_address = 25;
+  uint64 relay_address = 26;
 }
 message ReloadProbeRequest {
   string session_id = 1;
@@ -782,6 +818,260 @@ message StackTrace {
   uint32 captured_depth = 7; // Native depth before filtering; bounded by requested_depth.
   // This is the invocation's entry stack, including on POST events.
 }
+message ObjectWatchRequest {
+  string session_id = 1;
+  enum Action { START = 0; STATUS = 1; STOP = 2; PREVIEW = 3; PREPARE = 4; }
+  Action action = 2;
+  string concrete_type = 3;
+  string base_type = 4;
+  string owner_type = 5;
+  string field = 6;
+  string collection = 7;
+  string snapshot_field = 8;
+  string code_symbol = 9; // ELF linkage symbol or DWARF selector.
+  uint32 stack_depth = 10;
+  uint64 watch_id = 11;
+  uint32 max_elements = 12;
+  uint32 max_string_bytes = 13;
+  bool no_values = 14;
+  enum Backend { PTRACE = 0; CODE_CACHE = 1; }
+  Backend backend = 15;
+  string code_module = 16; // Optional live writer module for code-cache.
+  string borrow_caller = 17; // Main executable caller of get() and the indirect writer.
+  string executable_file = 18; // Local to the server, used only by PREPARE.
+  ObjectWatchPlan prepared_bindings = 19;
+  enum Mode { WRITES = 0; SNAPSHOTS = 1; }
+  Mode mode = 20;
+  repeated PreparedInjector methods = 21;
+  repeated string snapshot_fields = 22;
+  repeated string snapshot_keys = 23;
+  bool first_seen = 24; // Admit an ABI-verified receiver for one writer invocation.
+  string vector_field = 25;
+  string element_key_field = 26;
+  optional uint32 element_key = 27;
+  string mutation_symbol = 28;
+  bool writer_entry = 29; // Redirect every entry to a standalone verified leaf writer.
+  enum Synchronization {
+    SYNCHRONIZATION_UNSPECIFIED = 0;
+    THREAD_CONFINED = 1;
+    CALLER_LOCK = 2;
+    STABLE_AT_BOUNDARIES = 3;
+  }
+  Synchronization synchronization = 30;
+  uint32 snapshot_max_depth = 31;
+  uint32 snapshot_max_bytes = 32;
+  uint32 max_instances = 33;
+  message SourceWriter {
+    string symbol = 1;
+    string function = 2;
+    string file = 3;
+    uint32 line = 4;
+  }
+  repeated SourceWriter source_writers = 34;
+  uint64 max_events = 35;
+  uint32 timeout_seconds = 36;
+  uint32 writer_tid = 37;
+  string snapshot_module = 38; // Optional mapped image selector for compatible method rebinding.
+  string map_field = 39;
+  string map_key = 40;
+  uint32 event_buffer = 41; // Native code-cache ring size, zero selects the default.
+  string union_tag = 42; // Nonoverlapping uint32 or uint32-backed enum discriminator.
+  message UnionCase {
+    uint32 tag = 1;
+    string member = 2;
+  }
+  repeated UnionCase union_cases = 43;
+  repeated uint32 async_signals = 44; // Existing application handlers bridged by the native cache.
+  string application_rendezvous = 45; // Verified AArch64 userspace loader rendezvous.
+  repeated string additional_code_symbols = 46; // Other verified writers in the selected image.
+  enum OverflowPolicy { DROP_NEW = 0; STOP_CAPTURE = 1; }
+  OverflowPolicy overflow_policy = 47;
+  bool syscall_output = 48; // Diagnostic read/pread64 output into an exact scalar field.
+  bool cfi_stack = 49; // Seed native CFI with the original application registers.
+  uint32 serialize_wait_us = 50; // Maximum per-range ordering wait. Zero keeps concurrent capture.
+  repeated string additional_mutation_symbols = 51; // Independently verified storage-changing calls.
+  bool follow_calls = 52; // Translate the live callees of selected writer scopes.
+  uint32 runtime_limit = 53; // Maximum retained runtime translations, zero selects the default.
+  string shared_file = 54; // Server-local regular file backing watched shared storage.
+  string pointee_field = 55; // DWARF-verified data-member path, separated by -> for pointer hops.
+  string owner_add = 56;
+  string owner_get = 57;
+  string owner_remove = 58;
+  string owner_snapshot = 59;
+}
+
+message ObjectWatchPlan {
+  string executable_build_id = 1;
+  string writer_build_id = 2;
+  uint64 field_offset = 3;
+  string field_encoding = 4;
+  message Binding {
+    string role = 1;
+    string module = 2;
+    string module_build_id = 3;
+    uint64 elf_pc = 4;
+    uint64 runtime_pc = 5; // Absent in the offline package.
+    bytes original = 6;
+    string function = 7;
+    uint32 patch_size = 8;
+  }
+  repeated Binding bindings = 5;
+  string binary_sha256 = 6; // Pinned method image identity, including when there is no GNU build ID.
+  string executable_sha256 = 7;
+  repeated ObjectWatchRequest.SourceWriter source_writers = 8;
+  repeated uint64 pointee_offsets = 9;
+}
+
+message ObjectWatchPackage {
+  uint32 version = 1;
+  ObjectWatchRequest definition = 2;
+  ObjectWatchPlan plan = 3;
+}
+
+message ObjectWatchStatus {
+  uint64 watch_id = 1;
+  bool active = 2;
+  uint32 store_sites = 3;
+  uint32 unsupported_sites = 4;
+  uint64 observations = 5;
+  string diagnostic = 6;
+  bool restoration_pending = 7;
+  bool no_values = 8;
+  ObjectWatchRequest.Backend backend = 9;
+  message Redirect {
+    uint64 pc = 1;
+    bytes original = 2;
+    bytes installed = 3;
+    uint64 translated_pc = 4;
+  }
+  repeated Redirect redirects = 10;
+  uint64 executed_stores = 11; // Completed native instructions in the code cache.
+  uint64 dropped = 12;
+  uint64 dispatch_pc = 13;
+  uint64 dispatch_target = 14;
+  uint64 dispatch_return = 15;
+  uint64 matched_dispatches = 16;
+  ObjectWatchPlan plan = 17;
+  string binding_status = 18;
+  repeated Probe method_probes = 19;
+  ObjectWatchRequest.Mode mode = 20;
+  uint32 admitted_receivers = 21;
+  uint64 coverage_gaps = 22;
+  string capture_limit = 23;
+  uint32 event_buffer = 24;
+  uint32 runtime_translations = 25;
+  uint32 runtime_reclaimed = 26;
+  bool external_write_order_unknown = 27;
+  uint32 static_fragments = 28;
+  uint32 static_reclaimed = 29;
+}
+
+message ObjectObservation {
+  enum Kind {
+    UNSPECIFIED = 0;
+    CREATED = 1;
+    OWNER_ADDED = 2;
+    BORROW_RETURN = 3;
+    FIELD_CHANGED = 4;
+    SNAPSHOT_DELTA = 5;
+    DESTROY_BEGIN = 6;
+    TEARDOWN_END = 7;
+    OWNER_REMOVED = 8;
+    COVERAGE_GAP = 9;
+    FIELD_WRITTEN = 10;
+    CONSTRUCTION_ABORTED = 11;
+    LIFETIME_UNCERTAIN = 12;
+    OBSERVATION_ENDED = 13;
+    FIRST_SEEN = 14;
+    RANGE_BOUND = 15;
+    RANGE_SUSPENDED = 16;
+  }
+  Kind kind = 1;
+  uint64 lifetime_id = 2; // Unique within the watch (TraceEvent.probe_id).
+  uint64 generation = 3;
+  string concrete_type = 4;
+  uint64 owner_address = 5;
+  string field = 6;
+  uint64 destination = 7;
+  optional sint32 old_integer = 8;
+  optional sint32 new_integer = 9;
+  optional bytes old_string = 10;
+  optional bytes new_string = 11;
+  uint64 pc = 12;
+  uint64 elf_pc = 13;
+  string module = 14;
+  string file = 15;
+  uint32 line = 16;
+  string diagnostic = 17;
+  optional uint64 owner_index = 18;
+  string function = 19; // Original application function containing the observation PC.
+  uint64 borrow_id = 20; // Correlates an admitted borrow with its writes within this watch.
+  string module_build_id = 21;
+  uint32 column = 22;
+  enum LocationKind {
+    LOCATION_UNSPECIFIED = 0;
+    STORE = 1;
+    CALL_BOUNDARY = 2;
+    ENTRY_ANCHOR = 3;
+    SYSCALL_OUTPUT = 4;
+  }
+  LocationKind location_kind = 23;
+  message InlineLocation {
+    string function = 1;
+    string file = 2;
+    uint32 line = 3;
+    uint32 column = 4;
+  }
+  repeated InlineLocation inline_chain = 24; // Innermost frame first.
+  bool source_unavailable = 25;
+  optional bytes old_bytes = 26; // Verified storage with no admitted typed interpretation.
+  optional bytes new_bytes = 27;
+  uint64 boundary_probe_id = 28;
+  string module_sha256 = 29;
+  enum ClosureReason {
+    CLOSURE_UNSPECIFIED = 0;
+    DESTRUCTOR_RETURN = 1;
+    UNWOUND = 2;
+    WATCH_STOPPED = 3;
+    TARGET_EXITED = 4;
+    MAPPING_CHANGED = 5;
+    THREAD_EXITED = 6;
+    METHOD_RETURN = 7;
+    SCOPE_CHANGED = 8;
+    WATCH_DETACHED = 9;
+    WATCH_TIMEOUT = 10;
+    EVENT_LIMIT = 11;
+    BUFFER_OVERFLOW = 12;
+  }
+  ClosureReason closure_reason = 30;
+  uint64 storage_generation = 31;
+  ObjectWatchRequest.Synchronization synchronization = 32;
+  message SnapshotValue {
+    oneof value {
+      bool null_value = 1;
+      bool boolean_value = 2;
+      sint64 signed_value = 3;
+      uint64 unsigned_value = 4;
+      double real_value = 5;
+      string string_value = 6;
+    }
+  }
+  SnapshotValue snapshot_before = 33;
+  SnapshotValue snapshot_after = 34;
+  optional uint32 old_union_tag = 35;
+  optional uint32 new_union_tag = 36;
+  string old_union_member = 37;
+  string new_union_member = 38;
+  uint32 runtime_module_generation = 39; // Verified runtime image generation within this watch.
+  message SharedStorage {
+    uint64 device = 1;
+    uint64 inode = 2;
+    uint64 file_offset = 3;
+  }
+  SharedStorage shared_storage = 40; // Same live file and byte offset across watched processes.
+  bool external_write_order_unknown = 41;
+}
+
 message TraceEvent {
   uint32 protocol_version = 1;
   string session_id = 2;
@@ -809,4 +1099,6 @@ message TraceEvent {
   string server_instance_id = 22; // Unique server lifetime; sequence alone is not durable identity.
   clangtracer.context.v1.ValueSnapshot receiver_snapshot = 23;
   PreparedInjector replay_types = 24; // Server-supplied declarations and standard headers only.
+  ObjectObservation object_observation = 25;
+  bool receiver_sampled_at_return = 26;
 }

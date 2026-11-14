@@ -311,14 +311,16 @@ std::string digest(llvm::StringRef bytes) {
 }
 
 std::string inspect_elf(const fs::path &path, const std::function<void(const Elf &)> &inspect,
-                        std::string_view expected_digest) {
+                        std::string_view expected_digest, bool allow_aarch64) {
   auto binary = llvm::object::createBinary(path.string());
   if (!binary) throw std::runtime_error(llvm::toString(binary.takeError()));
   const auto *elf = llvm::dyn_cast<Elf>(binary->getBinary());
-  if (!elf || elf->getArch() != llvm::Triple::x86_64 ||
+  if (!elf || (elf->getArch() != llvm::Triple::x86_64 &&
+               !(allow_aarch64 && elf->getArch() == llvm::Triple::aarch64)) ||
       (elf->getELFFile().getHeader().e_type != llvm::ELF::ET_EXEC &&
        elf->getELFFile().getHeader().e_type != llvm::ELF::ET_DYN))
-    throw std::runtime_error("module must be a linked Linux x86_64 ELF image");
+    throw std::runtime_error(allow_aarch64 ? "module must be a linked Linux x86-64 or AArch64 ELF image" :
+                                           "module must be a linked Linux x86_64 ELF image");
   const auto hash = digest(elf->getMemoryBufferRef().getBuffer());
   if (!expected_digest.empty() && hash != expected_digest)
     throw std::invalid_argument("module_identity_mismatch: ELF differs from the module index");

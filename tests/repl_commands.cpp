@@ -168,6 +168,13 @@ int main() {
       "--stack-application-only false");
   require(full_stack.number("--stack-depth", 0) == UINT32_MAX);
   require(full_stack.option("--stack-application-only") == "false");
+  require(parse_command("%probe inject f --backend entry").option("--backend") == "entry");
+  bad("%probe inject f --backend code-cache");
+  bad("%probe inject f --backend entry --caller g");
+  bad("%interceptor upload hook --target f --caller ''");
+  bad("%probe inject f --stack-application-only maybe");
+  require(parse_command("%object start --type demo::State --code f --field value --backend code-cache")
+              .option("--backend") == "code-cache");
   require(parse_command("%server start --context-event-bytes 4194304")
               .number("--context-event-bytes", 0) == 4194304);
   bad("%server start --context-event-bytes 0");

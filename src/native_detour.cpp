@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "native_detour.hpp"
 
 #include <algorithm>
@@ -131,7 +132,8 @@ bool allowed_instruction(const llvm::MCInst &inst,
 }
 
 std::optional<std::size_t> memory_access_size(const llvm::MCInst &inst,
-                                              const llvm::MCInstrInfo &ins) {
+                                              const llvm::MCInstrInfo &ins,
+                                              bool code_cache) {
   const auto &desc = ins.get(inst.getOpcode());
   // LEA and memory-form NOP do not access the computed memory address.
   if (!desc.mayLoad() && !desc.mayStore())
@@ -150,6 +152,8 @@ std::optional<std::size_t> memory_access_size(const llvm::MCInst &inst,
   for (auto width : widths)
     if (compat::starts_with(name, width.prefix))
       return width.bytes;
+  if (const auto width = code_cache ? scalar_fp_load_width(name) : 0)
+    return width;
   return std::nullopt;
 }
 
@@ -157,7 +161,8 @@ std::optional<std::size_t> memory_access_size(const llvm::MCInst &inst,
 // with an immediate have additional bytes after the RIP displacement.
 bool record_relocation(Decoder &d, llvm::MCInst inst,
                        compat::span<const std::uint8_t> bytes, std::size_t offset,
-                       std::size_t size, Patch &patch, std::string &error) {
+                       std::size_t size, Patch &patch, std::string &error,
+                       bool code_cache = false) {
   std::optional<unsigned> rip;
   for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
     if (!inst.getOperand(i).isReg() || !inst.getOperand(i).getReg()) {
@@ -178,7 +183,7 @@ bool record_relocation(Decoder &d, llvm::MCInst inst,
   if (!rip) {
     return true;
   }
-  const auto access_size = memory_access_size(inst, *d.ins);
+  const auto access_size = memory_access_size(inst, *d.ins, code_cache);
   if (!access_size)
     return fail(error, "target RIP-relative memory width is unsupported");
   // X86 MC memory operands are base, scale, index, displacement, segment.
@@ -480,6 +485,115 @@ bool prepare_entry_jump(const Patch &patch, void *trampoline,
     write_absolute_jump(output.data(), target);
   }
   std::fill(output.begin() + patch.jump_size, output.begin() + patch.size, 0x90);
+  return true;
+}
+
+bool decode_getter(std::string_view bytes, std::size_t &trap_offset, std::string &error) {
+  trap_offset = ::tracer::compat::starts_with(bytes, "\xf3\x0f\x1e\xfa") ? 4 : 0;
+  bytes.remove_prefix(trap_offset);
+  // MOV r/m32,EAX with RDI as the base, followed by a plain near RET.
+  if ((bytes.size() == 3 || bytes.size() == 4 || bytes.size() == 7) &&
+      bytes.front() == '\x8b' && bytes.back() == '\xc3') {
+    const auto operand = static_cast<unsigned char>(bytes[1]);
+    if ((bytes.size() == 3 && operand == 0x07) ||
+        (bytes.size() == 4 && operand == 0x47) ||
+        (bytes.size() == 7 && operand == 0x87))
+      return true;
+  }
+  return fail(error, "entry fallback requires a complete 32-bit receiver load and return");
+}
+
+bool create_getter_copy(std::string_view bytes, std::uintptr_t caller,
+                        void *&address, std::size_t &size, std::string &error) {
+  const long page = ::sysconf(_SC_PAGESIZE);
+  if (page < static_cast<long>(kRelayOffset + kJumpBytes) || bytes.size() > kRelayOffset)
+    return fail(error, "invalid getter copy allocation bounds");
+  Patch placement;
+  placement.entry = caller;
+  placement.jump_size = caller ? kRelativeJumpBytes : kJumpBytes;
+  void *memory = allocate(placement, static_cast<std::size_t>(page), error);
+  if (memory == MAP_FAILED) {
+    if (!caller)
+      fail(error, "could not allocate executable getter copy");
+    return false;
+  }
+  std::memcpy(memory, bytes.data(), bytes.size());
+  if (::mprotect(memory, page, PROT_READ | PROT_EXEC) != 0) {
+    ::munmap(memory, page);
+    return fail(error, "could not make getter copy executable");
+  }
+  address = memory;
+  size = page;
+  return true;
+}
+
+bool prepare_call_relay(std::uintptr_t caller, void *copy, std::size_t size,
+                        const void *wrapper, compat::span<std::uint8_t> output,
+                        std::uintptr_t &relay, std::string &error) {
+  Patch placement;
+  placement.entry = caller;
+  placement.jump_size = placement.size = kRelativeJumpBytes;
+  if (!prepare_entry_jump(placement, copy, size, wrapper, output, error))
+    return false;
+  output[0] = 0xe8;
+  relay = reinterpret_cast<std::uintptr_t>(copy) + kRelayOffset;
+  return true;
+}
+
+bool allocate_code_cache(std::uintptr_t caller, std::size_t bytes,
+                         void *&address, std::size_t &size, std::string &error,
+                         compat::span<const RipRelocation> relocations) {
+  const auto page = ::sysconf(_SC_PAGESIZE);
+  if (page <= 0 || !bytes || bytes > static_cast<std::size_t>(INT32_MAX))
+    return fail(error, "invalid code-cache allocation bounds");
+  const auto aligned = (bytes + page - 1) / page * page;
+  Patch placement;
+  placement.entry = caller;
+  placement.jump_size = kRelativeJumpBytes;
+  placement.relocations.assign(relocations.begin(), relocations.end());
+  auto *memory = allocate(placement, aligned, error);
+  if (memory == MAP_FAILED)
+    return false;
+  address = memory;
+  size = aligned;
+  return true;
+}
+
+std::size_t scalar_fp_load_width(std::string_view opcode) {
+  // LLVM distinguishes the intrinsic form of legacy scalar SSE operations.
+  if (::tracer::compat::ends_with(opcode, "_Int"))
+    opcode.remove_suffix(4);
+  if (opcode.size() != 7 || !::tracer::compat::ends_with(opcode, "rm"))
+    return 0;
+  const auto operation = opcode.substr(0, 3);
+  if (operation != "ADD" && operation != "SUB" && operation != "MUL" &&
+      operation != "DIV" && operation != "MIN" && operation != "MAX")
+    return 0;
+  const auto precision = opcode.substr(3, 2);
+  return precision == "SD" ? 8 : precision == "SS" ? 4 : 0;
+}
+
+bool code_cache_rip_relocation(compat::span<const std::uint8_t> bytes,
+                               std::uintptr_t pc, RipRelocation &relocation,
+                               std::string &error) {
+  Decoder decoder;
+  if (!make_decoder(decoder, error))
+    return false;
+  llvm::MCInst inst;
+  std::uint64_t size = 0;
+  Patch patch;
+  patch.entry = pc;
+  if (decoder.dis->getInstruction(inst, size, {bytes.data(), bytes.size()}, pc,
+                                  llvm::nulls()) != llvm::MCDisassembler::Success ||
+      size != bytes.size() ||
+      (!allowed_instruction(inst, *decoder.ins) &&
+       !scalar_fp_load_width(decoder.ins->getName(inst.getOpcode()))))
+    return fail(error, "unsupported RIP-relative code-cache instruction");
+  if (!record_relocation(decoder, inst, bytes, 0, size, patch, error, true))
+    return false;
+  if (patch.relocations.size() != 1)
+    return fail(error, "expected one verified RIP-relative operand");
+  relocation = patch.relocations.front();
   return true;
 }
 } // namespace tracer::native_detour

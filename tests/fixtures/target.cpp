@@ -2,6 +2,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <stdexcept>
 #include <pthread.h>
@@ -113,11 +114,21 @@ void *shared_context_child_entry(void *opaque) {
   const auto encoded = reinterpret_cast<std::intptr_t>(opaque);
   const bool delayed = encoded < 0;
   const int value = static_cast<int>(delayed ? -encoded : encoded);
+  const auto *gate = delayed ? std::getenv("TRACER_TEST_PTHREAD_DRAIN_GATE") : nullptr;
+  const bool held = gate && ::access(gate, F_OK) == 0;
   if (delayed) {
-    timespec delay{1, 500'000'000};
-    while (::nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+    if (held) {
+      std::fputs("shared drain child blocked\n", stderr);
+      while (::access(gate, F_OK) == 0)
+        ::usleep(1000);
+    } else {
+      timespec delay{1, 500'000'000};
+      while (::nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+    }
   }
   const int result = shared_child_target(value);
+  if (held)
+    std::fputs("shared drain child finished\n", stderr);
   return reinterpret_cast<void *>(static_cast<std::intptr_t>(result));
 }
 } // namespace

@@ -467,6 +467,487 @@ instruction-aligned window accepted by the current copy-only detour policy.
 If the policy rejects the entry, the preview shows the reason. It performs
 no installation or writes.
 
+## Probe a short getter
+
+`%probe inject` uses the `auto` backend by default. It keeps the verified
+entry jump when the overwrite window and relocation fit. The installed
+probe reports its backend, selection reason, and patch address.
+
+```text
+%probe inject "demo::Circle::get_radius() const" --backend auto --caller "demo::call_radius(const demo::Circle &)" --stack-depth 6
+%record getter.db --sqlite --phase POST --probe PROBE_ID --count 4 --timeout 30
+%detach
+```
+
+For a supported short integer getter, `--caller` selects a named function
+in the same module. The call-site backend requires one verified five-byte
+direct call to the getter and an executable relay within rel32 range of the
+next instruction. It traces calls through that site. Use `--backend entry`
+to require an entry jump.
+
+When auto has no verified caller or no reachable relay, the trap backend
+copies the complete getter and installs one `INT3` at its verified entry.
+The server redirects owned traps to the normal wrapper, leaving the
+application's return address on its stack. The initial supported body is
+a 32-bit load from the receiver followed by `ret`. An existing ENDBR64
+stays in place and selects the trap path. The trap owns execution control for its session and
+restores its byte at stop, detach, or a thread or process creation stop.
+Remove a fallback probe before replacing it.
+
+## Trace object lifetimes and state in a prebuilt binary
+
+Use the full Linux build on x86-64 or AArch64, with the REPL, server, and agent from the same build. Supply the existing ELF and its matching DWARF, either embedded or in a matching separate debug file. The watch installs patches in process memory. The application executable and source files stay intact.
+
+On `c++17`, use that branch's preparation tools to generate typed adapters and object watch plans from the existing binary and its original compile commands. Regenerate typed adapters created on `main` before preparing a watch on `c++17`.
+
+The plan records the capture mode you select during preparation.
+
+- **Individual writes.** Select one `--field` and a writer with `--code`. Use `--backend code-cache` to run supported stores in the target without a ptrace stop for every write. `--backend ptrace` is the default and steps verified stores for diagnostic runs. By default, the watch samples values and reports changes. Start a saved write plan with `--no-values` to record `FIELD_WRITTEN` for each completed admitted store, including same-value stores, without field samples. The backend is part of the saved plan.
+- **Method snapshots.** Use `--on` with the original header and compile command to compare the receiver at verified entry and return boundaries. A snapshot delta describes the net change during one call. Supply the synchronization policy that protects the sampled state. See [method snapshots](#prepare-an-object-watch-for-method-snapshots).
+
+### Run a scalar write watch on x86-64
+
+From the repository root on Linux x86-64, use a full build in `build` with tests enabled. Build the demonstration fixture once and start it in the first terminal. It prints its PID and waits for input.
+
+```sh
+cmake --build build --target repl-object-plan-target
+sh -c 'printf "PID=%s\n" "$$"; exec "$1"' _ ./build/repl-object-plan-target
+```
+
+From the same directory in a second terminal, open the REPL. Use a fresh package directory and SQLite path for each run.
+
+```sh
+./build/clang-tracer-repl --server ./build/clang-tracer-server --agent ./build/libclang_tracer_agent.so --fail-fast
+```
+
+Prepare the plan before attaching. Then replace `PID` with the printed PID and check that preview reports `binding=same-build` and a verified store site. Start installs the redirects and prints the watch ID.
+
+```text
+%object prepare demo::PlanRecord --module ./build/repl-object-plan-target --field value --code "demo::write_value(demo::PlanRecord &)" --backend code-cache --output ./record-watch
+%attach PID
+%object preview --plan ./record-watch
+%object start --plan ./record-watch --stack-depth 4
+%record object-writes.db --sqlite --name object.trace --probe WATCH_ID --count 2 --timeout 30
+```
+
+Replace `WATCH_ID` with the ID printed by start. While `%record` is waiting, enter `g` in the first terminal. The fixture prints `value=23`. The recorder should report `received=2` and `complete=true` for the creation and the write from 17 to 23.
+
+```text
+%object status WATCH_ID
+%object stop WATCH_ID
+%detach
+%events open object-writes.db --as saved
+%events list saved
+%events show saved --index 1
+%events stack saved --index 1
+```
+
+Stop restores the verified instruction bytes. Check `active=no` and `restoration_pending=no` before detaching. If restoration is pending, retry stop using the same ID. Replay works after detach, including in a fresh REPL. Enter `q` in the first terminal to exit the fixture. To repeat with `--no-values`, restart the fixture, reuse the write plan, add the flag to `%object start`, and use a fresh recording path. The two events are still creation and a store, with the store shown as `FIELD_WRITTEN`.
+
+### Read coverage and cleanup status
+
+- Review the resolved fields, writer sites, and binding status in preview. Preview is read-only. A same-build restart resolves fresh live addresses. A compatible rebuild requires verifiable field and code bindings. Missing or mismatched evidence can prevent a watch from starting.
+- Lifecycle events require observable, unambiguous construction and teardown. An out-of-line copy of an inline constructor or destructor can provide the boundary if its ABI is verified. A fully inlined or optimized-away call can leave a partial timeline. `--first-seen` can scope a supported standalone write watch to one verified writer invocation when construction is unavailable.
+- On x86-64, a short lifetime boundary can use verified alignment NOPs after the function. A short destructor return can also jump through the relocated entry window. If the mapped ELF lacks a safe redirect for a required entry or exit, use `--backend ptrace` for the lifetime trace.
+- When completion must be observed after a direct call, a tail jump into the lifetime boundary requires a verified continuation. Preview and start reject unverified tail callers because they can bypass the return hook.
+- Ptrace can observe stores in a writer that ends in an indirect call or jump when every block in the writer is decoded and any gaps contain only alignment NOPs. It observes the selected writer's stores. An indirect jump with unverified blocks, such as an unresolved jump table, is refused.
+- When the complete and base constructors share an entry, a verified direct call from outside constructor and destructor frames can identify a complete construction. When a known derived type can initialize its base as an aggregate, these shared entries remain uncertain unless stronger evidence is available.
+- On x86-64, scalar watches admit verified 32-bit integer arithmetic, bitwise and shift updates. For locked atomic instructions without a returned old value, code-cache records the write and reports that the values could not be verified. Ptrace can sample the values while target peers are parked.
+- Collection and pointee watches require verified mutation boundaries and supported identities. Unverified inline paths can leave coverage gaps. Tagged-union decoding requires a verified unsigned 32-bit discriminator and supported 32-bit alternatives. Untagged union observations carry storage bytes.
+- Native capture covers admitted code and threads. Generated helper windows can leave signal or stack gaps, including AArch64 scalable signal records that exceed the fixed Linux signal frame. Shared-file identity correlates recordings across processes, where ordering can remain partial.
+- Use `%object status` to check drops, unsupported sites, coverage gaps, and capture limits. Use `%object stop` or `%detach` to retire the watch and restore patches. See the [verification record](../object-watch-progress.md) for the exercised cases and limits.
+
+## Prepare an object watch for method snapshots
+
+Prepare from the original headers and compile command. The package contains the generated adapter and the verified ELF entry. Declare the synchronization that protects the receiver and any storage the adapter follows. Use `thread-confined` when that graph is accessed from a single thread. Use `caller-lock` when the caller holds the application's lock over the method and both samples. Use `stable-at-boundaries` when the application establishes safe entry and return samples, for example by joining a child writer before return. For the Portfolio commands below, run the rebalance while `%record` is waiting and substitute the PID and watch ID from your run.
+
+```text
+%object prepare demo::Portfolio --module ./portfolio --include ./portfolio.hpp --policy ./snapshot-policy.hpp --compdb ./compile_commands.json --translation-unit ./portfolio.cpp --on "demo::Portfolio::rebalance()" --field legs --field risk --key legs=id --key risk=key --synchronization thread-confined --output ./portfolio-watch --emit-source ./generated
+%attach PID
+%object preview --plan ./portfolio-watch
+%object start --plan ./portfolio-watch --stack-depth 8
+%record portfolio.db --sqlite --name object.trace --probe WATCH_ID --count 2 --timeout 30
+%object stop WATCH_ID
+%detach
+%events open portfolio.db --as saved
+```
+
+Snapshot deltas describe the interval between a method's entry and return. Fields select the reported paths. The generated receiver codec reads the receiver and the pointees authorized by the preparation policy. A failed sample yields a coverage gap. A missing return yields a coverage gap when the probe retires. Set `--max-elements`, `--max-string-bytes`, `--max-depth`, `--max-snapshot-bytes`, and `--max-instances` to bound capture and observation.
+
+Method snapshots support up to 65,536 encoded bytes per value, 65,536 elements, and a depth of 64. The default byte and element budgets are 4,096 and the default depth is 32. The element budget is shared by the captured containers in each value. A field selection captures the selected top-level receiver members and their contents. A nested path filters which changes to report within its selected member.
+
+For method snapshots, `--max-instances` limits receivers with an outstanding sample. Completed calls release their receiver slots. The watch detects overlapping calls on a receiver and relies on the declared synchronization policy across separate invocations.
+
+For constructor-based watches, `--max-instances` limits live observed objects. Retirement releases the slot. The watch retains each observed address's generation counter until the watch ends so that address reuse remains distinguishable in replay.
+
+A compatible rebuilt ELF can reuse a prepared method watch when DWARF confirms the receiver layout and the original void, scalar, or pointer signature. Pass `--module` to preview and start if the rebuilt image has a new name.
+
+On AArch64 the native agent samples the receiver at a verified entry and at each verified return instruction. The original method executes in its application mapping, and CFI stack capture starts at its original entry. An exception that leaves the method can produce a missing-return gap when the watch retires.
+
+An `AnyPayloads<Record>` specialization can register named record payloads for a direct `std::any` field. Name the field with a type alias to a tuple of the admitted types. The typed projection appears as `extension_snapshot` for the example below.
+
+```cpp
+namespace tracer_snapshot {
+template <class Record> struct AnyPayloads;
+template <> struct AnyPayloads<demo::Portfolio> {
+  using extension = std::tuple<demo::RiskState>;
+};
+}
+```
+
+## Follow logical collection entries during writes
+
+```text
+%object start --type demo::Portfolio --field quantity --vector legs --element-key id=12 --code "demo::Portfolio::rebalance()" --mutation _ZNSt6vectorIN4demo3LegESaIS1_EE7reserveEm
+```
+
+The watch validates the writer's first receiver argument and the selected libstdc++ vector layout from DWARF. It binds a unique element by its 32-bit unsigned key and suspends that address during the selected mutation. A verified return can admit a new storage generation. Add `--backend code-cache --synchronization thread-confined` to translate the admitted fragments of a nonleaf writer and its selected mutation. On either backend, use `--first-seen` for a standalone scalar receiver whose constructor was inlined, absent, or ran before attaching. The provisional identity lasts for one writer invocation.
+
+Repeat `--mutation` when the writer uses more than one storage-changing function. Each selected function must accept the verified container as its first argument. Native capture verifies direct calls and their return continuations. For an inlined function, the watch verifies the receiver and the control-flow edges into and out of its matching DWARF ranges. An inline instance can span disjoint ranges. With declared synchronization and value capture, `RANGE_BOUND` includes the verified value at binding. A rebind includes the prior value when it was sampled safely before suspension.
+
+Use `--map risk --map-key AAPL --field exposure.limit` to follow a nested field in a `std::map<std::string, T>` entry. Select a mutation that takes the map as its first argument. The watch verifies the libstdc++ tree and key layout from DWARF. Each verified return binds a new map generation, including when an allocator reuses an address. An absent key or a traversal that exceeds its budget yields a coverage gap. Map and vector writes require a signed 32-bit value field.
+
+## Trace a Shape through Image
+
+Build the fixture once with a Linux x86-64 GCC 8.5 compiler and matching
+embedded DWARF. Run it in one terminal and leave it at `READY`.
+
+```sh
+"$GXX85" -std=c++17 -O2 -g -fno-omit-frame-pointer -fcf-protection=none \
+  -fPIE -pie -pthread -Wl,--build-id=sha1 tests/fixtures/repl_object_watch.cpp -o shapes
+./shapes
+```
+
+Attach from the native REPL and start the watch. Enter `g` in the target
+terminal while the REPL is recording. The fixture builds, mutates, and
+removes two Circles in the same allocation slot.
+
+```text
+%attach PID
+%object start --type demo::Circle --base demo::Shape --owner demo::Image --field radius --collection _shapes --snapshot-field _description --code borrowed_write --stack-depth 5
+%record shapes.db --sqlite --name object.trace --count 15 --timeout 30
+%object stop
+%detach
+%events open shapes.db --as shapes
+%events list shapes --limit 15
+%events stack shapes --index 4
+```
+
+The diagnostic backend admits existing target threads and one writer function
+in the main executable. It uses ELF linkage for the complete constructor and
+destructor and the `add`, `get`, `remove`, and `set_description` boundaries.
+It verifies the mapped build ID, live instruction bytes, DWARF layouts and
+RTTI. The supported layout uses a verified fixed base offset, an `int32`
+field, the libstdc++ C++11 string ABI and a vector of default-sized unique
+pointers. The remove boundary checks the watched entries against the verified
+membership after return. Use `--owner-add`, `--owner-get`, `--owner-remove`, and
+`--owner-snapshot` to select differently named methods with the supported ABI.
+The default selectors use `add`, `get`, `remove`, and `set_description` on the
+declared owner or base. Preview verifies the receiver and callable shape.
+
+The server owns the breakpoints until stop or detach. It parks peers while
+the writer steps each admitted instruction. The effective destination must
+equal the selected field of a live generation. An interrupted store emits a
+coverage gap. A successful retry can produce a fresh delta at the same PC.
+Enter `f` instead of `g` and record 16 events to exercise that path.
+The string delta comes from the verified setter boundary. Stack depth defaults
+to zero. Enabled write stacks walk available frame pointers in the main executable.
+Use `--max-elements` and `--max-string-bytes` to set snapshot limits.
+
+Add `--no-values` to record `FIELD_WRITTEN` for every completed store,
+including a same-value store. This skips pre/post value reads and omits
+value samples from lifecycle and fault records. Status shows `values=off`.
+The default captures value changes and verified boundary snapshots.
+
+Coverage is partial. Stores outside the selected function, unsupported
+instructions and optimized-away lifetime boundaries are outside this draft.
+New threads in the same process can enter the diagnostic watch. An exec or
+fork boundary that changes the observed process reports partial coverage.
+Use `%object status` for counts and restoration state. Unsupported sites,
+reported gaps, or dropped observations mark coverage partial. If restoration
+needs a retry, the watch keeps its ID and the target remains stopped.
+Use `--tid` to select the thread whose stores are reported. The diagnostic backend restores its patches when `--max-events` or `--timeout` is reached. Native code-cache and method watches cap observations at those limits and keep their patches until stop or detach.
+Set `--event-buffer` to size the native code-cache event queue. The default is 4096 observations. When the queue fills, `--overflow drop` counts and drops the new observation. `--overflow stop` ends capture at the first overflow and reports that reason. Application stores continue in either mode.
+
+For a standalone scalar with all its writers covered by the code-cache watch, set `--serialize-wait-us N` to serialize the observed stores and event publication for each field address. The wait is bounded by the supplied number of microseconds. If writers overlap after the wait or tracing is interrupted by re-entry, the event reports unavailable ordering and withholds the old value. A mismatch between consecutive value samples reports an intervening change outside the observed store sequence. The default uses concurrent capture.
+
+Use `--shared-file PATH` on each process's native `std::atomic<int>` watch to correlate writes to a writable shared file mapping. A scalar watch can also use this option when the application protects the field with a process-shared lock and the watch declares `--synchronization caller-lock`. The server holds the file open, and the agent checks the live device, inode and byte offset. Recordings expose those three values as `sharedStorage` across overlapping watches on the same host. An atomic read-modify-write can report its own previous value. Coverage remains partial because other writers and their ordering are unknown. Both capture modes retain the shared storage identity.
+
+Use `--pointee "routes.head->node" --field state.quantity` to follow a pointer path within a verified writer invocation. Dots select embedded members and arrows follow raw data pointers, verified libstdc++ default-deleter `std::unique_ptr`, and verified libstdc++ `std::shared_ptr`. Supply `--mutation` for the owner operation that changes the path and declare `thread-confined` or `caller-lock` synchronization. Each successful rebind starts a storage generation, even when the final address repeats. A null or unreadable path suspends write attribution and produces a coverage gap.
+
+## Trace a direct integer assignment
+
+To find direct writes in source during preparation, pass `--discover-writers`, `--compdb`, and one or more `--translation-unit` arguments. The command saves source candidates with the ELF plan and can select their verified writer functions. Repeat `--code` to select additional verified writers, including writers that reach the field through aliases.
+
+Build the `tests/fixtures/person` sources as separate translation units with
+`-O2 -g` and LTO disabled. Run the prebuilt fixture until it prints `READY`.
+The standalone watch binds a signed 32-bit field using the record layout
+from the writer's DWARF and a verified constructor return.
+
+```text
+%attach PID
+%memory maps
+%probe entry "demo::update(demo::Person &)" --mapping TOKEN
+%memory read PC --mapping TOKEN --count SIZE
+%object start --type demo::Person --field age --code "demo::update(demo::Person &)" --stack-depth 4
+%memory maps
+%memory read PC --mapping PATCHED_TOKEN --count SIZE
+%record age.db --sqlite --name object.trace --count 2 --timeout 30
+%detach
+%attach PID
+%memory maps
+%memory read PC --mapping RESTORED_TOKEN --count SIZE
+%events open age.db --as ages
+%events show ages --index 1
+%detach
+```
+
+Use the address and instruction size of the store shown by `%probe entry`.
+Enter `g` in the fixture terminal while recording to construct the Person
+with age 42 and assign 1 twice. The watch records the original writer PC
+and DWARF source line. With `--no-values`, record three events to include
+the constructor and both writes. After verifying the restored instruction,
+enter `r` to read the live value. After the last detach, enter `v` to run
+the assignment again, then `q` to exit.
+
+## Trace atomic integer updates
+
+For a DWARF-verified libstdc++ `std::atomic<int>` field, the watch admits
+32-bit `mov`, `lock xadd`, and `lock cmpxchg` in the selected function.
+With values enabled, a store takes its new value from the source operand
+and displays `old=unavailable`. Fetch-add uses the returned old value and
+the input increment. Compare-and-exchange emits a write only when the
+post-instruction zero flag is set, including in `--no-values` mode.
+The diagnostic backend steps the complete instruction, including LOCK.
+At detach it restores the full original bytes and rewinds any owned trap
+that has yet to execute.
+
+## Decode a tagged union write
+
+Pass `--union-tag FIELD` and a `--union-case TAG=MEMBER` for each admitted
+alternative. Use a direct member path such as `--field payload.integer`
+to identify the four-byte storage, and declare `--synchronization thread-confined`
+or `caller-lock` to protect the tag and storage during both samples.
+
+```text
+%object prepare tagged_test::State --module ./fixture --field payload.integer --code _ZN11tagged_test10write_bitsERNS_5StateEj --union-tag kind --union-case 1=integer --union-case 2=real --synchronization thread-confined --backend code-cache --output watch
+```
+
+The plan checks the tag offset and each alternative against DWARF. A tag
+can be an unsigned 32-bit field or an enum with that underlying type.
+Signed integers, unsigned integers, and floats are supported as 32-bit
+alternatives. Unknown or unreadable tags retain raw storage bytes.
+`--no-values` skips both the discriminator and storage reads.
+
+## Trace writes in the native code cache
+
+```text
+%object start --backend code-cache --type demo::Person --field age --code person_write_many
+%object status
+%record age.db --sqlite --name object.trace --count 4000 --timeout 30
+%detach
+```
+
+`ptrace` is the default. Select `code-cache` to translate verified leaf
+functions or independently verified writer fragments into executable
+memory in the target. Standalone signed 32-bit fields and `std::atomic<int>` use
+complete constructor and destructor boundaries in the main executable.
+On x86-64, a standalone leaf writer with a visible function pointer or
+virtual entry uses a verified entry redirect. This covers direct calls,
+function pointers, and vtable dispatch into that writer. Use
+`--writer-entry` to require this coverage for every selected leaf, including
+with repeated `--code`. An entry redirect needs a verified overwrite
+window. Short leaves can use verified alignment padding. A symbol export
+alone allows a fallback to direct call sites when no entry window verifies.
+Preview and status report partial coverage for direct call sites alone.
+For a shared writer, `--module` takes a unique mapped ELF basename or
+absolute path. A shared leaf that uses an entry redirect needs a verified
+nonfaulting overwrite window.
+Native watches capture virtual destruction at the destructor entry, including
+deleting destructors that inline the complete destructor. A watch fails to
+start if its virtual destructor has no verified redirect. When code-cache
+capture relies on direct calls or return continuations, preview and start
+reject unverified call sites, including sites behind unresolved jump tables.
+Supported ELF exception tables let the planner verify calls in cleanup
+blocks, including direct branches into a matching cold partition. The
+diagnostic backend rejects writers with an unresolved indirect branch,
+such as a jump table.
+Inlined lifetimes, forked children, and unadmitted store instructions are
+outside coverage.
+
+Application threads run the original store encoding once in the translated
+function. The agent reads the effective address and operands around that
+instruction and publishes to a shared event queue. `--no-values` skips
+value sampling and still checks the outcome of compare-and-exchange.
+`%object status` reports each redirect, the number of completed translated
+store instructions, and event drops. The store count includes failed
+compare-and-exchanges and stores to untracked addresses.
+
+Events use the original application PC. For a synchronous SIGSEGV, SIGBUS,
+SIGFPE, or SIGILL on a copied instruction, a chained application handler
+sees that PC and can retry or skip the instruction. If the signal takes its
+default action and the original instruction is covered by a redirect or
+cannot be verified, the kernel delivers the fault at the translated PC.
+Keep fault signal dispositions stable during tracing. Use `--async-signal N`
+for a signal with an existing application handler. At a copied application instruction the handler sees
+the original PC and can resume or select another original instruction.
+The x86-64 and AArch64 hooks defer these signals during supported capture
+callbacks and runtime call resolution when system calls are unfiltered.
+The handler sees the original callee and caller return address after
+ordinary and tail call resolution. For AArch64 scalable state that fits
+the fixed Linux signal frame, the agent restores the spilled SVE or SME
+records before invoking the handler. Delivery in an uncovered helper
+window records a coverage gap.
+Optional stacks use
+available application frame pointers. The hooks use application stack
+space to save registers and extended processor state.
+`--stack-cfi` with `--stack-depth N` unwinds from the saved application
+registers and original store PC. The emitted stack reports whether CFI
+reached the root, hit the depth limit, or stopped at a missing rule.
+Unwinding directly through generated helper code remains unavailable.
+
+Stop or detach restores the complete redirect instructions and drains
+queued observations. The agent releases retired translated bodies after
+active executions have drained. Stable entry and exit stubs and the
+associated signal metadata remain available for delayed execution.
+When the process replaces its executable image, status closes the watch
+with a mapping-change coverage gap after confirming the old redirects
+and translated code are absent.
+
+### Trace scalar writes on Linux AArch64
+
+Use the normal REPL with the AArch64 object server. Offline preparation,
+preview, lifecycle and scalar write events, SQLite recording, and replay
+use the same commands and event types as on x86-64. The diagnostic backend
+uses four-byte breakpoint instructions. The code-cache backend installs
+four-byte branches to relocated instructions and releases ptrace control
+after arming.
+
+```text
+%attach PID
+%object start --type arm_test::Record --field value --code arm_write_value --backend code-cache
+%record writes.db --sqlite --name object.trace --count 10 --timeout 30
+%object stop
+```
+
+Live installation selects an application thread at a verified idle
+sleep or a userspace rendezvous. For a rendezvous, pass
+`--rendezvous SYMBOL` and select an existing main-image function where
+the thread can safely enter the loader. Threads created after installation
+can execute the redirects. The backend supports 32-bit
+STR/STUR, release stores, LSE fetch-add with a returned prior value, and
+LSE compare-and-exchange. An admitted writer in a loaded shared library
+can be selected with `--module`. CFI capture follows saved link registers,
+including signed return addresses. In-process capture preserves SVE
+vector, predicate, and first-fault registers. Injection and capture also
+preserve SME streaming state, ZA, TPIDR2 and, on SME2, ZT0.
+
+### Follow live callees
+
+```text
+%object start --type demo::Record --field value --backend code-cache --code dispatch --follow-calls
+```
+
+The selected executable or mapped shared-library scope supplies the call sites. A verified direct
+or indirect call enters a native gateway with its original return
+address. Calls already covered by lifetime boundaries retain those redirects. Verified direct edges can extend the selected scope to nested
+functions in the same image that keep executing at their original PCs. A runtime
+gateway checks live targets against their ELF bytes and translates
+supported leaf instructions and tail calls. For a discovered nonleaf
+scope, the controller verifies and installs its call and store redirects
+before the first covered execution. Its original call sites keep their
+return PCs. Ordinary stores run without controller stops.
+Stores match the
+watched address and lifetime even when the callee receives it through an
+alias. Replayed stores include the mapped ELF identity and the runtime
+module generation. A shared library can load after arming and unload
+between calls.
+
+Use `--runtime-limit N` to bound nested scope discovery and retained translations. The default is
+1,024. When a callee exceeds the limit or its code cannot be verified and
+translated, the original call runs and the watch records a coverage gap.
+Stopping restores the redirects and closes entry to cached callees. The
+agent releases each retired callee mapping after its active executions
+have drained. A shared scope selected with `--module` keeps a loader
+reference through patch restoration and drain. `%object status` reports
+runtime translation and release counts.
+
+### Observe startup before main
+
+`clang-tracer-object-watch launch definition.json ./target [ARGS...]`
+starts a selected prebuilt ELF under the diagnostic backend and arms the
+watch at the Linux exec stop. The definition is a JSON object watch
+request with `concreteType`, `field`, and `codeSymbol`. The command emits
+JSON event lines and the `exec-stop` coverage marker to stdout. The
+target's output goes to stderr and its stdin reads EOF. SIGINT requests
+live detachment and exact patch restoration.
+
+For a native code-cache definition, run
+`clang-tracer-object-watch launch --agent ./libclang_tracer_agent.so definition.json ./target [ARGS...]`
+with the agent built for the target architecture. This arms at the verified
+ELF executable entry after the dynamic loader transfers control. The
+`executable-entry` marker identifies the start of coverage, which includes
+constructors run by the executable startup code and `main`.
+
+On an eligible glibc target, add `--loader-ready` after the agent path to
+arm after relocation and before preinit and dependency constructors.
+The launcher verifies the loader mapping and its consistent-state
+notification. Set `codeModule` in the JSON definition to select a shared
+library already present in the initial loader link map.
+
+Use `--syscall-output --synchronization thread-confined` on a diagnostic
+scalar watch to observe `read` and `pread` when the destination is the
+exact 32-bit field. A short, overlapping, or unreadable output records a
+coverage gap and withholds the values. These events identify the verified
+syscall instruction and its mapped image.
+
+### Trace a virtual write through a borrowed reference
+
+```text
+%object start --backend code-cache --type demo::Circle --base demo::Shape --owner demo::Image --collection _shapes --field radius --caller borrowed_resize --module libct-shapes-gcc85.so --code "demo::Circle::resize(int)"
+%record radius.db --sqlite --name object.trace --count 2 --timeout 30
+%object status
+%detach
+```
+
+The named main-executable caller must call the leaf getter directly, then
+reach one register- or memory-indirect near call along a straight-line path
+with a stable stack pointer and no intervening stores. The call executes
+in place and resolves its target normally. A verified entry jump at the
+selected writer preserves the original call frame and any ENDBR64 landing
+instruction. Other targets execute through their original entries.
+
+The watch starts before construction. A verified return from the complete
+constructor registers a lifetime ID and advances the generation at its
+address. The constructor may use relocatable RIP-relative loads or address
+computations. A leaf `Image::add` returns the inserted pointer in RAX, and
+the agent confirms membership in the DWARF-verified vector of unique
+pointers. The getter and writer check that owner, the primary-base RTTI,
+and the live lifetime ID. Each operation also carries a `borrow_id`.
+
+The deleting and complete destructor entries retire the lifetime before
+their original bodies continue. A deleting destructor that invokes the
+complete destructor produces one retirement. If the owner has already
+cleared the slot, the same boundary emits `OWNER_REMOVED`. The fixture uses
+`unique_ptr::reset` for that ordering and a class allocator that reuses one
+aligned slot. Each lifetime has its own ID even when the object address
+and name repeat.
+
+The verified lifecycle path covers a concrete type with an unambiguous
+complete-constructor entry, including aliases for a final type. It needs
+a leaf constructor and add, safe entry windows, and a stable owner during
+the borrowed operation. Ambiguous base construction, inlined boundaries,
+arbitrary owner mutations, and string snapshots are outside coverage.
+Destruction reports its start. The fixture independently checks completed
+deallocation and reuse.
+
+The loader pins the selected shared image at its verified load bias for
+the lifetime of the retained translation. Patch installation and restoration
+verify the live file-backed mappings while the target threads are stopped.
+This supports uniquely mapped, loader-managed ELF images in the base
+namespace. Manual unmapping, alternate loader namespaces, and indirect
+tail jumps at the borrow site are outside coverage.
+
 ## Interceptor upload
 
 ```text

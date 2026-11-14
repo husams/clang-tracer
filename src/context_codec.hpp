@@ -7,6 +7,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <new>
 #include <optional>
 #include <set>
 #include <string>
@@ -53,11 +54,60 @@ struct EncodeBudget {
   const char *cut = nullptr;
   bool truncated = false;
   CaptureLimits limits{};
-  std::array<PathStep, 32> path{};
+  std::array<PathStep, max_capture_depth> path{};
   Truncation truncation = nullptr;
   void *truncation_context = nullptr;
+  const char *failure = nullptr;
+  struct PointerGraph {
+    explicit PointerGraph(std::size_t limit) noexcept : limit(std::min(limit, max_capture_items)) {}
+
+    bool admit(std::uintptr_t address) noexcept {
+      if (!address || size >= limit)
+        return false;
+      if (!seen && !allocate())
+        return false;
+      // Mix aligned addresses before indexing a table kept at most half full.
+      std::uint64_t hash = address;
+      hash = (hash ^ (hash >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+      hash = (hash ^ (hash >> 27)) * UINT64_C(0x94d049bb133111eb);
+      auto index = static_cast<std::size_t>(hash ^ (hash >> 31)) & mask;
+      while (seen[index]) {
+        if (seen[index] == address)
+          return false;
+        index = (index + 1) & mask;
+      }
+      seen[index] = address;
+      ++size;
+      return true;
+    }
+
+  private:
+    bool allocate() noexcept {
+      if (mask)
+        return false;
+      std::size_t slots = 2;
+      while (slots / 2 < limit)
+        slots *= 2;
+      mask = slots - 1;
+      seen.reset(new (std::nothrow) std::uintptr_t[slots]{});
+      return bool(seen);
+    }
+
+    std::unique_ptr<std::uintptr_t[]> seen;
+    const std::size_t limit;
+    std::size_t size = 0, mask = 0;
+  };
+  PointerGraph *pointer_graph = nullptr;
   bool enter() noexcept {
-    return ++visits <= limits.visits && ++depth <= limits.depth;
+    if (++visits > limits.visits) {
+      failure = "snapshot exceeds traversal budget";
+      return false;
+    }
+    if (++depth > limits.depth) {
+      failure = "snapshot exceeds depth budget";
+      return false;
+    }
+    return true;
   }
   void leave() noexcept {
     if (depth)
@@ -74,9 +124,11 @@ struct EncodeBudget {
                  std::size_t &selected) noexcept {
     if (max_items > item_cap)
       return false;
-    selected = std::min<std::size_t>({n, max_items, item_cap});
-    if (selected > limits.items - std::min(items, limits.items))
+    selected = std::min(n, max_items);
+    if (selected > limits.items - std::min(items, limits.items)) {
+      failure = "snapshot exceeds element budget";
       return false;
+    }
     items += selected;
     ++visits;
     const auto saved = path_size;
@@ -88,6 +140,7 @@ struct EncodeBudget {
     if (n > selected &&
         (!truncation || !truncation(truncation_context,
                                     {path.data(), path_size}, n, selected))) {
+      failure = "snapshot exceeds element budget";
       pop(saved);
       return false;
     }
@@ -317,9 +370,12 @@ bool encode_snapshot_pointer(BoundedProtoWriter &w, std::uint32_t field,
                              EncodeBudget &budget) noexcept {
   if (!w.begin_message(field))
     return false;
-  bool ok = w.u64(1, reinterpret_cast<std::uintptr_t>(pointer));
+  const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+  const bool suppressed = owned && pointer && budget.pointer_graph &&
+                          !budget.pointer_graph->admit(address);
+  bool ok = w.u64(1, address) && w.boolean(3, suppressed);
   if constexpr (CanSnapshotPointee<T>::value)
-    if (ok && owned && pointer) {
+    if (ok && owned && pointer && !suppressed) {
       // A pointee that is not wholly readable is left out, not dereferenced.
       if (!budget.readable ||
           (budget.spend() && budget.readable(pointer, sizeof(T), alignof(T))))

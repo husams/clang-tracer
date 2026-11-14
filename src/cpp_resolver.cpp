@@ -40,6 +40,7 @@
 #include <clang/AST/Expr.h>
 #include <clang/AST/Mangle.h>
 #include <clang/AST/RecordLayout.h>
+#include <clang/AST/ParentMapContext.h>
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/Basic/DiagnosticOptions.h>
 #include <clang/Basic/TargetInfo.h>
@@ -181,6 +182,7 @@ struct SnapshotRoot {
     std::string field;
     std::vector<const clang::CXXRecordDecl *> dynamic_types;
     bool automatic = false;
+    bool erased_any = false;
   };
   std::vector<Member> members;
 };
@@ -219,7 +221,7 @@ std::vector<const clang::CXXRecordDecl *> discover_dynamic_types(
     clang::CXXBasePaths paths;
     if (record != base &&
         (!record->isDerivedFrom(base, paths) ||
-         paths.isAmbiguous(ast.getCanonicalType(ast.getRecordType(base))) ||
+         paths.isAmbiguous(ast.getCanonicalType(tracer::prepared::record_type(ast, base))) ||
          std::none_of(paths.begin(), paths.end(), [](const auto &path) {
            return path.Access == clang::AS_public;
          })))
@@ -229,7 +231,7 @@ std::vector<const clang::CXXRecordDecl *> discover_dynamic_types(
     } catch (const std::invalid_argument &) {
       continue;
     }
-    const auto identity = tracer::prepared::type_name(ast, ast.getRecordType(record));
+    const auto identity = tracer::prepared::type_name(ast, tracer::prepared::record_type(ast, record));
     if (!eligible.emplace(identity, record).second)
       throw std::invalid_argument("ambiguous snapshot type identity: " + identity);
   }
@@ -240,8 +242,8 @@ std::vector<const clang::CXXRecordDecl *> discover_dynamic_types(
   return result;
 }
 
-class FollowPointersFinder final
-    : public clang::RecursiveASTVisitor<FollowPointersFinder> {
+class SnapshotPolicyFinder final
+    : public clang::RecursiveASTVisitor<SnapshotPolicyFinder> {
 public:
   bool VisitClassTemplateSpecializationDecl(
       clang::ClassTemplateSpecializationDecl *specialization) {
@@ -249,15 +251,60 @@ public:
         !visited.insert(specialization->getCanonicalDecl()).second)
       return true;
     const auto *templ = specialization->getSpecializedTemplate();
-    if (!templ || templ->getQualifiedNameAsString() != "tracer_snapshot::FollowPointers")
+    if (!templ)
+      return true;
+    const auto name = templ->getQualifiedNameAsString();
+    if (name != "tracer_snapshot::FollowPointers" && name != "tracer_snapshot::AnyPayloads")
       return true;
     const auto &args = specialization->getTemplateArgs();
     if (args.size() != 1 || args[0].getKind() != clang::TemplateArgument::Type)
-      throw std::invalid_argument("FollowPointers specialization requires one record type");
+      throw std::invalid_argument(name + " specialization requires one record type");
     const auto *record = args[0].getAsType()->getAsCXXRecordDecl();
     record = record ? record->getDefinition() : nullptr;
     if (!record)
-      throw std::invalid_argument("FollowPointers policy record must be complete in prepare inputs");
+      throw std::invalid_argument(name + " policy record must be complete in prepare inputs");
+    if (name == "tracer_snapshot::AnyPayloads") {
+      if (!specialization->getASTContext().getLangOpts().RTTI)
+        throw std::invalid_argument("AnyPayloads requires RTTI-enabled source flags");
+      auto &members = any_policies[record->getCanonicalDecl()];
+      for (const auto *declaration : specialization->decls()) {
+        const auto *alias = llvm::dyn_cast<clang::TypeAliasDecl>(declaration);
+        if (!alias)
+          continue;
+        const auto *tuple = llvm::dyn_cast_or_null<clang::ClassTemplateSpecializationDecl>(
+            alias->getUnderlyingType()->getAsCXXRecordDecl());
+        if (!tuple || tuple->getSpecializedTemplate()->getQualifiedNameAsString() != "std::tuple" ||
+            tuple->getTemplateArgs().size() != 1 ||
+            tuple->getTemplateArgs()[0].getKind() != clang::TemplateArgument::Pack)
+          throw std::invalid_argument("AnyPayloads member aliases require std::tuple of record types");
+        SnapshotRoot::Member member;
+        member.field = alias->getNameAsString();
+        member.erased_any = true;
+        const auto fields = record->fields();
+        const auto field = std::find_if(fields.begin(), fields.end(), [&](const auto *candidate) {
+          return candidate->getNameAsString() == member.field;
+        });
+        const auto *erased = field == fields.end() ? nullptr : (*field)->getType()->getAsCXXRecordDecl();
+        if (!erased || erased->getQualifiedNameAsString() != "std::any" ||
+            (*field)->getType().isVolatileQualified())
+          throw std::invalid_argument("AnyPayloads field must be a direct std::any member");
+        std::set<const clang::CXXRecordDecl *> seen;
+        for (const auto &argument : tuple->getTemplateArgs()[0].pack_elements()) {
+          const auto *payload = argument.getAsType()->getAsCXXRecordDecl();
+          payload = payload ? payload->getDefinition() : nullptr;
+          validate_snapshot_candidate(payload);
+          if (!seen.insert(payload->getCanonicalDecl()).second)
+            throw std::invalid_argument("AnyPayloads contains a duplicate payload type");
+          member.dynamic_types.push_back(payload);
+        }
+        if (member.dynamic_types.empty())
+          throw std::invalid_argument("AnyPayloads requires at least one payload type per member");
+        members.push_back(std::move(member));
+      }
+      if (members.empty())
+        throw std::invalid_argument("AnyPayloads must name at least one std::any member");
+      return true;
+    }
     const clang::VarDecl *fields = nullptr;
     if (const auto *definition = specialization->getDefinition())
       for (const auto *decl : definition->decls())
@@ -309,15 +356,9 @@ public:
     return true;
   }
   std::map<const clang::CXXRecordDecl *, std::vector<std::string>> policies;
+  std::map<const clang::CXXRecordDecl *, std::vector<SnapshotRoot::Member>> any_policies;
   std::set<const clang::CXXRecordDecl *> visited;
 };
-
-std::map<const clang::CXXRecordDecl *, std::vector<std::string>>
-find_follow_pointers_policies(clang::ASTContext &ast) {
-  FollowPointersFinder finder;
-  finder.TraverseDecl(ast.getTranslationUnitDecl());
-  return std::move(finder.policies);
-}
 
 std::vector<const clang::CXXRecordDecl *> discover_member_types(
     clang::ASTContext &ast, const clang::CXXRecordDecl *base,
@@ -350,13 +391,14 @@ PreparedSnapshots prepare_snapshot_roots(
   const auto *result_record = result_root ? snapshot_record_type(result_type) : nullptr;
   const auto *dynamic_result_root = function.getReturnType()->isPointerType()
       ? snapshot_record_type(function.getReturnType()) : nullptr;
-  const auto policies = find_follow_pointers_policies(ast);
+  SnapshotPolicyFinder policies;
+  policies.TraverseDecl(ast.getTranslationUnitDecl());
   RecordDefinitions record_finder;
   record_finder.TraverseDecl(ast.getTranslationUnitDecl());
   const auto &definitions = record_finder.records;
   std::sort(roots.begin(), roots.end(), [&](const auto *left, const auto *right) {
-    return tracer::prepared::type_name(ast, ast.getRecordType(left)) <
-           tracer::prepared::type_name(ast, ast.getRecordType(right));
+    return tracer::prepared::type_name(ast, tracer::prepared::record_type(ast, left)) <
+           tracer::prepared::type_name(ast, tracer::prepared::record_type(ast, right));
   });
   roots.erase(std::unique(roots.begin(), roots.end(), [](const auto *left, const auto *right) {
     return left->getCanonicalDecl() == right->getCanonicalDecl();
@@ -418,7 +460,7 @@ PreparedSnapshots prepare_snapshot_roots(
               // only with evidence that it is a live object: a polymorphic
               // pointee whose RTTI matches a derived class, or the declared
               // class of an owner-held implementation pointer.
-              const bool safe = snapshot_members::checked_safe(ast.getRecordType(pointee));
+              const bool safe = snapshot_members::checked_safe(tracer::prepared::record_type(ast, pointee));
               std::vector<const clang::CXXRecordDecl *> member_types;
               if (pointee->isPolymorphic()) {
                 const bool opaque = ast.getSourceManager().isBeforeInTranslationUnit(
@@ -483,8 +525,8 @@ PreparedSnapshots prepare_snapshot_roots(
     if (dynamic_result_root &&
         root->getCanonicalDecl() == dynamic_result_root->getCanonicalDecl())
       policy.dynamic_types = discover_dynamic_types(ast, root, definitions, false);
-    const auto policy_fields = policies.find(root->getCanonicalDecl());
-    if (policy_fields != policies.end()) {
+    const auto policy_fields = policies.policies.find(root->getCanonicalDecl());
+    if (policy_fields != policies.policies.end()) {
       for (const auto &field_name : policy_fields->second) {
         std::vector<snapshot_members::Step> steps;
         if (!snapshot_members::resolve(root, field_name, steps))
@@ -548,6 +590,9 @@ PreparedSnapshots prepare_snapshot_roots(
               {field->getNameAsString(), std::move(member_types), true});
       }
     }
+    if (const auto payloads = policies.any_policies.find(root->getCanonicalDecl());
+        payloads != policies.any_policies.end())
+      policy.members.insert(policy.members.end(), payloads->second.begin(), payloads->second.end());
     for (const auto *dynamic_type : policy.dynamic_types) {
       if (!roots_seen.count(dynamic_type->getCanonicalDecl()))
         pending.push_back(dynamic_type);
@@ -565,8 +610,8 @@ PreparedSnapshots prepare_snapshot_roots(
                           member.dynamic_types.end());
   }
   std::sort(policy_types.begin(), policy_types.end(), [&](const auto *left, const auto *right) {
-    return tracer::prepared::type_name(ast, ast.getRecordType(left)) <
-           tracer::prepared::type_name(ast, ast.getRecordType(right));
+    return tracer::prepared::type_name(ast, tracer::prepared::record_type(ast, left)) <
+           tracer::prepared::type_name(ast, tracer::prepared::record_type(ast, right));
   });
   std::vector<const clang::CXXRecordDecl *> types;
   std::map<std::string, const clang::CXXRecordDecl *> identities;
@@ -574,7 +619,7 @@ PreparedSnapshots prepare_snapshot_roots(
     if (!types.empty() &&
         types.back()->getCanonicalDecl() == record->getCanonicalDecl())
       continue;
-    const auto identity = tracer::prepared::type_name(ast, ast.getRecordType(record));
+    const auto identity = tracer::prepared::type_name(ast, tracer::prepared::record_type(ast, record));
     if (!identities.emplace(identity, record->getCanonicalDecl()).second)
       throw std::invalid_argument("ambiguous snapshot type identity: " + identity);
     types.push_back(record);
@@ -589,8 +634,8 @@ PreparedSnapshots prepare_snapshot_roots(
   };
   PreparedSnapshots prepared;
   std::sort(root_policies.begin(), root_policies.end(), [&](const auto &left, const auto &right) {
-    return tracer::prepared::type_name(ast, ast.getRecordType(left.record)) <
-           tracer::prepared::type_name(ast, ast.getRecordType(right.record));
+    return tracer::prepared::type_name(ast, tracer::prepared::record_type(ast, left.record)) <
+           tracer::prepared::type_name(ast, tracer::prepared::record_type(ast, right.record));
   });
   for (const auto &root : root_policies) {
     api::PreparedSnapshotRecord record;
@@ -601,6 +646,7 @@ PreparedSnapshots prepare_snapshot_roots(
       auto &prepared_member = member.automatic
           ? *record.add_automatic_members() : *record.add_members();
       prepared_member.set_field(member.field);
+      prepared_member.set_erased_any(member.erased_any);
       for (const auto *dynamic_type : member.dynamic_types)
         prepared_member.add_dynamic_types(index_of(dynamic_type));
     }
@@ -608,6 +654,124 @@ PreparedSnapshots prepare_snapshot_roots(
   }
   prepared.types = std::move(types);
   return prepared;
+}
+
+std::string storage_name(const clang::NamedDecl &decl) {
+  std::string name = decl.getNameAsString();
+  for (const auto *parent = decl.getDeclContext(); parent && !parent->isTranslationUnit();
+       parent = parent->getParent()) {
+    if (const auto *scope = llvm::dyn_cast<clang::NamespaceDecl>(parent))
+      name = scope->getNameAsString() + "::" + name;
+    else if (const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(parent))
+      name = record->getNameAsString() + "::" + name;
+  }
+  return name;
+}
+
+std::string storage_type(clang::ASTContext &ast, clang::QualType type, unsigned depth = 0) {
+  if (type.isNull() || depth > 12)
+    return "?";
+  type = type.getCanonicalType().getUnqualifiedType();
+  if (type->isPointerType() || type->isReferenceType()) {
+    const auto kind = type->isPointerType() ? "*" : type->isLValueReferenceType() ? "&" : "&&";
+    return kind + storage_type(ast, type->getPointeeType(), depth + 1);
+  }
+  if (const auto *record = type->getAsCXXRecordDecl()) {
+    if (const auto *special = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record)) {
+      std::string name = storage_name(*special->getSpecializedTemplate());
+      const auto append = [&](auto &&self, const clang::TemplateArgument &arg) -> bool {
+        if (arg.getKind() == clang::TemplateArgument::Type)
+          name += "<" + storage_type(ast, arg.getAsType(), depth + 1) + ">";
+        else if (arg.getKind() == clang::TemplateArgument::Integral) {
+          llvm::SmallString<32> value;
+          arg.getAsIntegral().toString(value, 10);
+          name += "<#" + value.str().str() + ">";
+        } else if (arg.getKind() == clang::TemplateArgument::Pack) {
+          for (const auto &element : arg.pack_elements())
+            if (!self(self, element))
+              return false;
+        } else {
+          return false;
+        }
+        return true;
+      };
+      for (const auto &arg : special->getTemplateArgs().asArray())
+        if (!append(append, arg))
+          return "?";
+      return name;
+    }
+    return storage_name(*record);
+  }
+  if (const auto *enumeration = type->getAs<clang::EnumType>())
+    return storage_name(*enumeration->getDecl());
+  if (type->isVoidType()) return "void";
+  if (type->isBooleanType()) return "bool";
+  if (type->isCharType())
+    return ast.getTargetInfo().getTriple().isAArch64() ? "char" :
+        type->isSignedIntegerType() ? "signed-char" : "unsigned-char";
+  if (type->isSpecificBuiltinType(clang::BuiltinType::SChar)) return "signed-char";
+  if (type->isSpecificBuiltinType(clang::BuiltinType::UChar)) return "unsigned-char";
+  if (type->isSignedIntegerType()) return "signed" + std::to_string(ast.getTypeSize(type));
+  if (type->isUnsignedIntegerType()) return "unsigned" + std::to_string(ast.getTypeSize(type));
+  if (type->isRealFloatingType()) return "float" + std::to_string(ast.getTypeSize(type));
+  if (const auto *array = llvm::dyn_cast<clang::ConstantArrayType>(type.getTypePtr()))
+    return "[" + std::to_string(array->getSize().getLimitedValue()) + "]" +
+        storage_type(ast, array->getElementType(), depth + 1);
+  return "?";
+}
+
+void describe_receiver_storage(clang::ASTContext &ast, const clang::CXXRecordDecl *receiver,
+                               const PreparedSnapshots &snapshots, api::PreparedInjector &package) {
+  std::set<const clang::CXXRecordDecl *> seen;
+  std::vector<const clang::CXXRecordDecl *> pending = snapshots.types;
+  pending.push_back(receiver);
+  while (!pending.empty()) {
+    const auto *record = pending.back();
+    pending.pop_back();
+    if (!record || !(record = record->getDefinition()) || !seen.insert(record).second)
+      continue;
+    if (const auto *special = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record)) {
+      const auto add = [&](auto &&self, const clang::TemplateArgument &arg) -> void {
+        if (arg.getKind() == clang::TemplateArgument::Type && !arg.getAsType()->isPointerType())
+          pending.push_back(snapshot_record_type(arg.getAsType()));
+        else if (arg.getKind() == clang::TemplateArgument::Pack)
+          for (const auto &element : arg.pack_elements())
+            self(self, element);
+      };
+      for (const auto &arg : special->getTemplateArgs().asArray())
+        add(add, arg);
+    }
+    if (record->isInStdNamespace())
+      continue;
+    const auto &layout = ast.getASTRecordLayout(record);
+    auto &description = *package.add_receiver_storage();
+    description.set_name(storage_type(ast, tracer::prepared::record_type(ast, record)));
+    description.set_bytes(layout.getSize().getQuantity());
+    for (const auto &base : record->bases()) {
+      const auto *decl = base.getType()->getAsCXXRecordDecl()->getDefinition();
+      auto &member = *description.add_members();
+      member.set_base(true);
+      member.set_type(storage_type(ast, base.getType()));
+      member.set_needs_dynamic_location(base.isVirtual());
+      if (!base.isVirtual())
+        member.set_offset_bits(ast.toBits(layout.getBaseClassOffset(decl)));
+      pending.push_back(decl);
+    }
+    for (const auto *field : record->fields()) {
+      auto &member = *description.add_members();
+      member.set_name(field->getNameAsString());
+      member.set_offset_bits(layout.getFieldOffset(field->getFieldIndex()));
+      member.set_type(storage_type(ast, field->getType()));
+      member.set_needs_dynamic_location(field->isBitField() || field->getType()->isIncompleteType());
+      if (!member.needs_dynamic_location())
+        member.set_bytes(ast.getTypeSizeInChars(field->getType()).getQuantity());
+      auto value = field->getType();
+      while (const auto *array = ast.getAsArrayType(value))
+        value = array->getElementType();
+      if (!value->isPointerType() && !value->isReferenceType())
+        pending.push_back(snapshot_record_type(value));
+    }
+  }
 }
 
 struct Selector {
@@ -767,6 +931,7 @@ struct FrozenInvocation {
   bool pointer_layouts = true;
   int member_level = 3;
   api::SnapshotLimits limits;
+  bool receiver_storage = false;
 };
 
 class PrepareDiagnostics final : public clang::TextDiagnosticPrinter {
@@ -1041,6 +1206,8 @@ public:
           for (const auto *snapshot_type : snapshots.types)
             tracer::prepared::describe_record(*context_, *snapshot_type,
                 *package.add_snapshot_types());
+          if (invocation_.receiver_storage && method && !method->isStatic())
+            describe_receiver_storage(*context_, method->getParent(), snapshots, package);
           for (const auto &record : snapshots.records)
             *package.add_snapshot_records() = record;
           for (const auto &header : adapter.standard_headers)
@@ -1223,12 +1390,14 @@ public:
   bool BeginSourceFileAction(clang::CompilerInstance& compiler) override {
     const auto& target = compiler.getTarget();
     const auto& triple = target.getTriple();
-    if (triple.getArch() != llvm::Triple::x86_64 || !triple.isOSLinux() ||
+    const bool supported_arch = triple.getArch() == llvm::Triple::x86_64 ||
+        (prepared_ && frozen_invocation_.receiver_storage && triple.getArch() == llvm::Triple::aarch64);
+    if (!supported_arch || !triple.isOSLinux() ||
         target.getPointerWidth(clang::LangAS::Default) != 64 || target.getLongWidth() != 64 ||
         (prepared_ && (!triple.isOSBinFormatELF() || !target.isLittleEndian() ||
                        !target.getCXXABI().isItaniumFamily()))) {
       target_error_ = prepared_
-          ? "compilation database ABI does not match the trace target (expected Linux x86_64 "
+          ? "compilation database ABI does not match the trace target (expected supported Linux "
             "ELF LP64 with the Itanium C++ ABI, found " + triple.str() + ")"
           : "compilation database must target Linux x86_64 (found " + triple.str() + ")";
       return false;
@@ -1560,11 +1729,113 @@ ResolvedCallable resolve_cpp_callable(const std::string& name,
   return select_cpp_candidate(std::move(candidates), selector, name);
 }
 
+std::vector<api::ObjectWatchRequest::SourceWriter> discover_object_writers(
+    const std::string &type, const std::string &field, const std::string &compdb,
+    const std::vector<std::string> &sources) {
+  using Writer = api::ObjectWatchRequest::SourceWriter;
+  if (type.empty() || field.empty() || sources.empty())
+    throw std::invalid_argument("writer discovery requires a record, field and translation unit");
+  auto database = load_database(compdb);
+  std::map<std::string, Writer> writers;
+  class Visitor final : public clang::RecursiveASTVisitor<Visitor> {
+    clang::ASTContext &ast_;
+    const std::string &type_;
+    const std::string &field_;
+    std::map<std::string, Writer> &writers_;
+
+    void record(const clang::Expr *expression) {
+      if (!expression)
+        return;
+      const auto *member = llvm::dyn_cast<clang::MemberExpr>(expression->IgnoreParenImpCasts());
+      const auto *field = member ? llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl()) : nullptr;
+      if (!field || field->getNameAsString() != field_ ||
+          field->getParent()->getQualifiedNameAsString() != type_)
+        return;
+      auto parent = clang::DynTypedNode::create(*member);
+      for (unsigned depth = 0; depth < 64; ++depth) {
+        const auto parents = ast_.getParents(parent);
+        if (parents.size() != 1)
+          return;
+        parent = parents[0];
+        const auto *function = parent.get<clang::FunctionDecl>();
+        if (!function)
+          continue;
+        if (llvm::isa<clang::CXXConstructorDecl, clang::CXXDestructorDecl>(function) ||
+            function->isDependentContext())
+          return;
+        const auto symbol = tracer::prepared::mangle(function, ast_);
+        if (symbol.empty() || writers_.count(symbol))
+          return;
+        const auto location = ast_.getSourceManager().getPresumedLoc(member->getExprLoc());
+        Writer candidate;
+        candidate.set_symbol(symbol);
+        candidate.set_function(function->getQualifiedNameAsString());
+        if (location.isValid()) {
+          candidate.set_file(location.getFilename());
+          candidate.set_line(location.getLine());
+        }
+        writers_.emplace(symbol, std::move(candidate));
+        return;
+      }
+    }
+
+  public:
+    Visitor(clang::ASTContext &ast, const std::string &type, const std::string &field,
+            std::map<std::string, Writer> &writers)
+        : ast_(ast), type_(type), field_(field), writers_(writers) {}
+
+    bool VisitBinaryOperator(clang::BinaryOperator *operation) {
+      if (operation->isAssignmentOp())
+        record(operation->getLHS());
+      return true;
+    }
+    bool VisitUnaryOperator(clang::UnaryOperator *operation) {
+      if (operation->isIncrementDecrementOp())
+        record(operation->getSubExpr());
+      return true;
+    }
+    bool VisitCXXMemberCallExpr(clang::CXXMemberCallExpr *operation) {
+      const auto *method = operation->getMethodDecl();
+      if (method) {
+        const auto name = method->getNameAsString();
+        if (name == "store" || name == "exchange" || ::tracer::compat::starts_with(name, "fetch_") ||
+            ::tracer::compat::starts_with(name, "compare_exchange_"))
+          record(operation->getImplicitObjectArgument());
+      }
+      return true;
+    }
+  };
+  for (const auto &source : sources) {
+    if (database->getCompileCommands(source).empty())
+      throw std::invalid_argument("no compile command for writer source: " + source);
+    clang::tooling::ClangTool tool(*database, {source});
+    tool.appendArgumentsAdjuster(clang::tooling::getClangStripOutputAdjuster());
+    tool.appendArgumentsAdjuster(clang::tooling::getClangSyntaxOnlyAdjuster());
+    tool.appendArgumentsAdjuster([](const clang::tooling::CommandLineArguments &arguments,
+                                   llvm::StringRef) {
+      auto result = arguments;
+      if (!has_resource_dir_argument(result))
+        result.push_back(std::string("-resource-dir=") + TRACER_CLANG_RESOURCE_DIR);
+      return result;
+    });
+    std::vector<std::unique_ptr<clang::ASTUnit>> units;
+    if (tool.buildASTs(units) || units.size() != 1)
+      throw std::runtime_error("writer discovery requires one successfully parsed command for " + source);
+    auto &ast = units.front()->getASTContext();
+    Visitor visitor(ast, type, field, writers);
+    visitor.TraverseDecl(ast.getTranslationUnitDecl());
+  }
+  std::vector<Writer> result;
+  for (auto &[symbol, writer] : writers)
+    result.push_back(std::move(writer));
+  return result;
+}
+
 ResolvedCallable resolve_header_callable(const std::string& name,
                                          const api::ProbeSpec& headers,
                                          const PreparedHeaderCommand& command,
                                          bool pointer_layouts, int member_level,
-                                         const api::SnapshotLimits& limits) {
+                                         const api::SnapshotLimits& limits, bool receiver_storage) {
   const auto selector = parse_selector(name);
   if (!selector.has_parameters || headers.include_headers().empty())
     throw std::runtime_error("prepared generation requires an explicit selector and header context");
@@ -1676,6 +1947,7 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   invocation.pointer_layouts = pointer_layouts;
   invocation.member_level = member_level;
   invocation.limits = limits;
+  invocation.receiver_storage = receiver_storage;
   invocation.prepared_headers.assign(headers.include_headers().begin(),
                                      headers.include_headers().end());
   tool.appendArgumentsAdjuster([&](const clang::tooling::CommandLineArguments& args,
@@ -1727,7 +1999,10 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
     tracer::prepared::describe_record(unit->getASTContext(), *record, actual);
     if (actual.SerializeAsString() != adapter.snapshot_types(i).SerializeAsString())
       throw std::runtime_error(
-          "generated prepared adapter does not reproduce snapshot layout " + alias_name);
+          "generated prepared adapter does not reproduce snapshot layout " + alias_name +
+          " (" + adapter.snapshot_types(i).record_name() + ", source bytes " +
+          std::to_string(adapter.snapshot_types(i).record_size()) + ", adapter bytes " +
+          std::to_string(actual.record_size()) + ")");
     snapshot_types.push_back(record);
   }
   std::set<std::uint32_t> snapshot_roots;
@@ -1744,7 +2019,7 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
     clang::CXXBasePaths paths;
     if (!candidate->isDerivedFrom(base, paths) ||
         paths.isAmbiguous(unit->getASTContext().getCanonicalType(
-            unit->getASTContext().getRecordType(base))) ||
+            tracer::prepared::record_type(unit->getASTContext(), base))) ||
         std::none_of(paths.begin(), paths.end(), [](const auto &path) {
           return path.Access == clang::AS_public;
         }))
@@ -1761,9 +2036,22 @@ void verify_prepared_adapter(const std::string &name, const api::PreparedInjecto
       validate_dynamic_edge(root, type_index, true);
     const auto validate_member = [&](const api::PreparedSnapshotMember &member,
                                      bool automatic) {
-      (void)automatic;
       if (member.field().empty())
         throw std::runtime_error("prepared snapshot member has an empty field name");
+      if (member.erased_any()) {
+        const auto *field = snapshot_members::find(root, member.field());
+        const auto *erased = field ? field->getType()->getAsCXXRecordDecl() : nullptr;
+        if (automatic || !erased || erased->getQualifiedNameAsString() != "std::any" ||
+            field->getType().isVolatileQualified() || member.dynamic_types().empty())
+          throw std::runtime_error("prepared erased snapshot requires a std::any member and payloads");
+        std::set<std::uint32_t> unique;
+        for (const auto index : member.dynamic_types()) {
+          if (index >= snapshot_types.size() || !unique.insert(index).second)
+            throw std::runtime_error("prepared std::any payload index is invalid or duplicated");
+          validate_snapshot_candidate(snapshot_types[index]);
+        }
+        return;
+      }
       std::vector<snapshot_members::Step> steps;
       if (!snapshot_members::resolve(root, member.field(), steps))
         throw std::runtime_error("prepared snapshot member is not a raw pointer or reference path");

@@ -58,6 +58,13 @@ ngd::HeapObject::~HeapObject() {
 TARGET = r'''#include "item.hpp"
 #include <cstdio>
 #include <sys/prctl.h>
+
+#ifndef PR_SET_PTRACER
+#define PR_SET_PTRACER 0x59616d61
+#endif
+#ifndef PR_SET_PTRACER_ANY
+#define PR_SET_PTRACER_ANY (~0UL)
+#endif
 #include <unistd.h>
 
 namespace {

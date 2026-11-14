@@ -13,6 +13,7 @@
 namespace clang {
 class ASTContext;
 class CXXRecordDecl;
+class FieldDecl;
 class QualType;
 } // namespace clang
 
@@ -151,36 +152,48 @@ enum class CodecAccess { public_members, snapshot_members };
 
 // Generic scoped payloads need no state/shared_state marker. The root
 // descriptor is a wrapper whose field 1 is named `value`.
+struct SnapshotFieldSelection {
+  const clang::CXXRecordDecl *record = nullptr;
+  std::vector<std::string> names;
+  bool includes(const clang::CXXRecordDecl *root, const clang::FieldDecl &field) const;
+};
+
 SchemaResult build_payload_schema(clang::ASTContext &, clang::QualType payload,
                                   StateFamilyKey, SchemaLimits = {},
-                                  CodecAccess = CodecAccess::public_members);
+                                  CodecAccess = CodecAccess::public_members,
+                                  const SnapshotFieldSelection & = {});
 // Emits owner-side Codec<T> specializations from declarations. The caller
 // appends this source to the checked owner compilation unit; no user mappings.
 CodecSourceResult render_state_codec_source(const clang::CXXRecordDecl &);
 CodecSourceResult
 render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* const> roots,
-                           CodecAccess = CodecAccess::public_members);
+                           CodecAccess = CodecAccess::public_members,
+                           const SnapshotFieldSelection & = {});
 // Combines marked State<T> record roots and generic payload QualTypes into one
 // deduplicated recursive codec emission pass.
 CodecSourceResult
 render_context_codec_sources(clang::ASTContext&,
                              ::tracer::compat::span<const clang::CXXRecordDecl* const> state_roots,
                              ::tracer::compat::span<const clang::QualType> payload_roots,
-                             CodecAccess = CodecAccess::public_members);
+                             CodecAccess = CodecAccess::public_members,
+                             const SnapshotFieldSelection & = {});
 struct SnapshotMemberAccessor {
   const clang::CXXRecordDecl *root_type = nullptr;
   std::string member_name;
+  bool erased_any = false;
 };
 CodecSourceResult render_snapshot_member_accessors(
     clang::ASTContext &,
     ::tracer::compat::span<const clang::QualType> payload_roots,
     ::tracer::compat::span<const SnapshotMemberAccessor> members,
-    CodecAccess = CodecAccess::snapshot_members);
+    CodecAccess = CodecAccess::snapshot_members,
+    const SnapshotFieldSelection & = {});
 // Emits any required user-record codecs plus a root call that encodes payload
 // as field 1; builtin/string/container roots use encode_value directly.
 CodecSourceResult render_payload_codec_source(clang::ASTContext &,
                                               clang::QualType payload,
-                                              CodecAccess = CodecAccess::public_members);
+                                              CodecAccess = CodecAccess::public_members,
+                                              const SnapshotFieldSelection & = {});
 // Resolves a dotted logical field path independently against each immutable
 // revision. Missing paths remain explicit; renamed fields are never inferred.
 std::vector<RevisionField>

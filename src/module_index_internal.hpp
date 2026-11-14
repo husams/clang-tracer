@@ -18,7 +18,7 @@ namespace fs = std::filesystem;
 
 std::string digest(llvm::StringRef bytes);
 std::string inspect_elf(const fs::path &, const std::function<void(const Elf &)> & = {},
-                        std::string_view expected_digest = {});
+                        std::string_view expected_digest = {}, bool allow_aarch64 = false);
 ModuleIdentity scan(const ModuleSource &, const ModuleIndexOptions &,
                     const std::function<void(const ModuleType &)> &,
                     const std::function<void(const ModuleSymbol &)> &);

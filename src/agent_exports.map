@@ -10,6 +10,7 @@
     tracer_agent_reclaim_v1;
     tracer_agent_page_monitor_start_v1;
     tracer_agent_page_monitor_stop_v1;
+    tracer_agent_object_cache_v34;
     tracer_context_pthread_create_detour;
   local:
     *;

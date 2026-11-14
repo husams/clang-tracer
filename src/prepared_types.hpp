@@ -10,6 +10,7 @@
 #include <clang/AST/VTableBuilder.h>
 #include <clang/AST/Mangle.h>
 #include <clang/Sema/Sema.h>
+#include <clang/Basic/Version.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/SHA256.h>
 
@@ -18,6 +19,15 @@
 #include <unordered_set>
 
 namespace tracer::prepared {
+
+inline clang::QualType record_type(clang::ASTContext &ast,
+                                   const clang::RecordDecl *record) {
+#if CLANG_VERSION_MAJOR >= 22
+  return clang::QualType(ast.getCanonicalTagType(record).getTypePtr(), 0);
+#else
+  return ast.getRecordType(record);
+#endif
+}
 
 inline std::string type_name(clang::ASTContext &ast, clang::QualType type) {
   clang::PrintingPolicy policy(ast.getLangOpts());
@@ -40,7 +50,7 @@ inline std::string record_layout(clang::ASTContext &ast,
     record = record->getDefinition();
     if (!record || !seen.insert(record).second)
       return;
-    add(type_name(ast, ast.getRecordType(record)));
+    add(type_name(ast, record_type(ast, record)));
     const auto &layout = ast.getASTRecordLayout(record);
     number(layout.getSize().getQuantity());
     number(layout.getAlignment().getQuantity());
@@ -97,7 +107,7 @@ inline void describe_record(clang::ASTContext &ast,
                             const clang::CXXRecordDecl &record,
                             clangtracer::v1::DebugInfo &info) {
   const auto &layout = ast.getASTRecordLayout(&record);
-  info.set_record_name(type_name(ast, ast.getRecordType(&record)));
+  info.set_record_name(type_name(ast, record_type(ast, &record)));
   info.set_record_size(layout.getSize().getQuantity());
   info.set_record_alignment(layout.getAlignment().getQuantity());
   info.set_record_is_opaque(true);
