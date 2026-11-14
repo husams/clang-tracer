@@ -171,9 +171,9 @@ span.linenos.special { color: #e6edf3; background-color: #6e7681; padding-left: 
   <input id="nav-filter" type="search" placeholder="Probe, replay, Python…" autocomplete="off">
   <p id="no-sections" role="status" hidden>No sections match.</p>
   <nav aria-label="Chapters">
-  <div class="nav-group"><h2>Get started</h2><ul><li><details><summary>Clang Tracer user guide</summary><div class="subnav"><a href="#user">Overview</a><a href="#user--install-and-check-the-tools">Install and check the tools</a><a href="#user--open-the-interactive-guide">Open the interactive guide</a><a href="#user--create-a-target-and-a-basic-probe">Create a target and a basic probe</a><a href="#user--prepare-a-probe-when-you-only-have-a-binary">Prepare a probe when you only have a binary</a><a href="#user--related-documentation">Related documentation</a></div></details></li><li><details><summary>Clang Tracer tutorials</summary><div class="subnav"><a href="#tutorials">Overview</a><a href="#tutorials--inspect-a-process-and-a-function-entry">Inspect a process and a function entry</a><a href="#tutorials--edit-validate-reload-and-restore">Edit, validate, reload, and restore</a><a href="#tutorials--trace-a-function-template-instantiation">Trace a function template instantiation</a><a href="#tutorials--preview-and-apply-bulk-tracing">Preview and apply bulk tracing</a><a href="#tutorials--capture-and-inspect-complete-native-stacks">Capture and inspect complete native stacks</a><a href="#tutorials--capture-in-the-background-and-query-in-c">Capture in the background and query in C++</a><a href="#tutorials--record-and-replay-offline">Record and replay offline</a><a href="#tutorials--prepare-a-reusable-probe">Prepare a reusable probe</a><a href="#tutorials--decode-objects-containers-and-method-receivers">Decode objects, containers, and method receivers</a><a href="#tutorials--observe-shared-context-and-thread-propagation">Observe shared context and thread propagation</a><a href="#tutorials--collect-every-call-of-one-request">Collect every call of one request</a><a href="#tutorials--automate-tracing-with-python">Automate tracing with Python</a><a href="#tutorials--trace-from-the-python-console-or-the-native-cli">Trace from the Python console or the native CLI</a><a href="#tutorials--run-the-installed-end-to-end-jit-demo">Run the installed end-to-end JIT demo</a></div></details></li></ul></div>
+  <div class="nav-group"><h2>Get started</h2><ul><li><details><summary>Clang Tracer user guide</summary><div class="subnav"><a href="#user">Overview</a><a href="#user--install-and-check-the-tools">Install and check the tools</a><a href="#user--open-the-interactive-guide">Open the interactive guide</a><a href="#user--create-a-target-and-a-basic-probe">Create a target and a basic probe</a><a href="#user--prepare-a-probe-when-you-only-have-a-binary">Prepare a probe when you only have a binary</a><a href="#user--trace-changes-to-c-objects">Trace changes to C++ objects</a><a href="#user--related-documentation">Related documentation</a></div></details></li><li><details><summary>Clang Tracer tutorials</summary><div class="subnav"><a href="#tutorials">Overview</a><a href="#tutorials--inspect-a-process-and-a-function-entry">Inspect a process and a function entry</a><a href="#tutorials--edit-validate-reload-and-restore">Edit, validate, reload, and restore</a><a href="#tutorials--trace-a-function-template-instantiation">Trace a function template instantiation</a><a href="#tutorials--preview-and-apply-bulk-tracing">Preview and apply bulk tracing</a><a href="#tutorials--capture-and-inspect-complete-native-stacks">Capture and inspect complete native stacks</a><a href="#tutorials--capture-in-the-background-and-query-in-c">Capture in the background and query in C++</a><a href="#tutorials--record-and-replay-offline">Record and replay offline</a><a href="#tutorials--prepare-a-reusable-probe">Prepare a reusable probe</a><a href="#tutorials--decode-objects-containers-and-method-receivers">Decode objects, containers, and method receivers</a><a href="#tutorials--observe-shared-context-and-thread-propagation">Observe shared context and thread propagation</a><a href="#tutorials--collect-every-call-of-one-request">Collect every call of one request</a><a href="#tutorials--automate-tracing-with-python">Automate tracing with Python</a><a href="#tutorials--trace-from-the-python-console-or-the-native-cli">Trace from the Python console or the native CLI</a><a href="#tutorials--run-the-installed-end-to-end-jit-demo">Run the installed end-to-end JIT demo</a></div></details></li></ul></div>
 <div class="nav-group"><h2>Reference</h2><ul><li><details><summary>Command reference</summary><div class="subnav"><a href="#commands">Overview</a><a href="#commands--native-repl-startup">Native REPL startup</a><a href="#commands--native-repl-session-and-discovery-commands">Native REPL session and discovery commands</a><a href="#commands--native-repl-module-index-commands">Native REPL module index commands</a><a href="#commands--native-repl-probe-and-bulk-trace-commands">Native REPL probe and bulk trace commands</a><a href="#commands--native-repl-memory-and-c-commands">Native REPL memory and C++ commands</a><a href="#commands--native-repl-capture-and-recording-commands">Native REPL capture and recording commands</a><a href="#commands--native-server">Native server</a><a href="#commands--native-command-line-client">Native command-line client</a><a href="#commands--python-console-startup-and-server-commands">Python console startup and server commands</a><a href="#commands--offline-probe-preparation">Offline probe preparation</a><a href="#commands--build-and-deployment-scripts">Build and deployment scripts</a></div></details></li><li><details><summary>Clang Tracer developer guide</summary><div class="subnav"><a href="#developer">Overview</a><a href="#developer--python-client-api">Python client API</a><a href="#developer--native-repl-c-client-api">Native REPL C++ client API</a><a href="#developer--agent-callback-api">Agent callback API</a><a href="#developer--grpc-control-api">gRPC control API</a><a href="#developer--build-and-validate-changes">Build and validate changes</a></div></details></li></ul></div>
-<div class="nav-group"><h2>Walkthroughs</h2><ul><li><details><summary>Build and deploy on RHEL-compatible Linux</summary><div class="subnav"><a href="#install">Overview</a><a href="#install--dependencies">Dependencies</a><a href="#install--select-the-compiler-and-llvm-installation">Select the compiler and LLVM installation</a><a href="#install--installation-layout">Installation layout</a><a href="#install--archives-and-rpms">Archives and RPMs</a><a href="#install--verification">Verification</a></div></details></li><li><details><summary>Native C++ REPL</summary><div class="subnav"><a href="#repl">Overview</a><a href="#repl--build">Build</a><a href="#repl--prepare-a-probe-from-a-binary-without-headers">Prepare a probe from a binary without headers</a><a href="#repl--start-and-attach">Start and attach</a><a href="#repl--browse-a-local-c-target">Browse a local C++ target</a><a href="#repl--preview-a-bulk-trace">Preview a bulk trace</a><a href="#repl--apply-and-remove-a-bulk-trace">Apply and remove a bulk trace</a><a href="#repl--read-and-scan-mapped-memory">Read and scan mapped memory</a><a href="#repl--preview-a-verified-function-entry">Preview a verified function entry</a><a href="#repl--interceptor-upload">Interceptor upload</a><a href="#repl--collect-and-inspect">Collect and inspect</a><a href="#repl--analyze-in-c">Analyze in C++</a><a href="#repl--cleanup-and-scripted-use">Cleanup and scripted use</a><a href="#repl--regenerate-the-grammar">Regenerate the grammar</a><a href="#repl--validation">Validation</a></div></details></li><li><details><summary>Clang Tracer Python client</summary><div class="subnav"><a href="#python">Overview</a><a href="#python--install-and-open-the-console">Install and open the console</a><a href="#python--index-a-module-and-prepare-a-probe-without-application-headers">Index a module and prepare a probe without application headers</a><a href="#python--programmatic-tracing">Programmatic tracing</a><a href="#python--discover-functions-and-methods">Discover functions and methods</a><a href="#python--receiving-and-recording-traces">Receiving and recording traces</a><a href="#python--launch-status-and-shutdown">Launch, status and shutdown</a><a href="#python--console-commands">Console commands</a><a href="#python--development">Development</a></div></details></li><li><details><summary>Event retention and SQLite storage</summary><div class="subnav"><a href="#storage">Overview</a><a href="#storage--configure-retained-history">Configure retained history</a><a href="#storage--save-or-drain">Save or drain</a><a href="#storage--sqlite-format-and-failure-handling">SQLite format and failure handling</a><a href="#storage--verification">Verification</a></div></details></li><li><details><summary>Shared context</summary><div class="subnav"><a href="#context">Overview</a><a href="#context--declare-and-use-state">Declare and use state</a><a href="#context--thread-propagation">Thread propagation</a><a href="#context--events-and-field-queries">Events and field queries</a><a href="#context--package-lineage">Package lineage</a><a href="#context--build-and-recording">Build and recording</a><a href="#context--acceptance-source">Acceptance source</a></div></details></li></ul></div>
+<div class="nav-group"><h2>Walkthroughs</h2><ul><li><details><summary>Build and deploy on RHEL-compatible Linux</summary><div class="subnav"><a href="#install">Overview</a><a href="#install--dependencies">Dependencies</a><a href="#install--select-the-compiler-and-llvm-installation">Select the compiler and LLVM installation</a><a href="#install--installation-layout">Installation layout</a><a href="#install--archives-and-rpms">Archives and RPMs</a><a href="#install--verification">Verification</a></div></details></li><li><details><summary>Native C++ REPL</summary><div class="subnav"><a href="#repl">Overview</a><a href="#repl--build">Build</a><a href="#repl--prepare-a-probe-from-a-binary-without-headers">Prepare a probe from a binary without headers</a><a href="#repl--start-and-attach">Start and attach</a><a href="#repl--browse-a-local-c-target">Browse a local C++ target</a><a href="#repl--preview-a-bulk-trace">Preview a bulk trace</a><a href="#repl--apply-and-remove-a-bulk-trace">Apply and remove a bulk trace</a><a href="#repl--read-and-scan-mapped-memory">Read and scan mapped memory</a><a href="#repl--preview-a-verified-function-entry">Preview a verified function entry</a><a href="#repl--probe-a-short-getter">Probe a short getter</a><a href="#repl--trace-object-lifetimes-and-state-in-a-prebuilt-binary">Trace object lifetimes and state in a prebuilt binary</a><a href="#repl--prepare-an-object-watch-for-method-snapshots">Prepare an object watch for method snapshots</a><a href="#repl--follow-logical-collection-entries-during-writes">Follow logical collection entries during writes</a><a href="#repl--trace-a-shape-through-image">Trace a Shape through Image</a><a href="#repl--trace-a-direct-integer-assignment">Trace a direct integer assignment</a><a href="#repl--trace-atomic-integer-updates">Trace atomic integer updates</a><a href="#repl--decode-a-tagged-union-write">Decode a tagged union write</a><a href="#repl--trace-writes-in-the-native-code-cache">Trace writes in the native code cache</a><a href="#repl--interceptor-upload">Interceptor upload</a><a href="#repl--collect-and-inspect">Collect and inspect</a><a href="#repl--analyze-in-c">Analyze in C++</a><a href="#repl--cleanup-and-scripted-use">Cleanup and scripted use</a><a href="#repl--regenerate-the-grammar">Regenerate the grammar</a><a href="#repl--validation">Validation</a></div></details></li><li><details><summary>Clang Tracer Python client</summary><div class="subnav"><a href="#python">Overview</a><a href="#python--install-and-open-the-console">Install and open the console</a><a href="#python--index-a-module-and-prepare-a-probe-without-application-headers">Index a module and prepare a probe without application headers</a><a href="#python--programmatic-tracing">Programmatic tracing</a><a href="#python--discover-functions-and-methods">Discover functions and methods</a><a href="#python--receiving-and-recording-traces">Receiving and recording traces</a><a href="#python--launch-status-and-shutdown">Launch, status and shutdown</a><a href="#python--console-commands">Console commands</a><a href="#python--development">Development</a></div></details></li><li><details><summary>Event retention and SQLite storage</summary><div class="subnav"><a href="#storage">Overview</a><a href="#storage--configure-retained-history">Configure retained history</a><a href="#storage--save-or-drain">Save or drain</a><a href="#storage--sqlite-format-and-failure-handling">SQLite format and failure handling</a><a href="#storage--verification">Verification</a></div></details></li><li><details><summary>Shared context</summary><div class="subnav"><a href="#context">Overview</a><a href="#context--declare-and-use-state">Declare and use state</a><a href="#context--thread-propagation">Thread propagation</a><a href="#context--events-and-field-queries">Events and field queries</a><a href="#context--package-lineage">Package lineage</a><a href="#context--build-and-recording">Build and recording</a><a href="#context--acceptance-source">Acceptance source</a></div></details></li></ul></div>
 <div class="nav-group"><h2>Runnable examples</h2><ul><li><details><summary>Basic PRE and POST callbacks</summary><div class="subnav"><a href="#example-callback">Overview</a></div></details></li><li><details><summary>Legacy entry-only callback</summary><div class="subnav"><a href="#example-legacy">Overview</a></div></details></li><li><details><summary>Complete native C++ interceptor example</summary><div class="subnav"><a href="#example-interceptor">Overview</a><a href="#example-interceptor--targetcpp">target.cpp</a><a href="#example-interceptor--methodcpp">method.cpp</a><a href="#example-interceptor--free_functioncpp">free_function.cpp</a><a href="#example-interceptor--run-the-normal-cli">Run the normal CLI</a><a href="#example-interceptor--recorded-normal-cli-run">Recorded normal CLI run</a></div></details></li><li><details><summary>DWARF-typed class-instance arguments</summary><div class="subnav"><a href="#example-arguments">Overview</a><a href="#example-arguments--orderhpp-target-owned-optional-for-tracing">order.hpp (target-owned, optional for tracing)</a><a href="#example-arguments--targetcpp">target.cpp</a><a href="#example-arguments--interceptorcpp">interceptor.cpp</a><a href="#example-arguments--pointercpp">pointer.cpp</a><a href="#example-arguments--run-using-the-normal-cli">Run using the normal CLI</a><a href="#example-arguments--optional-headers-and-compile_commandsjson">Optional headers and compile_commands.json</a><a href="#example-arguments--supported-boundary">Supported boundary</a></div></details></li><li><details><summary>Generate and inject from the native C++ REPL</summary><div class="subnav"><a href="#example-prepared">Overview</a><a href="#example-prepared--1-generate-the-package-from-the-header">1. Generate the package from the header</a><a href="#example-prepared--2-validate-against-the-running-application">2. Validate against the running application</a><a href="#example-prepared--3-inject-and-collect">3. Inject and collect</a><a href="#example-prepared--4-restore-and-exit">4. Restore and exit</a><a href="#example-prepared--equivalent-native-c-api">Equivalent native C++ API</a><a href="#example-prepared--modes-and-scope-of-this-draft">Modes and scope of this draft</a><a href="#example-prepared--automatic-snapshots-for-returned-pointers">Automatic snapshots for returned pointers</a><a href="#example-prepared--typed-method-example">Typed method example</a><a href="#example-prepared--typed-custom-event">Typed custom event</a></div></details></li><li><details><summary>Typed values in the native REPL</summary><div class="subnav"><a href="#example-values">Overview</a><a href="#example-values--1-user-defined-structs-and-classes">1. User-defined structs and classes</a><a href="#example-values--2-scalars-and-simple-standard-types">2. Scalars and simple standard types</a><a href="#example-values--3-sequence-containers-and-nested-records">3. Sequence containers and nested records</a><a href="#example-values--4-associative-containers">4. Associative containers</a><a href="#example-values--capture-boundaries">Capture boundaries</a></div></details></li><li><details><summary>Capture native C++ call stacks</summary><div class="subnav"><a href="#example-stack">Overview</a><a href="#example-stack--measured-overhead">Measured overhead</a><a href="#example-stack--optional-pre-arguments-and-post-return-value">Optional PRE arguments and POST return value</a><a href="#example-stack--read-names-modules-and-source-lines-inside-both-hooks">Read names, modules and source lines inside both hooks</a></div></details></li><li><details><summary>Shared context: one request, two probes, one worker</summary><div class="subnav"><a href="#example-shared">Overview</a><a href="#example-shared--run-manually">Run manually</a></div></details></li><li><details><summary>Local JIT tracing in the native REPL</summary><div class="subnav"><a href="#example-jit">Overview</a><a href="#example-jit--inspect-and-reload-interactively">Inspect and reload interactively</a></div></details></li><li><details><summary>Python API examples</summary><div class="subnav"><a href="#example-python">Overview</a><a href="#example-python--run-the-installed-examples">Run the installed examples</a><a href="#example-python--run-from-a-source-checkout">Run from a source checkout</a></div></details></li><li><details><summary>Validation and benchmark notes</summary><div class="subnav"><a href="#validation">Overview</a><a href="#validation--reproduce-the-checks">Reproduce the checks</a><a href="#validation--pie-detour-regression-checks">PIE detour regression checks</a><a href="#validation--measured-tracing-overhead">Measured tracing overhead</a></div></details></li></ul></div>
   </nav>
 </aside>
@@ -322,6 +322,14 @@ types and functions. See <a href="#repl--prepare-a-probe-from-a-binary-without-h
 for the callback, injection commands, and C++ API, or the
 <a href="#python--index-a-module-and-prepare-a-probe-without-application-headers">Python guide</a>
 for the programmatic workflow.</p>
+<h3 id="user--trace-changes-to-c-objects">Trace changes to C++ objects</h3>
+<p>Use a native REPL method watch to compare a live receiver before and after
+a call in a prebuilt executable. Select private members, strings, nested
+records, or containers with <code>--field</code>. Pair vector elements by a stable ID
+and map entries by key using <code>--key</code>, then inspect the typed changes from
+the SQLite recording. Individual write watches identify the actual store
+instruction for supported typed fields inside a selected vector element,
+ordered or unordered map entry, or pointee. See the <a href="#repl--prepare-an-object-watch-for-method-snapshots">native REPL object watch walkthrough</a>.</p>
 <h3 id="user--related-documentation">Related documentation</h3>
 <ul>
 <li><a href="#commands">Command reference</a></li>
@@ -2677,6 +2685,400 @@ them. Indirect targets are shown as unresolved. <code>patch_size</code> shows th
 instruction-aligned window accepted by the current copy-only detour policy.
 If the policy rejects the entry, the preview shows the reason. It performs
 no installation or writes.</p>
+<h3 id="repl--probe-a-short-getter">Probe a short getter</h3>
+<p><code>%probe inject</code> uses the <code>auto</code> backend by default. It keeps the verified
+entry jump when the overwrite window and relocation fit. The installed
+probe reports its backend, selection reason, and patch address.</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%probe<span class="w"> </span>inject<span class="w"> </span><span class="s2">&quot;demo::Circle::get_radius() const&quot;</span><span class="w"> </span>--backend<span class="w"> </span>auto<span class="w"> </span>--caller<span class="w"> </span><span class="s2">&quot;demo::call_radius(const demo::Circle &amp;)&quot;</span><span class="w"> </span>--stack-depth<span class="w"> </span><span class="m">6</span>
+%record<span class="w"> </span>getter.db<span class="w"> </span>--sqlite<span class="w"> </span>--phase<span class="w"> </span>POST<span class="w"> </span>--probe<span class="w"> </span>PROBE_ID<span class="w"> </span>--count<span class="w"> </span><span class="m">4</span><span class="w"> </span>--timeout<span class="w"> </span><span class="m">30</span>
+%detach
+</code></pre></div>
+<p>For a supported short integer getter, <code>--caller</code> selects a named function
+in the same module. The call-site backend requires one verified five-byte
+direct call to the getter and an executable relay within rel32 range of the
+next instruction. It traces calls through that site. Use <code>--backend entry</code>
+to require an entry jump.</p>
+<p>When auto has no verified caller or no reachable relay, the trap backend
+copies the complete getter and installs one <code>INT3</code> at its verified entry.
+The server redirects owned traps to the normal wrapper, leaving the
+application's return address on its stack. The initial supported body is
+a 32-bit load from the receiver followed by <code>ret</code>. An existing ENDBR64
+stays in place and selects the trap path. The trap owns execution control for its session and
+restores its byte at stop, detach, or a thread or process creation stop.
+Remove a fallback probe before replacing it.</p>
+<h3 id="repl--trace-object-lifetimes-and-state-in-a-prebuilt-binary">Trace object lifetimes and state in a prebuilt binary</h3>
+<p>Use the full Linux build on x86-64 or AArch64, with the REPL, server, and agent from the same build. Supply the existing ELF and its matching DWARF, either embedded or in a matching separate debug file. The watch installs patches in process memory. The application executable and source files stay intact.</p>
+<p>The plan records the capture mode you select during preparation.</p>
+<ul>
+<li><strong>Individual writes.</strong> Select one <code>--field</code> and a writer with <code>--code</code>. Use <code>--backend code-cache</code> to run supported stores in the target without a ptrace stop for every write. <code>--backend ptrace</code> is the default and steps verified stores for diagnostic runs. By default, the watch samples values and reports changes. Start a saved write plan with <code>--no-values</code> to record <code>FIELD_WRITTEN</code> for each completed admitted store, including same-value stores, without field samples. The backend is part of the saved plan.</li>
+<li><strong>Method snapshots.</strong> Use <code>--on</code> with the original header and compile command to compare the receiver at verified entry and return boundaries. A snapshot delta describes the net change during one call. Supply the synchronization policy that protects the sampled state. See <a href="#repl--prepare-an-object-watch-for-method-snapshots">method snapshots</a>.</li>
+</ul>
+<h4 id="repl--run-a-scalar-write-watch-on-x86-64">Run a scalar write watch on x86-64</h4>
+<p>From the repository root on Linux x86-64, use a full build in <code>build</code> with tests enabled. Build the demonstration fixture once and start it in the first terminal. It prints its PID and waits for input.</p>
+<div class="code-block"><div class="code-bar"><span>sh</span><button class="copy" type="button">Copy</button></div><pre><code>cmake<span class="w"> </span>--build<span class="w"> </span>build<span class="w"> </span>--target<span class="w"> </span>repl-object-plan-target
+sh<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;printf &quot;PID=%s\n&quot; &quot;$$&quot;; exec &quot;$1&quot;&#39;</span><span class="w"> </span>_<span class="w"> </span>./build/repl-object-plan-target
+</code></pre></div>
+<p>From the same directory in a second terminal, open the REPL. Use a fresh package directory and SQLite path for each run.</p>
+<div class="code-block"><div class="code-bar"><span>sh</span><button class="copy" type="button">Copy</button></div><pre><code>./build/clang-tracer-repl<span class="w"> </span>--server<span class="w"> </span>./build/clang-tracer-server<span class="w"> </span>--agent<span class="w"> </span>./build/libclang_tracer_agent.so<span class="w"> </span>--fail-fast
+</code></pre></div>
+<p>Prepare the plan before attaching. Then replace <code>PID</code> with the printed PID and check that preview reports <code>binding=same-build</code> and a verified store site. Start installs the redirects and prints the watch ID.</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%object<span class="w"> </span>prepare<span class="w"> </span>demo::PlanRecord<span class="w"> </span>--module<span class="w"> </span>./build/repl-object-plan-target<span class="w"> </span>--field<span class="w"> </span>value<span class="w"> </span>--code<span class="w"> </span><span class="s2">&quot;demo::write_value(demo::PlanRecord &amp;)&quot;</span><span class="w"> </span>--backend<span class="w"> </span>code-cache<span class="w"> </span>--output<span class="w"> </span>./record-watch
+%attach<span class="w"> </span>PID
+%object<span class="w"> </span>preview<span class="w"> </span>--plan<span class="w"> </span>./record-watch
+%object<span class="w"> </span>start<span class="w"> </span>--plan<span class="w"> </span>./record-watch<span class="w"> </span>--stack-depth<span class="w"> </span><span class="m">4</span>
+%record<span class="w"> </span>object-writes.db<span class="w"> </span>--sqlite<span class="w"> </span>--name<span class="w"> </span>object.trace<span class="w"> </span>--probe<span class="w"> </span>WATCH_ID<span class="w"> </span>--count<span class="w"> </span><span class="m">2</span><span class="w"> </span>--timeout<span class="w"> </span><span class="m">30</span>
+</code></pre></div>
+<p>Replace <code>WATCH_ID</code> with the ID printed by start. While <code>%record</code> is waiting, enter <code>g</code> in the first terminal. The fixture prints <code>value=23</code>. The recorder should report <code>received=2</code> and <code>complete=true</code> for the creation and the write from 17 to 23.</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%object<span class="w"> </span>status<span class="w"> </span>WATCH_ID
+%object<span class="w"> </span>stop<span class="w"> </span>WATCH_ID
+%detach
+%events<span class="w"> </span>open<span class="w"> </span>object-writes.db<span class="w"> </span>--as<span class="w"> </span>saved
+%events<span class="w"> </span>list<span class="w"> </span>saved
+%events<span class="w"> </span>show<span class="w"> </span>saved<span class="w"> </span>--index<span class="w"> </span><span class="m">1</span>
+%events<span class="w"> </span>stack<span class="w"> </span>saved<span class="w"> </span>--index<span class="w"> </span><span class="m">1</span>
+</code></pre></div>
+<p>Stop restores the verified instruction bytes. Check <code>active=no</code> and <code>restoration_pending=no</code> before detaching. If restoration is pending, retry stop using the same ID. Replay works after detach, including in a fresh REPL. Enter <code>q</code> in the first terminal to exit the fixture. To repeat with <code>--no-values</code>, restart the fixture, reuse the write plan, add the flag to <code>%object start</code>, and use a fresh recording path. The two events are still creation and a store, with the store shown as <code>FIELD_WRITTEN</code>.</p>
+<h4 id="repl--read-coverage-and-cleanup-status">Read coverage and cleanup status</h4>
+<ul>
+<li>Review the resolved fields, writer sites, and binding status in preview. Preview is read-only. A same-build restart resolves fresh live addresses. A compatible rebuild requires verifiable field and code bindings. Missing or mismatched evidence can prevent a watch from starting.</li>
+<li>Lifecycle events require observable, unambiguous construction and teardown. An out-of-line copy of an inline constructor or destructor can provide the boundary if its ABI is verified. A fully inlined or optimized-away call can leave a partial timeline. <code>--first-seen</code> can scope a supported standalone write watch to one verified writer invocation when construction is unavailable.</li>
+<li>On x86-64, a short lifetime boundary can use verified alignment NOPs after the function. A short destructor return can also jump through the relocated entry window. If the mapped ELF lacks a safe redirect for a required entry or exit, use <code>--backend ptrace</code> for the lifetime trace.</li>
+<li>When completion must be observed after a direct call, a tail jump into the lifetime boundary requires a verified continuation. Preview and start reject unverified tail callers because they can bypass the return hook.</li>
+<li>Ptrace can observe stores in a writer that ends in an indirect call or jump when every block in the writer is decoded and any gaps contain only alignment NOPs. It observes the selected writer's stores. An indirect jump with unverified blocks, such as an unresolved jump table, is refused.</li>
+<li>When the complete and base constructors share an entry, a verified direct call from outside constructor and destructor frames can identify a complete construction. When a known derived type can initialize its base as an aggregate, these shared entries remain uncertain unless stronger evidence is available.</li>
+<li>On x86-64, scalar watches admit verified 32-bit integer arithmetic, bitwise and shift updates. For locked atomic instructions without a returned old value, code-cache records the write and reports that the values could not be verified. Ptrace can sample the values while target peers are parked.</li>
+<li>Collection and pointee watches require verified mutation boundaries and supported identities. Unverified inline paths can leave coverage gaps. Tagged-union decoding requires a verified unsigned 32-bit discriminator and supported 32-bit alternatives. Untagged union observations carry storage bytes.</li>
+<li>Native capture covers admitted code and threads. Generated helper windows can leave signal or stack gaps, including AArch64 scalable signal records that exceed the fixed Linux signal frame. Shared-file identity correlates recordings across processes, where ordering can remain partial.</li>
+<li>Use <code>%object status</code> to check drops, unsupported sites, coverage gaps, and capture limits. Use <code>%object stop</code> or <code>%detach</code> to retire the watch and restore patches. See the <a href="https://github.com/husams/clang-tracer/blob/main/object-watch-progress.md">verification record</a> for the exercised cases and limits.</li>
+</ul>
+<h3 id="repl--prepare-an-object-watch-for-method-snapshots">Prepare an object watch for method snapshots</h3>
+<p>Prepare from the original headers and compile command. The package contains the generated adapter and the verified ELF entry. Declare the synchronization that protects the receiver and any storage the adapter follows. Use <code>thread-confined</code> when that graph is accessed from a single thread. Use <code>caller-lock</code> when the caller holds the application's lock over the method and both samples. Use <code>stable-at-boundaries</code> when the application establishes safe entry and return samples, for example by joining a child writer before return. For the Portfolio commands below, run the rebalance while <code>%record</code> is waiting and substitute the PID and watch ID from your run.</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%object<span class="w"> </span>prepare<span class="w"> </span>demo::Portfolio<span class="w"> </span>--module<span class="w"> </span>./portfolio<span class="w"> </span>--include<span class="w"> </span>./portfolio.hpp<span class="w"> </span>--policy<span class="w"> </span>./snapshot-policy.hpp<span class="w"> </span>--compdb<span class="w"> </span>./compile_commands.json<span class="w"> </span>--translation-unit<span class="w"> </span>./portfolio.cpp<span class="w"> </span>--on<span class="w"> </span><span class="s2">&quot;demo::Portfolio::rebalance()&quot;</span><span class="w"> </span>--field<span class="w"> </span>legs<span class="w"> </span>--field<span class="w"> </span>risk<span class="w"> </span>--key<span class="w"> </span><span class="nv">legs</span><span class="o">=</span>id<span class="w"> </span>--key<span class="w"> </span><span class="nv">risk</span><span class="o">=</span>key<span class="w"> </span>--synchronization<span class="w"> </span>thread-confined<span class="w"> </span>--output<span class="w"> </span>./portfolio-watch<span class="w"> </span>--emit-source<span class="w"> </span>./generated
+%attach<span class="w"> </span>PID
+%object<span class="w"> </span>preview<span class="w"> </span>--plan<span class="w"> </span>./portfolio-watch
+%object<span class="w"> </span>start<span class="w"> </span>--plan<span class="w"> </span>./portfolio-watch<span class="w"> </span>--stack-depth<span class="w"> </span><span class="m">8</span>
+%record<span class="w"> </span>portfolio.db<span class="w"> </span>--sqlite<span class="w"> </span>--name<span class="w"> </span>object.trace<span class="w"> </span>--probe<span class="w"> </span>WATCH_ID<span class="w"> </span>--count<span class="w"> </span><span class="m">2</span><span class="w"> </span>--timeout<span class="w"> </span><span class="m">30</span>
+%object<span class="w"> </span>stop<span class="w"> </span>WATCH_ID
+%detach
+%events<span class="w"> </span>open<span class="w"> </span>portfolio.db<span class="w"> </span>--as<span class="w"> </span>saved
+</code></pre></div>
+<p>Snapshot deltas describe the interval between a method's entry and return. Fields select the reported paths. The generated receiver codec reads the receiver and the pointees authorized by the preparation policy. A failed sample yields a coverage gap. A missing return yields a coverage gap when the probe retires. Set <code>--max-elements</code>, <code>--max-string-bytes</code>, <code>--max-depth</code>, <code>--max-snapshot-bytes</code>, and <code>--max-instances</code> to bound capture and observation.</p>
+<p>Choose method snapshots for changes to strings, private nested records,
+containers, variants, or registered pointees. For example, the Portfolio
+watch pairs entries by leg ID and map key and can report a leaf change such
+as <code>risk_[&quot;AAPL&quot;].limits_[0]</code>. An added or removed map entry or keyed vector
+element includes its captured record or sequence on the corresponding side
+of the delta. Use <code>%events show saved --index N</code> to inspect the typed values,
+or <code>%events export saved --format json --output changes.json</code> to export them.
+In JSON, <code>snapshotBefore</code> and <code>snapshotAfter</code> carry recursive <code>children</code> for
+composite values, with <code>fieldName</code> on record children. The capture limits
+also apply to values replayed from SQLite.
+When no key identity is available, the watch retains both captured entry
+sequences in the coverage gap and withholds individual adds and removals.</p>
+<p>Method snapshots support up to 65,536 encoded bytes per value, 65,536 elements, and a depth of 64. The default byte and element budgets are 4,096 and the default depth is 32. The element budget is shared by the captured containers in each value. A field selection captures the selected top-level receiver members and their contents. A nested path filters which changes to report within its selected member.</p>
+<p>For method snapshots, <code>--max-instances</code> limits receivers with an outstanding sample. Completed calls release their receiver slots. The watch detects overlapping calls on a receiver and relies on the declared synchronization policy across separate invocations.</p>
+<p>For constructor-based watches, <code>--max-instances</code> limits live observed objects. Retirement releases the slot. The watch retains each observed address's generation counter until the watch ends so that address reuse remains distinguishable in replay.</p>
+<p>A compatible rebuilt ELF can reuse a prepared method watch when DWARF confirms the receiver layout and the original void, scalar, or pointer signature. Pass <code>--module</code> to preview and start if the rebuilt image has a new name.</p>
+<p>On AArch64 the native agent samples the receiver at a verified entry and at each verified return instruction. The original method executes in its application mapping, and CFI stack capture starts at its original entry. An exception that leaves the method can produce a missing-return gap when the watch retires.</p>
+<p>An <code>AnyPayloads&lt;Record&gt;</code> specialization can register named record payloads for a direct <code>std::any</code> field. Name the field with a type alias to a tuple of the admitted types. The typed projection appears as <code>extension_snapshot</code> for the example below.</p>
+<div class="code-block"><div class="code-bar"><span>cpp</span><button class="copy" type="button">Copy</button></div><pre><code><span class="k">namespace</span><span class="w"> </span><span class="nn">tracer_snapshot</span><span class="w"> </span><span class="p">{</span>
+<span class="k">template</span><span class="w"> </span><span class="o">&lt;</span><span class="k">class</span><span class="w"> </span><span class="nc">Record</span><span class="o">&gt;</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">AnyPayloads</span><span class="p">;</span>
+<span class="k">template</span><span class="w"> </span><span class="o">&lt;&gt;</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">AnyPayloads</span><span class="o">&lt;</span><span class="n">demo</span><span class="o">::</span><span class="n">Portfolio</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">using</span><span class="w"> </span><span class="n">extension</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">tuple</span><span class="o">&lt;</span><span class="n">demo</span><span class="o">::</span><span class="n">RiskState</span><span class="o">&gt;</span><span class="p">;</span>
+<span class="p">};</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="repl--follow-logical-collection-entries-during-writes">Follow logical collection entries during writes</h3>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%object<span class="w"> </span>start<span class="w"> </span>--type<span class="w"> </span>demo::Portfolio<span class="w"> </span>--field<span class="w"> </span>quantity<span class="w"> </span>--vector<span class="w"> </span>legs<span class="w"> </span>--element-key<span class="w"> </span><span class="nv">id</span><span class="o">=</span><span class="m">12</span><span class="w"> </span>--code<span class="w"> </span><span class="s2">&quot;demo::Portfolio::rebalance()&quot;</span><span class="w"> </span>--mutation<span class="w"> </span>_ZNSt6vectorIN4demo3LegESaIS1_EE7reserveEm
+</code></pre></div>
+<p>The watch validates the writer's first receiver argument and the selected libstdc++ vector layout from DWARF. It binds a unique element by its 32-bit unsigned key and suspends that address during the selected mutation. A verified return can admit a new storage generation. Add <code>--backend code-cache --synchronization thread-confined</code> to translate the admitted fragments of a nonleaf writer and its selected mutation. On either backend, use <code>--first-seen</code> for a standalone scalar receiver whose constructor was inlined, absent, or ran before attaching. The provisional identity lasts for one writer invocation.</p>
+<p>Repeat <code>--mutation</code> when the writer uses more than one storage-changing function. Each selected function must accept the verified container as its first argument. Native capture verifies direct calls and their return continuations. For an inlined function, the watch verifies the receiver and the control-flow edges into and out of its matching DWARF ranges. An inline instance can span disjoint ranges. With declared synchronization and value capture, <code>RANGE_BOUND</code> includes the verified value at binding. A rebind includes the prior value when it was sampled safely before suspension.</p>
+<p>Use <code>--map risk --map-key AAPL --field exposure.limit</code> to follow a nested field in a <code>std::map</code> entry. For <code>std::unordered_map&lt;int, T&gt;</code>, use a numeric key such as <code>--map-key &quot;-7&quot;</code>. Both containers require a verified libstdc++ layout and default key equivalence. Use <code>--field value</code> when the mapped value is itself numeric. Select a mutation such as insert, erase or rehash that takes the map as its first argument. The watch suspends the old binding and verifies the new generation on return, even when the matching node keeps its address. Rehash alone emits no field change. Missing, duplicate or unreadable keys and exhausted traversal budgets produce coverage gaps.</p>
+<p>Individual field watches can capture admitted stores to integers, booleans, enums, floats and doubles within private records, vectors, maps and pointees. Preview reports the verified encoding and the admitted writer sites. For exact writes, replay identifies the store instruction and its source line. Structural changes to containers and changes to strings, variants and <code>std::any</code> can be inspected with typed method snapshots at verified boundaries.</p>
+<h3 id="repl--trace-a-shape-through-image">Trace a Shape through Image</h3>
+<p>Build the fixture once with a Linux x86-64 GCC 8.5 compiler and matching
+embedded DWARF. Run it in one terminal and leave it at <code>READY</code>.</p>
+<div class="code-block"><div class="code-bar"><span>sh</span><button class="copy" type="button">Copy</button></div><pre><code><span class="s2">&quot;</span><span class="nv">$GXX85</span><span class="s2">&quot;</span><span class="w"> </span>-std<span class="o">=</span>c++17<span class="w"> </span>-O2<span class="w"> </span>-g<span class="w"> </span>-fno-omit-frame-pointer<span class="w"> </span>-fcf-protection<span class="o">=</span>none<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-fPIE<span class="w"> </span>-pie<span class="w"> </span>-pthread<span class="w"> </span>-Wl,--build-id<span class="o">=</span>sha1<span class="w"> </span>tests/fixtures/repl_object_watch.cpp<span class="w"> </span>-o<span class="w"> </span>shapes
+./shapes
+</code></pre></div>
+<p>Attach from the native REPL and start the watch. Enter <code>g</code> in the target
+terminal while the REPL is recording. The fixture builds, mutates, and
+removes two Circles in the same allocation slot.</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%attach<span class="w"> </span>PID
+%object<span class="w"> </span>start<span class="w"> </span>--type<span class="w"> </span>demo::Circle<span class="w"> </span>--base<span class="w"> </span>demo::Shape<span class="w"> </span>--owner<span class="w"> </span>demo::Image<span class="w"> </span>--field<span class="w"> </span>radius<span class="w"> </span>--collection<span class="w"> </span>_shapes<span class="w"> </span>--snapshot-field<span class="w"> </span>_description<span class="w"> </span>--code<span class="w"> </span>borrowed_write<span class="w"> </span>--stack-depth<span class="w"> </span><span class="m">5</span>
+%record<span class="w"> </span>shapes.db<span class="w"> </span>--sqlite<span class="w"> </span>--name<span class="w"> </span>object.trace<span class="w"> </span>--count<span class="w"> </span><span class="m">15</span><span class="w"> </span>--timeout<span class="w"> </span><span class="m">30</span>
+%object<span class="w"> </span>stop
+%detach
+%events<span class="w"> </span>open<span class="w"> </span>shapes.db<span class="w"> </span>--as<span class="w"> </span>shapes
+%events<span class="w"> </span>list<span class="w"> </span>shapes<span class="w"> </span>--limit<span class="w"> </span><span class="m">15</span>
+%events<span class="w"> </span>stack<span class="w"> </span>shapes<span class="w"> </span>--index<span class="w"> </span><span class="m">4</span>
+</code></pre></div>
+<p>The diagnostic backend admits existing target threads and one writer function
+in the main executable. It uses ELF linkage for the complete constructor and
+destructor and the <code>add</code>, <code>get</code>, <code>remove</code>, and <code>set_description</code> boundaries.
+It verifies the mapped build ID, live instruction bytes, DWARF layouts and
+RTTI. The supported layout uses a verified fixed base offset, an <code>int32</code>
+field, the libstdc++ C++11 string ABI and a vector of default-sized unique
+pointers. The remove boundary checks the watched entries against the verified
+membership after return. Use <code>--owner-add</code>, <code>--owner-get</code>, <code>--owner-remove</code>, and
+<code>--owner-snapshot</code> to select differently named methods with the supported ABI.
+The default selectors use <code>add</code>, <code>get</code>, <code>remove</code>, and <code>set_description</code> on the
+declared owner or base. Preview verifies the receiver and callable shape.</p>
+<p>The server owns the breakpoints until stop or detach. It parks peers while
+the writer steps each admitted instruction. The effective destination must
+equal the selected field of a live generation. An interrupted store emits a
+coverage gap. A successful retry can produce a fresh delta at the same PC.
+Enter <code>f</code> instead of <code>g</code> and record 16 events to exercise that path.
+The string delta comes from the verified setter boundary. Stack depth defaults
+to zero. Enabled write stacks walk available frame pointers in the main executable.
+Use <code>--max-elements</code> and <code>--max-string-bytes</code> to set snapshot limits.</p>
+<p>Add <code>--no-values</code> to record <code>FIELD_WRITTEN</code> for every completed store,
+including a same-value store. This skips pre/post value reads and omits
+value samples from lifecycle and fault records. Status shows <code>values=off</code>.
+The default captures value changes and verified boundary snapshots.</p>
+<p>Coverage is partial. Stores outside the selected function, unsupported
+instructions and optimized-away lifetime boundaries are outside this draft.
+New threads in the same process can enter the diagnostic watch. An exec or
+fork boundary that changes the observed process reports partial coverage.
+Use <code>%object status</code> for counts and restoration state. Unsupported sites,
+reported gaps, or dropped observations mark coverage partial. If restoration
+needs a retry, the watch keeps its ID and the target remains stopped.
+Use <code>--tid</code> to select the thread whose stores are reported. The diagnostic backend restores its patches when <code>--max-events</code> or <code>--timeout</code> is reached. Native code-cache and method watches cap observations at those limits and keep their patches until stop or detach.
+Set <code>--event-buffer</code> to size the native code-cache event queue. The default is 4096 observations. When the queue fills, <code>--overflow drop</code> counts and drops the new observation. <code>--overflow stop</code> ends capture at the first overflow and reports that reason. Application stores continue in either mode.</p>
+<p>For a standalone scalar with all its writers covered by the code-cache watch, set <code>--serialize-wait-us N</code> to serialize the observed stores and event publication for each field address. The wait is bounded by the supplied number of microseconds. If writers overlap after the wait or tracing is interrupted by re-entry, the event reports unavailable ordering and withholds the old value. A mismatch between consecutive value samples reports an intervening change outside the observed store sequence. The default uses concurrent capture.</p>
+<p>Use <code>--shared-file PATH</code> on each process's native <code>std::atomic&lt;int&gt;</code> watch to correlate writes to a writable shared file mapping. A scalar watch can also use this option when the application protects the field with a process-shared lock and the watch declares <code>--synchronization caller-lock</code>. The server holds the file open, and the agent checks the live device, inode and byte offset. Recordings expose those three values as <code>sharedStorage</code> across overlapping watches on the same host. An atomic read-modify-write can report its own previous value. Coverage remains partial because other writers and their ordering are unknown. Both capture modes retain the shared storage identity.</p>
+<p>Use <code>--pointee &quot;routes.head-&gt;node&quot; --field state.quantity</code> to follow a pointer path within a verified writer invocation. Dots select embedded members and arrows follow raw data pointers, verified libstdc++ default-deleter <code>std::unique_ptr</code>, and verified libstdc++ <code>std::shared_ptr</code>. Supply <code>--mutation</code> for the owner operation that changes the path and declare <code>thread-confined</code> or <code>caller-lock</code> synchronization. Each successful rebind starts a storage generation, even when the final address repeats. A null or unreadable path suspends write attribution and produces a coverage gap.</p>
+<h3 id="repl--trace-a-direct-integer-assignment">Trace a direct integer assignment</h3>
+<p>To find direct writes in source during preparation, pass <code>--discover-writers</code>, <code>--compdb</code>, and one or more <code>--translation-unit</code> arguments. The command saves source candidates with the ELF plan and can select their verified writer functions. Repeat <code>--code</code> to select additional verified writers, including writers that reach the field through aliases.</p>
+<p>Build the <code>tests/fixtures/person</code> sources as separate translation units with
+<code>-O2 -g</code> and LTO disabled. Run the prebuilt fixture until it prints <code>READY</code>.
+The standalone watch binds a signed 32-bit field using the record layout
+from the writer's DWARF and a verified constructor return.</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%attach<span class="w"> </span>PID
+%memory<span class="w"> </span>maps
+%probe<span class="w"> </span>entry<span class="w"> </span><span class="s2">&quot;demo::update(demo::Person &amp;)&quot;</span><span class="w"> </span>--mapping<span class="w"> </span>TOKEN
+%memory<span class="w"> </span><span class="nb">read</span><span class="w"> </span>PC<span class="w"> </span>--mapping<span class="w"> </span>TOKEN<span class="w"> </span>--count<span class="w"> </span>SIZE
+%object<span class="w"> </span>start<span class="w"> </span>--type<span class="w"> </span>demo::Person<span class="w"> </span>--field<span class="w"> </span>age<span class="w"> </span>--code<span class="w"> </span><span class="s2">&quot;demo::update(demo::Person &amp;)&quot;</span><span class="w"> </span>--stack-depth<span class="w"> </span><span class="m">4</span>
+%memory<span class="w"> </span>maps
+%memory<span class="w"> </span><span class="nb">read</span><span class="w"> </span>PC<span class="w"> </span>--mapping<span class="w"> </span>PATCHED_TOKEN<span class="w"> </span>--count<span class="w"> </span>SIZE
+%record<span class="w"> </span>age.db<span class="w"> </span>--sqlite<span class="w"> </span>--name<span class="w"> </span>object.trace<span class="w"> </span>--count<span class="w"> </span><span class="m">2</span><span class="w"> </span>--timeout<span class="w"> </span><span class="m">30</span>
+%detach
+%attach<span class="w"> </span>PID
+%memory<span class="w"> </span>maps
+%memory<span class="w"> </span><span class="nb">read</span><span class="w"> </span>PC<span class="w"> </span>--mapping<span class="w"> </span>RESTORED_TOKEN<span class="w"> </span>--count<span class="w"> </span>SIZE
+%events<span class="w"> </span>open<span class="w"> </span>age.db<span class="w"> </span>--as<span class="w"> </span>ages
+%events<span class="w"> </span>show<span class="w"> </span>ages<span class="w"> </span>--index<span class="w"> </span><span class="m">1</span>
+%detach
+</code></pre></div>
+<p>Use the address and instruction size of the store shown by <code>%probe entry</code>.
+Enter <code>g</code> in the fixture terminal while recording to construct the Person
+with age 42 and assign 1 twice. The watch records the original writer PC
+and DWARF source line. With <code>--no-values</code>, record three events to include
+the constructor and both writes. After verifying the restored instruction,
+enter <code>r</code> to read the live value. After the last detach, enter <code>v</code> to run
+the assignment again, then <code>q</code> to exit.</p>
+<h3 id="repl--trace-atomic-integer-updates">Trace atomic integer updates</h3>
+<p>For a DWARF-verified libstdc++ <code>std::atomic&lt;int&gt;</code> field, the watch admits
+32-bit <code>mov</code>, <code>lock xadd</code>, and <code>lock cmpxchg</code> in the selected function.
+With values enabled, a store takes its new value from the source operand
+and displays <code>old=unavailable</code>. Fetch-add uses the returned old value and
+the input increment. Compare-and-exchange emits a write only when the
+post-instruction zero flag is set, including in <code>--no-values</code> mode.
+The diagnostic backend steps the complete instruction, including LOCK.
+At detach it restores the full original bytes and rewinds any owned trap
+that has yet to execute.</p>
+<h3 id="repl--decode-a-tagged-union-write">Decode a tagged union write</h3>
+<p>Pass <code>--union-tag FIELD</code> and a <code>--union-case TAG=MEMBER</code> for each admitted
+alternative. Use a direct member path such as <code>--field payload.integer</code>
+to identify the four-byte storage, and declare <code>--synchronization thread-confined</code>
+or <code>caller-lock</code> to protect the tag and storage during both samples.</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%object<span class="w"> </span>prepare<span class="w"> </span>tagged_test::State<span class="w"> </span>--module<span class="w"> </span>./fixture<span class="w"> </span>--field<span class="w"> </span>payload.integer<span class="w"> </span>--code<span class="w"> </span>_ZN11tagged_test10write_bitsERNS_5StateEj<span class="w"> </span>--union-tag<span class="w"> </span>kind<span class="w"> </span>--union-case<span class="w"> </span><span class="nv">1</span><span class="o">=</span>integer<span class="w"> </span>--union-case<span class="w"> </span><span class="nv">2</span><span class="o">=</span>real<span class="w"> </span>--synchronization<span class="w"> </span>thread-confined<span class="w"> </span>--backend<span class="w"> </span>code-cache<span class="w"> </span>--output<span class="w"> </span>watch
+</code></pre></div>
+<p>The plan checks the tag offset and each alternative against DWARF. A tag
+can be an unsigned 32-bit field or an enum with that underlying type.
+Signed integers, unsigned integers, and floats are supported as 32-bit
+alternatives. Unknown or unreadable tags retain raw storage bytes.
+<code>--no-values</code> skips both the discriminator and storage reads.</p>
+<h3 id="repl--trace-writes-in-the-native-code-cache">Trace writes in the native code cache</h3>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%object<span class="w"> </span>start<span class="w"> </span>--backend<span class="w"> </span>code-cache<span class="w"> </span>--type<span class="w"> </span>demo::Person<span class="w"> </span>--field<span class="w"> </span>age<span class="w"> </span>--code<span class="w"> </span>person_write_many
+%object<span class="w"> </span>status
+%record<span class="w"> </span>age.db<span class="w"> </span>--sqlite<span class="w"> </span>--name<span class="w"> </span>object.trace<span class="w"> </span>--count<span class="w"> </span><span class="m">4000</span><span class="w"> </span>--timeout<span class="w"> </span><span class="m">30</span>
+%detach
+</code></pre></div>
+<p><code>ptrace</code> is the default. Select <code>code-cache</code> to translate verified leaf
+functions or independently verified writer fragments into executable
+memory in the target. Standalone signed 32-bit fields and <code>std::atomic&lt;int&gt;</code> use
+complete constructor and destructor boundaries in the main executable.
+On x86-64, a standalone leaf writer with a visible function pointer or
+virtual entry uses a verified entry redirect. This covers direct calls,
+function pointers, and vtable dispatch into that writer. Use
+<code>--writer-entry</code> to require this coverage for every selected leaf, including
+with repeated <code>--code</code>. An entry redirect needs a verified overwrite
+window. Short leaves can use verified alignment padding. A symbol export
+alone allows a fallback to direct call sites when no entry window verifies.
+Preview and status report partial coverage for direct call sites alone.
+For a shared writer, <code>--module</code> takes a unique mapped ELF basename or
+absolute path. A shared leaf that uses an entry redirect needs a verified
+nonfaulting overwrite window.
+Native watches capture virtual destruction at the destructor entry, including
+deleting destructors that inline the complete destructor. A watch fails to
+start if its virtual destructor has no verified redirect. When code-cache
+capture relies on direct calls or return continuations, preview and start
+reject unverified call sites, including sites behind unresolved jump tables.
+Supported ELF exception tables let the planner verify calls in cleanup
+blocks, including direct branches into a matching cold partition. The
+diagnostic backend rejects writers with an unresolved indirect branch,
+such as a jump table.
+Inlined lifetimes, forked children, and unadmitted store instructions are
+outside coverage.</p>
+<p>Application threads run the original store encoding once in the translated
+function. The agent reads the effective address and operands around that
+instruction and publishes to a shared event queue. <code>--no-values</code> skips
+value sampling and still checks the outcome of compare-and-exchange.
+<code>%object status</code> reports each redirect, the number of completed translated
+store instructions, and event drops. The store count includes failed
+compare-and-exchanges and stores to untracked addresses.</p>
+<p>Events use the original application PC. For a synchronous SIGSEGV, SIGBUS,
+SIGFPE, or SIGILL on a copied instruction, a chained application handler
+sees that PC and can retry or skip the instruction. If the signal takes its
+default action and the original instruction is covered by a redirect or
+cannot be verified, the kernel delivers the fault at the translated PC.
+Keep fault signal dispositions stable during tracing. Use <code>--async-signal N</code>
+for a signal with an existing application handler. At a copied application instruction the handler sees
+the original PC and can resume or select another original instruction.
+The x86-64 and AArch64 hooks defer these signals during supported capture
+callbacks and runtime call resolution when system calls are unfiltered.
+The handler sees the original callee and caller return address after
+ordinary and tail call resolution. For AArch64 scalable state that fits
+the fixed Linux signal frame, the agent restores the spilled SVE or SME
+records before invoking the handler. Delivery in an uncovered helper
+window records a coverage gap.
+Optional stacks use
+available application frame pointers. The hooks use application stack
+space to save registers and extended processor state.
+<code>--stack-cfi</code> with <code>--stack-depth N</code> unwinds from the saved application
+registers and original store PC. The emitted stack reports whether CFI
+reached the root, hit the depth limit, or stopped at a missing rule.
+Unwinding directly through generated helper code remains unavailable.</p>
+<p>Stop or detach restores the complete redirect instructions and drains
+queued observations. The agent releases retired translated bodies after
+active executions have drained. Stable entry and exit stubs and the
+associated signal metadata remain available for delayed execution.
+When the process replaces its executable image, status closes the watch
+with a mapping-change coverage gap after confirming the old redirects
+and translated code are absent.</p>
+<h4 id="repl--trace-scalar-writes-on-linux-aarch64">Trace scalar writes on Linux AArch64</h4>
+<p>Use the normal REPL with the AArch64 object server. Offline preparation,
+preview, lifecycle and scalar write events, SQLite recording, and replay
+use the same commands and event types as on x86-64. The diagnostic backend
+uses four-byte breakpoint instructions. The code-cache backend installs
+four-byte branches to relocated instructions and releases ptrace control
+after arming.</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%attach<span class="w"> </span>PID
+%object<span class="w"> </span>start<span class="w"> </span>--type<span class="w"> </span>arm_test::Record<span class="w"> </span>--field<span class="w"> </span>value<span class="w"> </span>--code<span class="w"> </span>arm_write_value<span class="w"> </span>--backend<span class="w"> </span>code-cache
+%record<span class="w"> </span>writes.db<span class="w"> </span>--sqlite<span class="w"> </span>--name<span class="w"> </span>object.trace<span class="w"> </span>--count<span class="w"> </span><span class="m">10</span><span class="w"> </span>--timeout<span class="w"> </span><span class="m">30</span>
+%object<span class="w"> </span>stop
+</code></pre></div>
+<p>Live installation selects an application thread at a verified idle
+sleep or a userspace rendezvous. For a rendezvous, pass
+<code>--rendezvous SYMBOL</code> and select an existing main-image function where
+the thread can safely enter the loader. Threads created after installation
+can execute the redirects. The backend supports 32-bit
+STR/STUR, release stores, LSE fetch-add with a returned prior value, and
+LSE compare-and-exchange. An admitted writer in a loaded shared library
+can be selected with <code>--module</code>. CFI capture follows saved link registers,
+including signed return addresses. In-process capture preserves SVE
+vector, predicate, and first-fault registers. Injection and capture also
+preserve SME streaming state, ZA, TPIDR2 and, on SME2, ZT0.</p>
+<h4 id="repl--follow-live-callees">Follow live callees</h4>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%object<span class="w"> </span>start<span class="w"> </span>--type<span class="w"> </span>demo::Record<span class="w"> </span>--field<span class="w"> </span>value<span class="w"> </span>--backend<span class="w"> </span>code-cache<span class="w"> </span>--code<span class="w"> </span>dispatch<span class="w"> </span>--follow-calls
+</code></pre></div>
+<p>The selected executable or mapped shared-library scope supplies the call sites. A verified direct
+or indirect call enters a native gateway with its original return
+address. Calls already covered by lifetime boundaries retain those redirects. Verified direct edges can extend the selected scope to nested
+functions in the same image that keep executing at their original PCs. A runtime
+gateway checks live targets against their ELF bytes and translates
+supported leaf instructions and tail calls. For a discovered nonleaf
+scope, the controller verifies and installs its call and store redirects
+before the first covered execution. Its original call sites keep their
+return PCs. Ordinary stores run without controller stops.
+Stores match the
+watched address and lifetime even when the callee receives it through an
+alias. Replayed stores include the mapped ELF identity and the runtime
+module generation. A shared library can load after arming and unload
+between calls.</p>
+<p>Use <code>--runtime-limit N</code> to bound nested scope discovery and retained translations. The default is
+1,024. When a callee exceeds the limit or its code cannot be verified and
+translated, the original call runs and the watch records a coverage gap.
+Stopping restores the redirects and closes entry to cached callees. The
+agent releases each retired callee mapping after its active executions
+have drained. A shared scope selected with <code>--module</code> keeps a loader
+reference through patch restoration and drain. <code>%object status</code> reports
+runtime translation and release counts.</p>
+<h4 id="repl--observe-startup-before-main">Observe startup before main</h4>
+<p><code>clang-tracer-object-watch launch definition.json ./target [ARGS...]</code>
+starts a selected prebuilt ELF under the diagnostic backend and arms the
+watch at the Linux exec stop. The definition is a JSON object watch
+request with <code>concreteType</code>, <code>field</code>, and <code>codeSymbol</code>. The command emits
+JSON event lines and the <code>exec-stop</code> coverage marker to stdout. The
+target's output goes to stderr and its stdin reads EOF. SIGINT requests
+live detachment and exact patch restoration.</p>
+<p>For a native code-cache definition, run
+<code>clang-tracer-object-watch launch --agent ./libclang_tracer_agent.so definition.json ./target [ARGS...]</code>
+with the agent built for the target architecture. This arms at the verified
+ELF executable entry after the dynamic loader transfers control. The
+<code>executable-entry</code> marker identifies the start of coverage, which includes
+constructors run by the executable startup code and <code>main</code>.</p>
+<p>On an eligible glibc target, add <code>--loader-ready</code> after the agent path to
+arm after relocation and before preinit and dependency constructors.
+The launcher verifies the loader mapping and its consistent-state
+notification. Set <code>codeModule</code> in the JSON definition to select a shared
+library already present in the initial loader link map.</p>
+<p>Use <code>--syscall-output --synchronization thread-confined</code> on a diagnostic
+scalar watch to observe <code>read</code> and <code>pread</code> when the destination is the
+exact 32-bit field. A short, overlapping, or unreadable output records a
+coverage gap and withholds the values. These events identify the verified
+syscall instruction and its mapped image.</p>
+<h4 id="repl--trace-a-virtual-write-through-a-borrowed-reference">Trace a virtual write through a borrowed reference</h4>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%object<span class="w"> </span>start<span class="w"> </span>--backend<span class="w"> </span>code-cache<span class="w"> </span>--type<span class="w"> </span>demo::Circle<span class="w"> </span>--base<span class="w"> </span>demo::Shape<span class="w"> </span>--owner<span class="w"> </span>demo::Image<span class="w"> </span>--collection<span class="w"> </span>_shapes<span class="w"> </span>--field<span class="w"> </span>radius<span class="w"> </span>--caller<span class="w"> </span>borrowed_resize<span class="w"> </span>--module<span class="w"> </span>libct-shapes-gcc85.so<span class="w"> </span>--code<span class="w"> </span><span class="s2">&quot;demo::Circle::resize(int)&quot;</span>
+%record<span class="w"> </span>radius.db<span class="w"> </span>--sqlite<span class="w"> </span>--name<span class="w"> </span>object.trace<span class="w"> </span>--count<span class="w"> </span><span class="m">2</span><span class="w"> </span>--timeout<span class="w"> </span><span class="m">30</span>
+%object<span class="w"> </span>status
+%detach
+</code></pre></div>
+<p>The named main-executable caller must call the leaf getter directly, then
+reach one register- or memory-indirect near call along a straight-line path
+with a stable stack pointer and no intervening stores. The call executes
+in place and resolves its target normally. A verified entry jump at the
+selected writer preserves the original call frame and any ENDBR64 landing
+instruction. Other targets execute through their original entries.</p>
+<p>The watch starts before construction. A verified return from the complete
+constructor registers a lifetime ID and advances the generation at its
+address. The constructor may use relocatable RIP-relative loads or address
+computations. A leaf <code>Image::add</code> returns the inserted pointer in RAX, and
+the agent confirms membership in the DWARF-verified vector of unique
+pointers. The getter and writer check that owner, the primary-base RTTI,
+and the live lifetime ID. Each operation also carries a <code>borrow_id</code>.</p>
+<p>The deleting and complete destructor entries retire the lifetime before
+their original bodies continue. A deleting destructor that invokes the
+complete destructor produces one retirement. If the owner has already
+cleared the slot, the same boundary emits <code>OWNER_REMOVED</code>. The fixture uses
+<code>unique_ptr::reset</code> for that ordering and a class allocator that reuses one
+aligned slot. Each lifetime has its own ID even when the object address
+and name repeat.</p>
+<p>The verified lifecycle path covers a concrete type with an unambiguous
+complete-constructor entry, including aliases for a final type. It needs
+a leaf constructor and add, safe entry windows, and a stable owner during
+the borrowed operation. Ambiguous base construction, inlined boundaries,
+arbitrary owner mutations, and string snapshots are outside coverage.
+Destruction reports its start. The fixture independently checks completed
+deallocation and reuse.</p>
+<p>The loader pins the selected shared image at its verified load bias for
+the lifetime of the retained translation. Patch installation and restoration
+verify the live file-backed mappings while the target threads are stopped.
+This supports uniquely mapped, loader-managed ELF images in the base
+namespace. Manual unmapping, alternate loader namespaces, and indirect
+tail jumps at the borrow site are outside coverage.</p>
 <h3 id="repl--interceptor-upload">Interceptor upload</h3>
 <div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%server<span class="w"> </span>status
 %sessions

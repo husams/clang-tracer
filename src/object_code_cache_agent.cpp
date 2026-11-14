@@ -231,6 +231,7 @@ struct State {
   Channel *channel;
   pid_t pid;
   Address offset;
+  unsigned field_width = 4;
   Address union_tag_offset;
   Address receiver_typeinfo;
   std::uint64_t async_signals;
@@ -401,7 +402,7 @@ struct Sample {
   Address stack = 0, destination = 0;
   Lifetime life{};
   std::uint32_t input = 0, expected = 0;
-  std::int32_t old = 0;
+  std::uint64_t old = 0;
   bool has_old = false;
   Address collection_owner = 0;
   std::uint64_t storage_generation = 0;
@@ -439,7 +440,7 @@ struct CollectionScope {
   bool valid = false;
   Address mutation_return = 0, mutation_stack = 0;
   Address inline_mutation = 0;
-  std::optional<std::int32_t> prior_value = std::nullopt;
+  std::optional<std::uint64_t> prior_value = std::nullopt;
 };
 thread_local CollectionScope collection_scope;
 struct Borrowed {
@@ -553,6 +554,16 @@ bool read_self_memory(Address address, void *output, std::size_t size) noexcept 
 template <typename T>
 bool read_self(Address address, T &value) noexcept {
   return read_self_memory(address, &value, sizeof(T));
+}
+
+bool read_field(const State &watch, Address address, std::uint64_t &bits) noexcept {
+  bits = 0;
+  return read_self_memory(address, &bits, watch.field_width);
+}
+
+bool supported_store(const State &watch, const native_entry::ScalarStore &store) {
+  return store.supports(watch.atomic) && (!watch.atomic || !store.reads_memory_value()) &&
+         store.width == watch.field_width;
 }
 
 std::optional<std::uint64_t> shared_file_offset_from_maps(int fd, const SharedFileIdentity &file,
@@ -775,7 +786,7 @@ void emit(State &watch, Observation &event) noexcept {
 
 void emit_collection(State &watch, const Site &site, const Registers &regs,
                  const CollectionScope &scope, Hook hook, std::uint8_t gap = 0,
-                 std::optional<std::int32_t> old = {}, std::optional<std::int32_t> next = {}) noexcept {
+                 std::optional<std::uint64_t> old = {}, std::optional<std::uint64_t> next = {}) noexcept {
   Observation event{};
   event.object = scope.owner;
   event.pc = site.instruction.pc;
@@ -818,7 +829,7 @@ bool collection_destination(State &watch, const object_watch::RangeHeader &heade
   if (plan.pointer_hops) {
     const auto pointee = header[plan.pointer_hops - 1];
     if (pointee > UINT64_MAX - watch.offset ||
-        pointee + watch.offset > UINT64_MAX - (sizeof(std::int32_t) - 1))
+        pointee + watch.offset > UINT64_MAX - (watch.field_width - 1))
       return false;
     destination = pointee + watch.offset;
     return true;
@@ -865,8 +876,8 @@ void bind_collection(State &watch, const Site &site, const Registers &regs, Coll
   scope.header = header;
   scope.destination = destination;
   scope.valid = true;
-  std::int32_t next = 0;
-  const bool sampled = !watch.no_values && read_self(destination, next);
+  std::uint64_t next = 0;
+  const bool sampled = !watch.no_values && read_field(watch, destination, next);
   emit_collection(watch, site, regs, scope, Hook::collection_bound, 0,
                   sampled ? old : std::nullopt, sampled ? std::optional(next) : std::nullopt);
   if (!watch.no_values && !sampled)
@@ -951,11 +962,11 @@ void collection_boundary(State &watch, const Site &site, const Registers &regs, 
       if (!watch.no_values) {
         object_watch::RangeHeader header{};
         Address current = 0;
-        std::int32_t value = 0;
+        std::uint64_t value = 0;
         if (!collection_header(watch, scope, header) || header != scope.header ||
             !collection_destination(watch, header, current) || current != scope.destination) {
           emit_collection(watch, site, regs, scope, Hook::collection_gap, 4);
-        } else if (read_self(current, value)) {
+        } else if (read_field(watch, current, value)) {
           scope.prior_value = value;
         } else {
           emit_collection(watch, site, regs, scope, Hook::collection_gap, 5);
@@ -1044,7 +1055,7 @@ void emit_boundary(State &watch, const Site &site, Address object, const Lifetim
     }
   }
   if (hook == Hook::create && !watch.no_values && !watch.shared_file.inode &&
-      read_self(object + watch.offset, event.new_value)) {
+      read_field(watch, object + watch.offset, event.new_value)) {
     event.values = 2;
     if (const auto tag = union_tag(watch, object)) {
       event.new_tag = *tag;
@@ -1435,7 +1446,7 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
   event.generation = life->generation;
   event.hook = Hook::create;
   if (!watch.no_values && !watch.shared_file.inode &&
-      read_self(event.object + watch.offset, event.new_value)) {
+      read_field(watch, event.object + watch.offset, event.new_value)) {
     event.values = 2;
     if (const auto tag = union_tag(watch, event.object)) {
       event.new_tag = *tag;
@@ -1630,7 +1641,7 @@ void before(const Site *site, const Registers *regs) noexcept {
       sample.expected = regs->value(inst.result ? inst.result : rax);
       if (!watch.no_values) {
         sample.input = inst.value ? regs->value(inst.value) : inst.immediate;
-        sample.has_old = !watch.atomic && read_self(destination, sample.old);
+        sample.has_old = !watch.atomic && read_field(watch, destination, sample.old);
         sample.old_tag = union_tag(watch, scope.owner);
         if (!watch.atomic && !sample.has_old) {
           emit_collection(watch, *site, *regs, scope, Hook::collection_gap, 5);
@@ -1676,7 +1687,7 @@ void before(const Site *site, const Registers *regs) noexcept {
     if (!watch.no_values) {
       sample.input = inst.value ? regs->value(inst.value) : inst.immediate;
       if (window)
-        sample.has_old = read_self(destination, sample.old);
+        sample.has_old = read_field(watch, destination, sample.old);
       sample.old_tag = union_tag(watch, destination - watch.offset);
     }
     pending = sample;
@@ -1703,9 +1714,11 @@ void complete(const Site *site, const Registers *regs) {
   auto input = sample.input;
   // Locked instructions without a returned old value cannot establish values
   // in the presence of uninstrumented atomic writers. Ptrace can park peers.
-  const bool readable = watch.no_values || !rmw || (!watch.atomic &&
+  auto observed = static_cast<std::uint64_t>(input);
+  const bool needs_read = rmw || inst.sample_store_memory;
+  const bool readable = watch.no_values || !needs_read || (!watch.atomic &&
       (sample.site == site && sample.stack == regs->value(rsp) && sample.has_old &&
-       read_self(sample.destination, input)));
+       read_field(watch, sample.destination, observed)));
   const bool overlapping = ordered ?
       sample.overlapping || sample.write_window->load(std::memory_order_acquire) /
           write_epoch_increment != sample.write_epoch ||
@@ -1720,7 +1733,7 @@ void complete(const Site *site, const Registers *regs) {
       return;
   }
   const auto object = sample.collection_owner ? sample.collection_owner : sample.destination - watch.offset;
-  const bool new_value_available = readable && (!rmw || watch.no_values || !overlapping);
+  const bool new_value_available = readable && (!needs_read || watch.no_values || !overlapping);
   std::unique_lock lock(watch.mutex);
   bool drift = false;
   if (sample.collection_owner) {
@@ -1741,8 +1754,8 @@ void complete(const Site *site, const Registers *regs) {
       if (overlapping || !sample.has_old || !new_value_available) {
         last.reset();
       } else {
-        drift = last && *last != sample.old;
-        last = std::bit_cast<std::int32_t>(input);
+        drift = last && static_cast<std::uint32_t>(*last) != sample.old;
+        last = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(observed));
       }
     }
   }
@@ -1775,14 +1788,14 @@ void complete(const Site *site, const Registers *regs) {
     bool has_old = sample.has_old && !overlapping && !drift;
     if (inst.hook == Hook::xadd) {
       const auto returned = static_cast<std::uint32_t>(regs->value(inst.result ? inst.result : inst.value));
-      old = std::bit_cast<std::int32_t>(returned);
+      old = returned;
       has_old = true;
-      input += returned;
+      observed = static_cast<std::uint32_t>(input + returned);
     } else if (inst.hook == Hook::cas) {
-      old = std::bit_cast<std::int32_t>(sample.expected);
+      old = sample.expected;
       has_old = true;
     }
-    event.new_value = std::bit_cast<std::int32_t>(input);
+    event.new_value = observed;
     const auto next_tag = overlapping ? std::nullopt : union_tag(watch, object);
     if (!watch.atomic && has_old && old == event.new_value && sample.old_tag == next_tag)
       return;
@@ -3966,7 +3979,7 @@ void prepare_runtime_scope(RuntimeBlock &block, State &watch, Address start,
     return out;
   };
   const auto store = [&](const native_entry::Instruction &inst) {
-    return inst.store32 && inst.store32->supports(watch.atomic);
+    return inst.memory_store && supported_store(watch, *inst.memory_store);
   };
   std::set<Address> covered_stores;
   for (auto it = body.instructions.begin(); it != body.instructions.end(); ++it) {
@@ -4070,7 +4083,7 @@ void prepare_runtime_scope(RuntimeBlock &block, State &watch, Address start,
                                               &native_entry::Instruction::address);
       for (auto &out : fragment.code) {
         if (store(*decoded)) {
-          instrument_store(out, *decoded->store32);
+          instrument_store(out, *decoded->memory_store);
           covered_stores.insert(out.pc);
         }
         ++decoded;
@@ -4287,8 +4300,8 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
           ++spill;
         const auto code = decode_leaf(target, block->bytes, true,
           [&](const native_entry::Instruction &inst, Instruction &out) {
-            if (inst.store32 && inst.store32->supports(watch.atomic))
-              instrument_store(out, *inst.store32);
+            if (inst.memory_store && supported_store(watch, *inst.memory_store))
+              instrument_store(out, *inst.memory_store);
             // Parameter spills in the usual frame-pointer leaf do not write
             // the receiver. The decoder verifies the base and displacement.
             else if (inst.may_store && inst.flow == NativeFlow::ordinary &&
@@ -4434,6 +4447,9 @@ void initialize(Init &init
 #endif
   watch->pid = ::getpid();
   watch->offset = init.scalar;
+  if (init.field_width != 1 && init.field_width != 2 && init.field_width != 4 && init.field_width != 8)
+    throw std::runtime_error("invalid native write field width");
+  watch->field_width = init.field_width;
   watch->union_tag_offset = init.union_tag_offset;
   watch->receiver_typeinfo = init.receiver_typeinfo;
   watch->async_signals = init.async_signals;
@@ -4506,7 +4522,7 @@ void initialize(Init &init
 } // namespace
 } // namespace tracer::object_cache
 
-extern "C" int tracer_agent_object_cache_v34(tracer::object_cache::Init *request) {
+extern "C" int tracer_agent_object_cache_v35(tracer::object_cache::Init *request) {
   try {
     tracer::object_cache::initialize(*request);
     return 0;

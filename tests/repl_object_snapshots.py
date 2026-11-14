@@ -75,7 +75,7 @@ def run(args):
                 redirects[pc] = before
         send(repl, start_watch)
         out.expect(r"^error: RPC 6: a snapshot watch is already active$")
-        send(repl, f"%record complex.db --sqlite --probe {watch[1]} --name object.trace --count 32 --timeout 5")
+        send(repl, f"%record complex.db --sqlite --probe {watch[1]} --name object.trace --count 128 --timeout 5")
         (root / "mutate.now").touch()
         try:
             app.expect(r"^DONE$")
