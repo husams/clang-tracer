@@ -69,6 +69,13 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"memory maps", K::memory_maps},
                                         {"memory read", K::memory_read},
                                         {"memory scan", K::memory_scan},
+                                        {"live update", K::live_update},
+                                        {"live preview", K::live_preview},
+                                        {"live status", K::live_status},
+                                        {"live revert", K::live_revert},
+                                        {"live mock", K::live_mock},
+                                        {"live update-data", K::live_update_data},
+                                        {"live scan-heap", K::live_scan_heap},
                                         {"object start", K::object_start},
                                         {"object prepare", K::object_prepare},
                                         {"object preview", K::object_preview},
@@ -187,7 +194,7 @@ public:
         "--first-seen", "--writer-entry", "--discover-writers", "--syscall-output", "--stack-cfi",
         "--follow-calls"};
     const std::set<std::string> repeated = {"--include", "--compile-option", "--key",
-                                           "--name", "--type"};
+                                           "--name", "--type", "--bind", "--from-scan"};
     const std::set<std::string> bulk_repeated = {"--module", "--exclude", "--exact"};
     const std::set<std::string> object_repeated = {"--field", "--on", "--include", "--key", "--union-case", "--code",
                                                   "--translation-unit", "--async-signal", "--mutation"};

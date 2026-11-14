@@ -56,6 +56,42 @@ standard-library include roots. Installing the client alone does not install a
 Linux server or agent.
 
 
+## Live code replacement on Linux x86-64
+
+Use `%live preview FILE...` to inspect the exact native entries. `%live update FILE...`
+previews the same saved snapshot and automatically applies an admitted group.
+`%live status` lists active entries. `%live revert` restores the parent revision,
+and `%live revert 0` restores the build's original entries.
+
+At build time preserve the original project files under a separate snapshot root.
+Record their relative paths and SHA-256 hashes alongside the executable and exact
+compilation database hashes in `clang-tracer-live.textproto`. Example shape:
+
+```textproto
+source_root: "/project/src"
+snapshot_root: "/project/live-build-snapshot"
+module: "/project/build/app"
+module_sha256: "<SHA-256 of app>"
+compilation_database_sha256: "<SHA-256 of compile_commands.json>"
+inputs { path: "app.cpp" sha256: "<SHA-256 of original app.cpp>" }
+inputs { path: "pricing.hpp" sha256: "<SHA-256 of original pricing.hpp>" }
+```
+
+Build affected units with debug information, `-O0 -fno-inline`,
+`-fpatchable-function-entry=16,0` and a GNU ELF build ID. The manifest must
+cover project dependencies. The compile database must record a matching
+profile for each new translation unit. The REPL can select the database and
+manifest using `--compdb FILE` and `--build FILE`.
+
+The initial profile admits exact symbols in the main executable and checks
+the original entry padding, source signature and lowered ABI before changing
+text. Related entries need a drained stack. Standalone adjusting thunks,
+folded aliases, missing call coverage, and unsupported ABI changes need a
+rebuild. Revisions keep JIT code mapped for escaped pointers and active calls.
+`--retention-limit N` sets the maximum number of retained JIT generations,
+including reverted generations. Reconnect to the same server to inspect
+the active revision.
+
 ## Prepare a probe from a binary without headers
 
 Build a module index from a Linux x86-64 ELF executable or shared library.

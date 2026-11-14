@@ -8,6 +8,7 @@
     tracer_agent_runtime_profile_v1;
     tracer_agent_capacity_v1;
     tracer_agent_object_cache_v34;
+    tracer_agent_live_v1;
     tracer_context_pthread_create_detour;
   local:
     *;

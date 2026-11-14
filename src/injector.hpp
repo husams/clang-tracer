@@ -93,7 +93,8 @@ public:
   // It must not throw.
   [[nodiscard]] bool patch_code_batch(::tracer::compat::span<const CodePatch> patches,
                                      const std::function<void()> &validate_mappings = {},
-                                     const std::function<void()> &on_commit = {});
+                                     const std::function<void()> &on_commit = {},
+                                     ::tracer::compat::span<const CodePatch> drained_ranges = {});
   void remote_free(std::uintptr_t address, std::size_t size);
 
   [[nodiscard]] std::uintptr_t

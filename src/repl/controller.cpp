@@ -1661,6 +1661,102 @@ bool Controller::execute(const Command &command) {
     detach(session);
     return true;
   }
+  case K::live_update:
+  case K::live_preview:
+  case K::live_status:
+  case K::live_revert:
+  case K::live_mock:
+  case K::live_update_data:
+  case K::live_scan_heap: {
+    require_session(selected_);
+    api::LiveUpdateRequest request;
+    request.set_session_id(selected_.id);
+    switch (command.kind) {
+    case K::live_update: request.set_action(api::LiveUpdateRequest::UPDATE); break;
+    case K::live_preview: request.set_action(api::LiveUpdateRequest::PREVIEW); break;
+    case K::live_status: request.set_action(api::LiveUpdateRequest::STATUS); break;
+    case K::live_revert: request.set_action(api::LiveUpdateRequest::REVERT); break;
+    case K::live_mock: request.set_action(api::LiveUpdateRequest::MOCK); break;
+    case K::live_update_data: request.set_action(api::LiveUpdateRequest::UPDATE_DATA); break;
+    case K::live_scan_heap: request.set_action(api::LiveUpdateRequest::SCAN_HEAP); break;
+    default: throw std::logic_error("invalid live command");
+    }
+    if (command.kind == K::live_revert && !args.empty()) {
+      request.set_revision(unsigned_number(args.front(), "revision"));
+      request.set_has_exact_revision(true);
+    }
+    if (command.kind == K::live_update || command.kind == K::live_preview) {
+      if (args.empty())
+        throw std::invalid_argument("provide at least one source or header");
+      request.set_build_manifest(std::filesystem::absolute(
+          command.option("--build", "clang-tracer-live.textproto")).string());
+      request.set_compilation_database(std::filesystem::absolute(
+          command.option("--compdb", "compile_commands.json")).string());
+      if (command.has("--retention-limit")) {
+        const auto limit = command.number("--retention-limit", 0);
+        if (!limit)
+          throw std::invalid_argument("retention limit must be positive");
+        request.set_retention_limit(limit);
+      }
+      for (const auto &arg : args) {
+        const auto path = std::filesystem::canonical(arg);
+        std::ifstream input(path, std::ios::binary);
+        if (!input)
+          throw std::runtime_error("cannot read saved source " + path.string());
+        auto *source = request.add_sources();
+        source->set_path(path.string());
+        source->set_contents(std::string(std::istreambuf_iterator<char>(input), {}));
+      }
+    } else if (command.kind != K::live_status && command.kind != K::live_revert) {
+      for (const auto &arg : args)
+        request.add_arguments(arg);
+    }
+    for (const auto &[name, options] : command.options) {
+      if ((command.kind == K::live_update || command.kind == K::live_preview) &&
+          (name == "--compdb" || name == "--build" || name == "--retention-limit"))
+        continue;
+      for (const auto &value : options) {
+        auto *option = request.add_options();
+        option->set_name(name);
+        option->set_value(value);
+      }
+    }
+    const auto print = [&](const api::LiveUpdateStatus &response) {
+      out_ << "live " << api::LiveUpdateStatus::State_Name(response.state())
+           << " revision=" << response.active_revision()
+           << " retained=" << response.retained_generations() << '/' << response.retention_limit();
+      if (!response.diagnostic().empty())
+        out_ << " " << response.diagnostic();
+      out_ << '\n';
+      for (const auto &entry : response.candidates()) {
+        out_ << "  " << api::LiveUpdateStatus::State_Name(entry.state())
+             << ' ' << entry.signature() << " [" << entry.symbol() << "] "
+             << entry.module() << " " << entry.source();
+        if (entry.address())
+          out_ << " address=0x" << std::hex << entry.address() << std::dec;
+        if (!entry.diagnostic().empty())
+          out_ << " " << entry.diagnostic();
+        out_ << '\n';
+      }
+      out_.flush();
+    };
+    const auto perform = [&] {
+      return unary<api::LiveUpdateStatus>(
+          [&](auto &context, auto &response) { return stub_->LiveUpdate(&context, request, &response); },
+          settings_.timeout_seconds);
+    };
+    if (command.kind == K::live_update) {
+      request.set_action(api::LiveUpdateRequest::PREVIEW);
+      const auto preview = perform();
+      print(preview);
+      if (preview.state() != api::LiveUpdateStatus::PLANNED)
+        return true;
+      request.set_preview_revision(preview.active_revision());
+      request.set_action(api::LiveUpdateRequest::UPDATE);
+    }
+    print(perform());
+    return true;
+  }
   case K::object_start:
   case K::object_prepare:
   case K::object_preview:

@@ -1923,6 +1923,24 @@ public:
     return memory::scan(*context, *session, timeout_, *request, *response);
   }
 
+  grpc::Status LiveUpdate(grpc::ServerContext *context, const api::LiveUpdateRequest *request,
+                          api::LiveUpdateStatus *response) override {
+    const auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    const std::lock_guard lock(session->operation_mutex());
+    if (request->action() != api::LiveUpdateRequest::STATUS) {
+      const auto group = snapshot_group(session->id());
+      if (group && snapshot_group_active(*group, session->snapshot())) {
+        response->set_state(api::LiveUpdateStatus::BLOCKED);
+        response->set_diagnostic("stop the active snapshot watch before changing native code");
+        return grpc::Status::OK;
+      }
+    }
+    *response = session->live_update(*request, [&] { return context->IsCancelled(); });
+    return grpc::Status::OK;
+  }
+
   grpc::Status ObjectWatch(grpc::ServerContext *, const api::ObjectWatchRequest *request,
                            api::ObjectWatchStatus *response) override {
     const bool prepare = request->action() == api::ObjectWatchRequest::PREPARE;

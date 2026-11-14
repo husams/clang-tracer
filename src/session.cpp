@@ -238,6 +238,8 @@ clangtracer::v1::ObjectWatchStatus Session::object_watch(
   if (request.has_prepared_bindings())
     binding_status = object_watch::preview(request, pid_, executable_).binding_status();
   require_probe_control_locked();
+  if (live_.active)
+    throw std::runtime_error("revert live replacements before installing a trace");
   if (pthread_create_patch_committed_ ||
       std::any_of(probes_.begin(), probes_.end(), [](const auto &item) {
         return item.second.patch_committed || item.second.value.active() ||
@@ -471,6 +473,7 @@ void Session::attach(const std::string &expected_executable) {
     const auto validate = agent_symbol("tracer_agent_validate");
     const auto capacity = agent_symbol("tracer_agent_capacity_v1");
     const auto object_cache = agent_symbol("tracer_agent_object_cache_v34");
+    const auto live = agent_symbol("tracer_agent_live_v1");
     const auto pthread_detour =
         agent_symbol("tracer_context_pthread_create_detour");
     if (!start || !stop) {
@@ -485,6 +488,7 @@ void Session::attach(const std::string &expected_executable) {
     validate_address_ = validate;
     capacity_address_ = capacity;
     object_cache_address_ = object_cache;
+    live_address_ = live;
     pthread_detour_address_ = pthread_detour;
   } catch (...) {
     if (process.unsafe()) {
@@ -508,6 +512,8 @@ Session::validate_probe(const clangtracer::v1::ProbeSpec &spec,
                         clangtracer::v1::ValidateProbeRequest::Level level) {
   std::lock_guard lock(mutex_);
   require_probe_control_locked();
+  if (live_.active)
+    throw std::runtime_error("revert live replacements before installing a trace");
   check_identity_locked();
   if (state_ != clangtracer::v1::Session::ATTACHED) {
     throw std::runtime_error("session is not attached");
@@ -588,6 +594,8 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
                    const std::function<bool()> &cancelled) {
   std::lock_guard lock(mutex_);
   require_probe_control_locked();
+  if (live_.active)
+    throw std::runtime_error("revert live replacements before installing a trace");
   check_identity_locked();
   if (state_ != clangtracer::v1::Session::ATTACHED) {
     throw std::runtime_error("session is not attached");
@@ -1456,6 +1464,11 @@ void Session::detach() {
                                             : error_);
   }
   check_identity_locked();
+  if (live_.active) {
+    const auto result = revert_live_locked(0);
+    if (result.state() != clangtracer::v1::LiveUpdateStatus::REVERTED)
+      throw std::runtime_error("live restoration incomplete: " + result.diagnostic());
+  }
   for (auto &[id, probe] : probes_) {
     (void)id;
     if (probe.value.active() || probe.value.draining())
@@ -1480,6 +1493,13 @@ void Session::shutdown() noexcept {
   if (state_ == clangtracer::v1::Session::DETACHED ||
       state_ == clangtracer::v1::Session::EXITED || unsafe_target_)
     return;
+  if (live_.active) {
+    const auto result = revert_live_locked(0);
+    if (result.state() != clangtracer::v1::LiveUpdateStatus::REVERTED) {
+      set_failed_locked("live restoration incomplete: " + result.diagnostic());
+      return;
+    }
+  }
   std::string first_error =
       state_ == clangtracer::v1::Session::FAILED ? error_ : std::string{};
   const auto shutdown_deadline =

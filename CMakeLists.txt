@@ -94,7 +94,7 @@ add_library(tracer_grpc STATIC ${TRACER_PROTO_DIR}/tracer.grpc.pb.cc)
 target_link_libraries(tracer_grpc PUBLIC tracer_proto gRPC::grpc++)
 
 add_library(clang_tracer_agent SHARED src/agent.cpp src/native_detour.cpp src/native_entry.cpp
-  src/object_code_cache_agent.cpp
+  src/object_code_cache_agent.cpp src/live_compile.cpp src/live_jit.cpp src/live_agent.cpp
   src/value_snapshot_codegen.cpp src/value_snapshot_storage.cpp src/snapshot_encoder.cpp src/callback_pch.cpp
   src/debug_resolver.cpp src/native_stack.cpp src/event_transport.cpp
   src/context_agent_delivery.cpp src/agent_runtime_profile.cpp)
@@ -119,7 +119,7 @@ add_custom_command(TARGET clang_tracer_agent POST_BUILD
 add_executable(clang-tracer-server src/main.cpp src/server.cpp src/session.cpp src/injector.cpp src/admission.cpp
   src/debug_resolver.cpp src/header_context.cpp src/process_memory.cpp src/native_entry.cpp src/native_detour.cpp
   src/object_watch.cpp src/object_watch_plan.cpp src/object_snapshot.cpp src/object_launch.cpp
-  src/object_code_cache.cpp src/entry_trap.cpp)
+  src/object_code_cache.cpp src/entry_trap.cpp src/live_compile.cpp src/live_plan.cpp src/live_session.cpp)
 target_include_directories(clang-tracer-server PRIVATE include ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_compile_definitions(clang-tracer-server PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
 target_link_libraries(clang-tracer-server PRIVATE tracer_grpc tracer_context_collector

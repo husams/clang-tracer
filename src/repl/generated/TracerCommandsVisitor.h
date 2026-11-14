@@ -95,6 +95,10 @@ public:
 
     virtual std::any visitKeyword(TracerCommandsParser::KeywordContext *context) = 0;
 
+    virtual std::any visitLiveUpdate(TracerCommandsParser::LiveUpdateContext *context) = 0;
+
+    virtual std::any visitLiveOption(TracerCommandsParser::LiveOptionContext *context) = 0;
+
     virtual std::any visitObjectWatch(TracerCommandsParser::ObjectWatchContext *context) = 0;
 
     virtual std::any visitObjectOption(TracerCommandsParser::ObjectOptionContext *context) = 0;

@@ -19,6 +19,7 @@ service Tracer {
   rpc ReadMemory(ReadMemoryRequest) returns (ReadMemoryResponse);
   rpc ScanMemory(ScanMemoryRequest) returns (ScanMemoryResponse);
   rpc PreviewFunctionEntry(PreviewFunctionEntryRequest) returns (PreviewFunctionEntryResponse);
+  rpc LiveUpdate(LiveUpdateRequest) returns (LiveUpdateStatus);
   rpc ObjectWatch(ObjectWatchRequest) returns (ObjectWatchStatus);
   rpc ListThreads(ListThreadsRequest) returns (ListThreadsResponse);
   rpc ListSymbols(ListSymbolsRequest) returns (ListSymbolsResponse);
@@ -934,4 +935,91 @@ message TraceEvent {
   PreparedInjector replay_types = 24; // Server-supplied declarations and standard headers only.
   ObjectObservation object_observation = 25;
   bool receiver_sampled_at_return = 26;
+}
+
+// Source snapshots and in-target compilation are separate from publication.
+message LiveUpdateRequest {
+  enum Action {
+    UPDATE = 0;
+    PREVIEW = 1;
+    STATUS = 2;
+    REVERT = 3;
+    MOCK = 4;
+    UPDATE_DATA = 5;
+    SCAN_HEAP = 6;
+  }
+  message Source {
+    string path = 1;
+    bytes contents = 2;
+  }
+  message Option {
+    string name = 1;
+    string value = 2;
+  }
+  string session_id = 1;
+  Action action = 2;
+  repeated Source sources = 3;
+  string compilation_database = 4;
+  string build_manifest = 5;
+  uint64 revision = 6;
+  uint64 retention_limit = 7;
+  repeated string arguments = 8;
+  repeated Option options = 9;
+  bool has_exact_revision = 10;
+  optional uint64 preview_revision = 11;
+}
+
+message LiveUpdateStatus {
+  enum State {
+    PLANNED = 0;
+    APPLIED = 1;
+    BLOCKED = 2;
+    STALE = 3;
+    RESTORATION_REQUIRED = 4;
+    UNCHANGED = 5;
+    REVERTED = 6;
+    CURRENT = 7;
+  }
+  message Candidate {
+    State state = 1;
+    string symbol = 2;
+    string signature = 3;
+    string source = 4;
+    string module = 5;
+    uint64 address = 6;
+    string diagnostic = 7;
+  }
+  State state = 1;
+  uint64 active_revision = 2;
+  uint64 retained_generations = 3;
+  uint64 retention_limit = 4;
+  repeated Candidate candidates = 5;
+  string diagnostic = 6;
+}
+
+// Private payload for the versioned target agent entry.
+message LiveJitInput {
+  message CompileUnit {
+    string path = 1;
+    string directory = 2;
+    repeated string compiler_arguments = 3;
+  }
+  repeated LiveUpdateRequest.Source sources = 1;
+  repeated CompileUnit units = 2;
+  map<string, uint64> imports = 3;
+  repeated string entry_symbols = 4;
+}
+
+message LiveBuildManifest {
+  // Paths are relative to source_root. Snapshots preserve the same layout.
+  message Input {
+    string path = 1;
+    string sha256 = 2;
+  }
+  string source_root = 1;
+  string snapshot_root = 2;
+  string module = 3;
+  string module_sha256 = 4;
+  string compilation_database_sha256 = 5;
+  repeated Input inputs = 6;
 }

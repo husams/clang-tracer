@@ -935,6 +935,12 @@ function(tracer_add_native_repl)
             --${_example} --smoke)
         set_tests_properties(native_repl_prepared_${_test_suffix} PROPERTIES TIMEOUT 120)
       endforeach()
+      add_test(NAME native_repl_live_update
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_live_update.py"
+          --compiler "${CMAKE_CXX_COMPILER}"
+          --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+          --agent $<TARGET_FILE:clang_tracer_agent>)
+      set_tests_properties(native_repl_live_update PROPERTIES TIMEOUT 240)
       add_test(NAME native_repl_integration
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_native_integration.py"
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
