@@ -1174,8 +1174,9 @@ std::pair<std::size_t, std::size_t> Controller::background_storage() const {
   std::pair<std::size_t, std::size_t> used{};
   for (const auto& weak : background_) {
     if (auto state = weak.lock()) {
-      used.first += state->max_events;
-      used.second += state->max_bytes;
+      const auto reserved = state->reserved();
+      used.first += reserved.first;
+      used.second += reserved.second;
     }
   }
   return used;

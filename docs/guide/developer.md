@@ -180,7 +180,7 @@ with client.watch_events([session.id], timeout=30) as stream:
 | Type and methods | Behavior |
 | --- | --- |
 | `Collection::size(), at(index), begin(), end()` | Count retained events, index with bounds checking, or iterate. Fields `events`, `received`, `evicted`, `complete`, `cancelled`, and `timed_out` expose capture state. |
-| `EventRange::snapshot(), running(), error(), stop(), begin(), end()` | Copy a stable bounded collection, check the producer or error text, stop it while retaining data, or iterate a point-in-time snapshot. Release all range copies to release its capture reservation. |
+| `EventRange::snapshot(), running(), error(), stop(), begin(), end()` | Copy a stable bounded collection, check the producer or error text, stop it while retaining data, or iterate a point-in-time snapshot. A running range reserves the remaining collection storage; once it finishes or is stopped it keeps only the room its retained events use. Release all range copies to release that too. |
 | `Event::sequence(), probe_id(), call_id(), phase(), function_name()` | Read the event cursor, emitting probe, call identity, phase, and name. |
 | `Event::has_result(), argument_value(index), result_value()` | Check return presence or decode a scalar into `ScalarValue` (bool, signed or unsigned 64-bit integer, or double). Void is present but has no scalar value. |
 | `Event::argument_snapshot(index), result_snapshot(), receiver_snapshot(), state_snapshot(index=0)` | Read owned structured data from an argument, return, method receiver, or context state. A receiver snapshot represents entry fields. |

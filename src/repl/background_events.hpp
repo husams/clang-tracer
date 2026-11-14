@@ -1,6 +1,7 @@
 #pragma once
 #include <mutex>
 #include <thread>
+#include <utility>
 
 #include <grpcpp/grpcpp.h>
 
@@ -26,6 +27,9 @@ public:
                    unsigned timeout, std::size_t max_events, std::size_t max_bytes);
   ~BackgroundEvents();
   Collection snapshot() const;
+  // Events and bytes charged to the shared collection storage: the whole
+  // limit while receiving, and only what was retained once finished.
+  std::pair<std::size_t, std::size_t> reserved() const;
   bool running() const;
   std::string error() const;
   void stop();
