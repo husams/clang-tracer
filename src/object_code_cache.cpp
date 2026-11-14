@@ -452,12 +452,21 @@ struct Watch::Impl {
           add_entry(start, size);
           continue;
         }
-        if (request.writer_entry() || plan.writer_address_taken(start))
+        if (request.writer_entry() || plan.writer_address_taken(start)) {
           prepare_writer_entry(start, size);
-        else {
-          direct_writer_calls = true;
-          entries.push_back(start);
+          continue;
         }
+        if (plan.writer_exported(start)) {
+          // An export alone does not establish an indirect caller.
+          try {
+            prepare_writer_entry(start, size);
+            continue;
+          } catch (const std::runtime_error &) {
+            // Retain verified direct calls with partial coverage.
+          }
+        }
+        direct_writer_calls = true;
+        entries.push_back(start);
       }
       for (const auto &[pc, size] : plan.boundaries) {
         const auto &site = plan.sites.at(pc);
@@ -731,10 +740,10 @@ struct Watch::Impl {
           return inst.flow != Flow::copy && inst.target > patch && inst.target < end;
         }))
       throw std::runtime_error("an application edge enters the code-cache writer redirect");
-    if (overlaps_fragment(patch, end) ||
-        !entry_windows.emplace(patch, end - patch).second ||
-        !incoming.emplace(start, std::vector<Address>{patch}).second)
+    if (overlaps_fragment(patch, end) || incoming.count(start))
       throw std::runtime_error("code-cache writer entry overlaps another redirect");
+    entry_windows.emplace(patch, end - patch);
+    incoming.emplace(start, std::vector<Address>{patch});
   }
 #endif
 
@@ -1302,14 +1311,14 @@ struct Watch::Impl {
       for (const auto call : callers) {
         const auto next = call + 5;
         const auto [caller, length] = plan.containing_function(call);
-        const auto pads = plan.landing_pads(caller, length);
-        const auto caller_body = native_entry::scan(caller, plan.code(caller).substr(0, length), pads);
+        const auto roots = plan.exception_roots(caller, length);
+        const auto caller_body = native_entry::scan(caller, plan.code(caller).substr(0, length), roots);
         auto fragment = straight_fragment(plan, caller_body, next, leave, false, true);
         if (fragment.empty() || overlaps_entry(fragment) ||
             overlaps_fragment(fragment.front().pc, fragment.back().pc + fragment.back().size))
           throw std::runtime_error("lifetime return continuation has no disjoint native redirect");
         const auto end = fragment.back().pc + fragment.back().size;
-        if (std::ranges::any_of(pads, [&](const auto pad) { return pad >= next && pad < end; }) ||
+        if (std::ranges::any_of(roots, [&](const auto root) { return root >= next && root < end; }) ||
             !check_interior(next, end))
           throw std::runtime_error("an application edge enters the lifetime return continuation");
         fragment.front().boundary_pc = pc;
@@ -1935,7 +1944,7 @@ Watch::Watch(const api::ObjectWatchRequest &request, std::uint64_t id, std::uint
 Watch::~Watch() = default;
 
 void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
-                    bool permanent_startup_module) {
+                    std::chrono::steady_clock::time_point deadline, bool permanent_startup_module) {
   auto &p = *impl_;
   p.verify_live(process);
   Init init;
@@ -2130,20 +2139,26 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
     });
   }
   p.verify_live(process);
-  if (p.request.timeout_seconds())
-    p.channel->deadline_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        (std::chrono::steady_clock::now() + std::chrono::seconds(p.request.timeout_seconds()))
-            .time_since_epoch()).count(), std::memory_order_release);
-  p.channel->activity.store(enabled, std::memory_order_release);
-  if (p.runtime_limit)
-    p.channel->runtime_prefix_gate.store(enabled, std::memory_order_release);
+  const auto batch = p.patches(false);
   try {
-    if (!process.patch_code_batch(p.patches(false), [&] {
-          p.verify_mappings();
-          if (!p.entry_windows.empty() || !p.runtime_calls.empty() || p.fragmented_lifecycle)
-            p.verify_live(process);
-        }))
-      throw std::runtime_error("a target thread occupies a code-cache redirect");
+    while (!process.patch_code_batch(batch, [&] {
+      p.verify_mappings();
+      if (!p.entry_windows.empty() || !p.runtime_calls.empty() || p.fragmented_lifecycle)
+        p.verify_live(process);
+    }, [&]() noexcept {
+      if (p.request.timeout_seconds())
+        p.channel->deadline_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            (std::chrono::steady_clock::now() + std::chrono::seconds(p.request.timeout_seconds()))
+                .time_since_epoch()).count(), std::memory_order_release);
+      if (p.runtime_limit)
+        p.channel->runtime_prefix_gate.store(enabled, std::memory_order_release);
+      p.channel->activity.store(enabled, std::memory_order_release);
+    })) {
+      // The occupied window was left intact and the peers were released.
+      if (std::chrono::steady_clock::now() >= deadline)
+        throw std::runtime_error("a target thread occupies a code-cache redirect");
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
   } catch (...) {
     p.channel->activity.fetch_and(~enabled, std::memory_order_acq_rel);
     if (process.unsafe()) {
@@ -2164,7 +2179,9 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
 #if defined(__aarch64__)
       "in-process AArch64 leaf translation with verified scalar and atomic redirects";
 #else
-      p.direct_writer_calls ? "in-process x86-64 leaf translation with atomic MOV/XADD/CMPXCHG and verified direct writer call sites only" :
+      p.direct_writer_calls ?
+      "in-process x86-64 leaf translation with atomic MOV/XADD/CMPXCHG and verified direct writer call sites only"
+      " (use --writer-entry to require entry coverage)" :
       "in-process x86-64 leaf translation with atomic MOV/XADD/CMPXCHG and verified writer entry redirects";
 #endif
 }
@@ -2394,7 +2411,7 @@ api::ObjectWatchStatus Watch::preview() const {
   report.set_diagnostic(!p.runtime_calls.empty() ? "verified call redirects; callees resolve at runtime" :
       p.fragmented_writer ? "verified native writer fragments and redirect windows" :
       p.plan.layout.logical_collection() ? "verified native collection fragments and redirect windows" :
-      p.direct_writer_calls ? "verified direct writer call sites only" :
+      p.direct_writer_calls ? "verified direct writer call sites only (use --writer-entry to require entry coverage)" :
                         "verified leaf translations and candidate redirect windows");
   *report.mutable_plan() = p.plan.describe(p.pid != 0);
   if (p.pid) {

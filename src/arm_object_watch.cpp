@@ -244,7 +244,7 @@ void NativeWatch::start(const std::string &agent, const std::string &rendezvous)
         offset += width;
       }
     }
-    p.watch.install(process, object_cache::load_agent(process, canonical));
+    p.watch.install(process, object_cache::load_agent(process, canonical), deadline);
     process.detach();
   } catch (...) {
     p.unsafe = process.unsafe();

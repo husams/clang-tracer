@@ -250,9 +250,10 @@ clangtracer::v1::ObjectWatchStatus Session::object_watch(
     auto prepared = std::make_unique<object_cache::Watch>(
         request, id, pid_, executable_, event_path_, std::move(publish));
     injector::Process process;
-    attach_process(process, std::chrono::steady_clock::now() + operation_timeout_);
+    const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
+    attach_process(process, deadline);
     try {
-      prepared->install(process, object_cache_address_);
+      prepared->install(process, object_cache_address_, deadline);
       object_cache_ = std::move(prepared);
       object_watch_.reset();
       process.detach();

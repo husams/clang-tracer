@@ -1268,7 +1268,54 @@ struct Plan::Image {
     }
   }
 
-  std::vector<std::uint64_t> landing_pads(std::uint64_t start, std::size_t size) const {
+  std::vector<std::uint64_t> cold_entries(std::uint64_t start, std::size_t size) const {
+    std::set<std::string_view> hot_names;
+    for (const auto &symbol : symbols) {
+      if (symbol.kind != llvm::ELF::STT_FUNC || symbol.range.first != start - *bias)
+        continue;
+      const std::string_view name = symbol.linkage;
+      const auto suffix = name.rfind(".cold");
+      if (suffix == name.npos)
+        continue;
+      const auto number = name.substr(suffix + 5);
+      if (number.empty() || (number.size() > 1 && number.front() == '.' &&
+          std::ranges::all_of(number.substr(1), [](char ch) { return ch >= '0' && ch <= '9'; })))
+        hot_names.insert(name.substr(0, suffix));
+    }
+    if (hot_names.empty())
+      return {};
+
+    std::set<Range> hot;
+    for (const auto &symbol : symbols)
+      if (symbol.kind == llvm::ELF::STT_FUNC && hot_names.count(symbol.linkage))
+        hot.insert(symbol.range);
+    if (hot.size() != 1)
+      return {};
+    const auto [address, length] = *hot.begin();
+    const auto hot_start = *bias + address;
+    const auto bytes = code(hot_start);
+    if (length > bytes.size())
+      return {};
+    // A named partition alone proves no instruction boundary. Decode the
+    // hot range and its LSDA roots, then admit only actual branches to it.
+    const auto pads = local_landing_pads(hot_start, length);
+    const auto body = native_entry::scan(hot_start, bytes.substr(0, length), pads);
+    if (!body.diagnostic.empty() || body.decode_failed)
+      return {};
+    std::vector<std::uint64_t> entries;
+    std::uint64_t end = 0;
+    for (const auto &inst : body.instructions) {
+      if (inst.address < end)
+        return {};
+      end = inst.address + inst.size;
+      if (inst.flow == native_entry::Flow::branch && inst.target &&
+          *inst.target >= start && *inst.target - start < size)
+        entries.push_back(*inst.target);
+    }
+    return entries;
+  }
+
+  std::vector<std::uint64_t> local_landing_pads(std::uint64_t start, std::size_t size) const {
     if (!exception_entries)
       index_exception_entries();
     std::vector<std::uint64_t> entries;
@@ -1279,6 +1326,74 @@ struct Plan::Image {
     return entries;
   }
 
+  std::vector<std::uint64_t> exception_roots(std::uint64_t start, std::size_t size) const {
+    auto roots = local_landing_pads(start, size);
+    const auto cold = cold_entries(start, size);
+    roots.insert(roots.end(), cold.begin(), cold.end());
+    return roots;
+  }
+
+#if defined(__x86_64__)
+  void index_ibt_delete_entries(const llvm::object::ELFObjectFileBase &object) const {
+    std::set<std::uint64_t> delete_slots;
+    for (const auto &section : object.sections()) {
+      auto name = section.getName();
+      if (!name) {
+        llvm::consumeError(name.takeError());
+        continue;
+      }
+      if (*name != ".rela.plt")
+        continue;
+      for (const auto &relocation : section.relocations()) {
+        if (relocation.getType() != llvm::ELF::R_X86_64_JUMP_SLOT)
+          continue;
+        const auto symbol = relocation.getSymbol();
+        if (symbol == object.symbol_end())
+          continue;
+        auto target = symbol->getName();
+        if (!target) {
+          llvm::consumeError(target.takeError());
+          continue;
+        }
+        if (operator_delete_name(*target))
+          delete_slots.insert(relocation.getOffset());
+      }
+    }
+    if (delete_slots.empty())
+      return;
+
+    for (const auto &section : object.sections()) {
+      auto name = section.getName();
+      if (!name) {
+        llvm::consumeError(name.takeError());
+        continue;
+      }
+      if (*name != ".plt.sec" || !section.isText())
+        continue;
+      auto contents = section.getContents();
+      if (!contents) {
+        llvm::consumeError(contents.takeError());
+        continue;
+      }
+      // GNU IBT PLT entries are 16-byte ENDBR64 + JMP *disp32(%rip)
+      // stubs. Match their GOT slots by relocation, independent of order.
+      for (std::size_t offset = 0; offset + 16 <= contents->size(); offset += 16) {
+        const auto stub = contents->substr(offset, 16);
+        if (!stub.starts_with("\xf3\x0f\x1e\xfa"))
+          continue;
+        const auto jump = stub[4] == '\xf2' ? 5 : 4; // Optional BND prefix.
+        if (!stub.substr(jump).starts_with("\xff\x25"))
+          continue;
+        std::int32_t displacement;
+        std::memcpy(&displacement, stub.data() + jump + 2, sizeof(displacement));
+        const auto entry = section.getAddress() + offset;
+        if (delete_slots.count(entry + jump + 6 + displacement))
+          delete_plt->insert(entry);
+      }
+    }
+  }
+#endif
+
   bool is_delete_target(std::uint64_t address) const {
     if (std::ranges::any_of(symbols, [&](const auto &symbol) {
           return symbol.kind == llvm::ELF::STT_FUNC && symbol.range.first == address &&
@@ -1287,11 +1402,14 @@ struct Plan::Image {
       return true;
     if (!delete_plt) {
       delete_plt.emplace();
+      const auto &object = llvm::cast<llvm::object::ELFObjectFileBase>(*executable.getBinary());
+#if defined(__x86_64__)
+      index_ibt_delete_entries(object);
+#endif
       const auto triple = llvm::sys::getDefaultTargetTriple();
       std::string error;
       if (const auto *target = llvm::TargetRegistry::lookupTarget(triple, error)) {
         const std::unique_ptr<llvm::MCSubtargetInfo> sub(target->createMCSubtargetInfo(triple, "generic", ""));
-        const auto &object = llvm::cast<llvm::object::ELFObjectFileBase>(*executable.getBinary());
         if (sub)
           for (const auto &entry : object.getPltEntries(*sub)) {
             if (!entry.Symbol)
@@ -2030,7 +2148,7 @@ void find_direct_redirects(const auto &callers, Redirects &result, DirectEdges e
       };
       auto unverified = unverified_site();
       if (unverified) {
-        const auto landing_pads = callers.landing_pads(start, size);
+        const auto landing_pads = callers.exception_roots(start, size);
         if (!landing_pads.empty()) {
           decoded = native_entry::scan(start, bytes.substr(0, size), landing_pads);
           unverified = unverified_site();
@@ -2140,48 +2258,24 @@ bool Plan::writer_address_taken(std::uint64_t pc) const {
   }
 
   const auto &elf = llvm::cast<llvm::object::ELF64LEObjectFile>(*image->executable.getBinary());
-  // Exported entry points may also be obtained by another image or dlsym.
-  for (const auto &symbol : elf.getDynamicSymbolIterators()) {
-    auto value = symbol.getAddress();
-    auto flags = symbol.getFlags();
-    const bool exported = value && flags && *value == address &&
-        !(*flags & llvm::object::SymbolRef::SF_Undefined) &&
-        (*flags & llvm::object::SymbolRef::SF_Exported);
-    if (!value)
-      llvm::consumeError(value.takeError());
-    if (!flags)
-      llvm::consumeError(flags.takeError());
-    if (exported)
-      return true;
-  }
-
   // In an executable with fixed addresses, the linker can resolve pointer
   // constants completely (including immediates and read-only vtable slots).
   const auto pointer = std::string_view(reinterpret_cast<const char *>(&address), sizeof(address));
   const auto &object = static_cast<const llvm::object::ELFObjectFileBase &>(elf);
   const bool fixed = object.getEType() == llvm::ELF::ET_EXEC;
   for (const auto &[start, bytes] : image->text) {
-    if (fixed && bytes.find(pointer) != bytes.npos)
+    // Absolute immediates can materialize an entry address in registers or
+    // memory. A byte match only requests an independently verified entry
+    // window. It never authorizes modifying the instruction with the match.
+    if (fixed && bytes.find(pointer.substr(0, address <= UINT32_MAX ? 4 : 8)) != bytes.npos)
       return true;
-    // An absolute MOV immediate or a RIP-relative LEA can materialize
-    // the entry address. A byte match only selects a verified entry patch
-    // or refusal. It never authorizes patching the apparent reference.
-    for (std::size_t i = 0; i + 5 <= bytes.size(); ++i) {
-      const auto opcode = static_cast<unsigned char>(bytes[i]);
-      const auto operand = static_cast<unsigned char>(bytes[i + 1]);
-      if (fixed && address <= UINT32_MAX) {
-        if (opcode >= 0xb8 && opcode <= 0xbf && bytes.substr(i + 1, 4) == pointer.substr(0, 4))
-          return true;
-        if (opcode == 0xc7 && (operand & 0xf8) == 0xc0 &&
-            i + 6 <= bytes.size() && bytes.substr(i + 2, 4) == pointer.substr(0, 4))
-          return true;
-      }
-      if (opcode == 0x8d && (operand & 0xc7) == 0x05 && i + 6 <= bytes.size()) {
-        std::int32_t displacement;
-        std::memcpy(&displacement, bytes.data() + i + 2, sizeof(displacement));
-        if (start + i + 6 + displacement == address)
-          return true;
-      }
+    for (std::size_t i = 0; i + 6 <= bytes.size(); ++i) {
+      if (bytes[i] != '\x8d' || (bytes[i + 1] & 0xc7) != 0x05)
+        continue;
+      std::int32_t displacement;
+      std::memcpy(&displacement, bytes.data() + i + 2, sizeof(displacement));
+      if (start + i + 6 + displacement == address)
+        return true;
     }
   }
 
@@ -2221,6 +2315,28 @@ bool Plan::writer_address_taken(std::uint64_t pc) const {
       else if (std::string_view(bytes->data(), bytes->size()).find(pointer) != std::string_view::npos)
         return true; // Fixed pointers and in-place addends for packed relative relocations.
     }
+  }
+  return false;
+}
+
+bool Plan::writer_exported(std::uint64_t pc) const {
+  const auto *image = image_for(pc);
+  if (!image)
+    return false;
+  const auto address = pc - *image->bias;
+  const auto &elf = llvm::cast<llvm::object::ELF64LEObjectFile>(*image->executable.getBinary());
+  for (const auto &symbol : elf.getDynamicSymbolIterators()) {
+    auto value = symbol.getAddress();
+    auto flags = symbol.getFlags();
+    const bool exported = value && flags && *value == address &&
+        !(*flags & llvm::object::SymbolRef::SF_Undefined) &&
+        (*flags & llvm::object::SymbolRef::SF_Exported);
+    if (!value)
+      llvm::consumeError(value.takeError());
+    if (!flags)
+      llvm::consumeError(flags.takeError());
+    if (exported)
+      return true;
   }
   return false;
 }
@@ -2326,9 +2442,9 @@ std::uint64_t Plan::constructor_tail_target(std::uint64_t pc) const {
   return 0;
 }
 
-std::vector<std::uint64_t> Plan::landing_pads(std::uint64_t start, std::size_t size) const {
+std::vector<std::uint64_t> Plan::exception_roots(std::uint64_t start, std::size_t size) const {
   const auto *image = image_for(start);
-  return image ? image->landing_pads(start, size) : std::vector<std::uint64_t>{};
+  return image ? image->exception_roots(start, size) : std::vector<std::uint64_t>{};
 }
 
 std::vector<std::uint64_t> Plan::lifetime_return_callers(std::uint64_t pc, bool constructor) const {
