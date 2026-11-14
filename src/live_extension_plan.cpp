@@ -4,6 +4,7 @@
 #include "live_data.hpp"
 #include "live_plan.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <stdexcept>
 
@@ -66,8 +67,11 @@ api::LiveJitInput encode(const JitRequest &request, const std::vector<std::strin
     source->set_path(snapshot.path);
     source->set_contents(snapshot.contents);
   }
-  for (const auto &[name, address] : request.imports)
-    (*result.mutable_imports())[name] = address;
+  for (const auto &[name, address] : request.imports) {
+    auto *item = result.add_imports();
+    item->set_name(name);
+    item->set_address(address);
+  }
   for (const auto &argument : request.compiler_arguments)
     result.add_compiler_arguments(argument);
   return result;
@@ -148,8 +152,31 @@ ExtensionPlan plan_extension(std::uint32_t pid, std::uint64_t process_start,
   input.set_registry(sources.entry);
   if (!input.hook_file().empty())
     update_paths.push_back(input.hook_file());
-  if (!update_paths.empty())
-    *input.mutable_update() = encode(sources.jit, update_paths);
+  if (!update_paths.empty()) {
+    auto *update = input.mutable_update();
+    *update = encode(sources.jit, update_paths);
+    if (!registry.empty() && std::none_of(update->units().begin(), update->units().end(),
+          [&](const auto &unit) { return unit.path() != input.hook_file(); })) {
+      const auto wrapper = (fs::path(update_paths.front()).parent_path() /
+          ".clang-tracer-managed-recipe.cpp").string();
+      auto *unit = update->add_units();
+      unit->set_path(wrapper);
+      unit->set_directory(fs::path(wrapper).parent_path().string());
+      for (const auto &argument : update->compiler_arguments())
+        unit->add_compiler_arguments(argument);
+      auto *file = update->add_sources();
+      file->set_path(wrapper);
+      std::string content;
+      for (const auto &path : update_paths) {
+        if (path == input.hook_file())
+          continue;
+        if (path.find_first_of("\\\"\r\n") != std::string::npos)
+          throw std::runtime_error("invalid path for generated migration input");
+        content += "#include \"" + path + "\"\n";
+      }
+      file->set_contents(content);
+    }
+  }
   if (!discovery.empty())
     *input.mutable_discovery() = encode(sources.jit, {discovery});
   result.validate = std::move(sources.validate);

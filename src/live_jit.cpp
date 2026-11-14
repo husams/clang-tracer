@@ -40,12 +40,15 @@ std::uintptr_t runtime_import(llvm::StringRef name) {
       .Cases("malloc", "calloc", "free", "realloc", true)
       .Cases("memcpy", "memset", "memmove", "memcmp", true)
       .Cases("strlen", "strcmp", "abort", "puts", true)
+      .Cases("pthread_mutex_lock", "pthread_mutex_unlock", "__libc_single_threaded", true)
       .Default(false);
   const auto is_cxx = name.starts_with("__cxa_") && name != "__cxa_atexit" &&
                       name != "__cxa_thread_atexit" && name != "__cxa_thread_atexit_impl";
   const auto is_cpp = is_cxx || name == "__gxx_personality_v0" ||
                       name.starts_with("_ZSt") || name.starts_with("_ZNSt") ||
                       name.starts_with("_ZNKSt") || name.starts_with("_ZTVSt") ||
+                      name.starts_with("_ZNSa") || name.starts_with("_ZNKSa") ||
+                      name == "__dynamic_cast" ||
                       name.starts_with("_ZTISt") || name.starts_with("_ZTSSt") ||
                       name.starts_with("_ZTVN10__cxxabiv1") ||
                       name.starts_with("_Zn") || name.starts_with("_Zd");

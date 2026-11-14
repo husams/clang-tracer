@@ -46,8 +46,11 @@ std::string payload(const live::JitRequest &request) {
     for (const auto &argument : unit.compiler_arguments)
       output->add_compiler_arguments(argument);
   }
-  for (const auto &[name, address] : request.imports)
-    (*wire.mutable_imports())[name] = address;
+  for (const auto &[name, address] : request.imports) {
+    auto *item = wire.add_imports();
+    item->set_name(name);
+    item->set_address(address);
+  }
   for (const auto &name : request.entry_symbols)
     wire.add_entry_symbols(name);
   if (wire.ByteSizeLong() > live::max_payload_bytes)
