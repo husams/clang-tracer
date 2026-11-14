@@ -1,6 +1,7 @@
 # Lesson 15: collect every call of one request
 
-Reference: [Shared context](../../../docs/shared-context.md).
+Guide section: [Collect every call of one request](../../../docs/guide/tutorials.md#collect-every-call-of-one-request).
+State API: [Shared context](../../../docs/shared-context.md).
 
 The target is a small checkout service. One request, `handle_checkout`, calls
 `authenticate`, `price_item` two or three times, and `charge_card`. Each Enter

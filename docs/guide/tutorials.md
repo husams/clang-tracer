@@ -240,6 +240,187 @@ unset CLANG_TRACER_ENDPOINT
 
 Look for `request.step` events sharing the same request ID. The worker inherits context through supported `pthread_create` propagation and reports twice the request ID. The outer call reports the worker result plus one. For an explicit scope or a durable producer/collector journal, follow [Shared context](../shared-context.md).
 
+## Collect every call of one request
+
+A service handles a request by calling several functions, and concurrent requests interleave their calls. This lab installs one probe per function, connects the probes through one shared state, and publishes a single event per request that lists every call the request made. The files are in [lesson 15](../../examples/lessons/15-request-calls/README.md).
+
+Save the service as `target.cpp`. `handle_checkout` is one request; each Enter serves two requests on two threads at once.
+
+```cpp
+// A small checkout service: every request runs the same four steps.
+// Ordinary application code with no dependency on the tracer.
+#include <cstdio>
+#include <poll.h>
+#include <sys/prctl.h>
+#include <thread>
+#include <unistd.h>
+
+// The pauses make the two requests of a round overlap.
+__attribute__((noinline)) int authenticate(int user) {
+  usleep(30'000);
+  return user % 2; // 1 = accepted
+}
+
+__attribute__((noinline)) int price_item(int sku, int quantity) {
+  usleep(30'000);
+  return sku / 10 * quantity;
+}
+
+__attribute__((noinline)) int charge_card(int user, int amount) {
+  usleep(30'000);
+  return amount > 0 ? 9000 + user : -1; // receipt number
+}
+
+// One request. Everything it calls belongs to this request.
+__attribute__((noinline)) int handle_checkout(int request, int user) {
+  if (!authenticate(user))
+    return -1;
+  int total = price_item(120, 2) + price_item(350, 1);
+  if (request % 2 == 0)
+    total += price_item(990, 3);
+  return charge_card(user, total);
+}
+
+int main() {
+#ifdef PR_SET_PTRACER
+  if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) == -1) {
+    perror("PR_SET_PTRACER");
+    return 1;
+  }
+#endif
+  std::printf("PID %ld | press Enter to serve two overlapping requests, Ctrl+C to exit\n",
+              static_cast<long>(getpid()));
+  std::fflush(stdout);
+
+  int request = 0;
+  pollfd input{STDIN_FILENO, POLLIN, 0};
+  while (true) {
+    // Check stdin without blocking in a read while the tracer attaches.
+    if (poll(&input, 1, 0) > 0) {
+      char byte;
+      if (read(STDIN_FILENO, &byte, 1) != 1) break;
+      if (byte == '\n') {
+        const int first = ++request, second = ++request;
+        int receipts[2] = {0, 0};
+        // Two clients at once: their calls interleave in time.
+        std::thread a([&] { receipts[0] = handle_checkout(first, 41); });
+        usleep(15'000);
+        std::thread b([&] { receipts[1] = handle_checkout(second, 77); });
+        a.join();
+        b.join();
+        std::printf("request %d -> receipt %d | request %d -> receipt %d\n",
+                    first, receipts[0], second, receipts[1]);
+        std::fflush(stdout);
+      }
+    }
+    usleep(20'000);
+  }
+}
+```
+
+```bash
+c++ -g -O0 -fno-omit-frame-pointer -fno-pie -pthread -no-pie -Wl,--build-id target.cpp -o target
+./target
+```
+
+Save the shared state as `state.hpp`. Every observer includes it, so all of them see the same `RequestState` type.
+
+```cpp
+// The state every probe of this lesson shares. Each hook file includes it.
+// The callback compiler supplies Call, State and shared_state.
+#include <string>
+#include <vector>
+
+struct RequestScope {};
+
+// One traced call made while serving a request.
+struct Step {
+  std::string function;
+  int argument = 0; // sku for price_item, otherwise the user
+  int result = 0;
+};
+
+// One object exists per request. The engine creates it when the outermost
+// probed call starts and releases it when that call returns, so overlapping
+// requests on different threads never see each other's steps.
+struct RequestState : shared_state<RequestScope> {
+  int request = 0;
+  std::vector<Step> steps;
+};
+```
+
+Save the request observer as `request.cpp`. It records the request number on entry and publishes the state when the request returns.
+
+```cpp
+// Probe for handle_checkout(int, int): it opens the request and reports it.
+#include "state.hpp"
+
+struct Interceptor {
+  // Asks the engine to create or reuse RequestState. Declaration only.
+  Interceptor(State<RequestState>);
+
+  // The outermost call of the request: the state is fresh here.
+  void pre(const Call& call, RequestState& state) {
+    state.request = call.arg<int>(0);
+  }
+
+  // By now the step probes have appended every call the request made.
+  // Publish the whole list as one event.
+  void post(const Call& call, RequestState&) {
+    call.field("receipt", call.result<int>());
+    call.context().event("request.completed");
+  }
+};
+```
+
+Save one step observer per called function. This is `price_item.cpp`; create `authenticate.cpp` and `charge_card.cpp` the same way, changing only the name in the string.
+
+```cpp
+// Probe for price_item: appends this call to the request it runs in.
+#include "state.hpp"
+
+struct Interceptor {
+  Interceptor(State<RequestState>);
+
+  void post(const Call& call, RequestState& state) {
+    state.steps.push_back({"price_item", call.arg<int>(0), call.result<int>()});
+  }
+};
+```
+
+Start the REPL in the same directory and install the four probes. Press Enter once in the target terminal while `%collect` waits.
+
+```bash
+%attach 12345
+%probe inject "handle_checkout(int, int)" --callback request.cpp --print-arguments --print-result
+%probe inject "authenticate(int)" --callback authenticate.cpp
+%probe inject "price_item(int, int)" --callback price_item.cpp
+%probe inject "charge_card(int, int)" --callback charge_card.cpp
+%collect --name request.completed --count 2 --timeout 30 --as requests
+%events list requests
+```
+
+The collection holds two POST events of `handle_checkout`, one per request. Print the steps each one carries. The lesson has this loop as `report.cpp` for `%cpp load report.cpp`.
+
+```cpp
+for (const auto& event : tracer.batch("requests")) {
+  auto state = event.state_snapshot();
+  std::cout << "request " << state.field("request").as<int>() << ':';
+  for (const auto& step : state.field("steps").elements())
+    std::cout << ' ' << step.field("function").as<std::string>() << '('
+              << step.field("argument").as<int>() << ")="
+              << step.field("result").as<int>();
+  std::cout << '\n';
+}
+```
+
+```text
+request 1: authenticate(41)=1 price_item(120)=24 price_item(350)=35 charge_card(41)=9041
+request 2: authenticate(77)=1 price_item(120)=24 price_item(350)=35 price_item(990)=297 charge_card(77)=9077
+```
+
+All four observers declare `Interceptor(State<RequestState>)`, and `RequestState` derives from `shared_state<RequestScope>`, so probes that run inside the same request receive the same object. The state starts with the outermost probed call, here `handle_checkout`, and ends when that call returns, which keeps the two overlapping requests apart. Only `request.cpp` publishes an event, and `%collect --name` selects it, so you receive one event per request instead of one per call. `%events show requests --index 0` prints the same state as a `decoded state RequestState` line without any C++. Finish with `%detach`. [Shared context](../shared-context.md) describes the state API.
+
 ## Trace from the native CLI
 
 Use the [first-probe target](user.md#create-a-target-and-a-basic-probe).
