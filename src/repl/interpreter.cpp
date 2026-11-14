@@ -13,6 +13,7 @@
 #include <clang/Interpreter/Interpreter.h>
 #include <clang/Interpreter/PartialTranslationUnit.h>
 #include <clang/Interpreter/Value.h>
+#include <clang/Lex/Lexer.h>
 #include <clang/Lex/Preprocessor.h>
 #include <clang/Tooling/Tooling.h>
 #include <llvm/Config/llvm-config.h>
@@ -206,6 +207,8 @@ struct CppEngine::Impl {
   std::map<std::filesystem::path, HeaderInput> headers;
   std::map<std::pair<std::string, std::filesystem::path>, std::string> mappings;
   std::set<std::string> imported_adapters;
+  // Qualified names of the types and aliases the imported adapters defined.
+  std::set<std::string> adapter_definitions;
   bool synchronized = true;
   bool user_cells = false;
   explicit Impl(const std::filesystem::path& facade)
@@ -310,6 +313,62 @@ struct CppEngine::Impl {
     }
   }
 };
+
+// One namespace-scope definition written in a prepared adapter.
+namespace {
+struct AdapterDefinition {
+  std::string name;
+  std::size_t begin = 0;
+  std::size_t end = 0; // one past the terminating semicolon
+};
+
+void collect_adapter_definitions(const clang::DeclContext &scope, const std::string &source,
+                                 std::vector<AdapterDefinition> &definitions) {
+  const auto &ast = llvm::cast<clang::Decl>(scope).getASTContext();
+  const auto &sources = ast.getSourceManager();
+  for (const auto *decl : scope.decls()) {
+    if (decl->isImplicit() || !sources.isWrittenInMainFile(decl->getLocation()))
+      continue;
+    if (const auto *ns = llvm::dyn_cast<clang::NamespaceDecl>(decl)) {
+      collect_adapter_definitions(*ns, source, definitions);
+      continue;
+    }
+    const auto *tag = llvm::dyn_cast<clang::TagDecl>(decl);
+    const auto *alias = llvm::dyn_cast<clang::TypedefNameDecl>(decl);
+    // Template specializations keep their own definitions.
+    const bool definition = tag && tag->isThisDeclarationADefinition() && tag->getIdentifier() &&
+                            !llvm::isa<clang::ClassTemplateSpecializationDecl>(tag);
+    // SnapshotTypeN is numbered per adapter, so two adapters reuse the names.
+    const bool snapshot_alias = alias &&
+        alias->getQualifiedNameAsString().rfind("tracer_prepared::SnapshotType", 0) == 0;
+    if (!definition && !snapshot_alias)
+      continue;
+    const auto range = decl->getSourceRange();
+    const auto last = clang::Lexer::getLocForEndOfToken(range.getEnd(), 0, sources,
+                                                        ast.getLangOpts());
+    if (range.getBegin().isMacroID() || last.isInvalid() || last.isMacroID())
+      continue;
+    auto end = static_cast<std::size_t>(sources.getFileOffset(last));
+    while (end < source.size() && (source[end] == ' ' || source[end] == '\n'))
+      ++end;
+    if (end >= source.size() || source[end] != ';')
+      continue;
+    definitions.push_back({llvm::cast<clang::NamedDecl>(decl)->getQualifiedNameAsString(),
+                           sources.getFileOffset(range.getBegin()), end + 1});
+  }
+}
+
+std::vector<AdapterDefinition> adapter_definitions(const std::string &source,
+                                                   const std::vector<std::string> &arguments) {
+  auto unit = clang::tooling::buildASTFromCodeWithArgs(source, arguments, "prepared-adapter.cc");
+  if (!unit || unit->getDiagnostics().hasErrorOccurred())
+    return {};
+  std::vector<AdapterDefinition> definitions;
+  collect_adapter_definitions(*unit->getASTContext().getTranslationUnitDecl(), source,
+                              definitions);
+  return definitions;
+}
+} // namespace
 
 CppEngine::CppEngine(Facade &facade, std::vector<std::string> arguments)
     : facade_(facade), arguments_(std::move(arguments)) {}
@@ -484,10 +543,29 @@ std::string CppEngine::import_prepared_adapter(const std::string &source,
   const auto key = mapping_digest(source);
   if (impl_ && impl_->imported_adapters.count(key))
     return {};
-  const auto path = mapping_cache_directory() / ("prepared-" + key + ".hpp");
-  save_mapping_header(path, key, "#pragma once\n" + source);
+  initialize();
+  // Adapters of probes that share application types each declare those types.
+  // The interpreter cannot take a second definition, so keep the first one and
+  // drop the repeats from this adapter.
+  const auto definitions = adapter_definitions(source, profile_arguments(arguments_));
+  auto body = source;
+  std::string reused;
+  for (auto definition = definitions.rbegin(); definition != definitions.rend(); ++definition) {
+    if (!impl_->adapter_definitions.count(definition->name))
+      continue;
+    body.erase(definition->begin, definition->end - definition->begin);
+    if (definition->name.rfind("tracer_prepared::", 0))
+      reused = " " + definition->name + reused;
+  }
+  const auto body_key = body == source ? key : mapping_digest(body);
+  const auto path = mapping_cache_directory() / ("prepared-" + body_key + ".hpp");
+  save_mapping_header(path, body_key, "#pragma once\n" + body);
   auto imported = import_headers({path.string()}, {}, {}, modules);
   impl_->imported_adapters.insert(key);
+  for (const auto &definition : definitions)
+    impl_->adapter_definitions.insert(definition.name);
+  if (!reused.empty())
+    imported += "\nreused imported types:" + reused;
   return imported;
 }
 

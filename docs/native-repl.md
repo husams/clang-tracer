@@ -1608,6 +1608,11 @@ target's environment forces that fallback for testing. In a followed member a
 left out by the checks or the read budget looks the same as one with no
 pointee.
 
+Prepared packages of probes that share application types each declare those
+types. One REPL session keeps the first declaration of a type and drops the
+repeats from later packages, reporting them as `reused imported types: ...`,
+so several prepared probes on the same classes can be injected in one session.
+
 A reusable record policy can follow specific raw pointer or reference fields wherever that
 record is captured as an argument, receiver, or result. Define the policy in
 a C++ header and supply it through the existing `%probe prepare --include`
