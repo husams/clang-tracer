@@ -128,7 +128,8 @@ bool publish(std::uint32_t pid, std::uint64_t process_start,
     (void)value;
     addresses.insert(address);
   }
-  std::vector<injector::CodePatch> patches, drained;
+  std::vector<injector::CodePatch> patches;
+  std::vector<injector::CodeRange> drained;
   std::vector<const live::Entry *> bindings;
   for (const auto address : addresses) {
     const auto old = from.entries.find(address);
@@ -144,9 +145,9 @@ bool publish(std::uint32_t pid, std::uint64_t process_start,
     bindings.push_back(&entry);
     if (!registry_gated && (from.safe_point == live::SafePoint::drained_stack ||
                             to.safe_point == live::SafePoint::drained_stack)) {
-      drained.push_back({entry.address, nullptr, nullptr, entry.function_size});
+      drained.push_back({entry.address, entry.function_size, entry.return_at_end});
       if (old != from.entries.end())
-        drained.push_back({old->second.mapping_begin, nullptr, nullptr, old->second.mapping_size});
+        drained.push_back({old->second.mapping_begin, old->second.mapping_size});
     }
   }
   if (before_write)

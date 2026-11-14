@@ -270,7 +270,8 @@ Entry bind(std::uint32_t pid, const Image &image, const Symbol &symbol,
     throw std::runtime_error("rebuild required: entry needs a reserved 14-byte NOP overwrite window");
   return {symbol.name, signature(symbol.name, definition), site(definition), image.path,
           symbol.address, address, symbol.size, std::string(code.substr(0, prefix)),
-          llvm::toHex(llvm::object::getBuildID(&image.elf), true)};
+          llvm::toHex(llvm::object::getBuildID(&image.elf), true),
+          native_entry::may_return_at_end(address, code)};
 }
 
 bool thunk_for(const std::string &symbol, const std::string &demangled) {

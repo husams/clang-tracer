@@ -49,6 +49,7 @@ struct Entry {
   std::size_t function_size = 0;
   std::string original_bytes;
   std::string build_id;
+  bool return_at_end = true;
   // A verified reserved NOP window leaves a stable native bypass at this
   // address, including the original unwind metadata and argument registers.
   [[nodiscard]] std::uintptr_t original() const noexcept {

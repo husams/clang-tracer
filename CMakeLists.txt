@@ -262,7 +262,8 @@ if(BUILD_TESTING)
   add_test(NAME callback_pch_unavailable
     COMMAND callback-pch-tests "${_tracer_resource_dir}" --unavailable-cache)
   set_tests_properties(callback_pch_reuse callback_pch_unavailable PROPERTIES TIMEOUT 60)
-  add_executable(native-detour-tests tests/native_detour_tests.cpp src/native_detour.cpp)
+  add_executable(native-detour-tests tests/native_detour_tests.cpp
+    src/native_detour.cpp src/native_entry.cpp)
   target_include_directories(native-detour-tests PRIVATE include src ${LLVM_INCLUDE_DIRS})
   target_link_libraries(native-detour-tests PRIVATE LLVM tracer_headers)
   target_compile_options(native-detour-tests PRIVATE -Wall -Wextra -Wpedantic)

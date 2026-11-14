@@ -859,20 +859,23 @@ struct Process::PeerFreeze {
   }
 
 #if defined(__x86_64__)
-  [[nodiscard]] bool may_have_active_frames(::tracer::compat::span<const CodePatch> ranges) const {
+  [[nodiscard]] bool may_have_active_frames(::tracer::compat::span<const CodeRange> ranges) const {
     if (ranges.empty())
       return false;
     // Look for both current PCs and saved return/signal PCs. An incomplete
     // stack read is a failed drain. Stale words can delay publication.
     const auto mappings = read_maps(process.process_id_);
-    const auto inside = [&](std::uintptr_t value) {
+    const auto inside = [&](std::uintptr_t value, bool saved_pc) {
       return std::any_of(ranges.begin(), ranges.end(), [&](const auto &range) {
-        return value > range.address && value - range.address <= range.size;
+        if (value <= range.address)
+          return false;
+        const auto offset = value - range.address;
+        return offset < range.size || (saved_pc && offset == range.size && range.return_at_end);
       });
     };
     const auto affected = [&](pid_t tid) {
       const auto regs = object_target::read_registers(tid);
-      if (inside(regs.rip) || (regs.rsp & (sizeof(std::uintptr_t) - 1)))
+      if (inside(regs.rip, false) || (regs.rsp & (sizeof(std::uintptr_t) - 1)))
         return true;
       const auto mapping = std::find_if(mappings.begin(), mappings.end(), [&](const auto &map) {
         return map.readable && regs.rsp >= map.start && regs.rsp < map.end;
@@ -886,7 +889,8 @@ struct Process::PeerFreeze {
         iovec remote{reinterpret_cast<void *>(cursor), count};
         const auto got = linux_api::process_vm_readv(process.process_id_, &local, 1, &remote, 1, 0);
         if (got != static_cast<ssize_t>(count) ||
-            std::any_of(words.begin(), words.begin() + count / sizeof(words.front()), inside))
+            std::any_of(words.begin(), words.begin() + count / sizeof(words.front()),
+                        [&](auto value) { return inside(value, true); }))
           return true;
         cursor += count;
       }
@@ -1735,7 +1739,7 @@ bool Process::patch_code(std::uintptr_t address, const void *expected,
 bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches,
                                const std::function<void()> &validate_mappings,
                                const std::function<void()> &on_commit,
-                               ::tracer::compat::span<const CodePatch> drained_ranges) {
+                               ::tracer::compat::span<const CodeRange> drained_ranges) {
   ensure_usable();
   if (patches.empty())
     return true;
