@@ -21,6 +21,7 @@ run the section's commands without typing the sources first.
 | [13-native-cli](13-native-cli/README.md) | [Trace from the native CLI](../../docs/guide/tutorials.md#trace-from-the-native-cli) |
 | [14-launch](14-launch/README.md) | [Launch a local application](../../docs/native-repl.md#launch-a-local-application) (REPL walkthrough) |
 | [15-request-calls](15-request-calls/README.md) | [Collect every call of one request](../../docs/guide/tutorials.md#collect-every-call-of-one-request) |
+| [16-polymorphic-items](16-polymorphic-items/README.md) | [Strings and class/struct values](../../docs/native-repl.md#strings-and-classstruct-values) (REPL walkthrough) |
 
 The remaining sections need no project. "Install and check the tools" and
 "Open the interactive guide" only run installed commands, and "Run the
