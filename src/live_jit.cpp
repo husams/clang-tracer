@@ -48,6 +48,7 @@ std::uintptr_t runtime_import(llvm::StringRef name) {
                       name.starts_with("_ZSt") || name.starts_with("_ZNSt") ||
                       name.starts_with("_ZNKSt") || name.starts_with("_ZTVSt") ||
                       name.starts_with("_ZNSa") || name.starts_with("_ZNKSa") ||
+                      name.starts_with("_ZNSi") || name.starts_with("_ZNSo") ||
                       name == "__dynamic_cast" ||
                       name.starts_with("_ZTISt") || name.starts_with("_ZTSSt") ||
                       name.starts_with("_ZTVN10__cxxabiv1") ||
@@ -56,7 +57,12 @@ std::uintptr_t runtime_import(llvm::StringRef name) {
   if (!is_c && !is_cpp && !is_unwind)
     return 0;
   const auto symbol = name.str();
-  void *address = ::dlsym(RTLD_DEFAULT, symbol.c_str());
+  const auto library = is_c ? "libc.so.6" : is_unwind ? "libgcc_s.so.1" : "libstdc++.so.6";
+  std::unique_ptr<void, decltype(&::dlclose)> handle(
+      ::dlopen(library, RTLD_NOW | RTLD_NOLOAD), &::dlclose);
+  if (!handle)
+    return 0;
+  void *address = ::dlsym(handle.get(), symbol.c_str());
   Dl_info info{};
   if (!address || !::dladdr(address, &info) || !info.dli_fname)
     return 0;

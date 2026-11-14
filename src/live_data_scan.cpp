@@ -8,14 +8,15 @@
 #include <set>
 #include <stdexcept>
 
-#include <dlfcn.h>
-#include <link.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/DebugInfo/DWARF/DWARFContext.h>
 #include <llvm/DebugInfo/DWARF/DWARFDie.h>
 #include <llvm/Demangle/Demangle.h>
 #include <llvm/Object/BuildID.h>
 #include <llvm/Object/ELFObjectFile.h>
+
+#include <dlfcn.h>
+#include <link.h>
 
 #include "debug_resolver.hpp"
 #include "linux_syscalls.hpp"
@@ -145,7 +146,7 @@ void collect_symbols(const Elf& elf, Symbols& wanted) {
   const auto collect = [&](auto symbols) {
     for (const auto symbol : symbols) {
       const llvm::object::ELFSymbolRef entry(symbol);
-      if (entry.getELFType() != llvm::ELF::STT_OBJECT) {
+      if (entry.getELFType() != STT_OBJECT) {
         continue;
       }
       auto name = entry.getName();
@@ -232,7 +233,7 @@ struct TargetImage::Image {
       throw std::runtime_error(llvm::toString(headers.takeError()));
     }
     for (const auto& segment : *headers) {
-      if (segment.p_type == llvm::ELF::PT_LOAD && (segment.p_flags & llvm::ELF::PF_X) &&
+      if (segment.p_type == PT_LOAD && (segment.p_flags & PF_X) &&
           segment.p_filesz && !text) {
         text = segment.p_vaddr;
       }
