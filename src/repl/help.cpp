@@ -109,10 +109,15 @@ const CommandTopic commands[] = {
     {"instructions stop", "%instructions stop [--save NEW_FILE]",
      "Stop and drain the selected session's capture, then print original instruction addresses and selected details."},
     {"processes", "%processes [--filter TEXT]", "List local target processes that match the filter."},
-    {"sessions", "%sessions", "List sessions known to the connected server."},
-    {"use", "%use SESSION", "Select an attached session for subsequent commands.", "%use s1"},
+    {"sessions", "%sessions",
+     "List sessions known to the connected server, one per line with ID, PID and state. "
+     "The selected session is marked with *."},
+    {"use", "%use SESSION",
+     "Select an attached session for subsequent commands. SESSION is an ID from %sessions or a unique prefix of one.",
+     "%use s1"},
     {"status", "%status", "Show connection details, the selected session, and retained collections."},
-    {"detach", "%detach [SESSION]", "Detach the selected or named session and remove its probes."},
+    {"detach", "%detach [SESSION]",
+     "Detach the selected or named session and remove its probes. SESSION may be a unique ID prefix."},
     {"modules", "%modules [[--filter TEXT] [--details] | --elf PATH | --watch [--count N] [--timeout SECONDS]]",
      "List application modules in the selected process. The filter matches a case-sensitive path substring. "
      "Details show executable mappings, file identity, and a mapping token. "

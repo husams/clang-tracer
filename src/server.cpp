@@ -1580,9 +1580,11 @@ public:
         return {grpc::StatusCode::ALREADY_EXISTS,
                 "a session already owns this PID"};
       }
-      if (sessions_.size() + pending_pids_.size() >= kSessionLimit) {
+      if (sessions_.size() + pending_pids_.size() >= kSessionLimit &&
+          !evict_finished_session_locked()) {
         return {grpc::StatusCode::RESOURCE_EXHAUSTED,
-                "session history limit reached"};
+                "session limit reached: " + std::to_string(kSessionLimit) +
+                    " sessions are attached, attaching, or failed; detach one first"};
       }
       if (!pending_pids_.insert(pid).second) {
         return {grpc::StatusCode::ALREADY_EXISTS,
@@ -1608,6 +1610,7 @@ public:
       std::lock_guard lock(mutex_);
       pending_pids_.erase(pid);
       sessions_.emplace(id, session);
+      session_order_.push_back(id);
       active_by_pid_[pid] = id;
     } catch (const injector::InitialAdmissionUnavailable &error) {
       // Admission is read-only and Process::attach has confirmed that all
@@ -1625,6 +1628,7 @@ public:
       std::lock_guard lock(mutex_);
       pending_pids_.erase(pid);
       sessions_.emplace(id, session);
+      session_order_.push_back(id);
       return status_for(error);
     }
     response->CopyFrom(session->snapshot());
@@ -2686,6 +2690,36 @@ private:
   std::map<std::string, std::shared_ptr<SnapshotGroup>> snapshot_groups_;
   std::map<std::uint32_t, std::string> active_by_pid_;
   std::set<std::uint32_t> pending_pids_;
+  // Session ids in attach order, oldest first, so history eviction is FIFO.
+  std::deque<std::string> session_order_;
+
+  // Finished sessions are kept only as history. Drop the oldest one so a full
+  // table of detached or exited sessions never blocks a new attach. Requires
+  // mutex_. Returns false when every retained session still owns a target.
+  bool evict_finished_session_locked() {
+    for (auto it = session_order_.begin(); it != session_order_.end();) {
+      const auto found = sessions_.find(*it);
+      if (found == sessions_.end()) {
+        it = session_order_.erase(it);
+        continue;
+      }
+      // Notice a target that exited without a later request touching it.
+      found->second->refresh_process_state();
+      const auto state = found->second->snapshot().state();
+      if (state != clangtracer::v1::Session::DETACHED &&
+          state != clangtracer::v1::Session::EXITED) {
+        ++it;
+        continue;
+      }
+      const auto active = active_by_pid_.find(found->second->pid());
+      if (active != active_by_pid_.end() && active->second == found->first)
+        active_by_pid_.erase(active);
+      sessions_.erase(found);
+      session_order_.erase(it);
+      return true;
+    }
+    return false;
+  }
 
   std::shared_ptr<Session> find_session(const std::string &id) {
     std::lock_guard lock(mutex_);
