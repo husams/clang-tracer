@@ -79,4 +79,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_
   endforeach()
   set_property(TARGET tracer_context_stdlib APPEND PROPERTY LINK_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/context_stdlib.map)
+  if(BUILD_TESTING)
+    add_executable(context-stdlib-init-tests tests/context_stdlib_init_tests.cpp)
+    target_link_libraries(context-stdlib-init-tests PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+    add_dependencies(context-stdlib-init-tests tracer_context_stdlib)
+    add_test(NAME shared_context_stdlib_init
+      COMMAND context-stdlib-init-tests $<TARGET_FILE:tracer_context_stdlib>)
+    set_tests_properties(shared_context_stdlib_init PROPERTIES TIMEOUT 15)
+  endif()
 endif()
