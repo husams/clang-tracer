@@ -4,6 +4,7 @@
 #include "../proc_identity.hpp"
 #include "../sqlite_events.hpp"
 #include "../bounded_proto.hpp"
+#include "../live_mock.hpp"
 #include "../value_snapshot_storage.hpp"
 
 #include <algorithm>
@@ -1659,6 +1660,171 @@ bool Controller::execute(const Command &command) {
       session.connection = connection_;
     }
     detach(session);
+    return true;
+  }
+  case K::live_update:
+  case K::live_preview:
+  case K::live_watch:
+  case K::live_status:
+  case K::live_revert:
+  case K::live_mock:
+  case K::live_update_data:
+  case K::live_scan_heap: {
+    require_session(selected_);
+    api::LiveUpdateRequest request;
+    request.set_session_id(selected_.id);
+    switch (command.kind) {
+    case K::live_update: request.set_action(api::LiveUpdateRequest::UPDATE); break;
+    case K::live_preview:
+    case K::live_watch: request.set_action(api::LiveUpdateRequest::PREVIEW); break;
+    case K::live_status: request.set_action(api::LiveUpdateRequest::STATUS); break;
+    case K::live_revert: request.set_action(api::LiveUpdateRequest::REVERT); break;
+    case K::live_mock: request.set_action(api::LiveUpdateRequest::MOCK); break;
+    case K::live_update_data: request.set_action(api::LiveUpdateRequest::UPDATE_DATA); break;
+    case K::live_scan_heap: request.set_action(api::LiveUpdateRequest::SCAN_HEAP); break;
+    default: throw std::logic_error("invalid live command");
+    }
+    if (command.kind == K::live_revert && !args.empty()) {
+      request.set_revision(unsigned_number(args.front(), "revision"));
+      request.set_has_exact_revision(true);
+    }
+    if (command.has("--retention-limit")) {
+      const auto limit = command.number("--retention-limit", 0);
+      if (!limit)
+        throw std::invalid_argument("retention limit must be positive");
+      request.set_retention_limit(limit);
+    }
+    const auto snapshot = [](const std::filesystem::path &path) {
+      std::ifstream input(path, std::ios::binary);
+      if (!input)
+        throw std::runtime_error("cannot read saved source " + path.string());
+      return std::string(std::istreambuf_iterator<char>(input), {});
+    };
+    std::map<std::string, std::string> watched;
+    if (command.kind == K::live_update || command.kind == K::live_preview ||
+        command.kind == K::live_watch) {
+      if (args.empty())
+        throw std::invalid_argument("provide at least one source or header");
+      for (const auto &arg : args) {
+        const auto path = std::filesystem::canonical(arg).string();
+        auto contents = snapshot(path);
+        if (command.kind == K::live_watch) {
+          if (!watched.emplace(path, std::move(contents)).second)
+            throw std::invalid_argument("duplicate live watch file: " + path);
+        } else {
+          auto *source = request.add_sources();
+          source->set_path(path);
+          source->set_contents(std::move(contents));
+        }
+      }
+    } else if (command.kind != K::live_status && command.kind != K::live_revert) {
+      for (const auto &arg : args)
+        request.add_arguments(arg);
+    }
+    if (command.kind != K::live_status && command.kind != K::live_revert) {
+      request.set_build_manifest(std::filesystem::absolute(
+          command.option("--build", "clang-tracer-live.textproto")).string());
+      request.set_compilation_database(std::filesystem::absolute(
+          command.option("--compdb", "compile_commands.json")).string());
+    }
+    for (const auto &[name, options] : command.options) {
+      if (name == "--compdb" || name == "--build" || name == "--retention-limit")
+        continue;
+      for (const auto &value : options) {
+        auto *option = request.add_options();
+        option->set_name(name);
+        option->set_value(value);
+      }
+    }
+    if (command.kind == K::live_mock)
+      tracer::live::snapshot_live_mock(request);
+    const auto print = [&](const api::LiveUpdateStatus &response) {
+      out_ << "live " << api::LiveUpdateStatus::State_Name(response.state())
+           << " revision=" << response.active_revision()
+           << " retained=" << response.retained_generations() << '/' << response.retention_limit();
+      if (!response.diagnostic().empty())
+        out_ << " " << response.diagnostic();
+      out_ << '\n';
+      for (const auto &note : response.notes())
+        out_ << "  " << note << '\n';
+      for (const auto &entry : response.candidates()) {
+        out_ << "  " << api::LiveUpdateStatus::State_Name(entry.state())
+             << ' ' << entry.signature() << " [" << entry.symbol() << "] "
+             << entry.module() << " " << entry.source();
+        if (entry.address())
+          out_ << " address=0x" << std::hex << entry.address() << std::dec;
+        if (!entry.diagnostic().empty())
+          out_ << " " << entry.diagnostic();
+        out_ << '\n';
+      }
+      out_.flush();
+    };
+    const auto perform = [&] {
+      return unary<api::LiveUpdateStatus>(
+          [&](auto &context, auto &response) {
+            Cancellation cancel(context);
+            return stub_->LiveUpdate(&context, request, &response);
+          },
+          settings_.timeout_seconds);
+    };
+    const auto preview_and_apply = [&] {
+      request.clear_preview_revision();
+      request.set_action(api::LiveUpdateRequest::PREVIEW);
+      const auto preview = perform();
+      print(preview);
+      if (preview.state() != api::LiveUpdateStatus::PLANNED || interrupted)
+        return preview.state() == api::LiveUpdateStatus::UNCHANGED;
+      request.set_preview_revision(preview.active_revision());
+      request.set_action(api::LiveUpdateRequest::UPDATE);
+      const auto applied = perform();
+      print(applied);
+      return applied.state() == api::LiveUpdateStatus::APPLIED ||
+             applied.state() == api::LiveUpdateStatus::UNCHANGED;
+    };
+    if (command.kind == K::live_watch) {
+      out_ << "Watching " << watched.size() << " live source files. Press Ctrl-C to stop.\n";
+      out_.flush();
+      std::map<std::string, std::string> pending;
+      while (!interrupted) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        request.clear_sources();
+        std::map<std::string, std::string> saved;
+        try {
+          for (const auto &[path, before] : watched) {
+            auto contents = snapshot(path);
+            if (contents != before)
+              saved.emplace(path, std::move(contents));
+          }
+        } catch (const std::exception &) {
+          // Editors may temporarily remove a path while replacing its contents.
+          continue;
+        }
+        if (saved.empty() || interrupted)
+          continue;
+        for (auto &[path, contents] : saved) {
+          watched.at(path) = contents;
+          pending.insert_or_assign(path, std::move(contents));
+        }
+        for (const auto &[path, contents] : pending) {
+          auto *source = request.add_sources();
+          source->set_path(path);
+          source->set_contents(contents);
+        }
+        try {
+          if (preview_and_apply())
+            pending.clear();
+        } catch (const std::exception &) {
+          if (!interrupted)
+            throw;
+        }
+      }
+      out_ << "Live watch stopped.\n";
+      out_.flush();
+    } else if (command.kind == K::live_update) {
+      preview_and_apply();
+    } else {
+      print(perform());
+    }
     return true;
   }
   case K::object_start:

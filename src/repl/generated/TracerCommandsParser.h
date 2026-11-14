@@ -1,5 +1,5 @@
 
-// Generated from src/repl/TracerCommands.g4 by ANTLR 4.13.2
+// Generated from TracerCommands.g4 by ANTLR 4.13.2
 
 #pragma once
 
@@ -42,10 +42,14 @@ public:
     T__154 = 155, T__155 = 156, T__156 = 157, T__157 = 158, T__158 = 159,
     T__159 = 160, T__160 = 161, T__161 = 162, T__162 = 163, T__163 = 164,
     T__164 = 165, T__165 = 166, T__166 = 167, T__167 = 168, T__168 = 169,
-    T__169 = 170, T__170 = 171, T__171 = 172, UINT = 173, STRING = 174,
-    SHELL = 175, METADATA_ONLY = 176, SQLITE = 177, STACK = 178, CWD = 179,
-    SIGNATURE = 180, MEMBER = 181, SNAPSHOT_RETURN_POINTEE = 182, WORD = 183,
-    WS = 184
+    T__169 = 170, T__170 = 171, T__171 = 172, T__172 = 173, T__173 = 174,
+    T__174 = 175, T__175 = 176, T__176 = 177, T__177 = 178, T__178 = 179,
+    T__179 = 180, T__180 = 181, T__181 = 182, T__182 = 183, T__183 = 184,
+    T__184 = 185, T__185 = 186, T__186 = 187, T__187 = 188, T__188 = 189,
+    T__189 = 190, T__190 = 191, T__191 = 192, UINT = 193, STRING = 194,
+    SHELL = 195, METADATA_ONLY = 196, SQLITE = 197, STACK = 198, CWD = 199,
+    SIGNATURE = 200, MEMBER = 201, SNAPSHOT_RETURN_POINTEE = 202, WORD = 203,
+    WS = 204
   };
 
   enum {
@@ -58,9 +62,10 @@ public:
     RuleInterceptor = 23, RuleEvents = 24, RuleCollect = 25, RuleRecord = 26,
     RuleStreamOption = 27, RuleCpp = 28, RuleShell = 29, RuleComplete = 30,
     RuleType = 31, RuleHelp = 32, RuleQuit = 33, RuleBulkTrace = 34, RuleBulkTraceOption = 35,
-    RuleValue = 36, RuleKeyword = 37, RuleObjectWatch = 38, RuleObjectOption = 39,
-    RuleMemory = 40, RuleProbeEntry = 41, RuleProbeReload = 42, RuleStackFilter = 43,
-    RuleContextEventBytes = 44, RuleExtraCompileOption = 45, RuleCwdOption = 46
+    RuleValue = 36, RuleKeyword = 37, RuleLiveUpdate = 38, RuleLiveScanSelection = 39,
+    RuleLiveOption = 40, RuleObjectWatch = 41, RuleObjectOption = 42, RuleMemory = 43,
+    RuleProbeEntry = 44, RuleProbeReload = 45, RuleStackFilter = 46, RuleContextEventBytes = 47,
+    RuleExtraCompileOption = 48, RuleCwdOption = 49
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -118,6 +123,9 @@ public:
   class BulkTraceOptionContext;
   class ValueContext;
   class KeywordContext;
+  class LiveUpdateContext;
+  class LiveScanSelectionContext;
+  class LiveOptionContext;
   class ObjectWatchContext;
   class ObjectOptionContext;
   class MemoryContext;
@@ -173,6 +181,7 @@ public:
     ProbeEntryContext *probeEntry();
     ProbeReloadContext *probeReload();
     ObjectWatchContext *objectWatch();
+    LiveUpdateContext *liveUpdate();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -708,6 +717,53 @@ public:
   };
 
   KeywordContext* keyword();
+
+  class  LiveUpdateContext : public antlr4::ParserRuleContext {
+  public:
+    LiveUpdateContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    std::vector<ValueContext *> value();
+    ValueContext* value(size_t i);
+    std::vector<LiveOptionContext *> liveOption();
+    LiveOptionContext* liveOption(size_t i);
+    antlr4::tree::TerminalNode *UINT();
+    std::vector<LiveScanSelectionContext *> liveScanSelection();
+    LiveScanSelectionContext* liveScanSelection(size_t i);
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  LiveUpdateContext* liveUpdate();
+
+  class  LiveScanSelectionContext : public antlr4::ParserRuleContext {
+  public:
+    LiveScanSelectionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    std::vector<ValueContext *> value();
+    ValueContext* value(size_t i);
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  LiveScanSelectionContext* liveScanSelection();
+
+  class  LiveOptionContext : public antlr4::ParserRuleContext {
+  public:
+    LiveOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+    antlr4::tree::TerminalNode *UINT();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  LiveOptionContext* liveOption();
 
   class  ObjectWatchContext : public antlr4::ParserRuleContext {
   public:

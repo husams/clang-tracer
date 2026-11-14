@@ -56,6 +56,85 @@ standard-library include roots. Installing the client alone does not install a
 Linux server or agent.
 
 
+## Live code replacement on Linux x86-64
+
+Use `%live preview FILE...` to inspect the exact native entries. `%live update FILE...`
+previews the same saved snapshot and automatically applies an admitted group.
+`%live status` lists active entries. `%live revert` restores the parent revision,
+and `%live revert 0` restores the build's original entries. Run
+`%live watch source/checkout.cpp source/pricer.cpp` to preview and apply saved
+edits as you test. Press Ctrl-C to return to the prompt.
+
+At build time preserve the original project files under a separate snapshot root.
+Record their relative paths and SHA-256 hashes alongside the executable and exact
+compilation database hashes in `clang-tracer-live.textproto`. Example shape:
+
+```textproto
+source_root: "/project/src"
+snapshot_root: "/project/live-build-snapshot"
+module: "/project/build/app"
+module_sha256: "<SHA-256 of app>"
+compilation_database_sha256: "<SHA-256 of compile_commands.json>"
+inputs { path: "app.cpp" sha256: "<SHA-256 of original app.cpp>" }
+inputs { path: "pricing.hpp" sha256: "<SHA-256 of original pricing.hpp>" }
+```
+
+Build affected units with debug information, `-O0 -fno-inline`,
+`-fpatchable-function-entry=16,0` and a GNU ELF build ID. The manifest must
+cover project dependencies. The compile database must record a matching
+profile for each new translation unit. The REPL can select the database and
+manifest using `--compdb FILE` and `--build FILE`.
+
+The initial profile admits exact symbols in the main executable and checks
+the original entry padding, source signature and lowered ABI before changing
+text. Related entries need a drained stack or the managed registry gate.
+The ABI check covers SysV variadic bodies, fixed-argument Win64 bodies,
+non-trivial returns, and compiler-emitted lifecycle variants. An unresolved
+thunk, unproven alias, or missing call coverage requires a rebuild. Revisions
+keep JIT code mapped for escaped pointers and active calls.
+`--retention-limit N` sets the maximum number of retained JIT generations,
+including reverted generations. Reconnect to the same server to inspect
+the active revision.
+
+```text
+%live mock "ProductStore::load(int)" --file product_fixture.cpp --function load_fixture --fixture products.txt
+%live update-data shared.cpp --discover-file discover.cpp --discover-function discover
+%live scan-heap --type example::Cache --type example::Account
+%live update update.hpp --after-file after.cpp --after-function fixture::after --for-each Cache
+```
+
+Live mocks use exact signatures. `--bind "ALIAS=SIGNATURE"` binds a verified
+application callable. `%live revert` restores the previous dispatch.
+
+Object callbacks use a discovery function with `clang_tracer::ObjectSink`
+from `<clang_tracer/live.hpp>`. A callback may take shared owners, borrowed
+pointers, or per-type reference overloads. Discovery supplies each object's
+existing owner or guarded borrow. Heap scans report candidates and their
+evidence. With libstdc++ and matching DWARF, the scanner also discovers static
+`std::atomic<std::shared_ptr<T>>` roots and atomically loads their owners.
+Automatic discovery admits recognized `make_shared` storage for the exact
+pointee. Other owners can use an explicit discovery callback. For a write
+using `--from-scan ID ...`, the updater reacquires each candidate's original
+owner. Heap addresses with unknown ownership remain read-only.
+
+Managed migration requires application storage using
+`<tracer/live_migration.hpp>` and an exported
+`extern "C" tracer::live::managed::Registry* clang_tracer_managed_registry_v1() noexcept`.
+Submit a C++ recipe that exports `clang_tracer_managed_update_v1`, with the
+after hook in its own file if needed. Use `%live update update.hpp --managed true`
+for a recipe with no hook. Include ABI-compatible application source changes
+with the recipe to publish both together.
+
+```text
+%live update update.hpp cache_code.cpp --after-file after.cpp --after-function fixture::after --for-each Cache
+```
+
+Calls that depend on the managed state must execute under the same registry
+gate. The tool drains managed access, installs the verified native entries,
+and runs the hook against the migrated instances before releasing access.
+If the hook fails, the tool restores the prior entries and state under the
+same gate.
+
 ## Prepare a probe from a binary without headers
 
 Build a module index from a Linux x86-64 ELF executable or shared library.

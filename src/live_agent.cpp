@@ -1,0 +1,152 @@
+#include "live_agent_protocol.hpp"
+#include "live_agent_extension.hpp"
+#include "live_mock_recursion.hpp"
+#include "live_update.hpp"
+#include "tracer.pb.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <fstream>
+#include <map>
+#include <mutex>
+#include <stdexcept>
+
+namespace tracer::live {
+namespace {
+struct Images {
+  std::mutex mutex;
+  std::uint64_t last_token = 0;
+  std::map<std::uint64_t, std::shared_ptr<JitImage>> retained;
+};
+
+Images &images() {
+  // Intentionally process-lifetime: target pointers or frames may outlive the
+  // controller and must remain callable during normal DSO teardown.
+  static auto *state = new Images;
+  return *state;
+}
+
+std::pair<std::uintptr_t, std::size_t> executable_mapping(std::uintptr_t address) {
+  std::ifstream input("/proc/self/maps");
+  std::string line;
+  while (std::getline(input, line)) {
+    unsigned long begin = 0, end = 0;
+    char flags[5]{};
+    if (std::sscanf(line.c_str(), "%lx-%lx %4s", &begin, &end, flags) == 3 &&
+        flags[2] == 'x' && address >= begin && address < end)
+      return {begin, end - begin};
+  }
+  throw std::runtime_error("ORC address lacks an executable target mapping");
+}
+
+} // namespace
+
+EntryImage describe_entry(JitImage &image, std::string_view symbol) {
+  const auto address = image.lookup(symbol);
+  const auto [begin, size] = executable_mapping(address);
+  return {address, begin, size};
+}
+
+std::uint64_t retain_image(std::shared_ptr<JitImage> image, std::uint64_t limit) {
+  auto &state = images();
+  std::lock_guard lock(state.mutex);
+  if (!limit || state.retained.size() >= limit)
+    throw std::runtime_error("live JIT retained generation limit reached");
+  if (state.last_token == UINT64_MAX)
+    throw std::runtime_error("live JIT generation identifiers exhausted");
+  const auto token = state.last_token + 1;
+  state.retained.emplace(token, std::move(image));
+  state.last_token = token;
+  return token;
+}
+
+std::uint64_t retained_image_count() {
+  auto &state = images();
+  std::lock_guard lock(state.mutex);
+  return state.retained.size();
+}
+
+JitRequest decode_jit(const clangtracer::v1::LiveJitInput &input) {
+  JitRequest result;
+  result.compiler_arguments.assign(input.compiler_arguments().begin(), input.compiler_arguments().end());
+  for (const auto &source : input.sources())
+    result.files.push_back({source.path(), source.contents()});
+  for (const auto &unit : input.units())
+    result.translation_units.push_back({unit.path(), unit.directory(),
+        {unit.compiler_arguments().begin(), unit.compiler_arguments().end()}});
+  for (const auto &item : input.imports())
+    if (!result.imports.emplace(item.name(), item.address()).second)
+      throw std::runtime_error("duplicate live import " + item.name());
+  result.entry_symbols.assign(input.entry_symbols().begin(), input.entry_symbols().end());
+  return result;
+}
+
+namespace {
+JitRequest jit_input(const AgentRequest &request) {
+  clangtracer::v1::LiveJitInput input;
+  if (!request.input || !request.input_size || request.input_size > max_payload_bytes ||
+      !input.ParseFromArray(reinterpret_cast<const void *>(request.input), request.input_size))
+    throw std::runtime_error("invalid live JIT source payload");
+  auto result = decode_jit(input);
+  result.imports.insert_or_assign("clangtracer_live_mock_top_v1",
+                         reinterpret_cast<std::uintptr_t>(&clangtracer_live_mock_top_v1));
+  if (result.entry_symbols.empty() || result.entry_symbols.size() > max_entries)
+    throw std::runtime_error("invalid live JIT entry count");
+  return result;
+}
+} // namespace
+} // namespace tracer::live
+
+extern "C" int tracer_agent_live_v1(tracer::live::AgentRequest *request) noexcept {
+  using namespace tracer::live;
+  if (!request || request->version != agent_magic)
+    return -1;
+  try {
+    if (request->action == AgentRequest::Action::launch ||
+        request->action == AgentRequest::Action::poll ||
+        request->action == AgentRequest::Action::publication_result) {
+      execute_extension(*request);
+      return 0;
+    }
+    request->error[0] = '\0';
+    request->retained = retained_image_count();
+    switch (request->action) {
+    case AgentRequest::Action::launch:
+    case AgentRequest::Action::poll:
+    case AgentRequest::Action::publication_result:
+      break;
+    case AgentRequest::Action::status:
+      return 0;
+    case AgentRequest::Action::discard: {
+      auto &state = images();
+      std::lock_guard lock(state.mutex);
+      state.retained.erase(request->token);
+      request->retained = state.retained.size();
+      return 0;
+    }
+    case AgentRequest::Action::stage: {
+      if (!request->limit || request->retained >= request->limit)
+        throw std::runtime_error("live JIT retained generation limit reached");
+      auto input = jit_input(*request);
+      auto image = compile_in_target(input);
+      request->count = input.entry_symbols.size();
+      for (std::size_t i = 0; i < input.entry_symbols.size(); ++i) {
+        const auto entry = describe_entry(*image, input.entry_symbols[i]);
+        request->addresses[i] = entry.address;
+        request->mapping_begin[i] = entry.mapping_begin;
+        request->mapping_size[i] = entry.mapping_size;
+      }
+      request->token = retain_image(std::move(image), request->limit);
+      request->retained = retained_image_count();
+      return 0;
+    }
+    }
+    throw std::runtime_error("unknown live JIT agent action");
+  } catch (const std::exception &error) {
+    std::snprintf(request->error, sizeof(request->error), "%s", error.what());
+    return 1;
+  } catch (...) {
+    std::snprintf(request->error, sizeof(request->error), "unexpected live JIT failure");
+    return 1;
+  }
+}

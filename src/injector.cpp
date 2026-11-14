@@ -46,6 +46,7 @@
 
 #include "admission.hpp"
 #include "mapped_path.hpp"
+#include "linux_syscalls.hpp"
 #include "object_launch.hpp"
 #include "object_target.hpp"
 #include "runtime_identity.hpp"
@@ -492,9 +493,8 @@ InjectedStop inspect_injected_stop(pid_t process_id, pid_t tid, int status,
   return stop;
 }
 
-std::vector<unsigned char> read_remote(pid_t tid, std::uintptr_t address,
-                                       std::size_t size) {
-  std::vector<unsigned char> result(size);
+void read_remote_into(pid_t tid, std::uintptr_t address, void *destination, std::size_t size) {
+  auto *result = static_cast<unsigned char *>(destination);
   std::size_t copied = 0;
   while (copied < size) {
     errno = 0;
@@ -505,9 +505,14 @@ std::vector<unsigned char> read_remote(pid_t tid, std::uintptr_t address,
       throw_errno("read tracee memory");
     }
     const auto amount = std::min(sizeof(word), size - copied);
-    std::memcpy(result.data() + copied, &word, amount);
+    std::memcpy(result + copied, &word, amount);
     copied += amount;
   }
+}
+
+std::vector<unsigned char> read_remote(pid_t tid, std::uintptr_t address, std::size_t size) {
+  std::vector<unsigned char> result(size);
+  read_remote_into(tid, address, result.data(), result.size());
   return result;
 }
 
@@ -852,6 +857,51 @@ struct Process::PeerFreeze {
     const auto leader_ip = process.instruction_pointer();
     return leader_ip > address && leader_ip < end;
   }
+
+#if defined(__x86_64__)
+  [[nodiscard]] bool may_have_active_frames(::tracer::compat::span<const CodeRange> ranges) const {
+    if (ranges.empty())
+      return false;
+    // Look for both current PCs and saved return/signal PCs. An incomplete
+    // stack read is a failed drain. Stale words can delay publication.
+    const auto mappings = read_maps(process.process_id_);
+    const auto inside = [&](std::uintptr_t value, bool saved_pc) {
+      return std::any_of(ranges.begin(), ranges.end(), [&](const auto &range) {
+        if (value <= range.address)
+          return false;
+        const auto offset = value - range.address;
+        return offset < range.size || (saved_pc && offset == range.size && range.return_at_end);
+      });
+    };
+    const auto affected = [&](pid_t tid) {
+      const auto regs = object_target::read_registers(tid);
+      if (inside(regs.rip, false) || (regs.rsp & (sizeof(std::uintptr_t) - 1)))
+        return true;
+      const auto mapping = std::find_if(mappings.begin(), mappings.end(), [&](const auto &map) {
+        return map.readable && regs.rsp >= map.start && regs.rsp < map.end;
+      });
+      if (mapping == mappings.end() || mapping->path != "[stack]")
+        return true; // An alternate or unidentified stack cannot certify a drain.
+      std::array<std::uintptr_t, 512> words{};
+      for (auto cursor = static_cast<std::uintptr_t>(regs.rsp); cursor < mapping->end;) {
+        const auto count = std::min<std::size_t>(sizeof(words), mapping->end - cursor);
+        iovec local{words.data(), count};
+        iovec remote{reinterpret_cast<void *>(cursor), count};
+        const auto got = linux_api::process_vm_readv(process.process_id_, &local, 1, &remote, 1, 0);
+        if (got != static_cast<ssize_t>(count) ||
+            std::any_of(words.begin(), words.begin() + count / sizeof(words.front()),
+                        [&](auto value) { return inside(value, true); }))
+          return true;
+        cursor += count;
+      }
+      return false;
+    };
+    return affected(process.tid_) ||
+        std::any_of(peers.begin(), peers.end(), [&](const auto &peer) {
+          return peer.stopped && affected(peer.tid);
+        });
+  }
+#endif
 
   void promote(pid_t tid) {
     const auto selected = find(tid);
@@ -1688,7 +1738,8 @@ bool Process::patch_code(std::uintptr_t address, const void *expected,
 
 bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches,
                                const std::function<void()> &validate_mappings,
-                               const std::function<void()> &on_commit) {
+                               const std::function<void()> &on_commit,
+                               ::tracer::compat::span<const CodeRange> drained_ranges) {
   ensure_usable();
   if (patches.empty())
     return true;
@@ -1712,7 +1763,24 @@ bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches,
       throw std::invalid_argument("patch_code_batch ranges overlap");
   }
 
+  std::vector<std::vector<unsigned char>> before;
+  before.reserve(patches.size());
+  for (const auto &patch : patches)
+    before.emplace_back(patch.size);
+  auto scratch = std::vector<unsigned char>(
+      std::max_element(patches.begin(), patches.end(), [](const auto &a, const auto &b) {
+        return a.size < b.size;
+      })->size);
   PeerFreeze peers(*this);
+#if defined(__x86_64__)
+  if (peers.may_have_active_frames(drained_ranges)) {
+    peers.release();
+    return false;
+  }
+#else
+  if (!drained_ranges.empty())
+    throw std::runtime_error("native stack drain is unavailable");
+#endif
   if (validate_mappings)
     validate_mappings();
   for (const auto &patch : patches) {
@@ -1722,13 +1790,11 @@ bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches,
     }
   }
 
-  std::vector<std::vector<unsigned char>> before;
-  before.reserve(patches.size());
-  for (const auto &patch : patches) {
-    before.push_back(read_remote(tid_, patch.address, patch.size));
-    if (std::memcmp(before.back().data(), patch.expected, patch.size) != 0)
-      throw std::runtime_error(
-          "patch_code_batch precondition did not match target bytes");
+  for (std::size_t i = 0; i < patches.size(); ++i) {
+    const auto &patch = patches[i];
+    read_remote_into(tid_, patch.address, before[i].data(), patch.size);
+    if (std::memcmp(before[i].data(), patch.expected, patch.size) != 0)
+      throw std::runtime_error("patch_code_batch precondition did not match target bytes");
   }
 
   std::size_t attempted = 0;
@@ -1737,9 +1803,8 @@ bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches,
       attempted = i + 1; // write_remote can fail after a partial word write.
       write_remote(tid_, patches[i].address, patches[i].replacement,
                    patches[i].size);
-      const auto committed =
-          read_remote(tid_, patches[i].address, patches[i].size);
-      if (std::memcmp(committed.data(), patches[i].replacement,
+      read_remote_into(tid_, patches[i].address, scratch.data(), patches[i].size);
+      if (std::memcmp(scratch.data(), patches[i].replacement,
                       patches[i].size) != 0)
         throw std::runtime_error("patch_code_batch verification failed");
     }
@@ -1750,9 +1815,8 @@ bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches,
         const auto i = --attempted;
         write_remote(tid_, patches[i].address, before[i].data(),
                      before[i].size());
-        const auto restored =
-            read_remote(tid_, patches[i].address, before[i].size());
-        if (std::memcmp(restored.data(), before[i].data(), before[i].size()) !=
+        read_remote_into(tid_, patches[i].address, scratch.data(), before[i].size());
+        if (std::memcmp(scratch.data(), before[i].data(), before[i].size()) !=
             0)
           throw std::runtime_error(
               "patch_code_batch rollback verification failed");

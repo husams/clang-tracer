@@ -1,5 +1,5 @@
 
-// Generated from src/repl/TracerCommands.g4 by ANTLR 4.13.2
+// Generated from TracerCommands.g4 by ANTLR 4.13.2
 
 #pragma once
 
@@ -42,10 +42,14 @@ public:
     T__154 = 155, T__155 = 156, T__156 = 157, T__157 = 158, T__158 = 159,
     T__159 = 160, T__160 = 161, T__161 = 162, T__162 = 163, T__163 = 164,
     T__164 = 165, T__165 = 166, T__166 = 167, T__167 = 168, T__168 = 169,
-    T__169 = 170, T__170 = 171, T__171 = 172, UINT = 173, STRING = 174,
-    SHELL = 175, METADATA_ONLY = 176, SQLITE = 177, STACK = 178, CWD = 179,
-    SIGNATURE = 180, MEMBER = 181, SNAPSHOT_RETURN_POINTEE = 182, WORD = 183,
-    WS = 184
+    T__169 = 170, T__170 = 171, T__171 = 172, T__172 = 173, T__173 = 174,
+    T__174 = 175, T__175 = 176, T__176 = 177, T__177 = 178, T__178 = 179,
+    T__179 = 180, T__180 = 181, T__181 = 182, T__182 = 183, T__183 = 184,
+    T__184 = 185, T__185 = 186, T__186 = 187, T__187 = 188, T__188 = 189,
+    T__189 = 190, T__190 = 191, T__191 = 192, UINT = 193, STRING = 194,
+    SHELL = 195, METADATA_ONLY = 196, SQLITE = 197, STACK = 198, CWD = 199,
+    SIGNATURE = 200, MEMBER = 201, SNAPSHOT_RETURN_POINTEE = 202, WORD = 203,
+    WS = 204
   };
 
   explicit TracerCommandsLexer(antlr4::CharStream *input);

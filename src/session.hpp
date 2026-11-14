@@ -13,11 +13,13 @@
 #include <vector>
 
 #include "admission.hpp"
+#include "live_transaction.hpp"
 
 #include "tracer.grpc.pb.h"
 #include "tracer/protocol.hpp"
 
 namespace tracer {
+namespace live { struct AgentRequest; }
 namespace injector {
 class Process;
 class EntryTrap;
@@ -28,6 +30,8 @@ class Watch;
 namespace object_cache {
 class Watch;
 }
+
+namespace live { struct Plan; }
 
 class AgentRuntimeIncompatible final : public std::runtime_error {
 public:
@@ -63,6 +67,8 @@ public:
       std::function<void(clangtracer::v1::TraceEvent)> publish);
   static clangtracer::v1::ObjectWatchStatus prepare_object_watch(
       const clangtracer::v1::ObjectWatchRequest &request);
+  clangtracer::v1::LiveUpdateStatus live_update(const clangtracer::v1::LiveUpdateRequest &request,
+                                               const std::function<bool()> &cancelled = {});
   void shutdown() noexcept;
   void record_failure(const std::string &message);
   void refresh_process_state() noexcept;
@@ -115,6 +121,8 @@ private:
   std::string executable_;
   std::optional<clangtracer::v1::JitRuntimeProfile> jit_runtime_;
   bool unsafe_target_ = false;
+  std::uintptr_t live_address_ = 0;
+  live::Transaction live_;
   std::uintptr_t start_address_ = 0;
   std::uintptr_t stop_address_ = 0;
   std::uintptr_t validate_address_ = 0;
@@ -131,6 +139,16 @@ private:
 
   void attach_process(tracer::injector::Process &process,
                       std::chrono::steady_clock::time_point deadline);
+  clangtracer::v1::LiveUpdateStatus activate_live_locked(
+      const live::Plan &plan, std::uint64_t expected_revision, std::uint64_t retention_limit,
+      const std::function<bool()> &cancelled, clangtracer::v1::LiveUpdateStatus result);
+  clangtracer::v1::LiveUpdateStatus run_live_extension_locked(
+      clangtracer::v1::LiveAgentExtension input,
+      const std::function<void(live::AgentRequest &)> &publication = {});
+  clangtracer::v1::LiveUpdateStatus apply_live_extension_locked(
+      const clangtracer::v1::LiveUpdateRequest &request, clangtracer::v1::LiveUpdateStatus result,
+      const std::function<bool()> &cancelled);
+  clangtracer::v1::LiveUpdateStatus revert_live_locked(std::uint64_t revision);
   void check_identity_locked();
   void require_probe_control_locked(std::uint64_t removing = 0) const;
   void stop_object_watch_locked();
