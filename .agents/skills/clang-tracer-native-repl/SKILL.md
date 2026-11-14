@@ -242,6 +242,8 @@ Use the matching Linux x86-64 or AArch64 REPL, server, and agent with the existi
 
 Attach, run `%object preview --plan DIRECTORY`, and check the binding and admitted sites. Use `%object start --plan DIRECTORY` to arm the watch. Writes capture values by default. Add `--no-values` to a write watch to record completed stores, including same-value stores, without samples. Record while the workload runs with `%record capture.db --sqlite --name object.trace --probe WATCH_ID --count N --timeout SECONDS`. Check `%object status WATCH_ID`, then stop with `%object stop WATCH_ID` and confirm restoration before `%detach`. Open the recording with `%events open capture.db --as saved` and inspect it with `%events list saved` or `%events show saved --index 0`.
 
+For complex fields, use method snapshots with `--field` and, where needed, `--key PATH=MEMBER` for vector IDs or `--key PATH=key` for maps. Verify nested private fields, strings, container entries, and permitted pointees in the replay. Added and removed entries carry the captured value tree in `snapshotAfter` or `snapshotBefore`. When the task requires an exact writer line, use a supported individual field write watch and verify coverage of the selected writer.
+
 Report gaps and drops as partial evidence. Lifecycle and ownership require verified boundaries, and unadmitted writers, unsafe reads, generated helper windows, and external writers can limit what the trace establishes. Follow the [runnable example and coverage limits in the native REPL guide](../../../docs/native-repl.md#trace-object-lifetimes-and-state-in-a-prebuilt-binary) for detailed commands and collection, union, and shared-library cases.
 
 ## Record and replay events

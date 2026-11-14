@@ -1047,6 +1047,10 @@ message ObjectObservation {
   uint64 storage_generation = 31;
   ObjectWatchRequest.Synchronization synchronization = 32;
   message SnapshotValue {
+    enum CompositeKind {
+      RECORD = 0;
+      SEQUENCE = 1;
+    }
     oneof value {
       bool null_value = 1;
       bool boolean_value = 2;
@@ -1054,7 +1058,13 @@ message ObjectObservation {
       uint64 unsigned_value = 4;
       double real_value = 5;
       string string_value = 6;
+      CompositeKind composite_kind = 7;
+      bytes bytes_value = 12;
     }
+    repeated SnapshotValue children = 8;
+    string cpp_type = 9;
+    string container_role = 10;
+    string field_name = 11; // Name on a child of a record.
   }
   SnapshotValue snapshot_before = 33;
   SnapshotValue snapshot_after = 34;

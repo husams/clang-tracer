@@ -2,6 +2,7 @@
 
 #include "repl/event_value.hpp"
 #include "context_transport.pb.h"
+#include "tracer.pb.h"
 
 namespace tracer_repl {
 using Snapshot = clangtracer::context::v1::ValueSnapshot;
@@ -22,6 +23,9 @@ struct SnapshotChange {
   std::optional<EventValue> before = {};
   std::optional<EventValue> after = {};
 };
+
+void encode_observation_value(const EventValue &value,
+    clangtracer::v1::ObjectObservation::SnapshotValue &output);
 
 void validate_snapshot_keys(const std::vector<std::string> &keys);
 std::vector<SnapshotChange> compare_snapshots(const Snapshot &before, const Snapshot &after,
