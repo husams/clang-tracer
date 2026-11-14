@@ -3,6 +3,8 @@
 #include "../module_index_format.hpp"
 #include "../proc_identity.hpp"
 #include "../sqlite_events.hpp"
+#include "../bounded_proto.hpp"
+#include "../value_snapshot_storage.hpp"
 
 #include <algorithm>
 #include <array>
@@ -16,6 +18,7 @@
 #include <iomanip>
 #include <limits>
 #include <random>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -804,7 +807,8 @@ void Controller::module_command(const Command &command) {
   }
 }
 
-void Controller::prepare(const std::string &selector, const Command &options) {
+namespace {
+std::string preparer_executable() {
   const char *configured = std::getenv("TRACER_PREPARE_EXECUTABLE");
   std::string executable = "clang-tracer-prepare-injectors-native";
   if (configured && *configured) {
@@ -820,9 +824,74 @@ void Controller::prepare(const std::string &selector, const Command &options) {
     }
   }
 #endif
+  return executable;
+}
+
+void run_preparer(std::vector<std::string> arguments, const char *failure) {
+  std::vector<char *> argv;
+  for (auto &argument : arguments) argv.push_back(argument.data());
+  argv.push_back(nullptr);
+  pid_t pid = 0;
+  const int started = ::posix_spawnp(&pid, argv.front(), nullptr, nullptr, argv.data(), environ);
+  if (started)
+    throw std::system_error(started, std::generic_category(), "cannot start native preparer");
+  int status = 0;
+  while (::waitpid(pid, &status, 0) < 0)
+    if (errno != EINTR) throw std::runtime_error("cannot wait for native preparation");
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    throw std::runtime_error(failure);
+}
+
+class PreparationDirectory {
+  std::string path_ = (std::filesystem::temp_directory_path() / "clang-tracer-object-XXXXXX").string();
+
+public:
+  PreparationDirectory() {
+    if (!::mkdtemp(path_.data()))
+      throw std::system_error(errno, std::generic_category(), "cannot stage object preparation");
+  }
+  ~PreparationDirectory() {
+    std::error_code error;
+    std::filesystem::remove_all(path_, error);
+  }
+  std::filesystem::path file(const std::string &name) const { return std::filesystem::path(path_) / name; }
+};
+
+void discover_writers(const Command &command, api::ObjectWatchRequest &request) {
+  if (!command.has("--compdb") || !command.has("--translation-unit"))
+    throw std::invalid_argument("writer discovery requires --compdb and --translation-unit");
+  PreparationDirectory staging;
+  const auto file = staging.file("writers.pb");
+  std::vector<std::string> arguments{preparer_executable(), "--write-candidates",
+      request.concrete_type() + "::" + request.field(), "--compdb", command.option("--compdb"),
+      "--output", file.string()};
+  for (const auto &unit : command.options.at("--translation-unit")) {
+    arguments.push_back("--translation-unit");
+    arguments.push_back(unit);
+  }
+  run_preparer(std::move(arguments), "native writer discovery failed");
+  api::ObjectWatchRequest result;
+  std::ifstream input(file, std::ios::binary);
+  if (!input || std::filesystem::file_size(file) > 1024 * 1024 || !result.ParseFromIstream(&input))
+    throw std::runtime_error("cannot read source writer candidates");
+  if (request.code_symbol().empty()) {
+    if (result.source_writers().empty())
+      throw std::invalid_argument("writer discovery requires --code when it finds no candidates");
+    request.set_code_symbol(result.source_writers(0).symbol());
+    std::set<std::string> seen{request.code_symbol()};
+    for (const auto &writer : result.source_writers())
+      if (seen.insert(writer.symbol()).second)
+        request.add_additional_code_symbols(writer.symbol());
+  }
+  *request.mutable_source_writers() = std::move(*result.mutable_source_writers());
+}
+} // namespace
+
+Controller::PreparedPackage Controller::prepare_package(const std::string &selector,
+                                                         const Command &options) {
   const bool elf_mode = options.has("--signature");
   const bool indexed = !elf_mode && !options.has("--include");
-  std::vector<std::string> arguments{executable, "--selector", selector};
+  std::vector<std::string> arguments{preparer_executable(), "--selector", selector};
   if (indexed) {
     arguments.insert(arguments.end(), {"--module-index", module_index_path(options).string()});
     if (options.has("--id")) arguments.insert(arguments.end(), {"--id", options.option("--id")});
@@ -839,6 +908,7 @@ void Controller::prepare(const std::string &selector, const Command &options) {
     arguments.insert(arguments.end(), {"--compdb", database});
   }
   if (options.has("--metadata-only")) arguments.push_back("--metadata-only");
+  if (options.has("--receiver-storage")) arguments.push_back("--receiver-storage");
   for (const auto *key : {"--translation-unit", "--module"}) {
     if (options.has(key)) {
       arguments.emplace_back(key);
@@ -863,20 +933,8 @@ void Controller::prepare(const std::string &selector, const Command &options) {
     arguments.emplace_back("--extra-arg");
     arguments.push_back(argument);
   }
-  std::vector<char *> argv;
-  for (auto &argument : arguments) argv.push_back(argument.data());
-  argv.push_back(nullptr);
-  pid_t pid = 0;
-  const int started = ::posix_spawnp(&pid, argv.front(), nullptr, nullptr, argv.data(), environ);
-  if (started)
-    throw std::system_error(started, std::generic_category(), "cannot start native preparer");
-  int status = 0;
-  while (::waitpid(pid, &status, 0) < 0)
-    if (errno != EINTR) throw std::runtime_error("cannot wait for native preparation");
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-    throw std::runtime_error(indexed ? "indexed probe preparation failed"
-                                     : elf_mode ? "native ELF signature preparation failed"
-                                      : "native header preparation failed");
+  run_preparer(std::move(arguments), indexed ? "indexed probe preparation failed" :
+      elf_mode ? "native ELF signature preparation failed" : "native header preparation failed");
   const auto output = probe_path(options, options.option("--output"));
   const auto directory = options.has("--cwd") ? std::filesystem::canonical(output)
                                                : std::filesystem::absolute(output);
@@ -886,8 +944,40 @@ void Controller::prepare(const std::string &selector, const Command &options) {
   if (!input || std::filesystem::file_size(file) > 65536 ||
       !package.artifact.ParseFromIstream(&input))
     throw std::runtime_error("cannot read newly generated prepared package");
-  prepared_packages_.insert_or_assign(compact_selector(selector), std::move(package));
   out_ << "prepared directory=" << directory << '\n';
+  return package;
+}
+
+void Controller::prepare(const std::string &selector, const Command &options) {
+  prepared_packages_.insert_or_assign(compact_selector(selector), prepare_package(selector, options));
+}
+
+void Controller::prepare_object_methods(const Command &command, api::ObjectWatchRequest &request) {
+  if (!command.has("--on") || !command.has("--include"))
+    throw std::invalid_argument("snapshot preparation requires --on METHOD and --include HEADER");
+  const auto &methods = command.options.at("--on");
+  const auto units = command.options.find("--translation-unit");
+  if (units != command.options.end() && units->second.size() != 1 &&
+      units->second.size() != methods.size())
+    throw std::invalid_argument("provide one translation unit or one per method in method order");
+  if (methods.size() > 16)
+    throw std::invalid_argument("snapshot preparation allows up to 16 methods");
+  PreparationDirectory staging;
+  Command options;
+  options.options["--receiver-storage"] = {"true"};
+  for (const auto *name : {"--include", "--compdb"})
+    if (command.has(name))
+      options.options[name] = command.options.at(name);
+  if (command.has("--policy"))
+    options.options["--include"].push_back(command.option("--policy"));
+  options.options["--module"] = {request.executable_file()};
+  for (std::size_t index = 0; index < methods.size(); ++index) {
+    if (units != command.options.end())
+      options.options["--translation-unit"] = {
+          units->second[units->second.size() == 1 ? 0 : index]};
+    options.options["--output"] = {staging.file(std::to_string(index)).string()};
+    *request.add_methods() = prepare_package(methods[index], options).artifact;
+  }
 }
 
 std::vector<std::string> Controller::take_pending_imports() {
@@ -915,6 +1005,9 @@ std::uint64_t Controller::inject(const SessionHandle &session,
   spec.set_print_arguments(options.has("--print-arguments"));
   spec.set_print_result(options.has("--print-result"));
   spec.set_snapshot_return_pointee(options.has("--snapshot-return-pointee"));
+  spec.set_snapshot_receiver_at_return(options.has("--snapshot-receiver-at-return"));
+  spec.set_native_backend(options.option("--backend", "auto"));
+  spec.set_direct_caller(options.option("--caller"));
   api::AddProbeRequest request;
   request.set_session_id(session.id);
   *request.mutable_spec() = std::move(spec);
@@ -938,6 +1031,14 @@ std::uint64_t Controller::inject(const SessionHandle &session,
     out_ << " resolve_ns=" << resolve_ns
          << " jit_compile_ns=" << result.jit_compile_ns()
          << " patch_install_ns=" << result.patch_install_ns();
+  if (!result.backend().empty()) {
+    out_ << " backend=" << result.backend() << " reason=" << result.backend_reason()
+         << " entry=0x" << std::hex << result.entry_address()
+         << " patch=0x" << result.patch_address();
+    if (result.relay_address())
+      out_ << " relay=0x" << result.relay_address();
+    out_ << std::dec;
+  }
   out_ << '\n';
   return result.id();
 }
@@ -1560,6 +1661,402 @@ bool Controller::execute(const Command &command) {
     detach(session);
     return true;
   }
+  case K::object_start:
+  case K::object_prepare:
+  case K::object_preview:
+  case K::object_status:
+  case K::object_stop: {
+    const bool preparing = command.kind == K::object_prepare;
+    const bool previewing = command.kind == K::object_preview;
+    const bool defining = preparing || previewing || command.kind == K::object_start;
+    if (preparing)
+      ensure_connected();
+    else
+      require_session(selected_);
+    api::ObjectWatchRequest request;
+    if (defining) {
+      const auto mode = command.option("--mode", command.has("--on") ? "snapshots" : "");
+      if (!mode.empty() && mode != "writes" && mode != "snapshots")
+        throw std::invalid_argument("--mode must be writes or snapshots");
+      if (command.has("--plan")) {
+        for (const auto &[option, values] : command.options)
+          if (option != "--plan" && option != "--mode" && option != "--stack-depth" &&
+              option != "--max-elements" && option != "--max-string-bytes" &&
+              option != "--max-depth" && option != "--max-snapshot-bytes" &&
+              option != "--max-instances" && option != "--max-events" &&
+              option != "--event-buffer" && option != "--no-values" &&
+              option != "--timeout" && option != "--tid" && option != "--module" &&
+              option != "--rendezvous" && option != "--overflow" && option != "--stack-cfi" &&
+              option != "--serialize-wait-us" && option != "--runtime-limit")
+            throw std::invalid_argument("object definition options cannot override --plan");
+        if (preparing)
+          throw std::invalid_argument("prepare from an explicit object definition");
+        api::ObjectWatchPackage package;
+        const auto file = std::filesystem::path(command.option("--plan")) / "object-plan.pb";
+        std::ifstream input(file, std::ios::binary);
+        if (!input || std::filesystem::file_size(file) > 4 * 1024 * 1024 ||
+            !package.ParseFromIstream(&input) ||
+            package.version() != 1 || !package.has_definition() || !package.has_plan())
+          throw std::runtime_error("cannot read object watch package: " + file.string());
+        request = package.definition();
+        *request.mutable_prepared_bindings() = package.plan();
+        if (command.has("--module")) {
+          if (request.mode() == api::ObjectWatchRequest::SNAPSHOTS)
+            request.set_snapshot_module(command.option("--module"));
+          else if (!request.code_module().empty())
+            request.set_code_module(command.option("--module"));
+          else
+            throw std::invalid_argument("--module requires a saved method or shared writer plan");
+        }
+        if (command.has("--no-values"))
+          request.set_no_values(true);
+        if (!mode.empty() && (mode == "snapshots") != (request.mode() == api::ObjectWatchRequest::SNAPSHOTS))
+          throw std::invalid_argument("the requested mode does not match the saved object package");
+      } else {
+        if (!args.empty() && command.has("--type"))
+          throw std::invalid_argument("provide either a record argument or --type");
+        request.set_concrete_type(args.empty() ? command.option("--type") : args.front());
+        if (mode == "snapshots") {
+          if (!preparing)
+            throw std::invalid_argument("snapshot watches require a prepared --plan");
+          if (command.has("--discover-writers"))
+            throw std::invalid_argument("source writer discovery requires a write watch");
+          request.set_mode(api::ObjectWatchRequest::SNAPSHOTS);
+          if (command.has("--field"))
+            for (const auto &value : command.options.at("--field"))
+              request.add_snapshot_fields(value);
+          if (command.has("--key"))
+            for (const auto &value : command.options.at("--key"))
+              request.add_snapshot_keys(value);
+        } else {
+          for (const auto *name : {"--include", "--policy",
+                                   "--on", "--key", "--emit-source",
+                                   "--max-depth", "--max-snapshot-bytes"})
+            if (command.has(name))
+              throw std::invalid_argument(std::string(name) + " requires snapshot preparation");
+          if (command.has("--field") && command.options.at("--field").size() != 1)
+            throw std::invalid_argument("write watches require a single --field");
+          if ((command.has("--discover-writers") && !preparing) ||
+              ((command.has("--compdb") || command.has("--translation-unit")) &&
+               !command.has("--discover-writers")))
+            throw std::invalid_argument("writer source inputs require %object prepare --discover-writers");
+        }
+        request.set_base_type(command.option("--base"));
+        request.set_owner_type(command.option("--owner"));
+        request.set_owner_add(command.option("--owner-add"));
+        request.set_owner_get(command.option("--owner-get"));
+        request.set_owner_remove(command.option("--owner-remove"));
+        request.set_owner_snapshot(command.option("--owner-snapshot"));
+        request.set_field(command.option("--field"));
+        request.set_collection(command.option("--collection"));
+        request.set_snapshot_field(command.option("--snapshot-field"));
+        request.set_code_symbol(command.option("--code"));
+        if (command.has("--code")) {
+          const auto &writers = command.options.at("--code");
+          request.set_code_symbol(writers.front());
+          for (std::size_t i = 1; i < writers.size(); ++i)
+            request.add_additional_code_symbols(writers[i]);
+        }
+        request.set_code_module(command.option("--module"));
+        request.set_borrow_caller(command.option("--caller"));
+        request.set_no_values(command.has("--no-values"));
+        request.set_first_seen(command.has("--first-seen") || command.has("--vector") ||
+                               command.has("--map") || command.has("--pointee"));
+        request.set_writer_entry(command.has("--writer-entry"));
+        request.set_follow_calls(command.has("--follow-calls"));
+        request.set_syscall_output(command.has("--syscall-output"));
+        request.set_vector_field(command.option("--vector"));
+        request.set_map_field(command.option("--map"));
+        request.set_map_key(command.option("--map-key"));
+        request.set_pointee_field(command.option("--pointee"));
+        request.set_union_tag(command.option("--union-tag"));
+        if (command.has("--union-case")) {
+          for (const auto &mapping : command.options.at("--union-case")) {
+            const auto split = mapping.find('=');
+            if (split == std::string::npos || split == 0 || split + 1 == mapping.size())
+              throw std::invalid_argument("--union-case requires UINT32=MEMBER");
+            auto &item = *request.add_union_cases();
+            item.set_tag(unsigned_number(mapping.substr(0, split), "union discriminator", UINT32_MAX));
+            item.set_member(mapping.substr(split + 1));
+          }
+        }
+        if (command.has("--async-signal"))
+          for (const auto &value : command.options.at("--async-signal"))
+            request.add_async_signals(unsigned_number(value, "asynchronous signal", 64));
+        if (command.has("--map") != command.has("--map-key"))
+          throw std::invalid_argument("--map and --map-key are required together");
+        if (command.has("--synchronization") || request.mode() == api::ObjectWatchRequest::SNAPSHOTS) {
+          if (request.mode() != api::ObjectWatchRequest::SNAPSHOTS && request.vector_field().empty() &&
+              request.map_field().empty() && request.pointee_field().empty() &&
+              request.union_tag().empty() && request.owner_type().empty() &&
+              !request.syscall_output() && !command.has("--shared-file"))
+            throw std::invalid_argument("--synchronization requires a snapshot, collection, ownership, union or syscall watch");
+          const auto synchronization = command.option("--synchronization");
+          if (synchronization == "thread-confined")
+            request.set_synchronization(api::ObjectWatchRequest::THREAD_CONFINED);
+          else if (synchronization == "caller-lock")
+            request.set_synchronization(api::ObjectWatchRequest::CALLER_LOCK);
+          else if (synchronization == "stable-at-boundaries" &&
+                   request.mode() == api::ObjectWatchRequest::SNAPSHOTS)
+            request.set_synchronization(api::ObjectWatchRequest::STABLE_AT_BOUNDARIES);
+          else
+            throw std::invalid_argument("provide a supported --synchronization policy");
+        }
+        if (command.has("--mutation")) {
+          const auto &mutations = command.options.at("--mutation");
+          request.set_mutation_symbol(mutations.front());
+          for (std::size_t i = 1; i < mutations.size(); ++i)
+            request.add_additional_mutation_symbols(mutations[i]);
+        }
+        if (command.has("--element-key")) {
+          const auto key = command.option("--element-key");
+          const auto split = key.find('=');
+          if (split == std::string::npos || split == 0 || split + 1 == key.size())
+            throw std::invalid_argument("--element-key requires FIELD=UINT32");
+          request.set_element_key_field(key.substr(0, split));
+          request.set_element_key(unsigned_number(key.substr(split + 1), "element key", UINT32_MAX));
+        }
+        const auto backend = command.option("--backend", "ptrace");
+        if (backend == "code-cache")
+          request.set_backend(api::ObjectWatchRequest::CODE_CACHE);
+        else if (backend != "ptrace")
+          throw std::invalid_argument("--backend must be ptrace or code-cache");
+      }
+      if (command.has("--rendezvous")) {
+        if (request.backend() != api::ObjectWatchRequest::CODE_CACHE)
+          throw std::invalid_argument("--rendezvous requires code-cache");
+        request.set_application_rendezvous(command.option("--rendezvous"));
+      }
+      if (request.syscall_output() &&
+          (request.backend() != api::ObjectWatchRequest::PTRACE ||
+           request.mode() != api::ObjectWatchRequest::WRITES))
+        throw std::invalid_argument("--syscall-output requires diagnostic write capture");
+      if (command.has("--overflow")) {
+        const auto policy = command.option("--overflow");
+        if (request.backend() != api::ObjectWatchRequest::CODE_CACHE ||
+            request.mode() != api::ObjectWatchRequest::WRITES || (policy != "drop" && policy != "stop"))
+          throw std::invalid_argument("--overflow requires code-cache and drop or stop");
+        request.set_overflow_policy(policy == "stop" ? api::ObjectWatchRequest::STOP_CAPTURE :
+                                                      api::ObjectWatchRequest::DROP_NEW);
+      }
+      if (preparing) {
+        const auto file = command.option("--executable", command.option("--module"));
+        if (file.empty() || !command.has("--output"))
+          throw std::invalid_argument("object prepare requires --module ELF and --output DIRECTORY");
+        request.set_executable_file(std::filesystem::canonical(file).string());
+        if (!command.has("--executable"))
+          request.clear_code_module();
+        else if (!request.code_module().empty())
+          request.set_code_module(std::filesystem::canonical(request.code_module()).string());
+        if (request.mode() == api::ObjectWatchRequest::SNAPSHOTS)
+          prepare_object_methods(command, request);
+        else if (command.has("--discover-writers"))
+          discover_writers(command, request);
+      } else if (command.has("--executable") || command.has("--output")) {
+        throw std::invalid_argument("--executable and --output are for object prepare");
+      }
+      const auto number = [&](const std::string &name, std::uint32_t fallback,
+                              std::uint32_t maximum) {
+        return unsigned_number(command.option(name, std::to_string(fallback)), name, maximum);
+      };
+      request.set_stack_depth(number("--stack-depth", request.stack_depth(), 64));
+      if (command.has("--stack-cfi"))
+        request.set_cfi_stack(true);
+      if (request.cfi_stack() && (!request.stack_depth() ||
+          request.backend() != api::ObjectWatchRequest::CODE_CACHE ||
+          request.mode() != api::ObjectWatchRequest::WRITES))
+        throw std::invalid_argument("--stack-cfi requires code-cache write capture and --stack-depth");
+      request.set_serialize_wait_us(number("--serialize-wait-us", request.serialize_wait_us(),
+                                          UINT32_MAX));
+      if (request.serialize_wait_us() && (request.mode() != api::ObjectWatchRequest::WRITES ||
+          request.backend() != api::ObjectWatchRequest::CODE_CACHE || request.writer_tid()))
+        throw std::invalid_argument("--serialize-wait-us requires code-cache writes from all watched threads");
+      if (request.follow_calls() && (request.mode() != api::ObjectWatchRequest::WRITES ||
+          request.backend() != api::ObjectWatchRequest::CODE_CACHE))
+        throw std::invalid_argument("--follow-calls requires code-cache write capture");
+      request.set_runtime_limit(number("--runtime-limit", request.runtime_limit(), 65536));
+      if (request.runtime_limit() && !request.follow_calls())
+        throw std::invalid_argument("--runtime-limit requires --follow-calls");
+      if (command.has("--shared-file"))
+        request.set_shared_file(std::filesystem::absolute(command.option("--shared-file")).string());
+      if (!request.shared_file().empty() && (request.mode() != api::ObjectWatchRequest::WRITES ||
+          request.backend() != api::ObjectWatchRequest::CODE_CACHE))
+        throw std::invalid_argument("--shared-file requires code-cache write capture");
+      request.set_max_elements(number("--max-elements",
+          request.max_elements() ? request.max_elements() : 4096, 65536));
+      request.set_max_string_bytes(number("--max-string-bytes",
+          request.max_string_bytes() ? request.max_string_bytes() : 4096, 65536));
+      if (request.mode() == api::ObjectWatchRequest::SNAPSHOTS) {
+        request.set_snapshot_max_depth(number("--max-depth",
+            request.snapshot_max_depth() ? request.snapshot_max_depth() : 32,
+            tracer::context_engine::max_capture_depth));
+        request.set_snapshot_max_bytes(number("--max-snapshot-bytes",
+            request.snapshot_max_bytes() ? request.snapshot_max_bytes() : 4096,
+            tracer::max_snapshot_bytes));
+      } else if (command.has("--max-depth") || command.has("--max-snapshot-bytes")) {
+        throw std::invalid_argument("snapshot bounds require a snapshot watch");
+      }
+      const auto default_instances =
+          request.mode() == api::ObjectWatchRequest::SNAPSHOTS || !request.vector_field().empty() ||
+          !request.map_field().empty() || !request.pointee_field().empty() ? 1024U : 0U;
+      request.set_max_instances(number("--max-instances",
+          request.max_instances() ? request.max_instances() : default_instances, 65536));
+      request.set_max_events(unsigned_number(command.option("--max-events",
+          std::to_string(request.max_events())), "maximum observations"));
+      request.set_event_buffer(number("--event-buffer", request.event_buffer(), 65536));
+      if (command.has("--event-buffer") && request.event_buffer() < 2)
+        throw std::invalid_argument("--event-buffer requires at least two slots");
+      request.set_timeout_seconds(number("--timeout", request.timeout_seconds(), UINT32_MAX));
+      if (command.has("--tid")) {
+        if (preparing || request.mode() == api::ObjectWatchRequest::SNAPSHOTS)
+          throw std::invalid_argument("--tid selects a live writer thread");
+        const auto tid = number("--tid", 0, INT32_MAX);
+        if (!tid)
+          throw std::invalid_argument("--tid requires a positive thread ID");
+        request.set_writer_tid(tid);
+      }
+      if (request.serialize_wait_us() && request.writer_tid())
+        throw std::invalid_argument("--serialize-wait-us requires writes from all watched threads");
+      request.set_action(preparing ? api::ObjectWatchRequest::PREPARE :
+                         previewing ? api::ObjectWatchRequest::PREVIEW : api::ObjectWatchRequest::START);
+    } else {
+      request.set_action(command.kind == K::object_stop ? api::ObjectWatchRequest::STOP
+                                                      : api::ObjectWatchRequest::STATUS);
+      if (!args.empty())
+        request.set_watch_id(unsigned_number(args.front(), "watch ID"));
+    }
+    request.set_session_id(preparing ? "" : selected_.id);
+    const auto result = unary<api::ObjectWatchStatus>(
+        [&](auto &c, auto &r) { return stub_->ObjectWatch(&c, request, &r); },
+        settings_.timeout_seconds);
+    if (preparing) {
+      const auto directory = std::filesystem::absolute(command.option("--output"));
+      if (!std::filesystem::create_directory(directory))
+        throw std::runtime_error("object package directory already exists: " + directory.string());
+      try {
+        api::ObjectWatchPackage package;
+        package.set_version(1);
+        auto &definition = *package.mutable_definition();
+        definition = request;
+        definition.set_action(api::ObjectWatchRequest::START);
+        definition.clear_executable_file();
+        if (!definition.code_module().empty())
+          definition.set_code_module(std::filesystem::path(definition.code_module()).filename().string());
+        *package.mutable_plan() = result.plan();
+        std::ofstream plan(directory / "object-plan.pb", std::ios::binary);
+        std::ofstream text(directory / "object-definition.textproto");
+        if (!plan || !text || !package.SerializeToOstream(&plan))
+          throw std::runtime_error("cannot write object watch package");
+        text << definition.DebugString();
+        plan.close();
+        text.close();
+        if (!plan || !text)
+          throw std::runtime_error("cannot finish object watch package");
+        if (command.has("--emit-source")) {
+          const auto source = std::filesystem::absolute(command.option("--emit-source"));
+          if (!std::filesystem::create_directory(source))
+            throw std::runtime_error("adapter source directory already exists: " + source.string());
+          try {
+            for (int index = 0; index < request.methods_size(); ++index) {
+              std::ofstream adapter(source / ("method-" + std::to_string(index + 1) + ".hpp"));
+              adapter << tracer::prepared::adapter_source(request.methods(index));
+              adapter.close();
+              if (!adapter)
+                throw std::runtime_error("cannot write generated snapshot adapter");
+            }
+          } catch (...) {
+            std::error_code error;
+            std::filesystem::remove_all(source, error);
+            throw;
+          }
+        }
+      } catch (...) {
+        std::error_code cleanup;
+        std::filesystem::remove(directory / "object-plan.pb", cleanup);
+        std::filesystem::remove(directory / "object-definition.textproto", cleanup);
+        std::filesystem::remove(directory, cleanup);
+        throw;
+      }
+      out_ << "object package=" << directory << '\n';
+    }
+    out_ << "watch=" << result.watch_id() << " active=" << (result.active() ? "yes" : "no")
+         << " stores=" << result.store_sites() << " unsupported=" << result.unsupported_sites()
+         << " observations=" << result.observations()
+         << " restoration_pending=" << (result.restoration_pending() ? "yes" : "no")
+         << " values=" << (result.no_values() ? "off" : "on")
+         << " backend=" << (result.mode() == api::ObjectWatchRequest::SNAPSHOTS ? "method-detour" :
+                            result.backend() == api::ObjectWatchRequest::CODE_CACHE ? "code-cache" : "ptrace")
+         << " executed_stores=" << result.executed_stores()
+         << " dropped=" << result.dropped()
+         << " redirects=" << result.redirects_size();
+    if (result.mode() == api::ObjectWatchRequest::SNAPSHOTS)
+      out_ << " receivers=" << result.admitted_receivers();
+    if (result.mode() == api::ObjectWatchRequest::SNAPSHOTS || result.coverage_gaps())
+      out_ << " coverage_gaps=" << result.coverage_gaps();
+    if (result.coverage_gaps() || result.unsupported_sites() || result.dropped() ||
+        result.external_write_order_unknown())
+      out_ << " coverage=partial";
+    if (!result.capture_limit().empty())
+      out_ << " capture_limit=" << result.capture_limit();
+    if (result.event_buffer())
+      out_ << " event_buffer=" << result.event_buffer();
+    if (result.runtime_translations())
+      out_ << " runtime_translations=" << result.runtime_translations()
+           << " runtime_reclaimed=" << result.runtime_reclaimed();
+    if (result.static_fragments())
+      out_ << " static_fragments=" << result.static_fragments()
+           << " static_reclaimed=" << result.static_reclaimed();
+    out_ << " | " << result.diagnostic() << '\n';
+    const auto hex = [](const std::string &bytes) {
+      std::ostringstream out;
+      out << std::hex << std::setfill('0');
+      for (unsigned char byte : bytes)
+        out << std::setw(2) << unsigned(byte);
+      return out.str();
+    };
+    if (!result.binding_status().empty())
+      out_ << "binding=" << result.binding_status() << '\n';
+    if (result.has_plan()) {
+      const auto &plan = result.plan();
+      for (const auto &candidate : plan.source_writers())
+        out_ << "source_writer=" << std::quoted(candidate.function()) << " symbol="
+             << std::quoted(candidate.symbol()) << " file=" << std::quoted(candidate.file())
+             << " line=" << candidate.line() << '\n';
+      if (result.mode() == api::ObjectWatchRequest::WRITES)
+        out_ << "field=" << request.field() << " encoding=" << std::quoted(plan.field_encoding())
+             << " offset=" << plan.field_offset() << " build_id=" << plan.writer_build_id() << '\n';
+      for (const auto &binding : plan.bindings()) {
+        out_ << "site role=" << std::quoted(binding.role()) << " elf=0x" << std::hex
+             << binding.elf_pc();
+        if (binding.runtime_pc())
+          out_ << " pc=0x" << binding.runtime_pc();
+        out_ << std::dec << " bytes=" << binding.original().size()
+             << " module=" << std::quoted(binding.module())
+             << " function=" << std::quoted(binding.function());
+        if (binding.role() == "store" || binding.role().starts_with("inline mutation "))
+          out_ << " original=" << hex(binding.original());
+        if (binding.role() == "method")
+          out_ << " patch_bytes=" << binding.patch_size() << " original=" << hex(binding.original());
+        out_ << '\n';
+      }
+    }
+    for (const auto &probe : result.method_probes())
+      out_ << "method_probe=" << probe.id() << " active=" << (probe.active() ? "yes" : "no")
+           << " restored=" << (probe.original_bytes_restored() ? "yes" : "no") << '\n';
+    for (const auto &redirect : result.redirects())
+      out_ << "redirect=0x" << std::hex << redirect.pc()
+           << " translated=0x" << redirect.translated_pc() << std::dec
+           << " original=" << hex(redirect.original())
+           << " installed=" << hex(redirect.installed()) << '\n';
+    if (result.dispatch_pc())
+      out_ << "dispatch=0x" << std::hex << result.dispatch_pc()
+           << " target=0x" << result.dispatch_target()
+           << " return=0x" << result.dispatch_return() << std::dec
+           << " matched=" << result.matched_dispatches() << '\n';
+    if (result.restoration_pending())
+      throw std::runtime_error("retry %object stop before detaching");
+    return true;
+  }
   case K::module_index:
   case K::module_use:
   case K::module_types:
@@ -1898,6 +2395,17 @@ public:
   case K::event_show: {
     auto b = batch(args.at(0));
     print(b.at(command.number("--index", 0)));
+    return true;
+  }
+  case K::event_diff: {
+    const auto &events = buffer(args.at(0)).events();
+    const auto pre = command.number("--pre", 0);
+    const auto post = command.number("--post", 0);
+    if (pre >= events.size() || post >= events.size())
+      throw std::out_of_range("event index is outside the retained collection");
+    const auto keys = command.options.find("--key");
+    print_receiver_delta(events[pre]->message, events[post]->message,
+        keys == command.options.end() ? std::vector<std::string>{} : keys->second, out_);
     return true;
   }
   case K::event_stack: {

@@ -69,6 +69,11 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"memory maps", K::memory_maps},
                                         {"memory read", K::memory_read},
                                         {"memory scan", K::memory_scan},
+                                        {"object start", K::object_start},
+                                        {"object prepare", K::object_prepare},
+                                        {"object preview", K::object_preview},
+                                        {"object status", K::object_status},
+                                        {"object stop", K::object_stop},
                                         {"trace preview", K::bulk_preview},
                                         {"trace apply", K::bulk_apply},
                                         {"trace remove", K::bulk_remove},
@@ -88,6 +93,7 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"events", K::events},
                                         {"events list", K::event_list},
                                         {"events show", K::event_show},
+                                        {"events diff", K::event_diff},
                                         {"events stack", K::event_stack},
                                         {"events calls", K::event_calls},
                                         {"events stats", K::event_stats},
@@ -176,11 +182,15 @@ public:
     }
     const std::set<std::string> flags = {
         "--all", "--metadata-only", "--print-arguments", "--print-result",
-        "--snapshot-return-pointee",
-        "--details", "--addresses", "--sqlite", "--member", "--exported"};
-    const std::set<std::string> repeated = {"--include", "--compile-option",
+        "--snapshot-return-pointee", "--snapshot-receiver-at-return",
+        "--details", "--addresses", "--sqlite", "--member", "--exported", "--no-values",
+        "--first-seen", "--writer-entry", "--discover-writers", "--syscall-output", "--stack-cfi",
+        "--follow-calls"};
+    const std::set<std::string> repeated = {"--include", "--compile-option", "--key",
                                            "--name", "--type"};
     const std::set<std::string> bulk_repeated = {"--module", "--exclude", "--exact"};
+    const std::set<std::string> object_repeated = {"--field", "--on", "--include", "--key", "--union-case", "--code",
+                                                  "--translation-unit", "--async-signal", "--mutation"};
     for (; i + 1 < ts.size(); ++i) {
       if (const auto extra = extra_compile_options_.find(i);
           extra != extra_compile_options_.end()) {
@@ -196,7 +206,10 @@ public:
         const bool bulk_repeat = result.kind == K::bulk_preview && bulk_repeated.count(text);
         const bool module_repeat = result.kind == K::module_emit &&
                                    (text == "--symbol" || text == "--id");
-        if (result.has(text) && !repeated.count(text) && !bulk_repeat && !module_repeat) {
+        const bool object = result.kind == K::object_start || result.kind == K::object_prepare ||
+                            result.kind == K::object_preview;
+        const bool normal_repeat = object ? object_repeated.count(text) : repeated.count(text);
+        if (result.has(text) && !normal_repeat && !bulk_repeat && !module_repeat) {
           throw std::invalid_argument("duplicate option: " + text);
         }
         result.options[text].push_back(
@@ -372,6 +385,13 @@ Command parse_command(const std::string &input) {
   const auto application_only = command.option("--stack-application-only", "true");
   if (application_only != "true" && application_only != "false") {
     throw std::invalid_argument("--stack-application-only must be true or false");
+  }
+  if (command.kind == K::inject || command.kind == K::draft_upload) {
+    const auto backend = command.option("--backend", "auto");
+    if (backend != "auto" && backend != "entry")
+      throw std::invalid_argument("--backend must be auto or entry");
+    if (command.has("--caller") && (backend != "auto" || command.option("--caller").empty()))
+      throw std::invalid_argument("--caller requires a nonempty selector and the auto backend");
   }
   if (command.number("--stack-depth", 0) > UINT32_MAX) {
     throw std::invalid_argument("--stack-depth must fit a 32-bit depth");

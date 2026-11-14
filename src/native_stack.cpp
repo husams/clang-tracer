@@ -37,13 +37,31 @@
 
 namespace {
 using namespace llvm::ELF;
+#if defined(__aarch64__)
+constexpr unsigned native_sp = 31, native_pc = 32, native_return = 30;
+constexpr auto native_machine = EM_AARCH64;
+constexpr auto call_size = 4;
+bool preserved_register(unsigned reg) { return reg >= 19 && reg <= 30; }
+#else
+constexpr unsigned native_sp = 7, native_pc = 16, native_return = native_pc;
+constexpr auto native_machine = EM_X86_64;
+constexpr auto call_size = 1;
+bool preserved_register(unsigned reg) { return reg == 3 || reg == 6 || (reg >= 12 && reg <= 15); }
+#endif
+constexpr unsigned native_registers = std::tuple_size_v<tracer::NativeCodeRegisters>;
+using RegisterMask = std::uint64_t;
+constexpr RegisterMask register_bit(unsigned reg) { return RegisterMask{1} << reg; }
+
+#if defined(__x86_64__)
 thread_local tracer::TraceContext *current_context = nullptr;
+#endif
 
 [[noreturn]] void stop(const char *detail) { throw std::runtime_error(detail); }
 
 struct Image;
 struct Mapping {
   std::uint64_t begin{}, end{}, offset{};
+  std::uint64_t device_major{}, device_minor{}, inode{};
   bool readable{}, executable{};
   std::string path;
   // Verified only for this fresh /proc snapshot, never retained across
@@ -197,14 +215,12 @@ std::vector<Mapping> mappings(std::uint64_t stack_pointer = 0,
     number(m.offset, 16);
     separator(' ');
     spaces();
-    std::uint64_t ignored_device_component = 0;
-    number(ignored_device_component, 16);
+    number(m.device_major, 16);
     separator(':');
-    number(ignored_device_component, 16);
+    number(m.device_minor, 16);
     separator(' ');
     spaces();
-    std::uint64_t ignored_inode = 0;
-    number(ignored_inode, 10);
+    number(m.inode, 10);
     if (cursor != end && *cursor != ' ' && *cursor != '\t')
       stop("invalid native mapping");
     spaces();
@@ -255,6 +271,7 @@ std::vector<Mapping> mappings(std::uint64_t stack_pointer = 0,
   return result;
 }
 
+#if defined(__x86_64__)
 bool runtime_module(std::string_view path) {
   std::string name(path.substr(path.find_last_of('/') + 1));
   std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
@@ -338,6 +355,7 @@ struct FrameSymbols {
   std::uint64_t module_offset = 0;
   bool application = false;
 };
+#endif
 
 // Immutable instructions for one object PC. Compile LLVM's row/rule objects
 // once, but keep live register availability, bounds and memory checks per call.
@@ -350,10 +368,13 @@ struct UnwindPlan {
   };
   unsigned cfa_register = 0;
   std::int32_t cfa_offset = 0;
-  std::uint32_t preserved = 0;
+  RegisterMask preserved = 0;
   bool root = false;
+#if defined(__aarch64__)
+  bool signed_return = false;
+#endif
   unsigned count = 0;
-  std::array<Rule, 17> rules;
+  std::array<Rule, native_registers> rules;
 };
 
 struct Image {
@@ -365,8 +386,9 @@ struct Image {
   bool retained = false;
   std::unordered_map<std::uint64_t, std::vector<llvm::dwarf::UnwindRow>> rows;
   std::unordered_map<std::uint64_t, UnwindPlan> plans;
-  std::unordered_map<std::uint64_t, std::shared_ptr<const FrameSymbols>>
-      symbols;
+#if defined(__x86_64__)
+  std::unordered_map<std::uint64_t, std::shared_ptr<const FrameSymbols>> symbols;
+#endif
 };
 
 // Shared by probes; all LLVM contexts and row caches are protected together.
@@ -383,14 +405,18 @@ struct Cache {
   std::shared_ptr<Image> image(const Mapping &m) {
     if (m.path.empty() || m.path.front() != '/')
       stop("native ELF mapped path is unavailable");
-    const auto existing = images.find(m.path);
+    auto key = m.path;
+    key.push_back('\0');
+    key += std::to_string(m.device_major) + ':' + std::to_string(m.device_minor) + ':' +
+           std::to_string(m.inode);
+    const auto existing = images.find(key);
     if (existing != images.end())
       return existing->second;
 
     // A trace session treats the mapped binary as immutable. Procfs device
     // and inode values can differ from stat() for OverlayFS mappings, so the
-    // mapped path selects the session cache and ELF load offsets/ranges below
-    // validate each PC against the live mapping.
+    // mapped identity selects the session cache and ELF load offsets/ranges
+    // below validate each PC against the live mapping.
     const int fd = ::open(m.path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0)
       stop("cannot open native ELF");
@@ -432,7 +458,7 @@ struct Cache {
     if (std::memcmp(header.e_ident, "\177ELF", 4) ||
         header.e_ident[EI_CLASS] != ELFCLASS64 ||
         header.e_ident[EI_DATA] != ELFDATA2LSB ||
-        header.e_machine != EM_X86_64 ||
+        header.e_machine != native_machine ||
         (header.e_type != ET_DYN && header.e_type != ET_EXEC) ||
         header.e_phentsize != sizeof(Elf64_Phdr) ||
         header.e_phoff > contents.size() ||
@@ -463,7 +489,7 @@ struct Cache {
     // Retention is optional. Captures keep oversized or uncached images alive
     // in their mapping snapshot and apply the same unwind and lookup rules.
     if (images.size() < 64 && contents.size() <= 512 * 1024 * 1024 - bytes) {
-      images.emplace(m.path, result);
+      images.emplace(std::move(key), result);
       result->retained = true;
       bytes += contents.size();
     }
@@ -511,7 +537,7 @@ rows_for(Location loc, std::vector<llvm::dwarf::UnwindRow> &scratch) {
         loc.pc - fde->getInitialLocation() >= fde->getAddressRange())
       continue;
     auto *cie = fde->getLinkedCIE();
-    if (!cie || cie->getReturnAddressRegister() != 16 ||
+    if (!cie || cie->getReturnAddressRegister() != native_return ||
         ::tracer::compat::contains(cie->getAugmentationString(), 'S')) {
       stop("signal or incomplete native CFI frame");
     }
@@ -546,10 +572,11 @@ std::uint64_t add_offset(std::uint64_t value, std::int32_t offset) {
 }
 
 struct Registers {
-  std::array<std::uint64_t, 17> values{};
-  std::uint32_t known = 0;
-  bool has(unsigned reg) const { return (known & (1u << reg)) != 0; }
+  tracer::NativeCodeRegisters values{};
+  RegisterMask known = 0;
+  bool has(unsigned reg) const { return (known & register_bit(reg)) != 0; }
 };
+#if defined(__x86_64__)
 Registers seed(const tracer::TraceContext &ctx) {
   Registers r;
   r.values[6] = ctx.caller_bp;
@@ -558,6 +585,7 @@ Registers seed(const tracer::TraceContext &ctx) {
   r.known = (1u << 6) | (1u << 7) | (1u << 16);
   return r;
 }
+#endif
 
 thread_local std::array<std::uint8_t, 4096> stack_page_bytes;
 const long native_page_bytes = ::sysconf(_SC_PAGESIZE);
@@ -640,20 +668,27 @@ const UnwindPlan &plan_for(Location loc, UnwindPlan &fallback) {
   using Rule = llvm::dwarf::UnwindLocation;
   const auto &cfa = row->getCFAValue();
   if (cfa.getLocation() != Rule::RegPlusOffset || cfa.hasAddressSpace() ||
-      cfa.getRegister() >= 17)
+      cfa.getRegister() >= native_registers)
     stop("native CFA requires an unavailable register or expression");
   fallback.cfa_register = cfa.getRegister();
   fallback.cfa_offset = cfa.getOffset();
-  for (unsigned i = 0; i < 17; ++i) {
+#if defined(__aarch64__)
+  constexpr unsigned ra_sign_state = 34; // DWARF AArch64 RA_SIGN_STATE.
+  if (const auto rule = row->getRegisterLocations().getRegisterLocation(ra_sign_state)) {
+    if (rule->getLocation() != Rule::Constant)
+      stop("native CFI return signing state is unavailable");
+    fallback.signed_return = (rule->getConstant() & 1) != 0;
+  }
+#endif
+  for (unsigned i = 0; i < native_registers; ++i) {
     const auto rule = row->getRegisterLocations().getRegisterLocation(i);
     if (!rule || rule->getLocation() == Rule::Unspecified) {
-      if (i == 3 || i == 6 || (i >= 12 && i <= 15))
-        fallback.preserved |= 1u << i;
+      if (preserved_register(i))
+        fallback.preserved |= register_bit(i);
     } else if (rule->getLocation() == Rule::Undefined) {
-      // Only undefined RIP explicitly ends the walk.
-      fallback.root |= i == 16;
+      fallback.root |= i == native_return;
     } else if (rule->getLocation() == Rule::Same) {
-      fallback.preserved |= 1u << i;
+      fallback.preserved |= register_bit(i);
     } else if (rule->getLocation() == Rule::CFAPlusOffset &&
                !rule->hasAddressSpace()) {
       fallback.rules[fallback.count++] = {
@@ -661,7 +696,7 @@ const UnwindPlan &plan_for(Location loc, UnwindPlan &fallback) {
           static_cast<std::uint8_t>(i), 0, rule->getOffset()};
     } else if (rule->getLocation() == Rule::RegPlusOffset &&
                !rule->hasAddressSpace() && !rule->getDereference() &&
-               rule->getRegister() < 17) {
+               rule->getRegister() < native_registers) {
       fallback.rules[fallback.count++] = {
           UnwindPlan::Register, static_cast<std::uint8_t>(i),
           static_cast<std::uint8_t>(rule->getRegister()), rule->getOffset()};
@@ -686,15 +721,16 @@ Registers unwind(Registers r, Location loc, const Mapping &stack,
   if (!r.has(plan.cfa_register))
     stop("native CFA requires an unavailable register or expression");
   const auto sp = add_offset(r.values[plan.cfa_register], plan.cfa_offset);
-  if (sp <= r.values[7] || sp < stack.begin || sp > stack.end)
+  if (sp < r.values[native_sp] || (native_pc == native_return && sp == r.values[native_sp]) ||
+      sp < stack.begin || sp > stack.end)
     stop("native CFA does not advance within the original stack");
   Registers next = r;
   next.known = r.known & plan.preserved;
   if (plan.root) {
-    next.values[16] = 0;
-    next.known |= 1u << 16;
+    next.values[native_return] = 0;
+    next.known |= register_bit(native_return);
   }
-  std::array<iovec, 17> local_reads, remote_reads;
+  std::array<iovec, native_registers> local_reads, remote_reads;
   unsigned read_count = 0;
   for (unsigned i = 0; i < plan.count; ++i) {
     const auto &rule = plan.rules[i];
@@ -703,7 +739,7 @@ Registers unwind(Registers r, Location loc, const Mapping &stack,
       if (r.has(rule.source)) {
         next.values[destination] =
             add_offset(r.values[rule.source], rule.offset);
-        next.known |= 1u << destination;
+        next.known |= register_bit(destination);
       }
       continue;
     }
@@ -717,16 +753,25 @@ Registers unwind(Registers r, Location loc, const Mapping &stack,
     } else {
       next.values[destination] = value;
     }
-    next.known |= 1u << destination;
+    next.known |= register_bit(destination);
   }
   memory.read(local_reads.data(), remote_reads.data(), read_count);
-  next.values[7] = sp;
-  next.known |= 1u << 7;
-  if (!next.has(16))
+  next.values[native_sp] = sp;
+  next.known |= register_bit(native_sp);
+  if (!next.has(native_return))
     stop("native CFI cannot recover the caller PC");
+  next.values[native_pc] = next.values[native_return];
+#if defined(__aarch64__)
+  if (plan.signed_return)
+    next.values[native_pc] = tracer::strip_return_signature(next.values[native_pc]);
+#endif
+  next.known |= register_bit(native_pc);
+  if (sp == r.values[native_sp] && next.values[native_pc] == r.values[native_pc])
+    stop("native CFI did not advance beyond a leaf");
   return next;
 }
 
+#if defined(__x86_64__)
 std::string readable_text(std::string value) {
   value.resize(std::min<std::size_t>(value.size(), 256));
   for (char &c : value)
@@ -855,8 +900,10 @@ std::shared_ptr<const FrameSymbols> symbols_for(Location loc) {
   }
   return metadata;
 }
+#endif
 } // namespace
 
+#if defined(__x86_64__)
 struct tracer::NativeStackStorage {
   std::vector<StackFrame> frames;
   std::unordered_map<std::uint64_t, std::shared_ptr<const FrameSymbols>> symbols;
@@ -923,8 +970,51 @@ extern "C" void tracer_stack_leave(tracer::TraceContext *ctx) noexcept {
   tracer::release_native_stack(*ctx);
   errno = saved_errno;
 }
+#endif
 
 namespace tracer {
+NativeCodeStack capture_native_code_stack(const NativeCodeRegisters &registers,
+    std::span<std::uint64_t> pcs, std::span<std::uint64_t> stack_pointers) noexcept {
+  NativeCodeStack result;
+  const auto depth = std::min(pcs.size(), stack_pointers.size());
+  if (!depth || !registers[native_pc])
+    return result;
+  pcs.front() = registers[native_pc];
+  stack_pointers.front() = registers[native_sp];
+  result.count = 1;
+  try {
+    const auto process = ::getpid();
+    const auto maps = mappings(registers[native_sp], process);
+    const auto stack = std::ranges::find_if(maps, [&](const auto &mapping) {
+      return mapping.readable && registers[native_sp] >= mapping.begin && registers[native_sp] < mapping.end;
+    });
+    if (stack == maps.end())
+      return result;
+    const std::lock_guard lock(cache.mutex);
+    StackMemory memory{registers[native_sp], *stack, process};
+    Registers current{registers, register_bit(native_registers) - 1};
+    current = unwind(current, locate(maps, current.values[native_pc]), *stack, memory);
+    while (current.values[native_pc]) {
+      if (result.count == depth) {
+        result.status = StackStatus::Truncated;
+        return result;
+      }
+      if (current.values[native_pc] < call_size)
+        break;
+      const auto location = locate(maps, current.values[native_pc] - call_size);
+      pcs[result.count] = current.values[native_pc];
+      stack_pointers[result.count++] = current.values[native_sp];
+      current = unwind(current, location, *stack, memory);
+    }
+    if (!current.values[native_pc])
+      result.status = StackStatus::Complete;
+  } catch (...) {
+    // Keep all original frames verified before the missing or invalid row.
+  }
+  return result;
+}
+
+#if defined(__x86_64__)
 void begin_native_stack_session(std::string_view session_id) {
   std::lock_guard lock(cache.mutex);
   if (cache.session_id == session_id)
@@ -1058,4 +1148,5 @@ void serialize_native_stack(const StackTrace &stack,
     out->set_application_frame(frame.application_frame);
   }
 }
+#endif
 } // namespace tracer

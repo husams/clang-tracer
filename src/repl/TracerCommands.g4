@@ -3,7 +3,8 @@ grammar TracerCommands;
 line : '%' command EOF;
 command : server | attach | processes | sessions | use | status | detach
         | modules | moduleIndex | threads | symbols | probe | interceptor | events | collect | record
-        | cpp | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload;
+        | cpp | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload
+        | objectWatch;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
 serverOption : ('--executable' | '--agent') value | contextEventBytes;
 attach : 'attach' (UINT ('--start-time' UINT)?)?;
@@ -39,13 +40,16 @@ resolveOption : ('--include' | '--compdb' | '--translation-unit' | '--module' | 
                 | '--prepared' | '--prepared-mode') value
               | extraCompileOption;
 deployOption : resolveOption | '--stack-depth' (UINT | WORD)
-             | '--print-arguments' | '--print-result' | SNAPSHOT_RETURN_POINTEE | stackFilter;
+             | '--print-arguments' | '--print-result' | SNAPSHOT_RETURN_POINTEE
+             | '--snapshot-receiver-at-return' | stackFilter
+             | ('--backend' | '--caller') value;
 interceptor : 'interceptor' ('load' value '--as' value | 'edit' value | 'show' value
       | 'validate' value '--target' value resolveOption*
             | 'upload' value '--target' value deployOption*);
 events : 'events' (streamOption*
        | 'list' value ('--limit' UINT)?
        | 'show' value '--index' UINT
+       | 'diff' value '--pre' UINT '--post' UINT ('--key' value)*
        | STACK value '--index' UINT
        | 'calls' value | 'stats' value | 'clear' value
        | 'open' value '--as' value
@@ -78,7 +82,24 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'import'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
         | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview' | 'apply'
-        | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | STACK;
+        | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | 'object' | STACK;
+objectWatch : 'object' ('prepare' value? objectOption+ | ('start' | 'preview') objectOption+
+                        | ('stop' | 'status') UINT?);
+objectOption : ('--type' | '--base' | '--owner' | '--field' | '--collection'
+                 | '--owner-add' | '--owner-get' | '--owner-remove' | '--owner-snapshot'
+                 | '--snapshot-field' | '--code' | '--backend' | '--module' | '--caller'
+                 | '--plan' | '--output' | '--executable' | '--mode'
+                 | '--include' | '--policy' | '--compdb' | '--translation-unit'
+                 | '--on' | '--key' | '--emit-source'
+                 | '--vector' | '--element-key' | '--map' | '--map-key' | '--pointee'
+                 | '--mutation' | '--synchronization' | '--union-tag' | '--union-case'
+                 | '--rendezvous' | '--overflow' | '--shared-file') value
+             | ('--stack-depth' | '--max-elements' | '--max-string-bytes'
+                 | '--max-depth' | '--max-snapshot-bytes' | '--max-instances'
+                 | '--max-events' | '--event-buffer' | '--timeout' | '--tid' | '--async-signal'
+                 | '--serialize-wait-us' | '--runtime-limit') UINT
+             | '--no-values' | '--first-seen' | '--writer-entry' | '--discover-writers' | '--follow-calls'
+             | '--syscall-output' | '--stack-cfi';
 memory : 'memory' ('maps' | 'read' value '--mapping' value
                  ('--count' UINT | '--type' value)
                  | 'scan' value '--mapping' value '--count' UINT

@@ -5,6 +5,8 @@
 #include "prepared_contract.hpp"
 #include "prepared_types.hpp"
 #include "snapshot_encoder.hpp"
+#include "bounded_proto.hpp"
+#include "value_snapshot_storage.hpp"
 
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/CXXInheritance.h>
@@ -72,7 +74,7 @@ bool supports_itanium_dynamic_rtti(clang::ASTContext &ast) {
   const auto *vtable = llvm::dyn_cast<clang::ItaniumVTableContext>(
       ast.getVTableContext());
   return ast.getLangOpts().RTTI &&
-         target.getTriple().getArch() == llvm::Triple::x86_64 &&
+         (target.getTriple().getArch() == llvm::Triple::x86_64 || target.getTriple().isAArch64()) &&
          target.getTriple().isOSLinux() && target.isLittleEndian() &&
          target.getPointerWidth(clang::LangAS::Default) == 64 &&
          target.getLongWidth() == 64 && target.getCXXABI().isItaniumFamily() &&
@@ -92,11 +94,13 @@ std::string itanium_rtti_type_name(clang::ASTContext &ast,
   return {};
 }
 bool codec_types_supported(clang::QualType type,
-                           std::set<const clang::CXXRecordDecl *> &seen) {
+                           std::set<const clang::CXXRecordDecl *> &seen,
+                           const context_engine::SnapshotFieldSelection &selection,
+                           const clang::CXXRecordDecl *root = nullptr) {
   if (type.getNonReferenceType().isVolatileQualified())
     return false;
   if (const auto *array = type->getAsArrayTypeUnsafe())
-    return codec_types_supported(array->getElementType(), seen);
+    return codec_types_supported(array->getElementType(), seen, selection);
   const auto *record = type.getNonReferenceType()->getAsCXXRecordDecl();
   if (!record || !seen.insert(record->getCanonicalDecl()).second)
     return true;
@@ -142,7 +146,7 @@ bool codec_types_supported(clang::QualType type,
       if (primary == "weak_ptr" || !pointee->isObjectType() || pointee->isArrayType() ||
           pointee->isIncompleteType() || pointee.isVolatileQualified())
         return true;
-      return codec_types_supported(pointee, seen);
+      return codec_types_supported(pointee, seen, selection);
     }
     if (name.rfind("std::", 0) == 0) {
       const auto supported = [&](auto &&check, const clang::TemplateArgument &argument) -> bool {
@@ -150,7 +154,7 @@ bool codec_types_supported(clang::QualType type,
           return std::all_of(argument.pack_begin(), argument.pack_end(),
                              [&](const auto &item) { return check(check, item); });
         return argument.getKind() != clang::TemplateArgument::Type ||
-               codec_types_supported(argument.getAsType(), seen);
+               codec_types_supported(argument.getAsType(), seen, selection);
       };
       for (const auto &argument : args.asArray())
         if (!supported(supported, argument))
@@ -161,11 +165,13 @@ bool codec_types_supported(clang::QualType type,
   record = record->getDefinition();
   if (!record)
     return false;
+  if (!root)
+    root = record;
   for (const auto *member : record->fields())
-    if (!codec_types_supported(member->getType(), seen))
+    if (selection.includes(root, *member) && !codec_types_supported(member->getType(), seen, selection))
       return false;
   for (const auto &base : record->bases())
-    if (!codec_types_supported(base.getType(), seen))
+    if (!codec_types_supported(base.getType(), seen, selection, root))
       return false;
   return true;
 }
@@ -257,6 +263,7 @@ make_value_snapshot_code(clang::ASTContext &ast,
     std::vector<SnapshotProjection> projections;
     bool polymorphic = false;
     bool automatic = false;
+    bool erased_any = false;
   };
   struct Entry {
     unsigned index;
@@ -271,6 +278,18 @@ make_value_snapshot_code(clang::ASTContext &ast,
   };
   std::vector<Entry> entries;
   const auto &info = spec.debug_info();
+  const bool report_unavailable = spec.snapshot_report_unavailable();
+  context_engine::SnapshotFieldSelection selection;
+  if (report_unavailable && !spec.snapshot_receiver_fields().empty()) {
+    const auto receiver = tracer_alias(ast, "ResolvedTarget");
+    selection.record = receiver.isNull() ? nullptr : receiver->getAsCXXRecordDecl();
+    for (const auto &path : spec.snapshot_receiver_fields()) {
+      auto name = std::string_view(path).substr(0, path.find_first_of(".["));
+      if (const auto qualifier = name.rfind("::"); qualifier != std::string_view::npos)
+        name.remove_prefix(qualifier + 2);
+      selection.names.emplace_back(name);
+    }
+  }
   const auto access = tracer::prepared::is_typed_version(spec.prepared().format_version())
       ? context_engine::CodecAccess::snapshot_members
       : context_engine::CodecAccess::public_members;
@@ -288,17 +307,17 @@ make_value_snapshot_code(clang::ASTContext &ast,
     context_engine::SchemaLimits limits;
     limits.descriptor_bytes = 4096;
     limits.fields = 128;
-    limits.depth = 16;
+    limits.depth = report_unavailable ? context_engine::max_capture_depth : 16;
     entry.schema = context_engine::build_payload_schema(
-        ast, type, std::move(family), limits, access);
+        ast, type, std::move(family), limits, access, selection);
     const auto codec =
-        context_engine::render_payload_codec_source(ast, type, access);
+        context_engine::render_payload_codec_source(ast, type, access, selection);
     if (!entry.schema)
       entry.error = entry.schema.error;
     else if (!codec)
       entry.error = codec.error;
     std::set<const clang::CXXRecordDecl *> seen;
-    if (!codec_types_supported(type, seen))
+    if (!codec_types_supported(type, seen, selection))
       entry.error = "unsupported string character type in " +
                     error_subject.str();
     if (is_volatile)
@@ -382,7 +401,7 @@ make_value_snapshot_code(clang::ASTContext &ast,
       }
       clang::CXXBasePaths paths;
       if (!record->isDerivedFrom(base, paths) ||
-          paths.isAmbiguous(ast.getCanonicalType(ast.getRecordType(base)))) {
+          paths.isAmbiguous(ast.getCanonicalType(tracer::prepared::record_type(ast, base)))) {
         projection.error = "prepared snapshot type is not an unambiguous derived pointee";
         return projection;
       }
@@ -424,7 +443,7 @@ make_value_snapshot_code(clang::ASTContext &ast,
       }
     }
     std::set<const clang::CXXRecordDecl *> seen;
-    if (!codec_types_supported(projection.payload_type, seen)) {
+    if (!codec_types_supported(projection.payload_type, seen, selection)) {
       projection.error = "unsupported type in prepared snapshot payload";
       return projection;
     }
@@ -484,9 +503,7 @@ make_value_snapshot_code(clang::ASTContext &ast,
             field = decl;
             break;
           }
-        if (!field || !field->getType()->isPointerType() ||
-            field->getType().isVolatileQualified() ||
-            field->getType()->getPointeeType().isVolatileQualified())
+        if (!field || field->getType().isVolatileQualified())
           return;
         const auto output_name = member_policy.field() + "_snapshot";
         const bool name_collision = std::any_of(
@@ -495,6 +512,30 @@ make_value_snapshot_code(clang::ASTContext &ast,
               return decl->getNameAsString() == output_name;
             });
         if (name_collision)
+          return;
+        if (member_policy.erased_any()) {
+          const auto *erased = field->getType()->getAsCXXRecordDecl();
+          if (automatic || !erased || erased->getQualifiedNameAsString() != "std::any")
+            return;
+          FollowedMember followed;
+          followed.field = field;
+          followed.name = member_policy.field();
+          followed.erased_any = true;
+          for (const auto index : member_policy.dynamic_types())
+            if (const auto *layout = record_metadata(index)) {
+              const auto payload = registry_type(index);
+              if (payload.isNull())
+                continue;
+              auto projection = make_projection(payload, *layout, payload, false);
+              if (projection.error.empty())
+                followed.projections.push_back(std::move(projection));
+            }
+          if (!followed.projections.empty())
+            entry.members.push_back(std::move(followed));
+          return;
+        }
+        if (!field->getType()->isPointerType() ||
+            field->getType()->getPointeeType().isVolatileQualified())
           return;
         auto base_type = field->getType()->getPointeeType()
                              .getUnqualifiedType().getCanonicalType();
@@ -618,6 +659,13 @@ make_value_snapshot_code(clang::ASTContext &ast,
   for (auto &entry : entries) {
     if (entry.error.empty()) {
       configure_record_policy(entry);
+    if (entry.role == Role::receiver && selection.record) {
+        std::erase_if(entry.members, [&](const auto &member) {
+          const auto projection = member.name + "_snapshot";
+          return std::find(selection.names.begin(), selection.names.end(), member.name) == selection.names.end() &&
+                 std::find(selection.names.begin(), selection.names.end(), projection) == selection.names.end();
+        });
+      }
       if (entry.result_pointee) {
         if (entry.dynamic_projections.empty() &&
             spec.prepared().has_snapshot_return_type())
@@ -641,7 +689,7 @@ make_value_snapshot_code(clang::ASTContext &ast,
   const std::string scope = R"(
 extern "C" std::size_t tracer_snapshot_mark() noexcept;
 extern "C" void tracer_snapshot_reset(std::size_t) noexcept;
-extern "C" std::byte* tracer_snapshot_storage(std::size_t*) noexcept;
+extern "C" std::byte* tracer_snapshot_storage(std::size_t*, std::size_t) noexcept;
 extern "C" void tracer_snapshot_commit(std::size_t,std::size_t) noexcept;
 namespace tracer_snapshot_detail {
 struct Scope { std::size_t mark = tracer_snapshot_mark(); bool active=true;
@@ -669,9 +717,9 @@ struct Scope { std::size_t mark = tracer_snapshot_mark(); bool active=true;
     }
   if (!types.empty()) {
     const auto codecs = member_accessors.empty()
-        ? context_engine::render_context_codec_sources(ast, {}, types, access)
+        ? context_engine::render_context_codec_sources(ast, {}, types, access, selection)
         : context_engine::render_snapshot_member_accessors(
-              ast, types, member_accessors, access);
+              ast, types, member_accessors, access, selection);
     if (!codecs) {
       for (auto &entry : entries)
         if (entry.error.empty())
@@ -712,10 +760,10 @@ struct Scope { std::size_t mark = tracer_snapshot_mark(); bool active=true;
                             }));
       });
   const bool has_automatic_capture = std::any_of(
-      entries.begin(), entries.end(), [](const auto &entry) {
+      entries.begin(), entries.end(), [report_unavailable](const auto &entry) {
         return std::any_of(entry.members.begin(), entry.members.end(),
-                           [](const auto &member) {
-                             return member.automatic &&
+                           [report_unavailable](const auto &member) {
+                             return (member.automatic || (report_unavailable && member.polymorphic)) &&
                                     !member.projections.empty();
                            });
       });
@@ -734,27 +782,58 @@ struct Scope { std::size_t mark = tracer_snapshot_mark(); bool active=true;
                                   });
                             }));
       });
-  if (!types.empty())
+  if (!types.empty()) {
+    const auto bound = [](std::uint32_t value, std::size_t fallback, std::size_t limit) {
+      return std::to_string(value ? std::min<std::size_t>(value, limit) : fallback);
+    };
+    code.declarations += "\nnamespace tracer_snapshot_detail {\n"
+        "constexpr std::size_t snapshot_items=" + bound(spec.snapshot_max_items(), 4096, context_engine::max_capture_items) + ";\n"
+        "constexpr std::size_t snapshot_strings=" + bound(spec.snapshot_max_string_bytes(), 4096, max_snapshot_bytes) + ";\n"
+        "constexpr std::size_t snapshot_depth=" + bound(spec.snapshot_max_depth(), 32, context_engine::max_capture_depth) + ";\n"
+        "constexpr std::size_t snapshot_bytes=" + bound(spec.snapshot_max_bytes(), 4096, max_snapshot_bytes) + ";\n"
+        "}\n";
     code.declarations += R"(
 namespace tracer_snapshot_detail {
 template<class T> void encode(tracer::ValueSnapshot& snapshot, const T& value) noexcept {
   const auto mark=tracer_snapshot_mark();
   std::size_t capacity = 0;
-  std::byte* storage = tracer_snapshot_storage(&capacity);
+  std::byte* storage = tracer_snapshot_storage(&capacity,snapshot_bytes);
   tracer::context_engine::CaptureLimits limits;
-  limits.bytes=capacity; limits.string_bytes=4096;
+  limits.bytes=capacity; limits.string_bytes=snapshot_strings;
+  limits.depth=snapshot_depth; limits.items=snapshot_items; limits.item_cap=snapshot_items;
+  limits.visits=std::max(limits.visits,capacity);
   tracer::context_engine::BoundedProtoWriter writer({storage,capacity},limits);
-  tracer::context_engine::EncodeBudget budget; budget.max_items=4096;
+  tracer::context_engine::EncodeBudget budget;
+)";
+    if (report_unavailable)
+      code.declarations += "  tracer::context_engine::EncodeBudget::PointerGraph pointer_graph(snapshot_items);\n"
+                           "  budget.pointer_graph=&pointer_graph;\n";
+    code.declarations += R"(
+  budget.max_items=snapshot_items; budget.limits=limits;
   const bool ok=tracer::context_engine::encode_value(writer,1,value,budget);
   auto bytes=writer.finish();
   if(ok && writer.status()==tracer::context_engine::CaptureStatus::ok){
     snapshot.status=tracer::ValueSnapshot::Complete; snapshot.payload=bytes.data();
     snapshot.payload_size=bytes.size(); tracer_snapshot_commit(mark,bytes.size());
-  }else{tracer_snapshot_reset(mark); snapshot.status=tracer::ValueSnapshot::LimitExceeded; snapshot.detail="snapshot exceeds capture budget";}
+  }else{
+    tracer_snapshot_reset(mark);
+    snapshot.status=tracer::ValueSnapshot::LimitExceeded;
+    using Status=tracer::context_engine::CaptureStatus;
+    switch(writer.status()){
+    case Status::bytes_exceeded: snapshot.detail="snapshot exceeds byte budget"; break;
+    case Status::items_exceeded: snapshot.detail="snapshot exceeds element budget"; break;
+    case Status::string_exceeded: snapshot.detail="snapshot exceeds string budget"; break;
+    case Status::depth_exceeded: snapshot.detail="snapshot exceeds depth budget"; break;
+    case Status::visits_exceeded: snapshot.detail="snapshot exceeds traversal budget"; break;
+    case Status::work_exceeded: snapshot.detail="snapshot exceeds encoding work budget"; break;
+    default: snapshot.detail=budget.failure ? budget.failure : "snapshot exceeds capture budget"; break;
+    }
+  }
 }
 
 }
 )";
+  }
   if (has_custom_encoder)
     code.declarations += R"(
 #include <cerrno>
@@ -800,6 +879,31 @@ template<class T> bool has_itanium_rtti(const T* object) noexcept {
 extern "C" bool tracer_snapshot_read_rtti(const void*, const void**, const char**) noexcept;
 extern "C" bool tracer_snapshot_rtti_matches(const char*, const char*, std::size_t, const void*, const void*, std::size_t, std::size_t) noexcept;
 )";
+  if (report_unavailable) {
+    code.declarations += R"(
+#include <cstddef>
+#include <cstdint>
+extern "C" bool tracer_snapshot_read_rtti_provider(const void*, const void**, const char**, const void**, const void**) noexcept;
+extern "C" bool tracer_snapshot_readable(const void*, std::size_t, std::size_t) noexcept;
+namespace tracer_snapshot_detail {
+inline bool verified_rtti_storage(const void* address, std::size_t size) noexcept {
+  const auto value=reinterpret_cast<std::uintptr_t>(address);
+)";
+    for (const auto &range : spec.snapshot_rtti_ranges())
+      if (range.begin() && range.end() > range.begin())
+        code.declarations += "  if(value>=" + std::to_string(range.begin()) +
+            "ULL && value<" + std::to_string(range.end()) + "ULL && size<=" +
+            std::to_string(range.end()) + "ULL-value) return true;\n";
+    code.declarations += R"(  return false;
+}
+inline bool verified_vtable(const void* address) noexcept {
+  const auto value=reinterpret_cast<std::uintptr_t>(address);
+  return value>=2*sizeof(void*) && verified_rtti_storage(
+      reinterpret_cast<const void*>(value-2*sizeof(void*)),3*sizeof(void*));
+}
+}
+)";
+  }
   for (const auto &entry : entries) {
     const bool receiver = entry.role == Role::receiver;
     const bool result = entry.role == Role::result;
@@ -808,7 +912,7 @@ extern "C" bool tracer_snapshot_rtti_matches(const char*, const char*, std::size
     const auto slot = receiver ? "ctx.receiver_snapshot"
                                : result ? "ctx.result.snapshot"
                                         : "ctx.arguments[" + std::to_string(entry.index) + "].snapshot";
-    auto &body = result ? code.result : code.arguments;
+    auto &body = receiver ? code.receiver : result ? code.result : code.arguments;
     body += "tracer::ValueSnapshot snapshot_" + id + ";\n";
     if (!entry.members.empty())
       body += "tracer::ValueSnapshot child_snapshots_" + id + "[" +
@@ -816,6 +920,9 @@ extern "C" bool tracer_snapshot_rtti_matches(const char*, const char*, std::size
               "tracer::ValueSnapshotMember child_members_" + id + "[" +
               std::to_string(entry.members.size()) + "]{};\n"
               "std::size_t child_member_count_" + id + "=0;\n";
+    if (report_unavailable && !entry.members.empty() && entry.error.empty())
+      body += "tracer::context_engine::EncodeBudget::PointerGraph child_graph_" + id +
+              "(tracer_snapshot_detail::snapshot_items);\n";
     if (entry.result_pointee)
       body += "if (auto *result_pointee=tracer::Call(ctx).result()) {\n";
     body += slot + "=&snapshot_" + id + ";\n";
@@ -956,29 +1063,70 @@ extern "C" bool tracer_snapshot_rtti_matches(const char*, const char*, std::size
       const auto child = "child_snapshots_" + id + "[" + std::to_string(m) + "]";
       const auto helper = "tracer::context_engine::snapshot_access::snapshot_member_" +
                           std::to_string(member.accessor_id);
+      const auto attach_child = [&]() {
+        if (!report_unavailable)
+          body += "if(" + child + ".status==tracer::ValueSnapshot::Complete){\n";
+        body += "child_members_" + id + "[child_member_count_" + id +
+                "]={" + literal(member.name + "_snapshot") + ",&" + child +
+                "}; ++child_member_count_" + id + ";\n";
+        if (!report_unavailable)
+          body += "}\n";
+      };
+      if (member.erased_any) {
+        const auto erased = "erased_member_" + id + "_" + std::to_string(m);
+        body += "const auto& " + erased + "=" + helper + "(" + root_expr + ");\n";
+        for (std::size_t i = 0; i < member.projections.size(); ++i) {
+          const auto &projection = member.projections[i];
+          body += (i ? "else if" : "if") + std::string("(const auto* ") + pointer +
+                  "=std::any_cast<" + projection.cpp_type + ">(&" + erased + ")){\n";
+          if (report_unavailable)
+            body += "if(tracer_snapshot_readable(" + pointer + ",sizeof(" + projection.cpp_type +
+                    "),alignof(" + projection.cpp_type + "))){\n";
+          emit_projection(projection, child, "*" + pointer,
+                          "_member_" + std::to_string(member.accessor_id) +
+                              "_" + std::to_string(i), false);
+          if (report_unavailable)
+            body += "}else{ " + child + ".detail=\"registered std::any payload storage unavailable\"; }\n";
+          body += "}\n";
+        }
+        if (report_unavailable)
+          body += "if(!" + child + ".detail && " + child +
+                  ".status!=tracer::ValueSnapshot::Complete) " + child +
+                  ".detail=\"unregistered std::any payload\";\n";
+        attach_child();
+        continue;
+      }
       body += "auto " + pointer + "=" + helper + "(" + root_expr + ");\n"
               "if(" + pointer + "){\n";
-      const auto attach_child = [&]() {
-        body += "if(" + child + ".status==tracer::ValueSnapshot::Complete){\n"
-                "child_members_" + id + "[child_member_count_" + id +
-                "]={" + literal(member.name + "_snapshot") + ",&" + child +
-                "}; ++child_member_count_" + id + ";\n}\n";
-      };
-      if (member.automatic) {
+      if (member.automatic || (report_unavailable && member.polymorphic)) {
         const auto complete = "automatic_complete_" + id + "_" +
                               std::to_string(m);
         const auto type_name = "automatic_type_name_" + id + "_" +
                                std::to_string(m);
-        body += "const void* " + complete + "=nullptr; const char* " +
-                type_name + "=nullptr;\n"
-                "if(tracer_snapshot_read_rtti(static_cast<const void*>(" +
-                pointer + "),&" + complete + ",&" + type_name + ")){\n";
+        body += "const void* " + complete + "=nullptr; const char* " + type_name + "=nullptr;\n";
+        if (report_unavailable) {
+          const auto provider = "rtti_provider_" + id + "_" + std::to_string(m);
+          const auto table = "rtti_table_" + id + "_" + std::to_string(m);
+          body += "const void* " + provider + "=nullptr; const void* " + table + "=nullptr;\n"
+                  "if(tracer_snapshot_read_rtti_provider(static_cast<const void*>(" + pointer +
+                  "),&" + complete + ",&" + type_name + ",&" + provider + ",&" + table +
+                  ") && tracer_snapshot_detail::verified_rtti_storage(" + provider +
+                  ",2*sizeof(void*)) && tracer_snapshot_detail::verified_vtable(" + table +
+                  ") && tracer_snapshot_detail::verified_rtti_storage(" + type_name +
+                  ",1)){\n";
+        } else {
+          body += "if(tracer_snapshot_read_rtti(static_cast<const void*>(" + pointer +
+                  "),&" + complete + ",&" + type_name + ")){\n";
+        }
         bool first = true;
         for (std::size_t i = 0; i < member.projections.size(); ++i) {
           const auto &projection = member.projections[i];
           if (projection.rtti_name.empty())
             continue;
           body += first ? "if(" : "else if(";
+          if (report_unavailable)
+            body += "tracer_snapshot_detail::verified_rtti_storage(" + type_name + "," +
+                    std::to_string(projection.rtti_name.size() + 2) + ") && ";
           body += "tracer_snapshot_rtti_matches(" + type_name + "," +
                   literal(projection.rtti_name) + "," +
                   std::to_string(projection.rtti_name.size()) + "," + complete +
@@ -986,10 +1134,14 @@ extern "C" bool tracer_snapshot_rtti_matches(const char*, const char*, std::size
                   projection.cpp_type + "),alignof(" + projection.cpp_type +"))){\n";
           const auto value = "*static_cast<const " + projection.cpp_type +
                              "*>(" + complete + ")";
+          if (report_unavailable)
+            body += "if(child_graph_" + id + ".admit(reinterpret_cast<std::uintptr_t>(" +
+                    complete + "))){\n";
           emit_projection(projection, child, value,
                           "_member_" + std::to_string(member.accessor_id) +
                               "_" + std::to_string(i), false);
-          attach_child();
+          if (report_unavailable)
+            body += "}else{ " + child + ".detail=\"pointee alias or capture graph budget exhausted\"; }\n";
           body += "}\n";
           first = false;
         }
@@ -1002,21 +1154,33 @@ extern "C" bool tracer_snapshot_rtti_matches(const char*, const char*, std::size
           if (member.polymorphic && !projection.rtti_name.empty())
             body += "tracer_snapshot_detail::has_itanium_rtti(" + pointer + ") && std::strcmp(typeid(*" +
                     pointer + ").name()," + literal(projection.rtti_name) + ")==0){\n";
+          else if (report_unavailable)
+            body += "tracer_snapshot_readable(" + pointer + ",sizeof(" + projection.cpp_type +
+                    "),alignof(" + projection.cpp_type + "))){\n";
           else
             body += "true){\n";
           const auto value = member.polymorphic && !projection.rtti_name.empty()
               ? "*static_cast<const " + projection.cpp_type +
                     "*>(dynamic_cast<const void*>(" + pointer + "))"
               : "*" + pointer;
+          if (report_unavailable)
+            body += "if(child_graph_" + id + ".admit(reinterpret_cast<std::uintptr_t>(" +
+                    pointer + "))){\n";
           emit_projection(projection, child, value,
                           "_member_" + std::to_string(member.accessor_id) +
                               "_" + std::to_string(i), false);
-          attach_child();
+          if (report_unavailable)
+            body += "}else{ " + child + ".detail=\"pointee alias or capture graph budget exhausted\"; }\n";
           body += "}\n";
           first = false;
         }
       }
       body += "}\n";
+      if (report_unavailable)
+        body += "if(!" + child + ".detail && " + child +
+                ".status!=tracer::ValueSnapshot::Complete) " + child +
+                ".detail=\"pointee type, provider or readable storage unavailable\";\n";
+      attach_child();
     }
     if (!entry.members.empty())
       body += "snapshot_" + id + ".members=child_members_" + id +

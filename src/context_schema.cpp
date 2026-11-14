@@ -1,4 +1,5 @@
 #include "context_schema.hpp"
+#include "bounded_proto.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -17,6 +18,7 @@
 #include <clang/Basic/SourceManager.h>
 #include <google/protobuf/descriptor.pb.h>
 #include <llvm/ADT/SmallString.h>
+#include <llvm/Config/llvm-config.h>
 #include <llvm/Support/FileSystem.h>
 
 #include "tracer/compat.hpp"
@@ -31,7 +33,11 @@ using FDS = google::protobuf::FileDescriptorSet;
 std::string record_spelling(const clang::CXXRecordDecl *record) {
   clang::PrintingPolicy policy(record->getASTContext().getLangOpts());
   policy.SuppressTagKeyword = true;
+#if LLVM_VERSION_MAJOR >= 22
+  return clang::QualType(record->getASTContext().getCanonicalTagType(record).getTypePtr(), 0)
+#else
   return clang::QualType(record->getTypeForDecl(), 0)
+#endif
       .getCanonicalType().getAsString(policy);
 }
 
@@ -170,6 +176,7 @@ struct Builder {
   std::size_t fields = 0, messages = 0;
   std::string error;
   bool snapshot = false;
+  const SnapshotFieldSelection *selection = nullptr;
 
   bool system_default_specialization(
       const clang::ClassTemplateSpecializationDecl *s) const {
@@ -209,7 +216,8 @@ struct Builder {
   void collect_fields(const clang::CXXRecordDecl *r, SchemaMessage &out,
                       unsigned depth, std::uint32_t &id,
                       std::unordered_set<const clang::CXXRecordDecl *> &seen,
-                      std::unordered_map<std::string, std::pair<std::size_t, std::string>> &owners) {
+                      std::unordered_map<std::string, std::pair<std::size_t, std::string>> &owners,
+                      const clang::CXXRecordDecl *root) {
     if (!r || !r->hasDefinition() || !error.empty()) {
       return;
     }
@@ -232,10 +240,12 @@ struct Builder {
       }
       auto *br = bt->getAsCXXRecordDecl();
       if (br && br->hasDefinition()) {
-        collect_fields(br, out, depth, id, seen, owners);
+        collect_fields(br, out, depth, id, seen, owners, root);
       }
     }
     for (const auto *f : r->fields()) {
+      if (selection && !selection->includes(root, *f))
+        continue;
       if (snapshot && f->isUnnamedBitField())
         continue;
       if (f->isBitField() && !snapshot) {
@@ -390,6 +400,7 @@ struct Builder {
         record->fields.push_back(snapshot_scalar("address", 1, SchemaKind::unsigned_integer, 64));
         if (snapshot_pointee(arg(s, 0)))
           add_optional(arg(s, 0), "value");
+        record->fields.push_back(snapshot_scalar("suppressed", 3, SchemaKind::boolean, 1));
       }
       out.kind = SchemaKind::message;
       out.message = std::move(record);
@@ -646,7 +657,7 @@ struct Builder {
     std::uint32_t id = 1;
     std::unordered_set<const clang::CXXRecordDecl *> seen;
     std::unordered_map<std::string, std::pair<std::size_t, std::string>> owners;
-    collect_fields(r, *result, depth, id, seen, owners);
+    collect_fields(r, *result, depth, id, seen, owners, r);
     active.erase(r);
     cache.emplace(r, result);
     return result;
@@ -987,7 +998,7 @@ SchemaRecord::SchemaRecord(StateFamilyKey f, std::string root, std::string rev,
 
 CodecSourceResult
 render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* const> roots,
-                           CodecAccess access_policy) {
+                           CodecAccess access_policy, const SnapshotFieldSelection &selection) {
   const bool snapshot = access_policy == CodecAccess::snapshot_members;
   CodecSourceResult result;
   std::vector<const clang::CXXRecordDecl *> records;
@@ -1072,11 +1083,21 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
                        "codec generation";
         return;
       }
-      gather_record(br->getDefinition());
+      if (!snapshot || !selection.record)
+        gather_record(br->getDefinition());
     }
-    for (const auto *f : r->fields()) {
-      gather_type(f->getType());
-    }
+    const auto gather_members = [&](const auto &self, const clang::CXXRecordDecl *owner) -> void {
+      for (const auto *f : owner->fields())
+        if (selection.includes(r, *f))
+          gather_type(f->getType());
+      if (snapshot && selection.record)
+        for (const auto &base : owner->bases()) {
+          const auto *record = base.getType()->getAsCXXRecordDecl();
+          if (!is_marker(base.getType()) && record && record->hasDefinition())
+            self(self, record->getDefinition());
+        }
+    };
+    gather_members(gather_members, r);
     active.erase(r);
     done.insert(r);
     records.push_back(r);
@@ -1138,6 +1159,8 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
         }
       }
       for (const auto *field : r->fields()) {
+        if (!selection.includes(record, *field))
+          continue;
         if (snapshot && field->isUnnamedBitField())
           continue;
         auto access = field->getAccess();
@@ -1187,7 +1210,7 @@ render_state_codec_sources(::tracer::compat::span<const clang::CXXRecordDecl* co
            << " static bool write(BoundedProtoWriter& w, std::uint32_t field, "
               "const ::"
            << type_name << "& value, EncodeBudget& budget) noexcept {\n"
-           << "  if (budget.max_items > 4096 || !w.begin_message(field)) "
+           << "  if (budget.max_items > std::min(budget.limits.item_cap, max_capture_items) || !w.begin_message(field)) "
               "return false; std::uint32_t field_number=1; const bool "
               "ok=write_fields(w,value,budget,field_number); return "
               "w.end_message() && ok;\n }\n};\n";
@@ -1206,7 +1229,7 @@ CodecSourceResult
 render_context_codec_sources(clang::ASTContext& ast,
                              ::tracer::compat::span<const clang::CXXRecordDecl* const> state_roots,
                              ::tracer::compat::span<const clang::QualType> payload_roots,
-                             CodecAccess access_policy) {
+                             CodecAccess access_policy, const SnapshotFieldSelection &selection) {
   std::vector<const clang::CXXRecordDecl *> roots(state_roots.begin(),
                                                   state_roots.end());
   std::unordered_set<const clang::CXXRecordDecl *> seen(roots.begin(),
@@ -1262,20 +1285,20 @@ render_context_codec_sources(clang::ASTContext& ast,
   for (const auto payload : payload_roots) {
     visit(payload);
   }
-  return render_state_codec_sources(roots, access_policy);
+  return render_state_codec_sources(roots, access_policy, selection);
 }
 
 CodecSourceResult render_snapshot_member_accessors(
     clang::ASTContext &ast,
     ::tracer::compat::span<const clang::QualType> payload_roots,
     ::tracer::compat::span<const SnapshotMemberAccessor> members,
-    CodecAccess access_policy) {
+    CodecAccess access_policy, const SnapshotFieldSelection &selection) {
   CodecSourceResult result;
   if (access_policy != CodecAccess::snapshot_members || members.empty()) {
     result.error = "followed snapshot fields require snapshot member access";
     return result;
   }
-  result = render_context_codec_sources(ast, {}, payload_roots, access_policy);
+  result = render_context_codec_sources(ast, {}, payload_roots, access_policy, selection);
   if (!result)
     return result;
   result.source += "\nnamespace tracer::context_engine::snapshot_access {\n";
@@ -1290,8 +1313,10 @@ CodecSourceResult render_snapshot_member_accessors(
           field = candidate;
           break;
         }
-    if (!root || !field || !field->getType()->isPointerType()) {
-      result.error = "followed snapshot field is not a direct raw pointer field";
+    const auto *erased = field ? field->getType()->getAsCXXRecordDecl() : nullptr;
+    if (!root || !field || (!field->getType()->isPointerType() &&
+        (!erased || erased->getQualifiedNameAsString() != "std::any"))) {
+      result.error = "snapshot projection requires a direct raw pointer or std::any field";
       result.source.clear();
       return result;
     }
@@ -1312,22 +1337,26 @@ CodecSourceResult render_snapshot_member_accessors(
 
 CodecSourceResult render_payload_codec_source(clang::ASTContext &ast,
                                               clang::QualType payload,
-                                              CodecAccess access_policy) {
+                                              CodecAccess access_policy, const SnapshotFieldSelection &selection) {
   CodecSourceResult result;
   const auto type = payload.getCanonicalType().getAsString();
   if (type.empty()) {
     result.error = "generic payload type has no canonical spelling";
     return result;
   }
-  Builder validator{ast, SchemaLimits{}};
+  SchemaLimits limits;
+  if (access_policy == CodecAccess::snapshot_members)
+    limits.depth = max_capture_depth;
+  Builder validator{ast, limits};
   validator.snapshot = access_policy == CodecAccess::snapshot_members;
+  validator.selection = &selection;
   (void)validator.describe(payload, "value", 1, 0);
   if (!validator.error.empty()) {
     result.error = std::move(validator.error);
     return result;
   }
   const clang::QualType payload_roots[] = {payload};
-  const auto generated = render_context_codec_sources(ast, {}, payload_roots, access_policy);
+  const auto generated = render_context_codec_sources(ast, {}, payload_roots, access_policy, selection);
   if (!generated) {
     result.error = generated.error;
     return result;
@@ -1606,7 +1635,7 @@ SchemaResult build_payload_schema_impl(clang::ASTContext &ast,
                                        clang::QualType payload,
                                        StateFamilyKey family,
                                        SchemaLimits limits,
-                                       CodecAccess access_policy) {
+                                       CodecAccess access_policy, const SnapshotFieldSelection &selection) {
   SchemaResult result;
   const auto payload_type = canonical_with_template_arguments(payload);
   if (payload.isNull() || payload_type.empty()) {
@@ -1631,6 +1660,7 @@ SchemaResult build_payload_schema_impl(clang::ASTContext &ast,
   }
   Builder b{ast, limits};
   b.snapshot = access_policy == CodecAccess::snapshot_members;
+  b.selection = &selection;
   auto *file = b.files.add_file();
   file->set_name("state_schema.proto");
   file->set_package("tracer.generated.state");
@@ -1759,8 +1789,18 @@ SchemaResult build_payload_schema_impl(clang::ASTContext &ast,
 SchemaResult build_payload_schema(clang::ASTContext &ast,
                                   clang::QualType payload,
                                   StateFamilyKey family, SchemaLimits limits,
-                                  CodecAccess access_policy) {
+                                  CodecAccess access_policy, const SnapshotFieldSelection &selection) {
   return build_payload_schema_impl(ast, payload, std::move(family), limits,
-                                   access_policy);
+                                   access_policy, selection);
+}
+
+bool SnapshotFieldSelection::includes(const clang::CXXRecordDecl *root,
+                                      const clang::FieldDecl &field) const {
+  if (!record || !root || root->getCanonicalDecl() != record->getCanonicalDecl())
+    return true;
+  const auto name = field.getName();
+  return std::any_of(names.begin(), names.end(), [&](const auto &selected) {
+    return name == selected;
+  });
 }
 } // namespace tracer::context_engine

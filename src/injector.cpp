@@ -11,10 +11,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <istream>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -36,9 +39,15 @@
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__aarch64__)
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#endif
 
 #include "admission.hpp"
 #include "mapped_path.hpp"
+#include "object_launch.hpp"
+#include "object_target.hpp"
 #include "runtime_identity.hpp"
 #include "tracer/compat.hpp"
 
@@ -62,6 +71,23 @@ constexpr auto kCallTimeout = std::chrono::seconds(30);
 constexpr std::uint64_t kX86TraceFlag = 0x100;
 constexpr std::uint64_t kX86DirectionFlag = 0x400;
 constexpr std::size_t kKernelSignalMaskSize = sizeof(std::uint64_t);
+#if defined(__aarch64__)
+constexpr unsigned fpmr_regset = 0x40e; // NT_ARM_FPMR
+constexpr unsigned long fpmr_hwcap = 1UL << 48; // HWCAP2_FPMR
+#endif
+using NativeRegisters = object_target::Registers;
+
+#if defined(__aarch64__)
+constexpr auto native_machine = EM_AARCH64;
+constexpr std::array<unsigned char, 8> syscall_stub{0x01, 0x00, 0x00, 0xd4, 0, 0, 0x20, 0xd4};
+constexpr std::array<unsigned char, 8> call_stub{0x00, 0x02, 0x3f, 0xd6, 0, 0, 0x20, 0xd4};
+constexpr std::size_t completion_offset = 4; // BRK reports the trapped instruction.
+#else
+constexpr auto native_machine = EM_X86_64;
+constexpr std::array<unsigned char, 3> syscall_stub{0x0f, 0x05, 0xcc};
+constexpr std::array<unsigned char, 3> call_stub{0xff, 0xd0, 0xcc};
+constexpr std::size_t completion_offset = 3; // INT3 reports the successor.
+#endif
 
 [[noreturn]] void throw_errno(std::string_view operation) {
   const int error = errno;
@@ -184,10 +210,14 @@ std::string_view syscall_name(long number) {
   switch (number) {
   case SYS_futex:
     return "futex";
+#ifdef SYS_epoll_wait
   case SYS_epoll_wait:
     return "epoll_wait";
+#endif
+#ifdef SYS_poll
   case SYS_poll:
     return "poll";
+#endif
   case SYS_read:
     return "read";
   case SYS_accept:
@@ -218,18 +248,51 @@ void verify_target_executable(pid_t process_id) {
   executable.read(reinterpret_cast<char *>(&header), sizeof(header));
   if (!executable || std::memcmp(header.e_ident, ELFMAG, SELFMAG) != 0 ||
       header.e_ident[EI_CLASS] != ELFCLASS64 ||
-      header.e_ident[EI_DATA] != ELFDATA2LSB || header.e_machine != EM_X86_64) {
+      header.e_ident[EI_DATA] != ELFDATA2LSB || header.e_machine != native_machine) {
     throw std::runtime_error(
-        "target is not a native little-endian Linux x86_64 ELF executable");
+        "target is not a native little-endian Linux ELF executable");
   }
 }
 
 struct RegisterState {
-  user_regs_struct general{};
+  NativeRegisters general{};
+#if defined(__aarch64__)
+  int syscall_number = -1;
+  unsigned vector_regset = NT_FPREGSET;
+  user_sve_header nonstreaming{};
+  std::vector<unsigned char> za;
+  std::array<std::uint64_t, 2> tls{};
+  std::optional<std::array<unsigned char, 64>> zt;
+  std::optional<std::uint64_t> fpmr;
+#endif
   std::vector<unsigned char> xstate =
       std::vector<unsigned char>(kXstateCapacity);
-  std::size_t xstate_size = 0;
 };
+
+#if defined(__aarch64__)
+void read_arm_regset(pid_t tid, unsigned note, void *data, std::size_t size) {
+  iovec buffer{data, size};
+  ptrace_checked(PTRACE_GETREGSET, tid, reinterpret_cast<void *>(static_cast<std::uintptr_t>(note)),
+                 &buffer, "read AArch64 register set " + std::to_string(note));
+  if (buffer.iov_len != size)
+    throw std::runtime_error("incomplete AArch64 register set " + std::to_string(note));
+}
+
+void write_arm_regset(pid_t tid, unsigned note, const void *data, std::size_t size) {
+  iovec buffer{const_cast<void *>(data), size};
+  ptrace_checked(PTRACE_SETREGSET, tid, reinterpret_cast<void *>(static_cast<std::uintptr_t>(note)),
+                 &buffer, "restore AArch64 register set " + std::to_string(note));
+}
+
+template <typename Header>
+Header arm_regset_header(pid_t tid, unsigned note) {
+  Header header{};
+  read_arm_regset(tid, note, &header, sizeof(header));
+  if (header.size < sizeof(header) || header.size > header.max_size)
+    throw std::runtime_error("invalid AArch64 variable register set size");
+  return header;
+}
+#endif
 
 RegisterState read_registers(pid_t tid) {
   RegisterState state;
@@ -238,6 +301,40 @@ RegisterState read_registers(pid_t tid) {
       PTRACE_GETREGSET, tid,
       reinterpret_cast<void *>(static_cast<std::uintptr_t>(NT_PRSTATUS)),
       &general_iov, "read general registers");
+#if defined(__aarch64__)
+  read_arm_regset(tid, NT_ARM_SYSTEM_CALL, &state.syscall_number, sizeof(state.syscall_number));
+  const auto hwcap2 = ::getauxval(AT_HWCAP2);
+  if (hwcap2 & fpmr_hwcap) {
+    auto &value = state.fpmr.emplace();
+    read_arm_regset(tid, fpmr_regset, &value, sizeof(value));
+  }
+  const bool sve = (::getauxval(AT_HWCAP) & HWCAP_SVE) != 0;
+  if (hwcap2 & HWCAP2_SME) {
+    const auto streaming = arm_regset_header<user_sve_header>(tid, NT_ARM_SSVE);
+    if (streaming.size > sizeof(streaming)) {
+      state.vector_regset = NT_ARM_SSVE;
+      state.xstate.resize(streaming.size);
+      if (sve)
+        state.nonstreaming = arm_regset_header<user_sve_header>(tid, NT_ARM_SVE);
+      state.nonstreaming.size = sizeof(state.nonstreaming);
+    }
+    const auto za = arm_regset_header<user_za_header>(tid, NT_ARM_ZA);
+    state.za.resize(za.size);
+    read_arm_regset(tid, NT_ARM_ZA, state.za.data(), state.za.size());
+    if (za.size > sizeof(za) && (hwcap2 & HWCAP2_SME2)) {
+      auto &zt = state.zt.emplace();
+      read_arm_regset(tid, NT_ARM_ZT, zt.data(), zt.size());
+    }
+    read_arm_regset(tid, NT_ARM_TLS, state.tls.data(), sizeof(state.tls));
+  }
+  if (state.vector_regset == NT_FPREGSET && sve) {
+    state.vector_regset = NT_ARM_SVE;
+    state.xstate.resize(arm_regset_header<user_sve_header>(tid, NT_ARM_SVE).size);
+  } else if (state.vector_regset == NT_FPREGSET) {
+    state.xstate.resize(sizeof(user_fpsimd_state));
+  }
+  read_arm_regset(tid, state.vector_regset, state.xstate.data(), state.xstate.size());
+#else
   iovec xstate_iov{state.xstate.data(), state.xstate.size()};
   if (::ptrace(
           PTRACE_GETREGSET, tid,
@@ -253,20 +350,43 @@ RegisterState read_registers(pid_t tid) {
         reinterpret_cast<void *>(static_cast<std::uintptr_t>(NT_FPREGSET)),
         &xstate_iov, "read legacy floating point state");
   }
-  state.xstate_size = xstate_iov.iov_len;
-  state.xstate.resize(state.xstate_size);
+  state.xstate.resize(xstate_iov.iov_len);
+#endif
   return state;
 }
 
-void write_registers(pid_t tid, const RegisterState &state) {
-  iovec general_iov{const_cast<user_regs_struct *>(&state.general),
+void write_registers(pid_t tid, const RegisterState &state, [[maybe_unused]] bool injecting = false) {
+  iovec general_iov{const_cast<NativeRegisters *>(&state.general),
                     sizeof(state.general)};
   ptrace_checked(
       PTRACE_SETREGSET, tid,
       reinterpret_cast<void *>(static_cast<std::uintptr_t>(NT_PRSTATUS)),
       &general_iov, "restore general registers");
-  iovec xstate_iov{const_cast<unsigned char *>(state.xstate.data()),
-                   state.xstate.size()};
+#if defined(__aarch64__)
+  write_arm_regset(tid, NT_ARM_SYSTEM_CALL, &state.syscall_number, sizeof(state.syscall_number));
+  if (injecting) {
+    // Enter ordinary ABI code with streaming mode and matrix state disabled.
+    if (state.tls[1]) {
+      const std::array<std::uint64_t, 2> tls{state.tls[0], 0};
+      write_arm_regset(tid, NT_ARM_TLS, tls.data(), sizeof(tls));
+    }
+    if (state.vector_regset == NT_ARM_SSVE)
+      write_arm_regset(tid, NT_ARM_SVE, &state.nonstreaming, sizeof(state.nonstreaming));
+    if (state.za.size() > sizeof(user_za_header))
+      write_arm_regset(tid, NT_ARM_ZA, state.za.data(), sizeof(user_za_header));
+  } else {
+    write_arm_regset(tid, state.vector_regset, state.xstate.data(), state.xstate.size());
+    if (state.fpmr)
+      write_arm_regset(tid, fpmr_regset, &*state.fpmr, sizeof(*state.fpmr));
+    if (!state.za.empty()) {
+      write_arm_regset(tid, NT_ARM_ZA, state.za.data(), state.za.size());
+      if (state.zt)
+        write_arm_regset(tid, NT_ARM_ZT, state.zt->data(), state.zt->size());
+      write_arm_regset(tid, NT_ARM_TLS, state.tls.data(), sizeof(state.tls));
+    }
+  }
+#else
+  iovec xstate_iov{const_cast<unsigned char *>(state.xstate.data()), state.xstate.size()};
   if (::ptrace(
           PTRACE_SETREGSET, tid,
           reinterpret_cast<void *>(static_cast<std::uintptr_t>(NT_X86_XSTATE)),
@@ -281,6 +401,7 @@ void write_registers(pid_t tid, const RegisterState &state) {
         reinterpret_cast<void *>(static_cast<std::uintptr_t>(NT_FPREGSET)),
         &xstate_iov, "restore legacy floating point state");
   }
+#endif
 }
 
 std::uint64_t read_signal_mask(pid_t tid) {
@@ -297,12 +418,12 @@ void write_signal_mask(pid_t tid, std::uint64_t mask) {
                  "set tracee signal mask");
 }
 
-std::uintptr_t register_ip(const user_regs_struct &registers) {
-  return static_cast<std::uintptr_t>(registers.rip);
+std::uintptr_t register_ip(const NativeRegisters &registers) {
+  return object_target::pc(registers);
 }
 
 bool confirmed_injected_fault(const siginfo_t &info,
-                              const user_regs_struct &registers,
+                              const NativeRegisters &registers,
                               pid_t process_id, pid_t tid) {
   // A signal-specific synchronous fault was raised while this thread was
   // executing the injected code. Generic SI_KERNEL and async codes do not
@@ -318,6 +439,9 @@ bool confirmed_injected_fault(const siginfo_t &info,
   case SIGFPE:
     return info.si_code >= FPE_INTDIV && info.si_code <= FPE_FLTSUB;
   case SIGABRT:
+#if defined(__aarch64__)
+    return false;
+#else
     // si_pid is shared by peer threads. Confirm that the stopped thread
     // itself issued a successful thread-directed abort to its own TID.
     return info.si_code == SI_TKILL && info.si_pid == process_id &&
@@ -329,6 +453,7 @@ bool confirmed_injected_fault(const siginfo_t &info,
             (registers.orig_rax == SYS_tkill &&
              registers.rdi == static_cast<unsigned long long>(tid) &&
              registers.rsi == SIGABRT));
+#endif
   default:
     return false;
   }
@@ -337,7 +462,7 @@ bool confirmed_injected_fault(const siginfo_t &info,
 enum class InjectedStopKind { unexpected, completion, confirmed_fault };
 
 struct InjectedStop {
-  user_regs_struct registers{};
+  NativeRegisters registers{};
   int signal;
   InjectedStopKind kind = InjectedStopKind::unexpected;
 };
@@ -352,13 +477,12 @@ InjectedStop inspect_injected_stop(pid_t process_id, pid_t tid, int status,
   // it available to the normal recovery path.
   if (signal_stop)
     pending_signal = stop.signal;
-  ptrace_checked(PTRACE_GETREGS, tid, nullptr, &stop.registers,
-                 "read injected stop registers");
+  stop.registers = object_target::read_registers(tid);
   siginfo_t info{};
   if (!signal_stop || ::ptrace(PTRACE_GETSIGINFO, tid, nullptr, &info) != 0 ||
       info.si_signo != stop.signal)
     return stop;
-  if (stop.signal == SIGTRAP && stop.registers.rip == completion_ip &&
+  if (stop.signal == SIGTRAP && register_ip(stop.registers) == completion_ip &&
       (info.si_code == TRAP_BRKPT || info.si_code == SI_KERNEL))
     stop.kind = InjectedStopKind::completion;
   else if (confirmed_injected_fault(info, stop.registers, process_id, tid))
@@ -456,6 +580,131 @@ std::vector<MapEntry> read_maps(pid_t process_id) {
   return maps;
 }
 
+struct ExecutableEntry {
+  std::uintptr_t pc;
+  std::vector<unsigned char> bytes;
+  std::uintptr_t debug = 0;
+  std::uintptr_t loader = 0;
+};
+
+bool startup_dependency(pid_t pid, const link_map *first, std::string_view selected) {
+  std::set<std::uintptr_t> seen;
+  for (auto *current = first; current;) {
+    const auto address = reinterpret_cast<std::uintptr_t>(current);
+    if (!seen.insert(address).second)
+      return false;
+    link_map map{};
+    const auto bytes = read_remote(pid, address, sizeof(map));
+    std::memcpy(&map, bytes.data(), sizeof(map));
+    if (map.l_name) {
+      std::string path;
+      auto cursor = reinterpret_cast<std::uintptr_t>(map.l_name);
+      while (path.size() < 4096) {
+        const auto count = std::min<std::size_t>(256, 4096 - (cursor & 4095));
+        const auto chunk = read_remote(pid, cursor, count);
+        const auto end = std::find(chunk.begin(), chunk.end(), 0);
+        path.append(chunk.begin(), end);
+        if (end != chunk.end())
+          break;
+        cursor += count;
+      }
+      if (!path.empty() && (std::filesystem::path(path).filename() == selected ||
+          tracer::detail::canonical_mapped_path(path) == selected))
+        return true;
+    }
+    current = map.l_next;
+  }
+  return false;
+}
+
+std::uintptr_t map_load_bias(const std::vector<MapEntry> &maps, const std::string &path);
+
+ExecutableEntry verify_launch_entry(pid_t pid, bool loader_ready) {
+  verify_target_executable(pid);
+  const auto proc = std::filesystem::path("/proc") / std::to_string(pid);
+  std::ifstream auxv(proc / "auxv", std::ios::binary);
+  std::uintptr_t entry = 0, interpreter = 0;
+  bool secure = false;
+  Elf64_auxv_t value{};
+  while (auxv.read(reinterpret_cast<char *>(&value), sizeof(value)) && value.a_type != AT_NULL) {
+    if (value.a_type == AT_ENTRY)
+      entry = value.a_un.a_val;
+    else if (value.a_type == AT_BASE)
+      interpreter = value.a_un.a_val;
+    else if (value.a_type == AT_SECURE)
+      secure = value.a_un.a_val != 0;
+  }
+  if (!auxv || !entry || !interpreter || secure || entry % object_target::trap.size())
+    throw std::runtime_error("native startup requires a dynamically linked ELF with a verified entry");
+
+  auto maps = read_maps(pid);
+  auto image = tracer::detail::canonical_mapped_path(std::filesystem::read_symlink(proc / "exe").string());
+  std::uintptr_t debug_address = 0;
+  if (loader_ready) {
+    void *symbol = ::dlsym(RTLD_DEFAULT, "_dl_debug_state");
+    void *debug = ::dlsym(RTLD_DEFAULT, "_r_debug");
+    Dl_info info{}, debug_info{};
+    if (!symbol || !debug || !::dladdr(symbol, &info) || !::dladdr(debug, &debug_info) ||
+        info.dli_fbase != debug_info.dli_fbase || !info.dli_fname)
+      throw std::runtime_error("native loader checkpoint requires glibc debugger symbols");
+    image = tracer::detail::canonical_mapped_path(info.dli_fname);
+    if (image.empty() || map_load_bias(maps, image) != interpreter)
+      throw std::runtime_error("target does not use the verified glibc loader image");
+    const auto base = reinterpret_cast<std::uintptr_t>(info.dli_fbase);
+    const auto local_entry = reinterpret_cast<std::uintptr_t>(symbol);
+    const auto local_debug = reinterpret_cast<std::uintptr_t>(debug);
+    if (local_entry < base || local_debug < base ||
+        local_entry - base > UINTPTR_MAX - interpreter || local_debug - base > UINTPTR_MAX - interpreter)
+      throw std::runtime_error("glibc loader checkpoint address overflows");
+    entry = interpreter + (local_entry - base);
+    debug_address = interpreter + (local_debug - base);
+  }
+
+  std::ifstream executable(loader_ready ? std::filesystem::path(image) : proc / "exe", std::ios::binary);
+  Elf64_Ehdr header{};
+  if (!executable.read(reinterpret_cast<char *>(&header), sizeof(header)) ||
+      (header.e_type != ET_EXEC && header.e_type != ET_DYN) ||
+      header.e_phentsize != sizeof(Elf64_Phdr) || header.e_phnum == PN_XNUM ||
+      header.e_phoff > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))
+    throw std::runtime_error("cannot verify the target executable's program headers");
+  executable.seekg(static_cast<std::streamoff>(header.e_phoff));
+  std::optional<std::uint64_t> entry_offset;
+  bool has_interpreter = false;
+  for (unsigned i = 0; i < header.e_phnum; ++i) {
+    Elf64_Phdr segment{};
+    if (!executable.read(reinterpret_cast<char *>(&segment), sizeof(segment)))
+      throw std::runtime_error("cannot read a target program header");
+    has_interpreter |= segment.p_type == PT_INTERP;
+    const auto elf_entry = loader_ready ? entry - interpreter : header.e_entry;
+    if (segment.p_type != PT_LOAD || !(segment.p_flags & PF_X) || elf_entry < segment.p_vaddr)
+      continue;
+    const auto offset = elf_entry - segment.p_vaddr;
+    if (offset <= segment.p_filesz && syscall_stub.size() <= segment.p_filesz - offset &&
+        segment.p_offset <= UINT64_MAX - offset) {
+      if (entry_offset)
+        throw std::runtime_error("the executable entry is in multiple ELF segments");
+      entry_offset = segment.p_offset + offset;
+    }
+  }
+  if ((!loader_ready && !has_interpreter) || !entry_offset || entry % object_target::trap.size() ||
+      *entry_offset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))
+    throw std::runtime_error("the executable entry is outside file-backed ELF text");
+
+  const auto mapping = std::find_if(maps.begin(), maps.end(), [&](const auto &map) {
+    return map.executable && map.readable && map.module_path == image &&
+           map.start <= entry && entry < map.end && syscall_stub.size() <= map.end - entry &&
+           entry - map.start <= *entry_offset && map.offset == *entry_offset - (entry - map.start);
+  });
+  if (image.empty() || mapping == maps.end())
+    throw std::runtime_error("AT_ENTRY disagrees with the executable ELF mapping");
+  executable.seekg(static_cast<std::streamoff>(*entry_offset));
+  ExecutableEntry result{entry, std::vector<unsigned char>(syscall_stub.size()), debug_address, interpreter};
+  if (!executable.read(reinterpret_cast<char *>(result.bytes.data()), result.bytes.size()) ||
+      read_remote(pid, entry, result.bytes.size()) != result.bytes)
+    throw std::runtime_error("live executable entry differs from verified ELF bytes");
+  return result;
+}
+
 bool same_module_path(const MapEntry &map, const std::string &path) {
   return !path.empty() && map.module_path == path;
 }
@@ -482,6 +731,10 @@ std::uintptr_t map_load_bias(const std::vector<MapEntry> &maps,
 }
 
 } // namespace
+
+void write_stopped_code_byte(pid_t tid, std::uintptr_t address, unsigned char value) {
+  write_remote(tid, address, &value, 1);
+}
 
 struct Process::PeerFreeze {
   struct Peer {
@@ -550,7 +803,7 @@ struct Process::PeerFreeze {
             throw_errno("PTRACE_INTERRUPT peer thread");
           }
           try {
-            wait_peer(peers.back(), deadline, process.process_id_);
+            wait_peer(peers.back(), deadline, process.process_id_, process.patch_only_);
           } catch (...) {
             update_signal(tid, peers.back().pending_signal);
             throw;
@@ -591,7 +844,7 @@ struct Process::PeerFreeze {
       if (!peer.stopped) {
         continue;
       }
-      const auto ip = register_ip(read_registers(peer.tid).general);
+      const auto ip = register_ip(object_target::read_registers(peer.tid));
       if (ip > address && ip < end) {
         return true;
       }
@@ -663,7 +916,7 @@ struct Process::PeerFreeze {
               ::ptrace(PTRACE_INTERRUPT, it->tid, nullptr, nullptr) == 0) {
             try {
               wait_peer(*it, std::chrono::steady_clock::now() + kStopTimeout,
-                        process.process_id_);
+                        process.process_id_, process.patch_only_);
             } catch (...) {
             }
             update_signal(it->tid, it->pending_signal);
@@ -726,7 +979,7 @@ private:
 
   static void wait_peer(Peer &peer,
                         std::chrono::steady_clock::time_point deadline,
-                        pid_t process_id) {
+                        pid_t process_id, bool patch_only) {
     for (;;) {
       int status = 0;
       const pid_t result = ::waitpid(peer.tid, &status, __WALL | WNOHANG);
@@ -740,7 +993,7 @@ private:
         }
         const unsigned int event = static_cast<unsigned int>(status) >> 16;
         const int signal = WSTOPSIG(status);
-        if (event == PTRACE_EVENT_STOP && signal == SIGTRAP) {
+        if (event == PTRACE_EVENT_STOP && (signal == SIGTRAP || patch_only)) {
           peer.stopped = true;
           return;
         }
@@ -826,7 +1079,8 @@ Process::Process(Process &&other) noexcept
       call_page_(std::exchange(other.call_page_, 0)),
       call_page_size_(std::exchange(other.call_page_size_, 0)),
       poisoned_(std::exchange(other.poisoned_, false)),
-      tracee_stopped_(std::exchange(other.tracee_stopped_, false)) {}
+      tracee_stopped_(std::exchange(other.tracee_stopped_, false)),
+      patch_only_(std::exchange(other.patch_only_, false)) {}
 
 Process &Process::operator=(Process &&other) noexcept {
   if (this == &other) {
@@ -866,6 +1120,7 @@ Process &Process::operator=(Process &&other) noexcept {
   call_page_size_ = std::exchange(other.call_page_size_, 0);
   poisoned_ = std::exchange(other.poisoned_, false);
   tracee_stopped_ = std::exchange(other.tracee_stopped_, false);
+  patch_only_ = std::exchange(other.patch_only_, false);
   return *this;
 }
 
@@ -896,7 +1151,99 @@ void Process::mark_unsafe() noexcept { poison_process(); }
 
 void Process::attach(pid_t process_id,
                      ::tracer::compat::span<const ApplicationModule> application_modules) {
-#if !defined(__linux__) || !defined(__x86_64__)
+  attach_impl(process_id, application_modules, false);
+}
+
+void Process::attach_for_patch(pid_t process_id) {
+  attach_impl(process_id, {}, true);
+}
+
+void Process::attach_at_application_point(pid_t process_id, std::uintptr_t entry, std::size_t size) {
+  if (!entry || !size || size > UINTPTR_MAX - entry)
+    throw std::invalid_argument("invalid application rendezvous range");
+  attach_impl(process_id, {}, false, entry, size);
+}
+
+void Process::adopt_executable_entry(object_launch::Child &child,
+                                    std::chrono::steady_clock::time_point deadline, bool loader_ready,
+                                    std::string_view startup_module) {
+  if (attached() || child.pid() <= 0 ||
+      (static_cast<unsigned>(child.exec_status()) >> 16) != PTRACE_EVENT_EXEC)
+    throw std::logic_error("native startup requires an owned exec stop");
+  const auto pid = child.pid();
+  const auto entry = verify_launch_entry(pid, loader_ready);
+  const auto trap = object_target::trap;
+  if (std::memcmp(entry.bytes.data(), trap.data(), trap.size()) == 0)
+    throw std::runtime_error("cannot own an existing breakpoint at the executable entry");
+  object_target::write_stopped_code(pid, entry.pc, trap);
+
+  int deliver = 0;
+  for (;;) {
+    ptrace_checked(PTRACE_CONT, pid, nullptr,
+                   reinterpret_cast<void *>(static_cast<std::uintptr_t>(deliver)),
+                   "continue to executable entry");
+    int status = -1;
+    if (!wait_stopped(pid, deadline, status)) {
+      if (WIFEXITED(status) || WIFSIGNALED(status))
+        child.release();
+      throw std::runtime_error("target did not reach its executable entry");
+    }
+    if (static_cast<unsigned>(status) >> 16)
+      throw std::runtime_error("target changed execution or spawned a task before its executable entry");
+    deliver = WSTOPSIG(status);
+    if (deliver != SIGTRAP)
+      continue;
+    const auto regs = object_target::read_registers(pid);
+    if (object_target::trap_pc(regs) != entry.pc)
+      continue;
+    siginfo_t signal{};
+    ptrace_checked(PTRACE_GETSIGINFO, pid, nullptr, &signal, "verify executable entry breakpoint");
+    if (signal.si_code != TRAP_BRKPT && signal.si_code != SI_KERNEL)
+      continue;
+    if (thread_ids(pid).size() != 1)
+      throw std::runtime_error("native startup requires one thread at the executable entry");
+    const auto armed = read_remote(pid, entry.pc, entry.bytes.size());
+    if (std::memcmp(armed.data(), trap.data(), trap.size()) != 0 ||
+        !std::equal(armed.begin() + trap.size(), armed.end(), entry.bytes.begin() + trap.size()))
+      throw std::runtime_error("executable entry changed while the loader ran");
+    object_target::write_stopped_code(pid, entry.pc,
+        {reinterpret_cast<const char *>(entry.bytes.data()), trap.size()});
+    object_target::set_pc(pid, regs, entry.pc);
+    if (read_remote(pid, entry.pc, entry.bytes.size()) != entry.bytes)
+      throw std::runtime_error("executable entry breakpoint was not restored");
+    if (entry.debug) {
+      r_debug debug{};
+      const auto raw = read_remote(pid, entry.debug, sizeof(debug));
+      std::memcpy(&debug, raw.data(), sizeof(debug));
+      if (debug.r_state != r_debug::RT_CONSISTENT || debug.r_brk != entry.pc ||
+          debug.r_ldbase != entry.loader || debug.r_version < 1 || !debug.r_map) {
+        ptrace_checked(PTRACE_SINGLESTEP, pid, nullptr, nullptr, "step glibc loader notification");
+        int step = 0;
+        if (!wait_stopped(pid, deadline, step) || WSTOPSIG(step) != SIGTRAP ||
+            static_cast<unsigned>(step) >> 16)
+          throw std::runtime_error("cannot safely pass an early glibc loader notification");
+        if (read_remote(pid, entry.pc, entry.bytes.size()) != entry.bytes)
+          throw std::runtime_error("glibc notification changed during startup");
+        object_target::write_stopped_code(pid, entry.pc, trap);
+        deliver = 0;
+        continue;
+      }
+      if (!startup_module.empty() && !startup_dependency(pid, debug.r_map, startup_module))
+        throw std::runtime_error("selected startup module is outside the initial glibc link map");
+    }
+    ptrace_checked(PTRACE_SETOPTIONS, pid, nullptr,
+                   reinterpret_cast<void *>(static_cast<std::uintptr_t>(PTRACE_O_EXITKILL)),
+                   "set native startup cleanup options");
+    process_id_ = tid_ = pid;
+    tracee_stopped_ = true;
+    return;
+  }
+}
+
+void Process::attach_impl(pid_t process_id,
+                          ::tracer::compat::span<const ApplicationModule> application_modules,
+                          bool patch_only, std::uintptr_t rendezvous, std::size_t rendezvous_size) {
+#if !defined(__linux__) || (!defined(__x86_64__) && !defined(__aarch64__))
   (void)process_id;
   throw std::runtime_error("native injector is supported only on Linux x86_64");
 #else
@@ -913,6 +1260,17 @@ void Process::attach(pid_t process_id,
   process_id_ = process_id;
   tid_ = process_id;
   bool stopped = false;
+#if defined(__aarch64__)
+  bool stepping_sleep = false;
+  auto completed_sleep_step = [&](int status) {
+    siginfo_t info{};
+    return WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP &&
+           (static_cast<unsigned int>(status) >> 16) == 0 &&
+           ::ptrace(PTRACE_GETSIGINFO, tid_, nullptr, &info) == 0 &&
+           (info.si_code == TRAP_TRACE ||
+            (info.si_code == SI_USER && info.si_pid == 0 && info.si_uid == 0));
+  };
+#endif
   try {
     ptrace_checked(PTRACE_INTERRUPT, tid_, nullptr, nullptr,
                    "PTRACE_INTERRUPT");
@@ -927,7 +1285,7 @@ void Process::attach(pid_t process_id,
     stopped = true;
     tracee_stopped_ = true;
     const unsigned int event = static_cast<unsigned int>(status) >> 16;
-    if (event == PTRACE_EVENT_STOP && WSTOPSIG(status) != SIGTRAP) {
+    if (event == PTRACE_EVENT_STOP && WSTOPSIG(status) != SIGTRAP && !patch_only) {
       pending_signal_ = WSTOPSIG(status);
       throw IdlePointUnavailable(
           "target leader is in a job-control group stop; refusing injection");
@@ -936,6 +1294,81 @@ void Process::attach(pid_t process_id,
       // Preserve a genuine signal-delivery stop if one raced with interrupt.
       pending_signal_ = WSTOPSIG(status);
     }
+    patch_only_ = patch_only;
+    if (patch_only_)
+      return;
+#if defined(__aarch64__)
+    const auto svc = object_target::system_call;
+    const auto maps = rendezvous ? std::vector<MapEntry>{} : read_maps(process_id_);
+    const auto eligible = [&](pid_t candidate, int pending_signal) -> std::optional<std::uintptr_t> {
+      if (pending_signal)
+        return std::nullopt;
+      if (candidate != process_id_) {
+        std::uintptr_t tls = 0;
+        iovec buffer{&tls, sizeof(tls)};
+        if (::ptrace(PTRACE_GETREGSET, candidate, NT_ARM_TLS, &buffer) == -1 ||
+            buffer.iov_len != sizeof(tls) || !tls)
+          return std::nullopt;
+      }
+      const auto registers = object_target::read_registers(candidate);
+      const auto pc = register_ip(registers);
+      if (stopped_syscall(candidate) >= 0)
+        return std::nullopt;
+      if (rendezvous) {
+        if (pc >= rendezvous && pc - rendezvous < rendezvous_size &&
+            rendezvous_size - (pc - rendezvous) >= syscall_stub.size())
+          return pc;
+        return std::nullopt;
+      }
+      const auto number = registers.regs[8];
+      if (number != SYS_nanosleep && number != SYS_clock_nanosleep)
+        return std::nullopt;
+      const auto executable = std::any_of(maps.begin(), maps.end(), [&](const auto &map) {
+        return map.executable && map.readable && !map.module_path.empty() &&
+               pc >= map.start && pc < map.end && svc.size() + syscall_stub.size() <= map.end - pc;
+      });
+      if (executable && read_remote(candidate, pc, svc.size()) ==
+                            std::vector<unsigned char>(svc.begin(), svc.end()))
+        return pc;
+      return std::nullopt;
+    };
+    auto admitted_pc = eligible(tid_, pending_signal_);
+    if (!admitted_pc) {
+      PeerFreeze freeze(*this);
+      for (const auto &peer : freeze.peers) {
+        if (!peer.stopped)
+          continue;
+        admitted_pc = eligible(peer.tid, peer.pending_signal);
+        if (admitted_pc) {
+          freeze.promote(peer.tid);
+          break;
+        }
+      }
+      freeze.release();
+    }
+    if (!admitted_pc)
+      throw IdlePointUnavailable("AArch64 injection requires a thread at an idle sleep or a verified rendezvous");
+    if (!rendezvous) {
+      // AArch64 can expose a rewound SVC before the kernel restarts the sleep.
+      // Let the kernel finish that restart before borrowing the application PC.
+      ptrace_checked(PTRACE_SINGLESTEP, tid_, nullptr, nullptr, "complete AArch64 idle sleep");
+      stepping_sleep = true;
+      stopped = tracee_stopped_ = false;
+      if (!wait_stopped(tid_, std::chrono::steady_clock::now() + kStopTimeout, status) ||
+          !WIFSTOPPED(status))
+        throw IdlePointUnavailable("AArch64 idle sleep did not reach its return instruction");
+      stopped = tracee_stopped_ = true;
+      const bool stepped = completed_sleep_step(status);
+      if (!stepped && ((static_cast<unsigned int>(status) >> 16) != PTRACE_EVENT_STOP ||
+                       WSTOPSIG(status) != SIGTRAP))
+        pending_signal_ = WSTOPSIG(status);
+      if (!stepped || register_ip(object_target::read_registers(tid_)) != *admitted_pc + svc.size())
+        throw IdlePointUnavailable("AArch64 idle sleep was interrupted before returning to userspace");
+    }
+#else
+    (void)rendezvous_size;
+    if (rendezvous)
+      throw std::invalid_argument("explicit application rendezvous is supported only on AArch64");
     validate_application_modules(process_id_, application_modules);
     struct Rejection {
       pid_t tid;
@@ -945,7 +1378,7 @@ void Process::attach(pid_t process_id,
     std::vector<Rejection> rejected;
     auto eligible = [&](pid_t candidate_tid) {
       const long syscall_number = stopped_syscall(candidate_tid);
-      const auto registers = read_registers(candidate_tid).general;
+      const auto registers = object_target::read_registers(candidate_tid);
       if (candidate_tid != process_id_ && registers.fs_base == 0) {
         rejected.push_back({candidate_tid, syscall_number,
                             "worker has no thread pointer for dlopen"});
@@ -1003,8 +1436,15 @@ void Process::attach(pid_t process_id,
       freeze.promote(selected_tid);
       freeze.release();
     }
+#endif
   } catch (...) {
     const auto original_failure = std::current_exception();
+    if (traced_peers_.empty() && !thread_exists(process_id_, tid_)) {
+      process_id_ = tid_ = -1;
+      pending_signal_ = 0;
+      tracee_stopped_ = false;
+      std::rethrow_exception(original_failure);
+    }
     if (!stopped) {
       // A timeout does not prove the tracee stopped. Keep ownership if it
       // cannot be stopped; detaching a running tracee would be unsafe.
@@ -1012,9 +1452,13 @@ void Process::attach(pid_t process_id,
       int recovery_status = 0;
       stopped =
           wait_stopped(tid_, std::chrono::steady_clock::now() + kStopTimeout,
-                       recovery_status);
+                       recovery_status) && WIFSTOPPED(recovery_status);
       tracee_stopped_ = stopped;
-      if (stopped && ((static_cast<unsigned int>(recovery_status) >> 16) !=
+      if (stopped &&
+#if defined(__aarch64__)
+          !(stepping_sleep && completed_sleep_step(recovery_status)) &&
+#endif
+          ((static_cast<unsigned int>(recovery_status) >> 16) !=
                           PTRACE_EVENT_STOP ||
                       WSTOPSIG(recovery_status) != SIGTRAP)) {
         pending_signal_ = WSTOPSIG(recovery_status);
@@ -1074,6 +1518,7 @@ void Process::detach() {
   process_id_ = -1;
   pending_signal_ = 0;
   tracee_stopped_ = false;
+  patch_only_ = false;
   scratch_stack_ = 0;
   scratch_stack_size_ = 0;
   call_page_ = 0;
@@ -1096,9 +1541,15 @@ void Process::preserve_poisoned_stop() {
     throw_errno("request SIGSTOP for unsafe tracee");
   }
   for (const auto &[peer_tid, signal] : traced_peers_) {
-    user_regs_struct peer_registers{};
+    NativeRegisters peer_registers{};
+#if defined(__aarch64__)
+    iovec peer_buffer{&peer_registers, sizeof(peer_registers)};
+    const bool already_stopped =
+        ::ptrace(PTRACE_GETREGSET, peer_tid, NT_PRSTATUS, &peer_buffer) == 0;
+#else
     const bool already_stopped =
         ::ptrace(PTRACE_GETREGS, peer_tid, nullptr, &peer_registers) == 0;
+#endif
     if (!already_stopped &&
         ::ptrace(PTRACE_INTERRUPT, peer_tid, nullptr, nullptr) == -1) {
       if ((errno == ESRCH || errno == ECHILD) &&
@@ -1140,6 +1591,7 @@ void Process::preserve_poisoned_stop() {
   process_id_ = -1;
   pending_signal_ = 0;
   tracee_stopped_ = false;
+  patch_only_ = false;
   scratch_stack_ = 0;
   scratch_stack_size_ = 0;
   call_page_ = 0;
@@ -1154,7 +1606,7 @@ void Process::preserve_poisoned_stop() {
 
 std::uintptr_t Process::instruction_pointer() const {
   ensure_usable();
-  return register_ip(read_registers(tid_).general);
+  return register_ip(object_target::read_registers(tid_));
 }
 
 void Process::remote_read(std::uintptr_t address, void *destination,
@@ -1234,7 +1686,9 @@ bool Process::patch_code(std::uintptr_t address, const void *expected,
   return true;
 }
 
-bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches) {
+bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches,
+                               const std::function<void()> &validate_mappings,
+                               const std::function<void()> &on_commit) {
   ensure_usable();
   if (patches.empty())
     return true;
@@ -1259,6 +1713,8 @@ bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches) 
   }
 
   PeerFreeze peers(*this);
+  if (validate_mappings)
+    validate_mappings();
   for (const auto &patch : patches) {
     if (peers.contains_instruction(patch.address, patch.size)) {
       peers.release();
@@ -1313,6 +1769,8 @@ bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches) 
     }
     std::rethrow_exception(failure);
   }
+  if (on_commit)
+    on_commit();
   peers.release();
   return true;
 }
@@ -1356,18 +1814,24 @@ std::uintptr_t
 Process::remote_syscall(long number,
                         const std::array<std::uintptr_t, 6> &arguments) {
   ensure_usable();
+  if (patch_only_)
+    throw std::logic_error("patch-only attachment cannot execute a remote syscall");
   PeerFreeze peers(*this);
   const auto saved = read_registers(tid_);
   const auto saved_signal_mask = read_signal_mask(tid_);
   const auto ip = register_ip(saved.general);
-  constexpr std::array<unsigned char, 3> stub{0x0f, 0x05,
-                                              0xcc}; // syscall; int3
+  constexpr auto stub = syscall_stub;
   if (peers.contains_instruction(ip, stub.size())) {
     throw std::runtime_error("cannot install native syscall stub while a "
                              "thread is inside its bytes");
   }
   const auto original = read_remote(tid_, ip, stub.size());
   auto modified = saved;
+#if defined(__aarch64__)
+  modified.syscall_number = -1;
+  std::copy(arguments.begin(), arguments.end(), modified.general.regs);
+  modified.general.regs[8] = static_cast<std::uint64_t>(number);
+#else
   modified.general.rax = static_cast<unsigned long long>(number);
   modified.general.orig_rax = static_cast<unsigned long long>(-1);
   modified.general.rdi = arguments[0];
@@ -1376,6 +1840,7 @@ Process::remote_syscall(long number,
   modified.general.r10 = arguments[3];
   modified.general.r8 = arguments[4];
   modified.general.r9 = arguments[5];
+#endif
 
   bool code_changed = false;
   bool execution_started = false;
@@ -1387,7 +1852,7 @@ Process::remote_syscall(long number,
   try {
     code_changed = true;
     write_remote(tid_, ip, stub.data(), stub.size());
-    write_registers(tid_, modified);
+    write_registers(tid_, modified, true);
     write_signal_mask(tid_, ~std::uint64_t{0});
     signal_mask_blocked = true;
     ptrace_checked(PTRACE_CONT, tid_, nullptr, nullptr,
@@ -1413,7 +1878,7 @@ Process::remote_syscall(long number,
     tracee_stopped = true;
     tracee_stopped_ = true;
     const auto stop = inspect_injected_stop(process_id_, tid_, status,
-                                           ip + stub.size(), pending_signal_);
+                                           ip + completion_offset, pending_signal_);
     if (stop.kind != InjectedStopKind::completion) {
       throw std::runtime_error(
           "native syscall stopped on signal " + std::to_string(stop.signal) +
@@ -1421,7 +1886,7 @@ Process::remote_syscall(long number,
                ? " (confirmed injected fault; signal delivery suppressed)"
                : ""));
     }
-    result = stop.registers.rax;
+    result = object_target::result(stop.registers);
     if (static_cast<long long>(result) < 0 &&
         static_cast<long long>(result) >= -4095) {
       throw std::runtime_error("remote syscall failed with errno " +
@@ -1480,6 +1945,8 @@ Process::remote_call(std::uintptr_t function,
                      const std::array<std::uintptr_t, 6> &arguments,
                      std::size_t argument_count) {
   ensure_usable();
+  if (patch_only_)
+    throw std::logic_error("patch-only attachment cannot execute a remote call");
   if (function == 0) {
     throw std::invalid_argument("remote function address is null");
   }
@@ -1538,9 +2005,8 @@ Process::remote_call_raw(std::uintptr_t function,
     }
     call_page_size_ = static_cast<std::size_t>(page_size);
     call_page_ = remote_allocate(call_page_size_);
-    constexpr std::array<unsigned char, 3> stub{0xff, 0xd0,
-                                                0xcc}; // call rax; int3
-    constexpr std::array<unsigned char, 3> zero_bytes{};
+    constexpr auto stub = call_stub;
+    constexpr std::array<unsigned char, stub.size()> zero_bytes{};
     if (!patch_code(call_page_, zero_bytes.data(), stub.data(), stub.size())) {
       throw std::runtime_error(
           "call page instruction pointer was occupied during initialization");
@@ -1556,6 +2022,14 @@ Process::remote_call_raw(std::uintptr_t function,
   const auto saved = read_registers(tid_);
   const auto saved_signal_mask = read_signal_mask(tid_);
   auto modified = saved;
+#if defined(__aarch64__)
+  modified.syscall_number = -1;
+  modified.general.pc = call_page_;
+  modified.general.regs[16] = function;
+  std::fill_n(modified.general.regs, 6, 0);
+  std::copy_n(arguments.begin(), argument_count, modified.general.regs);
+  modified.general.sp = (scratch_stack_ + scratch_stack_size_) & ~std::uintptr_t{15};
+#else
   modified.general.rip = call_page_;
   modified.general.rax = function;
   modified.general.orig_rax = static_cast<unsigned long long>(-1);
@@ -1568,6 +2042,7 @@ Process::remote_call_raw(std::uintptr_t function,
   modified.general.r9 = argument_count > 5 ? arguments[5] : 0;
   modified.general.rsp =
       (scratch_stack_ + scratch_stack_size_) & ~std::uintptr_t{15};
+#endif
 
   bool execution_started = false;
   bool tracee_stopped = true;
@@ -1576,7 +2051,7 @@ Process::remote_call_raw(std::uintptr_t function,
   std::exception_ptr failure;
   std::uintptr_t result = 0;
   try {
-    write_registers(tid_, modified);
+    write_registers(tid_, modified, true);
     write_signal_mask(tid_, ~std::uint64_t{0});
     signal_mask_blocked = true;
     ptrace_checked(PTRACE_CONT, tid_, nullptr, nullptr,
@@ -1604,17 +2079,17 @@ Process::remote_call_raw(std::uintptr_t function,
     tracee_stopped = true;
     tracee_stopped_ = true;
     const auto stop = inspect_injected_stop(process_id_, tid_, status,
-                                           call_page_ + 3, pending_signal_);
+                                           call_page_ + completion_offset, pending_signal_);
     if (stop.kind != InjectedStopKind::completion) {
       throw std::runtime_error(
           "remote call stopped on signal " + std::to_string(stop.signal) +
-          " at PC " + std::to_string(stop.registers.rip) +
+          " at PC " + std::to_string(register_ip(stop.registers)) +
           " before its completion; the callee may have side effects" +
           (stop.kind == InjectedStopKind::confirmed_fault
                ? "; confirmed injected fault, signal delivery suppressed"
                : ""));
     }
-    result = stop.registers.rax;
+    result = object_target::result(stop.registers);
   } catch (...) {
     failure = std::current_exception();
     if (execution_started && !tracee_stopped) {
