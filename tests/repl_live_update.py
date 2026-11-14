@@ -22,7 +22,33 @@ struct Pricer : Base {
 };
 int checkout(int);
 """
+TEMPLATES = """#pragma once
+template <typename T>
+struct Adjust {
+  static T apply(T value) { return value + 1; }
+};
+
+template <>
+struct Adjust<double> {
+  static double apply(double value) { return value; }
+};
+
+template <typename T>
+struct CachePolicy {
+  static int limit(T) { return 64; }
+};
+
+template <typename T>
+struct CachePolicy<T *> {
+  static int limit(T *value) { return value ? 256 : 0; }
+};
+
+template <typename T>
+[[gnu::always_inline]] inline int folded(T) { return 5; }
+"""
+
 MAIN = """#include "price.hpp"
+#include "templates.hpp"
 #include <cstdio>
 #include <sys/prctl.h>
 #include <unistd.h>
@@ -33,6 +59,8 @@ MAIN = """#include "price.hpp"
 
 __attribute__((noinline)) int direct(const Pricer &p) { return p.Pricer::quote(10); }
 __attribute__((noinline)) int indirect(const Base &p) { return p.quote(10); }
+__attribute__((noinline)) int inline_caller() { return folded(1); }
+
 int main() {
   if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)) return 1;
   Pricer p;
@@ -41,6 +69,16 @@ int main() {
   std::fflush(stdout);
   while (true) {
     usleep(3000);
+    if (access("templates", F_OK) == 0) {
+      unlink("templates");
+      int i = 1;
+      double d = 1;
+      std::printf("templates %d %.0f %d %d %d %d %d\\n", Adjust<int>::apply(5),
+          Adjust<double>::apply(150), CachePolicy<int>::limit(5),
+          CachePolicy<int*>::limit(&i), CachePolicy<double*>::limit(&d),
+          CachePolicy<int*>::limit(nullptr), inline_caller());
+      std::fflush(stdout);
+    }
     if (access("call", F_OK)) continue;
     unlink("call");
     std::printf("%d %d %d %d\\n", getpid(), saved(6000), direct(p), indirect(p));
@@ -68,7 +106,8 @@ def verify(args, root, cleanup):
     baseline = root / "baseline"
     source.mkdir()
     baseline.mkdir()
-    for name, contents in {"main.cpp": MAIN, "price.hpp": HEADER, "price.cpp": ORIGINAL}.items():
+    for name, contents in {"main.cpp": MAIN, "price.hpp": HEADER, "price.cpp": ORIGINAL,
+                           "templates.hpp": TEMPLATES}.items():
         (source / name).write_text(contents)
         (baseline / name).write_text(contents)
     executable = root / "target"
@@ -152,6 +191,21 @@ def verify(args, root, cleanup):
     call(5960, 12)
     repl.send_signal(signal.SIGINT)
     console.expect(r"^Live watch stopped")
+    send(repl, "%live revert")
+    console.expect(r"^live REVERTED revision=0")
+    (root / "templates").touch()
+    app.expect(r"^templates 6 150 64 256 256 0 5$")
+    (source / "templates.hpp").write_text(
+        TEMPLATES.replace("return value;", "return value > 100 ? 100 : value;")
+                 .replace("value ? 256", "value ? 512").replace("return 5;", "return 8;"))
+    send(repl, "%live update source/templates.hpp --retention-limit 3")
+    console.expect(r"^live APPLIED revision=3 retained=3/3")
+    (root / "templates").touch()
+    app.expect(r"^templates 6 100 64 512 512 0 8$")
+    send(repl, "%live revert")
+    console.expect(r"^live REVERTED revision=0")
+    (root / "templates").touch()
+    app.expect(r"^templates 6 150 64 256 256 0 5$")
     send(repl, "%detach")
     console.expect(r"^detached session=")
 
