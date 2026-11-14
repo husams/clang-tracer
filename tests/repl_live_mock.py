@@ -100,6 +100,12 @@ def products(repl, server, agent, target):
                 '--function load_fixture --fixture products.txt', r"cannot read mock fixture")
         assert mock(command, signature, "invalid_source.cpp", "invalid", state="BLOCKED")[1] == good
         assert mock(command, signature, "invalid_abi.cpp", "invalid_load", state="BLOCKED")[1] == good
+        refused = command(
+            f'%live mock "{signature}" --file product_cached.cpp --function load_cached_discount '
+            '--bind "find_cached=ProductStore::find_cached(long)"',
+            r"^live BLOCKED revision=(\d+).*no build-bound emitted declaration.*ProductStore::find_cached\(long\)",
+        )
+        assert refused[1] == good
         call("l 42", "load=42 price=1999 name=Desk lamp queries=0 stored=1999")
         command("%live revert", r"^live REVERTED revision=0")
         call("l 42", "load=42 price=500 name=Database queries=1 stored=1999")
