@@ -6,8 +6,10 @@ import argparse
 import errno
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -38,7 +40,7 @@ def assert_field_unreadable(pid, address):
     assert ctypes.get_errno() == errno.EFAULT
 
 
-def run_case(repl, server, agent, fixture, source, no_values, backend, fault=None):
+def run_case(repl, server, agent, fixture, source, no_values, backend, fault=None, writer_entry=False):
     source_line = next(i for i, line in enumerate(source.read_text().splitlines(), 1)
                        if "STORE_LINE" in line)
     with tempfile.TemporaryDirectory(prefix="ct-person-") as directory, ExitStack() as cleanup:
@@ -90,6 +92,8 @@ def run_case(repl, server, agent, fixture, source, no_values, backend, fault=Non
 
         mode = "off" if no_values else "on"
         option = " --no-values" if no_values else ""
+        if writer_entry:
+            option += " --writer-entry"
         send(f"%object start --type demo::Person --field age --code {WRITER} "
              f"--backend {backend} --stack-depth 4{option}")
         started = out.expect(r"^watch=(\d+) active=yes stores=1 .*|^error:")
@@ -98,7 +102,12 @@ def run_case(repl, server, agent, fixture, source, no_values, backend, fault=Non
         assert f"values={mode}" in started.string
         redirects = read_redirects(console, out, started, backend, target.pid, ())
         patched = read_code(pc, maps(), len(original))
-        assert patched == (original if redirects else b"\xcc" + original[1:])
+        if writer_entry:
+            entry = next((address for address, window in redirects.items()
+                          if address <= pc < address + len(window[0])), None)
+            assert entry is not None and patched != original
+        else:
+            assert patched == (original if redirects else b"\xcc" + original[1:])
 
         db, replay = root / "age.db", root / "age.json"
         write_count = 2 if no_values and fault != "fault-skip" else 1
@@ -194,21 +203,72 @@ def run_case(repl, server, agent, fixture, source, no_values, backend, fault=Non
                   f"writes={write_count} fault_gaps=1")
 
 
+def run_fatal(args, fixture, fault):
+    divide = fault == "fault-divide"
+    writer = "_ZN4demo9remainderERNS_6PersonEi" if divide else WRITER
+    expected_signal = signal.SIGFPE if divide else signal.SIGSEGV
+    with tempfile.TemporaryDirectory(prefix="ct-person-fatal-") as directory, ExitStack() as cleanup:
+        target = subprocess.Popen([fixture, fault], cwd=directory, text=True, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        cleanup.callback(stop, target)
+        Transcript(target.stdout).expect(r"^READY address=")
+        control = subprocess.Popen(
+            [args.repl, "--server", args.server, "--agent", args.agent, "--attach", str(target.pid)],
+            cwd=directory, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        cleanup.callback(stop, control)
+        out = Transcript(control.stdout)
+
+        def send(process, command):
+            process.stdin.write(command + "\n")
+            process.stdin.flush()
+
+        out.expect(rf"^attached session=\S+ pid={target.pid}$")
+        with Path(f"/proc/{target.pid}/mem").open("rb", buffering=0) as memory:
+            def read(pc, size):
+                return os.pread(memory.fileno(), size, pc)
+
+            definition = f"--type demo::Person --field age --code {writer} --backend code-cache --writer-entry"
+            send(control, f"%object preview {definition}")
+            if not divide:
+                store = out.expect(r'^site role="store" elf=0x[0-9a-f]+ pc=(0x[0-9a-f]+) .*original=([0-9a-f]+)$')
+                pc, original = int(store[1], 16), bytes.fromhex(store[2])
+                assert read(pc, len(original)) == original
+            send(control, f"%object start {definition}")
+            watch = out.expect(r"^watch=(\d+) active=yes stores=1 .*|^error:")
+            assert watch[1], watch.string
+            redirects = read_redirects(control, out, watch, "code-cache", target.pid, (), live_read=read)
+            if divide:
+                # The optimized writer's IDIV starts inside the entry jump.
+                assert any(original.startswith(bytes.fromhex("8b0799f7fe"))
+                           for original, _, _ in redirects.values()), redirects
+            else:
+                assert any(address <= pc < address + len(window[0]) for address, window in redirects.items())
+                assert read(pc, len(original)) != original
+            send(target, "g")
+            result = target.wait(timeout=15)
+            assert result == -expected_signal, (fault, result)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("repl", "server", "agent", "fixture", "source"):
         parser.add_argument(name)
     parser.add_argument("--backend", choices=("ptrace", "code-cache"), default="ptrace")
     parser.add_argument("--faults", action="store_true")
+    parser.add_argument("--entry-faults", action="store_true")
     args = parser.parse_args()
     fixture, source = Path(args.fixture).resolve(), Path(args.source).resolve()
     original_elf = hashlib.sha256(fixture.read_bytes()).digest()
+    if args.entry_faults:
+        for fault in ("fault-default", "fault-ignored", "fault-divide"):
+            run_fatal(args, fixture, fault)
     for no_values in (False, True):
-        run_case(args.repl, args.server, args.agent, fixture, source, no_values, args.backend)
-        if args.faults:
+        if not args.entry_faults:
+            run_case(args.repl, args.server, args.agent, fixture, source, no_values, args.backend)
+        if args.faults or args.entry_faults:
             for fault in ("fault-retry", "fault-skip"):
                 run_case(args.repl, args.server, args.agent, fixture, source, no_values,
-                         args.backend, fault)
+                         args.backend, fault, writer_entry=args.entry_faults)
     assert hashlib.sha256(fixture.read_bytes()).digest() == original_elf
 
 

@@ -8,4 +8,5 @@ struct Person {
 };
 
 void update(Person &person);
+void remainder(Person &person, int divisor);
 }

@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -63,7 +64,11 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
   const bool write_only = argc == 2 && std::strcmp(argv[1], "write-only") == 0;
   const bool skip = argc == 2 && std::strcmp(argv[1], "fault-skip") == 0;
-  const bool fault = skip || (argc == 2 && std::strcmp(argv[1], "fault-retry") == 0);
+  const bool handled = skip || (argc == 2 && std::strcmp(argv[1], "fault-retry") == 0);
+  const bool fatal = argc == 2 && std::strcmp(argv[1], "fault-default") == 0;
+  const bool ignored = argc == 2 && std::strcmp(argv[1], "fault-ignored") == 0;
+  const bool divide = argc == 2 && std::strcmp(argv[1], "fault-divide") == 0;
+  const bool fault = handled || fatal || ignored;
   alignas(demo::Person) unsigned char local[sizeof(demo::Person)];
   void *storage = local;
   if (write_only || fault) {
@@ -72,7 +77,12 @@ int main(int argc, char **argv) {
     if (storage == MAP_FAILED)
       return 6;
   }
-  if (fault) {
+  if (fatal || ignored || divide) {
+    struct rlimit limit{};
+    if (::setrlimit(RLIMIT_CORE, &limit) || (ignored && ::signal(SIGSEGV, SIG_IGN) == SIG_ERR))
+      return 11;
+  }
+  if (handled) {
     protected_address.store(reinterpret_cast<std::uintptr_t>(storage), std::memory_order_relaxed);
     skip_fault = skip;
     struct sigaction action{};
@@ -88,6 +98,10 @@ int main(int argc, char **argv) {
   auto &person = *::new (storage) demo::Person{42};
   if (fault && ::mprotect(storage, sizeof(person), PROT_READ))
     return 12;
+  if (divide) {
+    demo::remainder(person, 0);
+    return 15;
+  }
   errno = EDOM;
   demo::update(person);
   if (errno != EDOM)

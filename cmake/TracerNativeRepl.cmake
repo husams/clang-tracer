@@ -867,6 +867,12 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-person-target>
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/person/person.cpp" --backend code-cache --faults)
       set_tests_properties(native_repl_code_cache_faults PROPERTIES TIMEOUT 120)
+      add_test(NAME native_repl_code_cache_entry_faults
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_person_store.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-person-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/person/person.cpp" --backend code-cache --entry-faults)
+      set_tests_properties(native_repl_code_cache_entry_faults PROPERTIES TIMEOUT 120)
       add_library(repl-shared-shapes-library SHARED tests/fixtures/shared_shapes/library.cpp)
       add_executable(repl-shared-shapes-target tests/fixtures/shared_shapes/driver.cpp)
       set_target_properties(repl-shared-shapes-library repl-shared-shapes-target

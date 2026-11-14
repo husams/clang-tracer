@@ -782,9 +782,11 @@ compare-and-exchanges and stores to untracked addresses.
 
 Events use the original application PC. For a synchronous SIGSEGV, SIGBUS,
 SIGFPE, or SIGILL on a copied instruction, a chained application handler
-sees that PC and can retry or skip the instruction. Keep fault signal dispositions
-stable during tracing. Use `--async-signal N` for a signal with an existing
-application handler. At a copied application instruction the handler sees
+sees that PC and can retry or skip the instruction. If the signal takes its
+default action and the original instruction is covered by a redirect or
+cannot be verified, the kernel delivers the fault at the translated PC.
+Keep fault signal dispositions stable during tracing. Use `--async-signal N`
+for a signal with an existing application handler. At a copied application instruction the handler sees
 the original PC and can resume or select another original instruction.
 The x86-64 and AArch64 hooks defer these signals during supported capture
 callbacks and runtime call resolution when system calls are unfiltered.
