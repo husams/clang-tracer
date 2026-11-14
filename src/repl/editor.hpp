@@ -20,6 +20,7 @@ class Input {
   };
 
   bool terminal_;
+  std::string history_path_;
   replxx::Replxx editor_;
   CppEngine* cpp_ = nullptr;
   std::string previous_;

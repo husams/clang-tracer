@@ -222,6 +222,10 @@ function(tracer_add_native_repl)
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_terminal.py"
         $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:repl-client-tests>)
     set_tests_properties(native_repl_terminal PROPERTIES TIMEOUT 120)
+    add_test(NAME native_repl_history
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_history.py"
+        $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:repl-client-tests>)
+    set_tests_properties(native_repl_history PROPERTIES TIMEOUT 120)
     add_test(NAME native_repl_auto_records
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_auto_records.py"
         $<TARGET_FILE:clang-tracer-repl>)
