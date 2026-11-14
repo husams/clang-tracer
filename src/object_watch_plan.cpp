@@ -908,12 +908,17 @@ DWARFDie container_node(DWARFDie container, DWARFDie pair, std::string_view pref
   return result;
 }
 
-bool node_has_base(DWARFDie node, DWARFDie base) {
+bool node_has_base(DWARFDie node, DWARFDie base, unsigned depth = 8) {
+  if (!depth)
+    return false;
   const auto children = node.children();
   return std::any_of(children.begin(), children.end(), [&](const auto child) {
-    return child.getTag() == dw::DW_TAG_inheritance && type(child) == base &&
-           number(child, dw::DW_AT_data_member_location) == 0 &&
-           number(child, dw::DW_AT_virtuality).value_or(0) == 0;
+    if (child.getTag() != dw::DW_TAG_inheritance ||
+        number(child, dw::DW_AT_data_member_location) != 0 ||
+        number(child, dw::DW_AT_virtuality).value_or(0) != 0)
+      return false;
+    const auto inherited = type(child);
+    return inherited && (inherited == base || node_has_base(inherited, base, depth - 1));
   });
 }
 
