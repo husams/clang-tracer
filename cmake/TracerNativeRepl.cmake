@@ -946,6 +946,15 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:clang_tracer_agent> "${CMAKE_CXX_COMPILER}")
       set_tests_properties(native_repl_live_mock PROPERTIES TIMEOUT 300)
+      foreach(_live_case IN ITEMS data migration)
+        add_test(NAME native_repl_live_${_live_case}
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_live_data_and_migration.py"
+            --case "${_live_case}" --compiler "${CMAKE_CXX_COMPILER}"
+            --sdk "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+            --agent $<TARGET_FILE:clang_tracer_agent>)
+        set_tests_properties(native_repl_live_${_live_case} PROPERTIES TIMEOUT 240)
+      endforeach()
       add_test(NAME native_repl_integration
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_native_integration.py"
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>

@@ -16,7 +16,7 @@ llvm_lib=$("$llvm" --libdir)
 resolver="$baseline/CMakeFiles/clang_tracer_agent.dir/src/debug_resolver.cpp.o"
 
 flags=(-std=c++23 -g -O0 -I"$root/src" -I"$common" -I"$root/include"
-  -I"$baseline/generated" -isystem "$llvm_include"
+  -I"$baseline/generated" -I"$baseline/context-generated" -isystem "$llvm_include"
   "-DTRACER_CLANG_RESOURCE_DIR=\"$resource\"")
 sources=("$root"/src/live_data{,_scan,_jit,_command}.cpp
   "$common"/live_{compile,jit}.cpp "$root/tests/live_data_target.cpp"

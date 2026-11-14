@@ -38,7 +38,7 @@ void checked(llvm::Error error) {
 std::uintptr_t runtime_import(llvm::StringRef name) {
   const auto is_c = llvm::StringSwitch<bool>(name)
       .Cases("malloc", "calloc", "free", "realloc", true)
-      .Cases("memcpy", "memset", "memmove", "memcmp", true)
+      .Cases("memcpy", "memset", "memmove", "memcmp", "bcmp", true)
       .Cases("strlen", "strcmp", "abort", "puts", true)
       .Cases("pthread_mutex_lock", "pthread_mutex_unlock", "__libc_single_threaded", true)
       .Default(false);
