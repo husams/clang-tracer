@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -54,6 +55,7 @@
 #include <clang/Tooling/CompilationDatabase.h>
 #include <clang/Tooling/Tooling.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/ADT/ArrayRef.h>
@@ -116,6 +118,136 @@ constexpr std::size_t kJumpBytes = tracer::native_detour::kJumpBytes;
 using tracer::native_detour::initialize_llvm;
 thread_local unsigned callback_depth = 0;
 
+const char *agent_log_path() noexcept {
+  // Capture startup configuration before the sender begins logging.
+  static const auto path = [] {
+    std::array<char, PATH_MAX> result{};
+    const char *configured = ::secure_getenv("CLANG_TRACER_AGENT_LOG");
+    if (configured && configured[0] == '/') {
+      const auto size = ::strnlen(configured, result.size());
+      if (size < result.size())
+        std::memcpy(result.data(), configured, size);
+    }
+    return result;
+  }();
+  return path.data();
+}
+
+int open_agent_log() noexcept {
+  const char *path = agent_log_path();
+  if (!path[0])
+    return -1;
+  // A bootstrap call borrows an application thread. Avoid introducing
+  // cancellation points while opening and writing its diagnostics.
+  const int fd = static_cast<int>(::syscall(
+      SYS_openat, AT_FDCWD, path,
+      O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW |
+          O_NOCTTY,
+      S_IRUSR | S_IWUSR));
+  if (fd < 0)
+    return -1;
+  struct stat info {};
+  if (::fstat(fd, &info) == 0 && S_ISREG(info.st_mode) &&
+      info.st_uid == ::geteuid() && !(info.st_mode & (S_IRWXG | S_IRWXO)))
+    return fd;
+  (void)::syscall(SYS_close, fd);
+  return -1;
+}
+
+void log_agent(const char *operation, const char *stage,
+               std::uint64_t probe_id, const char *outcome, int error_number = 0,
+               std::uint64_t callback_errors = 0,
+               std::uint64_t event_drops = 0, std::uint64_t call_id = 0,
+               const char *message = nullptr) noexcept {
+  const int saved_errno = errno;
+  ++callback_depth;
+  const int fd = open_agent_log();
+  if (fd >= 0) {
+    timespec now{};
+    ::clock_gettime(CLOCK_REALTIME, &now);
+    char line[512];
+    const int size = std::snprintf(
+        line, sizeof(line),
+        "clang-tracer agent time=%lld.%09ld pid=%ld probe_id=%llu call_id=%llu "
+        "operation=%s stage=%s outcome=%s errno=%d callback_errors=%llu "
+        "event_drops=%llu%s%s\n",
+        static_cast<long long>(now.tv_sec), now.tv_nsec,
+        static_cast<long>(::getpid()),
+        static_cast<unsigned long long>(probe_id),
+        static_cast<unsigned long long>(call_id), operation, stage, outcome,
+        error_number, static_cast<unsigned long long>(callback_errors),
+        static_cast<unsigned long long>(event_drops),
+        message ? " message=" : "", message ? message : "");
+    // Linux appends pwrite on an O_APPEND descriptor. The positional write
+    // also avoids a SIGPIPE if the application replaces this descriptor.
+    if (size > 0 && static_cast<std::size_t>(size) < sizeof(line))
+      (void)::syscall(SYS_pwrite64, fd, line, static_cast<std::size_t>(size),
+                      0LL);
+    (void)::syscall(SYS_close, fd);
+  }
+  --callback_depth;
+  errno = saved_errno;
+}
+
+class AgentOperation {
+public:
+  AgentOperation(const char *name, const tracer::Request *request) noexcept
+      : probe_id_(request && request->version == tracer::kBootstrapVersion
+                      ? request->probe_id
+                      : 0),
+        name_(name) {}
+
+  void progress(const char *next_stage) noexcept {
+    stage = next_stage;
+    log_agent(name_, stage, probe_id_, "started");
+  }
+
+  void waiting(std::uint64_t callback_errors, std::uint64_t event_drops) const
+      noexcept {
+    log_agent(name_, stage, probe_id_, "pending", 0, callback_errors,
+              event_drops);
+  }
+
+  int finish(int status, int error_number = 0,
+             std::uint64_t callback_errors = 0,
+             std::uint64_t event_drops = 0) const noexcept {
+    log_agent(name_, stage, probe_id_, status == 0 ? "ok" : "failed",
+              error_number, callback_errors, event_drops);
+    return status;
+  }
+
+  const char *stage = "request";
+
+private:
+  const std::uint64_t probe_id_;
+  const char *name_;
+};
+
+void report_agent_failures() noexcept;
+void write_agent_logs() noexcept;
+
+struct CallbackLog {
+  static constexpr std::size_t kCapacity = 16;
+  static constexpr std::size_t kMessageSize = 192;
+  struct Entry {
+    std::uint64_t call_id;
+    tracer::TracePhase phase;
+    tracer::LogLevel level;
+    // Outcome of a hook the agent ran. Null for a callback's own message.
+    const char *hook_outcome;
+    char message[kMessageSize + 1];
+  };
+  // Producers try once. The sender releases this before writing any records.
+  std::atomic_flag busy = ATOMIC_FLAG_INIT;
+  std::size_t count = 0;
+  std::array<Entry, kCapacity> entries{};
+  // Set after queueing so the sender skips probes with nothing to write.
+  std::atomic<bool> pending{false};
+  std::atomic<std::uint64_t> dropped{0};
+  // Only the event sender reads and updates the reported total.
+  std::uint64_t reported_dropped = 0;
+};
+
 struct DebugRecord {
   clang::CXXRecordDecl *decl;
   clangtracer::v1::ReceiverContext layout;
@@ -147,6 +279,10 @@ struct Probe {
   std::atomic<std::uint64_t> sequence{0};
   tracer::EventDelivery delivery;
   std::atomic<std::uint64_t> callback_errors{0};
+  // Only the event sender reads and updates the reported totals.
+  std::uint64_t reported_callback_errors = 0;
+  std::uint64_t reported_event_drops = 0;
+  CallbackLog log;
   std::atomic<std::uint64_t> call_ids{0};
   std::atomic<std::uint64_t> in_flight{0};
   std::atomic<bool> callback_enabled{true};
@@ -194,7 +330,8 @@ struct Agent {
   tracer::ContextRegistry context_registry;
   std::shared_ptr<tracer::context_engine::ContextCapturePool> context_capture;
   unsigned next_context_hook = 0;
-  tracer::EventTransport transport{[] { ++callback_depth; }};
+  const bool logging_enabled = agent_log_path()[0] != '\0';
+  tracer::EventTransport transport;
   std::shared_ptr<tracer::context_engine::PropagationLedger> propagation_ledger;
   std::unique_ptr<tracer::context_scheduler::ContextPthreadDetour>
       pthread_detour;
@@ -203,7 +340,10 @@ struct Agent {
   tracer::Request pthread_patch{};
   std::size_t context_probe_count = 0;
 
-  Agent() {
+  Agent()
+      : transport([] { ++callback_depth; },
+                  logging_enabled ? &report_agent_failures : nullptr,
+                  logging_enabled ? &write_agent_logs : nullptr) {
     for (auto &slot : probe_slots) {
       slot.store(nullptr, std::memory_order_relaxed);
     }
@@ -295,6 +435,20 @@ void append_diagnostics(clangtracer::v1::ValidationReport &report,
   }
 }
 
+void append_source_errors(
+    clangtracer::v1::ValidationReport &report,
+    const std::vector<tracer::ContextSourceError> &errors) {
+  for (const auto &error : errors) {
+    auto *output = report.add_diagnostics();
+    output->set_stage("syntax");
+    output->set_severity("error");
+    output->set_file(error.file);
+    output->set_line(error.line);
+    output->set_column(error.column);
+    output->set_message(error.message);
+  }
+}
+
 void append_failure(clangtracer::v1::ValidationReport &report,
                     const char *stage, const std::string &message) {
   if (message.empty())
@@ -343,6 +497,125 @@ extern "C" void tracer_shared_resume(void *);
 std::mutex agent_mutex;
 std::atomic<Agent *> agent{nullptr};
 std::atomic<std::uint64_t> validation_report_sequence{0};
+
+const char *log_level_name(tracer::LogLevel level) noexcept {
+  switch (level) {
+  case tracer::LogLevel::Info:
+    return "info";
+  case tracer::LogLevel::Warning:
+    return "warning";
+  case tracer::LogLevel::Error:
+    return "error";
+  }
+  return "unknown";
+}
+
+void report_agent_failures() noexcept {
+  auto *current = agent.load(std::memory_order_acquire);
+  if (!current)
+    return;
+  for (const auto &slot : current->probe_slots) {
+    auto *probe = slot.load(std::memory_order_acquire);
+    if (!probe)
+      continue;
+    const auto errors = probe->callback_errors.load(std::memory_order_relaxed);
+    const auto drops = probe->delivery.dropped.load(std::memory_order_acquire);
+    if (errors != probe->reported_callback_errors ||
+        drops != probe->reported_event_drops) {
+      log_agent("probe", "runtime", probe->request.probe_id, "degraded",
+                probe->delivery.last_send_errno.load(std::memory_order_relaxed),
+                errors, drops);
+      probe->reported_callback_errors = errors;
+      probe->reported_event_drops = drops;
+    }
+  }
+}
+
+// Writes queued hook records and callback messages in the order they ran.
+void write_agent_logs() noexcept {
+  auto *current = agent.load(std::memory_order_acquire);
+  if (!current)
+    return;
+  for (const auto &slot : current->probe_slots) {
+    auto *probe = slot.load(std::memory_order_acquire);
+    if (!probe)
+      continue;
+    auto &log = probe->log;
+    if (log.pending.exchange(false, std::memory_order_acq_rel)) {
+      if (log.busy.test_and_set(std::memory_order_acquire)) {
+        // A producer holds the queue. Leave its entries for the next pass.
+        log.pending.store(true, std::memory_order_release);
+        continue;
+      }
+      std::array<CallbackLog::Entry, CallbackLog::kCapacity> pending;
+      const auto count = log.count;
+      std::copy_n(log.entries.begin(), count, pending.begin());
+      log.count = 0;
+      log.busy.clear(std::memory_order_release);
+      for (std::size_t i = 0; i < count; ++i) {
+        const auto &entry = pending[i];
+        const char *phase =
+            entry.phase == tracer::TracePhase::Pre ? "pre" : "post";
+        if (entry.hook_outcome)
+          log_agent("hook", phase, probe->request.probe_id, entry.hook_outcome,
+                    0, 0, 0, entry.call_id);
+        else
+          log_agent("callback", phase, probe->request.probe_id,
+                    log_level_name(entry.level), 0, 0, 0, entry.call_id,
+                    entry.message);
+      }
+    }
+    const auto dropped = log.dropped.load(std::memory_order_relaxed);
+    if (dropped != log.reported_dropped) {
+      char lost[48];
+      std::snprintf(lost, sizeof(lost), "%llu records lost",
+                    static_cast<unsigned long long>(dropped -
+                                                    log.reported_dropped));
+      log_agent("log", "queue", probe->request.probe_id, "dropped", 0, 0, 0, 0,
+                lost);
+      log.reported_dropped = dropped;
+    }
+  }
+}
+
+// Queues one record for the sender. A full or contended queue drops it.
+bool enqueue_agent_log(Probe &probe, const tracer::TraceContext &context,
+                       tracer::LogLevel level, const char *hook_outcome,
+                       const char *message, std::size_t size) noexcept {
+  auto &log = probe.log;
+  bool queued = false;
+  if (!log.busy.test_and_set(std::memory_order_acquire)) {
+    queued = log.count < log.entries.size();
+    if (queued) {
+      auto &entry = log.entries[log.count++];
+      entry.call_id = context.call_id;
+      entry.phase = context.phase;
+      entry.level = level;
+      entry.hook_outcome = hook_outcome;
+      size = std::min(size, CallbackLog::kMessageSize);
+      for (std::size_t i = 0; i < size; ++i) {
+        const auto byte = static_cast<unsigned char>(message[i]);
+        entry.message[i] = byte < 32 || byte == 127 ? '?' : message[i];
+      }
+      entry.message[size] = '\0';
+    }
+    log.busy.clear(std::memory_order_release);
+  }
+  if (queued)
+    log.pending.store(true, std::memory_order_release);
+  else
+    log.dropped.fetch_add(1, std::memory_order_relaxed);
+  return queued;
+}
+
+// Records that the agent ran a PRE or POST hook, when logging is enabled.
+void log_hook(Probe &probe, const tracer::TraceContext &context,
+              bool succeeded) noexcept {
+  auto *owner = agent.load(std::memory_order_acquire);
+  if (owner && owner->logging_enabled)
+    (void)enqueue_agent_log(probe, context, tracer::LogLevel::Info,
+                            succeeded ? "ok" : "failed", nullptr, 0);
+}
 
 Probe *find_probe(std::uint64_t id) noexcept {
   Agent *current = agent.load(std::memory_order_acquire);
@@ -595,7 +868,10 @@ extern "C" void tracer_shared_dispatch(void *opaque,
   const auto entry = raw->phase == tracer::TracePhase::Pre
                          ? token->probe->shared_generation->pre_entry()
                          : token->probe->shared_generation->post_entry();
-  if (!invoke_shared(*token, entry)) {
+  const bool hook_succeeded = invoke_shared(*token, entry);
+  if (token->probe->shared_generation->has_hook(raw->phase))
+    log_hook(*token->probe, token->raw, hook_succeeded);
+  if (!hook_succeeded) {
     token->enabled = false;
     token->probe->callback_errors.fetch_add(1, std::memory_order_relaxed);
     tracer::context_execution::runtime_diagnostics().record(
@@ -4142,6 +4418,7 @@ bool compile_shared_probe(Probe &p,
                            : recovered_record_declarations(specification)) +
                       argument_aliases(specification) +
                       interceptor_template_prelude(specification.callback_source()) +
+                      "#line 1 \"callback_source\"\n" +
                       callback_body + "\n" + signature_assert;
   // Scalar shared wrappers need no user declarations. Recompiling their full
   // callback headers here can consume the operation deadline before admission.
@@ -4197,6 +4474,7 @@ bool compile_shared_probe(Probe &p,
       use_plain ? (plain_snapshots->arguments.empty() ? nullptr : plain_snapshots)
                 : wrapper_snapshots;
   activation.compiler_arguments = arguments;
+  activation.callback_log = &tracer::detail::tracer_enqueue_log;
   if (!specification.callback_package_path().empty())
     activation.file_name = specification.callback_package_path();
   std::copy_n(p.request.source_lineage_id, activation.source_lineage_id.size(),
@@ -4206,6 +4484,8 @@ bool compile_shared_probe(Probe &p,
         tracer::preflight_context_source(activation, syntax_only);
     if (!preflight) {
       error = preflight.error;
+      if (report)
+        append_source_errors(*report, preflight.source_errors);
       return false;
     }
     const auto generated_wrapper =
@@ -4372,6 +4652,7 @@ bool bind_probe_symbols(clang::Interpreter &interpreter,
   bind("tracer_callback_cleanup_enter", &tracer_callback_cleanup_enter);
   bind("tracer_callback_lifecycle_leave", &tracer_callback_lifecycle_leave);
   bind("tracer_callback_failure", &tracer_callback_failure);
+  bind("tracer_enqueue_log", &tracer::detail::tracer_enqueue_log);
   bind("tracer_event_dispatch", &tracer_event_dispatch);
   bind("tracer_probe_enter", &tracer_probe_enter);
   bind("tracer_probe_leave", &tracer_probe_leave);
@@ -4923,6 +5204,14 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   DiagnosticCapture user_capture(nullptr);
   auto user_ast =
       build_callback_ast(user_source, "clang-tracer-callback.cc", user_capture);
+  // A callback that failed to parse explains the later generic rejections.
+  const auto prefer_parse_errors = [&] {
+    if (!user_capture.had_error())
+      return;
+    if (report)
+      append_diagnostics(*report, user_capture, "syntax");
+    error = user_capture.message();
+  };
   bool shape_valid = false;
   if (user_ast) {
     if (prepared_callback_context) {
@@ -4936,10 +5225,15 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
         }
       }
     }
-    if (typed_prepared && !validate_prepared_types(*user_ast, specification, result_sret, error))
-      return false;
     const auto context_declarations =
         tracer::analyze_context_declarations(user_ast->getASTContext());
+    if (typed_prepared && !validate_prepared_types(*user_ast, specification, result_sret, error)) {
+      // State shorthand fails this plain parse by design, so a context
+      // callback keeps the specific rejection.
+      if (!context_declarations.requires_context)
+        prefer_parse_errors();
+      return false;
+    }
     if (context_declarations.requires_context) {
       if (tracer::find_snapshot_encoders(user_ast->getASTContext()).requested) {
         error = "tracer_snapshot::encode requires an invocation-scoped callback";
@@ -4981,7 +5275,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   } else {
     baseline_error = user_capture.message();
   }
-  if (!user_capture.message().empty() && baseline_error.empty()) {
+  if (!user_capture.message().empty() &&
+      (baseline_error.empty() || user_capture.had_error())) {
     baseline_error = user_capture.message();
   }
 
@@ -5402,11 +5697,15 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
         i < p->argument_names.size() ? p->argument_names[i].c_str() : nullptr;
   try {
     value = p->callback(&invocation, instance, &succeeded);
+    // The bridge reports whether a hook exists for this phase and ran.
+    if (succeeded)
+      log_hook(*p, invocation, true);
   } catch (const __cxxabiv1::__forced_unwind &) {
     --callback_depth;
     throw;
   } catch (...) {
     succeeded = false;
+    log_hook(*p, invocation, false);
     // Class adapters disable only their failed invocation. Legacy callbacks
     // retain their existing probe-wide failure behavior.
     if (!p->class_callback)
@@ -5657,6 +5956,17 @@ bool validate_request(const tracer::Request &r, std::string &error) {
 }
 } // namespace
 
+bool tracer::detail::tracer_enqueue_log(const TraceContext *context,
+                                       const char *message, std::size_t size,
+                                       LogLevel level) noexcept {
+  auto *owner = agent.load(std::memory_order_acquire);
+  if (!owner || !owner->logging_enabled || !context || !message || size == 0)
+    return false;
+  auto *probe = find_probe(context->probe_id);
+  return probe &&
+         enqueue_agent_log(*probe, *context, level, nullptr, message, size);
+}
+
 extern "C" {
 // The server reads this word without stopping or executing code in the target.
 static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
@@ -5665,17 +5975,20 @@ std::atomic<std::uint64_t> tracer_agent_capacity_v1{tracer::kAgentCapacityTag};
 }
 
 extern "C" int tracer_agent_start(tracer::Request *request) {
+  AgentOperation operation("prepare", request);
   try {
     tracer::context_scheduler::ScopedPthreadBypass compiler_threads;
     if (!request || request->version != tracer::kBootstrapVersion) {
-      return -1;
+      return operation.finish(-1);
     }
+    operation.progress("validate_request");
     request->error[0] = '\0';
     std::string error;
     if (!validate_request(*request, error)) {
       set_error(request, error.c_str());
-      return -1;
+      return operation.finish(-1);
     }
+    operation.stage = "initialize_agent";
     std::lock_guard<std::mutex> lock(agent_mutex);
     Agent *current = agent.load(std::memory_order_acquire);
     if (!current) {
@@ -5687,15 +6000,15 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     Agent &a = *current;
     if (a.pid && a.pid != ::getpid()) {
       set_error(request, "agent session pid mismatch");
-      return -1;
+      return operation.finish(-1);
     }
     if (find_probe(request->probe_id)) {
       set_error(request, "probe_id has already been used in this process");
-      return -1;
+      return operation.finish(-1);
     }
     if (a.retained >= tracer::kMaxProbes) {
       set_error(request, "the process has reached its 32 retained-probe limit");
-      return -1;
+      return operation.finish(-1);
     }
     // A durable collector can reconnect while old probes are still active.
     // Keep their shared metadata alive; refresh a new session only after the
@@ -5717,17 +6030,19 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     auto p = std::make_unique<Probe>();
     p->request = *request;
     clangtracer::v1::ProbeSpec specification;
+    operation.stage = "read_probe_spec";
     if (!read_probe_spec(p->request, specification, error)) {
       set_error(request, error.c_str());
-      return -1;
+      return operation.finish(-1);
     }
     if (const auto *invalid = tracer::scalar_override_error(specification)) {
       set_error(request, invalid);
-      return -1;
+      return operation.finish(-1);
     }
     // Named tracing uses the target's own independently re-read DWARF and ELF
     // mappings. No dynamic symbol lookup is involved, including for local and
     // hidden functions. Raw-symbol requests retain their explicit dlsym path.
+    operation.stage = "resolve_symbol";
     std::optional<VerifiedDebugEntry> verified_debug_entry;
     void *entry = nullptr;
     if (specification.has_debug_info()) {
@@ -5739,15 +6054,16 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     }
     if (!entry) {
       set_error(request, "target symbol was not found in the process");
-      return -1;
+      return operation.finish(-1);
     }
+    operation.stage = "validate_patch";
     p->request.original_entry = reinterpret_cast<std::uintptr_t>(entry);
     int prot = 0;
     std::uintptr_t map_lo = 0, map_hi = 0;
     if (!mapping(entry, map_lo, map_hi, prot) ||
         (prot & (PROT_READ | PROT_EXEC)) != (PROT_READ | PROT_EXEC)) {
       set_error(request, "target symbol is not in a readable executable mapping");
-      return -1;
+      return operation.finish(-1);
     }
     Probe *replaced = nullptr;
     bool entry_matches_original = true;
@@ -5759,14 +6075,14 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
         if (prior.patch_size > map_hi - p->request.original_entry) {
           set_error(request,
                     "target symbol address is already hooked by another probe");
-          return -1;
+          return operation.finish(-1);
         }
         if (std::memcmp(entry, prior.installed, prior.patch_size) == 0) {
           // A retired wrapper from a previous session can remain resident
           // after its entry is restored. Only the live detour has an owner.
           if (request->reject_replacement || replaced || other->session_id != request->session_id) {
             set_error(request, "target symbol address is already hooked by another probe");
-            return -1;
+            return operation.finish(-1);
           }
           replaced = other;
         }
@@ -5776,11 +6092,11 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     if (request->expected_replaced_probe_id &&
         (!replaced || replaced->request.probe_id != request->expected_replaced_probe_id)) {
       set_error(request, "reload probe no longer owns the target entry");
-      return -1;
+      return operation.finish(-1);
     }
     if (!replaced && !entry_matches_original) {
       set_error(request, "live entry does not match any retained probe generation");
-      return -1;
+      return operation.finish(-1);
     }
     tracer::native_detour::Patch target_patch;
     if (replaced) {
@@ -5795,18 +6111,18 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
               p->request.original_entry, target_patch, error,
               replaced->entry_jump_size)) {
         set_error(request, error.c_str());
-        return -1;
+        return operation.finish(-1);
       }
     } else if (!decode_patch(static_cast<const std::uint8_t *>(entry), p->request,
                              target_patch, error,
                              specification.debug_info().entry_size())) {
       set_error(request, error.c_str());
-      return -1;
+      return operation.finish(-1);
     }
     if (specification.has_debug_info() &&
         p->request.patch_size > specification.debug_info().entry_size()) {
       set_error(request, "safe patch window exceeds the verified function range");
-      return -1;
+      return operation.finish(-1);
     }
     for (std::size_t i = 0; i < a.probes.size(); ++i) {
       auto *other = a.probes[i].get();
@@ -5824,26 +6140,28 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
                  ye = y + p->request.patch_size;
       if (x < ye && y < xe) {
         set_error(request, "target patch overlaps an already hooked function");
-        return -1;
+        return operation.finish(-1);
       }
     }
+    operation.stage = "create_trampoline";
     if (!tracer::native_detour::create_trampoline(
             target_patch, p->trampoline, p->mapping_size, error)) {
       set_error(request, error.c_str());
-      return -1;
+      return operation.finish(-1);
     }
+    operation.progress("compile_callback");
     const auto compile_started = std::chrono::steady_clock::now();
     if (!compile_probe(
             *p, specification, error, true, false, nullptr,
             verified_debug_entry ? &*verified_debug_entry : nullptr)) {
       set_error(request, error.c_str());
-      return -1;
+      return operation.finish(-1);
     }
     if (!tracer::native_detour::prepare_entry_jump(
             target_patch, p->trampoline, p->mapping_size, p->wrapper,
             {p->request.installed, p->request.patch_size}, error)) {
       set_error(request, error.c_str());
-      return -1;
+      return operation.finish(-1);
     }
     p->entry_jump_size = target_patch.jump_size;
     p->request.jit_compile_ns =
@@ -5851,41 +6169,48 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
             std::chrono::steady_clock::now() - compile_started).count();
     if (specification.reclaimable() && p->request.context_required) {
       set_error(request, "reclaimable observers cannot schedule shared-context work");
-      return -1;
+      return operation.finish(-1);
     }
     p->reclaimable = specification.reclaimable();
+    operation.stage = "prepare_context";
     if (p->request.context_required && !prepare_context_pthread(a, *p, error)) {
       set_error(request, error.c_str());
-      return -1;
+      return operation.finish(-1);
     }
+    operation.stage = "create_event_socket";
     p->delivery.socket_fd =
         ::socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (p->delivery.socket_fd < 0) {
+      const int error_number = errno;
       set_error(request, "could not create event socket");
-      return -1;
+      return operation.finish(-1, error_number);
     }
+    operation.stage = "connect_event_socket";
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     if (std::strlen(request->event_socket) >= sizeof(addr.sun_path)) {
       set_error(request, "event socket path is too long");
-      return -1;
+      return operation.finish(-1);
     }
     std::strncpy(addr.sun_path, request->event_socket,
                  sizeof(addr.sun_path) - 1);
     if (::connect(p->delivery.socket_fd, reinterpret_cast<sockaddr *>(&addr),
                   sizeof(addr))) {
+      const int error_number = errno;
       set_error(request, "could not connect event socket");
-      return -1;
+      return operation.finish(-1, error_number);
     }
+    operation.stage = "enable_context";
     if (p->request.context_required) {
       if (!a.pthread_detour || !a.pthread_detour->enable_propagation()) {
         set_error(request,
                   "native pthread_create propagation adapter is unavailable");
-        return -1;
+        return operation.finish(-1);
       }
       p->scheduler_counted = true;
       ++a.context_probe_count;
     }
+    operation.stage = "publish_probe";
     p->session_id = request->session_id;
     a.pid = ::getpid();
     const auto slot = static_cast<std::size_t>(std::find_if(a.probes.begin(), a.probes.end(),
@@ -5901,13 +6226,13 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     tracer_agent_capacity_v1.store(tracer::kAgentCapacityTag | a.retained,
                                   std::memory_order_relaxed);
     *request = installed_probe->request;
-    return 0;
+    return operation.finish(0);
   } catch (const std::exception &e) {
     set_error(request, e.what());
-    return -1;
+    return operation.finish(-1);
   } catch (...) {
     set_error(request, "unexpected exception while adding probe");
-    return -1;
+    return operation.finish(-1);
   }
 }
 
@@ -6113,27 +6438,29 @@ extern "C" int tracer_agent_validate(tracer::ValidationRequest *request) {
 }
 
 extern "C" int tracer_agent_stop(tracer::Request *request) {
+  AgentOperation operation("stop", request);
   try {
     if (!request || request->version != tracer::kBootstrapVersion) {
-      return -1;
+      return operation.finish(-1);
     }
     std::lock_guard<std::mutex> lock(agent_mutex);
     auto *current = agent.load(std::memory_order_acquire);
     if (!current) {
       set_error(request, "agent is not initialized");
-      return -1;
+      return operation.finish(-1);
     }
     Agent &a = *current;
     auto *p = find_probe(request->probe_id);
     if (!p) {
       set_error(request, "probe_id is unknown");
-      return -1;
+      return operation.finish(-1);
     }
     if (std::strncmp(request->session_id, p->request.session_id,
                      sizeof(request->session_id)) != 0) {
       set_error(request, "probe session id does not match");
-      return -1;
+      return operation.finish(-1);
     }
+    operation.stage = "verify_original_patch";
     void *entry = reinterpret_cast<void *>(p->request.original_entry);
     std::uintptr_t lo = 0, hi = 0;
     int prot = 0;
@@ -6141,7 +6468,7 @@ extern "C" int tracer_agent_stop(tracer::Request *request) {
         p->request.patch_size > hi - reinterpret_cast<std::uintptr_t>(entry) ||
         (prot & (PROT_READ | PROT_EXEC)) != (PROT_READ | PROT_EXEC)) {
       set_error(request, "remove requires the original executable mapping");
-      return -2;
+      return operation.finish(-2);
     }
     const bool restored = std::memcmp(entry, p->request.original, p->request.patch_size) == 0;
     const bool superseded = !restored && std::any_of(
@@ -6166,6 +6493,7 @@ extern "C" int tracer_agent_stop(tracer::Request *request) {
       set_error(request, "probe invocations are in flight; remove can be retried");
       return 1;
     }
+    operation.stage = "drain";
     p->active.exchange(false, std::memory_order_seq_cst);
     if (p->scheduler_counted) {
       p->scheduler_counted = false;
@@ -6174,7 +6502,7 @@ extern "C" int tracer_agent_stop(tracer::Request *request) {
       if (a.context_probe_count == 0 && a.pthread_detour)
         a.pthread_detour->disable_propagation();
     }
-    tracer::EventTransport::begin_drain(p->delivery);
+    const bool first_drain = tracer::EventTransport::begin_drain(p->delivery);
     const auto scheduler_tasks =
         a.pthread_detour ? a.pthread_detour->outstanding_tasks() : 0;
     p->request.pthread_create_active_tasks =
@@ -6191,6 +6519,8 @@ extern "C" int tracer_agent_stop(tracer::Request *request) {
       set_error(request, "probe callbacks, accepted pthread tasks or queued "
                          "events are in flight; "
                          "remove can be retried");
+      if (first_drain)
+        operation.waiting(request->callback_errors, request->event_drops);
       return 1;
     }
     if (p->transport_active) {
@@ -6203,12 +6533,14 @@ extern "C" int tracer_agent_stop(tracer::Request *request) {
     p->request.callback_errors =
         p->callback_errors.load(std::memory_order_relaxed);
     *request = p->request;
-    return 0;
+    return operation.finish(
+        0, p->delivery.last_send_errno.load(std::memory_order_relaxed),
+        request->callback_errors, request->event_drops);
   } catch (const std::exception &e) {
     set_error(request, e.what());
-    return -1;
+    return operation.finish(-1);
   } catch (...) {
     set_error(request, "unexpected exception while removing probe");
-    return -1;
+    return operation.finish(-1);
   }
 }

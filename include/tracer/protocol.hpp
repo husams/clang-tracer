@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string_view>
 
 namespace tracer {
 inline constexpr std::uint32_t kProtocolVersion = 2;
@@ -85,6 +86,7 @@ enum class CallableKind : std::uint32_t {
   Method = 2
 };
 enum class TracePhase : std::uint32_t { Pre = 1, Post = 2, Exception = 3 };
+enum class LogLevel : std::uint8_t { Info, Warning, Error };
 
 struct ValueSnapshot;
 struct ValueSnapshotMember {
@@ -160,6 +162,12 @@ struct ScalarOverrides {
   }
 };
 
+struct TraceContext;
+namespace detail {
+extern "C" bool tracer_enqueue_log(const TraceContext *, const char *,
+                                   std::size_t, LogLevel) noexcept;
+}
+
 struct TraceContext {
   std::uint64_t probe_id = 0;
   std::uint64_t object_address = 0;
@@ -201,6 +209,12 @@ struct TraceContext {
   std::uint64_t original_entry_time_ns = 0;
   void *original_state = nullptr;
   std::uint64_t (*invoke_original)(void *) = nullptr;
+  // True means the message was queued for best-effort agent logging.
+  bool log(std::string_view message,
+           LogLevel level = LogLevel::Info) const noexcept {
+    return detail::tracer_enqueue_log(this, message.data(), message.size(),
+                                     level);
+  }
 };
 
 struct Request {

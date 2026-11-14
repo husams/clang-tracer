@@ -80,17 +80,78 @@ struct AliasFinder final : clang::RecursiveASTVisitor<AliasFinder> {
   const clang::TypeAliasDecl *found = nullptr;
 };
 
+// Keeps Clang's errors so a failed parse reports what was rejected.
+class ParseErrorCollector final : public clang::DiagnosticConsumer {
+public:
+  void HandleDiagnostic(clang::DiagnosticsEngine::Level level,
+                        const clang::Diagnostic &info) override {
+    clang::DiagnosticConsumer::HandleDiagnostic(level, info);
+    if (level < clang::DiagnosticsEngine::Error) {
+      return;
+    }
+    llvm::SmallString<256> message;
+    info.FormatDiagnostic(message);
+    ContextSourceError error;
+    error.message.assign(message.begin(), message.end());
+    if (info.hasSourceManager() && info.getLocation().isValid()) {
+      const auto location =
+          info.getSourceManager().getPresumedLoc(info.getLocation());
+      if (location.isValid()) {
+        error.file = location.getFilename();
+        error.line = location.getLine();
+        error.column = location.getColumn();
+      }
+    }
+    errors_.push_back(std::move(error));
+  }
+
+  std::vector<ContextSourceError> take() noexcept { return std::move(errors_); }
+
+private:
+  std::vector<ContextSourceError> errors_;
+};
+
+// Renders errors one per line, in Clang's file:line:column form.
+std::string error_lines(const std::vector<ContextSourceError> &errors) {
+  std::string text;
+  for (const auto &error : errors) {
+    if (!text.empty()) {
+      text += '\n';
+    }
+    if (!error.file.empty()) {
+      text += error.file + ":" + std::to_string(error.line) + ":" +
+              std::to_string(error.column) + ": ";
+    }
+    text += "error: " + error.message;
+  }
+  return text;
+}
+
 std::unique_ptr<clang::ASTUnit>
 parse_source(const std::string &source,
              const std::vector<std::string> &arguments,
-             const std::string &file_name) {
-  clang::IgnoringDiagConsumer ignored;
-  return clang::tooling::buildASTFromCodeWithArgs(
+             const std::string &file_name,
+             std::vector<ContextSourceError> *errors = nullptr) {
+  ParseErrorCollector collector;
+  auto ast = clang::tooling::buildASTFromCodeWithArgs(
       "#include \"tracer/callback.hpp\"\n#include \"context_facade.hpp\"\n" +
           source,
       clang_driver_arguments(arguments), file_name, "clang-context-activation",
       std::make_shared<clang::PCHContainerOperations>(),
-      clang::tooling::getClangStripDependencyFileAdjuster(), {}, &ignored);
+      clang::tooling::getClangStripDependencyFileAdjuster(), {}, &collector);
+  if (errors) {
+    *errors = collector.take();
+  }
+  return ast;
+}
+
+// Appends the collected Clang errors to a parse failure summary.
+std::string parse_failure(std::string summary,
+                          const std::vector<ContextSourceError> &errors) {
+  if (!errors.empty()) {
+    summary += "\n" + error_lines(errors);
+  }
+  return summary;
 }
 
 std::string error_text(llvm::Error error) {
@@ -1184,8 +1245,13 @@ extern "C" bool clangtracer_context_post(void* storage,
   return source;
 }
 
-std::vector<ContextNativeAddress> native_addresses() {
+std::vector<ContextNativeAddress>
+native_addresses(decltype(&detail::tracer_enqueue_log) callback_log) {
   using namespace context_facade;
+  if (!callback_log) {
+    callback_log = [](const TraceContext *, const char *, std::size_t,
+                      LogLevel) noexcept { return false; };
+  }
   return {{"::tracer::context_facade::active_generation",
            reinterpret_cast<std::uintptr_t>(&active_generation)},
           {"::tracer::context_facade::current_context",
@@ -1193,7 +1259,9 @@ std::vector<ContextNativeAddress> native_addresses() {
           {"::tracer::context_facade::emit_event",
            reinterpret_cast<std::uintptr_t>(&emit_event)},
           {"::tracer::context_facade::active_thread_id",
-           reinterpret_cast<std::uintptr_t>(&active_thread_id)}};
+           reinterpret_cast<std::uintptr_t>(&active_thread_id)},
+          {"::tracer::detail::tracer_enqueue_log",
+           reinterpret_cast<std::uintptr_t>(callback_log)}};
 }
 
 std::string entry_declarations() {
@@ -1267,14 +1335,15 @@ ContextActivationGeneration::ContextActivationGeneration(
     std::string selected_class, std::size_t object_bytes,
     std::size_t object_alignment, std::uintptr_t construct, std::uintptr_t pre,
     std::uintptr_t post, std::uintptr_t destroy,
-    std::vector<std::string> lineage_diagnostics, bool requires_stack)
+    std::vector<std::string> lineage_diagnostics, bool requires_stack,
+    bool has_pre, bool has_post)
     : owner_code_(std::move(owner)), callback_code_(std::move(callback)),
       scopes_(std::move(scopes)), schemas_(std::move(schemas)),
       class_(std::move(selected_class)), object_bytes_(object_bytes),
       object_alignment_(object_alignment), construct_(construct), pre_(pre),
       post_(post), destroy_(destroy),
       lineage_diagnostics_(std::move(lineage_diagnostics)),
-      requires_stack_(requires_stack) {}
+      requires_stack_(requires_stack), has_pre_(has_pre), has_post_(has_post) {}
 
 ContextActivationResult
 prepare_context_source(const ContextActivationRequest &request,
@@ -1320,9 +1389,16 @@ prepare_context_source(const ContextActivationRequest &request,
   if (!prepared.error.empty()) {
     return fail(prepared.error);
   }
-  auto ast = parse_source(prepared.source, arguments, request.file_name);
+  std::vector<ContextSourceError> parse_errors;
+  auto ast = parse_source(prepared.source, arguments, request.file_name,
+                          &parse_errors);
   if (!ast || ast->getDiagnostics().hasErrorOccurred()) {
-    return fail("invalid_context_activation: checked source parse failed");
+    if (parse_errors.empty()) {
+      return fail("invalid_context_activation: checked source parse failed");
+    }
+    // This is the callback as written, so Clang's errors are the report.
+    result.source_errors = std::move(parse_errors);
+    return fail(error_lines(result.source_errors));
   }
   auto declarations = analyze_context_declarations(ast->getASTContext());
   if (!declarations.error.empty()) {
@@ -1403,9 +1479,12 @@ prepare_context_source(const ContextActivationRequest &request,
   }
   std::string callback_source = input_copy + facade.definitions;
   auto lifecycle_ast = parse_source(callback_source, arguments,
-                                    request.file_name + ".lifecycle.cc");
+                                    request.file_name + ".lifecycle.cc",
+                                    &parse_errors);
   if (!lifecycle_ast || lifecycle_ast->getDiagnostics().hasErrorOccurred()) {
-    return fail("invalid_context_activation: facade traits failed to parse");
+    return fail(parse_failure(
+        "invalid_context_activation: facade traits failed to parse",
+        parse_errors));
   }
   auto lifecycle =
       generate_context_lifecycle(*lifecycle_ast, "clangtracer_context_private");
@@ -1413,9 +1492,11 @@ prepare_context_source(const ContextActivationRequest &request,
     return fail(lifecycle.error);
   }
   auto hooks_ast = parse_source(lifecycle.compilation_copy, arguments,
-                                request.file_name + ".hooks.cc");
+                                request.file_name + ".hooks.cc", &parse_errors);
   if (!hooks_ast || hooks_ast->getDiagnostics().hasErrorOccurred()) {
-    return fail("invalid_context_activation: lifecycle source failed to parse");
+    return fail(parse_failure(
+        "invalid_context_activation: lifecycle source failed to parse",
+        parse_errors));
   }
   auto hooks =
       generate_context_hooks(*hooks_ast, "clangtracer_context_private");
@@ -1423,12 +1504,14 @@ prepare_context_source(const ContextActivationRequest &request,
     return fail(hooks.error);
   }
   auto hooks_source = hooks.compilation_copy;
-  auto final_callback_ast = parse_source(hooks_source, arguments,
-                                         request.file_name + ".entrypoints.cc");
+  auto final_callback_ast =
+      parse_source(hooks_source, arguments,
+                   request.file_name + ".entrypoints.cc", &parse_errors);
   if (!final_callback_ast ||
       final_callback_ast->getDiagnostics().hasErrorOccurred()) {
-    return fail("invalid_context_activation: lowered hook source failed to "
-                "reparse");
+    return fail(parse_failure("invalid_context_activation: lowered hook source "
+                              "failed to reparse",
+                              parse_errors));
   }
   if (!add_entry_friends(*final_callback_ast, hooks_source, selected->type,
                          result.error)) {
@@ -1470,10 +1553,13 @@ prepare_context_source(const ContextActivationRequest &request,
   callback_source = hooks_source + wrappers;
 
   if (preflight && syntax_only) {
-    auto wrapper_ast = parse_source(callback_source, arguments,
-                                    request.file_name + ".preflight.cc");
+    auto wrapper_ast =
+        parse_source(callback_source, arguments,
+                     request.file_name + ".preflight.cc", &parse_errors);
     if (!wrapper_ast || wrapper_ast->getDiagnostics().hasErrorOccurred()) {
-      return fail("invalid_context_activation: lowered wrapper syntax failed");
+      return fail(parse_failure(
+          "invalid_context_activation: lowered wrapper syntax failed",
+          parse_errors));
     }
     result.preflight_success = true;
     return result;
@@ -1548,7 +1634,8 @@ prepare_context_source(const ContextActivationRequest &request,
   }
 
   auto native_imports = ContextNativeSymbol::catalog(
-      "#include \"context_facade.hpp\"\n", arguments, native_addresses());
+      "#include \"context_facade.hpp\"\n", arguments,
+      native_addresses(request.callback_log));
   if (!native_imports) {
     return fail("invalid_context_activation: native facade catalog failed: " +
                 error_text(native_imports.takeError()));
@@ -1643,6 +1730,11 @@ prepare_context_source(const ContextActivationRequest &request,
   if (!construct || !pre || !post || !destroy) {
     return result;
   }
+  const auto has_hook = [&](std::string_view method) {
+    return std::any_of(
+        selected->hooks.begin(), selected->hooks.end(),
+        [&](const auto &hook) { return hook.method == method; });
+  };
   result.generation = std::shared_ptr<const ContextActivationGeneration>(
       new ContextActivationGeneration(
           std::move(effective_owner), *callback_code,
@@ -1652,7 +1744,8 @@ prepare_context_source(const ContextActivationRequest &request,
           declarations.requires_stack_capture ||
               std::any_of(
                   selected->hooks.begin(), selected->hooks.end(),
-                  [](const auto &hook) { return hook.captures_stack; })));
+                  [](const auto &hook) { return hook.captures_stack; }),
+          has_hook("pre"), has_hook("post")));
   return result;
 }
 
@@ -1665,9 +1758,8 @@ activate_context_source(const ContextActivationRequest &request,
 ContextPreflightResult
 preflight_context_source(const ContextActivationRequest &request,
                          bool syntax_only) {
-  const auto prepared =
-      prepare_context_source(request, nullptr, true, syntax_only);
-  return {prepared.error};
+  auto prepared = prepare_context_source(request, nullptr, true, syntax_only);
+  return {std::move(prepared.error), std::move(prepared.source_errors)};
 }
 
 } // namespace tracer

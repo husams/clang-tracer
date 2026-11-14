@@ -212,6 +212,11 @@ public:
 
   std::uint64_t id() const noexcept { return context_.call_id; }
 
+  bool log(std::string_view message,
+           LogLevel level = LogLevel::Info) const noexcept {
+    return context_.log(message, level);
+  }
+
   // Read-only rendering preferences; both are off unless explicitly enabled.
   const CallbackPrintOptions &print_options() const noexcept {
     return context_.printing;

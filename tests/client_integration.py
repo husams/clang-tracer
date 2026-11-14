@@ -209,6 +209,28 @@ def main() -> int:
             require("validation success=false" in validation_output and ":2:" in validation_output,
                     f"syntax diagnostic omitted its source location: {validation_output}")
 
+            invalid_context = output_dir / "invalid-context-interceptor.cpp"
+            write_text(invalid_context,
+                       "struct Interceptor {\n  void pre(const Call& call) {\n"
+                       "    call.context().event(\"seen\")\n  }\n};\n")
+            for level in ("syntax", "compile"):
+                validation = subprocess.run(
+                    [str(args.client), "--endpoint", endpoint, "validate", str(target.pid),
+                     "traced_work(int)", "--callback", str(invalid_context), "--level", level],
+                    capture_output=True,
+                    timeout=20,
+                    check=False,
+                )
+                validation_output = (validation.stdout + validation.stderr).decode(
+                    "utf-8", errors="replace"
+                )
+                require(validation.returncode == 1 and
+                        "callback_source:3:" in validation_output and
+                        "expected ';'" in validation_output and
+                        "invalid_context_activation" not in validation_output,
+                        f"shared callback {level} validation hid its parse error: "
+                        f"{validation_output}")
+
             valid_callback = output_dir / "valid-interceptor.cpp"
             write_text(valid_callback,
                        "class Interceptor { public: void pre(const Call&) {} };\n")
