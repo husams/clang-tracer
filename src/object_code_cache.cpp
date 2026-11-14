@@ -336,6 +336,7 @@ struct Watch::Impl {
   Dispatch dispatch;
   unsigned admitted_stores = 0;
   bool fragmented_writer = false;
+  bool direct_writer_calls = false;
   bool fragmented_lifecycle = false;
   std::map<Address, std::size_t> entry_windows;
   std::set<Address> runtime_calls;
@@ -447,10 +448,16 @@ struct Watch::Impl {
         return patch + width;
       };
       for (const auto &[start, size] : writer_entries) {
-        if (!request.writer_entry() && !plan.shared_writer() && !plan.caller_start)
-          entries.push_back(start);
-        else
+        if (plan.shared_writer() || plan.caller_start) {
           add_entry(start, size);
+          continue;
+        }
+        if (request.writer_entry() || plan.writer_address_taken(start))
+          prepare_writer_entry(start, size);
+        else {
+          direct_writer_calls = true;
+          entries.push_back(start);
+        }
       }
       for (const auto &[pc, size] : plan.boundaries) {
         const auto &site = plan.sites.at(pc);
@@ -517,7 +524,7 @@ struct Watch::Impl {
             if (needs_entry) {
               const auto end = leaf.back().pc + leaf.back().size;
               const auto padding = end - leaf.front().pc < 5 && end == pc + size ?
-                  plan.lifetime_padding(pc, leaf.front().pc, end) : 0;
+                  plan.redirect_padding(pc, leaf.front().pc, end) : 0;
               if (end - leaf.front().pc + padding < 5)
                 throw std::runtime_error(constructor ? "delegating constructor target has no verified entry redirect" :
                     "virtual destructor has no verified entry redirect; indirect destruction would be missed");
@@ -602,6 +609,8 @@ struct Watch::Impl {
           prepare_runtime_calls(native_entry::scan(start, bytes));
     }
 #endif
+    if (direct_writer_calls)
+      ++plan.unsupported; // Other calls into the original writer are outside this scope.
     if (request.follow_calls() && runtime_calls.empty() && !admitted_stores)
       throw std::runtime_error("selected scopes have no verified runtime call redirect");
     for (const auto &function : functions) {
@@ -684,6 +693,50 @@ struct Watch::Impl {
       resume_targets.emplace(start, end);
     functions.push_back(std::move(fragment));
   }
+
+#if defined(__x86_64__)
+  void prepare_writer_entry(Address start, std::size_t size) {
+    const auto bytes = plan.code(start).substr(0, size);
+    // verify_function has already verified the entire leaf, including faulting
+    // instructions. The jump can replace those instructions because the
+    // translated body executes them with their original application PCs.
+    const auto &leaf = *std::ranges::find_if(functions, [&](const auto &function) {
+      return function.front().pc == start;
+    });
+    const auto patch = bytes.starts_with("\xf3\x0f\x1e\xfa") ? start + 4 : start;
+    auto end = patch;
+    for (const auto &inst : leaf) {
+      if (inst.pc < patch)
+        continue;
+      if (inst.pc != end || end - patch >= 5)
+        break;
+      end += inst.size;
+    }
+    if (end - patch < 5) {
+      // The padding check also verifies that no direct edge enters the window.
+      const auto padding = end == start + size ? plan.redirect_padding(start, patch, end) : 0;
+      if (!padding)
+        throw std::runtime_error("code-cache writer has no verified entry redirect");
+      end += padding;
+    } else {
+      std::vector<Address> interior;
+      for (auto pc = patch + 1; pc < end; ++pc)
+        interior.push_back(pc);
+      if (std::ranges::any_of(plan.direct_redirects(interior), [](const auto &edge) {
+            return !edge.second.empty();
+          }))
+        throw std::runtime_error("an application edge enters the code-cache writer redirect");
+    }
+    if (std::ranges::any_of(leaf, [&](const auto &inst) {
+          return inst.flow != Flow::copy && inst.target > patch && inst.target < end;
+        }))
+      throw std::runtime_error("an application edge enters the code-cache writer redirect");
+    if (overlaps_fragment(patch, end) ||
+        !entry_windows.emplace(patch, end - patch).second ||
+        !incoming.emplace(start, std::vector<Address>{patch}).second)
+      throw std::runtime_error("code-cache writer entry overlaps another redirect");
+  }
+#endif
 
 #if defined(__aarch64__)
   void prepare_arm_fragments() {
@@ -1188,7 +1241,7 @@ struct Watch::Impl {
         std::size_t extension = 0;
 #if defined(__x86_64__)
         if (!trial.empty() && width < 5 && end == pc + size)
-          extension = plan.lifetime_padding(pc, candidate.address, end);
+          extension = plan.redirect_padding(pc, candidate.address, end);
 #endif
         if (trial.empty() || trial.back().pc != inst.address || overlaps_entry(trial) ||
             overlaps_fragment(trial.front().pc, end + extension))
@@ -2111,7 +2164,8 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
 #if defined(__aarch64__)
       "in-process AArch64 leaf translation with verified scalar and atomic redirects";
 #else
-      "in-process x86-64 leaf translation with atomic MOV/XADD/CMPXCHG and verified redirects";
+      p.direct_writer_calls ? "in-process x86-64 leaf translation with atomic MOV/XADD/CMPXCHG and verified direct writer call sites only" :
+      "in-process x86-64 leaf translation with atomic MOV/XADD/CMPXCHG and verified writer entry redirects";
 #endif
 }
 
@@ -2340,6 +2394,7 @@ api::ObjectWatchStatus Watch::preview() const {
   report.set_diagnostic(!p.runtime_calls.empty() ? "verified call redirects; callees resolve at runtime" :
       p.fragmented_writer ? "verified native writer fragments and redirect windows" :
       p.plan.layout.logical_collection() ? "verified native collection fragments and redirect windows" :
+      p.direct_writer_calls ? "verified direct writer call sites only" :
                         "verified leaf translations and candidate redirect windows");
   *report.mutable_plan() = p.plan.describe(p.pid != 0);
   if (p.pid) {
