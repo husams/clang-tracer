@@ -119,6 +119,8 @@ struct LogicalRange {
   std::uint64_t generation = 0;
   bool valid = false;
   std::optional<std::uint64_t> prior_value = std::nullopt;
+  std::optional<LogicalRangeSample> prior_logical;
+  bool destroyed = false;
 };
 struct Frame {
   Boundary role;
@@ -540,9 +542,9 @@ struct Watch::Worker {
     const auto destination = map_destination(layout.map, header, layout.scalar, request.map_key(),
         request.max_elements(), request.max_string_bytes(),
         [&](auto address, void *output, auto size) { return read_memory(pid, address, output, size); });
-    if (!destination)
+    if (!destination || (!*destination && !request.logical_updates()))
       throw std::runtime_error("logical map key or node links could not be verified within the read budget");
-    return destination;
+    return *destination;
   }
 
   RangeHeader range_header(Address object) const {
@@ -589,7 +591,7 @@ struct Watch::Worker {
         throw std::runtime_error("logical vector element key is duplicated");
       destination = add(add(begin, offset), layout.scalar);
     }
-    if (!destination)
+    if (!destination && !request.logical_updates())
       throw std::runtime_error("logical vector element key is unavailable");
     return destination;
   }
@@ -836,36 +838,85 @@ struct Watch::Worker {
          request.synchronization() == Request::CALLER_LOCK);
   }
 
+  LogicalRangeSample logical_sample(const RangeHeader &header, Address destination) {
+    LogicalRangeSample sample;
+    sample.destination = destination;
+    const auto &layout = plan->layout;
+    if (layout.logical_vector) {
+      sample.size = (header[1] - header[0]) / layout.stride;
+      if (destination)
+        sample.index = (destination - header[0] - layout.scalar) / layout.stride;
+    } else {
+      sample.size = header[1];
+    }
+    if (destination && range_snapshot_enabled())
+      sample.value = read_field(destination);
+    return sample;
+  }
+
   void suspend_range(pid_t tid, Frame &scope, Address pc, const Registers &regs,
                      const api::StackTrace *anchor_stack = nullptr) {
-    if (!scope.range.valid)
+    scope.range.prior_logical.reset();
+    if (scope.range.destroyed || (!scope.range.valid && !request.logical_updates()))
       return;
+    const bool was_bound = scope.range.valid;
     scope.range.valid = false;
-    if (range_snapshot_enabled()) {
+    if (range_snapshot_enabled() || request.logical_updates()) {
       try {
         const auto header = range_header(scope.receiver);
-        if (header != scope.range.header || range_element(header) != scope.range.destination)
+        const auto destination = range_element(header);
+        if (was_bound && (header != scope.range.header || destination != scope.range.destination))
           throw std::runtime_error("collection range changed outside a verified mutation return");
-        scope.range.prior_value = read_field(scope.range.destination);
+        if (request.logical_updates()) {
+          scope.range.prior_logical = logical_sample(header, destination);
+          scope.range.prior_value = scope.range.prior_logical->value;
+        } else {
+          scope.range.prior_value = read_field(scope.range.destination);
+        }
       } catch (const std::runtime_error &error) {
         gap(tid, pc, regs, error.what());
       }
     }
-    emit(tid, Observation::RANGE_SUSPENDED, scope.life, pc, regs, [&](auto &out) {
-      out.set_field(field_path());
-      out.set_storage_generation(scope.range.generation);
-      out.set_destination(scope.range.destination);
-      out.set_synchronization(request.synchronization());
-    }, anchor_stack);
+    if (was_bound)
+      emit(tid, Observation::RANGE_SUSPENDED, scope.life, pc, regs, [&](auto &out) {
+        out.set_field(field_path());
+        out.set_storage_generation(scope.range.generation);
+        out.set_destination(scope.range.destination);
+        out.set_synchronization(request.synchronization());
+      }, anchor_stack);
   }
 
   void bind_range(pid_t tid, Frame &scope, Address pc, const Registers &regs,
-                   const api::StackTrace &anchor_stack) {
+                   const api::StackTrace &anchor_stack, Address mutation = 0) {
     const auto old = std::exchange(scope.range.prior_value, std::nullopt);
+    const auto before = std::exchange(scope.range.prior_logical, std::nullopt);
     scope.range.valid = false;
+    if (scope.range.destroyed)
+      return;
+    const bool destroyed = plan->destruction_mutations.count(mutation) != 0;
+    scope.range.destroyed = destroyed;
     try {
-      const auto header = range_header(scope.receiver);
-      const auto destination = range_element(header);
+      const auto header = destroyed ? RangeHeader{} : range_header(scope.receiver);
+      const auto destination = destroyed ? 0 : range_element(header);
+      if (before) {
+        const auto after = destroyed ? LogicalRangeSample{} : logical_sample(header, destination);
+        const auto change = logical_change(*before, after, destroyed);
+        if (change != LogicalChange::none)
+          emit(tid, Observation::LOGICAL_UPDATE, scope.life, pc, regs, [&](auto &out) {
+            out.set_location_kind(Observation::CALL_BOUNDARY);
+            out.set_field(field_path());
+            out.set_destination(destination);
+            out.set_synchronization(request.synchronization());
+            set_logical_update(out, plan->layout, *before, after, change);
+            if (const auto selector = plan->mutation_selectors.find(mutation);
+                selector != plan->mutation_selectors.end())
+              out.mutable_logical_update()->set_mutation(selector->second);
+          }, &anchor_stack);
+      }
+      if (!destination) {
+        scope.range.destination = 0;
+        return;
+      }
       if (!scope.range.generation || plan->layout.logical_map || !plan->layout.pointer_offsets.empty() ||
           header[0] != scope.range.header[0] ||
           destination != scope.range.destination)
@@ -1128,7 +1179,7 @@ struct Watch::Worker {
         return pending.role == Boundary::writer_scope && pending.life.id == frame.life.id;
       });
       if (scope != task.frames.rend())
-        bind_range(tid, *scope, pc, regs, frame.entry_stack);
+        bind_range(tid, *scope, pc, regs, frame.entry_stack, frame.entry);
       break;
     }
     }
@@ -1309,7 +1360,7 @@ struct Watch::Worker {
               suspend_range(tid, *scope, pc, regs);
             } else if (pc != mutation.begin && scope->active_inline_mutation == mutation.begin) {
               scope->active_inline_mutation = 0;
-              bind_range(tid, *scope, pc, regs, scope->entry_stack);
+              bind_range(tid, *scope, pc, regs, scope->entry_stack, mutation.begin);
             }
           }
         }

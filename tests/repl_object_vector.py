@@ -51,7 +51,11 @@ def run(args):
         elif args.gap == "read-budget":
             definition += " --max-elements 1"
         if args.backend == "code-cache":
-            definition += " --backend code-cache --synchronization thread-confined"
+            definition += " --backend code-cache"
+        if args.logical or args.backend == "code-cache":
+            definition += " --synchronization thread-confined"
+        if args.logical:
+            definition += " --mode logical-writes"
         send(control, f"%object prepare demo::Portfolio {definition} --module ./portfolio --output ./vector-watch")
         prepared = out.expect(r"^object package=|^error:")
         assert prepared.string.startswith("object package="), prepared.string
@@ -78,12 +82,15 @@ def run(args):
         else:
             assert redirects and all(read_code(control, out, pc, token, 1) != b"\xcc" for pc, _ in sites)
         count = 4 if args.gap else 7 if args.map else 6
-        # Gap cases wait for the record deadline to detect unexpected extra rows.
-        wanted = count + bool(args.gap)
-        deadline = 3 if args.gap else 20
+        ordered_update = args.logical and args.map and not args.hash_map
+        count += int(ordered_update)
+        # Wait for the deadline when checking for the absence of extra events.
+        wait_for_deadline = bool(args.gap or args.logical)
+        wanted = count + wait_for_deadline
+        deadline = 4 if wait_for_deadline else 20
         send(control, f"%record collection.db --sqlite --probe {watch[1]} --name object.trace --count {wanted} --timeout {deadline}")
         (root / "rebalance.now").touch()
-        out.expect(rf"^received={count} .*" + ("timed_out=true" if args.gap else "complete=true"))
+        out.expect(rf"^received={count} .*" + ("timed_out=true" if wait_for_deadline else "complete=true"))
         send(control, f"%object stop {watch[1]}")
         out.expect(rf"^watch={watch[1]} active=no .*restoration_pending=no ")
         token = maps(control, out)
@@ -110,6 +117,20 @@ def run(args):
         assert control.wait(timeout=15) == 0, "".join(out.seen[-20:])
         events = json.loads((root / "collection.json").read_text())
         observations = [event["objectObservation"] for event in events]
+        if args.logical:
+            updates = [item for item in observations if item["kind"] == "LOGICAL_UPDATE"]
+            assert len(updates) == int(ordered_update), updates
+            if ordered_update:
+                update, = updates
+                assert update["logicalUpdate"]["change"] == "VALUE_CHANGED", update
+                assert update["locationKind"] == "CALL_BOUNDARY", update
+                assert update["snapshotBefore"]["unsignedValue"] == str(limit_base + 60), update
+                assert update["snapshotAfter"]["unsignedValue"] == str(limit_base + 70), update
+                print("verified typed map replacement at its logical boundary")
+            else:
+                print("verified storage relocation without a logical update")
+            events = [event for event in events if event["objectObservation"]["kind"] != "LOGICAL_UPDATE"]
+            observations = [event["objectObservation"] for event in events]
         for name, digest in expected.items():
             assert hashlib.sha256((root / name).read_bytes()).hexdigest() == digest
             assert hashlib.sha256((args.fixture_dir / name).read_bytes()).hexdigest() == digest
@@ -176,7 +197,10 @@ def main():
     parser.add_argument("--wide", action="store_true", help="expect the unsigned 64-bit map fixture")
     parser.add_argument("--hash-map", action="store_true", help="verify rehash with an integral key")
     parser.add_argument("--gap", choices=("missing-key", "read-budget"))
+    parser.add_argument("--logical", action="store_true", help="verify logical updates alongside stores")
     args = parser.parse_args()
+    if args.logical and (not args.wide or args.gap):
+        parser.error("--logical requires the wide fixture with no injected coverage gap")
     if (args.gap or args.wide or args.hash_map) and not args.map:
         parser.error("--gap, --wide and --hash-map require --map")
     run(args)
