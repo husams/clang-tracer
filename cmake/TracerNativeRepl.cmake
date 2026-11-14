@@ -222,6 +222,10 @@ function(tracer_add_native_repl)
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_terminal.py"
         $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:repl-client-tests>)
     set_tests_properties(native_repl_terminal PROPERTIES TIMEOUT 120)
+    add_test(NAME native_repl_history
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_history.py"
+        $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:repl-client-tests>)
+    set_tests_properties(native_repl_history PROPERTIES TIMEOUT 120)
     add_test(NAME native_repl_auto_records
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_auto_records.py"
         $<TARGET_FILE:clang-tracer-repl>)
@@ -979,6 +983,11 @@ function(tracer_add_native_repl)
           --target $<TARGET_FILE:repl-complex-fixture>
           --header "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/repl_complex_types.hpp")
       set_tests_properties(native_repl_complex_integration PROPERTIES TIMEOUT 600)
+      add_test(NAME native_repl_session_history
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_session_history.py"
+          --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+          --target $<TARGET_FILE:repl-complex-fixture>)
+      set_tests_properties(native_repl_session_history PROPERTIES TIMEOUT 600)
       add_test(NAME native_repl_value_examples
         COMMAND "${CMAKE_COMMAND}" -E env
           "CLANG_TRACER_REPL=$<TARGET_FILE:clang-tracer-repl>"

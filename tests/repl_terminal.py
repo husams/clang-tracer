@@ -24,6 +24,7 @@ def main():
                               stderr=subprocess.PIPE, text=True)
     workspace = tempfile.TemporaryDirectory(prefix="tracer-repl-editor-")
     work = Path(workspace.name)
+    home = tempfile.TemporaryDirectory(prefix="tracer-repl-home-")
     headers = work / "editör headers"
     headers.mkdir()
     changed_header = work / "changed.hpp"
@@ -73,7 +74,8 @@ def main():
     try:
         assert server.stdout.readline().strip() == "ready"
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 160, 0, 0))
-        env = dict(os.environ, TERM="xterm-256color")
+        # Keep editor history out of the real home directory.
+        env = dict(os.environ, TERM="xterm-256color", HOME=home.name)
         env.pop("NO_COLOR", None)
         child = subprocess.Popen([console, "--endpoint", endpoint],
                                  stdin=slave, stdout=slave, stderr=slave,
@@ -249,6 +251,7 @@ def main():
         server.terminate()
         server.communicate(timeout=10)
         workspace.cleanup()
+        home.cleanup()
     print("native terminal print/completion checks passed")
 
 
