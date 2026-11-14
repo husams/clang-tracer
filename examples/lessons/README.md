@@ -20,6 +20,7 @@ run the section's commands without typing the sources first.
 | [12-shared-context](12-shared-context/README.md) | [Observe shared context and thread propagation](../../docs/guide/tutorials.md#observe-shared-context-and-thread-propagation) |
 | [13-native-cli](13-native-cli/README.md) | [Trace from the native CLI](../../docs/guide/tutorials.md#trace-from-the-native-cli) |
 | [14-launch](14-launch/README.md) | [Launch a local application](../../docs/native-repl.md#launch-a-local-application) (REPL walkthrough) |
+| [15-request-calls](15-request-calls/README.md) | [Shared context](../../docs/shared-context.md) (several probes connected by one request state) |
 
 The remaining sections need no project. "Install and check the tools" and
 "Open the interactive guide" only run installed commands, and "Run the
