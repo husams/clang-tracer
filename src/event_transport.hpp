@@ -36,8 +36,11 @@ public:
     std::string bytes;
   };
 
+  // report_diagnostics runs about once a second. write_logs runs on every
+  // sender pass so queued agent log records reach the file promptly.
   explicit EventTransport(void (*suppress_callbacks)() = nullptr,
-                          void (*report_diagnostics)() noexcept = nullptr);
+                          void (*report_diagnostics)() noexcept = nullptr,
+                          void (*write_logs)() noexcept = nullptr);
   ~EventTransport();
   EventTransport(const EventTransport &) = delete;
   EventTransport &operator=(const EventTransport &) = delete;
@@ -57,6 +60,7 @@ private:
   int wake_fd_ = -1;
   void (*suppress_callbacks_)();
   void (*report_diagnostics_)() noexcept;
+  void (*write_logs_)() noexcept;
   std::chrono::steady_clock::time_point next_agent_report_{};
   std::thread worker_;
 

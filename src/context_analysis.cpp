@@ -1140,6 +1140,7 @@ public:
   // Legacy callbacks, including their non-void PRE ABI and native helpers,
   // remain under the ordinary callback-shape validator.
   if (!context_relevant) return true;
+    bool uses_context = has_dependency;
     for (const auto *method : record->methods()) {
       const auto name = method->getNameAsString();
       if (name != "pre" && name != "post") {
@@ -1246,15 +1247,16 @@ public:
                         "allowed while a direct access frame is held";
         return false;
       }
-      if (!has_dependency && hook.injected.empty() && hook.direct.empty() &&
-          hook.visitors.empty() && hook.generic_direct.empty() &&
-          hook.generic_visitors.empty() &&
-          hook.generic_scope_initializers.empty() && !hook.events &&
-          !hook.local_scope_changes)
-        continue;
+      uses_context |= !hook.injected.empty() || !hook.direct.empty() ||
+                      !hook.visitors.empty() || !hook.generic_direct.empty() ||
+                      !hook.generic_visitors.empty() ||
+                      !hook.generic_scope_initializers.empty() || hook.events ||
+                      hook.local_scope_changes;
       plan.hooks.push_back(std::move(hook));
     }
-    if (!has_dependency && plan.hooks.empty()) return true;
+    // A class is planned when any hook uses context. Its other hooks stay in
+    // the plan so the generated dispatch still runs them.
+    if (!uses_context) return true;
     plan.context_only = !has_dependency;
     result_.classes.push_back(std::move(plan));
     return true;

@@ -301,6 +301,14 @@ int main(int argc, char **argv) {
     require(context_only.requires_context &&
                 !tracer::context_activation_error(context_only).empty(),
             "context-only consumer bypassed activation checks");
+    const auto plain_hook =
+        analyze("struct Interceptor { void pre(const Call& c) { "
+                "c.context().event(\"seen\"); } void post(const Call& c) { "
+                "c.log(\"done\"); } }; ");
+    require(plain_hook.error.empty() && plain_hook.classes.size() == 1 &&
+                plain_hook.classes[0].hooks.size() == 2 &&
+                plain_hook.classes[0].hooks[1].method == "post",
+            "hook without context use was dropped from a context class");
     const auto mixed = analyze(R"CPP(
       namespace example {
       struct Scope {};
@@ -336,7 +344,7 @@ int main(int argc, char **argv) {
                 "Hook(State<Data>) {} void pre(const Call&, Data&) {} }; ");
     require(::tracer::compat::starts_with(body.error, "invalid_state_constructor:"),
             "user constructor body was treated as generated");
-    std::cout << "7 Clang context declaration/admission checks passed\n";
+    std::cout << "8 Clang context declaration/admission checks passed\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <string_view>
 
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/RecursiveASTVisitor.h>
@@ -153,6 +154,16 @@ public:
         marker += "};\n";
       }
       marker += "#pragma clang diagnostic pop\n/*__TRACER_CONTEXT_PLACEHOLDER_END__*/\n";
+      // The marker adds lines. Restore the numbering so diagnostics for the
+      // rest of the body name the lines the user wrote.
+      if (const auto presumed = sm.getPresumedLoc(body); presumed.isValid()) {
+        marker += "#line " + std::to_string(presumed.getLine()) + " \"";
+        for (const char c : std::string_view(presumed.getFilename())) {
+          if (c == '"' || c == '\\') marker += '\\';
+          marker += c;
+        }
+        marker += "\"\n";
+      }
       inserts.push_back({sm.getFileOffset(body) + 1, std::move(marker)});
     }
     return true;

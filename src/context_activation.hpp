@@ -32,12 +32,22 @@ struct ContextActivationError final {
   explicit operator bool() const noexcept { return !message.empty(); }
 };
 
+// One Clang error from a callback source that failed to parse.
+struct ContextSourceError final {
+  std::string file;
+  unsigned line = 0;
+  unsigned column = 0;
+  std::string message;
+};
+
 struct ContextActivationResult;
 ContextActivationResult
 activate_context_source(const ContextActivationRequest &, ContextRegistry &);
 
 struct ContextPreflightResult final {
   std::string error;
+  // Set when the callback source itself failed to parse.
+  std::vector<ContextSourceError> source_errors;
 
   explicit operator bool() const noexcept { return error.empty(); }
 };
@@ -96,6 +106,11 @@ public:
 
   bool requires_stack() const noexcept { return requires_stack_; }
 
+  // Whether the interceptor defines the hook dispatched for this phase.
+  bool has_hook(TracePhase phase) const noexcept {
+    return phase == TracePhase::Pre ? has_pre_ : has_post_;
+  }
+
 private:
   friend ContextActivationResult prepare_context_source(
       const ContextActivationRequest &, ContextRegistry *, bool, bool);
@@ -107,7 +122,8 @@ private:
       std::vector<std::shared_ptr<const RegisteredContextScope>>,
       std::vector<std::shared_ptr<const context_engine::SchemaRecord>>,
       std::string, std::size_t, std::size_t, std::uintptr_t, std::uintptr_t,
-      std::uintptr_t, std::uintptr_t, std::vector<std::string>, bool);
+      std::uintptr_t, std::uintptr_t, std::vector<std::string>, bool, bool,
+      bool);
   const std::shared_ptr<const PrivateContextCode> owner_code_;
   const std::shared_ptr<const PrivateContextCode> callback_code_;
   const std::vector<std::shared_ptr<const RegisteredContextScope>> scopes_;
@@ -118,11 +134,14 @@ private:
   const std::uintptr_t construct_, pre_, post_, destroy_;
   const std::vector<std::string> lineage_diagnostics_;
   const bool requires_stack_;
+  const bool has_pre_, has_post_;
 };
 
 struct ContextActivationResult final {
   std::shared_ptr<const ContextActivationGeneration> generation;
   std::string error;
+  // Set when the callback source itself failed to parse.
+  std::vector<ContextSourceError> source_errors;
   bool preflight_success = false;
 
   explicit operator bool() const noexcept {

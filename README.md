@@ -598,6 +598,20 @@ Messages are capped at 192 bytes and control characters are replaced with
 `?`. Queued messages are best effort and may be lost if the target exits
 before the sender writes them.
 
+With logging enabled, the agent also records each PRE and POST hook it runs.
+A hook record follows the messages logged by that hook.
+
+```text
+... call_id=7 operation=callback stage=pre outcome=info ... message=entered add
+... call_id=7 operation=hook stage=pre outcome=ok ...
+... call_id=7 operation=hook stage=post outcome=failed ...
+```
+
+`outcome=failed` means the hook threw or the agent could not run it. Hook
+records and callback messages share one queue per probe. When it overflows,
+the agent writes `operation=log stage=queue outcome=dropped` with the number
+of lost records.
+
 ## Client usage
 
 The client presents readable text in the terminal; it still sends gRPC requests

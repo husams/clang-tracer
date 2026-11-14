@@ -243,6 +243,7 @@ private:
 };
 
 void report_agent_failures() noexcept;
+void write_agent_logs() noexcept;
 
 struct CallbackLog {
   static constexpr std::size_t kCapacity = 16;
@@ -251,12 +252,19 @@ struct CallbackLog {
     std::uint64_t call_id;
     tracer::TracePhase phase;
     tracer::LogLevel level;
+    // Outcome of a hook the agent ran. Null for a callback's own message.
+    const char *hook_outcome;
     char message[kMessageSize + 1];
   };
   // Producers try once. The sender releases this before writing any records.
   std::atomic_flag busy = ATOMIC_FLAG_INIT;
   std::size_t count = 0;
   std::array<Entry, kCapacity> entries{};
+  // Set after queueing so the sender skips probes with nothing to write.
+  std::atomic<bool> pending{false};
+  std::atomic<std::uint64_t> dropped{0};
+  // Only the event sender reads and updates the reported total.
+  std::uint64_t reported_dropped = 0;
 };
 
 struct DebugRecord {
@@ -351,7 +359,8 @@ struct Agent {
 
   Agent()
       : transport([] { ++callback_depth; },
-                  logging_enabled ? &report_agent_failures : nullptr) {
+                  logging_enabled ? &report_agent_failures : nullptr,
+                  logging_enabled ? &write_agent_logs : nullptr) {
     for (auto &slot : probe_slots) {
       slot.store(nullptr, std::memory_order_relaxed);
     }
@@ -443,6 +452,20 @@ void append_diagnostics(clangtracer::v1::ValidationReport &report,
   }
 }
 
+void append_source_errors(
+    clangtracer::v1::ValidationReport &report,
+    const std::vector<tracer::ContextSourceError> &errors) {
+  for (const auto &error : errors) {
+    auto *output = report.add_diagnostics();
+    output->set_stage("syntax");
+    output->set_severity("error");
+    output->set_file(error.file);
+    output->set_line(error.line);
+    output->set_column(error.column);
+    output->set_message(error.message);
+  }
+}
+
 void append_failure(clangtracer::v1::ValidationReport &report,
                     const char *stage, const std::string &message) {
   if (message.empty())
@@ -522,22 +545,93 @@ void report_agent_failures() noexcept {
       probe->reported_callback_errors = errors;
       probe->reported_event_drops = drops;
     }
-    auto &log = probe->log;
-    if (log.busy.test_and_set(std::memory_order_acquire))
+  }
+}
+
+// Writes queued hook records and callback messages in the order they ran.
+void write_agent_logs() noexcept {
+  auto *current = agent.load(std::memory_order_acquire);
+  if (!current)
+    return;
+  for (const auto &slot : current->probe_slots) {
+    auto *probe = slot.load(std::memory_order_acquire);
+    if (!probe)
       continue;
-    std::array<CallbackLog::Entry, CallbackLog::kCapacity> pending;
-    const auto count = log.count;
-    std::copy_n(log.entries.begin(), count, pending.begin());
-    log.count = 0;
-    log.busy.clear(std::memory_order_release);
-    for (std::size_t i = 0; i < count; ++i) {
-      const auto &entry = pending[i];
-      log_agent("callback", entry.phase == tracer::TracePhase::Pre ? "pre"
-                                                                  : "post",
-                probe->request.probe_id, log_level_name(entry.level), 0, 0, 0,
-                entry.call_id, entry.message);
+    auto &log = probe->log;
+    if (log.pending.exchange(false, std::memory_order_acq_rel)) {
+      if (log.busy.test_and_set(std::memory_order_acquire)) {
+        // A producer holds the queue. Leave its entries for the next pass.
+        log.pending.store(true, std::memory_order_release);
+        continue;
+      }
+      std::array<CallbackLog::Entry, CallbackLog::kCapacity> pending;
+      const auto count = log.count;
+      std::copy_n(log.entries.begin(), count, pending.begin());
+      log.count = 0;
+      log.busy.clear(std::memory_order_release);
+      for (std::size_t i = 0; i < count; ++i) {
+        const auto &entry = pending[i];
+        const char *phase =
+            entry.phase == tracer::TracePhase::Pre ? "pre" : "post";
+        if (entry.hook_outcome)
+          log_agent("hook", phase, probe->request.probe_id, entry.hook_outcome,
+                    0, 0, 0, entry.call_id);
+        else
+          log_agent("callback", phase, probe->request.probe_id,
+                    log_level_name(entry.level), 0, 0, 0, entry.call_id,
+                    entry.message);
+      }
+    }
+    const auto dropped = log.dropped.load(std::memory_order_relaxed);
+    if (dropped != log.reported_dropped) {
+      char lost[48];
+      std::snprintf(lost, sizeof(lost), "%llu records lost",
+                    static_cast<unsigned long long>(dropped -
+                                                    log.reported_dropped));
+      log_agent("log", "queue", probe->request.probe_id, "dropped", 0, 0, 0, 0,
+                lost);
+      log.reported_dropped = dropped;
     }
   }
+}
+
+// Queues one record for the sender. A full or contended queue drops it.
+bool enqueue_agent_log(Probe &probe, const tracer::TraceContext &context,
+                       tracer::LogLevel level, const char *hook_outcome,
+                       const char *message, std::size_t size) noexcept {
+  auto &log = probe.log;
+  bool queued = false;
+  if (!log.busy.test_and_set(std::memory_order_acquire)) {
+    queued = log.count < log.entries.size();
+    if (queued) {
+      auto &entry = log.entries[log.count++];
+      entry.call_id = context.call_id;
+      entry.phase = context.phase;
+      entry.level = level;
+      entry.hook_outcome = hook_outcome;
+      size = std::min(size, CallbackLog::kMessageSize);
+      for (std::size_t i = 0; i < size; ++i) {
+        const auto byte = static_cast<unsigned char>(message[i]);
+        entry.message[i] = byte < 32 || byte == 127 ? '?' : message[i];
+      }
+      entry.message[size] = '\0';
+    }
+    log.busy.clear(std::memory_order_release);
+  }
+  if (queued)
+    log.pending.store(true, std::memory_order_release);
+  else
+    log.dropped.fetch_add(1, std::memory_order_relaxed);
+  return queued;
+}
+
+// Records that the agent ran a PRE or POST hook, when logging is enabled.
+void log_hook(Probe &probe, const tracer::TraceContext &context,
+              bool succeeded) noexcept {
+  auto *owner = agent.load(std::memory_order_acquire);
+  if (owner && owner->logging_enabled)
+    (void)enqueue_agent_log(probe, context, tracer::LogLevel::Info,
+                            succeeded ? "ok" : "failed", nullptr, 0);
 }
 
 Probe *find_probe(std::uint64_t id) noexcept {
@@ -794,7 +888,10 @@ extern "C" void tracer_shared_dispatch(void *opaque,
   const auto entry = raw->phase == tracer::TracePhase::Pre
                          ? token->probe->shared_generation->pre_entry()
                          : token->probe->shared_generation->post_entry();
-  if (!invoke_shared(*token, entry)) {
+  const bool hook_succeeded = invoke_shared(*token, entry);
+  if (token->probe->shared_generation->has_hook(raw->phase))
+    log_hook(*token->probe, token->raw, hook_succeeded);
+  if (!hook_succeeded) {
     token->enabled = false;
     token->probe->callback_errors.fetch_add(1, std::memory_order_relaxed);
     tracer::context_execution::runtime_diagnostics().record(
@@ -4254,6 +4351,7 @@ bool compile_shared_probe(Probe &p,
                            : recovered_record_declarations(specification)) +
                       argument_aliases(specification) +
                       interceptor_template_prelude(specification.callback_source()) +
+                      "#line 1 \"callback_source\"\n" +
                       callback_body + "\n" + signature_assert;
   // Scalar shared wrappers need no user declarations. Recompiling their full
   // callback headers here can consume the operation deadline before admission.
@@ -4273,6 +4371,8 @@ bool compile_shared_probe(Probe &p,
         tracer::preflight_context_source(activation, syntax_only);
     if (!preflight) {
       error = preflight.error;
+      if (report)
+        append_source_errors(*report, preflight.source_errors);
       return false;
     }
     const auto generated_wrapper =
@@ -4970,6 +5070,14 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   DiagnosticCapture user_capture(nullptr);
   auto user_ast =
       build_callback_ast(user_source, "clang-tracer-callback.cc", user_capture);
+  // A callback that failed to parse explains the later generic rejections.
+  const auto prefer_parse_errors = [&] {
+    if (!user_capture.had_error())
+      return;
+    if (report)
+      append_diagnostics(*report, user_capture, "syntax");
+    error = user_capture.message();
+  };
   bool shape_valid = false;
   if (user_ast) {
     if (prepared_callback_context) {
@@ -4983,10 +5091,15 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
         }
       }
     }
-    if (typed_prepared && !validate_prepared_types(*user_ast, specification, result_sret, error))
-      return false;
     const auto context_declarations =
         tracer::analyze_context_declarations(user_ast->getASTContext());
+    if (typed_prepared && !validate_prepared_types(*user_ast, specification, result_sret, error)) {
+      // State shorthand fails this plain parse by design, so a context
+      // callback keeps the specific rejection.
+      if (!context_declarations.requires_context)
+        prefer_parse_errors();
+      return false;
+    }
     if (context_declarations.requires_context) {
       if (tracer::find_snapshot_encoders(user_ast->getASTContext()).requested) {
         error = "tracer_snapshot::encode requires an invocation-scoped callback";
@@ -5021,7 +5134,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   } else {
     baseline_error = user_capture.message();
   }
-  if (!user_capture.message().empty() && baseline_error.empty()) {
+  if (!user_capture.message().empty() &&
+      (baseline_error.empty() || user_capture.had_error())) {
     baseline_error = user_capture.message();
   }
 
@@ -5377,8 +5491,12 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
         i < p->argument_names.size() ? p->argument_names[i].c_str() : nullptr;
   try {
     value = p->callback(&invocation, instance, &succeeded);
+    // The bridge reports whether a hook exists for this phase and ran.
+    if (succeeded)
+      log_hook(*p, invocation, true);
   } catch (...) {
     succeeded = false;
+    log_hook(*p, invocation, false);
     // Class adapters disable only their failed invocation. Legacy callbacks
     // retain their existing probe-wide failure behavior.
     if (!p->class_callback)
@@ -5634,26 +5752,8 @@ bool tracer::detail::tracer_enqueue_log(const TraceContext *context,
   if (!owner || !owner->logging_enabled || !context || !message || size == 0)
     return false;
   auto *probe = find_probe(context->probe_id);
-  if (!probe)
-    return false;
-  auto &log = probe->log;
-  if (log.busy.test_and_set(std::memory_order_acquire))
-    return false;
-  const bool queued = log.count < log.entries.size();
-  if (queued) {
-    auto &entry = log.entries[log.count++];
-    entry.call_id = context->call_id;
-    entry.phase = context->phase;
-    entry.level = level;
-    size = std::min(size, CallbackLog::kMessageSize);
-    for (std::size_t i = 0; i < size; ++i) {
-      const auto byte = static_cast<unsigned char>(message[i]);
-      entry.message[i] = byte < 32 || byte == 127 ? '?' : message[i];
-    }
-    entry.message[size] = '\0';
-  }
-  log.busy.clear(std::memory_order_release);
-  return queued;
+  return probe &&
+         enqueue_agent_log(*probe, *context, level, nullptr, message, size);
 }
 
 extern "C" {

@@ -255,6 +255,8 @@ For a reusable specialization and a concrete C++ template target, see [Trace a f
 
 Set `CLANG_TRACER_AGENT_LOG` to an absolute writable log path in the **target's environment before launching it**. The target owns the private log. Records include PID, probe ID, call ID and phase where applicable. Messages are capped at 192 bytes and delivered on a best-effort basis.
 
+With logging enabled, the agent also writes an `operation=hook` record for each PRE and POST hook it runs, after the messages logged by that hook. Its `outcome` is `ok`, or `failed` when the hook threw or could not run. Hook records and callback messages share one queue per probe. When it overflows, the agent writes `operation=log stage=queue outcome=dropped` with the number of lost records.
+
 ### Shared context API
 
 Declare payloads with `state<Scope>` or `shared_state<Scope>`. Declare hook dependencies with `State<T>` in the interceptor constructor. Shared state follows the engine's guarded access rules, while ordinary state requires synchronization by the callback author. Use the [shared context walkthrough](../shared-context.md) for package lineage, propagation and durable recording.

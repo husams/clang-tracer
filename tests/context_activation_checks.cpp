@@ -215,9 +215,15 @@ void verify_context_activation() {
     tracer::ContextActivationRequest context_only_request = request;
     context_only_request.source_lineage_id[0] = 0x78;
     context_only_request.file_name = "context-only-activation.cc";
+    static int post_logs = 0;
+    post_logs = 0;
     context_only_request.callback_log =
         [](const tracer::TraceContext *context, const char *text,
            std::size_t size, tracer::LogLevel level) noexcept {
+          if (std::string_view(text, size) == "post log") {
+            ++post_logs;
+            return true;
+          }
           return context && context->call_id == 42 &&
                  std::string_view(text, size) == "context log" &&
                  level == tracer::LogLevel::Warning;
@@ -229,6 +235,7 @@ struct EventInterceptor {
     if (!call.log("context log", tracer::LogLevel::Warning)) throw 7;
     call.context().event("context.only");
   }
+  void post(const Call& call) { call.log("post log"); }
 };
 }
 )CPP";
@@ -248,6 +255,8 @@ struct EventInterceptor {
         reinterpret_cast<Entry>(context_only.generation->construct_entry());
     const auto emitter_pre =
         reinterpret_cast<Entry>(context_only.generation->pre_entry());
+    const auto emitter_post =
+        reinterpret_cast<Entry>(context_only.generation->post_entry());
     const auto emitter_destroy =
         reinterpret_cast<Destroy>(context_only.generation->destroy_entry());
     alignas(64) std::array<std::byte, 4096> emitter_object{};
@@ -267,6 +276,11 @@ struct EventInterceptor {
                   sink.batches.back().event().name() == "context.only" &&
                   sink.batches.back().event().states_size() == 1,
               "context-only emitter could not capture a foreign live state");
+      require(context_only.generation->has_hook(tracer::TracePhase::Post) &&
+                  guarded_entry(*context_only.generation, emitter_post,
+                                emitter_object.data(), &trace) &&
+                  post_logs == 1,
+              "context-only POST hook without context use did not run");
       require(guarded_destroy(*context_only.generation, emitter_destroy,
                               emitter_object.data()),
               "context-only destroy entrypoint failed");
