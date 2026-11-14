@@ -1673,7 +1673,7 @@ clang-tracer<span class="w"> </span>--request<span class="w"> </span>watch.textp
 </tr>
 <tr>
 <td><code>EventRange::snapshot(), running(), error(), stop(), begin(), end()</code></td>
-<td>Copy the currently retained events without waiting, check the producer or error text, stop it while retaining data, or iterate from the oldest retained event, waiting for later ones until the range finishes or Ctrl+C. Release all range copies to release its capture reservation.</td>
+<td>Copy the currently retained events without waiting, check the producer or error text, stop it while retaining data, or iterate from the oldest retained event, waiting for later ones until the range finishes or Ctrl+C. A running range reserves the remaining collection storage; once it finishes or is stopped it keeps only the room its retained events use. Release all range copies to release that too.</td>
 </tr>
 <tr>
 <td><code>Event::sequence(), probe_id(), call_id(), phase(), function_name()</code></td>
