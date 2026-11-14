@@ -243,12 +243,18 @@ std::shared_ptr<JitImage> compile_in_target(const JitRequest &request) {
         diagnostic->print(printer);
       }, &link_error);
   auto linked = std::make_unique<llvm::Module>("clang-tracer-live-revision", *context);
+  const std::unordered_set<std::string> entries(
+      request.entry_symbols.begin(), request.entry_symbols.end());
   std::unordered_set<std::string> definitions;
   for (const auto &unit : units) {
     auto compiled = compile_unit(request, unit, context.get());
     auto &module = *compiled.module;
     isolate_definitions(module, request);
-    for (const auto &function : module) {
+    for (auto &function : module) {
+      // The IR linker can drop unused linkonce_odr instantiations before
+      // ORC sees the caller's exact requested export.
+      if (function.hasLinkOnceODRLinkage() && entries.contains(function.getName().str()))
+        function.setLinkage(llvm::GlobalValue::WeakODRLinkage);
       if (!function.isDeclaration() && function.hasExternalLinkage() &&
           !definitions.insert(function.getName().str()).second)
         throw std::runtime_error("duplicate native definition: " + function.getName().str());
@@ -258,9 +264,7 @@ std::shared_ptr<JitImage> compile_in_target(const JitRequest &request) {
   }
   context->setDiagnosticHandlerCallBack(nullptr);
 
-  if (!request.entry_symbols.empty()) {
-    const std::unordered_set<std::string> entries(
-        request.entry_symbols.begin(), request.entry_symbols.end());
+  if (!entries.empty()) {
     for (const auto &entry : entries) {
       const auto *function = linked->getFunction(entry);
       if (!function || function->isDeclaration() || function->hasLocalLinkage())
