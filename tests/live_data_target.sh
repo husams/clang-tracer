@@ -14,6 +14,11 @@ resource=$("$cxx" -print-resource-dir)
 llvm_include=$("$llvm" --includedir)
 llvm_lib=$("$llvm" --libdir)
 resolver="$baseline/CMakeFiles/clang_tracer_agent.dir/src/debug_resolver.cpp.o"
+protobuf=$(awk -F= '/^Protobuf_LIBRARY_RELEASE:FILEPATH=/ {print $2}' "$baseline/CMakeCache.txt")
+if [[ -z "$protobuf" || ! -f "$protobuf" ]]; then
+  echo "Cannot find build-matched protobuf library in $baseline." >&2
+  exit 1
+fi
 
 flags=(-std=c++23 -g -O0 -I"$root/src" -I"$common" -I"$root/include"
   -I"$baseline/generated" -I"$baseline/context-generated" -isystem "$llvm_include"
@@ -24,6 +29,6 @@ sources=("$root"/src/live_data{,_scan,_jit,_command}.cpp
 "$cxx" "${flags[@]}" -Wl,--build-id=sha1 -rdynamic "${sources[@]}" "$resolver" \
   "$baseline/libtracer_proto.a" "$baseline/libtracer_context_transport_proto.a" \
   -L"$llvm_lib" -Wl,-rpath,"$llvm_lib" \
-  -lclang-cpp -lLLVM -lprotobuf -ldl -pthread -o "$output/live_data_target"
+  -lclang-cpp -lLLVM "$protobuf" -ldl -pthread -o "$output/live_data_target"
 build_id=$(readelf -n "$output/live_data_target" | awk '/Build ID/ {print $3}')
 "$output/live_data_target" "$root/tests/fixtures/live_data" "$root/include" "$build_id"
