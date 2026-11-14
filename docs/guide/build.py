@@ -24,13 +24,6 @@ CHAPTERS = {
     "Advanced": {
         "advanced": "docs/guide/advanced.md",
     },
-    "Reference": {
-        "command-reference": "docs/guide/command-reference.md",
-        "api-reference": "docs/guide/api-reference.md",
-        "commands": "docs/guide/commands.md",
-        "developer": "docs/guide/developer.md",
-        "cpp17": "docs/guide/cpp17.md",
-    },
     "Walkthroughs": {
         "install": "docs/build-rhel.md",
         "gcc85": "docs/gcc85-compatibility.md",
@@ -56,6 +49,15 @@ CHAPTERS = {
         "python-client": "docs/guide/python-client.md",
         "python": "python/README.md",
         "example-python": "examples/python/README.md",
+    },
+    "References": {
+        "commands": "docs/guide/commands.md",
+        "developer": "docs/guide/developer.md",
+        "cpp17": "docs/guide/cpp17.md",
+    },
+    "Appendixes": {
+        "command-reference": "docs/guide/command-reference.md",
+        "api-reference": "docs/guide/api-reference.md",
     },
 }
 CHAPTER_IDS = {ROOT / path: key for group in CHAPTERS.values() for key, path in group.items()}
