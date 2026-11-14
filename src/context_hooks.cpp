@@ -392,11 +392,13 @@ private:
 ContextHookParseCopy prepare_context_hook_parse_copy(
     const std::string &source,
     const std::vector<std::string> &compiler_arguments,
-    const std::string &file_name) {
+    const std::string &file_name,
+    const PreparedAdapterRegion &prepared_adapter) {
   ContextHookParseCopy result;
+  const std::string prefix = "#include \"tracer/callback.hpp\"\n";
   clang::IgnoringDiagConsumer ignore_diagnostics;
   auto ast = clang::tooling::buildASTFromCodeWithArgs(
-      "#include \"tracer/callback.hpp\"\n" + source,
+      prefix + source,
       clang_driver_arguments(compiler_arguments), file_name,
       "clang-context-preparse",
       std::make_shared<clang::PCHContainerOperations>(),
@@ -411,6 +413,23 @@ ContextHookParseCopy prepare_context_hook_parse_copy(
   if (!discovery.error.empty()) { result.error = discovery.error; return result; }
   auto &sm = ast->getSourceManager();
   result.source = sm.getBufferData(sm.getMainFileID()).str();
+  // Insert offsets and the region both live in the prefixed buffer. Translate
+  // the region from those original offsets before any insert is applied.
+  std::size_t shift = prefix.size();
+  const std::size_t region_begin = prepared_adapter.offset + prefix.size();
+  const std::size_t region_end = region_begin + prepared_adapter.size;
+  if (prepared_adapter.size != 0) {
+    for (const auto &insert : discovery.inserts) {
+      if (insert.offset > region_begin && insert.offset < region_end) {
+        result.error = "invalid_context_parse: placeholder insertion inside "
+                       "the prepared adapter region";
+        return result;
+      }
+      if (insert.offset <= region_begin) shift += insert.text.size();
+    }
+    result.prepared_adapter = prepared_adapter;
+    result.prepared_adapter.offset = prepared_adapter.offset + shift;
+  }
   std::sort(discovery.inserts.begin(), discovery.inserts.end(),
       [](const auto &a, const auto &b) { return a.offset > b.offset; });
   for (const auto &insert : discovery.inserts)

@@ -194,4 +194,59 @@ void verify_context_support_effects() {
   if (validate("", "struct Data : shared_state<Scope> {};",
                "namespace std { extern void user_reserved(); }").empty())
     throw std::runtime_error("reserved std declaration was admitted");
+
+  // Prepared adapter exemption. The fixture is assembled from pieces so the
+  // region offset and size are computed rather than hard-coded.
+  const std::string adapter_symbol = "adapter_target_symbol";
+  const auto validate_region = [&](const std::string &before,
+                                   const std::string &adapter,
+                                   const std::string &after) {
+    const std::string header = "struct Scope {};\n";
+    const std::string source = header + before + adapter + after;
+    auto ast = clang::tooling::buildASTFromCodeWithArgs(
+        source, args, "context-support-effects-adapter.cc");
+    if (!ast || ast->getDiagnostics().hasErrorOccurred())
+      throw std::runtime_error("prepared adapter AST fixture did not parse");
+    const tracer::PreparedAdapterRegion region{header.size() + before.size(),
+                                               adapter.size(), adapter_symbol};
+    return tracer::validate_context_support_effects(*ast, &region);
+  };
+  const std::string label =
+      "void adapter_target(int) __asm__(\"" + adapter_symbol + "\");\n";
+  const std::string rejected_prefix =
+      "unsupported_context_native_declaration:";
+  if (const auto error = validate_region("", label, ""); !error.empty())
+    throw std::runtime_error("exact adapter label was rejected: " + error);
+  if (!::tracer::compat::starts_with(validate_region(label, "", ""),
+                                     rejected_prefix) ||
+      !::tracer::compat::starts_with(
+          validate_region("void other_target(int);\n", label,
+                          "void user_target(int) __asm__(\"" + adapter_symbol +
+                              "\");\n"),
+          rejected_prefix))
+    throw std::runtime_error("adapter label outside the region was admitted");
+  if (!::tracer::compat::starts_with(
+          validate_region("",
+                          "void adapter_target(int) __asm__(\"other_symbol\");\n",
+                          ""),
+          rejected_prefix))
+    throw std::runtime_error("different adapter label was admitted");
+  if (!::tracer::compat::starts_with(
+          validate_region("#define ADAPTER_LABEL __asm__(\"" + adapter_symbol +
+                              "\")\n",
+                          "void adapter_target(int) ADAPTER_LABEL;\n", ""),
+          rejected_prefix))
+    throw std::runtime_error("macro-expanded adapter label was admitted");
+  if (!::tracer::compat::starts_with(
+          validate_region("",
+                          "void adapter_target(int) "
+                          "__attribute__((section(\"adapter_section\")));\n",
+                          ""),
+          rejected_prefix))
+    throw std::runtime_error("section attribute in the adapter region was admitted");
+  if (!::tracer::compat::starts_with(
+          validate_region("", "extern int adapter_value __asm__(\"" +
+                                  adapter_symbol + "\");\n", ""),
+          rejected_prefix))
+    throw std::runtime_error("variable carrying the adapter label was admitted");
 }

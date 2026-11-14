@@ -4235,6 +4235,12 @@ bool compile_shared_probe(Probe &p,
       specification.prepared().format_version());
   std::string requested_header_source = typed_prepared
       ? tracer::prepared::adapter_source(specification.prepared()) : std::string();
+  if (typed_prepared) {
+    activation.prepared_adapter.offset =
+        forced_include_source.size() + callback_includes.size();
+    activation.prepared_adapter.size = requested_header_source.size();
+    activation.prepared_adapter.symbol = specification.symbol();
+  }
   for (const auto &header : specification.include_headers())
     requested_header_source += "#include \"" + header + "\"\n";
   const bool has_real_headers = typed_prepared || specification.has_header_context() ||

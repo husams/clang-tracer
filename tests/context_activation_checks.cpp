@@ -312,6 +312,64 @@ struct Interceptor {
       "two-state private owner with shared nested codec did not activate: " +
           shared_child.error);
 
+  {
+    // The generated adapter label is admitted only inside its declared region,
+    // and the region must follow the parse copy's placeholder insertions: the
+    // shorthand hook precedes the region, so its marker shifts the offsets.
+    const std::string hook = R"CPP(
+namespace adapted {
+struct Scope {};
+struct Data : shared_state<Scope> { int value = 0; };
+struct Interceptor {
+  Interceptor(State<Data>);
+  void pre(const Call&) { state.value++; }
+};
+}
+)CPP";
+    const std::string adapter =
+        "namespace adapter_probe {\n"
+        "int target(int) __asm__(\"adapter_target_symbol\");\n"
+        "}\n";
+    tracer::ContextActivationRequest adapter_request = request;
+    adapter_request.source_lineage_id[0] = 0x7b;
+    adapter_request.file_name = "prepared-adapter-activation.cc";
+    adapter_request.source = hook + adapter;
+    adapter_request.prepared_adapter = {hook.size(), adapter.size(),
+                                        "adapter_target_symbol"};
+    const auto admitted = tracer::preflight_context_source(adapter_request, true);
+    require(static_cast<bool>(admitted),
+            "generated adapter label was not admitted: " + admitted.error);
+
+    auto wrong_symbol = adapter_request;
+    wrong_symbol.prepared_adapter.symbol = "other_symbol";
+    const auto wrong = tracer::preflight_context_source(wrong_symbol, true);
+    require(!wrong && wrong.error.find("unsupported_context_native_declaration:") !=
+                          std::string::npos,
+            "adapter label for a different symbol was admitted: " + wrong.error);
+
+    auto no_region = adapter_request;
+    no_region.prepared_adapter = {};
+    const auto unmarked = tracer::preflight_context_source(no_region, true);
+    require(!unmarked && unmarked.error.find(
+                             "unsupported_context_native_declaration:") !=
+                             std::string::npos,
+            "adapter label without a region was admitted: " + unmarked.error);
+
+    auto out_of_bounds = adapter_request;
+    out_of_bounds.prepared_adapter.size = adapter_request.source.size();
+    const auto bounds = tracer::preflight_context_source(out_of_bounds, true);
+    require(!bounds && bounds.error.find("invalid_context_activation:") !=
+                           std::string::npos,
+            "out-of-bounds adapter region was accepted: " + bounds.error);
+
+    auto empty_symbol = adapter_request;
+    empty_symbol.prepared_adapter.symbol.clear();
+    const auto empty = tracer::preflight_context_source(empty_symbol, true);
+    require(!empty && empty.error.find("invalid_context_activation:") !=
+                          std::string::npos,
+            "adapter region with an empty symbol was accepted: " + empty.error);
+  }
+
   tracer::ContextActivationRequest generic_value_request = request;
   generic_value_request.source_lineage_id[0] = 0x7a;
   generic_value_request.file_name = "generic-payload-live-activation.cc";

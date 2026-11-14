@@ -1322,14 +1322,45 @@ prepare_context_source(const ContextActivationRequest &request,
     }
   }
 
+  const auto &region = request.prepared_adapter;
+  if (region.size != 0 &&
+      (region.symbol.empty() || region.offset > request.source.size() ||
+       region.size > request.source.size() - region.offset)) {
+    return fail("invalid_context_activation: prepared adapter region is "
+                "empty-symbol or outside the source");
+  }
   const auto prepared = prepare_context_hook_parse_copy(
-      request.source, arguments, request.file_name);
+      request.source, arguments, request.file_name, region);
   if (!prepared.error.empty()) {
     return fail(prepared.error);
   }
   auto ast = parse_source(prepared.source, arguments, request.file_name);
   if (!ast || ast->getDiagnostics().hasErrorOccurred()) {
     return fail("invalid_context_activation: checked source parse failed");
+  }
+  // parse_source prepends its own includes, so the guard indexes the AST's main
+  // buffer, not prepared.source. Derive the shift from that buffer and verify
+  // the final region against the original adapter bytes there.
+  PreparedAdapterRegion final_region;
+  if (region.size != 0) {
+    const auto &sources = ast->getSourceManager();
+    const std::string buffer =
+        sources.getBufferData(sources.getMainFileID()).str();
+    final_region = prepared.prepared_adapter;
+    const bool suffix =
+        buffer.size() >= prepared.source.size() &&
+        buffer.compare(buffer.size() - prepared.source.size(),
+                       prepared.source.size(), prepared.source) == 0;
+    if (suffix)
+      final_region.offset += buffer.size() - prepared.source.size();
+    if (!suffix || final_region.size != region.size ||
+        final_region.offset > buffer.size() ||
+        final_region.size > buffer.size() - final_region.offset ||
+        buffer.compare(final_region.offset, final_region.size, request.source,
+                       region.offset, region.size) != 0) {
+      return fail("invalid_context_activation: prepared adapter range "
+                  "mismatch");
+    }
   }
   auto declarations = analyze_context_declarations(ast->getASTContext());
   if (!declarations.error.empty()) {
@@ -1345,7 +1376,8 @@ prepare_context_source(const ContextActivationRequest &request,
   }
   auto input_copy = "#include \"tracer/callback.hpp\"\n" +
                     entry_declarations() + prepared.source;
-  if (auto effect_error = validate_context_support_effects(*ast);
+  if (auto effect_error = validate_context_support_effects(
+          *ast, region.size != 0 ? &final_region : nullptr);
       !effect_error.empty()) {
     return fail(effect_error);
   }
