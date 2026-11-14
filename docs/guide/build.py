@@ -21,7 +21,12 @@ CHAPTERS = {
         "user": "docs/guide/user.md",
         "tutorials": "docs/guide/tutorials.md",
     },
+    "Advanced": {
+        "advanced": "docs/guide/advanced.md",
+    },
     "Reference": {
+        "command-reference": "docs/guide/command-reference.md",
+        "api-reference": "docs/guide/api-reference.md",
         "commands": "docs/guide/commands.md",
         "developer": "docs/guide/developer.md",
         "cpp17": "docs/guide/cpp17.md",
@@ -35,6 +40,7 @@ CHAPTERS = {
         "context": "docs/shared-context.md",
     },
     "Runnable examples": {
+        "lesson-items": "examples/lessons/16-polymorphic-items/README.md",
         "example-callback": "examples/basic-callbacks/README.md",
         "example-legacy": "examples/legacy-callbacks/README.md",
         "example-interceptor": "examples/cpp-interceptors/README.md",
@@ -64,6 +70,8 @@ def format_code(tokens, index, options, env):
     language = token.info.split()[0] if token.info.strip() else "text"
     if language == "text" and re.search(r"^%[a-z]", token.content, re.MULTILINE):
         language = "bash"
+    if language == "plain":
+        return f'<pre class="syntax"><code>{html.escape(token.content)}</code></pre>\n'
     try:
         lexer = get_lexer_by_name(language)
     except ClassNotFound:
@@ -124,9 +132,12 @@ def render():
                     duplicate += 1
                 used_ids.add(anchor)
                 token.attrSet("id", anchor)
-                if token.tag in {"h1", "h2"}:
-                    label = "Overview" if token.tag == "h1" else html.escape(title)
-                    headings.append(f'<a href="#{anchor}">{label}</a>')
+                deep_reference = key in {"command-reference", "api-reference"}
+                if token.tag in {"h1", "h2"} or (deep_reference and token.tag == "h3"):
+                    label = "Overview" if token.tag == "h1" else title
+                    if key == "command-reference" and title.startswith("Command "):
+                        label = "%" + title.removeprefix("Command ")
+                    headings.append(f'<a href="#{anchor}">{html.escape(label)}</a>')
                 if token.tag == "h1":
                     chapter_title = html.escape(title)
                 token.tag = f"h{min(int(token.tag[1:]) + 1, 6)}"

@@ -8,7 +8,7 @@ Use the native REPL and its C++ facade to control a session, index modules, and 
 | Server | Verify target identity, read ELF and DWARF, validate the ABI, coordinate injection, retain events and report loss. |
 | Agent | Run the JIT-compiled callback in the target and export captured data through a bounded transport. |
 
-See the [C++17 branch reference](cpp17.md#additional-client-and-callback-apis) for additional APIs. See the [user guide](user.md) for installation and the first callback, and the [tutorials](tutorials.md) for complete workflows.
+Start with the [indexed C++ API appendix](api-reference.md) for methods and examples. See the [C++17 branch reference](cpp17.md#additional-client-and-callback-apis) for additional APIs. See the [user guide](user.md) for installation and the first callback, and the [tutorials](tutorials.md) for complete workflows.
 
 ## Native REPL C++ client API
 
@@ -48,7 +48,7 @@ See the [C++17 branch reference](cpp17.md#additional-client-and-callback-apis) f
 | `EventValue::field(name), fields(), elements(), at(index), size()` | Access an object member, the object map, the element array, a checked element, or the size of an object, array, or string. Incompatible shapes and missing members raise exceptions. |
 | `EventValue::as<T>()`, `EventRecord<T>`, `EventCodec<T>` | Convert to an owning scalar, supported standard container, or user type. Define `EventRecord<T>::type_name` and `fields()` with `event_member(name, &T::member)`, or specialize `EventCodec<T>::decode(const EventValue&)` for custom construction. |
 
-Pipe an `EventRange` or `Collection` through `tracer_repl::take(n)`, `drop(n)`, `first()` (optional value), `stride(n)`, `enumerate()` (zero-based index and value), `filter(predicate)`, `take_while(predicate)`, `drop_while(predicate)`, or `transform(function)`. `to_vector()` and `reverse()` materialize a vector. Filtering and projection run on the foreground snapshot.
+Pipe an `EventRange` or `Collection` through `tracer_repl::take(n)`, `drop(n)`, `first()` (optional value), `stride(n)`, `enumerate()` (zero-based index and value), `filter(predicate)`, `take_while(predicate)`, `drop_while(predicate)`, or `transform(function)`. `to_vector()` and `reverse()` materialize a vector. Filtering and projection run in the foreground as you iterate.
 
 ```cpp
 // Install the probe with --print-result before collecting.

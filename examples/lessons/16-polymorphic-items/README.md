@@ -1,7 +1,6 @@
 # Lesson 16: capture polymorphic items and their containers
 
-Reference: [Strings and class/struct values](../../../docs/native-repl.md#strings-and-classstruct-values)
-(REPL walkthrough; the user guide has no section for this lesson yet).
+Reference: [Polymorphic items tutorial](../../../docs/guide/tutorials.md#lesson-16-follow-polymorphic-items-through-two-probes) and [advanced capture](../../../docs/guide/advanced.md).
 
 Earlier lessons captured integers and one flat record. Here the traced
 functions work with `Item`, a handle whose data lives behind an interface
@@ -23,7 +22,7 @@ refers to, with everything it stores.
 | `encoded.cpp` | Prints which implementation served each `encode` call, for part 2. |
 | `Makefile` | Builds `target` and writes `compile_commands.json` for this directory. |
 
-Run `make`, start `./target`, then start `clang-tracer-repl` in this directory.
+Run `make` with the compiler from the tracer build profile (set `CXX` for SDK builds), start `./target`, then start `clang-tracer-repl` in this directory.
 
 ## Part 1: the items the factory returns
 
@@ -39,7 +38,7 @@ its address.
 %collect --count 3 --timeout 30 --phase POST --as items
 ```
 
-`%probe prepare` also makes the REPL import the item classes, which is why
+Injection from a package prepared in the current REPL also imports the item classes, which is why
 `Item` and `ItemV3` are usable below. If you restart the REPL and inject from
 the existing `prepared-create` directory without preparing again, import them
 yourself first with `%cpp import item_factory.hpp`.
@@ -91,7 +90,7 @@ Expected: `3` and `26`.
 implementation. The probe captures the receiver (`this`), so each event says
 which implementation ran. You can stay in the session of part 1 (skip
 `%attach`) or start a new one. In the same session the REPL already has the
-item classes from the first prepared package, so it keeps them and prints
+item classes from the first injected package, so it keeps them and prints
 `reused imported types: Item ItemInterface ...` for the second.
 
 ```bash

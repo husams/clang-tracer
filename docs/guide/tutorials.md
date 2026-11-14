@@ -462,3 +462,59 @@ cd /usr/local/share/clang-tracer/examples/native-repl-jit
 ```
 
 The first run performs bulk trace setup, capture, SQLite recording, and offline C++ analysis. It reports `JIT_EXAMPLE_PASSED=3`. The interactive run lets you explore mapping inspection, function entry previews and observer reload. See the [example walkthrough](https://github.com/husams/clang-tracer/tree/c++17/examples/native-repl-jit).
+
+## Lesson 16: follow polymorphic items through two probes
+
+Build and start the [lesson 16 project](../../examples/lessons/16-polymorphic-items/README.md) on Linux. Use the compiler and standard library from the tracer's build profile. For a GCC 8.5 SDK tracer, pass the SDK's `clang++` as `make CXX=/path/to/sdk/bin/clang++` (and set its runtime search path if required by that SDK). Mixing system and SDK headers can leave only addresses with an unsupported standard-library diagnostic.
+
+```bash
+cd examples/lessons/16-polymorphic-items
+make
+./target
+```
+
+Start `clang-tracer-repl` in a second terminal in the same directory and substitute the PID printed by the target. Prepare and inject the factory first:
+
+```text
+%attach PID
+%probe prepare "ItemFactory::create(const std::string&) const" --include item_factory.hpp --translation-unit target.cpp --output prepared-create
+%probe inject "ItemFactory::create(const std::string&) const" --prepared prepared-create --prepared-mode require --snapshot-return-pointee
+%collect --name "ItemFactory::create(const std::string&) const" --phase POST --count 3 --timeout 30 --as items
+```
+
+Press Enter once while collecting. Run `%cpp load report.cpp`: expect `ItemV1`, `ItemV2`, and `ItemV3` and their inherited fields and containers. Continue in **the same REPL**:
+
+```text
+%probe prepare "Item::encode(const std::string&) const" --include item_factory.hpp --translation-unit target.cpp --output prepared-encode
+%probe inject "Item::encode(const std::string&) const" --prepared prepared-encode --prepared-mode require
+%collect --name "Item::encode(const std::string&) const" --phase POST --count 3 --timeout 30 --as encoded
+```
+
+Press Enter once more. Expect the second injection to report `reused imported types:` rather than redefining the shared classes. Run `%cpp load encoded.cpp`. The factory result snapshot owns the returned item's fields. For `encode`, use the receiver snapshot to find `impl_snapshot` and use `result_as<std::string>()` for the encoded text. Finish with `%detach` and `%quit`. Try the [explicit pointer policy](advanced.md#write-a-followpointers-policy) next.
+
+## Lesson 17: trace writes without rebuilding the target
+
+Use the [prebuilt object-watch exercise](../native-repl.md#run-a-scalar-write-watch-on-x86-64). Build the fixture once, start it, and leave it running. In the REPL, prepare a plan with `--field value --backend code-cache` from its existing ELF, attach, and preview. Preview should report `binding=same-build` and a verified store site. Start the plan and record two `object.trace` events to SQLite. Enter `g` in the fixture while recording.
+
+Replay in the REPL after stopping the watch and detaching:
+
+```text
+%events open object-writes.db --as saved
+%events list saved
+%events show saved --index 1
+%events stack saved --index 1
+```
+
+Expect one creation and a write from 17 to 23. Check `%object status WATCH_ID` after stopping: the watch should be inactive with no restoration pending. Restart the fixture, use a fresh recording path, and add `--no-values` to start. Expect a `FIELD_WRITTEN` event without before or after samples. This distinction matters when a store writes back the same value. For logical container changes during a method, use the [advanced method-watch lesson](advanced.md#watch-logical-state-at-method-boundaries).
+
+## Lesson 18: stream and release a counted range
+
+Use the [first-probe target](user.md#create-a-target-and-a-basic-probe), attached with its add probe installed. In the REPL start a counted background range and iterate:
+
+```cpp
+auto live = tracer.events_async(session, 4, 30);
+for (const auto& e : live) std::cout << e.phase() << ' ' << e.sequence() << '\n';
+auto retained = live.snapshot();
+```
+
+Press Enter once in the target while iteration waits. Expect PRE and POST immediately, with the REPL still waiting. Press Enter again to reach four events and return to the prompt. Check `retained.complete` and `retained.size()`. You can start another capture while holding `live`: the completed range only keeps storage for its retained events. Release range copies when done. If iteration ends early, inspect `live.error()` and the snapshot counters before assuming every call was captured.

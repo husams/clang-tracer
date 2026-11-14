@@ -8,7 +8,7 @@ Clang Tracer attaches to a running Linux x86-64 C++ process. A **session** ident
 | `clang-tracer` | Run one tracing operation at a time in a shell or script. |
 | `clang-tracer-module` | Index and inspect compiled ELF files and their debug information from the shell. |
 
-Start with the first probe below, then use the [command reference](commands.md) and [tutorials](tutorials.md).
+Start with the first probe below, then use the [tutorials](tutorials.md), [advanced guide](advanced.md), [command appendix](command-reference.md), and [C++ API appendix](api-reference.md).
 
 ## Install and check the tools
 
