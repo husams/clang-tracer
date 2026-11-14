@@ -873,6 +873,50 @@ DWARFDie named_type(DWARFDie owner, std::string_view wanted) {
   return result;
 }
 
+// Clang can omit an unused private typedef even though it describes the node
+// and its template argument. Resolve that node in the same compile unit.
+DWARFDie container_node(DWARFDie container, DWARFDie pair, std::string_view prefix,
+                       std::string_view alias) {
+  if (const auto declared = named_type(container, alias)) {
+    if (pointer(declared))
+      return type(declared);
+    if (record(declared))
+      return declared;
+  }
+  const auto value = storage_type(pair);
+  if (!pair || value.find('?') != std::string::npos)
+    return {};
+  const auto node_name = std::string(prefix) + "<" + value + ">";
+  std::vector<DWARFDie> pending{container.getDwarfUnit()->getUnitDIE(false)};
+  DWARFDie result;
+  while (!pending.empty()) {
+    const auto parent = pending.back();
+    pending.pop_back();
+    for (const auto child : parent.children()) {
+      if (child.getTag() == dw::DW_TAG_namespace) {
+        pending.push_back(child);
+      } else if (record(child) && size_of(child)) {
+        const auto type_name = storage_type(child);
+        if (type_name == node_name || ::tracer::compat::starts_with(type_name, node_name + "<")) {
+          if (result)
+            throw std::runtime_error("ambiguous libstdc++ container node layout");
+          result = child;
+        }
+      }
+    }
+  }
+  return result;
+}
+
+bool node_has_base(DWARFDie node, DWARFDie base) {
+  const auto children = node.children();
+  return std::any_of(children.begin(), children.end(), [&](const auto child) {
+    return child.getTag() == dw::DW_TAG_inheritance && type(child) == base &&
+           number(child, dw::DW_AT_data_member_location) == 0 &&
+           number(child, dw::DW_AT_virtuality).value_or(0) == 0;
+  });
+}
+
 Member pointee_storage(DWARFDie wrapper) {
   if (pointer(wrapper))
     return {type(wrapper), 0};
@@ -946,15 +990,15 @@ Layout inspect_hash_map(Member map, const clangtracer::v1::ObjectWatchRequest &r
   const auto before = member(table.type, "_M_before_begin");
   const auto count = member(table.type, "_M_element_count");
   const auto next_link = member(before.type, "_M_nxt");
-  const auto node = named_type(table.type, "__node_type");
   const auto pair = named_type(table.type, "_Value");
+  const auto node = container_node(table.type, pair, "std::__detail::_Hash_node", "__node_type");
   const auto equality = named_type(table.type, "_Equal");
   auto hash = named_type(map.type, "_Hash");
   if (!hash)
     hash = named_type(table.type, "_H1");
   if (!hash)
     hash = named_type(table.type, "_Hash");
-  if (!pointer(next_link.type) || type(next_link.type) != before.type ||
+  if (!pointer(next_link.type) || storage_type(type(next_link.type)) != storage_type(before.type) ||
       storage_type(count.type) != "unsigned64" ||
       !::tracer::compat::starts_with(qualified(node), "std::__detail::_Hash_node<") ||
       !::tracer::compat::starts_with(qualified(pair), "std::pair<"))
@@ -962,7 +1006,9 @@ Layout inspect_hash_map(Member map, const clangtracer::v1::ObjectWatchRequest &r
   const auto node_link = member(node, "_M_nxt");
   const auto storage = member(node, "_M_storage");
   const auto key = member(pair, "first");
-  if (node_link.type != next_link.type || node_link.offset != next_link.offset ||
+  if (!node_has_base(node, before.type) ||
+      storage_type(node_link.type) != storage_type(next_link.type) ||
+      node_link.offset != next_link.offset ||
       size_of(storage.type) != size_of(pair) ||
       !::tracer::compat::starts_with(qualified(equality), "std::equal_to<") ||
       !::tracer::compat::starts_with(qualified(hash), "std::hash<") ||
@@ -1002,29 +1048,22 @@ Layout inspect_map(DWARFDie owner, const clangtracer::v1::ObjectWatchRequest &re
   const auto parent = member(header.type, "_M_parent");
   const auto left = member(header.type, "_M_left");
   const auto right = member(header.type, "_M_right");
-  const auto link = named_type(tree.type, "_Link_type");
-  const auto node = type(link);
   const auto pair = named_type(tree.type, "_Val");
+  const auto node = container_node(tree.type, pair, "std::_Rb_tree_node", "_Link_type");
   const auto comparator = named_type(tree.type, "_Compare");
-  if (!pointer(link) || !record(node) || !record(pair) ||
+  if (!record(node) || !record(pair) ||
       !::tracer::compat::starts_with(qualified(node), "std::_Rb_tree_node<") || !::tracer::compat::starts_with(qualified(pair), "std::pair<") ||
       !::tracer::compat::starts_with(qualified(comparator), "std::less<") ||
       !pointer(parent.type) || !pointer(left.type) || !pointer(right.type) ||
       storage_type(count.type) != "unsigned64")
     throw std::runtime_error("cannot verify the libstdc++ map tree, comparator or node layout");
-  bool fixed_base = false;
-  for (const auto child : node.children())
-    if (child.getTag() == dw::DW_TAG_inheritance && type(child) == header.type &&
-        number(child, dw::DW_AT_data_member_location) == 0 &&
-        number(child, dw::DW_AT_virtuality).value_or(0) == 0)
-      fixed_base = true;
   const auto storage = member(node, "_M_storage");
   const auto key = member(pair, "first");
   const auto value = member(pair, "second");
   bool opaque_union = false;
   const auto scalar = request.field() == "value" && !record(value.type) ?
       Member{value.type, 0} : nested_member(value.type, request.field(), opaque_union);
-  if (!fixed_base || size_of(storage.type) != size_of(pair) ||
+  if (!node_has_base(node, header.type) || size_of(storage.type) != size_of(pair) ||
       qualified(named_type(comparator, "_Tp")) != qualified(key.type) ||
       opaque_union)
     throw std::runtime_error("logical map requires verified node storage and non-union value");
