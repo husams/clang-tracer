@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 namespace tracer::object_watch {
@@ -54,12 +55,14 @@ bool map_key_matches(const MapLayout &layout, std::uint64_t node, std::string_vi
 // Walk the verified libstdc++ tree via parent links without allocating in the
 // target. Each node is visited once on descent, and the count bounds all links.
 template <typename Reader>
-std::uint64_t map_destination(const MapLayout &layout, const std::array<std::uint64_t, 3> &header,
+std::optional<std::uint64_t> map_destination(const MapLayout &layout, const std::array<std::uint64_t, 3> &header,
                               std::uint64_t scalar, std::string_view key,
                               unsigned max_elements, unsigned max_string_bytes, Reader read) {
   const auto [root, count, sentinel] = header;
+  if (!root && !count)
+    return std::uint64_t{0};
   if (!root || root == sentinel || !count || count > max_elements)
-    return 0;
+    return std::nullopt;
   const auto field = [&](auto node, auto offset, std::uint64_t &value) {
     return node <= UINT64_MAX - offset && read(node + offset, &value, sizeof(value));
   };
@@ -81,9 +84,9 @@ std::uint64_t map_destination(const MapLayout &layout, const std::array<std::uin
   if (layout.hash) {
     for (std::uint64_t i = 0; i < count; ++i) {
       if (!node || node == sentinel || !admit() || !field(node, layout.next, node))
-        return 0;
+        return std::nullopt;
     }
-    return node ? 0 : destination;
+    return node ? std::nullopt : std::optional(destination);
   }
   for (std::uint64_t step = 0; step < 2 * count; ++step) {
     std::uint64_t left, right, parent;
@@ -91,29 +94,29 @@ std::uint64_t map_destination(const MapLayout &layout, const std::array<std::uin
         !field(node, layout.parent, parent) || !parent || parent == node ||
         left == node || right == node || left == sentinel || right == sentinel ||
         (left && left == right) || (parent == sentinel) != (node == root))
-      return 0;
+      return std::nullopt;
     auto next = parent;
     if (descending) {
       if (previous != parent)
-        return 0;
+        return std::nullopt;
       if (++visited > count)
-        return 0;
+        return std::nullopt;
       if (!admit())
-        return 0;
+        return std::nullopt;
       if (left || right)
         next = left ? left : right;
     } else if (previous == left) {
       if (right)
         next = right;
     } else if (previous != right) {
-      return 0;
+      return std::nullopt;
     }
     if (next == sentinel)
-      return visited == count ? destination : 0;
+      return visited == count ? std::optional(destination) : std::nullopt;
     descending = next != parent;
     previous = node;
     node = next;
   }
-  return 0;
+  return std::nullopt;
 }
 } // namespace tracer::object_watch

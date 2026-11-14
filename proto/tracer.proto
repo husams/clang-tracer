@@ -731,6 +731,7 @@ message ObjectWatchRequest {
   string owner_get = 57;
   string owner_remove = 58;
   string owner_snapshot = 59;
+  bool logical_updates = 60; // Compare the selected identity at verified mutation boundaries.
 }
 
 message ObjectWatchPlan {
@@ -818,6 +819,7 @@ message ObjectObservation {
     FIRST_SEEN = 14;
     RANGE_BOUND = 15;
     RANGE_SUSPENDED = 16;
+    LOGICAL_UPDATE = 17;
   }
   Kind kind = 1;
   uint64 lifetime_id = 2; // Unique within the watch (TraceEvent.probe_id).
@@ -913,6 +915,24 @@ message ObjectObservation {
   }
   SharedStorage shared_storage = 40; // Same live file and byte offset across watched processes.
   bool external_write_order_unknown = 41;
+  message LogicalUpdate {
+    enum Change {
+      CHANGE_UNSPECIFIED = 0;
+      INSERTED = 1;
+      ERASED = 2;
+      MOVED = 3;
+      VALUE_CHANGED = 4;
+      RESIZED = 5;
+      DESTROYED = 6;
+    }
+    Change change = 1;
+    optional uint64 before_index = 2;
+    optional uint64 after_index = 3;
+    optional uint64 before_size = 4;
+    optional uint64 after_size = 5;
+    string mutation = 6;
+  }
+  LogicalUpdate logical_update = 42;
 }
 
 message TraceEvent {

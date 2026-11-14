@@ -1763,6 +1763,11 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     layout = inspect_layout(*lifetime.dwarf, request, nullptr, *lifetime.dwarf);
   else
     layout = inspect_layout(*image_->dwarf, request, layout_unit, *lifetime.dwarf);
+  if (request.logical_updates() &&
+      (!(layout.logical_vector || layout.logical_map) ||
+       (request.synchronization() != Request::THREAD_CONFINED &&
+        request.synchronization() != Request::CALLER_LOCK)))
+    throw std::invalid_argument("logical updates require a synchronized vector or map write watch");
   if (!request.shared_file().empty() &&
       (request.backend() != Request::CODE_CACHE || request.mode() != Request::WRITES ||
        (!layout.atomic && request.synchronization() != Request::CALLER_LOCK) ||
@@ -2033,7 +2038,13 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       }
       const auto writer_body = native_entry::scan(writer_start, code(writer_start).substr(0, writer.second));
       std::set<Range> mutations;
-      const auto add_mutation = [&](const std::string &selector) {
+      const auto add_mutation = [&](std::string selector) {
+        const bool destroys = selector.starts_with("destroy=");
+        if (destroys) {
+          if (!request.logical_updates())
+            throw std::invalid_argument("destroy= requires --mode logical-writes");
+          selector.erase(0, 8);
+        }
         if (selector.empty() || selector.size() > 512 || selector.find('\0') != std::string::npos)
           throw std::invalid_argument("invalid collection mutation selector");
         std::optional<Range> mutation;
@@ -2045,6 +2056,8 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         const bool direct = mutation && std::ranges::any_of(writer_body.instructions, [&](const auto &inst) {
           return inst.flow == native_entry::Flow::call && inst.target == bias + mutation->first;
         });
+        if (destroys && !direct)
+          throw std::runtime_error("destruction requires a directly called verified boundary: " + selector);
         if (!direct) {
           const auto inlined = inline_mutations_in(writer_debug.FunctionDIE, bias, selector,
                                                    container_name, writer_body);
@@ -2068,6 +2081,8 @@ Plan::Plan(std::uint32_t pid, std::string executable,
                 }))
               throw std::runtime_error("inlined collection mutation boundaries overlap");
             inline_mutations.emplace(region.begin, region);
+            if (request.logical_updates())
+              mutation_selectors.emplace(region.begin, selector);
             const auto install_anchor = [&](std::uint64_t pc) {
               const auto inst = std::ranges::find_if(writer_body.instructions, [&](const auto &candidate) {
                 return candidate.address == pc;
@@ -2092,7 +2107,11 @@ Plan::Plan(std::uint32_t pid, std::string executable,
                              layout.logical_map))
           throw std::runtime_error("mutation must take the same verified container as its first argument: " +
                                    selector);
-        install_boundary(*image_, Boundary::collection_mutation, *mutation, selector, false);
+        const auto entry = install_boundary(*image_, Boundary::collection_mutation, *mutation, selector, false);
+        if (request.logical_updates())
+          mutation_selectors.emplace(entry, selector);
+        if (destroys)
+          destruction_mutations.insert(entry);
       };
       add_mutation(request.mutation_symbol());
       for (const auto &selector : request.additional_mutation_symbols())
@@ -2160,7 +2179,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
                          !is_padding(previous_end, start + length)))
       throw std::runtime_error("object watch cannot verify an indirect branch in " +
                                source(start).function + ": " + indirect->text);
-    if (stores == prior_count && !request.follow_calls())
+    if (stores == prior_count && !request.follow_calls() && !request.logical_updates())
       throw std::runtime_error("no supported field-width store in " + source(start).function);
   };
   add_writer(writer_start, writer.second);
@@ -3099,5 +3118,24 @@ void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &
   };
   capture(old, true);
   capture(next, false);
+}
+
+void set_logical_update(clangtracer::v1::ObjectObservation &event, const Layout &layout,
+                        const LogicalRangeSample &before, const LogicalRangeSample &after,
+                        LogicalChange change) {
+  using Update = clangtracer::v1::ObjectObservation::LogicalUpdate;
+  constexpr Update::Change changes[]{Update::CHANGE_UNSPECIFIED, Update::INSERTED,
+      Update::ERASED, Update::MOVED, Update::VALUE_CHANGED, Update::RESIZED, Update::DESTROYED};
+  auto &update = *event.mutable_logical_update();
+  update.set_change(changes[static_cast<unsigned>(change)]);
+  if (before.index)
+    update.set_before_index(*before.index);
+  if (after.index)
+    update.set_after_index(*after.index);
+  if (before.size)
+    update.set_before_size(*before.size);
+  if (after.size)
+    update.set_after_size(*after.size);
+  set_scalar_values(event, layout, {before.value, {}}, {after.value, {}});
 }
 } // namespace tracer::object_watch

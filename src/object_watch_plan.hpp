@@ -12,6 +12,7 @@
 
 #include "native_entry.hpp"
 #include "object_map_range.hpp"
+#include "object_logical_range.hpp"
 #include "object_pointee_range.hpp"
 #include "tracer.pb.h"
 
@@ -108,6 +109,8 @@ public:
   std::map<std::uint64_t, std::uint64_t> delegating_constructor_tails;
   bool virtual_destructor = false;
   std::map<std::uint64_t, InlineMutation> inline_mutations;
+  std::set<std::uint64_t> destruction_mutations;
+  std::map<std::uint64_t, std::string> mutation_selectors;
   unsigned stores = 0, unsupported = 0;
   google::protobuf::RepeatedPtrField<clangtracer::v1::ObjectWatchRequest::SourceWriter> source_writers;
 
@@ -154,4 +157,7 @@ struct ScalarSample {
 };
 void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &layout,
                        ScalarSample old, ScalarSample next);
+void set_logical_update(clangtracer::v1::ObjectObservation &event, const Layout &layout,
+                        const LogicalRangeSample &before, const LogicalRangeSample &after,
+                        LogicalChange change);
 } // namespace tracer::object_watch

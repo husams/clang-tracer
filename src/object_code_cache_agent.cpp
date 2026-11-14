@@ -441,6 +441,8 @@ struct CollectionScope {
   Address mutation_return = 0, mutation_stack = 0;
   Address inline_mutation = 0;
   std::optional<std::uint64_t> prior_value = std::nullopt;
+  std::optional<object_watch::LogicalRangeSample> prior_logical;
+  bool destroyed = false;
 };
 thread_local CollectionScope collection_scope;
 struct Borrowed {
@@ -695,27 +697,29 @@ bool capture_exhausted(Channel &channel) noexcept {
   return false;
 }
 
-NativeCodeRegisters application_registers(const Registers &regs, Address pc) noexcept {
+NativeCodeRegisters application_registers(const Registers &regs, Address pc,
+                                           Address stack_adjust = 0) noexcept {
   NativeCodeRegisters result{};
 #if defined(__aarch64__)
   std::copy(regs.saved.begin(), regs.saved.end(), result.begin());
-  result[31] = regs.value(rsp);
+  result[31] = regs.value(rsp) + stack_adjust;
 #else
   constexpr std::array mapping{rax, rdx, rcx, rbx, rsi, rdi, rbp, rsp,
                                8U, 9U, 10U, 11U, 12U, 13U, 14U, 15U};
   for (std::size_t index = 0; index < mapping.size(); ++index)
     result[index] = regs.value(mapping[index]);
+  result[7] += stack_adjust;
 #endif
   result.back() = pc;
   return result;
 }
 
 void stack(State &watch, Observation &event, const Registers &regs,
-           const NativeCodeRegisters *before_store = nullptr) noexcept {
+           const NativeCodeRegisters *before_store = nullptr, Address stack_adjust = 0) noexcept {
   if (!watch.stack_depth)
     return;
   if (watch.cfi_stack) {
-    const auto original = before_store ? *before_store : application_registers(regs, event.pc);
+    const auto original = before_store ? *before_store : application_registers(regs, event.pc, stack_adjust);
     const auto depth = std::min<std::size_t>(watch.stack_depth, stack_limit);
     const auto capture = capture_native_code_stack(original, std::span(event.frames).first(depth),
                                                     std::span(event.stack_pointers).first(depth));
@@ -724,7 +728,7 @@ void stack(State &watch, Observation &event, const Registers &regs,
     return;
   }
   auto frame = regs.value(rbp);
-  auto sp = regs.value(rsp);
+  auto sp = regs.value(rsp) + stack_adjust;
   auto pc = event.pc;
   while (event.depth < watch.stack_depth && pc) {
     const auto index = event.depth++;
@@ -789,7 +793,7 @@ void emit_collection(State &watch, const Site &site, const Registers &regs,
                  std::optional<std::uint64_t> old = {}, std::optional<std::uint64_t> next = {}) noexcept {
   Observation event{};
   event.object = scope.owner;
-  event.pc = site.instruction.pc;
+  event.pc = site.instruction.continuation_pc();
   event.id = scope.id;
   event.storage_generation = scope.generation;
   event.destination = scope.destination;
@@ -803,7 +807,7 @@ void emit_collection(State &watch, const Site &site, const Registers &regs,
     event.new_value = *next;
     event.values |= 2;
   }
-  stack(watch, event, regs);
+  stack(watch, event, regs, nullptr, site.instruction.collection_return ? sizeof(Address) : 0);
   emit(watch, event);
 }
 
@@ -836,10 +840,11 @@ bool collection_destination(State &watch, const object_watch::RangeHeader &heade
   }
   const auto begin = header[0], end = header[1], capacity_address = header[2];
   if (plan.is_map) {
-    destination = object_watch::map_destination(plan.map, {begin, end, capacity_address}, watch.offset,
+    const auto selected = object_watch::map_destination(plan.map, {begin, end, capacity_address}, watch.offset,
         std::string_view(plan.map_key.data(), plan.map_key_size), plan.max_elements,
         plan.max_string_bytes, read_self_memory);
-    return destination != 0;
+    destination = selected.value_or(0);
+    return selected && (destination || plan.logical_updates);
   }
   if (!plan.stride || end < begin || capacity_address < end || (!begin && end) ||
       (end - begin) % plan.stride || (capacity_address - begin) % plan.stride ||
@@ -856,17 +861,70 @@ bool collection_destination(State &watch, const object_watch::RangeHeader &heade
       destination = element + watch.offset;
     }
   }
-  return destination != 0;
+  return destination || plan.logical_updates;
 }
 
-void bind_collection(State &watch, const Site &site, const Registers &regs, CollectionScope &scope) noexcept {
+std::optional<object_watch::LogicalRangeSample> logical_sample(
+    const State &watch, const object_watch::RangeHeader &header, Address destination) noexcept {
+  object_watch::LogicalRangeSample sample;
+  sample.destination = destination;
+  if (watch.collection.is_map) {
+    sample.size = header[1];
+  } else {
+    sample.size = (header[1] - header[0]) / watch.collection.stride;
+    if (destination)
+      sample.index = (destination - header[0] - watch.offset) / watch.collection.stride;
+  }
+  if (destination && !watch.no_values) {
+    std::uint64_t bits;
+    if (!read_field(watch, destination, bits))
+      return std::nullopt;
+    sample.value = bits;
+  }
+  return sample;
+}
+
+void bind_collection(State &watch, const Site &site, const Registers &regs,
+                     CollectionScope &scope, bool destroyed = false) noexcept {
   object_watch::RangeHeader header{};
   Address destination = 0;
   const auto old = std::exchange(scope.prior_value, std::nullopt);
+  const auto before = std::exchange(scope.prior_logical, std::nullopt);
   scope.valid = false;
-  if (!collection_header(watch, scope, header) || !collection_destination(watch, header, destination)) {
+  if (scope.destroyed)
+    return;
+  scope.destroyed = destroyed;
+  if (!destroyed &&
+      (!collection_header(watch, scope, header) || !collection_destination(watch, header, destination))) {
     scope.destination = 0;
     emit_collection(watch, site, regs, scope, Hook::collection_gap, watch.collection.pointer_hops ? 7 : 1);
+    return;
+  }
+  if (before) {
+    const auto after = destroyed ? std::optional(object_watch::LogicalRangeSample{}) :
+                                   logical_sample(watch, header, destination);
+    if (!after) {
+      emit_collection(watch, site, regs, scope, Hook::collection_gap, 8);
+    } else {
+      const auto change = object_watch::logical_change(*before, *after, destroyed);
+      if (change != object_watch::LogicalChange::none) {
+        Observation event{};
+        event.object = scope.owner;
+        event.pc = site.instruction.continuation_pc();
+        event.id = scope.id;
+        event.destination = destination;
+        event.hook = Hook::collection_update;
+        event.logical_before = *before;
+        event.logical_after = *after;
+        event.logical_change = change;
+        event.logical_boundary = site.instruction.boundary_pc;
+        stack(watch, event, regs, nullptr, site.instruction.collection_return ? sizeof(Address) : 0);
+        emit(watch, event);
+      }
+    }
+  }
+  if (!destination) {
+    scope.destination = 0;
     return;
   }
   if (!scope.generation || watch.collection.is_map || watch.collection.pointer_hops ||
@@ -928,6 +986,8 @@ void collection_boundary(State &watch, const Site &site, const Registers &regs, 
   if (hook == Hook::collection_end) {
     const std::lock_guard lock(watch.mutex);
     watch.active_collections.erase(scope.owner);
+    if (watch.collection.logical_updates && (scope.mutation_return || scope.inline_mutation))
+      emit_collection(watch, site, regs, scope, Hook::collection_gap, 2);
     emit_collection(watch, site, regs, scope, Hook::collection_end);
     scope = {};
     return;
@@ -937,7 +997,8 @@ void collection_boundary(State &watch, const Site &site, const Registers &regs, 
     const auto receiver = instruction.inline_mutation_entry ?
         regs.value(instruction.inline_receiver_register) + static_cast<Address>(instruction.inline_receiver_offset) :
         regs.value(rdi);
-    if (receiver != scope.owner + watch.collection.object || scope.mutation_return || scope.inline_mutation)
+    if (scope.destroyed || receiver != scope.owner + watch.collection.object ||
+        scope.mutation_return || scope.inline_mutation)
       return;
     if (instruction.inline_mutation_entry) {
       scope.inline_mutation = instruction.boundary_pc;
@@ -947,7 +1008,7 @@ void collection_boundary(State &watch, const Site &site, const Registers &regs, 
       if (!application_return(regs, return_pc) || !std::ranges::any_of(watch.sites, [&](const auto &successor) {
             return successor.instruction.collection_resume &&
                    successor.instruction.boundary_pc == instruction.boundary_pc &&
-                   successor.instruction.pc == return_pc;
+                   successor.instruction.continuation_pc() == return_pc;
           }))
         return;
       scope.mutation_return = return_pc;
@@ -957,9 +1018,23 @@ void collection_boundary(State &watch, const Site &site, const Registers &regs, 
       scope.mutation_stack = regs.value(rsp) + sizeof(Address);
 #endif
     }
+    scope.prior_logical.reset();
+    if (watch.collection.logical_updates) {
+      object_watch::RangeHeader header{};
+      Address current = 0;
+      if (collection_header(watch, scope, header) &&
+          collection_destination(watch, header, current) &&
+          (!scope.valid || (header == scope.header && current == scope.destination))) {
+        scope.prior_logical = logical_sample(watch, header, current);
+      }
+      if (!scope.prior_logical)
+        emit_collection(watch, site, regs, scope, Hook::collection_gap, 4);
+    }
     if (scope.valid) {
       scope.valid = false;
-      if (!watch.no_values) {
+      if (watch.collection.logical_updates) {
+        scope.prior_value = scope.prior_logical ? scope.prior_logical->value : std::nullopt;
+      } else if (!watch.no_values) {
         object_watch::RangeHeader header{};
         Address current = 0;
         std::uint64_t value = 0;
@@ -975,15 +1050,16 @@ void collection_boundary(State &watch, const Site &site, const Registers &regs, 
       emit_collection(watch, site, regs, scope, Hook::collection_suspend);
     }
   } else if (hook == Hook::collection_resume &&
-             (scope.mutation_return == site.instruction.pc ||
+             (scope.mutation_return == site.instruction.continuation_pc() ||
               (scope.inline_mutation && scope.inline_mutation == site.instruction.boundary_pc)) &&
-             scope.mutation_stack == regs.value(rsp)) {
+             scope.mutation_stack == regs.value(rsp) +
+                 (site.instruction.collection_return ? sizeof(Address) : 0)) {
     scope.mutation_return = 0;
     scope.inline_mutation = 0;
     const std::lock_guard lock(watch.mutex);
     if (const auto found = watch.active_collections.find(scope.owner);
         found != watch.active_collections.end() && found->second)
-      bind_collection(watch, site, regs, scope);
+      bind_collection(watch, site, regs, scope, site.instruction.destroys_collection);
   }
 }
 
@@ -4384,6 +4460,10 @@ Address resolve_runtime_call(const Site *site, const Registers *regs) noexcept {
 }
 
 DispatchDestination resolve_dispatch_call(const Site *site, const Registers *regs) noexcept {
+  if (site->instruction.collection_return) {
+    before(site, regs);
+    return {site->instruction.target, site->instruction.target};
+  }
   const auto target = original_call_target(*site, *regs);
   return {target, resolve_runtime_target(site, target)};
 }
@@ -4522,7 +4602,7 @@ void initialize(Init &init
 } // namespace
 } // namespace tracer::object_cache
 
-extern "C" int tracer_agent_object_cache_v35(tracer::object_cache::Init *request) {
+extern "C" int tracer_agent_object_cache_v36(tracer::object_cache::Init *request) {
   try {
     tracer::object_cache::initialize(*request);
     return 0;
