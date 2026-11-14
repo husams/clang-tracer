@@ -118,7 +118,7 @@ struct LogicalRange {
   Address destination = 0;
   std::uint64_t generation = 0;
   bool valid = false;
-  std::optional<std::int32_t> prior_value = std::nullopt;
+  std::optional<std::uint64_t> prior_value = std::nullopt;
 };
 struct Frame {
   Boundary role;
@@ -568,7 +568,7 @@ struct Watch::Worker {
     const auto &layout = plan->layout;
     if (!layout.pointer_offsets.empty()) {
       const auto address = add(header[layout.pointer_offsets.size() - 1], layout.scalar);
-      (void)add(address, sizeof(std::int32_t) - 1);
+      (void)add(address, layout.field_width - 1);
       return address;
     }
     if (layout.logical_map)
@@ -596,6 +596,13 @@ struct Watch::Worker {
 
   std::string field_path() const {
     return object_watch::field_path(request, plan->layout);
+  }
+
+  std::uint64_t read_field(Address address) const {
+    std::uint64_t value = 0;
+    if (!read_memory(pid, address, &value, plan->layout.field_width))
+      throw std::runtime_error("watched field value is unreadable");
+    return value;
   }
 
   std::optional<std::uint32_t> union_tag(Address receiver) const {
@@ -839,7 +846,7 @@ struct Watch::Worker {
         const auto header = range_header(scope.receiver);
         if (header != scope.range.header || range_element(header) != scope.range.destination)
           throw std::runtime_error("collection range changed outside a verified mutation return");
-        scope.range.prior_value = read<std::int32_t>(pid, scope.range.destination);
+        scope.range.prior_value = read_field(scope.range.destination);
       } catch (const std::runtime_error &error) {
         gap(tid, pc, regs, error.what());
       }
@@ -866,9 +873,9 @@ struct Watch::Worker {
       scope.range.header = header;
       scope.range.destination = destination;
       scope.range.valid = true;
-      std::int32_t next = 0;
+      std::uint64_t next = 0;
       const bool sampled = range_snapshot_enabled() &&
-          read_memory(pid, destination, &next, sizeof(next));
+          read_memory(pid, destination, &next, plan->layout.field_width);
       emit(tid, Observation::RANGE_BOUND, scope.life, pc, regs, [&](auto &out) {
         out.set_field(field_path());
         out.set_storage_generation(scope.range.generation);
@@ -1011,9 +1018,9 @@ struct Watch::Worker {
         throw std::runtime_error("complete constructor returned with an unexpected type or a live generation");
       if (request.max_instances() && live.size() >= request.max_instances())
         throw std::runtime_error("receiver admission limit reached");
-      std::optional<std::int32_t> initial;
+      std::optional<std::uint64_t> initial;
       if (!request.no_values() && !plan->layout.logical_collection())
-        initial = read<std::int32_t>(pid, add(receiver, plan->layout.scalar));
+        initial = read_field(add(receiver, plan->layout.scalar));
       Lifetime life{receiver, ++next_id, ++generations[receiver], 0};
       live.emplace(receiver, life);
       emit(tid, Observation::CREATED, life, pc, regs, [&](auto &out) {
@@ -1131,7 +1138,7 @@ struct Watch::Worker {
     Lifetime life;
     Address destination;
     const native_entry::ScalarStore &store;
-    std::optional<std::int32_t> old;
+    std::optional<std::uint64_t> old;
     std::uint64_t storage_generation = 0;
     bool scoped = false;
     std::optional<std::uint32_t> old_tag = std::nullopt;
@@ -1184,7 +1191,7 @@ struct Watch::Worker {
     if (!pending.life.id)
       return std::nullopt;
     if (!request.no_values() && (!plan->layout.atomic || s.kind == native_entry::ScalarStore::Kind::rmw))
-      pending.old = read<std::int32_t>(pid, destination);
+      pending.old = read_field(destination);
     pending.old_tag = union_tag(pending.life.address);
     return pending;
   }
@@ -1205,7 +1212,7 @@ struct Watch::Worker {
         return;
     }
     auto old = sample.old;
-    std::optional<std::int32_t> value;
+    std::optional<std::uint64_t> value;
     std::optional<std::uint32_t> next_tag;
     if (!request.no_values()) {
       if (plan->layout.atomic && store.kind != Kind::rmw) {
@@ -1214,14 +1221,14 @@ struct Watch::Worker {
         if (store.kind == Kind::exchange_add) {
           const auto &result = store.result_register.empty() ? store.value_register : store.result_register;
           const auto returned = static_cast<std::uint32_t>(reg(after, result, 0));
-          old = std::bit_cast<std::int32_t>(returned);
+          old = returned;
           input += returned;
         } else if (store.kind == Kind::compare_exchange) {
-          old = std::bit_cast<std::int32_t>(expected);
+          old = expected;
         }
-        value = std::bit_cast<std::int32_t>(input);
+        value = input;
       } else {
-        value = read<std::int32_t>(pid, sample.destination);
+        value = read_field(sample.destination);
         next_tag = union_tag(sample.life.address);
         if (value == old && next_tag == sample.old_tag)
           return;

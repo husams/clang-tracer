@@ -26,6 +26,8 @@
 #include "tracer/compat.hpp"
 #include "tracer/protocol.hpp"
 
+#include <tuple>
+
 namespace tracer::native_entry {
 namespace {
 constexpr std::size_t jump_bytes = 14;
@@ -242,7 +244,7 @@ std::size_t patch_window(const Decoder &decoder, std::uint64_t address,
 } // namespace
 
 namespace {
-std::optional<ScalarStore> store32(const Decoder &decoder, const llvm::MCInst &inst,
+std::optional<ScalarStore> memory_store(const Decoder &decoder, const llvm::MCInst &inst,
                                    std::string_view bytes) {
   using Kind = ScalarStore::Kind;
   const auto opcode = decoder.ins->getName(inst.getOpcode());
@@ -252,6 +254,19 @@ std::optional<ScalarStore> store32(const Decoder &decoder, const llvm::MCInst &i
       return {};
     return decoder.regs->getName(inst.getOperand(operand).getReg());
   };
+  for (const auto &[scaled, unscaled, size] : {
+           std::tuple{"STRBBui", "STURBBi", 1U}, std::tuple{"STRHHui", "STURHHi", 2U},
+           std::tuple{"STRXui", "STURXi", 8U}, std::tuple{"STRSui", "STURSi", 4U},
+           std::tuple{"STRDui", "STURDi", 8U}}) {
+    if (opcode != scaled && opcode != unscaled)
+      continue;
+    if (inst.getNumOperands() != 3 || reg(0).empty() || reg(1).empty() ||
+        !inst.getOperand(2).isImm())
+      return std::nullopt;
+    return ScalarStore{reg(1), {}, 1,
+        inst.getOperand(2).getImm() * (opcode == scaled ? size : 1), Kind::move,
+        {}, std::nullopt, {}, false, size};
+  }
   if ((opcode == "STRWui" || opcode == "STURWi") &&
       inst.getNumOperands() == 3 && !reg(0).empty() && !reg(1).empty() &&
       inst.getOperand(2).isImm())
@@ -295,6 +310,8 @@ std::optional<ScalarStore> store32(const Decoder &decoder, const llvm::MCInst &i
   Kind kind = Kind::move;
   unsigned memory = 0;
   unsigned value = 5;
+  unsigned width = 4;
+  bool sample_memory = false;
   if (locked && bytes.starts_with("\x0f\xc1") && opcode == "XADD32rm" &&
       inst.getNumOperands() == 7 && inst.getOperand(0).isReg() &&
       inst.getOperand(1).isReg() &&
@@ -310,10 +327,22 @@ std::optional<ScalarStore> store32(const Decoder &decoder, const llvm::MCInst &i
              (inst.getNumOperands() == 6 && (integer_arithmetic(opcode, "mr") ||
                 integer_arithmetic(opcode, "mi") || integer_arithmetic(opcode, "mi8")))) {
     kind = Kind::rmw;
-  } else if (locked || bytes.empty() || inst.getNumOperands() != 6 ||
-             !((bytes.front() == '\x89' && opcode == "MOV32mr") ||
-               (bytes.front() == '\xc7' && opcode == "MOV32mi"))) {
-    return std::nullopt;
+  } else {
+    if (locked || bytes.empty() || inst.getNumOperands() != 6)
+      return std::nullopt;
+    if (opcode == "MOV8mr" || opcode == "MOV8mi")
+      width = 1;
+    else if (opcode == "MOV16mr" || opcode == "MOV16mi")
+      width = 2;
+    else if (opcode == "MOV64mr" || opcode == "MOV64mi32" ||
+             opcode == "MOVSDmr" || opcode == "VMOVSDmr")
+      width = 8;
+    else if (opcode != "MOV32mr" && opcode != "MOV32mi" &&
+             opcode != "MOVSSmr" && opcode != "VMOVSSmr")
+      return std::nullopt;
+    sample_memory = width != 4 || opcode == "MOVSSmr" || opcode == "VMOVSSmr";
+    if (!sample_memory && bytes.front() != '\x89' && bytes.front() != '\xc7')
+      return std::nullopt;
   }
   const auto &base = inst.getOperand(memory);
   const auto &scale = inst.getOperand(memory + 1);
@@ -331,6 +360,9 @@ std::optional<ScalarStore> store32(const Decoder &decoder, const llvm::MCInst &i
   ScalarStore store{register_name(base), register_name(index),
                     static_cast<unsigned>(scale.getImm()), disp.getImm(),
                     kind, {}, std::nullopt, {}};
+  store.width = width;
+  if (sample_memory)
+    return store;
   if (kind == Kind::rmw) {
     store.locked = locked;
     return store;
@@ -430,7 +462,7 @@ Preview inspect(std::uint64_t address, std::string_view bytes, bool entry,
         check_definition(instruction.getOperand(i).getReg());
     for (auto reg : desc.implicit_defs())
       check_definition(reg);
-    auto store = store32(decoder, instruction, bytes.substr(offset, size));
+    auto store = memory_store(decoder, instruction, bytes.substr(offset, size));
 #if defined(__aarch64__)
     const bool frame_store = false;
     const bool architectural_hint = printed == "nop" || printed.starts_with("bti") ||

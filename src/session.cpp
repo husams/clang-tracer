@@ -438,7 +438,7 @@ void Session::attach(const std::string &expected_executable) {
   // scratch buffer is reused for another symbol name or the profile.
   const auto scratch_size = std::max(
       {agent_path_.size() + 1, sizeof(AgentRuntimeProfile),
-       sizeof("tracer_agent_object_cache_v34")});
+       sizeof("tracer_agent_object_cache_v35")});
   try {
     scratch = process.remote_allocate(scratch_size);
     process.remote_write(scratch, agent_path_.c_str(), agent_path_.size() + 1);
@@ -470,7 +470,7 @@ void Session::attach(const std::string &expected_executable) {
     const auto stop = agent_symbol("tracer_agent_stop");
     const auto validate = agent_symbol("tracer_agent_validate");
     const auto capacity = agent_symbol("tracer_agent_capacity_v1");
-    const auto object_cache = agent_symbol("tracer_agent_object_cache_v34");
+    const auto object_cache = agent_symbol("tracer_agent_object_cache_v35");
     const auto pthread_detour =
         agent_symbol("tracer_context_pthread_create_detour");
     if (!start || !stop) {

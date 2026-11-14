@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <charconv>
 #include <cctype>
 #include <cstring>
 #include <filesystem>
@@ -798,6 +799,33 @@ std::vector<InlineMutation> inline_mutations_in(DWARFDie writer, std::uint64_t b
   return result;
 }
 
+void set_field_layout(Layout &layout, DWARFDie field) {
+  const auto bytes = size_of(field);
+  if (!bytes || (*bytes != 1 && *bytes != 2 && *bytes != 4 && *bytes != 8))
+    throw std::runtime_error("individual writes require a supported field width");
+  auto encoding = storage_type(field);
+  if (field.getTag() == dw::DW_TAG_enumeration_type) {
+    const auto underlying = type(field);
+    if (size_of(underlying) != bytes)
+      throw std::runtime_error("cannot verify enum field representation");
+    encoding = storage_type(underlying);
+  }
+  using FieldType = Layout::FieldType;
+  if (encoding == "signed32")
+    layout.field_type = FieldType::int32;
+  else if (std::string_view(encoding).starts_with("signed"))
+    layout.field_type = FieldType::signed_integer;
+  else if (std::string_view(encoding).starts_with("unsigned") || encoding == "char")
+    layout.field_type = FieldType::unsigned_integer;
+  else if (encoding == "bool" && *bytes == 1)
+    layout.field_type = FieldType::boolean;
+  else if (encoding == "float32" || encoding == "float64")
+    layout.field_type = FieldType::real;
+  else
+    throw std::runtime_error("individual writes require a verified numeric field or enum");
+  layout.field_width = *bytes;
+}
+
 Layout inspect_vector(DWARFDie owner, const clangtracer::v1::ObjectWatchRequest &request) {
   const auto vector = member(owner, request.vector_field());
   if (!qualified(vector.type).starts_with("std::vector<"))
@@ -816,10 +844,12 @@ Layout inspect_vector(DWARFDie owner, const clangtracer::v1::ObjectWatchRequest 
   bool opaque_union = false;
   const auto scalar = nested_member(element, request.field(), opaque_union);
   const auto key = member(element, request.element_key_field());
-  if (storage_type(scalar.type) != "signed32" || storage_type(key.type) != "unsigned32" ||
-      scalar.offset == key.offset || opaque_union)
-    throw std::runtime_error("logical vector requires distinct uint32 key and int32 value members");
+  if (storage_type(key.type) != "unsigned32" || opaque_union)
+    throw std::runtime_error("logical vector requires a uint32 key and a non-union value");
   Layout result{};
+  set_field_layout(result, scalar.type);
+  if (scalar.offset < key.offset + 4 && key.offset < scalar.offset + result.field_width)
+    throw std::runtime_error("logical vector key and value overlap");
   result.scalar = scalar.offset;
   result.key_offset = key.offset;
   result.stride = *stride;
@@ -841,6 +871,55 @@ DWARFDie named_type(DWARFDie owner, std::string_view wanted) {
       result = type(child);
     }
   return result;
+}
+
+// Clang can omit an unused private typedef even though it describes the node
+// and its template argument. Resolve that node in the same compile unit.
+DWARFDie container_node(DWARFDie container, DWARFDie pair, std::string_view prefix,
+                       std::string_view alias) {
+  if (const auto declared = named_type(container, alias)) {
+    if (pointer(declared))
+      return type(declared);
+    if (record(declared))
+      return declared;
+  }
+  const auto value = storage_type(pair);
+  if (!pair || value.find('?') != std::string::npos)
+    return {};
+  const auto node_name = std::string(prefix) + "<" + value + ">";
+  std::vector<DWARFDie> pending{container.getDwarfUnit()->getUnitDIE(false)};
+  DWARFDie result;
+  while (!pending.empty()) {
+    const auto parent = pending.back();
+    pending.pop_back();
+    for (const auto child : parent.children()) {
+      if (child.getTag() == dw::DW_TAG_namespace) {
+        pending.push_back(child);
+      } else if (record(child) && size_of(child)) {
+        const auto type_name = storage_type(child);
+        if (type_name == node_name || type_name.starts_with(node_name + "<")) {
+          if (result)
+            throw std::runtime_error("ambiguous libstdc++ container node layout");
+          result = child;
+        }
+      }
+    }
+  }
+  return result;
+}
+
+bool node_has_base(DWARFDie node, DWARFDie base, unsigned depth = 8) {
+  if (!depth)
+    return false;
+  const auto children = node.children();
+  return std::any_of(children.begin(), children.end(), [&](const auto child) {
+    if (child.getTag() != dw::DW_TAG_inheritance ||
+        number(child, dw::DW_AT_data_member_location) != 0 ||
+        number(child, dw::DW_AT_virtuality).value_or(0) != 0)
+      return false;
+    const auto inherited = type(child);
+    return inherited && (inherited == base || node_has_base(inherited, base, depth - 1));
+  });
 }
 
 Member pointee_storage(DWARFDie wrapper) {
@@ -865,8 +944,106 @@ Member pointee_storage(DWARFDie wrapper) {
   throw std::runtime_error("pointee path requires a verified data pointer or libstdc++ smart pointer");
 }
 
+void set_map_key(MapLayout &layout, const Member &key, std::uint64_t storage,
+                 std::string_view requested) {
+  const auto identity = qualified(key.type);
+  if (identity.starts_with("std::__cxx11::basic_string<char") &&
+      qualified(named_type(key.type, "_Traits")) == "std::char_traits<char>" &&
+      qualified(named_type(key.type, "_Alloc")) == "std::allocator<char>") {
+    const auto data = member(key.type, "_M_dataplus");
+    const auto pointer_field = member(data.type, "_M_p");
+    const auto length = member(key.type, "_M_string_length");
+    if (!pointer(pointer_field.type) || storage_type(length.type) != "unsigned64")
+      throw std::runtime_error("logical map string key layout is unverified");
+    layout.key_pointer = storage + key.offset + data.offset + pointer_field.offset;
+    layout.key_length = storage + key.offset + length.offset;
+    return;
+  }
+  if (key.type.getTag() != dw::DW_TAG_base_type || !size_of(key.type))
+    throw std::runtime_error("logical map requires a string or integral key");
+  const auto bytes = *size_of(key.type);
+  const auto encoding = number(key.type, dw::DW_AT_encoding);
+  const auto signed_key = encoding == dw::DW_ATE_signed || encoding == dw::DW_ATE_signed_char;
+  if ((bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8) ||
+      (!signed_key && encoding != dw::DW_ATE_unsigned && encoding != dw::DW_ATE_unsigned_char &&
+       encoding != dw::DW_ATE_boolean))
+    throw std::runtime_error("logical map requires a string or integral key");
+  const auto end = requested.data() + requested.size();
+  const auto mask = UINT64_MAX >> (64 - bytes * 8);
+  std::uint64_t bits;
+  if (signed_key) {
+    std::int64_t value = 0;
+    const auto parsed = std::from_chars(requested.data(), end, value);
+    if (parsed.ec != std::errc{} || parsed.ptr != end ||
+        (bytes < 8 && (value > static_cast<std::int64_t>(mask >> 1) ||
+                       value < -static_cast<std::int64_t>(mask >> 1) - 1)))
+      throw std::runtime_error("logical map key is outside its signed width");
+    bits = static_cast<std::uint64_t>(value) & mask;
+  } else {
+    const auto parsed = std::from_chars(requested.data(), end, bits);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || bits > mask ||
+        (encoding == dw::DW_ATE_boolean && bits > 1))
+      throw std::runtime_error("logical map key is outside its unsigned width");
+  }
+  layout.key_width = bytes;
+  layout.key_bits = bits;
+  layout.key_offset = storage + key.offset;
+}
+
+Layout inspect_hash_map(Member map, const clangtracer::v1::ObjectWatchRequest &request) {
+  const auto table = member(map.type, "_M_h");
+  const auto before = member(table.type, "_M_before_begin");
+  const auto count = member(table.type, "_M_element_count");
+  const auto next_link = member(before.type, "_M_nxt");
+  const auto pair = named_type(table.type, "_Value");
+  const auto node = container_node(table.type, pair, "std::__detail::_Hash_node", "__node_type");
+  const auto equality = named_type(table.type, "_Equal");
+  auto hash = named_type(map.type, "_Hash");
+  if (!hash)
+    hash = named_type(table.type, "_H1");
+  if (!hash)
+    hash = named_type(table.type, "_Hash");
+  if (!pointer(next_link.type) || storage_type(type(next_link.type)) != storage_type(before.type) ||
+      storage_type(count.type) != "unsigned64" ||
+      !qualified(node).starts_with("std::__detail::_Hash_node<") ||
+      !qualified(pair).starts_with("std::pair<"))
+    throw std::runtime_error("cannot verify the libstdc++ unordered-map node layout");
+  const auto node_link = member(node, "_M_nxt");
+  const auto storage = member(node, "_M_storage");
+  const auto key = member(pair, "first");
+  if (!node_has_base(node, before.type) ||
+      storage_type(node_link.type) != storage_type(next_link.type) ||
+      node_link.offset != next_link.offset ||
+      size_of(storage.type) != size_of(pair) ||
+      !qualified(equality).starts_with("std::equal_to<") ||
+      !qualified(hash).starts_with("std::hash<") ||
+      qualified(named_type(equality, "_Tp")) != qualified(key.type) ||
+      qualified(named_type(hash, "_Tp")) != qualified(key.type))
+    throw std::runtime_error("cannot verify unordered-map storage or default key equivalence");
+  const auto value = member(pair, "second");
+  bool opaque = false;
+  const auto field = request.field() == "value" && !record(value.type) ?
+      Member{value.type, 0} : nested_member(value.type, request.field(), opaque);
+  if (opaque)
+    throw std::runtime_error("unordered-map write capture requires a non-union value");
+  Layout result{};
+  set_field_layout(result, field.type);
+  set_map_key(result.map, key, storage.offset, request.map_key());
+  result.logical_map = true;
+  result.map.hash = true;
+  result.map.next = node_link.offset;
+  result.map.header = map.offset + table.offset + before.offset;
+  result.map.root = result.map.header + next_link.offset;
+  result.map.count = map.offset + table.offset + count.offset;
+  result.vector_object = map.offset;
+  result.scalar = storage.offset + value.offset + field.offset;
+  return result;
+}
+
 Layout inspect_map(DWARFDie owner, const clangtracer::v1::ObjectWatchRequest &request) {
   const auto map = member(owner, request.map_field());
+  if (qualified(map.type).starts_with("std::unordered_map<"))
+    return inspect_hash_map(map, request);
   if (!qualified(map.type).starts_with("std::map<"))
     throw std::runtime_error("logical map capture requires a libstdc++ map");
   const auto tree = member(map.type, "_M_t");
@@ -876,40 +1053,27 @@ Layout inspect_map(DWARFDie owner, const clangtracer::v1::ObjectWatchRequest &re
   const auto parent = member(header.type, "_M_parent");
   const auto left = member(header.type, "_M_left");
   const auto right = member(header.type, "_M_right");
-  const auto link = named_type(tree.type, "_Link_type");
-  const auto node = type(link);
   const auto pair = named_type(tree.type, "_Val");
+  const auto node = container_node(tree.type, pair, "std::_Rb_tree_node", "_Link_type");
   const auto comparator = named_type(tree.type, "_Compare");
-  if (!pointer(link) || !record(node) || !record(pair) ||
+  if (!record(node) || !record(pair) ||
       !qualified(node).starts_with("std::_Rb_tree_node<") || !qualified(pair).starts_with("std::pair<") ||
       !qualified(comparator).starts_with("std::less<") ||
       !pointer(parent.type) || !pointer(left.type) || !pointer(right.type) ||
       storage_type(count.type) != "unsigned64")
     throw std::runtime_error("cannot verify the libstdc++ map tree, comparator or node layout");
-  bool fixed_base = false;
-  for (const auto child : node.children())
-    if (child.getTag() == dw::DW_TAG_inheritance && type(child) == header.type &&
-        number(child, dw::DW_AT_data_member_location) == 0 &&
-        number(child, dw::DW_AT_virtuality).value_or(0) == 0)
-      fixed_base = true;
   const auto storage = member(node, "_M_storage");
   const auto key = member(pair, "first");
   const auto value = member(pair, "second");
   bool opaque_union = false;
-  const auto scalar = nested_member(value.type, request.field(), opaque_union);
-  if (!fixed_base || size_of(storage.type) != size_of(pair) ||
-      !qualified(key.type).starts_with("std::__cxx11::basic_string<char") ||
-      qualified(named_type(key.type, "_Traits")) != "std::char_traits<char>" ||
-      qualified(named_type(key.type, "_Alloc")) != "std::allocator<char>" ||
+  const auto scalar = request.field() == "value" && !record(value.type) ?
+      Member{value.type, 0} : nested_member(value.type, request.field(), opaque_union);
+  if (!node_has_base(node, header.type) || size_of(storage.type) != size_of(pair) ||
       qualified(named_type(comparator, "_Tp")) != qualified(key.type) ||
-      storage_type(scalar.type) != "signed32" || opaque_union)
-    throw std::runtime_error("logical map requires verified node storage, string key and int32 value");
-  const auto data = member(key.type, "_M_dataplus");
-  const auto key_pointer = member(data.type, "_M_p");
-  const auto key_length = member(key.type, "_M_string_length");
-  if (!pointer(key_pointer.type) || storage_type(key_length.type) != "unsigned64")
-    throw std::runtime_error("logical map string key layout is unverified");
+      opaque_union)
+    throw std::runtime_error("logical map requires verified node storage and non-union value");
   Layout result{};
+  set_field_layout(result, scalar.type);
   result.logical_map = true;
   result.scalar = storage.offset + value.offset + scalar.offset;
   result.vector_object = map.offset;
@@ -920,8 +1084,7 @@ Layout inspect_map(DWARFDie owner, const clangtracer::v1::ObjectWatchRequest &re
   result.map.left = left.offset;
   result.map.right = right.offset;
   result.map.parent = parent.offset;
-  result.map.key_pointer = storage.offset + key.offset + data.offset + key_pointer.offset;
-  result.map.key_length = storage.offset + key.offset + key_length.offset;
+  set_map_key(result.map, key, storage.offset, request.map_key());
   return result;
 }
 
@@ -955,8 +1118,9 @@ Layout inspect_layout(llvm::DWARFContext &dwarf,
     }
     bool opaque = false;
     const auto field = nested_member(current, request.field(), opaque);
-    if (opaque || storage_type(field.type) != "signed32")
-      throw std::runtime_error("pointee write capture requires a signed 32-bit field");
+    if (opaque)
+      throw std::runtime_error("pointee write capture requires a non-union field");
+    set_field_layout(result, field.type);
     result.scalar = field.offset;
     return result;
   }
@@ -1014,8 +1178,6 @@ Layout inspect_layout(llvm::DWARFContext &dwarf,
     if (number(scalar.type, dw::DW_AT_byte_size) != 4 ||
         backing.offset != 0 || !signed_int32(backing.type))
       throw std::runtime_error("object watch cannot verify std::atomic<int> storage");
-  } else if (!signed_int32(scalar.type)) {
-    throw std::runtime_error("object watch requires a signed 32-bit field or std::atomic<int>");
   }
   if (request.owner_type().empty()) {
     bool primary_vptr = false, virtual_member = false;
@@ -1035,6 +1197,8 @@ Layout inspect_layout(llvm::DWARFContext &dwarf,
     Layout direct{};
     direct.scalar = scalar.offset;
     direct.atomic = atomic;
+    if (!atomic)
+      set_field_layout(direct, scalar.type);
     direct.primary_rtti = primary_vptr;
     return direct;
   }
@@ -1055,6 +1219,8 @@ Layout inspect_layout(llvm::DWARFContext &dwarf,
   Layout result{};
   result.scalar = scalar.offset;
   result.atomic = atomic;
+  if (!atomic)
+    set_field_layout(result, scalar.type);
   result.base_offset = *base_offset;
   if (!request.snapshot_field().empty()) {
     const auto string = member(base, request.snapshot_field());
@@ -1600,7 +1766,8 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   if (!request.shared_file().empty() &&
       (request.backend() != Request::CODE_CACHE || request.mode() != Request::WRITES ||
        (!layout.atomic && request.synchronization() != Request::CALLER_LOCK) ||
-       layout.opaque_union || request.first_seen() || !request.borrow_caller().empty() ||
+       layout.opaque_union || layout.field_type != Layout::FieldType::int32 ||
+       request.first_seen() || !request.borrow_caller().empty() ||
        !request.owner_type().empty()))
     throw std::invalid_argument("shared-file capture requires a native atomic int or a scalar under caller-lock");
   if (!request.additional_mutation_symbols().empty() &&
@@ -1608,11 +1775,13 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     throw std::invalid_argument("multiple mutation selectors require a logical collection");
   if (request.serialize_wait_us() &&
       (request.backend() != clangtracer::v1::ObjectWatchRequest::CODE_CACHE || request.writer_tid() ||
-       layout.atomic || layout.opaque_union || layout.union_tag_offset || request.first_seen()))
+       layout.atomic || layout.opaque_union || layout.union_tag_offset || request.first_seen() ||
+       layout.field_type != Layout::FieldType::int32))
     throw std::invalid_argument("write ordering requires code-cache capture of a standalone scalar and all watched threads");
   if (request.syscall_output() &&
       (request.backend() != clangtracer::v1::ObjectWatchRequest::PTRACE || layout.atomic ||
        layout.opaque_union || layout.union_tag_offset || request.first_seen() ||
+       layout.field_type != Layout::FieldType::int32 ||
        !request.owner_type().empty() ||
        (request.synchronization() != clangtracer::v1::ObjectWatchRequest::THREAD_CONFINED &&
         request.synchronization() != clangtracer::v1::ObjectWatchRequest::CALLER_LOCK)))
@@ -1968,7 +2137,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       if (has_indirect && request.backend() == Request::PTRACE && !unclassified_bytes)
         unclassified_bytes = !is_padding(previous_end, instruction.address);
       previous_end = instruction.address + instruction.size;
-      if (!instruction.store32 || !instruction.store32->supports(layout.atomic)) {
+      if (!instruction.memory_store || !layout.watch_store(*instruction.memory_store)) {
         if (instruction.may_store && instruction.flow == native_entry::Flow::ordinary)
           ++unsupported;
         continue;
@@ -1977,11 +2146,11 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         if ((existing->second.boundary && existing->second.boundary != Boundary::writer_scope) ||
             existing->second.bytes.size() != instruction.size)
           throw std::runtime_error("store overlaps an object watch boundary");
-        existing->second.store = instruction.store32;
+        existing->second.store = instruction.memory_store;
       } else {
         sites.emplace(instruction.address,
             Site{std::string(code(instruction.address).substr(0, instruction.size)),
-                 std::nullopt, instruction.store32});
+                 std::nullopt, instruction.memory_store});
       }
       ++stores;
     }
@@ -1992,7 +2161,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       throw std::runtime_error("object watch cannot verify an indirect branch in " +
                                source(start).function + ": " + indirect->text);
     if (stores == prior_count && !request.follow_calls())
-      throw std::runtime_error("no supported 32-bit store in " + source(start).function);
+      throw std::runtime_error("no supported field-width store in " + source(start).function);
   };
   add_writer(writer_start, writer.second);
   writer_bytes = writer_ranges.front().second;
@@ -2003,6 +2172,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     if (auto *unit = image_->dwarf->getDIEsForAddress(extra.first).CompileUnit) {
       const auto other = inspect_layout(*image_->dwarf, request, unit, *lifetime.dwarf);
       if (other.scalar != layout.scalar || other.atomic != layout.atomic ||
+          other.field_type != layout.field_type || other.field_width != layout.field_width ||
           other.opaque_union != layout.opaque_union || other.union_tag_offset != layout.union_tag_offset ||
           other.union_cases != layout.union_cases)
         throw std::runtime_error("selected writers disagree on the verified field layout");
@@ -2708,9 +2878,14 @@ clangtracer::v1::ObjectWatchPlan Plan::describe(bool live) const {
   plan.set_field_offset(layout.scalar);
   for (const auto offset : layout.pointer_offsets)
     plan.add_pointee_offsets(offset);
+  constexpr const char *types[]{"signed int32", "signed integer", "unsigned integer",
+                                "boolean", "floating point"};
   plan.set_field_encoding(layout.union_tag_offset ? "tagged union" :
       layout.opaque_union ? "opaque union bytes" :
-      layout.atomic ? "libstdc++ atomic int32" : "signed int32");
+      layout.atomic ? "libstdc++ atomic int32" :
+      layout.field_type == Layout::FieldType::int32 ? "signed int32" :
+      std::string(types[static_cast<unsigned>(layout.field_type)]) + " (" +
+          std::to_string(layout.field_width) + " bytes)");
   const auto add = [&](std::uint64_t pc, std::string_view bytes, const char *role) {
     auto &binding = *plan.add_bindings();
     const auto *image = image_for(pc);
@@ -2817,8 +2992,12 @@ std::string field_path(const clangtracer::v1::ObjectWatchRequest &request, const
   const auto prefix = request.concrete_type() + "::";
   if (layout.logical_map) {
     std::ostringstream path;
-    path << prefix << request.map_field() << '[' << std::quoted(request.map_key()) << "]."
-         << request.field();
+    path << prefix << request.map_field() << '[';
+    if (layout.map.key_width)
+      path << request.map_key();
+    else
+      path << std::quoted(request.map_key());
+    path << "]." << request.field();
     return path.str();
   }
   if (layout.logical_vector)
@@ -2834,10 +3013,48 @@ std::string field_path(const clangtracer::v1::ObjectWatchRequest &request, const
 void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &layout,
                        ScalarSample old, ScalarSample next) {
   if (!layout.opaque_union) {
+    using FieldType = Layout::FieldType;
+    const auto capture = [&](std::uint64_t bits, bool before) {
+      if (layout.field_type == FieldType::int32) {
+        const auto value = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(bits));
+        if (before)
+          event.set_old_integer(value);
+        else
+          event.set_new_integer(value);
+        return;
+      }
+      auto &value = before ? *event.mutable_snapshot_before() : *event.mutable_snapshot_after();
+      switch (layout.field_type) {
+      case FieldType::signed_integer: {
+        const auto shift = 64 - layout.field_width * 8;
+        const auto shifted = std::bit_cast<std::int64_t>(bits << shift);
+        value.set_signed_value(shifted >> shift);
+        break;
+      }
+      case FieldType::unsigned_integer:
+        value.set_unsigned_value(bits);
+        break;
+      case FieldType::boolean:
+        if (bits <= 1) {
+          value.set_boolean_value(bits != 0);
+        } else {
+          value.set_bytes_value(&bits, 1);
+          event.set_diagnostic("field contains an invalid bool representation");
+        }
+        break;
+      case FieldType::real:
+        value.set_real_value(layout.field_width == 4 ?
+            std::bit_cast<float>(static_cast<std::uint32_t>(bits)) :
+            std::bit_cast<double>(bits));
+        break;
+      case FieldType::int32:
+        break;
+      }
+    };
     if (old.value)
-      event.set_old_integer(*old.value);
+      capture(*old.value, true);
     if (next.value)
-      event.set_new_integer(*next.value);
+      capture(*next.value, false);
     return;
   }
   if (!layout.union_tag_offset)
@@ -2845,6 +3062,7 @@ void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &
   const auto capture = [&](const ScalarSample &sample, bool before) {
     if (!sample.value)
       return;
+    const auto bits = static_cast<std::uint32_t>(*sample.value);
     const auto alternative = sample.tag ? layout.union_cases.find(*sample.tag) : layout.union_cases.end();
     if (sample.tag) {
       if (before)
@@ -2856,9 +3074,9 @@ void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &
       if (layout.union_tag_offset)
         event.set_diagnostic("union discriminator is unreadable or unregistered");
       if (before)
-        event.set_old_bytes(&*sample.value, sizeof(*sample.value));
+        event.set_old_bytes(&bits, sizeof(bits));
       else
-        event.set_new_bytes(&*sample.value, sizeof(*sample.value));
+        event.set_new_bytes(&bits, sizeof(bits));
       return;
     }
     const auto &[member, type] = alternative->second;
@@ -2869,13 +3087,13 @@ void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &
       event.set_new_union_member(member);
     switch (type) {
     case UnionCase::Type::signed_integer:
-      value.set_signed_value(*sample.value);
+      value.set_signed_value(std::bit_cast<std::int32_t>(bits));
       break;
     case UnionCase::Type::unsigned_integer:
-      value.set_unsigned_value(static_cast<std::uint32_t>(*sample.value));
+      value.set_unsigned_value(bits);
       break;
     case UnionCase::Type::real:
-      value.set_real_value(std::bit_cast<float>(*sample.value));
+      value.set_real_value(std::bit_cast<float>(bits));
       break;
     }
   };

@@ -413,6 +413,19 @@ Prepare from the original headers and compile command. The package contains the 
 
 Snapshot deltas describe the interval between a method's entry and return. Fields select the reported paths. The generated receiver codec reads the receiver and the pointees authorized by the preparation policy. A failed sample yields a coverage gap. A missing return yields a coverage gap when the probe retires. Set `--max-elements`, `--max-string-bytes`, `--max-depth`, `--max-snapshot-bytes`, and `--max-instances` to bound capture and observation.
 
+Choose method snapshots for changes to strings, private nested records,
+containers, variants, or registered pointees. For example, the Portfolio
+watch pairs entries by leg ID and map key and can report a leaf change such
+as `risk_["AAPL"].limits_[0]`. An added or removed map entry or keyed vector
+element includes its captured record or sequence on the corresponding side
+of the delta. Use `%events show saved --index N` to inspect the typed values,
+or `%events export saved --format json --output changes.json` to export them.
+In JSON, `snapshotBefore` and `snapshotAfter` carry recursive `children` for
+composite values, with `fieldName` on record children. The capture limits
+also apply to values replayed from SQLite.
+When no key identity is available, the watch retains both captured entry
+sequences in the coverage gap and withholds individual adds and removals.
+
 Method snapshots support up to 65,536 encoded bytes per value, 65,536 elements, and a depth of 64. The default byte and element budgets are 4,096 and the default depth is 32. The element budget is shared by the captured containers in each value. A field selection captures the selected top-level receiver members and their contents. A nested path filters which changes to report within its selected member.
 
 For method snapshots, `--max-instances` limits receivers with an outstanding sample. Completed calls release their receiver slots. The watch detects overlapping calls on a receiver and relies on the declared synchronization policy across separate invocations.
@@ -444,7 +457,9 @@ The watch validates the writer's first receiver argument and the selected libstd
 
 Repeat `--mutation` when the writer uses more than one storage-changing function. Each selected function must accept the verified container as its first argument. Native capture verifies direct calls and their return continuations. For an inlined function, the watch verifies the receiver and the control-flow edges into and out of its matching DWARF ranges. An inline instance can span disjoint ranges. With declared synchronization and value capture, `RANGE_BOUND` includes the verified value at binding. A rebind includes the prior value when it was sampled safely before suspension.
 
-Use `--map risk --map-key AAPL --field exposure.limit` to follow a nested field in a `std::map<std::string, T>` entry. Select a mutation that takes the map as its first argument. The watch verifies the libstdc++ tree and key layout from DWARF. Each verified return binds a new map generation, including when an allocator reuses an address. An absent key or a traversal that exceeds its budget yields a coverage gap. Map and vector writes require a signed 32-bit value field.
+Use `--map risk --map-key AAPL --field exposure.limit` to follow a nested field in a `std::map` entry. For `std::unordered_map<int, T>`, use a numeric key such as `--map-key "-7"`. Both containers require a verified libstdc++ layout and default key equivalence. Use `--field value` when the mapped value is itself numeric. Select a mutation such as insert, erase or rehash that takes the map as its first argument. The watch suspends the old binding and verifies the new generation on return, even when the matching node keeps its address. Rehash alone emits no field change. Missing, duplicate or unreadable keys and exhausted traversal budgets produce coverage gaps.
+
+Individual field watches can capture admitted stores to integers, booleans, enums, floats and doubles within private records, vectors, maps and pointees. Preview reports the verified encoding and the admitted writer sites. For exact writes, replay identifies the store instruction and its source line. Structural changes to containers and changes to strings, variants and `std::any` can be inspected with typed method snapshots at verified boundaries.
 
 ## Trace a Shape through Image
 

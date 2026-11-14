@@ -18,7 +18,10 @@ from run import Output, maps, read_code, read_redirects, send, stop, verify_rest
 def run(args):
     preserved = ("portfolio", "portfolio.cpp", "portfolio.hpp")
     expected = {name: hashlib.sha256((args.fixture_dir / name).read_bytes()).hexdigest() for name in preserved}
-    assert expected["portfolio"] == (args.fixture_dir / "portfolio.sha256").read_text().split()[0]
+    limit_base = 1 << 40 if args.wide else 0
+    manifest = args.fixture_dir / "portfolio.sha256"
+    if manifest.exists():
+        assert expected["portfolio"] == manifest.read_text().split()[0]
     notes = subprocess.check_output(["readelf", "--notes", args.fixture_dir / "portfolio"], text=True)
     build_id = re.search(r"Build ID: ([0-9a-f]+)", notes)
     with tempfile.TemporaryDirectory(prefix="ct-object-collection-") as directory, ExitStack() as cleanup:
@@ -40,6 +43,9 @@ def run(args):
         if args.map:
             definition = ('--field exposure.limit --map risk --map-key AAPL --code "demo::Portfolio::rebalance()" '
                           '--mutation _ZN4demo12replace_riskERSt3mapINSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEENS_4RiskESt4lessIS6_ESaISt4pairIKS6_S7_EEE')
+        if args.hash_map:
+            definition = ('--field exposure.limit --map risk --map-key "-7" --code "demo::Portfolio::rebalance()" '
+                          '--mutation "demo::replace_risk"')
         if args.gap == "missing-key":
             definition = definition.replace("--map-key AAPL", "--map-key INVALID")
         elif args.gap == "read-budget":
@@ -88,14 +94,15 @@ def run(args):
         (root / "stop.now").touch()
         assert target.wait(timeout=10) == 0
         if args.map:
-            before = app.expect(r"^before replace limit_addr=(0x[0-9a-f]+) limit=50$")
-            after = app.expect(r"^after replace limit_addr=(0x[0-9a-f]+) limit=70$")
-            write = app.expect(r"^after write limit_addr=(0x[0-9a-f]+) limit=80$")
+            before = app.expect(rf"^before replace limit_addr=(0x[0-9a-f]+) limit={limit_base + 50}$")
+            after = app.expect(rf"^after replace limit_addr=(0x[0-9a-f]+) limit={limit_base + (60 if args.hash_map else 70)}$")
+            write = app.expect(rf"^after write limit_addr=(0x[0-9a-f]+) limit={limit_base + 80}$")
         else:
             before = app.expect(r"^before reserve id=12 capacity=1 quantity_addr=(0x[0-9a-f]+) quantity=100$")
             after = app.expect(r"^after reserve id=12 capacity=2 quantity_addr=(0x[0-9a-f]+) quantity=100$")
             write = app.expect(r"^after write id=12 capacity=2 quantity_addr=(0x[0-9a-f]+) quantity=75$")
-        assert before[1] != after[1] == write[1]
+        assert after[1] == write[1]
+        assert (before[1] == after[1]) == args.hash_map
         send(control, "%events open collection.db --as saved")
         out.expect(rf"^opened events={count} retained={count} evicted=0$")
         send(control, "%events export saved --format json --output collection.json")
@@ -123,6 +130,8 @@ def run(args):
         assert observations[-1]["closureReason"] == "METHOD_RETURN"
         first_generation_rows = 3 if args.map else 2
         path = 'demo::Portfolio::risk["AAPL"].exposure.limit' if args.map else "demo::Portfolio::legs[id=12].quantity"
+        if args.hash_map:
+            path = "demo::Portfolio::risk[-7].exposure.limit"
         addresses = [before[1]] * first_generation_rows + [after[1]] * 2
         generations = [1] * first_generation_rows + [2, 2]
         for item, address, generation in zip(observations[1:-1], addresses, generations):
@@ -131,20 +140,28 @@ def run(args):
             assert item["field"] == path, item
         writes = [(2, 50, 60, "before = 60;"), (5, 70, 80, "after = 80;")] if args.map else [
             (4, 100, 75, "legs.at(0).quantity = 75;")]
+        if args.hash_map:
+            writes[1] = (5, 60, 80, "after = 80;")
         source = (root / "portfolio.cpp").read_text().splitlines()
         for position, old, new, statement in writes:
             change = observations[position]
-            assert (change["oldInteger"], change["newInteger"]) == (old, new), change
+            if args.wide:
+                assert change["snapshotBefore"]["unsignedValue"] == str(limit_base + old), change
+                assert change["snapshotAfter"]["unsignedValue"] == str(limit_base + new), change
+            else:
+                assert (change["oldInteger"], change["newInteger"]) == (old, new), change
             if build_id:
                 assert change["moduleBuildId"] == build_id[1], change
             else:
                 assert change["moduleSha256"] == expected["portfolio"], change
             assert change["locationKind"] == "STORE", change
-            source_line = next(index for index, line in enumerate(source, 1) if statement in line)
+            alternatives = (statement, statement.replace(" = ", " = limit_base + "))
+            source_line = next(index for index, line in enumerate(source, 1)
+                               if any(candidate in line for candidate in alternatives))
             assert change["line"] == source_line and change["file"].endswith("portfolio.cpp"), change
             stack = events[position]["stack"]
             assert stack["status"] == "PARTIAL" and stack["frames"][0]["pc"] == change["pc"], change
-            print(f"captured {old} -> {new} at line {source_line}")
+            print(f"captured {limit_base + old} -> {limit_base + new} at line {source_line}")
         print(f"verified unchanged Portfolio sha256={expected['portfolio']}")
         print(f"generation 1 {before[1]} -> suspended -> generation 2 {after[1]}")
         print(f"backend={args.backend} restored {len(sites)} store sites and {len(redirects)} redirects")
@@ -156,10 +173,12 @@ def main():
         parser.add_argument(name, type=lambda value: Path(value).resolve())
     parser.add_argument("--backend", choices=("ptrace", "code-cache"), default="ptrace")
     parser.add_argument("--map", action="store_true", help="verify map node replacement and nested field writes")
+    parser.add_argument("--wide", action="store_true", help="expect the unsigned 64-bit map fixture")
+    parser.add_argument("--hash-map", action="store_true", help="verify rehash with an integral key")
     parser.add_argument("--gap", choices=("missing-key", "read-budget"))
     args = parser.parse_args()
-    if args.gap and not args.map:
-        parser.error("--gap requires --map")
+    if (args.gap or args.wide or args.hash_map) and not args.map:
+        parser.error("--gap, --wide and --hash-map require --map")
     run(args)
 
 

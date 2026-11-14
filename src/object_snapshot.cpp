@@ -433,6 +433,27 @@ std::optional<std::string> delta_scalar(const EventValue &value) {
   return std::nullopt;
 }
 
+bool valid_utf8(std::string_view text) {
+  for (std::size_t index = 0; index < text.size();) {
+    const auto lead = static_cast<unsigned char>(text[index++]);
+    if (lead < 0x80)
+      continue;
+    if (lead < 0xc2 || lead > 0xf4)
+      return false;
+    const std::size_t count = lead < 0xe0 ? 1 : lead < 0xf0 ? 2 : 3;
+    if (count > text.size() - index)
+      return false;
+    const auto next = static_cast<unsigned char>(text[index]);
+    if ((lead == 0xe0 && next < 0xa0) || (lead == 0xed && next >= 0xa0) ||
+        (lead == 0xf0 && next < 0x90) || (lead == 0xf4 && next >= 0x90))
+      return false;
+    for (std::size_t i = 0; i < count; ++i)
+      if ((static_cast<unsigned char>(text[index++]) & 0xc0) != 0x80)
+        return false;
+  }
+  return true;
+}
+
 class ReceiverDelta {
   using Array = EventValue::Array;
   using KeyIndex = std::map<std::string, std::size_t>;
@@ -442,15 +463,21 @@ class ReceiverDelta {
   void change(const std::string &path, std::string detail,
               const EventValue *before = nullptr, const EventValue *after = nullptr) {
     SnapshotChange change{path, std::move(detail), false};
-    if (before && delta_scalar(*before))
+    if (before)
       change.before = *before;
-    if (after && delta_scalar(*after))
+    if (after)
       change.after = *after;
     changes_.push_back(std::move(change));
   }
 
-  void gap(const std::string &path, std::string_view reason) {
-    changes_.push_back({path, std::string(reason), true});
+  void gap(const std::string &path, std::string_view reason,
+           const EventValue *before = nullptr, const EventValue *after = nullptr) {
+    SnapshotChange change{path, std::string(reason), true};
+    if (before)
+      change.before = *before;
+    if (after)
+      change.after = *after;
+    changes_.push_back(std::move(change));
   }
 
   static std::optional<KeyIndex> index(const Array &items, const std::string &member,
@@ -470,12 +497,14 @@ class ReceiverDelta {
     return result;
   }
 
-  void array(const std::string &path, const Array &before, const Array &after,
+  void array(const std::string &path, const EventValue &old, const EventValue &next,
              bool associative) {
+    const auto &before = old.elements();
+    const auto &after = next.elements();
     const auto policy = keys_.find(path);
     if (policy == keys_.end()) {
       if (associative) {
-        gap(path, "key identity policy unavailable");
+        gap(path, "key identity policy unavailable", &old, &next);
         return;
       }
       for (std::size_t i = 0; i < std::min(before.size(), after.size()); ++i)
@@ -487,13 +516,13 @@ class ReceiverDelta {
     }
     const auto &member = policy->second;
     if (associative && member != "key") {
-      gap(path, "associative identity must select key");
+      gap(path, "associative identity must select key", &old, &next);
       return;
     }
     const auto old_index = index(before, member, associative);
     const auto new_index = index(after, member, associative);
     if (!old_index || !new_index) {
-      gap(path, "identity missing, unsupported, or duplicate");
+      gap(path, "identity missing, unsupported, or duplicate", &old, &next);
       return;
     }
     const auto member_path = [&](const std::string &key) {
@@ -587,15 +616,14 @@ class ReceiverDelta {
         return;
       }
     }
-    if (const auto *old = std::get_if<Array>(&before.data())) {
-      if (const auto *next = std::get_if<Array>(&after.data())) {
-        const auto &role = before.container_role();
-        if (role != after.container_role())
-          gap(path, "incompatible container roles");
-        else
-          array(path, *old, *next, role == "map" || role == "unordered_map");
-        return;
-      }
+    if (std::holds_alternative<Array>(before.data()) &&
+        std::holds_alternative<Array>(after.data())) {
+      const auto &role = before.container_role();
+      if (role != after.container_role())
+        gap(path, "incompatible container roles");
+      else
+        array(path, before, after, role == "map" || role == "unordered_map");
+      return;
     }
     const auto old = delta_scalar(before), next = delta_scalar(after);
     if (old && next) {
@@ -688,6 +716,41 @@ std::vector<SnapshotChange> compare_snapshots(const Snapshot &before, const Snap
 
 void validate_snapshot_keys(const std::vector<std::string> &keys) {
   (void)ReceiverDelta(keys);
+}
+
+void encode_observation_value(const EventValue &value,
+    clangtracer::v1::ObjectObservation::SnapshotValue &output) {
+  const auto &data = value.data();
+  if (value.is_null()) {
+    output.set_null_value(true);
+  } else if (const auto *boolean = std::get_if<bool>(&data)) {
+    output.set_boolean_value(*boolean);
+  } else if (const auto *integer = std::get_if<std::int64_t>(&data)) {
+    output.set_signed_value(*integer);
+  } else if (const auto *integer = std::get_if<std::uint64_t>(&data)) {
+    output.set_unsigned_value(*integer);
+  } else if (const auto *real = std::get_if<double>(&data)) {
+    output.set_real_value(*real);
+  } else if (const auto *text = std::get_if<std::string>(&data)) {
+    if (valid_utf8(*text))
+      output.set_string_value(*text);
+    else
+      output.set_bytes_value(*text);
+  } else if (const auto *record = std::get_if<EventValue::Object>(&data)) {
+    output.set_cpp_type(value.cpp_type());
+    output.set_composite_kind(clangtracer::v1::ObjectObservation::SnapshotValue::RECORD);
+    for (const auto &[name, field] : *record) {
+      auto &child = *output.add_children();
+      child.set_field_name(name);
+      encode_observation_value(field, child);
+    }
+  } else {
+    output.set_cpp_type(value.cpp_type());
+    output.set_container_role(value.container_role());
+    output.set_composite_kind(clangtracer::v1::ObjectObservation::SnapshotValue::SEQUENCE);
+    for (const auto &element : std::get<EventValue::Array>(data))
+      encode_observation_value(element, *output.add_children());
+  }
 }
 
 // The native REPL JIT needs a stable destructor for snapshot temporaries.

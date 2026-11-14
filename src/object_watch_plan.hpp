@@ -47,8 +47,11 @@ struct UnionCase {
   bool operator==(const UnionCase &) const = default;
 };
 struct Layout {
+  enum class FieldType { int32, signed_integer, unsigned_integer, boolean, real };
   std::uint64_t scalar, string_pointer, string_length;
   std::uint64_t vector_begin, vector_end, vector_capacity, stride, pointee;
+  FieldType field_type = FieldType::int32;
+  unsigned field_width = 4;
   bool atomic = false;
   bool opaque_union = false;
   std::optional<std::uint64_t> union_tag_offset;
@@ -61,6 +64,10 @@ struct Layout {
   bool logical_collection() const { return logical_vector || logical_map || !pointer_offsets.empty(); }
   bool primary_rtti = false;
   std::uint64_t base_offset = 0;
+  bool watch_store(const native_entry::ScalarStore &store) const {
+    return store.supports(atomic) && (!atomic || !store.reads_memory_value()) &&
+           store.width == field_width;
+  }
 };
 
 class Plan {
@@ -142,7 +149,7 @@ std::string compare_prepared(const clangtracer::v1::ObjectWatchPlan &prepared,
                              const clangtracer::v1::ObjectWatchPlan &live, bool no_values);
 std::string field_path(const clangtracer::v1::ObjectWatchRequest &request, const Layout &layout);
 struct ScalarSample {
-  std::optional<std::int32_t> value;
+  std::optional<std::uint64_t> value;
   std::optional<std::uint32_t> tag;
 };
 void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &layout,

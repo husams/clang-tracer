@@ -86,6 +86,7 @@ inline void instrument_store(Instruction &out, const native_entry::ScalarStore &
   out.scale = store.scale;
   out.displacement = store.displacement;
   out.immediate = store.immediate.value_or(0);
+  out.sample_store_memory = store.reads_memory_value();
 }
 
 template <typename Transform>
