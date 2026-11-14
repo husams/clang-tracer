@@ -428,6 +428,21 @@ function(tracer_add_native_repl)
         set_tests_properties(${_pointee_test} PROPERTIES TIMEOUT 180)
       endforeach()
       if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+        add_executable(repl-object-structural-target tests/fixtures/object_structural.cpp)
+        set_target_properties(repl-object-structural-target PROPERTIES CXX_STANDARD 17
+          INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_compile_options(repl-object-structural-target PRIVATE -g -O2 -fPIE
+          -fno-omit-frame-pointer ${_object_test_arch_flags})
+        target_link_options(repl-object-structural-target PRIVATE -pie "LINKER:--build-id=sha1")
+        foreach(_backend ptrace code-cache)
+          set(_test "native_repl_object_structural_${_backend}")
+          add_test(NAME ${_test}
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_structural.py"
+              $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+              $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-structural-target>
+              --backend ${_backend})
+          set_tests_properties(${_test} PROPERTIES TIMEOUT 120)
+        endforeach()
         set(_map_fixture_source "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/object_map")
         foreach(_map_kind ordered hash)
           set(_map_target "repl-object-${_map_kind}-map-target")
@@ -454,6 +469,11 @@ function(tracer_add_native_repl)
                 $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
                 $<TARGET_FILE:${_object_cache_agent}> "${_map_dir}" ${_map_options} --backend ${_backend})
             set_tests_properties(${_map_test} PROPERTIES TIMEOUT 120)
+            add_test(NAME ${_map_test}_logical
+              COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_vector.py"
+                $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+                $<TARGET_FILE:${_object_cache_agent}> "${_map_dir}" ${_map_options} --backend ${_backend} --logical)
+            set_tests_properties(${_map_test}_logical PROPERTIES TIMEOUT 120)
           endforeach()
         endforeach()
       endif()

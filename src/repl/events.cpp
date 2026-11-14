@@ -420,6 +420,20 @@ std::string event_summary(const api::TraceEvent &event) {
       out << " slot=" << object.owner_index();
     if (!object.field().empty())
       out << " " << object.field();
+    if (object.has_logical_update()) {
+      const auto &update = object.logical_update();
+      out << ' ' << api::ObjectObservation::LogicalUpdate::Change_Name(update.change());
+      if (!update.mutation().empty())
+        out << " mutation=" << std::quoted(update.mutation());
+      if (update.has_before_index())
+        out << " before_index=" << update.before_index();
+      if (update.has_after_index())
+        out << " after_index=" << update.after_index();
+      if (update.has_before_size())
+        out << " before_size=" << update.before_size();
+      if (update.has_after_size())
+        out << " after_size=" << update.after_size();
+    }
     if (object.has_old_integer())
       out << " " << object.old_integer() << " ->";
     else if (object.kind() == api::ObjectObservation::FIELD_CHANGED && object.has_new_integer())

@@ -1733,8 +1733,8 @@ bool Controller::execute(const Command &command) {
     api::ObjectWatchRequest request;
     if (defining) {
       const auto mode = command.option("--mode", command.has("--on") ? "snapshots" : "");
-      if (!mode.empty() && mode != "writes" && mode != "snapshots")
-        throw std::invalid_argument("--mode must be writes or snapshots");
+      if (!mode.empty() && mode != "writes" && mode != "snapshots" && mode != "logical-writes")
+        throw std::invalid_argument("--mode must be writes, logical-writes or snapshots");
       if (command.has("--plan")) {
         for (const auto &[option, values] : command.options)
           if (option != "--plan" && option != "--mode" && option != "--stack-depth" &&
@@ -1767,7 +1767,9 @@ bool Controller::execute(const Command &command) {
         }
         if (command.has("--no-values"))
           request.set_no_values(true);
-        if (!mode.empty() && (mode == "snapshots") != (request.mode() == api::ObjectWatchRequest::SNAPSHOTS))
+        if (!mode.empty() &&
+            ((mode == "snapshots") != (request.mode() == api::ObjectWatchRequest::SNAPSHOTS) ||
+             (mode == "logical-writes") != request.logical_updates()))
           throw std::invalid_argument("the requested mode does not match the saved object package");
       } else {
         if (!args.empty() && command.has("--type"))
@@ -1817,6 +1819,7 @@ bool Controller::execute(const Command &command) {
         request.set_code_module(command.option("--module"));
         request.set_borrow_caller(command.option("--caller"));
         request.set_no_values(command.has("--no-values"));
+        request.set_logical_updates(mode == "logical-writes");
         request.set_first_seen(command.has("--first-seen") || command.has("--vector") ||
                                command.has("--map") || command.has("--pointee"));
         request.set_writer_entry(command.has("--writer-entry"));

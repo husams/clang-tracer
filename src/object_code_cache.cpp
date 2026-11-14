@@ -68,7 +68,7 @@ struct SharedFile {
 }
 
 std::uintptr_t load_agent(injector::Process &process, const std::string &path) {
-  constexpr char export_name[] = "tracer_agent_object_cache_v35";
+  constexpr char export_name[] = "tracer_agent_object_cache_v36";
   const auto size = std::max(path.size() + 1, sizeof(export_name));
   const auto memory = process.remote_allocate(size);
   std::uintptr_t entry = 0;
@@ -635,7 +635,7 @@ struct Watch::Impl {
       sources.emplace(function.front().pc, plan.source(function.front().pc));
       for (const auto &inst : function)
         if (inst.hook != Hook::none || inst.collection_resume || inst.inline_mutation_entry) {
-          sources.emplace(inst.pc, plan.source(inst.pc));
+          sources.emplace(inst.continuation_pc(), plan.source(inst.continuation_pc()));
           if (inst.boundary_pc)
             sources.emplace(inst.boundary_pc, plan.source(inst.boundary_pc));
         }
@@ -902,10 +902,12 @@ struct Watch::Impl {
           if (patch != functions.end()) {
             patch->front().collection_resume = true;
             patch->front().boundary_pc = pc;
+            patch->front().destroys_collection = plan.destruction_mutations.count(pc) != 0;
           } else {
             auto continuation = instruction(next);
             continuation.collection_resume = true;
             continuation.boundary_pc = pc;
+            continuation.destroys_collection = plan.destruction_mutations.count(pc) != 0;
             add_fragment({continuation}, false);
           }
         }
@@ -1357,15 +1359,50 @@ struct Watch::Impl {
       if (!tail.empty() && tail.back().pc + tail.back().size - next <= 18 &&
           !overlaps_fragment(next, tail.back().pc + tail.back().size)) {
         tail.front().boundary_pc = boundary;
+        tail.front().destroys_collection = plan.destruction_mutations.count(boundary) != 0;
         tail.back().hook = Hook::collection_end;
         covered_returns.insert(tail.back().pc);
         add(std::move(tail), true);
         return;
       }
       auto continuation = straight_fragment(plan, writer_body, next, Hook::collection_resume, false, true);
+      if (continuation.empty() && plan.mutation_selectors.count(boundary) &&
+          !plan.inline_mutations.count(boundary)) {
+        // A neighboring direct CALL can host the hook if the short prefix
+        // between the actual return and that call cannot modify the sample.
+        // Preserve the following call's hardware return address on both stacks.
+        auto call = std::lower_bound(std::begin(writer_body.instructions), std::end(writer_body.instructions), next,
+            [](const auto &inst, Address pc) { return inst.address < pc; });
+        auto expected = next;
+        for (; call != std::end(writer_body.instructions) && call->address == expected &&
+               expected - next < direct_call_width && call->flow == NativeFlow::ordinary &&
+               call->falls_through && call->cache_copyable && !call->may_store &&
+               !call->changes_stack; ++call)
+          expected += call->size;
+        if (call != std::end(writer_body.instructions) && call->address == expected &&
+            call->flow == NativeFlow::call && call->size == direct_call_width && call->target &&
+            !overlaps_fragment(next, expected + call->size)) {
+          const auto bytes = plan.code(expected).substr(0, call->size);
+          if (!bytes.empty() && bytes.front() == '\xe8') {
+            Instruction route;
+            route.pc = expected;
+            route.size = call->size;
+            route.target = *call->target;
+            route.flow = Flow::runtime_call;
+            route.collection_resume = true;
+            route.collection_return = next;
+            route.boundary_pc = boundary;
+            route.destroys_collection = plan.destruction_mutations.count(boundary) != 0;
+            std::memcpy(route.bytes.data(), bytes.data(), call->size);
+            add({route}, true);
+            return;
+          }
+        }
+      }
       if (continuation.empty())
         throw std::runtime_error("collection mutation has no safe native return continuation");
       continuation.front().boundary_pc = boundary;
+      continuation.front().destroys_collection = plan.destruction_mutations.count(boundary) != 0;
       add(std::move(continuation), false);
     };
     for (const auto &[entry, mutation] : plan.inline_mutations) {
@@ -1445,7 +1482,7 @@ struct Watch::Impl {
       admitted_stores += std::ranges::count_if(fragment, [](const auto &inst) {
         return writer(inst.hook);
       });
-    if (!admitted_stores)
+    if (!admitted_stores && !request.logical_updates())
       throw std::runtime_error("no independently patchable native collection store");
     plan.unsupported += plan.stores - admitted_stores;
   }
@@ -1503,6 +1540,8 @@ struct Watch::Impl {
       item.set_kind(Observation::RANGE_BOUND);
     else if (sample.hook == Hook::collection_suspend)
       item.set_kind(Observation::RANGE_SUSPENDED);
+    else if (sample.hook == Hook::collection_update)
+      item.set_kind(Observation::LOGICAL_UPDATE);
     else if (sample.hook == Hook::collection_end || sample.hook == Hook::lifetime_reused)
       item.set_kind(Observation::OBSERVATION_ENDED);
     else if (sample.hook == Hook::collection_gap || sample.hook == Hook::async_gap ||
@@ -1540,6 +1579,16 @@ struct Watch::Impl {
     const bool store = writer(sample.hook) || sample.hook == Hook::store_fault ||
                        sample.hook == Hook::post_store_signal || sample.hook == Hook::scope_signal;
     item.set_location_kind(store ? Observation::STORE : Observation::ENTRY_ANCHOR);
+    if (sample.hook == Hook::collection_update) {
+      item.set_location_kind(Observation::CALL_BOUNDARY);
+      item.set_field(object_watch::field_path(request, plan.layout));
+      item.set_destination(sample.destination);
+      object_watch::set_logical_update(item, plan.layout, sample.logical_before,
+                                       sample.logical_after, sample.logical_change);
+      if (const auto selector = plan.mutation_selectors.find(sample.logical_boundary);
+          selector != plan.mutation_selectors.end())
+        item.mutable_logical_update()->set_mutation(selector->second);
+    }
     if (sample.hook == Hook::construction_aborted) {
       item.set_closure_reason(Observation::UNWOUND);
       item.set_diagnostic("constructor unwound without a verified return");
@@ -2014,6 +2063,7 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
         p.request.element_key(), p.request.max_elements(),
         p.request.max_instances() ? p.request.max_instances() : 1024};
     init.collection.is_map = layout.logical_map;
+    init.collection.logical_updates = p.request.logical_updates();
     init.collection.pointer_hops = layout.pointer_offsets.size();
     std::copy(layout.pointer_offsets.begin(), layout.pointer_offsets.end(),
               init.collection.pointer_offsets.begin());
@@ -2128,7 +2178,9 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
         continue;
       }
       const bool entry = p.entry_windows.count(caller);
-      if (entry) {
+      if (p.functions[index].front().collection_return) {
+        bytes[0] = '\xe8';
+      } else if (entry) {
         bytes.assign(bytes.size(), '\x90');
         bytes[0] = '\xe9';
       }
