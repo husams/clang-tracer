@@ -4,12 +4,16 @@
 #include <utility>
 #include <vector>
 
+#include "context_prepared_adapter.hpp"
+
 namespace clang { class ASTUnit; }
 
 namespace tracer {
 struct ContextHookParseCopy {
   std::string source;
   std::string error;
+  // The input region translated into `source`; size 0 when none was given.
+  PreparedAdapterRegion prepared_adapter;
 };
 
 // Speculative parser pass for optional state shorthand. The supplied source is
@@ -17,7 +21,8 @@ struct ContextHookParseCopy {
 // placeholder bindings are replaced by generate_context_hooks().
 ContextHookParseCopy prepare_context_hook_parse_copy(
     const std::string &source, const std::vector<std::string> &compiler_arguments,
-    const std::string &file_name = "context-hook-input.cc");
+    const std::string &file_name = "context-hook-input.cc",
+    const PreparedAdapterRegion &prepared_adapter = {});
 
 struct GeneratedContextHook {
   std::string type;
