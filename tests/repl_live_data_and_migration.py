@@ -74,7 +74,11 @@ DATA_MAIN = r"""
 #include <cstdio>
 #include <iostream>
 #include <string>
+#include <poll.h>
+#include <sys/prctl.h>
+#include <unistd.h>
 int main() {
+  if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)) return 1;
   using namespace example;
   g_primary_cache = std::make_shared<Cache>();
   secondary_cache = std::make_shared<Cache>();
@@ -82,7 +86,13 @@ int main() {
   accounts = {std::make_shared<Account>(2), std::make_shared<Account>(3)};
   auto unowned = std::make_unique<Account>(7);
   std::cout << "ready" << std::endl;
-  for (std::string input; std::getline(std::cin, input);) {
+  for (std::string input;;) {
+    usleep(2000);
+    pollfd ready{STDIN_FILENO, POLLIN, 0};
+    if (poll(&ready, 1, 0) <= 0)
+      continue;
+    if (!std::getline(std::cin, input))
+      break;
     if (input == "addresses") {
       std::printf("known cache=0x%lx account=0x%lx unowned=0x%lx\n",
           reinterpret_cast<unsigned long>(g_primary_cache.get()),
@@ -130,6 +140,9 @@ MANAGED_MAIN = r"""
 #include <cstdio>
 #include <iostream>
 #include <string>
+#include <poll.h>
+#include <sys/prctl.h>
+#include <unistd.h>
 namespace managed = tracer::live::managed;
 using namespace fixture;
 managed::Registry registry;
@@ -137,6 +150,7 @@ extern "C" managed::Registry* clang_tracer_managed_registry_v1() noexcept { retu
 extern "C" void fixture_hook_observe(int) {}
 
 int main() {
+  if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)) return 1;
   managed::InstanceId ids[3];
   {
     auto access = registry.access();
@@ -152,7 +166,13 @@ int main() {
       ids[i] = access.create("Cache", &seeds[i]);
   }
   std::cout << "ready" << std::endl;
-  for (std::string command; std::getline(std::cin, command);) {
+  for (std::string command;;) {
+    usleep(2000);
+    pollfd ready{STDIN_FILENO, POLLIN, 0};
+    if (poll(&ready, 1, 0) <= 0)
+      continue;
+    if (!std::getline(std::cin, command))
+      break;
     auto access = registry.access();
     for (auto id : ids) {
       if (command == "old")

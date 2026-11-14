@@ -6,6 +6,8 @@
 #include <memory>
 #include <stdexcept>
 
+#include <poll.h>
+#include <unistd.h>
 #include <sys/prctl.h>
 
 namespace {
@@ -107,7 +109,13 @@ int main() {
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
   std::puts("ready");
   char line[64];
-  while (std::fgets(line, sizeof(line), stdin)) {
+  for (;;) {
+    usleep(2000);
+    pollfd ready{STDIN_FILENO, POLLIN, 0};
+    if (poll(&ready, 1, 0) <= 0)
+      continue;
+    if (!std::fgets(line, sizeof(line), stdin))
+      break;
     int id = 0;
     switch (line[0]) {
     case 'l': {
