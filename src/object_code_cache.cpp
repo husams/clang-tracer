@@ -69,7 +69,7 @@ struct SharedFile {
 }
 
 std::uintptr_t load_agent(injector::Process &process, const std::string &path) {
-  constexpr char export_name[] = "tracer_agent_object_cache_v34";
+  constexpr char export_name[] = "tracer_agent_object_cache_v35";
   const auto size = std::max(path.size() + 1, sizeof(export_name));
   const auto memory = process.remote_allocate(size);
   std::uintptr_t entry = 0;
@@ -295,11 +295,15 @@ std::vector<Instruction> straight_fragment(const object_watch::Plan &plan,
       copy.target = *inst.target;
     }
     copy.collection_resume = inst.address == start && hook == Hook::collection_resume;
-    if (inst.address == start && hook != Hook::none && !copy.collection_resume)
+    if (inst.address == start && hook == Hook::collection_enter)
+      copy.scope_entry = true;
+    else if (inst.address == start && hook != Hook::none && !copy.collection_resume)
       copy.hook = hook;
-    else if (const auto store = plan.sites.find(inst.address);
-             store != plan.sites.end() && store->second.store)
-      instrument_store(copy, *store->second.store);
+    if (copy.hook == Hook::none) {
+      const auto store = plan.sites.find(inst.address);
+      if (store != plan.sites.end() && store->second.store)
+        instrument_store(copy, *store->second.store);
+    }
     next += inst.size;
     if ((exit && !terminal) || tail)
       break;
@@ -1391,13 +1395,16 @@ struct Watch::Impl {
         add_continuation(next, pc);
     }
     for (const auto &ret : writer_body.instructions) {
-      if (ret.flow != NativeFlow::returns || covered_returns.count(ret.address))
+      const bool tail = ret.flow == NativeFlow::branch && !ret.falls_through && ret.target &&
+          (*ret.target < plan.writer_start || *ret.target - plan.writer_start >= plan.writer_bytes.size());
+      if ((ret.flow != NativeFlow::returns && !tail) || covered_returns.count(ret.address))
         continue;
       std::vector<Instruction> fragment;
       for (const NativeInstruction &candidate : writer_body.instructions) {
-        if (candidate.address >= ret.address || ret.address + ret.size - candidate.address > 18)
+        if (candidate.address > ret.address || ret.address + ret.size - candidate.address > 18)
           continue;
-        auto trial = straight_fragment(plan, writer_body, candidate.address, Hook::none, true);
+        auto trial = straight_fragment(plan, writer_body, candidate.address, Hook::none, !tail,
+                                       false, tail ? ret.target : std::nullopt);
         if (!trial.empty() && trial.back().pc == ret.address &&
             !overlaps_fragment(trial.front().pc, ret.address + ret.size))
           fragment = std::move(trial);
@@ -1415,7 +1422,26 @@ struct Watch::Impl {
           }))
         continue;
       auto fragment = straight_fragment(plan, writer_body, pc, Hook::none);
-      if (fragment.empty() || overlaps_fragment(pc, fragment.back().pc + fragment.back().size))
+      if (fragment.empty() || overlaps_fragment(pc, fragment.back().pc + fragment.back().size)) {
+        // A short store immediately before a call cannot host a five-byte
+        // jump. Include its verified straight-line predecessor when that
+        // window still leaves the call and all incoming edges intact.
+        const auto store = std::lower_bound(writer_body.instructions.begin(), writer_body.instructions.end(), pc,
+            [](const auto &instruction, auto address) { return instruction.address < address; });
+        for (auto prior = std::make_reverse_iterator(store); prior != writer_body.instructions.rend(); ++prior) {
+          if (pc - prior->address > 14)
+            break;
+          const auto width = pc - prior->address + site.bytes.size();
+          auto candidate = straight_fragment(plan, writer_body, prior->address, Hook::none,
+                                             false, false, {}, false, std::max<std::size_t>(5, width));
+          if (!candidate.empty() &&
+              !overlaps_fragment(candidate.front().pc, candidate.back().pc + candidate.back().size)) {
+            fragment = std::move(candidate);
+            break;
+          }
+        }
+      }
+      if (fragment.empty() || overlaps_fragment(fragment.front().pc, fragment.back().pc + fragment.back().size))
         continue;
       add(std::move(fragment), false);
     }
@@ -1609,7 +1635,8 @@ struct Watch::Impl {
       if (sample.gap == 2)
         item.set_diagnostic("field changed between observed stores; old value unavailable");
       else if (sample.gap == 3)
-        item.set_diagnostic("read-modify-write values could not be verified");
+        item.set_diagnostic(sample.hook == Hook::rmw ? "read-modify-write values could not be verified" :
+                                                     "store values could not be verified");
       else
         item.set_diagnostic(request.serialize_wait_us() ? "observed write ordering unavailable" :
                             "overlapping observed writes; old value unavailable");
@@ -1967,6 +1994,7 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
     throw std::runtime_error("code-cache event channel path is too long");
   std::memcpy(init.path, p.path.c_str(), p.path.size() + 1);
   init.scalar = p.plan.layout.scalar;
+  init.field_width = p.plan.layout.field_width;
   init.tagged_union = p.plan.layout.union_tag_offset.has_value();
   init.union_tag_offset = p.plan.layout.union_tag_offset.value_or(0);
   init.receiver_typeinfo = p.plan.layout.primary_rtti || !p.request.owner_type().empty() ?

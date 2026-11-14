@@ -32,13 +32,24 @@ struct MoveBomb {
 struct Registered {
   int value;
 };
+class Risk {
+  std::string label_;
+  std::vector<int> limits_;
+
+public:
+  Risk(std::string label, std::vector<int> limits);
+  void raise_limit() { limits_.at(0) = 60; }
+};
 class State {
   std::vector<std::unique_ptr<int>> items_;
   std::vector<int> large_ = std::vector<int>(4300, 21);
   std::vector<int> unselected_ = std::vector<int>(40000, 99);
   std::vector<std::vector<int>> nested_{{3, 4}, {7, 8}};
   std::map<int, int> map_{{7, 10}, {9, 20}};
+  std::map<std::string, Risk> risk_{
+      {"AAPL", Risk("equity", {50})}, {"OLD", Risk("retired", {10, 20})}};
   std::unordered_map<int, int> hash_{{1, 10}, {2, 20}, {3, 30}};
+  std::unordered_map<int, int> unmatched_{{4, 40}, {5, 50}};
   std::variant<int, int, MoveBomb> note_{std::in_place_index<0>, 5};
   std::any extension_{Registered{12}};
   Secondary *child_;

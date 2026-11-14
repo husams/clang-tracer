@@ -24,6 +24,10 @@ struct ScalarStore {
   std::optional<std::uint32_t> immediate;
   std::string result_register; // Previous value returned by an AArch64 LSE operation.
   bool locked = false;
+  unsigned width = 4;
+  bool reads_memory_value() const {
+    return kind == Kind::move && value_register.empty() && !immediate;
+  }
 
   bool supports(bool atomic) const {
     return kind == Kind::move || (kind == Kind::rmw ? atomic == locked : atomic);
@@ -38,7 +42,7 @@ struct Instruction {
   std::optional<std::uint64_t> target;
   bool falls_through;
   bool may_store;
-  std::optional<ScalarStore> store32;
+  std::optional<ScalarStore> memory_store;
   bool cache_copyable;
   bool changes_receiver;
   bool changes_stack;

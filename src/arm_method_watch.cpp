@@ -65,15 +65,6 @@ struct Redirect {
   Address gateway = 0;
 };
 
-void encode_value(const tracer_repl::EventValue &value, api::ObjectObservation::SnapshotValue &output) {
-  const auto &data = value.data();
-  if (value.is_null()) output.set_null_value(true);
-  else if (const auto *v = std::get_if<bool>(&data)) output.set_boolean_value(*v);
-  else if (const auto *v = std::get_if<std::int64_t>(&data)) output.set_signed_value(*v);
-  else if (const auto *v = std::get_if<std::uint64_t>(&data)) output.set_unsigned_value(*v);
-  else if (const auto *v = std::get_if<double>(&data)) output.set_real_value(*v);
-  else if (const auto *v = std::get_if<std::string>(&data)) output.set_string_value(*v);
-}
 }
 
 struct MethodWatch::Impl {
@@ -216,8 +207,10 @@ struct MethodWatch::Impl {
     observation.set_diagnostic(change.detail);
     observation.set_closure_reason(reason);
     observation.set_synchronization(request.synchronization());
-    if (change.before) encode_value(*change.before, *observation.mutable_snapshot_before());
-    if (change.after) encode_value(*change.after, *observation.mutable_snapshot_after());
+    if (change.before)
+      tracer_repl::encode_observation_value(*change.before, *observation.mutable_snapshot_before());
+    if (change.after)
+      tracer_repl::encode_observation_value(*change.after, *observation.mutable_snapshot_after());
     if (captured && captured->frames_size())
       *event.mutable_stack() = *captured;
     report.set_observations(report.observations() + 1);
