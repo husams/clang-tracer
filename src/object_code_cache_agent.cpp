@@ -2221,6 +2221,7 @@ void fault(int sig, siginfo_t *info, void *context) {
   auto &sp = registers[REG_RSP];
 #endif
   const auto interrupted = static_cast<Address>(pc);
+  const auto interrupted_sp = sp;
   const bool async = info->si_code <= 0 || !synchronous_fault_signal(sig);
   const auto selected = [&](const State &watch) {
     return !async || (watch.async_signals & (1ULL << (sig - 1)));
@@ -2392,22 +2393,30 @@ void fault(int sig, siginfo_t *info, void *context) {
     }
   }
   const auto &previous = previous_actions[sig];
-  if (previous.sa_handler == SIG_DFL) {
-    // Re-execute the unchanged original instruction so the kernel delivers
-    // the default action and original PC. For a raised signal, re-raise it.
-    ::sigaction(sig, &previous, nullptr);
+  if (previous.sa_handler == SIG_DFL || previous.sa_handler == SIG_IGN) {
+    if (previous.sa_handler == SIG_IGN && info->si_code <= 0)
+      return;
+
+    if (faulting && !async && part == Part::instruction) {
+      const PreserveErrno preserve;
+      const auto &instruction = faulting->instruction;
+      std::array<std::uint8_t, 15> live{};
+      // Use the original PC only when its full instruction is still there.
+      // An entry redirect can cover it, and the original mapping can be
+      // unreadable. In either case refault at the translated instruction.
+      if (!read_self_memory(original_pc, live.data(), instruction.size) ||
+          std::memcmp(live.data(), instruction.bytes.data(), instruction.size) != 0) {
+        pc = interrupted;
+        sp = interrupted_sp;
+      }
+    }
+    // Linux takes the default action on a hardware fault even when the
+    // application ignored the signal. Raised signals must be sent again.
+    struct sigaction action{};
+    action.sa_handler = SIG_DFL;
+    ::sigaction(sig, &action, nullptr);
     if (info->si_code <= 0)
       ::raise(sig);
-    return;
-  }
-  if (previous.sa_handler == SIG_IGN) {
-    if (info->si_code > 0) {
-      // Linux delivers a synchronous hardware fault with the default action
-      // when the application has ignored its signal.
-      struct sigaction action{};
-      action.sa_handler = SIG_DFL;
-      ::sigaction(sig, &action, nullptr);
-    }
     return;
   }
   auto application_info = *info;
