@@ -35,7 +35,8 @@ def run(args):
         target, app = start([root / "fixture"])
         app.expect(r"^READY$")
         repl, out = start([args.repl, "--server", args.server, "--agent", args.agent])
-        field_names = ["items_", "large_", "nested_", "map_", "hash_", "note_", "extension_", "child__snapshot"]
+        field_names = ["items_", "large_", "nested_", "map_", "risk_", "hash_", "unmatched_", "note_",
+                       "extension_", "child__snapshot"]
         method_names = ["rehash_only", "mutate", "make_valueless", "replace_child"]
         if args.registered_any:
             field_names.extend(("extension__snapshot", "alias__snapshot"))
@@ -43,7 +44,7 @@ def run(args):
         fields = " ".join(f"--field {field}" for field in field_names)
         methods = " ".join(f'--on "snapshot_test::State::{method}()"' for method in method_names)
         synchronization = "stable-at-boundaries" if args.registered_any else "thread-confined"
-        send(repl, f"%object prepare snapshot_test::State {methods} {fields} --key map_=key --key hash_=key "
+        send(repl, f"%object prepare snapshot_test::State {methods} {fields} --key map_=key --key risk_=key --key hash_=key "
                    "--include state.hpp --policy policy.hpp --compdb compile_commands.json "
                    f"--translation-unit state.cpp --synchronization {synchronization} "
                    "--module fixture --output watch")
@@ -93,8 +94,10 @@ def run(args):
         assert repl.wait(timeout=10) == 1
         records = [event["objectObservation"] for event in json.loads((root / "complex.json").read_text())]
         assert not any("receiver admission limit" in item.get("diagnostic", "") for item in records)
-        assert all("::rehash_only()" not in item["function"] or item["kind"] == "COVERAGE_GAP"
-                   for item in records), records
+        assert all(
+            item["kind"] == "COVERAGE_GAP"
+            for item in records if "::rehash_only()" in item["function"]
+        ), records
         mutate = {(item["field"], item["diagnostic"]): item for item in records
                   if item["function"].endswith("::mutate()")}
         assert ("items_[350].value", "350 -> 700") in mutate, mutate
@@ -104,6 +107,27 @@ def run(args):
         assert mutate["map_[7]", "removed"]["snapshotBefore"]["signedValue"] == "10", mutate
         assert mutate["map_[12]", "added"]["snapshotAfter"]["signedValue"] == "30", mutate
         assert ("map_[9]", "20 -> 21") in mutate, mutate
+        assert ('risk_["AAPL"].limits_[0]', "50 -> 60") in mutate, mutate
+        for key, delta, side, label, limits in (
+            ("OLD", "removed", "snapshotBefore", "retired", [10, 20]),
+            ("MSFT", "added", "snapshotAfter", "new", [30, 40]),
+        ):
+            value = mutate[f'risk_["{key}"]', delta][side]
+            assert value["compositeKind"] == "RECORD", value
+            assert value["cppType"] == "snapshot_test::Risk", value
+            fields = {field["fieldName"]: field for field in value["children"]}
+            assert fields["label_"]["stringValue"] == label, fields
+            sequence = fields["limits_"]
+            assert sequence["compositeKind"] == "SEQUENCE", sequence
+            assert [int(item["signedValue"]) for item in sequence["children"]] == limits, sequence
+        unknown_identity = mutate["unmatched_", "key identity policy unavailable"]
+        assert unknown_identity["kind"] == "COVERAGE_GAP", unknown_identity
+        assert not any(field.startswith("unmatched_[") for field, _ in mutate), mutate
+        for side, keys in (("snapshotBefore", {4, 5}), ("snapshotAfter", {5, 6})):
+            sample = unknown_identity[side]
+            assert sample["containerRole"] == "unordered_map", sample
+            assert {int(field["signedValue"]) for entry in sample["children"]
+                    for field in entry["children"] if field["fieldName"] == "key"} == keys, sample
         assert ("note_", "index 0 -> index 1") in mutate, mutate
         if args.registered_any:
             assert all(item["synchronization"] == "STABLE_AT_BOUNDARIES" for item in records)

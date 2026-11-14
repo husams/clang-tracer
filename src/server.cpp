@@ -1093,26 +1093,10 @@ private:
     observation.set_field(change.path);
     observation.set_diagnostic(change.detail);
     observation.set_synchronization(binding.watch->synchronization);
-    const auto set_snapshot_value = [](const tracer_repl::EventValue &value,
-                                       api::ObjectObservation::SnapshotValue &out) {
-      const auto &data = value.data();
-      if (value.is_null())
-        out.set_null_value(true);
-      else if (const auto *boolean = std::get_if<bool>(&data))
-        out.set_boolean_value(*boolean);
-      else if (const auto *integer = std::get_if<std::int64_t>(&data))
-        out.set_signed_value(*integer);
-      else if (const auto *integer = std::get_if<std::uint64_t>(&data))
-        out.set_unsigned_value(*integer);
-      else if (const auto *real = std::get_if<double>(&data))
-        out.set_real_value(*real);
-      else if (const auto *text = std::get_if<std::string>(&data))
-        out.set_string_value(*text);
-    };
     if (change.before)
-      set_snapshot_value(*change.before, *observation.mutable_snapshot_before());
+      tracer_repl::encode_observation_value(*change.before, *observation.mutable_snapshot_before());
     if (change.after)
-      set_snapshot_value(*change.after, *observation.mutable_snapshot_after());
+      tracer_repl::encode_observation_value(*change.after, *observation.mutable_snapshot_after());
     ++binding.watch->observations;
     binding.watch->gaps += change.gap;
     append_native_locked(std::move(event));

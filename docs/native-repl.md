@@ -413,6 +413,19 @@ Prepare from the original headers and compile command. The package contains the 
 
 Snapshot deltas describe the interval between a method's entry and return. Fields select the reported paths. The generated receiver codec reads the receiver and the pointees authorized by the preparation policy. A failed sample yields a coverage gap. A missing return yields a coverage gap when the probe retires. Set `--max-elements`, `--max-string-bytes`, `--max-depth`, `--max-snapshot-bytes`, and `--max-instances` to bound capture and observation.
 
+Choose method snapshots for changes to strings, private nested records,
+containers, variants, or registered pointees. For example, the Portfolio
+watch pairs entries by leg ID and map key and can report a leaf change such
+as `risk_["AAPL"].limits_[0]`. An added or removed map entry or keyed vector
+element includes its captured record or sequence on the corresponding side
+of the delta. Use `%events show saved --index N` to inspect the typed values,
+or `%events export saved --format json --output changes.json` to export them.
+In JSON, `snapshotBefore` and `snapshotAfter` carry recursive `children` for
+composite values, with `fieldName` on record children. The capture limits
+also apply to values replayed from SQLite.
+When no key identity is available, the watch retains both captured entry
+sequences in the coverage gap and withholds individual adds and removals.
+
 Method snapshots support up to 65,536 encoded bytes per value, 65,536 elements, and a depth of 64. The default byte and element budgets are 4,096 and the default depth is 32. The element budget is shared by the captured containers in each value. A field selection captures the selected top-level receiver members and their contents. A nested path filters which changes to report within its selected member.
 
 For method snapshots, `--max-instances` limits receivers with an outstanding sample. Completed calls release their receiver slots. The watch detects overlapping calls on a receiver and relies on the declared synchronization policy across separate invocations.
