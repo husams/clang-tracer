@@ -2454,11 +2454,17 @@ public:
     if (run)
       request.set_command(args.at(1));
     else {
-      const auto &path = args.at(load ? 0 : 1);
+      const auto path_index = load ? 0u : 1u;
+      const bool has_path = path_index < args.size();
+      const auto path = has_path ? args[path_index] : std::string{};
+      if (has_path && path.empty())
+        throw std::invalid_argument("agent plugin source path is empty");
       if (prepare_agent)
         prepare_agent(request, path);
-      else
+      else if (has_path)
         request.set_source(read_source(path));
+      else
+        throw std::invalid_argument("agent plugin reload requires FILE or an installed package");
     }
     agent_plugin(request);
     return true;

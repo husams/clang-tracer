@@ -396,6 +396,8 @@ void Plugins::prepare_agent_plugin(clangtracer::v1::AgentPluginRequest& request,
     prepare_agent_package(request, *package, path, cpp);
     return;
   }
+  if (path.empty())
+    throw std::invalid_argument("agent plugin reload requires FILE for a plugin without an installed package");
   request.set_source(read_source(path));
   offer_agent_object(request, path, cpp);
 }

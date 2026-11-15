@@ -86,7 +86,7 @@ def main(repl, server, agent, fixture, example):
         time.sleep(.025)
         cursor, held = events(probe, cursor, ("PRE",))
         assert held != first
-        send(f'%plugin agent reload a "{source}"')
+        send("%plugin agent reload a")
         output.expect(r"^agent a generation 2 active \(cache hit\)$")
         counters(0, 1)
 

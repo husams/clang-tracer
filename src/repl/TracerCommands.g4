@@ -114,7 +114,7 @@ cwdOption : CWD value;
 plugin : 'plugin' (('load' | 'enable') value '--as' value | 'disable' value
                   | 'reload' value | 'list'
                   | 'run' value value | 'commands' value
-                  | 'agent' ('load' value '--as' value | 'reload' value value
+                  | 'agent' ('load' value '--as' value | 'reload' value value?
                             | 'run' value value));
 pluginKeyword : 'plugin' | 'run' | 'commands' | 'agent' | 'enable' | 'disable';
 UINT : [0-9]+;
