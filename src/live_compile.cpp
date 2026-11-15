@@ -129,7 +129,13 @@ public:
         site = ir_digest(bytes.take_front(begin)) + ir_digest(bytes.drop_front(end + 1));
       }
     }
-    return visit_function(lambda->getCallOperator(), std::move(site));
+    auto *call = lambda->getCallOperator();
+    if (auto *generic = call->getDescribedFunctionTemplate()) {
+      for (auto *specialization : generic->specializations())
+        visit_function(specialization, site);
+      return true;
+    }
+    return visit_function(call, std::move(site));
   }
 
 private:
@@ -238,6 +244,12 @@ private:
       append_type(field->getType(), out, seen);
     }
     if (cxx) {
+      if (cxx->isLambda())
+        for (const auto &capture : cxx->captures()) {
+          out << " capture " << static_cast<unsigned>(capture.getCaptureKind());
+          if (capture.capturesVariable())
+            out << ':' << capture.getCapturedVar()->getNameAsString();
+        }
       if (!context_.getSourceManager().isInSystemHeader(record->getLocation()))
         out << " trivial-copy=" << cxx->isTriviallyCopyable()
             << " trivial-copy-ctor=" << cxx->hasTrivialCopyConstructor()
@@ -829,6 +841,9 @@ std::map<std::string, Definition> definitions(const CompiledUnit &unit) {
                        function.hasWeakODRLinkage() || function.hasAvailableExternallyLinkage();
     if (const auto site = unit.lambda_sites.find(function.getName().str()); site != unit.lambda_sites.end())
       item.lambda_site = site->second;
+    else if (item.local && function.getName().contains("$_") &&
+             llvm::StringRef(item.type).contains("operator()"))
+      item.lambda_site.emplace();
     if (const auto source = unit.source_definitions.find(function.getName().str());
         source != unit.source_definitions.end())
       item.source_definition = source->second;

@@ -473,6 +473,8 @@ Status Session::apply_live_extension_locked(const Action &request, Status result
   next.managed_native = !planned.native.entries.empty();
   for (const auto &source : planned.native.accepted_sources)
     next.sources[source.path] = source;
+  for (const auto &[unit, closures] : planned.native.private_closures)
+    next.private_closures.insert_or_assign(unit, closures);
   live_.managed_transition.emplace(live::ManagedTransition{previous, next_id, limit, false});
   try {
     result = finish_managed_locked(run_live_extension_locked(planned.input, [&](AgentRequest &phase) {
@@ -674,6 +676,8 @@ clangtracer::v1::LiveUpdateStatus Session::activate_live_locked(
     next.managed_native = false;
     for (const auto &source : plan.accepted_sources)
       next.sources[source.path] = source;
+    for (const auto &[unit, closures] : plan.private_closures)
+      next.private_closures.insert_or_assign(unit, closures);
     read_entries(next, plan, response);
 
     const auto next_id = live_.last_committed + 1;

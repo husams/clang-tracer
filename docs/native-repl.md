@@ -107,11 +107,14 @@ compiler-generated constant requires a rebuild. Changes to existing static
 storage or record ABI require a rebuild or a managed migration. The ABI check
 includes changes to copy, move, and destruction triviality.
 Translation-unit-local functions and data require an unambiguous ELF file
-marker and exact symbol. Each changed function
-also requires a patchable native entry. A body-only edit to an existing
+marker and exact symbol. Live replacements use a patchable native entry.
+A body-only edit to an existing
 lambda can update already-registered callbacks when its source identity and
-capture ABI match the native entry. Changes to a lambda with unverified
-identity or captures may require a rebuild.
+capture ABI match the native entry, including which variables it captures
+and their order. A live update can replace a lambda and its private template
+instantiations together when every call stays within the enclosing function.
+Changes to an escaping lambda with unverified identity or captures require
+a rebuild.
 When a recorded unit initialized the
 standard streams, replacement units can reuse them. Existing native storage
 keeps its verified initialization and destruction code. Changes to module

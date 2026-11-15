@@ -12,8 +12,10 @@
 #include <llvm/Demangle/Demangle.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/InstrTypes.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/Operator.h>
 #include <llvm/Object/BuildID.h>
 #include <llvm/Object/ELFObjectFile.h>
 #include <llvm/Support/SHA256.h>
@@ -334,12 +336,17 @@ bool equivalent_body(const Definition &before, const Definition &after) {
   return same_definition(before, after) || equivalent_inline_body(before, after);
 }
 
-std::string closure_owner(std::string_view symbol, const std::map<std::string, Definition> &code) {
+using ClosureScope = std::pair<std::string, std::string>;
+
+ClosureScope closure_scope(std::string_view symbol, const std::map<std::string, Definition> &code) {
   // Clang's local lambda symbols embed the enclosing Itanium function name
   // and an ordinal such as `3$_0`. That ordinal can change within one body.
   const auto marker = symbol.find("$_");
   if (marker == std::string_view::npos)
     return {};
+  auto end = marker + 2;
+  while (end < symbol.size() && std::isdigit(static_cast<unsigned char>(symbol[end])))
+    ++end;
   auto suffix = marker;
   while (suffix && std::isdigit(static_cast<unsigned char>(symbol[suffix - 1])))
     --suffix;
@@ -352,19 +359,90 @@ std::string closure_owner(std::string_view symbol, const std::map<std::string, D
   for (auto start = symbol.find('Z', 2); start < suffix; start = symbol.find('Z', start + 1)) {
     auto owner = "_Z" + std::string(symbol.substr(start + 1, suffix - start - 1));
     if (code.contains(owner))
-      return owner;
+      return {std::move(owner), std::string(symbol.substr(marker, end - marker))};
   }
   return {};
 }
 
 bool closure_is_local_to(const llvm::Module &module, const std::string &symbol,
-                         const std::string &owner) {
-  const auto *function = module.getFunction(symbol);
-  return function && std::ranges::all_of(function->uses(), [&](const llvm::Use &use) {
-    const auto *call = llvm::dyn_cast<llvm::CallBase>(use.getUser());
-    return call && &call->getCalledOperandUse() == &use &&
-           call->getFunction()->getName() == owner;
-  });
+                         const std::string &owner, std::set<std::string> *route = nullptr) {
+  const auto *entry = module.getFunction(symbol);
+  if (!entry)
+    return false;
+  llvm::SmallVector<const llvm::Function *> pending{entry};
+  llvm::SmallPtrSet<const llvm::Function *, 32> visited;
+  // Templates and algorithms can introduce private forwarding functions.
+  // Every route into the old operator must be a direct call under its owner.
+  while (!pending.empty()) {
+    const auto *function = pending.pop_back_val();
+    if (function->getName() == owner || !visited.insert(function).second)
+      continue;
+    if (!function->hasLocalLinkage())
+      return false;
+    if (route)
+      route->insert(function->getName().str());
+    for (const auto &use : function->uses()) {
+      const auto *call = llvm::dyn_cast<llvm::CallBase>(use.getUser());
+      if (!call || &call->getCalledOperandUse() != &use)
+        return false;
+      pending.push_back(call->getFunction());
+    }
+  }
+  return true;
+}
+
+bool closure_is_on_stack(const llvm::Function &function, llvm::StringRef owner) {
+  const unsigned receiver = function.hasStructRetAttr() ? 1 : 0;
+  if (function.arg_size() <= receiver || !function.getArg(receiver)->getType()->isPointerTy())
+    return false;
+  llvm::SmallVector<const llvm::Value *> pending{function.getArg(receiver)};
+  llvm::SmallPtrSet<const llvm::Value *, 32> visited;
+  bool found_stack = false;
+  while (!pending.empty()) {
+    const auto *value = pending.pop_back_val()->stripPointerCasts();
+    if (!visited.insert(value).second)
+      continue;
+    if (llvm::isa<llvm::AllocaInst>(value)) {
+      found_stack = true;
+    } else if (const auto *field = llvm::dyn_cast<llvm::GEPOperator>(value)) {
+      pending.push_back(field->getPointerOperand());
+    } else if (const auto *argument = llvm::dyn_cast<llvm::Argument>(value)) {
+      const auto *parent = argument->getParent();
+      if (parent->getName() == owner || !parent->hasLocalLinkage())
+        return false;
+      for (const auto &use : parent->uses()) {
+        const auto *call = llvm::dyn_cast<llvm::CallBase>(use.getUser());
+        if (!call || &call->getCalledOperandUse() != &use || call->arg_size() <= argument->getArgNo())
+          return false;
+        pending.push_back(call->getArgOperand(argument->getArgNo()));
+      }
+    } else if (const auto *load = llvm::dyn_cast<llvm::LoadInst>(value)) {
+      // Clang spills reference arguments to a local pointer slot at -O0.
+      const auto *slot = llvm::dyn_cast<llvm::AllocaInst>(load->getPointerOperand());
+      if (!slot || !slot->getAllocatedType()->isPointerTy())
+        return false;
+      for (const auto *use : slot->users()) {
+        if (const auto *store = llvm::dyn_cast<llvm::StoreInst>(use);
+            store && store->getPointerOperand() == slot && store->getValueOperand() != slot)
+          pending.push_back(store->getValueOperand());
+        else if (!llvm::isa<llvm::LoadInst>(use))
+          return false;
+      }
+    } else if (const auto *call = llvm::dyn_cast<llvm::CallBase>(value)) {
+      const auto *callee = call->getCalledFunction();
+      if (!callee || callee->isDeclaration())
+        return false;
+      for (const auto &block : *callee)
+        if (const auto *ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator())) {
+          if (!ret->getReturnValue())
+            return false;
+          pending.push_back(ret->getReturnValue());
+        }
+    } else {
+      return false;
+    }
+  }
+  return found_stack;
 }
 
 using CallGraph = std::map<std::string, std::set<std::string>>;
@@ -520,6 +598,11 @@ bool translation_unit(const fs::path &path) {
   return suffix == ".cpp" || suffix == ".cc" || suffix == ".cxx" || suffix == ".C";
 }
 
+std::size_t reserved_entry_prefix(std::uintptr_t address, std::string_view code) {
+  const auto prefix = native_entry::nop_prefix(address, code.substr(0, kMaxPatchBytes), 14);
+  return prefix < code.size() ? prefix : 0;
+}
+
 Entry bind(std::uint32_t pid, const Image &image, const Symbol &symbol,
            const Definition &definition, const Revision &active) {
   if (symbol.type != llvm::ELF::STT_FUNC || !symbol.size)
@@ -531,8 +614,8 @@ Entry bind(std::uint32_t pid, const Image &image, const Symbol &symbol,
   if (prior != active.entries.end())
     return prior->second.binding;
   const auto code = image.code(symbol);
-  const auto prefix = native_entry::nop_prefix(address, code.substr(0, kMaxPatchBytes), 14);
-  if (!prefix || prefix >= code.size())
+  const auto prefix = reserved_entry_prefix(address, code);
+  if (!prefix)
     throw std::runtime_error("rebuild required: entry needs a reserved 14-byte NOP overwrite window");
   return {symbol.name, signature(symbol.name, definition), site(definition), image.path,
           symbol.address, address, symbol.size, std::string(code.substr(0, prefix)),
@@ -1016,6 +1099,12 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     }
     bool reuse_global_lifecycle = false;
     std::set<std::string> revision_closures;
+    // A private dispatch route from an earlier revision must stay private
+    // when an enclosing function is recompiled for a different edit.
+    if (const auto prior = active.private_closures.find(path); prior != active.private_closures.end())
+      for (const auto &name : prior->second)
+        if (after_definitions.contains(name))
+          revision_closures.insert(name);
     if (before) {
       auto before_definitions = changed ? definitions(*before) : after_definitions;
       std::optional<CompiledUnit> built;
@@ -1050,7 +1139,8 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
           const auto *symbol = definition.local ? local_symbol(name, path) : image.find(name, false);
           if (symbol && std::ranges::any_of(active.entries, [&](const auto &entry) {
                 const auto &binding = entry.second.binding;
-                return binding.module == module && binding.elf_address == symbol->address;
+                return binding.module == module && binding.elf_address == symbol->address &&
+                       !entry.second.mock_original;
               }))
             reappeared_patched.insert(name);
         }
@@ -1060,9 +1150,13 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       for (const auto &[name, prior] : before_definitions) {
         const auto next = after_definitions.find(name);
         if (!prior.lambda_site || prior.lambda_site->empty() || next == after_definitions.end() ||
-            prior.lambda_site != next->second.lambda_site ||
-            (!reappeared_patched.contains(name) && equivalent_body(prior, next->second)) ||
-            !prior.local || !local_symbol(name, path))
+            prior.lambda_site != next->second.lambda_site || prior.abi != next->second.abi ||
+            revision_closures.contains(name) ||
+            (!reappeared_patched.contains(name) && equivalent_body(prior, next->second)))
+          continue;
+        const auto *symbol = prior.local ? local_symbol(name, path) : image.find(name, false);
+        if (!symbol || symbol->type != llvm::ELF::STT_FUNC || !symbol->size ||
+            !reserved_entry_prefix(symbol->address, image.code(*symbol)))
           continue;
         // An earlier revision may have introduced a different closure at the
         // same mangled ordinal. Require the native build's lexical identity.
@@ -1074,7 +1168,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
             continue;
         }
         native_closures.insert(name);
-        verified_lambdas.insert(local_import_name(path, name));
+        verified_lambdas.insert(prior.local ? local_import_name(path, name) : name);
       }
       if (changed) {
         for (const auto &[name, layout] : before->record_layouts) {
@@ -1124,16 +1218,19 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
             native_locals[value.getName().str()].insert(path);
       collect(old_bodies, path, before_definitions);
       std::set<std::string> changed_owners;
+      std::set<ClosureScope> changed_families;
       const auto compare_closures = [&](const auto &left, const auto &right) {
         for (const auto &[name, body] : left) {
           if (!body.local || native_closures.contains(name))
             continue;
-          const auto owner = closure_owner(name, before_definitions);
-          if (owner.empty() || !after_definitions.contains(owner))
+          auto scope = closure_scope(name, before_definitions);
+          if (scope.first.empty() || !after_definitions.contains(scope.first))
             continue;
           const auto other = right.find(name);
-          if (other == right.end() || !equivalent_body(body, other->second))
-            changed_owners.insert(owner);
+          if (other == right.end() || !equivalent_body(body, other->second)) {
+            changed_owners.insert(scope.first);
+            changed_families.insert(std::move(scope));
+          }
         }
       };
       compare_closures(before_definitions, after_definitions);
@@ -1141,30 +1238,44 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       for (const auto &[name, prior] : before_definitions) {
         if (!prior.lambda_site || native_closures.contains(name))
           continue;
-        const auto owner = closure_owner(name, before_definitions);
+        const auto [owner, ordinal] = closure_scope(name, before_definitions);
         if (owner.empty() || !changed_owners.contains(owner))
           continue;
         const auto next = after_definitions.find(name);
         if (next != after_definitions.end() && equivalent_body(prior, next->second))
           continue;
-        if (!closure_is_local_to(*before->module, name, owner))
+        const bool captured_state = !prior.has_source_abi || llvm::StringRef(prior.abi).contains(" capture ") ||
+            (next != after_definitions.end() && llvm::StringRef(next->second.abi).contains(" capture "));
+        if (captured_state && next != after_definitions.end() && prior.abi != next->second.abi)
+          block(path, name, "rebuild required: lambda capture layout or callable ABI changed");
+        else if (!closure_is_local_to(*before->module, name, owner) ||
+            (captured_state && !closure_is_on_stack(*before->module->getFunction(name), owner)))
           block(path, name, "rebuild required: cannot match an existing lambda used outside its enclosing function");
-        else
+        else {
           result.safe_point = SafePoint::drained_stack;
+          // Preserve the whole new dispatch route. Importing an unchanged
+          // algorithm instantiation would send the call to the old operator.
+          std::set<std::string> route;
+          if (next != after_definitions.end() &&
+              closure_is_local_to(*after.module, name, owner, &route))
+            revision_closures.merge(route);
+        }
       }
       for (const auto &[name, body] : after_definitions) {
         if (!body.local || native_closures.contains(name))
           continue;
-        const auto prior = before_definitions.find(name);
-        if (prior != before_definitions.end() && equivalent_body(prior->second, body))
+        const auto scope = closure_scope(name, before_definitions);
+        if (!changed_families.contains(scope))
           continue;
-        const auto owner = closure_owner(name, before_definitions);
-        const auto next = after_definitions.find(owner);
-        if (next != after_definitions.end() &&
-            (changed_owners.contains(owner) ||
-             !equivalent_body(before_definitions.at(owner), next->second)))
-          revision_closures.insert(name);
+        const auto prior = before_definitions.find(name);
+        if (body.lambda_site && prior != before_definitions.end() &&
+            equivalent_body(prior->second, body) &&
+            !closure_is_local_to(*before->module, name, scope.first))
+          continue;
+        revision_closures.insert(name);
       }
+      for (const auto &name : native_closures)
+        revision_closures.erase(name);
       // A linker may select one of several differently lowered inline
       // copies. Detect source changes against the same TU's prior IR first.
       for (const auto &[name, prior] : before_definitions) {
@@ -1196,6 +1307,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     // A previous revision may have supplied a TU with no ELF counterpart.
     // Relink its accepted snapshot so new callers can resolve those helpers.
     if (changed || !sources.saved.count(path)) {
+      result.private_closures.emplace(path, revision_closures);
       current.translation_units.push_back(unit);
       current.translation_units.back().reuse_global_lifecycle = reuse_global_lifecycle;
       for (const auto &value : after.module->global_values()) {

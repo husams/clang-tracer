@@ -277,7 +277,7 @@ using namespace fixture;
 extern "C" LIVE_ENTRY int cache_code() { return cache_scale(); }
 extern "C" LIVE_ENTRY int cache_other() { return 2; }
 extern "C" LIVE_ENTRY void cache_print(managed::Registry::Access& access, managed::InstanceId id) {
-  access.with<CacheV1>("Cache", id, "cache.1", [](const auto& cache) {
+  access.with<CacheV1>("Cache", id, "cache.1", [](const CacheV1& cache) {
     std::printf("old %zu\n", cache.entries.size());
   });
 }

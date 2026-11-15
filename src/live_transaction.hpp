@@ -5,6 +5,7 @@
 
 #include <map>
 #include <optional>
+#include <set>
 
 namespace tracer::live {
 
@@ -24,6 +25,7 @@ struct Revision {
   bool managed_native = false;
   std::map<std::uintptr_t, ActiveEntry> entries;
   std::map<std::string, SourceFile> sources;
+  std::map<std::string, std::set<std::string>> private_closures;
 };
 
 struct ManagedTransition {

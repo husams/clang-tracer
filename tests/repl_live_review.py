@@ -29,6 +29,7 @@ int calculate(int);
 int accepted_key();
 int registered(int);
 int policy_check(int);
+int count_above(int);
 int main() {
   if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)) return 1;
   std::thread([] { for (;;) usleep(100000); }).detach();
@@ -39,8 +40,9 @@ int main() {
       unlink("call");
       int one;
       try { one = first(10); } catch (int value) { one = value; }
-      std::printf("%d %d %d %d %d %d %d %d %d\n", one, second(10), lookup(1), third(10),
-                  adjacent_value(), calculate(10), accepted_key(), registered(10), policy_check(10));
+      std::printf("%d %d %d %d %d %d %d %d %d %d\n", one, second(10), lookup(1), third(10),
+                  adjacent_value(), calculate(10), accepted_key(), registered(10), policy_check(10),
+                  count_above(2));
       std::fflush(stdout);
     }
     usleep(3000);
@@ -49,6 +51,7 @@ int main() {
 """
 
 APP = """
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -77,7 +80,13 @@ int lookup(int i) { const char *empty = ""; return table[i] + empty[0]; }
 LIVE_ENTRY int first(int i) { return i + 1; }
 LIVE_ENTRY int second(int i) { return i + 2; }
 LIVE_ENTRY int policy_check(int i) { return policy_total(i) + 1; }
-int registered(int i) {
+LIVE_ENTRY int count_above(int threshold) {
+  std::array<int, 4> values{1, 2, 3, 4};
+  return std::count_if(values.begin(), values.end(), [=](const auto& value) {
+    return value > threshold;
+  });
+}
+LIVE_ENTRY int registered(int i) {
   static int (*const callback)(int) = [](int v) LIVE_ENTRY { return v + 17; };
   return callback(i);
 }
@@ -189,14 +198,29 @@ def run(args, root, cleanup):
         result = console.expect(r"^live (APPLIED|BLOCKED|STALE|REVERTED|UNCHANGED|RESTORATION_REQUIRED) revision=")
         assert result[1] == outcome, "".join(console.seen[-25:])
 
-    def call(first, second, *, third=15, calculated=3, key=7, callback=27, policy=22, runtime=False):
+    def call(first, second, *, third=15, calculated=3, key=7, callback=27,
+             policy=22, count=2, runtime=False):
         (root / "call").touch()
         if runtime:
             app.expect(r"^runtime=10$")
-        app.expect(rf"^{first} {second} 2 {third} 7 {calculated} {key} {callback} {policy}$")
+        app.expect(rf"^{first} {second} 2 {third} 7 {calculated} {key} {callback} {policy} {count}$")
 
     app_source = source / "app.cpp"
     call(11, 12)
+    app_source.write_text(APP.replace("value > threshold", "value >= threshold"))
+    command("%live update source/app.cpp --retention-limit 32", "APPLIED")
+    call(11, 12, count=3)
+    mixed = APP.replace("value > threshold", "value < threshold").replace("return i + 2;", "return i + 20;")
+    app_source.write_text(mixed)
+    command("%live update source/app.cpp", "APPLIED")
+    call(11, 30, count=1)
+    # A later caller-only update must keep using the private predicate.
+    app_source.write_text(mixed.replace("return std::count_if", "return 10 + std::count_if"))
+    command("%live update source/app.cpp", "APPLIED")
+    call(11, 30, count=11)
+    command("%live revert 0", "REVERTED")
+    call(11, 12)
+
     # Emitting policy_scale first adds nounwind to policy_total without
     # changing its instructions or introducing an unwind edge.
     app_source.write_text(APP.replace("return policy_total(i) + 1;",
@@ -233,6 +257,7 @@ def run(args, root, cleanup):
         "  static int (*const callback)(int)", "  [[maybe_unused]] auto prior = [] { return 0; };\n"
                                              "  static int (*const callback)(int)"))
     command("%live update source/app.cpp", "BLOCKED")
+    console.expect(r"cannot match an existing lambda used outside its enclosing function")
     call(11, 12)
     layout = APP.replace("struct Config { int a; }", "struct Config { int a; int b; }")
     layout = layout.replace("return i + 1;", "storage.config.b = 99; return i + 1;")
