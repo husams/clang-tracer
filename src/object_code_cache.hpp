@@ -24,6 +24,8 @@ public:
   ~Watch();
   void install(injector::Process &process, std::uintptr_t agent_entry,
                std::chrono::steady_clock::time_point deadline, bool permanent_startup_module = false);
+  void set_registration_active(bool active) noexcept;
+  bool is_registration(std::uint64_t id) const noexcept;
   void stop_runtime_admissions();
   bool restore(injector::Process &process);
   bool retire_if_mapping_changed(std::chrono::steady_clock::time_point deadline);

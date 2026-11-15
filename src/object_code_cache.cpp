@@ -685,6 +685,7 @@ struct Watch::Impl {
       throw std::runtime_error("cannot map the code-cache event channel");
     }
     channel = new (memory) Channel;
+    channel->registration_active.store(!request.staged_registration(), std::memory_order_relaxed);
     for (std::size_t index = 0; index < event_buffer; ++index) {
       auto *slot = new (channel->slot(index)) Slot;
       slot->turn.store(index, std::memory_order_relaxed);
@@ -2166,6 +2167,7 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
   auto &p = *impl_;
   p.verify_live(process);
   Init init;
+  init.identity_watch_id = p.request.staged_registration() ? p.id : 0;
   if (p.path.size() >= sizeof(init.path))
     throw std::runtime_error("code-cache event channel path is too long");
   std::memcpy(init.path, p.path.c_str(), p.path.size() + 1);
@@ -2185,7 +2187,7 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
   init.runtime_limit = p.runtime_limit;
   init.shared_file = p.shared_file.identity;
   init.max_events = p.request.max_events();
-  init.no_values = p.request.no_values();
+  init.no_values = p.request.no_values() || p.request.lifetimes_only();
   init.stop_on_overflow = p.request.overflow_policy() == api::ObjectWatchRequest::STOP_CAPTURE;
   init.cfi_stack = p.request.cfi_stack();
   init.atomic = p.plan.layout.atomic;
@@ -2419,6 +2421,15 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
       " (use --writer-entry to require entry coverage)" :
       "in-process x86-64 leaf translation with atomic MOV/XADD/CMPXCHG and verified writer entry redirects";
 #endif
+}
+
+void Watch::set_registration_active(bool active) noexcept {
+  if (impl_->channel)
+    impl_->channel->registration_active.store(active, std::memory_order_release);
+}
+
+bool Watch::is_registration(std::uint64_t id) const noexcept {
+  return id && impl_->request.staged_registration() && impl_->id == id;
 }
 
 void Watch::stop_runtime_admissions() {

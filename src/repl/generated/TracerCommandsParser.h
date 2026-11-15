@@ -42,10 +42,11 @@ public:
     T__154 = 155, T__155 = 156, T__156 = 157, T__157 = 158, T__158 = 159,
     T__159 = 160, T__160 = 161, T__161 = 162, T__162 = 163, T__163 = 164,
     T__164 = 165, T__165 = 166, T__166 = 167, T__167 = 168, T__168 = 169,
-    T__169 = 170, T__170 = 171, T__171 = 172, UINT = 173, STRING = 174,
-    SHELL = 175, METADATA_ONLY = 176, SQLITE = 177, STACK = 178, CWD = 179,
-    SIGNATURE = 180, MEMBER = 181, SNAPSHOT_RETURN_POINTEE = 182, WORD = 183,
-    WS = 184
+    T__169 = 170, T__170 = 171, T__171 = 172, T__172 = 173, T__173 = 174,
+    T__174 = 175, T__175 = 176, T__176 = 177, T__177 = 178, UINT = 179,
+    STRING = 180, SHELL = 181, METADATA_ONLY = 182, SQLITE = 183, STACK = 184,
+    CWD = 185, SIGNATURE = 186, MEMBER = 187, SNAPSHOT_RETURN_POINTEE = 188,
+    WORD = 189, WS = 190
   };
 
   enum {
@@ -58,9 +59,10 @@ public:
     RuleInterceptor = 23, RuleEvents = 24, RuleCollect = 25, RuleRecord = 26,
     RuleStreamOption = 27, RuleCpp = 28, RuleShell = 29, RuleComplete = 30,
     RuleType = 31, RuleHelp = 32, RuleQuit = 33, RuleBulkTrace = 34, RuleBulkTraceOption = 35,
-    RuleValue = 36, RuleKeyword = 37, RuleObjectWatch = 38, RuleObjectOption = 39,
-    RuleMemory = 40, RuleProbeEntry = 41, RuleProbeReload = 42, RuleStackFilter = 43,
-    RuleContextEventBytes = 44, RuleExtraCompileOption = 45, RuleCwdOption = 46
+    RuleValue = 36, RuleKeyword = 37, RuleObjectProbe = 38, RuleObjectProbePrepareOption = 39,
+    RuleObjectProbeBindOption = 40, RuleObjectWatch = 41, RuleObjectOption = 42,
+    RuleMemory = 43, RuleProbeEntry = 44, RuleProbeReload = 45, RuleStackFilter = 46,
+    RuleContextEventBytes = 47, RuleExtraCompileOption = 48, RuleCwdOption = 49
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -118,6 +120,9 @@ public:
   class BulkTraceOptionContext;
   class ValueContext;
   class KeywordContext;
+  class ObjectProbeContext;
+  class ObjectProbePrepareOptionContext;
+  class ObjectProbeBindOptionContext;
   class ObjectWatchContext;
   class ObjectOptionContext;
   class MemoryContext;
@@ -173,6 +178,7 @@ public:
     ProbeEntryContext *probeEntry();
     ProbeReloadContext *probeReload();
     ObjectWatchContext *objectWatch();
+    ObjectProbeContext *objectProbe();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -708,6 +714,51 @@ public:
   };
 
   KeywordContext* keyword();
+
+  class  ObjectProbeContext : public antlr4::ParserRuleContext {
+  public:
+    ObjectProbeContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+    std::vector<ObjectProbePrepareOptionContext *> objectProbePrepareOption();
+    ObjectProbePrepareOptionContext* objectProbePrepareOption(size_t i);
+    std::vector<ObjectProbeBindOptionContext *> objectProbeBindOption();
+    ObjectProbeBindOptionContext* objectProbeBindOption(size_t i);
+    antlr4::tree::TerminalNode *UINT();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  ObjectProbeContext* objectProbe();
+
+  class  ObjectProbePrepareOptionContext : public antlr4::ParserRuleContext {
+  public:
+    ObjectProbePrepareOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+    ExtraCompileOptionContext *extraCompileOption();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  ObjectProbePrepareOptionContext* objectProbePrepareOption();
+
+  class  ObjectProbeBindOptionContext : public antlr4::ParserRuleContext {
+  public:
+    ObjectProbeBindOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+
+  };
+
+  ObjectProbeBindOptionContext* objectProbeBindOption();
 
   class  ObjectWatchContext : public antlr4::ParserRuleContext {
   public:

@@ -20,6 +20,7 @@ service Tracer {
   rpc ScanMemory(ScanMemoryRequest) returns (ScanMemoryResponse);
   rpc PreviewFunctionEntry(PreviewFunctionEntryRequest) returns (PreviewFunctionEntryResponse);
   rpc ObjectWatch(ObjectWatchRequest) returns (ObjectWatchStatus);
+  rpc ObjectProbe(ObjectProbeRequest) returns (ObjectProbeStatus);
   rpc ListThreads(ListThreadsRequest) returns (ListThreadsResponse);
   rpc ListSymbols(ListSymbolsRequest) returns (ListSymbolsResponse);
   rpc PreviewBulkTrace(PreviewBulkTraceRequest) returns (PreviewBulkTraceResponse);
@@ -250,6 +251,7 @@ message ProbeSpec {
   }
   repeated SnapshotRttiRange snapshot_rtti_ranges = 36;
   repeated string snapshot_receiver_fields = 37; // Receiver fields used by object watch comparison.
+  uint64 object_watch_id = 38; // Assigned by the server for grouped methods.
 }
 message AttachRequest {
   uint32 pid = 1;
@@ -733,6 +735,37 @@ message ObjectWatchRequest {
   string owner_remove = 58;
   string owner_snapshot = 59;
   bool logical_updates = 60; // Compare the selected identity at verified mutation boundaries.
+  bool lifetimes_only = 61; // Code-cache lifecycle planning without a writer.
+  bool staged_registration = 62; // Internal use by ObjectProbe. Published as a group.
+}
+
+message ObjectProbeRequest {
+  enum Action { PREVIEW = 0; START = 1; STATUS = 2; STOP = 3; }
+  string session_id = 1;
+  Action action = 2;
+  uint64 registration_id = 3;
+  ObjectWatchRequest watch = 4;
+  repeated PreparedInjector methods = 5;
+  string callback_source = 6;
+  string method_module = 7;
+  ObjectProbeBinding preview = 8;
+}
+
+message ObjectProbeBinding {
+  ObjectWatchPlan watch = 1;
+  // Includes resolved receiver layout and live entry identity.
+  repeated DebugInfo methods = 2;
+  repeated ObjectWatchPlan.Binding method_patches = 3;
+}
+
+message ObjectProbeStatus {
+  uint64 registration_id = 1;
+  bool active = 2;
+  bool restoration_pending = 3;
+  ObjectWatchStatus watch = 4;
+  repeated Probe methods = 5;
+  ObjectProbeBinding binding = 6;
+  string diagnostic = 7;
 }
 
 message ObjectWatchPlan {

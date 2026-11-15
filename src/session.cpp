@@ -176,7 +176,8 @@ Session::Session(std::string id, std::uint32_t pid, std::uint64_t process_start,
 
 Session::~Session() = default;
 
-void Session::require_probe_control_locked(std::uint64_t removing) const {
+void Session::require_probe_control_locked(std::uint64_t removing,
+                                           std::uint64_t registration) const {
   if (entry_trap_ && removing != trap_probe_id_)
     throw std::runtime_error("remove the entry trap before changing other native probes");
   if (object_watch_) {
@@ -184,11 +185,29 @@ void Session::require_probe_control_locked(std::uint64_t removing) const {
     if (status.active() || status.restoration_pending())
       throw std::runtime_error("stop the object watch before changing native probes");
   }
-  if (object_cache_) {
+  if (object_cache_ && !object_cache_->is_registration(registration)) {
     const auto status = object_cache_->status();
     if (status.active() || status.restoration_pending())
       throw std::runtime_error("stop the object watch before changing native probes");
   }
+}
+
+bool Session::has_object_probe_registration(std::uint64_t registration) const {
+  std::lock_guard lock(mutex_);
+  return object_cache_ && object_cache_->is_registration(registration);
+}
+
+void Session::set_object_probe_active(std::uint64_t registration, bool active) {
+  std::lock_guard lock(mutex_);
+  if (!object_cache_ || !object_cache_->is_registration(registration))
+    throw std::invalid_argument("no matching object probe registration");
+  if (active) {
+    check_identity_locked();
+    const auto status = object_cache_->status();
+    if (!status.active() || status.restoration_pending())
+      throw std::runtime_error("cannot publish a stopped object probe");
+  }
+  object_cache_->set_registration_active(active);
 }
 
 clangtracer::v1::ObjectWatchStatus Session::prepare_object_watch(
@@ -218,6 +237,9 @@ clangtracer::v1::ObjectWatchStatus Session::object_watch(
         if (state_ == clangtracer::v1::Session::ATTACHED)
           retire_changed_object_cache_locked(std::chrono::steady_clock::now() + operation_timeout_);
       }
+      if (request.action() == Request::STOP && !request.staged_registration() &&
+          object_cache_->is_registration(object_cache_->status().watch_id()))
+        throw std::invalid_argument("stop this registration with %object-probe stop");
       if (request.action() == Request::STOP || state_ == clangtracer::v1::Session::EXITED)
         stop_object_cache_locked();
       return object_cache_->status();
@@ -238,11 +260,17 @@ clangtracer::v1::ObjectWatchStatus Session::object_watch(
   if (request.has_prepared_bindings())
     binding_status = object_watch::preview(request, pid_, executable_).binding_status();
   require_probe_control_locked();
-  if (pthread_create_patch_committed_ ||
-      std::any_of(probes_.begin(), probes_.end(), [](const auto &item) {
-        return item.second.patch_committed || item.second.value.active() ||
-               item.second.value.draining() || item.second.remote_request;
-      }))
+  bool grouped_method = false;
+  for (const auto &[probe_id, probe] : probes_) {
+    (void)probe_id;
+    if (!probe.patch_committed && !probe.value.active() &&
+        !probe.value.draining() && !probe.remote_request)
+      continue;
+    if (!request.staged_registration() || probe.reload_spec.object_watch_id() != id)
+      throw std::runtime_error("remove the session's native probes before starting an object watch");
+    grouped_method = true;
+  }
+  if (pthread_create_patch_committed_ && !grouped_method)
     throw std::runtime_error("remove the session's native probes before starting an object watch");
   if (request.backend() == Request::CODE_CACHE) {
     if (!object_cache_address_)
@@ -282,6 +310,7 @@ clangtracer::v1::ObjectWatchStatus Session::object_watch(
 
 void Session::stop_object_watch_locked() {
   if (object_cache_) {
+    object_cache_->set_registration_active(false);
     stop_object_cache_locked(true);
     return;
   }
@@ -587,7 +616,7 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
                    const std::string &bulk_batch_id, std::uint64_t reload_probe_id,
                    const std::function<bool()> &cancelled) {
   std::lock_guard lock(mutex_);
-  require_probe_control_locked();
+  require_probe_control_locked(0, spec.object_watch_id());
   check_identity_locked();
   if (state_ != clangtracer::v1::Session::ATTACHED) {
     throw std::runtime_error("session is not attached");
@@ -656,7 +685,8 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     remote_request = process.remote_allocate(sizeof(Request));
     Request request{};
     request.probe_id = probe_id;
-    request.reject_replacement = !reload_probe_id && !batch_id.empty();
+    request.object_watch_id = spec.object_watch_id();
+    request.reject_replacement = !reload_probe_id && (!batch_id.empty() || spec.object_watch_id());
     request.expected_replaced_probe_id = reload_probe_id;
     copy_field(request.session_id, id_, "session id");
     request.context_native_pid = pid_;
@@ -1431,13 +1461,13 @@ std::uint64_t Session::events_sent(std::uint64_t probe_id) const {
 
 clangtracer::v1::Probe Session::remove_probe(std::uint64_t probe_id) {
   std::lock_guard lock(mutex_);
-  require_probe_control_locked(probe_id);
+  auto &probe = find_probe_locked(probe_id);
+  require_probe_control_locked(probe_id, probe.reload_spec.object_watch_id());
   if (unsafe_target_) {
     throw std::runtime_error(error_.empty() ? "session is in failed state"
                                             : error_);
   }
   check_identity_locked();
-  auto &probe = find_probe_locked(probe_id);
   if (probe.value.active() || probe.value.draining())
     stop_probe_locked(probe, false);
   else

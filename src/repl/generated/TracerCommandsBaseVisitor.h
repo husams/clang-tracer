@@ -167,6 +167,18 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitObjectProbe(TracerCommandsParser::ObjectProbeContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitObjectProbePrepareOption(TracerCommandsParser::ObjectProbePrepareOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitObjectProbeBindOption(TracerCommandsParser::ObjectProbeBindOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitObjectWatch(TracerCommandsParser::ObjectWatchContext *ctx) override {
     return visitChildren(ctx);
   }

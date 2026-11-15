@@ -116,6 +116,14 @@ const CommandTopic commands[] = {
      "Record observations with %record FILE --sqlite --name object.trace."},
     {"object status", "%object status [WATCH_ID]", "Show admitted store sites, observations and restoration status."},
     {"object stop", "%object stop [WATCH_ID]", "Restore the watch's patches and release execution control."},
+    {"object-probe prepare", "%object-probe prepare TYPE --method METHOD --include HEADER --compdb FILE --translation-unit TU --callbacks SOURCE --output FILE",
+      "Prepare an offline type package. A field write package uses --field FIELD --code WRITER."},
+    {"object-probe preview", "%object-probe preview --package FILE [--module MAPPING]",
+      "Bind the package to an attached target and check the patch windows."},
+    {"object-probe start", "%object-probe start --package FILE [--module MAPPING]",
+      "Activate the verified object probe and its method callbacks."},
+    {"object-probe status", "%object-probe status [ID]", "Report group coverage and restoration."},
+    {"object-probe stop", "%object-probe stop [ID]", "Close callback admission and restore the group's patches."},
 
     {"trace", "", "Preview, apply, or remove a bulk C++ trace."},
     {"trace preview", "%trace preview [--module GLOB] [--include GLOB] [--exclude GLOB] [--exact SIGNATURE]\n"

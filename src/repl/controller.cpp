@@ -1,4 +1,5 @@
 #include "controller.hpp"
+#include "object_probe_package.hpp"
 #include "../prepared_contract.hpp"
 #include "../module_index_format.hpp"
 #include "../proc_identity.hpp"
@@ -433,6 +434,7 @@ void Controller::start_server(const Command &command) {
 void Controller::disconnect() {
   stop_background();
   stub_.reset();
+  object_probe_preview_.reset();
   selected_ = {};
   ++connection_;
   endpoint_.clear();
@@ -975,6 +977,165 @@ Controller::PreparedPackage Controller::prepare_package(const std::string &selec
     throw std::runtime_error("cannot read newly generated prepared package");
   out_ << "prepared directory=" << directory << '\n';
   return package;
+}
+
+void Controller::object_probe_command(const Command &command) {
+  using K = CommandKind;
+  using Request = api::ObjectProbeRequest;
+  const auto values = [&](const char *name) {
+    const auto found = command.options.find(name);
+    return found == command.options.end() ? std::vector<std::string>{} : found->second;
+  };
+  if (command.kind == K::object_probe_prepare) {
+    if (!command.has("--output"))
+      throw std::invalid_argument("object probe preparation requires --output FILE");
+    ObjectProbePackageInput input;
+    input.qualified_type = command.arguments.at(0);
+    input.methods = values("--method");
+    input.fields = values("--field");
+    input.writer_selectors = values("--code");
+    input.allow_dwarf_writer_fallback = command.has("--dwarf-writers");
+    input.compile.includes = values("--include");
+    input.compile.compilation_database = command.option("--compdb");
+    input.compile.translation_unit = command.option("--translation-unit");
+    input.compile.extra_arguments = probe_extra_arguments(command, settings_);
+    if (command.has("--callbacks"))
+      input.callback_source = read_source(command.option("--callbacks"));
+    if (input.fields.size() > 1)
+      throw std::invalid_argument("select one field per object probe");
+    if (!input.fields.empty() && input.writer_selectors.empty()) {
+      api::ObjectWatchRequest discovery;
+      discovery.set_concrete_type(input.qualified_type);
+      discovery.set_field(input.fields.front());
+      discover_writers(command, discovery);
+      input.writer_selectors.push_back(discovery.code_symbol());
+      for (const auto &additional : discovery.additional_code_symbols())
+        input.writer_selectors.push_back(additional);
+    }
+    if (!input.fields.empty() && input.methods.empty() && !input.allow_dwarf_writer_fallback &&
+        (!command.has("--compdb") || !command.has("--translation-unit")))
+      throw std::invalid_argument("supply original compilation context or select --dwarf-writers");
+    PreparationDirectory staging;
+    std::size_t method_index = 0;
+    const auto package = ObjectProbePackage::prepare(input,
+        [&](const std::string &selector, const ObjectProbeCompileInputs &compile) {
+      Command options;
+      options.options["--receiver-storage"] = {"true"};
+      options.options["--include"] = compile.includes;
+      options.options["--compdb"] = {compile.compilation_database};
+      options.options["--translation-unit"] = {compile.translation_unit};
+      options.options["--output"] = {staging.file(std::to_string(method_index++)).string()};
+      options.extra_compile_argument_inputs = command.extra_compile_argument_inputs;
+      options.extra_compile_arguments = command.extra_compile_arguments;
+      return prepare_package(selector, options).artifact;
+    });
+    package.save(command.option("--output"));
+    out_ << "object-probe package=" << command.option("--output")
+         << " type=" << input.qualified_type << " methods=" << input.methods.size()
+         << " writers=" << input.writer_selectors.size() << '\n';
+    return;
+  }
+
+  require_session(selected_);
+  Request request;
+  request.set_session_id(selected_.id);
+  std::string definition;
+  if (command.kind == K::object_probe_status || command.kind == K::object_probe_stop) {
+    request.set_action(command.kind == K::object_probe_status ? Request::STATUS : Request::STOP);
+    if (!command.arguments.empty())
+      request.set_registration_id(unsigned_number(command.arguments.front(), "registration id"));
+  } else {
+    if (!command.has("--package"))
+      throw std::invalid_argument("object probe requires --package FILE");
+    const auto package = ObjectProbePackage::load(command.option("--package"));
+    const auto &input = package.input();
+    const auto starting = command.kind == K::object_probe_start;
+    request.set_action(Request::START);
+    for (const auto &artifact : package.prepared_methods())
+      *request.add_methods() = artifact;
+    request.set_callback_source(input.callback_source);
+    request.set_method_module(command.option("--method-module", command.option("--module")));
+    auto &watch = *request.mutable_watch();
+    watch.set_concrete_type(input.qualified_type);
+    watch.set_code_module(command.option("--module"));
+    if (!input.fields.empty()) {
+      watch.set_field(input.fields.front());
+      watch.set_code_symbol(input.writer_selectors.front());
+      for (std::size_t i = 1; i < input.writer_selectors.size(); ++i)
+        watch.add_additional_code_symbols(input.writer_selectors[i]);
+    }
+    watch.set_follow_calls(command.has("--follow-calls"));
+    watch.set_no_values(command.has("--no-values"));
+    watch.set_first_seen(command.has("--first-seen"));
+    watch.set_union_tag(command.option("--union-tag"));
+    if (command.has("--synchronization")) {
+      const auto policy = command.option("--synchronization");
+      if (policy == "thread-confined")
+        watch.set_synchronization(api::ObjectWatchRequest::THREAD_CONFINED);
+      else if (policy == "caller-lock")
+        watch.set_synchronization(api::ObjectWatchRequest::CALLER_LOCK);
+      else
+        throw std::invalid_argument("synchronization must be thread-confined or caller-lock");
+    }
+    for (const auto &mapping : values("--union-case")) {
+      const auto split = mapping.find('=');
+      if (split == std::string::npos || !split || split + 1 == mapping.size())
+        throw std::invalid_argument("--union-case requires TAG=MEMBER");
+      const auto literal = mapping.substr(0, split);
+      auto *item = watch.add_union_cases();
+      if (literal.front() == '-') {
+        std::size_t consumed = 0;
+        const auto tag = std::stoll(literal, &consumed);
+        if (consumed != literal.size())
+          throw std::invalid_argument("invalid signed union discriminator");
+        item->set_tag_bits(static_cast<std::uint64_t>(tag));
+      } else {
+        item->set_tag_bits(unsigned_number(literal, "union discriminator"));
+      }
+      item->set_member(mapping.substr(split + 1));
+    }
+    definition = request.SerializeAsString();
+    if (starting && object_probe_preview_ && object_probe_preview_->definition == definition)
+      *request.mutable_preview() = object_probe_preview_->binding;
+    if (!starting)
+      request.set_action(Request::PREVIEW);
+  }
+  const auto result = unary<api::ObjectProbeStatus>(
+      [&](auto &context, auto &reply) { return stub_->ObjectProbe(&context, request, &reply); },
+      settings_.timeout_seconds);
+  if (request.action() == Request::PREVIEW) {
+    object_probe_preview_ = ObjectProbePreview{std::move(definition), result.binding()};
+    const auto &watch = result.watch();
+    out_ << "object-probe preview build_id=" << watch.plan().executable_build_id()
+         << " writer_build_id=" << watch.plan().writer_build_id()
+         << " sites=" << watch.store_sites() << " unsupported=" << watch.unsupported_sites()
+         << " redirects=" << watch.redirects_size() << '\n';
+    for (const auto &binding : watch.plan().bindings())
+      out_ << "  " << binding.role() << " " << binding.function()
+           << " module=" << binding.module() << " pc=0x" << std::hex << binding.runtime_pc()
+           << std::dec << '\n';
+    for (const auto &patch : result.binding().method_patches())
+      out_ << "  method " << patch.function() << " module=" << patch.module()
+           << " pc=0x" << std::hex << patch.runtime_pc() << std::dec
+           << " verified_bytes=" << patch.patch_size() << '\n';
+    out_ << result.diagnostic() << '\n';
+    return;
+  }
+  const auto &watch = result.watch();
+  out_ << "object-probe registration=" << result.registration_id()
+       << " active=" << (result.active() ? "yes" : "no")
+       << " methods=" << result.methods_size()
+       << " observations=" << watch.observations() << " dropped=" << watch.dropped()
+       << " coverage_gaps=" << watch.coverage_gaps()
+       << " runtime_gap_hits=" << watch.runtime_gap_hits()
+       << " restoration_pending=" << (result.restoration_pending() ? "yes" : "no")
+       << " | " << result.diagnostic() << '\n';
+  for (const auto &method : result.methods())
+    out_ << "  method_probe=" << method.id()
+         << " active=" << (method.active() ? "yes" : "no")
+         << " restored=" << (method.original_bytes_restored() ? "yes" : "no") << '\n';
+  if (result.restoration_pending())
+    throw std::runtime_error("retry %object-probe stop with the registration id");
 }
 
 void Controller::prepare(const std::string &selector, const Command &options) {
@@ -1718,6 +1879,13 @@ bool Controller::execute(const Command &command) {
     detach(session);
     return true;
   }
+  case K::object_probe_prepare:
+  case K::object_probe_preview:
+  case K::object_probe_start:
+  case K::object_probe_status:
+  case K::object_probe_stop:
+    object_probe_command(command);
+    return true;
   case K::object_start:
   case K::object_prepare:
   case K::object_preview:

@@ -4,7 +4,7 @@ line : '%' command EOF;
 command : server | attach | processes | sessions | use | status | detach
         | modules | moduleIndex | threads | symbols | probe | interceptor | events | collect | record
         | cpp | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload
-        | objectWatch;
+        | objectWatch | objectProbe;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
 serverOption : ('--executable' | '--agent') value | contextEventBytes;
 attach : 'attach' (UINT ('--start-time' UINT)?)?;
@@ -82,7 +82,16 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'import'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
         | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview' | 'apply'
-        | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | 'object' | STACK;
+        | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | 'object' | 'object-probe' | STACK;
+objectProbe : 'object-probe' ('prepare' value objectProbePrepareOption+
+                            | ('preview' | 'start') objectProbeBindOption+
+                            | ('status' | 'stop') UINT?);
+objectProbePrepareOption : ('--include' | '--compdb' | '--translation-unit' | '--callbacks'
+                            | '--output' | '--method' | '--field' | '--code') value
+                         | '--dwarf-writers' | extraCompileOption;
+objectProbeBindOption : ('--package' | '--module' | '--method-module'
+                         | '--union-tag' | '--union-case' | '--synchronization') value
+                      | '--follow-calls' | '--no-values' | '--first-seen';
 objectWatch : 'object' ('prepare' value? objectOption+ | ('start' | 'preview') objectOption+
                         | ('stop' | 'status') UINT?);
 objectOption : ('--type' | '--base' | '--owner' | '--field' | '--collection'

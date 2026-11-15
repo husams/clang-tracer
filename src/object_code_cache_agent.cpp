@@ -1,4 +1,5 @@
 #include "object_code_cache_protocol.hpp"
+#include "object_code_cache_identity.hpp"
 
 #include "object_code_cache_decode.hpp"
 #if defined(__aarch64__)
@@ -309,6 +310,8 @@ struct State {
   std::map<Address, pid_t> active_collections;
   std::uint64_t next_id = 0;
   std::uint64_t next_borrow = 0;
+  std::uint64_t identity_watch_id = 0;
+  bool identity_lifecycle_covered = false;
 
   // Call with mutex held and no current lifetime at this address.
   Lifetime *admit_lifetime(Address object) {
@@ -337,6 +340,7 @@ Address tail_body(const State &watch, Address entry) noexcept {
 std::atomic<State *> retained{nullptr};
 std::mutex install_mutex;
 struct sigaction previous_actions[NSIG]{};
+std::array<std::atomic_flag, NSIG> previous_delivered{};
 std::array<bool, NSIG> bridge_installed{};
 
 void finish_runtime_prefix(State &watch) noexcept {
@@ -791,6 +795,15 @@ void stack(State &watch, Observation &event, const Registers &regs,
 
 void emit(State &watch, Observation &event) noexcept {
   auto &channel = *watch.channel;
+  // A type-wide registration stages its lifecycle redirects before method
+  // probes are ready. Keep target-side identity accounting active, but never
+  // reserve an event slot that could be published after group activation.
+  // Ordinary ObjectWatch instances have no identity_watch_id and keep their
+  // existing event behavior.
+  if (watch.identity_watch_id &&
+      (!channel.registration_active.load(std::memory_order_acquire) ||
+       !(watch.static_gate.load(std::memory_order_acquire) & enabled)))
+    return;
   if (capture_exhausted(channel))
     return;
   auto position = channel.tail.load(std::memory_order_relaxed);
@@ -2617,8 +2630,10 @@ void fault(int sig, siginfo_t *info, void *context) {
     }
   }
   const auto &previous = previous_actions[sig];
-  if (previous.sa_handler == SIG_DFL || previous.sa_handler == SIG_IGN) {
-    if (previous.sa_handler == SIG_IGN && info->si_code <= 0)
+  const bool one_shot_consumed = (previous.sa_flags & SA_RESETHAND) &&
+      previous_delivered[sig].test_and_set(std::memory_order_relaxed);
+  if (one_shot_consumed || previous.sa_handler == SIG_DFL || previous.sa_handler == SIG_IGN) {
+    if (!one_shot_consumed && previous.sa_handler == SIG_IGN && info->si_code <= 0)
       return;
 
     if (faulting && !async && part == Part::instruction) {
@@ -2706,7 +2721,16 @@ void fault(int sig, siginfo_t *info, void *context) {
   }
 }
 
-void install_bridge(std::uint64_t async_signals) {
+void install_bridge(std::uint64_t async_signals, bool grouped) {
+  // Grouped JIT preparation runs before the cache is installed. Reacquire a
+  // disposition only when no retained translation can still use the old chain.
+  bool allow_rebind = grouped;
+  for (auto *watch = retained.load(std::memory_order_acquire); allow_rebind && watch;
+       watch = watch->previous) {
+    if (watch->static_gate.load(std::memory_order_acquire) ||
+        watch->runtime_inflight.load(std::memory_order_acquire))
+      allow_rebind = false;
+  }
   std::vector<int> signals{SIGSEGV, SIGBUS, SIGFPE, SIGILL};
   for (int sig = 1; sig < NSIG && sig <= 64; ++sig)
     if (!synchronous_fault_signal(sig) && (async_signals & (1ULL << (sig - 1))))
@@ -2716,24 +2740,26 @@ void install_bridge(std::uint64_t async_signals) {
     struct sigaction current{};
     if (::sigaction(sig, nullptr, &current))
       throw std::runtime_error("cannot read application signal disposition");
-    if (bridge_installed[sig]) {
-      if (!(current.sa_flags & SA_SIGINFO) || current.sa_sigaction != fault)
-        throw std::runtime_error("application replaced the code-cache signal handler");
-    } else {
-      if (current.sa_flags & SA_RESETHAND)
-        throw std::runtime_error("code cache cannot chain one-shot signal handlers");
-      if ((async_signals & (1ULL << (sig - 1))) &&
-          (current.sa_handler == SIG_DFL || current.sa_handler == SIG_IGN))
-        throw std::runtime_error("asynchronous signal needs an existing application handler");
-      previous_actions[sig] = current;
-      missing.push_back(sig);
-    }
+    if (bridge_installed[sig] && (current.sa_flags & SA_SIGINFO) && current.sa_sigaction == fault)
+      continue;
+    if (bridge_installed[sig] && !allow_rebind)
+      throw std::runtime_error("application replaced the code-cache signal handler");
+    if ((current.sa_flags & SA_RESETHAND) && !grouped)
+      throw std::runtime_error("code cache cannot chain one-shot signal handlers");
+    if ((async_signals & (1ULL << (sig - 1))) &&
+        (current.sa_handler == SIG_DFL || current.sa_handler == SIG_IGN))
+      throw std::runtime_error("asynchronous signal needs an existing application handler");
+    previous_actions[sig] = current;
+    previous_delivered[sig].clear(std::memory_order_relaxed);
+    missing.push_back(sig);
   }
   for (const auto sig : missing) {
     struct sigaction action{};
     action.sa_mask = previous_actions[sig].sa_mask;
     action.sa_flags = SA_SIGINFO |
         (previous_actions[sig].sa_flags & (SA_ONSTACK | SA_NODEFER | SA_RESTART));
+    if (previous_actions[sig].sa_flags & SA_RESETHAND)
+      action.sa_flags |= SA_NODEFER;
     action.sa_sigaction = fault;
     if (::sigaction(sig, &action, nullptr)) {
       for (const auto installed : missing) {
@@ -4883,6 +4909,7 @@ void initialize(Init &init
   }
 #endif
   watch->pid = ::getpid();
+  watch->identity_watch_id = init.identity_watch_id;
   watch->offset = init.scalar;
   if (init.field_width != 1 && init.field_width != 2 && init.field_width != 4 && init.field_width != 8)
     throw std::runtime_error("invalid native write field width");
@@ -4942,6 +4969,33 @@ void initialize(Init &init
   for (const auto &function : functions)
     for (std::size_t i = 0; i < function.count; ++i)
       watch->sites.push_back({function.instructions[i], watch.get(), function.instructions[0].pc});
+  if (watch->identity_watch_id) {
+    bool constructor_entry = false, constructor_return = false;
+    bool destructor_entry = false, destructor_return = false;
+    for (const auto &site : watch->sites) {
+      switch (site.instruction.hook) {
+      case Hook::constructor_enter: constructor_entry = true; break;
+      case Hook::constructor_return: constructor_return = true; break;
+      case Hook::create:
+        constructor_entry = constructor_return = true;
+        break;
+      case Hook::destructor_enter:
+      case Hook::destroy_begin:
+        destructor_entry = true;
+        break;
+      case Hook::destructor_return:
+      case Hook::destroy_end:
+        destructor_return = true;
+        break;
+      case Hook::destroy_both:
+        destructor_entry = destructor_return = true;
+        break;
+      default: break;
+      }
+    }
+    watch->identity_lifecycle_covered = constructor_entry && constructor_return &&
+        destructor_entry && destructor_return;
+  }
   const XState xstate;
   std::size_t first = 0;
   for (auto &function : functions) {
@@ -4951,7 +5005,7 @@ void initialize(Init &init
     install_static_fragment(*watch, sites, function, xstate);
     first += function.count;
   }
-  install_bridge(watch->async_signals);
+  install_bridge(watch->async_signals, watch->identity_watch_id != 0);
   if (!watch->static_bodies.empty())
     watch->channel->static_fragments.store(watch->static_bodies.size(), std::memory_order_release);
   if (!watch->static_bodies.empty() || (watch->module_pin && watch->runtime_limit)) {
@@ -4962,6 +5016,55 @@ void initialize(Init &init
   retained.store(watch.release(), std::memory_order_release);
 }
 } // namespace
+
+namespace identity {
+Identity lookup(std::uint64_t watch_id, std::uint64_t receiver,
+                bool receiver_type_verified) noexcept {
+  try {
+    if (!watch_id || !receiver)
+      return {Status::unregistered, 0, 0};
+    State *watch = nullptr;
+    for (auto *candidate = retained.load(std::memory_order_acquire); candidate;
+         candidate = candidate->previous) {
+      if (candidate->identity_watch_id == watch_id) {
+        watch = candidate;
+        break;
+      }
+    }
+    if (!watch || !watch->identity_lifecycle_covered)
+      return {Status::unregistered, 0, 0};
+    if (!(watch->static_gate.load(std::memory_order_acquire) & enabled))
+      return {Status::retired, 0, 0};
+
+    // Constructor/destructor frames are thread-local so an invocation on a
+    // different thread cannot borrow partially constructed or tearing-down
+    // storage. The destructor frame owns a copied identity after map erasure.
+    for (auto frame = lifecycle_frames.rbegin(); frame != lifecycle_frames.rend(); ++frame) {
+      if (frame->watch != watch || frame->event.object != receiver)
+        continue;
+      if (frame->constructor)
+        return {watch->channel->registration_active.load(std::memory_order_acquire)
+                    ? Status::provisional : Status::staged, 0, 0};
+      return {Status::destroying, frame->event.id, frame->event.generation};
+    }
+
+    std::lock_guard lock(watch->mutex);
+    if (const auto found = watch->lifetimes.find(receiver); found != watch->lifetimes.end()) {
+      const auto &life = found->second;
+      if (!life.id)
+        return {Status::provisional, 0, 0};
+      const auto active = watch->channel->registration_active.load(std::memory_order_acquire);
+      return {active ? Status::active : Status::staged, life.id, life.generation};
+    }
+    if (const auto history = watch->generations.find(receiver);
+        history != watch->generations.end() && history->second.generation)
+      return {Status::stale, 0, history->second.generation};
+    return {receiver_type_verified ? Status::provisional : Status::absent, 0, 0};
+  } catch (...) {
+    return {Status::unregistered, 0, 0};
+  }
+}
+} // namespace identity
 } // namespace tracer::object_cache
 
 extern "C" int tracer_agent_object_cache_v38(tracer::object_cache::Init *request) {

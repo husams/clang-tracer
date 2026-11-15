@@ -1748,6 +1748,8 @@ public:
   grpc::Status AddProbe(grpc::ServerContext *,
                         const clangtracer::v1::AddProbeRequest *request,
                         clangtracer::v1::Probe *response) override {
+    if (request->spec().object_watch_id())
+      return {grpc::StatusCode::INVALID_ARGUMENT, "install grouped methods with ObjectProbe"};
     const auto validation = validate_probe(request->spec());
     if (!validation.ok())
       return validation;
@@ -1767,6 +1769,8 @@ public:
       return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
     std::lock_guard operation_lock(session->operation_mutex());
     try {
+      if (object_probe_member(session->id(), request->probe_id()))
+        return {grpc::StatusCode::FAILED_PRECONDITION, "stop the object probe before changing its methods"};
       auto spec = session->reload_spec(request->probe_id(), request->callback_source());
       const auto validation = validate_probe(spec);
       if (!validation.ok())
@@ -1799,6 +1803,8 @@ public:
     if (!session)
       return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
     std::lock_guard operation_lock(session->operation_mutex());
+    if (object_probe_member(session->id(), request->probe_id()))
+      return {grpc::StatusCode::FAILED_PRECONDITION, "stop the object probe registration"};
     return remove_probe(session, request->probe_id(), response);
   }
 
@@ -1913,6 +1919,8 @@ public:
 
   grpc::Status ObjectWatch(grpc::ServerContext *, const api::ObjectWatchRequest *request,
                            api::ObjectWatchStatus *response) override {
+    if (request->lifetimes_only() || request->staged_registration())
+      return {grpc::StatusCode::INVALID_ARGUMENT, "use ObjectProbe for a type registration"};
     const bool prepare = request->action() == api::ObjectWatchRequest::PREPARE;
     auto session = find_session(request->session_id());
     if (!prepare && !session)
@@ -2044,6 +2052,37 @@ public:
         snapshot_groups_.erase(session->id());
       }
       return grpc::Status::OK;
+    } catch (const std::exception &error) {
+      return status_for(error);
+    }
+  }
+
+  grpc::Status ObjectProbe(grpc::ServerContext *context, const api::ObjectProbeRequest *request,
+                            api::ObjectProbeStatus *response) override {
+    using GroupRequest = api::ObjectProbeRequest;
+#if !defined(__linux__) || !defined(__x86_64__)
+    return {grpc::StatusCode::UNIMPLEMENTED, "object probe requires Linux x86-64"};
+#endif
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    const std::lock_guard operation_lock(session->operation_mutex());
+    try {
+      const auto group = object_probe_group(session->id());
+      switch (request->action()) {
+      case GroupRequest::STATUS:
+      case GroupRequest::STOP:
+        if (!group || (request->registration_id() && group->id != request->registration_id()))
+          return {grpc::StatusCode::NOT_FOUND, "no matching type registration in this session"};
+        if (request->action() == GroupRequest::STOP)
+          stop_object_probe(session, *group);
+        return describe_object_probe(session, *group, *response);
+      case GroupRequest::PREVIEW:
+      case GroupRequest::START:
+        return bind_object_probe(*context, session, *request, group, *response);
+      default:
+        return {grpc::StatusCode::INVALID_ARGUMENT, "unknown object probe action"};
+      }
     } catch (const std::exception &error) {
       return status_for(error);
     }
@@ -2536,6 +2575,18 @@ private:
   std::mutex mutex_;
   std::map<std::string, std::shared_ptr<Session>> sessions_;
   std::map<std::string, std::shared_ptr<SnapshotGroup>> snapshot_groups_;
+  struct ObjectProbeGroup {
+    std::uint64_t id = 0;
+    bool published = false;
+    bool finished = false;
+    api::ObjectWatchStatus stopped_watch;
+    api::ObjectProbeRequest definition;
+    api::ObjectProbeBinding binding;
+    std::vector<std::uint64_t> methods;
+    std::string diagnostic;
+  };
+  // Individual groups are accessed under the corresponding session operation lock.
+  std::map<std::string, std::shared_ptr<ObjectProbeGroup>> object_probe_groups_;
   std::map<std::uint32_t, std::string> active_by_pid_;
   std::set<std::uint32_t> pending_pids_;
   // Session ids in attach order, oldest first, so history eviction is FIFO.
@@ -2562,6 +2613,7 @@ private:
       const auto active = active_by_pid_.find(found->second->pid());
       if (active != active_by_pid_.end() && active->second == found->first)
         active_by_pid_.erase(active);
+      object_probe_groups_.erase(found->first);
       sessions_.erase(found);
       session_order_.erase(it);
       return true;
@@ -2818,6 +2870,266 @@ public:
     }
     events_.activate_snapshot_watch(*group->events);
     return snapshot_watch_status(session, *group, api::ObjectWatchRequest::STATUS, response);
+  }
+
+  std::shared_ptr<ObjectProbeGroup> object_probe_group(const std::string &session_id) {
+    const std::lock_guard lock(mutex_);
+    const auto found = object_probe_groups_.find(session_id);
+    return found == object_probe_groups_.end() ? nullptr : found->second;
+  }
+
+  bool object_probe_member(const std::string &session_id, std::uint64_t id) {
+    const auto group = object_probe_group(session_id);
+    return group && std::find(group->methods.begin(), group->methods.end(), id) != group->methods.end();
+  }
+
+  static api::ObjectWatchRequest object_probe_watch_request(const api::ObjectProbeRequest &request) {
+    using Watch = api::ObjectWatchRequest;
+    const auto &input = request.watch();
+    const auto valid = [](const std::string &value) {
+      return value.size() <= 512 && value.find('\0') == std::string::npos;
+    };
+    if (input.concrete_type().empty() || !valid(input.concrete_type()) ||
+        !valid(input.field()) || !valid(input.code_symbol()) || !valid(input.code_module()) ||
+        !valid(input.union_tag()) || input.additional_code_symbols_size() > 15 ||
+        input.union_cases_size() > 32)
+      throw std::invalid_argument("invalid object probe type, field, union, or writer selector");
+    Watch watch;
+    watch.set_session_id(request.session_id());
+    watch.set_concrete_type(input.concrete_type());
+    watch.set_backend(Watch::CODE_CACHE);
+    watch.set_staged_registration(true);
+    watch.set_lifetimes_only(input.field().empty());
+    watch.set_field(input.field());
+    watch.set_code_symbol(input.code_symbol());
+    watch.set_code_module(watch.lifetimes_only() && input.code_module().empty()
+                              ? request.method_module() : input.code_module());
+    watch.set_follow_calls(input.follow_calls());
+    watch.set_max_elements(256);
+    watch.set_max_string_bytes(256);
+    watch.set_no_values(input.no_values());
+    watch.set_first_seen(input.first_seen());
+    watch.set_union_tag(input.union_tag());
+    watch.set_synchronization(input.synchronization());
+    if (watch.lifetimes_only() && (request.methods().empty() || !watch.code_symbol().empty() ||
+        watch.follow_calls() || watch.first_seen() || watch.no_values() ||
+        !watch.union_tag().empty() || !input.union_cases().empty() || !input.additional_code_symbols().empty()))
+      throw std::invalid_argument("lifetime-only object probes require methods and take no writer options");
+    if ((!watch.lifetimes_only() && watch.code_symbol().empty()) ||
+        (watch.union_tag().empty() != input.union_cases().empty()) ||
+        (watch.follow_calls() && !request.methods().empty()))
+      throw std::invalid_argument("invalid write selection or runtime writer following with method probes");
+    const bool synchronized = watch.synchronization() == Watch::THREAD_CONFINED ||
+                              watch.synchronization() == Watch::CALLER_LOCK;
+    if (!watch.union_tag().empty() && !synchronized)
+      throw std::invalid_argument("tagged union capture requires thread-confined or caller-lock synchronization");
+    if (watch.first_seen() && !watch.code_module().empty())
+      throw std::invalid_argument("first-seen capture requires a standalone executable writer");
+    for (const auto &writer : input.additional_code_symbols()) {
+      if (writer.empty() || !valid(writer))
+        throw std::invalid_argument("invalid additional writer selector");
+      watch.add_additional_code_symbols(writer);
+    }
+    for (const auto &entry : input.union_cases()) {
+      if (entry.member().empty() || !valid(entry.member()))
+        throw std::invalid_argument("invalid union case member");
+      *watch.add_union_cases() = entry;
+    }
+    return watch;
+  }
+
+  grpc::Status describe_object_probe(const std::shared_ptr<Session> &session,
+                                    ObjectProbeGroup &group, api::ObjectProbeStatus &response) {
+    using Watch = api::ObjectWatchRequest;
+    response.set_registration_id(group.id);
+    *response.mutable_binding() = group.binding;
+    session->refresh_process_state();
+    const auto current = session->snapshot();
+    const bool exited = current.state() == api::Session::EXITED || current.state() == api::Session::DETACHED;
+    bool methods_live = false;
+    for (const auto &probe : current.probes()) {
+      if (std::find(group.methods.begin(), group.methods.end(), probe.id()) == group.methods.end())
+        continue;
+      *response.add_methods() = probe;
+      methods_live |= probe.active() || probe.draining();
+    }
+    if (group.finished)
+      *response.mutable_watch() = group.stopped_watch;
+    if (!group.finished && !exited && session->has_object_probe_registration(group.id)) {
+      Watch watch;
+      watch.set_action(Watch::STATUS);
+      watch.set_watch_id(group.id);
+      *response.mutable_watch() = session->object_watch(watch, 0, {});
+    }
+    response.set_active(group.published && !exited && response.watch().active());
+    response.set_restoration_pending(!exited && (response.watch().restoration_pending() ||
+        (!response.active() && (methods_live || !group.finished))));
+    response.set_diagnostic(exited ? "target exited or detached" : group.diagnostic);
+    return grpc::Status::OK;
+  }
+
+  void stop_object_probe(const std::shared_ptr<Session> &session, ObjectProbeGroup &group) {
+    using Watch = api::ObjectWatchRequest;
+    if (group.finished)
+      return;
+    session->refresh_process_state();
+    if (session->snapshot().state() == api::Session::EXITED) {
+      group.published = false;
+      group.finished = true;
+      return;
+    }
+    const bool has_watch = session->has_object_probe_registration(group.id);
+    if (has_watch)
+      session->set_object_probe_active(group.id, false);
+    group.published = false;
+    for (auto it = group.methods.rbegin(); it != group.methods.rend(); ++it) {
+      api::Probe probe;
+      const auto result = remove_probe(session, *it, &probe);
+      if (!result.ok()) {
+        group.diagnostic = "method restoration pending for " + std::to_string(*it) + ": " +
+                           result.error_message();
+        return;
+      }
+    }
+    if (!has_watch) {
+      group.finished = true;
+      return;
+    }
+    Watch watch;
+    watch.set_action(Watch::STOP);
+    watch.set_watch_id(group.id);
+    watch.set_staged_registration(true);
+    const auto stopped = session->object_watch(watch, 0, {});
+    group.finished = !stopped.active() && !stopped.restoration_pending();
+    group.stopped_watch = stopped;
+    group.diagnostic = stopped.diagnostic();
+  }
+
+  grpc::Status bind_object_probe(grpc::ServerContext &context,
+      const std::shared_ptr<Session> &session, const api::ObjectProbeRequest &request,
+      const std::shared_ptr<ObjectProbeGroup> &previous, api::ObjectProbeStatus &response) {
+    using Request = api::ObjectProbeRequest;
+    using Watch = api::ObjectWatchRequest;
+    const bool starting = request.action() == Request::START;
+    if (request.methods_size() > static_cast<int>(kMaxProbes) ||
+        (request.methods().empty() != request.callback_source().empty()) ||
+        request.callback_source().size() > kMaxCallbackSource ||
+        request.callback_source().find('\0') != std::string::npos ||
+        request.method_module().size() > 4096 || request.method_module().find('\0') != std::string::npos)
+      throw std::invalid_argument("invalid object probe methods or callback source");
+    auto definition = request;
+    definition.clear_preview();
+    definition.set_action(Request::START);
+    if (starting && previous && !previous->finished) {
+      if (previous->published && previous->definition.SerializeAsString() == definition.SerializeAsString())
+        return describe_object_probe(session, *previous, response);
+      return {grpc::StatusCode::FAILED_PRECONDITION, "stop the existing object probe registration first"};
+    }
+    auto watch = object_probe_watch_request(request);
+    session->refresh_process_state();
+    if (session->snapshot().state() != api::Session::ATTACHED)
+      return {grpc::StatusCode::FAILED_PRECONDITION, "object probe requires a live attached session"};
+    watch.set_action(Watch::PREVIEW);
+    const auto preview = session->object_watch(watch, 0, {});
+    *response.mutable_watch() = preview;
+    auto &binding = *response.mutable_binding();
+    *binding.mutable_watch() = preview.plan();
+    std::vector<api::ProbeSpec> methods;
+    std::set<std::uint64_t> entries;
+    for (const auto &artifact : request.methods()) {
+      if (!tracer::prepared::is_typed_version(artifact.format_version()) || artifact.selector().empty())
+        throw std::invalid_argument("object probe requires an exact typed prepared method");
+      client::DebugLookupOptions lookup;
+      lookup.module = request.method_module();
+      lookup.is_cancelled = [&] { return context.IsCancelled(); };
+      auto resolved = client::bind_prepared_callable(session->pid(), artifact, lookup);
+      auto &spec = resolved.spec;
+      const auto &info = spec.debug_info();
+      if (spec.signature().kind() != api::METHOD ||
+          info.record_name() != watch.concrete_type() ||
+          !info.runtime_entry() || !info.entry_size() ||
+          !entries.insert(info.runtime_entry()).second)
+        throw std::invalid_argument("method requires a unique exact receiver of the registered type");
+      for (const auto &patch : preview.redirects()) {
+        if ((patch.pc() >= info.runtime_entry() && patch.pc() - info.runtime_entry() < info.entry_size()) ||
+            (patch.pc() < info.runtime_entry() && info.runtime_entry() - patch.pc() < patch.original().size()))
+          throw std::invalid_argument("method overlaps an object lifecycle or writer patch: " + artifact.selector());
+      }
+      const auto boundary = object_watch::Plan::method_boundary(
+          info.module(), artifact, &info, true, session->pid());
+      const bool owns_lifetime = std::any_of(binding.watch().bindings().begin(),
+          binding.watch().bindings().end(), [&](const auto &entry) {
+        return entry.role() == "construct" && entry.module() == info.module();
+      });
+      if (!owns_lifetime)
+        throw std::invalid_argument("method and complete lifetime must be verified in the same image");
+      *binding.add_methods() = info;
+      *binding.add_method_patches() = boundary.binding;
+      spec.set_callback_source(request.callback_source());
+      spec.set_native_backend("entry");
+      const auto validated = validate_probe(spec);
+      if (!validated.ok())
+        return validated;
+      methods.push_back(std::move(spec));
+    }
+    if (request.has_preview() && request.preview().SerializeAsString() != binding.SerializeAsString())
+      return {grpc::StatusCode::FAILED_PRECONDITION, "stale object probe binding; preview the attached image again"};
+    if (!starting) {
+      response.set_diagnostic("verified exact receiver methods and candidate watch patches");
+      return grpc::Status::OK;
+    }
+
+    auto group = std::make_shared<ObjectProbeGroup>();
+    do { group->id = next_probe_id_.fetch_add(1); } while (!group->id);
+    group->definition = std::move(definition);
+    group->binding = binding;
+    watch.set_action(Watch::START);
+    *watch.mutable_prepared_bindings() = binding.watch();
+    {
+      const std::lock_guard lock(mutex_);
+      object_probe_groups_[session->id()] = group;
+    }
+    try {
+      for (auto &spec : methods) {
+        spec.set_object_watch_id(group->id);
+        api::Probe probe;
+        std::uint64_t id = 0;
+        const auto result = install_probe(session, spec, {}, id, &probe, 0, [&] {
+          return context.IsCancelled() || std::chrono::system_clock::now() >= context.deadline();
+        });
+        if (result.ok() && probe.active()) {
+          group->methods.push_back(id);
+          continue;
+        }
+        if (id) {
+          const auto snapshot = session->snapshot();
+          for (const auto &current : snapshot.probes())
+            if (current.id() == id)
+              group->methods.push_back(id);
+        }
+        throw std::runtime_error("object probe method installation failed: " + result.error_message());
+      }
+      if (context.IsCancelled() || std::chrono::system_clock::now() >= context.deadline())
+        throw std::runtime_error("object probe activation cancelled");
+      const auto installed = session->object_watch(watch, group->id, [this](auto event) {
+        events_.publish_object_observation(std::move(event));
+      });
+      if (!installed.active() || installed.restoration_pending())
+        throw std::runtime_error("object probe watch failed to become active");
+      session->set_object_probe_active(group->id, true);
+      group->published = true;
+      group->diagnostic = installed.diagnostic();
+    } catch (const std::exception &error) {
+      try {
+        stop_object_probe(session, *group);
+      } catch (const std::exception &cleanup) {
+        group->diagnostic = std::string("restoration pending: ") + cleanup.what();
+      }
+      if (group->finished)
+        return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
+      group->diagnostic = std::string(error.what()) + " | " + group->diagnostic;
+    }
+    return describe_object_probe(session, *group, response);
   }
 
   void erase_active_pid_if_inactive(const std::shared_ptr<Session> &session) {

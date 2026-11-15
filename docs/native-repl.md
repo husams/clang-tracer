@@ -335,6 +335,66 @@ stays in place and selects the trap path. The trap owns execution control for it
 restores its byte at stop, detach, or a thread or process creation stop.
 Remove a fallback probe before replacing it.
 
+## Register a C++ type for object probing
+
+`%object-probe` prepares a package, binds it to a Linux x86-64 process,
+and controls its admitted lifetime hooks and typed method observers under one
+registration ID. The target's ELF remains on disk and the tracer verifies live
+patch windows before activation.
+
+Prepare without an executable or an attachment. Pass the original header,
+compilation database and translation unit and select each exact method with
+`--method`. The package embeds the callback source and prepared method
+adapters. For example, an interceptor for a `Counter` method can use the
+registered lifetime ID alongside its ordinary call ID.
+
+```cpp
+template <> class Interceptor<tracer::ResolvedSignature> {
+public:
+  long long pre(const Call& call) {
+    return static_cast<long long>(call.object_id());
+  }
+  long long post(const Call& call) {
+    return static_cast<long long>(call.object_generation());
+  }
+};
+```
+
+```text
+%object-probe prepare demo::Counter --include ./counter.hpp --compdb ./compile_commands.json --translation-unit ./counter.cpp --method "demo::Counter::add(int)" --callbacks ./callbacks.cpp --output ./counter.object
+%attach PID
+%object-probe preview --package ./counter.object
+%object-probe start --package ./counter.object
+%object-probe status REGISTRATION_ID
+%object-probe stop REGISTRATION_ID
+```
+
+The preview shows verified lifecycle and method patch windows. Start
+revalidates the binding, stages the patches, and admits callbacks only after
+publication. Record lifetime and write events with `%record --probe
+REGISTRATION_ID`. Start also prints the member probe IDs for selecting normal
+PRE and POST events. Each callback sees the object ID and generation copied
+at entry. Borrowed receiver views follow the usual interceptor lifetime.
+
+For individual writes, prepare a field and its writer. Omit `--code` to use
+writer discovery from the original compilation database. When the writer is
+already known, select it explicitly and use `--dwarf-writers` for a write-only
+package prepared without a compilation database.
+
+```text
+%object-probe prepare demo::Counter --field value --code "demo::Counter::set(int)" --dwarf-writers --output ./writes.object
+%object-probe preview --package ./writes.object
+%object-probe start --package ./writes.object
+```
+
+For a writer in an attached shared library, pass its mapped name with
+`--module`. `--follow-calls` is available for write-only packages. Follow the
+coverage counts in status when the writer reaches native callees. A combined
+registration requires disjoint method and writer patch windows. The current
+method path admits exact receivers with verified construction and skips
+receivers whose lifetime predates attachment. Lifecycle and write observations
+use the existing event stream.
+
 ## Trace object lifetimes and state in a prebuilt binary
 
 Use the full Linux build on x86-64 or AArch64, with the REPL, server, and agent from the same build. Supply the existing ELF and its matching DWARF, either embedded or in a matching separate debug file. The watch installs patches in process memory. The application executable and source files stay intact.

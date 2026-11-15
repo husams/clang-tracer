@@ -60,11 +60,13 @@ function(tracer_add_native_repl)
   target_include_directories(tracer_repl_rpc PUBLIC "${_generated}")
   target_link_libraries(tracer_repl_rpc PUBLIC gRPC::grpc++ protobuf::libprotobuf)
   add_library(tracer_repl_client STATIC "${_repl}/controller.cpp" "${_repl}/server_process.cpp"
-    "${_repl}/events.cpp" "${_repl}/../object_snapshot.cpp" "${_repl}/background_events.cpp")
+    "${_repl}/events.cpp" "${_repl}/../object_snapshot.cpp" "${_repl}/background_events.cpp"
+    "${_repl}/object_probe_package.cpp")
   target_include_directories(tracer_repl_client PUBLIC "${_repl}"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
   target_link_libraries(tracer_repl_client PUBLIC tracer_repl_rpc tracer_repl_commands Threads::Threads
     PRIVATE SQLite::SQLite3)
+  target_include_directories(tracer_repl_client SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
   target_compile_options(tracer_repl_client PRIVATE -Wall -Wextra -Wpedantic)
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/TracerToolchain.cmake")
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/TracerJitConfig.cmake")
@@ -83,7 +85,7 @@ function(tracer_add_native_repl)
   add_executable(clang-tracer-module "${_src}/module_index_cli.cpp")
   target_include_directories(clang-tracer-module SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
   target_link_libraries(clang-tracer-module PRIVATE tracer_module_index LLVM)
-  target_link_libraries(tracer_repl_client PUBLIC tracer_module_index)
+  target_link_libraries(tracer_repl_client PUBLIC tracer_module_index PRIVATE LLVM)
   install(TARGETS tracer_module_index clang-tracer-module
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Runtime
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Runtime)
@@ -897,6 +899,11 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:repl-shared-shapes-library>)
       set_tests_properties(native_repl_code_cache_shared PROPERTIES TIMEOUT 120)
       if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+        add_test(NAME native_repl_type_object_probe
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_type_object_probe.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:clang_tracer_agent> "${CMAKE_CXX_COMPILER}")
+        set_tests_properties(native_repl_type_object_probe PROPERTIES TIMEOUT 180)
         add_library(repl-object-shared-writer-library SHARED
           tests/fixtures/object_shared_writer/library.cpp)
         add_executable(repl-object-shared-writer-target

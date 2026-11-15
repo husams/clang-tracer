@@ -118,6 +118,7 @@ public:
   std::set<std::pair<std::uint64_t, std::uint64_t>> complete_constructor_returns;
   std::map<std::uint64_t, std::uint64_t> delegating_constructor_tails;
   bool virtual_destructor = false;
+  bool lifetimes_only = false;
   std::map<std::uint64_t, InlineMutation> inline_mutations;
   std::set<std::uint64_t> destruction_mutations;
   std::map<std::uint64_t, std::string> mutation_selectors;

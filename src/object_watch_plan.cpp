@@ -1954,6 +1954,96 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   image_ = std::make_unique<Image>(pid, module, module == executable);
   if (module != executable)
     main_ = std::make_unique<Image>(pid, executable, true);
+
+  if (request.lifetimes_only()) {
+    lifetimes_only = true;
+    const auto &concrete = request.concrete_type();
+    const auto leaf = leaf_name(concrete);
+    const auto constructor_name = concrete + "::" + leaf + "(";
+    const auto destructor_name = concrete + "::~" + leaf + "(";
+    const auto is_constructor = [&](const Symbol &symbol) {
+      return symbol.kind == llvm::ELF::STT_FUNC && symbol.demangled.starts_with(constructor_name) &&
+          symbol.linkage.find('.') == std::string::npos &&
+          (symbol.linkage.contains("C1E") || symbol.linkage.contains("C2E"));
+    };
+    auto *const lifetime_image = image_.get();
+    const auto constructor = std::ranges::find_if(lifetime_image->symbols, is_constructor);
+    if (constructor == lifetime_image->symbols.end())
+      throw std::runtime_error("no verified constructor entries for lifetime-only type " + concrete);
+    for (const auto &entry : lifetime_image->symbols) {
+      if (!is_constructor(entry))
+        continue;
+      const auto site = lifetime_image->dwarf->getDIEsForAddress(entry.range.first);
+      const auto type = find_record(*lifetime_image->dwarf, concrete, site.CompileUnit);
+      std::set<DWARFDie> seen;
+      if (has_virtual_members_or_bases(type, seen))
+        throw std::runtime_error("lifetime-only identity cannot establish complete-object ownership for a polymorphic type");
+    }
+    if (derived_types(*lifetime_image->dwarf, concrete).present ||
+        (main_ && derived_types(*main_->dwarf, concrete).present))
+      throw std::runtime_error("lifetime-only identity cannot disambiguate known derived construction of " +
+                               concrete + "; register the complete derived type until constructor coverage is available");
+    const auto add_lifecycle = [&](const Symbol &symbol, Boundary role, bool uncertain,
+                                   bool deleting = false) {
+      const auto pc = lifetime_image->bind(pid, symbol.range);
+      const auto decoded = native_entry::scan(pc,
+          lifetime_image->code(pc).substr(0, std::min<std::uint64_t>(symbol.range.second, 15)));
+      if (decoded.instructions.empty())
+        throw std::runtime_error("cannot decode a verified object lifetime entry: " + symbol.demangled);
+      auto [site, inserted] = sites.try_emplace(pc,
+          Site{std::string(lifetime_image->code(pc).substr(0, decoded.instructions.front().size)),
+               role, std::nullopt, uncertain, 0, deleting});
+      if (!inserted) {
+        if (site->second.boundary != role)
+          throw std::runtime_error("constructor and destructor entries overlap");
+        site->second.uncertain_complete &= uncertain;
+        site->second.deleting_destructor |= deleting;
+      }
+      boundaries.emplace(pc, symbol.range.second);
+      virtual_destructor |= deleting;
+    };
+
+    std::set<Range> destructors;
+    for (const auto &symbol : lifetime_image->symbols) {
+      if (symbol.kind != llvm::ELF::STT_FUNC || symbol.linkage.find('.') != std::string::npos)
+        continue;
+      if (symbol.demangled.starts_with(destructor_name) &&
+          (symbol.linkage.contains("D1Ev") || symbol.linkage.contains("D0Ev")))
+        destructors.insert(symbol.range);
+    }
+    for (const auto &symbol : lifetime_image->symbols) {
+      if (symbol.kind == llvm::ELF::STT_FUNC && symbol.demangled.starts_with(constructor_name) &&
+          symbol.linkage.find('.') == std::string::npos && symbol.linkage.contains("C1E")) {
+        add_lifecycle(symbol, Boundary::construct, false);
+      }
+    }
+    for (const auto &symbol : lifetime_image->symbols) {
+      if (symbol.kind != llvm::ELF::STT_FUNC || symbol.demangled.starts_with(constructor_name) == false ||
+          symbol.linkage.find('.') != std::string::npos || !symbol.linkage.contains("C2E"))
+        continue;
+      // A base-object constructor is not proof of a complete object. Retain
+      // its boundary only as an uncertainty marker unless a C1 entry aliases it.
+      add_lifecycle(symbol, Boundary::construct, true);
+    }
+    if (destructors.empty())
+      throw std::runtime_error("no verified destructor entries for lifetime-only type " + concrete);
+    for (const auto &symbol : lifetime_image->symbols) {
+      if (symbol.kind != llvm::ELF::STT_FUNC || !symbol.demangled.starts_with(destructor_name) ||
+          symbol.linkage.find('.') != std::string::npos)
+        continue;
+      if (symbol.linkage.contains("D1Ev"))
+        add_lifecycle(symbol, Boundary::destroy, false);
+      else if (symbol.linkage.contains("D0Ev"))
+        add_lifecycle(symbol, Boundary::destroy, false, true);
+    }
+    if (std::ranges::none_of(sites, [](const auto &entry) {
+          return entry.second.boundary == Boundary::destroy && !entry.second.deleting_destructor;
+        }))
+      throw std::runtime_error("lifetime-only type has no complete destructor entry: " + concrete);
+    bias = *lifetime_image->bias;
+    return;
+  }
+
   Range writer;
   try {
     writer = image_->function(pid, request.code_symbol(),
@@ -3238,9 +3328,11 @@ Plan::MethodBoundary Plan::method_boundary(const std::string &module,
 clangtracer::v1::ObjectWatchPlan Plan::describe(bool live) const {
   clangtracer::v1::ObjectWatchPlan plan;
   plan.set_executable_build_id((main_ ? *main_ : *image_).build_id);
-  plan.set_writer_build_id(image_->build_id);
   plan.set_executable_sha256((main_ ? *main_ : *image_).sha256);
-  plan.set_binary_sha256(image_->sha256);
+  const auto *binding_image = lifetimes_only && !boundaries.empty() ?
+      image_for(boundaries.begin()->first) : image_.get();
+  plan.set_writer_build_id(binding_image ? binding_image->build_id : image_->build_id);
+  plan.set_binary_sha256(binding_image ? binding_image->sha256 : image_->sha256);
   *plan.mutable_source_writers() = source_writers;
   plan.set_field_offset(layout.scalar);
   for (const auto offset : layout.pointer_offsets)
@@ -3249,7 +3341,7 @@ clangtracer::v1::ObjectWatchPlan Plan::describe(bool live) const {
                                 "boolean", "floating point"};
   constexpr const char *complex_types[]{"", "std::string storage", "std::variant storage",
                                         "std::any storage", "union storage"};
-  plan.set_field_encoding(layout.value_write.active() ?
+  plan.set_field_encoding(lifetimes_only ? "lifetime identity only" : layout.value_write.active() ?
       complex_types[static_cast<unsigned>(layout.value_write.kind)] :
       layout.union_tag_offset ? "tagged union" :
       layout.opaque_union ? "opaque union bytes" :
