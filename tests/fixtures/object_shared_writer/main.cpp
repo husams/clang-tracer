@@ -18,6 +18,23 @@ __attribute__((noinline)) int adjust(Record &record, int value, bool store) {
 } // namespace shared_writer
 #endif
 
+#if defined(SHARED_WRITER_WEAK_INTERPOSE)
+namespace shared_writer {
+
+__attribute__((noinline)) void store(Record &record, int value) {
+  record.value = value; // WEAK_HELPER_STORE
+}
+
+__attribute__((weak, noinline)) int adjust(Record &record, int value, bool should_store) {
+  const int adjusted = value + 1;
+  if (should_store)
+    store(record, adjusted);
+  return adjusted;
+}
+
+} // namespace shared_writer
+#endif
+
 int main() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   if (::fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK) != 0)

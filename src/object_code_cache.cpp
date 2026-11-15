@@ -1756,6 +1756,9 @@ struct Watch::Impl {
       case DispatchGap::outside_plt_scope:
         item.set_diagnostic("PLT callee ran natively because its scope is outside the calling ELF and executable");
         break;
+      case DispatchGap::weak_scope:
+        item.set_diagnostic("runtime callee ran natively because its weak export cannot be redirected safely");
+        break;
       default:
         item.set_diagnostic("callee could not be translated from verified live executable bytes");
         break;

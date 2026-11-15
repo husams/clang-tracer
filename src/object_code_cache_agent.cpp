@@ -225,6 +225,12 @@ struct RuntimeImage {
   llvm::object::OwningBinary<llvm::object::Binary> binary;
   std::uint32_t module_index = 0;
 
+  struct FunctionImage {
+    std::string bytes;
+    Address file_offset = 0;
+    bool weak = false;
+  };
+
   struct PltStub {
     Address got_address = 0;
     Address lazy_target = 0;
@@ -233,7 +239,7 @@ struct RuntimeImage {
   };
 
   explicit RuntimeImage(const RuntimeLocation &location);
-  std::pair<std::string, Address> function(Address elf_address) const;
+  FunctionImage function(Address elf_address) const;
   std::optional<PltStub> plt_stub(Address elf_address) const;
 };
 
@@ -283,6 +289,11 @@ struct State {
   std::map<std::pair<RuntimeImageKey, Address>, RuntimeImage::PltStub> runtime_plt_stubs;
   std::map<std::pair<RuntimeImageKey, Address>, RuntimeBlock *> runtime_targets;
   std::map<std::tuple<dev_t, ino_t, Address, Address>, RuntimeBlock *> runtime_scopes;
+  struct RuntimeRejection {
+    DispatchGap reason = DispatchGap::translation_failed;
+    bool plt_only = false;
+  };
+  std::map<std::pair<RuntimeImageKey, Address>, RuntimeRejection> runtime_rejections;
   // Bound per-slot lazy-binding rows by runtime_limit; occurrence totals live in Channel.
   std::set<std::tuple<RuntimeImageKey, Address, Address>> runtime_lazy_slots;
   std::atomic<RuntimeBlock *> runtime_blocks{nullptr};
@@ -4095,10 +4106,11 @@ RuntimeImage::RuntimeImage(const RuntimeLocation &location) {
   binary = {std::move(*elf), std::move(buffer)};
 }
 
-std::pair<std::string, Address> RuntimeImage::function(Address address) const {
+RuntimeImage::FunctionImage RuntimeImage::function(Address address) const {
   const auto &object = *llvm::cast<llvm::object::ELF64LEObjectFile>(binary.getBinary());
   Address size = 0;
-  const auto find_entry = [&](const llvm::object::SymbolRef &symbol) {
+  bool weak = false;
+  const auto find_entry = [&](const llvm::object::SymbolRef &symbol, bool dynamic) {
     const llvm::object::ELFSymbolRef elf(symbol);
     if (elf.getELFType() != STT_FUNC || !elf.getSize())
       return;
@@ -4111,12 +4123,13 @@ std::pair<std::string, Address> RuntimeImage::function(Address address) const {
       if (size && size != elf.getSize())
         throw std::runtime_error("runtime callee has ambiguous ELF symbol extents");
       size = elf.getSize();
+      weak |= dynamic && elf.getBinding() == STB_WEAK;
     }
   };
   for (const auto &symbol : object.symbols())
-    find_entry(symbol);
+    find_entry(symbol, false);
   for (const auto &symbol : object.getDynamicSymbolIterators())
-    find_entry(symbol);
+    find_entry(symbol, true);
   if (!size)
     throw std::runtime_error("runtime callee has no concrete ELF symbol extent");
   auto headers = object.getELFFile().program_headers();
@@ -4133,7 +4146,7 @@ std::pair<std::string, Address> RuntimeImage::function(Address address) const {
     const Address delta = address - segment.p_vaddr;
     if (delta <= segment.p_filesz && size <= segment.p_filesz - delta) {
       const Address offset = segment.p_offset + delta;
-      return {file.substr(offset, size).str(), offset};
+      return {file.substr(offset, size).str(), offset, weak};
     }
   }
   throw std::runtime_error("runtime callee exceeds executable ELF segment");
@@ -4543,6 +4556,22 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
         }
         return *fresh;
       };
+      const auto remember_rejection = [&](const RuntimeImageKey &key, Address destination,
+                                          DispatchGap reason, bool plt_only) noexcept {
+        try {
+          const auto rejection_key = std::pair{key, destination};
+          const auto found = watch.runtime_rejections.find(rejection_key);
+          if (found != watch.runtime_rejections.end()) {
+            if (found->second.plt_only && !plt_only)
+              found->second = {reason, plt_only};
+          } else if (watch.runtime_rejections.size() < watch.runtime_limit) {
+            watch.runtime_rejections.emplace(rejection_key,
+                State::RuntimeRejection{reason, plt_only});
+          }
+        } catch (...) {
+          // Rejection memoization is best-effort; always preserve the call path.
+        }
+      };
 #if defined(__x86_64__)
       using PltStub = RuntimeImage::PltStub;
       const auto stub_key = std::pair{image_key, target};
@@ -4605,6 +4634,13 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
 #endif
       // The resolved target key uses the current GOT value for PLT calls.
       const auto target_key = std::pair{image_key, target};
+      const bool outside_plt_scope = from_plt && !location.main_image && image_key != plt_owner_key;
+      if (const auto rejected = watch.runtime_rejections.find(target_key);
+          rejected != watch.runtime_rejections.end() &&
+          (!rejected->second.plt_only || outside_plt_scope)) {
+        gap = static_cast<std::uint8_t>(rejected->second.reason);
+        throw std::runtime_error("runtime callee has a memoized unsupported scope");
+      }
       const auto scope_key = std::tuple{location.device, location.inode, location.bias, target};
       if (const auto cached = watch.runtime_scopes.find(scope_key); cached != watch.runtime_scopes.end()) {
         const auto &scope = *cached->second;
@@ -4634,18 +4670,32 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
       }
       const auto &image = image_for();
       auto block = std::make_unique<RuntimeBlock>();
-      std::tie(block->bytes, block->file_offset) = image.function(target - location.bias);
+      auto function = image.function(target - location.bias);
+      block->bytes = std::move(function.bytes);
+      block->file_offset = function.file_offset;
       if (!matches_runtime_bytes(target, location, *block))
         throw std::runtime_error("runtime callee bytes disagree with the mapped ELF");
       const auto decoded = native_entry::scan(target, block->bytes);
-      const bool nonleaf = !decoded.decode_failed && decoded.diagnostic.empty() &&
+      const bool decode_verified = !decoded.decode_failed && decoded.diagnostic.empty() &&
+          !decoded.instructions.empty();
+      const bool nonleaf = decode_verified &&
           std::ranges::any_of(decoded.instructions, [](const auto &inst) {
             return inst.flow == NativeFlow::call;
           });
       const auto module_index = fresh ? watch.runtime_modules + 1 : image.module_index;
+      if (function.weak && (!decode_verified || nonleaf)) {
+        gap = static_cast<std::uint8_t>(DispatchGap::weak_scope);
+        remember_rejection(image_key, target, DispatchGap::weak_scope, false);
+        throw std::runtime_error("dynamically exported weak function cannot be redirected safely");
+      }
+      if (!decode_verified) {
+        remember_rejection(image_key, target, DispatchGap::translation_failed, false);
+        throw std::runtime_error("runtime callee has permanently unsupported verified bytes");
+      }
       if (nonleaf) {
-        if (from_plt && !location.main_image && image_key != plt_owner_key) {
+        if (outside_plt_scope) {
           gap = static_cast<std::uint8_t>(DispatchGap::outside_plt_scope);
+          remember_rejection(image_key, target, DispatchGap::outside_plt_scope, true);
           throw std::runtime_error("PLT target is outside the executable and calling library");
         }
         const auto first_slot = watch.runtime_count;
