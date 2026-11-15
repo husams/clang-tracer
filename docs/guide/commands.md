@@ -142,7 +142,9 @@ Ctrl+C cancels active capture and preserves partial results. Trigger new calls f
 | --- | --- |
 | `%object prepare demo::Record --module ./app --field value --code "demo::write_value(demo::Record &)" --backend code-cache --output ./record-watch` | Save a reusable write watch for an ELF executable. |
 | `%object prepare demo::Record --executable ./app --module ./libdemo.so --field value --code "demo::write_value(demo::Record &)" --backend code-cache --follow-calls --output ./record-watch` | Prepare a shared-library writer. `--executable` identifies the process executable; `--module` identifies the library containing the writer. A lone shared-library path is rejected with this usage form. |
-| `%object preview --plan ./record-watch` / `%object start --plan ./record-watch` | Check the saved plan or start it. A non-leaf shared writer needs `--follow-calls`. If an omitted `--module` leaves the writer unresolved in the executable but it matches one mapped library, the diagnostic names that library and says which `--module` to use. |
+| `%object preview --plan ./record-watch` / `%object start --plan ./record-watch` | Check the saved plan or start it. In an eligible standalone write scope, a non-leaf shared writer needs `--follow-calls`; it cannot be combined with owner, collection, caller, `--writer-entry`, or unsupported `--first-seen` scopes. If an omitted `--module` leaves the writer unresolved in the executable but it matches one mapped library, the diagnostic names that library and says which `--module` to use. |
+
+On x86-64, see the [native REPL guide](../native-repl.md#follow-live-callees) for PLT coverage and the separate entry-window limitation.
 
 ## Native server
 

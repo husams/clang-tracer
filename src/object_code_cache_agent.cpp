@@ -24,6 +24,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <thread>
@@ -172,6 +173,7 @@ struct Site {
 #endif
   GateWindow entry_gate{};
   std::vector<ExitWindow> exit_gates{};
+  mutable std::uint32_t dispatch_gap_mask = 0;
 };
 
 struct Lifetime {
@@ -281,6 +283,8 @@ struct State {
   std::map<std::pair<RuntimeImageKey, Address>, RuntimeImage::PltStub> runtime_plt_stubs;
   std::map<std::pair<RuntimeImageKey, Address>, RuntimeBlock *> runtime_targets;
   std::map<std::tuple<dev_t, ino_t, Address, Address>, RuntimeBlock *> runtime_scopes;
+  // Bound per-slot lazy-binding rows by runtime_limit; occurrence totals live in Channel.
+  std::set<std::tuple<RuntimeImageKey, Address, Address>> runtime_lazy_slots;
   std::atomic<RuntimeBlock *> runtime_blocks{nullptr};
   State *previous = nullptr;
   std::mutex mutex;
@@ -1650,14 +1654,9 @@ void before(const Site *site, const Registers *regs) noexcept {
     return;
   if (inside_helper) {
     helper_reentry.fetch_add(1, std::memory_order_relaxed);
-#if defined(__aarch64__)
-    if (watch.snapshot_mapping) {
-      auto &queue = *static_cast<arm_snapshot::Queue *>(watch.snapshot_mapping->address);
-      queue.drops.fetch_add(1, std::memory_order_relaxed);
-      return;
-    }
-#endif
-    watch.channel->dropped.fetch_add(1, std::memory_order_relaxed);
+    watch.channel->helper_reentries.fetch_add(1, std::memory_order_relaxed);
+    // Helper reentry is accounted separately and is not an application event
+    // or a capture loss, including for the snapshot backend.
     return;
   }
   const HelperGuard guard(site);
@@ -2030,12 +2029,12 @@ void after(const Site *site, const Registers *regs) noexcept {
       cancel_pending();
     return;
   }
-  channel.executed_stores.fetch_add(1, std::memory_order_relaxed);
   if (inside_helper) {
     helper_reentry.fetch_add(1, std::memory_order_relaxed);
-    channel.dropped.fetch_add(1, std::memory_order_relaxed);
+    channel.helper_reentries.fetch_add(1, std::memory_order_relaxed);
     return;
   }
+  channel.executed_stores.fetch_add(1, std::memory_order_relaxed);
   const HelperGuard guard(site);
   try {
     complete(site, regs);
@@ -4500,12 +4499,18 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
   const Activity activity(*watch.channel);
   if (!activity.active)
     return fallback;
+  if (inside_helper) {
+    watch.channel->helper_reentries.fetch_add(1, std::memory_order_relaxed);
+    return fallback;
+  }
   if (watch.channel->reclaim_request.load(std::memory_order_acquire))
     return fallback;
   if (std::ranges::binary_search(watch.static_scopes, target))
     return fallback;
-  std::uint8_t gap = 1;
-  if (!inside_helper) {
+  std::uint8_t gap = static_cast<std::uint8_t>(DispatchGap::translation_failed);
+  bool from_plt = false;
+  RuntimeImageKey plt_owner_key{};
+  {
     const HelperGuard guard(site);
     try {
       // Query the loader before taking the watch lock. Loader callbacks can
@@ -4554,6 +4559,8 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
         }
       }
       if (plt) {
+        from_plt = true;
+        plt_owner_key = stub_key.first;
         std::array<char, 11> live_stub{};
         if (plt->file_offset != location.offset || plt->bytes.size() > location.end - target ||
             !read_self_memory(target, live_stub.data(), plt->bytes.size()) ||
@@ -4562,8 +4569,28 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
         Address slot_value = 0;
         if (!read_self(location.bias + plt->got_address, slot_value))
           throw std::runtime_error("cannot read the verified runtime PLT GOT slot");
-        if (plt->lazy_target && slot_value == location.bias + plt->lazy_target)
+        if (plt->lazy_target && slot_value == location.bias + plt->lazy_target) {
+          watch.channel->runtime_gap_hits.fetch_add(1, std::memory_order_relaxed);
+          const auto slot_key = std::tuple{stub_key.first, plt->got_address, slot_value};
+          bool first = false;
+          try {
+            first = watch.runtime_lazy_slots.size() < watch.runtime_limit &&
+                watch.runtime_lazy_slots.insert(slot_key).second;
+          } catch (...) {
+            // Keep the linker path untouched if diagnostic accounting runs out of memory.
+          }
+          if (first) {
+            lock.unlock();
+            Observation event{};
+            event.pc = site->instruction.pc;
+            event.destination = target;
+            event.runtime_module = site->runtime_module;
+            event.hook = Hook::dispatch_gap;
+            event.gap = static_cast<std::uint8_t>(DispatchGap::lazy_plt);
+            emit(watch, event);
+          }
           return fallback;
+        }
         lock.unlock();
         location = locate_runtime_target(slot_value);
         lock.lock();
@@ -4602,7 +4629,7 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
         watch.runtime_targets.erase(cached);
       }
       if (watch.runtime_count == watch.runtime_limit) {
-        gap = 2;
+        gap = static_cast<std::uint8_t>(DispatchGap::runtime_limit);
         throw std::runtime_error("runtime translation limit reached");
       }
       const auto &image = image_for();
@@ -4617,6 +4644,10 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
           });
       const auto module_index = fresh ? watch.runtime_modules + 1 : image.module_index;
       if (nonleaf) {
+        if (from_plt && !location.main_image && image_key != plt_owner_key) {
+          gap = static_cast<std::uint8_t>(DispatchGap::outside_plt_scope);
+          throw std::runtime_error("PLT target is outside the executable and calling library");
+        }
         const auto first_slot = watch.runtime_count;
         prepare_runtime_scope(*block, watch, target, module_index, decoded);
         if (!location.main_image) {
@@ -4713,9 +4744,16 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
       // The real application call still enters its original callee.
     }
   }
+  watch.channel->runtime_gap_hits.fetch_add(1, std::memory_order_relaxed);
+  const auto bit = std::uint32_t{1} << gap;
+  const bool already_reported =
+      (__atomic_fetch_or(&site->dispatch_gap_mask, bit, __ATOMIC_RELAXED) & bit) != 0;
+  if (already_reported)
+    return fallback;
   Observation event{};
   event.pc = site->instruction.pc;
   event.destination = target;
+  event.runtime_module = site->runtime_module;
   event.hook = Hook::dispatch_gap;
   event.gap = gap;
   emit(watch, event);

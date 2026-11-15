@@ -2067,7 +2067,11 @@ bool Controller::execute(const Command &command) {
       out_ << " receivers=" << result.admitted_receivers();
     if (result.mode() == api::ObjectWatchRequest::SNAPSHOTS || result.coverage_gaps())
       out_ << " coverage_gaps=" << result.coverage_gaps();
-    if (result.coverage_gaps() || result.unsupported_sites() || result.dropped() ||
+    if (result.runtime_gap_hits())
+      out_ << " runtime_gap_hits=" << result.runtime_gap_hits();
+    if (result.helper_reentries())
+      out_ << " helper_reentries=" << result.helper_reentries();
+    if (result.coverage_gaps() || result.runtime_gap_hits() || result.unsupported_sites() || result.dropped() ||
         result.external_write_order_unknown())
       out_ << " coverage=partial";
     if (!result.capture_limit().empty())

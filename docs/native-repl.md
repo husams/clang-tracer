@@ -396,6 +396,9 @@ library has a different path. Without `--module`, writer lookup first checks
 the main executable; if the writer is found in exactly one mapped shared ELF,
 the error names that module and the option to use. Shared writers with calls
 need `--follow-calls`; the diagnostic names the selected module and the flag.
+Call following is available only for standalone writes: it cannot be combined
+with owner or collection scopes, `--caller`, `--writer-entry`, or `--first-seen`
+unless first-seen has a supported structured value layout.
 
 ### Read coverage and cleanup status
 
@@ -744,6 +747,22 @@ watched address and lifetime even when the callee receives it through an
 alias. Replayed stores include the mapped ELF identity and the runtime
 module generation. A shared library can load after arming and unload
 between calls.
+
+On x86-64, a verified PLT stub can lead to a leaf translation in any bound ELF.
+In-place redirects for a nonleaf callee reached through a PLT call are limited
+to the ELF that owns that PLT stub and the process executable; other nonleaf
+callees run natively and produce an explicit coverage gap. An unbound lazy PLT
+slot also runs natively and produces one explicit gap for that slot while the
+loader binds it; subsequent calls use the current GOT target. These lazy-binding
+gaps are distinct from failures to translate a bound callee. Dispatch gaps are
+reported once per call site and reason, with `runtime_gap_hits` tracking
+occurrences; `helper_reentries` counts tracer-internal traffic separately.
+This PLT behavior applies to x86-64; AArch64 handling is unchanged.
+
+This call-following behavior does not remove entry-redirection limits. A short
+x86-64 writer entry can still be rejected when code-cache cannot verify a
+five-byte nonfaulting patch window, as can happen for a trivial one-store
+constructor. That setup error is separate from a runtime coverage gap.
 
 Use `--runtime-limit N` to bound nested scope discovery and retained translations. The default is
 1,024. When a callee exceeds the limit or its code cannot be verified and
