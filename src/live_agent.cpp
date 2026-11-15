@@ -75,7 +75,8 @@ JitRequest decode_jit(const clangtracer::v1::LiveJitInput &input) {
     result.files.push_back({source.path(), source.contents()});
   for (const auto &unit : input.units())
     result.translation_units.push_back({unit.path(), unit.directory(),
-        {unit.compiler_arguments().begin(), unit.compiler_arguments().end()}});
+        {unit.compiler_arguments().begin(), unit.compiler_arguments().end()},
+        unit.reuse_stream_initializer()});
   for (const auto &item : input.imports())
     if (!result.imports.emplace(item.name(), item.address()).second)
       throw std::runtime_error("duplicate live import " + item.name());
@@ -86,7 +87,8 @@ JitRequest decode_jit(const clangtracer::v1::LiveJitInput &input) {
 namespace {
 JitRequest jit_input(const AgentRequest &request) {
   clangtracer::v1::LiveJitInput input;
-  if (!request.input || !request.input_size || request.input_size > max_payload_bytes ||
+  if (!request.input || !request.input_size || request.input_limit > max_input_bytes ||
+      request.input_size > request.input_limit ||
       !input.ParseFromArray(reinterpret_cast<const void *>(request.input), request.input_size))
     throw std::runtime_error("invalid live JIT source payload");
   auto result = decode_jit(input);

@@ -19,6 +19,7 @@ struct TranslationUnit {
   std::string path;
   std::string directory;
   std::vector<std::string> compiler_arguments;
+  bool reuse_stream_initializer = false;
 };
 
 struct JitRequest {

@@ -24,6 +24,7 @@ int second(int);
 int lookup(int);
 int third(int);
 int adjacent_value();
+int calculate(int);
 int main() {
   if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)) return 1;
   std::thread([] { for (;;) usleep(100000); }).detach();
@@ -32,9 +33,10 @@ int main() {
   for (;;) {
     if (!access("call", F_OK)) {
       unlink("call");
-      const int one = first(10);
-      std::printf("%d %d %d %d %d\n", one, second(10), lookup(1), third(10),
-                  adjacent_value());
+      int one;
+      try { one = first(10); } catch (int value) { one = value; }
+      std::printf("%d %d %d %d %d %d\n", one, second(10), lookup(1), third(10),
+                  adjacent_value(), calculate(10));
       std::fflush(stdout);
     }
     usleep(3000);
@@ -43,21 +45,27 @@ int main() {
 """
 
 APP = """
+#include <cstdio>
+#include <iostream>
 #include <vector>
+#include <unistd.h>
 struct Config { int a; };
 struct Storage { Config config; int adjacent; };
 Storage storage{{1}, 7};
 static const int table[] = {1, 2, 3};
-int lookup(int i) { return table[i]; }
+int lookup(int i) { const char *empty = ""; return table[i] + empty[0]; }
 int first(int i) { return i + 1; }
 int second(int i) { return i + 2; }
+static int counter = 1;
+int calculate(int i) { int values[] = {1, 2, 3}; return values[i % 3] + counter; }
 int adjacent_value() { return storage.adjacent; }
 int vector_entry(int i) { std::vector<int> values; values.push_back(i); return values.back(); }
 """
 
 OTHER = """
+static int counter = 2;
 static int helper(int i) { return i + 3; }
-int third(int i) { return helper(i); }
+int third(int i) { return helper(i) + counter; }
 """
 
 
@@ -110,9 +118,11 @@ def run(args, root, cleanup):
         result = console.expect(r"^live (APPLIED|BLOCKED|STALE|REVERTED|UNCHANGED|RESTORATION_REQUIRED) revision=")
         assert result[1] == outcome, "".join(console.seen[-25:])
 
-    def call(first, second):
+    def call(first, second, *, third=15, calculated=3, runtime=False):
         (root / "call").touch()
-        app.expect(rf"^{first} {second} 2 13 7$")
+        if runtime:
+            app.expect(r"^runtime=10$")
+        app.expect(rf"^{first} {second} 2 {third} 7 {calculated}$")
 
     app_source = source / "app.cpp"
     call(11, 12)
@@ -121,7 +131,7 @@ def run(args, root, cleanup):
     app_source.write_text(layout)
     command("%live update source/app.cpp", "BLOCKED")
     call(11, 12)
-    app_source.write_text(APP.replace("{1, 2, 3}", "{1, 9, 3}"))
+    app_source.write_text(APP.replace("table[] = {1, 2, 3}", "table[] = {1, 9, 3}"))
     command("%live update source/app.cpp", "BLOCKED")
     call(11, 12)
 
@@ -144,6 +154,18 @@ def run(args, root, cleanup):
     app_source.write_text(with_extra.replace("return extra(i);", "return extra(i) + 1;"))
     command("%live update source/app.cpp", "APPLIED")
     call(81, 12)
+    command("%live revert 0", "REVERTED")
+    app_source.write_text(APP.replace("values[] = {1, 2, 3}", "values[] = {1, 9, 3}")
+                         .replace("return i + 1;",
+                                  'usleep(1); std::printf("runtime=%d\\n", i); throw i + 79;'))
+    send(repl, "%live update source/app.cpp --payload-limit 1")
+    console.expect(r"^live BLOCKED .*exceeds --payload-limit")
+    call(11, 12)
+    command("%live update source/app.cpp --payload-limit 33554432", "APPLIED")
+    call(89, 12, calculated=10, runtime=True)
+    (source / "other.cpp").write_text(OTHER.replace("return i + 3", "return i + 30"))
+    command("%live update source/other.cpp", "APPLIED")
+    call(89, 12, third=42, calculated=10, runtime=True)
     send(repl, "%detach")
     console.expect(r"^detached session=")
     call(11, 12)

@@ -18,6 +18,7 @@
 
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -57,11 +58,17 @@ std::uintptr_t runtime_import(llvm::StringRef name) {
   const auto is_c = llvm::StringSwitch<bool>(name)
       .Cases("memcpy", "memset", "memmove", "memcmp", "bcmp", "memchr", true)
       .Cases("strlen", "strcmp", "abort", "puts", true)
+      .Cases("printf", "snprintf", "getenv", "strncmp", "usleep", true)
       .Cases("pthread_mutex_lock", "pthread_mutex_unlock", "__libc_single_threaded", true)
       .Default(false);
   const auto is_cxx = name.starts_with("__cxa_") && name != "__cxa_atexit" &&
                       name != "__cxa_thread_atexit" && name != "__cxa_thread_atexit_impl";
-  const auto is_cpp = is_cxx || name == "__gxx_personality_v0" ||
+  const auto fundamental_rtti = llvm::StringSwitch<bool>(name)
+      .Cases("_ZTIb", "_ZTIc", "_ZTIa", "_ZTIh", "_ZTIs", "_ZTIt", true)
+      .Cases("_ZTIi", "_ZTIj", "_ZTIl", "_ZTIm", "_ZTIx", "_ZTIy", true)
+      .Cases("_ZTIf", "_ZTId", "_ZTIe", "_ZTIw", "_ZTIv", true)
+      .Default(false);
+  const auto is_cpp = is_cxx || fundamental_rtti || name == "__gxx_personality_v0" ||
                       name.starts_with("_ZSt") || name.starts_with("_ZNSt") ||
                       name.starts_with("_ZNKSt") || name.starts_with("_ZTVSt") ||
                       name.starts_with("_ZNSa") || name.starts_with("_ZNKSa") ||
@@ -177,7 +184,12 @@ void isolate_definitions(llvm::Module &module, const JitRequest &request,
     if (!value.hasLocalLinkage() || !value.hasName())
       continue;
     const auto import = local_import_name(unit.path, value.getName().str());
-    if (request.imports.contains(import))
+    if (auto *function = llvm::dyn_cast<llvm::Function>(&value);
+        function && std::ranges::find(request.entry_symbols, import) != request.entry_symbols.end()) {
+      function->setName(import);
+      function->setLinkage(llvm::GlobalValue::ExternalLinkage);
+      function->setDSOLocal(false);
+    } else if (request.imports.contains(import))
       value.setName(import);
     else if (request.imports.contains(value.getName().str()))
       throw std::runtime_error("unscoped import collides with local symbol: " + value.getName().str());
@@ -267,6 +279,8 @@ std::shared_ptr<JitImage> compile_in_target(const JitRequest &request) {
   for (const auto &unit : units) {
     auto compiled = compile_unit(request, unit, context.get());
     auto &module = *compiled.module;
+    if (unit.reuse_stream_initializer)
+      omit_standard_stream_initializer(module);
     isolate_definitions(module, request, unit);
     for (auto &function : module) {
       // The IR linker can drop unused linkonce_odr instantiations before

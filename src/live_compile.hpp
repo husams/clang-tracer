@@ -47,6 +47,8 @@ struct Definition {
 };
 
 bool mergeable_literal(const llvm::GlobalVariable &global);
+bool has_standard_stream_initializer(llvm::Module &module);
+void omit_standard_stream_initializer(llvm::Module &module);
 std::map<std::string, std::string> data_definitions(const CompiledUnit &unit);
 std::string local_import_name(std::string_view path, std::string_view name);
 

@@ -29,6 +29,7 @@
 #include <llvm/IR/DebugInfo.h>
 
 #include <filesystem>
+#include <optional>
 #include <tuple>
 #include <stdexcept>
 
@@ -263,18 +264,102 @@ std::unique_ptr<llvm::Module> comparison_module(const llvm::Module &module) {
   // Clang numbers pooled literals across the entire translation unit.
   // Their contents and alignment, rather than that ordinal, define the
   // value used by each instruction and initializer.
-  for (auto &global : copy->globals())
-    if (mergeable_literal(global))
-      global.setName(".live.literal." + ir_digest(initializer_text(global) + ":" +
-          std::to_string(global.getAlign().valueOrOne().value())));
+  std::map<std::string, llvm::GlobalVariable *> literals;
+  llvm::SmallVector<llvm::GlobalVariable *> redundant;
+  for (auto &global : copy->globals()) {
+    if (!mergeable_literal(global))
+      continue;
+    const auto name = ".live.literal." + ir_digest(initializer_text(global) + ":" +
+        std::to_string(global.getAlign().valueOrOne().value()));
+    const auto [prior, inserted] = literals.emplace(name, &global);
+    if (!inserted && global.getInitializer() == prior->second->getInitializer() &&
+        global.getType() == prior->second->getType()) {
+      global.replaceAllUsesWith(prior->second);
+      redundant.push_back(&global);
+    } else {
+      global.setName(name);
+    }
+  }
+  for (auto *global : redundant)
+    global->eraseFromParent();
   return copy;
+}
+
+struct StreamInitializer {
+  llvm::GlobalVariable *table;
+  llvm::Function *wrapper;
+  llvm::Function *init;
+  llvm::GlobalVariable *storage;
+};
+
+bool declares_standard_stream_initializer(const llvm::Module &module) {
+  return llvm::StringRef(module.getModuleInlineAsm()).trim() ==
+      ".globl _ZSt21ios_base_library_initv";
+}
+
+std::optional<StreamInitializer> standard_stream_initializer(llvm::Module &module) {
+  auto *table = module.getNamedGlobal("llvm.global_ctors");
+  auto *storage = module.getNamedGlobal("_ZStL8__ioinit");
+  if (!table || !table->hasInitializer() || !table->use_empty() ||
+      !storage || !storage->hasLocalLinkage() || !storage->hasNUses(2))
+    return std::nullopt;
+  const auto *list = llvm::dyn_cast<llvm::ConstantArray>(table->getInitializer());
+  if (!list || list->getNumOperands() != 1)
+    return std::nullopt;
+  const auto *entry = llvm::dyn_cast<llvm::ConstantStruct>(list->getOperand(0));
+  if (!entry || entry->getNumOperands() != 3 || !entry->getOperand(2)->isNullValue())
+    return std::nullopt;
+  auto *wrapper = llvm::dyn_cast<llvm::Function>(entry->getOperand(1));
+  if (!wrapper || !wrapper->hasLocalLinkage() || !wrapper->hasOneUse() ||
+      wrapper->size() != 1 || wrapper->front().size() != 2 ||
+      !llvm::isa<llvm::ReturnInst>(wrapper->front().back()))
+    return std::nullopt;
+  const auto *call = llvm::dyn_cast<llvm::CallInst>(&wrapper->front().front());
+  auto *init = call ? call->getCalledFunction() : nullptr;
+  if (!init || !init->hasLocalLinkage() || !init->hasOneUse() ||
+      init->size() != 1 || init->front().size() != 3 ||
+      !llvm::isa<llvm::ReturnInst>(init->front().back()))
+    return std::nullopt;
+  const auto *construct = llvm::dyn_cast<llvm::CallInst>(&init->front().front());
+  const auto *atexit = llvm::dyn_cast<llvm::CallInst>(init->front().back().getPrevNode());
+  if (!construct || construct->arg_size() != 1 || construct->getArgOperand(0) != storage ||
+      !construct->getCalledFunction() || !construct->getCalledFunction()->isDeclaration() ||
+      construct->getCalledFunction()->getName() != "_ZNSt8ios_base4InitC1Ev" ||
+      !atexit || atexit->arg_size() != 3 || atexit->getArgOperand(1) != storage ||
+      !atexit->getCalledFunction() || !atexit->getCalledFunction()->isDeclaration() ||
+      atexit->getCalledFunction()->getName() != "__cxa_atexit")
+    return std::nullopt;
+  const auto *destroy = llvm::dyn_cast<llvm::Function>(atexit->getArgOperand(0));
+  if (!destroy || !destroy->isDeclaration() || destroy->getName() != "_ZNSt8ios_base4InitD1Ev" ||
+      atexit->getArgOperand(2) != module.getNamedGlobal("__dso_handle"))
+    return std::nullopt;
+  return StreamInitializer{table, wrapper, init, storage};
 }
 } // namespace
 
 bool mergeable_literal(const llvm::GlobalVariable &global) {
+  const auto name = global.getName();
   return global.hasPrivateLinkage() && global.hasGlobalUnnamedAddr() && global.isConstant() &&
-         global.hasInitializer() && global.getName().starts_with(".str") &&
-         llvm::isa<llvm::ConstantDataArray>(global.getInitializer());
+         global.hasInitializer() && (name.starts_with(".str") || name.starts_with("__const.") ||
+                                    name.starts_with("__PRETTY_FUNCTION__.") ||
+                                    name.starts_with(".live.literal.")) &&
+         llvm::isa<llvm::ConstantDataSequential, llvm::ConstantAggregateZero>(global.getInitializer());
+}
+
+bool has_standard_stream_initializer(llvm::Module &module) {
+  return declares_standard_stream_initializer(module) || standard_stream_initializer(module).has_value();
+}
+
+void omit_standard_stream_initializer(llvm::Module &module) {
+  if (declares_standard_stream_initializer(module))
+    module.setModuleInlineAsm("");
+  if (const auto init = standard_stream_initializer(module)) {
+    init->table->eraseFromParent();
+    init->wrapper->removeDeadConstantUsers();
+    init->wrapper->eraseFromParent();
+    init->init->eraseFromParent();
+    init->storage->eraseFromParent();
+  }
 }
 
 std::string local_import_name(std::string_view path, std::string_view name) {
@@ -285,7 +370,7 @@ std::map<std::string, std::string> data_definitions(const CompiledUnit &unit) {
   auto module = comparison_module(*unit.module);
   std::map<std::string, std::string> data;
   for (const auto &global : module->globals()) {
-    if (!global.hasInitializer() || global.getName().starts_with(".live.literal."))
+    if (!global.hasInitializer() || mergeable_literal(global))
       continue;
     const auto size = module->getDataLayout().getTypeAllocSize(global.getValueType());
     data.emplace(global.getName().str(), std::to_string(size.getKnownMinValue()) + ":" +

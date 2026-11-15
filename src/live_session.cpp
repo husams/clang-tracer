@@ -24,7 +24,15 @@ using Status = api::LiveUpdateStatus;
 using Action = api::LiveUpdateRequest;
 using live::AgentRequest;
 
-std::string payload(const live::JitRequest &request) {
+std::size_t payload_limit(const Action &request) {
+  const auto limit = request.has_payload_limit() ? request.payload_limit() : live::default_payload_bytes;
+  if (limit == 0 || limit > live::max_input_bytes)
+    throw std::invalid_argument("--payload-limit must be between 1 and " +
+                                std::to_string(live::max_input_bytes) + " bytes");
+  return static_cast<std::size_t>(limit);
+}
+
+std::string payload(const live::JitRequest &request, std::size_t limit) {
   api::LiveJitInput wire;
   for (const auto &file : request.files) {
     auto *output = wire.add_sources();
@@ -44,6 +52,7 @@ std::string payload(const live::JitRequest &request) {
     auto *output = wire.add_units();
     output->set_path(unit.path);
     output->set_directory(unit.directory);
+    output->set_reuse_stream_initializer(unit.reuse_stream_initializer);
     for (const auto &argument : unit.compiler_arguments)
       output->add_compiler_arguments(argument);
   }
@@ -54,8 +63,9 @@ std::string payload(const live::JitRequest &request) {
   }
   for (const auto &name : request.entry_symbols)
     wire.add_entry_symbols(name);
-  if (wire.ByteSizeLong() > live::max_payload_bytes)
-    throw std::runtime_error("live JIT snapshot exceeds the transport budget");
+  if (wire.ByteSizeLong() > limit)
+    throw std::runtime_error("live JIT snapshot exceeds --payload-limit (" +
+                             std::to_string(limit) + " bytes)");
   return wire.SerializeAsString();
 }
 
@@ -64,7 +74,7 @@ AgentRequest invoke(injector::Process &process, std::uintptr_t entry, AgentReque
   if (!entry)
     throw std::runtime_error("attached agent has no live JIT service");
   const auto capacity = output ? request.output_capacity : 0;
-  if (capacity > live::max_payload_bytes)
+  if (capacity > live::max_report_bytes)
     throw std::runtime_error("live extension response exceeds the transport budget");
   const auto size = sizeof(request) + input.size() + capacity;
   const auto remote = process.remote_allocate(size);
@@ -258,18 +268,20 @@ std::optional<Status> Session::poll_pending_live_data_locked() {
 }
 
 Status Session::run_live_extension_locked(api::LiveAgentExtension input,
-    const std::function<void(AgentRequest &)> &publication) {
+    const std::function<void(AgentRequest &)> &publication, std::size_t input_limit) {
   injector::Process process;
   const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
   input.set_deadline_nanoseconds(std::chrono::duration_cast<std::chrono::nanoseconds>(
       deadline.time_since_epoch()).count());
+  if (input.ByteSizeLong() > input_limit)
+    throw std::runtime_error("live extension snapshots exceed --payload-limit (" +
+                             std::to_string(input_limit) + " bytes)");
   const auto bytes = input.SerializeAsString();
-  if (bytes.size() > live::max_payload_bytes)
-    throw std::runtime_error("live extension snapshots exceed the transport budget");
   try {
     attach_process(process, deadline);
     AgentRequest start;
     start.action = AgentRequest::Action::launch;
+    start.input_limit = input_limit;
     const auto launch = invoke(process, live_address_, start, bytes);
     if (!launch.token)
       throw std::runtime_error("agent did not start the live operation");
@@ -435,7 +447,7 @@ Status Session::apply_live_extension_locked(const Action &request, Status result
     return result;
   }
   if (!managed)
-    return run_live_extension_locked(planned.input);
+    return run_live_extension_locked(planned.input, {}, payload_limit(request));
 
   const auto next_id = live_.last_committed + 1;
   if (!next_id)
@@ -464,7 +476,7 @@ Status Session::apply_live_extension_locked(const Action &request, Status result
       } else {
         publish_managed(phase, pid_, process_start_, next, before, {});
       }
-    }));
+    }, payload_limit(request)));
   } catch (...) {
     if (!live_.pending_extension) {
       live_.revisions.erase(record);
@@ -527,13 +539,14 @@ clangtracer::v1::LiveUpdateStatus Session::live_update(
       return revert_live_locked(request.has_exact_revision() ? request.revision() :
                                     live_.revisions.at(live_.active).parent);
     const auto expected_revision = live_.active;
+    const auto input_limit = payload_limit(request);
     if (request.action() == Action::MOCK) {
       const auto plan = live::plan_live_mock(pid_, executable_, request,
                                              live_.revisions.at(expected_revision), cancelled);
       for (const auto &candidate : plan.candidates)
         result.add_candidates()->CopyFrom(candidate);
       return activate_live_locked(plan, expected_revision, request.retention_limit(),
-                                  cancelled, std::move(result));
+                                  cancelled, std::move(result), input_limit);
     }
     if (request.has_preview_revision() && request.preview_revision() != expected_revision)
       throw live::Stale("active revision changed after preview; rediscover the update");
@@ -564,7 +577,7 @@ clangtracer::v1::LiveUpdateStatus Session::live_update(
       return result;
     }
     return activate_live_locked(plan, expected_revision, request.retention_limit(),
-                                cancelled, std::move(result));
+                                cancelled, std::move(result), input_limit);
   } catch (const std::exception &error) {
     result.set_state(unsafe_target_ || live_.managed_transition ? Status::RESTORATION_REQUIRED :
                      dynamic_cast<const live::Stale *>(&error) ? Status::STALE : Status::BLOCKED);
@@ -575,7 +588,7 @@ clangtracer::v1::LiveUpdateStatus Session::live_update(
 
 clangtracer::v1::LiveUpdateStatus Session::activate_live_locked(
     const live::Plan &plan, std::uint64_t expected_revision, std::uint64_t retention_limit,
-    const std::function<bool()> &cancelled, Status result) {
+    const std::function<bool()> &cancelled, Status result, std::size_t input_limit) {
   injector::Process process;
   std::uint64_t staged_token = 0;
   std::uint64_t stage_operation = 0;
@@ -588,12 +601,13 @@ clangtracer::v1::LiveUpdateStatus Session::activate_live_locked(
       plan.validate_sources();
     if (plan.jit.entry_symbols.size() != plan.entries.size())
       throw std::runtime_error("each native entry needs one exact JIT definition");
-    const auto source_bytes = payload(plan.jit);
+    const auto source_bytes = payload(plan.jit, input_limit);
     const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
     attach_process(process, deadline);
     AgentRequest stage;
     stage.action = AgentRequest::Action::stage;
     stage.limit = retention_limit ? retention_limit : live_.limit;
+    stage.input_limit = input_limit;
     stage_operation = invoke(process, live_address_, stage, source_bytes).token;
     process.detach();
     if (!stage_operation)

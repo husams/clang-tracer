@@ -1753,6 +1753,8 @@ bool Controller::execute(const Command &command) {
         throw std::invalid_argument("retention limit must be positive");
       request.set_retention_limit(limit);
     }
+    if (command.has("--payload-limit"))
+      request.set_payload_limit(command.number("--payload-limit", 0));
     const auto snapshot = [](const std::filesystem::path &path) {
       std::ifstream input(path, std::ios::binary);
       if (!input)
@@ -1789,7 +1791,8 @@ bool Controller::execute(const Command &command) {
           command.option("--compdb", "compile_commands.json")).string());
     }
     for (const auto &[name, options] : command.options) {
-      if (name == "--compdb" || name == "--build" || name == "--retention-limit")
+      if (name == "--compdb" || name == "--build" || name == "--retention-limit" ||
+          name == "--payload-limit")
         continue;
       for (const auto &value : options) {
         auto *option = request.add_options();

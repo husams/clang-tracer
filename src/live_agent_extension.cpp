@@ -186,7 +186,7 @@ Status execute(const Extension &input, std::uint64_t token) {
       throw std::runtime_error("unknown live extension action");
 
     LiveDataSelection selection;
-    selection.module = input.module();
+    selection.module = input.selection_module();
     if (input.address())
       selection.address = input.address();
     selection.scan_ids.assign(input.scan_ids().begin(), input.scan_ids().end());
@@ -240,7 +240,8 @@ void execute_extension(AgentRequest &request) {
     if (state.pending.valid() || (state.response && !state.response_delivered))
       throw std::runtime_error("a live extension is still active or awaiting its result");
     Extension input;
-    if (!request.input || !request.input_size || request.input_size > max_payload_bytes ||
+    if (!request.input || !request.input_size || request.input_limit > max_input_bytes ||
+        request.input_size > request.input_limit ||
         !input.ParseFromArray(reinterpret_cast<const void *>(request.input), request.input_size))
       throw std::runtime_error("invalid live extension payload");
     if (state.last == UINT64_MAX)
@@ -299,7 +300,7 @@ void execute_extension(AgentRequest &request) {
   if (!state.response)
     state.response = state.pending.get();
   auto size = state.response->ByteSizeLong();
-  if (size > max_payload_bytes) {
+  if (size > max_report_bytes) {
     state.response->clear_candidates();
     state.response->clear_notes();
     state.response->set_diagnostic(state.response->diagnostic() +

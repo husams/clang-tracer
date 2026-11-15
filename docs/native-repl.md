@@ -88,6 +88,10 @@ manifest using `--compdb FILE` and `--build FILE`.
 The initial profile admits exact symbols in the main executable and checks
 the original entry padding, source signature and lowered ABI before changing
 text. Related entries need a drained stack or the managed registry gate.
+Each submission publishes as a single group. When preview reports a blocker,
+submit independent edits separately. Optimized targets and automatic
+partitioning into independently publishable groups require further coverage
+verification.
 The ABI check covers SysV variadic bodies, fixed-argument Win64 bodies,
 non-trivial returns, and compiler-emitted lifecycle variants. An unresolved
 thunk, unproven alias, or missing call coverage requires a rebuild. Revisions
@@ -95,6 +99,21 @@ keep JIT code mapped for escaped pointers and active calls.
 `--retention-limit N` sets the maximum number of retained JIT generations,
 including reverted generations. Reconnect to the same server to inspect
 the active revision.
+
+Empty string literals and function-local literal arrays can change with
+their code. Changes to existing static storage or record layouts require a
+rebuild or a managed migration. Translation-unit-local functions and data
+require an unambiguous ELF file marker and exact symbol. Each changed function
+also requires a patchable native entry. The JIT reuses the already-run standard
+stream initializer when the recorded build and replacement contain the same
+recognized form. Other module constructors and destructors require a rebuild.
+Runtime imports must match the target image or an admitted Linux runtime
+symbol.
+
+`--payload-limit BYTES` sets the maximum serialized source and dependency
+snapshot sent to the target for a live operation. The default is 16 MiB.
+The REPL also enforces its 32 MiB limit on an outgoing RPC. Preview and apply
+validate the build and saved source snapshots separately.
 
 ```text
 %live mock "ProductStore::load(int)" --file product_fixture.cpp --function load_fixture --fixture products.txt
@@ -119,6 +138,9 @@ Automatic discovery admits recognized `make_shared` storage for the exact
 pointee. Other owners can use an explicit discovery callback. For a write
 using `--from-scan ID ...`, the updater reacquires each candidate's original
 owner. Heap addresses with unknown ownership remain read-only.
+For `%live update-data`, `--module MODULE` filters against the build
+manifest's verified ELF. A different mapped module is rejected before
+the callback runs.
 
 Managed migration requires application storage using
 `<tracer/live_migration.hpp>` and an exported

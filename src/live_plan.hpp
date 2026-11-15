@@ -37,6 +37,7 @@ struct BuildInputs {
 
 BuildInputs open_native_build(const std::string &executable,
                              const clangtracer::v1::LiveUpdateRequest &request);
+std::string live_build_module(const std::string &manifest_path);
 
 Entry bind_native_entry(std::uint32_t pid, const std::string &module,
                         const std::string &linkage, const Revision &active, bool overwrite = true);

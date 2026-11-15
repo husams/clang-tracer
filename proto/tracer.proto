@@ -1015,6 +1015,7 @@ message LiveUpdateRequest {
   repeated Option options = 9;
   bool has_exact_revision = 10;
   optional uint64 preview_revision = 11;
+  optional uint64 payload_limit = 12;
 }
 
 message LiveUpdateStatus {
@@ -1053,6 +1054,7 @@ message LiveJitInput {
     string path = 1;
     string directory = 2;
     repeated string compiler_arguments = 3;
+    bool reuse_stream_initializer = 4;
   }
   repeated LiveUpdateRequest.Source sources = 1;
   repeated CompileUnit units = 2;
@@ -1092,6 +1094,7 @@ message LiveAgentExtension {
   int64 deadline_nanoseconds = 17;
   uint64 retention_limit = 18;
   bool publish_native = 19;
+  string selection_module = 20;
 }
 
 message LiveBuildManifest {

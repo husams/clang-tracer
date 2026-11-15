@@ -129,7 +129,10 @@ def live_data(args, folder):
     with ExitStack() as cleanup:
         app, repl, _, result_line = attach(args, target, cleanup)
         app("status", r"^cache=100/0 other=100/0 account=200/0 unowned=200/0$")
-        repl("%live update-data shared.cpp --discover-file discover.cpp --discover-function discover",
+        update = "%live update-data shared.cpp --discover-file discover.cpp --discover-function discover"
+        repl(update + " --module libc.so.6", r"^live BLOCKED .*module filter differs")
+        app("status", r"^cache=100/0 other=100/0 account=200/0 unowned=200/0$")
+        repl(update + " --module live-target",
              r"^live APPLIED .*updated=5 .*duplicates=1")
         app("status", r"^cache=999/1 other=999/1 account=5000/1 unowned=200/0$")
         addresses = app("addresses", r"^known cache=(0x\w+) account=(0x\w+) unowned=(0x\w+)$")

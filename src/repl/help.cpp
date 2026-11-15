@@ -73,9 +73,9 @@ const CommandTopic commands[] = {
      "Find supported C++ callables. Use --addresses for verified entries or --address with the mapping token to look up a PC.",
      "%symbols --filter Calculator --limit 20 --addresses"},
     {"live", "", "Preview, apply, inspect, and revert verified native code replacements."},
-    {"live update", "%live update FILE... [--compdb FILE] [--build MANIFEST] [--retention-limit N]\n"
+    {"live update", "%live update FILE... [--compdb FILE] [--build MANIFEST] [--retention-limit N] [--payload-limit BYTES]\n"
      "  [--managed true | --after-file FILE --after-function NAME --for-each TYPE]",
-     "Preview the saved source snapshot, then apply its verified native entries."},
+     "Publish a verified -O0 group. Local entries need a unique ELF file marker and a patchable entry."},
     {"live preview", "%live preview FILE... [--compdb FILE] [--build MANIFEST]",
      "Show the exact native entries and blockers for a saved source snapshot."},
     {"live status", "%live status", "List the active revision and retained JIT generation count."},
@@ -83,7 +83,7 @@ const CommandTopic commands[] = {
      "Watch saved files and automatically preview and apply eligible changes. Press Ctrl-C to stop watching."},
     {"live mock", "%live mock SIGNATURE --file FILE --function FUNCTION [--fixture FILE] [--bind ALIAS=SIGNATURE] [--recursion original]",
      "Compile a typed replacement into the target and activate it as a live revision."},
-    {"live update-data", "%live update-data FILE [--discover-file FILE --discover-function NAME] [--address ADDRESS] [--from-scan ID ...]",
+    {"live update-data", "%live update-data FILE [--discover-file FILE --discover-function NAME] [--module MODULE] [--address ADDRESS] [--from-scan ID ...]",
      "Run a C++ callback once per selected object with verified ownership or borrowing."},
     {"live scan-heap", "%live scan-heap --type TYPE [--type TYPE] [--module MODULE]",
      "Find candidate objects in the target heap and report the evidence for each candidate."},

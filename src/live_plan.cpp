@@ -54,6 +54,7 @@ struct Symbol {
   std::uint64_t size;
   unsigned type;
   bool local;
+  std::string file;
   auto operator<=>(const Symbol &) const = default;
 };
 
@@ -62,6 +63,7 @@ struct Image {
   llvm::object::OwningBinary<llvm::object::Binary> binary;
   const Elf &elf;
   std::vector<Symbol> symbols;
+  std::map<std::string, unsigned> file_markers;
 
   static llvm::object::OwningBinary<llvm::object::Binary> open(const std::string &path) {
     auto image = llvm::object::createBinary(path);
@@ -75,7 +77,7 @@ struct Image {
     if ((!sha.empty() && digest(elf.getMemoryBufferRef().getBuffer()) != sha) ||
         llvm::object::getBuildID(&elf).empty())
       throw std::runtime_error("build manifest does not identify the ELF build");
-    const auto append = [&](const auto &symbol) {
+    const auto append = [&](const auto &symbol, const std::string &file) {
       const llvm::object::ELFSymbolRef native(symbol);
       const auto type = native.getELFType();
       if (type != llvm::ELF::STT_FUNC && type != llvm::ELF::STT_OBJECT &&
@@ -90,14 +92,25 @@ struct Image {
         if (!name) llvm::consumeError(name.takeError());
         throw std::runtime_error("cannot read complete ELF symbol inventory");
       }
+      const auto local = native.getBinding() == llvm::ELF::STB_LOCAL;
       if (*address && !name->empty() && !(*flags & llvm::object::SymbolRef::SF_Undefined))
-        symbols.push_back({name->str(), *address, native.getSize(), type,
-                           native.getBinding() == llvm::ELF::STB_LOCAL});
+        symbols.push_back({name->str(), *address, native.getSize(), type, local,
+                           local ? file : std::string{}});
     };
-    for (const auto &item : elf.symbols())
-      append(item);
+    std::string file;
+    for (const auto &item : elf.symbols()) {
+      if (llvm::object::ELFSymbolRef(item).getELFType() == llvm::ELF::STT_FILE) {
+        auto name = item.getName();
+        if (!name)
+          throw std::runtime_error(llvm::toString(name.takeError()));
+        file = fs::path(name->str()).filename().string();
+        ++file_markers[file];
+      } else {
+        append(item, file);
+      }
+    }
     for (const auto &item : elf.getDynamicSymbolIterators())
-      append(item);
+      append(item, {});
     std::sort(symbols.begin(), symbols.end());
     symbols.erase(std::unique(symbols.begin(), symbols.end()), symbols.end());
   }
@@ -118,6 +131,24 @@ struct Image {
         continue;
       if (match)
         throw std::runtime_error("ambiguous duplicate ELF symbol: " + name);
+      match = &*it;
+    }
+    return match;
+  }
+
+  const Symbol *find_local(const std::string &name, const std::string &unit) const {
+    const auto file = fs::path(unit).filename().string();
+    const auto marker = file_markers.find(file);
+    if (marker == file_markers.end() || marker->second != 1)
+      return nullptr;
+    const auto first = std::lower_bound(symbols.begin(), symbols.end(), name,
+        [](const Symbol &symbol, const std::string &value) { return symbol.name < value; });
+    const Symbol *match = nullptr;
+    for (auto it = first; it != symbols.end() && it->name == name; ++it) {
+      if (!it->local || it->file != file)
+        continue;
+      if (match)
+        return nullptr;
       match = &*it;
     }
     return match;
@@ -247,6 +278,7 @@ Sources snapshot_inputs(const api::LiveBuildManifest &manifest,
 
 struct Body {
   std::string name;
+  std::string unit;
   Definition definition;
   bool inconsistent = false;
 };
@@ -259,7 +291,7 @@ void collect(std::map<std::string, Body> &all, const std::string &path,
       affected->insert(key);
     const auto item = all.find(key);
     if (item == all.end())
-      all.emplace(key, Body{name, std::move(definition)});
+      all.emplace(key, Body{name, path, std::move(definition)});
     else if (item->second.definition.implementation != definition.implementation ||
              item->second.definition.abi != definition.abi)
       item->second.inconsistent = true;
@@ -376,6 +408,14 @@ Entry bind_native_entry(std::uint32_t pid, const std::string &module,
       throw std::runtime_error("rebuild required: native alias or thunk needs coverage proof: " + alias.name);
   }
   return bind(pid, image, *symbol, {}, active);
+}
+
+std::string live_build_module(const std::string &manifest_path) {
+  api::LiveBuildManifest manifest;
+  if (!google::protobuf::TextFormat::ParseFromString(read_file(manifest_path), &manifest) ||
+      manifest.module().empty())
+    throw std::runtime_error("live build manifest does not identify a module");
+  return fs::canonical(manifest.module()).string();
 }
 
 BuildInputs open_native_build(const std::string &executable,
@@ -661,6 +701,8 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     // Relink its accepted snapshot so new callers can resolve those helpers.
     if (changed || !sources.saved.count(path)) {
       current.translation_units.push_back(unit);
+      current.translation_units.back().reuse_stream_initializer =
+          sources.saved.count(path) && before && has_standard_stream_initializer(*before->module);
       for (const auto &value : after.module->global_values()) {
         if (!value.hasName())
           continue;
@@ -703,12 +745,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     if (next != new_bodies.end() && old.implementation == next->second.definition.implementation &&
         old.abi == next->second.definition.abi && !next->second.inconsistent && !body.inconsistent)
       continue;
-    if (old.local) {
-      if (within(sources.root, old.path))
-        block(site(old), name, "rebuild required: changed translation-unit-local implementation");
-      continue;
-    }
-    const auto *symbol = image.find(name, false);
+    const auto *symbol = old.local ? image.find_local(name, body.unit) : image.find(name, false);
     if (!symbol) {
       if (!within(sources.root, old.path))
         continue;
@@ -718,7 +755,9 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       candidate.set_source(site(old));
       candidate.set_module(module);
       candidate.set_state(api::LiveUpdateStatus::BLOCKED);
-      candidate.set_diagnostic("rebuild required: changed definition has no standalone native entry");
+      candidate.set_diagnostic(old.local
+          ? "rebuild required: local definition has no exact ELF translation-unit entry"
+          : "rebuild required: changed definition has no standalone native entry");
       continue;
     }
     auto &candidate = result.candidates.emplace_back();
@@ -732,7 +771,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         throw std::runtime_error("rebuild required: emitted implementations or callable ABI differ");
       const auto callable = llvm::demangle(name);
       for (const auto &alias : image.symbols) {
-        if (alias.name == name || alias.type != llvm::ELF::STT_FUNC)
+        if (&alias == symbol || alias.type != llvm::ELF::STT_FUNC)
           continue;
         if (alias.address == symbol->address) {
           const auto prior = physical_body(name, old_bodies);
@@ -760,17 +799,19 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
                                      alias.name);
         }
       }
-      const auto canonical = physical_body(name, new_bodies);
+      if (old.local && (!old.alias_target.empty() || !next->second.definition.alias_target.empty()))
+        throw std::runtime_error("rebuild required: local lifecycle alias needs a verified native entry");
+      const auto canonical = physical_body(key, new_bodies);
       auto binding = bind(pid, image, *symbol, old, active);
       candidate.set_address(binding.address);
       candidate.set_state(api::LiveUpdateStatus::PLANNED);
       if (entries.emplace(binding.address, canonical).second) {
-        binding.symbol = canonical;
+        binding.symbol = old.local ? name : canonical;
         result.entries.push_back(std::move(binding));
       } else if (entries.at(binding.address) != canonical) {
         throw std::runtime_error("rebuild required: multiple definitions name one native entry");
       }
-      replaced.insert(name);
+      replaced.insert(key);
       replaced.insert(canonical);
     } catch (const std::exception &failure) {
       candidate.set_state(api::LiveUpdateStatus::BLOCKED);
@@ -785,19 +826,18 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
   for (const auto &[import, ref] : referenced) {
     const auto &name = ref.name;
     const bool local = ref.local;
-    if (!local && replaced.count(name))
+    if (replaced.count(import))
       continue;
     if (local) {
       const auto prior = native_locals.find(name);
       if (prior == native_locals.end() || !prior->second.contains(ref.unit))
         continue;
-      if (prior->second.size() != 1) {
-        if (ref.size)
-          block(ref.unit, name, "rebuild required: ambiguous translation-unit-local storage");
-        continue;
-      }
     }
-    const auto *symbol = image.find(name, local);
+    const auto *symbol = local ? image.find_local(name, ref.unit) : image.find(name, false);
+    if (local && !symbol && ref.size) {
+      block(ref.unit, name, "rebuild required: no exact ELF translation-unit storage");
+      continue;
+    }
     if (!symbol || !symbol->size ||
         (symbol->type != llvm::ELF::STT_FUNC && symbol->type != llvm::ELF::STT_OBJECT))
       continue;
@@ -817,7 +857,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     result.jit.imports.emplace(import, bias + symbol->address);
   }
   for (const auto &entry : result.entries)
-    result.jit.entry_symbols.push_back(entry.symbol);
+    result.jit.entry_symbols.push_back(entries.at(entry.address));
   if (result.entries.size() > 1)
     result.safe_point = SafePoint::drained_stack;
 

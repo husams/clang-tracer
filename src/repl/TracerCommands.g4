@@ -92,7 +92,7 @@ liveOption : ('--build' | '--compdb' | '--file' | '--function' | '--fixture' | '
               | '--recursion' | '--discover-file' | '--discover-function' | '--module'
               | '--address' | '--type'
               | '--after-file' | '--after-function' | '--for-each' | '--managed') value
-           | '--retention-limit' UINT;
+           | ('--retention-limit' | PAYLOAD_LIMIT) UINT;
 objectWatch : 'object' ('prepare' value? objectOption+ | ('start' | 'preview') objectOption+
                         | ('stop' | 'status') UINT?);
 objectOption : ('--type' | '--base' | '--owner' | '--field' | '--collection'
@@ -133,5 +133,6 @@ SIGNATURE : '--signature';
 MEMBER : '--member';
 SNAPSHOT_RETURN_POINTEE : '--snapshot-return-pointee';
 RECOVER : 'recover';
+PAYLOAD_LIMIT : '--payload-limit';
 WORD : ~[ \t\r\n"'\\%`]+;
 WS : [ \t\r\n]+ -> skip;

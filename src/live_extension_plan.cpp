@@ -58,6 +58,7 @@ api::LiveJitInput encode(const JitRequest &request, const std::vector<std::strin
       auto *output = result.add_units();
       output->set_path(unit.path);
       output->set_directory(unit.directory);
+      output->set_reuse_stream_initializer(unit.reuse_stream_initializer);
       for (const auto &argument : unit.compiler_arguments)
         output->add_compiler_arguments(argument);
     }
@@ -95,7 +96,8 @@ ExtensionPlan plan_extension(std::uint32_t pid, std::uint64_t process_start,
     input.set_action(Extension::DATA_UPDATE);
     discovery = std::move(parsed.discover_file);
     input.set_discovery_function(parsed.discover_function);
-    module = std::move(parsed.selection.module);
+    module = live_build_module(request.build_manifest());
+    input.set_selection_module(std::move(parsed.selection.module));
     if (parsed.selection.address)
       input.set_address(*parsed.selection.address);
     for (const auto &id : parsed.selection.scan_ids)

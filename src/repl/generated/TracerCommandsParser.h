@@ -49,7 +49,7 @@ public:
     T__189 = 190, T__190 = 191, T__191 = 192, UINT = 193, STRING = 194,
     SHELL = 195, METADATA_ONLY = 196, SQLITE = 197, STACK = 198, CWD = 199,
     SIGNATURE = 200, MEMBER = 201, SNAPSHOT_RETURN_POINTEE = 202, RECOVER = 203,
-    WORD = 204, WS = 205
+    PAYLOAD_LIMIT = 204, WORD = 205, WS = 206
   };
 
   enum {
@@ -759,6 +759,7 @@ public:
     virtual size_t getRuleIndex() const override;
     ValueContext *value();
     antlr4::tree::TerminalNode *UINT();
+    antlr4::tree::TerminalNode *PAYLOAD_LIMIT();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;

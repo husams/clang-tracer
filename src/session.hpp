@@ -141,13 +141,15 @@ private:
                       std::chrono::steady_clock::time_point deadline);
   clangtracer::v1::LiveUpdateStatus activate_live_locked(
       const live::Plan &plan, std::uint64_t expected_revision, std::uint64_t retention_limit,
-      const std::function<bool()> &cancelled, clangtracer::v1::LiveUpdateStatus result);
+      const std::function<bool()> &cancelled, clangtracer::v1::LiveUpdateStatus result,
+      std::size_t input_limit);
   std::optional<clangtracer::v1::LiveUpdateStatus> read_live_extension_report_locked(
       injector::Process &process, const live::AgentRequest &response);
   std::optional<clangtracer::v1::LiveUpdateStatus> poll_pending_live_data_locked();
   clangtracer::v1::LiveUpdateStatus run_live_extension_locked(
       clangtracer::v1::LiveAgentExtension input,
-      const std::function<void(live::AgentRequest &)> &publication = {});
+      const std::function<void(live::AgentRequest &)> &publication = {},
+      std::size_t input_limit = live::default_payload_bytes);
   clangtracer::v1::LiveUpdateStatus collect_live_extension_locked(
       std::chrono::steady_clock::time_point deadline,
       const std::function<void(live::AgentRequest &)> &publication);
