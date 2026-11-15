@@ -100,7 +100,9 @@ Plan plan_live_mock(std::uint32_t pid, const std::string& executable,
     callable.address = entry.address;
     if (i == 0) {
       context.target = std::move(callable);
-      context.original = entry.original();
+      const auto previous = active.entries.find(entry.address);
+      context.original = previous == active.entries.end() ? entry.original()
+                                                          : previous->second.destination;
     } else {
       context.bindings.push_back(std::move(callable));
     }

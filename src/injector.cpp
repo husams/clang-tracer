@@ -548,7 +548,7 @@ struct MapEntry {
   std::uintptr_t offset = 0;
   std::string path;
   std::string module_path;
-  bool readable = false, executable = false;
+  bool readable = false, executable = false, private_writable = false;
 };
 
 std::vector<MapEntry> read_maps(pid_t process_id) {
@@ -567,6 +567,8 @@ std::vector<MapEntry> read_maps(pid_t process_id) {
     MapEntry entry;
     entry.readable = permissions.find('r') != std::string::npos;
     entry.executable = permissions.find('x') != std::string::npos;
+    entry.private_writable = permissions.size() == 4 && permissions[1] == 'w' &&
+                             permissions[3] == 'p';
     const auto dash = range.find('-');
     if (dash == std::string::npos) {
       continue;
@@ -880,8 +882,16 @@ struct Process::PeerFreeze {
       const auto mapping = std::find_if(mappings.begin(), mappings.end(), [&](const auto &map) {
         return map.readable && regs.rsp >= map.start && regs.rsp < map.end;
       });
-      if (mapping == mappings.end() || mapping->path != "[stack]")
-        return true; // An alternate or unidentified stack cannot certify a drain.
+      if (mapping == mappings.end())
+        return true;
+      // On glibc x86-64, a default pthread's stack and thread descriptor
+      // share a mapping, with the FS base above the stack. Require this
+      // evidence before treating an unnamed mapping as the regular stack.
+      const bool pthread_stack = mapping->private_writable &&
+          (mapping->path.empty() || mapping->path.starts_with("[anon:glibc: pthread stack")) &&
+          regs.fs_base > regs.rsp && regs.fs_base < mapping->end;
+      if (mapping->path != "[stack]" && !pthread_stack)
+        return true;
       std::array<std::uintptr_t, 512> words{};
       for (auto cursor = static_cast<std::uintptr_t>(regs.rsp); cursor < mapping->end;) {
         const auto count = std::min<std::size_t>(sizeof(words), mapping->end - cursor);

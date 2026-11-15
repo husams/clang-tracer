@@ -129,7 +129,8 @@ bool publish(std::uint32_t pid, std::uint64_t process_start,
     addresses.insert(address);
   }
   std::vector<injector::CodePatch> patches;
-  std::vector<injector::CodeRange> drained;
+  std::vector<injector::CodeRange> affected;
+  bool requires_drain = false;
   std::vector<const live::Entry *> bindings;
   for (const auto address : addresses) {
     const auto old = from.entries.find(address);
@@ -143,13 +144,14 @@ bool publish(std::uint32_t pid, std::uint64_t process_start,
       throw live::Stale("overwrite window changed for " + entry.symbol);
     patches.push_back({address, expected.data(), installed.data(), expected.size()});
     bindings.push_back(&entry);
-    if (!registry_gated && (from.safe_point == live::SafePoint::drained_stack ||
-                            to.safe_point == live::SafePoint::drained_stack)) {
-      drained.push_back({entry.address, entry.function_size, entry.return_at_end});
-      if (old != from.entries.end())
-        drained.push_back({old->second.mapping_begin, old->second.mapping_size});
-    }
+    requires_drain |= (old != from.entries.end() && old->second.requires_drain) ||
+                      (next != to.entries.end() && next->second.requires_drain);
+    affected.push_back({entry.address, entry.function_size, entry.return_at_end});
+    if (old != from.entries.end())
+      affected.push_back({old->second.mapping_begin, old->second.mapping_size});
   }
+  if (registry_gated || !requires_drain)
+    affected.clear();
   if (before_write)
     before_write();
   const auto validate = [&] {
@@ -164,13 +166,13 @@ bool publish(std::uint32_t pid, std::uint64_t process_start,
     return true;
   }
   process.attach_for_patch(static_cast<pid_t>(pid));
-  if (!process.patch_code_batch(patches, validate, committed, drained))
+  if (!process.patch_code_batch(patches, validate, committed, affected))
     return false;
   process.detach();
   return true;
 }
 void read_entries(live::Revision &next, const std::vector<live::Entry> &entries,
-                  const AgentRequest &response) {
+                  const AgentRequest &response, live::SafePoint safe_point) {
   if (response.count != entries.size() || entries.size() > live::max_entries)
     throw std::runtime_error("live JIT service returned incomplete entry addresses");
   for (std::size_t i = 0; i < entries.size(); ++i) {
@@ -179,9 +181,10 @@ void read_entries(live::Revision &next, const std::vector<live::Entry> &entries,
         response.addresses[i] < response.mapping_begin[i] ||
         response.addresses[i] - response.mapping_begin[i] >= response.mapping_size[i])
       throw std::runtime_error("agent returned an unverified JIT executable mapping");
-    next.entries[entry.address] = {
-        entry, jump_to(entry.original_bytes.size(), response.addresses[i]),
-        response.addresses[i], response.mapping_begin[i], response.mapping_size[i]};
+    auto &slot = next.entries[entry.address];
+    const bool requires_drain = slot.requires_drain || safe_point == live::SafePoint::drained_stack;
+    slot = {entry, jump_to(entry.original_bytes.size(), response.addresses[i]),
+            response.addresses[i], response.mapping_begin[i], response.mapping_size[i], requires_drain};
   }
 }
 
@@ -321,8 +324,6 @@ Status Session::apply_live_extension_locked(const Action &request, Status result
   record->second.managed = 0;
   auto &next = record->second;
   next.managed_native = !planned.native.entries.empty();
-  if (!planned.native.entries.empty())
-    next.safe_point = planned.native.safe_point;
   for (const auto &source : planned.native.accepted_sources)
     next.sources[source.path] = source;
   const auto limit = request.retention_limit() ? request.retention_limit() : live_.limit;
@@ -330,7 +331,7 @@ Status Session::apply_live_extension_locked(const Action &request, Status result
   try {
     result = run_live_extension_locked(planned.input, [&](AgentRequest &phase) {
       if (phase.publication == AgentRequest::Publication::install) {
-        read_entries(next, planned.native.entries, phase);
+        read_entries(next, planned.native.entries, phase, planned.native.safe_point);
         publish_managed(phase, pid_, process_start_, before, next, [&] {
           if (cancelled && cancelled())
             throw live::Stale("managed update cancelled before publication");
@@ -475,10 +476,9 @@ clangtracer::v1::LiveUpdateStatus Session::activate_live_locked(
     next.parent = expected_revision;
     next.managed = 0;
     next.managed_native = false;
-    next.safe_point = plan.safe_point;
     for (const auto &source : plan.accepted_sources)
       next.sources[source.path] = source;
-    read_entries(next, plan.entries, response);
+    read_entries(next, plan.entries, response, plan.safe_point);
 
     const auto next_id = live_.last_committed + 1;
     if (!next_id)

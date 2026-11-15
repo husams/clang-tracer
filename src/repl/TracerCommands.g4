@@ -83,7 +83,7 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
         | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview' | 'apply'
         | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | 'object'
-        | 'live' | 'update' | 'revert' | 'mock' | 'update-data' | 'scan-heap' | STACK;
+        | 'live' | 'update' | 'revert' | 'mock' | 'update-data' | 'scan-heap' | 'watch' | STACK;
 liveUpdate : 'live' (('update' | 'preview' | 'watch') (value | liveOption)+ | 'status' | 'revert' UINT?
                    | 'mock' value liveOption+ | 'update-data' value (liveOption | liveScanSelection)*
                    | 'scan-heap' liveOption+);
