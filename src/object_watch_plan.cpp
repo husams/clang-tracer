@@ -853,9 +853,15 @@ void inspect_variant_write(Layout &layout, DWARFDie field) {
   layout.value_write.selector = selector.offset;
   layout.value_write.selector_width = selector_width;
   for (std::uint64_t index = 0;
-       ::tracer::compat::starts_with(qualified(storage.type), "std::__detail::__variant::_Variadic_union<") &&
-           name(storage.type) != "_Variadic_union<>";
+       ::tracer::compat::starts_with(qualified(storage.type), "std::__detail::__variant::_Variadic_union<");
        ++index) {
+    // Recent libstdc++ versions keep a bool template argument even in
+    // the terminal union. A complete terminal union contains no members.
+    const auto members = storage.type.children();
+    if (size_of(storage.type) == 1 && std::none_of(members.begin(), members.end(), [](DWARFDie die) {
+          return die.getTag() == dw::DW_TAG_member;
+        }))
+      break;
     const auto first = member(storage.type, "_M_first");
     const auto payload = first_type_parameter(first.type);
     const auto slot = member(first.type, "_M_storage");
