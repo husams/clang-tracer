@@ -122,7 +122,8 @@ bool entry_instruction(const llvm::MCInst &inst, const llvm::MCInstrInfo &ins,
       "PUSH64r",   "POP64r",    "MOV64rr",    "MOV32rr",   "MOV16rr",
       "MOV8rr",    "MOV32ri",   "MOV64rm",   "MOV32rm",   "MOV16rm",
       "MOV8rm",    "MOV64mr",   "MOV32mr",    "MOV16mr",   "MOV8mr",
-      "MOVSS",     "MOVSD",     "MOVAPS",     "MOVUPS",    "LEA64r",
+      "MOVSS",     "MOVSD",     "MOVAPS",     "MOVUPS",    "MOVDQA", "MOVDQU",
+      "VMOVAPS",   "VMOVUPS",   "VMOVDQA",   "VMOVDQU",  "LEA64r",
       "LEA32r",    "SUB64ri8",  "SUB64ri32",  "ADD64ri8",  "ADD64ri32",
       "ADD32ri8",  "ADD32ri",   "ADD32rr",    "IMUL32rri8", "IMUL32rri", "IMUL32rmi8",
       "IMUL32rmi",
@@ -337,6 +338,10 @@ std::optional<ScalarStore> memory_store(const Decoder &decoder, const llvm::MCIn
     else if (opcode == "MOV64mr" || opcode == "MOV64mi32" ||
              opcode == "MOVSDmr" || opcode == "VMOVSDmr")
       width = 8;
+    else if (opcode == "MOVUPSmr" || opcode == "MOVAPSmr" || opcode == "MOVDQUmr" ||
+             opcode == "MOVDQAmr" || opcode == "VMOVUPSmr" || opcode == "VMOVAPSmr" ||
+             opcode == "VMOVDQUmr" || opcode == "VMOVDQAmr")
+      width = 16;
     else if (opcode != "MOV32mr" && opcode != "MOV32mi" &&
              opcode != "MOVSSmr" && opcode != "VMOVSSmr")
       return std::nullopt;

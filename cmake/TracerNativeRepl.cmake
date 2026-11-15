@@ -497,6 +497,27 @@ function(tracer_add_native_repl)
               --backend ${_backend})
           set_tests_properties(${_test} PROPERTIES TIMEOUT 120)
         endforeach()
+        add_executable(repl-object-value-writes-target tests/fixtures/object_value_writes.cpp)
+        set_target_properties(repl-object-value-writes-target PROPERTIES CXX_STANDARD 17
+          INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_compile_options(repl-object-value-writes-target PRIVATE -g -O2 -fPIE
+          -fno-omit-frame-pointer ${_object_test_arch_flags})
+        target_link_options(repl-object-value-writes-target PRIVATE -pie "LINKER:--build-id=sha1")
+        foreach(_backend ptrace code-cache)
+          set(_value_cases short_text long_text variant_value variant_text any_inline any_heap any_text)
+          if(_backend STREQUAL "code-cache")
+            list(APPEND _value_cases delegated_text)
+          endif()
+          foreach(_case IN LISTS _value_cases)
+            set(_test "native_repl_object_value_${_case}_${_backend}")
+            add_test(NAME ${_test}
+              COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_value_writes.py"
+                $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+                $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-value-writes-target>
+                ${_case} --backend ${_backend})
+            set_tests_properties(${_test} PROPERTIES TIMEOUT 120)
+          endforeach()
+        endforeach()
         set(_map_fixture_source "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/object_map")
         foreach(_map_kind ordered hash)
           set(_map_target "repl-object-${_map_kind}-map-target")

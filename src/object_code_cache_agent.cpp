@@ -233,6 +233,9 @@ struct State {
   pid_t pid;
   Address offset;
   unsigned field_width = 4;
+  object_watch::ValueWriteLayout value_write;
+  std::vector<object_watch::ValueWriteAlternative> value_alternatives;
+  unsigned value_string_limit = 0;
   Address union_tag_offset;
   Address receiver_typeinfo;
   std::uint64_t async_signals;
@@ -426,6 +429,8 @@ struct Sample {
   std::uint32_t input = 0, expected = 0;
   std::uint64_t old = 0;
   bool has_old = false;
+  object_watch::ValueWrite storage_write;
+  object_watch::ValueStoreBytes storage_before{};
   Address collection_owner = 0;
   std::uint64_t storage_generation = 0;
   std::optional<std::uint32_t> old_tag = std::nullopt;
@@ -465,6 +470,8 @@ struct CollectionScope {
   std::optional<std::uint64_t> prior_value = std::nullopt;
   std::optional<object_watch::LogicalRangeSample> prior_logical;
   bool destroyed = false;
+  bool value_partial = false;
+  Address writer_return = 0;
 };
 thread_local CollectionScope collection_scope;
 struct Borrowed {
@@ -586,6 +593,8 @@ bool read_field(const State &watch, Address address, std::uint64_t &bits) noexce
 }
 
 bool supported_store(const State &watch, const native_entry::ScalarStore &store) {
+  if (watch.value_write.active())
+    return store.supports(false) && store.width <= object_watch::max_value_store_width;
   return store.supports(watch.atomic) && (!watch.atomic || !store.reads_memory_value()) &&
          store.width == watch.field_width;
 }
@@ -897,7 +906,7 @@ std::optional<object_watch::LogicalRangeSample> logical_sample(
     if (destination)
       sample.index = (destination - header[0] - watch.offset) / watch.collection.stride;
   }
-  if (destination && !watch.no_values) {
+  if (destination && !watch.no_values && !watch.value_write.active()) {
     std::uint64_t bits;
     if (!read_field(watch, destination, bits))
       return std::nullopt;
@@ -957,10 +966,11 @@ void bind_collection(State &watch, const Site &site, const Registers &regs,
   scope.destination = destination;
   scope.valid = true;
   std::uint64_t next = 0;
-  const bool sampled = !watch.no_values && read_field(watch, destination, next);
+  const bool capture = !watch.no_values && !watch.value_write.active();
+  const bool sampled = capture && read_field(watch, destination, next);
   emit_collection(watch, site, regs, scope, Hook::collection_bound, 0,
                   sampled ? old : std::nullopt, sampled ? std::optional(next) : std::nullopt);
-  if (!watch.no_values && !sampled)
+  if (capture && !sampled)
     emit_collection(watch, site, regs, scope, Hook::collection_gap, 8);
 }
 
@@ -980,6 +990,8 @@ void collection_boundary(State &watch, const Site &site, const Registers &regs, 
     if (!owner || owner > UINT64_MAX - last)
       return;
     scope = {&watch, owner, regs.value(rsp), 0, {}, ++watch.next_id};
+    if (watch.value_write.active())
+      (void)application_return(regs, scope.writer_return);
     const auto tid = static_cast<pid_t>(::syscall(SYS_gettid));
     if (watch.active_collections.size() >= plan.max_instances &&
         !watch.active_collections.count(owner)) {
@@ -1003,8 +1015,14 @@ void collection_boundary(State &watch, const Site &site, const Registers &regs, 
     }
     return;
   }
-  if (scope.watch != &watch || !scope.owner || regs.value(rsp) > scope.entry_stack)
+  if (scope.watch != &watch || !scope.owner)
     return;
+  if (hook == Hook::collection_end && site.instruction.successor_return) {
+    if (scope.writer_return != site.instruction.pc || regs.value(rsp) != scope.entry_stack + sizeof(Address))
+      return;
+  } else if (regs.value(rsp) > scope.entry_stack) {
+    return;
+  }
   if (hook == Hook::collection_end) {
     const std::lock_guard lock(watch.mutex);
     watch.active_collections.erase(scope.owner);
@@ -1056,7 +1074,7 @@ void collection_boundary(State &watch, const Site &site, const Registers &regs, 
       scope.valid = false;
       if (watch.collection.logical_updates) {
         scope.prior_value = scope.prior_logical ? scope.prior_logical->value : std::nullopt;
-      } else if (!watch.no_values) {
+      } else if (!watch.no_values && !watch.value_write.active()) {
         object_watch::RangeHeader header{};
         Address current = 0;
         std::uint64_t value = 0;
@@ -1725,21 +1743,37 @@ void before(const Site *site, const Registers *regs) noexcept {
       if (active == watch.active_collections.end() || !active->second ||
           (watch.collection.active() &&
            (!collection_header(watch, scope, header) || header != scope.header ||
-            (destination == scope.destination &&
-             (!collection_destination(watch, header, current) || current != destination))))) {
+            ((destination == scope.destination || watch.value_write.active()) &&
+             (!collection_destination(watch, header, current) || current != scope.destination))))) {
         scope.valid = false;
         emit_collection(watch, *site, *regs, scope, Hook::collection_gap, 4);
         return;
       }
-      if (destination != scope.destination)
+      auto match = object_watch::ValueWriteMatch{};
+      if (watch.value_write.active()) {
+        match = object_watch::match_value_store(watch.value_write, watch.value_alternatives.data(),
+            watch.value_alternatives.size(), watch.value_string_limit, scope.destination,
+            destination, inst.store_width, read_self_memory);
+        if (match.partial && !scope.value_partial) {
+          scope.value_partial = true;
+          emit_collection(watch, *site, *regs, scope, Hook::collection_gap, 9);
+        }
+        if (!match.write.size)
+          return;
+      } else if (destination != scope.destination) {
         return;
+      }
       Sample sample{site, regs->value(rsp), destination, {scope.id, 0, 0}};
       if (watch.cfi_stack)
         pending_cfi_registers = application_registers(*regs, inst.pc);
       sample.collection_owner = scope.owner;
       sample.storage_generation = scope.generation;
       sample.expected = regs->value(inst.result ? inst.result : rax);
-      if (!watch.no_values) {
+      sample.storage_write = match.write;
+      if (!watch.no_values && sample.storage_write.size) {
+        sample.has_old = read_self_memory(sample.storage_write.address, sample.storage_before.data(),
+                                          sample.storage_write.size);
+      } else if (!watch.no_values) {
         sample.input = inst.value ? regs->value(inst.value) : inst.immediate;
         sample.has_old = !watch.atomic && read_field(watch, destination, sample.old);
         sample.old_tag = union_tag(watch, scope.owner);
@@ -1815,7 +1849,7 @@ void complete(const Site *site, const Registers *regs) {
   // Locked instructions without a returned old value cannot establish values
   // in the presence of uninstrumented atomic writers. Ptrace can park peers.
   auto observed = static_cast<std::uint64_t>(input);
-  const bool needs_read = rmw || inst.sample_store_memory;
+  const bool needs_read = !sample.storage_write.size && (rmw || inst.sample_store_memory);
   const bool readable = watch.no_values || !needs_read || (!watch.atomic &&
       (sample.site == site && sample.stack == regs->value(rsp) && sample.has_old &&
        read_field(watch, sample.destination, observed)));
@@ -1883,7 +1917,19 @@ void complete(const Site *site, const Registers *regs) {
     event.has_shared_file_offset = true;
     event.shared_file_offset = *sample.shared_file_offset;
   }
-  if (!watch.no_values && new_value_available) {
+  if (sample.storage_write.size) {
+    event.storage_write = sample.storage_write;
+    if (!watch.no_values) {
+      event.storage_before = sample.storage_before;
+      const bool after_read = read_self_memory(sample.storage_write.address, event.storage_after.data(),
+                                               sample.storage_write.size);
+      event.values = (sample.has_old ? 1 : 0) | (after_read ? 2 : 0);
+      if (event.values == 3 && event.storage_before == event.storage_after)
+        return;
+      if (event.values != 3)
+        event.gap = 3;
+    }
+  } else if (!watch.no_values && new_value_available) {
     auto old = sample.old;
     bool has_old = sample.has_old && !overlapping && !drift;
     if (inst.hook == Hook::xadd) {
@@ -4582,6 +4628,11 @@ void initialize(Init &init
   watch->first_seen = init.first_seen;
   watch->borrow = init.borrow;
   watch->collection = init.collection;
+  watch->value_write = init.value_write;
+  watch->value_string_limit = init.value_string_limit;
+  if (init.value_alternative_count)
+    watch->value_alternatives.assign(init.value_alternatives,
+                                    init.value_alternatives + init.value_alternative_count);
   if (init.static_scope_count)
     watch->static_scopes.assign(init.static_scopes, init.static_scopes + init.static_scope_count);
   if (init.complete_constructor_return_count)
@@ -4624,7 +4675,7 @@ void initialize(Init &init
 } // namespace
 } // namespace tracer::object_cache
 
-extern "C" int tracer_agent_object_cache_v36(tracer::object_cache::Init *request) {
+extern "C" int tracer_agent_object_cache_v37(tracer::object_cache::Init *request) {
   try {
     tracer::object_cache::initialize(*request);
     return 0;

@@ -245,7 +245,9 @@ records, or containers with `--field`. Pair vector elements by a stable ID
 and map entries by key using `--key`, then inspect the typed changes from
 the SQLite recording. Individual write watches identify the actual store
 instruction for supported typed fields inside a selected vector element,
-ordered or unordered map entry, or pointee. For keyed vectors and maps,
+ordered or unordered map entry, or pointee. They also trace verified
+libstdc++ string, variant and any storage with original store locations and
+before and after bytes. For keyed vectors and maps,
 `--mode logical-writes` also records changes at verified mutation and
 destruction boundaries. See the [native REPL object watch walkthrough](../native-repl.md#prepare-an-object-watch-for-method-snapshots).
 

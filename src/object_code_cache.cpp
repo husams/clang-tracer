@@ -69,7 +69,7 @@ struct SharedFile {
 }
 
 std::uintptr_t load_agent(injector::Process &process, const std::string &path) {
-  constexpr char export_name[] = "tracer_agent_object_cache_v36";
+  constexpr char export_name[] = "tracer_agent_object_cache_v37";
   const auto size = std::max(path.size() + 1, sizeof(export_name));
   const auto memory = process.remote_allocate(size);
   std::uintptr_t entry = 0;
@@ -384,8 +384,8 @@ struct Watch::Impl {
     if (runtime_limit > max_runtime_limit || (spec.runtime_limit() && !spec.follow_calls()))
       throw std::invalid_argument("invalid runtime code-cache translation limit");
     admitted_stores = plan.stores;
-    if (request.follow_calls() && (request.first_seen() || request.writer_entry() ||
-        plan.caller_start || !request.owner_type().empty() ||
+    if (request.follow_calls() && ((request.first_seen() && !plan.layout.value_write.active()) ||
+        request.writer_entry() || plan.caller_start || !request.owner_type().empty() ||
         plan.layout.logical_collection()))
       throw std::invalid_argument("runtime call following requires a standalone writer scope");
 #if defined(__aarch64__)
@@ -394,8 +394,22 @@ struct Watch::Impl {
       for (const auto &[start, bytes] : plan.writer_ranges)
         prepare_runtime_calls(native_entry::scan(start, bytes));
 #else
-    if (plan.layout.logical_collection()) {
+    const bool complex_nonleaf = plan.layout.value_write.active() && [&] {
+      const auto body = native_entry::scan(plan.writer_start, plan.writer_bytes);
+      return std::any_of(std::begin(body.instructions), std::end(body.instructions), [](const auto &inst) {
+        return inst.flow == NativeFlow::call;
+      });
+    }();
+    if (plan.layout.logical_collection() || complex_nonleaf) {
       prepare_collection_fragments();
+      if (request.follow_calls()) {
+        for (const auto &[start, bytes] : plan.writer_ranges) {
+          const auto body = native_entry::scan(start, bytes);
+          if (start != plan.writer_start)
+            admitted_stores += prepare_writer_fragments(body);
+          prepare_runtime_calls(body);
+        }
+      }
     } else {
       std::vector<std::pair<Address, std::size_t>> writer_entries;
       admitted_stores = 0;
@@ -459,7 +473,7 @@ struct Watch::Impl {
           add_entry(start, size);
           continue;
         }
-        if (request.writer_entry() || plan.writer_address_taken(start)) {
+        if (plan.layout.value_write.active() || request.writer_entry() || plan.writer_address_taken(start)) {
           prepare_writer_entry(start, size);
           continue;
         }
@@ -1431,28 +1445,112 @@ struct Watch::Impl {
       for (const auto next : mutation_successors(writer_body, pc))
         add_continuation(next, pc);
     }
+    const auto external_entry = [&](Address begin, Address limit) {
+      std::vector<Address> interior;
+      for (auto address = begin + 1; address < limit; ++address)
+        interior.push_back(address);
+      for (const auto &[address, callers] : plan.direct_redirects(interior))
+        if (!callers.empty())
+          return true;
+      return false;
+    };
+    bool needs_caller_return = false;
     for (const auto &ret : writer_body.instructions) {
       const bool tail = ret.flow == NativeFlow::branch && !ret.falls_through && ret.target &&
           (*ret.target < plan.writer_start || *ret.target - plan.writer_start >= plan.writer_bytes.size());
       if ((ret.flow != NativeFlow::returns && !tail) || covered_returns.count(ret.address))
         continue;
       std::vector<Instruction> fragment;
+      std::size_t padding = 0;
       for (const NativeInstruction &candidate : writer_body.instructions) {
         if (candidate.address > ret.address || ret.address + ret.size - candidate.address > 18)
           continue;
+        const auto end = ret.address + ret.size;
+        const auto width = end - candidate.address;
+        const auto extension = plan.layout.value_write.active() && !tail && width < 5 &&
+            end == plan.writer_start + plan.writer_bytes.size() ?
+                plan.redirect_padding(plan.writer_start, candidate.address, end) : 0;
         auto trial = straight_fragment(plan, writer_body, candidate.address, Hook::none, !tail,
-                                       false, tail ? ret.target : std::nullopt);
-        if (!trial.empty() && trial.back().pc == ret.address &&
-            !overlaps_fragment(trial.front().pc, ret.address + ret.size))
+                                       false, tail ? ret.target : std::nullopt, extension != 0);
+        if (!trial.empty() && trial.back().pc == ret.address && width + extension >= 5 &&
+            !overlaps_fragment(trial.front().pc, end + extension)) {
           fragment = std::move(trial);
+          padding = extension;
+        }
       }
-      if (fragment.empty())
-        throw std::runtime_error("collection writer return has no safe native redirect");
+      Address relay = 0;
+      if (fragment.empty() && plan.layout.value_write.active() && !tail) {
+        // A short epilogue next to another symbol cannot use padding. A
+        // disjoint translated window can host the second jump instead.
+        const auto end = ret.address + ret.size;
+        for (const auto &candidate : writer_body.instructions) {
+          if (candidate.address > ret.address || end - candidate.address < 2 ||
+              end - candidate.address >= direct_call_width ||
+              overlaps_fragment(candidate.address, end))
+            continue;
+          auto exit = straight_fragment(plan, writer_body, candidate.address, Hook::none,
+                                        true, false, {}, true);
+          if (exit.empty() || exit.back().pc != ret.address || external_entry(candidate.address, end))
+            continue;
+          for (const auto &prior : writer_body.instructions) {
+            if (prior.address > candidate.address || candidate.address - prior.address < 10 ||
+                candidate.address - prior.address > 128)
+              continue;
+            auto gateway = straight_fragment(plan, writer_body, prior.address, Hook::none,
+                                             false, false, {}, false, 10);
+            if (gateway.empty())
+              continue;
+            const auto last = gateway.back().pc + gateway.back().size;
+            if (last > candidate.address || overlaps_fragment(prior.address, last) ||
+                external_entry(prior.address, last))
+              continue;
+            relay = prior.address + direct_call_width;
+            add(std::move(gateway), false);
+            fragment = std::move(exit);
+            break;
+          }
+          if (relay)
+            break;
+        }
+      }
+      if (fragment.empty()) {
+        if (!plan.layout.value_write.active())
+          throw std::runtime_error("collection writer return has no safe native redirect");
+        needs_caller_return = true;
+        continue;
+      }
       fragment.back().hook = Hook::collection_end;
-      add(std::move(fragment), true);
+      add_fragment(std::move(fragment), true, padding, relay);
+    }
+    if (needs_caller_return) {
+      const auto callers = plan.lifetime_return_callers(plan.writer_start, false);
+      if (callers.empty() || plan.writer_address_taken(plan.writer_start) ||
+          plan.writer_exported(plan.writer_start))
+        throw std::runtime_error("writer needs a verified return or direct caller continuation");
+      for (const auto call : callers) {
+        const auto next = call + direct_call_width;
+        const auto [start, size] = plan.containing_function(call);
+        const auto roots = plan.exception_roots(start, size);
+        const auto body = native_entry::scan(start, plan.code(start).substr(0, size), roots);
+        const auto successor = std::find_if(body.instructions.begin(), body.instructions.end(),
+            [&](const auto &inst) { return inst.address == next; });
+        const auto jump = successor != body.instructions.end() && successor->flow == NativeFlow::branch &&
+            !successor->falls_through ? successor->target : std::nullopt;
+        auto fragment = straight_fragment(plan, body, next, Hook::collection_end, false, true, jump);
+        if (fragment.empty())
+          throw std::runtime_error("writer caller continuation has no safe native redirect");
+        const auto limit = fragment.back().pc + fragment.back().size;
+        if (external_entry(next, limit) ||
+            std::any_of(roots.begin(), roots.end(), [&](const auto root) {
+              return root >= next && root < limit;
+            }))
+          throw std::runtime_error("an application edge enters the writer caller continuation");
+        fragment.front().successor_return = true;
+        add(std::move(fragment), jump.has_value());
+      }
     }
     for (const auto &[pc, site] : plan.sites) {
-      if (!site.store)
+      if (!site.store || pc < plan.writer_start || pc - plan.writer_start >= plan.writer_bytes.size())
         continue;
       if (std::any_of(entry_windows.begin(), entry_windows.end(), [&](const auto &entry) {
             return pc >= entry.first && pc - entry.first < entry.second;
@@ -1480,6 +1578,25 @@ struct Watch::Impl {
       }
       if (fragment.empty() || overlaps_fragment(fragment.front().pc, fragment.back().pc + fragment.back().size))
         continue;
+      if (plan.layout.value_write.active()) {
+        // Leave closely spaced short stores together so the first redirect
+        // does not consume the only instructions available to the second.
+        const auto start = fragment.front().pc;
+        while (true) {
+          const auto end = fragment.back().pc + fragment.back().size;
+          const auto next = plan.sites.lower_bound(end);
+          if (next == plan.sites.end() || next->first - end >= direct_call_width ||
+              next->first - plan.writer_start >= plan.writer_bytes.size() ||
+              !next->second.store || next->second.bytes.size() >= direct_call_width)
+            break;
+          const auto width = next->first - start + next->second.bytes.size();
+          auto combined = straight_fragment(plan, writer_body, start, Hook::none,
+                                             false, false, {}, false, width);
+          if (combined.empty() || overlaps_fragment(start, combined.back().pc + combined.back().size))
+            break;
+          fragment = std::move(combined);
+        }
+      }
       add(std::move(fragment), false);
     }
     admitted_stores = 0;
@@ -1487,9 +1604,13 @@ struct Watch::Impl {
       admitted_stores += std::count_if(std::begin(fragment), std::end(fragment), [](const auto &inst) {
         return writer(inst.hook);
       });
-    if (!admitted_stores && !request.logical_updates())
+    if (!admitted_stores && !request.logical_updates() && !request.follow_calls())
       throw std::runtime_error("no independently patchable native collection store");
-    plan.unsupported += plan.stores - admitted_stores;
+    const auto stores_in_writer = std::count_if(plan.sites.begin(), plan.sites.end(), [&](const auto &entry) {
+      return entry.second.store && entry.first >= plan.writer_start &&
+          entry.first - plan.writer_start < plan.writer_bytes.size();
+    });
+    plan.unsupported += stores_in_writer - admitted_stores;
   }
 
   std::size_t patch_size(Address pc) const {
@@ -1651,7 +1772,7 @@ struct Watch::Impl {
       item.set_diagnostic("receiver admission limit reached");
     if (sample.hook == Hook::owner_remove && sample.gap)
       item.set_diagnostic("previous membership absent at transfer boundary");
-    if (plan.layout.logical_collection() || plan.layout.union_tag_offset || shared_file.identity.inode)
+    if (plan.layout.scoped_storage() || plan.layout.union_tag_offset || shared_file.identity.inode)
       item.set_synchronization(request.synchronization());
     if (sample.hook == Hook::collection_bound || sample.hook == Hook::collection_suspend) {
       item.set_destination(sample.destination);
@@ -1670,11 +1791,16 @@ struct Watch::Impl {
             "collection range changed outside a verified mutation return",
             "old field value is unreadable", "receiver admission limit reached",
             "pointee path is null, unreadable or outside the address range",
-            "bound field value is unreadable"};
+            "bound field value is unreadable",
+            "complex payload storage could not be verified within the read budget"};
         item.set_diagnostic(messages[std::min<std::size_t>(sample.gap, std::size(messages) - 1)]);
       }
     }
-    if (sample.values || (plan.layout.opaque_union && (writer(sample.hook) || sample.hook == Hook::create)))
+    if (sample.storage_write.size)
+      object_watch::set_storage_write(item, sample.storage_write,
+          sample.values & 1 ? &sample.storage_before : nullptr,
+          sample.values & 2 ? &sample.storage_after : nullptr);
+    else if (sample.values || (plan.layout.opaque_union && (writer(sample.hook) || sample.hook == Hook::create)))
       object_watch::set_scalar_values(item, plan.layout,
           {sample.values & 1 ? std::optional(sample.old_value) : std::nullopt,
            sample.values & 4 ? std::optional(sample.old_tag) : std::nullopt},
@@ -1984,7 +2110,7 @@ struct Watch::Impl {
   }
 
   void verify_live(injector::Process &process) const {
-    if (plan.layout.logical_collection() || fragmented_writer || fragmented_lifecycle)
+    if (plan.layout.scoped_storage() || fragmented_writer || fragmented_lifecycle)
       plan.verify_live(pid);
     if (plan.caller_start) {
       std::string current(plan.caller_bytes.size(), '\0');
@@ -2064,6 +2190,8 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
   init.atomic = p.plan.layout.atomic;
   init.first_seen = p.request.first_seen();
   init.permanent_startup_module = permanent_startup_module;
+  init.value_write = p.plan.layout.value_write;
+  init.value_string_limit = p.request.max_string_bytes();
   init.collection.max_instances = p.request.max_instances() ? p.request.max_instances() : 1024;
   if (p.plan.shared_writer()) {
     if (p.plan.module.size() >= sizeof(init.module))
@@ -2104,7 +2232,12 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
   for (const auto &[entry, pc] : p.plan.complete_constructor_returns)
     constructor_returns.push_back({entry, pc});
   const auto returns_size = constructor_returns.size() * sizeof(ConstructorReturn);
+  const auto &alternatives = p.plan.layout.value_alternatives;
   std::size_t size = sizeof(init) + table_size + scopes_size + returns_size;
+  if (alternatives.size() > (SIZE_MAX - size) / sizeof(object_watch::ValueWriteAlternative))
+    throw std::runtime_error("code-cache value metadata size overflows");
+  const auto alternatives_size = alternatives.size() * sizeof(object_watch::ValueWriteAlternative);
+  size += alternatives_size;
   for (const auto &function : p.functions) {
     if (function.size() > (SIZE_MAX - size) / sizeof(Instruction))
       throw std::runtime_error("code-cache request size overflows");
@@ -2114,6 +2247,12 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
   try {
     const auto table = remote + sizeof(init);
     auto address = table + table_size;
+    if (!alternatives.empty()) {
+      init.value_alternatives = reinterpret_cast<const object_watch::ValueWriteAlternative *>(address);
+      init.value_alternative_count = alternatives.size();
+      process.remote_write(address, alternatives.data(), alternatives_size);
+      address += alternatives_size;
+    }
     if (!static_scopes.empty()) {
       init.static_scopes = reinterpret_cast<const Address *>(address);
       init.static_scope_count = static_scopes.size();
@@ -2506,7 +2645,7 @@ api::ObjectWatchStatus Watch::preview() const {
   report.set_external_write_order_unknown(p.shared_file.identity.inode != 0);
   report.set_diagnostic(!p.runtime_calls.empty() ? "verified call redirects; callees resolve at runtime" :
       p.fragmented_writer ? "verified native writer fragments and redirect windows" :
-      p.plan.layout.logical_collection() ? "verified native collection fragments and redirect windows" :
+      p.plan.layout.scoped_storage() ? "verified native scoped storage and redirect windows" :
       p.direct_writer_calls ? "verified direct writer call sites only (use --writer-entry to require entry coverage)" :
                         "verified leaf translations and candidate redirect windows");
   *report.mutable_plan() = p.plan.describe(p.pid != 0);
