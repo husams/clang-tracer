@@ -450,6 +450,7 @@ clangtracer::v1::LiveUpdateStatus Session::activate_live_locked(
     const std::function<bool()> &cancelled, Status result) {
   injector::Process process;
   std::uint64_t staged_token = 0;
+  std::uint64_t stage_operation = 0;
   bool did_commit = false;
   try {
     if (plan.entries.size() > live::max_entries)
@@ -465,10 +466,32 @@ clangtracer::v1::LiveUpdateStatus Session::activate_live_locked(
     AgentRequest stage;
     stage.action = AgentRequest::Action::stage;
     stage.limit = retention_limit ? retention_limit : live_.limit;
-    const auto response = invoke(process, live_address_, stage, source_bytes);
-    staged_token = response.token;
-    live_.retained = response.retained;
+    stage_operation = invoke(process, live_address_, stage, source_bytes).token;
     process.detach();
+    if (!stage_operation)
+      throw std::runtime_error("agent did not launch the native live compile");
+
+    AgentRequest poll;
+    poll.action = AgentRequest::Action::stage_poll;
+    poll.token = stage_operation;
+    AgentRequest response;
+    for (;;) {
+      if (cancelled && cancelled())
+        throw live::Stale("native live compile cancelled");
+      if (std::chrono::steady_clock::now() >= deadline)
+        throw std::runtime_error("native live compile exceeded the operation timeout");
+      attach_process(process, deadline);
+      response = invoke(process, live_address_, poll);
+      if (response.ready) {
+        stage_operation = 0;
+        staged_token = response.token;
+        live_.retained = response.retained;
+      }
+      process.detach();
+      if (response.ready)
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
     if (!staged_token)
       throw std::runtime_error("live JIT service did not retain the native image");
 
@@ -510,14 +533,15 @@ clangtracer::v1::LiveUpdateStatus Session::activate_live_locked(
   } catch (const std::exception &error) {
     const auto stale = dynamic_cast<const live::Stale *>(&error) != nullptr;
     result.set_diagnostic(error.what());
-    if (staged_token && !did_commit && !process.unsafe()) {
+    if ((stage_operation || staged_token) && !did_commit && !process.unsafe()) {
       try {
         if (process.attached())
           process.detach();
         attach_process(process, std::chrono::steady_clock::now() + operation_timeout_);
         AgentRequest discard;
-        discard.action = AgentRequest::Action::discard;
-        discard.token = staged_token;
+        discard.action = stage_operation ? AgentRequest::Action::stage_abandon
+                                         : AgentRequest::Action::discard;
+        discard.token = stage_operation ? stage_operation : staged_token;
         live_.retained = invoke(process, live_address_, discard).retained;
         process.detach();
       } catch (const std::exception &discard_error) {

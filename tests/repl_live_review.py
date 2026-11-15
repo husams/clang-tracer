@@ -122,13 +122,13 @@ def run(args, root, cleanup):
     call(11, 12)
 
     with_local = APP.replace("int first", 'static int helper(int i) { return i * 1000; }\nint first')
-    with_local = with_local.replace("return i + 1;", 'return helper(i) + "new"[0];')
+    with_local = with_local.replace("return i + 1;", 'return helper(i) + "new"[i % 3];')
     with_local = with_local.replace("return i + 2;", "return i + 20;")
     app_source.write_text(with_local)
     command("%live update source/app.cpp", "APPLIED")
-    call(10110, 30)
+    call(10101, 30)
     command('%live mock "first(int)" --file pass.cpp --function passthrough', "APPLIED")
-    call(10110, 30)
+    call(10101, 30)
     command("%live revert 0", "REVERTED")
     call(11, 12)
 

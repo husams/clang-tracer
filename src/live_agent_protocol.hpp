@@ -8,10 +8,12 @@ namespace tracer::live {
 
 inline constexpr std::size_t max_entries = 256;
 inline constexpr std::size_t max_payload_bytes = 16 * 1024 * 1024;
-inline constexpr std::uint64_t agent_magic = 0x4c49564500000002ULL;
+inline constexpr std::uint64_t agent_magic = 0x4c49564500000003ULL;
 
 struct AgentRequest {
-  enum class Action : std::uint32_t { stage, discard, status, launch, poll, publication_result };
+  enum class Action : std::uint32_t {
+    stage, discard, status, launch, poll, publication_result, stage_poll, stage_abandon
+  };
   enum class Publication : std::uint32_t { none, install, restore };
   enum class CodeOutcome : std::uint32_t { unchanged, installed, stale, uncertain };
   std::uint64_t version = agent_magic;

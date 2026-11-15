@@ -7,9 +7,11 @@
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <future>
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 
 namespace tracer::live {
 namespace {
@@ -94,6 +96,73 @@ JitRequest jit_input(const AgentRequest &request) {
     throw std::runtime_error("invalid live JIT entry count");
   return result;
 }
+struct StageResult {
+  std::shared_ptr<JitImage> image;
+  std::vector<EntryImage> entries;
+};
+
+struct NativeStage {
+  std::mutex mutex;
+  std::uint64_t token = 0;
+  std::uint64_t limit = 0;
+  bool abandoned = false;
+  std::future<StageResult> pending;
+};
+
+void stage_native(AgentRequest &request) {
+  static auto *state = new NativeStage;
+  std::lock_guard lock(state->mutex);
+  const bool ready = state->pending.valid() &&
+      state->pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+  if (request.action == AgentRequest::Action::stage) {
+    // A cancelled compilation may still be unwinding on its worker. Reap
+    // completed work, and do not queue another compile behind a running one.
+    if (ready)
+      state->pending = {};
+    if (state->pending.valid())
+      throw std::runtime_error("a previous native live compile is still running");
+    if (!request.limit || request.retained >= request.limit)
+      throw std::runtime_error("live JIT retained generation limit reached");
+    if (state->token == UINT64_MAX)
+      throw std::runtime_error("native live stage identifiers exhausted");
+    std::packaged_task<StageResult()> task([input = jit_input(request)] {
+      StageResult result;
+      result.image = compile_in_target(input);
+      for (const auto &symbol : input.entry_symbols)
+        result.entries.push_back(describe_entry(*result.image, symbol));
+      return result;
+    });
+    auto pending = task.get_future();
+    std::thread(std::move(task)).detach();
+    state->pending = std::move(pending);
+    state->limit = request.limit;
+    state->abandoned = false;
+    request.token = ++state->token;
+    return;
+  }
+  if (!request.token || request.token != state->token)
+    throw std::runtime_error("unknown native live stage");
+  if (request.action == AgentRequest::Action::stage_abandon) {
+    state->abandoned = true;
+    if (ready)
+      state->pending = {};
+    return;
+  }
+  if (!state->pending.valid() || state->abandoned)
+    throw std::runtime_error("native live stage is no longer pending");
+  if (!ready)
+    return;
+  auto result = state->pending.get();
+  request.count = result.entries.size();
+  for (std::size_t i = 0; i < result.entries.size(); ++i) {
+    request.addresses[i] = result.entries[i].address;
+    request.mapping_begin[i] = result.entries[i].mapping_begin;
+    request.mapping_size[i] = result.entries[i].mapping_size;
+  }
+  request.token = retain_image(std::move(result.image), state->limit);
+  request.retained = retained_image_count();
+  request.ready = 1;
+}
 } // namespace
 } // namespace tracer::live
 
@@ -124,22 +193,11 @@ extern "C" int tracer_agent_live_v1(tracer::live::AgentRequest *request) noexcep
       request->retained = state.retained.size();
       return 0;
     }
-    case AgentRequest::Action::stage: {
-      if (!request->limit || request->retained >= request->limit)
-        throw std::runtime_error("live JIT retained generation limit reached");
-      auto input = jit_input(*request);
-      auto image = compile_in_target(input);
-      request->count = input.entry_symbols.size();
-      for (std::size_t i = 0; i < input.entry_symbols.size(); ++i) {
-        const auto entry = describe_entry(*image, input.entry_symbols[i]);
-        request->addresses[i] = entry.address;
-        request->mapping_begin[i] = entry.mapping_begin;
-        request->mapping_size[i] = entry.mapping_size;
-      }
-      request->token = retain_image(std::move(image), request->limit);
-      request->retained = retained_image_count();
+    case AgentRequest::Action::stage:
+    case AgentRequest::Action::stage_poll:
+    case AgentRequest::Action::stage_abandon:
+      stage_native(*request);
       return 0;
-    }
     }
     throw std::runtime_error("unknown live JIT agent action");
   } catch (const std::exception &error) {
