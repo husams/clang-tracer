@@ -68,7 +68,7 @@ struct SharedFile {
 }
 
 std::uintptr_t load_agent(injector::Process &process, const std::string &path) {
-  constexpr char export_name[] = "tracer_agent_object_cache_v37";
+  constexpr char export_name[] = "tracer_agent_object_cache_v38";
   const auto size = std::max(path.size() + 1, sizeof(export_name));
   const auto memory = process.remote_allocate(size);
   std::uintptr_t entry = 0;
@@ -391,7 +391,7 @@ struct Watch::Impl {
       for (const auto &[start, bytes] : plan.writer_ranges)
         prepare_runtime_calls(native_entry::scan(start, bytes));
 #else
-    const bool complex_nonleaf = plan.layout.value_write.active() && [&] {
+    const bool complex_nonleaf = request.first_seen() && plan.layout.value_write.active() && [&] {
       const auto body = native_entry::scan(plan.writer_start, plan.writer_bytes);
       return std::ranges::any_of(body.instructions, [](const auto &inst) {
         return inst.flow == NativeFlow::call;
@@ -1726,8 +1726,8 @@ struct Watch::Impl {
       item.set_diagnostic("asynchronous signal " + std::to_string(sample.gap) +
                           " arrived in a generated helper; application PC unavailable");
     if (sample.hook == Hook::create)
-      item.set_field(plan.layout.union_tag_offset ? object_watch::field_path(request, plan.layout) :
-                     plan.layout.opaque_union ? "<storage>" : request.field());
+      item.set_field(!plan.layout.union_path.empty() ? object_watch::field_path(request, plan.layout) :
+                      plan.layout.opaque_union ? "<storage>" : request.field());
     if (store) {
       item.set_destination(sample.destination);
       item.set_field(object_watch::field_path(request, plan.layout));
@@ -1781,11 +1781,14 @@ struct Watch::Impl {
         item.set_diagnostic(messages[std::min<std::size_t>(sample.gap, std::size(messages) - 1)]);
       }
     }
-    if (sample.storage_write.size)
+    if (sample.hook == Hook::collection_gap && sample.gap == 10)
+      item.set_diagnostic("store intersects multiple live union objects");
+    if (sample.storage_write.size) {
       object_watch::set_storage_write(item, sample.storage_write,
           sample.values & 1 ? &sample.storage_before : nullptr,
           sample.values & 2 ? &sample.storage_after : nullptr);
-    else if (sample.values || (plan.layout.opaque_union && (writer(sample.hook) || sample.hook == Hook::create)))
+      object_watch::set_union_write(item, plan.layout, sample.union_before, sample.union_after);
+    } else if (sample.values || (plan.layout.opaque_union && (writer(sample.hook) || sample.hook == Hook::create)))
       object_watch::set_scalar_values(item, plan.layout,
           {sample.values & 1 ? std::optional(sample.old_value) : std::nullopt,
            sample.values & 4 ? std::optional(sample.old_tag) : std::nullopt},

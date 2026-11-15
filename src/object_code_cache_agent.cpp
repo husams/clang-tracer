@@ -178,6 +178,7 @@ struct Lifetime {
   std::uint64_t id = 0, generation = 0;
   Address owner = 0;
   std::optional<std::int32_t> last_ordered_value = std::nullopt;
+  object_watch::UnionActivation union_activation;
 };
 
 struct Mapping {
@@ -409,6 +410,8 @@ struct Sample {
   bool has_old = false;
   object_watch::ValueWrite storage_write;
   object_watch::ValueStoreBytes storage_before{};
+  Address storage_field = 0, storage_receiver = 0;
+  object_watch::UnionWriteState union_before;
   Address collection_owner = 0;
   std::uint64_t storage_generation = 0;
   std::optional<std::uint32_t> old_tag = std::nullopt;
@@ -449,6 +452,7 @@ struct CollectionScope {
   std::optional<object_watch::LogicalRangeSample> prior_logical;
   bool destroyed = false;
   bool value_partial = false;
+  object_watch::UnionActivation union_activation;
   Address writer_return = 0;
 };
 thread_local CollectionScope collection_scope;
@@ -943,6 +947,7 @@ void bind_collection(State &watch, const Site &site, const Registers &regs,
   scope.header = header;
   scope.destination = destination;
   scope.valid = true;
+  scope.union_activation = {};
   std::uint64_t next = 0;
   const bool capture = !watch.no_values && !watch.value_write.active();
   const bool sampled = capture && read_field(watch, destination, next);
@@ -1148,8 +1153,8 @@ void emit_boundary(State &watch, const Site &site, Address object, const Lifetim
       event.shared_file_offset = *offset;
     }
   }
-  if (hook == Hook::create && !watch.no_values && !watch.shared_file.inode &&
-      read_field(watch, object + watch.offset, event.new_value)) {
+  if (hook == Hook::create && !watch.no_values && !watch.value_write.active() &&
+      !watch.shared_file.inode && read_field(watch, object + watch.offset, event.new_value)) {
     event.values = 2;
     if (const auto tag = union_tag(watch, object)) {
       event.new_tag = *tag;
@@ -1539,7 +1544,7 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
   event.id = life->id;
   event.generation = life->generation;
   event.hook = Hook::create;
-  if (!watch.no_values && !watch.shared_file.inode &&
+  if (!watch.no_values && !watch.value_write.active() && !watch.shared_file.inode &&
       read_field(watch, event.object + watch.offset, event.new_value)) {
     event.values = 2;
     if (const auto tag = union_tag(watch, event.object)) {
@@ -1746,9 +1751,13 @@ void before(const Site *site, const Registers *regs) noexcept {
       sample.storage_generation = scope.generation;
       sample.expected = regs->value(inst.result ? inst.result : rax);
       sample.storage_write = match.write;
+      sample.storage_field = scope.destination;
       if (!watch.no_values && sample.storage_write.size) {
         sample.has_old = read_self_memory(sample.storage_write.address, sample.storage_before.data(),
                                           sample.storage_write.size);
+        sample.union_before = object_watch::sample_union_write(watch.value_write,
+            watch.value_alternatives.data(), watch.value_alternatives.size(), sample.storage_field,
+            sample.storage_write, read_self_memory);
       } else if (!watch.no_values) {
         sample.input = inst.value ? regs->value(inst.value) : inst.immediate;
         sample.has_old = !watch.atomic && read_field(watch, destination, sample.old);
@@ -1761,8 +1770,11 @@ void before(const Site *site, const Registers *regs) noexcept {
       pending = sample;
       return;
     }
-    if (destination < watch.offset)
+    const bool union_storage = watch.value_write.kind == object_watch::ValueWriteKind::union_storage;
+    if (destination < watch.offset && !union_storage)
       return;
+    auto receiver = destination - watch.offset;
+    object_watch::ValueWrite write;
     Lifetime life;
     std::atomic<std::uint64_t> *window = nullptr;
     if (watch.borrow.dispatch_return)
@@ -1770,7 +1782,24 @@ void before(const Site *site, const Registers *regs) noexcept {
         return;
     {
       const std::lock_guard lock(watch.mutex);
-      const auto found = watch.lifetimes.find(destination - watch.offset);
+      auto found = std::as_const(watch.lifetimes).find(receiver);
+      if (union_storage) {
+        const auto match = object_watch::match_live_union(watch.value_write, watch.lifetimes,
+            watch.offset, destination, inst.store_width, [&] {
+              Observation event{};
+              event.pc = inst.pc;
+              event.destination = destination;
+              event.hook = Hook::collection_gap;
+              event.gap = 10;
+              stack(watch, event, *regs);
+              emit(watch, event);
+            });
+        found = match.first;
+        write = match.second;
+        if (!write.size)
+          return;
+        receiver = found->first;
+      }
       if (found == watch.lifetimes.end() || !found->second.id)
         return;
       life = found->second;
@@ -1778,9 +1807,14 @@ void before(const Site *site, const Registers *regs) noexcept {
                                            life.owner != active_borrow.owner))
         return;
       if (watch.serialize_wait_us || (!watch.no_values && !watch.atomic))
-        window = &watch.generations.at(destination - watch.offset).write_window;
+        window = &watch.generations.at(receiver).write_window;
     }
     Sample sample{site, regs->value(rsp), destination, life};
+    sample.storage_write = write;
+    if (write.size) {
+      sample.storage_receiver = receiver;
+      sample.storage_field = receiver + watch.offset;
+    }
     if (watch.shared_file.inode) {
       sample.shared_file_offset = shared_file_offset(watch, destination);
       if (!sample.shared_file_offset)
@@ -1795,10 +1829,17 @@ void before(const Site *site, const Registers *regs) noexcept {
       reserve_write(sample, *window, watch.serialize_wait_us);
     }
     if (!watch.no_values) {
-      sample.input = inst.value ? regs->value(inst.value) : inst.immediate;
-      if (window)
-        sample.has_old = read_field(watch, destination, sample.old);
-      sample.old_tag = union_tag(watch, destination - watch.offset);
+      if (write.size) {
+        sample.has_old = read_self_memory(write.address, sample.storage_before.data(), write.size);
+        sample.union_before = object_watch::sample_union_write(watch.value_write,
+            watch.value_alternatives.data(), watch.value_alternatives.size(), sample.storage_field,
+            write, read_self_memory);
+      } else {
+        sample.input = inst.value ? regs->value(inst.value) : inst.immediate;
+        if (window)
+          sample.has_old = read_field(watch, destination, sample.old);
+        sample.old_tag = union_tag(watch, receiver);
+      }
     }
     pending = sample;
   } catch (...) {
@@ -1829,6 +1870,18 @@ void complete(const Site *site, const Registers *regs) {
   const bool readable = watch.no_values || !needs_read || (!watch.atomic &&
       (sample.site == site && sample.stack == regs->value(rsp) && sample.has_old &&
        read_field(watch, sample.destination, observed)));
+  object_watch::ValueStoreBytes storage_after{};
+  auto union_before = sample.union_before;
+  object_watch::UnionWriteState union_after;
+  bool storage_read = false;
+  if (sample.storage_write.size && !watch.no_values &&
+      sample.site == site && sample.stack == regs->value(rsp)) {
+    storage_read = read_self_memory(sample.storage_write.address, storage_after.data(),
+                                    sample.storage_write.size);
+    union_after = object_watch::sample_union_write(watch.value_write,
+        watch.value_alternatives.data(), watch.value_alternatives.size(), sample.storage_field,
+        sample.storage_write, read_self_memory);
+  }
   const bool overlapping = ordered ?
       sample.overlapping || sample.write_window->load(std::memory_order_acquire) /
           write_epoch_increment != sample.write_epoch ||
@@ -1842,16 +1895,19 @@ void complete(const Site *site, const Registers *regs) {
     if (!succeeded)
       return;
   }
-  const auto object = sample.collection_owner ? sample.collection_owner : sample.destination - watch.offset;
+  const auto object = sample.collection_owner ? sample.collection_owner :
+                      sample.storage_receiver ? sample.storage_receiver : sample.destination - watch.offset;
   const bool new_value_available = readable && (!needs_read || watch.no_values || !overlapping);
   std::unique_lock lock(watch.mutex);
   bool drift = false;
+  object_watch::UnionActivation *activation = nullptr;
   if (sample.collection_owner) {
     const auto active = watch.active_collections.find(object);
     if (active == watch.active_collections.end() || !active->second ||
         collection_scope.watch != &watch || !collection_scope.valid ||
         collection_scope.id != sample.life.id || collection_scope.generation != sample.storage_generation)
       return;
+    activation = &collection_scope.union_activation;
   } else {
     const auto found = watch.lifetimes.find(object);
     if (found == watch.lifetimes.end() || found->second.id != sample.life.id ||
@@ -1859,6 +1915,7 @@ void complete(const Site *site, const Registers *regs) {
        (active_borrow.watch != &watch || active_borrow.life.id != sample.life.id ||
         found->second.owner != active_borrow.owner)))
       return;
+    activation = &found->second.union_activation;
     if (ordered && !watch.no_values) {
       auto &last = found->second.last_ordered_value;
       if (overlapping || !sample.has_old || !new_value_available) {
@@ -1869,6 +1926,11 @@ void complete(const Site *site, const Registers *regs) {
       }
     }
   }
+  if (sample.storage_write.size && !watch.no_values &&
+      watch.value_write.kind == object_watch::ValueWriteKind::union_storage && watch.value_write.selector_width)
+    object_watch::confirm_union_payload(*activation, watch.value_alternatives.data(),
+        watch.value_alternatives.size(), sample.storage_field, sample.storage_write,
+        sample.has_old && storage_read && !overlapping, union_before, union_after);
   if (!watch.borrow.dispatch_return)
     lock.unlock();
   Observation event{};
@@ -1895,15 +1957,20 @@ void complete(const Site *site, const Registers *regs) {
   }
   if (sample.storage_write.size) {
     event.storage_write = sample.storage_write;
-    if (!watch.no_values) {
+    if (!watch.no_values && !overlapping) {
       event.storage_before = sample.storage_before;
-      const bool after_read = read_self_memory(sample.storage_write.address, event.storage_after.data(),
-                                               sample.storage_write.size);
-      event.values = (sample.has_old ? 1 : 0) | (after_read ? 2 : 0);
-      if (event.values == 3 && event.storage_before == event.storage_after)
+      event.storage_after = storage_after;
+      event.values = (sample.has_old ? 1 : 0) | (storage_read ? 2 : 0);
+      event.union_before = union_before;
+      event.union_after = union_after;
+      if (event.values == 3 && event.storage_before == event.storage_after &&
+          event.union_before.tag == event.union_after.tag &&
+          event.union_before.scalar == event.union_after.scalar)
         return;
       if (event.values != 3)
         event.gap = 3;
+    } else if (overlapping) {
+      event.gap = 1;
     }
   } else if (!watch.no_values && new_value_available) {
     auto old = sample.old;
@@ -4653,7 +4720,7 @@ void initialize(Init &init
 } // namespace
 } // namespace tracer::object_cache
 
-extern "C" int tracer_agent_object_cache_v37(tracer::object_cache::Init *request) {
+extern "C" int tracer_agent_object_cache_v38(tracer::object_cache::Init *request) {
   try {
     tracer::object_cache::initialize(*request);
     return 0;

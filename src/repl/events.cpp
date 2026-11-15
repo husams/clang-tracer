@@ -449,7 +449,7 @@ std::string event_summary(const api::TraceEvent &event) {
       out << " \"" << google::protobuf::CEscape(object.old_string()) << "\" ->";
     if (object.has_new_string())
       out << " \"" << google::protobuf::CEscape(object.new_string()) << '"';
-    const auto union_sample = [&](std::uint32_t tag, const std::string &member,
+    const auto union_sample = [&](std::uint64_t tag, const std::string &member,
                                   const api::ObjectObservation::SnapshotValue &value) {
       out << " tag=" << tag;
       if (member.empty())
@@ -462,11 +462,16 @@ std::string event_summary(const api::TraceEvent &event) {
       else if (value.has_real_value())
         out << value.real_value();
     };
-    if (object.has_old_union_tag()) {
+    if (object.has_storage_write() && object.storage_write().has_before_discriminator()) {
+      union_sample(object.storage_write().before_discriminator(), object.old_union_member(), object.snapshot_before());
+      out << " ->";
+    } else if (object.has_old_union_tag()) {
       union_sample(object.old_union_tag(), object.old_union_member(), object.snapshot_before());
       out << " ->";
     }
-    if (object.has_new_union_tag())
+    if (object.has_storage_write() && object.storage_write().has_after_discriminator())
+      union_sample(object.storage_write().after_discriminator(), object.new_union_member(), object.snapshot_after());
+    else if (object.has_new_union_tag())
       union_sample(object.new_union_tag(), object.new_union_member(), object.snapshot_after());
     const auto raw_bytes = [&](const std::string &bytes) {
       std::ostringstream encoded;

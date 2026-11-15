@@ -464,6 +464,29 @@ function(tracer_add_native_repl)
             set_tests_properties(${_test} PROPERTIES TIMEOUT 120)
           endforeach()
         endforeach()
+        add_executable(repl-object-nested-union-target tests/fixtures/object_nested_union.cpp)
+        set_target_properties(repl-object-nested-union-target PROPERTIES CXX_STANDARD 17
+          INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_compile_options(repl-object-nested-union-target PRIVATE -g -O2 -fPIE
+          -fno-omit-frame-pointer ${_object_test_arch_flags})
+        target_link_options(repl-object-nested-union-target PRIVATE -pie "LINKER:--build-id=sha1")
+        foreach(_backend ptrace code-cache)
+          foreach(_case wide wide_member wide_leaf tagged unknown switch pair lifecycle)
+            set(_options)
+            set(_scenario ${_case})
+            if(_case STREQUAL "lifecycle")
+              set(_scenario tagged)
+              set(_options --lifecycle)
+            endif()
+            set(_test "native_repl_object_nested_union_${_case}_${_backend}")
+            add_test(NAME ${_test}
+              COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_nested_union.py"
+                $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+                $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-nested-union-target>
+                ${_scenario} --backend ${_backend} ${_options})
+            set_tests_properties(${_test} PROPERTIES TIMEOUT 120)
+          endforeach()
+        endforeach()
         set(_map_fixture_source "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/object_map")
         foreach(_map_kind ordered hash)
           set(_map_target "repl-object-${_map_kind}-map-target")

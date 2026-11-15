@@ -708,10 +708,11 @@ message ObjectWatchRequest {
   string map_field = 39;
   string map_key = 40;
   uint32 event_buffer = 41; // Native code-cache ring size, zero selects the default.
-  string union_tag = 42; // Nonoverlapping uint32 or uint32-backed enum discriminator.
+  string union_tag = 42; // Verified nonoverlapping integral or enum discriminator.
   message UnionCase {
     uint32 tag = 1;
     string member = 2;
+    optional uint64 tag_bits = 3; // Wide discriminator or sign-extended negative literal.
   }
   repeated UnionCase union_cases = 43;
   repeated uint32 async_signals = 44; // Existing application handlers bridged by the native cache.
@@ -939,11 +940,14 @@ message ObjectObservation {
       REPRESENTATION = 1;
       STRING_DATA = 2;
       ANY_PAYLOAD = 3;
+      UNION_TAG = 4;
     }
     Region region = 1;
     uint64 address = 2; // First affected byte of the selected field or payload.
     uint64 offset = 3; // From the start of the reported region.
     uint32 size = 4;
+    optional uint64 before_discriminator = 5;
+    optional uint64 after_discriminator = 6;
   }
   StorageWrite storage_write = 43;
 }
