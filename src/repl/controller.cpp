@@ -2170,9 +2170,22 @@ bool Controller::execute(const Command &command) {
           for (const auto &mapping : command.options.at("--union-case")) {
             const auto split = mapping.find('=');
             if (split == std::string::npos || split == 0 || split + 1 == mapping.size())
-              throw std::invalid_argument("--union-case requires UINT32=MEMBER");
+              throw std::invalid_argument("--union-case requires TAG=MEMBER");
             auto &item = *request.add_union_cases();
-            item.set_tag(unsigned_number(mapping.substr(0, split), "union discriminator", UINT32_MAX));
+            const auto literal = mapping.substr(0, split);
+            if (literal.front() == '-') {
+              std::size_t consumed = 0;
+              const auto negative = std::stoll(literal, &consumed, 10);
+              if (consumed != literal.size())
+                throw std::invalid_argument("invalid signed union discriminator");
+              item.set_tag_bits(static_cast<std::uint64_t>(negative));
+            } else {
+              const auto tag = unsigned_number(literal, "union discriminator");
+              if (tag <= UINT32_MAX)
+                item.set_tag(tag);
+              else
+                item.set_tag_bits(tag);
+            }
             item.set_member(mapping.substr(split + 1));
           }
         }

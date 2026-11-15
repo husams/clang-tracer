@@ -2120,8 +2120,8 @@ public:
         const bool logical_range = vector || map || pointee;
         const bool tagged_union = !request->union_tag().empty();
         if (tagged_union != !request->union_cases().empty() ||
-            request->union_cases_size() > 128 || (tagged_union && (ownership || logical_range)))
-          throw std::invalid_argument("a standalone tagged union requires --union-tag and --union-case");
+            request->union_cases_size() > 128 || (tagged_union && ownership))
+          throw std::invalid_argument("tagged union capture requires --union-tag and --union-case");
         if (tagged_union &&
             request->synchronization() != api::ObjectWatchRequest::THREAD_CONFINED &&
             request->synchronization() != api::ObjectWatchRequest::CALLER_LOCK)

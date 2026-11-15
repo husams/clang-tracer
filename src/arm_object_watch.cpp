@@ -142,7 +142,7 @@ void validate(api::ObjectWatchRequest &request) {
   const bool synchronized = request.synchronization() == Request::THREAD_CONFINED ||
                             request.synchronization() == Request::CALLER_LOCK;
   if (tagged != !request.union_cases().empty() || request.union_cases_size() > 128 ||
-      (tagged && (!synchronized || ownership || logical_range)))
+      (tagged && (!synchronized || ownership)))
     throw std::invalid_argument("tagged union capture requires declared synchronization and tag cases");
   if (ownership != !request.base_type().empty() || ownership != !request.collection().empty() ||
       (ownership && request.first_seen()) ||
