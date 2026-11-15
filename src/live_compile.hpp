@@ -26,7 +26,7 @@ struct CompiledUnit {
   std::set<std::string> inputs;
   std::map<std::string, std::string> record_layouts;
   std::map<std::string, std::pair<std::string, std::string>> types;
-  std::map<std::string, unsigned> system_definitions;
+  std::map<std::string, unsigned> source_definitions;
 };
 
 enum class CompileInspection { native_metadata, ir_only };
@@ -34,7 +34,8 @@ enum class CompileInspection { native_metadata, ir_only };
 CompiledUnit compile_unit(const JitRequest &request, const TranslationUnit &unit,
                           llvm::LLVMContext *context = nullptr,
                           const std::function<void(clang::ASTContext &)> &inspect = {},
-                          CompileInspection inspection = CompileInspection::ir_only);
+                          CompileInspection inspection = CompileInspection::ir_only,
+                          const std::set<std::string> *changed_inputs = nullptr);
 
 struct Definition {
   std::string implementation;
@@ -47,14 +48,19 @@ struct Definition {
   bool supported_abi = false;
   bool local = false;
   bool discardable = false;
-  std::optional<unsigned> system_definition;
+  std::optional<unsigned> source_definition;
+  std::set<std::string> callees;
+  unsigned invokes = 0;
+  std::string normal_flow;
 };
 
 bool private_constant(const llvm::GlobalVariable &global);
+bool standard_inline_constant(const llvm::GlobalVariable &global);
 bool has_standard_stream_initializer(llvm::Module &module);
 void omit_standard_stream_initializer(llvm::Module &module);
 std::map<std::string, std::string> data_definitions(const CompiledUnit &unit);
 std::string local_import_name(std::string_view path, std::string_view name);
+std::string native_entry_import_name(std::string_view name);
 
 bool supported_entry_abi(const llvm::Function &function);
 std::map<std::string, Definition> definitions(const CompiledUnit &unit);

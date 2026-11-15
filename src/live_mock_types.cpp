@@ -60,9 +60,31 @@ public:
       }
       signature += ')';
     }
-    const auto key = normalize_mock_selector(signature);
+    auto key = normalize_mock_selector(signature);
     if (!selectors_.contains(key)) {
-      return true;
+      const auto written = [&](bool canonical) {
+        std::string spelling = decl->getQualifiedNameAsString() + '(';
+        for (const auto *parameter : decl->parameters()) {
+          if (spelling.back() != '(')
+            spelling += ',';
+          auto type = parameter->getType();
+          spelling += type_name(canonical ? type.getCanonicalType() : type, false);
+        }
+        spelling += ')';
+        if (const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(decl)) {
+          if (method->isConst()) spelling += " const";
+          if (method->isVolatile()) spelling += " volatile";
+          if (method->getRefQualifier() == clang::RQ_LValue) spelling += " &";
+          if (method->getRefQualifier() == clang::RQ_RValue) spelling += " &&";
+        }
+        return normalize_mock_selector(std::move(spelling));
+      };
+      key = written(false);
+      if (!selectors_.contains(key)) {
+        key = written(true);
+        if (!selectors_.contains(key))
+          return true;
+      }
     }
     if (declarations.contains(key)) {
       throw std::invalid_argument("ambiguous mock declaration for " + signature);
@@ -101,11 +123,11 @@ public:
   std::map<std::string, MockDeclaration> declarations;
 
 private:
-  std::string type_name(clang::QualType type) const {
+  std::string type_name(clang::QualType type, bool leading_scope = true) const {
     auto policy = ast_.getPrintingPolicy();
     policy.SuppressUnwrittenScope = true;
     policy.FullyQualifiedName = true;
-    return clang::TypeName::getFullyQualifiedName(type, ast_, policy, true);
+    return clang::TypeName::getFullyQualifiedName(type, ast_, policy, leading_scope);
   }
 
   void add_header(MockDeclaration& entry, clang::SourceLocation location) const {

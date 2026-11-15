@@ -123,6 +123,10 @@ private:
   bool unsafe_target_ = false;
   std::uintptr_t live_address_ = 0;
   live::Transaction live_;
+  std::shared_ptr<live::Plan> live_preview_;
+  std::string live_preview_key_;
+  std::uint64_t live_preview_revision_ = 0;
+  std::uint64_t live_preview_process_start_ = 0;
   std::uintptr_t start_address_ = 0;
   std::uintptr_t stop_address_ = 0;
   std::uintptr_t validate_address_ = 0;

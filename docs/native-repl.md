@@ -104,20 +104,22 @@ the active revision.
 Empty string literals and function-local literal arrays can change with
 their code. A replacement that would expose a different address for a
 compiler-generated constant requires a rebuild. Changes to existing static
-storage or record layouts require a rebuild or a managed migration.
-Translation-unit-local functions and data
-require an unambiguous ELF file marker and exact symbol. Each changed function
+storage or record ABI require a rebuild or a managed migration. The ABI check
+includes changes to copy, move, and destruction triviality.
+Translation-unit-local functions and data require an unambiguous ELF file
+marker and exact symbol. Each changed function
 also requires a patchable native entry. When a recorded unit initialized the
 standard streams, replacement units can reuse them. Existing native storage
 keeps its verified initialization and destruction code. Changes to module
 initialization or destruction require a rebuild. Native updates can use
-symbols exported by the standard Linux runtime libraries already loaded in
-the target.
+symbols exported by standard Linux runtime libraries in the target, including
+definitions interposed in its dynamic lookup scope.
 
 `--payload-limit BYTES` sets the maximum serialized source and dependency
 snapshot sent to the target for a live operation. The default is 16 MiB.
-The REPL also enforces its 32 MiB limit on an outgoing RPC. Preview and apply
-validate the build and saved source snapshots separately.
+The REPL also enforces its 32 MiB limit on an outgoing RPC. Apply can reuse
+the preview's plan for the same input and revision after rechecking the
+saved files and executable mappings.
 
 ```text
 %live mock "ProductStore::load(int)" --file product_fixture.cpp --function load_fixture --fixture products.txt
@@ -126,7 +128,8 @@ validate the build and saved source snapshots separately.
 %live update update.hpp --after-file after.cpp --after-function fixture::after --for-each Cache
 ```
 
-Live mocks use exact signatures. `--bind "ALIAS=SIGNATURE"` binds a verified
+Live mocks use exact signatures, with source-style or demangled qualifiers.
+`--bind "ALIAS=SIGNATURE"` binds a verified
 application callable. `ctx.original(...)` calls the unmocked implementation,
 including any active live update. Replacing a mock preserves that underlying
 implementation. Use `--recursion original` to route recursive calls through

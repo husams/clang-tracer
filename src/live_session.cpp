@@ -566,7 +566,21 @@ clangtracer::v1::LiveUpdateStatus Session::live_update(
       return apply_live_extension_locked(request, std::move(result), cancelled);
     if (request.action() != Action::UPDATE && request.action() != Action::PREVIEW)
       throw std::runtime_error("unknown live update action");
-    auto plan = live::plan_sources(pid_, executable_, request, live_.revisions.at(expected_revision), cancelled);
+    auto preview_key = request;
+    preview_key.set_action(Action::PREVIEW);
+    preview_key.clear_preview_revision();
+    auto key = preview_key.SerializeAsString();
+    std::shared_ptr<live::Plan> saved;
+    if (request.action() == Action::UPDATE && request.has_preview_revision() &&
+        live_preview_revision_ == expected_revision && live_preview_process_start_ == process_start_ &&
+        live_preview_key_ == key)
+      saved = std::move(live_preview_);
+    live_preview_.reset();
+    live_preview_key_.clear();
+    if (!saved)
+      saved = std::make_shared<live::Plan>(live::plan_sources(
+          pid_, executable_, request, live_.revisions.at(expected_revision), cancelled));
+    auto &plan = *saved;
     bool blocked = false;
     for (const auto &candidate : plan.candidates) {
       result.add_candidates()->CopyFrom(candidate);
@@ -584,6 +598,10 @@ clangtracer::v1::LiveUpdateStatus Session::live_update(
     }
     if (request.action() == Action::PREVIEW) {
       check_payload_size(jit_wire(plan.jit), input_limit, "live JIT snapshot");
+      live_preview_ = std::move(saved);
+      live_preview_key_ = std::move(key);
+      live_preview_revision_ = expected_revision;
+      live_preview_process_start_ = process_start_;
       result.set_state(Status::PLANNED);
       return result;
     }

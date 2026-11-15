@@ -1,5 +1,6 @@
 #include "live_compile.hpp"
 
+#include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/StringSwitch.h>
 #include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
@@ -9,7 +10,9 @@
 #include <llvm/IR/DiagnosticInfo.h>
 #include <llvm/IR/DiagnosticPrinter.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/Operator.h>
 #include <llvm/Linker/Linker.h>
 #include <llvm/Support/Path.h>
 #include <llvm/Support/TargetSelect.h>
@@ -48,6 +51,7 @@ void checked(llvm::Error error) {
 std::uintptr_t runtime_import(llvm::StringRef name) {
   const auto malloc_family = llvm::StringSwitch<bool>(name)
       .Cases("malloc", "calloc", "free", "realloc", true)
+      .Cases("aligned_alloc", "posix_memalign", "memalign", "valloc", "pvalloc", true)
       .Default(false);
   const auto new_delete = name.starts_with("_Znw") || name.starts_with("_Zna") ||
                          name.starts_with("_Zdl") || name.starts_with("_Zda");
@@ -96,7 +100,10 @@ std::uintptr_t runtime_import(llvm::StringRef name) {
     return 0;
   const auto owner = llvm::sys::path::filename(info.dli_fname);
   const auto expected = is_c ? "libc.so." : is_unwind ? "libgcc_s.so." : "libstdc++.so.";
-  return owner.starts_with(expected) ? reinterpret_cast<std::uintptr_t>(address) : 0;
+  if (!owner.starts_with(expected))
+    return 0;
+  auto *visible = ::dlsym(RTLD_DEFAULT, symbol.c_str());
+  return reinterpret_cast<std::uintptr_t>(visible ? visible : address);
 }
 
 std::uintptr_t standard_runtime_import(llvm::StringRef name) {
@@ -119,7 +126,11 @@ std::uintptr_t standard_runtime_import(llvm::StringRef name) {
         (owner == provider ||
          (std::string_view(library) == "libc.so.6" && info.dli_fname &&
           std::string_view(info.dli_fname) == "linux-vdso.so.1")))
-      return reinterpret_cast<std::uintptr_t>(address);
+      if (const auto *visible = ::dlsym(RTLD_DEFAULT, symbol.c_str())) {
+        Dl_info visible_info{};
+        if (::dladdr(visible, &visible_info))
+          return reinterpret_cast<std::uintptr_t>(visible);
+      }
   }
   return 0;
 }
@@ -210,6 +221,31 @@ bool source_file(const std::string &path) {
   return extension == ".cpp" || extension == ".cc" || extension == ".cxx" || extension == ".C";
 }
 
+bool only_reads_constant(const llvm::GlobalVariable &global) {
+  llvm::SmallPtrSet<const llvm::Value *, 16> seen;
+  llvm::SmallVector<const llvm::Value *> pending{&global};
+  while (!pending.empty()) {
+    const auto *pointer = pending.pop_back_val();
+    if (!seen.insert(pointer).second)
+      continue;
+    for (const auto *use : pointer->users()) {
+      if (const auto *copy = llvm::dyn_cast<llvm::MemTransferInst>(use);
+          copy && copy->getRawSource() == pointer && copy->getRawDest() != pointer &&
+          !copy->isVolatile())
+        continue;
+      if (const auto *read = llvm::dyn_cast<llvm::LoadInst>(use);
+          read && !read->isVolatile() && !read->isAtomic())
+        continue;
+      if (llvm::isa<llvm::GEPOperator, llvm::BitCastOperator>(use)) {
+        pending.push_back(use);
+        continue;
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
 void isolate_definitions(llvm::Module &module, const JitRequest &request,
                          const TranslationUnit &unit) {
   // Keep ELF imports for internal-linkage symbols private to their original TU.
@@ -226,6 +262,23 @@ void isolate_definitions(llvm::Module &module, const JitRequest &request,
       value.setName(import);
     else if (request.imports.contains(value.getName().str()))
       throw std::runtime_error("unscoped import collides with local symbol: " + value.getName().str());
+  }
+  // Keep calls in a retained image on the native dispatch path, including
+  // calls between entries published together. Either entry may change later.
+  std::vector<llvm::GlobalValue *> dispatches;
+  for (auto &value : module.global_values())
+    if (llvm::isa<llvm::FunctionType>(value.getValueType()) &&
+        request.imports.contains(native_entry_import_name(value.getName().str())))
+      dispatches.push_back(&value);
+  for (auto *entry : dispatches) {
+    const auto import = native_entry_import_name(entry->getName().str());
+    if (module.getNamedValue(import))
+      throw std::runtime_error("native entry dispatch symbol collision: " + import);
+    auto *callee = llvm::Function::Create(llvm::cast<llvm::FunctionType>(entry->getValueType()),
+                                         llvm::GlobalValue::ExternalLinkage, import, module);
+    entry->replaceUsesWithIf(callee, [](const llvm::Use &use) {
+      return !llvm::isa<llvm::GlobalAlias>(use.getUser());
+    });
   }
   // Use the target instance of known application storage and unchanged code.
   // The retained revision owns only its new code and immutable local constants.
@@ -254,7 +307,8 @@ void isolate_definitions(llvm::Module &module, const JitRequest &request,
     }
     if (global.hasInitializer() && !global.getName().starts_with("llvm.") &&
         (!global.isConstant() || global.isThreadLocal() ||
-         (!global.hasLocalLinkage() && !global.hasLinkOnceODRLinkage())))
+         (!global.hasLocalLinkage() && !global.hasLinkOnceODRLinkage() &&
+          !standard_inline_constant(global))))
       throw std::runtime_error("unverified global storage in revision: " + global.getName().str());
   }
   if (!module.getModuleInlineAsm().empty() || module.getNamedGlobal("llvm.global_ctors") ||
@@ -351,7 +405,8 @@ std::shared_ptr<JitImage> compile_in_target(const JitRequest &request) {
     // Once unused code is dropped, any such surviving object could expose
     // an address different from the native revision's.
     for (const auto &global : linked->globals())
-      if (private_constant(global) && !global.hasGlobalUnnamedAddr())
+      if (private_constant(global) && !global.hasGlobalUnnamedAddr() &&
+          !only_reads_constant(global))
         throw std::runtime_error("rebuild required: unverified address-sensitive constant " +
                                  global.getName().str());
   }

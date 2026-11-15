@@ -280,10 +280,19 @@ extern "C" LIVE_ENTRY void cache_print(managed::Registry::Access& access, manage
 }
 """
     patch_source.write_text(original_code)
-    target = build_target(args, folder, ["main.cpp", "cache_code.cpp"], ["state.hpp"],
+    (folder / "gate.cpp").write_text("""
+#include <tracer/live_migration.hpp>
+namespace managed = tracer::live::managed;
+extern managed::Registry registry;
+managed::Registry::Access open_gate() { return registry.access(); }
+""")
+    target = build_target(args, folder, ["main.cpp", "cache_code.cpp", "gate.cpp"], ["state.hpp"],
                           standard="c++17", entry_flags=())
     shutil.copyfile(ROOT / "live_migration" / "state_v2.hpp", folder / "state_v2.hpp")
     source = (folder / "after.cpp").read_text()
+    recipe = (folder / "update.hpp").read_text()
+    (folder.parent / "outside_recipe.hpp").write_text(
+        recipe.replace('"state_v2.hpp"', json.dumps(str(folder / "state_v2.hpp"))))
     (folder / "reject.cpp").write_text("#define FAIL_HOOK\n" + source)
     with ExitStack() as cleanup:
         app, repl, app_line, console_line = attach(args, target, cleanup)
@@ -297,8 +306,8 @@ extern "C" LIVE_ENTRY void cache_print(managed::Registry::Access& access, manage
                                  'cache.max_entries, cache.hook_calls'))
         update = "%live update update.hpp cache_code.cpp state_v2.hpp"
         patch_source.write_text(patched_code.replace(
-            "using namespace fixture;", "using namespace fixture;\nextern managed::Registry registry;"
-        ).replace("  access.with<CacheV2>", "  auto late_access = registry.access();\n"
+            "using namespace fixture;", "using namespace fixture;\nmanaged::Registry::Access open_gate();"
+        ).replace("  access.with<CacheV2>", "  auto late_access = open_gate();\n"
                   "  late_access.with<CacheV2>"))
         repl(update + " --managed true", r"^live BLOCKED revision=0 .*incompatible native entry")
         console_line(r"^  BLOCKED .*acquire the managed registry gate in the caller")
@@ -320,7 +329,7 @@ extern "C" LIVE_ENTRY void cache_print(managed::Registry::Access& access, manage
         app("old", r"^code 1$")
         app_line(r"^other 2$")
         app_line(r"^old 0$")
-        repl(update + " --after-file after.cpp" + options,
+        repl(update.replace("update.hpp", "../outside_recipe.hpp") + " --after-file after.cpp" + options,
              r"^live APPLIED revision=1 .*instances=3")
         app("new", r"^code 27$")
         app_line(r"^new 700 4796 1$")
@@ -334,6 +343,10 @@ extern "C" LIVE_ENTRY void cache_print(managed::Registry::Access& access, manage
         app_line(r"^new 700 1024 0$")
         app_line(r"^new 1400 1024 0$")
         app_line(r"^new 0 1024 0$")
+        repl("%live revert", r"^live REVERTED revision=0")
+        app("old", r"^old 0$")
+        repl("%live update update.hpp state_v2.hpp --managed true",
+             r"^live APPLIED revision=3 .*instances=3")
         repl("%live revert", r"^live REVERTED revision=0")
         app("old", r"^old 0$")
 

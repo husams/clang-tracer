@@ -165,7 +165,7 @@ ExtensionPlan plan_extension(std::uint32_t pid, std::uint64_t process_start,
       if (known || active.sources.contains(source.path()))
         native_inputs = true;
       else
-        recipe_inputs.insert(source.path());
+        recipe_inputs.insert(fs::canonical(source.path()).string());
     }
     if (native_inputs) {
       result.native = plan_sources(pid, module, request, active, cancelled, &recipe_inputs);

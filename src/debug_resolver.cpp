@@ -1225,6 +1225,53 @@ std::uint64_t bind_live_executable(std::uint32_t pid, const std::string &path,
   return live - entry;
 }
 
+LiveCodeMappings snapshot_live_code_mappings(
+    std::uint32_t pid, const std::string &path,
+    const llvm::object::ObjectFile &object, std::uint64_t bias) {
+  const auto &elf = llvm::cast<llvm::object::ELF64LEObjectFile>(object).getELFFile();
+  auto programs = elf.program_headers();
+  if (!programs)
+    throw std::runtime_error(llvm::toString(programs.takeError()));
+  struct Segment { std::uint64_t address, offset, size; };
+  std::vector<Segment> segments;
+  const auto file_size = object.getMemoryBufferRef().getBufferSize();
+  for (const auto &program : *programs) {
+    if (program.p_type != llvm::ELF::PT_LOAD || !(program.p_flags & llvm::ELF::PF_X))
+      continue;
+    if (program.p_offset > file_size || program.p_filesz > file_size - program.p_offset)
+      throw std::runtime_error("executable ELF segment exceeds debug image");
+    segments.push_back({program.p_vaddr, program.p_offset, program.p_filesz});
+  }
+  const std::vector<std::string> paths{path};
+  auto mappings = read_executable_mappings(pid, paths);
+  auto fingerprint = mapping_fingerprint(paths, mappings);
+  return {
+      [segments = std::move(segments), mappings = std::move(mappings), bias]
+      (std::uint64_t entry, std::uint64_t size) {
+        if (!size || entry > UINT64_MAX - bias)
+          return false;
+        std::set<std::uint64_t> addresses;
+        for (const auto &segment : segments) {
+          if (entry < segment.address || entry - segment.address >= segment.size ||
+              size > segment.size - (entry - segment.address))
+            continue;
+          const auto offset = segment.offset + (entry - segment.address);
+          for (const auto &mapping : mappings) {
+            if (offset < mapping.offset || offset - mapping.offset >= mapping.end - mapping.begin)
+              continue;
+            const auto address = mapping.begin + (offset - mapping.offset);
+            if (size <= mapping.end - address)
+              addresses.insert(address);
+          }
+        }
+        return addresses.size() == 1 && *addresses.begin() == bias + entry;
+      },
+      [pid, paths, fingerprint = std::move(fingerprint)] {
+        return mapping_fingerprint(paths, read_executable_mappings(pid, paths)) == fingerprint;
+      },
+  };
+}
+
 std::optional<std::string> find_matching_debug_file(
     const std::string &path, const llvm::object::ObjectFile &object) {
   const auto *elf = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(&object);

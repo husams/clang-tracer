@@ -18,12 +18,16 @@
 #include <llvm/Support/SHA256.h>
 
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
+#include <deque>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <thread>
 
 namespace tracer::live {
 namespace {
@@ -224,7 +228,8 @@ struct Sources {
 };
 
 Sources snapshot_inputs(const api::LiveBuildManifest &manifest,
-                        const api::LiveUpdateRequest &request, const Revision &active) {
+                        const api::LiveUpdateRequest &request, const Revision &active,
+                        const std::set<std::string> *managed_inputs) {
   Sources result;
   result.root = fs::canonical(manifest.source_root());
   const auto snapshot = fs::canonical(manifest.snapshot_root());
@@ -250,7 +255,8 @@ Sources snapshot_inputs(const api::LiveBuildManifest &manifest,
   std::map<std::string, std::string> overrides;
   for (const auto &source : request.sources()) {
     const auto path = fs::canonical(source.path()).string();
-    if (!within(result.root, path) || !result.submitted.insert(path).second)
+    if ((!within(result.root, path) && !(managed_inputs && managed_inputs->contains(path))) ||
+        !result.submitted.insert(path).second)
       throw std::runtime_error("invalid or duplicate submitted source: " + path);
     if (read_file(path) != source.contents())
       throw Stale("saved source changed after submission: " + path);
@@ -297,7 +303,6 @@ void collect(std::map<std::string, Body> &all, const std::string &path,
 struct Change {
   Body before;
   std::optional<Definition> after;
-  bool enters_registry = false;
 };
 
 bool same_definition(const Definition &left, const Definition &right) {
@@ -305,37 +310,80 @@ bool same_definition(const Definition &left, const Definition &right) {
          left.local == right.local && left.alias_target == right.alias_target;
 }
 
-bool unchanged_system_body(const Definition &before, const Definition &after) {
-  // Retain the linker-selected body when identical system header code was
-  // lowered differently because another declaration was emitted earlier.
-  return before.system_definition && before.system_definition == after.system_definition &&
+bool equivalent_inline_body(const Definition &before, const Definition &after) {
+  // Clang can lower the same inline source with or without an unwind edge.
+  // A different call dependency means the instantiation needs independent proof.
+  return before.source_definition && before.source_definition == after.source_definition &&
          before.path == after.path && before.discardable && after.discardable &&
-         !before.local && !after.local && before.abi == after.abi;
+         !before.local && !after.local && before.abi == after.abi &&
+         before.callees == after.callees && before.invokes != after.invokes &&
+         !before.normal_flow.empty() && before.normal_flow == after.normal_flow;
 }
 
-bool enters_registry(const llvm::Module &module, const std::string &name) {
-  const auto *entry = module.getNamedValue(name);
-  if (!entry)
-    return false;
-  const auto *function = llvm::dyn_cast<llvm::Function>(entry->stripPointerCastsAndAliases());
-  if (!function)
-    return false;
-  constexpr llvm::StringLiteral access("_ZN6tracer4live7managed8Registry6accessEv");
-  llvm::SmallPtrSet<const llvm::Function *, 16> visited;
-  std::vector<const llvm::Function *> pending{function};
-  while (!pending.empty()) {
-    const auto *body = pending.back();
-    pending.pop_back();
-    if (!visited.insert(body).second)
+bool equivalent_body(const Definition &before, const Definition &after) {
+  return same_definition(before, after) || equivalent_inline_body(before, after);
+}
+
+std::string closure_owner(std::string_view symbol, const std::map<std::string, Definition> &code) {
+  // Clang's local lambda symbols embed the enclosing Itanium function name
+  // and an ordinal such as `3$_0`. That ordinal can change within one body.
+  const auto marker = symbol.find("$_");
+  if (marker == std::string_view::npos)
+    return {};
+  auto suffix = marker;
+  while (suffix && std::isdigit(static_cast<unsigned char>(symbol[suffix - 1])))
+    --suffix;
+  while (suffix && std::string_view("rVKRO").find(symbol[suffix - 1]) != std::string_view::npos)
+    --suffix;
+  if (suffix && symbol[suffix - 1] == 'N')
+    --suffix;
+  if (!suffix || symbol[--suffix] != 'E')
+    return {};
+  for (auto start = symbol.find('Z', 2); start < suffix; start = symbol.find('Z', start + 1)) {
+    auto owner = "_Z" + std::string(symbol.substr(start + 1, suffix - start - 1));
+    if (code.contains(owner))
+      return owner;
+  }
+  return {};
+}
+
+using CallGraph = std::map<std::string, std::set<std::string>>;
+
+void collect_calls(CallGraph &calls, const llvm::Module &module, const std::string &unit) {
+  const auto key = [&](const llvm::GlobalValue &value) {
+    return value.hasLocalLinkage() ? local_import_name(unit, value.getName().str())
+                                   : value.getName().str();
+  };
+  for (const auto &function : module) {
+    if (function.isDeclaration())
       continue;
-    if (body->getName() == access)
-      return true;
-    for (const auto &block : *body)
+    auto &edges = calls[key(function)];
+    for (const auto &block : function)
       for (const auto &inst : block)
         if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&inst))
           if (const auto *callee = llvm::dyn_cast<llvm::Function>(
-                  call->getCalledOperand()->stripPointerCastsAndAliases()))
-            pending.push_back(callee);
+                  call->getCalledOperand()->stripPointerCastsAndAliases());
+              callee && !callee->isIntrinsic())
+            edges.insert(key(*callee));
+  }
+  for (const auto &alias : module.aliases())
+    if (const auto *target = alias.getAliaseeObject())
+      calls[key(alias)].insert(key(*target));
+}
+
+bool enters_registry(const CallGraph &calls, const std::string &name) {
+  constexpr llvm::StringLiteral access("_ZN6tracer4live7managed8Registry6accessEv");
+  std::set<std::string> visited;
+  std::vector<std::string> pending{name};
+  while (!pending.empty()) {
+    auto current = std::move(pending.back());
+    pending.pop_back();
+    if (!visited.insert(current).second)
+      continue;
+    if (current == access)
+      return true;
+    if (const auto found = calls.find(current); found != calls.end())
+      pending.insert(pending.end(), found->second.begin(), found->second.end());
   }
   return false;
 }
@@ -374,7 +422,7 @@ bool unchanged_global_lifecycle(const llvm::Module &before, const llvm::Module &
       const auto next = new_code.find(name);
       const auto &prior = old_code.at(name);
       if (next == new_code.end() ||
-          (!same_definition(prior, next->second) && !unchanged_system_body(prior, next->second)))
+          (!same_definition(prior, next->second) && !equivalent_inline_body(prior, next->second)))
         return false;
       for (const auto &block : *function)
         for (const auto &instruction : block)
@@ -534,7 +582,7 @@ BuildInputs open_native_build(const std::string &executable,
   if (!database)
     throw std::runtime_error("cannot read compilation database: " + error);
 
-  const auto sources = snapshot_inputs(manifest, {}, {});
+  const auto sources = snapshot_inputs(manifest, {}, {}, nullptr);
   BuildInputs result;
   result.module = module;
   result.source_root = sources.root.string();
@@ -698,7 +746,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
   if (!database)
     throw std::runtime_error("cannot read compilation database: " + error);
 
-  auto sources = snapshot_inputs(manifest, request, active);
+  auto sources = snapshot_inputs(manifest, request, active, managed_inputs);
   const auto commands = database->getAllCompileCommands();
   std::map<std::string, TranslationUnit> profiles;
   for (const auto &command : commands) {
@@ -757,7 +805,12 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
   current.resolve_standard_runtime = true;
   JitRequest baseline;
   baseline.files = sources.baseline;
+  JitRequest original;
+  if (!active.sources.empty())
+    for (const auto &[path, contents] : sources.saved)
+      original.files.push_back({path, contents});
   std::map<std::string, Body> old_bodies, new_bodies;
+  CallGraph before_calls, after_calls;
   std::map<std::string, Change> changes;
   std::set<std::string> covered, unchanged;
   std::map<std::string, std::set<std::string>> native_locals;
@@ -779,26 +832,49 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     candidate.set_module(module);
     candidate.set_diagnostic(std::move(diagnostic));
   };
+  struct Snapshots {
+    std::optional<CompiledUnit> before, updated;
+  };
+  const auto compile_snapshots = [&](const TranslationUnit &unit) {
+    Snapshots compiled;
+    if (sources.saved.contains(unit.path) || active.sources.contains(unit.path))
+      compiled.before.emplace(compile_unit(baseline, unit, nullptr, {},
+                                           CompileInspection::native_metadata,
+                                           sources.saved.contains(unit.path)
+                                               ? &sources.submitted : nullptr));
+    if (!compiled.before || sources.submitted.contains(unit.path) ||
+        std::ranges::any_of(compiled.before->inputs,
+            [&](const auto &input) { return sources.submitted.contains(input); }))
+      compiled.updated.emplace(compile_unit(current, unit, nullptr, {},
+                                            CompileInspection::native_metadata));
+    return compiled;
+  };
+  // Independent frontends use separate LLVM contexts. Leave capacity for
+  // target work and keep only one batch of compiled modules in flight.
+  const auto compile_jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
+  std::deque<std::future<Snapshots>> compiling;
+  auto next_unit = profiles.begin();
+  const auto launch = [&] {
+    while (compiling.size() < compile_jobs && next_unit != profiles.end()) {
+      const auto *unit = &next_unit++->second;
+      compiling.push_back(std::async(std::launch::async, [&compile_snapshots, unit] {
+        return compile_snapshots(*unit);
+      }));
+    }
+  };
+  launch();
   for (const auto &[path, unit] : profiles) {
     if (cancelled && cancelled())
       throw Stale("live source compilation cancelled");
-    const auto compile_snapshot = [&](const JitRequest &snapshot) {
-      return compile_unit(snapshot, unit, nullptr, {}, CompileInspection::native_metadata);
-    };
-    std::optional<CompiledUnit> before;
-    if (sources.saved.count(path) || active.sources.count(path))
-      before.emplace(compile_snapshot(baseline));
+    auto [before, updated] = compiling.front().get();
+    compiling.pop_front();
+    launch();
     if (!target_initialized_streams && before && recorded_unit(path) &&
         has_standard_stream_initializer(*before->module))
       target_initialized_streams = true;
     // Only submitted inputs differ between the snapshots. Reuse the first
     // compilation when neither the TU nor any of its includes was submitted.
-    const bool changed = !before || sources.submitted.count(path) ||
-        std::ranges::any_of(before->inputs,
-            [&](const auto &input) { return sources.submitted.count(input); });
-    std::optional<CompiledUnit> updated;
-    if (changed)
-      updated.emplace(compile_snapshot(current));
+    const bool changed = updated.has_value();
     const auto &after = updated ? *updated : *before;
     covered.insert(path);
     for (const auto &dependency : after.inputs) {
@@ -809,12 +885,54 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         throw std::runtime_error("unrecorded project dependency: " + dependency);
       covered.insert(dependency);
     }
+    if (!changed && sources.saved.contains(path)) {
+      // No submitted file reaches this TU. Its emitted names still provide
+      // coverage evidence for shared symbols, without fingerprinting bodies.
+      const auto mark_unchanged = [&](const llvm::GlobalValue &value) {
+        const auto name = value.getName().str();
+        unchanged.insert(value.hasLocalLinkage() ? local_import_name(path, name) : name);
+      };
+      for (const auto &function : *after.module)
+        if (!function.isDeclaration())
+          mark_unchanged(function);
+      for (const auto &alias : after.module->aliases())
+        mark_unchanged(alias);
+      if (managed_inputs) {
+        collect_calls(before_calls, *after.module, path);
+        collect_calls(after_calls, *after.module, path);
+      }
+      continue;
+    }
     auto after_definitions = definitions(after);
+    if (managed_inputs) {
+      if (before)
+        collect_calls(before_calls, *before->module, path);
+      collect_calls(after_calls, *after.module, path);
+    }
     bool reuse_global_lifecycle = false;
+    std::set<std::string> revision_closures;
     if (before) {
-      const auto before_definitions = changed ? definitions(*before) : after_definitions;
+      auto before_definitions = changed ? definitions(*before) : after_definitions;
+      std::optional<CompiledUnit> built;
+      // Dropping the last use can stop Clang emitting a callable while its
+      // native entry still exists. Compare a reappearing body with the exact
+      // build snapshot and keep calls routed through that entry.
+      if (changed && sources.saved.contains(path) && !original.files.empty() &&
+          std::ranges::any_of(after_definitions, [&](const auto &entry) {
+            if (before_definitions.contains(entry.first))
+              return false;
+            return entry.second.local ? local_symbol(entry.first, path) != nullptr
+                                      : image.find(entry.first, false) != nullptr;
+          })) {
+        built.emplace(compile_unit(original, unit, nullptr, {}, CompileInspection::native_metadata));
+        auto vanished = definitions(*built);
+        std::erase_if(vanished, [&](const auto &entry) {
+          return !after_definitions.contains(entry.first);
+        });
+        before_definitions.merge(vanished);
+      }
       if (sources.saved.count(path))
-        for (const auto &value : before->module->global_values())
+        for (const auto &value : (built ? built->module : before->module)->global_values())
           if (value.hasName() && value.hasLocalLinkage())
             native_locals[value.getName().str()].insert(path);
       if (changed) {
@@ -839,21 +957,48 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         }
         for (const auto &[name, storage] : new_data) {
           (void)storage;
-          if (!old_data.contains(name))
+          const auto *global = after.module->getNamedGlobal(name);
+          if (!old_data.contains(name) && !(global && standard_inline_constant(*global)))
             block(path, name, "rebuild required: new persistent data definition");
         }
       }
       collect(old_bodies, path, before_definitions);
+      std::set<std::string> changed_owners;
+      const auto compare_closures = [&](const auto &left, const auto &right) {
+        for (const auto &[name, body] : left) {
+          if (!body.local)
+            continue;
+          const auto owner = closure_owner(name, before_definitions);
+          if (owner.empty() || !after_definitions.contains(owner))
+            continue;
+          const auto other = right.find(name);
+          if (other == right.end() || !equivalent_body(body, other->second))
+            changed_owners.insert(owner);
+        }
+      };
+      compare_closures(before_definitions, after_definitions);
+      compare_closures(after_definitions, before_definitions);
+      for (const auto &[name, body] : after_definitions) {
+        if (!body.local)
+          continue;
+        const auto owner = closure_owner(name, before_definitions);
+        const auto next = after_definitions.find(owner);
+        if (next != after_definitions.end() &&
+            (changed_owners.contains(owner) ||
+             !equivalent_body(before_definitions.at(owner), next->second)))
+          revision_closures.insert(name);
+      }
       // A linker may select one of several differently lowered inline
       // copies. Detect source changes against the same TU's prior IR first.
       for (const auto &[name, prior] : before_definitions) {
+        if (revision_closures.contains(name))
+          continue;
         const auto key = prior.local ? local_import_name(path, name) : name;
         const auto next = after_definitions.find(name);
         if (next == after_definitions.end() && prior.discardable)
           continue;
-        if (next != after_definitions.end() &&
-            (same_definition(prior, next->second) ||
-             unchanged_system_body(prior, next->second))) {
+        if (next != after_definitions.end() && !changed_owners.contains(name) &&
+            equivalent_body(prior, next->second)) {
           unchanged.insert(key);
           continue;
         }
@@ -861,12 +1006,10 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
             ? std::nullopt : std::optional<Definition>{next->second};
         auto [item, inserted] = changes.try_emplace(
             key, Change{Body{name, path, prior}, replacement});
-        if (managed_inputs && !item->second.enters_registry)
-          item->second.enters_registry =
-              enters_registry(*before->module, name) || enters_registry(*after.module, name);
         if (!inserted && (item->second.before.definition.abi != prior.abi ||
             !replacement || !item->second.after ||
-            !same_definition(*item->second.after, *replacement)))
+            (!same_definition(*item->second.after, *replacement) &&
+             !equivalent_inline_body(*item->second.after, *replacement))))
           item->second.before.inconsistent = true;
       }
       covered.insert(before->inputs.begin(), before->inputs.end());
@@ -884,6 +1027,8 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         if (global && private_constant(*global))
           continue;
         const auto name = value.getName().str();
+        if (value.hasLocalLinkage() && revision_closures.contains(name))
+          continue;
         const auto import = value.hasLocalLinkage() ? local_import_name(path, name) : name;
         std::optional<std::uint64_t> size;
         if (global && global->getValueType()->isSized())
@@ -938,7 +1083,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     candidate.set_source(site(next ? *next : old));
     candidate.set_module(module);
     try {
-      if (change.enters_registry)
+      if (managed_inputs && (enters_registry(before_calls, key) || enters_registry(after_calls, key)))
         throw std::runtime_error(
             "rebuild required: acquire the managed registry gate in the caller before entering the updated function");
       if (!old.has_source_abi || !old.supported_abi || !next || body.inconsistent ||
@@ -980,14 +1125,16 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       auto binding = bind(pid, image, *symbol, old, active);
       candidate.set_address(binding.address);
       candidate.set_state(api::LiveUpdateStatus::PLANNED);
-      if (entries.emplace(binding.address, canonical).second) {
+      const auto address = binding.address;
+      if (entries.emplace(address, canonical).second) {
         binding.symbol = old.local ? name : canonical;
         result.entries.push_back(std::move(binding));
-      } else if (entries.at(binding.address) != canonical) {
+      } else if (entries.at(address) != canonical) {
         throw std::runtime_error("rebuild required: multiple definitions name one native entry");
       }
       replaced.insert(key);
       replaced.insert(canonical);
+      result.jit.imports.emplace(native_entry_import_name(key), address);
     } catch (const std::exception &failure) {
       candidate.set_state(api::LiveUpdateStatus::BLOCKED);
       candidate.set_diagnostic(failure.what());
@@ -998,6 +1145,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
   if (!main)
     throw std::runtime_error("cannot verify the executable load bias without main");
   const auto bias = client::bind_live_executable(pid, module, image.elf, main->address, main->size);
+  auto mappings = client::snapshot_live_code_mappings(pid, module, image.elf, bias);
   for (const auto &[import, ref] : referenced) {
     const auto &name = ref.name;
     const bool local = ref.local;
@@ -1016,10 +1164,8 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     if (!symbol || !symbol->size ||
         (symbol->type != llvm::ELF::STT_FUNC && symbol->type != llvm::ELF::STT_OBJECT))
       continue;
-    if (symbol->type == llvm::ELF::STT_FUNC) {
-      const auto mapped_bias = client::bind_live_executable(pid, module, image.elf,
-                                                            symbol->address, symbol->size);
-      if (mapped_bias != bias)
+    if (symbol->type == llvm::ELF::STT_FUNC && !result.jit.imports.contains(import)) {
+      if (!mappings.contains(symbol->address, symbol->size))
         throw Stale("import moved across ELF instances: " + name);
     }
     // Some external IR declarations, including RTTI vtables, describe a
@@ -1038,9 +1184,10 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
 
   result.validate_sources = [files = std::move(sources.submitted),
       snapshots = result.jit.files, module, sha = manifest.module_sha256(),
-      database_path, database_contents, manifest_path, manifest_contents] {
+      database_path, database_contents, manifest_path, manifest_contents,
+      current_mappings = std::move(mappings.current)] {
     if (read_file(database_path) != database_contents || read_file(manifest_path) != manifest_contents ||
-        digest(read_file(module)) != sha)
+        digest(read_file(module)) != sha || !current_mappings())
       throw Stale("ELF, compile profile or build manifest changed after staging");
     for (const auto &file : snapshots)
       if (files.count(file.path) && read_file(file.path) != file.contents)
