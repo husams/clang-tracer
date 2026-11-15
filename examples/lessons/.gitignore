@@ -10,5 +10,9 @@ target-split
 *.textproto
 recovered-*/
 prepared*/
+*-watch/
+generated/
 mappings.hpp
 build/
+.cache/
+shared-context-target
