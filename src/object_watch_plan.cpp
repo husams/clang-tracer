@@ -512,8 +512,16 @@ Member member(DWARFDie parent, const std::string &wanted) {
   return matches.front();
 }
 
+struct LocatedUnion {
+  std::optional<Member> storage;
+  std::string path;
+};
+
 Member nested_member(DWARFDie parent, std::string_view path, bool &opaque_union,
-                     DWARFDie *direct_union = nullptr) {
+                     LocatedUnion *selected_union = nullptr) {
+  const auto original = path;
+  if (selected_union && parent.getTag() == dw::DW_TAG_union_type)
+    selected_union->storage = Member{parent, 0};
   std::uint64_t offset = 0;
   while (true) {
     opaque_union |= parent.getTag() == dw::DW_TAG_union_type;
@@ -522,11 +530,13 @@ Member nested_member(DWARFDie parent, std::string_view path, bool &opaque_union,
     if (selected.offset > UINT64_MAX - offset)
       throw std::runtime_error("nested object field offset overflows");
     offset += selected.offset;
-    if (split == std::string_view::npos) {
-      if (direct_union && parent.getTag() == dw::DW_TAG_union_type && selected.offset == 0)
-        *direct_union = parent;
-      return {selected.type, offset};
+    if (selected_union && !selected_union->storage && selected.type.getTag() == dw::DW_TAG_union_type) {
+      selected_union->storage = Member{selected.type, offset};
+      selected_union->path = original.substr(0, original.size() - path.size() +
+                                             std::min(split, path.size()));
     }
+    if (split == std::string_view::npos)
+      return {selected.type, offset};
     parent = selected.type;
     path.remove_prefix(split + 1);
   }
@@ -940,6 +950,123 @@ void set_field_layout(Layout &layout, DWARFDie field) {
   layout.field_width = *bytes;
 }
 
+std::optional<Layout> inspect_union_field(DWARFDie owner,
+    const clangtracer::v1::ObjectWatchRequest &request, const LocatedUnion &selected,
+    const Member &leaf, bool allow_legacy) {
+  if (!selected.storage) {
+    if (!request.union_tag().empty())
+      throw std::runtime_error("tagged capture requires --field to select union storage");
+    return std::nullopt;
+  }
+  const auto &storage = *selected.storage;
+  const auto size = size_of(storage.type).value_or(0);
+  if (!size || !request.owner_type().empty())
+    throw std::runtime_error("union watches require verified storage in a record, collection or pointee");
+  Layout result{};
+  result.scalar = storage.offset;
+  result.opaque_union = true;
+  result.union_path = selected.path;
+  using Type = UnionCase::Type;
+  auto &layout = result.value_write;
+  layout.kind = ValueWriteKind::union_storage;
+  layout.size = size;
+  // Keep the established event format for existing four-byte member watches.
+  const auto member_start = selected.path.empty() ? 0 : selected.path.size() + 1;
+  bool legacy = allow_legacy && !request.first_seen() &&
+      size == 4 && size_of(leaf.type) == 4 && leaf.offset == storage.offset &&
+      selected.path.size() < request.field().size() &&
+      request.field().find('.', member_start) == std::string::npos;
+  if (!request.union_tag().empty()) {
+    bool tag_in_union = false;
+    const auto tag = nested_member(owner, request.union_tag(), tag_in_union);
+    const auto tag_type = tag.type.getTag() == dw::DW_TAG_enumeration_type ? type(tag.type) : tag.type;
+    const auto encoding = storage_type(tag_type);
+    const auto width = size_of(tag_type).value_or(0);
+    const bool signed_tag = ::tracer::compat::starts_with(encoding, "signed");
+    if (tag_in_union || (width != 1 && width != 2 && width != 4 && width != 8) ||
+        !(signed_tag || ::tracer::compat::starts_with(encoding, "unsigned") || encoding == "bool") ||
+        (tag.offset < storage.offset + size && storage.offset < tag.offset + width))
+      throw std::runtime_error("union tag must be a verified nonoverlapping integral or enum field");
+    layout.selector_before = tag.offset < storage.offset;
+    layout.selector = layout.selector_before ? storage.offset - tag.offset : tag.offset - storage.offset;
+    layout.selector_width = width;
+    legacy = legacy && encoding == "unsigned32";
+    const auto mask = width == 8 ? UINT64_MAX : (std::uint64_t{1} << (8 * width)) - 1;
+    for (const auto &entry : request.union_cases()) {
+      if (entry.member().empty() || entry.member().size() > 512 ||
+          entry.member().find('\0') != std::string::npos)
+        throw std::runtime_error("invalid union case member name");
+      auto tag_bits = entry.has_tag_bits() ? entry.tag_bits() : entry.tag();
+      if (tag_bits > mask && !(signed_tag && (tag_bits | mask) == UINT64_MAX &&
+                               (tag_bits & (std::uint64_t{1} << (8 * width - 1)))))
+        throw std::runtime_error("union case tag exceeds the discriminator representation");
+      tag_bits &= mask;
+      if (encoding == "bool" && tag_bits > 1)
+        throw std::runtime_error("union case tag exceeds the bool representation");
+      bool nested_union = false;
+      const auto split = entry.member().find('.');
+      auto alternative = member(storage.type, entry.member().substr(0, split));
+      if (split != std::string::npos) {
+        const auto child = nested_member(alternative.type,
+            std::string_view(entry.member()).substr(split + 1), nested_union);
+        alternative = {child.type, alternative.offset + child.offset};
+      }
+      const auto bytes = storage_size(alternative.type).value_or(0);
+      const auto underlying = alternative.type.getTag() == dw::DW_TAG_enumeration_type ?
+          type(alternative.type) : alternative.type;
+      const auto scalar = storage_type(underlying);
+      auto kind = Type::opaque;
+      if (!nested_union && (bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8)) {
+        if (::tracer::compat::starts_with(scalar, "signed"))
+          kind = Type::signed_integer;
+        else if (::tracer::compat::starts_with(scalar, "unsigned"))
+          kind = Type::unsigned_integer;
+        else if (scalar == "float32" || scalar == "float64")
+          kind = Type::real;
+        else if (scalar == "bool")
+          kind = Type::boolean;
+      }
+      if (!bytes || alternative.offset > size || bytes > size - alternative.offset ||
+          !result.union_cases.emplace(tag_bits, UnionCase{entry.member(), kind,
+              kind == Type::opaque ? 0u : static_cast<unsigned>(bytes)}).second)
+        throw std::runtime_error("union cases require verified member ranges and distinct tags");
+      ValueWriteAlternative value{};
+      value.selector = tag_bits;
+      value.offset = alternative.offset;
+      value.size = bytes;
+      value.scalar = kind != Type::opaque;
+      result.value_alternatives.push_back(value);
+      legacy = legacy && alternative.offset == 0 && bytes == 4 &&
+          kind != Type::opaque && kind != Type::boolean;
+    }
+    if (legacy)
+      result.union_tag_offset = tag.offset;
+  }
+  if (legacy) {
+    layout = {};
+    result.value_alternatives.clear();
+    if (!result.union_tag_offset)
+      result.union_path.clear();
+  }
+  return result;
+}
+
+Layout inspect_value_field(DWARFDie parent, const clangtracer::v1::ObjectWatchRequest &request,
+                           bool whole_value = false) {
+  bool opaque = false;
+  LocatedUnion selected;
+  const auto field = whole_value ? Member{parent, 0} :
+      nested_member(parent, request.field(), opaque, &selected);
+  if (whole_value && parent.getTag() == dw::DW_TAG_union_type)
+    selected = {field, request.field()};
+  if (auto layout = inspect_union_field(parent, request, selected, field, false))
+    return std::move(*layout);
+  Layout result{};
+  result.scalar = field.offset;
+  set_field_layout(result, field.type);
+  return result;
+}
+
 Layout inspect_vector(DWARFDie owner, const clangtracer::v1::ObjectWatchRequest &request) {
   const auto vector = member(owner, request.vector_field());
   if (!::tracer::compat::starts_with(qualified(vector.type), "std::vector<"))
@@ -955,16 +1082,21 @@ Layout inspect_vector(DWARFDie owner, const clangtracer::v1::ObjectWatchRequest 
       storage_type(begin.type) != storage_type(end.type) ||
       storage_type(begin.type) != storage_type(capacity.type))
     throw std::runtime_error("vector storage pointers or element layout could not be verified");
-  bool opaque_union = false;
-  const auto scalar = nested_member(element, request.field(), opaque_union);
   const auto key = member(element, request.element_key_field());
-  if (storage_type(key.type) != "unsigned32" || opaque_union)
-    throw std::runtime_error("logical vector requires a uint32 key and a non-union value");
-  Layout result{};
-  set_field_layout(result, scalar.type);
-  if (scalar.offset < key.offset + 4 && key.offset < scalar.offset + result.field_size())
+  if (storage_type(key.type) != "unsigned32")
+    throw std::runtime_error("logical vector requires a uint32 key");
+  auto result = inspect_value_field(element, request);
+  const auto overlaps_key = [&](auto offset, auto size) {
+    return offset < key.offset + 4 && key.offset < offset + size;
+  };
+  if (overlaps_key(result.scalar, result.field_size()))
     throw std::runtime_error("logical vector key and value overlap");
-  result.scalar = scalar.offset;
+  const auto &storage = result.value_write;
+  if (storage.kind == ValueWriteKind::union_storage && storage.selector_width) {
+    const auto tag = storage.selector_before ? result.scalar - storage.selector : result.scalar + storage.selector;
+    if (overlaps_key(tag, storage.selector_width))
+      throw std::runtime_error("logical vector key and union tag overlap");
+  }
   result.key_offset = key.offset;
   result.stride = *stride;
   result.vector_object = vector.offset;
@@ -1135,14 +1267,10 @@ Layout inspect_hash_map(Member map, const clangtracer::v1::ObjectWatchRequest &r
       qualified(named_type(hash, "_Tp")) != qualified(key.type))
     throw std::runtime_error("cannot verify unordered-map storage or default key equivalence");
   const auto value = member(pair, "second");
-  bool opaque = false;
-  const auto field = request.field() == "value" && (!record(value.type) || verified_string_type(value.type) ||
-       ::tracer::compat::starts_with(qualified(value.type), "std::variant<") || qualified(value.type) == "std::any") ?
-      Member{value.type, 0} : nested_member(value.type, request.field(), opaque);
-  if (opaque)
-    throw std::runtime_error("unordered-map write capture requires a non-union value");
-  Layout result{};
-  set_field_layout(result, field.type);
+  auto result = inspect_value_field(value.type, request,
+      request.field() == "value" && (!record(value.type) || verified_string_type(value.type) ||
+          value.type.getTag() == dw::DW_TAG_union_type ||
+          ::tracer::compat::starts_with(qualified(value.type), "std::variant<") || qualified(value.type) == "std::any"));
   set_map_key(result.map, key, storage.offset, request.map_key());
   result.logical_map = true;
   result.map.hash = true;
@@ -1151,7 +1279,7 @@ Layout inspect_hash_map(Member map, const clangtracer::v1::ObjectWatchRequest &r
   result.map.root = result.map.header + next_link.offset;
   result.map.count = map.offset + table.offset + count.offset;
   result.vector_object = map.offset;
-  result.scalar = storage.offset + value.offset + field.offset;
+  result.scalar += storage.offset + value.offset;
   return result;
 }
 
@@ -1180,18 +1308,15 @@ Layout inspect_map(DWARFDie owner, const clangtracer::v1::ObjectWatchRequest &re
   const auto storage = member(node, "_M_storage");
   const auto key = member(pair, "first");
   const auto value = member(pair, "second");
-  bool opaque_union = false;
-  const auto scalar = request.field() == "value" && (!record(value.type) || verified_string_type(value.type) ||
-       ::tracer::compat::starts_with(qualified(value.type), "std::variant<") || qualified(value.type) == "std::any") ?
-      Member{value.type, 0} : nested_member(value.type, request.field(), opaque_union);
   if (!node_has_base(node, header.type) || size_of(storage.type) != size_of(pair) ||
-      qualified(named_type(comparator, "_Tp")) != qualified(key.type) ||
-      opaque_union)
-    throw std::runtime_error("logical map requires verified node storage and non-union value");
-  Layout result{};
-  set_field_layout(result, scalar.type);
+      qualified(named_type(comparator, "_Tp")) != qualified(key.type))
+    throw std::runtime_error("logical map requires verified node storage and key equivalence");
+  auto result = inspect_value_field(value.type, request,
+      request.field() == "value" && (!record(value.type) || verified_string_type(value.type) ||
+          value.type.getTag() == dw::DW_TAG_union_type ||
+          ::tracer::compat::starts_with(qualified(value.type), "std::variant<") || qualified(value.type) == "std::any"));
   result.logical_map = true;
-  result.scalar = storage.offset + value.offset + scalar.offset;
+  result.scalar += storage.offset + value.offset;
   result.vector_object = map.offset;
   const auto tree_offset = map.offset + tree.offset + implementation.offset;
   result.map.header = tree_offset + header.offset;
@@ -1232,57 +1357,15 @@ Layout inspect_layout(llvm::DWARFContext &dwarf,
         break;
       path.remove_prefix(next + 2);
     }
-    bool opaque = false;
-    const auto field = nested_member(current, request.field(), opaque);
-    if (opaque)
-      throw std::runtime_error("pointee write capture requires a non-union field");
-    set_field_layout(result, field.type);
-    result.scalar = field.offset;
-    return result;
+    auto field = inspect_value_field(current, request);
+    field.pointer_offsets = std::move(result.pointer_offsets);
+    return field;
   }
   bool opaque_union = false;
-  DWARFDie direct_union;
-  const auto scalar = nested_member(concrete, request.field(), opaque_union, &direct_union);
-  if (opaque_union) {
-    if (!request.owner_type().empty() || size_of(scalar.type) != 4)
-      throw std::runtime_error("union watches require a standalone four-byte storage range");
-    Layout result{};
-    result.scalar = scalar.offset;
-    result.opaque_union = true;
-    if (!request.union_tag().empty()) {
-      bool tag_in_union = false;
-      const auto discriminator = nested_member(concrete, request.union_tag(), tag_in_union);
-      const auto tag_type = discriminator.type.getTag() == dw::DW_TAG_enumeration_type
-          ? type(discriminator.type) : discriminator.type;
-      if (!direct_union || tag_in_union || storage_type(tag_type) != "unsigned32" ||
-          std::max(discriminator.offset, scalar.offset) -
-              std::min(discriminator.offset, scalar.offset) < 4)
-        throw std::runtime_error("union tag must be a verified nonoverlapping uint32 field");
-      result.union_tag_offset = discriminator.offset;
-      for (const auto &entry : request.union_cases()) {
-        if (entry.member().empty() || entry.member().size() > 512 ||
-            entry.member().find('\0') != std::string::npos)
-          throw std::runtime_error("invalid union case member name");
-        const auto alternative = member(direct_union, entry.member());
-        const auto encoding = storage_type(alternative.type);
-        UnionCase::Type kind;
-        if (encoding == "signed32")
-          kind = UnionCase::Type::signed_integer;
-        else if (encoding == "unsigned32")
-          kind = UnionCase::Type::unsigned_integer;
-        else if (encoding == "float32")
-          kind = UnionCase::Type::real;
-        else
-          throw std::runtime_error("union case requires a signed, unsigned or floating 32-bit member");
-        if (alternative.offset || !result.union_cases.emplace(entry.tag(),
-            UnionCase{entry.member(), kind}).second)
-          throw std::runtime_error("overlapping union cases require distinct discriminator values");
-      }
-    }
-    return result;
-  }
-  if (!request.union_tag().empty())
-    throw std::runtime_error("tagged capture requires --field to select a union member");
+  LocatedUnion selected;
+  const auto scalar = nested_member(concrete, request.field(), opaque_union, &selected);
+  if (auto layout = inspect_union_field(concrete, request, selected, scalar, true))
+    return std::move(*layout);
   const auto signed_int32 = [](DWARFDie type) {
     return type.getTag() == dw::DW_TAG_base_type &&
         number(type, dw::DW_AT_byte_size) == 4 &&
@@ -1828,7 +1911,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       (request.pointee_field().size() > 512 || request.pointee_field().find('\0') != std::string::npos ||
        !request.first_seen() || request.mutation_symbol().empty() || request.writer_entry() ||
        !request.vector_field().empty() || !request.map_field().empty() ||
-       !request.owner_type().empty() || !request.code_module().empty() || !request.union_tag().empty() ||
+       !request.owner_type().empty() || !request.code_module().empty() ||
        (request.synchronization() != Request::THREAD_CONFINED &&
         request.synchronization() != Request::CALLER_LOCK)))
     throw std::invalid_argument("pointee capture requires a standalone writer, mutation and synchronization policy");
@@ -1880,10 +1963,13 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   else
     layout = inspect_layout(*image_->dwarf, request, layout_unit, *lifetime.dwarf);
   if (layout.value_write.active()) {
-    if (!request.first_seen() || !request.owner_type().empty() ||
-        (request.synchronization() != Request::THREAD_CONFINED &&
+    const bool union_storage = layout.value_write.kind == ValueWriteKind::union_storage;
+    if ((!union_storage && !request.first_seen()) || !request.owner_type().empty() ||
+        ((!union_storage || layout.value_write.selector_width ||
+          (request.first_seen() && request.backend() == Request::CODE_CACHE && !request.no_values())) &&
+         request.synchronization() != Request::THREAD_CONFINED &&
          request.synchronization() != Request::CALLER_LOCK))
-      throw std::invalid_argument("complex value writes require a scoped writer and declared synchronization");
+      throw std::invalid_argument("complex value writes require verified lifetime and synchronization");
     if (layout.value_write.kind == ValueWriteKind::any) {
       const auto &value = layout.value_write;
       constexpr std::string_view internal = "std::any::_Manager_internal<";
@@ -2361,7 +2447,18 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     const auto extra = image_->function(pid, selector);
     if (auto *unit = image_->dwarf->getDIEsForAddress(extra.first).CompileUnit) {
       const auto other = inspect_layout(*image_->dwarf, request, unit, *lifetime.dwarf);
-      if (other.scalar != layout.scalar || other.atomic != layout.atomic ||
+      const auto &value = layout.value_write;
+      const auto &candidate = other.value_write;
+      const bool same_storage = candidate.kind == value.kind && candidate.size == value.size &&
+          candidate.selector == value.selector && candidate.selector_width == value.selector_width &&
+          candidate.selector_before == value.selector_before &&
+          std::equal(layout.value_alternatives.begin(), layout.value_alternatives.end(),
+                     other.value_alternatives.begin(), other.value_alternatives.end(),
+                     [](const auto &first, const auto &second) {
+                       return first.selector == second.selector && first.offset == second.offset &&
+                              first.size == second.size && first.scalar == second.scalar;
+                     });
+      if (!same_storage || other.scalar != layout.scalar || other.atomic != layout.atomic ||
           other.field_type != layout.field_type || other.field_width != layout.field_width ||
           other.opaque_union != layout.opaque_union || other.union_tag_offset != layout.union_tag_offset ||
           other.union_cases != layout.union_cases)
@@ -3072,7 +3169,7 @@ clangtracer::v1::ObjectWatchPlan Plan::describe(bool live) const {
   constexpr const char *types[]{"signed int32", "signed integer", "unsigned integer",
                                 "boolean", "floating point"};
   constexpr const char *complex_types[]{"", "std::string storage", "std::variant storage",
-                                        "std::any storage"};
+                                        "std::any storage", "union storage"};
   plan.set_field_encoding(layout.value_write.active() ?
       complex_types[static_cast<unsigned>(layout.value_write.kind)] :
       layout.union_tag_offset ? "tagged union" :
@@ -3185,6 +3282,7 @@ std::string compare_prepared(const clangtracer::v1::ObjectWatchPlan &prepared,
 
 std::string field_path(const clangtracer::v1::ObjectWatchRequest &request, const Layout &layout) {
   const auto prefix = request.concrete_type() + "::";
+  const auto &field = layout.union_path.empty() ? request.field() : layout.union_path;
   if (layout.logical_map) {
     std::ostringstream path;
     path << prefix << request.map_field() << '[';
@@ -3192,21 +3290,23 @@ std::string field_path(const clangtracer::v1::ObjectWatchRequest &request, const
       path << request.map_key();
     else
       path << std::quoted(request.map_key());
-    path << "]." << request.field();
+    path << "]." << field;
     return path.str();
   }
   if (layout.logical_vector)
     return prefix + request.vector_field() + "[" + request.element_key_field() + "=" +
-           std::to_string(request.element_key()) + "]." + request.field();
+           std::to_string(request.element_key()) + "]." + field;
   if (!layout.pointer_offsets.empty())
-    return prefix + request.pointee_field() + "->" + request.field();
+    return prefix + request.pointee_field() + "->" + field;
   if (layout.union_tag_offset)
     return prefix + request.field().substr(0, request.field().rfind('.'));
-  return prefix + (layout.opaque_union ? "<storage>" : request.field());
+  return prefix + (layout.opaque_union && layout.union_path.empty() ? "<storage>" : field);
 }
 
 void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &layout,
                        ScalarSample old, ScalarSample next) {
+  if (layout.value_write.kind == ValueWriteKind::union_storage)
+    return;
   if (!layout.opaque_union) {
     using FieldType = Layout::FieldType;
     const auto capture = [&](std::uint64_t bits, bool before) {
@@ -3274,7 +3374,7 @@ void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &
         event.set_new_bytes(&bits, sizeof(bits));
       return;
     }
-    const auto &[member, type] = alternative->second;
+    const auto &[member, type, width] = alternative->second;
     auto &value = before ? *event.mutable_snapshot_before() : *event.mutable_snapshot_after();
     if (before)
       event.set_old_union_member(member);
@@ -3290,10 +3390,79 @@ void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &
     case UnionCase::Type::real:
       value.set_real_value(::tracer::compat::bit_cast<float>(bits));
       break;
+    case UnionCase::Type::boolean:
+    case UnionCase::Type::opaque:
+      break;
     }
   };
   capture(old, true);
   capture(next, false);
+}
+
+void set_union_write(clangtracer::v1::ObjectObservation &event, const Layout &layout,
+                     const UnionWriteState &before, const UnionWriteState &after) {
+  if (layout.value_write.kind != ValueWriteKind::union_storage)
+    return;
+  if (!layout.value_write.selector_width) {
+    if (event.has_old_bytes() || event.has_new_bytes())
+      event.set_diagnostic("untagged union storage; active member unavailable");
+    return;
+  }
+  const auto capture = [&](const auto &side, bool old) {
+    if (!side.tag)
+      return;
+    if (old) {
+      event.mutable_storage_write()->set_before_discriminator(*side.tag);
+      if (*side.tag <= UINT32_MAX)
+        event.set_old_union_tag(*side.tag);
+    } else {
+      event.mutable_storage_write()->set_after_discriminator(*side.tag);
+      if (*side.tag <= UINT32_MAX)
+        event.set_new_union_tag(*side.tag);
+    }
+    const auto selected = layout.union_cases.find(*side.tag);
+    if (selected == layout.union_cases.end())
+      return;
+    const auto &alt = selected->second;
+    if (old)
+      event.set_old_union_member(alt.member);
+    else
+      event.set_new_union_member(alt.member);
+    // Publishing a tag alone does not prove that its new alternate object
+    // has already been initialized. Pair typed values only under a stable tag.
+    if (!side.scalar || before.tag != after.tag)
+      return;
+    const auto bits = *side.scalar;
+    auto &value = old ? *event.mutable_snapshot_before() : *event.mutable_snapshot_after();
+    switch (alt.type) {
+    case UnionCase::Type::signed_integer: {
+      const auto shift = 64 - alt.width * 8;
+      value.set_signed_value(::tracer::compat::bit_cast<std::int64_t>(bits << shift) >> shift);
+      break;
+    }
+    case UnionCase::Type::unsigned_integer:
+      value.set_unsigned_value(bits);
+      break;
+    case UnionCase::Type::real:
+      value.set_real_value(alt.width == 4 ?
+          ::tracer::compat::bit_cast<float>(static_cast<std::uint32_t>(bits)) : ::tracer::compat::bit_cast<double>(bits));
+      break;
+    case UnionCase::Type::boolean:
+      if (bits <= 1)
+        value.set_boolean_value(bits != 0);
+      else
+        value.set_bytes_value(&bits, 1);
+      break;
+    case UnionCase::Type::opaque:
+      break;
+    }
+  };
+  capture(before, true);
+  capture(after, false);
+  if ((event.has_old_bytes() || event.has_new_bytes()) &&
+      (!before.tag || !after.tag || !layout.union_cases.count(*before.tag) ||
+       !layout.union_cases.count(*after.tag)))
+    event.set_diagnostic("union discriminator is unreadable or unregistered");
 }
 
 void set_storage_write(clangtracer::v1::ObjectObservation &event, const ValueWrite &write,
@@ -3301,7 +3470,7 @@ void set_storage_write(clangtracer::v1::ObjectObservation &event, const ValueWri
   using Region = clangtracer::v1::ObjectObservation::StorageWrite;
   auto &store = *event.mutable_storage_write();
   constexpr Region::Region regions[]{Region::REGION_UNSPECIFIED, Region::REPRESENTATION,
-                                      Region::STRING_DATA, Region::ANY_PAYLOAD};
+                                      Region::STRING_DATA, Region::ANY_PAYLOAD, Region::UNION_TAG};
   store.set_region(regions[static_cast<unsigned>(write.region)]);
   store.set_address(write.address);
   store.set_offset(write.offset);

@@ -187,6 +187,7 @@ const CommandTopic commands[] = {
      "Select a verified --mutation SYMBOL and declare --synchronization for native collection capture. "
      "Use --mode logical-writes for keyed collection changes and --mutation destroy=SYMBOL for destruction. "
      "For libstdc++ string, variant and any storage writes, use --first-seen and declare --synchronization. "
+     "Select a nested union with --field PATH and supply --union-tag PATH and --union-case TAG=MEMBER for typed capture. "
      "Use --owner-add, --owner-get, --owner-remove and --owner-snapshot to select ownership boundaries. "
      "Use --no-values to record every completed write and omit field samples. "
      "Record observations with %record FILE --sqlite --name object.trace."},

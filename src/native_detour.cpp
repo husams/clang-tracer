@@ -114,7 +114,8 @@ bool allowed_instruction(const llvm::MCInst &inst,
       "PUSH64r",   "POP64r",    "MOV64rr",    "MOV32rr",   "MOV16rr",
       "MOV8rr",    "MOV32ri",   "MOV64rm",    "MOV32rm",   "MOV16rm",
       "MOV8rm",    "MOV64mr",   "MOV32mr",    "MOV16mr",   "MOV8mr",
-      "MOVSS",     "MOVSD",     "MOVAPS",     "MOVUPS",    "LEA64r",
+      "MOVSS",     "MOVSD",     "MOVAPS",     "MOVUPS",    "MOVDQArm", "MOVDQUrm",
+      "LEA64r",
       "LEA32r",    "SUB64ri8",  "SUB64ri32",  "ADD64ri8",  "ADD64ri32",
       "ADD32ri8",  "ADD32ri",   "ADD32rr",    "IMUL32rri8", "IMUL32rri", "IMUL32rmi8",
       "IMUL32rmi", "XOR64rr",   "XOR32rr",    "TEST64rr",  "TEST32rr",
@@ -148,7 +149,7 @@ std::optional<std::size_t> memory_access_size(const llvm::MCInst &inst,
       {"MOV32mr", 4},  {"MOV32mi", 4}, {"MOV16rm", 2},   {"MOV16mr", 2},
       {"MOV16mi", 2},  {"MOV8rm", 1},  {"MOV8mr", 1},    {"MOV8mi", 1},
       {"MOVSS", 4},    {"MOVSD", 8},   {"MOVAPS", 16},   {"MOVUPS", 16},
-      {"IMUL32rmi", 4}};
+      {"MOVDQArm", 16}, {"MOVDQUrm", 16}, {"IMUL32rmi", 4}};
   for (auto width : widths)
     if (compat::starts_with(name, width.prefix))
       return width.bytes;
