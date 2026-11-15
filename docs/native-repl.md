@@ -108,7 +108,11 @@ storage or record ABI require a rebuild or a managed migration. The ABI check
 includes changes to copy, move, and destruction triviality.
 Translation-unit-local functions and data require an unambiguous ELF file
 marker and exact symbol. Each changed function
-also requires a patchable native entry. When a recorded unit initialized the
+also requires a patchable native entry. A body-only edit to an existing
+lambda can update already-registered callbacks when its source identity and
+capture ABI match the native entry. Changes to a lambda with unverified
+identity or captures may require a rebuild.
+When a recorded unit initialized the
 standard streams, replacement units can reuse them. Existing native storage
 keeps its verified initialization and destruction code. Changes to module
 initialization or destruction require a rebuild. Native updates can use
@@ -119,7 +123,11 @@ definitions interposed in its dynamic lookup scope.
 snapshot sent to the target for a live operation. The default is 16 MiB.
 The REPL also enforces its 32 MiB limit on an outgoing RPC. Apply can reuse
 the preview's plan for the same input and revision after rechecking the
-saved files and executable mappings.
+saved files and executable mappings. Set `CLANG_TRACER_LIVE_COMPILE_JOBS`
+in the server environment to choose how many translation units it compiles
+concurrently. The default is half the reported hardware threads, rounded
+down with a minimum of one. Large submissions and a busy host may need a
+longer REPL `--timeout`.
 
 ```text
 %live mock "ProductStore::load(int)" --file product_fixture.cpp --function load_fixture --fixture products.txt
@@ -156,6 +164,8 @@ Submit a C++ recipe that exports `clang_tracer_managed_update_v1`, with the
 after hook in its own file if needed. Use `%live update update.hpp --managed true`
 for a recipe with no hook. Include ABI-compatible application source changes
 and any new layout headers with the recipe to publish them together.
+Recipe and hook files can live outside the recorded source root. An
+application dependency outside that root requires a rebuild to update it.
 The hook may return `void` or `bool` and supports C++17.
 
 ```text

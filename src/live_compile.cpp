@@ -45,6 +45,8 @@
 
 namespace tracer::live {
 namespace {
+std::string ir_digest(llvm::StringRef bytes);
+
 class IncludeInputs final : public clang::PPCallbacks {
 public:
   explicit IncludeInputs(std::set<std::string> &inputs) : inputs_(inputs) {}
@@ -108,9 +110,36 @@ public:
   }
 
   bool VisitFunctionDecl(clang::FunctionDecl *function) {
+    return visit_function(function);
+  }
+
+  bool VisitLambdaExpr(clang::LambdaExpr *lambda) {
+    const auto &sources = context_.getSourceManager();
+    const auto *body = lambda->getBody();
+    const auto first = body->getBeginLoc();
+    const auto last = body->getEndLoc();
+    std::string site;
+    if (first.isFileID() && last.isFileID() && !sources.isInSystemHeader(first)) {
+      const auto [file, begin] = sources.getDecomposedLoc(first);
+      const auto [end_file, end] = sources.getDecomposedLoc(last);
+      const auto bytes = sources.getBufferData(file);
+      if (file == end_file && begin < end && end < bytes.size()) {
+        // A matching Itanium ordinal alone does not identify a closure.
+        // Prove that only this lambda's body was edited in this source file.
+        site = ir_digest(bytes.take_front(begin)) + ir_digest(bytes.drop_front(end + 1));
+      }
+    }
+    return visit_function(lambda->getCallOperator(), std::move(site));
+  }
+
+private:
+  bool visit_function(clang::FunctionDecl *function, std::string lambda_site = {}) {
+    const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(function);
+    const bool lambda = method && method->getParent()->isLambda() &&
+        method->getOverloadedOperator() == clang::OO_Call;
     const auto location = context_.getSourceManager().getExpansionLoc(function->getLocation());
     if (!function->isThisDeclarationADefinition() || function->isDependentContext() ||
-        function->isImplicit() || function->isInvalidDecl())
+        (function->isImplicit() && !lambda) || function->isInvalidDecl())
       return true;
 
     std::string display;
@@ -136,7 +165,7 @@ public:
       fingerprint = type;
       llvm::raw_string_ostream layout(fingerprint);
       std::set<const clang::RecordDecl *> seen;
-      if (const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(function)) {
+      if (method) {
         layout << " static=" << method->isStatic() << " virtual=" << method->isVirtual();
         append_record(method->getParent(), layout, seen);
       }
@@ -154,6 +183,11 @@ public:
         symbol << function->getName();
       if (source_definition)
         unit_.source_definitions.insert_or_assign(name, *source_definition);
+      if (lambda && !system) {
+        auto &site = unit_.lambda_sites[name];
+        if (!lambda_site.empty())
+          site = lambda_site;
+      }
       if (!system)
         unit_.types.insert_or_assign(name, std::pair{display, fingerprint});
     };
@@ -170,7 +204,6 @@ public:
     return true;
   }
 
-private:
   void append_type(clang::QualType input, llvm::raw_ostream &out,
                    std::set<const clang::RecordDecl *> &seen) {
     const auto type = input.getCanonicalType();
@@ -189,17 +222,22 @@ private:
         !seen.insert(record).second)
       return;
     const auto &layout = context_.getASTRecordLayout(record);
-    out << " record " << record->getQualifiedNameAsString() << ':'
+    const auto *cxx = llvm::dyn_cast<clang::CXXRecordDecl>(record);
+    const auto name = cxx && cxx->isLambda() ? "(lambda)" : record->getQualifiedNameAsString();
+    out << " record " << name << ':'
         << layout.getSize().getQuantity() << ':' << layout.getAlignment().getQuantity();
+    clang::PrintingPolicy types(context_.getLangOpts());
+    types.AnonymousTagLocations = false;
     unsigned index = 0;
     for (const auto *field : record->fields()) {
       out << " field " << field->getNameAsString() << ':'
-          << field->getType().getCanonicalType().getAsString() << ':' << layout.getFieldOffset(index++);
+          << field->getType().getCanonicalType().getAsString(types) << ':'
+          << layout.getFieldOffset(index++);
       if (field->isBitField())
         out << ':' << field->getBitWidthValue();
       append_type(field->getType(), out, seen);
     }
-    if (const auto *cxx = llvm::dyn_cast<clang::CXXRecordDecl>(record)) {
+    if (cxx) {
       if (!context_.getSourceManager().isInSystemHeader(record->getLocation()))
         out << " trivial-copy=" << cxx->isTriviallyCopyable()
             << " trivial-copy-ctor=" << cxx->hasTrivialCopyConstructor()
@@ -789,9 +827,17 @@ std::map<std::string, Definition> definitions(const CompiledUnit &unit) {
     item.local = function.hasLocalLinkage();
     item.discardable = item.local || function.hasLinkOnceODRLinkage() ||
                        function.hasWeakODRLinkage() || function.hasAvailableExternallyLinkage();
+    if (const auto site = unit.lambda_sites.find(function.getName().str()); site != unit.lambda_sites.end())
+      item.lambda_site = site->second;
     if (const auto source = unit.source_definitions.find(function.getName().str());
         source != unit.source_definitions.end())
       item.source_definition = source->second;
+    if (item.source_definition && !item.has_source_abi) {
+      item.nounwind = function.hasFnAttribute(llvm::Attribute::NoUnwind);
+      item.attributes_without_nounwind = function.getAttributes()
+          .removeFnAttribute(function.getContext(), llvm::Attribute::NoUnwind)
+          .getFnAttrs().getAsString();
+    }
     // Parameter lowering can include opaque pointers. Compare the bodies only
     // after independently checking the native declaration and LLVM ABI.
     auto &body = *normalized->getFunction(function.getName());

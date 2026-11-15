@@ -10,6 +10,7 @@
 #include <google/protobuf/text_format.h>
 #include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/Demangle/Demangle.h>
+#include <llvm/IR/Constants.h>
 #include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -18,7 +19,9 @@
 #include <llvm/Support/SHA256.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <deque>
 #include <fstream>
@@ -313,11 +316,18 @@ bool same_definition(const Definition &left, const Definition &right) {
 bool equivalent_inline_body(const Definition &before, const Definition &after) {
   // Clang can lower the same inline source with or without an unwind edge.
   // A different call dependency means the instantiation needs independent proof.
-  return before.source_definition && before.source_definition == after.source_definition &&
-         before.path == after.path && before.discardable && after.discardable &&
-         !before.local && !after.local && before.abi == after.abi &&
-         before.callees == after.callees && before.invokes != after.invokes &&
-         !before.normal_flow.empty() && before.normal_flow == after.normal_flow;
+  if (!before.source_definition || before.source_definition != after.source_definition ||
+      before.path != after.path || !before.discardable || !after.discardable ||
+      before.local || after.local || before.abi != after.abi || before.callees != after.callees)
+    return false;
+  if (before.invokes != after.invokes)
+    return !before.normal_flow.empty() && before.normal_flow == after.normal_flow;
+  // A previously instantiated system function can also gain nounwind
+  // without changing any instruction or exception edge in the body.
+  return !before.has_source_abi && !after.has_source_abi && before.nounwind != after.nounwind &&
+         before.attributes_without_nounwind == after.attributes_without_nounwind &&
+         llvm::StringRef(before.implementation).split('\n').second ==
+             llvm::StringRef(after.implementation).split('\n').second;
 }
 
 bool equivalent_body(const Definition &before, const Definition &after) {
@@ -345,6 +355,16 @@ std::string closure_owner(std::string_view symbol, const std::map<std::string, D
       return owner;
   }
   return {};
+}
+
+bool closure_is_local_to(const llvm::Module &module, const std::string &symbol,
+                         const std::string &owner) {
+  const auto *function = module.getFunction(symbol);
+  return function && std::ranges::all_of(function->uses(), [&](const llvm::Use &use) {
+    const auto *call = llvm::dyn_cast<llvm::CallBase>(use.getUser());
+    return call && &call->getCalledOperandUse() == &use &&
+           call->getFunction()->getName() == owner;
+  });
 }
 
 using CallGraph = std::map<std::string, std::set<std::string>>;
@@ -388,11 +408,57 @@ bool enters_registry(const CallGraph &calls, const std::string &name) {
   return false;
 }
 
+// A stored callback keeps the native entry address. Its implementation can
+// change independently when the recorded initialization never invokes it.
+bool lifecycle_calls(const llvm::Module &module, std::set<std::string> &called) {
+  llvm::SmallVector<const llvm::Function *> pending;
+  llvm::SmallPtrSet<const llvm::Function *, 32> visited;
+  for (const auto *name : {"llvm.global_ctors", "llvm.global_dtors"}) {
+    const auto *table = module.getNamedGlobal(name);
+    if (!table)
+      continue;
+    if (!table->hasInitializer())
+      return false;
+    const auto *list = llvm::dyn_cast<llvm::ConstantArray>(table->getInitializer());
+    if (!list)
+      return false;
+    for (const auto &item : list->operands()) {
+      const auto *entry = llvm::dyn_cast<llvm::ConstantStruct>(item.get());
+      if (!entry || entry->getNumOperands() != 3)
+        return false;
+      const auto *function = llvm::dyn_cast<llvm::Function>(entry->getOperand(1)->stripPointerCasts());
+      if (!function)
+        return false;
+      pending.push_back(function);
+    }
+  }
+  while (!pending.empty()) {
+    const auto *function = pending.pop_back_val();
+    if (!visited.insert(function).second)
+      continue;
+    const auto name = function->getName();
+    called.insert(name.str());
+    if (function->isDeclaration() && !function->isIntrinsic() && name != "__cxa_atexit" &&
+        name != "__cxa_begin_catch" && name != "_ZSt9terminatev")
+      return false;
+    for (const auto &block : *function)
+      for (const auto &instruction : block)
+        if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction)) {
+          const auto *callee = call->getCalledFunction();
+          if (!callee)
+            return false;
+          pending.push_back(callee);
+        }
+  }
+  return true;
+}
+
 bool unchanged_global_lifecycle(const llvm::Module &before, const llvm::Module &after,
     const std::map<std::string, std::string> &old_data,
     const std::map<std::string, std::string> &new_data,
     const std::map<std::string, Definition> &old_code,
-    const std::map<std::string, Definition> &new_code) {
+    const std::map<std::string, Definition> &new_code,
+    const std::set<std::string> &native_closures) {
   std::vector<const llvm::Value *> pending;
   for (const auto *name : {"llvm.global_ctors", "llvm.global_dtors"}) {
     const auto prior = old_data.find(name);
@@ -411,6 +477,7 @@ bool unchanged_global_lifecycle(const llvm::Module &before, const llvm::Module &
   // Verify the lifecycle table and the code it references before leaving
   // initialization and destruction of native storage with the original ELF.
   llvm::SmallPtrSet<const llvm::Value *, 32> visited;
+  std::optional<std::set<std::string>> lifecycle_entries;
   while (!pending.empty()) {
     const auto *value = pending.back();
     pending.pop_back();
@@ -421,9 +488,21 @@ bool unchanged_global_lifecycle(const llvm::Module &before, const llvm::Module &
       const auto name = function->getName().str();
       const auto next = new_code.find(name);
       const auto &prior = old_code.at(name);
-      if (next == new_code.end() ||
-          (!same_definition(prior, next->second) && !equivalent_inline_body(prior, next->second)))
+      if (next == new_code.end())
         return false;
+      if (!equivalent_body(prior, next->second)) {
+        if (!native_closures.contains(name) || prior.abi != next->second.abi)
+          return false;
+        if (!lifecycle_entries) {
+          lifecycle_entries.emplace();
+          if (!lifecycle_calls(before, *lifecycle_entries) ||
+              !lifecycle_calls(after, *lifecycle_entries))
+            return false;
+        }
+        if (lifecycle_entries->contains(name))
+          return false;
+        continue;
+      }
       for (const auto &block : *function)
         for (const auto &instruction : block)
           pending.push_back(&instruction);
@@ -747,6 +826,20 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     throw std::runtime_error("cannot read compilation database: " + error);
 
   auto sources = snapshot_inputs(manifest, request, active, managed_inputs);
+  std::vector<std::string> external_recipe_inputs;
+  if (managed_inputs)
+    for (const auto &path : *managed_inputs)
+      if (!within(sources.root, path))
+        external_recipe_inputs.push_back(path);
+  const auto verify_recipe_inputs = [&](const CompiledUnit &unit) {
+    for (const auto &external : external_recipe_inputs)
+      for (const auto &dependency : unit.inputs) {
+        std::error_code error;
+        if (external == dependency || fs::equivalent(external, dependency, error))
+          throw std::runtime_error("native dependency outside the build source root cannot be updated: " +
+                                   external);
+      }
+  };
   const auto commands = database->getAllCompileCommands();
   std::map<std::string, TranslationUnit> profiles;
   for (const auto &command : commands) {
@@ -813,6 +906,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
   CallGraph before_calls, after_calls;
   std::map<std::string, Change> changes;
   std::set<std::string> covered, unchanged;
+  std::set<std::string> verified_lambdas;
   std::map<std::string, std::set<std::string>> native_locals;
   bool target_initialized_streams = false;
   struct Reference {
@@ -842,16 +936,27 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
                                            CompileInspection::native_metadata,
                                            sources.saved.contains(unit.path)
                                                ? &sources.submitted : nullptr));
+    if (compiled.before)
+      verify_recipe_inputs(*compiled.before);
     if (!compiled.before || sources.submitted.contains(unit.path) ||
         std::ranges::any_of(compiled.before->inputs,
             [&](const auto &input) { return sources.submitted.contains(input); }))
       compiled.updated.emplace(compile_unit(current, unit, nullptr, {},
                                             CompileInspection::native_metadata));
+    if (compiled.updated)
+      verify_recipe_inputs(*compiled.updated);
     return compiled;
   };
   // Independent frontends use separate LLVM contexts. Leave capacity for
   // target work and keep only one batch of compiled modules in flight.
-  const auto compile_jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
+  auto compile_jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
+  if (const auto *value = std::getenv("CLANG_TRACER_LIVE_COMPILE_JOBS")) {
+    const std::string_view text(value);
+    const auto end = text.data() + text.size();
+    const auto [next, error] = std::from_chars(text.data(), end, compile_jobs);
+    if (error != std::errc{} || next != end || !compile_jobs)
+      throw std::runtime_error("CLANG_TRACER_LIVE_COMPILE_JOBS must be a positive integer");
+  }
   std::deque<std::future<Snapshots>> compiling;
   auto next_unit = profiles.begin();
   const auto launch = [&] {
@@ -914,6 +1019,14 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     if (before) {
       auto before_definitions = changed ? definitions(*before) : after_definitions;
       std::optional<CompiledUnit> built;
+      std::map<std::string, Definition> built_definitions;
+      const auto inspect_build = [&] {
+        if (!built) {
+          built.emplace(compile_unit(original, unit, nullptr, {}, CompileInspection::native_metadata));
+          built_definitions = definitions(*built);
+        }
+      };
+      std::set<std::string> reappeared_patched;
       // Dropping the last use can stop Clang emitting a callable while its
       // native entry still exists. Compare a reappearing body with the exact
       // build snapshot and keep calls routed through that entry.
@@ -924,17 +1037,45 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
             return entry.second.local ? local_symbol(entry.first, path) != nullptr
                                       : image.find(entry.first, false) != nullptr;
           })) {
-        built.emplace(compile_unit(original, unit, nullptr, {}, CompileInspection::native_metadata));
-        auto vanished = definitions(*built);
+        inspect_build();
+        auto vanished = built_definitions;
         std::erase_if(vanished, [&](const auto &entry) {
           return !after_definitions.contains(entry.first);
         });
+        // The built definition proves identity, but the current native entry
+        // may still dispatch to an earlier live replacement.
+        for (const auto &[name, definition] : vanished) {
+          if (before_definitions.contains(name))
+            continue;
+          const auto *symbol = definition.local ? local_symbol(name, path) : image.find(name, false);
+          if (symbol && std::ranges::any_of(active.entries, [&](const auto &entry) {
+                const auto &binding = entry.second.binding;
+                return binding.module == module && binding.elf_address == symbol->address;
+              }))
+            reappeared_patched.insert(name);
+        }
         before_definitions.merge(vanished);
       }
-      if (sources.saved.count(path))
-        for (const auto &value : (built ? built->module : before->module)->global_values())
-          if (value.hasName() && value.hasLocalLinkage())
-            native_locals[value.getName().str()].insert(path);
+      std::set<std::string> native_closures;
+      for (const auto &[name, prior] : before_definitions) {
+        const auto next = after_definitions.find(name);
+        if (!prior.lambda_site || prior.lambda_site->empty() || next == after_definitions.end() ||
+            prior.lambda_site != next->second.lambda_site ||
+            (!reappeared_patched.contains(name) && equivalent_body(prior, next->second)) ||
+            !prior.local || !local_symbol(name, path))
+          continue;
+        // An earlier revision may have introduced a different closure at the
+        // same mangled ordinal. Require the native build's lexical identity.
+        if (!original.files.empty()) {
+          inspect_build();
+          const auto native = built_definitions.find(name);
+          if (native == built_definitions.end() || native->second.lambda_site != prior.lambda_site ||
+              native->second.abi != prior.abi)
+            continue;
+        }
+        native_closures.insert(name);
+        verified_lambdas.insert(local_import_name(path, name));
+      }
       if (changed) {
         for (const auto &[name, layout] : before->record_layouts) {
           const auto updated = after.record_layouts.find(name);
@@ -945,7 +1086,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         const auto new_data = data_definitions(after);
         reuse_global_lifecycle = recorded_unit(path) &&
             unchanged_global_lifecycle(*before->module, *after.module,
-                old_data, new_data, before_definitions, after_definitions);
+                old_data, new_data, before_definitions, after_definitions, native_closures);
         for (const auto &[name, storage] : old_data) {
           const auto updated = new_data.find(name);
           const auto *global = before->module->getNamedGlobal(name);
@@ -955,18 +1096,37 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
           if (!omitted_local && (updated == new_data.end() || updated->second != storage))
             block(path, name, "rebuild required: existing data definition changed");
         }
+        std::optional<std::map<std::string, std::string>> built_data;
         for (const auto &[name, storage] : new_data) {
-          (void)storage;
           const auto *global = after.module->getNamedGlobal(name);
-          if (!old_data.contains(name) && !(global && standard_inline_constant(*global)))
-            block(path, name, "rebuild required: new persistent data definition");
+          if (old_data.contains(name) || (global && standard_inline_constant(*global)))
+            continue;
+          if (global && sources.saved.contains(path) && !original.files.empty()) {
+            const auto *symbol = global->hasLocalLinkage() ? local_symbol(name, path)
+                                                           : image.find(name, false);
+            if (symbol && symbol->type == llvm::ELF::STT_OBJECT && symbol->size) {
+              // Storage can also stop being emitted while its native value
+              // remains live. A matching built definition reuses that value.
+              inspect_build();
+              if (!built_data)
+                built_data.emplace(data_definitions(*built));
+              const auto prior = built_data->find(name);
+              if (prior != built_data->end() && prior->second == storage)
+                continue;
+            }
+          }
+          block(path, name, "rebuild required: new persistent data definition");
         }
       }
+      if (sources.saved.count(path))
+        for (const auto &value : (built ? built->module : before->module)->global_values())
+          if (value.hasName() && value.hasLocalLinkage())
+            native_locals[value.getName().str()].insert(path);
       collect(old_bodies, path, before_definitions);
       std::set<std::string> changed_owners;
       const auto compare_closures = [&](const auto &left, const auto &right) {
         for (const auto &[name, body] : left) {
-          if (!body.local)
+          if (!body.local || native_closures.contains(name))
             continue;
           const auto owner = closure_owner(name, before_definitions);
           if (owner.empty() || !after_definitions.contains(owner))
@@ -978,8 +1138,25 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       };
       compare_closures(before_definitions, after_definitions);
       compare_closures(after_definitions, before_definitions);
+      for (const auto &[name, prior] : before_definitions) {
+        if (!prior.lambda_site || native_closures.contains(name))
+          continue;
+        const auto owner = closure_owner(name, before_definitions);
+        if (owner.empty() || !changed_owners.contains(owner))
+          continue;
+        const auto next = after_definitions.find(name);
+        if (next != after_definitions.end() && equivalent_body(prior, next->second))
+          continue;
+        if (!closure_is_local_to(*before->module, name, owner))
+          block(path, name, "rebuild required: cannot match an existing lambda used outside its enclosing function");
+        else
+          result.safe_point = SafePoint::drained_stack;
+      }
       for (const auto &[name, body] : after_definitions) {
-        if (!body.local)
+        if (!body.local || native_closures.contains(name))
+          continue;
+        const auto prior = before_definitions.find(name);
+        if (prior != before_definitions.end() && equivalent_body(prior->second, body))
           continue;
         const auto owner = closure_owner(name, before_definitions);
         const auto next = after_definitions.find(owner);
@@ -998,6 +1175,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         if (next == after_definitions.end() && prior.discardable)
           continue;
         if (next != after_definitions.end() && !changed_owners.contains(name) &&
+            !reappeared_patched.contains(name) &&
             equivalent_body(prior, next->second)) {
           unchanged.insert(key);
           continue;
@@ -1041,6 +1219,11 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
   for (const auto &path : sources.submitted)
     if (!covered.count(path) && !(managed_inputs && managed_inputs->contains(path)))
       throw std::runtime_error("no verified translation unit profile or dependency uses " + path);
+  if (managed_inputs && changes.empty() && result.candidates.empty() &&
+      std::ranges::all_of(sources.submitted, [&](const auto &path) {
+        return managed_inputs->contains(path) && !covered.contains(path);
+      }))
+    return result;
 
   result.jit = std::move(current);
   for (auto &unit : result.jit.translation_units)
@@ -1086,6 +1269,8 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       if (managed_inputs && (enters_registry(before_calls, key) || enters_registry(after_calls, key)))
         throw std::runtime_error(
             "rebuild required: acquire the managed registry gate in the caller before entering the updated function");
+      if (old.lambda_site && !verified_lambdas.contains(key))
+        throw std::runtime_error("rebuild required: cannot verify that the native lambda is the same closure");
       if (!old.has_source_abi || !old.supported_abi || !next || body.inconsistent ||
           unchanged.contains(key) || old.abi != next->abi || !next->supported_abi)
         throw std::runtime_error("rebuild required: emitted implementations or callable ABI differ");

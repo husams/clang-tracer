@@ -26,6 +26,7 @@ int third(int);
 int adjacent_value();
 int calculate(int);
 int accepted_key();
+int registered(int);
 int main() {
   if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)) return 1;
   std::thread([] { for (;;) usleep(100000); }).detach();
@@ -36,8 +37,8 @@ int main() {
       unlink("call");
       int one;
       try { one = first(10); } catch (int value) { one = value; }
-      std::printf("%d %d %d %d %d %d %d\n", one, second(10), lookup(1), third(10),
-                  adjacent_value(), calculate(10), accepted_key());
+      std::printf("%d %d %d %d %d %d %d %d\n", one, second(10), lookup(1), third(10),
+                  adjacent_value(), calculate(10), accepted_key(), registered(10));
       std::fflush(stdout);
     }
     usleep(3000);
@@ -71,6 +72,10 @@ static const int table[] = {1, 2, 3};
 int lookup(int i) { const char *empty = ""; return table[i] + empty[0]; }
 LIVE_ENTRY int first(int i) { return i + 1; }
 LIVE_ENTRY int second(int i) { return i + 2; }
+int registered(int i) {
+  static int (*const callback)(int) = [](int v) LIVE_ENTRY { return v + 17; };
+  return callback(i);
+}
 static int counter = 1;
 LIVE_ENTRY int calculate(int i) { int values[] = {1, 2, 3}; return values[i % 3] + counter; }
 int adjacent_value() { return storage.adjacent; }
@@ -155,13 +160,29 @@ def run(args, root, cleanup):
         result = console.expect(r"^live (APPLIED|BLOCKED|STALE|REVERTED|UNCHANGED|RESTORATION_REQUIRED) revision=")
         assert result[1] == outcome, "".join(console.seen[-25:])
 
-    def call(first, second, *, third=15, calculated=3, key=7, runtime=False):
+    def call(first, second, *, third=15, calculated=3, key=7, callback=27, runtime=False):
         (root / "call").touch()
         if runtime:
             app.expect(r"^runtime=10$")
-        app.expect(rf"^{first} {second} 2 {third} 7 {calculated} {key}$")
+        app.expect(rf"^{first} {second} 2 {third} 7 {calculated} {key} {callback}$")
 
     app_source = source / "app.cpp"
+    call(11, 12)
+    revised_callback = APP.replace("return v + 17;", "return v + 100;")
+    app_source.write_text(revised_callback)
+    compiler_version = subprocess.check_output([args.compiler, "--version"], text=True)
+    if "clang" in compiler_version.splitlines()[0].lower():
+        command("%live update source/app.cpp", "APPLIED")
+        call(11, 12, callback=110)
+        command("%live revert 0", "REVERTED")
+    else:
+        # GCC's function-scope lambda linkage name differs from Clang's.
+        command("%live update source/app.cpp", "BLOCKED")
+    call(11, 12)
+    app_source.write_text(revised_callback.replace(
+        "  static int (*const callback)(int)", "  [[maybe_unused]] auto prior = [] { return 0; };\n"
+                                             "  static int (*const callback)(int)"))
+    command("%live update source/app.cpp", "BLOCKED")
     call(11, 12)
     layout = APP.replace("struct Config { int a; }", "struct Config { int a; int b; }")
     layout = layout.replace("return i + 1;", "storage.config.b = 99; return i + 1;")
@@ -233,6 +254,12 @@ struct Handle {
     other_source.write_text(OTHER.replace("return i + 3;", "return i + 30;"))
     command("%live update source/other.cpp", "APPLIED")
     call(89, 12, third=42, calculated=10, runtime=True)
+    other_source.write_text(OTHER.replace("return helper(i) + counter;", "return i + 5;"))
+    command("%live update source/other.cpp", "APPLIED")
+    call(89, 12, calculated=10, runtime=True)
+    other_source.write_text(OTHER)
+    command("%live update source/other.cpp", "APPLIED")
+    call(89, 12, calculated=10, runtime=True)
     send(repl, "%detach")
     console.expect(r"^detached session=")
     call(11, 12)

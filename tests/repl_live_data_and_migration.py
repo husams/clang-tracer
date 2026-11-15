@@ -266,12 +266,15 @@ def migration(args, folder):
         shutil.copyfile(ROOT / "live_migration" / name, folder / name)
     (folder / "main.cpp").write_text(MANAGED_MAIN)
     patch_source = folder / "cache_code.cpp"
+    external_native_header = folder.parent / "outside_native.hpp"
+    external_native_header.write_text("inline int cache_scale() { return 1; }\n")
     original_code = r"""
 #include "state.hpp"
+#include "../outside_native.hpp"
 #include <cstdio>
 using namespace fixture;
 #define LIVE_ENTRY __attribute__((patchable_function_entry(16, 0)))
-extern "C" LIVE_ENTRY int cache_code() { return 1; }
+extern "C" LIVE_ENTRY int cache_code() { return cache_scale(); }
 extern "C" LIVE_ENTRY int cache_other() { return 2; }
 extern "C" LIVE_ENTRY void cache_print(managed::Registry::Access& access, managed::InstanceId id) {
   access.with<CacheV1>("Cache", id, "cache.1", [](const auto& cache) {
@@ -297,7 +300,7 @@ managed::Registry::Access open_gate() { return registry.access(); }
     with ExitStack() as cleanup:
         app, repl, app_line, console_line = attach(args, target, cleanup)
         app("old", r"^old 0$")
-        patched_code = (original_code.replace("return 1;", "return 27;")
+        patched_code = (original_code.replace("return cache_scale();", "return 27;")
                         .replace("return 2;", "return 28;")
                         .replace('"state.hpp"', '"state_v2.hpp"')
                         .replace("CacheV1", "CacheV2").replace('"cache.1"', '"cache.2"')
@@ -305,6 +308,13 @@ managed::Registry::Access open_gate() { return registry.access(); }
                                  '"new %zu %zu %d\\n", cache.entries.size(), '
                                  'cache.max_entries, cache.hook_calls'))
         update = "%live update update.hpp cache_code.cpp state_v2.hpp"
+        patch_source.write_text(patched_code)
+        external_native_header.write_text("inline int cache_scale() { return 2; }\n")
+        repl(update + " ../outside_native.hpp --managed true",
+             r"^live BLOCKED revision=0 .*native dependency outside the build source root")
+        external_native_header.write_text("inline int cache_scale() { return 1; }\n")
+        app("old", r"^code 1$")
+        app_line(r"^old 0$")
         patch_source.write_text(patched_code.replace(
             "using namespace fixture;", "using namespace fixture;\nmanaged::Registry::Access open_gate();"
         ).replace("  access.with<CacheV2>", "  auto late_access = open_gate();\n"
@@ -347,6 +357,10 @@ managed::Registry::Access open_gate() { return registry.access(); }
         app("old", r"^old 0$")
         repl("%live update update.hpp state_v2.hpp --managed true",
              r"^live APPLIED revision=3 .*instances=3")
+        repl("%live revert", r"^live REVERTED revision=0")
+        app("old", r"^old 0$")
+        repl("%live update ../outside_recipe.hpp state_v2.hpp --managed true",
+             r"^live APPLIED revision=4 .*instances=3")
         repl("%live revert", r"^live REVERTED revision=0")
         app("old", r"^old 0$")
 

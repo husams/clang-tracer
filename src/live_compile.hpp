@@ -27,6 +27,7 @@ struct CompiledUnit {
   std::map<std::string, std::string> record_layouts;
   std::map<std::string, std::pair<std::string, std::string>> types;
   std::map<std::string, unsigned> source_definitions;
+  std::map<std::string, std::string> lambda_sites;
 };
 
 enum class CompileInspection { native_metadata, ir_only };
@@ -48,9 +49,12 @@ struct Definition {
   bool supported_abi = false;
   bool local = false;
   bool discardable = false;
+  std::optional<std::string> lambda_site;
   std::optional<unsigned> source_definition;
   std::set<std::string> callees;
   unsigned invokes = 0;
+  bool nounwind = false;
+  std::string attributes_without_nounwind;
   std::string normal_flow;
 };
 
