@@ -402,6 +402,8 @@ void reclaim_code(State *watch) noexcept {
         watch->runtime_scopes.clear();
         watch->runtime_images.clear();
         watch->runtime_plt_stubs.clear();
+        watch->runtime_rejections.clear();
+        watch->runtime_lazy_slots.clear();
         channel.runtime_reclaimed.store(reclaimed, std::memory_order_release);
         runtime_done = true;
       }
@@ -4659,12 +4661,6 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
       // The resolved target key uses the current GOT value for PLT calls.
       const auto target_key = std::pair{image_key, target};
       const bool outside_plt_scope = from_plt && !location.main_image && image_key != plt_owner_key;
-      if (const auto rejected = watch.runtime_rejections.find(target_key);
-          rejected != watch.runtime_rejections.end() &&
-          (!rejected->second.plt_only || outside_plt_scope)) {
-        gap = static_cast<std::uint8_t>(rejected->second.reason);
-        throw std::runtime_error("runtime callee has a memoized unsupported scope");
-      }
       const auto scope_key = std::tuple{location.device, location.inode, location.bias, target};
       if (const auto cached = watch.runtime_scopes.find(scope_key); cached != watch.runtime_scopes.end()) {
         const auto &scope = *cached->second;
@@ -4688,6 +4684,12 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
           return enter(*cached->second);
         watch.runtime_targets.erase(cached);
       }
+      if (const auto rejected = watch.runtime_rejections.find(target_key);
+          rejected != watch.runtime_rejections.end() &&
+          (!rejected->second.plt_only || outside_plt_scope)) {
+        gap = static_cast<std::uint8_t>(rejected->second.reason);
+        throw std::runtime_error("runtime callee has a memoized unsupported scope");
+      }
       if (watch.runtime_count == watch.runtime_limit) {
         gap = static_cast<std::uint8_t>(DispatchGap::runtime_limit);
         throw std::runtime_error("runtime translation limit reached");
@@ -4707,7 +4709,7 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
             return inst.flow == NativeFlow::call;
           });
       const auto module_index = fresh ? watch.runtime_modules + 1 : image.module_index;
-      if (function.weak && (!decode_verified || nonleaf)) {
+      if (function.weak && nonleaf) {
         gap = static_cast<std::uint8_t>(DispatchGap::weak_scope);
         remember_rejection(image_key, target, DispatchGap::weak_scope, false);
         throw std::runtime_error("dynamically exported weak function cannot be redirected safely");
