@@ -520,6 +520,8 @@ struct LocatedUnion {
 Member nested_member(DWARFDie parent, std::string_view path, bool &opaque_union,
                      LocatedUnion *selected_union = nullptr) {
   const auto original = path;
+  if (selected_union && parent.getTag() == dw::DW_TAG_union_type)
+    selected_union->storage = Member{parent, 0};
   std::uint64_t offset = 0;
   while (true) {
     opaque_union |= parent.getTag() == dw::DW_TAG_union_type;
@@ -969,10 +971,11 @@ std::optional<Layout> inspect_union_field(DWARFDie owner,
   layout.kind = ValueWriteKind::union_storage;
   layout.size = size;
   // Keep the established event format for existing four-byte member watches.
+  const auto member_start = selected.path.empty() ? 0 : selected.path.size() + 1;
   bool legacy = allow_legacy && !request.first_seen() &&
       size == 4 && size_of(leaf.type) == 4 && leaf.offset == storage.offset &&
       selected.path.size() < request.field().size() &&
-      request.field().find('.', selected.path.size() + 1) == std::string::npos;
+      request.field().find('.', member_start) == std::string::npos;
   if (!request.union_tag().empty()) {
     bool tag_in_union = false;
     const auto tag = nested_member(owner, request.union_tag(), tag_in_union);
