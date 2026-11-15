@@ -1,0 +1,2 @@
+%probe validate "lesson::Derived::score(int) const" --callback ./derived-hook.cpp --prepared ./derived-package --prepared-mode require
+%probe inject "lesson::Derived::score(int) const" --callback ./derived-hook.cpp --prepared ./derived-package --prepared-mode require

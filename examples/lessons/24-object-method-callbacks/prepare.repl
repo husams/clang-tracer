@@ -1,0 +1,3 @@
+%probe prepare "lesson::Counter::add(int)" --include ./objects.hpp --compdb ./build/compile_commands.json --translation-unit ./target.cpp --output ./counter-package
+%probe prepare "lesson::Derived::score(int) const" --include ./objects.hpp --compdb ./build/compile_commands.json --translation-unit ./target.cpp --output ./derived-package
+%quit

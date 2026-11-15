@@ -337,6 +337,9 @@ Remove a fallback probe before replacing it.
 
 ## Trace object lifetimes and state in a prebuilt binary
 
+The [hands-on lessons](../examples/lessons/README.md) provide small interactive
+targets for prepared callbacks, lifetimes, field writes, and logical updates.
+
 Use the full Linux build on x86-64 or AArch64, with the REPL, server, and agent from the same build. Supply the existing ELF and its matching DWARF, either embedded or in a matching separate debug file. The watch installs patches in process memory. The application executable and source files stay intact.
 
 The plan records the capture mode you select during preparation.

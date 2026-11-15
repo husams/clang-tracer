@@ -1,0 +1,2 @@
+%probe validate "lesson::Counter::add(int)" --callback ./counter-hook.cpp --prepared ./counter-package --prepared-mode require
+%probe inject "lesson::Counter::add(int)" --callback ./counter-hook.cpp --prepared ./counter-package --prepared-mode require
