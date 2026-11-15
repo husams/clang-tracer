@@ -3085,8 +3085,9 @@ public:
 
     if (watch.lifetimes_only() && watch.code_module().empty())
       watch.set_code_module(methods.front().debug_info().module());
+    const bool verify_method_lifetimes = !methods.empty();
     watch.set_action(Watch::PREVIEW);
-    const auto preview = session->object_watch(watch, 0, {});
+    const auto preview = session->object_watch(watch, 0, {}, verify_method_lifetimes);
     *response.mutable_watch() = preview;
     auto &binding = *response.mutable_binding();
     *binding.mutable_watch() = preview.plan();
@@ -3161,7 +3162,7 @@ public:
         throw std::runtime_error("object probe activation cancelled");
       const auto installed = session->object_watch(watch, group->id, [this](auto event) {
         events_.publish_object_observation(std::move(event));
-      });
+      }, verify_method_lifetimes);
       if (!installed.active() || installed.restoration_pending())
         throw std::runtime_error("object probe watch failed to become active");
       session->set_object_probe_active(group->id, true);

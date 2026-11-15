@@ -244,7 +244,8 @@ clangtracer::v1::ObjectWatchStatus Session::prepare_object_watch(
 
 clangtracer::v1::ObjectWatchStatus Session::object_watch(
     const clangtracer::v1::ObjectWatchRequest &request, std::uint64_t id,
-    std::function<void(clangtracer::v1::TraceEvent)> publish) {
+    std::function<void(clangtracer::v1::TraceEvent)> publish,
+    bool verify_method_lifetimes) {
   using Request = clangtracer::v1::ObjectWatchRequest;
   std::lock_guard lock(mutex_);
   if (request.action() == Request::STATUS || request.action() == Request::STOP) {
@@ -279,17 +280,17 @@ clangtracer::v1::ObjectWatchStatus Session::object_watch(
   if (state_ != clangtracer::v1::Session::ATTACHED || unsafe_target_)
     throw std::runtime_error("object watch requires a live attached session");
   if (request.action() == Request::PREVIEW)
-    return object_watch::preview(request, pid_, executable_);
+    return object_watch::preview(request, pid_, executable_, verify_method_lifetimes);
   std::string binding_status;
   if (request.has_prepared_bindings())
-    binding_status = object_watch::preview(request, pid_, executable_).binding_status();
+    binding_status = object_watch::preview(request, pid_, executable_, verify_method_lifetimes).binding_status();
   require_probe_control_locked();
   require_object_watch_sites_locked(request.staged_registration() ? id : 0);
   if (request.backend() == Request::CODE_CACHE) {
     if (!object_cache_address_)
       throw std::runtime_error("the loaded agent does not export the code-cache backend");
     auto prepared = std::make_unique<object_cache::Watch>(
-        request, id, pid_, executable_, event_path_, std::move(publish));
+        request, id, pid_, executable_, event_path_, std::move(publish), verify_method_lifetimes);
     injector::Process process;
     const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
     attach_process(process, deadline);

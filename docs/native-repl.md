@@ -397,11 +397,16 @@ Use `--first-seen` with a write-only package and a standalone executable writer.
 coverage counts in status when the writer reaches native callees. A combined
 registration requires disjoint method and writer patch windows. A verified
 identity requires evidence that the constructor built a complete object and
-that the watch covers its destruction. A receiver can have provisional
+that the watch covers its destruction. Evidence can come from a distinct
+complete-constructor entry, a verified caller outside constructors and destructors,
+or a call through a verified PLT entry for the complete-constructor symbol.
+A receiver can have provisional
 identity when construction predates attach, the constructor is ambiguous,
 lifetime symbols also exist in the executable, or no destructor entry can be
 verified. Its callback reports
-`identity_verified() == false` with zero object ID and generation.
+`identity_verified() == false` with zero object ID and generation. An observed
+destructor can report zero-ID teardown boundaries for an earlier provisional
+construction of the same receiver address.
 Live method and code-cache events arrive independently. JSON export orders
 each grouped registration's retained events by monotonic observation time.
 The event sequence remains the server's arrival cursor. Correlate verified

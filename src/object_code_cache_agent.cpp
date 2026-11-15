@@ -1457,6 +1457,14 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
       !watch.channel->registration_active.load(std::memory_order_acquire))
     return;
   const auto object = regs.value(rdi);
+  const bool identity_type_matches = !watch.identity_watch_id ||
+      !watch.receiver_typeinfo ||
+      ((kind == Hook::create || kind == Hook::destroy_begin) &&
+       matches_type(object, watch.receiver_typeinfo, watch.borrow.base_offset));
+  if (watch.identity_watch_id &&
+      (kind == Hook::create || kind == Hook::destroy_begin) &&
+      !identity_type_matches)
+    return;
   if (kind == Hook::create && watch.shared_file.inode &&
       (object > UINT64_MAX - watch.offset || !shared_file_offset(watch, object + watch.offset)))
     return;
@@ -1476,8 +1484,15 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
       }
       if (const auto *life = watch.admit_lifetime(object))
         emit_boundary(watch, site, object, *life, kind);
-      else
+      else {
+        if (watch.identity_watch_id && identity_type_matches) {
+          auto &history = watch.generations[object];
+          history.observed = true;
+          history.uncertain_live = false;
+          history.provisional_live = true;
+        }
         emit_boundary(watch, site, object, {}, Hook::admission_gap);
+      }
       return;
     }
   }
@@ -1498,6 +1513,12 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
       }
       const auto *item = watch.admit_lifetime(object);
       if (!item) {
+        if (watch.identity_watch_id && identity_type_matches) {
+          auto &history = watch.generations[object];
+          history.observed = true;
+          history.uncertain_live = false;
+          history.provisional_live = true;
+        }
         emit_boundary(watch, site, object, {}, Hook::admission_gap);
         return;
       }
@@ -1505,14 +1526,21 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
     } else {
       destroying = {};
       auto &history = watch.generations[object];
+      // A verified address/type observation can support destructor boundaries
+      // without claiming a complete-object lifetime identity.
+      const bool provisional = watch.identity_watch_id && history.observed &&
+          (history.uncertain_live || history.provisional_live) && identity_type_matches;
       history.observed = true;
       history.uncertain_live = false;
       history.provisional_live = false;
       const auto found = watch.lifetimes.find(object);
-      if (found == watch.lifetimes.end() || !found->second.id)
-        return;
-      life = found->second;
-      watch.lifetimes.erase(found);
+      if (found == watch.lifetimes.end() || !found->second.id) {
+        if (!provisional)
+          return;
+      } else {
+        life = found->second;
+        watch.lifetimes.erase(found);
+      }
       destroying = {&site, regs.value(rsp), object, life};
     }
   }
@@ -1564,19 +1592,29 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
     }
     stack(watch, event, regs);
     if (!constructor) {
+      const bool exact_type = !watch.receiver_typeinfo ||
+          matches_type(object, watch.receiver_typeinfo, watch.borrow.base_offset);
+      if (watch.identity_watch_id && !exact_type)
+        return;
       const std::lock_guard lock(watch.mutex);
       const std::unique_lock identity_lock(watch.identity_mutex);
       auto &history = watch.generations[object];
+      // Keep provisional observations visible, but never attach a fabricated ID.
+      const bool provisional = watch.identity_watch_id && history.observed &&
+          (history.uncertain_live || history.provisional_live) && exact_type;
       history.observed = true;
       history.uncertain_live = false;
       history.provisional_live = false;
       const auto item = watch.lifetimes.find(object);
-      if (item == watch.lifetimes.end() || !item->second.id)
-        return;
-      event.id = item->second.id;
-      event.generation = item->second.generation;
-      event.owner = item->second.owner;
-      watch.lifetimes.erase(item);
+      if (item == watch.lifetimes.end() || !item->second.id) {
+        if (!provisional)
+          return;
+      } else {
+        event.id = item->second.id;
+        event.generation = item->second.generation;
+        event.owner = item->second.owner;
+        watch.lifetimes.erase(item);
+      }
       event.hook = Hook::destroy_begin;
       emit(watch, event);
     }

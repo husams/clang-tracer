@@ -20,7 +20,8 @@ class Watch {
 public:
   Watch(const clangtracer::v1::ObjectWatchRequest &request, std::uint64_t id,
         std::uint32_t pid, const std::string &executable, const std::string &event_path,
-        std::function<void(clangtracer::v1::TraceEvent)> publish);
+        std::function<void(clangtracer::v1::TraceEvent)> publish,
+        bool verify_method_lifetimes = false);
   ~Watch();
   void install(injector::Process &process, std::uintptr_t agent_entry,
                std::chrono::steady_clock::time_point deadline, bool permanent_startup_module = false);

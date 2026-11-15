@@ -1242,13 +1242,27 @@ void verify_rebound_method_signature(DWARFDie function, const api::PreparedInjec
   const auto matches = [&](api::ValueType kind, const std::string &actual, const std::string &wanted) {
     return kind != api::OBJECT && spelling(actual) == spelling(wanted);
   };
-  if (!shape.receiver || qualified(shape.receiver) != receiver || shape.receiver_volatile ||
-      types.receiver_volatile() || shape.signature.kind() != expected.kind() ||
-      shape.signature.result() != expected.result() ||
-      !matches(expected.result(), shape.result_spelling, types.result_cpp_type()) ||
-      shape.signature.arguments_size() != expected.arguments_size() ||
+  if (!shape.receiver)
+    throw std::runtime_error("compatible method rebinding needs a DWARF receiver for " + receiver);
+  if (const auto actual = qualified(shape.receiver); actual != receiver)
+    throw std::runtime_error("compatible method rebinding found a different receiver (DWARF " +
+                             actual + ", prepared " + receiver + ")");
+  if (shape.receiver_volatile || types.receiver_volatile())
+    throw std::runtime_error("compatible method rebinding does not support volatile receivers");
+  if (shape.signature.kind() != expected.kind())
+    throw std::runtime_error("compatible method rebinding found a different callable kind");
+  if (shape.signature.arguments_size() != expected.arguments_size() ||
       types.arguments_size() != expected.arguments_size())
-    throw std::runtime_error("compatible method rebinding requires a verified receiver and callable ABI");
+    throw std::runtime_error("compatible method rebinding found a different argument count");
+  const auto result_types = " (DWARF " + shape.result_spelling + ", prepared " +
+      types.result_cpp_type() + ")";
+  if (shape.signature.result() != expected.result())
+    throw std::runtime_error("compatible method rebinding found a different return ABI" + result_types);
+  if (expected.result() == api::OBJECT)
+    throw std::runtime_error("compatible method rebinding cannot verify a by-value object return ABI" +
+                             result_types);
+  if (!matches(expected.result(), shape.result_spelling, types.result_cpp_type()))
+    throw std::runtime_error("compatible method rebinding found a different return type" + result_types);
   const auto matches_object_value = [&](const api::DebugArgument &actual,
                                         const api::DebugArgument &wanted) {
     if (!actual.is_object_value() || actual.is_reference() || !actual.has_object_type() ||
@@ -1266,7 +1280,9 @@ void verify_rebound_method_signature(DWARFDie function, const api::PreparedInjec
         ? matches_object_value(actual, wanted)
         : matches(expected.arguments(index), actual.cpp_type(), wanted.cpp_type());
     if (shape.signature.arguments(index) != expected.arguments(index) || !argument_matches)
-      throw std::runtime_error("compatible method rebinding found a different argument ABI");
+      throw std::runtime_error("compatible method rebinding found a different or unverified ABI for argument " +
+                               std::to_string(index + 1) + " (DWARF " + actual.cpp_type() +
+                               ", prepared " + wanted.cpp_type() + ")");
   }
 }
 

@@ -376,11 +376,11 @@ struct Watch::Impl {
 
   Impl(const api::ObjectWatchRequest &spec, std::uint64_t watch_id, std::uint32_t target,
        const std::string &executable, const std::string &event_path,
-       std::function<void(api::TraceEvent)> sink)
+       std::function<void(api::TraceEvent)> sink, bool verify_method_lifetimes)
       : request(spec), id(watch_id), pid(target),
         process_start(pid ? proc::start_time(proc::directory(pid) / "stat") : 0),
         executable(executable), publish(std::move(sink)),
-        plan(target, executable, spec), shared_file(spec.shared_file()),
+        plan(target, executable, spec, verify_method_lifetimes), shared_file(spec.shared_file()),
         event_buffer(spec.event_buffer() ? spec.event_buffer() : default_event_buffer),
         runtime_limit(spec.follow_calls() ? (spec.runtime_limit() ? spec.runtime_limit() :
                                              default_runtime_limit) : 0) {
@@ -452,7 +452,8 @@ struct Watch::Impl {
             inst.hook = Hook::collection_end;
       }
       if (plan.lifetimes_only ||
-          (!plan.caller_start && (!plan.shared_writer() || request.follow_calls()))) {
+          (!plan.caller_start &&
+           (verify_method_lifetimes || !plan.shared_writer() || request.follow_calls()))) {
         fragmented_lifecycle = plan.lifetimes_only || plan.layout.primary_rtti || plan.virtual_destructor ||
             !plan.delegating_constructor_tails.empty() || !request.owner_type().empty() ||
             std::any_of(plan.boundaries.begin(), plan.boundaries.end(), [&](const auto &entry) {
@@ -1731,10 +1732,16 @@ struct Watch::Impl {
       item.set_closure_reason(Observation::UNWOUND);
       item.set_diagnostic("constructor unwound without a verified return");
     } else if (sample.hook == Hook::construction_uncertain) {
-      item.set_diagnostic(sample.gap ? "complete and base constructors share the same entry" :
-                                      "constructor returned with an unverified receiver");
-    } else if (sample.hook == Hook::destroy_end) {
-      item.set_closure_reason(Observation::DESTRUCTOR_RETURN);
+      const char *reason = "constructor returned with an unverified receiver";
+      if (sample.gap)
+        reason = request.staged_registration() ? "complete-object construction could not be verified" :
+                                                "complete and base constructors share the same entry";
+      item.set_diagnostic(reason);
+    } else if (sample.hook == Hook::destroy_begin || sample.hook == Hook::destroy_end) {
+      if (sample.hook == Hook::destroy_end)
+        item.set_closure_reason(Observation::DESTRUCTOR_RETURN);
+      if (request.staged_registration() && !sample.id)
+        item.set_diagnostic("provisional destructor boundary with unverified complete-object identity");
     } else if (sample.hook == Hook::lifetime_reused) {
       item.set_closure_reason(Observation::SCOPE_CHANGED);
       item.set_diagnostic("receiver storage reused without an observed destructor");
@@ -2299,8 +2306,9 @@ struct Watch::Impl {
 
 Watch::Watch(const api::ObjectWatchRequest &request, std::uint64_t id, std::uint32_t pid,
              const std::string &executable, const std::string &event_path,
-             std::function<void(api::TraceEvent)> publish)
-    : impl_(std::make_unique<Impl>(request, id, pid, executable, event_path, std::move(publish))) {}
+             std::function<void(api::TraceEvent)> publish, bool verify_method_lifetimes)
+    : impl_(std::make_unique<Impl>(request, id, pid, executable, event_path,
+                                  std::move(publish), verify_method_lifetimes)) {}
 Watch::~Watch() = default;
 
 void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
@@ -2814,13 +2822,13 @@ api::ObjectWatchStatus Watch::preview() const {
 namespace tracer::object_watch {
 clangtracer::v1::ObjectWatchStatus preview(
     const clangtracer::v1::ObjectWatchRequest &request, std::uint32_t pid,
-    const std::string &executable) {
+    const std::string &executable, bool verify_method_lifetimes) {
   using Request = clangtracer::v1::ObjectWatchRequest;
   if (request.follow_calls() && request.backend() != Request::CODE_CACHE)
     throw std::invalid_argument("runtime call following requires code-cache write capture");
   clangtracer::v1::ObjectWatchStatus result;
   if (request.backend() == Request::CODE_CACHE) {
-    result = object_cache::Watch(request, 0, pid, executable, {}, {}).preview();
+    result = object_cache::Watch(request, 0, pid, executable, {}, {}, verify_method_lifetimes).preview();
   } else {
     Plan plan(pid, executable, request);
     if (pid)

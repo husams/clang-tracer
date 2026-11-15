@@ -913,10 +913,7 @@ void run_preparer(std::vector<std::string> arguments, const char *failure) {
     ::close(diagnostic_pipe[0]);
     throw std::system_error(started, std::generic_category(), "cannot start native preparer");
   }
-  constexpr std::size_t diagnostic_limit = 16 * 1024;
-  std::string diagnostics;
   std::array<char, 4096> buffer{};
-  bool truncated = false;
   int read_error = 0;
   const auto drain = [&](std::size_t size) {
     ssize_t count;
@@ -925,9 +922,6 @@ void run_preparer(std::vector<std::string> arguments, const char *failure) {
     } while (count < 0 && errno == EINTR);
     if (count > 0) {
       std::cerr.write(buffer.data(), count);
-      const auto available = diagnostic_limit - diagnostics.size();
-      diagnostics.append(buffer.data(), std::min<std::size_t>(available, count));
-      truncated |= static_cast<std::size_t>(count) > available;
     } else if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
       read_error = errno;
     }
@@ -974,20 +968,14 @@ void run_preparer(std::vector<std::string> arguments, const char *failure) {
     throw std::runtime_error("cannot wait for native preparation");
   if (read_error)
     throw std::system_error(read_error, std::generic_category(), "cannot read native preparation diagnostics");
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-    while (!diagnostics.empty() && std::isspace(static_cast<unsigned char>(diagnostics.back())))
-      diagnostics.pop_back();
-    std::string detail = diagnostics.empty() ? "" : ": " + diagnostics;
-    if (WIFSIGNALED(status))
-      detail += std::string(detail.empty() ? ": " : "; ") +
-          "preparer terminated by signal " + std::to_string(WTERMSIG(status));
-    else if (WIFEXITED(status))
-      detail += std::string(detail.empty() ? ": " : "; ") +
-          "preparer exited with status " + std::to_string(WEXITSTATUS(status));
-    if (truncated)
-      detail += " [diagnostics truncated]";
-    throw std::runtime_error(std::string(failure) + detail);
-  }
+  if (WIFSIGNALED(status))
+    throw std::runtime_error(std::string(failure) + ": preparer terminated by signal " +
+                             std::to_string(WTERMSIG(status)));
+  if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+    throw std::runtime_error(std::string(failure) + ": preparer exited with status " +
+                             std::to_string(WEXITSTATUS(status)));
+  if (!WIFEXITED(status))
+    throw std::runtime_error(std::string(failure) + ": unexpected preparer status");
 }
 
 class PreparationDirectory {

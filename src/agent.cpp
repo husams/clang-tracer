@@ -82,7 +82,9 @@
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <clang/Interpreter/Interpreter.h>
+#if defined(__GLIBCXX__)
 #include <bits/cxxabi_forced.h>
+#endif
 #include <llvm/MC/MCAsmInfo.h>
 #include <llvm/MC/MCContext.h>
 #include <llvm/MC/MCDisassembler/MCDisassembler.h>
@@ -2903,7 +2905,7 @@ std::string make_wrapper(const tracer::Request &r,
       "tracer::TraceContext*,unsigned,bool) noexcept;\n";
   code += "extern \"C\" void tracer_context_check_entry();\n";
   if (shared_mode)
-    code += "#include <bits/cxxabi_forced.h>\n"
+    code += "#if defined(__GLIBCXX__)\n#include <bits/cxxabi_forced.h>\n#endif\n"
             "extern \"C\" void* tracer_shared_enter(unsigned long long,const "
             "tracer::TraceContext*,unsigned);\n"
             "extern \"C\" void tracer_shared_leave(void*) noexcept;\n"
@@ -3187,12 +3189,14 @@ std::string make_wrapper(const tracer::Request &r,
   } else {
     code += "return result;\n";
   }
-  if (shared_mode)
-    code += "} catch (const __cxxabiv1::__forced_unwind&) { throw; } catch "
+  if (shared_mode) {
+    code += "}\n#if defined(__GLIBCXX__)\ncatch (const "
+            "__cxxabiv1::__forced_unwind&) { throw; }\n#endif\ncatch "
             "(...) { tracer_shared_leave(shared_guard.token); "
             "tracer_shared_resume(shared_guard.token); "
             "tracer_shared_release(shared_guard.token); "
             "shared_guard.token=nullptr; throw; }\n";
+  }
   code += "}";
   return code;
 }
@@ -5672,7 +5676,6 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
     return 0;
   }
   const int saved_errno = errno;
-  ++callback_depth;
   long long value = 0;
   bool succeeded = false;
   bool callback_failed = false;
@@ -5683,17 +5686,28 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
        i < invocation.argument_count && i < tracer::kMaxArguments; ++i)
     invocation.argument_names[i] =
         i < p->argument_names.size() ? p->argument_names[i].c_str() : nullptr;
+  ++callback_depth;
+  struct DispatchGuard {
+    tracer::TraceContext &context;
+    int saved_errno;
+    bool depth_active = true;
+    ~DispatchGuard() {
+      if (depth_active)
+        --callback_depth;
+      tracer::release_native_stack(context);
+      errno = saved_errno;
+    }
+  } dispatch_guard{invocation, saved_errno};
   try {
     value = p->callback(&invocation, instance, &succeeded);
     // The bridge reports whether a hook exists for this phase and ran.
     if (succeeded)
       log_hook(*p, invocation, true);
-  } catch (const __cxxabiv1::__forced_unwind &) {
-    --callback_depth;
-    tracer::release_native_stack(invocation);
-    errno = saved_errno;
-    throw;
-  } catch (...) {
+  }
+#if defined(__GLIBCXX__)
+  catch (const __cxxabiv1::__forced_unwind &) { throw; }
+#endif
+  catch (...) {
     callback_failed = true;
     succeeded = false;
     log_hook(*p, invocation, false);
@@ -5704,6 +5718,7 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
     p->callback_errors.fetch_add(1, std::memory_order_relaxed);
   }
   --callback_depth;
+  dispatch_guard.depth_active = false;
   if (succeeded) {
     tracer_event_dispatch(id, &invocation, value);
   } else if (callback_failed) {
@@ -5711,8 +5726,6 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
     // target's original invocation can continue unchanged.
     tracer_event_dispatch_impl(id, &invocation, 0, true, "callback threw");
   }
-  tracer::release_native_stack(invocation);
-  errno = saved_errno;
   return value;
 }
 

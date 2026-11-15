@@ -60,7 +60,8 @@ public:
   void detach();
   clangtracer::v1::ObjectWatchStatus object_watch(
       const clangtracer::v1::ObjectWatchRequest &request, std::uint64_t id,
-      std::function<void(clangtracer::v1::TraceEvent)> publish);
+      std::function<void(clangtracer::v1::TraceEvent)> publish,
+      bool verify_method_lifetimes = false);
   void preflight_object_probe();
   bool has_object_probe_registration(std::uint64_t registration) const;
   void set_object_probe_active(std::uint64_t registration, bool active);

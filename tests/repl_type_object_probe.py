@@ -70,9 +70,16 @@ def run(args):
         compdb = build / "compile_commands.json"
         library = build / "libcounter.so"
         target = build / "counter-target"
+        hidden_source = root / "hidden-derived.cpp"
+        hidden_object = build / "hidden-derived.o"
+        unit_source = root / "type-unit.cpp"
+        unit_object = build / "type-unit.o"
         package = root / "counter.object"
         local_package = root / "local-base.object"
+        unit_package = root / "type-unit-base.object"
         ctor_only_package = root / "ctor-only.object"
+        identity_method_package = root / "identity-method-only.object"
+        identity_combined_package = root / "identity-combined.object"
         bad_package = root / "rollback.object"
         fresh_package = root / "fresh.object"
         overlap = root / "overlap.object"
@@ -107,10 +114,27 @@ public:
 private:
   int value_;
 };
+class UnitBase {
+public:
+  explicit UnitBase(int initial);
+  ~UnitBase();
+  int value() const;
+private:
+  int value_;
+};
 class CtorOnly {
 public:
   explicit CtorOnly(int initial);
   int value() const;
+private:
+  int value_;
+};
+class IdentityC1EBase {
+public:
+  explicit IdentityC1EBase(int initial);
+  ~IdentityC1EBase();
+  int get() const;
+  void set(int value);
 private:
   int value_;
 };
@@ -127,8 +151,40 @@ int Counter::value() const { return value_; }
 LocalBase::LocalBase(int initial) : value_(initial) {}
 LocalBase::~LocalBase() { value_ = -1; }
 int LocalBase::value() const { return value_; }
+UnitBase::UnitBase(int initial) : value_(initial) {}
+UnitBase::~UnitBase() { value_ = -1; }
+int UnitBase::value() const { return value_; }
 CtorOnly::CtorOnly(int initial) : value_(initial) {}
 int CtorOnly::value() const { return value_; }
+IdentityC1EBase::IdentityC1EBase(int initial) : value_(initial) {}
+IdentityC1EBase::~IdentityC1EBase() { value_ = -1; }
+int IdentityC1EBase::get() const { return value_; }
+void IdentityC1EBase::set(int value) { value_ = value; }
+}
+""")
+        hidden_source.write_text("""#include "counter.hpp"
+namespace demo {
+class HiddenDerived final : public IdentityC1EBase {
+public:
+  explicit HiddenDerived(int initial) : IdentityC1EBase(initial), hidden_(initial + 1) {}
+  ~HiddenDerived() {}
+  int hidden_;
+};
+}
+extern "C" __attribute__((visibility("default"), noinline)) int
+hidden_derived_roundtrip(int initial) {
+  demo::HiddenDerived object(initial);
+  object.set(initial + 1);
+  return object.get();
+}
+""")
+        unit_source.write_text("""#include "counter.hpp"
+namespace demo {
+struct UnitDerived : UnitBase { int extra; };
+int use_type_unit() {
+  UnitDerived object{UnitBase(3), 4};
+  return object.value() + object.extra;
+}
 }
 """)
         driver.write_text("""#include \"counter.hpp\"
@@ -154,13 +210,31 @@ void exercise_local_derived() {
   } object(5);
   (void)object.value();
 }
+demo::IdentityC1EBase *unobserved_identity = nullptr;
 }
+extern "C" __attribute__((noinline)) void
+identity_set_through_c(demo::IdentityC1EBase *object, int value) {
+  object->set(value);
+}
+extern "C" __attribute__((noinline)) int
+identity_get_through_c(demo::IdentityC1EBase *object) {
+  return object->get();
+}
+extern "C" __attribute__((noinline)) int
+identity_main_roundtrip(int initial) {
+  demo::IdentityC1EBase object(initial);
+  const int before = identity_get_through_c(&object);
+  identity_set_through_c(&object, before + 2);
+  return identity_get_through_c(&object);
+}
+extern "C" int hidden_derived_roundtrip(int);
 int main() {
   if (::prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) != 0 ||
       ::fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK) != 0)
     return 2;
   demo::Counter existing(7);
   demo::CtorOnly ctor_only(9);
+  unobserved_identity = new demo::IdentityC1EBase(6);
   exercise_local_derived();
   std::cout << \"READY\" << std::endl;
   for (;;) {
@@ -185,6 +259,21 @@ int main() {
       std::cout << \"EXISTING=\" << existing.add(2) << std::endl;
     } else if (command == 'c') {
       std::cout << \"CTOR_ONLY=\" << ctor_only.value() << std::endl;
+    } else if (command == 'm') {
+      int result = 0;
+      {
+        demo::IdentityC1EBase object(40);
+        identity_set_through_c(&object, identity_get_through_c(&object) + 2);
+        result = identity_get_through_c(&object);
+      }
+      std::cout << \"IDENTITY_MAIN=\" << result
+                << \" EXTERN_C=\" << identity_main_roundtrip(60) << std::endl;
+    } else if (command == 'h') {
+      std::cout << \"HIDDEN_DERIVED=\" << hidden_derived_roundtrip(50) << std::endl;
+    } else if (command == 'u') {
+      delete unobserved_identity;
+      unobserved_identity = nullptr;
+      std::cout << \"UNOBSERVED_DESTROYED\" << std::endl;
     } else if (command == 'q') {
       return 0;
     }
@@ -244,6 +333,9 @@ public:
         methods = ("demo::Counter::add(int)",)
         writer = (f" --field value_ --code {quote('demo::Counter::store(int)')}"
                   )
+        identity_methods = ("demo::IdentityC1EBase::get() const",)
+        identity_writer = (f" --field value_ --code {quote('demo::IdentityC1EBase::set(int)')}"
+                           )
         before_build = (library.exists(), target.exists())
         assert before_build == (False, False), before_build
 
@@ -265,11 +357,23 @@ public:
                                    local_package, "demo::LocalBase"))
         local_prepared = out.expect(r"^(?:object-probe package=|prepared .*package|error:)")
         assert not local_prepared.string.startswith("error:"), local_prepared.string
+        send(repl, prepare_commands(("demo::UnitBase::value() const",), callbacks,
+                                   unit_package, "demo::UnitBase"))
+        out.expect(r"^object-probe package=.*type-unit-base.object")
         send(repl, prepare_commands(("demo::CtorOnly::value() const",), callbacks,
                                    ctor_only_package, "demo::CtorOnly"))
         ctor_only_prepared = out.expect(r"^(?:object-probe package=|prepared .*package|error:)")
         assert not ctor_only_prepared.string.startswith("error:"), ctor_only_prepared.string
-        for path in (package, bad_package, fresh_package, overlap, local_package, ctor_only_package):
+        send(repl, prepare_commands(identity_methods, callbacks, identity_method_package,
+                                    "demo::IdentityC1EBase"))
+        identity_method_prepared = out.expect(r"^(?:object-probe package=|prepared .*package|error:)")
+        assert not identity_method_prepared.string.startswith("error:"), identity_method_prepared.string
+        send(repl, prepare_commands(identity_methods, callbacks, identity_combined_package,
+                                    "demo::IdentityC1EBase") + identity_writer)
+        identity_combined_prepared = out.expect(r"^(?:object-probe package=|prepared .*package|error:)")
+        assert not identity_combined_prepared.string.startswith("error:"), identity_combined_prepared.string
+        for path in (package, bad_package, fresh_package, overlap, local_package, unit_package,
+                     ctor_only_package, identity_method_package, identity_combined_package):
             assert path.is_file() and path.read_bytes().startswith(b"CTKOPKG2"), path
         saved = package.read_bytes()
         obsolete = root / "obsolete.object"
@@ -289,7 +393,14 @@ public:
         # Compile the ELF only after offline preparation, then hide every source
         # input needed by preparation. Runtime preview must use the package.
         subprocess.run(compile_args, cwd=build, check=True)
-        subprocess.run([str(args.cxx), "-shared", str(build / "counter.o"), "-o", str(library)],
+        subprocess.run([str(args.cxx), "-std=c++20", "-g0", "-O0", "-fPIC", "-fno-inline",
+                        "-fpatchable-function-entry=8", f"-I{generated}", f"-I{root}",
+                        "-DCOUNTER_PAD_BYTES=13", "-c", str(hidden_source),
+                        "-o", str(hidden_object)], cwd=build, check=True)
+        subprocess.run([*compile_args[:-4], "-gdwarf-4", "-fdebug-types-section",
+                        "-c", str(unit_source), "-o", str(unit_object)], cwd=build, check=True)
+        subprocess.run([str(args.cxx), "-shared", str(build / "counter.o"),
+                        str(hidden_object), str(unit_object), "-o", str(library)],
                        cwd=build, check=True)
         subprocess.run([str(args.cxx), "-std=c++20", "-g", "-O0", "-fno-inline",
                         "-fpatchable-function-entry=8",
@@ -303,10 +414,35 @@ public:
             assert selector in nm, (selector, nm)
         assert "demo::CtorOnly::CtorOnly(int)" in nm, nm
         assert "demo::CtorOnly::~CtorOnly()" not in nm, nm
+        assert "demo::IdentityC1EBase::IdentityC1EBase(int)" in nm, nm
+        assert "demo::IdentityC1EBase::get() const" in nm, nm
         dwarf = subprocess.run(["readelf", "--debug-dump=info", "--wide", str(library)],
                                check=True, text=True, stdout=subprocess.PIPE).stdout
         assert "Counter" in dwarf and "value_" in dwarf
-        for path in (header, source, callbacks, bad_callbacks, generated / "counter_build_config.hpp"):
+        assert "Contents of the .debug_types section" in dwarf and "UnitDerived" in dwarf, dwarf
+        hidden_dwarf = subprocess.run(["readelf", "--debug-dump=info", "--wide",
+                                       str(hidden_object)], check=True, text=True,
+                                      stdout=subprocess.PIPE).stdout
+        assert not re.search(r"DW_TAG_(?:class_type|structure_type)", hidden_dwarf), hidden_dwarf
+        assert "HiddenDerived" not in dwarf, dwarf
+        target_relocations = subprocess.run(["readelf", "--relocs", "--wide", str(target)],
+                                            check=True, text=True,
+                                            stdout=subprocess.PIPE).stdout
+        c1_symbol = "_ZN4demo15IdentityC1EBaseC1Ei"
+        counter_c1_symbol = "_ZN4demo7CounterC1Ei"
+        assert c1_symbol in target_relocations and counter_c1_symbol in target_relocations, target_relocations
+        hidden_relocations = subprocess.run(
+            ["readelf", "--relocs", "--wide", str(hidden_object)], check=True,
+            text=True, stdout=subprocess.PIPE).stdout
+        assert "_ZN4demo15IdentityC1EBaseC2Ei" in hidden_relocations, hidden_relocations
+        target_dwarf = subprocess.run(["readelf", "--debug-dump=info", "--wide", str(target)],
+                                      check=True, text=True, stdout=subprocess.PIPE).stdout
+        for caller in ("identity_main_roundtrip", "identity_set_through_c",
+                       "cycle",
+                       "identity_get_through_c"):
+            assert caller in target_dwarf, (caller, target_dwarf)
+        for path in (header, source, hidden_source, unit_source, callbacks, bad_callbacks,
+                     generated / "counter_build_config.hpp"):
             shutil.move(path, hidden / path.name)
             assert not path.exists()
 
@@ -321,6 +457,8 @@ public:
         send(repl, f"%object-probe preview --package {quote(local_package)} --module libcounter.so")
         local_refusal = out.expect(r"^error: .*")
         assert "known derived construction of demo::LocalBase" in local_refusal.string, local_refusal.string
+        send(repl, f"%object-probe preview --package {quote(unit_package)} --module libcounter.so")
+        out.expect(r"^error: .*known derived construction of demo::UnitBase")
 
         ctor_only_binding = f"--package {quote(ctor_only_package)} --module libcounter.so"
         send(repl, f"%object-probe preview {ctor_only_binding}")
@@ -355,6 +493,122 @@ public:
         assert int(scalar(ctor_only_fields["object_id"])) == 0, ctor_only_event
         assert scalar(ctor_only_fields["identity_verified"]) in (False, "false", 0, "0"), ctor_only_event
 
+        def event_fields(event):
+            return {field.get("name"): scalar(field.get("value"))
+                    for field in event.get("objectFields", [])}
+
+        # Both main and a nonmember extern-C function construct IdentityC1EBase
+        # via its C1 PLT relocation, which is checked above at build time.
+        identity_binding = (f"--package {quote(identity_method_package)} "
+                            "--module libcounter.so")
+        send(repl, f"%object-probe preview {identity_binding}")
+        identity_preview = out.expect(r"^(?:object-probe preview|binding=|error:)")
+        assert not identity_preview.string.startswith("error:"), identity_preview.string
+        send(repl, f"%object-probe start {identity_binding}")
+        identity_started = out.expect(r"^object-probe registration=(\d+) active=yes methods=1")
+        identity_registration = identity_started[1]
+        identity_probe = out.expect(r"method_probe=(\d+) active=yes")[1]
+        send(repl, f"%record unobserved-dtor.db --sqlite --timeout 2 --after {ctor_only_record[1]}")
+        send(target_process, "u")
+        app.expect(r"^UNOBSERVED_DESTROYED$")
+        unobserved_record = out.expect(
+            r"^received=0 cursor=(\d+) .*timed_out=true .*recording=unobserved-dtor.db")
+        identity_after = int(unobserved_record[1])
+        send(repl, f"%record identity-main.db --sqlite --after {identity_after} --timeout 2")
+        send(target_process, "m")
+        app.expect(r"^IDENTITY_MAIN=42 EXTERN_C=62$")
+        identity_record = out.expect(
+            r"^received=10 cursor=(\d+) .*timed_out=true .*recording=identity-main.db")
+        send(repl, "%events open identity-main.db --as identity_main")
+        out.expect(r"^opened events=10 retained=10 evicted=0$")
+        send(repl, "%events export identity_main --format json --output identity-main.json")
+        send(repl, f"%object-probe stop {identity_registration}")
+        out.expect(rf"^object-probe registration={identity_registration} active=no .*restoration_pending=no")
+        identity_events = json.loads((root / "identity-main.json").read_text())
+        assert len(identity_events) == 10, identity_events
+        assert all(event.get("objectProbeRegistrationId") == identity_registration
+                   for event in identity_events), identity_events
+        identity_times = [int(event["monotonicTimeNs"]) for event in identity_events]
+        assert identity_times == sorted(identity_times), identity_events
+        identity_created = [event for event in identity_events
+                            if event.get("objectObservation", {}).get("kind") == "CREATED"]
+        identity_ended = [event for event in identity_events
+                          if event.get("objectObservation", {}).get("kind") == "TEARDOWN_END"]
+        identity_calls = [event for event in identity_events if event.get("probeId") == identity_probe]
+        assert len(identity_created) == len(identity_ended) == 2 and len(identity_calls) == 4, identity_events
+
+        def recorded_identity(event):
+            observation = event["objectObservation"]
+            return int(observation["lifetimeId"]), int(observation["generation"])
+
+        identities = {recorded_identity(event): identity_events.index(event) for event in identity_created}
+        assert len(identities) == 2 and {recorded_identity(event) for event in identity_ended} == set(identities)
+        assert all(object_id > 0 and generation > 0 for object_id, generation in identities)
+        call_counts = dict.fromkeys(identities, 0)
+        for event in identity_calls:
+            values = event_fields(event)
+            identity = int(values["object_id"]), int(values["object_generation"])
+            assert identity in identities and identities[identity] < identity_events.index(event), event
+            assert values["identity_verified"] in (True, "true", 1, "1")
+            call_counts[identity] += 1
+        assert all(count == 2 for count in call_counts.values()), identity_events
+
+        # A derived class compiled without DWARF has only a Base subobject
+        # constructor call. Combined method+writer observation must leave it
+        # provisional and must not publish a false complete-object CREATED.
+        hidden_binding = (f"--package {quote(identity_combined_package)} "
+                         "--module libcounter.so")
+        send(repl, f"%object-probe preview {hidden_binding}")
+        hidden_preview = out.expect(r"^(?:object-probe preview|binding=|error:)")
+        assert not hidden_preview.string.startswith("error:"), hidden_preview.string
+        send(repl, f"%object-probe start {hidden_binding}")
+        hidden_started = out.expect(r"^object-probe registration=(\d+) active=yes methods=1")
+        hidden_registration = hidden_started[1]
+        hidden_probe = out.expect(r"method_probe=(\d+) active=yes")[1]
+        send(repl, f"%record hidden-derived.db --sqlite --timeout 2 --after {identity_record[1]}")
+        send(target_process, "h")
+        app.expect(r"^HIDDEN_DERIVED=51$")
+        hidden_record = out.expect(
+            r"^received=(\d+) cursor=(\d+) .*timed_out=true .*recording=hidden-derived.db")
+        assert int(hidden_record[1]) > 0, "hidden derived call produced no method event"
+        send(repl, "%events open hidden-derived.db --as hidden_derived")
+        opened_hidden = out.expect(r"^opened events=(\d+) retained=\d+ evicted=0$")
+        send(repl, "%events export hidden_derived --format json --output hidden-derived.json")
+        send(repl, f"%object-probe stop {hidden_registration}")
+        out.expect(rf"^object-probe registration={hidden_registration} active=no .*restoration_pending=no")
+        hidden_events = json.loads((root / "hidden-derived.json").read_text())
+        assert len(hidden_events) == int(opened_hidden[1]), hidden_events
+        assert all(event.get("objectProbeRegistrationId") == hidden_registration
+                   for event in hidden_events), hidden_events
+        hidden_times = [int(event["monotonicTimeNs"]) for event in hidden_events]
+        assert hidden_times == sorted(hidden_times), hidden_events
+        hidden_observations = [event.get("objectObservation", {}) for event in hidden_events]
+        assert not any(observation.get("kind") == "CREATED" for observation in hidden_observations), hidden_events
+        hidden_destroy_begin = [event for event in hidden_events
+                                if event.get("objectObservation", {}).get("kind") == "DESTROY_BEGIN"]
+        hidden_teardown_end = [event for event in hidden_events
+                               if event.get("objectObservation", {}).get("kind") == "TEARDOWN_END"]
+        assert len(hidden_destroy_begin) == len(hidden_teardown_end) == 1, hidden_events
+        destroy_begin_observation = hidden_destroy_begin[0]["objectObservation"]
+        teardown_observation = hidden_teardown_end[0]["objectObservation"]
+        assert hidden_destroy_begin[0]["objectAddress"] == hidden_teardown_end[0]["objectAddress"], hidden_events
+        for observation in (destroy_begin_observation, teardown_observation):
+            assert int(observation.get("lifetimeId", 0)) == 0, observation
+            assert int(observation.get("generation", 0)) == 0, observation
+            assert observation.get("diagnostic") == (
+                "provisional destructor boundary with unverified complete-object identity"), observation
+        assert teardown_observation.get("closureReason") == "DESTRUCTOR_RETURN", teardown_observation
+        hidden_calls = [event for event in hidden_events
+                        if event.get("probeId") == hidden_probe and
+                        event.get("functionName", "").endswith("IdentityC1EBase::get() const")]
+        assert hidden_calls, hidden_events
+        for event in hidden_calls:
+            values = event_fields(event)
+            assert int(values["object_id"]) == int(values["object_generation"]) == 0, event
+            assert values["identity_verified"] in (False, "false", 0, "0"), event
+        assert all(not observation.get("lifetimeId") and not observation.get("generation")
+                   for observation in hidden_observations), hidden_events
+
         binding = f"--package {quote(package)} --module ./build-context/libcounter.so"
         send(repl, f"%object-probe preview --package {quote(obsolete)}")
         out.expect(r"^error: .*unsupported object-probe package format")
@@ -385,7 +639,7 @@ public:
         method_probe = out.expect(r"method_probe=(\d+) active=yes")
         send(repl, f"%object-probe preview {binding}")
         out.expect(r"^showing the verified binding of the active registration$")
-        send(repl, f"%record counter.db --sqlite --count 10 --after {ctor_only_record[1]} --timeout 10")
+        send(repl, f"%record counter.db --sqlite --count 10 --after {hidden_record[2]} --timeout 10")
         target_process.stdin.write("x\n")
         target_process.stdin.flush()
         app.expect(r"^CYCLED$")
@@ -489,6 +743,8 @@ public:
 
         events = json.loads((root / "counter.json").read_text())
         assert all(event.get("objectProbeRegistrationId") == registration for event in events), events
+        counter_times = [int(event["monotonicTimeNs"]) for event in events]
+        assert counter_times == sorted(counter_times), events
         observations = [event["objectObservation"] for event in events if "objectObservation" in event]
         created = [event for event in events if event.get("objectObservation", {}).get("kind") == "CREATED"]
         ended = [event for event in events if event.get("objectObservation", {}).get("kind") == "TEARDOWN_END"]
@@ -503,6 +759,11 @@ public:
             (int(event["objectObservation"]["lifetimeId"]),
              int(event["objectObservation"]["generation"])): events.index(event)
             for event in created
+        }
+        ended_at = {
+            (int(event["objectObservation"]["lifetimeId"]),
+             int(event["objectObservation"]["generation"])): events.index(event)
+            for event in ended
         }
         assert [(event["oldInteger"], event["newInteger"]) for event in writes] == [(10, 11), (20, 21)], writes
         calls = [event for event in events if event.get("functionName", "").startswith("demo::Counter::")]
@@ -527,6 +788,7 @@ public:
             identity = (int(values["object_id"]), int(values["object_generation"]))
             assert identity in identities, (identity, identities)
             assert created_at[identity] < events.index(event), (identity, events)
+            assert events.index(event) < ended_at[identity], (identity, events)
             assert values["identity_verified"] in (True, "true", 1, "1"), (event, values)
 
         for original, destination in ((header, hidden / header.name), (source, hidden / source.name),
