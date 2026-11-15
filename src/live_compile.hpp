@@ -50,7 +50,7 @@ struct Definition {
   std::optional<unsigned> system_definition;
 };
 
-bool mergeable_literal(const llvm::GlobalVariable &global);
+bool private_constant(const llvm::GlobalVariable &global);
 bool has_standard_stream_initializer(llvm::Module &module);
 void omit_standard_stream_initializer(llvm::Module &module);
 std::map<std::string, std::string> data_definitions(const CompiledUnit &unit);

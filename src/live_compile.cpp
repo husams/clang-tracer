@@ -14,11 +14,14 @@
 #include <clang/Lex/PPCallbacks.h>
 #include <clang/Lex/Preprocessor.h>
 #include <clang/Tooling/Tooling.h>
+#include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/StringExtras.h>
+#include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/IR/DebugInfoMetadata.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/GlobalAlias.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/Metadata.h>
 #include <llvm/Demangle/Demangle.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
@@ -271,6 +274,31 @@ std::string initializer_text(const llvm::GlobalVariable &global) {
   return text;
 }
 
+std::string constant_owners(const llvm::GlobalVariable &global) {
+  std::set<std::string> owners;
+  llvm::SmallPtrSet<const llvm::User *, 32> visited;
+  llvm::SmallVector<const llvm::User *> pending(global.users());
+  while (!pending.empty()) {
+    const auto *use = pending.pop_back_val();
+    if (!visited.insert(use).second)
+      continue;
+    if (const auto *instruction = llvm::dyn_cast<llvm::Instruction>(use)) {
+      owners.insert(instruction->getFunction()->getName().str());
+    } else if (const auto *parent = llvm::dyn_cast<llvm::GlobalValue>(use);
+               parent && !parent->hasPrivateLinkage()) {
+      owners.insert(parent->getName().str());
+    } else {
+      pending.append(use->user_begin(), use->user_end());
+    }
+  }
+  std::string names;
+  for (const auto &owner : owners) {
+    names += owner;
+    names += '\n';
+  }
+  return names;
+}
+
 std::unique_ptr<llvm::Module> comparison_module(const llvm::Module &module) {
   auto copy = llvm::CloneModule(module);
   llvm::StripDebugInfo(*copy);
@@ -278,24 +306,86 @@ std::unique_ptr<llvm::Module> comparison_module(const llvm::Module &module) {
   // Their contents and alignment, rather than that ordinal, define the
   // value used by each instruction and initializer.
   std::map<std::string, llvm::GlobalVariable *> literals;
+  llvm::SmallPtrSet<llvm::GlobalVariable *, 32> visited;
   llvm::SmallVector<llvm::GlobalVariable *> redundant;
-  for (auto &global : copy->globals()) {
-    if (!mergeable_literal(global))
-      continue;
-    const auto name = ".live.literal." + ir_digest(initializer_text(global) + ":" +
-        std::to_string(global.getAlign().valueOrOne().value()));
-    const auto [prior, inserted] = literals.emplace(name, &global);
-    if (!inserted && global.getInitializer() == prior->second->getInitializer() &&
-        global.getType() == prior->second->getType()) {
-      global.replaceAllUsesWith(prior->second);
-      redundant.push_back(&global);
-    } else {
-      global.setName(name);
+  const auto name_literal = [&](auto &&self, llvm::GlobalVariable &global) -> void {
+    if (!private_constant(global) || !visited.insert(&global).second)
+      return;
+    // Aggregate constants can refer to pooled strings and other constants.
+    // Visit referenced globals before printing the initializer. Collect the
+    // references before coalescing because that can replace constants in IR.
+    llvm::SmallVector<llvm::GlobalVariable *> references;
+    llvm::SmallVector<llvm::Constant *> pending{global.getInitializer()};
+    while (!pending.empty()) {
+      auto *operand = pending.pop_back_val();
+      if (auto *reference = llvm::dyn_cast<llvm::GlobalVariable>(operand))
+        references.push_back(reference);
+      else if (!llvm::isa<llvm::GlobalValue, llvm::BlockAddress>(operand))
+        for (auto &nested : operand->operands())
+          pending.push_back(llvm::cast<llvm::Constant>(nested.get()));
     }
-  }
+    for (auto *reference : references)
+      self(self, *reference);
+    const auto identity = global.hasGlobalUnnamedAddr() ? std::string{} : constant_owners(global);
+    const auto name = ".live.literal." + ir_digest(initializer_text(global) + ":" +
+        std::to_string(global.getAlign().valueOrOne().value()) + ":" + identity);
+    if (global.hasGlobalUnnamedAddr()) {
+      const auto [prior, inserted] = literals.emplace(name, &global);
+      if (!inserted && global.getInitializer() == prior->second->getInitializer() &&
+          global.getType() == prior->second->getType()) {
+        global.replaceAllUsesWith(prior->second);
+        redundant.push_back(&global);
+        return;
+      }
+    }
+    global.setName(name);
+  };
+  for (auto &global : copy->globals())
+    name_literal(name_literal, global);
   for (auto *global : redundant)
     global->eraseFromParent();
   return copy;
+}
+
+void append_instruction_metadata(llvm::Function &function, llvm::raw_ostream &out) {
+  llvm::DenseMap<const llvm::MDNode *, unsigned> nodes;
+  const auto describe = [&](auto &&self, const llvm::Metadata *metadata) -> void {
+    if (const auto *node = llvm::dyn_cast_or_null<llvm::MDNode>(metadata)) {
+      const auto [prior, inserted] = nodes.try_emplace(node, nodes.size());
+      out << '!' << prior->second;
+      if (inserted) {
+        out << ':' << node->getMetadataID() << ':' << node->isDistinct() << '{';
+        for (const auto &operand : node->operands()) {
+          self(self, operand.get());
+          out << ',';
+        }
+        out << '}';
+      }
+    } else if (metadata) {
+      metadata->printAsOperand(out, function.getParent());
+    } else {
+      out << "null";
+    }
+  };
+  llvm::SmallVector<llvm::StringRef> kinds;
+  function.getContext().getMDKindNames(kinds);
+  unsigned index = 0;
+  for (auto &block : function) {
+    for (auto &instruction : block) {
+      llvm::SmallVector<std::pair<unsigned, llvm::MDNode *>> attachments;
+      instruction.getAllMetadataOtherThanDebugLoc(attachments);
+      llvm::sort(attachments, [&](const auto &a, const auto &b) {
+        return kinds[a.first] < kinds[b.first];
+      });
+      for (const auto &[kind, node] : attachments) {
+        out << index << ':' << kinds[kind] << '=';
+        describe(describe, node);
+        out << '\n';
+        instruction.setMetadata(kind, nullptr);
+      }
+      ++index;
+    }
+  }
 }
 
 struct StreamInitializer {
@@ -350,13 +440,9 @@ std::optional<StreamInitializer> standard_stream_initializer(llvm::Module &modul
 }
 } // namespace
 
-bool mergeable_literal(const llvm::GlobalVariable &global) {
-  const auto name = global.getName();
-  return global.hasPrivateLinkage() && global.hasGlobalUnnamedAddr() && global.isConstant() &&
-         global.hasInitializer() && (name.starts_with(".str") || name.starts_with("__const.") ||
-                                    name.starts_with("__PRETTY_FUNCTION__.") ||
-                                    name.starts_with(".live.literal.")) &&
-         llvm::isa<llvm::ConstantDataSequential, llvm::ConstantAggregateZero>(global.getInitializer());
+bool private_constant(const llvm::GlobalVariable &global) {
+  return global.hasPrivateLinkage() && global.isConstant() && global.hasInitializer() &&
+         !global.isThreadLocal();
 }
 
 bool has_standard_stream_initializer(llvm::Module &module) {
@@ -384,7 +470,7 @@ std::map<std::string, std::string> data_definitions(const CompiledUnit &unit) {
   omit_standard_stream_initializer(*module);
   std::map<std::string, std::string> data;
   for (const auto &global : module->globals()) {
-    if (!global.hasInitializer() || mergeable_literal(global))
+    if (!global.hasInitializer() || private_constant(global))
       continue;
     const auto size = module->getDataLayout().getTypeAllocSize(global.getValueType());
     data.emplace(global.getName().str(), std::to_string(size.getKnownMinValue()) + ":" +
@@ -492,6 +578,7 @@ std::map<std::string, Definition> definitions(const CompiledUnit &unit) {
     std::string ir;
     llvm::raw_string_ostream implementation(ir);
     auto &body = *normalized->getFunction(function.getName());
+    append_instruction_metadata(body, implementation);
     implementation << body.getAttributes().getFnAttrs().getAsString() << '\n';
     body.setAttributes(body.getAttributes().removeFnAttributes(body.getContext()));
     // Attribute group IDs also belong to the module. Keep their contents

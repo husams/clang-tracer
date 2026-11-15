@@ -881,7 +881,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         if (!value.hasName())
           continue;
         const auto *global = llvm::dyn_cast<llvm::GlobalVariable>(&value);
-        if (global && mergeable_literal(*global))
+        if (global && private_constant(*global))
           continue;
         const auto name = value.getName().str();
         const auto import = value.hasLocalLinkage() ? local_import_name(path, name) : name;

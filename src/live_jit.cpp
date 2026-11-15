@@ -346,6 +346,15 @@ std::shared_ptr<JitImage> compile_in_target(const JitRequest &request) {
     llvm::ModuleAnalysisManager analyses;
     llvm::GlobalDCEPass().run(*linked, analyses);
   }
+  if (request.resolve_standard_runtime) {
+    // Clang may emit address-sensitive backing storage for unrelated code.
+    // Once unused code is dropped, any such surviving object could expose
+    // an address different from the native revision's.
+    for (const auto &global : linked->globals())
+      if (private_constant(global) && !global.hasGlobalUnnamedAddr())
+        throw std::runtime_error("rebuild required: unverified address-sensitive constant " +
+                                 global.getName().str());
+  }
   auto image = std::make_shared<Image>(request.resolve_standard_runtime);
   image->add(std::move(linked), std::move(context), request.imports);
   // Materialize selected entrypoints now, before the transaction stops peers.

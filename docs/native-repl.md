@@ -102,8 +102,10 @@ including reverted generations. Reconnect to the same server to inspect
 the active revision.
 
 Empty string literals and function-local literal arrays can change with
-their code. Changes to existing static storage or record layouts require a
-rebuild or a managed migration. Translation-unit-local functions and data
+their code. A replacement that would expose a different address for a
+compiler-generated constant requires a rebuild. Changes to existing static
+storage or record layouts require a rebuild or a managed migration.
+Translation-unit-local functions and data
 require an unambiguous ELF file marker and exact symbol. Each changed function
 also requires a patchable native entry. When a recorded unit initialized the
 standard streams, replacement units can reuse them. Existing native storage

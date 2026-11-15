@@ -45,10 +45,12 @@ int main() {
 """
 
 APP = """
+#include <array>
 #include <cstdio>
 #include <ctime>
 #include <iostream>
 #include <sstream>
+#include <string_view>
 #include <vector>
 #include <unistd.h>
 #define LIVE_ENTRY __attribute__((patchable_function_entry(16, 0)))
@@ -64,6 +66,14 @@ LIVE_ENTRY int calculate(int i) { int values[] = {1, 2, 3}; return values[i % 3]
 int adjacent_value() { return storage.adjacent; }
 int vector_entry(int i) { std::vector<int> values; values.push_back(i); return values.back(); }
 int formatted(int i) { std::ostringstream out; out << i; return out.str().size(); }
+int accepted_key(std::string_view name) {
+  const std::array<std::string_view, 2> keys{"deposit", "withdraw"};
+  for (const auto &key : keys)
+    if (name == key) return key.size();
+  for (auto key : {std::string_view{"settled"}, std::string_view{"pending"}})
+    if (name == key) return key.size();
+  return 0;
+}
 """
 
 OTHER = """
