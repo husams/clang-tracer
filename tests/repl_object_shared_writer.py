@@ -23,9 +23,10 @@ def expect_error(out, pattern):
     assert pattern in row[1], row.string
 
 
-def capture(root, args, app, app_out, repl, repl_out, session, endpoint, module, executable, label):
-    package = root / f"{label}-plan"
-    if executable:
+def capture(root, args, app, app_out, repl, repl_out, session, endpoint, cleanup, label, *, saved=False):
+    module = args.library
+    if saved:
+        package = root / f"{label}-plan"
         send(repl, f'%object prepare shared_writer::Record --executable "{args.fixture}" '
                    f'--module "{module}" --field value '
                    f'--code "shared_writer::write(shared_writer::Record &, int, bool)" '
@@ -89,7 +90,8 @@ def run(args):
         target, app = start([args.fixture], root, cleanup)
         app.expect(r"^READY$")
         disassembly = subprocess.check_output([args.objdump, "-Cd", args.library], text=True)
-        assert any("call" in line and "<shared_writer::adjust(" in line and "@plt>" in line
+        assert any("call" in line and ("<shared_writer::adjust(" in line or
+                                       "<_ZN13shared_writer6adjustE" in line) and "@plt>" in line
                    for line in disassembly.splitlines()), "fixture must retain an intra-DSO PLT call"
         repl, out = start([args.repl, "--endpoint", endpoint, "--attach", str(target.pid)],
                           root, cleanup)
@@ -105,12 +107,12 @@ def run(args):
         expect_error(out, "--follow-calls --module")
         assert repl.poll() is None, "the REPL should remain available for the next diagnostic case"
 
-        capture(root, args, target, app, repl, out, session, endpoint, args.library, False, "live")
+        capture(root, args, target, app, repl, out, session, endpoint, cleanup, "live")
         send(repl, f'%object prepare shared_writer::Record --module "{args.library}" '
                    '--field value --code "shared_writer::write(shared_writer::Record &, int, bool)" '
                    f'--backend code-cache --follow-calls --output "{root / "invalid-plan"}"')
         expect_error(out, "names a shared ELF without a program interpreter")
-        capture(root, args, target, app, repl, out, session, endpoint, args.library, True, "saved")
+        capture(root, args, target, app, repl, out, session, endpoint, cleanup, "saved", saved=True)
 
         send(repl, "%detach")
         out.expect(rf"^detached session={session}$")
