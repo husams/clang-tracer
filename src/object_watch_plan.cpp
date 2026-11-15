@@ -185,7 +185,7 @@ bool is_ctor_or_dtor_caller(DWARFDie function) {
     function = function.getParent();
   if (!function)
     return true;
-  const auto *linkage = function.getName(llvm::DINameKind::LinkageName);
+  const auto *linkage = function.getLinkageName();
   if (!linkage)
     return true;
   if (!std::string_view(linkage).starts_with("_Z"))
