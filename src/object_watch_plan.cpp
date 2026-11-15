@@ -44,6 +44,10 @@ namespace dw = llvm::dwarf;
 using llvm::DWARFDie;
 using llvm::object::ObjectFile;
 
+struct MissingElfSymbol : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
 auto open_elf(const std::string &path) {
   auto binary = llvm::object::createBinary(path);
   if (!binary)
@@ -1509,9 +1513,9 @@ Range select(const std::vector<Symbol> &symbols, const std::string &name,
       candidates.insert(symbol.range);
   }
   if (candidates.empty())
-    throw std::runtime_error("missing object watch ELF symbol: " + name);
+    throw MissingElfSymbol("missing or ambiguous object watch ELF symbol: " + name);
   if (candidates.size() != 1)
-    throw std::runtime_error("ambiguous object watch ELF symbol: " + name);
+    throw std::runtime_error("missing or ambiguous object watch ELF symbol: " + name);
   return *candidates.begin();
 }
 
@@ -1949,8 +1953,8 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   } catch (const std::exception &error) {
     const std::string message = error.what();
     const bool missing_main_match = pid && !main_ && request.code_module().empty() &&
-        (message.starts_with("no supported matching callable in mapped ELF debug information") ||
-         message.starts_with("missing object watch ELF symbol: "));
+        (dynamic_cast<const MissingElfSymbol *>(&error) ||
+         message.starts_with("no supported matching callable in mapped ELF debug information"));
     if (!missing_main_match)
       throw;
     std::set<std::string> matches;
