@@ -135,8 +135,11 @@ int main(int argc, char **argv) {
   else if (test == "variant_change") cell.variant_change();
   else if (test == "variant_valueless") cell.variant_valueless();
   else if (test == "any_text") cell.any_text();
-  else if (test == "delegated_text") cell.delegated_text();
-  else if (test == "any_inline") cell.any_inline();
+  else if (test == "delegated_text") {
+    cell.delegated_text();
+    if (std::puts("DELEGATED") == EOF)
+      return 3;
+  } else if (test == "any_inline") cell.any_inline();
   else if (test == "any_heap") cell.any_heap();
   else return 2;
   if (!cell.check(test))

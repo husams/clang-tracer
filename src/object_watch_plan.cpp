@@ -902,7 +902,7 @@ void set_field_layout(Layout &layout, DWARFDie field) {
     const auto internal = member(storage.type, "_M_buffer");
     if (!pointer(manager.type) || type(manager.type).getTag() != dw::DW_TAG_subroutine_type ||
         !pointer(external.type) || external.offset != internal.offset ||
-        size_of(internal.type) != size_of(external.type))
+        storage_size(internal.type) != size_of(external.type))
       throw std::runtime_error("cannot verify std::any manager and storage layout");
     complex.selector = manager.offset;
     complex.selector_width = 8;

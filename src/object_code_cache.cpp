@@ -470,7 +470,7 @@ struct Watch::Impl {
           add_entry(start, size);
           continue;
         }
-        if (request.writer_entry() || plan.writer_address_taken(start)) {
+        if (plan.layout.value_write.active() || request.writer_entry() || plan.writer_address_taken(start)) {
           prepare_writer_entry(start, size);
           continue;
         }
