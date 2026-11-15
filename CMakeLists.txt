@@ -280,6 +280,8 @@ if(BUILD_TESTING)
     tests/fixtures/live_data/model.cpp src/live_data.cpp src/live_data_jit.cpp
     src/live_data_scan.cpp src/debug_resolver.cpp)
   target_include_directories(live-data-target-tests PRIVATE src ${LLVM_INCLUDE_DIRS})
+  target_compile_definitions(live-data-target-tests PRIVATE
+    TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
   target_link_libraries(live-data-target-tests PRIVATE
     live-test-jit tracer_proto Threads::Threads)
   target_compile_options(live-data-target-tests PRIVATE -g -O0)
