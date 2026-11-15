@@ -587,6 +587,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     std::string name;
     std::string unit;
     bool local;
+    bool has_storage_definition;
     std::optional<std::uint64_t> size;
   };
   std::multimap<std::string, Reference> referenced;
@@ -663,7 +664,8 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         std::optional<std::uint64_t> size;
         if (global && global->getValueType()->isSized())
           size = after.module->getDataLayout().getTypeAllocSize(global->getValueType()).getFixedValue();
-        referenced.emplace(import, Reference{name, path, value.hasLocalLinkage(), size});
+        referenced.emplace(import, Reference{name, path, value.hasLocalLinkage(),
+                                             global && global->hasInitializer(), size});
       }
     }
   }
@@ -797,7 +799,10 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       if (mapped_bias != bias)
         throw Stale("import moved across ELF instances: " + name);
     }
-    if (symbol->type == llvm::ELF::STT_OBJECT && ref.size && *ref.size != symbol->size) {
+    // Some external IR declarations, including RTTI vtables, describe a
+    // prefix or placeholder for larger native storage.
+    if (symbol->type == llvm::ELF::STT_OBJECT && ref.size &&
+        (*ref.size > symbol->size || (ref.has_storage_definition && *ref.size != symbol->size))) {
       block(ref.unit, name, "rebuild required: imported storage size differs from the ELF");
       continue;
     }
