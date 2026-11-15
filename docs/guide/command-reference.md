@@ -727,7 +727,7 @@ Save a reusable object definition and verified ELF bindings without attaching. U
 **Usage**
 
 ```plain
-%object prepare TYPE --module ELF --field FIELD --code SELECTOR --output DIRECTORY
+%object prepare TYPE [--executable APP] --module ELF --field FIELD --code SELECTOR --output DIRECTORY
 ```
 
 **Example**
@@ -736,7 +736,15 @@ Save a reusable object definition and verified ELF bindings without attaching. U
 %object prepare demo::PlanRecord --module ./build/repl-object-plan-target --field value --code "demo::write_value(demo::PlanRecord &)" --backend code-cache --output record-watch
 ```
 
-Use a fresh plan directory for prepare. Preview and start accept a saved plan; method plans use `--on METHOD --include HEADER --policy HEADER --synchronization MODE` at preparation.
+For a shared-library writer, pass the process executable as `--executable APP`
+and the writer library as `--module LIB`. Add `--follow-calls` for a non-leaf
+shared writer with the code-cache backend.
+
+```plain
+%object prepare demo::Record --executable ./app --module ./libdemo.so --field value --code "demo::write_value(demo::Record &)" --backend code-cache --follow-calls --output record-watch
+```
+
+Use a fresh plan directory for prepare. Preview and start accept a saved plan. At preparation, method plans use `--on METHOD --include HEADER --policy HEADER --synchronization MODE`.
 
 [Object-watch lesson](tutorials.md#lesson-17-trace-writes-without-rebuilding-the-target) and [method snapshots](advanced.md#watch-logical-state-at-method-boundaries).
 

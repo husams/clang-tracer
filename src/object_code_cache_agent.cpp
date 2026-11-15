@@ -224,8 +224,16 @@ struct RuntimeImage {
   llvm::object::OwningBinary<llvm::object::Binary> binary;
   std::uint32_t module_index = 0;
 
+  struct PltStub {
+    Address got_address = 0;
+    Address lazy_target = 0;
+    Address file_offset = 0;
+    std::string bytes;
+  };
+
   explicit RuntimeImage(const RuntimeLocation &location);
   std::pair<std::string, Address> function(Address elf_address) const;
+  std::optional<PltStub> plt_stub(Address elf_address) const;
 };
 
 struct State {
@@ -271,6 +279,7 @@ struct State {
   bool recycler_started = false;
   std::atomic<std::uint64_t> runtime_inflight{0};
   std::map<RuntimeImageKey, RuntimeImage> runtime_images;
+  std::map<std::pair<RuntimeImageKey, Address>, RuntimeImage::PltStub> runtime_plt_stubs;
   std::map<std::pair<RuntimeImageKey, Address>, RuntimeBlock *> runtime_targets;
   std::map<std::tuple<dev_t, ino_t, Address, Address>, RuntimeBlock *> runtime_scopes;
   std::atomic<RuntimeBlock *> runtime_blocks{nullptr};
@@ -377,6 +386,7 @@ void reclaim_code(State *watch) noexcept {
         watch->runtime_targets.clear();
         watch->runtime_scopes.clear();
         watch->runtime_images.clear();
+        watch->runtime_plt_stubs.clear();
         channel.runtime_reclaimed.store(reclaimed, std::memory_order_release);
         runtime_done = true;
       }
@@ -4154,6 +4164,104 @@ std::pair<std::string, Address> RuntimeImage::function(Address address) const {
   throw std::runtime_error("runtime callee exceeds executable ELF segment");
 }
 
+std::optional<RuntimeImage::PltStub> RuntimeImage::plt_stub(Address address) const {
+#if !defined(__x86_64__)
+  (void)address;
+  return std::nullopt;
+#else
+  const auto &object = *llvm::cast<llvm::object::ELF64LEObjectFile>(binary.getBinary());
+  std::optional<llvm::object::ELFSectionRef> entry_section;
+  std::optional<llvm::object::ELFSectionRef> lazy_section;
+  for (const auto &section : object.sections()) {
+    auto name = section.getName();
+    if (!name) {
+      llvm::consumeError(name.takeError());
+      continue;
+    }
+    if ((*name != ".plt" && *name != ".plt.sec" && *name != ".plt.got") || !section.isText())
+      continue;
+    if (*name == ".plt")
+      lazy_section = llvm::object::ELFSectionRef(section);
+    if (address >= section.getAddress() && address - section.getAddress() < section.getSize())
+      entry_section = llvm::object::ELFSectionRef(section);
+  }
+  if (!entry_section)
+    return std::nullopt;
+  auto contents = entry_section->getContents();
+  if (!contents) {
+    llvm::consumeError(contents.takeError());
+    return std::nullopt;
+  }
+  const auto offset = address - entry_section->getAddress();
+  const auto entry = contents->substr(offset);
+  auto jump = entry;
+  if (jump.starts_with("\xf3\x0f\x1e\xfa")) // ENDBR64
+    jump = jump.drop_front(4);
+  if (jump.starts_with("\xf2\xff\x25")) // BND-prefixed indirect jump
+    jump = jump.drop_front(1);
+  if (jump.size() < 6 || !jump.starts_with("\xff\x25"))
+    return std::nullopt;
+  std::int32_t displacement = 0;
+  std::memcpy(&displacement, jump.data() + 2, sizeof(displacement));
+  const auto size = entry.size() - jump.size() + 6;
+  const Address got = address + size + displacement;
+  if (got % alignof(Address))
+    return std::nullopt;
+
+  // The RIP-relative slot must be backed by a dynamic GOT relocation.
+  bool got_slot = false;
+  bool jump_slot = false;
+  for (const auto &section : object.sections()) {
+    if (!(llvm::object::ELFSectionRef(section).getFlags() & llvm::ELF::SHF_ALLOC))
+      continue;
+    for (const auto &relocation : section.relocations()) {
+      if (relocation.getOffset() != got)
+        continue;
+      jump_slot |= relocation.getType() == llvm::ELF::R_X86_64_JUMP_SLOT;
+      got_slot |= relocation.getType() == llvm::ELF::R_X86_64_GLOB_DAT;
+    }
+  }
+  if (!jump_slot && !got_slot)
+    return std::nullopt;
+
+  auto headers = object.getELFFile().program_headers();
+  if (!headers) {
+    llvm::consumeError(headers.takeError());
+    return std::nullopt;
+  }
+  const auto file = object.getMemoryBufferRef().getBuffer();
+  const auto file_range = [&](Address start, std::size_t length, unsigned flags) -> std::optional<Address> {
+    for (const auto &segment : *headers) {
+      if (segment.p_type != PT_LOAD || (segment.p_flags & flags) != flags ||
+          start < segment.p_vaddr || segment.p_offset > file.size() ||
+          segment.p_filesz > file.size() - segment.p_offset)
+        continue;
+      const Address delta = start - segment.p_vaddr;
+      if (delta <= segment.p_filesz && length <= segment.p_filesz - delta)
+        return segment.p_offset + delta;
+    }
+    return std::nullopt;
+  };
+  const auto stub_offset = file_range(address, size, PF_X);
+  const auto got_offset = file_range(got, sizeof(Address), PF_R);
+  if (!stub_offset || *stub_offset != entry_section->getOffset() + offset || !got_offset)
+    return std::nullopt;
+
+  // For lazy JUMP_SLOT binding the file's initial GOT word points back into
+  // .plt, both for the classic continuation and a separate IBT resolver stub.
+  Address lazy_target = 0;
+  if (jump_slot && lazy_section) {
+    Address initial = 0;
+    std::memcpy(&initial, file.data() + *got_offset, sizeof(initial));
+    const auto begin = lazy_section->getAddress();
+    if (initial >= begin && initial - begin < lazy_section->getSize() &&
+        file_range(initial, 1, PF_X))
+      lazy_target = initial;
+  }
+  return PltStub{got, lazy_target, *stub_offset, entry.take_front(size).str()};
+#endif
+}
+
 bool matches_runtime_bytes(Address target, const RuntimeLocation &location, const RuntimeBlock &block) {
   if (block.file_offset != location.offset || block.bytes.size() > location.end - target)
     return false;
@@ -4426,11 +4534,9 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
     try {
       // Query the loader before taking the watch lock. Loader callbacks can
       // enter application code on a different thread.
-      const auto location = locate_runtime_target(target);
-      const RuntimeImageKey image_key{location.device, location.inode, location.bias,
-                                      location.unload_generation};
-      const auto target_key = std::pair{image_key, target};
-      const auto scope_key = std::tuple{location.device, location.inode, location.bias, target};
+      auto location = locate_runtime_target(target);
+      RuntimeImageKey image_key{location.device, location.inode, location.bias,
+                                location.unload_generation};
       std::unique_lock lock(watch.runtime_mutex);
       const auto enter = [&](const RuntimeBlock &block) {
         if (watch.channel->reclaim_request.load(std::memory_order_acquire))
@@ -4442,6 +4548,61 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
       };
       if (watch.channel->reclaim_request.load(std::memory_order_acquire))
         return fallback;
+      std::optional<RuntimeImage> fresh;
+      const auto image_for = [&]() -> const RuntimeImage & {
+        const auto known = watch.runtime_images.find(image_key);
+        if (known != watch.runtime_images.end()) {
+          fresh.reset();
+          return known->second;
+        }
+        if (!fresh) {
+          if (location.path.size() >= RuntimeModule{}.path.size())
+            throw std::runtime_error("runtime module path exceeds the event format");
+          fresh.emplace(location);
+        }
+        return *fresh;
+      };
+#if defined(__x86_64__)
+      using PltStub = RuntimeImage::PltStub;
+      const auto stub_key = std::pair{image_key, target};
+      const PltStub *plt = nullptr;
+      std::optional<PltStub> stub;
+      if (const auto cached = watch.runtime_plt_stubs.find(stub_key); cached != watch.runtime_plt_stubs.end()) {
+        plt = &cached->second;
+      } else if (watch.runtime_targets.find(stub_key) == watch.runtime_targets.end()) {
+        stub = image_for().plt_stub(target - location.bias);
+        if (stub) {
+          plt = &*stub;
+          if (watch.runtime_plt_stubs.size() < watch.runtime_limit)
+            plt = &watch.runtime_plt_stubs.emplace(stub_key, std::move(*stub)).first->second;
+        }
+      }
+      if (plt) {
+        std::array<char, 11> live_stub{};
+        if (plt->file_offset != location.offset || plt->bytes.size() > location.end - target ||
+            !read_self_memory(target, live_stub.data(), plt->bytes.size()) ||
+            std::memcmp(live_stub.data(), plt->bytes.data(), plt->bytes.size()))
+          throw std::runtime_error("runtime PLT bytes disagree with the mapped ELF");
+        Address slot_value = 0;
+        if (!read_self(location.bias + plt->got_address, slot_value))
+          throw std::runtime_error("cannot read the verified runtime PLT GOT slot");
+        if (plt->lazy_target && slot_value == location.bias + plt->lazy_target)
+          return fallback;
+        lock.unlock();
+        location = locate_runtime_target(slot_value);
+        lock.lock();
+        target = slot_value;
+        image_key = {location.device, location.inode, location.bias, location.unload_generation};
+        if (image_key != stub_key.first)
+          fresh.reset();
+        if (watch.channel->reclaim_request.load(std::memory_order_acquire) ||
+            std::binary_search(watch.static_scopes.begin(), watch.static_scopes.end(), target))
+          return fallback;
+      }
+#endif
+      // The resolved target key uses the current GOT value for PLT calls.
+      const auto target_key = std::pair{image_key, target};
+      const auto scope_key = std::tuple{location.device, location.inode, location.bias, target};
       if (const auto cached = watch.runtime_scopes.find(scope_key); cached != watch.runtime_scopes.end()) {
         const auto &scope = *cached->second;
         if (watch.channel->scope_status(watch.event_buffer, watch.runtime_limit, scope.scope_index)
@@ -4468,14 +4629,7 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
         gap = 2;
         throw std::runtime_error("runtime translation limit reached");
       }
-      const auto known = watch.runtime_images.find(image_key);
-      std::optional<RuntimeImage> fresh;
-      if (known == watch.runtime_images.end()) {
-        if (location.path.size() >= RuntimeModule{}.path.size())
-          throw std::runtime_error("runtime module path exceeds the event format");
-        fresh.emplace(location);
-      }
-      const auto &image = fresh ? *fresh : known->second;
+      const auto &image = image_for();
       auto block = std::make_unique<RuntimeBlock>();
       std::tie(block->bytes, block->file_offset) = image.function(target - location.bias);
       if (!matches_runtime_bytes(target, location, *block))

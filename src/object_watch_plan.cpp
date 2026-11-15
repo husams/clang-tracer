@@ -1508,8 +1508,10 @@ Range select(const std::vector<Symbol> &symbols, const std::string &name,
     if (symbol.kind == kind && matches(symbol))
       candidates.insert(symbol.range);
   }
+  if (candidates.empty())
+    throw std::runtime_error("missing object watch ELF symbol: " + name);
   if (candidates.size() != 1)
-    throw std::runtime_error("missing or ambiguous object watch ELF symbol: " + name);
+    throw std::runtime_error("ambiguous object watch ELF symbol: " + name);
   return *candidates.begin();
 }
 
@@ -1524,8 +1526,20 @@ std::string writer_module(std::uint32_t pid, const std::string &executable,
     if (selector == path || selector == std::filesystem::path(path).filename())
       candidates.push_back(path);
   if (candidates.size() != 1)
-    throw std::runtime_error("--module must identify one live ELF by path or basename");
+    throw std::runtime_error("--module must identify one live ELF by path or basename; "
+        "prepare shared writer plans with --executable APP --module LIB");
   return candidates.front();
+}
+
+bool has_program_interpreter(const llvm::object::ELF64LEObjectFile &object) {
+  auto programs = object.getELFFile().program_headers();
+  if (!programs) {
+    llvm::consumeError(programs.takeError());
+    return false;
+  }
+  return std::any_of(programs->begin(), programs->end(), [](const auto &program) {
+    return program.p_type == llvm::ELF::PT_INTERP;
+  });
 }
 // Read the call-site table used by the Itanium C++ unwinder on ELF. The
 // common GCC and Clang form uses the FDE entry as LPStart and ULEB128 or
@@ -1904,6 +1918,15 @@ Plan::Plan(std::uint32_t pid, std::string executable,
            const clangtracer::v1::ObjectWatchRequest &request)
     : module(writer_module(pid, executable, request.code_module())) {
   using Request = clangtracer::v1::ObjectWatchRequest;
+  if (!pid && request.code_module().empty()) {
+    const auto binary = open_elf(executable);
+    const auto &object = llvm::cast<llvm::object::ELF64LEObjectFile>(*binary.getBinary());
+    const auto &header = object.getELFFile().getHeader();
+    if (header.e_type == llvm::ELF::ET_DYN && header.e_entry == 0 &&
+        !has_program_interpreter(object))
+      throw std::invalid_argument("%object prepare --module names a shared ELF without a program interpreter; "
+          "use --executable APP --module LIB");
+  }
   if (request.follow_calls() && (request.backend() != Request::CODE_CACHE ||
                                 request.mode() != Request::WRITES))
     throw std::invalid_argument("runtime call following requires code-cache write capture");
@@ -1919,8 +1942,38 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   image_ = std::make_unique<Image>(pid, module, module == executable);
   if (module != executable)
     main_ = std::make_unique<Image>(pid, executable, true);
-  const auto writer = image_->function(pid, request.code_symbol(),
-      request.backend() == clangtracer::v1::ObjectWatchRequest::CODE_CACHE);
+  Range writer;
+  try {
+    writer = image_->function(pid, request.code_symbol(),
+        request.backend() == clangtracer::v1::ObjectWatchRequest::CODE_CACHE);
+  } catch (const std::exception &error) {
+    const std::string message = error.what();
+    const bool missing_main_match = pid && !main_ && request.code_module().empty() &&
+        (::tracer::compat::starts_with(message, "no supported matching callable in mapped ELF debug information") ||
+         ::tracer::compat::starts_with(message, "missing object watch ELF symbol: "));
+    if (!missing_main_match)
+      throw;
+    std::set<std::string> matches;
+    for (const auto &path : client::list_debug_modules(pid)) {
+      if (path == executable)
+        continue;
+      try {
+        Image candidate(pid, path, false);
+        (void)candidate.function(pid, request.code_symbol(),
+            request.backend() == Request::CODE_CACHE);
+        matches.insert(path);
+      } catch (const std::exception &) {
+        // Other modules are only diagnostic candidates; keep the main-image error.
+      }
+    }
+    if (matches.size() == 1)
+      throw std::runtime_error("writer is in shared module " + *matches.begin() +
+          "; use --module \"" + *matches.begin() +
+          "\" (add --follow-calls for a non-leaf code-cache writer)");
+    if (matches.size() > 1)
+      throw std::runtime_error("writer matches multiple shared modules; specify --module with one mapped ELF");
+    throw;
+  }
   writer_start = image_->bind(pid, writer);
   bias = *image_->bias;
   const auto writer_debug = image_->dwarf->getDIEsForAddress(writer.first);
@@ -2386,6 +2439,12 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     const auto decoded = native_entry::scan(start, bytes);
     if (decoded.decode_failed || !decoded.diagnostic.empty())
       throw std::runtime_error("cannot decode the selected writer function");
+    if (shared_writer() && request.backend() == Request::CODE_CACHE && !request.follow_calls() &&
+        std::any_of(decoded.instructions.begin(), decoded.instructions.end(), [](const auto &inst) {
+          return inst.flow == native_entry::Flow::call;
+        }))
+      throw std::runtime_error("shared writer in " + module +
+          " contains calls; use --follow-calls --module \"" + module + "\"");
     auto previous_end = start;
     const auto indirect = std::find_if(std::begin(decoded.instructions), std::end(decoded.instructions), [](const auto &instruction) {
       return instruction.flow == native_entry::Flow::branch && !instruction.target;

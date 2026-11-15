@@ -544,6 +544,20 @@ Replace `WATCH_ID` with the ID printed by start. While `%record` is waiting, ent
 
 Stop restores the verified instruction bytes. Check `active=no` and `restoration_pending=no` before detaching. If restoration is pending, retry stop using the same ID. Replay works after detach, including in a fresh REPL. Enter `q` in the first terminal to exit the fixture. To repeat with `--no-values`, restart the fixture, reuse the write plan, add the flag to `%object start`, and use a fresh recording path. The two events are still creation and a store, with the store shown as `FIELD_WRITTEN`.
 
+For a writer in a shared library, prepare against both the main executable and
+the library that contains the writer. A lone `--module` path that names a shared
+object is not an executable and is rejected. For example:
+
+```text
+%object prepare demo::Record --executable ./build/app --module ./build/libdemo.so --field value --code "demo::write_value(demo::Record &)" --backend code-cache --follow-calls --output ./record-watch
+```
+
+Use the same `--module` when starting or previewing the plan if the mapped
+library has a different path. Without `--module`, writer lookup first checks
+the main executable; if the writer is found in exactly one mapped shared ELF,
+the error names that module and the option to use. Shared writers with calls
+need `--follow-calls`; the diagnostic names the selected module and the flag.
+
 ### Read coverage and cleanup status
 
 - Review the resolved fields, writer sites, and binding status in preview. Preview is read-only. A same-build restart resolves fresh live addresses. A compatible rebuild requires verifiable field and code bindings. Missing or mismatched evidence can prevent a watch from starting.
@@ -788,7 +802,9 @@ window. Short leaves can use verified alignment padding. A symbol export
 alone allows a fallback to direct call sites when no entry window verifies.
 Preview and status report partial coverage for direct call sites alone.
 For a shared writer, `--module` takes a unique mapped ELF basename or
-absolute path. A shared leaf that uses an entry redirect needs a verified
+absolute path. A shared writer containing calls requires `--follow-calls`;
+otherwise code-cache setup rejects it before translating the writer and tells
+you which module and flag to use. A shared leaf that uses an entry redirect needs a verified
 nonfaulting overwrite window.
 Native watches capture virtual destruction at the destructor entry, including
 deleting destructors that inline the complete destructor. A watch fails to

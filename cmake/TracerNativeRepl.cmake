@@ -1005,6 +1005,31 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-shared-shapes-target>
           $<TARGET_FILE:repl-shared-shapes-library>)
       set_tests_properties(native_repl_code_cache_shared PROPERTIES TIMEOUT 120)
+      if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+        add_library(repl-object-shared-writer-library SHARED
+          tests/fixtures/object_shared_writer/library.cpp)
+        add_executable(repl-object-shared-writer-target
+          tests/fixtures/object_shared_writer/main.cpp)
+        set_target_properties(repl-object-shared-writer-library repl-object-shared-writer-target
+          PROPERTIES CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_include_directories(repl-object-shared-writer-library PRIVATE
+          tests/fixtures/object_shared_writer)
+        target_include_directories(repl-object-shared-writer-target PRIVATE
+          tests/fixtures/object_shared_writer)
+        target_compile_options(repl-object-shared-writer-library PRIVATE
+          -g -O1 -fPIC -fsemantic-interposition -fno-inline -fno-optimize-sibling-calls
+          -fpatchable-function-entry=5,0)
+        target_compile_options(repl-object-shared-writer-target PRIVATE -g -O0 -fPIE)
+        target_link_options(repl-object-shared-writer-library PRIVATE "LINKER:--build-id=sha1")
+        target_link_options(repl-object-shared-writer-target PRIVATE -pie "LINKER:--build-id=sha1")
+        target_link_libraries(repl-object-shared-writer-target PRIVATE repl-object-shared-writer-library)
+        add_test(NAME native_repl_object_shared_writer_plt
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_shared_writer.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-shared-writer-target>
+            $<TARGET_FILE:repl-object-shared-writer-library> "${CMAKE_OBJDUMP}")
+        set_tests_properties(native_repl_object_shared_writer_plt PROPERTIES TIMEOUT 180)
+      endif()
       add_executable(repl-atomic-person-target
         tests/fixtures/atomic_person/operations.cpp tests/fixtures/atomic_person/driver.cpp)
       set_target_properties(repl-atomic-person-target PROPERTIES CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
