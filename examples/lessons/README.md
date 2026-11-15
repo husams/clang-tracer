@@ -22,6 +22,12 @@ run the section's commands without typing the sources first.
 | [14-launch](14-launch/README.md) | [Launch a local application](../../docs/native-repl.md#launch-a-local-application) (REPL walkthrough) |
 | [15-request-calls](15-request-calls/README.md) | [Collect every call of one request](../../docs/guide/tutorials.md#collect-every-call-of-one-request) |
 | [16-polymorphic-items](16-polymorphic-items/README.md) | [Strings and class/struct values](../../docs/native-repl.md#strings-and-classstruct-values) (REPL walkthrough) |
+| [17-object-writes](17-object-writes/README.md) | [Trace object lifetimes and state in a prebuilt binary](../../docs/native-repl.md#trace-object-lifetimes-and-state-in-a-prebuilt-binary) (REPL walkthrough) |
+| [18-method-snapshots](18-method-snapshots/README.md) | [Prepare an object watch for method snapshots](../../docs/native-repl.md#prepare-an-object-watch-for-method-snapshots) (REPL walkthrough) |
+| [19-collection-entries](19-collection-entries/README.md) | [Follow logical collection entries during writes](../../docs/native-repl.md#follow-logical-collection-entries-during-writes) (REPL walkthrough) |
+| [20-map-entries](20-map-entries/README.md) | [Follow logical collection entries during writes](../../docs/native-repl.md#follow-logical-collection-entries-during-writes) (REPL walkthrough), nested fields in map entries |
+| [21-logical-updates](21-logical-updates/README.md) | [Follow logical collection entries during writes](../../docs/native-repl.md#follow-logical-collection-entries-during-writes) (REPL walkthrough), `--mode logical-writes` |
+| [22-string-storage-writes](22-string-storage-writes/README.md) | [Follow logical collection entries during writes](../../docs/native-repl.md#follow-logical-collection-entries-during-writes) (REPL walkthrough), string and variant storage |
 
 The remaining sections need no project. "Install and check the tools" and
 "Open the interactive guide" only run installed commands, and "Run the
