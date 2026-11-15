@@ -1,12 +1,5 @@
 #include "plugins.hpp"
 
-#include "../agent_plugin_protocol.hpp"
-#include "interpreter.hpp"
-#include "mapping_cache.hpp"
-#include "repl_config.hpp"
-#include "server_process.hpp"
-#include "tracer.pb.h"
-
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -15,12 +8,21 @@
 #include <ostream>
 #include <stdexcept>
 #include <system_error>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include <llvm/Support/Error.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/raw_ostream.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "../agent_plugin_protocol.hpp"
+#include "compiler_profile.hpp"
+#include "interpreter.hpp"
+#include "mapping_cache.hpp"
+#include "plugin_package.hpp"
+#include "repl_config.hpp"
+#include "server_process.hpp"
+#include "tracer.pb.h"
 
 namespace tracer_repl {
 namespace {
@@ -86,6 +88,37 @@ void save_enabled_plugin(const fs::path &record, const std::string &id,
   if (auto keep_error = file->keep(record.string()))
     throw std::runtime_error(llvm::toString(std::move(keep_error)));
 }
+
+std::vector<tracer::NativePluginUnit> plugin_units(const PluginPackage& package,
+                                                   const CppEngine& cpp) {
+  const auto sdk = plugin_sdk_directory();
+  const auto extras = resolve_plugin_flag_paths(package.extra_flags, package.directory);
+  std::vector<tracer::NativePluginUnit> units;
+  for (const auto& source : package.sources) {
+    auto arguments = plugin_profile(cpp, sdk);
+    if (!package.compile_commands.empty()) {
+      const auto file = package.translation_unit.empty() ? source : package.translation_unit;
+      const auto profile = compilation_database_profile(
+          package.compile_commands.string(), file.string(),
+          package.translation_unit.empty() ? DatabaseSelection::ExactOrUnique
+                                           : DatabaseSelection::Exact);
+      arguments.insert(arguments.end(), profile.arguments.begin(), profile.arguments.end());
+    }
+    if (!package.include.empty()) {
+      arguments.insert(arguments.end(), {"-I", package.include.string()});
+    }
+    arguments.insert(arguments.end(), extras.begin(), extras.end());
+    units.push_back({{source, {}, {}, {}, {}}, std::move(arguments)});
+  }
+  return units;
+}
+
+void report_load(std::ostream& out, const std::string& id,
+                 const tracer::NativePlugins::LoadResult& result) {
+  out << id << " generation " << result.generation << " active ("
+      << (result.cache_hit ? "cache hit" : "compiled") << ")\n";
+}
+
 } // namespace
 
 bool is_plugin_command(CommandKind kind) {
@@ -101,8 +134,66 @@ void Plugins::load(const std::string &id, const fs::path &source,
   const auto result = plugins_.load(
       id, {source, {}, {}, {}, {}}, plugin_profile(cpp, plugin_sdk_directory()),
       mapping_cache_directory().parent_path() / "plugins", reload);
-  out << id << " generation " << result.generation << " active ("
-      << (result.cache_hit ? "cache hit" : "compiled") << ")\n";
+  report_load(out, id, result);
+}
+
+void Plugins::load_installed(CppEngine& cpp, std::ostream& out, std::ostream& errors) {
+  try {
+    auto directory = installed_plugin_directory();
+    if (directory.empty() || !fs::exists(directory)) {
+      return;
+    }
+    directory = tracer::private_plugin_directory(directory, false, false);
+    std::vector<fs::path> manifests;
+    for (const auto& entry : fs::directory_iterator(directory)) {
+      const auto file = entry.path() / "plugin.toml";
+      if (fs::is_directory(entry.symlink_status()) &&
+          fs::is_regular_file(fs::symlink_status(file))) {
+        manifests.push_back(file);
+      }
+    }
+    std::sort(manifests.begin(), manifests.end());
+    for (const auto& manifest : manifests) {
+      try {
+        const auto package = read_plugin_package(manifest);
+        if (!package) {
+          continue;
+        }
+        std::vector<fs::path> headers;
+        if (!package->include.empty()) {
+          for (const auto& entry : fs::recursive_directory_iterator(package->include)) {
+            if (fs::is_symlink(entry.symlink_status())) {
+              throw std::runtime_error("public plugin includes cannot use symlinks: " +
+                                       entry.path().string());
+            }
+            if (fs::is_regular_file(entry.symlink_status())) {
+              const auto relative = entry.path().lexically_relative(package->include);
+              if (public_headers_.contains(relative)) {
+                throw std::runtime_error("duplicate public plugin header: " + relative.string());
+              }
+              headers.push_back(relative);
+            }
+          }
+        }
+        const auto result =
+            plugins_.load_package(package->id, plugin_units(*package, cpp), package->include,
+                                  mapping_cache_directory().parent_path() / "plugins", false);
+        try {
+          cpp.add_plugin_api(package->include, plugins_.public_symbols(package->id));
+        } catch (...) {
+          plugins_.discard(package->id);
+          throw;
+        }
+        public_headers_.insert(headers.begin(), headers.end());
+        installed_.emplace(package->id, InstalledPackage{manifest, !package->include.empty()});
+        report_load(out, package->id, result);
+      } catch (const std::exception& error) {
+        errors << "startup plugin " << manifest.string() << ": " << error.what() << '\n';
+      }
+    }
+  } catch (const std::exception& error) {
+    errors << "cannot read installed plugins: " << error.what() << '\n';
+  }
 }
 
 void Plugins::load_enabled(const CppEngine &cpp, std::ostream &out,
@@ -159,7 +250,21 @@ void Plugins::execute(const Command &command, const CppEngine &cpp,
   }
   if (command.kind == K::plugin_reload) {
     const auto &id = command.arguments.at(0);
-    load(id, plugins_.info(id).source, cpp, out, true);
+    if (const auto installed = installed_.find(id); installed != installed_.end()) {
+      const auto package = read_plugin_package(installed->second.manifest);
+      if (!package || package->id != id) {
+        throw std::runtime_error("installed plugin manifest changed its identity");
+      }
+      if (installed->second.has_include || !package->include.empty()) {
+        throw std::runtime_error("restart the REPL to reload a plugin with public C++ headers");
+      }
+      const auto result =
+          plugins_.load_package(id, plugin_units(*package, cpp), {},
+                                mapping_cache_directory().parent_path() / "plugins", true);
+      report_load(out, id, result);
+    } else {
+      load(id, plugins_.info(id).source, cpp, out, true);
+    }
     return;
   }
   if (command.kind == K::plugin_enable) {

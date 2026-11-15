@@ -5,16 +5,17 @@
 #include "native_detour.hpp"
 #endif
 
+#include <algorithm>
 #include <cerrno>
 #include <filesystem>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
 
-#include <sys/stat.h>
-#include <unistd.h>
-
+#include <clang/AST/Mangle.h>
+#include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/Basic/DiagnosticOptions.h>
 #include <clang/Basic/FileManager.h>
 #include <clang/Basic/Version.h>
@@ -38,6 +39,8 @@
 #include <llvm/Support/VirtualFileSystem.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/TargetParser/Host.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace tracer {
 namespace {
@@ -69,15 +72,94 @@ public:
   }
 };
 
-class CompilePlugin : public clang::EmitLLVMOnlyAction {
-  std::unique_ptr<llvm::Module> &module_;
+class PublicDeclarations : public clang::RecursiveASTVisitor<PublicDeclarations> {
+  const clang::SourceManager& sources_;
+  clang::ASTNameGenerator names_;
+  const fs::path& include_;
+  std::set<std::string>& symbols_;
+
+  void collect(const clang::NamedDecl* declaration) {
+    if (declaration->isImplicit() || !declaration->hasExternalFormalLinkage() ||
+        declaration->getDeclContext()->isDependentContext()) {
+      return;
+    }
+    const auto location =
+        sources_.getPresumedLoc(sources_.getExpansionLoc(declaration->getLocation()));
+    if (location.isInvalid()) {
+      return;
+    }
+    const auto relative = fs::path(location.getFilename()).lexically_relative(include_);
+    if (relative.empty() || *relative.begin() == "..") {
+      return;
+    }
+    if (const auto* record = llvm::dyn_cast<clang::CXXRecordDecl>(declaration->getDeclContext());
+        record && record->getQualifiedNameAsString() == "tracer::repl::Plugin") {
+      return;
+    }
+    if (llvm::isa<clang::VarDecl>(declaration)) {
+      auto name = names_.getName(declaration);
+      if (!name.empty() && name.find('\n') == name.npos) {
+        symbols_.insert(std::move(name));
+      }
+    } else {
+      for (auto& name : names_.getAllManglings(declaration)) {
+        if (!name.empty() && name.find('\n') == name.npos) {
+          symbols_.insert(std::move(name));
+        }
+      }
+    }
+  }
 
 public:
-  CompilePlugin(llvm::LLVMContext &context,
-                std::unique_ptr<llvm::Module> &module)
-      : clang::EmitLLVMOnlyAction(&context), module_(module) {}
+  PublicDeclarations(clang::ASTContext& context, const fs::path& include,
+                     std::set<std::string>& symbols)
+      : sources_(context.getSourceManager())
+      , names_(context)
+      , include_(include)
+      , symbols_(symbols) {}
+
+  bool VisitFunctionDecl(clang::FunctionDecl* declaration) {
+    if (!declaration->getDescribedFunctionTemplate()) {
+      collect(declaration);
+    }
+    return true;
+  }
+
+  bool VisitVarDecl(clang::VarDecl* declaration) {
+    if (declaration->hasGlobalStorage() && !declaration->isLocalVarDecl() &&
+        !declaration->getDescribedVarTemplate()) {
+      collect(declaration);
+    }
+    return true;
+  }
+};
+
+class CompilePlugin : public clang::EmitLLVMOnlyAction {
+  std::unique_ptr<llvm::Module> &module_;
+  const fs::path& include_;
+  std::set<std::string>& symbols_;
+
+public:
+  CompilePlugin(llvm::LLVMContext& context, std::unique_ptr<llvm::Module>& module,
+                const fs::path& include, std::set<std::string>& symbols)
+      : clang::EmitLLVMOnlyAction(&context)
+      , module_(module)
+      , include_(include)
+      , symbols_(symbols) {}
+
+  bool BeginSourceFileAction(clang::CompilerInstance& compiler) override {
+    if (!include_.empty()) {
+      compiler.getCodeGenOpts().ClearASTBeforeBackend = false;
+    }
+    return clang::EmitLLVMOnlyAction::BeginSourceFileAction(compiler);
+  }
 
   void EndSourceFileAction() override {
+    if (!include_.empty()) {
+      auto& context = getCompilerInstance().getASTContext();
+      PublicDeclarations declarations(context, include_, symbols_);
+      declarations.TraverseDecl(context.getTranslationUnitDecl());
+    }
     clang::EmitLLVMOnlyAction::EndSourceFileAction();
     module_ = takeModule();
   }
@@ -108,7 +190,7 @@ std::string digest(llvm::StringRef bytes) {
 
 } // namespace
 
-fs::path private_plugin_directory(const fs::path &directory, bool create) {
+fs::path private_plugin_directory(const fs::path& directory, bool create, bool owner_only) {
   if (create) {
     fs::create_directories(directory.parent_path());
     if (::mkdir(directory.c_str(), 0700) && errno != EEXIST)
@@ -127,10 +209,11 @@ fs::path private_plugin_directory(const fs::path &directory, bool create) {
     if (parent == parent.root_path())
       break;
   }
-  if (::lstat(canonical.c_str(), &info) || !S_ISDIR(info.st_mode) ||
-      info.st_uid != ::geteuid() || (info.st_mode & 0077))
-    throw std::runtime_error("plugin directory must be owner-only: " +
+  if (::lstat(canonical.c_str(), &info) || !S_ISDIR(info.st_mode) || info.st_uid != ::geteuid() ||
+      (info.st_mode & (owner_only ? 0077 : 0022))) {
+    throw std::runtime_error("plugin directory must be controlled by its owner: " +
                              canonical.string());
+  }
   return canonical;
 }
 
@@ -171,12 +254,47 @@ struct Artifact {
   std::unique_ptr<llvm::MemoryBuffer> object;
   bool reused;
   bool from_repl;
+  std::set<std::string> declarations;
 };
 
-std::optional<Artifact>
-plugin_object(llvm::orc::LLJIT &jit, const NativePluginSource &input,
-              const std::vector<std::string> &profile, const fs::path &cache,
-              std::optional<NativePluginObjectView> offer = {}) {
+std::filesystem::path declarations_file(fs::path object) {
+  return object.replace_extension(".exports");
+}
+
+std::map<std::string, bool> public_definitions(llvm::orc::LLJIT& jit,
+                                               const std::vector<Artifact>& artifacts) {
+  std::set<std::string> declared;
+  for (const auto& item : artifacts) {
+    declared.insert(item.declarations.begin(), item.declarations.end());
+  }
+  declared.erase(jit.mangle("tracer_repl_plugin_v1"));
+  std::map<std::string, bool> result;
+  if (declared.empty()) {
+    return result;
+  }
+  for (const auto& item : artifacts) {
+    auto object =
+        require(llvm::object::ObjectFile::createObjectFile(item.object->getMemBufferRef()));
+    for (const auto& symbol : object->symbols()) {
+      const auto flags = require(symbol.getFlags());
+      using Symbol = llvm::object::SymbolRef;
+      if (!(flags & Symbol::SF_Global) || (flags & (Symbol::SF_Undefined | Symbol::SF_Hidden))) {
+        continue;
+      }
+      auto name = require(symbol.getName()).str();
+      if (declared.contains(name)) {
+        result.emplace(std::move(name), require(symbol.getType()) == Symbol::ST_Function);
+      }
+    }
+  }
+  return result;
+}
+
+std::optional<Artifact> plugin_object(llvm::orc::LLJIT& jit, const NativePluginSource& input,
+                                      const std::vector<std::string>& profile,
+                                      const fs::path& cache,
+                                      std::optional<NativePluginObjectView> offer = {},
+                                      const fs::path& public_include = {}) {
   const auto &source = input.path;
   auto overlay = llvm::makeIntrusiveRefCnt<llvm::vfs::OverlayFileSystem>(
       llvm::vfs::getRealFileSystem());
@@ -230,14 +348,29 @@ plugin_object(llvm::orc::LLJIT &jit, const NativePluginSource &input,
   for (const auto &flag : profile)
     identity += '\0' + flag;
   identity += '\0';
+  if (!public_include.empty()) {
+    identity += "package-public-v2:" + public_include.string() + '\0';
+  }
   identity.append(preprocessed.data(), preprocessed.size());
   const auto fingerprint = digest(identity);
   if (offer && (offer->fingerprint != fingerprint ||
                 offer->checksum != digest(offer->bytes)))
     return {};
   auto path = private_plugin_directory(cache, true) / (fingerprint + ".o");
-  if (auto object = cached_object(path))
-    return Artifact{std::move(path), std::move(object), true, false};
+  if (auto object = cached_object(path)) {
+    if (public_include.empty()) {
+      return Artifact{std::move(path), std::move(object), true, false, {}};
+    }
+    if (auto metadata = cached_object(declarations_file(path))) {
+      llvm::SmallVector<llvm::StringRef, 16> entries;
+      auto contents = metadata->getBuffer();
+      if (contents.consume_front("exports-v1\n")) {
+        contents.split(entries, '\n', -1, false);
+        std::set<std::string> declarations(entries.begin(), entries.end());
+        return Artifact{std::move(path), std::move(object), true, false, std::move(declarations)};
+      }
+    }
+  }
   if (offer) {
     auto object =
         llvm::MemoryBuffer::getMemBufferCopy(offer->bytes, path.string());
@@ -259,7 +392,7 @@ plugin_object(llvm::orc::LLJIT &jit, const NativePluginSource &input,
           type == llvm::ELF::SHT_PREINIT_ARRAY)
         return {};
     }
-    return Artifact{path, std::move(object), false, true};
+    return Artifact{path, std::move(object), false, true, {}};
   }
 
   const auto snapshot = source.string() + ".ii";
@@ -273,8 +406,9 @@ plugin_object(llvm::orc::LLJIT &jit, const NativePluginSource &input,
                                      "c++-cpp-output", "--", snapshot});
   llvm::LLVMContext context;
   std::unique_ptr<llvm::Module> module;
+  std::set<std::string> declarations;
   clang_action(std::move(arguments),
-               std::make_unique<CompilePlugin>(context, module),
+               std::make_unique<CompilePlugin>(context, module, public_include, declarations),
                std::move(overlay), source);
   if (!module)
     throw std::runtime_error("Clang produced no plugin module: " +
@@ -294,7 +428,7 @@ plugin_object(llvm::orc::LLJIT &jit, const NativePluginSource &input,
       throw std::runtime_error(
           "plugins cannot define or import thread-local variables");
   auto object = require(jit.getIRCompileLayer().getCompiler()(*module));
-  return Artifact{std::move(path), std::move(object), false, false};
+  return Artifact{std::move(path), std::move(object), false, false, std::move(declarations)};
 }
 
 bool valid_name(const std::string &name) {
@@ -314,6 +448,7 @@ struct Generation {
   llvm::orc::JITDylib *scope;
   std::uint64_t number;
   std::map<std::string, Handler> handlers;
+  std::vector<NativePluginSymbol> exports;
 };
 
 std::map<std::string, Handler> read_handlers(llvm::orc::LLJIT &jit,
@@ -374,25 +509,31 @@ struct NativePlugins::Impl {
     return found->second;
   }
 
-  std::optional<LoadResult>
-  load(const std::string &id, NativePluginSource source,
-       const std::vector<std::string> &profile, const fs::path &cache,
-       bool reload, std::optional<NativePluginObjectView> offer = {}) {
+  std::optional<LoadResult> load(const std::string& id, const std::vector<NativePluginUnit>& units,
+                                 const fs::path& cache, bool reload,
+                                 std::optional<NativePluginObjectView> offer = {},
+                                 const fs::path& public_include = {}) {
     const auto previous = active.find(id);
     if (reload)
       find(id);
     else if (previous != active.end())
       throw std::invalid_argument("plugin already loaded: " + id);
-    std::optional<Artifact> artifact;
+    std::vector<Artifact> artifacts;
     try {
-      artifact = plugin_object(*jit, source, profile, cache, offer);
+      for (const auto& unit : units) {
+        auto artifact =
+            plugin_object(*jit, unit.source, unit.arguments, cache, offer, public_include);
+        if (!artifact) {
+          return {};
+        }
+        artifacts.push_back(std::move(*artifact));
+      }
     } catch (const std::exception &) {
       if (offer)
         return {};
       throw;
     }
-    if (!artifact)
-      return {};
+    const auto definitions = public_definitions(*jit, artifacts);
     jit_error.clear();
     auto &session = jit->getExecutionSession();
     // Bare scopes see only their own object. Peers and host process symbols
@@ -404,16 +545,33 @@ struct NativePlugins::Impl {
     auto *old_scope =
         previous == active.end() ? nullptr : previous->second.scope;
     try {
-      auto object = artifact->reused ? std::move(artifact->object)
-                                     : llvm::MemoryBuffer::getMemBufferCopy(
-                                           artifact->object->getBuffer(),
-                                           artifact->path.string());
-      require(jit->addObjectFile(scope, std::move(object)));
+      for (auto& artifact : artifacts) {
+        auto object = artifact.reused
+                          ? std::move(artifact.object)
+                          : llvm::MemoryBuffer::getMemBufferCopy(artifact.object->getBuffer());
+        require(jit->addObjectFile(scope, std::move(object)));
+      }
       auto handlers = read_handlers(*jit, scope);
-      if (!artifact->reused)
-        store_object(artifact->path, artifact->object->getBuffer());
-      active.insert_or_assign(id, Generation{std::move(source.path), &scope,
-                                             number, std::move(handlers)});
+      std::vector<NativePluginSymbol> exports;
+      for (const auto& [name, callable] : definitions) {
+        exports.push_back(
+            {name, require(jit->lookupLinkerMangled(scope, name)).getValue(), callable});
+      }
+      for (const auto& artifact : artifacts) {
+        if (artifact.reused) {
+          continue;
+        }
+        store_object(artifact.path, artifact.object->getBuffer());
+        if (!public_include.empty()) {
+          std::string contents = "exports-v1\n";
+          for (const auto& symbol : artifact.declarations) {
+            contents += symbol + '\n';
+          }
+          store_object(declarations_file(artifact.path), contents);
+        }
+      }
+      active.insert_or_assign(id, Generation{units.front().source.path, &scope, number,
+                                             std::move(handlers), std::move(exports)});
     } catch (const std::exception &error) {
       if (auto cleanup = session.removeJITDylib(scope))
         throw std::runtime_error(std::string(error.what()) + "; cleanup: " +
@@ -429,7 +587,10 @@ struct NativePlugins::Impl {
         throw std::runtime_error(id +
                                  " replacement active; retiring old scope: " +
                                  llvm::toString(std::move(retirement)));
-    return LoadResult{number, artifact->reused, artifact->from_repl};
+    return LoadResult{number,
+                      std::all_of(artifacts.begin(), artifacts.end(),
+                                  [](const auto& item) { return item.reused; }),
+                      artifacts.front().from_repl};
   }
 };
 
@@ -446,7 +607,7 @@ NativePlugins::load(const std::string &id, NativePluginSource source,
     throw std::invalid_argument("plugin is not loaded: " + id);
   if (!impl_)
     impl_ = std::make_unique<Impl>();
-  return *impl_->load(id, std::move(source), profile, cache, reload);
+  return *impl_->load(id, {{std::move(source), profile}}, cache, reload);
 }
 
 std::optional<NativePlugins::LoadResult>
@@ -458,7 +619,30 @@ NativePlugins::load_offered(const std::string &id, NativePluginSource source,
     throw std::invalid_argument("invalid plugin name: " + id);
   if (!impl_)
     impl_ = std::make_unique<Impl>();
-  return impl_->load(id, std::move(source), profile, cache, reload, offer);
+  return impl_->load(id, {{std::move(source), profile}}, cache, reload, offer);
+}
+
+NativePlugins::LoadResult NativePlugins::load_package(const std::string& id,
+                                                      const std::vector<NativePluginUnit>& units,
+                                                      const fs::path& include,
+                                                      const fs::path& cache, bool reload) {
+  if (!valid_name(id) || units.empty()) {
+    throw std::invalid_argument("invalid plugin name or empty source list: " + id);
+  }
+  if (!impl_) {
+    impl_ = std::make_unique<Impl>();
+  }
+  return *impl_->load(id, units, cache, reload, {}, include);
+}
+
+std::vector<NativePluginSymbol> NativePlugins::public_symbols(const std::string& id) const {
+  return impl_->find(id).exports;
+}
+
+void NativePlugins::discard(const std::string& id) {
+  auto* scope = impl_->find(id).scope;
+  impl_->active.erase(id);
+  require(impl_->jit->getExecutionSession().removeJITDylib(*scope));
 }
 
 NativePluginObject

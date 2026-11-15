@@ -1678,6 +1678,37 @@ guaranteed interruption. Ctrl+C also cancels tracing operations.
 Completion covers command names and local C++ declarations/members. Dynamic
 completion of remote tracing symbols remains follow-up work.
 
+## Install a local C++ plugin package
+
+Copy the trusted `examples/repl-public-plugin` directory to
+`~/.local/share/clang-tracer/plugins/my-api/`. If `XDG_DATA_HOME` is set,
+use `$XDG_DATA_HOME/clang-tracer/plugins/my-api/`. Keep `plugin.toml`,
+`src/`, and `include/` together. Launch `clang-tracer-repl` normally and
+enter C++ at the prompt.
+
+```cpp
+#include <my_api/my_type.hpp>
+my_api::my_instance.add(3);
+my_api::MyType local{};
+local.add(5);
+std::cout << my_api::my_instance.count << " " << local.count << std::endl;
+```
+
+The first startup reports `compiled` and prints `3 5` for the sample.
+A fresh startup with the same compiler inputs reports `cache hit` and
+starts with fresh plugin state. The REPL loads the manifest’s `[repl]`
+`sources` into one private JIT scope. Its public `include/` directory
+provides C++ declarations to the REPL and its checker. External definitions
+declared in those headers can link to the plugin’s code and storage.
+The class in `src/plugin.cpp` registers commands and stays in the plugin scope.
+
+The package manifest supports `id`, `[repl]` `sources`, and optional
+`compile_commands`, `translation_unit`, and `extra_flags` in that section.
+Paths to sources and compilation databases are relative to the manifest
+unless a database path is absolute. Restart the REPL to replace a package
+with public headers. A live C++ expression can retain addresses from that
+generation.
+
 ## Load local C++ plugins
 
 Load a trusted C++ source file with `%plugin load FILE --as NAME`. The REPL

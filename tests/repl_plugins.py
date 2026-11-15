@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 import re
@@ -15,6 +16,7 @@ with tempfile.TemporaryDirectory(prefix="tracer-repl-plugins-") as directory:
         **os.environ,
         "XDG_CACHE_HOME": str(root / "cache"),
         "XDG_CONFIG_HOME": str(root / "config"),
+        "XDG_DATA_HOME": str(root / "data"),
     }
     for name in ("a", "b"):
         shutil.copyfile(examples / f"plugin_{name}.cpp", root / f"plugin_{name}.cpp")
@@ -174,3 +176,64 @@ const TracerReplPluginV1 *tracer_repl_plugin_v1() { return &descriptor; }
     assert "b.tick = 10" in skipped and "b.tick = 20" in skipped, skipped
     assert "(no plugins loaded)" in run("%plugin list")
     print(cold + warm + rejected + invalidated + cold_start + warm_start, end="")
+
+    # Install a package by copying its files and start the REPL normally.
+    package = root / "data/clang-tracer/plugins/my-api"
+    shutil.copytree(examples.parent / "repl-public-plugin", package)
+    with (package / "src/my_type.cpp").open("a") as source:
+        source.write("\nunsigned private_plugin_counter = 77;\n")
+    (package / "src/private_detail.hpp").write_text("#pragma once\n")
+
+    usage = """#include <my_api/my_type.hpp>
+my_api::my_instance.add(3);
+my_api::MyType local{};
+local.add(5);
+std::cout << "shared=" << my_api::my_instance.count << " local=" << local.count << std::endl;
+"""
+    first_start = run(usage, cwd=startup_cwd)
+    assert "my-api generation 1 active (compiled)" in first_start, first_start
+    assert "shared=3 local=5" in first_start, first_start
+    second_start = run(usage, cwd=startup_cwd)
+    assert "my-api generation 1 active (cache hit)" in second_start, second_start
+    assert "shared=3 local=5" in second_start, second_start
+    shared_with_command = run(usage + "%plugin run my-api value")
+    assert "my-api.value = 3" in shared_with_command, shared_with_command
+
+    hidden_class = run("#include <my_api/my_type.hpp>\ntracer::repl::Plugin hidden;", expected_status=1)
+    assert "error:" in hidden_class and "Plugin" in hidden_class, hidden_class
+    hidden_header = run("#include <private_detail.hpp>", expected_status=1)
+    assert "private_detail.hpp" in hidden_header and "file not found" in hidden_header, hidden_header
+    hidden_symbol = run("""extern unsigned private_plugin_counter;
+std::cout << private_plugin_counter << std::endl;
+""", expected_status=1)
+    assert "Symbols not found" in hidden_symbol and "private_plugin_counter" in hidden_symbol, hidden_symbol
+    hidden_entry = run("""extern "C" const void *tracer_repl_plugin_v1();
+std::cout << tracer_repl_plugin_v1() << std::endl;
+""", expected_status=1)
+    assert "Symbols not found" in hidden_entry and "tracer_repl_plugin_v1" in hidden_entry, hidden_entry
+    print(first_start + second_start, end="")
+
+    project = root / "project"
+    (project / "headers").mkdir(parents=True)
+    (project / "headers/project_offset.hpp").write_text("#define PROJECT_OFFSET 4\n")
+    (project / "main.cpp").write_text("int main() {}\n")
+    database = project / "compile_commands.json"
+    database.write_text(json.dumps([{
+        "directory": str(project),
+        "file": "main.cpp",
+        "arguments": ["clang++", "-Iheaders", "-c", "main.cpp"],
+    }]))
+    (package / "extra").mkdir()
+    (package / "extra/plugin_offset.hpp").write_text("#define PLUGIN_OFFSET 6\n")
+    manifest = package / "plugin.toml"
+    with manifest.open("a") as configuration:
+        configuration.write(f"compile_commands = {json.dumps(str(database))}\n")
+        configuration.write('extra_flags = ["-I", "extra"]\n')
+    source = package / "src/my_type.cpp"
+    source.write_text(
+        '#include "project_offset.hpp"\n#include "plugin_offset.hpp"\n'
+        + source.read_text().replace("count += amount;", "count += amount + PROJECT_OFFSET + PLUGIN_OFFSET;")
+    )
+    configured = run(usage, cwd=startup_cwd)
+    assert "my-api generation 1 active (compiled)" in configured, configured
+    assert "shared=13 local=15" in configured, configured

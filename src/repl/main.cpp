@@ -198,9 +198,8 @@ int main(int argc, char **argv) {
     tr::Input input(color);
     tr::Controller controller(settings, std::cout);
     tr::Facade facade(controller);
-    tr::CppEngine cpp(facade, std::move(cpp_args));
     tr::Plugins plugins;
-    input.use_cpp(cpp);
+    tr::CppEngine cpp(facade, std::move(cpp_args));
     auto choose = [&](const std::string &prompt) {
       return input.read(prompt).value_or("");
     };
@@ -213,7 +212,9 @@ int main(int argc, char **argv) {
       std::cout << "Clang Tracer native C++23 REPL. %help lists commands; "
                    "%help api lists C++ APIs. Tab completes commands, paths, and C++.\n";
     }
+    plugins.load_installed(cpp, std::cout, std::cerr);
     plugins.load_enabled(cpp, std::cout, std::cerr);
+    input.use_cpp(cpp);
     bool failed = false;
     while (true) {
       // tracer.inject() can execute inside a JIT cell. Import after the cell

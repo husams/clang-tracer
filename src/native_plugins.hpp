@@ -10,8 +10,8 @@
 #include <vector>
 
 namespace tracer {
-std::filesystem::path
-private_plugin_directory(const std::filesystem::path &directory, bool create);
+std::filesystem::path private_plugin_directory(const std::filesystem::path& directory, bool create,
+                                               bool owner_only = true);
 
 struct NativePluginSource {
   std::filesystem::path path;
@@ -19,6 +19,17 @@ struct NativePluginSource {
   std::string_view sdk;
   std::filesystem::path sdk_file;
   std::string_view cpp_sdk;
+};
+
+struct NativePluginUnit {
+  NativePluginSource source;
+  std::vector<std::string> arguments;
+};
+
+struct NativePluginSymbol {
+  std::string name;
+  std::uint64_t address;
+  bool callable;
 };
 
 struct NativePluginObject {
@@ -59,6 +70,11 @@ public:
                const std::vector<std::string> &profile,
                const std::filesystem::path &cache, bool reload,
                NativePluginObjectView offer);
+  LoadResult load_package(const std::string& id, const std::vector<NativePluginUnit>& units,
+                          const std::filesystem::path& include, const std::filesystem::path& cache,
+                          bool reload);
+  std::vector<NativePluginSymbol> public_symbols(const std::string& id) const;
+  void discard(const std::string& id);
   NativePluginObject prepare(NativePluginSource source,
                              const std::vector<std::string> &profile,
                              const std::filesystem::path &cache);
