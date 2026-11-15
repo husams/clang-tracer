@@ -136,6 +136,14 @@ List commands accept `--format json`, `--limit N` and `--page TOKEN`.
 
 Ctrl+C cancels active capture and preserves partial results. Trigger new calls from the target terminal while a synchronous capture waits. The [native REPL walkthrough](../native-repl.md) explains replay filters, stack attribution, retention and mapping details.
 
+## Native object watches
+
+| Command and example | Options and behavior |
+| --- | --- |
+| `%object prepare demo::Record --module ./app --field value --code "demo::write_value(demo::Record &)" --backend code-cache --output ./record-watch` | Save a reusable write watch for an ELF executable. |
+| `%object prepare demo::Record --executable ./app --module ./libdemo.so --field value --code "demo::write_value(demo::Record &)" --backend code-cache --follow-calls --output ./record-watch` | Prepare a shared-library writer. `--executable` identifies the process executable; `--module` identifies the library containing the writer. A lone shared-library path is rejected with this usage form. |
+| `%object preview --plan ./record-watch` / `%object start --plan ./record-watch` | Check the saved plan or start it. A non-leaf shared writer needs `--follow-calls`. If an omitted `--module` leaves the writer unresolved in the executable but it matches one mapped library, the diagnostic names that library and says which `--module` to use. |
+
 ## Native server
 
 ```bash

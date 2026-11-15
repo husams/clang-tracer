@@ -1763,7 +1763,8 @@ bool Controller::execute(const Command &command) {
           else if (!request.code_module().empty())
             request.set_code_module(command.option("--module"));
           else
-            throw std::invalid_argument("--module requires a saved method or shared writer plan");
+            throw std::invalid_argument("--module requires a saved method or shared writer plan; "
+                "prepare a shared writer with %object prepare TYPE --executable APP --module LIB");
         }
         if (command.has("--no-values"))
           request.set_no_values(true);
