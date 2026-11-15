@@ -136,7 +136,7 @@ struct Frame {
   api::StackTrace entry_stack;
   LogicalRange range;
   Address active_inline_mutation = 0;
-  bool provisional = false;
+  bool provisional = false, value_partial = false;
 };
 struct Patch {
   std::string bytes;
@@ -833,7 +833,7 @@ struct Watch::Worker {
 
   bool range_snapshot_enabled() const {
     using Request = clangtracer::v1::ObjectWatchRequest;
-    return !request.no_values() &&
+    return !request.no_values() && !plan->layout.value_write.active() &&
         (request.synchronization() == Request::THREAD_CONFINED ||
          request.synchronization() == Request::CALLER_LOCK);
   }
@@ -1070,7 +1070,7 @@ struct Watch::Worker {
       if (request.max_instances() && live.size() >= request.max_instances())
         throw std::runtime_error("receiver admission limit reached");
       std::optional<std::uint64_t> initial;
-      if (!request.no_values() && !plan->layout.logical_collection())
+      if (!request.no_values() && !plan->layout.scoped_storage())
         initial = read_field(add(receiver, plan->layout.scalar));
       Lifetime life{receiver, ++next_id, ++generations[receiver], 0};
       live.emplace(receiver, life);
@@ -1193,6 +1193,9 @@ struct Watch::Worker {
     std::uint64_t storage_generation = 0;
     bool scoped = false;
     std::optional<std::uint32_t> old_tag = std::nullopt;
+    ValueWrite storage;
+    ValueStoreBytes bytes{};
+    bool before_read = false;
   };
 
   std::optional<Sample> sample(pid_t tid, Task &task, const Site &site, Address pc,
@@ -1204,6 +1207,44 @@ struct Watch::Worker {
     const auto destination = reg(regs, s.base, next) + s.scale * reg(regs, s.index, next) +
                              static_cast<Address>(s.displacement);
     Sample pending{{}, destination, s, std::nullopt};
+    if (plan->layout.value_write.active()) {
+      const auto &layout = plan->layout;
+      for (auto frame = task.frames.rbegin(); frame != task.frames.rend(); ++frame) {
+        if (frame->role != Boundary::writer_scope ||
+            (layout.logical_collection() && !frame->range.valid))
+          continue;
+        auto field = add(frame->receiver, layout.scalar);
+        if (layout.logical_collection()) {
+          try {
+            const auto header = range_header(frame->receiver);
+            if (header != frame->range.header || range_element(header) != frame->range.destination)
+              throw std::runtime_error("complex value range changed outside a verified mutation return");
+            field = frame->range.destination;
+          } catch (const std::runtime_error &error) {
+            frame->range.valid = false;
+            gap(tid, pc, regs, error.what());
+            continue;
+          }
+        }
+        const auto match = match_value_store(layout.value_write, layout.value_alternatives.data(),
+            layout.value_alternatives.size(), request.max_string_bytes(), field, destination, s.width,
+            [&](auto address, auto bytes, auto size) { return read_memory(pid, address, bytes, size); });
+        if (match.partial && !frame->value_partial) {
+          frame->value_partial = true;
+          gap(tid, pc, regs, "complex payload storage could not be verified within the read budget");
+        }
+        if (!match.write.size)
+          continue;
+        pending.life = frame->life;
+        pending.scoped = true;
+        pending.storage_generation = frame->range.generation;
+        pending.storage = match.write;
+        pending.before_read = !request.no_values() &&
+            read_memory(pid, pending.storage.address, pending.bytes.data(), pending.storage.size);
+        return pending;
+      }
+      return std::nullopt;
+    }
     if (plan->layout.logical_collection()) {
       for (auto frame = task.frames.rbegin(); frame != task.frames.rend(); ++frame) {
         if (frame->role != Boundary::writer_scope || !frame->range.valid)
@@ -1261,6 +1302,26 @@ struct Watch::Worker {
           static_cast<std::uint32_t>(reg(after, store.result_register, 0)) == expected;
       if (!succeeded)
         return;
+    }
+    if (sample.storage.size) {
+      ValueStoreBytes next{};
+      const bool after_read = !request.no_values() &&
+          read_memory(pid, sample.storage.address, next.data(), sample.storage.size);
+      const bool paired = sample.before_read && after_read;
+      if (paired && sample.bytes == next)
+        return;
+      emit(tid, paired ? Observation::FIELD_CHANGED : Observation::FIELD_WRITTEN,
+           sample.life, pc, before, [&](auto &out) {
+        out.set_field(field_path());
+        out.set_storage_generation(sample.storage_generation);
+        out.set_destination(sample.destination);
+        out.set_synchronization(request.synchronization());
+        set_storage_write(out, sample.storage, sample.before_read ? &sample.bytes : nullptr,
+                          after_read ? &next : nullptr);
+        if (!request.no_values() && !paired)
+          out.set_diagnostic("complex store bytes could not be paired");
+      });
+      return;
     }
     auto old = sample.old;
     std::optional<std::uint64_t> value;

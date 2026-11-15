@@ -1,5 +1,7 @@
 #pragma once
 
+#include "object_value_write.hpp"
+
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -46,7 +48,7 @@ struct Instruction {
   std::int64_t inline_receiver_offset = 0;
   std::uint32_t immediate = 0;
   std::uint8_t size = 0, condition = 0, base = 0, index = 0, scale = 0, value = 0, result = 0;
-  std::uint8_t inline_receiver_register = 0;
+  std::uint8_t inline_receiver_register = 0, store_width = 0;
   Hook hook = Hook::none;
   Flow flow = Flow::copy;
   bool dispatch_entry = false;
@@ -118,6 +120,10 @@ struct Init {
   Address module_bias = 0;
   BorrowPlan borrow{};
   CollectionPlan collection{};
+  object_watch::ValueWriteLayout value_write{};
+  const object_watch::ValueWriteAlternative *value_alternatives = nullptr;
+  std::size_t value_alternative_count = 0;
+  unsigned value_string_limit = 0;
   SharedFileIdentity shared_file{};
   unsigned stack_depth = 0;
   std::uint32_t max_instances = 0;
@@ -152,6 +158,8 @@ struct Observation {
   object_watch::LogicalRangeSample logical_before, logical_after;
   object_watch::LogicalChange logical_change = object_watch::LogicalChange::none;
   Address logical_boundary;
+  object_watch::ValueWrite storage_write;
+  object_watch::ValueStoreBytes storage_before, storage_after;
   std::array<Address, stack_limit> frames, stack_pointers;
 };
 
