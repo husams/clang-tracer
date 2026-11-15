@@ -285,7 +285,7 @@ int main(int argc, char **argv) {
         } else if (command.kind == tr::CommandKind::agent_plugin_load ||
                    command.kind == tr::CommandKind::agent_plugin_reload) {
           controller.execute(command, [&](auto &request, const auto &path) {
-            plugins.offer_agent_object(request, path, cpp);
+            plugins.prepare_agent_plugin(request, path, controller.agent_plugin_manifest(request), cpp);
           });
         } else if (command.kind == tr::CommandKind::type) {
           tr::print_code(std::cout, cpp.describe_symbol(command.arguments.at(0)),

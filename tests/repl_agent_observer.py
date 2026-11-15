@@ -1,4 +1,4 @@
-"""Verify an installed C++ observer registers on attach and emits target returns."""
+"""Exercise automatic attach and live package reload with two C++ observers."""
 from contextlib import ExitStack
 import os
 from pathlib import Path
@@ -22,11 +22,16 @@ def main(repl, server, agent, fixture, example):
         stack.callback(stop, child)
         target = Transcript(child.stdout)
         target.expect(r"^ready entry=")
-        package = root / "data/clang-tracer/plugins/latency"
-        shutil.copytree(example, package)
-        manifest = package / "plugin.toml"
-        manifest.write_text(manifest.read_text().replace("/absolute/path/to/your/application",
-                                                         os.readlink(f"/proc/{child.pid}/exe")))
+        executable = os.readlink(f"/proc/{child.pid}/exe")
+        packages = root / "data/clang-tracer/plugins"
+        for name in ("a", "b"):
+            package = packages / name
+            shutil.copytree(example, package)
+            manifest = package / "plugin.toml"
+            manifest.write_text(manifest.read_text().replace('id = "latency"', f'id = "{name}"')
+                                .replace("/absolute/path/to/your/application", executable))
+        source = packages / "a/src/latency.cpp"
+
         console = subprocess.Popen(
             [repl, "--server", server, "--agent", agent, "--attach", str(child.pid)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -38,47 +43,72 @@ def main(repl, server, agent, fixture, example):
             console.stdin.write(command + "\n")
             console.stdin.flush()
 
-        def trigger(command):
+        def trigger(command, message):
             child.stdin.write(command)
             child.stdin.flush()
+            target.expect(message)
+            output.seen.append(target.seen[-1])
 
-        def attached(result):
+        def attached(a_status):
             output.expect(rf"^attached session=\S+ pid={child.pid}$")
-            output.expect(rf"^agent latency generation 1 active \({result}\)$")
+            output.expect(rf"^agent a generation 1 active \({a_status}\)$")
+            output.expect(r"^agent b generation 1 active \(cache hit\)$")
             send('%probe inject "observed(int)"')
             return output.expect(r"^installed probe=(\d+)")[1]
 
-        def events(probe, after):
-            send(f"%events --probe {probe} --count 3 --after {after} --timeout 10")
-            calls = [output.expect(rf"^cursor=\d+ .*probe={probe} phase={phase} call=(\d+) ")
-                     for phase in ("PRE", "POST")]
-            emitted = output.expect(
-                rf"^cursor=(\d+) probe={probe} phase=AGENT_OBSERVER call=(\d+) plugin=latency "
-                r"elapsed_ns=(\d+) function=observed\(int\)$")
-            assert calls[0][1] == calls[1][1] == emitted[2]
-            output.expect(r"^received=3 .*complete=true")
-            send("%plugin agent run latency completed")
-            output.expect(r"^agent latency.completed = 1$")
-            return int(emitted[1]), int(emitted[3])
+        def counters(a, b):
+            for name, count in (("a", a), ("b", b)):
+                send(f"%plugin agent run {name} completed")
+                output.expect(rf"^agent {name}\.completed = {count}$")
 
-        first = attached("compiled")
-        trigger("h")
-        target.expect(r"^call held$")
+        def events(probe, after, phases, call=None, minimum_latency=0):
+            send(f"%events --probe {probe} --count {len(phases)} --after {after} --timeout 10")
+            for phase in phases:
+                event_phase = phase if phase in ("PRE", "POST") else "AGENT_OBSERVER"
+                suffix = (rf" plugin={phase} elapsed_ns=(\d+) function=observed\(int\)$"
+                          if phase in ("a", "b") else " ")
+                row = output.expect(
+                    rf"^cursor=(\d+) .*probe={probe} phase={event_phase} call=(\d+)" + suffix)
+                if call is None:
+                    call = row[2]
+                assert row[2] == call, output.seen
+                if phase in ("a", "b"):
+                    assert int(row[3]) >= minimum_latency, output.seen
+            output.expect(rf"^received={len(phases)} .*complete=true")
+            return int(row[1]), call
+
+        probe = attached("compiled")
+        trigger("s", r"^short call returned 12$")
+        cursor, first = events(probe, 0, ("PRE", "POST", "a", "b"))
+        counters(1, 1)
+
+        trigger("h", r"^call held$")
         time.sleep(.025)
-        trigger("r")
-        target.expect(r"^held call returned 11$")
-        cursor, elapsed = events(first, 0)
-        assert elapsed >= 20_000_000, elapsed
+        cursor, held = events(probe, cursor, ("PRE",))
+        assert held != first
+        send(f'%plugin agent reload a "{source}"')
+        output.expect(r"^agent a generation 2 active \(cache hit\)$")
+        counters(0, 1)
+
+        trigger("s", r"^short call returned 12$")
+        cursor, short = events(probe, cursor, ("PRE", "POST", "a", "b"))
+        assert short not in (first, held)
+        counters(1, 2)
+        trigger("r", r"^held call returned 11$")
+        cursor, _ = events(probe, cursor, ("POST", "a", "b"), held, minimum_latency=20_000_000)
+        counters(2, 3)
 
         send("%detach")
         output.expect(r"^detached session=")
         send(f"%attach {child.pid}")
         second = attached("cache hit")
-        trigger("s")
-        target.expect(r"^short call returned 12$")
-        events(second, cursor)
+        counters(0, 0)
+        trigger("s", r"^short call returned 12$")
+        events(second, cursor, ("PRE", "POST", "a", "b"))
+        counters(1, 1)
         send("%quit")
         assert console.wait(timeout=20) == 0 and child.poll() is None
+        assert source.read_bytes() == (Path(example) / "src/latency.cpp").read_bytes()
         print("".join(output.seen), end="")
 
 

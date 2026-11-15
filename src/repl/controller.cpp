@@ -406,6 +406,7 @@ void Controller::connect(const std::string &endpoint) {
   endpoint_ = endpoint;
   stop_background();
   stub_ = std::move(next);
+  agent_packages_.clear();
   selected_ = {};
   ++connection_;
 }
@@ -433,6 +434,7 @@ void Controller::start_server(const Command &command) {
 void Controller::disconnect() {
   stop_background();
   stub_.reset();
+  agent_packages_.clear();
   selected_ = {};
   ++connection_;
   endpoint_.clear();
@@ -511,10 +513,21 @@ void Controller::on_attach(std::function<void(const api::Session&)> hook) {
   attachment_hook_ = std::move(hook);
 }
 
-void Controller::agent_plugin(const api::AgentPluginRequest& request) {
+std::filesystem::path Controller::agent_plugin_manifest(const api::AgentPluginRequest& request) const {
+  if (const auto session = agent_packages_.find(request.session_id()); session != agent_packages_.end()) {
+    if (const auto package = session->second.find(request.plugin_id()); package != session->second.end())
+      return package->second;
+  }
+  return {};
+}
+
+void Controller::agent_plugin(const api::AgentPluginRequest& request,
+                              const std::filesystem::path& manifest) {
   const auto response = unary<api::AgentPluginResponse>(
       [&](auto& context, auto& reply) { return stub_->AgentPlugin(&context, request, &reply); },
       settings_.timeout_seconds);
+  if (!manifest.empty())
+    agent_packages_[request.session_id()].insert_or_assign(request.plugin_id(), manifest);
   if (request.operation() == api::AgentPluginRequest::RUN) {
     out_ << "agent " << request.plugin_id() << '.' << request.command() << " = " << response.value()
          << '\n';
@@ -656,6 +669,7 @@ void Controller::detach(const SessionHandle &session) {
                              " " + response.error());
   }
   owned_sessions_.erase(session.id);
+  agent_packages_.erase(session.id);
   for (auto it = pending_attaches_.begin(); it != pending_attaches_.end();) {
     const bool identified = it->second.candidate_ids.erase(session.id) != 0 ||
                             (response.pid() == it->first &&
@@ -1605,7 +1619,7 @@ void Controller::remove_bulk_trace(const std::string &batch_id) {
     throw std::runtime_error(report.diagnostic() + " | retry with %trace remove " + batch_id);
 }
 
-bool Controller::execute(const Command &command, const PluginOffer &offer) {
+bool Controller::execute(const Command& command, const PrepareAgentPlugin& prepare_agent) {
   const auto &args = command.arguments;
   using K = CommandKind;
   switch (command.kind) {
@@ -2441,9 +2455,10 @@ public:
       request.set_command(args.at(1));
     else {
       const auto &path = args.at(load ? 0 : 1);
-      request.set_source(read_source(path));
-      if (offer)
-        offer(request, path);
+      if (prepare_agent)
+        prepare_agent(request, path);
+      else
+        request.set_source(read_source(path));
     }
     agent_plugin(request);
     return true;

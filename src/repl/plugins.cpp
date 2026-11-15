@@ -220,46 +220,12 @@ void Plugins::load_attached(Controller& controller, const clangtracer::v1::Sessi
         if (!package || package->executable != session.executable()) {
           continue;
         }
-        using Request = clangtracer::v1::AgentPluginRequest;
-        Request request;
+        clangtracer::v1::AgentPluginRequest request;
         request.set_session_id(session.id());
         request.set_plugin_id(package->id);
-        request.set_expected_executable(package->executable);
-        const auto files = agent_package_files(*package);
-        if (files.size() == 1 && package->compile_commands.empty() &&
-            package->extra_flags.empty()) {
-          request.set_operation(Request::LOAD);
-          const auto source = package->sources.front().string();
-          request.set_source(read_source(source));
-          offer_agent_object(request, source, cpp);
-        } else {
-          request.set_operation(Request::LOAD_PACKAGE);
-          auto& bundle = *request.mutable_package();
-          bundle.set_compile_commands(package->compile_commands.string());
-          bundle.set_translation_unit(package->translation_unit.string());
-          for (const auto& flag : package->extra_flags) {
-            bundle.add_extra_flags(flag);
-          }
-          for (const auto& source : package->sources) {
-            bundle.add_sources(source.lexically_relative(package->directory).string());
-          }
-          std::uintmax_t size = bundle.ByteSizeLong();
-          for (const auto& path : files) {
-            const auto bytes = fs::file_size(path);
-            if (bytes > tracer::kMaxAgentPluginSource ||
-                size > tracer::kMaxAgentPluginSource - bytes) {
-              throw std::runtime_error("agent plugin package exceeds 4 MiB");
-            }
-            size += bytes;
-            auto& file = *bundle.add_files();
-            file.set_path(path.lexically_relative(package->directory).string());
-            file.set_contents(read_source(path.string()));
-          }
-          if (bundle.ByteSizeLong() > tracer::kMaxAgentPluginSource) {
-            throw std::runtime_error("agent plugin package exceeds 4 MiB");
-          }
-        }
-        controller.agent_plugin(request);
+        request.set_operation(clangtracer::v1::AgentPluginRequest::LOAD);
+        prepare_agent_package(request, *package, {}, cpp);
+        controller.agent_plugin(request, manifest);
       } catch (const std::exception& error) {
         errors << "attach plugin " << manifest.string() << ": " << error.what() << '\n';
       }
@@ -375,6 +341,65 @@ void Plugins::execute(const Command &command, const CppEngine &cpp,
     out << id << '.' << name << " = " << value << '\n';
   }
 }
+void Plugins::prepare_agent_package(clangtracer::v1::AgentPluginRequest& request,
+                                    const PluginPackage& package, const fs::path& replacement,
+                                    const CppEngine& cpp) {
+  using Request = clangtracer::v1::AgentPluginRequest;
+  request.set_expected_executable(package.executable);
+  const auto files = agent_package_files(package);
+  const auto input = replacement.empty() ? package.sources.front() : fs::canonical(replacement);
+  fs::path replaced;
+  if (!replacement.empty() && std::find(package.sources.begin(), package.sources.end(), input) ==
+                                 package.sources.end()) {
+    if (package.sources.size() != 1)
+      throw std::invalid_argument("reload FILE must be a declared source of a multi-source agent package");
+    replaced = package.sources.front();
+  }
+  if (files.size() == 1 && package.compile_commands.empty() && package.extra_flags.empty()) {
+    request.set_source(read_source(input.string()));
+    offer_agent_object(request, input.string(), cpp);
+    return;
+  }
+  request.set_operation(request.operation() == Request::RELOAD ? Request::RELOAD_PACKAGE
+                                                               : Request::LOAD_PACKAGE);
+  auto& bundle = *request.mutable_package();
+  bundle.set_compile_commands(package.compile_commands.string());
+  bundle.set_translation_unit(package.translation_unit.string());
+  for (const auto& flag : package.extra_flags)
+    bundle.add_extra_flags(flag);
+  for (const auto& source : package.sources)
+    bundle.add_sources(source.lexically_relative(package.directory).string());
+
+  std::uintmax_t size = bundle.ByteSizeLong();
+  for (const auto& path : files) {
+    const auto& content_path = path == replaced ? input : path;
+    const auto bytes = fs::file_size(content_path);
+    if (bytes > tracer::kMaxAgentPluginSource ||
+        size > tracer::kMaxAgentPluginSource - bytes)
+      throw std::runtime_error("agent plugin package exceeds 4 MiB");
+    size += bytes;
+    auto& file = *bundle.add_files();
+    file.set_path(path.lexically_relative(package.directory).string());
+    file.set_contents(read_source(content_path.string()));
+  }
+  if (bundle.ByteSizeLong() > tracer::kMaxAgentPluginSource)
+    throw std::runtime_error("agent plugin package exceeds 4 MiB");
+}
+
+void Plugins::prepare_agent_plugin(clangtracer::v1::AgentPluginRequest& request,
+                                   const std::string& path, const fs::path& manifest,
+                                   const CppEngine& cpp) {
+  if (request.operation() == clangtracer::v1::AgentPluginRequest::RELOAD && !manifest.empty()) {
+    const auto package = read_plugin_package(manifest, PluginComponent::Agent);
+    if (!package || package->id != request.plugin_id())
+      throw std::invalid_argument("installed agent plugin manifest changed its id or component");
+    prepare_agent_package(request, *package, path, cpp);
+    return;
+  }
+  request.set_source(read_source(path));
+  offer_agent_object(request, path, cpp);
+}
+
 void Plugins::offer_agent_object(clangtracer::v1::AgentPluginRequest &request,
                                  const std::string &path,
                                  const CppEngine &cpp) {

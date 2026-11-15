@@ -407,6 +407,7 @@ message AgentPluginRequest {
     RELOAD = 2;
     RUN = 3;
     LOAD_PACKAGE = 4;
+    RELOAD_PACKAGE = 5;
   }
   string session_id = 1;
   Operation operation = 2;
@@ -414,7 +415,7 @@ message AgentPluginRequest {
   bytes source = 4;
   string command = 5;
   AgentPluginObject repl_object = 6;
-  string expected_executable = 7; // Required for automatic package activation.
+  string expected_executable = 7; // Required for package activation or reload.
   AgentPluginPackage package = 8;
 }
 

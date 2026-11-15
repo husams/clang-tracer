@@ -15,6 +15,7 @@ class Session;
 namespace tracer_repl {
 class Controller;
 class CppEngine;
+struct PluginPackage;
 
 class Plugins {
   tracer::NativePlugins plugins_;
@@ -36,8 +37,16 @@ public:
                      const CppEngine& cpp, std::ostream& errors);
   void load_enabled(const CppEngine &cpp, std::ostream &out, std::ostream &errors);
   void execute(const Command &command, const CppEngine &cpp, std::ostream &out);
-  void offer_agent_object(clangtracer::v1::AgentPluginRequest &request,
-                          const std::string &path, const CppEngine &cpp);
+  void prepare_agent_plugin(clangtracer::v1::AgentPluginRequest& request,
+                            const std::string& path, const std::filesystem::path& manifest,
+                            const CppEngine& cpp);
+
+private:
+  void prepare_agent_package(clangtracer::v1::AgentPluginRequest& request,
+                             const PluginPackage& package,
+                             const std::filesystem::path& replacement, const CppEngine& cpp);
+  void offer_agent_object(clangtracer::v1::AgentPluginRequest& request,
+                          const std::string& path, const CppEngine& cpp);
 };
 
 bool is_plugin_command(CommandKind kind);

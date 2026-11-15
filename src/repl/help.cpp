@@ -231,7 +231,7 @@ const CommandTopic commands[] = {
     {"plugin commands", "%plugin commands NAME", "Show a plugin's commands and their help."},
     {"plugin agent", "", "Load and run trusted C++ plugins inside the selected target."},
     {"plugin agent load", "%plugin agent load FILE --as NAME", "Load C++ source in the selected target's injected agent."},
-    {"plugin agent reload", "%plugin agent reload NAME FILE", "Replace an agent plugin with a fresh generation built from FILE."},
+    {"plugin agent reload", "%plugin agent reload NAME FILE", "Replace an agent plugin from FILE using its installed package settings when available."},
     {"plugin agent run", "%plugin agent run NAME COMMAND", "Invoke a plugin command inside the selected target."},
     {"shell", "%shell \"COMMAND\"", "Run a local shell command and print its output.", R"(%shell "pwd")"},
     {"complete", "%complete \"C++ PREFIX\"", "List semantic C++ completions without evaluating the expression.",

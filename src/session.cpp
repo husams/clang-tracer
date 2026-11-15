@@ -663,12 +663,14 @@ Session::agent_plugin(const clangtracer::v1::AgentPluginRequest &rpc) {
     payload = rpc.source();
     break;
   case Rpc::LOAD_PACKAGE:
+  case Rpc::RELOAD_PACKAGE:
     if (expected.empty() || !rpc.has_package() || rpc.package().sources().empty() ||
         rpc.package().ByteSizeLong() > kMaxAgentPluginSource || !rpc.source().empty() ||
         !rpc.command().empty() || rpc.has_repl_object()) {
-      throw std::invalid_argument("package load requires an executable and package up to 4 MiB");
+      throw std::invalid_argument("package load or reload requires an executable and package up to 4 MiB");
     }
-    request.operation = AgentPluginOperation::LoadPackage;
+    request.operation = rpc.operation() == Rpc::RELOAD_PACKAGE ? AgentPluginOperation::ReloadPackage
+                                                               : AgentPluginOperation::LoadPackage;
     payload = rpc.package().SerializeAsString();
     break;
   case Rpc::RUN:

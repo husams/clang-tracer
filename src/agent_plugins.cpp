@@ -64,7 +64,7 @@ std::vector<std::string> target_profile() {
 }
 
 tracer::NativePlugins::LoadResult load_package(const tracer::AgentPluginCall& request,
-                                               const char* source) {
+                                               const char* source, bool reload) {
   clangtracer::v1::AgentPluginPackage package;
   if (!source || !package.ParseFromArray(source, static_cast<int>(request.source_size)) ||
       package.sources().empty()) {
@@ -113,7 +113,7 @@ tracer::NativePlugins::LoadResult load_package(const tracer::AgentPluginCall& re
                      std::move(profile)});
   }
   auto& plugins = sessions.try_emplace(request.session_id, true).first->second;
-  return plugins.load_package(request.plugin_id, units, {}, cache_directory(), false);
+  return plugins.load_package(request.plugin_id, units, {}, cache_directory(), reload);
 }
 
 int agent_plugin(tracer::AgentPluginCall *request, const char *source,
@@ -182,8 +182,10 @@ int agent_plugin(tracer::AgentPluginCall *request, const char *source,
       request->cache_hit = result.cache_hit;
       return result.from_repl ? tracer::kAgentPluginReusedReplObject : 0;
     }
-    case AgentPluginOperation::LoadPackage: {
-      const auto result = load_package(*request, source);
+    case AgentPluginOperation::LoadPackage:
+    case AgentPluginOperation::ReloadPackage: {
+      const auto result = load_package(*request, source,
+                                       request->operation == AgentPluginOperation::ReloadPackage);
       request->generation = result.generation;
       request->cache_hit = result.cache_hit;
       return 0;
