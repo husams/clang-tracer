@@ -911,8 +911,10 @@ between calls.
 
 On x86-64, a verified PLT stub can lead to a leaf translation in any bound ELF.
 In-place redirects for a nonleaf callee reached through a PLT call are limited
-to the ELF that owns that PLT stub and the process executable; other nonleaf
-callees run natively and produce an explicit coverage gap. An unbound lazy PLT
+to the ELF that owns that PLT stub and the process executable. Nonleaf callees
+with dynamically exported weak symbols run natively to keep process-wide
+runtime entry points safe for the tracer and other callers. These scope limits
+produce explicit coverage gaps. An unbound lazy PLT
 slot also runs natively and produces one explicit gap for that slot while the
 loader binds it; subsequent calls use the current GOT target. These lazy-binding
 gaps have their own diagnostic. Other dispatch gaps are reported once per call

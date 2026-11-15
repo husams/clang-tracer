@@ -40,7 +40,7 @@ inline bool writer(Hook hook) noexcept {
   return hook == Hook::move || hook == Hook::xadd || hook == Hook::cas || hook == Hook::rmw;
 }
 enum class DispatchGap : std::uint8_t {
-  translation_failed = 1, runtime_limit, lazy_plt, outside_plt_scope
+  translation_failed = 1, runtime_limit, lazy_plt, outside_plt_scope, weak_scope
 };
 enum class Flow : std::uint8_t { copy, jump, conditional, runtime_call, runtime_tail };
 
