@@ -5,6 +5,19 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#if defined(SHARED_WRITER_INTERPOSE)
+namespace shared_writer {
+
+__attribute__((noinline)) int adjust(Record &record, int value, bool store) {
+  const int adjusted = value + 1;
+  if (store)
+    record.value = adjusted; // EXECUTABLE_HELPER_STORE
+  return adjusted;
+}
+
+} // namespace shared_writer
+#endif
+
 int main() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   if (::fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK) != 0)
@@ -25,7 +38,6 @@ int main() {
       continue;
     {
       shared_writer::Record record(1);
-      shared_writer::write(record, 1, false);
       for (int value = 1; value <= 6; ++value)
         shared_writer::write(record, value, true);
       std::printf("DONE value=%d\n", record.value);

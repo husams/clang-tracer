@@ -1980,8 +1980,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     }
     if (matches.size() == 1)
       throw std::runtime_error("writer is in shared module " + *matches.begin() +
-          "; use --module \"" + *matches.begin() +
-          "\" (add --follow-calls for a non-leaf code-cache writer)");
+          "; use --module \"" + *matches.begin() + "\"");
     if (matches.size() > 1)
       throw std::runtime_error("writer matches multiple shared modules; specify --module with one mapped ELF");
     throw;
@@ -2456,7 +2455,10 @@ Plan::Plan(std::uint32_t pid, std::string executable,
           return inst.flow == native_entry::Flow::call;
         }))
       throw std::runtime_error("shared writer in " + module +
-          " contains calls; use --follow-calls --module \"" + module + "\"");
+          " contains calls; " +
+          (follow_calls_eligible(request)
+               ? "use --follow-calls --module \"" + module + "\""
+               : "--follow-calls is unavailable for this watch scope"));
     auto previous_end = start;
     const auto indirect = std::find_if(std::begin(decoded.instructions), std::end(decoded.instructions), [](const auto &instruction) {
       return instruction.flow == native_entry::Flow::branch && !instruction.target;
@@ -2595,6 +2597,13 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       throw std::runtime_error("object watch sites overlap");
     previous_end = pc + site.bytes.size();
   }
+}
+
+bool Plan::follow_calls_eligible(const clangtracer::v1::ObjectWatchRequest &request) const {
+  using Request = clangtracer::v1::ObjectWatchRequest;
+  return request.backend() == Request::CODE_CACHE && request.mode() == Request::WRITES &&
+      !(request.first_seen() && !layout.value_write.active()) && !request.writer_entry() &&
+      !caller_start && request.owner_type().empty() && !layout.logical_collection();
 }
 
 Plan::~Plan() = default;

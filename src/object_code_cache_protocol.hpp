@@ -39,6 +39,9 @@ enum class Hook : std::uint8_t {
 inline bool writer(Hook hook) noexcept {
   return hook == Hook::move || hook == Hook::xadd || hook == Hook::cas || hook == Hook::rmw;
 }
+enum class DispatchGap : std::uint8_t {
+  translation_failed = 1, runtime_limit, lazy_plt, outside_plt_scope
+};
 enum class Flow : std::uint8_t { copy, jump, conditional, runtime_call, runtime_tail };
 
 struct Instruction {
@@ -205,6 +208,7 @@ struct Channel {
   std::atomic<std::uint64_t> matched_dispatches{0};
   std::atomic<std::uint64_t> deadline_ns{0};
   std::atomic<unsigned> capture_limit{0};
+  std::atomic<std::uint64_t> runtime_gap_hits{0}, helper_reentries{0};
   // Aligned Slot objects follow the header in the shared mapping.
   Slot *slot(std::size_t index) noexcept {
     return reinterpret_cast<Slot *>(reinterpret_cast<std::uintptr_t>(this) +
