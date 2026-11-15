@@ -3,6 +3,7 @@
 from argparse import ArgumentParser
 from contextlib import ExitStack
 import json
+import os
 from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
@@ -27,6 +28,7 @@ int adjacent_value();
 int calculate(int);
 int accepted_key();
 int registered(int);
+int policy_check(int);
 int main() {
   if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)) return 1;
   std::thread([] { for (;;) usleep(100000); }).detach();
@@ -37,8 +39,8 @@ int main() {
       unlink("call");
       int one;
       try { one = first(10); } catch (int value) { one = value; }
-      std::printf("%d %d %d %d %d %d %d %d\n", one, second(10), lookup(1), third(10),
-                  adjacent_value(), calculate(10), accepted_key(), registered(10));
+      std::printf("%d %d %d %d %d %d %d %d %d\n", one, second(10), lookup(1), third(10),
+                  adjacent_value(), calculate(10), accepted_key(), registered(10), policy_check(10));
       std::fflush(stdout);
     }
     usleep(3000);
@@ -49,6 +51,7 @@ int main() {
 APP = """
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <iostream>
 #include <optional>
@@ -56,6 +59,7 @@ APP = """
 #include <string_view>
 #include <vector>
 #include <unistd.h>
+#include "system_policy.hpp"
 #define LIVE_ENTRY __attribute__((patchable_function_entry(16, 0)))
 struct Config { int a; };
 struct Storage { Config config; int adjacent; };
@@ -72,6 +76,7 @@ static const int table[] = {1, 2, 3};
 int lookup(int i) { const char *empty = ""; return table[i] + empty[0]; }
 LIVE_ENTRY int first(int i) { return i + 1; }
 LIVE_ENTRY int second(int i) { return i + 2; }
+LIVE_ENTRY int policy_check(int i) { return policy_total(i) + 1; }
 int registered(int i) {
   static int (*const callback)(int) = [](int v) LIVE_ENTRY { return v + 17; };
   return callback(i);
@@ -110,18 +115,41 @@ int names(int i) {
 }
 """
 
+SYSTEM_POLICY = """
+#pragma GCC system_header
+inline int policy_scale(int i) { return i * 2; }
+inline int policy_total(int i) { return policy_scale(i) + 1; }
+"""
+
+PRELOAD = """
+#include <cstdlib>
+#include <dlfcn.h>
+extern "C" void* aligned_alloc(std::size_t alignment, std::size_t size) noexcept {
+  if (alignment == 4096 && size == 1200128) return nullptr;
+  using Allocator = decltype(&aligned_alloc);
+  static const auto next = reinterpret_cast<Allocator>(::dlsym(RTLD_NEXT, "aligned_alloc"));
+  return next(alignment, size);
+}
+"""
+
 
 def run(args, root, cleanup):
     source = root / "source"
     baseline = root / "baseline"
     source.mkdir()
     baseline.mkdir()
-    for name, content in {"driver.cpp": DRIVER, "app.cpp": APP, "other.cpp": OTHER}.items():
+    for name, content in {"driver.cpp": DRIVER, "app.cpp": APP, "other.cpp": OTHER,
+                          "system_policy.hpp": SYSTEM_POLICY}.items():
         (source / name).write_text(content)
         (baseline / name).write_text(content)
     flags = ["-std=c++17", "-g", "-O0", "-fno-inline", "-fno-omit-frame-pointer",
              "-fcf-protection=none", "-pthread"]
     target = root / "target"
+    preload = root / "preload.cpp"
+    preload.write_text(PRELOAD)
+    allocator = root / "allocator.so"
+    subprocess.run([args.compiler, "-std=c++17", "-fPIC", "-shared", preload, "-ldl", "-o", allocator],
+                   check=True)
     subprocess.run([args.compiler, *flags, "-Wl,--build-id=sha1", source / "driver.cpp",
                     source / "app.cpp", source / "other.cpp", "-o", target], check=True)
     database = root / "compile_commands.json"
@@ -143,13 +171,14 @@ def run(args, root, cleanup):
         "int passthrough(const LiveMockContext &ctx, int value) { return ctx.original(value); }\n"
     )
 
-    def launch(*argv):
+    def launch(*argv, env=None):
         child = subprocess.Popen(argv, cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, text=True)
+                                 stderr=subprocess.STDOUT, text=True, env=env)
         cleanup.callback(stop, child)
         return child, Output(child.stdout, 60)
 
-    child, app = launch(target)
+    preload_values = [str(allocator), os.environ.get("LD_PRELOAD", "")]
+    child, app = launch(target, env={**os.environ, "LD_PRELOAD": " ".join(filter(None, preload_values))})
     app.expect(r"^READY$")
     repl, console = launch(args.repl, "--server", args.server, "--agent", args.agent,
                            "--attach", str(child.pid), "--timeout", "60")
@@ -160,14 +189,35 @@ def run(args, root, cleanup):
         result = console.expect(r"^live (APPLIED|BLOCKED|STALE|REVERTED|UNCHANGED|RESTORATION_REQUIRED) revision=")
         assert result[1] == outcome, "".join(console.seen[-25:])
 
-    def call(first, second, *, third=15, calculated=3, key=7, callback=27, runtime=False):
+    def call(first, second, *, third=15, calculated=3, key=7, callback=27, policy=22, runtime=False):
         (root / "call").touch()
         if runtime:
             app.expect(r"^runtime=10$")
-        app.expect(rf"^{first} {second} 2 {third} 7 {calculated} {key} {callback}$")
+        app.expect(rf"^{first} {second} 2 {third} 7 {calculated} {key} {callback} {policy}$")
 
     app_source = source / "app.cpp"
     call(11, 12)
+    # Emitting policy_scale first adds nounwind to policy_total without
+    # changing its instructions or introducing an unwind edge.
+    app_source.write_text(APP.replace("return policy_total(i) + 1;",
+                                      "return policy_scale(i) + policy_total(i) + 1;"))
+    command("%live update source/app.cpp", "APPLIED")
+    call(11, 12, policy=42)
+    command("%live revert 0", "REVERTED")
+    call(11, 12)
+
+    # glibc would allocate this block. Only the target's preloaded allocator
+    # returns null, so an update must observe the target's lookup order.
+    app_source.write_text(APP.replace("return i + 1;", """
+      auto* block = std::aligned_alloc(4096, 1200128);
+      if (!block) return i + 1000;
+      std::free(block);
+      return i + 1;"""))
+    command("%live update source/app.cpp", "APPLIED")
+    call(1010, 12)
+    command("%live revert 0", "REVERTED")
+    call(11, 12)
+
     revised_callback = APP.replace("return v + 17;", "return v + 100;")
     app_source.write_text(revised_callback)
     compiler_version = subprocess.check_output([args.compiler, "--version"], text=True)

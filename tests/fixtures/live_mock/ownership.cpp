@@ -3,7 +3,7 @@
 #include "application.hpp"
 #include "live_mock_context.hpp"
 
-Quote* make_test_quote(const LiveMockContext& ctx, Pricer& self, int product) {
+Quote* make_test_quote(const LiveMockContext& ctx, const Pricer& self, const ProductId& product) {
   if (!ctx.is_test_product(self, product)) {
     return ctx.original(self, product);
   }

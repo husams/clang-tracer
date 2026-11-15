@@ -33,7 +33,7 @@ bool Pricer::is_test_product(int product) const {
   return product == test_id_;
 }
 
-Quote* Pricer::make_quote(int product) {
+Quote* Pricer::make_quote(const ProductId& product) const {
   ++original_calls_;
   return quote_create(product, 200);
 }

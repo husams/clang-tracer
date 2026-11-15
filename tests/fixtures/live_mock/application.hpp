@@ -33,19 +33,21 @@ struct Quote {
   int price;
 };
 
+using ProductId = int;
+
 class Pricer {
 public:
   explicit Pricer(int test_id)
       : test_id_(test_id) {}
 
-  virtual Quote* make_quote(int product);
+  virtual Quote* make_quote(const ProductId& product) const;
 
   int original_calls() const { return original_calls_; }
 
 private:
   bool is_test_product(int product) const;
   int test_id_;
-  int original_calls_ = 0;
+  mutable int original_calls_ = 0;
 };
 
 Quote* quote_create(int product, int price);

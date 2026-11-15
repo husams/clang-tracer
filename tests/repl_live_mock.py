@@ -121,9 +121,10 @@ def products(repl, server, agent, target):
 
 def ownership(repl, server, agent, target):
     with attached(repl, server, agent, target) as (call, command):
-        quote_revision = mock(command, "Pricer::make_quote(int)", "ownership.cpp", "make_test_quote",
-                              '--bind "is_test_product=Pricer::is_test_product(int) const" '
-                              '--bind "quote_create=quote_create(int, int)"')[1]
+        quote_bindings = ('--bind "is_test_product=Pricer::is_test_product(int) const" '
+                          '--bind "quote_create=quote_create(int, int)"')
+        quote_revision = mock(command, "Pricer::make_quote(const ProductId&) const",
+                              "ownership.cpp", "make_test_quote", quote_bindings)[1]
         call("q 77", "quote=77 price=200 calls=1")
         call("d", "destroying=77 price=200", "destroyed=1")
         call("q 42", "quote=42 price=125 calls=1")
@@ -151,6 +152,13 @@ def ownership(repl, server, agent, target):
         call("n 2", "nesting=33 originals=3")
         command("%live revert 0", r"^live REVERTED revision=0")
         call("n 2", "nesting=3 originals=3")
+
+        selectors = ("Pricer::make_quote(const int &) const", "Pricer::make_quote(int const&) const")
+        for destroyed, selector in enumerate(selectors, start=4):
+            mock(command, selector, "ownership.cpp", "make_test_quote", quote_bindings)
+            call("q 42", "quote=42 price=125 calls=2")
+            call("d", "destroying=42 price=125", f"destroyed={destroyed}")
+        command("%live revert 0", r"^live REVERTED revision=0")
 
 
 def main(repl, server, agent, compiler=os.environ.get("CXX", "clang++")):
