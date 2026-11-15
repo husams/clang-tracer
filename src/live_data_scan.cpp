@@ -480,29 +480,42 @@ void TargetImage::discover_owners(const std::vector<std::string>& types,
   }
   std::set<Address> visited;
   for (const auto& root : image_->roots) {
-    if (!storage.contains(root.offset) || std::ranges::find(types, root.type) == types.end())
+    if (std::ranges::find(types, root.type) == types.end())
+      continue;
+    const auto skip = [&](const char* reason, void* object = nullptr) {
+      sink.register_verified({root.type, root.name, object, nullptr, reason});
+    };
+    const auto address = checked_add(image_->bias, root.offset);
+    if (!visited.insert(address).second)
       continue;
     const auto layout = records.find(root.type);
-    if (layout == records.end() || !layout->second)
+    if (layout == records.end() || !layout->second) {
+      skip("root pointee lacks a verified DWARF layout");
       continue;
-    const auto address = checked_add(image_->bias, root.offset);
-    if (address % alignof(AtomicOwner) || !visited.insert(address).second ||
+    }
+    if (!storage.contains(root.offset) || address % alignof(AtomicOwner) ||
         !std::ranges::any_of(maps, [&](const Mapping& map) {
           return map.permissions[1] == 'w' && map.name == image_->target.module &&
                  map.contains(address, sizeof(AtomicOwner));
-        }))
+        })) {
+      skip("atomic owner storage is outside a verified writable ELF mapping");
       continue;
+    }
     // libstdc++ atomic shared_ptr operations are type-erased at the control
     // block. Require the identified specialization and storage above rather
     // than interpreting ordinary shared_ptr bytes or an untyped heap word.
     const auto owner = reinterpret_cast<const AtomicOwner*>(address)->load();
-    if (!owner)
+    if (!owner) {
+      skip("atomic owner is empty");
       continue;
+    }
     // This recognized make_shared control block must own the exact object,
     // rather than an alias to an unrelated allocation or a no-op deleter.
     const auto allocated = std::get_deleter<std::_Sp_make_shared_tag>(owner);
-    if (static_cast<const void*>(allocated) != owner.get())
+    if (static_cast<const void*>(allocated) != owner.get()) {
+      skip("atomic owner is an alias or lacks verified make_shared storage", owner.get());
       continue;
+    }
     sink.register_verified({root.type, root.name, owner.get(), &owner, nullptr,
                             layout->second->size, layout->second->alignment, false});
   }

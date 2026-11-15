@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <set>
 #include <stdexcept>
 
@@ -52,6 +53,7 @@ struct Symbol {
   std::uint64_t address;
   std::uint64_t size;
   unsigned type;
+  bool local;
   auto operator<=>(const Symbol &) const = default;
 };
 
@@ -89,7 +91,8 @@ struct Image {
         throw std::runtime_error("cannot read complete ELF symbol inventory");
       }
       if (*address && !name->empty() && !(*flags & llvm::object::SymbolRef::SF_Undefined))
-        symbols.push_back({name->str(), *address, native.getSize(), type});
+        symbols.push_back({name->str(), *address, native.getSize(), type,
+                           native.getBinding() == llvm::ELF::STB_LOCAL});
     };
     for (const auto &item : elf.symbols())
       append(item);
@@ -106,14 +109,18 @@ struct Image {
     return *object;
   }
 
-  const Symbol *find(const std::string &name) const {
+  const Symbol *find(const std::string &name, std::optional<bool> local = std::nullopt) const {
     const auto item = std::lower_bound(symbols.begin(), symbols.end(), name,
         [](const Symbol &symbol, const std::string &value) { return symbol.name < value; });
-    if (item == symbols.end() || item->name != name)
-      return nullptr;
-    if (std::next(item) != symbols.end() && std::next(item)->name == name)
-      throw std::runtime_error("ambiguous duplicate ELF symbol: " + name);
-    return &*item;
+    const Symbol *match = nullptr;
+    for (auto it = item; it != symbols.end() && it->name == name; ++it) {
+      if (local && it->local != *local)
+        continue;
+      if (match)
+        throw std::runtime_error("ambiguous duplicate ELF symbol: " + name);
+      match = &*it;
+    }
+    return match;
   }
 
   std::string_view code(const Symbol &symbol) const {
@@ -239,15 +246,20 @@ Sources snapshot_inputs(const api::LiveBuildManifest &manifest,
 }
 
 struct Body {
+  std::string name;
   Definition definition;
   bool inconsistent = false;
 };
 
-void collect(std::map<std::string, Body> &all, const CompiledUnit &unit) {
-  for (auto &[name, definition] : definitions(unit)) {
-    const auto item = all.find(name);
+void collect(std::map<std::string, Body> &all, const std::string &path,
+             std::map<std::string, Definition> definitions, std::set<std::string> *affected = nullptr) {
+  for (auto &[name, definition] : definitions) {
+    const auto key = definition.local ? local_import_name(path, name) : name;
+    if (affected)
+      affected->insert(key);
+    const auto item = all.find(key);
     if (item == all.end())
-      all.emplace(name, Body{std::move(definition)});
+      all.emplace(key, Body{name, std::move(definition)});
     else if (item->second.definition.implementation != definition.implementation ||
              item->second.definition.abi != definition.abi)
       item->second.inconsistent = true;
@@ -486,9 +498,13 @@ ExtensionSources extension_sources(std::uint32_t pid, const std::string &module,
       if (!value.isDeclaration() || value.getName().empty())
         return;
       const auto name = value.getName().str();
-      const auto *symbol = image.find(name);
+      const auto *symbol = image.find(name, false);
       if (symbol && symbol->type == type && symbol->address <= UINTPTR_MAX - bias)
-        result.jit.imports.emplace(name, bias + symbol->address);
+        if (symbol->type == llvm::ELF::STT_OBJECT && ref.size && *ref.size != symbol->size) {
+      block(ref.local_unit, name, "rebuild required: imported storage size differs from the ELF");
+      continue;
+    }
+    result.jit.imports.emplace(import, bias + symbol->address);
     };
     for (const auto &function : *compiled.module)
       add_import(function, llvm::ELF::STT_FUNC);
@@ -569,7 +585,23 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
   JitRequest baseline;
   baseline.files = sources.baseline;
   std::map<std::string, Body> old_bodies, new_bodies;
-  std::set<std::string> covered, referenced, affected;
+  std::set<std::string> covered, affected;
+  std::map<std::string, std::set<std::string>> native_locals;
+  struct Reference {
+    std::string name;
+    std::string local_unit;
+    std::optional<std::uint64_t> size;
+  };
+  std::multimap<std::string, Reference> referenced;
+  Plan result;
+  const auto block = [&](const std::string &path, const std::string &name, std::string diagnostic) {
+    auto &candidate = result.candidates.emplace_back();
+    candidate.set_state(api::LiveUpdateStatus::BLOCKED);
+    candidate.set_symbol(name);
+    candidate.set_source(path);
+    candidate.set_module(module);
+    candidate.set_diagnostic(std::move(diagnostic));
+  };
   for (const auto &[path, unit] : profiles) {
     if (cancelled && cancelled())
       throw Stale("live source compilation cancelled");
@@ -592,34 +624,56 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     if (existing) {
       auto before = compile_unit(baseline, unit);
       changed |= uses_saved_edit(before);
-      if (changed)
-        for (const auto &[name, definition] : definitions(before)) {
-          (void)definition;
-          affected.insert(name);
+      if (sources.saved.count(path))
+        for (const auto &value : before.module->global_values())
+          if (value.hasName() && value.hasLocalLinkage())
+            native_locals[value.getName().str()].insert(path);
+      if (changed) {
+        for (const auto &[name, layout] : before.record_layouts) {
+          const auto updated = after.record_layouts.find(name);
+          if (updated != after.record_layouts.end() && updated->second != layout)
+            block(path, name, "rebuild required: existing record layout changed");
         }
-      collect(old_bodies, before);
+        const auto old_data = data_definitions(before);
+        const auto new_data = data_definitions(after);
+        for (const auto &[name, storage] : old_data) {
+          const auto updated = new_data.find(name);
+          if (updated == new_data.end() || updated->second != storage)
+            block(path, name, "rebuild required: existing data definition changed");
+        }
+        for (const auto &[name, storage] : new_data) {
+          (void)storage;
+          if (!old_data.contains(name))
+            block(path, name, "rebuild required: new persistent data definition");
+        }
+      }
+      collect(old_bodies, path, definitions(before), changed ? &affected : nullptr);
       covered.insert(before.inputs.begin(), before.inputs.end());
     }
-    collect(new_bodies, after);
-    // Link only affected units. All other references must bind to the exact
-    // existing ELF symbol or the allowed target runtime.
-    if (changed) {
+    collect(new_bodies, path, definitions(after));
+    // A previous revision may have supplied a TU with no ELF counterpart.
+    // Relink its accepted snapshot so new callers can resolve those helpers.
+    if (changed || !sources.saved.count(path)) {
       current.translation_units.push_back(unit);
-      for (const auto &function : *after.module)
-        if (function.hasName())
-          referenced.insert(function.getName().str());
-      for (const auto &global : after.module->globals())
-        if (global.hasName())
-          referenced.insert(global.getName().str());
-      for (const auto &alias : after.module->aliases())
-        referenced.insert(alias.getName().str());
+      for (const auto &value : after.module->global_values()) {
+        if (!value.hasName())
+          continue;
+        const auto *global = llvm::dyn_cast<llvm::GlobalVariable>(&value);
+        if (global && mergeable_literal(*global))
+          continue;
+        const auto name = value.getName().str();
+        const auto import = value.hasLocalLinkage() ? local_import_name(path, name) : name;
+        std::optional<std::uint64_t> size;
+        if (global && global->getValueType()->isSized())
+          size = after.module->getDataLayout().getTypeAllocSize(global->getValueType()).getFixedValue();
+        referenced.emplace(import, Reference{name, value.hasLocalLinkage() ? path : std::string{}, size});
+      }
     }
   }
   for (const auto &path : sources.submitted)
     if (!covered.count(path))
       throw std::runtime_error("no verified translation unit profile or dependency uses " + path);
 
-  Plan result;
   result.jit = std::move(current);
   for (const auto &file : result.jit.files)
     if (sources.submitted.count(file.path))
@@ -633,15 +687,21 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     return item->second.definition.alias_target.empty()
         ? name : item->second.definition.alias_target;
   };
-  for (const auto &[name, body] : old_bodies) {
-    if (!affected.contains(name))
+  for (const auto &[key, body] : old_bodies) {
+    if (!affected.contains(key))
       continue;
-    const auto next = new_bodies.find(name);
+    const auto &name = body.name;
+    const auto next = new_bodies.find(key);
     const auto &old = body.definition;
     if (next != new_bodies.end() && old.implementation == next->second.definition.implementation &&
         old.abi == next->second.definition.abi && !next->second.inconsistent && !body.inconsistent)
       continue;
-    const auto *symbol = image.find(name);
+    if (old.local) {
+      if (within(sources.root, old.path))
+        block(site(old), name, "rebuild required: changed translation-unit-local implementation");
+      continue;
+    }
+    const auto *symbol = image.find(name, false);
     if (!symbol) {
       if (!within(sources.root, old.path))
         continue;
@@ -715,10 +775,22 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
   if (!main)
     throw std::runtime_error("cannot verify the executable load bias without main");
   const auto bias = client::bind_live_executable(pid, module, image.elf, main->address, main->size);
-  for (const auto &name : referenced) {
-    if (replaced.count(name))
+  for (const auto &[import, ref] : referenced) {
+    const auto &name = ref.name;
+    const bool local = !ref.local_unit.empty();
+    if (!local && replaced.count(name))
       continue;
-    const auto *symbol = image.find(name);
+    if (local) {
+      const auto prior = native_locals.find(name);
+      if (prior == native_locals.end() || !prior->second.contains(ref.local_unit))
+        continue;
+      if (prior->second.size() != 1) {
+        if (ref.size)
+          block(ref.local_unit, name, "rebuild required: ambiguous translation-unit-local storage");
+        continue;
+      }
+    }
+    const auto *symbol = image.find(name, local);
     if (!symbol || !symbol->size ||
         (symbol->type != llvm::ELF::STT_FUNC && symbol->type != llvm::ELF::STT_OBJECT))
       continue;
@@ -728,7 +800,11 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       if (mapped_bias != bias)
         throw Stale("import moved across ELF instances: " + name);
     }
-    result.jit.imports.emplace(name, bias + symbol->address);
+    if (symbol->type == llvm::ELF::STT_OBJECT && ref.size && *ref.size != symbol->size) {
+      block(ref.local_unit, name, "rebuild required: imported storage size differs from the ELF");
+      continue;
+    }
+    result.jit.imports.emplace(import, bias + symbol->address);
   }
   for (const auto &entry : result.entries)
     result.jit.entry_symbols.push_back(entry.symbol);

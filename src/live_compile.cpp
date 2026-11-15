@@ -17,10 +17,12 @@
 #include <llvm/IR/DebugInfoMetadata.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/GlobalAlias.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/Demangle/Demangle.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/SHA256.h>
 #include <llvm/Support/VirtualFileSystem.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Transforms/Utils/Cloning.h>
@@ -66,10 +68,33 @@ private:
 class CallableTypes final : public clang::RecursiveASTVisitor<CallableTypes> {
 public:
   CallableTypes(clang::ASTContext &context,
-           std::map<std::string, std::pair<std::string, std::string>> &types)
-      : context_(context), mangler_(context.createMangleContext()), types_(types) {}
+           CompiledUnit &unit)
+      : context_(context), mangler_(context.createMangleContext()), unit_(unit) {}
 
   bool shouldVisitTemplateInstantiations() const { return true; }
+
+  bool VisitRecordDecl(clang::RecordDecl *record) {
+    const auto location = context_.getSourceManager().getExpansionLoc(record->getLocation());
+    if (!record->isCompleteDefinition() || record->isDependentContext() ||
+        record->isInvalidDecl() || record->isImplicit() ||
+        context_.getSourceManager().isInSystemHeader(location) ||
+        (!record->getIdentifier() && !record->getTypedefNameForAnonDecl()))
+      return true;
+
+    clang::PrintingPolicy policy(context_.getLangOpts());
+    policy.FullyQualifiedName = true;
+    std::string name;
+    llvm::raw_string_ostream printed_name(name);
+    record->getNameForDiagnostic(printed_name, policy, true);
+    if (name.empty())
+      return true;
+    std::string fingerprint;
+    llvm::raw_string_ostream layout(fingerprint);
+    std::set<const clang::RecordDecl *> seen;
+    append_record(record, layout, seen);
+    unit_.record_layouts.insert_or_assign(name, std::move(fingerprint));
+    return true;
+  }
 
   bool VisitFunctionDecl(clang::FunctionDecl *function) {
     const auto location = context_.getSourceManager().getExpansionLoc(function->getLocation());
@@ -104,7 +129,7 @@ public:
         mangler_->mangleName(declaration, symbol);
       else
         symbol << function->getName();
-      types_.insert_or_assign(name, std::pair{display, fingerprint});
+      unit_.types.insert_or_assign(name, std::pair{display, fingerprint});
     };
     if (const auto *constructor = llvm::dyn_cast<clang::CXXConstructorDecl>(function)) {
       record({constructor, clang::Ctor_Complete});
@@ -127,10 +152,8 @@ private:
       append_type(array->getElementType(), out, seen);
     else if (const auto *record = type.getNonReferenceType()->getAsRecordDecl())
       append_record(record, out, seen);
-    else if (type->isPointerType()) {
-      if (const auto *record = type->getPointeeType()->getAsRecordDecl())
-        append_record(record, out, seen);
-    }
+    else if (type->isPointerType())
+      append_type(type->getPointeeType(), out, seen);
   }
 
   void append_record(const clang::RecordDecl *input, llvm::raw_ostream &out,
@@ -168,7 +191,7 @@ private:
 
   clang::ASTContext &context_;
   std::unique_ptr<clang::MangleContext> mangler_;
-  std::map<std::string, std::pair<std::string, std::string>> &types_;
+  CompiledUnit &unit_;
 };
 
 class CompileAction final : public clang::EmitLLVMOnlyAction {
@@ -223,7 +246,55 @@ public:
 
   std::string errors;
 };
+std::string ir_digest(llvm::StringRef bytes) {
+  return llvm::toHex(llvm::SHA256::hash(llvm::arrayRefFromStringRef(bytes)), true);
+}
+
+std::string initializer_text(const llvm::GlobalVariable &global) {
+  std::string text;
+  llvm::raw_string_ostream out(text);
+  global.getInitializer()->printAsOperand(out, true, global.getParent());
+  return text;
+}
+
+std::unique_ptr<llvm::Module> comparison_module(const llvm::Module &module) {
+  auto copy = llvm::CloneModule(module);
+  llvm::StripDebugInfo(*copy);
+  // Clang numbers pooled literals across the entire translation unit.
+  // Their contents and alignment, rather than that ordinal, define the
+  // value used by each instruction and initializer.
+  for (auto &global : copy->globals())
+    if (mergeable_literal(global))
+      global.setName(".live.literal." + ir_digest(initializer_text(global) + ":" +
+          std::to_string(global.getAlign().valueOrOne().value())));
+  return copy;
+}
 } // namespace
+
+bool mergeable_literal(const llvm::GlobalVariable &global) {
+  return global.hasPrivateLinkage() && global.hasGlobalUnnamedAddr() && global.isConstant() &&
+         global.hasInitializer() && global.getName().starts_with(".str") &&
+         llvm::isa<llvm::ConstantDataArray>(global.getInitializer());
+}
+
+std::string local_import_name(std::string_view path, std::string_view name) {
+  return "__clangtracer_live_local_" + ir_digest(path) + "_" + std::string(name);
+}
+
+std::map<std::string, std::string> data_definitions(const CompiledUnit &unit) {
+  auto module = comparison_module(*unit.module);
+  std::map<std::string, std::string> data;
+  for (const auto &global : module->globals()) {
+    if (!global.hasInitializer() || global.getName().starts_with(".live.literal."))
+      continue;
+    const auto size = module->getDataLayout().getTypeAllocSize(global.getValueType());
+    data.emplace(global.getName().str(), std::to_string(size.getKnownMinValue()) + ":" +
+        std::to_string(global.getAlign().valueOrOne().value()) + ":" +
+        std::to_string(global.isConstant()) + ":" + std::to_string(global.isThreadLocal()) +
+        ":" + initializer_text(global));
+  }
+  return data;
+}
 
 CompiledUnit compile_unit(const JitRequest &request, const TranslationUnit &unit,
                           llvm::LLVMContext *context,
@@ -257,7 +328,7 @@ CompiledUnit compile_unit(const JitRequest &request, const TranslationUnit &unit
     if (inspect)
       inspect(ast);
     if (!ast.getDiagnostics().hasErrorOccurred()) {
-      CallableTypes visitor(ast, result.types);
+      CallableTypes visitor(ast, result);
       visitor.TraverseDecl(ast.getTranslationUnitDecl());
     }
   };
@@ -284,8 +355,7 @@ bool supported_entry_abi(const llvm::Function &function) {
 
 std::map<std::string, Definition> definitions(const CompiledUnit &unit) {
   const auto &module = *unit.module;
-  auto normalized = llvm::CloneModule(module);
-  llvm::StripDebugInfo(*normalized);
+  auto normalized = comparison_module(module);
   std::map<std::string, Definition> result;
   for (const auto &function : module.functions()) {
     if (function.isDeclaration() || function.isIntrinsic())
@@ -309,11 +379,24 @@ std::map<std::string, Definition> definitions(const CompiledUnit &unit) {
       item.has_source_abi = true;
     }
     item.supported_abi = supported_entry_abi(function);
+    item.local = function.hasLocalLinkage();
     // Parameter lowering can include opaque pointers. Compare the bodies only
     // after independently checking the native declaration and LLVM ABI.
     std::string ir;
     llvm::raw_string_ostream implementation(ir);
-    normalized->getFunction(function.getName())->print(implementation, nullptr, false, true);
+    auto &body = *normalized->getFunction(function.getName());
+    implementation << body.getAttributes().getFnAttrs().getAsString() << '\n';
+    body.setAttributes(body.getAttributes().removeFnAttributes(body.getContext()));
+    // Attribute group IDs also belong to the module. Keep their contents
+    // separately so changes in elsewhere-emitted code cannot renumber them.
+    for (auto &block : body)
+      for (auto &instruction : block)
+        if (auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction)) {
+          const auto attrs = call->getAttributes();
+          implementation << attrs.getFnAttrs().getAsString() << '\n';
+          call->setAttributes(attrs.removeFnAttributes(body.getContext()));
+        }
+    body.print(implementation, nullptr, false, true);
     llvm::SmallVector<llvm::StringRef, 32> lines;
     llvm::StringRef(ir).split(lines, '\n');
     for (const auto line : lines) {
@@ -342,6 +425,7 @@ std::map<std::string, Definition> definitions(const CompiledUnit &unit) {
       continue;
     auto item = body->second;
     item.alias_target = body->first;
+    item.local = alias.hasLocalLinkage();
     item.abi += " alias " + item.alias_target + " source=" + typed->second.second;
     result.emplace(alias.getName().str(), std::move(item));
   }

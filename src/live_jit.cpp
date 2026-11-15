@@ -44,8 +44,17 @@ void checked(llvm::Error error) {
 }
 
 std::uintptr_t runtime_import(llvm::StringRef name) {
-  const auto is_c = llvm::StringSwitch<bool>(name)
+  const auto malloc_family = llvm::StringSwitch<bool>(name)
       .Cases("malloc", "calloc", "free", "realloc", true)
+      .Default(false);
+  const auto new_delete = name.starts_with("_Znw") || name.starts_with("_Zna") ||
+                         name.starts_with("_Zdl") || name.starts_with("_Zda");
+  if (malloc_family || new_delete) {
+    // Use the target's interposed allocator so objects can cross the boundary
+    // between native code and the JIT in either direction.
+    return reinterpret_cast<std::uintptr_t>(::dlsym(RTLD_DEFAULT, name.str().c_str()));
+  }
+  const auto is_c = llvm::StringSwitch<bool>(name)
       .Cases("memcpy", "memset", "memmove", "memcmp", "bcmp", "memchr", true)
       .Cases("strlen", "strcmp", "abort", "puts", true)
       .Cases("pthread_mutex_lock", "pthread_mutex_unlock", "__libc_single_threaded", true)
@@ -59,8 +68,7 @@ std::uintptr_t runtime_import(llvm::StringRef name) {
                       name.starts_with("_ZNSi") || name.starts_with("_ZNSo") ||
                       name == "__dynamic_cast" ||
                       name.starts_with("_ZTISt") || name.starts_with("_ZTSSt") ||
-                      name.starts_with("_ZTVN10__cxxabiv1") ||
-                      name.starts_with("_Zn") || name.starts_with("_Zd");
+                      name.starts_with("_ZTVN10__cxxabiv1");
   const auto is_unwind = name.starts_with("_Unwind_");
   if (!is_c && !is_cpp && !is_unwind)
     return 0;
@@ -162,7 +170,18 @@ bool source_file(const std::string &path) {
   return extension == ".cpp" || extension == ".cc" || extension == ".cxx" || extension == ".C";
 }
 
-void isolate_definitions(llvm::Module &module, const JitRequest &request) {
+void isolate_definitions(llvm::Module &module, const JitRequest &request,
+                         const TranslationUnit &unit) {
+  // Keep ELF imports for internal-linkage symbols private to their original TU.
+  for (auto &value : module.global_values()) {
+    if (!value.hasLocalLinkage() || !value.hasName())
+      continue;
+    const auto import = local_import_name(unit.path, value.getName().str());
+    if (request.imports.contains(import))
+      value.setName(import);
+    else if (request.imports.contains(value.getName().str()))
+      throw std::runtime_error("unscoped import collides with local symbol: " + value.getName().str());
+  }
   // Use the target instance of known application storage and unchanged code.
   // The retained revision owns only its new code and immutable local constants.
   for (auto &function : module) {
@@ -248,7 +267,7 @@ std::shared_ptr<JitImage> compile_in_target(const JitRequest &request) {
   for (const auto &unit : units) {
     auto compiled = compile_unit(request, unit, context.get());
     auto &module = *compiled.module;
-    isolate_definitions(module, request);
+    isolate_definitions(module, request, unit);
     for (auto &function : module) {
       // The IR linker can drop unused linkonce_odr instantiations before
       // ORC sees the caller's exact requested export.

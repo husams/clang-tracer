@@ -13,6 +13,7 @@ namespace llvm {
 class LLVMContext;
 class Module;
 class Function;
+class GlobalVariable;
 }
 
 namespace tracer::live {
@@ -22,6 +23,7 @@ struct CompiledUnit {
   std::unique_ptr<llvm::LLVMContext> context;
   std::unique_ptr<llvm::Module> module;
   std::set<std::string> inputs;
+  std::map<std::string, std::string> record_layouts;
   std::map<std::string, std::pair<std::string, std::string>> types;
 };
 
@@ -38,7 +40,12 @@ struct Definition {
   std::string alias_target;
   bool has_source_abi = false;
   bool supported_abi = false;
+  bool local = false;
 };
+
+bool mergeable_literal(const llvm::GlobalVariable &global);
+std::map<std::string, std::string> data_definitions(const CompiledUnit &unit);
+std::string local_import_name(std::string_view path, std::string_view name);
 
 bool supported_entry_abi(const llvm::Function &function);
 std::map<std::string, Definition> definitions(const CompiledUnit &unit);
