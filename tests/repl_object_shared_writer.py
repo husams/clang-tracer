@@ -23,7 +23,7 @@ def expect_error(out, pattern):
     assert pattern in row[1], row.string
 
 
-def capture(root, args, app, app_out, repl, repl_out, session, endpoint, cleanup, label, *, saved=False):
+def capture(root, args, app, app_out, repl, repl_out, label, *, saved=False):
     module = args.library
     if saved:
         package = root / f"{label}-plan"
@@ -43,18 +43,14 @@ def capture(root, args, app, app_out, repl, repl_out, session, endpoint, cleanup
     probe = watch[1]
     database = root / f"{label}.db"
     export = root / f"{label}.json"
-    recorder, recording = start([args.repl, "--endpoint", endpoint],
-                                root, cleanup)
-    send(recorder, f"%record {database} --sqlite --session {session} --name writes "
-                   f"--probe {probe} --count 9 --timeout 20")
+    send(repl, f"%record {database} --sqlite --name object.trace --probe {probe} --count 9 --timeout 10")
     send(app, "g")
     app_out.expect(r"^DONE value=7$")
-    recording.expect(r"^received=9 .*complete=true")
-    send(recorder, "%quit")
-    assert recorder.wait(timeout=10) == 0
+    recording = repl_out.expect(r"^received=\d+ .*|^error:")
+    assert recording.string.startswith("received=9 ") and "complete=true" in recording.string, recording.string
     send(repl, f"%object status {probe}")
     status = repl_out.expect(rf"^watch={probe} active=yes .*$")
-    assert "executed_stores=6" in status.string and "coverage=partial" not in status.string, status.string
+    assert "executed_stores=6 " in status.string and "coverage_gaps=" not in status.string, status.string
     send(repl, f"%object stop {probe}")
     repl_out.expect(rf"^watch={probe} active=no .*restoration_pending=no .*")
     send(repl, f"%events open {database} --as {label}")
@@ -107,12 +103,12 @@ def run(args):
         expect_error(out, "--follow-calls --module")
         assert repl.poll() is None, "the REPL should remain available for the next diagnostic case"
 
-        capture(root, args, target, app, repl, out, session, endpoint, cleanup, "live")
+        capture(root, args, target, app, repl, out, "live")
         send(repl, f'%object prepare shared_writer::Record --module "{args.library}" '
                    '--field value --code "shared_writer::write(shared_writer::Record &, int, bool)" '
                    f'--backend code-cache --follow-calls --output "{root / "invalid-plan"}"')
         expect_error(out, "names a shared ELF without a program interpreter")
-        capture(root, args, target, app, repl, out, session, endpoint, cleanup, "saved", saved=True)
+        capture(root, args, target, app, repl, out, "saved", saved=True)
 
         send(repl, "%detach")
         out.expect(rf"^detached session={session}$")
