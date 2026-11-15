@@ -536,6 +536,8 @@ std::string event_summary(const api::TraceEvent &event) {
       out << " result=" << value_text(event.result());
     }
   }
+  if (event.callback_error())
+    out << " callback_error=true";
   out << " lost(agent=" << event.agent_dropped_events()
       << ",server=" << event.server_dropped_events() << ')';
   return out.str();
@@ -1098,14 +1100,41 @@ EventBuffer open_recording(const std::string &path, std::size_t max_events,
 }
 
 void export_json(const EventBuffer &buffer, const std::string &path) {
+  // Lifecycle samples and method events arrive on different transports. Both
+  // use the target's monotonic clock. Keep the original sequence as a cursor,
+  // and order each registration's exported subsequence by observation time.
+  using Registration = std::pair<std::string, std::uint64_t>;
+  const auto registration_of = [](const api::TraceEvent &event) -> Registration {
+    return {event.session_id(), event.object_probe_registration_id()};
+  };
+  const auto orderable = [](const api::TraceEvent &event) {
+    return event.object_probe_registration_id() && event.monotonic_time_ns();
+  };
+  std::map<Registration, std::vector<const api::TraceEvent *>> registrations;
+  for (const auto &event : buffer.events())
+    if (orderable(event->message))
+      registrations[registration_of(event->message)].push_back(&event->message);
+  for (auto &registration : registrations) {
+    auto &events = registration.second;
+    std::stable_sort(events.begin(), events.end(), [](const auto *a, const auto *b) {
+      return a->monotonic_time_ns() < b->monotonic_time_ns();
+    });
+    std::reverse(events.begin(), events.end());
+  }
+
   const int fd = create_recording(path);
   try {
     write_all(fd, "[\n", 2);
     bool first = true;
     for (const auto &event : buffer.events()) {
+      const auto *message = &event->message;
+      if (orderable(*message)) {
+        auto &events = registrations.at(registration_of(*message));
+        message = events.back();
+        events.pop_back();
+      }
       std::string json;
-      const auto status =
-          google::protobuf::util::MessageToJsonString(event->message, &json);
+      const auto status = google::protobuf::util::MessageToJsonString(*message, &json);
       if (!status.ok()) {
         throw std::runtime_error("cannot encode event as JSON");
       }

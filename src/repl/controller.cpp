@@ -869,15 +869,85 @@ void run_preparer(std::vector<std::string> arguments, const char *failure) {
   std::vector<char *> argv;
   for (auto &argument : arguments) argv.push_back(argument.data());
   argv.push_back(nullptr);
+  int diagnostic_pipe[2]{};
+  if (::pipe(diagnostic_pipe) != 0)
+    throw std::system_error(errno, std::generic_category(), "cannot capture native preparation diagnostics");
+  for (const auto fd : diagnostic_pipe) {
+    const int flags = ::fcntl(fd, F_GETFD);
+    if (flags < 0 || ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
+      const int error = errno;
+      ::close(diagnostic_pipe[0]);
+      ::close(diagnostic_pipe[1]);
+      throw std::system_error(error, std::generic_category(), "cannot secure native preparation diagnostics");
+    }
+  }
+  posix_spawn_file_actions_t actions;
+  int configured = ::posix_spawn_file_actions_init(&actions);
+  const bool actions_initialized = configured == 0;
+  if (!configured)
+    configured = ::posix_spawn_file_actions_adddup2(&actions, diagnostic_pipe[1], STDERR_FILENO);
+  if (!configured)
+    configured = ::posix_spawn_file_actions_addclose(&actions, diagnostic_pipe[0]);
+  if (!configured)
+    configured = ::posix_spawn_file_actions_addclose(&actions, diagnostic_pipe[1]);
+  if (configured) {
+    if (actions_initialized)
+      ::posix_spawn_file_actions_destroy(&actions);
+    ::close(diagnostic_pipe[0]);
+    ::close(diagnostic_pipe[1]);
+    throw std::system_error(configured, std::generic_category(), "cannot configure native preparation diagnostics");
+  }
   pid_t pid = 0;
-  const int started = ::posix_spawnp(&pid, argv.front(), nullptr, nullptr, argv.data(), environ);
-  if (started)
+  const int started = ::posix_spawnp(&pid, argv.front(), &actions, nullptr, argv.data(), environ);
+  ::posix_spawn_file_actions_destroy(&actions);
+  ::close(diagnostic_pipe[1]);
+  if (started) {
+    ::close(diagnostic_pipe[0]);
     throw std::system_error(started, std::generic_category(), "cannot start native preparer");
+  }
+  std::string diagnostics;
+  std::array<char, 2048> buffer{};
+  bool truncated = false;
+  int read_error = 0;
+  for (;;) {
+    const auto count = ::read(diagnostic_pipe[0], buffer.data(), buffer.size());
+    if (count > 0) {
+      constexpr std::size_t diagnostic_limit = 16 * 1024;
+      const auto available = diagnostic_limit - diagnostics.size();
+      diagnostics.append(buffer.data(), std::min<std::size_t>(available, count));
+      truncated |= static_cast<std::size_t>(count) > available;
+      continue;
+    }
+    if (count < 0 && errno == EINTR)
+      continue;
+    if (count < 0) {
+      read_error = errno;
+      break;
+    }
+    break;
+  }
+  ::close(diagnostic_pipe[0]);
   int status = 0;
   while (::waitpid(pid, &status, 0) < 0)
     if (errno != EINTR) throw std::runtime_error("cannot wait for native preparation");
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-    throw std::runtime_error(failure);
+  if (read_error)
+    throw std::system_error(read_error, std::generic_category(), "cannot read native preparation diagnostics");
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    while (!diagnostics.empty() && std::isspace(static_cast<unsigned char>(diagnostics.back())))
+      diagnostics.pop_back();
+    std::string detail = diagnostics.empty() ? "" : ": " + diagnostics;
+    if (WIFSIGNALED(status))
+      detail += std::string(detail.empty() ? ": " : "; ") +
+          "preparer terminated by signal " + std::to_string(WTERMSIG(status));
+    else if (WIFEXITED(status))
+      detail += std::string(detail.empty() ? ": " : "; ") +
+          "preparer exited with status " + std::to_string(WEXITSTATUS(status));
+    if (truncated)
+      detail += " [diagnostics truncated]";
+    throw std::runtime_error(std::string(failure) + detail);
+  }
+  if (!diagnostics.empty())
+    std::cerr << diagnostics;
 }
 
 class PreparationDirectory {

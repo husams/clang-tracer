@@ -20,6 +20,7 @@ def main():
     env.pop("CLANG_TRACER_ENDPOINT", None)
     env["TRACER_PREPARE_EXECUTABLE"] = str(args.repl.parent / "clang-tracer-prepare-injectors-native")
     selector = '"prepared_demo::compute(int)"'
+    struct_selector = '"prepared_demo::compute_struct(int)"'
     with tempfile.TemporaryDirectory(prefix="native-prepared-test-") as directory:
         root = Path(directory)
         header = args.example / "calculator.hpp"
@@ -53,8 +54,14 @@ def main():
         changed = None
         console = None
         try:
-            def prepare(include, output):
-                command = f'%probe prepare {selector} --include "{include}" --output "{output}"'
+            def prepare(include, output, selected=selector, database=None, source_file=None):
+                context = ""
+                if database is not None:
+                    context += f' --compdb "{database}"'
+                if source_file is not None:
+                    context += f' --translation-unit "{source_file}"'
+                command = (f'%probe prepare {selected} --include "{include}"'
+                           f'{context} --output "{output}"')
                 return subprocess.run([args.repl, "--fail-fast"], input=command + "\n%quit\n",
                                       text=True, capture_output=True, cwd=root, env=env, timeout=30)
 
@@ -182,6 +189,34 @@ std::cout << "PREPARED_TYPED_RESULTS=" << correct << std::endl;
             subprocess.run([args.compiler, "-std=c++17", "-DFIRST_DIRECTORY_ENTRY", "-fsyntax-only",
                             package / "generated/adapter.cpp"], check=True)
             assert not (package / "interceptor.cpp").exists()
+
+            # A 32-byte result forces the x86-64 sret ABI. Verify the generated
+            # callback retains and serializes the full result snapshot.
+            struct_package = root / "prepared_struct"
+            # Use the fixture's real compilation context; the synthetic SDK
+            # intentionally supplies a fake sysroot for driver tests.
+            offline = prepare(header, struct_package, struct_selector,
+                              args.compdb, donor)
+            assert offline.returncode == 0 and "prepared directory=" in offline.stdout, (
+                offline.stdout + offline.stderr)
+            struct_callback = root / "struct-interceptor.cpp"
+            struct_callback.write_text(
+                'template <> class Interceptor<prepared_demo::LargeResult(int)> { public: '
+                'long long post(const Call &call) { return call.result().marker; } };\n')
+            struct_args = f'--prepared "{struct_package}" --prepared-mode require'
+            struct_prefix = (
+                f'%probe resolve {struct_selector} {struct_args}\n'
+                f'%probe inject {struct_selector} --callback "{struct_callback}" {struct_args}\n')
+            struct_suffix = '''%collect --count 4 --timeout 15 --phase POST --as captured
+auto captured = tracer.batch("captured");
+bool correct = captured.size() == 4;
+for (const auto& e : captured) { correct = correct && e.result_snapshot().field("marker").as<int>() == e.argument_as<int>(0) + 7; }
+std::cout << "PREPARED_SRET_SNAPSHOTS=" << correct << std::endl;
+%probe remove PROBE_ID
+%quit
+'''
+            text = interact(struct_prefix, struct_suffix, target)
+            assert "PREPARED_SRET_SNAPSHOTS=1" in text, text
 
             default_compdb.write_text("invalid compilation database\n")
             cpp_package = root / "prepared_cpp"

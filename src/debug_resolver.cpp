@@ -1164,7 +1164,80 @@ void verify_rebound_method_signature(DWARFDie function, const api::PreparedInjec
   const auto spelling = [](std::string value) {
     if (value.starts_with("::"))
       value.erase(0, 2);
-    return compact(value);
+    value = compact(value);
+    if (value == "std::basic_string_view<char,std::char_traits<char>>")
+      return std::string("std::basic_string_view<char>");
+    return value;
+  };
+  const auto verified_string_view_layout = [&](const api::DebugInfo &actual,
+                                                const api::DebugInfo &wanted) {
+#if defined(__x86_64__)
+    const auto record_name = spelling(wanted.record_name());
+    if (record_name != "std::basic_string_view<char>" ||
+        spelling(actual.record_name()) != record_name || actual.record_is_opaque() ||
+        actual.record_size() != 16 ||
+        (actual.record_alignment() && actual.record_alignment() != 8) ||
+        wanted.record_size() != 16 || wanted.record_alignment() != 8 ||
+        actual.record_calling_convention() != api::RECORD_PASS_BY_VALUE ||
+        wanted.record_calling_convention() != api::RECORD_PASS_BY_VALUE ||
+        actual.record_pass_by_reference() || wanted.record_pass_by_reference() ||
+        actual.fields_size() != 2 || wanted.prepared_layout_sha256().size() != 32)
+      return false;
+    const auto &length = actual.fields(0);
+    const auto &data = actual.fields(1);
+    const auto canonical_field_type = [](std::string type) {
+      type = compact(type);
+      if (type == "long unsigned int" || type == "unsigned long int")
+        return std::string("unsignedlong");
+      if (type == "unsigned long")
+        return std::string("unsignedlong");
+      if (type == "const char*")
+        return std::string("constchar*");
+      return type;
+    };
+    if (length.name() != "_M_len" || length.byte_offset() != 0 ||
+        length.byte_size() != 8 || canonical_field_type(length.builtin_type()) != "unsignedlong" ||
+        data.name() != "_M_str" || data.byte_offset() != 8 || data.byte_size() != 8 ||
+        canonical_field_type(data.builtin_type()) != "constchar*")
+      return false;
+    if (length.type_chain_size() != 1 ||
+        length.type_chain(0).kind() != api::DebugTypeLevel::BUILTIN ||
+        length.type_chain(0).byte_size() != 8 ||
+        length.type_chain(0).dwarf_encoding() != llvm::dwarf::DW_ATE_unsigned ||
+        data.type_chain_size() != 2 ||
+        data.type_chain(0).kind() != api::DebugTypeLevel::POINTER ||
+        data.type_chain(0).byte_size() != 8 ||
+        data.type_chain(1).kind() != api::DebugTypeLevel::BUILTIN ||
+        data.type_chain(1).byte_size() != 1 || !data.type_chain(1).is_const())
+      return false;
+
+    llvm::SHA256 hash;
+    const auto add = [&](std::string_view value) {
+      hash.update(std::to_string(value.size()) + ":" + std::string(value));
+    };
+    const auto number = [&](std::uint64_t value) { add(std::to_string(value)); };
+    // This is the source-side record_layout() sequence for libstdc++'s two
+    // word string_view; the prepared digest binds these fields to its header.
+    add(wanted.record_name());
+    number(16);
+    number(8);
+    number(1);
+    add("_M_len");
+    add("unsigned long");
+    number(0);
+    number(0);
+    add("_M_str");
+    add("const char *");
+    number(64);
+    number(0);
+    const auto digest = hash.final();
+    return std::equal(digest.begin(), digest.end(),
+        reinterpret_cast<const std::uint8_t *>(wanted.prepared_layout_sha256().data()));
+#else
+    (void)actual;
+    (void)wanted;
+    return false;
+#endif
   };
   const auto matches = [&](api::ValueType kind, const std::string &actual, const std::string &wanted) {
     return kind != api::OBJECT && spelling(actual) == spelling(wanted);
@@ -1176,10 +1249,25 @@ void verify_rebound_method_signature(DWARFDie function, const api::PreparedInjec
       shape.signature.arguments_size() != expected.arguments_size() ||
       types.arguments_size() != expected.arguments_size())
     throw std::runtime_error("compatible method rebinding requires a verified receiver and callable ABI");
-  for (int index = 0; index < expected.arguments_size(); ++index)
-    if (shape.signature.arguments(index) != expected.arguments(index) ||
-        !matches(expected.arguments(index), shape.arguments[index].cpp_type(), types.arguments(index).cpp_type()))
+  const auto matches_object_value = [&](const api::DebugArgument &actual,
+                                        const api::DebugArgument &wanted) {
+    if (!actual.is_object_value() || actual.is_reference() || !actual.has_object_type() ||
+        !wanted.is_object_value() || wanted.is_reference() || !wanted.has_object_type())
+      return false;
+    const auto &actual_type = actual.object_type();
+    const auto &wanted_type = wanted.object_type();
+    // Top-level cv-qualifiers on a by-value parameter do not change its ABI.
+    return verified_string_view_layout(actual_type, wanted_type);
+  };
+  for (int index = 0; index < expected.arguments_size(); ++index) {
+    const auto &actual = shape.arguments[index];
+    const auto &wanted = types.arguments(index);
+    const bool argument_matches = expected.arguments(index) == api::OBJECT
+        ? matches_object_value(actual, wanted)
+        : matches(expected.arguments(index), actual.cpp_type(), wanted.cpp_type());
+    if (shape.signature.arguments(index) != expected.arguments(index) || !argument_matches)
       throw std::runtime_error("compatible method rebinding found a different argument ABI");
+  }
 }
 
 std::vector<std::string> list_debug_modules(std::uint32_t pid) {

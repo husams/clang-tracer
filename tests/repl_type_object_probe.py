@@ -231,6 +231,14 @@ public:
         for path in (package, bad_package, fresh_package, overlap):
             assert path.is_file() and path.read_bytes().startswith(b"CTKOPKG2"), path
         saved = package.read_bytes()
+        obsolete = root / "obsolete.object"
+        obsolete_payload = b"CTKOPKG1" + saved[8:-32]
+        obsolete.write_bytes(obsolete_payload + hashlib.sha256(obsolete_payload).digest())
+        wrong_version = root / "wrong-version.object"
+        # The first protobuf field encodes the version as a varint.
+        assert saved[8:10] == b"\x08\x01"
+        wrong_version_payload = saved[:8] + b"\x08\x02" + saved[10:-32]
+        wrong_version.write_bytes(wrong_version_payload + hashlib.sha256(wrong_version_payload).digest())
         send(repl, prepare_commands(methods, callbacks, package) + writer)
         out.expect(r"^error: .*package already exists")
         assert package.read_bytes() == saved
@@ -268,6 +276,12 @@ public:
         out.expect(rf"^attached session=\S+ pid={target_process.pid}$")
 
         binding = f"--package {quote(package)} --module ./build-context/libcounter.so"
+        send(repl, f"%object-probe preview --package {quote(obsolete)}")
+        out.expect(r"^error: .*unsupported object-probe package format")
+        send(repl, f"%object-probe preview --package {quote(wrong_version)}")
+        out.expect(r"^error: .*unsupported object-probe package version")
+        send(repl, f"%object-probe preview {binding} --first-seen")
+        out.expect(r"^error: .*--first-seen is supported for write-only object-probe packages")
         send(repl, f'%probe inject "demo::Counter::value() const" --callback {quote(ordinary_callback)} '
                    '--module libcounter.so')
         ordinary_id = out.expect(r"^installed probe=(\d+)")[1]
@@ -324,7 +338,7 @@ public:
 
         # A valid fresh registration immediately after rollback proves recovery
         # on this same PID and emits a callback event filtered by its probe ID.
-        fresh_binding = f"--package {quote(fresh_package)} --module libcounter.so"
+        fresh_binding = f"--package {quote(fresh_package)}"
         send(repl, f"%object-probe preview {fresh_binding}")
         preview = out.expect(r"^(?:object-probe preview|binding=|error:)")
         assert not preview.string.startswith("error:"), preview.string
@@ -394,6 +408,9 @@ public:
         assert str(fresh_call_id) == str(fresh_event["callId"]), fresh_event
 
         events = json.loads((root / "counter.json").read_text())
+        assert all(event.get("objectProbeRegistrationId") == registration for event in events), events
+        times = [int(event["monotonicTimeNs"]) for event in events]
+        assert times == sorted(times), times
         observations = [event["objectObservation"] for event in events if "objectObservation" in event]
         created = [event for event in events if event.get("objectObservation", {}).get("kind") == "CREATED"]
         ended = [event for event in events if event.get("objectObservation", {}).get("kind") == "TEARDOWN_END"]
@@ -404,6 +421,11 @@ public:
         identities = {(int(event["objectObservation"]["lifetimeId"]),
                        int(event["objectObservation"]["generation"])) for event in created}
         assert len(identities) == 2, identities
+        created_at = {
+            (int(event["objectObservation"]["lifetimeId"]),
+             int(event["objectObservation"]["generation"])): events.index(event)
+            for event in created
+        }
         assert [(event["oldInteger"], event["newInteger"]) for event in writes] == [(10, 11), (20, 21)], writes
         calls = [event for event in events if event.get("functionName", "").startswith("demo::Counter::")]
         assert any("demo::Counter::add" in event["functionName"] for event in calls), calls
@@ -433,6 +455,7 @@ public:
             assert str(values["call_id"]) == str(event["callId"]), (event, values)
             identity = (int(values["object_id"]), int(values["object_generation"]))
             assert identity in identities, (identity, identities)
+            assert created_at[identity] < events.index(event), (identity, events)
             assert values["identity_verified"] in (True, "true", 1, "1"), (event, values)
 
         for original, destination in ((header, hidden / header.name), (source, hidden / source.name),

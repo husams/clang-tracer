@@ -60,6 +60,10 @@ void State::replace_child() {
   child_ = &fallback;
   alias_ = &fallback;
 }
+LargeResult State::make_result() {
+  ++result_calls_;
+  return {result_calls_, {1001, 1002, 1003}};
+}
 } // namespace snapshot_test
 
 int main() {
@@ -76,6 +80,9 @@ int main() {
   other.rehash_only();
   state.rehash_only();
   state.update_registered();
+  const auto returned = state.make_result();
+  if (returned.marker != 1 || returned.payload[2] != 1003)
+    std::abort();
   state.mutate();
   state.make_valueless();
   state.replace_child();

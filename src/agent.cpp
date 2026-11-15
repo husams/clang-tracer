@@ -82,6 +82,7 @@
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <clang/Interpreter/Interpreter.h>
+#include <bits/cxxabi_forced.h>
 #include <llvm/MC/MCAsmInfo.h>
 #include <llvm/MC/MCContext.h>
 #include <llvm/MC/MCDisassembler/MCDisassembler.h>
@@ -501,7 +502,7 @@ extern "C" void tracer_capture_entry_stack(const tracer::TraceContext *,
                                            unsigned) noexcept;
 extern "C" long long tracer_callback_dispatch(unsigned long long,
                                               const tracer::TraceContext *,
-                                              void *) noexcept;
+                                              void *);
 extern "C" bool tracer_callback_lifecycle_enter(unsigned long long) noexcept;
 extern "C" void tracer_callback_cleanup_enter() noexcept;
 extern "C" void tracer_callback_lifecycle_leave() noexcept;
@@ -509,6 +510,9 @@ extern "C" void tracer_callback_failure(unsigned long long) noexcept;
 extern "C" void tracer_event_dispatch(unsigned long long,
                                       const tracer::TraceContext *,
                                       long long) noexcept;
+static void tracer_event_dispatch_impl(unsigned long long,
+                                       const tracer::TraceContext *, long long,
+                                       bool, const char *) noexcept;
 extern "C" void tracer_context_check_entry();
 extern "C" void *tracer_shared_enter(unsigned long long,
                                      const tracer::TraceContext *, unsigned);
@@ -2873,7 +2877,7 @@ std::string make_wrapper(const tracer::Request &r,
   };
   std::string code = (snapshots ? snapshots->declarations : std::string()) +
       "extern \"C\" long long tracer_callback_dispatch(unsigned long "
-      "long,const tracer::TraceContext*,void*) noexcept;\nextern \"C\" void "
+      "long,const tracer::TraceContext*,void*);\nextern \"C\" void "
       "tracer_event_dispatch(unsigned long long,const "
       "tracer::TraceContext*,long long) noexcept;\nextern \"C\" void "
       "tracer_probe_enter(unsigned long long) noexcept;\nextern \"C\" void "
@@ -5652,7 +5656,7 @@ extern "C" bool tracer_object_identity_lookup(
 
 extern "C" long long tracer_callback_dispatch(unsigned long long id,
                                               const tracer::TraceContext *ctx,
-                                              void *instance) noexcept {
+                                              void *instance) {
   auto *p = find_probe(id);
   if (!p || !ctx || !p->callbacks_active() ||
       !p->callback_enabled.load(std::memory_order_relaxed) || callback_depth) {
@@ -5662,6 +5666,7 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
   ++callback_depth;
   long long value = 0;
   bool succeeded = false;
+  bool callback_failed = false;
   tracer::TraceContext invocation = *ctx;
   invocation.stack_storage = nullptr;
   invocation.named_count = 0;
@@ -5674,7 +5679,13 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
     // The bridge reports whether a hook exists for this phase and ran.
     if (succeeded)
       log_hook(*p, invocation, true);
+  } catch (const __cxxabiv1::__forced_unwind &) {
+    --callback_depth;
+    tracer::release_native_stack(invocation);
+    errno = saved_errno;
+    throw;
   } catch (...) {
+    callback_failed = true;
     succeeded = false;
     log_hook(*p, invocation, false);
     // Class adapters disable only their failed invocation. Legacy callbacks
@@ -5686,6 +5697,10 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
   --callback_depth;
   if (succeeded) {
     tracer_event_dispatch(id, &invocation, value);
+  } else if (callback_failed) {
+    // Publish a bounded diagnostic after leaving callback admission so the
+    // target's original invocation can continue unchanged.
+    tracer_event_dispatch_impl(id, &invocation, 0, true, "callback threw");
   }
   tracer::release_native_stack(invocation);
   errno = saved_errno;
@@ -5730,9 +5745,10 @@ extern "C" void tracer_capture_entry_stack(const tracer::TraceContext *ctx,
 }
 
 
-extern "C" void tracer_event_dispatch(unsigned long long id,
-                                      const tracer::TraceContext *ctx,
-                                      long long cb) noexcept {
+static void tracer_event_dispatch_impl(unsigned long long id,
+                                       const tracer::TraceContext *ctx,
+                                       long long cb, bool callback_error,
+                                       const char *callback_error_message) noexcept {
   const int saved_errno = errno;
   auto *p = find_probe(id);
   if (callback_depth || !p || !ctx ||
@@ -5808,7 +5824,11 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
         *named->mutable_value() = to_proto_value(ctx->arguments[i]);
       }
     }
-    event.set_callback_value(cb);
+    if (!callback_error)
+      event.set_callback_value(cb);
+    event.set_callback_error(callback_error);
+    if (callback_error && callback_error_message)
+      event.set_callback_error_message(callback_error_message);
     if (ctx->phase == tracer::TracePhase::Post) {
       *event.mutable_result() = to_proto_value(ctx->result);
     }
@@ -5884,6 +5904,12 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
   transport.publish(*packet, valid);
   --callback_depth;
   errno = saved_errno;
+}
+
+extern "C" void tracer_event_dispatch(unsigned long long id,
+                                      const tracer::TraceContext *ctx,
+                                      long long cb) noexcept {
+  tracer_event_dispatch_impl(id, ctx, cb, false, nullptr);
 }
 
 bool validate_request(const tracer::Request &r, std::string &error) {

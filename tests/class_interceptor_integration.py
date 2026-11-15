@@ -528,11 +528,28 @@ def main() -> int:
                               args.compdb, args.source)
             rows, event_cursor = wait_binary(args.client, endpoint, target.pid, active,
                                             args.output_dir, args.protoc, args.proto,
-                                            4, event_cursor)
-            for row in rows:
+                                            7, event_cursor)
+            callback_errors = [row for row in rows
+                               if re.search(r"^callback_error:\s*true", row, re.M)]
+            successful_events = [row for row in rows if row not in callback_errors]
+            failed_calls = set()
+            for row in callback_errors:
+                call = re.search(r"^call_id:\s*(\d+)", row, re.M)
+                require(call and int(call.group(1)) % 2 == 1 and
+                        re.search(r"^phase:\s*PRE$", row, re.M),
+                        f"callback error did not identify a failed odd PRE invocation: {row}")
+                failed_calls.add(int(call.group(1)))
+            successful_calls = set()
+            post_calls = set()
+            for row in successful_events:
                 call = re.search(r"^call_id:\s*(\d+)", row, re.M)
                 require(call and int(call.group(1)) % 2 == 0,
                         f"failed invocation emitted a successful hook event: {row}")
+                successful_calls.add(int(call.group(1)))
+                if re.search(r"^phase:\s*POST$", row, re.M):
+                    post_calls.add(int(call.group(1)))
+            require(failed_calls and successful_calls and not (failed_calls & post_calls),
+                    f"failed PRE invocation received a successful POST: {rows}")
             remove_after_callback_failure(args.client, endpoint, target.pid, active,
                                           args.protoc, args.proto, args.output_dir,
                                           "invocation-recovery")
@@ -794,6 +811,17 @@ def main() -> int:
                 active, _ = trace(args.client, endpoint, target.pid,
                                   "Fixture::overloaded(int)", hook,
                                   args.compdb, args.source)
+                if label == "throwing":
+                    rows, event_cursor = wait_binary(
+                        args.client, endpoint, target.pid, active, args.output_dir,
+                        args.protoc, args.proto, 1, event_cursor)
+                    require(len(rows) == 1 and
+                            re.search(r"^callback_error:\s*true", rows[0], re.M) and
+                            re.search(r'^callback_error_message:\s*"callback threw"',
+                                      rows[0], re.M) and
+                            re.search(r"^phase:\s*PRE", rows[0], re.M) and
+                            re.search(r"^call_id:\s*[1-9]", rows[0], re.M),
+                            f"callback failure event did not identify the PRE invocation: {rows}")
                 time.sleep(.4)
                 # RemoveProbe reports the agent's contained callback failure count.
                 remove_after_callback_failure(args.client, endpoint, target.pid, active,
@@ -808,7 +836,7 @@ def main() -> int:
             require(all(int(row_pid) == target.pid and int(value) == int(arg) + 11
                         for row_pid, arg, value in method_rows),
                     "class callback failure changed original method results")
-            report.append("throwing and invalid Call access incremented callback_errors while original calls remained correct")
+            report.append("callback failure events identified the PRE call while callback_errors incremented and original calls remained correct")
 
             # Exercise the same class against worker threads, then detach under load.
             threaded_log = (args.output_dir / "threaded-target.log").open("wb")

@@ -369,12 +369,13 @@ public:
 %object-probe stop REGISTRATION_ID
 ```
 
-The preview shows verified lifecycle and method patch windows. Start
-revalidates the binding, stages the patches, and admits callbacks only after
-publication. Record lifetime and write events with `%record --probe
+The preview shows verified lifecycle and method patch windows. A method-only
+package can use the attached process's uniquely mapped method image. Use
+`--method-module` to disambiguate. Start revalidates the binding, stages the
+patches, and admits callbacks only after publication. Record lifetime and write events with `%record --probe
 REGISTRATION_ID`. Start also prints the member probe IDs for selecting normal
-PRE and POST events. Each callback sees the object ID and generation copied
-at entry. Borrowed receiver views follow the usual interceptor lifetime.
+PRE and POST events. A throwing callback records its call ID and phase.
+Each callback sees the object ID and generation copied at entry. Borrowed receiver views follow the usual interceptor lifetime.
 
 For individual writes, prepare a field and its writer. Omit `--code` to use
 writer discovery from the original compilation database. When the writer is
@@ -388,14 +389,16 @@ package prepared without a compilation database.
 ```
 
 For a writer in an attached shared library, pass its mapped name with
-`--module`. `--follow-calls` is available for write-only packages. Follow the
+`--module`. `--follow-calls` is available for write-only packages.
+Use `--first-seen` with a write-only package and a standalone executable writer. Follow the
 coverage counts in status when the writer reaches native callees. A combined
 registration requires disjoint method and writer patch windows. The current
 method path admits exact receivers with verified construction. An eligible
 receiver whose lifecycle predates attachment is provisional. Its callback
 reports `identity_verified() == false` with zero object ID and generation.
-Lifecycle and write observations use the existing event stream. The native
-method stream and code-cache ring deliver independently. Correlate verified
+Live method and code-cache events arrive independently. JSON export orders
+each grouped registration's retained events by monotonic observation time.
+The event sequence remains the server's arrival cursor. Correlate verified
 observations by registration, object ID and generation.
 Choose a fresh output path for each preparation.
 

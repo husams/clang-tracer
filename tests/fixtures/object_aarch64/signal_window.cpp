@@ -127,6 +127,7 @@ asm(".pushsection .text\n"
 
 namespace {
 bool after_store;
+bool one_shot;
 #if !defined(__aarch64__)
 bool at_return;
 #endif
@@ -214,7 +215,8 @@ void handle_signal(int, siginfo_t *, void *raw) {
 int main(int argc, char **argv) {
   if (argc != 2)
     return 1;
-  after_store = !std::strcmp(argv[1], "after");
+  one_shot = !std::strcmp(argv[1], "oneshot");
+  after_store = !std::strcmp(argv[1], "after") || one_shot;
 #if defined(__aarch64__)
   streaming = !std::strcmp(argv[1], "sme16");
   if (streaming || !std::strncmp(argv[1], "sve", 3)) {
@@ -233,7 +235,7 @@ int main(int argc, char **argv) {
   at_tail = !std::strcmp(argv[1], "tail");
   at_dispatch |= at_tail;
   struct sigaction action{};
-  action.sa_flags = SA_SIGINFO;
+  action.sa_flags = SA_SIGINFO | (one_shot ? SA_RESETHAND : 0);
   action.sa_sigaction = handle_signal;
   if (::sigaction(SIGUSR1, &action, nullptr))
     return 2;

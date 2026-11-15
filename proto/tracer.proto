@@ -1033,4 +1033,7 @@ message TraceEvent {
   PreparedInjector replay_types = 24; // Server-supplied declarations and standard headers only.
   ObjectObservation object_observation = 25;
   bool receiver_sampled_at_return = 26;
+  bool callback_error = 27; // The user callback failed for this invocation.
+  string callback_error_message = 28;
+  uint64 object_probe_registration_id = 29; // Zero for events outside an object-probe registration.
 }

@@ -139,7 +139,8 @@ def run(repl, server, agent, fixture, phase, no_values):
             position = phase
         elif phase == "exit" and not ARM:
             position = "return"
-        target, app = start([fixture, position])
+        fixture_mode = "oneshot" if phase == "oneshot" else position
+        target, app = start([fixture, fixture_mode])
         app.expect(r"^READY$")
         memory = cleanup.enter_context(Path(f"/proc/{target.pid}/mem").open("rb", buffering=0))
 
@@ -203,6 +204,17 @@ def run(repl, server, agent, fixture, phase, no_values):
         signal_at(target.pid, interrupt, root / ("tail.now" if phase == "tail" else "write.now"))
         app.expect(rf"^DONE pc_ok=1 value={23 if after else 43} result=44$")
         out.expect(rf"^received={count} .*complete=true")
+        if phase == "oneshot":
+            # The bridge must honor the application's SA_RESETHAND disposition:
+            # the second signal takes SIGUSR1's default action instead of
+            # calling the application's one-shot handler again.
+            target.send_signal(signal.SIGUSR1)
+            assert target.wait(timeout=10) == -signal.SIGUSR1
+            send(control, "%detach")
+            out.expect(r"^detached session=")
+            send(control, "%quit")
+            assert control.wait(timeout=10) == 0
+            return
         send(control, f"%object stop {watch[1]}")
         status = out.expect(rf"^watch={watch[1]} active=no .*restoration_pending=no ")
         if phase != "after":
@@ -239,7 +251,8 @@ if __name__ == "__main__":
     repl, server, agent, fixture = (Path(arg).resolve() for arg in sys.argv[1:5])
     digest = hashlib.sha256(fixture.read_bytes()).digest()
     scalable_state = ARM and (libc.getauxval(16) & (1 << 22) or libc.getauxval(26) & (1 << 23))
-    phases = ("entry", "gate", "after", "exit", "recovered" if scalable_state else "deferred")
+    phases = ("entry", "gate", "after", "exit", "recovered" if scalable_state else "deferred",
+              "oneshot")
     if not scalable_state or libc.getauxval(16) & (1 << 22):
         phases += ("dispatch", "tail")
     if ARM and libc.getauxval(16) & (1 << 22):

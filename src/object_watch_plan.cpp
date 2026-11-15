@@ -1968,6 +1968,10 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     };
     auto *const lifetime_image = image_.get();
     const auto constructor = std::ranges::find_if(lifetime_image->symbols, is_constructor);
+    if (constructor == lifetime_image->symbols.end() && main_ &&
+        std::ranges::any_of(main_->symbols, is_constructor))
+      throw std::runtime_error("lifetime-only constructor is defined in the executable, not the selected module; "
+                               "cross-image admission is not enabled for " + concrete);
     if (constructor == lifetime_image->symbols.end())
       throw std::runtime_error("no verified constructor entries for lifetime-only type " + concrete);
     for (const auto &entry : lifetime_image->symbols) {
@@ -2015,6 +2019,14 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       else if (symbol.demangled.starts_with(destructor_name) && symbol.linkage.contains("D2Ev"))
         base_destructors.insert(symbol.range);
     }
+    std::set<std::string> complete_constructor_overloads;
+    for (const auto &symbol : lifetime_image->symbols) {
+      if (symbol.kind == llvm::ELF::STT_FUNC &&
+          symbol.demangled.starts_with(constructor_name) &&
+          symbol.linkage.find('.') == std::string::npos &&
+          symbol.linkage.contains("C1E"))
+        complete_constructor_overloads.insert(symbol.demangled);
+    }
     for (const auto &symbol : lifetime_image->symbols) {
       if (symbol.kind == llvm::ELF::STT_FUNC && symbol.demangled.starts_with(constructor_name) &&
           symbol.linkage.find('.') == std::string::npos && symbol.linkage.contains("C1E")) {
@@ -2025,9 +2037,16 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       if (symbol.kind != llvm::ELF::STT_FUNC || symbol.demangled.starts_with(constructor_name) == false ||
           symbol.linkage.find('.') != std::string::npos || !symbol.linkage.contains("C2E"))
         continue;
-      // A base-object constructor is not proof of a complete object. Retain
-      // its boundary only as an uncertainty marker unless a C1 entry aliases it.
-      add_lifecycle(symbol, Boundary::construct, true);
+      // Match the legacy %object admission rule: when Clang emits only C2 for
+      // an overload, the base variant has the complete-object ABI if there is
+      // no virtual base (and therefore no VTT argument). Exact lifetime-only
+      // admission already rejects polymorphic records and known derived types.
+      const auto site = lifetime_image->dwarf->getDIEsForAddress(symbol.range.first);
+      const auto type = find_record(*lifetime_image->dwarf, concrete, site.CompileUnit);
+      std::set<DWARFDie> seen;
+      const bool complete_abi = !complete_constructor_overloads.contains(symbol.demangled) &&
+          type && !has_virtual_bases(type, seen);
+      add_lifecycle(symbol, Boundary::construct, !complete_abi);
     }
     std::vector<std::uint64_t> uncertain_constructors;
     for (const auto &[pc, site] : sites)

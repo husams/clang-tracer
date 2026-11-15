@@ -1647,6 +1647,8 @@ struct Watch::Impl {
     event.set_pid(pid);
     event.set_tid(sample.tid);
     event.set_probe_id(id);
+    if (request.staged_registration())
+      event.set_object_probe_registration_id(id);
     event.set_probe_sequence(sequence);
     event.set_agent_dropped_events(channel->dropped.load(std::memory_order_relaxed));
     event.set_monotonic_time_ns(sample.time);
@@ -1924,6 +1926,8 @@ struct Watch::Impl {
     event.set_session_id(request.session_id());
     event.set_pid(pid);
     event.set_probe_id(id);
+    if (request.staged_registration())
+      event.set_object_probe_registration_id(id);
     event.set_probe_sequence(sequence + 1);
     event.set_agent_dropped_events(channel->dropped.load(std::memory_order_relaxed));
     event.set_function_name("object.trace");
@@ -1954,9 +1958,8 @@ struct Watch::Impl {
         break;
     }
     open_lifetimes.clear();
-    if (reason == Observation::TARGET_EXITED ||
-        (request.staged_registration() && published.load(std::memory_order_acquire) &&
-         reason == Observation::WATCH_DETACHED)) {
+    if (request.staged_registration() && published.load(std::memory_order_acquire) &&
+        (reason == Observation::TARGET_EXITED || reason == Observation::WATCH_DETACHED)) {
       api::TraceEvent event;
       emit_final(event, Observation::OBSERVATION_ENDED, reason);
     }
@@ -2555,8 +2558,9 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
       "in-process AArch64 leaf translation with verified scalar and atomic redirects";
 #else
       p.direct_writer_calls ?
-      "in-process x86-64 leaf translation with atomic MOV/XADD/CMPXCHG and verified direct writer call sites only"
-      " (use --writer-entry to require entry coverage)" :
+      std::string("in-process x86-64 leaf translation with atomic MOV/XADD/CMPXCHG"
+                  " and verified direct writer call sites only") +
+          (p.request.staged_registration() ? "" : " (use --writer-entry to require entry coverage)") :
       "in-process x86-64 leaf translation with atomic MOV/XADD/CMPXCHG and verified writer entry redirects";
 #endif
 }
@@ -2781,7 +2785,9 @@ api::ObjectWatchStatus Watch::preview() const {
   report.set_diagnostic(!p.runtime_calls.empty() ? "verified call redirects; callees resolve at runtime" :
       p.fragmented_writer ? "verified native writer fragments and redirect windows" :
       p.plan.layout.scoped_storage() ? "verified native scoped storage and redirect windows" :
-      p.direct_writer_calls ? "verified direct writer call sites only (use --writer-entry to require entry coverage)" :
+      p.direct_writer_calls ?
+      std::string("verified direct writer call sites only") +
+          (p.request.staged_registration() ? "" : " (use --writer-entry to require entry coverage)") :
                         "verified leaf translations and candidate redirect windows");
   *report.mutable_plan() = p.plan.describe(p.pid != 0);
   if (p.pid) {

@@ -124,7 +124,7 @@ const CommandTopic commands[] = {
         "[--follow-calls] [--no-values] [--first-seen] [--union-tag FIELD --union-case TAG=MEMBER "
         "--synchronization thread-confined|caller-lock]",
       "Activate the verified object probe. Follow calls for write-only registrations. "
-      "Use first-seen with a standalone writer. Repeat union-case for each admitted tag."},
+      "Use first-seen with a standalone writer and a write-only package. Repeat union-case for each admitted tag."},
     {"object-probe status", "%object-probe status [ID]", "Report group coverage and restoration."},
     {"object-probe stop", "%object-probe stop [ID]", "Close callback admission and restore the group's patches."},
 

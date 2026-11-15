@@ -494,6 +494,7 @@ private:
     std::uint32_t pid = 0;
     std::string function_name;
     std::shared_ptr<const clangtracer::v1::PreparedInjector> replay_types;
+    std::uint64_t object_probe_registration_id = 0;
   };
 
 public:
@@ -526,7 +527,8 @@ public:
   void set_probe(const std::string &session_id, std::uint64_t probe_id,
                  std::uint32_t pid, std::string function_name, bool active,
                  const clangtracer::v1::PreparedInjector *prepared = nullptr,
-                 SnapshotBinding snapshot = {{}, {}, {}, nullptr}) {
+                 SnapshotBinding snapshot = {{}, {}, {}, nullptr},
+                 std::uint64_t object_probe_registration_id = 0) {
     std::shared_ptr<const clangtracer::v1::PreparedInjector> replay_types;
     if (prepared && tracer::prepared::is_typed_version(prepared->format_version()) &&
         !prepared->adapter_declarations().empty() &&
@@ -546,12 +548,15 @@ public:
       if (existing != active_probes_.end()) {
         function_name = existing->second.function_name;
         replay_types = existing->second.replay_types;
+        object_probe_registration_id = existing->second.object_probe_registration_id;
       } else if (const auto known = known_probes_.find(key);
                  known != known_probes_.end()) {
         function_name = known->second.function_name;
         replay_types = known->second.replay_types;
+        object_probe_registration_id = known->second.object_probe_registration_id;
       }
-      ProbeIdentity identity{pid, std::move(function_name), std::move(replay_types)};
+      ProbeIdentity identity{pid, std::move(function_name), std::move(replay_types),
+                             object_probe_registration_id};
       active_probes_[key] = identity;
       constexpr std::size_t kKnownProbeLimit = 4096;
       bool retain_probe_identity = true;
@@ -1470,6 +1475,7 @@ private:
       event.clear_replay_types();
       event.clear_object_observation();
       event.set_function_name(active->second.function_name);
+      event.set_object_probe_registration_id(active->second.object_probe_registration_id);
       const auto snapshot = snapshot_probes_.find(key);
       if (snapshot == snapshot_probes_.end()) {
         ++received_[key];
@@ -2915,6 +2921,8 @@ public:
     watch.set_first_seen(input.first_seen());
     watch.set_union_tag(input.union_tag());
     watch.set_synchronization(input.synchronization());
+    if (watch.first_seen() && !request.methods().empty())
+      throw std::invalid_argument("--first-seen is supported for write-only object-probe packages");
     if (watch.lifetimes_only() && (request.methods().empty() || !watch.code_symbol().empty() ||
         watch.follow_calls() || watch.first_seen() || watch.no_values() ||
         !watch.union_tag().empty() || !input.union_cases().empty() || !input.additional_code_symbols().empty()))
@@ -3051,12 +3059,8 @@ public:
     }
     session->preflight_object_probe();
     auto watch = object_probe_watch_request(request, session->snapshot());
-    watch.set_action(Watch::PREVIEW);
-    const auto preview = session->object_watch(watch, 0, {});
-    *response.mutable_watch() = preview;
-    auto &binding = *response.mutable_binding();
-    *binding.mutable_watch() = preview.plan();
     std::vector<api::ProbeSpec> methods;
+    methods.reserve(request.methods_size());
     std::set<std::uint64_t> entries;
     for (const auto &artifact : request.methods()) {
       if (!tracer::prepared::is_typed_version(artifact.format_version()) || artifact.selector().empty())
@@ -3064,14 +3068,31 @@ public:
       client::DebugLookupOptions lookup;
       lookup.module = request.method_module();
       lookup.is_cancelled = [&] { return context.IsCancelled(); };
-      auto resolved = client::bind_prepared_callable(session->pid(), artifact, lookup);
-      auto &spec = resolved.spec;
+      auto spec = client::bind_prepared_callable(session->pid(), artifact, lookup).spec;
       const auto &info = spec.debug_info();
       if (spec.signature().kind() != api::METHOD ||
           info.record_name() != watch.concrete_type() ||
           !info.runtime_entry() || !info.entry_size() ||
           !entries.insert(info.runtime_entry()).second)
         throw std::invalid_argument("method requires a unique exact receiver of the registered type");
+      spec.set_callback_source(request.callback_source());
+      spec.set_native_backend("entry");
+      const auto validated = validate_probe(spec);
+      if (!validated.ok())
+        return validated;
+      methods.push_back(std::move(spec));
+    }
+
+    if (watch.lifetimes_only() && watch.code_module().empty())
+      watch.set_code_module(methods.front().debug_info().module());
+    watch.set_action(Watch::PREVIEW);
+    const auto preview = session->object_watch(watch, 0, {});
+    *response.mutable_watch() = preview;
+    auto &binding = *response.mutable_binding();
+    *binding.mutable_watch() = preview.plan();
+    for (int i = 0; i < request.methods_size(); ++i) {
+      const auto &info = methods[i].debug_info();
+      const auto &artifact = request.methods(i);
       const auto boundary = object_watch::Plan::method_boundary(
           info.module(), artifact, &info, true, session->pid());
       const auto method_pc = boundary.binding.runtime_pc();
@@ -3096,12 +3117,6 @@ public:
         throw std::invalid_argument("method and its constructor evidence must be verified in the same image");
       *binding.add_methods() = info;
       *binding.add_method_patches() = boundary.binding;
-      spec.set_callback_source(request.callback_source());
-      spec.set_native_backend("entry");
-      const auto validated = validate_probe(spec);
-      if (!validated.ok())
-        return validated;
-      methods.push_back(std::move(spec));
     }
     if (request.has_preview() && request.preview().SerializeAsString() != binding.SerializeAsString())
       return {grpc::StatusCode::FAILED_PRECONDITION, "stale object probe binding; preview the attached image again"};
@@ -3218,7 +3233,8 @@ public:
               ? selector
               : spec.symbol();
       events_.set_probe(session->id(), pending_probe_id, session->pid(),
-                        function_name, true, &spec.prepared(), std::move(snapshot));
+                        function_name, true, &spec.prepared(), std::move(snapshot),
+                        spec.object_watch_id());
       const auto lineage = admit_probe_package(spec);
       if (!lineage.retained) {
         std::cerr << "clang-tracer: shared-context source lineage isolated: "
