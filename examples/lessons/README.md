@@ -28,6 +28,7 @@ run the section's commands without typing the sources first.
 | [20-map-entries](20-map-entries/README.md) | [Follow logical collection entries during writes](../../docs/native-repl.md#follow-logical-collection-entries-during-writes) (REPL walkthrough), nested fields in map entries |
 | [21-logical-updates](21-logical-updates/README.md) | [Follow logical collection entries during writes](../../docs/native-repl.md#follow-logical-collection-entries-during-writes) (REPL walkthrough), `--mode logical-writes` |
 | [22-string-storage-writes](22-string-storage-writes/README.md) | [Follow logical collection entries during writes](../../docs/native-repl.md#follow-logical-collection-entries-during-writes) (REPL walkthrough), string and variant storage |
+| [23-union-writes](23-union-writes/README.md) | [Trace individual writes to a nested union](../../docs/native-repl.md#trace-individual-writes-to-a-nested-union) (REPL walkthrough) |
 
 The remaining sections need no project. "Install and check the tools" and
 "Open the interactive guide" only run installed commands, and "Run the
