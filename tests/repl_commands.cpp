@@ -25,6 +25,9 @@ int main() {
           live.arguments.front() == "source one.cpp" && live.number("--retention-limit", 0) == 3);
   require(parse_command("%live preview source.cpp").kind == CommandKind::live_preview);
   require(parse_command("%live status").kind == CommandKind::live_status);
+  require(parse_command("%live watch source.cpp").kind == CommandKind::live_watch);
+  require(parse_command("%object prepare --type demo::State --code f --field value --output watch")
+              .option("--output") == "watch");
   require(parse_command("%live revert 0").arguments.front() == "0");
   require(parse_command("%attach 12345").kind == CommandKind::attach);
   require(parse_command("%probe prepare \"demo::compute(int)\" --include api.hpp "
