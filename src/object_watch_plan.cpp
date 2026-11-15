@@ -1535,14 +1535,24 @@ std::string writer_module(std::uint32_t pid, const std::string &executable,
   return candidates.front();
 }
 
-bool has_program_interpreter(const llvm::object::ELF64LEObjectFile &object) {
-  auto programs = object.getELFFile().program_headers();
-  if (!programs) {
-    llvm::consumeError(programs.takeError());
+bool is_shared_library(const llvm::object::ELF64LEObjectFile &object) {
+  const auto &elf = object.getELFFile();
+  if (elf.getHeader().e_type != llvm::ELF::ET_DYN)
     return false;
-  }
-  return std::any_of(programs->begin(), programs->end(), [](const auto &program) {
-    return program.p_type == llvm::ELF::PT_INTERP;
+  auto programs = elf.program_headers();
+  if (!programs)
+    throw std::runtime_error(llvm::toString(programs.takeError()));
+  if (std::any_of(programs->begin(), programs->end(), [](const auto &program) {
+        return program.p_type == llvm::ELF::PT_INTERP;
+      }))
+    return false;
+  // Static PIE has no interpreter. The PIE flag distinguishes it from a
+  // shared object even when the linker gives both an ELF entry address.
+  auto dynamic = elf.dynamicEntries();
+  if (!dynamic)
+    throw std::runtime_error(llvm::toString(dynamic.takeError()));
+  return std::none_of(dynamic->begin(), dynamic->end(), [](const auto &entry) {
+    return entry.getTag() == llvm::ELF::DT_FLAGS_1 && (entry.getVal() & llvm::ELF::DF_1_PIE);
   });
 }
 // Read the call-site table used by the Itanium C++ unwinder on ELF. The
@@ -1925,9 +1935,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   if (!pid && request.code_module().empty()) {
     const auto binary = open_elf(executable);
     const auto &object = llvm::cast<llvm::object::ELF64LEObjectFile>(*binary.getBinary());
-    const auto &header = object.getELFFile().getHeader();
-    if (header.e_type == llvm::ELF::ET_DYN && header.e_entry == 0 &&
-        !has_program_interpreter(object))
+    if (is_shared_library(object))
       throw std::invalid_argument("%object prepare --module names a shared ELF without a program interpreter; "
           "use --executable APP --module LIB");
   }
