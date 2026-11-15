@@ -754,15 +754,14 @@ to the ELF that owns that PLT stub and the process executable; other nonleaf
 callees run natively and produce an explicit coverage gap. An unbound lazy PLT
 slot also runs natively and produces one explicit gap for that slot while the
 loader binds it; subsequent calls use the current GOT target. These lazy-binding
-gaps are distinct from failures to translate a bound callee. Dispatch gaps are
-reported once per call site and reason, with `runtime_gap_hits` tracking
-occurrences; `helper_reentries` counts tracer-internal traffic separately.
-This PLT behavior applies to x86-64; AArch64 handling is unchanged.
+gaps have their own diagnostic. Other dispatch gaps are reported once per call
+site and reason. `runtime_gap_hits` tracks every occurrence, and
+`helper_reentries` counts tracer-internal traffic. On AArch64, PLT stubs that
+cannot be translated produce coverage gaps.
 
-This call-following behavior does not remove entry-redirection limits. A short
-x86-64 writer entry can still be rejected when code-cache cannot verify a
-five-byte nonfaulting patch window, as can happen for a trivial one-store
-constructor. That setup error is separate from a runtime coverage gap.
+On x86-64, an entry redirect requires a verified five-byte nonfaulting patch
+window. A trivial one-store constructor in a library can have a shorter entry,
+which prevents the watch from starting.
 
 Use `--runtime-limit N` to bound nested scope discovery and retained translations. The default is
 1,024. When a callee exceeds the limit or its code cannot be verified and
