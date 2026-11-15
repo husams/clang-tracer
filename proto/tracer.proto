@@ -800,6 +800,8 @@ message ObjectWatchStatus {
   bool external_write_order_unknown = 27;
   uint32 static_fragments = 28;
   uint32 static_reclaimed = 29;
+  uint64 runtime_gap_hits = 30; // Includes repeated runtime dispatch gaps.
+  uint64 helper_reentries = 31; // Tracer-internal hook entries excluded from capture.
 }
 
 message ObjectObservation {

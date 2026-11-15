@@ -24,6 +24,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <thread>
@@ -172,6 +173,7 @@ struct Site {
 #endif
   GateWindow entry_gate{};
   std::vector<ExitWindow> exit_gates{};
+  mutable std::uint32_t dispatch_gap_mask = 0;
 };
 
 struct Lifetime {
@@ -223,8 +225,22 @@ struct RuntimeImage {
   llvm::object::OwningBinary<llvm::object::Binary> binary;
   std::uint32_t module_index = 0;
 
+  struct FunctionImage {
+    std::string bytes;
+    Address file_offset = 0;
+    bool weak = false;
+  };
+
+  struct PltStub {
+    Address got_address = 0;
+    Address lazy_target = 0;
+    Address file_offset = 0;
+    std::string bytes;
+  };
+
   explicit RuntimeImage(const RuntimeLocation &location);
-  std::pair<std::string, Address> function(Address elf_address) const;
+  FunctionImage function(Address elf_address) const;
+  std::optional<PltStub> plt_stub(Address elf_address) const;
 };
 
 struct State {
@@ -270,8 +286,16 @@ struct State {
   bool recycler_started = false;
   std::atomic<std::uint64_t> runtime_inflight{0};
   std::map<RuntimeImageKey, RuntimeImage> runtime_images;
+  std::map<std::pair<RuntimeImageKey, Address>, RuntimeImage::PltStub> runtime_plt_stubs;
   std::map<std::pair<RuntimeImageKey, Address>, RuntimeBlock *> runtime_targets;
   std::map<std::tuple<dev_t, ino_t, Address, Address>, RuntimeBlock *> runtime_scopes;
+  struct RuntimeRejection {
+    DispatchGap reason = DispatchGap::translation_failed;
+    bool plt_only = false;
+  };
+  std::map<std::pair<RuntimeImageKey, Address>, RuntimeRejection> runtime_rejections;
+  // Bound per-slot lazy-binding rows by runtime_limit; occurrence totals live in Channel.
+  std::set<std::tuple<RuntimeImageKey, Address, Address>> runtime_lazy_slots;
   std::atomic<RuntimeBlock *> runtime_blocks{nullptr};
   State *previous = nullptr;
   std::mutex mutex;
@@ -376,6 +400,9 @@ void reclaim_code(State *watch) noexcept {
         watch->runtime_targets.clear();
         watch->runtime_scopes.clear();
         watch->runtime_images.clear();
+        watch->runtime_plt_stubs.clear();
+        watch->runtime_rejections.clear();
+        watch->runtime_lazy_slots.clear();
         channel.runtime_reclaimed.store(reclaimed, std::memory_order_release);
         runtime_done = true;
       }
@@ -1640,14 +1667,9 @@ void before(const Site *site, const Registers *regs) noexcept {
     return;
   if (inside_helper) {
     helper_reentry.fetch_add(1, std::memory_order_relaxed);
-#if defined(__aarch64__)
-    if (watch.snapshot_mapping) {
-      auto &queue = *static_cast<arm_snapshot::Queue *>(watch.snapshot_mapping->address);
-      queue.drops.fetch_add(1, std::memory_order_relaxed);
-      return;
-    }
-#endif
-    watch.channel->dropped.fetch_add(1, std::memory_order_relaxed);
+    watch.channel->helper_reentries.fetch_add(1, std::memory_order_relaxed);
+    // Helper reentry is accounted separately and is not an application event
+    // or a capture loss, including for the snapshot backend.
     return;
   }
   const HelperGuard guard(site);
@@ -2020,12 +2042,12 @@ void after(const Site *site, const Registers *regs) noexcept {
       cancel_pending();
     return;
   }
-  channel.executed_stores.fetch_add(1, std::memory_order_relaxed);
   if (inside_helper) {
     helper_reentry.fetch_add(1, std::memory_order_relaxed);
-    channel.dropped.fetch_add(1, std::memory_order_relaxed);
+    channel.helper_reentries.fetch_add(1, std::memory_order_relaxed);
     return;
   }
+  channel.executed_stores.fetch_add(1, std::memory_order_relaxed);
   const HelperGuard guard(site);
   try {
     complete(site, regs);
@@ -4086,10 +4108,11 @@ RuntimeImage::RuntimeImage(const RuntimeLocation &location) {
   binary = {std::move(*elf), std::move(buffer)};
 }
 
-std::pair<std::string, Address> RuntimeImage::function(Address address) const {
+RuntimeImage::FunctionImage RuntimeImage::function(Address address) const {
   const auto &object = *llvm::cast<llvm::object::ELF64LEObjectFile>(binary.getBinary());
   Address size = 0;
-  const auto find_entry = [&](const llvm::object::SymbolRef &symbol) {
+  bool weak = false;
+  const auto find_entry = [&](const llvm::object::SymbolRef &symbol, bool dynamic) {
     const llvm::object::ELFSymbolRef elf(symbol);
     if (elf.getELFType() != STT_FUNC || !elf.getSize())
       return;
@@ -4102,12 +4125,13 @@ std::pair<std::string, Address> RuntimeImage::function(Address address) const {
       if (size && size != elf.getSize())
         throw std::runtime_error("runtime callee has ambiguous ELF symbol extents");
       size = elf.getSize();
+      weak |= dynamic && elf.getBinding() == STB_WEAK;
     }
   };
   for (const auto &symbol : object.symbols())
-    find_entry(symbol);
+    find_entry(symbol, false);
   for (const auto &symbol : object.getDynamicSymbolIterators())
-    find_entry(symbol);
+    find_entry(symbol, true);
   if (!size)
     throw std::runtime_error("runtime callee has no concrete ELF symbol extent");
   auto headers = object.getELFFile().program_headers();
@@ -4124,10 +4148,108 @@ std::pair<std::string, Address> RuntimeImage::function(Address address) const {
     const Address delta = address - segment.p_vaddr;
     if (delta <= segment.p_filesz && size <= segment.p_filesz - delta) {
       const Address offset = segment.p_offset + delta;
-      return {file.substr(offset, size).str(), offset};
+      return {file.substr(offset, size).str(), offset, weak};
     }
   }
   throw std::runtime_error("runtime callee exceeds executable ELF segment");
+}
+
+std::optional<RuntimeImage::PltStub> RuntimeImage::plt_stub(Address address) const {
+#if !defined(__x86_64__)
+  (void)address;
+  return std::nullopt;
+#else
+  const auto &object = *llvm::cast<llvm::object::ELF64LEObjectFile>(binary.getBinary());
+  std::optional<llvm::object::ELFSectionRef> entry_section;
+  std::optional<llvm::object::ELFSectionRef> lazy_section;
+  for (const auto &section : object.sections()) {
+    auto name = section.getName();
+    if (!name) {
+      llvm::consumeError(name.takeError());
+      continue;
+    }
+    if ((*name != ".plt" && *name != ".plt.sec" && *name != ".plt.got") || !section.isText())
+      continue;
+    if (*name == ".plt")
+      lazy_section = llvm::object::ELFSectionRef(section);
+    if (address >= section.getAddress() && address - section.getAddress() < section.getSize())
+      entry_section = llvm::object::ELFSectionRef(section);
+  }
+  if (!entry_section)
+    return std::nullopt;
+  auto contents = entry_section->getContents();
+  if (!contents) {
+    llvm::consumeError(contents.takeError());
+    return std::nullopt;
+  }
+  const auto offset = address - entry_section->getAddress();
+  const auto entry = contents->substr(offset);
+  auto jump = entry;
+  if (jump.starts_with("\xf3\x0f\x1e\xfa")) // ENDBR64
+    jump = jump.drop_front(4);
+  if (jump.starts_with("\xf2\xff\x25")) // BND-prefixed indirect jump
+    jump = jump.drop_front(1);
+  if (jump.size() < 6 || !jump.starts_with("\xff\x25"))
+    return std::nullopt;
+  std::int32_t displacement = 0;
+  std::memcpy(&displacement, jump.data() + 2, sizeof(displacement));
+  const auto size = entry.size() - jump.size() + 6;
+  const Address got = address + size + displacement;
+  if (got % alignof(Address))
+    return std::nullopt;
+
+  // The RIP-relative slot must be backed by a dynamic GOT relocation.
+  bool got_slot = false;
+  bool jump_slot = false;
+  for (const auto &section : object.sections()) {
+    if (!(llvm::object::ELFSectionRef(section).getFlags() & SHF_ALLOC))
+      continue;
+    for (const auto &relocation : section.relocations()) {
+      if (relocation.getOffset() != got)
+        continue;
+      jump_slot |= relocation.getType() == R_X86_64_JUMP_SLOT;
+      got_slot |= relocation.getType() == R_X86_64_GLOB_DAT;
+    }
+  }
+  if (!jump_slot && !got_slot)
+    return std::nullopt;
+
+  auto headers = object.getELFFile().program_headers();
+  if (!headers) {
+    llvm::consumeError(headers.takeError());
+    return std::nullopt;
+  }
+  const auto file = object.getMemoryBufferRef().getBuffer();
+  const auto file_range = [&](Address start, std::size_t length, unsigned flags) -> std::optional<Address> {
+    for (const auto &segment : *headers) {
+      if (segment.p_type != PT_LOAD || (segment.p_flags & flags) != flags ||
+          start < segment.p_vaddr || segment.p_offset > file.size() ||
+          segment.p_filesz > file.size() - segment.p_offset)
+        continue;
+      const Address delta = start - segment.p_vaddr;
+      if (delta <= segment.p_filesz && length <= segment.p_filesz - delta)
+        return segment.p_offset + delta;
+    }
+    return std::nullopt;
+  };
+  const auto stub_offset = file_range(address, size, PF_X);
+  const auto got_offset = file_range(got, sizeof(Address), PF_R);
+  if (!stub_offset || *stub_offset != entry_section->getOffset() + offset || !got_offset)
+    return std::nullopt;
+
+  // For lazy JUMP_SLOT binding the file's initial GOT word points back into
+  // .plt, both for the classic continuation and a separate IBT resolver stub.
+  Address lazy_target = 0;
+  if (jump_slot && lazy_section) {
+    Address initial = 0;
+    std::memcpy(&initial, file.data() + *got_offset, sizeof(initial));
+    const auto begin = lazy_section->getAddress();
+    if (initial >= begin && initial - begin < lazy_section->getSize() &&
+        file_range(initial, 1, PF_X))
+      lazy_target = initial;
+  }
+  return PltStub{got, lazy_target, *stub_offset, entry.take_front(size).str()};
+#endif
 }
 
 bool matches_runtime_bytes(Address target, const RuntimeLocation &location, const RuntimeBlock &block) {
@@ -4392,21 +4514,25 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
   const Activity activity(*watch.channel);
   if (!activity.active)
     return fallback;
+  if (inside_helper) {
+    watch.channel->helper_reentries.fetch_add(1, std::memory_order_relaxed);
+    return fallback;
+  }
   if (watch.channel->reclaim_request.load(std::memory_order_acquire))
     return fallback;
   if (std::ranges::binary_search(watch.static_scopes, target))
     return fallback;
-  std::uint8_t gap = 1;
-  if (!inside_helper) {
+  std::uint8_t gap = static_cast<std::uint8_t>(DispatchGap::translation_failed);
+  bool from_plt = false;
+  RuntimeImageKey plt_owner_key{};
+  {
     const HelperGuard guard(site);
     try {
       // Query the loader before taking the watch lock. Loader callbacks can
       // enter application code on a different thread.
-      const auto location = locate_runtime_target(target);
-      const RuntimeImageKey image_key{location.device, location.inode, location.bias,
-                                      location.unload_generation};
-      const auto target_key = std::pair{image_key, target};
-      const auto scope_key = std::tuple{location.device, location.inode, location.bias, target};
+      auto location = locate_runtime_target(target);
+      RuntimeImageKey image_key{location.device, location.inode, location.bias,
+                                location.unload_generation};
       std::unique_lock lock(watch.runtime_mutex);
       const auto enter = [&](const RuntimeBlock &block) {
         if (watch.channel->reclaim_request.load(std::memory_order_acquire))
@@ -4418,6 +4544,100 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
       };
       if (watch.channel->reclaim_request.load(std::memory_order_acquire))
         return fallback;
+      std::optional<RuntimeImage> fresh;
+      const auto image_for = [&]() -> const RuntimeImage & {
+        const auto known = watch.runtime_images.find(image_key);
+        if (known != watch.runtime_images.end()) {
+          fresh.reset();
+          return known->second;
+        }
+        if (!fresh) {
+          if (location.path.size() >= RuntimeModule{}.path.size())
+            throw std::runtime_error("runtime module path exceeds the event format");
+          fresh.emplace(location);
+        }
+        return *fresh;
+      };
+      const auto remember_rejection = [&](const RuntimeImageKey &key, Address destination,
+                                          DispatchGap reason, bool plt_only) noexcept {
+        try {
+          const auto rejection_key = std::pair{key, destination};
+          const auto found = watch.runtime_rejections.find(rejection_key);
+          if (found != watch.runtime_rejections.end()) {
+            if (found->second.plt_only && !plt_only)
+              found->second = {reason, plt_only};
+          } else if (watch.runtime_rejections.size() < watch.runtime_limit) {
+            watch.runtime_rejections.emplace(rejection_key,
+                State::RuntimeRejection{reason, plt_only});
+          }
+        } catch (...) {
+          // Rejection memoization is best-effort; always preserve the call path.
+        }
+      };
+#if defined(__x86_64__)
+      using PltStub = RuntimeImage::PltStub;
+      const auto stub_key = std::pair{image_key, target};
+      const PltStub *plt = nullptr;
+      std::optional<PltStub> stub;
+      if (const auto cached = watch.runtime_plt_stubs.find(stub_key); cached != watch.runtime_plt_stubs.end()) {
+        plt = &cached->second;
+      } else if (watch.runtime_targets.find(stub_key) == watch.runtime_targets.end()) {
+        stub = image_for().plt_stub(target - location.bias);
+        if (stub) {
+          plt = &*stub;
+          if (watch.runtime_plt_stubs.size() < watch.runtime_limit)
+            plt = &watch.runtime_plt_stubs.emplace(stub_key, std::move(*stub)).first->second;
+        }
+      }
+      if (plt) {
+        from_plt = true;
+        plt_owner_key = stub_key.first;
+        std::array<char, 11> live_stub{};
+        if (plt->file_offset != location.offset || plt->bytes.size() > location.end - target ||
+            !read_self_memory(target, live_stub.data(), plt->bytes.size()) ||
+            std::memcmp(live_stub.data(), plt->bytes.data(), plt->bytes.size()))
+          throw std::runtime_error("runtime PLT bytes disagree with the mapped ELF");
+        Address slot_value = 0;
+        if (!read_self(location.bias + plt->got_address, slot_value))
+          throw std::runtime_error("cannot read the verified runtime PLT GOT slot");
+        if (plt->lazy_target && slot_value == location.bias + plt->lazy_target) {
+          watch.channel->runtime_gap_hits.fetch_add(1, std::memory_order_relaxed);
+          const auto slot_key = std::tuple{stub_key.first, plt->got_address, slot_value};
+          bool first = false;
+          try {
+            first = watch.runtime_lazy_slots.size() < watch.runtime_limit &&
+                watch.runtime_lazy_slots.insert(slot_key).second;
+          } catch (...) {
+            // Keep the linker path untouched if diagnostic accounting runs out of memory.
+          }
+          if (first) {
+            lock.unlock();
+            Observation event{};
+            event.pc = site->instruction.pc;
+            event.destination = target;
+            event.runtime_module = site->runtime_module;
+            event.hook = Hook::dispatch_gap;
+            event.gap = static_cast<std::uint8_t>(DispatchGap::lazy_plt);
+            emit(watch, event);
+          }
+          return fallback;
+        }
+        lock.unlock();
+        location = locate_runtime_target(slot_value);
+        lock.lock();
+        target = slot_value;
+        image_key = {location.device, location.inode, location.bias, location.unload_generation};
+        if (image_key != stub_key.first)
+          fresh.reset();
+        if (watch.channel->reclaim_request.load(std::memory_order_acquire) ||
+            std::binary_search(watch.static_scopes.begin(), watch.static_scopes.end(), target))
+          return fallback;
+      }
+#endif
+      // The resolved target key uses the current GOT value for PLT calls.
+      const auto target_key = std::pair{image_key, target};
+      const bool outside_plt_scope = from_plt && !location.main_image && image_key != plt_owner_key;
+      const auto scope_key = std::tuple{location.device, location.inode, location.bias, target};
       if (const auto cached = watch.runtime_scopes.find(scope_key); cached != watch.runtime_scopes.end()) {
         const auto &scope = *cached->second;
         if (watch.channel->scope_status(watch.event_buffer, watch.runtime_limit, scope.scope_index)
@@ -4440,29 +4660,46 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
           return enter(*cached->second);
         watch.runtime_targets.erase(cached);
       }
+      if (const auto rejected = watch.runtime_rejections.find(target_key);
+          rejected != watch.runtime_rejections.end() &&
+          (!rejected->second.plt_only || outside_plt_scope)) {
+        gap = static_cast<std::uint8_t>(rejected->second.reason);
+        throw std::runtime_error("runtime callee has a memoized unsupported scope");
+      }
       if (watch.runtime_count == watch.runtime_limit) {
-        gap = 2;
+        gap = static_cast<std::uint8_t>(DispatchGap::runtime_limit);
         throw std::runtime_error("runtime translation limit reached");
       }
-      const auto known = watch.runtime_images.find(image_key);
-      std::optional<RuntimeImage> fresh;
-      if (known == watch.runtime_images.end()) {
-        if (location.path.size() >= RuntimeModule{}.path.size())
-          throw std::runtime_error("runtime module path exceeds the event format");
-        fresh.emplace(location);
-      }
-      const auto &image = fresh ? *fresh : known->second;
+      const auto &image = image_for();
       auto block = std::make_unique<RuntimeBlock>();
-      std::tie(block->bytes, block->file_offset) = image.function(target - location.bias);
+      auto function = image.function(target - location.bias);
+      block->bytes = std::move(function.bytes);
+      block->file_offset = function.file_offset;
       if (!matches_runtime_bytes(target, location, *block))
         throw std::runtime_error("runtime callee bytes disagree with the mapped ELF");
       const auto decoded = native_entry::scan(target, block->bytes);
-      const bool nonleaf = !decoded.decode_failed && decoded.diagnostic.empty() &&
+      const bool decode_verified = !decoded.decode_failed && decoded.diagnostic.empty() &&
+          !decoded.instructions.empty();
+      const bool nonleaf = decode_verified &&
           std::ranges::any_of(decoded.instructions, [](const auto &inst) {
             return inst.flow == NativeFlow::call;
           });
       const auto module_index = fresh ? watch.runtime_modules + 1 : image.module_index;
+      if (function.weak && nonleaf) {
+        gap = static_cast<std::uint8_t>(DispatchGap::weak_scope);
+        remember_rejection(image_key, target, DispatchGap::weak_scope, false);
+        throw std::runtime_error("dynamically exported weak function cannot be redirected safely");
+      }
+      if (!decode_verified) {
+        remember_rejection(image_key, target, DispatchGap::translation_failed, false);
+        throw std::runtime_error("runtime callee has permanently unsupported verified bytes");
+      }
       if (nonleaf) {
+        if (outside_plt_scope) {
+          gap = static_cast<std::uint8_t>(DispatchGap::outside_plt_scope);
+          remember_rejection(image_key, target, DispatchGap::outside_plt_scope, true);
+          throw std::runtime_error("PLT target is outside the executable and calling library");
+        }
         const auto first_slot = watch.runtime_count;
         prepare_runtime_scope(*block, watch, target, module_index, decoded);
         if (!location.main_image) {
@@ -4559,9 +4796,16 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
       // The real application call still enters its original callee.
     }
   }
+  watch.channel->runtime_gap_hits.fetch_add(1, std::memory_order_relaxed);
+  const auto bit = std::uint32_t{1} << gap;
+  const bool already_reported =
+      (__atomic_fetch_or(&site->dispatch_gap_mask, bit, __ATOMIC_RELAXED) & bit) != 0;
+  if (already_reported)
+    return fallback;
   Observation event{};
   event.pc = site->instruction.pc;
   event.destination = target;
+  event.runtime_module = site->runtime_module;
   event.hook = Hook::dispatch_gap;
   event.gap = gap;
   emit(watch, event);

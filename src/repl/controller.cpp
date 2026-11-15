@@ -1936,7 +1936,8 @@ bool Controller::execute(const Command &command) {
           else if (!request.code_module().empty())
             request.set_code_module(command.option("--module"));
           else
-            throw std::invalid_argument("--module requires a saved method or shared writer plan");
+            throw std::invalid_argument("--module requires a saved method or shared writer plan; "
+                "prepare a shared writer with %object prepare TYPE --executable APP --module LIB");
         }
         if (command.has("--no-values"))
           request.set_no_values(true);
@@ -2239,7 +2240,11 @@ bool Controller::execute(const Command &command) {
       out_ << " receivers=" << result.admitted_receivers();
     if (result.mode() == api::ObjectWatchRequest::SNAPSHOTS || result.coverage_gaps())
       out_ << " coverage_gaps=" << result.coverage_gaps();
-    if (result.coverage_gaps() || result.unsupported_sites() || result.dropped() ||
+    if (result.runtime_gap_hits())
+      out_ << " runtime_gap_hits=" << result.runtime_gap_hits();
+    if (result.helper_reentries())
+      out_ << " helper_reentries=" << result.helper_reentries();
+    if (result.coverage_gaps() || result.runtime_gap_hits() || result.unsupported_sites() || result.dropped() ||
         result.external_write_order_unknown())
       out_ << " coverage=partial";
     if (!result.capture_limit().empty())

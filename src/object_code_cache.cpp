@@ -381,9 +381,7 @@ struct Watch::Impl {
     if (runtime_limit > max_runtime_limit || (spec.runtime_limit() && !spec.follow_calls()))
       throw std::invalid_argument("invalid runtime code-cache translation limit");
     admitted_stores = plan.stores;
-    if (request.follow_calls() && ((request.first_seen() && !plan.layout.value_write.active()) ||
-        request.writer_entry() || plan.caller_start || !request.owner_type().empty() ||
-        plan.layout.logical_collection()))
+    if (request.follow_calls() && !plan.follow_calls_eligible(request))
       throw std::invalid_argument("runtime call following requires a standalone writer scope");
 #if defined(__aarch64__)
     prepare_arm_fragments();
@@ -1748,8 +1746,23 @@ struct Watch::Impl {
     }
     if (sample.hook == Hook::dispatch_gap) {
       item.set_destination(sample.destination);
-      item.set_diagnostic(sample.gap == 2 ? "runtime translation limit reached" :
-          "callee could not be translated from verified live executable bytes");
+      switch (static_cast<DispatchGap>(sample.gap)) {
+      case DispatchGap::runtime_limit:
+        item.set_diagnostic("runtime translation limit reached");
+        break;
+      case DispatchGap::lazy_plt:
+        item.set_diagnostic("callee ran natively while the PLT slot was lazily bound");
+        break;
+      case DispatchGap::outside_plt_scope:
+        item.set_diagnostic("PLT callee ran natively because its scope is outside the calling ELF and executable");
+        break;
+      case DispatchGap::weak_scope:
+        item.set_diagnostic("runtime callee ran natively because its weak export cannot be redirected safely");
+        break;
+      default:
+        item.set_diagnostic("callee could not be translated from verified live executable bytes");
+        break;
+      }
     }
     if (sample.hook == Hook::owner_gap)
       item.set_diagnostic("owner membership could not be verified at the original method boundary");
@@ -2593,6 +2606,8 @@ api::ObjectWatchStatus Watch::status() const {
   report.set_dropped(p.channel->dropped.load(std::memory_order_relaxed) +
                      p.publish_errors.load(std::memory_order_relaxed));
   report.set_coverage_gaps(p.coverage_gaps.load(std::memory_order_relaxed));
+  report.set_runtime_gap_hits(p.channel->runtime_gap_hits.load(std::memory_order_relaxed));
+  report.set_helper_reentries(p.channel->helper_reentries.load(std::memory_order_relaxed));
   report.set_runtime_translations(p.channel->runtime_translations.load(std::memory_order_acquire));
   report.set_runtime_reclaimed(p.channel->runtime_reclaimed.load(std::memory_order_acquire));
   report.set_static_fragments(p.channel->static_fragments.load(std::memory_order_acquire));

@@ -124,6 +124,8 @@ public:
   unsigned stores = 0, unsupported = 0;
   google::protobuf::RepeatedPtrField<clangtracer::v1::ObjectWatchRequest::SourceWriter> source_writers;
 
+  bool follow_calls_eligible(const clangtracer::v1::ObjectWatchRequest &request) const;
+
   std::string_view code(std::uint64_t pc) const;
 #if defined(__x86_64__)
   bool writer_address_taken(std::uint64_t pc) const;
