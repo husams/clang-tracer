@@ -896,6 +896,79 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-shared-shapes-target>
           $<TARGET_FILE:repl-shared-shapes-library>)
       set_tests_properties(native_repl_code_cache_shared PROPERTIES TIMEOUT 120)
+      if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+        add_library(repl-object-shared-writer-library SHARED
+          tests/fixtures/object_shared_writer/library.cpp)
+        add_executable(repl-object-shared-writer-target
+          tests/fixtures/object_shared_writer/main.cpp)
+        add_executable(repl-object-shared-writer-interposed-target
+          tests/fixtures/object_shared_writer/main.cpp)
+        target_compile_definitions(repl-object-shared-writer-interposed-target PRIVATE
+          SHARED_WRITER_INTERPOSE=1)
+        add_executable(repl-object-shared-writer-weak-target
+          tests/fixtures/object_shared_writer/main.cpp)
+        target_compile_definitions(repl-object-shared-writer-weak-target PRIVATE
+          SHARED_WRITER_WEAK_INTERPOSE=1)
+        set_target_properties(repl-object-shared-writer-library repl-object-shared-writer-target
+          PROPERTIES CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
+        set_target_properties(repl-object-shared-writer-interposed-target
+          PROPERTIES CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
+        set_target_properties(repl-object-shared-writer-weak-target
+          PROPERTIES CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_include_directories(repl-object-shared-writer-library PRIVATE
+          tests/fixtures/object_shared_writer)
+        target_include_directories(repl-object-shared-writer-target PRIVATE
+          tests/fixtures/object_shared_writer)
+        target_compile_options(repl-object-shared-writer-library PRIVATE
+          -g -O1 -fPIC -fsemantic-interposition -fno-inline -fno-optimize-sibling-calls
+          -fpatchable-function-entry=5,0)
+        target_compile_options(repl-object-shared-writer-target PRIVATE -g -O0 -fPIE)
+        target_compile_options(repl-object-shared-writer-interposed-target PRIVATE
+          -g -O1 -fPIE)
+        target_compile_options(repl-object-shared-writer-weak-target PRIVATE
+          -g -O1 -fPIE -fno-optimize-sibling-calls)
+        target_link_options(repl-object-shared-writer-library PRIVATE
+          "LINKER:--build-id=sha1" "LINKER:-z,lazy")
+        target_link_options(repl-object-shared-writer-target PRIVATE
+          -pie "LINKER:--build-id=sha1" "LINKER:-z,lazy")
+        target_link_options(repl-object-shared-writer-interposed-target PRIVATE
+          -pie -rdynamic "LINKER:--build-id=sha1" "LINKER:-z,lazy")
+        target_link_options(repl-object-shared-writer-weak-target PRIVATE
+          -pie -rdynamic "LINKER:--build-id=sha1" "LINKER:-z,lazy")
+        target_link_libraries(repl-object-shared-writer-target PRIVATE repl-object-shared-writer-library)
+        target_link_libraries(repl-object-shared-writer-interposed-target PRIVATE
+          repl-object-shared-writer-library)
+        target_link_libraries(repl-object-shared-writer-weak-target PRIVATE
+          repl-object-shared-writer-library)
+        add_test(NAME native_repl_object_shared_writer_plt
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_shared_writer.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-shared-writer-target>
+            $<TARGET_FILE:repl-object-shared-writer-library> "${CMAKE_OBJDUMP}" "${CMAKE_NM}"
+            --scenario lazy)
+        set_tests_properties(native_repl_object_shared_writer_plt PROPERTIES TIMEOUT 180)
+        add_test(NAME native_repl_object_shared_writer_plt_eager
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_shared_writer.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-shared-writer-target>
+            $<TARGET_FILE:repl-object-shared-writer-library> "${CMAKE_OBJDUMP}" "${CMAKE_NM}"
+            --scenario eager)
+        set_tests_properties(native_repl_object_shared_writer_plt_eager PROPERTIES TIMEOUT 180)
+        add_test(NAME native_repl_object_shared_writer_plt_interposed
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_shared_writer.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-shared-writer-interposed-target>
+            $<TARGET_FILE:repl-object-shared-writer-library> "${CMAKE_OBJDUMP}" "${CMAKE_NM}"
+            --scenario interposed)
+        set_tests_properties(native_repl_object_shared_writer_plt_interposed PROPERTIES TIMEOUT 180)
+        add_test(NAME native_repl_object_shared_writer_plt_weak_export
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_shared_writer.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-shared-writer-weak-target>
+            $<TARGET_FILE:repl-object-shared-writer-library> "${CMAKE_OBJDUMP}" "${CMAKE_NM}"
+            --scenario weak)
+        set_tests_properties(native_repl_object_shared_writer_plt_weak_export PROPERTIES TIMEOUT 180)
+      endif()
       add_executable(repl-atomic-person-target
         tests/fixtures/atomic_person/operations.cpp tests/fixtures/atomic_person/driver.cpp)
       set_target_properties(repl-atomic-person-target PROPERTIES CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
