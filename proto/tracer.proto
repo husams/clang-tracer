@@ -933,6 +933,19 @@ message ObjectObservation {
     string mutation = 6;
   }
   LogicalUpdate logical_update = 42;
+  message StorageWrite {
+    enum Region {
+      REGION_UNSPECIFIED = 0;
+      REPRESENTATION = 1;
+      STRING_DATA = 2;
+      ANY_PAYLOAD = 3;
+    }
+    Region region = 1;
+    uint64 address = 2; // First affected byte of the selected field or payload.
+    uint64 offset = 3; // From the start of the reported region.
+    uint32 size = 4;
+  }
+  StorageWrite storage_write = 43;
 }
 
 message TraceEvent {
