@@ -941,6 +941,12 @@ function(tracer_add_native_repl)
           --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
           --agent $<TARGET_FILE:clang_tracer_agent>)
       set_tests_properties(native_repl_live_update PROPERTIES TIMEOUT 240)
+      add_test(NAME native_repl_live_review
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_live_review.py"
+          --compiler "${CMAKE_CXX_COMPILER}"
+          --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+          --agent $<TARGET_FILE:clang_tracer_agent>)
+      set_tests_properties(native_repl_live_review PROPERTIES TIMEOUT 300)
       add_test(NAME native_repl_live_mock
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_live_mock.py"
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
