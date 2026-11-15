@@ -85,7 +85,8 @@ int agent_plugin(tracer::AgentPluginCall *request, const char *source,
         offered = plugins.load_offered(
             request->plugin_id,
             {offer.source_path(), contents, tracer::kEmbeddedPluginHeader,
-             fs::path(offer.sdk_directory()) / "clang_tracer_repl_plugin.h"},
+             fs::path(offer.sdk_directory()) / "clang_tracer_repl_plugin.h",
+             tracer::kEmbeddedCppPluginHeader},
             offer_profile, cache, reload,
             {offer.fingerprint(), offer.checksum(), offer.object()});
       }
@@ -95,7 +96,8 @@ int agent_plugin(tracer::AgentPluginCall *request, const char *source,
                                  {"/__clang_tracer_plugin__/source.cpp",
                                   contents,
                                   tracer::kEmbeddedPluginHeader,
-                                  {}},
+                                  {},
+                                  tracer::kEmbeddedCppPluginHeader},
                                  profile, cache, reload);
       request->generation = result.generation;
       request->cache_hit = result.cache_hit;

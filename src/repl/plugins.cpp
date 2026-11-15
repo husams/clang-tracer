@@ -56,7 +56,7 @@ void Plugins::execute(const Command &command, const CppEngine &cpp,
     const auto path = reload ? plugins_.info(id).source
                              : fs::absolute(command.arguments.at(0));
     const auto result = plugins_.load(
-        id, {path, {}, {}, {}}, plugin_profile(cpp, plugin_sdk_directory()),
+        id, {path, {}, {}, {}, {}}, plugin_profile(cpp, plugin_sdk_directory()),
         mapping_cache_directory().parent_path() / "plugins", reload);
     out << id << " generation " << result.generation << " active ("
         << (result.cache_hit ? "cache hit" : "compiled") << ")\n";
@@ -81,7 +81,7 @@ void Plugins::offer_agent_object(clangtracer::v1::AgentPluginRequest &request,
     const auto source = fs::absolute(path);
     const auto sdk = plugin_sdk_directory();
     auto object = plugins_.prepare(
-        {source, request.source(), {}, {}}, plugin_profile(cpp, sdk),
+        {source, request.source(), {}, {}, {}}, plugin_profile(cpp, sdk),
         mapping_cache_directory().parent_path() / "plugins");
     if (object.bytes.size() > tracer::kMaxAgentPluginOffer)
       return;

@@ -67,6 +67,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/callback.hpp
   ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/context.hpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/repl/clang_tracer_repl_plugin.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/repl/clang_tracer_repl_plugin.hpp
   ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/protocol.hpp)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/protocol.hpp TRACER_PROTOCOL_HEADER)
 # Incremental input is a synthetic main file, not an includable disk header.
@@ -74,6 +75,7 @@ string(REPLACE "#pragma once" "" TRACER_PROTOCOL_HEADER "${TRACER_PROTOCOL_HEADE
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/callback.hpp TRACER_CALLBACK_HEADER)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/context.hpp TRACER_CONTEXT_HEADER)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/repl/clang_tracer_repl_plugin.h TRACER_PLUGIN_HEADER)
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/repl/clang_tracer_repl_plugin.hpp TRACER_CPP_PLUGIN_HEADER)
 configure_file(src/callback_source.hpp.in
   ${TRACER_PROTO_DIR}/callback_source.hpp @ONLY)
 add_custom_command(

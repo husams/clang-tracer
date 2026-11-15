@@ -9,6 +9,7 @@ find_package(LLVM REQUIRED CONFIG)
 
 add_executable(jit_plugin_globals main.cpp)
 target_include_directories(jit_plugin_globals SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
+target_include_directories(jit_plugin_globals PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../src/repl")
 if(TARGET LLVM)
   target_link_libraries(jit_plugin_globals PRIVATE LLVM)
 else()

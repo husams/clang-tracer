@@ -61,6 +61,43 @@ with tempfile.TemporaryDirectory(prefix="tracer-repl-plugins-") as directory:
     assert "%plugin load FILE --as NAME" in hints, hints
     assert "%plugin run a tick  Advance the counter" in hints, hints
 
+    (root / "instance.cpp").write_text("""#include "clang_tracer_repl_plugin.hpp"
+
+class tracer::repl::Plugin : public tracer::repl::PluginInterface<Plugin> {
+  uint64_t count_ = 0;
+
+public:
+  uint64_t tick() noexcept { return ++count_; }
+  uint64_t value() const noexcept { return count_; }
+
+  static constexpr Command commands[] = {
+      command<&Plugin::tick>("tick", "Increment the count."),
+      command<&Plugin::value>("value", "Read the count."),
+  };
+};
+""")
+    (root / "legacy.cpp").write_text("""#include "clang_tracer_repl_plugin.h"
+
+namespace {
+uint64_t value() { return 42; }
+constexpr TracerReplCommandV1 command{"value", "Read the value.", value};
+constexpr TracerReplPluginV1 descriptor{sizeof(descriptor), 1, &command};
+}
+
+const TracerReplPluginV1 *tracer_repl_plugin_v1() { return &descriptor; }
+""")
+    mixed = run("""%plugin load instance.cpp --as instance
+%plugin run instance tick
+%plugin run instance value
+%plugin load legacy.cpp --as legacy
+%plugin run legacy value
+%plugin reload instance
+%plugin run instance value""")
+    assert re.findall(r"^(?:instance|legacy)\.\w+ = \d+$", mixed, re.MULTILINE) == [
+        "instance.tick = 1", "instance.value = 1", "legacy.value = 42",
+        "instance.value = 0",
+    ], mixed
+
     # A missing global must not bind to the same symbol in another plugin.
     source_b = (root / "plugin_b.cpp").read_text()
     (root / "broken.cpp").write_text(source_b.replace(

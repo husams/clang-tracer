@@ -37,6 +37,8 @@ A's reset to zero, and B's preserved address and value before printing `PASS`.
 
 ## Run in the native REPL
 
+The REPL loads both C++ source files directly. The SDK provides the entry point for each plugin class.
+
 From the worktree root, start a native REPL built from this branch and enter
 the following commands. A fresh cache reports `compiled` for both loads.
 The reload reports `cache hit`, followed by `a.value = 0` and `b.value = 10`.

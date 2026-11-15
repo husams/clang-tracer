@@ -12,4 +12,6 @@ inline constexpr char kEmbeddedContextHeader[] = R"TRACER_CONTEXT(
 )TRACER_CONTEXT";
 inline constexpr char kEmbeddedPluginHeader[] =
     R"TRACER_PLUGIN(@TRACER_PLUGIN_HEADER@)TRACER_PLUGIN";
+inline constexpr char kEmbeddedCppPluginHeader[] =
+    R"TRACER_PLUGIN(@TRACER_CPP_PLUGIN_HEADER@)TRACER_PLUGIN";
 } // namespace tracer

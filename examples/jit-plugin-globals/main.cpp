@@ -1,4 +1,8 @@
+#include "clang_tracer_repl_plugin.h"
+
+#include <cstdlib>
 #include <iostream>
+#include <string_view>
 #include <utility>
 
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
@@ -11,7 +15,7 @@ namespace {
 struct Plugin {
   llvm::orc::JITDylib &scope;
   unsigned *counter;
-  unsigned (*tick)();
+  uint64_t (*tick)();
 };
 
 Plugin load_plugin(llvm::orc::LLJIT &jit, const char *scope_name,
@@ -22,8 +26,16 @@ Plugin load_plugin(llvm::orc::LLJIT &jit, const char *scope_name,
       llvm::MemoryBuffer::getFile(object_path, /*IsText=*/false)));
   check(jit.addObjectFile(scope, std::move(object)));
   auto counter = check(jit.lookup(scope, "plugin_counter")).toPtr<unsigned *>();
-  auto tick = check(jit.lookup(scope, "tick")).toPtr<unsigned (*)()>();
-  return {scope, counter, tick};
+  const auto entry = check(jit.lookup(scope, "tracer_repl_plugin_v1"))
+                         .toPtr<decltype(&tracer_repl_plugin_v1)>();
+  const auto *descriptor = entry();
+  for (size_t i = 0; i < descriptor->command_count; ++i) {
+    const auto &command = descriptor->commands[i];
+    if (std::string_view(command.name) == "tick")
+      return {scope, counter, command.run};
+  }
+  check(llvm::createStringError("plugin does not expose tick"));
+  std::abort();
 }
 
 void show(const char *generation, const Plugin &plugin) {

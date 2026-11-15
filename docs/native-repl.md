@@ -1704,14 +1704,34 @@ live under `$XDG_CACHE_HOME/clang-tracer/repl/plugins` or
 links into a fresh JIT scope. A successful reload resets that plugin's globals
 and leaves peer plugins active. A failed reload keeps the prior generation.
 
-The local V1 interface is declared in `clang_tracer_repl_plugin.h`, available
-on the plugin's include path. Implement `tracer_repl_plugin_v1()` to return a
-constant descriptor with named, synchronous, zero-argument commands returning
-`uint64_t`. Each source is a single translation unit and owns its globals.
-Use constant initialization and trivial destruction. The JIT scope resolves
-its own symbols, so peer globals and host libraries are unavailable for
-linking. Run plugins from trusted sources because they execute native code in
-the REPL process.
+Include `clang_tracer_repl_plugin.hpp` and define `tracer::repl::Plugin` in
+one C++ source file. List your commands in a static array. The SDK supplies
+the entry point and dispatches each command to the same instance of your
+class.
+
+```cpp
+#include "clang_tracer_repl_plugin.hpp"
+
+class tracer::repl::Plugin : public tracer::repl::PluginInterface<Plugin> {
+  uint64_t count_ = 0;
+
+public:
+  uint64_t tick() noexcept { return ++count_; }
+  uint64_t value() const noexcept { return count_; }
+
+  static constexpr Command commands[] = {
+      command<&Plugin::tick>("tick", "Increment the count."),
+      command<&Plugin::value>("value", "Read the count."),
+  };
+};
+```
+
+Commands are `noexcept`, take no arguments, and return a value convertible
+to `uint64_t`. Use constant initialization and trivial destruction for plugin
+state. Each load creates a fresh instance. Existing plugins using the V1 C entry point
+in `clang_tracer_repl_plugin.h` can still load. The JIT scope resolves its own
+symbols. Run plugins from trusted sources because they execute native code
+in the REPL process.
 
 ## Load plugins in an injected agent
 

@@ -186,6 +186,12 @@ plugin_object(llvm::orc::LLJIT &jit, const NativePluginSource &input,
               : input.sdk_file;
       memory->addFile(sdk_file.string(), 0,
                       llvm::MemoryBuffer::getMemBufferCopy(input.sdk));
+      if (!input.cpp_sdk.empty()) {
+        auto cpp_header = sdk_file;
+        cpp_header.replace_extension(".hpp");
+        memory->addFile(cpp_header.string(), 0,
+                        llvm::MemoryBuffer::getMemBufferCopy(input.cpp_sdk));
+      }
     }
   } else if (!fs::is_regular_file(source)) {
     throw std::runtime_error("plugin source is not a regular file: " +

@@ -15,6 +15,7 @@ struct NativePluginSource {
   std::optional<std::string_view> contents;
   std::string_view sdk;
   std::filesystem::path sdk_file;
+  std::string_view cpp_sdk;
 };
 
 struct NativePluginObject {

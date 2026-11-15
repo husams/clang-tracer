@@ -122,7 +122,7 @@ function(tracer_add_native_repl)
   install(TARGETS clang-tracer-prepare-injectors-native RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Runtime)
   # Each executable uses the facade it was built against, even across upgrades.
   set(_repl_facade_headers "${_repl}/api.hpp" "${_repl}/event_value.hpp"
-    "${_repl}/clang_tracer_repl_plugin.h"
+    "${_repl}/clang_tracer_repl_plugin.h" "${_repl}/clang_tracer_repl_plugin.hpp"
     "${_repl}/event_ranges.hpp" "${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/module_index.hpp")
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_repl_facade_headers}")
   set(_repl_facade_digests "")
