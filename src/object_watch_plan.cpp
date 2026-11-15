@@ -44,6 +44,10 @@ namespace dw = llvm::dwarf;
 using llvm::DWARFDie;
 using llvm::object::ObjectFile;
 
+struct MissingElfSymbol : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
 auto open_elf(const std::string &path) {
   auto binary = llvm::object::createBinary(path);
   if (!binary)
@@ -1508,6 +1512,8 @@ Range select(const std::vector<Symbol> &symbols, const std::string &name,
     if (symbol.kind == kind && matches(symbol))
       candidates.insert(symbol.range);
   }
+  if (candidates.empty())
+    throw MissingElfSymbol("missing or ambiguous object watch ELF symbol: " + name);
   if (candidates.size() != 1)
     throw std::runtime_error("missing or ambiguous object watch ELF symbol: " + name);
   return *candidates.begin();
@@ -1524,8 +1530,30 @@ std::string writer_module(std::uint32_t pid, const std::string &executable,
     if (selector == path || selector == std::filesystem::path(path).filename())
       candidates.push_back(path);
   if (candidates.size() != 1)
-    throw std::runtime_error("--module must identify one live ELF by path or basename");
+    throw std::runtime_error("--module must identify one live ELF by path or basename; "
+        "prepare shared writer plans with --executable APP --module LIB");
   return candidates.front();
+}
+
+bool is_shared_library(const llvm::object::ELF64LEObjectFile &object) {
+  const auto &elf = object.getELFFile();
+  if (elf.getHeader().e_type != llvm::ELF::ET_DYN)
+    return false;
+  auto programs = elf.program_headers();
+  if (!programs)
+    throw std::runtime_error(llvm::toString(programs.takeError()));
+  if (std::any_of(programs->begin(), programs->end(), [](const auto &program) {
+        return program.p_type == llvm::ELF::PT_INTERP;
+      }))
+    return false;
+  // Static PIE has no interpreter. The PIE flag distinguishes it from a
+  // shared object even when the linker gives both an ELF entry address.
+  auto dynamic = elf.dynamicEntries();
+  if (!dynamic)
+    throw std::runtime_error(llvm::toString(dynamic.takeError()));
+  return std::none_of(dynamic->begin(), dynamic->end(), [](const auto &entry) {
+    return entry.getTag() == llvm::ELF::DT_FLAGS_1 && (entry.getVal() & llvm::ELF::DF_1_PIE);
+  });
 }
 // Read the call-site table used by the Itanium C++ unwinder on ELF. The
 // common GCC and Clang form uses the FDE entry as LPStart and ULEB128 or
@@ -1904,6 +1932,13 @@ Plan::Plan(std::uint32_t pid, std::string executable,
            const clangtracer::v1::ObjectWatchRequest &request)
     : module(writer_module(pid, executable, request.code_module())) {
   using Request = clangtracer::v1::ObjectWatchRequest;
+  if (!pid && request.code_module().empty()) {
+    const auto binary = open_elf(executable);
+    const auto &object = llvm::cast<llvm::object::ELF64LEObjectFile>(*binary.getBinary());
+    if (is_shared_library(object))
+      throw std::invalid_argument("%object prepare --module names a shared ELF without a program interpreter; "
+          "use --executable APP --module LIB");
+  }
   if (request.follow_calls() && (request.backend() != Request::CODE_CACHE ||
                                 request.mode() != Request::WRITES))
     throw std::invalid_argument("runtime call following requires code-cache write capture");
@@ -1919,8 +1954,37 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   image_ = std::make_unique<Image>(pid, module, module == executable);
   if (module != executable)
     main_ = std::make_unique<Image>(pid, executable, true);
-  const auto writer = image_->function(pid, request.code_symbol(),
-      request.backend() == clangtracer::v1::ObjectWatchRequest::CODE_CACHE);
+  Range writer;
+  try {
+    writer = image_->function(pid, request.code_symbol(),
+        request.backend() == clangtracer::v1::ObjectWatchRequest::CODE_CACHE);
+  } catch (const std::exception &error) {
+    const std::string message = error.what();
+    const bool missing_main_match = pid && !main_ && request.code_module().empty() &&
+        (dynamic_cast<const MissingElfSymbol *>(&error) ||
+         ::tracer::compat::starts_with(message, "no supported matching callable in mapped ELF debug information"));
+    if (!missing_main_match)
+      throw;
+    std::set<std::string> matches;
+    for (const auto &path : client::list_debug_modules(pid)) {
+      if (path == executable)
+        continue;
+      try {
+        Image candidate(pid, path, false);
+        (void)candidate.function(pid, request.code_symbol(),
+            request.backend() == Request::CODE_CACHE);
+        matches.insert(path);
+      } catch (const std::exception &) {
+        // Other modules are only diagnostic candidates; keep the main-image error.
+      }
+    }
+    if (matches.size() == 1)
+      throw std::runtime_error("writer is in shared module " + *matches.begin() +
+          "; use --module \"" + *matches.begin() + "\"");
+    if (matches.size() > 1)
+      throw std::runtime_error("writer matches multiple shared modules; specify --module with one mapped ELF");
+    throw;
+  }
   writer_start = image_->bind(pid, writer);
   bias = *image_->bias;
   const auto writer_debug = image_->dwarf->getDIEsForAddress(writer.first);
@@ -2386,6 +2450,15 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     const auto decoded = native_entry::scan(start, bytes);
     if (decoded.decode_failed || !decoded.diagnostic.empty())
       throw std::runtime_error("cannot decode the selected writer function");
+    if (shared_writer() && request.backend() == Request::CODE_CACHE && !request.follow_calls() &&
+        std::any_of(decoded.instructions.begin(), decoded.instructions.end(), [](const auto &inst) {
+          return inst.flow == native_entry::Flow::call;
+        }))
+      throw std::runtime_error("shared writer in " + module +
+          " contains calls; " +
+          (follow_calls_eligible(request)
+               ? "use --follow-calls --module \"" + module + "\""
+               : "--follow-calls is unavailable for this watch scope"));
     auto previous_end = start;
     const auto indirect = std::find_if(std::begin(decoded.instructions), std::end(decoded.instructions), [](const auto &instruction) {
       return instruction.flow == native_entry::Flow::branch && !instruction.target;
@@ -2524,6 +2597,13 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       throw std::runtime_error("object watch sites overlap");
     previous_end = pc + site.bytes.size();
   }
+}
+
+bool Plan::follow_calls_eligible(const clangtracer::v1::ObjectWatchRequest &request) const {
+  using Request = clangtracer::v1::ObjectWatchRequest;
+  return request.backend() == Request::CODE_CACHE && request.mode() == Request::WRITES &&
+      !(request.first_seen() && !layout.value_write.active()) && !request.writer_entry() &&
+      !caller_start && request.owner_type().empty() && !layout.logical_collection();
 }
 
 Plan::~Plan() = default;

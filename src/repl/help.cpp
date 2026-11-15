@@ -164,9 +164,10 @@ const CommandTopic commands[] = {
      "The default result limit is 64 and the maximum is 1024.",
      R"(%memory scan 0xADDRESS --mapping TOKEN --count 4096 --pattern "48 8? ?? ff")"},
     {"object", "", "Watch object lifetimes, ownership, method snapshots and stores on Linux."},
-    {"object prepare", "%object prepare TYPE --module ELF --field FIELD --code SELECTOR --output DIRECTORY",
+    {"object prepare", "%object prepare TYPE [--executable APP] --module ELF --field FIELD --code SELECTOR --output DIRECTORY",
      "Save a reusable object definition and verified ELF bindings without attaching. "
-     "Use --on METHOD, --include HEADER, and --synchronization for a typed method watch."},
+     "For a shared-library writer, add --executable APP and keep --module LIB; a lone shared object "
+     "has no process interpreter. Use --on METHOD, --include HEADER, and --synchronization for a typed method watch."},
     {"object preview", "%object preview --plan DIRECTORY",
      "Resolve the plan against the selected process and check live code bytes without installing patches."},
     {"object start", "%object start --type TYPE --field FIELD --code SELECTOR "
@@ -176,7 +177,10 @@ const CommandTopic commands[] = {
      "Start a native watch with matching DWARF. Ptrace is the diagnostic default. "
      "Code cache translates supported writers and lifecycle fragments. "
      "Repeat --code to select multiple writers for a standalone main-image field. "
-     "Use --follow-calls to resolve callees at runtime from the selected scope, with --runtime-limit N to bound translations. "
+     "For an eligible standalone write scope, use --follow-calls to resolve callees at runtime, with --runtime-limit N to bound translations. "
+     "A non-leaf shared writer in that scope requires --follow-calls. If its writer is not in the main executable, name its ELF with --module. "
+     "--follow-calls is limited to standalone writes; it cannot be combined with --owner, collection or caller scopes, "
+     "--writer-entry, or --first-seen unless the watched value has a supported structured layout. "
      "Use --shared-file PATH to correlate shared storage across live processes. "
      "Use --pointee PATH with a verified --mutation to follow a DWARF-resolved pointer path. "
      "On AArch64, --rendezvous selects an existing single-threaded userspace checkpoint. "

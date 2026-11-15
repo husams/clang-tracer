@@ -544,6 +544,23 @@ Replace `WATCH_ID` with the ID printed by start. While `%record` is waiting, ent
 
 Stop restores the verified instruction bytes. Check `active=no` and `restoration_pending=no` before detaching. If restoration is pending, retry stop using the same ID. Replay works after detach, including in a fresh REPL. Enter `q` in the first terminal to exit the fixture. To repeat with `--no-values`, restart the fixture, reuse the write plan, add the flag to `%object start`, and use a fresh recording path. The two events are still creation and a store, with the store shown as `FIELD_WRITTEN`.
 
+For a writer in a shared library, prepare against both the main executable and
+the library that contains the writer. A lone `--module` path that names a shared
+object is not an executable and is rejected. For example:
+
+```text
+%object prepare demo::Record --executable ./build/app --module ./build/libdemo.so --field value --code "demo::write_value(demo::Record &)" --backend code-cache --follow-calls --output ./record-watch
+```
+
+Use the same `--module` when starting or previewing the plan if the mapped
+library has a different path. Without `--module`, writer lookup first checks
+the main executable; if the writer is found in exactly one mapped shared ELF,
+the error names that module and the option to use. Shared writers with calls
+need `--follow-calls`; the diagnostic names the selected module and the flag.
+Call following is available only for standalone writes: it cannot be combined
+with owner or collection scopes, `--caller`, `--writer-entry`, or `--first-seen`
+unless first-seen has a supported structured value layout.
+
 ### Read coverage and cleanup status
 
 - Review the resolved fields, writer sites, and binding status in preview. Preview is read-only. A same-build restart resolves fresh live addresses. A compatible rebuild requires verifiable field and code bindings. Missing or mismatched evidence can prevent a watch from starting.
@@ -788,7 +805,9 @@ window. Short leaves can use verified alignment padding. A symbol export
 alone allows a fallback to direct call sites when no entry window verifies.
 Preview and status report partial coverage for direct call sites alone.
 For a shared writer, `--module` takes a unique mapped ELF basename or
-absolute path. A shared leaf that uses an entry redirect needs a verified
+absolute path. A shared writer containing calls requires `--follow-calls`;
+otherwise code-cache setup rejects it before translating the writer and tells
+you which module and flag to use. A shared leaf that uses an entry redirect needs a verified
 nonfaulting overwrite window.
 Native watches capture virtual destruction at the destructor entry, including
 deleting destructors that inline the complete destructor. A watch fails to
@@ -889,6 +908,23 @@ watched address and lifetime even when the callee receives it through an
 alias. Replayed stores include the mapped ELF identity and the runtime
 module generation. A shared library can load after arming and unload
 between calls.
+
+On x86-64, a verified PLT stub can lead to a leaf translation in any bound ELF.
+In-place redirects for a nonleaf callee reached through a PLT call are limited
+to the ELF that owns that PLT stub and the process executable. Nonleaf callees
+with dynamically exported weak symbols run natively to keep process-wide
+runtime entry points safe for the tracer and other callers. These scope limits
+produce explicit coverage gaps. An unbound lazy PLT
+slot also runs natively and produces one explicit gap for that slot while the
+loader binds it; subsequent calls use the current GOT target. These lazy-binding
+gaps have their own diagnostic. Other dispatch gaps are reported once per call
+site and reason. `runtime_gap_hits` tracks every occurrence, and
+`helper_reentries` counts tracer-internal traffic. On AArch64, PLT stubs that
+cannot be translated produce coverage gaps.
+
+On x86-64, an entry redirect requires a verified five-byte nonfaulting patch
+window. A trivial one-store constructor in a library can have a shorter entry,
+which prevents the watch from starting.
 
 Use `--runtime-limit N` to bound nested scope discovery and retained translations. The default is
 1,024. When a callee exceeds the limit or its code cannot be verified and

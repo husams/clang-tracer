@@ -727,7 +727,7 @@ Save a reusable object definition and verified ELF bindings without attaching. U
 **Usage**
 
 ```plain
-%object prepare TYPE --module ELF --field FIELD --code SELECTOR --output DIRECTORY
+%object prepare TYPE [--executable APP] --module ELF --field FIELD --code SELECTOR --output DIRECTORY
 ```
 
 **Example**
@@ -736,7 +736,15 @@ Save a reusable object definition and verified ELF bindings without attaching. U
 %object prepare demo::PlanRecord --module ./build/repl-object-plan-target --field value --code "demo::write_value(demo::PlanRecord &)" --backend code-cache --output record-watch
 ```
 
-Use a fresh plan directory for prepare. Preview and start accept a saved plan; method plans use `--on METHOD --include HEADER --policy HEADER --synchronization MODE` at preparation.
+For a shared-library writer, pass the process executable as `--executable APP`
+and the writer library as `--module LIB`. Add `--follow-calls` for a non-leaf
+shared writer using standalone code-cache write capture.
+
+```plain
+%object prepare demo::Record --executable ./app --module ./libdemo.so --field value --code "demo::write_value(demo::Record &)" --backend code-cache --follow-calls --output record-watch
+```
+
+Use a fresh plan directory for prepare. Preview and start accept a saved plan. At preparation, method plans use `--on METHOD --include HEADER --policy HEADER --synchronization MODE`.
 
 [Object-watch lesson](tutorials.md#lesson-17-trace-writes-without-rebuilding-the-target) and [method snapshots](advanced.md#watch-logical-state-at-method-boundaries).
 
@@ -761,6 +769,15 @@ Use a fresh plan directory for prepare. Preview and start accept a saved plan; m
 [Object-watch lesson](tutorials.md#lesson-17-trace-writes-without-rebuilding-the-target) and [method snapshots](advanced.md#watch-logical-state-at-method-boundaries).
 
 ### Command object start
+
+`--follow-calls` requires standalone code-cache write capture. It is unavailable
+for owner scopes, logical collections, `--caller`, and `--writer-entry`. With
+`--first-seen`, it requires a supported structured value layout.
+
+On x86-64, an unbound lazy PLT slot runs natively and emits a distinct coverage
+gap. `runtime_gap_hits` counts dispatch gaps including repeated occurrences,
+while `helper_reentries` counts tracer-internal traffic separately. See
+[native call following](../native-repl.md#follow-live-callees) for module limits.
 
 Start a native watch with matching DWARF. Ptrace is the diagnostic default. Code cache translates supported writers and lifecycle fragments. Repeat --code to select multiple writers for a standalone main-image field. Use --follow-calls to resolve callees at runtime from the selected scope, with --runtime-limit N to bound translations. Use --shared-file PATH to correlate shared storage across live processes. Use --pointee PATH with a verified --mutation to follow a DWARF-resolved pointer path. On AArch64, --rendezvous selects an existing single-threaded userspace checkpoint. On x86-64, use --module for a shared writer and --caller to verify an Image::get borrow followed by an indirect call. Use --writer-entry for all entries into an admitted standalone leaf. Use --vector with --element-key FIELD=UINT32 or --map with --map-key KEY to track collection storage generations. Select a verified --mutation SYMBOL and declare --synchronization for native collection capture. Use --owner-add, --owner-get, --owner-remove and --owner-snapshot to select ownership boundaries. Use --no-values to record every completed write and omit field samples. Record observations with %record FILE --sqlite --name object.trace.
 
