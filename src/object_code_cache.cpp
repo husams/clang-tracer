@@ -68,7 +68,7 @@ struct SharedFile {
 }
 
 std::uintptr_t load_agent(injector::Process &process, const std::string &path) {
-  constexpr char export_name[] = "tracer_agent_object_cache_v34";
+  constexpr char export_name[] = "tracer_agent_object_cache_v38";
   const auto size = std::max(path.size() + 1, sizeof(export_name));
   const auto memory = process.remote_allocate(size);
   std::uintptr_t entry = 0;
@@ -294,11 +294,15 @@ std::vector<Instruction> straight_fragment(const object_watch::Plan &plan,
       copy.target = *inst.target;
     }
     copy.collection_resume = inst.address == start && hook == Hook::collection_resume;
-    if (inst.address == start && hook != Hook::none && !copy.collection_resume)
+    if (inst.address == start && hook == Hook::collection_enter)
+      copy.scope_entry = true;
+    else if (inst.address == start && hook != Hook::none && !copy.collection_resume)
       copy.hook = hook;
-    else if (const auto store = plan.sites.find(inst.address);
-             store != plan.sites.end() && store->second.store)
-      instrument_store(copy, *store->second.store);
+    if (copy.hook == Hook::none) {
+      const auto store = plan.sites.find(inst.address);
+      if (store != plan.sites.end() && store->second.store)
+        instrument_store(copy, *store->second.store);
+    }
     next += inst.size;
     if ((exit && !terminal) || tail)
       break;
@@ -377,8 +381,8 @@ struct Watch::Impl {
     if (runtime_limit > max_runtime_limit || (spec.runtime_limit() && !spec.follow_calls()))
       throw std::invalid_argument("invalid runtime code-cache translation limit");
     admitted_stores = plan.stores;
-    if (request.follow_calls() && (request.first_seen() || request.writer_entry() ||
-        plan.caller_start || !request.owner_type().empty() ||
+    if (request.follow_calls() && ((request.first_seen() && !plan.layout.value_write.active()) ||
+        request.writer_entry() || plan.caller_start || !request.owner_type().empty() ||
         plan.layout.logical_collection()))
       throw std::invalid_argument("runtime call following requires a standalone writer scope");
 #if defined(__aarch64__)
@@ -387,8 +391,22 @@ struct Watch::Impl {
       for (const auto &[start, bytes] : plan.writer_ranges)
         prepare_runtime_calls(native_entry::scan(start, bytes));
 #else
-    if (plan.layout.logical_collection()) {
+    const bool complex_nonleaf = request.first_seen() && plan.layout.value_write.active() && [&] {
+      const auto body = native_entry::scan(plan.writer_start, plan.writer_bytes);
+      return std::ranges::any_of(body.instructions, [](const auto &inst) {
+        return inst.flow == NativeFlow::call;
+      });
+    }();
+    if (plan.layout.logical_collection() || complex_nonleaf) {
       prepare_collection_fragments();
+      if (request.follow_calls()) {
+        for (const auto &[start, bytes] : plan.writer_ranges) {
+          const auto body = native_entry::scan(start, bytes);
+          if (start != plan.writer_start)
+            admitted_stores += prepare_writer_fragments(body);
+          prepare_runtime_calls(body);
+        }
+      }
     } else {
       std::vector<std::pair<Address, std::size_t>> writer_entries;
       admitted_stores = 0;
@@ -452,7 +470,7 @@ struct Watch::Impl {
           add_entry(start, size);
           continue;
         }
-        if (request.writer_entry() || plan.writer_address_taken(start)) {
+        if (plan.layout.value_write.active() || request.writer_entry() || plan.writer_address_taken(start)) {
           prepare_writer_entry(start, size);
           continue;
         }
@@ -631,7 +649,7 @@ struct Watch::Impl {
       sources.emplace(function.front().pc, plan.source(function.front().pc));
       for (const auto &inst : function)
         if (inst.hook != Hook::none || inst.collection_resume || inst.inline_mutation_entry) {
-          sources.emplace(inst.pc, plan.source(inst.pc));
+          sources.emplace(inst.continuation_pc(), plan.source(inst.continuation_pc()));
           if (inst.boundary_pc)
             sources.emplace(inst.boundary_pc, plan.source(inst.boundary_pc));
         }
@@ -898,10 +916,12 @@ struct Watch::Impl {
           if (patch != functions.end()) {
             patch->front().collection_resume = true;
             patch->front().boundary_pc = pc;
+            patch->front().destroys_collection = plan.destruction_mutations.count(pc) != 0;
           } else {
             auto continuation = instruction(next);
             continuation.collection_resume = true;
             continuation.boundary_pc = pc;
+            continuation.destroys_collection = plan.destruction_mutations.count(pc) != 0;
             add_fragment({continuation}, false);
           }
         }
@@ -1353,15 +1373,50 @@ struct Watch::Impl {
       if (!tail.empty() && tail.back().pc + tail.back().size - next <= 18 &&
           !overlaps_fragment(next, tail.back().pc + tail.back().size)) {
         tail.front().boundary_pc = boundary;
+        tail.front().destroys_collection = plan.destruction_mutations.count(boundary) != 0;
         tail.back().hook = Hook::collection_end;
         covered_returns.insert(tail.back().pc);
         add(std::move(tail), true);
         return;
       }
       auto continuation = straight_fragment(plan, writer_body, next, Hook::collection_resume, false, true);
+      if (continuation.empty() && plan.mutation_selectors.count(boundary) &&
+          !plan.inline_mutations.count(boundary)) {
+        // A neighboring direct CALL can host the hook if the short prefix
+        // between the actual return and that call cannot modify the sample.
+        // Preserve the following call's hardware return address on both stacks.
+        auto call = std::lower_bound(std::begin(writer_body.instructions), std::end(writer_body.instructions), next,
+            [](const auto &inst, Address pc) { return inst.address < pc; });
+        auto expected = next;
+        for (; call != std::end(writer_body.instructions) && call->address == expected &&
+               expected - next < direct_call_width && call->flow == NativeFlow::ordinary &&
+               call->falls_through && call->cache_copyable && !call->may_store &&
+               !call->changes_stack; ++call)
+          expected += call->size;
+        if (call != std::end(writer_body.instructions) && call->address == expected &&
+            call->flow == NativeFlow::call && call->size == direct_call_width && call->target &&
+            !overlaps_fragment(next, expected + call->size)) {
+          const auto bytes = plan.code(expected).substr(0, call->size);
+          if (!bytes.empty() && bytes.front() == '\xe8') {
+            Instruction route;
+            route.pc = expected;
+            route.size = call->size;
+            route.target = *call->target;
+            route.flow = Flow::runtime_call;
+            route.collection_resume = true;
+            route.collection_return = next;
+            route.boundary_pc = boundary;
+            route.destroys_collection = plan.destruction_mutations.count(boundary) != 0;
+            std::memcpy(route.bytes.data(), bytes.data(), call->size);
+            add({route}, true);
+            return;
+          }
+        }
+      }
       if (continuation.empty())
         throw std::runtime_error("collection mutation has no safe native return continuation");
       continuation.front().boundary_pc = boundary;
+      continuation.front().destroys_collection = plan.destruction_mutations.count(boundary) != 0;
       add(std::move(continuation), false);
     };
     for (const auto &[entry, mutation] : plan.inline_mutations) {
@@ -1385,33 +1440,158 @@ struct Watch::Impl {
       for (const auto next : mutation_successors(writer_body, pc))
         add_continuation(next, pc);
     }
+    const auto external_entry = [&](Address begin, Address limit) {
+      std::vector<Address> interior;
+      for (auto address = begin + 1; address < limit; ++address)
+        interior.push_back(address);
+      for (const auto &[address, callers] : plan.direct_redirects(interior))
+        if (!callers.empty())
+          return true;
+      return false;
+    };
+    bool needs_caller_return = false;
     for (const auto &ret : writer_body.instructions) {
-      if (ret.flow != NativeFlow::returns || covered_returns.count(ret.address))
+      const bool tail = ret.flow == NativeFlow::branch && !ret.falls_through && ret.target &&
+          (*ret.target < plan.writer_start || *ret.target - plan.writer_start >= plan.writer_bytes.size());
+      if ((ret.flow != NativeFlow::returns && !tail) || covered_returns.count(ret.address))
         continue;
       std::vector<Instruction> fragment;
+      std::size_t padding = 0;
       for (const NativeInstruction &candidate : writer_body.instructions) {
-        if (candidate.address >= ret.address || ret.address + ret.size - candidate.address > 18)
+        if (candidate.address > ret.address || ret.address + ret.size - candidate.address > 18)
           continue;
-        auto trial = straight_fragment(plan, writer_body, candidate.address, Hook::none, true);
-        if (!trial.empty() && trial.back().pc == ret.address &&
-            !overlaps_fragment(trial.front().pc, ret.address + ret.size))
+        const auto end = ret.address + ret.size;
+        const auto width = end - candidate.address;
+        const auto extension = plan.layout.value_write.active() && !tail && width < 5 &&
+            end == plan.writer_start + plan.writer_bytes.size() ?
+                plan.redirect_padding(plan.writer_start, candidate.address, end) : 0;
+        auto trial = straight_fragment(plan, writer_body, candidate.address, Hook::none, !tail,
+                                       false, tail ? ret.target : std::nullopt, extension != 0);
+        if (!trial.empty() && trial.back().pc == ret.address && width + extension >= 5 &&
+            !overlaps_fragment(trial.front().pc, end + extension)) {
           fragment = std::move(trial);
+          padding = extension;
+        }
       }
-      if (fragment.empty())
-        throw std::runtime_error("collection writer return has no safe native redirect");
+      Address relay = 0;
+      if (fragment.empty() && plan.layout.value_write.active() && !tail) {
+        // A short epilogue next to another symbol cannot use padding. A
+        // disjoint translated window can host the second jump instead.
+        const auto end = ret.address + ret.size;
+        for (const auto &candidate : writer_body.instructions) {
+          if (candidate.address > ret.address || end - candidate.address < 2 ||
+              end - candidate.address >= direct_call_width ||
+              overlaps_fragment(candidate.address, end))
+            continue;
+          auto exit = straight_fragment(plan, writer_body, candidate.address, Hook::none,
+                                        true, false, {}, true);
+          if (exit.empty() || exit.back().pc != ret.address || external_entry(candidate.address, end))
+            continue;
+          for (const auto &prior : writer_body.instructions) {
+            if (prior.address > candidate.address || candidate.address - prior.address < 10 ||
+                candidate.address - prior.address > 128)
+              continue;
+            auto gateway = straight_fragment(plan, writer_body, prior.address, Hook::none,
+                                             false, false, {}, false, 10);
+            if (gateway.empty())
+              continue;
+            const auto last = gateway.back().pc + gateway.back().size;
+            if (last > candidate.address || overlaps_fragment(prior.address, last) ||
+                external_entry(prior.address, last))
+              continue;
+            relay = prior.address + direct_call_width;
+            add(std::move(gateway), false);
+            fragment = std::move(exit);
+            break;
+          }
+          if (relay)
+            break;
+        }
+      }
+      if (fragment.empty()) {
+        if (!plan.layout.value_write.active())
+          throw std::runtime_error("collection writer return has no safe native redirect");
+        needs_caller_return = true;
+        continue;
+      }
       fragment.back().hook = Hook::collection_end;
-      add(std::move(fragment), true);
+      add_fragment(std::move(fragment), true, padding, relay);
+    }
+    if (needs_caller_return) {
+      const auto callers = plan.lifetime_return_callers(plan.writer_start, false);
+      if (callers.empty() || plan.writer_address_taken(plan.writer_start) ||
+          plan.writer_exported(plan.writer_start))
+        throw std::runtime_error("writer needs a verified return or direct caller continuation");
+      for (const auto call : callers) {
+        const auto next = call + direct_call_width;
+        const auto [start, size] = plan.containing_function(call);
+        const auto roots = plan.exception_roots(start, size);
+        const auto body = native_entry::scan(start, plan.code(start).substr(0, size), roots);
+        const auto successor = std::find_if(body.instructions.begin(), body.instructions.end(),
+            [&](const auto &inst) { return inst.address == next; });
+        const auto jump = successor != body.instructions.end() && successor->flow == NativeFlow::branch &&
+            !successor->falls_through ? successor->target : std::nullopt;
+        auto fragment = straight_fragment(plan, body, next, Hook::collection_end, false, true, jump);
+        if (fragment.empty())
+          throw std::runtime_error("writer caller continuation has no safe native redirect");
+        const auto limit = fragment.back().pc + fragment.back().size;
+        if (external_entry(next, limit) ||
+            std::any_of(roots.begin(), roots.end(), [&](const auto root) {
+              return root >= next && root < limit;
+            }))
+          throw std::runtime_error("an application edge enters the writer caller continuation");
+        fragment.front().successor_return = true;
+        add(std::move(fragment), jump.has_value());
+      }
     }
     for (const auto &[pc, site] : plan.sites) {
-      if (!site.store)
+      if (!site.store || pc < plan.writer_start || pc - plan.writer_start >= plan.writer_bytes.size())
         continue;
       if (std::any_of(entry_windows.begin(), entry_windows.end(), [&](const auto &entry) {
             return pc >= entry.first && pc - entry.first < entry.second;
           }))
         continue;
       auto fragment = straight_fragment(plan, writer_body, pc, Hook::none);
-      if (fragment.empty() || overlaps_fragment(pc, fragment.back().pc + fragment.back().size))
+      if (fragment.empty() || overlaps_fragment(pc, fragment.back().pc + fragment.back().size)) {
+        // A short store immediately before a call cannot host a five-byte
+        // jump. Include its verified straight-line predecessor when that
+        // window still leaves the call and all incoming edges intact.
+        const auto store = std::lower_bound(writer_body.instructions.begin(), writer_body.instructions.end(), pc,
+            [](const auto &instruction, auto address) { return instruction.address < address; });
+        for (auto prior = std::make_reverse_iterator(store); prior != writer_body.instructions.rend(); ++prior) {
+          if (pc - prior->address > 14)
+            break;
+          const auto width = pc - prior->address + site.bytes.size();
+          auto candidate = straight_fragment(plan, writer_body, prior->address, Hook::none,
+                                             false, false, {}, false, std::max<std::size_t>(5, width));
+          if (!candidate.empty() &&
+              !overlaps_fragment(candidate.front().pc, candidate.back().pc + candidate.back().size)) {
+            fragment = std::move(candidate);
+            break;
+          }
+        }
+      }
+      if (fragment.empty() || overlaps_fragment(fragment.front().pc, fragment.back().pc + fragment.back().size))
         continue;
+      if (plan.layout.value_write.active()) {
+        // Leave closely spaced short stores together so the first redirect
+        // does not consume the only instructions available to the second.
+        const auto start = fragment.front().pc;
+        while (true) {
+          const auto end = fragment.back().pc + fragment.back().size;
+          const auto next = plan.sites.lower_bound(end);
+          if (next == plan.sites.end() || next->first - end >= direct_call_width ||
+              next->first - plan.writer_start >= plan.writer_bytes.size() ||
+              !next->second.store || next->second.bytes.size() >= direct_call_width)
+            break;
+          const auto width = next->first - start + next->second.bytes.size();
+          auto combined = straight_fragment(plan, writer_body, start, Hook::none,
+                                             false, false, {}, false, width);
+          if (combined.empty() || overlaps_fragment(start, combined.back().pc + combined.back().size))
+            break;
+          fragment = std::move(combined);
+        }
+      }
       add(std::move(fragment), false);
     }
     admitted_stores = 0;
@@ -1419,9 +1599,13 @@ struct Watch::Impl {
       admitted_stores += std::ranges::count_if(fragment, [](const auto &inst) {
         return writer(inst.hook);
       });
-    if (!admitted_stores)
+    if (!admitted_stores && !request.logical_updates() && !request.follow_calls())
       throw std::runtime_error("no independently patchable native collection store");
-    plan.unsupported += plan.stores - admitted_stores;
+    const auto stores_in_writer = std::count_if(plan.sites.begin(), plan.sites.end(), [&](const auto &entry) {
+      return entry.second.store && entry.first >= plan.writer_start &&
+          entry.first - plan.writer_start < plan.writer_bytes.size();
+    });
+    plan.unsupported += stores_in_writer - admitted_stores;
   }
 
   std::size_t patch_size(Address pc) const {
@@ -1477,6 +1661,8 @@ struct Watch::Impl {
       item.set_kind(Observation::RANGE_BOUND);
     else if (sample.hook == Hook::collection_suspend)
       item.set_kind(Observation::RANGE_SUSPENDED);
+    else if (sample.hook == Hook::collection_update)
+      item.set_kind(Observation::LOGICAL_UPDATE);
     else if (sample.hook == Hook::collection_end || sample.hook == Hook::lifetime_reused)
       item.set_kind(Observation::OBSERVATION_ENDED);
     else if (sample.hook == Hook::collection_gap || sample.hook == Hook::async_gap ||
@@ -1514,6 +1700,16 @@ struct Watch::Impl {
     const bool store = writer(sample.hook) || sample.hook == Hook::store_fault ||
                        sample.hook == Hook::post_store_signal || sample.hook == Hook::scope_signal;
     item.set_location_kind(store ? Observation::STORE : Observation::ENTRY_ANCHOR);
+    if (sample.hook == Hook::collection_update) {
+      item.set_location_kind(Observation::CALL_BOUNDARY);
+      item.set_field(object_watch::field_path(request, plan.layout));
+      item.set_destination(sample.destination);
+      object_watch::set_logical_update(item, plan.layout, sample.logical_before,
+                                       sample.logical_after, sample.logical_change);
+      if (const auto selector = plan.mutation_selectors.find(sample.logical_boundary);
+          selector != plan.mutation_selectors.end())
+        item.mutable_logical_update()->set_mutation(selector->second);
+    }
     if (sample.hook == Hook::construction_aborted) {
       item.set_closure_reason(Observation::UNWOUND);
       item.set_diagnostic("constructor unwound without a verified return");
@@ -1530,8 +1726,8 @@ struct Watch::Impl {
       item.set_diagnostic("asynchronous signal " + std::to_string(sample.gap) +
                           " arrived in a generated helper; application PC unavailable");
     if (sample.hook == Hook::create)
-      item.set_field(plan.layout.union_tag_offset ? object_watch::field_path(request, plan.layout) :
-                     plan.layout.opaque_union ? "<storage>" : request.field());
+      item.set_field(!plan.layout.union_path.empty() ? object_watch::field_path(request, plan.layout) :
+                      plan.layout.opaque_union ? "<storage>" : request.field());
     if (store) {
       item.set_destination(sample.destination);
       item.set_field(object_watch::field_path(request, plan.layout));
@@ -1561,7 +1757,7 @@ struct Watch::Impl {
       item.set_diagnostic("receiver admission limit reached");
     if (sample.hook == Hook::owner_remove && sample.gap)
       item.set_diagnostic("previous membership absent at transfer boundary");
-    if (plan.layout.logical_collection() || plan.layout.union_tag_offset || shared_file.identity.inode)
+    if (plan.layout.scoped_storage() || plan.layout.union_tag_offset || shared_file.identity.inode)
       item.set_synchronization(request.synchronization());
     if (sample.hook == Hook::collection_bound || sample.hook == Hook::collection_suspend) {
       item.set_destination(sample.destination);
@@ -1580,11 +1776,19 @@ struct Watch::Impl {
             "collection range changed outside a verified mutation return",
             "old field value is unreadable", "receiver admission limit reached",
             "pointee path is null, unreadable or outside the address range",
-            "bound field value is unreadable"};
+            "bound field value is unreadable",
+            "complex payload storage could not be verified within the read budget"};
         item.set_diagnostic(messages[std::min<std::size_t>(sample.gap, std::size(messages) - 1)]);
       }
     }
-    if (sample.values || (plan.layout.opaque_union && (writer(sample.hook) || sample.hook == Hook::create)))
+    if (sample.hook == Hook::collection_gap && sample.gap == 10)
+      item.set_diagnostic("store intersects multiple live union objects");
+    if (sample.storage_write.size) {
+      object_watch::set_storage_write(item, sample.storage_write,
+          sample.values & 1 ? &sample.storage_before : nullptr,
+          sample.values & 2 ? &sample.storage_after : nullptr);
+      object_watch::set_union_write(item, plan.layout, sample.union_before, sample.union_after);
+    } else if (sample.values || (plan.layout.opaque_union && (writer(sample.hook) || sample.hook == Hook::create)))
       object_watch::set_scalar_values(item, plan.layout,
           {sample.values & 1 ? std::optional(sample.old_value) : std::nullopt,
            sample.values & 4 ? std::optional(sample.old_tag) : std::nullopt},
@@ -1594,7 +1798,8 @@ struct Watch::Impl {
       if (sample.gap == 2)
         item.set_diagnostic("field changed between observed stores; old value unavailable");
       else if (sample.gap == 3)
-        item.set_diagnostic("read-modify-write values could not be verified");
+        item.set_diagnostic(sample.hook == Hook::rmw ? "read-modify-write values could not be verified" :
+                                                     "store values could not be verified");
       else
         item.set_diagnostic(request.serialize_wait_us() ? "observed write ordering unavailable" :
                             "overlapping observed writes; old value unavailable");
@@ -1893,7 +2098,7 @@ struct Watch::Impl {
   }
 
   void verify_live(injector::Process &process) const {
-    if (plan.layout.logical_collection() || fragmented_writer || fragmented_lifecycle)
+    if (plan.layout.scoped_storage() || fragmented_writer || fragmented_lifecycle)
       plan.verify_live(pid);
     if (plan.caller_start) {
       std::string current(plan.caller_bytes.size(), '\0');
@@ -1952,6 +2157,7 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
     throw std::runtime_error("code-cache event channel path is too long");
   std::memcpy(init.path, p.path.c_str(), p.path.size() + 1);
   init.scalar = p.plan.layout.scalar;
+  init.field_width = p.plan.layout.field_width;
   init.tagged_union = p.plan.layout.union_tag_offset.has_value();
   init.union_tag_offset = p.plan.layout.union_tag_offset.value_or(0);
   init.receiver_typeinfo = p.plan.layout.primary_rtti || !p.request.owner_type().empty() ?
@@ -1972,6 +2178,8 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
   init.atomic = p.plan.layout.atomic;
   init.first_seen = p.request.first_seen();
   init.permanent_startup_module = permanent_startup_module;
+  init.value_write = p.plan.layout.value_write;
+  init.value_string_limit = p.request.max_string_bytes();
   init.collection.max_instances = p.request.max_instances() ? p.request.max_instances() : 1024;
   if (p.plan.shared_writer()) {
     if (p.plan.module.size() >= sizeof(init.module))
@@ -1986,6 +2194,7 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
         p.request.element_key(), p.request.max_elements(),
         p.request.max_instances() ? p.request.max_instances() : 1024};
     init.collection.is_map = layout.logical_map;
+    init.collection.logical_updates = p.request.logical_updates();
     init.collection.pointer_hops = layout.pointer_offsets.size();
     std::copy(layout.pointer_offsets.begin(), layout.pointer_offsets.end(),
               init.collection.pointer_offsets.begin());
@@ -2011,7 +2220,12 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
   for (const auto &[entry, pc] : p.plan.complete_constructor_returns)
     constructor_returns.push_back({entry, pc});
   const auto returns_size = constructor_returns.size() * sizeof(ConstructorReturn);
+  const auto &alternatives = p.plan.layout.value_alternatives;
   std::size_t size = sizeof(init) + table_size + scopes_size + returns_size;
+  if (alternatives.size() > (SIZE_MAX - size) / sizeof(object_watch::ValueWriteAlternative))
+    throw std::runtime_error("code-cache value metadata size overflows");
+  const auto alternatives_size = alternatives.size() * sizeof(object_watch::ValueWriteAlternative);
+  size += alternatives_size;
   for (const auto &function : p.functions) {
     if (function.size() > (SIZE_MAX - size) / sizeof(Instruction))
       throw std::runtime_error("code-cache request size overflows");
@@ -2021,6 +2235,12 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
   try {
     const auto table = remote + sizeof(init);
     auto address = table + table_size;
+    if (!alternatives.empty()) {
+      init.value_alternatives = reinterpret_cast<const object_watch::ValueWriteAlternative *>(address);
+      init.value_alternative_count = alternatives.size();
+      process.remote_write(address, alternatives.data(), alternatives_size);
+      address += alternatives_size;
+    }
     if (!static_scopes.empty()) {
       init.static_scopes = reinterpret_cast<const Address *>(address);
       init.static_scope_count = static_scopes.size();
@@ -2100,7 +2320,9 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
         continue;
       }
       const bool entry = p.entry_windows.count(caller);
-      if (entry) {
+      if (p.functions[index].front().collection_return) {
+        bytes[0] = '\xe8';
+      } else if (entry) {
         bytes.assign(bytes.size(), '\x90');
         bytes[0] = '\xe9';
       }
@@ -2410,7 +2632,7 @@ api::ObjectWatchStatus Watch::preview() const {
   report.set_external_write_order_unknown(p.shared_file.identity.inode != 0);
   report.set_diagnostic(!p.runtime_calls.empty() ? "verified call redirects; callees resolve at runtime" :
       p.fragmented_writer ? "verified native writer fragments and redirect windows" :
-      p.plan.layout.logical_collection() ? "verified native collection fragments and redirect windows" :
+      p.plan.layout.scoped_storage() ? "verified native scoped storage and redirect windows" :
       p.direct_writer_calls ? "verified direct writer call sites only (use --writer-entry to require entry coverage)" :
                         "verified leaf translations and candidate redirect windows");
   *report.mutable_plan() = p.plan.describe(p.pid != 0);

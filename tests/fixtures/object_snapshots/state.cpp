@@ -12,6 +12,9 @@ MoveBomb::MoveBomb(int error) { throw error; }
 MoveBomb::MoveBomb(MoveBomb &&) { throw 7; }
 MoveBomb &MoveBomb::operator=(MoveBomb &&) { throw 7; }
 
+Risk::Risk(std::string label, std::vector<int> limits)
+    : label_(std::move(label)), limits_(std::move(limits)) {}
+
 struct Opaque { int value; };
 struct Hidden final : Primary, Secondary { int hidden = 19; };
 
@@ -34,6 +37,11 @@ void State::mutate() {
   map_.erase(7);
   map_.at(9) = 21;
   map_.emplace(12, 30);
+  risk_.erase("OLD");
+  risk_.at("AAPL").raise_limit();
+  risk_.emplace("MSFT", Risk("new", {30, 40}));
+  unmatched_.erase(4);
+  unmatched_.emplace(6, 60);
   note_.emplace<1>(5);
   extension_ = Opaque{32};
   std::thread child_writer([this] { static_cast<Known &>(*child_).visible = 17; });

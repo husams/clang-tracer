@@ -112,13 +112,16 @@ struct Lifetime {
   Address address = 0;
   std::uint64_t id = 0, generation = 0;
   Address owner = 0;
+  UnionActivation union_activation;
 };
 struct LogicalRange {
   RangeHeader header{};
   Address destination = 0;
   std::uint64_t generation = 0;
   bool valid = false;
-  std::optional<std::int32_t> prior_value = std::nullopt;
+  std::optional<std::uint64_t> prior_value = std::nullopt;
+  std::optional<LogicalRangeSample> prior_logical;
+  bool destroyed = false;
 };
 struct Frame {
   Boundary role;
@@ -134,7 +137,8 @@ struct Frame {
   api::StackTrace entry_stack;
   LogicalRange range;
   Address active_inline_mutation = 0;
-  bool provisional = false;
+  bool provisional = false, value_partial = false;
+  UnionActivation union_activation;
 };
 struct Patch {
   std::string bytes;
@@ -540,9 +544,9 @@ struct Watch::Worker {
     const auto destination = map_destination(layout.map, header, layout.scalar, request.map_key(),
         request.max_elements(), request.max_string_bytes(),
         [&](auto address, void *output, auto size) { return read_memory(pid, address, output, size); });
-    if (!destination)
+    if (!destination || (!*destination && !request.logical_updates()))
       throw std::runtime_error("logical map key or node links could not be verified within the read budget");
-    return destination;
+    return *destination;
   }
 
   RangeHeader range_header(Address object) const {
@@ -568,7 +572,7 @@ struct Watch::Worker {
     const auto &layout = plan->layout;
     if (!layout.pointer_offsets.empty()) {
       const auto address = add(header[layout.pointer_offsets.size() - 1], layout.scalar);
-      (void)add(address, sizeof(std::int32_t) - 1);
+      (void)add(address, layout.field_width - 1);
       return address;
     }
     if (layout.logical_map)
@@ -589,13 +593,20 @@ struct Watch::Worker {
         throw std::runtime_error("logical vector element key is duplicated");
       destination = add(add(begin, offset), layout.scalar);
     }
-    if (!destination)
+    if (!destination && !request.logical_updates())
       throw std::runtime_error("logical vector element key is unavailable");
     return destination;
   }
 
   std::string field_path() const {
     return object_watch::field_path(request, plan->layout);
+  }
+
+  std::uint64_t read_field(Address address) const {
+    std::uint64_t value = 0;
+    if (!read_memory(pid, address, &value, plan->layout.field_width))
+      throw std::runtime_error("watched field value is unreadable");
+    return value;
   }
 
   std::optional<std::uint32_t> union_tag(Address receiver) const {
@@ -824,41 +835,90 @@ struct Watch::Worker {
 
   bool range_snapshot_enabled() const {
     using Request = clangtracer::v1::ObjectWatchRequest;
-    return !request.no_values() &&
+    return !request.no_values() && !plan->layout.value_write.active() &&
         (request.synchronization() == Request::THREAD_CONFINED ||
          request.synchronization() == Request::CALLER_LOCK);
   }
 
+  LogicalRangeSample logical_sample(const RangeHeader &header, Address destination) {
+    LogicalRangeSample sample;
+    sample.destination = destination;
+    const auto &layout = plan->layout;
+    if (layout.logical_vector) {
+      sample.size = (header[1] - header[0]) / layout.stride;
+      if (destination)
+        sample.index = (destination - header[0] - layout.scalar) / layout.stride;
+    } else {
+      sample.size = header[1];
+    }
+    if (destination && range_snapshot_enabled())
+      sample.value = read_field(destination);
+    return sample;
+  }
+
   void suspend_range(pid_t tid, Frame &scope, Address pc, const Registers &regs,
                      const api::StackTrace *anchor_stack = nullptr) {
-    if (!scope.range.valid)
+    scope.range.prior_logical.reset();
+    if (scope.range.destroyed || (!scope.range.valid && !request.logical_updates()))
       return;
+    const bool was_bound = scope.range.valid;
     scope.range.valid = false;
-    if (range_snapshot_enabled()) {
+    if (range_snapshot_enabled() || request.logical_updates()) {
       try {
         const auto header = range_header(scope.receiver);
-        if (header != scope.range.header || range_element(header) != scope.range.destination)
+        const auto destination = range_element(header);
+        if (was_bound && (header != scope.range.header || destination != scope.range.destination))
           throw std::runtime_error("collection range changed outside a verified mutation return");
-        scope.range.prior_value = read<std::int32_t>(pid, scope.range.destination);
+        if (request.logical_updates()) {
+          scope.range.prior_logical = logical_sample(header, destination);
+          scope.range.prior_value = scope.range.prior_logical->value;
+        } else {
+          scope.range.prior_value = read_field(scope.range.destination);
+        }
       } catch (const std::runtime_error &error) {
         gap(tid, pc, regs, error.what());
       }
     }
-    emit(tid, Observation::RANGE_SUSPENDED, scope.life, pc, regs, [&](auto &out) {
-      out.set_field(field_path());
-      out.set_storage_generation(scope.range.generation);
-      out.set_destination(scope.range.destination);
-      out.set_synchronization(request.synchronization());
-    }, anchor_stack);
+    if (was_bound)
+      emit(tid, Observation::RANGE_SUSPENDED, scope.life, pc, regs, [&](auto &out) {
+        out.set_field(field_path());
+        out.set_storage_generation(scope.range.generation);
+        out.set_destination(scope.range.destination);
+        out.set_synchronization(request.synchronization());
+      }, anchor_stack);
   }
 
   void bind_range(pid_t tid, Frame &scope, Address pc, const Registers &regs,
-                   const api::StackTrace &anchor_stack) {
+                   const api::StackTrace &anchor_stack, Address mutation = 0) {
     const auto old = std::exchange(scope.range.prior_value, std::nullopt);
+    const auto before = std::exchange(scope.range.prior_logical, std::nullopt);
     scope.range.valid = false;
+    if (scope.range.destroyed)
+      return;
+    const bool destroyed = plan->destruction_mutations.count(mutation) != 0;
+    scope.range.destroyed = destroyed;
     try {
-      const auto header = range_header(scope.receiver);
-      const auto destination = range_element(header);
+      const auto header = destroyed ? RangeHeader{} : range_header(scope.receiver);
+      const auto destination = destroyed ? 0 : range_element(header);
+      if (before) {
+        const auto after = destroyed ? LogicalRangeSample{} : logical_sample(header, destination);
+        const auto change = logical_change(*before, after, destroyed);
+        if (change != LogicalChange::none)
+          emit(tid, Observation::LOGICAL_UPDATE, scope.life, pc, regs, [&](auto &out) {
+            out.set_location_kind(Observation::CALL_BOUNDARY);
+            out.set_field(field_path());
+            out.set_destination(destination);
+            out.set_synchronization(request.synchronization());
+            set_logical_update(out, plan->layout, *before, after, change);
+            if (const auto selector = plan->mutation_selectors.find(mutation);
+                selector != plan->mutation_selectors.end())
+              out.mutable_logical_update()->set_mutation(selector->second);
+          }, &anchor_stack);
+      }
+      if (!destination) {
+        scope.range.destination = 0;
+        return;
+      }
       if (!scope.range.generation || plan->layout.logical_map || !plan->layout.pointer_offsets.empty() ||
           header[0] != scope.range.header[0] ||
           destination != scope.range.destination)
@@ -866,9 +926,10 @@ struct Watch::Worker {
       scope.range.header = header;
       scope.range.destination = destination;
       scope.range.valid = true;
-      std::int32_t next = 0;
+      scope.union_activation = {};
+      std::uint64_t next = 0;
       const bool sampled = range_snapshot_enabled() &&
-          read_memory(pid, destination, &next, sizeof(next));
+          read_memory(pid, destination, &next, plan->layout.field_width);
       emit(tid, Observation::RANGE_BOUND, scope.life, pc, regs, [&](auto &out) {
         out.set_field(field_path());
         out.set_storage_generation(scope.range.generation);
@@ -1011,13 +1072,13 @@ struct Watch::Worker {
         throw std::runtime_error("complete constructor returned with an unexpected type or a live generation");
       if (request.max_instances() && live.size() >= request.max_instances())
         throw std::runtime_error("receiver admission limit reached");
-      std::optional<std::int32_t> initial;
-      if (!request.no_values() && !plan->layout.logical_collection())
-        initial = read<std::int32_t>(pid, add(receiver, plan->layout.scalar));
+      std::optional<std::uint64_t> initial;
+      if (!request.no_values() && !plan->layout.scoped_storage())
+        initial = read_field(add(receiver, plan->layout.scalar));
       Lifetime life{receiver, ++next_id, ++generations[receiver], 0};
       live.emplace(receiver, life);
       emit(tid, Observation::CREATED, life, pc, regs, [&](auto &out) {
-        out.set_field(plan->layout.union_tag_offset ? field_path() :
+        out.set_field(!plan->layout.union_path.empty() ? field_path() :
                       plan->layout.opaque_union ? "<storage>" : request.field());
         set_scalar_values(out, plan->layout, {}, {initial, union_tag(receiver)});
         if (plan->layout.union_tag_offset)
@@ -1121,7 +1182,7 @@ struct Watch::Worker {
         return pending.role == Boundary::writer_scope && pending.life.id == frame.life.id;
       });
       if (scope != task.frames.rend())
-        bind_range(tid, *scope, pc, regs, frame.entry_stack);
+        bind_range(tid, *scope, pc, regs, frame.entry_stack, frame.entry);
       break;
     }
     }
@@ -1131,10 +1192,15 @@ struct Watch::Worker {
     Lifetime life;
     Address destination;
     const native_entry::ScalarStore &store;
-    std::optional<std::int32_t> old;
+    std::optional<std::uint64_t> old;
     std::uint64_t storage_generation = 0;
     bool scoped = false;
     std::optional<std::uint32_t> old_tag = std::nullopt;
+    ValueWrite storage;
+    Address storage_field = 0;
+    UnionWriteState union_before;
+    ValueStoreBytes bytes{};
+    bool before_read = false;
   };
 
   std::optional<Sample> sample(pid_t tid, Task &task, const Site &site, Address pc,
@@ -1146,6 +1212,62 @@ struct Watch::Worker {
     const auto destination = reg(regs, s.base, next) + s.scale * reg(regs, s.index, next) +
                              static_cast<Address>(s.displacement);
     Sample pending{{}, destination, s, std::nullopt};
+    if (plan->layout.value_write.active()) {
+      const auto &layout = plan->layout;
+      const auto read = [&](auto address, auto bytes, auto size) {
+        return read_memory(pid, address, bytes, size);
+      };
+      const auto sample_storage = [&](Address field, const ValueWrite &write) {
+        pending.storage = write;
+        pending.storage_field = field;
+        if (!request.no_values()) {
+          pending.before_read = read(write.address, pending.bytes.data(), write.size);
+          pending.union_before = sample_union_write(layout.value_write, layout.value_alternatives.data(),
+              layout.value_alternatives.size(), field, write, read);
+        }
+      };
+      if (!request.first_seen()) {
+        const auto [owner, write] = match_live_union(layout.value_write, live, layout.scalar,
+            destination, s.width, [&] { gap(tid, pc, regs, "store intersects multiple live union objects"); });
+        if (!write.size)
+          return std::nullopt;
+        pending.life = owner->second;
+        sample_storage(add(owner->first, layout.scalar), write);
+        return pending;
+      }
+      for (auto frame = task.frames.rbegin(); frame != task.frames.rend(); ++frame) {
+        if (frame->role != Boundary::writer_scope ||
+            (layout.logical_collection() && !frame->range.valid))
+          continue;
+        auto field = add(frame->receiver, layout.scalar);
+        if (layout.logical_collection()) {
+          try {
+            const auto header = range_header(frame->receiver);
+            if (header != frame->range.header || range_element(header) != frame->range.destination)
+              throw std::runtime_error("complex value range changed outside a verified mutation return");
+            field = frame->range.destination;
+          } catch (const std::runtime_error &error) {
+            frame->range.valid = false;
+            gap(tid, pc, regs, error.what());
+            continue;
+          }
+        }
+        const auto match = match_value_store(layout.value_write, layout.value_alternatives.data(),
+            layout.value_alternatives.size(), request.max_string_bytes(), field, destination, s.width, read);
+        if (match.partial && !frame->value_partial) {
+          frame->value_partial = true;
+          gap(tid, pc, regs, "complex payload storage could not be verified within the read budget");
+        }
+        if (!match.write.size)
+          continue;
+        pending.life = frame->life;
+        pending.scoped = true;
+        pending.storage_generation = frame->range.generation;
+        sample_storage(field, match.write);
+        return pending;
+      }
+      return std::nullopt;
+    }
     if (plan->layout.logical_collection()) {
       for (auto frame = task.frames.rbegin(); frame != task.frames.rend(); ++frame) {
         if (frame->role != Boundary::writer_scope || !frame->range.valid)
@@ -1184,12 +1306,12 @@ struct Watch::Worker {
     if (!pending.life.id)
       return std::nullopt;
     if (!request.no_values() && (!plan->layout.atomic || s.kind == native_entry::ScalarStore::Kind::rmw))
-      pending.old = read<std::int32_t>(pid, destination);
+      pending.old = read_field(destination);
     pending.old_tag = union_tag(pending.life.address);
     return pending;
   }
 
-  void complete(pid_t tid, const Sample &sample, Address pc,
+  void complete(pid_t tid, Task &task, const Sample &sample, Address pc,
                 const Registers &before, const Registers &after) {
     using Kind = native_entry::ScalarStore::Kind;
     const auto found = live.find(sample.life.address);
@@ -1204,8 +1326,57 @@ struct Watch::Worker {
       if (!succeeded)
         return;
     }
+    if (sample.storage.size) {
+      ValueStoreBytes next{};
+      const bool after_read = !request.no_values() &&
+          read_memory(pid, sample.storage.address, next.data(), sample.storage.size);
+      const bool paired = sample.before_read && after_read;
+      const auto &layout = plan->layout;
+      auto union_before = sample.union_before;
+      auto union_after = request.no_values() ? UnionWriteState{} :
+          sample_union_write(layout.value_write, layout.value_alternatives.data(),
+              layout.value_alternatives.size(), sample.storage_field, sample.storage,
+              [&](auto address, auto bytes, auto size) { return read_memory(pid, address, bytes, size); });
+      if (!request.no_values() && layout.value_write.selector_width &&
+          layout.value_write.kind == ValueWriteKind::union_storage) {
+        auto *activation = !sample.scoped ? &found->second.union_activation : nullptr;
+        if (sample.scoped) {
+          for (auto frame = task.frames.rbegin(); frame != task.frames.rend(); ++frame) {
+            if (frame->role == Boundary::writer_scope && frame->life.id == sample.life.id &&
+                frame->range.generation == sample.storage_generation) {
+              activation = &frame->union_activation;
+              break;
+            }
+          }
+        }
+        if (activation)
+          confirm_union_payload(*activation, layout.value_alternatives.data(),
+              layout.value_alternatives.size(), sample.storage_field, sample.storage, paired,
+              union_before, union_after);
+        else {
+          union_before.scalar.reset();
+          union_after.scalar.reset();
+        }
+      }
+      if (paired && sample.bytes == next && union_before.tag == union_after.tag &&
+          union_before.scalar == union_after.scalar)
+        return;
+      emit(tid, paired ? Observation::FIELD_CHANGED : Observation::FIELD_WRITTEN,
+           sample.life, pc, before, [&](auto &out) {
+        out.set_field(field_path());
+        out.set_storage_generation(sample.storage_generation);
+        out.set_destination(sample.destination);
+        out.set_synchronization(request.synchronization());
+        set_storage_write(out, sample.storage, sample.before_read ? &sample.bytes : nullptr,
+                          after_read ? &next : nullptr);
+        set_union_write(out, layout, union_before, union_after);
+        if (!request.no_values() && !paired)
+          out.set_diagnostic("complex store bytes could not be paired");
+      });
+      return;
+    }
     auto old = sample.old;
-    std::optional<std::int32_t> value;
+    std::optional<std::uint64_t> value;
     std::optional<std::uint32_t> next_tag;
     if (!request.no_values()) {
       if (plan->layout.atomic && store.kind != Kind::rmw) {
@@ -1214,14 +1385,14 @@ struct Watch::Worker {
         if (store.kind == Kind::exchange_add) {
           const auto &result = store.result_register.empty() ? store.value_register : store.result_register;
           const auto returned = static_cast<std::uint32_t>(reg(after, result, 0));
-          old = std::bit_cast<std::int32_t>(returned);
+          old = returned;
           input += returned;
         } else if (store.kind == Kind::compare_exchange) {
-          old = std::bit_cast<std::int32_t>(expected);
+          old = expected;
         }
-        value = std::bit_cast<std::int32_t>(input);
+        value = input;
       } else {
-        value = read<std::int32_t>(pid, sample.destination);
+        value = read_field(sample.destination);
         next_tag = union_tag(sample.life.address);
         if (value == old && next_tag == sample.old_tag)
           return;
@@ -1302,7 +1473,7 @@ struct Watch::Worker {
               suspend_range(tid, *scope, pc, regs);
             } else if (pc != mutation.begin && scope->active_inline_mutation == mutation.begin) {
               scope->active_inline_mutation = 0;
-              bind_range(tid, *scope, pc, regs, scope->entry_stack);
+              bind_range(tid, *scope, pc, regs, scope->entry_stack, mutation.begin);
             }
           }
         }
@@ -1345,7 +1516,7 @@ struct Watch::Worker {
       const auto after = trace_trap ? registers(tid) : Registers{};
       if (trace_trap && object_target::pc(after) == pc + expected.size()) {
         try {
-          complete(tid, *observation, pc, regs, after);
+          complete(tid, task, *observation, pc, regs, after);
         } catch (const std::runtime_error &error) {
           gap(tid, pc, regs, error.what());
         }

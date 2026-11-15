@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -6,6 +7,7 @@
 #include <type_traits>
 
 #include "events.hpp"
+#include "../src/object_snapshot.hpp"
 #include "fixtures/repl_complex_types.hpp"
 #include <google/protobuf/descriptor.pb.h>
 #include <google/protobuf/dynamic_message.h>
@@ -248,6 +250,12 @@ void complex_values() {
   auto *root = file->add_message_type();
   root->set_name("Root");
   field(root, "value", 1, FD::TYPE_MESSAGE, false, ".repl.test.Record");
+  auto *records = file->add_message_type();
+  records->set_name("Records");
+  field(records, "items", 1, FD::TYPE_MESSAGE, true, ".repl.test.Record");
+  auto *records_root = file->add_message_type();
+  records_root->set_name("RecordsRoot");
+  field(records_root, "value", 1, FD::TYPE_MESSAGE, false, ".repl.test.Records");
   auto *text_root = file->add_message_type();
   text_root->set_name("Text");
   field(text_root, "value", 1, FD::TYPE_BYTES);
@@ -296,6 +304,63 @@ void complex_values() {
   *message.mutable_result() = *argument;
   auto event = snapshot(message);
   auto decoded = event.argument_as<repl_fixture::Record>(0);
+  auto *observed = message.mutable_object_observation()->mutable_snapshot_after();
+  tracer_repl::encode_observation_value(event.argument_snapshot(0), *observed);
+  api::TraceEvent restored;
+  require(restored.ParseFromString(message.SerializeAsString()),
+          "round-trip an observation with nested and non-UTF-8 values");
+  const auto &observation = restored.object_observation().snapshot_after();
+  require(observation.composite_kind() == api::ObjectObservation::SnapshotValue::RECORD &&
+              observation.cpp_type() == "repl_fixture::Record",
+          "observation retains its captured record type");
+  const auto child = [](const auto &parent, std::string_view name) -> const auto & {
+    const auto found = std::find_if(parent.children().begin(), parent.children().end(),
+        [&](const auto &item) { return item.field_name() == name; });
+    if (found == parent.children().end())
+      throw std::runtime_error("missing observed field");
+    return *found;
+  };
+  const auto &samples = child(observation, "samples");
+  require(child(observation, "label").bytes_value() == bytes &&
+              child(child(observation, "location"), "name").string_value() == "owned-nested" &&
+              samples.composite_kind() == api::ObjectObservation::SnapshotValue::SEQUENCE &&
+              samples.children_size() == 2 && samples.children(1).signed_value() == 4,
+          "observation retains nested records, sequences, and binary strings");
+  message.clear_object_observation();
+  const auto keyed_snapshot = [&](int id) {
+    std::unique_ptr<google::protobuf::Message> wrapper(
+        factory.GetPrototype(pool.FindMessageTypeByName("repl.test.RecordsRoot"))->New());
+    auto *items = wrapper->GetReflection()->MutableMessage(wrapper.get(), wrapper->GetDescriptor()->field(0));
+    auto *item = items->GetReflection()->AddMessage(items, items->GetDescriptor()->field(0));
+    item->CopyFrom(*value);
+    r->SetInt32(item, d->FindFieldByName("id"), id);
+    tracer_repl::Snapshot sample = *captured;
+    sample.set_cpp_type("repl_fixture::Owner");
+    sample.set_root_type("repl.test.RecordsRoot");
+    sample.set_payload(wrapper->SerializeAsString());
+    sample.clear_container_roles();
+    sample.add_container_roles("1.1=vector");
+    return sample;
+  };
+  const auto old_items = keyed_snapshot(37);
+  auto new_items = keyed_snapshot(46);
+  const auto changes = tracer_repl::compare_snapshots(old_items, new_items, {"items=id"});
+  require(changes.size() == 2 && changes[0].detail == "removed" &&
+              changes[0].before && changes[0].before->field("label").as<std::string>() == bytes &&
+              changes[1].detail == "added" && changes[1].after &&
+              changes[1].after->field("location").field("code").as<int>() == 12,
+          "keyed changes retain the complete captured element");
+  const auto unmatched = tracer_repl::compare_snapshots(old_items, new_items, {"items=unknown"});
+  require(unmatched.size() == 1 && unmatched.front().gap &&
+              unmatched.front().before && unmatched.front().after &&
+              unmatched.front().before->at(0).field("id").as<int>() == 37 &&
+              unmatched.front().after->at(0).field("id").as<int>() == 46,
+          "an unknown identity retains samples without claiming adds or removals");
+  new_items.set_status(tracer_repl::Snapshot::LIMIT_EXCEEDED);
+  const auto unavailable = tracer_repl::compare_snapshots(old_items, new_items, {"items=id"});
+  require(unavailable.size() == 1 && unavailable.front().gap && !unavailable.front().before &&
+              !unavailable.front().after,
+          "a limited capture cannot report element removal");
   require(decoded.id == 37 && decoded.label == bytes &&
               decoded.location.code == 12 &&
               decoded.location.name == "owned-nested" &&

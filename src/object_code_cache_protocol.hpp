@@ -1,11 +1,14 @@
 #pragma once
 
+#include "object_value_write.hpp"
+
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <optional>
 
 #include "object_map_range.hpp"
+#include "object_logical_range.hpp"
 #include "object_pointee_range.hpp"
 
 namespace tracer::object_cache {
@@ -31,7 +34,7 @@ enum class Hook : std::uint8_t {
   construction_aborted, construction_uncertain, owner_add_enter, owner_add_return,
   owner_get_enter, owner_get_return, owner_remove_enter, owner_remove_return, owner_gap,
   dispatch_gap, shared_mapping_gap, post_store_signal, scope_signal, snapshot_entry, snapshot_return,
-  lifetime_reused, admission_gap, rmw
+  lifetime_reused, admission_gap, rmw, collection_update
 };
 inline bool writer(Hook hook) noexcept {
   return hook == Hook::move || hook == Hook::xadd || hook == Hook::cas || hook == Hook::rmw;
@@ -40,12 +43,12 @@ enum class Flow : std::uint8_t { copy, jump, conditional, runtime_call, runtime_
 
 struct Instruction {
   Address pc = 0, target = 0;
-  Address boundary_pc = 0;
+  Address boundary_pc = 0, collection_return = 0;
   std::int64_t displacement = 0;
   std::int64_t inline_receiver_offset = 0;
   std::uint32_t immediate = 0;
   std::uint8_t size = 0, condition = 0, base = 0, index = 0, scale = 0, value = 0, result = 0;
-  std::uint8_t inline_receiver_register = 0;
+  std::uint8_t inline_receiver_register = 0, store_width = 0;
   Hook hook = Hook::none;
   Flow flow = Flow::copy;
   bool dispatch_entry = false;
@@ -56,7 +59,11 @@ struct Instruction {
   bool rip_relative = false;
   bool indirect_memory = false;
   bool successor_return = false;
+  bool sample_store_memory = false;
+  bool destroys_collection = false;
   std::array<std::uint8_t, 15> bytes{};
+
+  Address continuation_pc() const noexcept { return collection_return ? collection_return : pc; }
 };
 
 struct Function {
@@ -83,6 +90,7 @@ struct CollectionPlan {
   std::uint32_t max_string_bytes = 0, map_key_size = 0;
   std::array<char, 512> map_key{};
   bool is_map = false;
+  bool logical_updates = false;
   std::array<Address, object_watch::max_pointee_hops> pointer_offsets{};
   unsigned pointer_hops = 0;
 
@@ -105,12 +113,17 @@ struct Init {
   const Address *static_scopes = nullptr;
   std::size_t static_scope_count = 0;
   std::uint64_t scalar = 0;
+  unsigned field_width = 4;
   std::uint64_t union_tag_offset = 0;
   std::uint64_t async_signals = 0;
   Address receiver_typeinfo = 0;
   Address module_bias = 0;
   BorrowPlan borrow{};
   CollectionPlan collection{};
+  object_watch::ValueWriteLayout value_write{};
+  const object_watch::ValueWriteAlternative *value_alternatives = nullptr;
+  std::size_t value_alternative_count = 0;
+  unsigned value_string_limit = 0;
   SharedFileIdentity shared_file{};
   unsigned stack_depth = 0;
   std::uint32_t max_instances = 0;
@@ -140,8 +153,14 @@ struct Observation {
   std::uint8_t values, depth, stack_status;
   std::uint8_t gap;
   bool has_shared_file_offset;
-  std::int32_t old_value, new_value;
+  std::uint64_t old_value, new_value;
   std::uint32_t old_tag, new_tag;
+  object_watch::LogicalRangeSample logical_before, logical_after;
+  object_watch::LogicalChange logical_change = object_watch::LogicalChange::none;
+  Address logical_boundary;
+  object_watch::ValueWrite storage_write;
+  object_watch::ValueStoreBytes storage_before, storage_after;
+  object_watch::UnionWriteState union_before, union_after;
   std::array<Address, stack_limit> frames, stack_pointers;
 };
 

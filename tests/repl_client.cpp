@@ -364,6 +364,22 @@ int main(int argc, char **argv) {
       Controller controller(settings, out);
       auto session = controller.attach(7);
       require(session.pid == 7, "selected session");
+      {
+        const auto listing_start = out.str().size();
+        controller.execute(parse_command("%sessions"));
+        require(out.str().substr(listing_start) == "* s1 pid=7 state=ATTACHED probes=0\n",
+                "sessions are listed one per line with the selection marked");
+        controller.execute(parse_command("%use s"));
+        require(out.str().find("selected session=s1\n", listing_start) != std::string::npos,
+                "a unique ID prefix selects a session");
+        try {
+          controller.execute(parse_command("%use missing"));
+          throw std::logic_error("selected an unknown session");
+        } catch (const std::runtime_error &error) {
+          require(std::string(error.what()).find("unknown session: missing") != std::string::npos,
+                  "unknown session IDs are reported");
+        }
+      }
       controller.inject(session, "multiply(int, int)",
                         "// client-only interceptor\n", Command{});
       require(service.installed == 1, "upload source by value");

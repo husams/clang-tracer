@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <iostream>
 #include <string_view>
 #include <thread>
@@ -127,6 +128,10 @@ EditorCompletions keywords(string_view text) {
 Input::Input(bool color) : terminal_(::isatty(STDIN_FILENO)) {
   editor_.set_no_color(!color);
   editor_.set_max_history_size(1000);
+  if (const auto* home = std::getenv("HOME"); terminal_ && home && *home) {
+    history_path_ = std::string(home) + "/.clang-tracer-history";
+    editor_.history_load(history_path_);
+  }
   editor_.set_double_tab_completion(false);
   if (terminal_ && ::isatty(STDOUT_FILENO)) editor_.enable_bracketed_paste();
   editor_.set_modify_callback([this](std::string& text, int& cursor) { changed(text, cursor); });
@@ -462,7 +467,11 @@ std::optional<std::string> Input::read(const std::string& prompt) {
     }
     if (!line) return {};
     std::string result(line);
-    if (!result.empty()) editor_.history_add(result);
+    if (!result.empty()) {
+      editor_.history_add(result);
+      // Merge into the shared file now so a crash or a concurrent REPL keeps it.
+      if (!history_path_.empty()) editor_.history_sync(history_path_);
+    }
     return result;
   }
 }

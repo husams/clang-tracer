@@ -420,6 +420,25 @@ std::string event_summary(const api::TraceEvent &event) {
       out << " slot=" << object.owner_index();
     if (!object.field().empty())
       out << " " << object.field();
+    if (object.has_logical_update()) {
+      const auto &update = object.logical_update();
+      out << ' ' << api::ObjectObservation::LogicalUpdate::Change_Name(update.change());
+      if (!update.mutation().empty())
+        out << " mutation=" << std::quoted(update.mutation());
+      if (update.has_before_index())
+        out << " before_index=" << update.before_index();
+      if (update.has_after_index())
+        out << " after_index=" << update.after_index();
+      if (update.has_before_size())
+        out << " before_size=" << update.before_size();
+      if (update.has_after_size())
+        out << " after_size=" << update.after_size();
+    }
+    if (object.has_storage_write()) {
+      const auto &write = object.storage_write();
+      out << ' ' << api::ObjectObservation::StorageWrite::Region_Name(write.region())
+          << " offset=" << write.offset() << " size=" << write.size();
+    }
     if (object.has_old_integer())
       out << " " << object.old_integer() << " ->";
     else if (object.kind() == api::ObjectObservation::FIELD_CHANGED && object.has_new_integer())
@@ -430,7 +449,7 @@ std::string event_summary(const api::TraceEvent &event) {
       out << " \"" << google::protobuf::CEscape(object.old_string()) << "\" ->";
     if (object.has_new_string())
       out << " \"" << google::protobuf::CEscape(object.new_string()) << '"';
-    const auto union_sample = [&](std::uint32_t tag, const std::string &member,
+    const auto union_sample = [&](std::uint64_t tag, const std::string &member,
                                   const api::ObjectObservation::SnapshotValue &value) {
       out << " tag=" << tag;
       if (member.empty())
@@ -443,11 +462,16 @@ std::string event_summary(const api::TraceEvent &event) {
       else if (value.has_real_value())
         out << value.real_value();
     };
-    if (object.has_old_union_tag()) {
+    if (object.has_storage_write() && object.storage_write().has_before_discriminator()) {
+      union_sample(object.storage_write().before_discriminator(), object.old_union_member(), object.snapshot_before());
+      out << " ->";
+    } else if (object.has_old_union_tag()) {
       union_sample(object.old_union_tag(), object.old_union_member(), object.snapshot_before());
       out << " ->";
     }
-    if (object.has_new_union_tag())
+    if (object.has_storage_write() && object.storage_write().has_after_discriminator())
+      union_sample(object.storage_write().after_discriminator(), object.new_union_member(), object.snapshot_after());
+    else if (object.has_new_union_tag())
       union_sample(object.new_union_tag(), object.new_union_member(), object.snapshot_after());
     const auto raw_bytes = [&](const std::string &bytes) {
       std::ostringstream encoded;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "object_value_write.hpp"
+
 #include <array>
 #include <functional>
 #include <map>
@@ -12,6 +14,7 @@
 
 #include "native_entry.hpp"
 #include "object_map_range.hpp"
+#include "object_logical_range.hpp"
 #include "object_pointee_range.hpp"
 #include "tracer.pb.h"
 
@@ -41,26 +44,41 @@ struct Source {
   std::vector<clangtracer::v1::ObjectObservation::InlineLocation> inline_chain;
 };
 struct UnionCase {
-  enum class Type { signed_integer, unsigned_integer, real };
+  enum class Type { signed_integer, unsigned_integer, real, boolean, opaque };
   std::string member;
   Type type;
+  unsigned width = 4;
   bool operator==(const UnionCase &) const = default;
 };
 struct Layout {
+  enum class FieldType { int32, signed_integer, unsigned_integer, boolean, real };
   std::uint64_t scalar, string_pointer, string_length;
   std::uint64_t vector_begin, vector_end, vector_capacity, stride, pointee;
+  FieldType field_type = FieldType::int32;
+  unsigned field_width = 4;
   bool atomic = false;
   bool opaque_union = false;
   std::optional<std::uint64_t> union_tag_offset;
-  std::map<std::uint32_t, UnionCase> union_cases;
+  std::map<std::uint64_t, UnionCase> union_cases;
+  std::string union_path;
   std::uint64_t vector_object = 0, key_offset = 0;
   bool logical_vector = false;
   bool logical_map = false;
   std::vector<std::uint64_t> pointer_offsets;
   MapLayout map;
+  ValueWriteLayout value_write;
+  std::vector<ValueWriteAlternative> value_alternatives;
+  bool scoped_storage() const { return logical_collection() || value_write.active(); }
+  std::uint64_t field_size() const { return value_write.active() ? value_write.size : field_width; }
   bool logical_collection() const { return logical_vector || logical_map || !pointer_offsets.empty(); }
   bool primary_rtti = false;
   std::uint64_t base_offset = 0;
+  bool watch_store(const native_entry::ScalarStore &store) const {
+    if (value_write.active())
+      return store.supports(false) && store.width <= max_value_store_width;
+    return store.supports(atomic) && (!atomic || !store.reads_memory_value()) &&
+           store.width == field_width;
+  }
 };
 
 class Plan {
@@ -101,6 +119,8 @@ public:
   std::map<std::uint64_t, std::uint64_t> delegating_constructor_tails;
   bool virtual_destructor = false;
   std::map<std::uint64_t, InlineMutation> inline_mutations;
+  std::set<std::uint64_t> destruction_mutations;
+  std::map<std::uint64_t, std::string> mutation_selectors;
   unsigned stores = 0, unsupported = 0;
   google::protobuf::RepeatedPtrField<clangtracer::v1::ObjectWatchRequest::SourceWriter> source_writers;
 
@@ -142,9 +162,16 @@ std::string compare_prepared(const clangtracer::v1::ObjectWatchPlan &prepared,
                              const clangtracer::v1::ObjectWatchPlan &live, bool no_values);
 std::string field_path(const clangtracer::v1::ObjectWatchRequest &request, const Layout &layout);
 struct ScalarSample {
-  std::optional<std::int32_t> value;
+  std::optional<std::uint64_t> value;
   std::optional<std::uint32_t> tag;
 };
 void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &layout,
                        ScalarSample old, ScalarSample next);
+void set_union_write(clangtracer::v1::ObjectObservation &event, const Layout &layout,
+                     const UnionWriteState &before, const UnionWriteState &after);
+void set_storage_write(clangtracer::v1::ObjectObservation &event, const ValueWrite &write,
+                       const ValueStoreBytes *before, const ValueStoreBytes *after);
+void set_logical_update(clangtracer::v1::ObjectObservation &event, const Layout &layout,
+                        const LogicalRangeSample &before, const LogicalRangeSample &after,
+                        LogicalChange change);
 } // namespace tracer::object_watch

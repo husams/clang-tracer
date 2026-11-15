@@ -481,7 +481,7 @@ Stop restores the verified instruction bytes. Check `active=no` and `restoration
 - Ptrace can observe stores in a writer that ends in an indirect call or jump when every block in the writer is decoded and any gaps contain only alignment NOPs. It observes the selected writer's stores. An indirect jump with unverified blocks, such as an unresolved jump table, is refused.
 - When the complete and base constructors share an entry, a verified direct call from outside constructor and destructor frames can identify a complete construction. When a known derived type can initialize its base as an aggregate, these shared entries remain uncertain unless stronger evidence is available.
 - On x86-64, scalar watches admit verified 32-bit integer arithmetic, bitwise and shift updates. For locked atomic instructions without a returned old value, code-cache records the write and reports that the values could not be verified. Ptrace can sample the values while target peers are parked.
-- Collection and pointee watches require verified mutation boundaries and supported identities. Unverified inline paths can leave coverage gaps. Tagged-union decoding requires a verified unsigned 32-bit discriminator and supported 32-bit alternatives. Untagged union observations carry storage bytes.
+- Collection and pointee watches require verified mutation boundaries and supported identities. Unverified inline paths can leave coverage gaps. Tagged-union decoding uses a verified integral or enum discriminator and declared cases. Untagged union stores retain the overlapping bytes.
 - Native capture covers admitted code and threads. Generated helper windows can leave signal or stack gaps, including AArch64 scalable signal records that exceed the fixed Linux signal frame. Shared-file identity correlates recordings across processes, where ordering can remain partial.
 - Use `%object status` to check drops, unsupported sites, coverage gaps, and capture limits. Use `%object stop` or `%detach` to retire the watch and restore patches. See the [verification record](../object-watch-progress.md) for the exercised cases and limits.
 
@@ -501,6 +501,19 @@ Prepare from the original headers and compile command. The package contains the 
 ```
 
 Snapshot deltas describe the interval between a method's entry and return. Fields select the reported paths. The generated receiver codec reads the receiver and the pointees authorized by the preparation policy. A failed sample yields a coverage gap. A missing return yields a coverage gap when the probe retires. Set `--max-elements`, `--max-string-bytes`, `--max-depth`, `--max-snapshot-bytes`, and `--max-instances` to bound capture and observation.
+
+Choose method snapshots for changes to strings, private nested records,
+containers, variants, or registered pointees. For example, the Portfolio
+watch pairs entries by leg ID and map key and can report a leaf change such
+as `risk_["AAPL"].limits_[0]`. An added or removed map entry or keyed vector
+element includes its captured record or sequence on the corresponding side
+of the delta. Use `%events show saved --index N` to inspect the typed values,
+or `%events export saved --format json --output changes.json` to export them.
+In JSON, `snapshotBefore` and `snapshotAfter` carry recursive `children` for
+composite values, with `fieldName` on record children. The capture limits
+also apply to values replayed from SQLite.
+When no key identity is available, the watch retains both captured entry
+sequences in the coverage gap and withholds individual adds and removals.
 
 Method snapshots support up to 65,536 encoded bytes per value, 65,536 elements, and a depth of 64. The default byte and element budgets are 4,096 and the default depth is 32. The element budget is shared by the captured containers in each value. A field selection captures the selected top-level receiver members and their contents. A nested path filters which changes to report within its selected member.
 
@@ -533,7 +546,26 @@ The watch validates the writer's first receiver argument and the selected libstd
 
 Repeat `--mutation` when the writer uses more than one storage-changing function. Each selected function must accept the verified container as its first argument. Native capture verifies direct calls and their return continuations. For an inlined function, the watch verifies the receiver and the control-flow edges into and out of its matching DWARF ranges. An inline instance can span disjoint ranges. With declared synchronization and value capture, `RANGE_BOUND` includes the verified value at binding. A rebind includes the prior value when it was sampled safely before suspension.
 
-Use `--map risk --map-key AAPL --field exposure.limit` to follow a nested field in a `std::map<std::string, T>` entry. Select a mutation that takes the map as its first argument. The watch verifies the libstdc++ tree and key layout from DWARF. Each verified return binds a new map generation, including when an allocator reuses an address. An absent key or a traversal that exceeds its budget yields a coverage gap. Map and vector writes require a signed 32-bit value field.
+Use `--map risk --map-key AAPL --field exposure.limit` to follow a nested field in a `std::map` entry. For `std::unordered_map<int, T>`, use a numeric key such as `--map-key "-7"`. Both containers require a verified libstdc++ layout and default key equivalence. Use `--field value` when the mapped value is itself numeric. Select a mutation such as insert, erase or rehash that takes the map as its first argument. The watch suspends the old binding and verifies the new generation on return, even when the matching node keeps its address. Rehash alone emits no field change. With the default write mode, missing, duplicate or unreadable keys and exhausted traversal budgets produce coverage gaps.
+
+Use `--mode logical-writes` with `--vector` or `--map` and declare `--synchronization thread-confined` or `caller-lock` to record the logical effect of each selected mutation. Repeat `--mutation` for insert, erase, move, swap and resize functions that take the selected container as their first argument. If a directly called function ends the selected container's lifetime, declare it with `--mutation "destroy=SYMBOL"`. A verified return records destruction from the pre-call sample and retires the watch for that container within the writer invocation.
+
+A `LOGICAL_UPDATE` includes the mutation selector, the change, available before and after sizes, vector indices, and typed field values. An entry swapped out of the selected container is erased from that container's view, and a subsequent insertion starts a new binding. Vector reallocation and hash rehashing alone leave the logical entry unchanged. A duplicate key, unreadable layout or exceeded traversal budget still produces a coverage gap. With `--no-values`, logical shape changes remain visible and field samples are omitted. Actual stores continue to report their own source instruction.
+
+Individual field watches capture admitted stores to integers, booleans, enums, floats, doubles and verified libstdc++ `std::string`, `std::variant` and `std::any` storage. They can follow a nested field within a private record, keyed vector, ordered or unordered map, or verified pointee. Replay shows the original store PC, source location and the before and after bytes for complex values. It retains successive writes that restore the original contents before the function returns.
+
+```text
+%object prepare demo::Portfolio --module ./portfolio --field summary.caption --code "demo::Portfolio::refresh()" --first-seen --synchronization thread-confined --backend code-cache --output ./caption-watch
+%attach PID
+%object preview --plan ./caption-watch
+%object start --plan ./caption-watch
+```
+
+Declare `thread-confined` or `caller-lock` for complex writes. A `storageWrite` event identifies the affected byte range in the value representation, character buffer, or verified out-of-line `std::any` payload. A string's inline and heap buffers are eligible. The active variant index selects any string buffer to follow. For `std::any`, the app's matching ELF and DWARF identify admitted managers and their payload layouts. An unknown manager leaves its payload opaque. When an instruction touches part of a field, only the intersecting bytes appear in the event. With `--no-values`, replay retains the location and range.
+
+Capture covers the selected writer and, with code cache and `--follow-calls` for a standalone watch, its admitted callees. Check preview and status for gaps. A newly allocated buffer becomes eligible when a verified live layout points to it. Use typed method snapshots for a whole string, the active variant value, a registered `std::any` projection, or a recursive value tree.
+
+`std::list`, `std::deque`, `std::set` and `std::unordered_set` have typed snapshot codecs. Keyed individual writes and structural tracking use the verified vector and map adapters. Pointee writes follow a verified raw, default-deleter `std::unique_ptr`, or `std::shared_ptr` path to the static pointee layout. Polymorphic snapshots can resolve derived fields from validated RTTI. Derived-field write attribution requires a separately verified concrete receiver.
 
 ## Trace a Shape through Image
 
@@ -650,22 +682,17 @@ The diagnostic backend steps the complete instruction, including LOCK.
 At detach it restores the full original bytes and rewinds any owned trap
 that has yet to execute.
 
-## Decode a tagged union write
+## Trace individual writes to a nested union
 
-Pass `--union-tag FIELD` and a `--union-case TAG=MEMBER` for each admitted
-alternative. Use a direct member path such as `--field payload.integer`
-to identify the four-byte storage, and declare `--synchronization thread-confined`
-or `caller-lock` to protect the tag and storage during both samples.
+Select the union itself with a path such as `--field envelope.state.payload`. A path through one of its alternatives resolves to the enclosing union storage. The plan verifies the full extent from DWARF. An untagged watch records only the affected bytes at each original store instruction and leaves the active member unknown.
+
+For a tagged union, supply `--union-tag FIELD`, a `--union-case TAG=MEMBER` for each known alternative, and `--synchronization thread-confined` or `caller-lock`. Use a verified nonoverlapping 8-, 16-, 32- or 64-bit integral or enum tag. Within a vector entry, map value or pointee, specify the tag relative to that entry, value or pointee.
 
 ```text
-%object prepare tagged_test::State --module ./fixture --field payload.integer --code _ZN11tagged_test10write_bitsERNS_5StateEj --union-tag kind --union-case 1=integer --union-case 2=real --synchronization thread-confined --backend code-cache --output watch
+%object prepare union_test::Cell --module ./fixture --field envelope.state.payload --code "union_test::Cell::tagged()" --union-tag envelope.state.kind --union-case 4294967297=number --union-case 4294967298=real --first-seen --synchronization thread-confined --backend code-cache --output watch
 ```
 
-The plan checks the tag offset and each alternative against DWARF. A tag
-can be an unsigned 32-bit field or an enum with that underlying type.
-Signed integers, unsigned integers, and floats are supported as 32-bit
-alternatives. Unknown or unreadable tags retain raw storage bytes.
-`--no-values` skips both the discriminator and storage reads.
+A mapped case can name a record alternative, or a typed leaf such as `wide.last`. When a store touches a supported numeric, enum or bool member under a stable tag, replay includes the typed sample and the affected bytes. Record and array alternatives keep their member name and affected bytes. Unknown or unreadable tags retain bytes without a typed sample. A discriminator store records the switch. After a switch, the next full write to the new scalar exposes its new value, and subsequent writes can pair both values. Replay includes the full tag in `storageWrite`. `--no-values` retains the store and affected range while skipping value reads. Existing four-byte member watches retain their event format.
 
 ## Trace writes in the native code cache
 
@@ -1671,6 +1698,12 @@ Enter continues an unfinished C++ block, parenthesis, bracket, string, or block
 comment in the multiline editor. Ctrl+C discards the entire pending input;
 earlier variables and tracing sessions remain available. Ctrl+J always inserts
 a newline; `%cpp load FILE` submits a multiline source file.
+
+In an interactive terminal the editor history persists in
+`$HOME/.clang-tracer-history` (mode 0600) and reloads at startup. Each accepted
+entry is merged into the file as it is entered, so concurrent REPLs share it and
+a crash loses nothing; a multiline cell stays one entry. Piped input and an
+unset or empty `HOME` leave history in memory only.
 
 Every submitted C++ cell is checked in a disposable `clang-tracer-repl-check`
 process before the live interpreter parses or executes it. The checker parses

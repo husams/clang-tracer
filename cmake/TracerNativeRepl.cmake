@@ -222,6 +222,10 @@ function(tracer_add_native_repl)
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_terminal.py"
         $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:repl-client-tests>)
     set_tests_properties(native_repl_terminal PROPERTIES TIMEOUT 120)
+    add_test(NAME native_repl_history
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_history.py"
+        $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:repl-client-tests>)
+    set_tests_properties(native_repl_history PROPERTIES TIMEOUT 120)
     add_test(NAME native_repl_auto_records
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_auto_records.py"
         $<TARGET_FILE:clang-tracer-repl>)
@@ -423,6 +427,100 @@ function(tracer_add_native_repl)
             $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:${_pointee_target}>)
         set_tests_properties(${_pointee_test} PROPERTIES TIMEOUT 180)
       endforeach()
+      if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+        add_executable(repl-object-structural-target tests/fixtures/object_structural.cpp)
+        set_target_properties(repl-object-structural-target PROPERTIES CXX_STANDARD 17
+          INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_compile_options(repl-object-structural-target PRIVATE -g -O2 -fPIE
+          -fno-omit-frame-pointer ${_object_test_arch_flags})
+        target_link_options(repl-object-structural-target PRIVATE -pie "LINKER:--build-id=sha1")
+        foreach(_backend ptrace code-cache)
+          set(_test "native_repl_object_structural_${_backend}")
+          add_test(NAME ${_test}
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_structural.py"
+              $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+              $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-structural-target>
+              --backend ${_backend})
+          set_tests_properties(${_test} PROPERTIES TIMEOUT 120)
+        endforeach()
+        add_executable(repl-object-value-writes-target tests/fixtures/object_value_writes.cpp)
+        set_target_properties(repl-object-value-writes-target PROPERTIES CXX_STANDARD 17
+          INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_compile_options(repl-object-value-writes-target PRIVATE -g -O2 -fPIE
+          -fno-omit-frame-pointer ${_object_test_arch_flags})
+        target_link_options(repl-object-value-writes-target PRIVATE -pie "LINKER:--build-id=sha1")
+        foreach(_backend ptrace code-cache)
+          set(_value_cases short_text long_text variant_value variant_text any_inline any_heap any_text)
+          if(_backend STREQUAL "code-cache")
+            list(APPEND _value_cases delegated_text)
+          endif()
+          foreach(_case IN LISTS _value_cases)
+            set(_test "native_repl_object_value_${_case}_${_backend}")
+            add_test(NAME ${_test}
+              COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_value_writes.py"
+                $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+                $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-value-writes-target>
+                ${_case} --backend ${_backend})
+            set_tests_properties(${_test} PROPERTIES TIMEOUT 120)
+          endforeach()
+        endforeach()
+        add_executable(repl-object-nested-union-target tests/fixtures/object_nested_union.cpp)
+        set_target_properties(repl-object-nested-union-target PROPERTIES CXX_STANDARD 17
+          INTERPROCEDURAL_OPTIMIZATION OFF)
+        target_compile_options(repl-object-nested-union-target PRIVATE -g -O2 -fPIE
+          -fno-omit-frame-pointer ${_object_test_arch_flags})
+        target_link_options(repl-object-nested-union-target PRIVATE -pie "LINKER:--build-id=sha1")
+        foreach(_backend ptrace code-cache)
+          foreach(_case wide wide_member wide_leaf tagged unknown switch pair lifecycle)
+            set(_options)
+            set(_scenario ${_case})
+            if(_case STREQUAL "lifecycle")
+              set(_scenario tagged)
+              set(_options --lifecycle)
+            endif()
+            set(_test "native_repl_object_nested_union_${_case}_${_backend}")
+            add_test(NAME ${_test}
+              COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_nested_union.py"
+                $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+                $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-nested-union-target>
+                ${_scenario} --backend ${_backend} ${_options})
+            set_tests_properties(${_test} PROPERTIES TIMEOUT 120)
+          endforeach()
+        endforeach()
+        set(_map_fixture_source "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/object_map")
+        foreach(_map_kind ordered hash)
+          set(_map_target "repl-object-${_map_kind}-map-target")
+          set(_map_dir "${CMAKE_CURRENT_BINARY_DIR}/object-${_map_kind}-map/$<CONFIG>")
+          add_executable(${_map_target} "${_map_fixture_source}/portfolio.cpp")
+          set_target_properties(${_map_target} PROPERTIES CXX_STANDARD 17 OUTPUT_NAME portfolio
+            RUNTIME_OUTPUT_DIRECTORY "${_map_dir}" INTERPROCEDURAL_OPTIMIZATION OFF)
+          target_compile_options(${_map_target} PRIVATE -g -O2 -fPIE -fno-omit-frame-pointer
+            ${_object_test_arch_flags} $<$<CXX_COMPILER_ID:GNU>:-fno-reorder-blocks-and-partition>)
+          target_link_options(${_map_target} PRIVATE -pie "LINKER:--build-id=sha1")
+          target_compile_definitions(${_map_target} PRIVATE TRACER_TEST_WIDE_FIELD)
+          set(_map_options --map --wide)
+          if(_map_kind STREQUAL "hash")
+            target_compile_definitions(${_map_target} PRIVATE TRACER_TEST_HASH_MAP)
+            list(APPEND _map_options --hash-map)
+          endif()
+          foreach(_file portfolio.cpp portfolio.hpp)
+            file(GENERATE OUTPUT "${_map_dir}/${_file}" INPUT "${_map_fixture_source}/${_file}")
+          endforeach()
+          foreach(_backend ptrace code-cache)
+            set(_map_test "native_repl_object_${_map_kind}_map_${_backend}")
+            add_test(NAME ${_map_test}
+              COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_vector.py"
+                $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+                $<TARGET_FILE:${_object_cache_agent}> "${_map_dir}" ${_map_options} --backend ${_backend})
+            set_tests_properties(${_map_test} PROPERTIES TIMEOUT 120)
+            add_test(NAME ${_map_test}_logical
+              COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_vector.py"
+                $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+                $<TARGET_FILE:${_object_cache_agent}> "${_map_dir}" ${_map_options} --backend ${_backend} --logical)
+            set_tests_properties(${_map_test}_logical PROPERTIES TIMEOUT 120)
+          endforeach()
+        endforeach()
+      endif()
       add_executable(repl-object-signal-window-target tests/fixtures/object_aarch64/signal_window.cpp)
       set_target_properties(repl-object-signal-window-target PROPERTIES CXX_STANDARD 17
         INTERPROCEDURAL_OPTIMIZATION OFF)
@@ -975,6 +1073,11 @@ function(tracer_add_native_repl)
           --target $<TARGET_FILE:repl-complex-fixture>
           --header "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/repl_complex_types.hpp")
       set_tests_properties(native_repl_complex_integration PROPERTIES TIMEOUT 600)
+      add_test(NAME native_repl_session_history
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_session_history.py"
+          --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+          --target $<TARGET_FILE:repl-complex-fixture>)
+      set_tests_properties(native_repl_session_history PROPERTIES TIMEOUT 600)
       add_test(NAME native_repl_value_examples
         COMMAND "${CMAKE_COMMAND}" -E env
           "CLANG_TRACER_REPL=$<TARGET_FILE:clang-tracer-repl>"
