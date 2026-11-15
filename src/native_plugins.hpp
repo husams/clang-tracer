@@ -10,6 +10,9 @@
 #include <vector>
 
 namespace tracer {
+std::filesystem::path
+private_plugin_directory(const std::filesystem::path &directory, bool create);
+
 struct NativePluginSource {
   std::filesystem::path path;
   std::optional<std::string_view> contents;

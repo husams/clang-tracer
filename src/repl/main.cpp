@@ -213,6 +213,7 @@ int main(int argc, char **argv) {
       std::cout << "Clang Tracer native C++23 REPL. %help lists commands; "
                    "%help api lists C++ APIs. Tab completes commands, paths, and C++.\n";
     }
+    plugins.load_enabled(cpp, std::cout, std::cerr);
     bool failed = false;
     while (true) {
       // tracer.inject() can execute inside a JIT cell. Import after the cell

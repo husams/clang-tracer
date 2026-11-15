@@ -1682,12 +1682,12 @@ completion of remote tracing symbols remains follow-up work.
 
 Load a trusted C++ source file with `%plugin load FILE --as NAME`. The REPL
 compiles it with its current local C++ compiler profile, so include paths and
-defines can come from `--cpp-arg` or `%cpp options compdb`. Use `--startup` with
-a file containing the load commands to load the same plugins at startup.
+defines can come from `--cpp-arg` or `%cpp options compdb`. Use
+`%plugin enable FILE --as NAME` to load a plugin now and on future launches.
 
 ```text
-%plugin load examples/jit-plugin-globals/plugin_a.cpp --as a
-%plugin load examples/jit-plugin-globals/plugin_b.cpp --as b
+%plugin enable examples/jit-plugin-globals/plugin_a.cpp --as a
+%plugin enable examples/jit-plugin-globals/plugin_b.cpp --as b
 %plugin commands a
 %plugin run a tick
 %plugin run b tick
@@ -1695,6 +1695,14 @@ a file containing the load commands to load the same plugins at startup.
 %plugin run a value
 %plugin run b value
 ```
+
+Enabled plugins load before the prompt or any `--startup` script. The REPL
+saves absolute source paths under `$XDG_CONFIG_HOME/clang-tracer/repl/enabled-plugins`
+or `~/.config/clang-tracer/repl/enabled-plugins`. Startup uses the launcher's
+C++ options, including any `--cpp-arg` flags. A plugin that fails to load is
+reported by name and startup continues. `%plugin disable NAME` removes its
+startup registration and the current session can keep using the loaded plugin.
+Use `%plugin load FILE --as NAME` for a single session.
 
 The first load reports `compiled`. A later load of the same source and compiler
 inputs reports `cache hit`. The REPL preprocesses the source to check the

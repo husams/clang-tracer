@@ -111,11 +111,12 @@ stackFilter : '--stack-application-only' value;
 contextEventBytes : ('--context-event-bytes' | '--context-transport-memory-bytes') UINT;
 extraCompileOption : '--extra-arg' value | '--extra-args' (value | SHELL)+;
 cwdOption : CWD value;
-plugin : 'plugin' ('load' value '--as' value | 'reload' value | 'list'
+plugin : 'plugin' (('load' | 'enable') value '--as' value | 'disable' value
+                  | 'reload' value | 'list'
                   | 'run' value value | 'commands' value
                   | 'agent' ('load' value '--as' value | 'reload' value value
                             | 'run' value value));
-pluginKeyword : 'plugin' | 'run' | 'commands' | 'agent';
+pluginKeyword : 'plugin' | 'run' | 'commands' | 'agent' | 'enable' | 'disable';
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';

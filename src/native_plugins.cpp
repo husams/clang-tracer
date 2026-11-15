@@ -106,29 +106,35 @@ std::string digest(llvm::StringRef bytes) {
                      /*LowerCase=*/true);
 }
 
-fs::path plugin_cache(const fs::path &directory) {
-  fs::create_directories(directory.parent_path());
-  if (::mkdir(directory.c_str(), 0700) && errno != EEXIST)
-    throw std::system_error(errno, std::generic_category(), directory.string());
-  // A cache entry becomes executable code. Use the resolved path and reject
-  // ancestors that another user could replace.
+} // namespace
+
+fs::path private_plugin_directory(const fs::path &directory, bool create) {
+  if (create) {
+    fs::create_directories(directory.parent_path());
+    if (::mkdir(directory.c_str(), 0700) && errno != EEXIST)
+      throw std::system_error(errno, std::generic_category(), directory.string());
+  }
+  // These files control what native code is loaded. Reject ancestors that
+  // another user could replace.
   auto canonical = fs::canonical(directory);
   struct stat info{};
   for (auto parent = canonical.parent_path();; parent = parent.parent_path()) {
     if (::stat(parent.c_str(), &info) ||
         (info.st_uid != 0 && info.st_uid != ::geteuid()) ||
         ((info.st_mode & 0022) && !(info.st_mode & S_ISVTX)))
-      throw std::runtime_error("untrusted plugin cache ancestor: " +
+      throw std::runtime_error("untrusted plugin directory ancestor: " +
                                parent.string());
     if (parent == parent.root_path())
       break;
   }
   if (::lstat(canonical.c_str(), &info) || !S_ISDIR(info.st_mode) ||
       info.st_uid != ::geteuid() || (info.st_mode & 0077))
-    throw std::runtime_error("plugin cache must be an owner-only directory: " +
+    throw std::runtime_error("plugin directory must be owner-only: " +
                              canonical.string());
   return canonical;
 }
+
+namespace {
 
 std::unique_ptr<llvm::MemoryBuffer> cached_object(const fs::path &path) {
   if (!fs::is_regular_file(fs::symlink_status(path)))
@@ -229,7 +235,7 @@ plugin_object(llvm::orc::LLJIT &jit, const NativePluginSource &input,
   if (offer && (offer->fingerprint != fingerprint ||
                 offer->checksum != digest(offer->bytes)))
     return {};
-  auto path = plugin_cache(cache) / (fingerprint + ".o");
+  auto path = private_plugin_directory(cache, true) / (fingerprint + ".o");
   if (auto object = cached_object(path))
     return Artifact{std::move(path), std::move(object), true, false};
   if (offer) {

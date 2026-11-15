@@ -15,7 +15,11 @@ class CppEngine;
 class Plugins {
   tracer::NativePlugins plugins_;
 
+  void load(const std::string &id, const std::filesystem::path &source,
+            const CppEngine &cpp, std::ostream &out, bool reload = false);
+
 public:
+  void load_enabled(const CppEngine &cpp, std::ostream &out, std::ostream &errors);
   void execute(const Command &command, const CppEngine &cpp, std::ostream &out);
   void offer_agent_object(clangtracer::v1::AgentPluginRequest &request,
                           const std::string &path, const CppEngine &cpp);

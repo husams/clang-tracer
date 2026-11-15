@@ -223,6 +223,8 @@ const CommandTopic commands[] = {
      "%cpp options compdb build/compile_commands.json --file src/target.cpp"},
     {"plugin", "", "Load and run trusted local C++ plugins in the REPL."},
     {"plugin load", "%plugin load FILE --as NAME", "Compile or reuse a cached object and load it in its own JIT scope."},
+    {"plugin enable", "%plugin enable FILE --as NAME", "Load a trusted C++ plugin and remember it for future REPL sessions."},
+    {"plugin disable", "%plugin disable NAME", "Stop loading a plugin automatically in future REPL sessions."},
     {"plugin reload", "%plugin reload NAME", "Stage a fresh generation for a loaded plugin and replace it if loading succeeds."},
     {"plugin list", "%plugin list", "List loaded plugins and their active generations."},
     {"plugin run", "%plugin run NAME COMMAND", "Run a command registered by a loaded plugin."},

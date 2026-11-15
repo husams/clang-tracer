@@ -64,6 +64,8 @@ enum class CommandKind {
   cpp_generate,
   cpp_options,
   plugin_load,
+  plugin_enable,
+  plugin_disable,
   plugin_reload,
   plugin_list,
   plugin_run,

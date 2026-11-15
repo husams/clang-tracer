@@ -2569,6 +2569,8 @@ public:
   case K::cpp_options:
   case K::cpp_generate:
   case K::plugin_load:
+  case K::plugin_enable:
+  case K::plugin_disable:
   case K::plugin_reload:
   case K::plugin_list:
   case K::plugin_run:

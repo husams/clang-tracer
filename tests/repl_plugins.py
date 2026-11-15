@@ -11,13 +11,17 @@ repl, examples = map(Path, sys.argv[1:])
 
 with tempfile.TemporaryDirectory(prefix="tracer-repl-plugins-") as directory:
     root = Path(directory)
-    env = {**os.environ, "XDG_CACHE_HOME": str(root / "cache")}
+    env = {
+        **os.environ,
+        "XDG_CACHE_HOME": str(root / "cache"),
+        "XDG_CONFIG_HOME": str(root / "config"),
+    }
     for name in ("a", "b"):
         shutil.copyfile(examples / f"plugin_{name}.cpp", root / f"plugin_{name}.cpp")
 
-    def run(commands, *, expected_status=0):
+    def run(commands, *, expected_status=0, cwd=root):
         result = subprocess.run(
-            [repl], input=commands + "\n%quit\n", cwd=root, env=env,
+            [repl], input=commands + "\n%quit\n", cwd=cwd, env=env,
             text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=40,
         )
         assert result.returncode == expected_status, result.stdout
@@ -122,4 +126,51 @@ const TracerReplPluginV1 *tracer_repl_plugin_v1() { return &descriptor; }
 %plugin run b tick""")
     assert "b generation 2 active (compiled)" in invalidated, invalidated
     assert "b.tick = 10" in invalidated and "b.tick = 11" in invalidated, invalidated
-    print(cold + warm + rejected + invalidated, end="")
+    assert "(no plugins loaded)" in run("%plugin list")
+    (root / "plugin_b.cpp").write_text(source_b)
+    enabled = run("""%plugin enable "plugin_a.cpp" --as a
+%plugin enable "plugin_b.cpp" --as b
+%help plugin enable
+%plugin run a tick
+%plugin run b tick""")
+    assert "a enabled at startup" in enabled and "b enabled at startup" in enabled, enabled
+    assert "%plugin enable FILE --as NAME" in enabled, enabled
+    assert "a.tick = 1" in enabled and "b.tick = 10" in enabled, enabled
+
+    startup_cwd = root / "other-directory"
+    startup_cwd.mkdir()
+    shutil.rmtree(root / "cache")
+    cold_start = run("%plugin run a tick\n%plugin run b tick", cwd=startup_cwd)
+    assert "a generation 1 active (compiled)" in cold_start, cold_start
+    assert "b generation 1 active (compiled)" in cold_start, cold_start
+    assert "a.tick = 1" in cold_start and "b.tick = 10" in cold_start, cold_start
+
+    warm_start = run("""%plugin run a address
+%plugin run b address
+%plugin run a tick
+%plugin run b tick
+%plugin reload a
+%plugin run a address
+%plugin run b address
+%plugin run a value
+%plugin run b value""", cwd=startup_cwd)
+    assert "a generation 1 active (cache hit)" in warm_start, warm_start
+    assert "b generation 1 active (cache hit)" in warm_start, warm_start
+    assert "a generation 2 active (cache hit)" in warm_start, warm_start
+    assert "a.value = 0" in warm_start and "b.value = 10" in warm_start, warm_start
+    a_first, a_second = re.findall(r"^a\.address = (\d+)$", warm_start, re.MULTILINE)
+    b_first, b_second = re.findall(r"^b\.address = (\d+)$", warm_start, re.MULTILINE)
+    assert a_first != a_second and b_first == b_second, warm_start
+    assert b_first not in (a_first, a_second), warm_start
+
+    source_a = root / "plugin_a.cpp"
+    source_a.rename(root / "missing_a.cpp")
+    skipped = run("""%plugin run b tick
+%plugin disable a
+%plugin disable b
+%plugin run b tick""", cwd=startup_cwd)
+    assert "startup plugin a:" in skipped, skipped
+    assert "b generation 1 active (cache hit)" in skipped, skipped
+    assert "b.tick = 10" in skipped and "b.tick = 20" in skipped, skipped
+    assert "(no plugins loaded)" in run("%plugin list")
+    print(cold + warm + rejected + invalidated + cold_start + warm_start, end="")
