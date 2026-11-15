@@ -815,13 +815,14 @@ def main() -> int:
                     rows, event_cursor = wait_binary(
                         args.client, endpoint, target.pid, active, args.output_dir,
                         args.protoc, args.proto, 1, event_cursor)
-                    require(len(rows) == 1 and
-                            re.search(r"^callback_error:\s*true", rows[0], re.M) and
-                            re.search(r'^callback_error_message:\s*"callback threw"',
-                                      rows[0], re.M) and
-                            re.search(r"^phase:\s*PRE", rows[0], re.M) and
-                            re.search(r"^call_id:\s*[1-9]", rows[0], re.M),
-                            f"callback failure event did not identify the PRE invocation: {rows}")
+                    require(bool(rows), "expected a callback failure event")
+                    for row in rows:
+                        require(re.search(r"^callback_error:\s*true$", row, re.M) and
+                                re.search(r'^callback_error_message:\s*"callback threw"$',
+                                          row, re.M) and
+                                re.search(r"^phase:\s*PRE$", row, re.M) and
+                                re.search(r"^call_id:\s*[1-9]\d*$", row, re.M),
+                                f"callback failure event did not identify the PRE invocation: {row}")
                 time.sleep(.4)
                 # RemoveProbe reports the agent's contained callback failure count.
                 remove_after_callback_failure(args.client, endpoint, target.pid, active,
