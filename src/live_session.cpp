@@ -171,8 +171,8 @@ bool publish(std::uint32_t pid, std::uint64_t process_start,
   process.detach();
   return true;
 }
-void read_entries(live::Revision &next, const std::vector<live::Entry> &entries,
-                  const AgentRequest &response, live::SafePoint safe_point) {
+void read_entries(live::Revision &next, const live::Plan &plan, const AgentRequest &response) {
+  const auto &entries = plan.entries;
   if (response.count != entries.size() || entries.size() > live::max_entries)
     throw std::runtime_error("live JIT service returned incomplete entry addresses");
   for (std::size_t i = 0; i < entries.size(); ++i) {
@@ -182,9 +182,10 @@ void read_entries(live::Revision &next, const std::vector<live::Entry> &entries,
         response.addresses[i] - response.mapping_begin[i] >= response.mapping_size[i])
       throw std::runtime_error("agent returned an unverified JIT executable mapping");
     auto &slot = next.entries[entry.address];
-    const bool requires_drain = slot.requires_drain || safe_point == live::SafePoint::drained_stack;
+    const bool requires_drain = slot.requires_drain || plan.safe_point == live::SafePoint::drained_stack;
     slot = {entry, jump_to(entry.original_bytes.size(), response.addresses[i]),
-            response.addresses[i], response.mapping_begin[i], response.mapping_size[i], requires_drain};
+            response.addresses[i], response.mapping_begin[i], response.mapping_size[i],
+            requires_drain, plan.mock_original};
   }
 }
 
@@ -367,7 +368,7 @@ Status Session::apply_live_extension_locked(const Action &request, Status result
   try {
     result = run_live_extension_locked(planned.input, [&](AgentRequest &phase) {
       if (phase.publication == AgentRequest::Publication::install) {
-        read_entries(next, planned.native.entries, phase, planned.native.safe_point);
+        read_entries(next, planned.native, phase);
         publish_managed(phase, pid_, process_start_, before, next, [&] {
           if (cancelled && cancelled())
             throw live::Stale("managed update cancelled before publication");
@@ -544,7 +545,7 @@ clangtracer::v1::LiveUpdateStatus Session::activate_live_locked(
     next.managed_native = false;
     for (const auto &source : plan.accepted_sources)
       next.sources[source.path] = source;
-    read_entries(next, plan.entries, response, plan.safe_point);
+    read_entries(next, plan, response);
 
     const auto next_id = live_.last_committed + 1;
     if (!next_id)

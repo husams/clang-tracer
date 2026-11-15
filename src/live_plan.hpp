@@ -14,6 +14,7 @@ struct Plan {
   std::vector<clangtracer::v1::LiveUpdateStatus::Candidate> candidates;
   std::vector<SourceFile> accepted_sources;
   SafePoint safe_point = SafePoint::independent_entry;
+  std::uintptr_t mock_original = 0;
   std::function<void()> validate_sources;
 };
 

@@ -104,10 +104,10 @@ the active revision.
 ```
 
 Live mocks use exact signatures. `--bind "ALIAS=SIGNATURE"` binds a verified
-application callable. `ctx.original(...)` calls the implementation active
-when the mock was installed. Use `--recursion original` to route recursive
-calls through that implementation. `%live revert` restores the previous
-dispatch.
+application callable. `ctx.original(...)` calls the unmocked implementation,
+including any active live update. Replacing a mock preserves that underlying
+implementation. Use `--recursion original` to route recursive calls through
+it. `%live revert` restores the previous dispatch.
 
 Object callbacks use a discovery function with `clang_tracer::ObjectSink`
 from `<clang_tracer/live.hpp>`. A callback may take shared owners, borrowed

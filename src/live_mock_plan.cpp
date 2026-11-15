@@ -101,8 +101,12 @@ Plan plan_live_mock(std::uint32_t pid, const std::string& executable,
     if (i == 0) {
       context.target = std::move(callable);
       const auto previous = active.entries.find(entry.address);
-      context.original = previous == active.entries.end() ? entry.original()
-                                                          : previous->second.destination;
+      context.original = entry.original();
+      if (previous != active.entries.end()) {
+        const auto &active_entry = previous->second;
+        context.original = active_entry.mock_original ? active_entry.mock_original
+                                                      : active_entry.destination;
+      }
     } else {
       context.bindings.push_back(std::move(callable));
     }
@@ -111,6 +115,7 @@ Plan plan_live_mock(std::uint32_t pid, const std::string& executable,
 
   Plan plan;
   plan.jit = build_live_mock(command, context);
+  plan.mock_original = context.original;
   plan.entries.push_back(entries.front());
   plan.validate_sources = [pid, entries = std::move(entries), validate_build = native.revalidate] {
     validate_build();

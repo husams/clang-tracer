@@ -15,6 +15,10 @@ DRIVER = r"""
 #include <thread>
 #include <sys/prctl.h>
 #include <unistd.h>
+#ifndef PR_SET_PTRACER
+#define PR_SET_PTRACER 0x59616d61
+#define PR_SET_PTRACER_ANY ((unsigned long)-1)
+#endif
 int first(int);
 int second(int);
 int lookup(int);

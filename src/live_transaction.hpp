@@ -13,6 +13,7 @@ struct ActiveEntry {
   std::uintptr_t mapping_begin = 0;
   std::size_t mapping_size = 0;
   bool requires_drain = false;
+  std::uintptr_t mock_original = 0;
 };
 
 struct Revision {
