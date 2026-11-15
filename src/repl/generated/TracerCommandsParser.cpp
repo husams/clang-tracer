@@ -1,5 +1,5 @@
 
-// Generated from TracerCommands.g4 by ANTLR 4.13.2
+// Generated from src/repl/TracerCommands.g4 by ANTLR 4.13.2
 
 
 #include "TracerCommandsVisitor.h"
@@ -185,7 +185,7 @@ void tracercommandsParserInitialize() {
     25,25,51,53,56,58,2,0,193,193,203,203,1,0,63,64,1,0,84,87,1,0,89,90,2,
     0,67,67,91,92,1,0,96,97,2,0,27,27,37,37,1,0,105,106,3,0,25,25,51,51,110,
     113,17,0,2,6,9,9,11,11,13,16,18,23,35,35,40,40,43,46,48,50,65,66,68,68,
-    70,72,77,83,89,90,94,109,114,126,198,198,3,0,108,108,122,122,127,127,
+    70,72,77,83,89,90,94,109,114,127,198,198,3,0,108,108,122,122,127,127,
     5,0,24,25,37,37,41,41,52,52,129,139,2,0,3,3,108,108,1,0,5,6,8,0,7,7,25,
     25,27,27,37,37,51,53,63,64,76,76,141,167,4,0,30,30,59,59,85,85,168,177,
     1,0,189,190,800,0,100,1,0,0,0,2,132,1,0,0,0,4,134,1,0,0,0,6,151,1,0,0,
@@ -1349,7 +1349,7 @@ TracerCommandsParser::DetachContext* TracerCommandsParser::detach() {
     _la = _input->LA(1);
     if ((((_la & ~ 0x3fULL) == 0) &&
       ((1ULL << _la) & 2103400120314492) != 0) || ((((_la - 65) & ~ 0x3fULL) == 0) &&
-      ((1ULL << (_la - 65)) & 4611158252360036587) != 0) || ((((_la - 193) & ~ 0x3fULL) == 0) &&
+      ((1ULL << (_la - 65)) & 9222844270787424491) != 0) || ((((_la - 193) & ~ 0x3fULL) == 0) &&
       ((1ULL << (_la - 193)) & 1059) != 0)) {
       setState(174);
       value();
@@ -3687,6 +3687,7 @@ TracerCommandsParser::CppContext* TracerCommandsParser::cpp() {
                 case TracerCommandsParser::T__123:
                 case TracerCommandsParser::T__124:
                 case TracerCommandsParser::T__125:
+                case TracerCommandsParser::T__126:
                 case TracerCommandsParser::UINT:
                 case TracerCommandsParser::STRING:
                 case TracerCommandsParser::STACK:
@@ -3710,7 +3711,7 @@ TracerCommandsParser::CppContext* TracerCommandsParser::cpp() {
               _la = _input->LA(1);
             } while ((((_la & ~ 0x3fULL) == 0) &&
               ((1ULL << _la) & 2103400120314492) != 0) || ((((_la - 65) & ~ 0x3fULL) == 0) &&
-              ((1ULL << (_la - 65)) & 4611158252360036587) != 0) || ((((_la - 193) & ~ 0x3fULL) == 0) &&
+              ((1ULL << (_la - 65)) & 9222844270787424491) != 0) || ((((_la - 193) & ~ 0x3fULL) == 0) &&
               ((1ULL << (_la - 193)) & 1063) != 0));
             break;
           }
@@ -3959,7 +3960,7 @@ TracerCommandsParser::HelpContext* TracerCommandsParser::help() {
     _la = _input->LA(1);
     if ((((_la & ~ 0x3fULL) == 0) &&
       ((1ULL << _la) & 2103400120314494) != 0) || ((((_la - 65) & ~ 0x3fULL) == 0) &&
-      ((1ULL << (_la - 65)) & 4611158252360036587) != 0) || ((((_la - 193) & ~ 0x3fULL) == 0) &&
+      ((1ULL << (_la - 65)) & 9222844270787424491) != 0) || ((((_la - 193) & ~ 0x3fULL) == 0) &&
       ((1ULL << (_la - 193)) & 1059) != 0)) {
       setState(486);
       _errHandler->sync(this);
@@ -3980,7 +3981,7 @@ TracerCommandsParser::HelpContext* TracerCommandsParser::help() {
         _la = _input->LA(1);
       } while ((((_la & ~ 0x3fULL) == 0) &&
         ((1ULL << _la) & 2103400120314492) != 0) || ((((_la - 65) & ~ 0x3fULL) == 0) &&
-        ((1ULL << (_la - 65)) & 4611158252360036587) != 0) || ((((_la - 193) & ~ 0x3fULL) == 0) &&
+        ((1ULL << (_la - 65)) & 9222844270787424491) != 0) || ((((_la - 193) & ~ 0x3fULL) == 0) &&
         ((1ULL << (_la - 193)) & 1059) != 0));
     }
 
@@ -4367,6 +4368,7 @@ TracerCommandsParser::ValueContext* TracerCommandsParser::value() {
       case TracerCommandsParser::T__123:
       case TracerCommandsParser::T__124:
       case TracerCommandsParser::T__125:
+      case TracerCommandsParser::T__126:
       case TracerCommandsParser::STACK: {
         enterOuterAlt(_localctx, 4);
         setState(521);
@@ -4429,7 +4431,7 @@ TracerCommandsParser::KeywordContext* TracerCommandsParser::keyword() {
     _la = _input->LA(1);
     if (!((((_la & ~ 0x3fULL) == 0) &&
       ((1ULL << _la) & 2103400120314492) != 0) || ((((_la - 65) & ~ 0x3fULL) == 0) &&
-      ((1ULL << (_la - 65)) & 4611158252360036587) != 0) || _la == TracerCommandsParser::STACK)) {
+      ((1ULL << (_la - 65)) & 9222844270787424491) != 0) || _la == TracerCommandsParser::STACK)) {
     _errHandler->recoverInline(this);
     }
     else {
@@ -4603,6 +4605,7 @@ TracerCommandsParser::LiveUpdateContext* TracerCommandsParser::liveUpdate() {
             case TracerCommandsParser::T__123:
             case TracerCommandsParser::T__124:
             case TracerCommandsParser::T__125:
+            case TracerCommandsParser::T__126:
             case TracerCommandsParser::UINT:
             case TracerCommandsParser::STRING:
             case TracerCommandsParser::STACK:
@@ -4642,7 +4645,7 @@ TracerCommandsParser::LiveUpdateContext* TracerCommandsParser::liveUpdate() {
           _la = _input->LA(1);
         } while ((((_la & ~ 0x3fULL) == 0) &&
           ((1ULL << _la) & 6609336260225660) != 0) || ((((_la - 65) & ~ 0x3fULL) == 0) &&
-          ((1ULL << (_la - 65)) & 4611158252360036587) != 0) || ((((_la - 129) & ~ 0x3fULL) == 0) &&
+          ((1ULL << (_la - 65)) & 9222844270787424491) != 0) || ((((_la - 129) & ~ 0x3fULL) == 0) &&
           ((1ULL << (_la - 129)) & 4095) != 0) || ((((_la - 193) & ~ 0x3fULL) == 0) &&
           ((1ULL << (_la - 193)) & 1059) != 0));
         break;
@@ -4826,7 +4829,7 @@ TracerCommandsParser::LiveScanSelectionContext* TracerCommandsParser::liveScanSe
       _la = _input->LA(1);
     } while ((((_la & ~ 0x3fULL) == 0) &&
       ((1ULL << _la) & 2103400120314492) != 0) || ((((_la - 65) & ~ 0x3fULL) == 0) &&
-      ((1ULL << (_la - 65)) & 4611158252360036587) != 0) || ((((_la - 193) & ~ 0x3fULL) == 0) &&
+      ((1ULL << (_la - 65)) & 9222844270787424491) != 0) || ((((_la - 193) & ~ 0x3fULL) == 0) &&
       ((1ULL << (_la - 193)) & 1059) != 0));
 
   }
@@ -5001,7 +5004,7 @@ TracerCommandsParser::ObjectWatchContext* TracerCommandsParser::objectWatch() {
         _la = _input->LA(1);
         if ((((_la & ~ 0x3fULL) == 0) &&
           ((1ULL << _la) & 2103400120314492) != 0) || ((((_la - 65) & ~ 0x3fULL) == 0) &&
-          ((1ULL << (_la - 65)) & 4611158252360036587) != 0) || ((((_la - 193) & ~ 0x3fULL) == 0) &&
+          ((1ULL << (_la - 65)) & 9222844270787424491) != 0) || ((((_la - 193) & ~ 0x3fULL) == 0) &&
           ((1ULL << (_la - 193)) & 1059) != 0)) {
           setState(577);
           value();
@@ -5539,6 +5542,7 @@ TracerCommandsParser::ProbeEntryContext* TracerCommandsParser::probeEntry() {
       case TracerCommandsParser::T__123:
       case TracerCommandsParser::T__124:
       case TracerCommandsParser::T__125:
+      case TracerCommandsParser::T__126:
       case TracerCommandsParser::UINT:
       case TracerCommandsParser::STRING:
       case TracerCommandsParser::STACK:
@@ -5931,6 +5935,7 @@ TracerCommandsParser::ExtraCompileOptionContext* TracerCommandsParser::extraComp
             case TracerCommandsParser::T__123:
             case TracerCommandsParser::T__124:
             case TracerCommandsParser::T__125:
+            case TracerCommandsParser::T__126:
             case TracerCommandsParser::UINT:
             case TracerCommandsParser::STRING:
             case TracerCommandsParser::STACK:
@@ -5954,7 +5959,7 @@ TracerCommandsParser::ExtraCompileOptionContext* TracerCommandsParser::extraComp
           _la = _input->LA(1);
         } while ((((_la & ~ 0x3fULL) == 0) &&
           ((1ULL << _la) & 2103400120314492) != 0) || ((((_la - 65) & ~ 0x3fULL) == 0) &&
-          ((1ULL << (_la - 65)) & 4611158252360036587) != 0) || ((((_la - 193) & ~ 0x3fULL) == 0) &&
+          ((1ULL << (_la - 65)) & 9222844270787424491) != 0) || ((((_la - 193) & ~ 0x3fULL) == 0) &&
           ((1ULL << (_la - 193)) & 1063) != 0));
         break;
       }
