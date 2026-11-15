@@ -211,7 +211,7 @@ ExtensionPlan plan_extension(std::uint32_t pid, std::uint64_t process_start,
     *update = encode(sources.jit, update_paths);
     for (const auto &symbol : sources.jit.entry_symbols)
       update->add_entry_symbols(symbol);
-    input.set_publish_native(!sources.jit.entry_symbols.empty());
+    input.set_publish_native(result.native.publishes_code());
     std::vector<std::string> recipe_headers;
     if (!registry.empty()) {
       for (const auto &path : update_paths) {

@@ -364,6 +364,32 @@ ClosureScope closure_scope(std::string_view symbol, const std::map<std::string, 
   return {};
 }
 
+bool lambda_was_renumbered(const std::string &name, const Definition &original,
+                           const std::string &owner,
+                           const std::map<std::string, Definition> &before,
+                           const std::map<std::string, Definition> &after) {
+  if (original.lambda_expression.empty())
+    return false;
+  const auto [original_owner, ordinal] = closure_scope(name, before);
+  if (original_owner != owner)
+    return false;
+  const auto call_signature = name.substr(name.find(ordinal) + ordinal.size());
+  const auto matches = [&](const auto &entry) {
+    const auto &[symbol, body] = entry;
+    const auto [candidate_owner, candidate_ordinal] = closure_scope(symbol, before);
+    return candidate_owner == owner && body.path == original.path &&
+           symbol.substr(symbol.find(candidate_ordinal) + candidate_ordinal.size()) == call_signature &&
+           (body.lambda_expression == original.lambda_expression ||
+            (!original.lambda_binding.empty() && body.lambda_binding == original.lambda_binding));
+  };
+  // Finding the same closure declaration at a unique new ordinal proves the
+  // capture layout at the old ordinal now belongs to a different closure.
+  if (std::ranges::count_if(before, matches) != 1 || std::ranges::count_if(after, matches) != 1)
+    return false;
+  const auto moved = std::ranges::find_if(after, matches);
+  return moved->first != name && moved->second.abi == original.abi;
+}
+
 bool closure_is_local_to(const llvm::Module &module, const std::string &symbol,
                          const std::string &owner, std::set<std::string> *route = nullptr) {
   const auto *entry = module.getFunction(symbol);
@@ -1105,6 +1131,18 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       for (const auto &name : prior->second)
         if (after_definitions.contains(name))
           revision_closures.insert(name);
+    std::set<ClosureScope> private_families;
+    for (const auto &name : revision_closures)
+      if (after_definitions.at(name).lambda_site) {
+        const auto scope = closure_scope(name, after_definitions);
+        if (!scope.first.empty())
+          private_families.insert(scope);
+      }
+    // An algorithm may disappear for one revision while the predicate stays
+    // private. Its re-emitted instantiation must use that private predicate.
+    for (const auto &[name, body] : after_definitions)
+      if (body.local && private_families.contains(closure_scope(name, after_definitions)))
+        revision_closures.insert(name);
     if (before) {
       auto before_definitions = changed ? definitions(*before) : after_definitions;
       std::optional<CompiledUnit> built;
@@ -1137,12 +1175,33 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
           if (before_definitions.contains(name))
             continue;
           const auto *symbol = definition.local ? local_symbol(name, path) : image.find(name, false);
-          if (symbol && std::ranges::any_of(active.entries, [&](const auto &entry) {
-                const auto &binding = entry.second.binding;
-                return binding.module == module && binding.elf_address == symbol->address &&
-                       !entry.second.mock_original;
-              }))
+          if (!symbol)
+            continue;
+          const auto installed = std::ranges::find_if(active.entries, [&](const auto &entry) {
+            const auto &binding = entry.second.binding;
+            return binding.module == module && binding.elf_address == symbol->address;
+          });
+          if (installed == active.entries.end())
+            continue;
+          const auto &slot = installed->second;
+          if (!slot.mock_original) {
             reappeared_patched.insert(name);
+          } else if (slot.mock_original != slot.binding.original() &&
+                     equivalent_body(definition, after_definitions.at(name))) {
+            if (!slot.native_mock_alternate) {
+              block(path, name, "rebuild required: the installed mock has no retained native original");
+              continue;
+            }
+            if (result.restore_mock_originals.insert(installed->first).second) {
+              auto &candidate = result.candidates.emplace_back();
+              candidate.set_state(api::LiveUpdateStatus::PLANNED);
+              candidate.set_symbol(slot.binding.symbol);
+              candidate.set_signature(slot.binding.signature);
+              candidate.set_source(slot.binding.source);
+              candidate.set_module(module);
+              candidate.set_address(installed->first);
+            }
+          }
         }
         before_definitions.merge(vanished);
       }
@@ -1246,12 +1305,14 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
           continue;
         const bool captured_state = !prior.has_source_abi || llvm::StringRef(prior.abi).contains(" capture ") ||
             (next != after_definitions.end() && llvm::StringRef(next->second.abi).contains(" capture "));
-        if (captured_state && next != after_definitions.end() && prior.abi != next->second.abi)
+        if (captured_state && next != after_definitions.end() && prior.abi != next->second.abi &&
+            !lambda_was_renumbered(name, prior, owner, before_definitions, after_definitions)) {
           block(path, name, "rebuild required: lambda capture layout or callable ABI changed");
-        else if (!closure_is_local_to(*before->module, name, owner) ||
-            (captured_state && !closure_is_on_stack(*before->module->getFunction(name), owner)))
-          block(path, name, "rebuild required: cannot match an existing lambda used outside its enclosing function");
-        else {
+        } else if (!closure_is_local_to(*before->module, name, owner)) {
+          block(path, name, "rebuild required: cannot prove the existing lambda's calls stay within its enclosing function");
+        } else if (captured_state && !closure_is_on_stack(*before->module->getFunction(name), owner)) {
+          block(path, name, "rebuild required: cannot prove the existing lambda's captured storage stays on the stack");
+        } else {
           result.safe_point = SafePoint::drained_stack;
           // Preserve the whole new dispatch route. Importing an unchanged
           // algorithm instantiation would send the call to the old operator.
@@ -1420,11 +1481,15 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         throw std::runtime_error("rebuild required: local lifecycle alias needs a verified native entry");
       const auto canonical = physical_body(key, new_bodies);
       auto binding = bind(pid, image, *symbol, old, active);
+      if (result.restore_mock_originals.contains(binding.address))
+        throw std::runtime_error("competing native replacement for a restored mock");
       candidate.set_address(binding.address);
       candidate.set_state(api::LiveUpdateStatus::PLANNED);
       const auto address = binding.address;
       if (entries.emplace(address, canonical).second) {
         binding.symbol = old.local ? name : canonical;
+        binding.signature = candidate.signature();
+        binding.source = candidate.source();
         result.entries.push_back(std::move(binding));
       } else if (entries.at(address) != canonical) {
         throw std::runtime_error("rebuild required: multiple definitions name one native entry");
@@ -1476,7 +1541,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
   }
   for (const auto &entry : result.entries)
     result.jit.entry_symbols.push_back(entries.at(entry.address));
-  if (result.entries.size() > 1)
+  if (result.entries.size() + result.restore_mock_originals.size() > 1)
     result.safe_point = SafePoint::drained_stack;
 
   result.validate_sources = [files = std::move(sources.submitted),

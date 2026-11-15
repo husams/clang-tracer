@@ -188,21 +188,49 @@ bool publish(std::uint32_t pid, std::uint64_t process_start,
   process.detach();
   return true;
 }
+std::size_t staged_entry_count(const live::Plan &plan) {
+  return plan.entries.size() + plan.has_native_mock_alternate;
+}
+
+live::JitEntryAddress read_jit_address(const AgentRequest &response, std::size_t index) {
+  const auto address = response.addresses[index];
+  const auto begin = response.mapping_begin[index];
+  const auto size = response.mapping_size[index];
+  if (!begin || !size || address < begin || address - begin >= size)
+    throw std::runtime_error("agent returned an unverified JIT executable mapping");
+  return {address, begin, size};
+}
+
 void read_entries(live::Revision &next, const live::Plan &plan, const AgentRequest &response) {
   const auto &entries = plan.entries;
-  if (response.count != entries.size() || entries.size() > live::max_entries)
+  if (response.count != staged_entry_count(plan) || response.count > live::max_entries)
     throw std::runtime_error("live JIT service returned incomplete entry addresses");
   for (std::size_t i = 0; i < entries.size(); ++i) {
     const auto &entry = entries[i];
-    if (!response.mapping_begin[i] || !response.mapping_size[i] ||
-        response.addresses[i] < response.mapping_begin[i] ||
-        response.addresses[i] - response.mapping_begin[i] >= response.mapping_size[i])
-      throw std::runtime_error("agent returned an unverified JIT executable mapping");
+    const auto output = read_jit_address(response, i);
     auto &slot = next.entries[entry.address];
     const bool requires_drain = slot.requires_drain || plan.safe_point == live::SafePoint::drained_stack;
-    slot = {entry, jump_to(entry.original_bytes.size(), response.addresses[i]),
-            response.addresses[i], response.mapping_begin[i], response.mapping_size[i],
-            requires_drain, plan.mock_original};
+    slot = {entry, jump_to(entry.original_bytes.size(), output.destination),
+            output.destination, output.mapping_begin, output.mapping_size,
+            requires_drain, plan.mock_original, {}};
+  }
+  if (plan.has_native_mock_alternate) {
+    if (entries.size() != 1 || !plan.mock_original)
+      throw std::runtime_error("invalid native mock alternate entry");
+    next.entries.at(entries.front().address).native_mock_alternate = read_jit_address(response, 1);
+  }
+  for (const auto address : plan.restore_mock_originals) {
+    auto &slot = next.entries.at(address);
+    if (!slot.mock_original || !slot.native_mock_alternate)
+      throw live::Stale("restoring a mock requires its retained native entry");
+    const auto output = *slot.native_mock_alternate;
+    slot.installed_bytes = jump_to(slot.binding.original_bytes.size(), output.destination);
+    slot.destination = output.destination;
+    slot.mapping_begin = output.mapping_begin;
+    slot.mapping_size = output.mapping_size;
+    slot.requires_drain |= plan.safe_point == live::SafePoint::drained_stack;
+    slot.mock_original = slot.binding.original();
+    slot.native_mock_alternate.reset();
   }
 }
 
@@ -470,7 +498,7 @@ Status Session::apply_live_extension_locked(const Action &request, Status result
   record->second.parent = previous;
   record->second.managed = 0;
   auto &next = record->second;
-  next.managed_native = !planned.native.entries.empty();
+  next.managed_native = planned.native.publishes_code();
   for (const auto &source : planned.native.accepted_sources)
     next.sources[source.path] = source;
   for (const auto &[unit, closures] : planned.native.private_closures)
@@ -593,7 +621,7 @@ clangtracer::v1::LiveUpdateStatus Session::live_update(
       result.set_diagnostic("submitted group lacks independent coverage evidence");
       return result;
     }
-    if (plan.entries.empty()) {
+    if (!plan.publishes_code()) {
       result.set_state(Status::UNCHANGED);
       result.set_diagnostic("no changed native application entry");
       return result;
@@ -625,50 +653,54 @@ clangtracer::v1::LiveUpdateStatus Session::activate_live_locked(
   std::uint64_t stage_operation = 0;
   bool did_commit = false;
   try {
-    if (plan.entries.size() > live::max_entries)
+    if (staged_entry_count(plan) > live::max_entries ||
+        plan.entries.size() + plan.restore_mock_originals.size() > live::max_entries)
       throw std::runtime_error("submitted group exceeds the live JIT entry budget");
 
     if (plan.validate_sources)
       plan.validate_sources();
-    if (plan.jit.entry_symbols.size() != plan.entries.size())
-      throw std::runtime_error("each native entry needs one exact JIT definition");
-    const auto wire = jit_wire(plan.jit);
-    check_payload_size(wire, input_limit, "live JIT snapshot");
-    const auto source_bytes = wire.SerializeAsString();
-    const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
-    attach_process(process, deadline);
-    AgentRequest stage;
-    stage.action = AgentRequest::Action::stage;
-    stage.limit = retention_limit ? retention_limit : live_.limit;
-    stage.input_limit = input_limit;
-    stage_operation = invoke(process, live_address_, stage, source_bytes).token;
-    process.detach();
-    if (!stage_operation)
-      throw std::runtime_error("agent did not launch the native live compile");
-
-    AgentRequest poll;
-    poll.action = AgentRequest::Action::stage_poll;
-    poll.token = stage_operation;
+    const auto limit = retention_limit ? retention_limit : live_.limit;
     AgentRequest response;
-    for (;;) {
-      if (cancelled && cancelled())
-        throw live::Stale("native live compile cancelled");
-      if (std::chrono::steady_clock::now() >= deadline)
-        throw std::runtime_error("native live compile exceeded the operation timeout");
+    if (!plan.entries.empty()) {
+      if (plan.jit.entry_symbols.size() != staged_entry_count(plan))
+        throw std::runtime_error("each native entry needs one exact JIT definition");
+      const auto wire = jit_wire(plan.jit);
+      check_payload_size(wire, input_limit, "live JIT snapshot");
+      const auto source_bytes = wire.SerializeAsString();
+      const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
       attach_process(process, deadline);
-      response = invoke(process, live_address_, poll);
-      if (response.ready) {
-        stage_operation = 0;
-        staged_token = response.token;
-        live_.retained = response.retained;
-      }
+      AgentRequest stage;
+      stage.action = AgentRequest::Action::stage;
+      stage.limit = limit;
+      stage.input_limit = input_limit;
+      stage_operation = invoke(process, live_address_, stage, source_bytes).token;
       process.detach();
-      if (response.ready)
-        break;
-      std::this_thread::sleep_for(std::chrono::milliseconds(15));
+      if (!stage_operation)
+        throw std::runtime_error("agent did not launch the native live compile");
+
+      AgentRequest poll;
+      poll.action = AgentRequest::Action::stage_poll;
+      poll.token = stage_operation;
+      for (;;) {
+        if (cancelled && cancelled())
+          throw live::Stale("native live compile cancelled");
+        if (std::chrono::steady_clock::now() >= deadline)
+          throw std::runtime_error("native live compile exceeded the operation timeout");
+        attach_process(process, deadline);
+        response = invoke(process, live_address_, poll);
+        if (response.ready) {
+          stage_operation = 0;
+          staged_token = response.token;
+          live_.retained = response.retained;
+        }
+        process.detach();
+        if (response.ready)
+          break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+      }
+      if (!staged_token)
+        throw std::runtime_error("live JIT service did not retain the native image");
     }
-    if (!staged_token)
-      throw std::runtime_error("live JIT service did not retain the native image");
 
     auto next = live_.revisions.at(expected_revision);
     next.parent = expected_revision;
@@ -695,7 +727,7 @@ clangtracer::v1::LiveUpdateStatus Session::activate_live_locked(
                        plan.validate_sources();
                    }, [&] {
                      live_.active = live_.last_committed = next_id;
-                     live_.limit = stage.limit;
+                     live_.limit = limit;
                      did_commit = true;
                    }))
         throw std::runtime_error("affected call chain or overwrite window is active; retry at a safe point");

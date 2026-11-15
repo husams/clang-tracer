@@ -186,6 +186,7 @@ extern "C" managed::Registry* clang_tracer_managed_registry_v1() noexcept { retu
 extern "C" int cache_code();
 extern "C" int cache_other();
 extern "C" void cache_print(managed::Registry::Access&, managed::InstanceId);
+extern "C" void cache_print_generic(managed::Registry::Access&, managed::InstanceId);
 std::array<unsigned char, 16> original_other;
 std::atomic_bool corrupt_restore = false;
 
@@ -252,8 +253,12 @@ int main() {
     auto access = registry.access();
     std::printf("code %d\n", cache_code());
     std::printf("other %d\n", cache_other());
-    for (auto id : ids)
-      cache_print(access, id);
+    for (int i = 0; i != 3; ++i) {
+      if (i == 1)
+        cache_print_generic(access, ids[i]);
+      else
+        cache_print(access, ids[i]);
+    }
     std::fflush(stdout);
   }
 }
@@ -278,6 +283,11 @@ extern "C" LIVE_ENTRY int cache_code() { return cache_scale(); }
 extern "C" LIVE_ENTRY int cache_other() { return 2; }
 extern "C" LIVE_ENTRY void cache_print(managed::Registry::Access& access, managed::InstanceId id) {
   access.with<CacheV1>("Cache", id, "cache.1", [](const CacheV1& cache) {
+    std::printf("old %zu\n", cache.entries.size());
+  });
+}
+extern "C" LIVE_ENTRY void cache_print_generic(managed::Registry::Access& access, managed::InstanceId id) {
+  access.with<CacheV1>("Cache", id, "cache.1", [](const auto& cache) {
     std::printf("old %zu\n", cache.entries.size());
   });
 }

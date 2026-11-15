@@ -9,6 +9,7 @@
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/Basic/Diagnostic.h>
 #include <clang/CodeGen/CodeGenAction.h>
+#include <clang/CodeGen/ModuleBuilder.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/MultiplexConsumer.h>
 #include <clang/Lex/PPCallbacks.h>
@@ -64,25 +65,38 @@ private:
   std::set<std::string> &inputs_;
 };
 
+using InspectUnit = std::function<void(clang::ASTContext &, clang::CodeGenerator &)>;
+
 class InspectAST final : public clang::ASTConsumer {
 public:
-  explicit InspectAST(const std::function<void(clang::ASTContext &)> &inspect)
-      : inspect_(inspect) {}
+  InspectAST(const InspectUnit &inspect, clang::CodeGenerator &generator)
+      : inspect_(inspect), generator_(generator) {}
 
   void HandleTranslationUnit(clang::ASTContext &context) override {
-    if (!context.getDiagnostics().hasErrorOccurred())
-      inspect_(context);
+    if (!context.getDiagnostics().hasErrorOccurred() && generator_.GetModule())
+      inspect_(context, generator_);
   }
 
 private:
-  const std::function<void(clang::ASTContext &)> &inspect_;
+  const InspectUnit &inspect_;
+  clang::CodeGenerator &generator_;
 };
 
 class CallableTypes final : public clang::RecursiveASTVisitor<CallableTypes> {
 public:
-  CallableTypes(clang::ASTContext &context,
-           CompiledUnit &unit)
-      : context_(context), mangler_(context.createMangleContext()), unit_(unit) {}
+  CallableTypes(clang::ASTContext &context, clang::CodeGenerator &generator, CompiledUnit &unit)
+      : context_(context), mangler_(context.createMangleContext()), unit_(unit) {
+    // A separate mangling context can assign lambda ordinals in a different
+    // order than IR emission, especially when templates defer instantiation.
+    for (const auto &function : generator.GetModule()->functions()) {
+      if (function.isDeclaration())
+        continue;
+      const auto *method = llvm::dyn_cast_or_null<clang::CXXMethodDecl>(
+          generator.GetDeclForMangledName(function.getName()));
+      if (method && method->getParent()->isLambda() && method->getOverloadedOperator() == clang::OO_Call)
+        emitted_lambdas_.try_emplace(method->getCanonicalDecl(), function.getName());
+    }
+  }
 
   bool shouldVisitTemplateInstantiations() const { return true; }
 
@@ -113,12 +127,22 @@ public:
     return visit_function(function);
   }
 
+  bool VisitVarDecl(clang::VarDecl *variable) {
+    if (!variable->isLocalVarDecl() || !variable->getIdentifier() || !variable->hasInit())
+      return true;
+    if (const auto *lambda = llvm::dyn_cast<clang::LambdaExpr>(
+            variable->getInit()->IgnoreUnlessSpelledInSource()))
+      lambda_variables_.insert_or_assign(lambda->getBeginLoc().getRawEncoding(),
+                                         variable->getNameAsString());
+    return true;
+  }
+
   bool VisitLambdaExpr(clang::LambdaExpr *lambda) {
     const auto &sources = context_.getSourceManager();
     const auto *body = lambda->getBody();
     const auto first = body->getBeginLoc();
     const auto last = body->getEndLoc();
-    std::string site;
+    CompiledUnit::LambdaSource source;
     if (first.isFileID() && last.isFileID() && !sources.isInSystemHeader(first)) {
       const auto [file, begin] = sources.getDecomposedLoc(first);
       const auto [end_file, end] = sources.getDecomposedLoc(last);
@@ -126,20 +150,29 @@ public:
       if (file == end_file && begin < end && end < bytes.size()) {
         // A matching Itanium ordinal alone does not identify a closure.
         // Prove that only this lambda's body was edited in this source file.
-        site = ir_digest(bytes.take_front(begin)) + ir_digest(bytes.drop_front(end + 1));
+        source.site = ir_digest(bytes.take_front(begin)) + ir_digest(bytes.drop_front(end + 1));
+        if (const auto start = lambda->getBeginLoc(); start.isFileID()) {
+          const auto [expression_file, offset] = sources.getDecomposedLoc(start);
+          if (expression_file == file && offset <= begin) {
+            source.expression = ir_digest(bytes.slice(offset, end + 1));
+            const auto variable = lambda_variables_.find(start.getRawEncoding());
+            if (variable != lambda_variables_.end())
+              source.binding = variable->second + ":" + ir_digest(bytes.slice(offset, begin));
+          }
+        }
       }
     }
     auto *call = lambda->getCallOperator();
     if (auto *generic = call->getDescribedFunctionTemplate()) {
       for (auto *specialization : generic->specializations())
-        visit_function(specialization, site);
+        visit_function(specialization, source);
       return true;
     }
-    return visit_function(call, std::move(site));
+    return visit_function(call, std::move(source));
   }
 
 private:
-  bool visit_function(clang::FunctionDecl *function, std::string lambda_site = {}) {
+  bool visit_function(clang::FunctionDecl *function, CompiledUnit::LambdaSource lambda_source = {}) {
     const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(function);
     const bool lambda = method && method->getParent()->isLambda() &&
         method->getOverloadedOperator() == clang::OO_Call;
@@ -182,17 +215,24 @@ private:
 
     const auto record = [&](clang::GlobalDecl declaration) {
       std::string name;
-      llvm::raw_string_ostream symbol(name);
-      if (mangler_->shouldMangleDeclName(function))
-        mangler_->mangleName(declaration, symbol);
-      else
-        symbol << function->getName();
+      if (lambda) {
+        const auto emitted = emitted_lambdas_.find(method->getCanonicalDecl());
+        if (emitted == emitted_lambdas_.end())
+          return;
+        name = emitted->second.str();
+      } else {
+        llvm::raw_string_ostream symbol(name);
+        if (mangler_->shouldMangleDeclName(function))
+          mangler_->mangleName(declaration, symbol);
+        else
+          symbol << function->getName();
+      }
       if (source_definition)
         unit_.source_definitions.insert_or_assign(name, *source_definition);
       if (lambda && !system) {
         auto &site = unit_.lambda_sites[name];
-        if (!lambda_site.empty())
-          site = lambda_site;
+        if (!lambda_source.site.empty())
+          site = lambda_source;
       }
       if (!system)
         unit_.types.insert_or_assign(name, std::pair{display, fingerprint});
@@ -272,23 +312,27 @@ private:
 
   clang::ASTContext &context_;
   std::unique_ptr<clang::MangleContext> mangler_;
+  llvm::DenseMap<const clang::FunctionDecl *, llvm::StringRef> emitted_lambdas_;
+  std::map<unsigned, std::string> lambda_variables_;
   CompiledUnit &unit_;
 };
 
 class CompileAction final : public clang::EmitLLVMOnlyAction {
 public:
   CompileAction(CompiledUnit &result, llvm::LLVMContext *context,
-                const std::function<void(clang::ASTContext &)> &inspect)
+                const InspectUnit &inspect)
       : clang::EmitLLVMOnlyAction(context), result_(result), inspect_(inspect) {}
 
   std::unique_ptr<clang::ASTConsumer> CreateASTConsumer(
       clang::CompilerInstance &compiler, llvm::StringRef input) override {
+    if (inspect_)
+      compiler.getCodeGenOpts().ClearASTBeforeBackend = false;
     auto codegen = clang::EmitLLVMOnlyAction::CreateASTConsumer(compiler, input);
     if (!inspect_ || !codegen)
       return codegen;
     std::vector<std::unique_ptr<clang::ASTConsumer>> consumers;
-    consumers.push_back(std::make_unique<InspectAST>(inspect_));
     consumers.push_back(std::move(codegen));
+    consumers.push_back(std::make_unique<InspectAST>(inspect_, *getCodeGenerator()));
     return std::make_unique<clang::MultiplexConsumer>(std::move(consumers));
   }
 
@@ -306,7 +350,7 @@ public:
 
 private:
   CompiledUnit &result_;
-  const std::function<void(clang::ASTContext &)> &inspect_;
+  const InspectUnit &inspect_;
 };
 
 class Diagnostics final : public clang::DiagnosticConsumer {
@@ -773,16 +817,16 @@ CompiledUnit compile_unit(const JitRequest &request, const TranslationUnit &unit
                                      "-fsyntax-only", "-g", "-fno-discard-value-names",
                                      "-x", "c++", unit.path});
   Diagnostics diagnostics;
-  std::function<void(clang::ASTContext &)> scan = inspect;
-  if (inspection == CompileInspection::native_metadata)
-    scan = [&](clang::ASTContext &ast) {
+  InspectUnit scan;
+  if (inspect || inspection == CompileInspection::native_metadata)
+    scan = [&](clang::ASTContext &ast, clang::CodeGenerator &generator) {
       if (inspect)
         inspect(ast);
-      if (!ast.getDiagnostics().hasErrorOccurred() &&
+      if (inspection == CompileInspection::native_metadata && !ast.getDiagnostics().hasErrorOccurred() &&
           (!changed_inputs || changed_inputs->contains(unit.path) ||
            std::ranges::any_of(result.inputs,
                [&](const auto &input) { return changed_inputs->contains(input); }))) {
-        CallableTypes visitor(ast, result);
+        CallableTypes visitor(ast, generator, result);
         visitor.TraverseDecl(ast.getTranslationUnitDecl());
       }
     };
@@ -839,9 +883,11 @@ std::map<std::string, Definition> definitions(const CompiledUnit &unit) {
     item.local = function.hasLocalLinkage();
     item.discardable = item.local || function.hasLinkOnceODRLinkage() ||
                        function.hasWeakODRLinkage() || function.hasAvailableExternallyLinkage();
-    if (const auto site = unit.lambda_sites.find(function.getName().str()); site != unit.lambda_sites.end())
-      item.lambda_site = site->second;
-    else if (item.local && function.getName().contains("$_") &&
+    if (const auto site = unit.lambda_sites.find(function.getName().str()); site != unit.lambda_sites.end()) {
+      item.lambda_site = site->second.site;
+      item.lambda_expression = site->second.expression;
+      item.lambda_binding = site->second.binding;
+    } else if (item.local && function.getName().contains("$_") &&
              llvm::StringRef(item.type).contains("operator()"))
       item.lambda_site.emplace();
     if (const auto source = unit.source_definitions.find(function.getName().str());

@@ -76,6 +76,7 @@ describe_mock_callables(clang::ASTContext& ast, std::span<const std::string> sel
 struct MockCompileContext {
   MockCallable target;
   std::uintptr_t original = 0;
+  std::uintptr_t native_original = 0;
   // In the exact same order as MockCommand::bindings.
   std::vector<MockCallable> bindings;
   // Build-bound application declarations and other snapshotted inputs.
@@ -87,6 +88,7 @@ struct MockCompileContext {
 };
 
 inline constexpr std::string_view mock_entry_symbol = "clangtracer_live_mock_entry_v1";
+inline constexpr std::string_view native_mock_entry_symbol = "clangtracer_live_mock_native_entry_v1";
 
 // Compiles the generated source to check ABI without publishing a revision.
 // The common agent path materializes the returned request with compile_in_target.

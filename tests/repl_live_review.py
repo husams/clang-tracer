@@ -28,6 +28,8 @@ int adjacent_value();
 int calculate(int);
 int accepted_key();
 int registered(int);
+int persistent_capture(int);
+int local_capture(int);
 int policy_check(int);
 int count_above(int);
 int main() {
@@ -40,9 +42,9 @@ int main() {
       unlink("call");
       int one;
       try { one = first(10); } catch (int value) { one = value; }
-      std::printf("%d %d %d %d %d %d %d %d %d %d\n", one, second(10), lookup(1), third(10),
+      std::printf("%d %d %d %d %d %d %d %d %d %d %d %d\n", one, second(10), lookup(1), third(10),
                   adjacent_value(), calculate(10), accepted_key(), registered(10), policy_check(10),
-                  count_above(2));
+                  count_above(2), persistent_capture(10), local_capture(10));
       std::fflush(stdout);
     }
     usleep(3000);
@@ -82,13 +84,24 @@ LIVE_ENTRY int second(int i) { return i + 2; }
 LIVE_ENTRY int policy_check(int i) { return policy_total(i) + 1; }
 LIVE_ENTRY int count_above(int threshold) {
   std::array<int, 4> values{1, 2, 3, 4};
-  return std::count_if(values.begin(), values.end(), [=](const auto& value) {
+  const auto predicate = [=](const auto& value) {
     return value > threshold;
-  });
+  };
+  return std::count_if(values.begin(), values.end(), predicate);
 }
 LIVE_ENTRY int registered(int i) {
   static int (*const callback)(int) = [](int v) LIVE_ENTRY { return v + 17; };
   return callback(i);
+}
+LIVE_ENTRY int persistent_capture(int i) {
+  int a = 5, b = 2;
+  static auto stored = [=](int v) { return v + a * 10 + b; };
+  auto copy = stored;
+  return copy(i);
+}
+LIVE_ENTRY int local_capture(int i) {
+  auto add = [&](int n) { return i + n; };
+  return add(2);
 }
 static int counter = 1;
 LIVE_ENTRY int calculate(int i) { int values[] = {1, 2, 3}; return values[i % 3] + counter; }
@@ -179,6 +192,9 @@ def run(args, root, cleanup):
     (root / "pass.cpp").write_text(
         "int passthrough(const LiveMockContext &ctx, int value) { return ctx.original(value); }\n"
     )
+    (root / "increment.cpp").write_text(
+        "int increment(const LiveMockContext &ctx, int value) { return ctx.original(value) + 1000; }\n"
+    )
 
     def launch(*argv, env=None):
         child = subprocess.Popen(argv, cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -199,11 +215,11 @@ def run(args, root, cleanup):
         assert result[1] == outcome, "".join(console.seen[-25:])
 
     def call(first, second, *, third=15, calculated=3, key=7, callback=27,
-             policy=22, count=2, runtime=False):
+             policy=22, count=2, local=12, runtime=False):
         (root / "call").touch()
         if runtime:
             app.expect(r"^runtime=10$")
-        app.expect(rf"^{first} {second} 2 {third} 7 {calculated} {key} {callback} {policy} {count}$")
+        app.expect(rf"^{first} {second} 2 {third} 7 {calculated} {key} {callback} {policy} {count} 62 {local}$")
 
     app_source = source / "app.cpp"
     call(11, 12)
@@ -218,6 +234,24 @@ def run(args, root, cleanup):
     app_source.write_text(mixed.replace("return std::count_if", "return 10 + std::count_if"))
     command("%live update source/app.cpp", "APPLIED")
     call(11, 30, count=11)
+    command("%live revert 0", "REVERTED")
+    call(11, 12)
+
+    revised = APP.replace("value > threshold", "value >= threshold")
+    app_source.write_text(revised.replace(
+        "return std::count_if(values.begin(), values.end(), predicate);", "return predicate(2);"))
+    command("%live update source/app.cpp", "APPLIED")
+    call(11, 12, count=1)
+    app_source.write_text(revised)
+    command("%live update source/app.cpp", "APPLIED")
+    call(11, 12, count=3)
+    command("%live revert 0", "REVERTED")
+    call(11, 12)
+
+    app_source.write_text(APP.replace(
+        "  auto add =", "  auto twice = [](int n) { return n * 2; };\n  i = twice(i);\n  auto add ="))
+    command("%live update source/app.cpp", "APPLIED")
+    call(11, 12, local=22)
     command("%live revert 0", "REVERTED")
     call(11, 12)
 
@@ -257,7 +291,11 @@ def run(args, root, cleanup):
         "  static int (*const callback)(int)", "  [[maybe_unused]] auto prior = [] { return 0; };\n"
                                              "  static int (*const callback)(int)"))
     command("%live update source/app.cpp", "BLOCKED")
-    console.expect(r"cannot match an existing lambda used outside its enclosing function")
+    console.expect(r"cannot prove the existing lambda's calls")
+    call(11, 12)
+    app_source.write_text(APP.replace("a * 10 + b", "b * 100 + a"))
+    command("%live update source/app.cpp", "BLOCKED")
+    console.expect(r"lambda capture layout or callable ABI changed")
     call(11, 12)
     layout = APP.replace("struct Config { int a; }", "struct Config { int a; int b; }")
     layout = layout.replace("return i + 1;", "storage.config.b = 99; return i + 1;")
@@ -329,12 +367,20 @@ struct Handle {
     other_source.write_text(OTHER.replace("return i + 3;", "return i + 30;"))
     command("%live update source/other.cpp", "APPLIED")
     call(89, 12, third=42, calculated=10, runtime=True)
+    command('%live mock "helper(int)" --file increment.cpp --function increment', "APPLIED")
+    call(89, 12, third=1042, calculated=10, runtime=True)
     other_source.write_text(OTHER.replace("return helper(i) + counter;", "return i + 5;"))
     command("%live update source/other.cpp", "APPLIED")
     call(89, 12, calculated=10, runtime=True)
     other_source.write_text(OTHER)
     command("%live update source/other.cpp", "APPLIED")
+    call(89, 12, third=1015, calculated=10, runtime=True)
+    send(repl, "%live status")
+    console.expect(r"^  APPLIED helper\(int\).*increment\.cpp")
+    command("%live revert", "REVERTED")
     call(89, 12, calculated=10, runtime=True)
+    command("%live revert", "REVERTED")
+    call(89, 12, third=1042, calculated=10, runtime=True)
     send(repl, "%detach")
     console.expect(r"^detached session=")
     call(11, 12)

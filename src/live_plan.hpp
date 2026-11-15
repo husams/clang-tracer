@@ -17,7 +17,11 @@ struct Plan {
   std::map<std::string, std::set<std::string>> private_closures;
   SafePoint safe_point = SafePoint::independent_entry;
   std::uintptr_t mock_original = 0;
+  bool has_native_mock_alternate = false;
+  std::set<std::uintptr_t> restore_mock_originals;
   std::function<void()> validate_sources;
+
+  bool publishes_code() const { return !entries.empty() || !restore_mock_originals.empty(); }
 };
 
 class Stale : public std::runtime_error {

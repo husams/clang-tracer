@@ -16,6 +16,7 @@ namespace {
 namespace fs = std::filesystem;
 constexpr std::string_view prefix = "clangtracer_live_mock_";
 constexpr std::string_view original_symbol = "clangtracer_live_mock_original_v1";
+constexpr std::string_view native_original_symbol = "clangtracer_live_mock_native_original_v1";
 constexpr std::string_view recursion_symbol = "clangtracer_live_mock_top_v1";
 
 bool identifier(std::string_view value) {
@@ -211,6 +212,12 @@ JitRequest build_live_mock(const MockCommand& command, const MockCompileContext&
   header += "extern \"C\" " + target.result + " " + original + "(" + target.native_types + ")" +
             target.exception_spec + ";\n";
   request.imports.emplace(original, context.original);
+  const bool alternate = context.native_original && context.native_original != context.original;
+  if (alternate) {
+    header += "extern \"C\" " + target.result + " " + std::string(native_original_symbol) +
+              "(" + target.native_types + ")" + target.exception_spec + ";\n";
+    request.imports.emplace(native_original_symbol, context.native_original);
+  }
   const auto add_native_import = [&](const MockCallable& callable) {
     const auto linkage = callable.native_definition->getName().str();
     if (std::string_view(linkage).starts_with(prefix)) {
@@ -225,7 +232,8 @@ JitRequest build_live_mock(const MockCommand& command, const MockCompileContext&
 
   std::string methods;
   methods += target.result + " original(" + target.context_parameters + ") const" +
-             target.exception_spec + " { return " + original + "(" + target.context_arguments +
+             target.exception_spec + " { return " + (alternate ? "original_entry" : original) +
+             "(" + target.context_arguments +
              "); }\n";
   std::set<std::string> aliases{"original", "fixture_text"};
   std::vector<std::string> imports;
@@ -250,7 +258,10 @@ JitRequest build_live_mock(const MockCommand& command, const MockCompileContext&
   }
   const auto fixture =
       command.fixture ? std::string_view(command.fixture->contents) : std::string_view{};
-  header += "struct Context {\n" + methods +
+  header += "struct Context {\n";
+  if (alternate)
+    header += "decltype(&" + original + ") original_entry = &" + original + ";\n";
+  header += methods +
             "std::string_view fixture_text() const noexcept { return {" + quote(fixture) + ", " +
             std::to_string(fixture.size()) + "}; }\n};\n}\n" +
             "using LiveMockContext = clangtracer_live_mock_detail::Context;\n";
@@ -277,52 +288,58 @@ struct FrameScope {
 };
 )cpp";
   }
-  code += "extern \"C\" " + target.result + " " + std::string(mock_entry_symbol) + "(" +
-          target.native_parameters + ")" + target.exception_spec + " {\n";
-  if (command.recursive_original) {
-    code += "auto *top = static_cast<Frame *>(" + std::string(recursion_symbol) +
-            "(nullptr, false));\n"
-            "const auto key = reinterpret_cast<const void *>(&" +
-            original +
+  const auto append_entry = [&](std::string_view entry_name, const std::string &original_entry) {
+    code += "extern \"C\" " + target.result + " " + std::string(entry_name) + "(" +
+            target.native_parameters + ")" + target.exception_spec + " {\n";
+    if (command.recursive_original) {
+      code += "auto *top = static_cast<Frame *>(" + std::string(recursion_symbol) +
+              "(nullptr, false));\n"
+              "const auto key = reinterpret_cast<const void *>(&" +
+              original_entry +
+              ");\n"
+              "for (auto *frame = top; frame; frame = frame->previous)\n"
+              "  if (frame->key == key) return " +
+              original_entry + "(" + target.native_arguments +
+              ");\n"
+              "FrameScope scope(key, top);\n";
+    }
+    const auto callback =
+        command.callback.starts_with("::") ? command.callback : "::" + command.callback;
+    code += "using WithContext = " + target.result + " (*)(" +
+            joined("const Context &", target.callback_types) + ")" + target.exception_spec +
+            ";\n"
+            "using Plain = " +
+            target.result + " (*)(" + target.callback_types + ")" + target.exception_spec +
+            ";\n"
+            "using Callback = decltype(&" +
+            callback +
             ");\n"
-            "for (auto *frame = top; frame; frame = frame->previous)\n"
-            "  if (frame->key == key) return " +
-            original + "(" + target.native_arguments +
+            "static_assert(std::is_convertible_v<Callback, WithContext> || "
+            "std::is_convertible_v<Callback, Plain>, \"mock callback type must match verified "
+            "callable\");\n";
+    if (command.fixture) {
+      code += "static_assert(std::is_convertible_v<Callback, WithContext>, "
+              "\"mock with fixture requires const LiveMockContext &\");\n";
+    }
+    code += "return [&](auto fn) -> " + target.result +
+            " {\n"
+            "if constexpr (std::is_convertible_v<decltype(fn), WithContext>)\n"
+            "  return fn(" +
+            joined(alternate ? "Context{&" + original_entry + "}" : "Context{}", target.callback_arguments) +
             ");\n"
-            "FrameScope scope(key, top);\n";
-  }
-  const auto callback =
-      command.callback.starts_with("::") ? command.callback : "::" + command.callback;
-  code += "using WithContext = " + target.result + " (*)(" +
-          joined("const Context &", target.callback_types) + ")" + target.exception_spec +
-          ";\n"
-          "using Plain = " +
-          target.result + " (*)(" + target.callback_types + ")" + target.exception_spec +
-          ";\n"
-          "using Callback = decltype(&" +
-          callback +
-          ");\n"
-          "static_assert(std::is_convertible_v<Callback, WithContext> || "
-          "std::is_convertible_v<Callback, Plain>, \"mock callback type must match verified "
-          "callable\");\n";
-  if (command.fixture) {
-    code += "static_assert(std::is_convertible_v<Callback, WithContext>, "
-            "\"mock with fixture requires const LiveMockContext &\");\n";
-  }
-  code += "return [&](auto fn) -> " + target.result +
-          " {\n"
-          "if constexpr (std::is_convertible_v<decltype(fn), WithContext>)\n"
-          "  return fn(" +
-          joined("Context{}", target.callback_arguments) +
-          ");\n"
-          "else return fn(" +
-          target.callback_arguments +
-          ");\n"
-          "}(&" +
-          callback + ");\n}\n}\n";
+            "else return fn(" +
+            target.callback_arguments +
+            ");\n"
+            "}(&" +
+            callback + ");\n}\n";
+    request.entry_symbols.emplace_back(entry_name);
+  };
+  append_entry(mock_entry_symbol, original);
+  if (alternate)
+    append_entry(native_mock_entry_symbol, std::string(native_original_symbol));
+  code += "}\n";
   request.files.push_back({unit, std::move(code)});
   request.translation_units.push_back({unit, context.directory, context.compiler_arguments});
-  request.entry_symbols.emplace_back(mock_entry_symbol);
 
   // Keep all typed imports visible in IR even if the callback does not call
   // one of them. The proof-only unit is never sent to the target.
@@ -331,6 +348,9 @@ struct FrameScope {
   proof_code += "\nnamespace clangtracer_live_mock_detail {\n"
                 "[[gnu::used]] static const auto proof_original = &" +
                 original + ";\n";
+  if (alternate)
+    proof_code += "[[gnu::used]] static const auto proof_native_original = &" +
+                  std::string(native_original_symbol) + ";\n";
   for (std::size_t i = 0; i < imports.size(); ++i) {
     proof_code +=
         "[[gnu::used]] static const auto proof_" + std::to_string(i) + " = &" + imports[i] + ";\n";
@@ -353,6 +373,10 @@ struct FrameScope {
   }
   verify_abi(compiled.module->getFunction(mock_entry_symbol), context.target);
   verify_abi(compiled.module->getFunction(original_symbol), context.target);
+  if (alternate) {
+    verify_abi(compiled.module->getFunction(native_mock_entry_symbol), context.target);
+    verify_abi(compiled.module->getFunction(native_original_symbol), context.target);
+  }
   const auto verify_direct = [&](const MockCallable& callable) {
     if (const auto* declaration =
             compiled.module->getFunction(callable.native_definition->getName())) {

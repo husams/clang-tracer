@@ -9,6 +9,12 @@
 
 namespace tracer::live {
 
+struct JitEntryAddress {
+  std::uintptr_t destination = 0;
+  std::uintptr_t mapping_begin = 0;
+  std::size_t mapping_size = 0;
+};
+
 struct ActiveEntry {
   Entry binding;
   std::string installed_bytes;
@@ -17,6 +23,7 @@ struct ActiveEntry {
   std::size_t mapping_size = 0;
   bool requires_drain = false;
   std::uintptr_t mock_original = 0;
+  std::optional<JitEntryAddress> native_mock_alternate;
 };
 
 struct Revision {

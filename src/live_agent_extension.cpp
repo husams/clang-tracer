@@ -100,7 +100,7 @@ Status execute(const Extension &input, std::uint64_t token) {
         throw managed::RebuildRequired("rebuild required: missing application-owned registry");
       auto jit = decode_jit(input.update());
       if (jit.entry_symbols.size() > max_entries ||
-          input.publish_native() != !jit.entry_symbols.empty())
+          (!input.publish_native() && !jit.entry_symbols.empty()))
         throw std::runtime_error("invalid managed native entry count");
       auto revision = managed::stage(*storage, jit,
           {input.hook_file(), input.hook_function(), input.hook_type()});
@@ -111,7 +111,8 @@ Status execute(const Extension &input, std::uint64_t token) {
           entries.push_back(describe_entry(*revision->image(), symbol));
         // A hook can throw after a native entry has been visible. Keep its
         // image resident even when the transaction restores the old bytes.
-        retain_image(revision->image(), input.retention_limit());
+        if (!entries.empty())
+          retain_image(revision->image(), input.retention_limit());
         publication.install = [deadline, entries = std::move(entries)] {
           return request_publication(Phase::install, deadline, entries);
         };

@@ -27,7 +27,12 @@ struct CompiledUnit {
   std::map<std::string, std::string> record_layouts;
   std::map<std::string, std::pair<std::string, std::string>> types;
   std::map<std::string, unsigned> source_definitions;
-  std::map<std::string, std::string> lambda_sites;
+  struct LambdaSource {
+    std::string site;
+    std::string expression;
+    std::string binding;
+  };
+  std::map<std::string, LambdaSource> lambda_sites;
 };
 
 enum class CompileInspection { native_metadata, ir_only };
@@ -50,6 +55,8 @@ struct Definition {
   bool local = false;
   bool discardable = false;
   std::optional<std::string> lambda_site;
+  std::string lambda_expression;
+  std::string lambda_binding;
   std::optional<unsigned> source_definition;
   std::set<std::string> callees;
   unsigned invokes = 0;
