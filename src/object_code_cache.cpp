@@ -1769,7 +1769,7 @@ struct Watch::Impl {
         item.set_diagnostic("callee ran natively while the PLT slot was lazily bound");
         break;
       case DispatchGap::outside_plt_scope:
-        item.set_diagnostic("PLT callee ran natively because its scope is outside the writer and executable");
+        item.set_diagnostic("PLT callee ran natively because its scope is outside the calling ELF and executable");
         break;
       default:
         item.set_diagnostic("callee could not be translated from verified live executable bytes");

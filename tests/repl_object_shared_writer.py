@@ -75,11 +75,13 @@ def capture(root, args, app, app_out, repl, repl_out, label, *, saved=False, laz
         assert gaps[0]["diagnostic"] == "callee ran natively while the PLT slot was lazily bound", gaps[0]
     source_name = "main.cpp" if args.scenario == "interposed" else "library.cpp"
     marker = "EXECUTABLE_HELPER_STORE" if args.scenario == "interposed" else "SHARED_HELPER_STORE"
+    expected_module = args.fixture if args.scenario == "interposed" else args.library
     source = Path(__file__).resolve().parent / "fixtures" / "object_shared_writer" / source_name
     store_line = next(i for i, line in enumerate(source.read_text().splitlines(), 1)
                       if marker in line)
     assert all(item["locationKind"] == "STORE" and item["field"] == "shared_writer::Record::value"
                and item["function"] == "shared_writer::adjust(shared_writer::Record&, int, bool)"
+               and Path(item["module"]) == expected_module
                and Path(item["file"]).name == source_name and item["line"] == store_line
                for item in writes), writes
     assert [item["kind"] for item in observations].count("CREATED") == 1, observations
@@ -121,6 +123,8 @@ def run(args):
         send(repl, f'%object start {common} --module "{args.library}"')
         expect_error(out, "--follow-calls --module")
         assert repl.poll() is None, "the REPL should remain available for the next diagnostic case"
+        send(repl, f'%object start {common} --module "{args.library}" --writer-entry')
+        expect_error(out, "--follow-calls is unavailable for this watch scope")
 
         capture(root, args, target, app, repl, out, args.scenario,
                 lazy_first=args.scenario == "lazy")
