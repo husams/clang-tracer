@@ -4188,13 +4188,13 @@ std::optional<RuntimeImage::PltStub> RuntimeImage::plt_stub(Address address) con
   bool got_slot = false;
   bool jump_slot = false;
   for (const auto &section : object.sections()) {
-    if (!(llvm::object::ELFSectionRef(section).getFlags() & llvm::ELF::SHF_ALLOC))
+    if (!(llvm::object::ELFSectionRef(section).getFlags() & SHF_ALLOC))
       continue;
     for (const auto &relocation : section.relocations()) {
       if (relocation.getOffset() != got)
         continue;
-      jump_slot |= relocation.getType() == llvm::ELF::R_X86_64_JUMP_SLOT;
-      got_slot |= relocation.getType() == llvm::ELF::R_X86_64_GLOB_DAT;
+      jump_slot |= relocation.getType() == R_X86_64_JUMP_SLOT;
+      got_slot |= relocation.getType() == R_X86_64_GLOB_DAT;
     }
   }
   if (!jump_slot && !got_slot)
