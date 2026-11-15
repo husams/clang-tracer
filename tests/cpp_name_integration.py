@@ -31,6 +31,15 @@ def trace(client: FriendlyClient, pid: int, declaration: str, callback: Path,
                       *options, timeout=timeout)
 
 
+def require_fixture_progress(process: subprocess.Popen[bytes], log_path: Path) -> None:
+    previous = log_path.read_bytes().count(b"CPP_NAME_PROGRESS ")
+    deadline = time.monotonic() + 5
+    while log_path.read_bytes().count(b"CPP_NAME_PROGRESS ") <= previous:
+        require(process.poll() is None and time.monotonic() < deadline,
+                "C++ name fixture stopped making progress")
+        time.sleep(0.05)
+
+
 def require_original_overloads(path: Path, pid: int) -> None:
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     rows = []
@@ -219,11 +228,12 @@ def main() -> int:
 
             # Negative callable cases now use a real mapped debug image. Header
             # compiler flags still come from a donor that need not exist.
-            negative_log = (output_dir / "negative-target.log").open("wb")
+            negative_log_path = output_dir / "negative-target.log"
+            negative_log = negative_log_path.open("wb")
             negative_target = subprocess.Popen([str(args.negative_target)],
                                                stdout=negative_log, stderr=negative_log)
             deadline = time.monotonic() + 5
-            while "CPP_NAME_FIXTURE pid=" not in (output_dir / "negative-target.log").read_text(errors="replace"):
+            while "CPP_NAME_FIXTURE pid=" not in negative_log_path.read_text(errors="replace"):
                 require(negative_target.poll() is None and time.monotonic() < deadline,
                         "negative DWARF fixture did not start")
                 time.sleep(.05)
@@ -307,13 +317,77 @@ def main() -> int:
                 "--include", str(malformed_source), expected_ok=False, timeout=45))
             require("error" in parse_error.lower() or "expected" in parse_error.lower(),
                     f"invalid syntax did not produce a parser diagnostic:\n{parse_error}")
-            valid_header = trace(client, negative_target.pid, "HeaderReceiver::read(int) const",
-                                 callback, "--compdb", str(negative_db), "--include", str(header), timeout=45)
-            require("header_context=" in valid_header.stdout.decode(), "header flag inference was not reported")
+            # Both the header and the callback need the donor's compiler context.
+            # The include directory is relative to the donor, not the target.
+            include_dir = temp_dir / "fixture-includes"
+            include_dir.mkdir()
+            write_text(temp_dir / "forced.hpp",
+                       "#pragma once\n#define COMPDB_FORCED_VALUE 4\n")
+            write_text(include_dir / "fixture_value.hpp",
+                       "#pragma once\ninline constexpr int fixture_value = "
+                       "COMPDB_FIXTURE_VALUE + COMPDB_FORCED_VALUE;\n")
+            write_text(header,
+                       "#pragma once\n#include <fixture_value.hpp>\n"
+                       "class HeaderReceiver { public: int bias = fixture_value; int read(int) const; };\n")
+            entry["directory"] = str(temp_dir)
+            entry["arguments"] = [*command[:-1], "-I", include_dir.name,
+                                  "-include", "forced.hpp", "-DCOMPDB_FIXTURE_VALUE=3",
+                                  "-Werror=sign-compare", "-Werror=pedantic",
+                                  command[-1]]
+            write_text(negative_db, json.dumps([entry]))
+            header_options = ("--compdb", str(negative_db), "--include", str(header))
+            selector = "HeaderReceiver::read(int) const"
+            invalid_callback = temp_dir / "invalid-callback.cpp"
+            write_text(invalid_callback,
+                       'extern "C" long long trace_callback(const TraceContext&) {\n'
+                       '  return fixture_value + missing_callback_value;\n'
+                       '}\n')
+            rejected = save_output(output_dir / "reject-invalid-compdb-callback.txt", client.run(
+                "validate", str(negative_target.pid), selector, "--callback", str(invalid_callback),
+                *header_options, expected_ok=False, timeout=45))
+            require("validation success=false" in rejected and "callback_source:2:" in rejected and
+                    "missing_callback_value" in rejected,
+                    f"invalid callback did not report its Clang diagnostic:\n{rejected}")
+            require_fixture_progress(negative_target, negative_log_path)
+
+            warning_callback = temp_dir / "warning-callback.cpp"
+            write_text(warning_callback,
+                       'extern "C" long long trace_callback(const TraceContext& context) {\n'
+                       '  int signed_count = -1;\n'
+                       '  return signed_count < context.argument_count;\n'
+                       '}\n')
+            rejected_warning = save_output(output_dir / "reject-compdb-warning.txt", client.run(
+                "validate", str(negative_target.pid), selector, "--callback", str(warning_callback),
+                *header_options, expected_ok=False, timeout=45))
+            require("validation success=false" in rejected_warning and
+                    "different signs" in rejected_warning,
+                    f"callback did not retain the donor's warning policy:\n{rejected_warning}")
+            require_fixture_progress(negative_target, negative_log_path)
+
+            valid_callback = temp_dir / "valid-callback.cpp"
+            write_text(valid_callback,
+                       'extern "C" long long trace_callback(const TraceContext& context) {\n'
+                       '  return fixture_value + context.argument_count;\n'
+                       '}\n')
+            validated = save_output(output_dir / "validate-compdb-callback.txt", client.run(
+                "validate", str(negative_target.pid), selector, "--callback", str(valid_callback),
+                *header_options, timeout=45))
+            require("validation success=true" in validated, f"callback did not validate:\n{validated}")
+            require_fixture_progress(negative_target, negative_log_path)
+            installed = save_output(output_dir / "trace-compdb-callback.txt", trace(
+                client, negative_target.pid, selector, valid_callback, *header_options, timeout=45))
+            require("header_context=" in installed, "header flag inference was not reported")
+            events, _ = wait_binary(args.client, endpoint, negative_target.pid,
+                                    read_probe_id(installed), output_dir,
+                                    args.protoc, args.proto, 1, 0)
+            require(all(callback_value(event) == 8 for event in events),
+                    f"expected a live callback using the database settings:\n{events}")
+            require_fixture_progress(negative_target, negative_log_path)
             require(not negative_source.exists(), "header parsing recreated/read the unavailable donor")
             client.run("detach", str(negative_target.pid), timeout=20)
             report.append("DWARF ambiguity, missing/mismatched/unsupported callables, BOOL header route, virtual methods, volatile qualification and unsigned spelling passed")
             report.append("optional headers preserved missing-database, malformed-header and x32 ABI rejection, without a donor source file")
+            report.append("compilation database flags reached callback validation and execution; target kept running")
 
             # Use the existing real callback with signed integral arguments for both overloads.
             event_client = FriendlyClient(args.client, endpoint)
@@ -430,7 +504,11 @@ def main() -> int:
     finally:
         if negative_target is not None and negative_target.poll() is None:
             negative_target.terminate()
-            negative_target.wait(timeout=3)
+            try:
+                negative_target.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                negative_target.kill()
+                negative_target.wait(timeout=3)
         if negative_log is not None:
             negative_log.close()
         if server is not None and server.poll() is None:
