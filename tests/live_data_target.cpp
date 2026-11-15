@@ -9,6 +9,11 @@
 #include <dlfcn.h>
 #include <pthread.h>
 
+#include <llvm/ADT/StringExtras.h>
+#include <llvm/Object/Binary.h>
+#include <llvm/Object/BuildID.h>
+#include <llvm/Object/ObjectFile.h>
+
 #include "fixtures/live_data/model.hpp"
 #include "live_data.hpp"
 #include "proc_identity.hpp"
@@ -178,7 +183,14 @@ void run_scan(Harness& harness, Account* unowned, const void* spoof, const void*
 } // namespace
 
 int main(int argc, char** argv) try {
-  check(argc == 4, "expected fixture directory, SDK include root and target build ID");
+  check(argc == 3 || argc == 4, "expected fixture directory, SDK include root and optional build ID");
+  auto elf = llvm::object::ObjectFile::createObjectFile("/proc/self/exe");
+  if (!elf)
+    throw std::runtime_error(llvm::toString(elf.takeError()));
+  const auto id = llvm::object::getBuildID(elf->getBinary());
+  check(!id.empty(), "fixture executable has no build ID");
+  const auto build_id = llvm::toHex(id, true);
+  check(argc == 3 || build_id == argv[3], "fixture build ID differs");
   // Force fixture allocation before constructing the in-target service.
   g_primary_cache = std::make_shared<Cache>();
   secondary_cache = std::make_shared<Cache>();
@@ -210,7 +222,7 @@ int main(int argc, char** argv) try {
       fs::canonical(argv[1]),
       fs::canonical(argv[2]),
       {},
-      {tracer::proc::start_time("/proc/self/stat"), fs::canonical("/proc/self/exe"), argv[3]}};
+      {tracer::proc::start_time("/proc/self/stat"), fs::canonical("/proc/self/exe"), build_id}};
   run_forms(harness);
   run_scan(harness, unowned.get(), bytes.get(), fake.get(), reinterpret_cast<void*>(freed_address),
            plain.get());

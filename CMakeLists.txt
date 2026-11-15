@@ -270,6 +270,31 @@ if(BUILD_TESTING)
   add_test(NAME native_detour_relocation COMMAND native-detour-tests)
   set_tests_properties(native_detour_relocation PROPERTIES TIMEOUT 30)
 
+  add_library(live-test-jit STATIC src/live_compile.cpp src/live_jit.cpp)
+  target_include_directories(live-test-jit SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
+  target_compile_definitions(live-test-jit PRIVATE
+    TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
+  target_link_libraries(live-test-jit PUBLIC clang-cpp LLVM ${CMAKE_DL_LIBS})
+
+  add_executable(live-data-target-tests tests/live_data_target.cpp
+    tests/fixtures/live_data/model.cpp src/live_data.cpp src/live_data_jit.cpp
+    src/live_data_scan.cpp src/debug_resolver.cpp)
+  target_include_directories(live-data-target-tests PRIVATE src ${LLVM_INCLUDE_DIRS})
+  target_link_libraries(live-data-target-tests PRIVATE
+    live-test-jit tracer_proto Threads::Threads)
+  target_compile_options(live-data-target-tests PRIVATE -g -O0)
+  target_link_options(live-data-target-tests PRIVATE "LINKER:--build-id=sha1")
+  set_target_properties(live-data-target-tests PROPERTIES ENABLE_EXPORTS ON)
+  add_test(NAME live_data_target COMMAND live-data-target-tests
+    "${PROJECT_SOURCE_DIR}/tests/fixtures/live_data" "${PROJECT_SOURCE_DIR}/include")
+
+  add_executable(live-migration-tests tests/live_migration/integration.cpp src/live_migration.cpp)
+  target_include_directories(live-migration-tests PRIVATE src include)
+  target_link_libraries(live-migration-tests PRIVATE live-test-jit Threads::Threads)
+  add_test(NAME live_migration_target COMMAND live-migration-tests
+    "${PROJECT_SOURCE_DIR}/tests/live_migration" "${PROJECT_SOURCE_DIR}/include")
+  set_tests_properties(live_data_target live_migration_target PROPERTIES TIMEOUT 120)
+
   # Exercise a PIE probe reached through a caller with relaxed alignment.
   add_executable(trace-target-pie tests/fixtures/target.cpp)
   target_compile_definitions(trace-target-pie PRIVATE TRACER_TEST_RELAXED_STACK_ALIGNMENT)

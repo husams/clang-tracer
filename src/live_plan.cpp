@@ -500,11 +500,7 @@ ExtensionSources extension_sources(std::uint32_t pid, const std::string &module,
       const auto name = value.getName().str();
       const auto *symbol = image.find(name, false);
       if (symbol && symbol->type == type && symbol->address <= UINTPTR_MAX - bias)
-        if (symbol->type == llvm::ELF::STT_OBJECT && ref.size && *ref.size != symbol->size) {
-      block(ref.local_unit, name, "rebuild required: imported storage size differs from the ELF");
-      continue;
-    }
-    result.jit.imports.emplace(import, bias + symbol->address);
+        result.jit.imports.emplace(name, bias + symbol->address);
     };
     for (const auto &function : *compiled.module)
       add_import(function, llvm::ELF::STT_FUNC);
@@ -589,7 +585,8 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
   std::map<std::string, std::set<std::string>> native_locals;
   struct Reference {
     std::string name;
-    std::string local_unit;
+    std::string unit;
+    bool local;
     std::optional<std::uint64_t> size;
   };
   std::multimap<std::string, Reference> referenced;
@@ -666,7 +663,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         std::optional<std::uint64_t> size;
         if (global && global->getValueType()->isSized())
           size = after.module->getDataLayout().getTypeAllocSize(global->getValueType()).getFixedValue();
-        referenced.emplace(import, Reference{name, value.hasLocalLinkage() ? path : std::string{}, size});
+        referenced.emplace(import, Reference{name, path, value.hasLocalLinkage(), size});
       }
     }
   }
@@ -777,16 +774,16 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
   const auto bias = client::bind_live_executable(pid, module, image.elf, main->address, main->size);
   for (const auto &[import, ref] : referenced) {
     const auto &name = ref.name;
-    const bool local = !ref.local_unit.empty();
+    const bool local = ref.local;
     if (!local && replaced.count(name))
       continue;
     if (local) {
       const auto prior = native_locals.find(name);
-      if (prior == native_locals.end() || !prior->second.contains(ref.local_unit))
+      if (prior == native_locals.end() || !prior->second.contains(ref.unit))
         continue;
       if (prior->second.size() != 1) {
         if (ref.size)
-          block(ref.local_unit, name, "rebuild required: ambiguous translation-unit-local storage");
+          block(ref.unit, name, "rebuild required: ambiguous translation-unit-local storage");
         continue;
       }
     }
@@ -801,7 +798,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         throw Stale("import moved across ELF instances: " + name);
     }
     if (symbol->type == llvm::ELF::STT_OBJECT && ref.size && *ref.size != symbol->size) {
-      block(ref.local_unit, name, "rebuild required: imported storage size differs from the ELF");
+      block(ref.unit, name, "rebuild required: imported storage size differs from the ELF");
       continue;
     }
     result.jit.imports.emplace(import, bias + symbol->address);
