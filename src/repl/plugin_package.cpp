@@ -1,5 +1,6 @@
 #include "plugin_package.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
@@ -147,7 +148,25 @@ fs::path installed_plugin_directory() {
   return {};
 }
 
-std::optional<PluginPackage> read_plugin_package(const fs::path& manifest) {
+std::vector<fs::path> installed_plugin_manifests() {
+  auto directory = installed_plugin_directory();
+  if (directory.empty() || !fs::exists(directory)) {
+    return {};
+  }
+  directory = tracer::private_plugin_directory(directory, false, false);
+  std::vector<fs::path> manifests;
+  for (const auto& entry : fs::directory_iterator(directory)) {
+    const auto file = entry.path() / "plugin.toml";
+    if (fs::is_directory(entry.symlink_status()) && fs::is_regular_file(fs::symlink_status(file))) {
+      manifests.push_back(file);
+    }
+  }
+  std::sort(manifests.begin(), manifests.end());
+  return manifests;
+}
+
+std::optional<PluginPackage> read_plugin_package(const fs::path& manifest,
+                                                 PluginComponent component) {
   const auto directory = tracer::private_plugin_directory(manifest.parent_path(), false, false);
   struct stat info{};
   if (::lstat(manifest.c_str(), &info) || !S_ISREG(info.st_mode) || info.st_uid != ::geteuid() ||
@@ -164,15 +183,20 @@ std::optional<PluginPackage> read_plugin_package(const fs::path& manifest) {
   package.directory = directory;
   std::vector<std::string> sources;
   bool supported_sdk = true;
-  bool has_repl = false;
-  bool in_repl = false;
+  const bool agent = component == PluginComponent::Agent;
+  const auto section = agent ? "[agent]" : "[repl]";
+  bool has_component = false;
+  bool in_component = false;
+  bool in_target = false;
   bool at_root = true;
   while (!reader.empty()) {
     const auto line = reader.line();
     if (line.starts_with("[")) {
       at_root = false;
-      in_repl = line.split('#').first.trim() == "[repl]";
-      has_repl |= in_repl;
+      const auto name = line.split('#').first.trim();
+      in_component = name == section;
+      in_target = agent && name == "[agent.target]";
+      has_component |= in_component;
     } else if (at_root && reader.key("id")) {
       package.id = reader.string();
       reader.end_value();
@@ -180,15 +204,27 @@ std::optional<PluginPackage> read_plugin_package(const fs::path& manifest) {
     } else if (at_root && reader.key("sdk")) {
       const auto sdk = reader.line().split('#').first.trim();
       supported_sdk = sdk == "1" || sdk == "2";
-    } else if (in_repl) {
+    } else if (in_target && reader.key("executable")) {
+      package.executable = reader.string();
+      reader.end_value();
+      continue;
+    } else if (in_component) {
       if (reader.key("sources")) {
         sources = reader.strings();
       } else if (reader.key("extra_flags")) {
         package.extra_flags = reader.strings();
       } else if (reader.key("compile_commands")) {
-        package.compile_commands = directory / reader.string();
+        const fs::path path = reader.string();
+        if (agent && !path.is_absolute()) {
+          throw std::invalid_argument("agent.compile_commands must be an absolute target path");
+        }
+        package.compile_commands = directory / path;
       } else if (reader.key("translation_unit")) {
-        package.translation_unit = directory / reader.string();
+        const fs::path path = reader.string();
+        if (agent && !path.is_absolute()) {
+          throw std::invalid_argument("agent.translation_unit must be an absolute target path");
+        }
+        package.translation_unit = directory / path;
       } else {
         reader.next_line();
         continue;
@@ -198,14 +234,19 @@ std::optional<PluginPackage> read_plugin_package(const fs::path& manifest) {
     }
     reader.next_line();
   }
-  if (!has_repl) {
+  if (!has_component) {
     return std::nullopt;
   }
   if (!supported_sdk) {
     throw std::invalid_argument("unsupported plugin SDK version");
   }
   if (package.id.empty() || sources.empty()) {
-    throw std::invalid_argument("plugin manifest needs an id and [repl] sources");
+    throw std::invalid_argument(std::string("plugin manifest needs an id and ") + section +
+                                " sources");
+  }
+  if (agent && (!fs::path(package.executable).is_absolute() ||
+                package.executable.find('\0') != std::string::npos)) {
+    throw std::invalid_argument("agent.target.executable must be an absolute target path");
   }
   for (const auto& source : sources) {
     package.sources.push_back(package_source(directory, source));

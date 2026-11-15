@@ -1,18 +1,19 @@
-#include "agent_plugin_protocol.hpp"
-
-#include "callback_source.hpp"
-#include "context_scheduler.hpp"
-#include "native_plugins.hpp"
-#include "runtime_paths.hpp"
-#include "tracer.pb.h"
-
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <stdexcept>
+
 #include <unistd.h>
+
+#include "agent_plugin_protocol.hpp"
+#include "callback_source.hpp"
+#include "context_scheduler.hpp"
+#include "native_plugins.hpp"
+#include "repl/compiler_profile.hpp"
+#include "runtime_paths.hpp"
+#include "tracer.pb.h"
 
 namespace {
 namespace fs = std::filesystem;
@@ -41,6 +42,75 @@ bool absolute_path(const std::string &path) {
   return path.find('\0') == std::string::npos && fs::path(path).is_absolute();
 }
 
+fs::path bundle_path(const std::string& path, const fs::path& root) {
+  const fs::path relative(path);
+  if (relative.empty() || relative.is_absolute() || path.find('\0') != path.npos ||
+      relative.lexically_normal() != relative || *relative.begin() == ".." ||
+      *relative.begin() == ".") {
+    throw std::invalid_argument("invalid agent package file path");
+  }
+  return root / relative;
+}
+
+std::vector<std::string> target_profile() {
+  auto profile = tracer::runtime::jit_arguments();
+  profile.insert(profile.begin(), {"-std=c++23", "-O0", "-fPIC", "-resource-dir",
+                                   tracer::runtime::clang_resource_dir()});
+  return profile;
+}
+
+tracer::NativePlugins::LoadResult load_package(const tracer::AgentPluginCall& request,
+                                               const char* source) {
+  clangtracer::v1::AgentPluginPackage package;
+  if (!source || !package.ParseFromArray(source, static_cast<int>(request.source_size)) ||
+      package.sources().empty()) {
+    throw std::invalid_argument("invalid agent plugin package");
+  }
+  if ((!package.compile_commands().empty() && !absolute_path(package.compile_commands())) ||
+      (!package.translation_unit().empty() && !absolute_path(package.translation_unit()))) {
+    throw std::invalid_argument("agent package compiler paths must be absolute");
+  }
+
+  const fs::path root = "/__clang_tracer_plugin__/package";
+  const auto sdk = root / "clang_tracer_repl_plugin.h";
+  std::map<fs::path, std::string_view> contents;
+  std::vector<tracer::NativePluginFile> files;
+  for (const auto& file : package.files()) {
+    auto path = bundle_path(file.path(), root);
+    if (path == sdk || path == root / "clang_tracer_repl_plugin.hpp" ||
+        !contents.emplace(path, file.contents()).second) {
+      throw std::invalid_argument("duplicate or reserved agent package file");
+    }
+    files.push_back({std::move(path), file.contents()});
+  }
+  const std::vector<std::string> extra(package.extra_flags().begin(), package.extra_flags().end());
+  const auto flags = tracer_repl::resolve_plugin_flag_paths(extra, root);
+  std::vector<tracer::NativePluginUnit> units;
+  for (const auto& source_path : package.sources()) {
+    const auto path = bundle_path(source_path, root);
+    const auto file = contents.find(path);
+    if (file == contents.end()) {
+      throw std::invalid_argument("agent package translation unit is missing");
+    }
+    auto profile = target_profile();
+    if (!package.compile_commands().empty()) {
+      using tracer_repl::DatabaseSelection;
+      const bool select = !package.translation_unit().empty();
+      const auto configuration = tracer_repl::compilation_database_profile(
+          package.compile_commands(), select ? package.translation_unit() : path.string(),
+          select ? DatabaseSelection::Exact : DatabaseSelection::ExactOrUnique);
+      profile.insert(profile.end(), configuration.arguments.begin(), configuration.arguments.end());
+    }
+    profile.insert(profile.begin(), {"-I", root.string(), "-I", (root / "include").string()});
+    profile.insert(profile.end(), flags.begin(), flags.end());
+    units.push_back({{path, file->second, tracer::kEmbeddedPluginHeader, sdk,
+                      tracer::kEmbeddedCppPluginHeader, files},
+                     std::move(profile)});
+  }
+  auto& plugins = sessions.try_emplace(request.session_id).first->second;
+  return plugins.load_package(request.plugin_id, units, {}, cache_directory(), false);
+}
+
 int agent_plugin(tracer::AgentPluginCall *request, const char *source,
                  const char *offer_bytes, std::size_t offer_size) noexcept {
   if (!request || request->version != 1)
@@ -61,10 +131,7 @@ int agent_plugin(tracer::AgentPluginCall *request, const char *source,
     case AgentPluginOperation::Reload: {
       if (!source || !request->source_size)
         throw std::invalid_argument("agent plugin source is required");
-      auto profile = tracer::runtime::jit_arguments();
-      profile.insert(profile.begin(),
-                     {"-std=c++23", "-O0", "-fPIC", "-resource-dir",
-                      tracer::runtime::clang_resource_dir()});
+      auto profile = target_profile();
       auto &plugins = sessions.try_emplace(request->session_id).first->second;
       const bool reload = request->operation == AgentPluginOperation::Reload;
       const std::string_view contents(source, request->source_size);
@@ -102,6 +169,12 @@ int agent_plugin(tracer::AgentPluginCall *request, const char *source,
       request->generation = result.generation;
       request->cache_hit = result.cache_hit;
       return result.from_repl ? tracer::kAgentPluginReusedReplObject : 0;
+    }
+    case AgentPluginOperation::LoadPackage: {
+      const auto result = load_package(*request, source);
+      request->generation = result.generation;
+      request->cache_hit = result.cache_hit;
+      return 0;
     }
     case AgentPluginOperation::Run: {
       const auto session = sessions.find(request->session_id);

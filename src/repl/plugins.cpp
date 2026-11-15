@@ -17,6 +17,7 @@
 
 #include "../agent_plugin_protocol.hpp"
 #include "compiler_profile.hpp"
+#include "controller.hpp"
 #include "interpreter.hpp"
 #include "mapping_cache.hpp"
 #include "plugin_package.hpp"
@@ -119,6 +120,31 @@ void report_load(std::ostream& out, const std::string& id,
       << (result.cache_hit ? "cache hit" : "compiled") << ")\n";
 }
 
+std::set<fs::path> agent_package_files(const PluginPackage& package) {
+  std::set<fs::path> paths(package.sources.begin(), package.sources.end());
+  std::set<fs::path> roots;
+  if (!package.include.empty()) {
+    roots.insert(package.include);
+  }
+  for (const auto& source : package.sources) {
+    roots.insert(source.parent_path());
+  }
+  for (const auto& root : roots) {
+    for (const auto& entry : fs::recursive_directory_iterator(root)) {
+      if (!fs::is_regular_file(entry.symlink_status())) {
+        continue;
+      }
+      const auto extension = entry.path().extension();
+      if (root == package.include || extension == ".h" || extension == ".hh" ||
+          extension == ".hpp" || extension == ".hxx" || extension == ".inc" ||
+          extension == ".inl" || extension == ".ipp" || extension == ".tpp") {
+        paths.insert(entry.path());
+      }
+    }
+  }
+  return paths;
+}
+
 } // namespace
 
 bool is_plugin_command(CommandKind kind) {
@@ -139,21 +165,7 @@ void Plugins::load(const std::string &id, const fs::path &source,
 
 void Plugins::load_installed(CppEngine& cpp, std::ostream& out, std::ostream& errors) {
   try {
-    auto directory = installed_plugin_directory();
-    if (directory.empty() || !fs::exists(directory)) {
-      return;
-    }
-    directory = tracer::private_plugin_directory(directory, false, false);
-    std::vector<fs::path> manifests;
-    for (const auto& entry : fs::directory_iterator(directory)) {
-      const auto file = entry.path() / "plugin.toml";
-      if (fs::is_directory(entry.symlink_status()) &&
-          fs::is_regular_file(fs::symlink_status(file))) {
-        manifests.push_back(file);
-      }
-    }
-    std::sort(manifests.begin(), manifests.end());
-    for (const auto& manifest : manifests) {
+    for (const auto& manifest : installed_plugin_manifests()) {
       try {
         const auto package = read_plugin_package(manifest);
         if (!package) {
@@ -193,6 +205,67 @@ void Plugins::load_installed(CppEngine& cpp, std::ostream& out, std::ostream& er
     }
   } catch (const std::exception& error) {
     errors << "cannot read installed plugins: " << error.what() << '\n';
+  }
+}
+
+void Plugins::load_attached(Controller& controller, const clangtracer::v1::Session& session,
+                            const CppEngine& cpp, std::ostream& errors) {
+  if (session.executable().empty()) {
+    return;
+  }
+  try {
+    for (const auto& manifest : installed_plugin_manifests()) {
+      try {
+        const auto package = read_plugin_package(manifest, PluginComponent::Agent);
+        if (!package || package->executable != session.executable()) {
+          continue;
+        }
+        using Request = clangtracer::v1::AgentPluginRequest;
+        Request request;
+        request.set_session_id(session.id());
+        request.set_plugin_id(package->id);
+        request.set_expected_executable(package->executable);
+        const auto files = agent_package_files(*package);
+        if (files.size() == 1 && package->compile_commands.empty() &&
+            package->extra_flags.empty()) {
+          request.set_operation(Request::LOAD);
+          const auto source = package->sources.front().string();
+          request.set_source(read_source(source));
+          offer_agent_object(request, source, cpp);
+        } else {
+          request.set_operation(Request::LOAD_PACKAGE);
+          auto& bundle = *request.mutable_package();
+          bundle.set_compile_commands(package->compile_commands.string());
+          bundle.set_translation_unit(package->translation_unit.string());
+          for (const auto& flag : package->extra_flags) {
+            bundle.add_extra_flags(flag);
+          }
+          for (const auto& source : package->sources) {
+            bundle.add_sources(source.lexically_relative(package->directory).string());
+          }
+          std::uintmax_t size = bundle.ByteSizeLong();
+          for (const auto& path : files) {
+            const auto bytes = fs::file_size(path);
+            if (bytes > tracer::kMaxAgentPluginSource ||
+                size > tracer::kMaxAgentPluginSource - bytes) {
+              throw std::runtime_error("agent plugin package exceeds 4 MiB");
+            }
+            size += bytes;
+            auto& file = *bundle.add_files();
+            file.set_path(path.lexically_relative(package->directory).string());
+            file.set_contents(read_source(path.string()));
+          }
+          if (bundle.ByteSizeLong() > tracer::kMaxAgentPluginSource) {
+            throw std::runtime_error("agent plugin package exceeds 4 MiB");
+          }
+        }
+        controller.agent_plugin(request);
+      } catch (const std::exception& error) {
+        errors << "attach plugin " << manifest.string() << ": " << error.what() << '\n';
+      }
+    }
+  } catch (const std::exception& error) {
+    errors << "cannot read agent plugin packages: " << error.what() << '\n';
   }
 }
 

@@ -9,9 +9,11 @@
 
 namespace clangtracer::v1 {
 class AgentPluginRequest;
+class Session;
 }
 
 namespace tracer_repl {
+class Controller;
 class CppEngine;
 
 class Plugins {
@@ -30,6 +32,8 @@ class Plugins {
 
 public:
   void load_installed(CppEngine& cpp, std::ostream& out, std::ostream& errors);
+  void load_attached(Controller& controller, const clangtracer::v1::Session& session,
+                     const CppEngine& cpp, std::ostream& errors);
   void load_enabled(const CppEngine &cpp, std::ostream &out, std::ostream &errors);
   void execute(const Command &command, const CppEngine &cpp, std::ostream &out);
   void offer_agent_object(clangtracer::v1::AgentPluginRequest &request,

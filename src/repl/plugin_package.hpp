@@ -6,6 +6,8 @@
 #include <vector>
 
 namespace tracer_repl {
+enum class PluginComponent { Repl, Agent };
+
 struct PluginPackage {
   std::string id;
   std::filesystem::path directory;
@@ -14,8 +16,11 @@ struct PluginPackage {
   std::filesystem::path compile_commands;
   std::filesystem::path translation_unit;
   std::vector<std::string> extra_flags;
+  std::string executable;
 };
 
 std::filesystem::path installed_plugin_directory();
-std::optional<PluginPackage> read_plugin_package(const std::filesystem::path& manifest);
+std::vector<std::filesystem::path> installed_plugin_manifests();
+std::optional<PluginPackage> read_plugin_package(const std::filesystem::path& manifest,
+                                                 PluginComponent component = PluginComponent::Repl);
 } // namespace tracer_repl

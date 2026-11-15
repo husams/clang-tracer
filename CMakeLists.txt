@@ -99,6 +99,7 @@ target_link_libraries(tracer_grpc PUBLIC tracer_proto gRPC::grpc++)
 
 add_library(clang_tracer_agent SHARED src/agent.cpp src/native_detour.cpp src/native_entry.cpp
   src/object_code_cache_agent.cpp src/agent_plugins.cpp src/native_plugins.cpp
+  src/repl/compiler_profile.cpp
   src/value_snapshot_codegen.cpp src/value_snapshot_storage.cpp src/snapshot_encoder.cpp src/callback_pch.cpp
   src/debug_resolver.cpp src/native_stack.cpp src/event_transport.cpp
   src/context_agent_delivery.cpp src/agent_runtime_profile.cpp)

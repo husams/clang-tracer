@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -13,12 +14,18 @@ namespace tracer {
 std::filesystem::path private_plugin_directory(const std::filesystem::path& directory, bool create,
                                                bool owner_only = true);
 
+struct NativePluginFile {
+  std::filesystem::path path;
+  std::string_view contents;
+};
+
 struct NativePluginSource {
   std::filesystem::path path;
   std::optional<std::string_view> contents;
   std::string_view sdk;
   std::filesystem::path sdk_file;
   std::string_view cpp_sdk;
+  std::span<const NativePluginFile> files{};
 };
 
 struct NativePluginUnit {

@@ -507,6 +507,27 @@ void Controller::require_session(const SessionHandle &session) {
   throw std::runtime_error("session is no longer attached: " + session.id);
 }
 
+void Controller::on_attach(std::function<void(const api::Session&)> hook) {
+  attachment_hook_ = std::move(hook);
+}
+
+void Controller::agent_plugin(const api::AgentPluginRequest& request) {
+  const auto response = unary<api::AgentPluginResponse>(
+      [&](auto& context, auto& reply) { return stub_->AgentPlugin(&context, request, &reply); },
+      settings_.timeout_seconds);
+  if (request.operation() == api::AgentPluginRequest::RUN) {
+    out_ << "agent " << request.plugin_id() << '.' << request.command() << " = " << response.value()
+         << '\n';
+  } else {
+    out_ << "agent " << request.plugin_id() << " generation " << response.generation()
+         << " active ("
+         << (response.reused_repl_object() ? "REPL object"
+             : response.cache_hit()        ? "cache hit"
+                                           : "compiled")
+         << ")\n";
+  }
+}
+
 SessionHandle Controller::attach(std::uint32_t pid,
                                  std::uint64_t expected_start_time,
                                  const std::string &expected_executable) {
@@ -583,6 +604,9 @@ SessionHandle Controller::attach(std::uint32_t pid,
   if (response.has_jit_runtime()) {
     out_ << "target JIT runtime " << response.jit_runtime().ShortDebugString()
          << '\n';
+  }
+  if (attachment_hook_) {
+    attachment_hook_(response);
   }
   return selected_;
 }
@@ -2421,18 +2445,7 @@ public:
       if (offer)
         offer(request, path);
     }
-    const auto response = unary<api::AgentPluginResponse>(
-        [&](auto &context, auto &reply) {
-          return stub_->AgentPlugin(&context, request, &reply);
-        }, settings_.timeout_seconds);
-    if (run)
-      out_ << "agent " << id << '.' << request.command() << " = "
-           << response.value() << '\n';
-    else
-      out_ << "agent " << id << " generation " << response.generation()
-           << " active (" << (response.reused_repl_object() ? "REPL object"
-                               : response.cache_hit() ? "cache hit" : "compiled")
-           << ")\n";
+    agent_plugin(request);
     return true;
   }
   case K::probe_reload: {

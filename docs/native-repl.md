@@ -1772,6 +1772,40 @@ in `clang_tracer_repl_plugin.h` can still load. The JIT scope resolves its own
 symbols. Run plugins from trusted sources because they execute native code
 in the REPL process.
 
+## Install an agent extension for automatic attachment
+
+On the REPL machine, copy a trusted extension package to
+`~/.local/share/clang-tracer/plugins/agent-counter/` (or the corresponding
+`XDG_DATA_HOME` path). Save `examples/jit-plugin-globals/plugin_b.cpp` as
+`src/plugin.cpp` in that package. Put the following `plugin.toml` at its
+root and set the executable to the exact absolute path reported by the
+target's Linux host.
+
+```toml
+id = "agent-counter"
+sdk = 1
+
+[agent]
+sources = ["src/plugin.cpp"]
+
+[agent.target]
+executable = "/absolute/path/to/application"
+```
+
+Start the server with `CLANG_TRACER_ALLOW_AGENT_PLUGINS=1` in its environment
+and attach to the application as usual. A new matching attachment activates
+the package before returning to the REPL prompt. Selecting an existing
+attachment preserves its plugin state. Approval or load failures identify the
+package and leave the attachment available.
+
+Single-file extensions use the existing REPL-object compatibility check.
+The agent compiles from source on a cache miss. Multi-file packages send
+their translation units and bundled headers for compilation in one target JIT
+scope. Optional `compile_commands`, `translation_unit`, and `extra_flags`
+under `[agent]` apply to target compilation. Use target-host paths for
+external build inputs. The agent caches the resulting objects and links a fresh
+instance for each matching attachment.
+
 ## Load plugins in an injected agent
 
 Start a local managed server with agent plugins enabled and attach to a Linux

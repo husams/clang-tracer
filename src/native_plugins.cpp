@@ -300,6 +300,11 @@ std::optional<Artifact> plugin_object(llvm::orc::LLJIT& jit, const NativePluginS
       llvm::vfs::getRealFileSystem());
   auto memory = llvm::makeIntrusiveRefCnt<llvm::vfs::InMemoryFileSystem>();
   overlay->pushOverlay(memory);
+  for (const auto& file : input.files) {
+    if (file.path != source) {
+      memory->addFile(file.path.string(), 0, llvm::MemoryBuffer::getMemBufferCopy(file.contents));
+    }
+  }
   if (input.contents) {
     memory->addFile(source.string(), 0,
                     llvm::MemoryBuffer::getMemBufferCopy(*input.contents));

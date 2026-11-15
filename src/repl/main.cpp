@@ -200,20 +200,20 @@ int main(int argc, char **argv) {
     tr::Facade facade(controller);
     tr::Plugins plugins;
     tr::CppEngine cpp(facade, std::move(cpp_args));
-    auto choose = [&](const std::string &prompt) {
-      return input.read(prompt).value_or("");
-    };
-    if (pid) {
-      controller.attach(pid);
-    } else if (!process.empty()) {
-      controller.select_process(process, choose);
-    }
+    auto choose = [&](const std::string& prompt) { return input.read(prompt).value_or(""); };
     if (input.terminal()) {
       std::cout << "Clang Tracer native C++23 REPL. %help lists commands; "
                    "%help api lists C++ APIs. Tab completes commands, paths, and C++.\n";
     }
     plugins.load_installed(cpp, std::cout, std::cerr);
     plugins.load_enabled(cpp, std::cout, std::cerr);
+    controller.on_attach(
+        [&](const auto& session) { plugins.load_attached(controller, session, cpp, std::cerr); });
+    if (pid) {
+      controller.attach(pid);
+    } else if (!process.empty()) {
+      controller.select_process(process, choose);
+    }
     input.use_cpp(cpp);
     bool failed = false;
     while (true) {

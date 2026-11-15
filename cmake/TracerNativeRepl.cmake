@@ -218,6 +218,10 @@ function(tracer_add_native_repl)
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_plugins.py"
         $<TARGET_FILE:clang-tracer-repl> "${CMAKE_CURRENT_SOURCE_DIR}/examples/jit-plugin-globals")
     set_tests_properties(native_repl_plugins PROPERTIES TIMEOUT 90)
+    add_test(NAME native_repl_agent_attach_rpc
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_agent_attach_rpc.py"
+        $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:repl-client-tests>)
+    set_tests_properties(native_repl_agent_attach_rpc PROPERTIES TIMEOUT 45)
     add_test(NAME native_repl_checker_session
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_checker_session.py"
         $<TARGET_FILE:clang-tracer-repl-check>)
@@ -1026,6 +1030,12 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-reload-target>
           "${CMAKE_CURRENT_SOURCE_DIR}/examples/jit-plugin-globals" fallback)
       set_tests_properties(native_repl_agent_plugin_fallback PROPERTIES TIMEOUT 120)
+      add_test(NAME native_repl_agent_plugin_autoload
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_agent_plugins.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-reload-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/examples/jit-plugin-globals" autoload)
+      set_tests_properties(native_repl_agent_plugin_autoload PROPERTIES TIMEOUT 120)
       add_executable(repl-bulk-concrete-target
         examples/prepared-injectors/concrete/target.cpp
         examples/prepared-injectors/concrete/virtual.cpp)

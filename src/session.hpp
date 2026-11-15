@@ -138,10 +138,10 @@ private:
   void attach_process(tracer::injector::Process &process,
                       std::chrono::steady_clock::time_point deadline);
   void check_identity_locked();
-  bool invoke_agent_plugin_locked(AgentPluginCall &request,
-                                  const std::string &source,
+  bool invoke_agent_plugin_locked(AgentPluginCall& request, const std::string& source,
                                   std::chrono::steady_clock::time_point deadline,
-                                  const std::string &offer = {});
+                                  const std::string& offer = {},
+                                  const std::string& expected_executable = {});
   void clear_agent_plugins_locked(std::chrono::steady_clock::time_point deadline);
   void require_probe_control_locked(std::uint64_t removing = 0) const;
   void stop_object_watch_locked();

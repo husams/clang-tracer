@@ -575,9 +575,10 @@ Session::validate_probe(const clangtracer::v1::ProbeSpec &spec,
   }
 }
 
-bool Session::invoke_agent_plugin_locked(
-    AgentPluginCall &request, const std::string &source,
-    std::chrono::steady_clock::time_point deadline, const std::string &offer) {
+bool Session::invoke_agent_plugin_locked(AgentPluginCall& request, const std::string& source,
+                                         std::chrono::steady_clock::time_point deadline,
+                                         const std::string& offer,
+                                         const std::string& expected_executable) {
   if (!plugin_address_)
     throw std::runtime_error("loaded native agent does not support plugins");
   copy_field(request.session_id, id_, "plugin session");
@@ -589,6 +590,13 @@ bool Session::invoke_agent_plugin_locked(
   std::uintptr_t buffer = 0;
   try {
     attach_process(process, deadline);
+    if (!expected_executable.empty()) {
+      std::error_code error;
+      const auto live = std::filesystem::read_symlink(proc::directory(pid_) / "exe", error);
+      if (error || live.string() != expected_executable) {
+        throw std::runtime_error("agent plugin target executable changed");
+      }
+    }
     buffer = process.remote_allocate(size);
     process.remote_write(buffer, &request, sizeof(request));
     const auto remote_source = source.empty() ? 0 : buffer + sizeof(request);
@@ -635,6 +643,11 @@ Session::agent_plugin(const clangtracer::v1::AgentPluginRequest &rpc) {
   require_probe_control_locked();
   AgentPluginCall request{};
   using Rpc = clangtracer::v1::AgentPluginRequest;
+  const auto& expected = rpc.expected_executable();
+  if (!expected.empty() && expected != executable_) {
+    throw std::invalid_argument("agent plugin target executable does not match the attachment");
+  }
+  std::string payload;
   switch (rpc.operation()) {
   case Rpc::LOAD:
   case Rpc::RELOAD:
@@ -642,12 +655,27 @@ Session::agent_plugin(const clangtracer::v1::AgentPluginRequest &rpc) {
         !rpc.command().empty())
       throw std::invalid_argument(
           "load and reload require plugin source up to 4 MiB");
+    if (rpc.has_package()) {
+      throw std::invalid_argument("source load cannot include a plugin package");
+    }
     request.operation = rpc.operation() == Rpc::LOAD ? AgentPluginOperation::Load
                                                     : AgentPluginOperation::Reload;
+    payload = rpc.source();
+    break;
+  case Rpc::LOAD_PACKAGE:
+    if (expected.empty() || !rpc.has_package() || rpc.package().sources().empty() ||
+        rpc.package().ByteSizeLong() > kMaxAgentPluginSource || !rpc.source().empty() ||
+        !rpc.command().empty() || rpc.has_repl_object()) {
+      throw std::invalid_argument("package load requires an executable and package up to 4 MiB");
+    }
+    request.operation = AgentPluginOperation::LoadPackage;
+    payload = rpc.package().SerializeAsString();
     break;
   case Rpc::RUN:
-    if (rpc.command().empty() || !rpc.source().empty() || rpc.has_repl_object())
+    if (rpc.command().empty() || !rpc.source().empty() || rpc.has_repl_object() ||
+        rpc.has_package()) {
       throw std::invalid_argument("run requires a plugin command");
+    }
     request.operation = AgentPluginOperation::Run;
     break;
   default:
@@ -661,8 +689,7 @@ Session::agent_plugin(const clangtracer::v1::AgentPluginRequest &rpc) {
                              rpc.repl_object().ByteSizeLong() <= kMaxAgentPluginOffer
                          ? rpc.repl_object().SerializeAsString() : std::string{};
   const auto reused = invoke_agent_plugin_locked(
-      request, rpc.source(), std::chrono::steady_clock::now() + operation_timeout_,
-      offer);
+      request, payload, std::chrono::steady_clock::now() + operation_timeout_, offer, expected);
   clangtracer::v1::AgentPluginResponse response;
   response.set_generation(request.generation);
   response.set_cache_hit(request.cache_hit);

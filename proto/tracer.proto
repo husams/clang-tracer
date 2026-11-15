@@ -386,12 +386,26 @@ message AgentPluginObject {
   bytes object = 5;
 }
 
+message AgentPluginFile {
+  string path = 1; // Relative to the package, delivered as a JIT input.
+  bytes contents = 2;
+}
+
+message AgentPluginPackage {
+  repeated AgentPluginFile files = 1;
+  repeated string sources = 2; // Relative paths of translation units in files.
+  string compile_commands = 3; // Absolute path on the target host.
+  string translation_unit = 4; // Absolute path on the target host.
+  repeated string extra_flags = 5;
+}
+
 message AgentPluginRequest {
   enum Operation {
     OPERATION_UNSPECIFIED = 0;
     LOAD = 1;
     RELOAD = 2;
     RUN = 3;
+    LOAD_PACKAGE = 4;
   }
   string session_id = 1;
   Operation operation = 2;
@@ -399,6 +413,8 @@ message AgentPluginRequest {
   bytes source = 4;
   string command = 5;
   AgentPluginObject repl_object = 6;
+  string expected_executable = 7; // Required for automatic package activation.
+  AgentPluginPackage package = 8;
 }
 
 message AgentPluginResponse {
