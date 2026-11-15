@@ -192,6 +192,30 @@ void Session::require_probe_control_locked(std::uint64_t removing,
   }
 }
 
+void Session::require_object_watch_sites_locked(std::uint64_t registration) const {
+  bool grouped_method = false;
+  for (const auto &[probe_id, probe] : probes_) {
+    (void)probe_id;
+    if (!probe.patch_committed && !probe.value.active() &&
+        !probe.value.draining() && !probe.remote_request)
+      continue;
+    if (!registration || probe.reload_spec.object_watch_id() != registration)
+      throw std::runtime_error("remove the session's native probes before starting an object watch");
+    grouped_method = true;
+  }
+  if (pthread_create_patch_committed_ && !grouped_method)
+    throw std::runtime_error("remove the session's native probes before starting an object watch");
+}
+
+void Session::preflight_object_probe() {
+  std::lock_guard lock(mutex_);
+  check_identity_locked();
+  if (state_ != clangtracer::v1::Session::ATTACHED || unsafe_target_)
+    throw std::runtime_error("object probe requires a live attached session");
+  require_probe_control_locked();
+  require_object_watch_sites_locked(0);
+}
+
 bool Session::has_object_probe_registration(std::uint64_t registration) const {
   std::lock_guard lock(mutex_);
   return object_cache_ && object_cache_->is_registration(registration);
@@ -260,18 +284,7 @@ clangtracer::v1::ObjectWatchStatus Session::object_watch(
   if (request.has_prepared_bindings())
     binding_status = object_watch::preview(request, pid_, executable_).binding_status();
   require_probe_control_locked();
-  bool grouped_method = false;
-  for (const auto &[probe_id, probe] : probes_) {
-    (void)probe_id;
-    if (!probe.patch_committed && !probe.value.active() &&
-        !probe.value.draining() && !probe.remote_request)
-      continue;
-    if (!request.staged_registration() || probe.reload_spec.object_watch_id() != id)
-      throw std::runtime_error("remove the session's native probes before starting an object watch");
-    grouped_method = true;
-  }
-  if (pthread_create_patch_committed_ && !grouped_method)
-    throw std::runtime_error("remove the session's native probes before starting an object watch");
+  require_object_watch_sites_locked(request.staged_registration() ? id : 0);
   if (request.backend() == Request::CODE_CACHE) {
     if (!object_cache_address_)
       throw std::runtime_error("the loaded agent does not export the code-cache backend");
@@ -467,7 +480,7 @@ void Session::attach(const std::string &expected_executable) {
   // scratch buffer is reused for another symbol name or the profile.
   const auto scratch_size = std::max(
       {agent_path_.size() + 1, sizeof(AgentRuntimeProfile),
-       sizeof("tracer_agent_object_cache_v38")});
+       sizeof("tracer_agent_object_cache_v39")});
   try {
     scratch = process.remote_allocate(scratch_size);
     process.remote_write(scratch, agent_path_.c_str(), agent_path_.size() + 1);
@@ -499,7 +512,7 @@ void Session::attach(const std::string &expected_executable) {
     const auto stop = agent_symbol("tracer_agent_stop");
     const auto validate = agent_symbol("tracer_agent_validate");
     const auto capacity = agent_symbol("tracer_agent_capacity_v1");
-    const auto object_cache = agent_symbol("tracer_agent_object_cache_v38");
+    const auto object_cache = agent_symbol("tracer_agent_object_cache_v39");
     const auto pthread_detour =
         agent_symbol("tracer_context_pthread_create_detour");
     if (!start || !stop) {

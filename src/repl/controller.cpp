@@ -649,6 +649,13 @@ void Controller::detach(const SessionHandle &session) {
     selected_ = {};
   }
   out_ << "detached session=" << request.session_id() << '\n';
+  if (response.has_object_probe()) {
+    const auto &group = response.object_probe();
+    out_ << "object-probe registration=" << group.registration_id()
+         << " active=" << (group.active() ? "yes" : "no")
+         << " restoration_pending=" << (group.restoration_pending() ? "yes" : "no")
+         << " | " << group.diagnostic() << '\n';
+  }
 }
 
 api::ProbeSpec Controller::resolve(const std::string &selector,
@@ -989,6 +996,9 @@ void Controller::object_probe_command(const Command &command) {
   if (command.kind == K::object_probe_prepare) {
     if (!command.has("--output"))
       throw std::invalid_argument("object probe preparation requires --output FILE");
+    const auto output = command.option("--output");
+    if (std::filesystem::exists(std::filesystem::symlink_status(output)))
+      throw std::invalid_argument("object-probe package already exists; select a new --output file");
     ObjectProbePackageInput input;
     input.qualified_type = command.arguments.at(0);
     input.methods = values("--method");
@@ -1027,20 +1037,28 @@ void Controller::object_probe_command(const Command &command) {
       options.options["--output"] = {staging.file(std::to_string(method_index++)).string()};
       options.extra_compile_argument_inputs = command.extra_compile_argument_inputs;
       options.extra_compile_arguments = command.extra_compile_arguments;
-      return prepare_package(selector, options).artifact;
+      try {
+        return prepare_package(selector, options).artifact;
+      } catch (const std::exception &error) {
+        throw std::runtime_error("cannot prepare object probe method " + selector + " | " + error.what());
+      }
     });
-    package.save(command.option("--output"));
+    package.save(output);
     out_ << "object-probe package=" << command.option("--output")
          << " type=" << input.qualified_type << " methods=" << input.methods.size()
          << " writers=" << input.writer_selectors.size() << '\n';
     return;
   }
 
-  require_session(selected_);
+  const bool inspecting = command.kind == K::object_probe_status || command.kind == K::object_probe_stop;
+  if (!inspecting)
+    require_session(selected_);
+  else if (!stub_ || selected_.id.empty() || selected_.connection != connection_)
+    throw std::runtime_error("no valid selected session; use %attach PID or %use SESSION");
   Request request;
   request.set_session_id(selected_.id);
   std::string definition;
-  if (command.kind == K::object_probe_status || command.kind == K::object_probe_stop) {
+  if (inspecting) {
     request.set_action(command.kind == K::object_probe_status ? Request::STATUS : Request::STOP);
     if (!command.arguments.empty())
       request.set_registration_id(unsigned_number(command.arguments.front(), "registration id"));
@@ -1054,10 +1072,14 @@ void Controller::object_probe_command(const Command &command) {
     for (const auto &artifact : package.prepared_methods())
       *request.add_methods() = artifact;
     request.set_callback_source(input.callback_source);
-    request.set_method_module(command.option("--method-module", command.option("--module")));
+    const auto module_path = [](const std::string &selector) {
+      const std::filesystem::path path(selector);
+      return path.has_parent_path() ? std::filesystem::absolute(path).lexically_normal().string() : selector;
+    };
+    request.set_method_module(module_path(command.option("--method-module", command.option("--module"))));
     auto &watch = *request.mutable_watch();
     watch.set_concrete_type(input.qualified_type);
-    watch.set_code_module(command.option("--module"));
+    watch.set_code_module(module_path(command.option("--module")));
     if (!input.fields.empty()) {
       watch.set_field(input.fields.front());
       watch.set_code_symbol(input.writer_selectors.front());

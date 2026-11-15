@@ -491,9 +491,9 @@ extern "C" void tracer_probe_enter(unsigned long long) noexcept;
 extern "C" void tracer_probe_leave(unsigned long long) noexcept;
 extern "C" bool tracer_object_identity_lookup(unsigned long long,
                                                unsigned long long,
-                                               bool,
                                                std::uint64_t *,
-                                               std::uint64_t *) noexcept;
+                                               std::uint64_t *,
+                                               bool *) noexcept;
 extern "C" unsigned long long tracer_next_call_id(unsigned long long) noexcept;
 extern "C" void tracer_capture_stack(const tracer::TraceContext *, unsigned,
                                      bool) noexcept;
@@ -1029,7 +1029,8 @@ bool read_probe_spec(const tracer::Request &request,
   }
   if (request.object_watch_id &&
       (request.kind != tracer::CallableKind::Method ||
-       (!spec.has_receiver() && !spec.has_debug_info()))) {
+       !spec.has_debug_info() || spec.debug_info().record_name().empty() ||
+       !tracer::prepared::is_typed_version(spec.prepared().format_version()))) {
     error = "object-watch method requires verified receiver type metadata";
     return false;
   }
@@ -2878,7 +2879,7 @@ std::string make_wrapper(const tracer::Request &r,
       "tracer_probe_enter(unsigned long long) noexcept;\nextern \"C\" void "
       "tracer_probe_leave(unsigned long long) noexcept;\nextern \"C\" "
       "unsigned long long tracer_next_call_id(unsigned long long) noexcept;\n";
-  code += "extern \"C\" bool tracer_object_identity_lookup(unsigned long long,unsigned long long,bool,std::uint64_t*,std::uint64_t*) noexcept;\n";
+  code += "extern \"C\" bool tracer_object_identity_lookup(unsigned long long,unsigned long long,std::uint64_t*,std::uint64_t*,bool*) noexcept;\n";
   code +=
       "extern \"C\" void tracer_stack_enter(tracer::TraceContext*,void*) "
       "noexcept;\n"
@@ -2975,47 +2976,60 @@ std::string make_wrapper(const tracer::Request &r,
   if (r.kind == tracer::CallableKind::Method) {
     code += "ctx.object_address=reinterpret_cast<uintptr_t>(self);\n";
   }
-  code += std::string("bool object_identity_active=") +
-          (r.object_watch_id ? "false;\n" : "true;\n");
-  if (r.object_watch_id) {
+  const bool grouped = r.object_watch_id != 0;
+  const std::string admit = grouped ? "if(object_identity_active) " : "";
+  if (grouped) {
     code += "ctx.object_watch_id=" + std::to_string(r.object_watch_id) +
-            "ULL; object_identity_active=tracer_object_identity_lookup(" +
+            "ULL; const bool object_identity_active=tracer_object_identity_lookup(" +
             std::to_string(r.object_watch_id) +
-            "ULL,ctx.object_address," +
-            (spec && (spec->has_receiver() || spec->has_debug_info())
-                 ? "true" : "false") +
-            ",&ctx.object_id,&ctx.object_generation);"
-            "ctx.object_identity_verified=object_identity_active;\n";
+            "ULL,ctx.object_address,&ctx.object_id,&ctx.object_generation,&ctx.object_identity_verified);\n";
+  }
+  if (snapshots) {
+    if (grouped) {
+      code += snapshots->storage;
+    } else {
+      code += snapshots->scope + snapshots->argument_storage +
+              snapshots->receiver_storage;
+    }
   }
   for (unsigned i = 0; i < r.argument_count; ++i) {
     fill_value(code, i, r.arguments[i], indirect_argument(i));
   }
-  if (snapshots)
-    code += "if(object_identity_active){\n" + snapshots->arguments +
-            snapshots->receiver + "}\n";
+  if (snapshots) {
+    if (grouped)
+      code += "if(object_identity_active){\n" + snapshots->arguments +
+              snapshots->receiver + "}\n";
+    else
+      code += snapshots->arguments + snapshots->receiver;
+  }
   if (!shared_mode && spec && spec->stack_depth())
     code += "tracer_capture_entry_stack(&ctx," +
             std::to_string(spec->stack_depth()) + ");\n";
   if (shared_mode) {
     code += "struct SharedGuard { void* token=nullptr; ~SharedGuard() noexcept "
             "{ if(token){tracer_shared_leave(token); tracer_shared_release(token);} } } "
-            "shared_guard;\n"
-            "if(object_identity_active) shared_guard.token=tracer_shared_enter(" +
+            "shared_guard;\n" + admit + "shared_guard.token=tracer_shared_enter(" +
             std::to_string(r.probe_id) + "ULL,&ctx," +
-            std::to_string(spec ? spec->stack_depth() : 0) +
-            "U);\ntry { if(shared_guard.token) tracer_shared_resume(shared_guard.token);\n";
+            std::to_string(spec ? spec->stack_depth() : 0) + "U);\ntry { " +
+            (grouped ? "if(shared_guard.token) " : "") +
+            "tracer_shared_resume(shared_guard.token);\n";
   } else if (class_mode) {
-    code += "std::optional<tracer_invocation_instance> tracer_invocation;"
-            "if(object_identity_active) tracer_invocation.emplace(ctx);\n";
+    if (grouped)
+      code += "std::optional<tracer_invocation_instance> tracer_invocation;"
+              "if(object_identity_active) tracer_invocation.emplace(ctx);\n";
+    else
+      code += "tracer_invocation_instance tracer_invocation(ctx);\n";
   }
   const std::string instance =
-      class_mode ? "(tracer_invocation ? &*tracer_invocation : nullptr)"
+      class_mode ? (grouped
+                        ? "(tracer_invocation ? &*tracer_invocation : nullptr)"
+                        : "&tracer_invocation")
                  : "nullptr";
   if (has_pre) {
     if (shared_mode)
-      code += "if(object_identity_active) tracer_shared_dispatch(shared_guard.token,&ctx);\n";
+      code += admit + "tracer_shared_dispatch(shared_guard.token,&ctx);\n";
     else
-      code += "if(object_identity_active) (void)tracer_callback_dispatch(" + std::to_string(r.probe_id) +
+      code += admit + "(void)tracer_callback_dispatch(" + std::to_string(r.probe_id) +
               "ULL,&ctx," + instance + ");\n";
   }
   code += "auto original=reinterpret_cast<Original>(" +
@@ -3108,21 +3122,37 @@ std::string make_wrapper(const tracer::Request &r,
   if (shared_mode && r.result != tracer::ValueType::Object)
     code += "}\n";
   if (has_post) {
-    if (refresh_receiver)
-      code += "if(object_identity_active){ auto* entry_receiver_snapshot=ctx.receiver_snapshot;\n"
-              "{ tracer_snapshot_detail::Scope return_receiver_scope;\n" + snapshots->receiver;
-    if (snapshots)
-      code += "if(object_identity_active){ ctx.phase=tracer::TracePhase::Post;\n" +
-              snapshots->result + "}\n";
+    if (refresh_receiver) {
+      if (grouped)
+        code += "if(object_identity_active){ auto* entry_receiver_snapshot=ctx.receiver_snapshot;\n"
+                "{ tracer_snapshot_detail::Scope return_receiver_scope;\n" +
+                snapshots->receiver_storage + snapshots->receiver;
+      else
+        code += "auto* entry_receiver_snapshot=ctx.receiver_snapshot;\n"
+                "{ tracer_snapshot_detail::Scope return_receiver_scope;\n" +
+                snapshots->receiver_storage + snapshots->receiver;
+    }
+    if (snapshots) {
+      if (grouped)
+        code += "if(object_identity_active){ ctx.phase=tracer::TracePhase::Post;\n" +
+                snapshots->result + "}\n";
+      else
+        code += "ctx.phase=tracer::TracePhase::Post;\n" +
+                snapshots->result_storage + snapshots->result;
+    }
     if (shared_mode)
-      code += "ctx.phase=tracer::TracePhase::Post; "
-              "if(object_identity_active) tracer_shared_dispatch(shared_guard.token,&ctx);\n";
+      code += "ctx.phase=tracer::TracePhase::Post; " + admit +
+              "tracer_shared_dispatch(shared_guard.token,&ctx);\n";
     else
-      code += "ctx.phase=tracer::TracePhase::Post; "
-              "if(object_identity_active) (void)tracer_callback_dispatch(" +
+      code += "ctx.phase=tracer::TracePhase::Post; " + admit +
+              "(void)tracer_callback_dispatch(" +
               std::to_string(r.probe_id) + "ULL,&ctx," + instance + ");\n";
-    if (refresh_receiver)
-      code += "} ctx.receiver_snapshot=entry_receiver_snapshot; }\n";
+    if (refresh_receiver) {
+      if (grouped)
+        code += "} ctx.receiver_snapshot=entry_receiver_snapshot; }\n";
+      else
+        code += "} ctx.receiver_snapshot=entry_receiver_snapshot;\n";
+    }
   }
   if (shared_mode)
     code += "tracer_shared_leave(shared_guard.token); "
@@ -3131,8 +3161,10 @@ std::string make_wrapper(const tracer::Request &r,
             "shared_guard.token=nullptr;\n";
   if (result_sret) {
     if (class_mode)
-      code += "if(tracer_invocation) tracer_invocation->destroy();\n";
-    if (snapshots && !snapshots->arguments.empty())
+      code += grouped
+                  ? "if(tracer_invocation) tracer_invocation->destroy();\n"
+                  : "tracer_invocation.destroy();\n";
+    if (snapshots && !snapshots->scope.empty())
       code += "snapshot_scope.release();\n";
     code += "tracer_stack_leave(&ctx); stack_guard.ctx=nullptr; "
             "tracer_probe_leave(" + std::to_string(r.probe_id) +
@@ -5605,26 +5637,17 @@ tracer_next_call_id(unsigned long long id) noexcept {
 
 extern "C" bool tracer_object_identity_lookup(
     unsigned long long watch_id, unsigned long long receiver,
-    bool receiver_type_verified, std::uint64_t *object_id,
-    std::uint64_t *generation) noexcept {
-  const int saved_errno = errno;
-  if (!object_id || !generation) {
-    errno = saved_errno;
+    std::uint64_t *object_id, std::uint64_t *generation,
+    bool *identity_verified) noexcept {
+  if (!object_id || !generation || !identity_verified)
     return false;
-  }
-  *object_id = 0;
-  *generation = 0;
-  const auto identity = tracer::object_cache::identity::lookup(
-      watch_id, receiver, receiver_type_verified);
-  const bool active =
-      identity.status == tracer::object_cache::identity::Status::active &&
-      identity.object_id != 0 && identity.generation != 0;
-  if (active) {
-    *object_id = identity.object_id;
-    *generation = identity.generation;
-  }
+  const int saved_errno = errno;
+  const auto identity = tracer::object_cache::identity::lookup(watch_id, receiver);
+  *object_id = identity ? identity->object_id : 0;
+  *generation = identity ? identity->generation : 0;
+  *identity_verified = *object_id != 0;
   errno = saved_errno;
-  return active;
+  return identity.has_value();
 }
 
 extern "C" long long tracer_callback_dispatch(unsigned long long id,

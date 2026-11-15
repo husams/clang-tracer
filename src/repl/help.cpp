@@ -118,10 +118,13 @@ const CommandTopic commands[] = {
     {"object stop", "%object stop [WATCH_ID]", "Restore the watch's patches and release execution control."},
     {"object-probe prepare", "%object-probe prepare TYPE --method METHOD --include HEADER --compdb FILE --translation-unit TU --callbacks SOURCE --output FILE",
       "Prepare an offline type package. A field write package uses --field FIELD --code WRITER."},
-    {"object-probe preview", "%object-probe preview --package FILE [--module MAPPING]",
-      "Bind the package to an attached target and check the patch windows."},
-    {"object-probe start", "%object-probe start --package FILE [--module MAPPING]",
-      "Activate the verified object probe and its method callbacks."},
+    {"object-probe preview", "%object-probe preview --package FILE [--module MAPPING] [start options]",
+      "Bind an attached target and check patch windows. Use the same options for preview and start."},
+    {"object-probe start", "%object-probe start --package FILE [--module MAPPING] [--method-module MAPPING] "
+        "[--follow-calls] [--no-values] [--first-seen] [--union-tag FIELD --union-case TAG=MEMBER "
+        "--synchronization thread-confined|caller-lock]",
+      "Activate the verified object probe. Follow calls for write-only registrations. "
+      "Use first-seen with a standalone writer. Repeat union-case for each admitted tag."},
     {"object-probe status", "%object-probe status [ID]", "Report group coverage and restoration."},
     {"object-probe stop", "%object-probe stop [ID]", "Close callback admission and restore the group's patches."},
 

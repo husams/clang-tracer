@@ -61,6 +61,7 @@ public:
   clangtracer::v1::ObjectWatchStatus object_watch(
       const clangtracer::v1::ObjectWatchRequest &request, std::uint64_t id,
       std::function<void(clangtracer::v1::TraceEvent)> publish);
+  void preflight_object_probe();
   bool has_object_probe_registration(std::uint64_t registration) const;
   void set_object_probe_active(std::uint64_t registration, bool active);
   static clangtracer::v1::ObjectWatchStatus prepare_object_watch(
@@ -136,6 +137,7 @@ private:
   void check_identity_locked();
   void require_probe_control_locked(std::uint64_t removing = 0,
                                     std::uint64_t registration = 0) const;
+  void require_object_watch_sites_locked(std::uint64_t registration) const;
   void stop_object_watch_locked();
   void stop_object_cache_locked(bool detaching = false);
   bool retire_changed_object_cache_locked(std::chrono::steady_clock::time_point deadline);

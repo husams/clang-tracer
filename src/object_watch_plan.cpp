@@ -2003,13 +2003,17 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       virtual_destructor |= deleting;
     };
 
-    std::set<Range> destructors;
+    std::set<Range> destructors, deleting_destructors;
+    std::set<Range> base_destructors;
     for (const auto &symbol : lifetime_image->symbols) {
       if (symbol.kind != llvm::ELF::STT_FUNC || symbol.linkage.find('.') != std::string::npos)
         continue;
-      if (symbol.demangled.starts_with(destructor_name) &&
-          (symbol.linkage.contains("D1Ev") || symbol.linkage.contains("D0Ev")))
+      if (symbol.demangled.starts_with(destructor_name) && symbol.linkage.contains("D1Ev"))
         destructors.insert(symbol.range);
+      else if (symbol.demangled.starts_with(destructor_name) && symbol.linkage.contains("D0Ev"))
+        deleting_destructors.insert(symbol.range);
+      else if (symbol.demangled.starts_with(destructor_name) && symbol.linkage.contains("D2Ev"))
+        base_destructors.insert(symbol.range);
     }
     for (const auto &symbol : lifetime_image->symbols) {
       if (symbol.kind == llvm::ELF::STT_FUNC && symbol.demangled.starts_with(constructor_name) &&
@@ -2025,15 +2029,53 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       // its boundary only as an uncertainty marker unless a C1 entry aliases it.
       add_lifecycle(symbol, Boundary::construct, true);
     }
+    std::vector<std::uint64_t> uncertain_constructors;
+    for (const auto &[pc, site] : sites)
+      if (site.boundary == Boundary::construct && site.uncertain_complete)
+        uncertain_constructors.push_back(pc);
+    for (const auto &[entry, calls] : direct_redirects(uncertain_constructors, true, false)) {
+      for (const auto call : calls) {
+        const auto *caller_image = image_for(call);
+        if (!caller_image || !caller_image->bias)
+          continue;
+        const auto address = call - *caller_image->bias;
+        const auto debug = caller_image->dwarf->getDIEsForAddress(address);
+        if (!debug.CompileUnit)
+          continue;
+        llvm::SmallVector<DWARFDie, 4> chain;
+        debug.CompileUnit->getInlinedChainForAddress(address, chain);
+        if (chain.empty() || std::ranges::any_of(chain, [](const auto die) {
+              const auto *linkage = die.getName(llvm::DINameKind::LinkageName);
+              if (!linkage)
+                return true;
+              llvm::ItaniumPartialDemangler parsed;
+              return parsed.partialDemangle(linkage) ? std::string_view(linkage).starts_with("_Z") :
+                  parsed.isCtorOrDtor();
+            }))
+          continue;
+        complete_constructor_returns.emplace(entry, call + object_cache::direct_call_width);
+      }
+    }
+    const bool has_complete_constructor_entry = std::ranges::any_of(sites, [](const auto &entry) {
+      return entry.second.boundary == Boundary::construct && !entry.second.uncertain_complete;
+    });
+    if (!uncertain_constructors.empty() && complete_constructor_returns.empty() &&
+        !has_complete_constructor_entry)
+      throw std::runtime_error("lifetime-only C2 constructor has no verified complete-object caller evidence: " +
+                               concrete);
     if (destructors.empty())
-      throw std::runtime_error("no verified destructor entries for lifetime-only type " + concrete);
+      destructors = std::move(base_destructors);
+    if (destructors.empty())
+      throw std::runtime_error("no verified complete or base destructor entries for lifetime-only type " + concrete);
     for (const auto &symbol : lifetime_image->symbols) {
       if (symbol.kind != llvm::ELF::STT_FUNC || !symbol.demangled.starts_with(destructor_name) ||
           symbol.linkage.find('.') != std::string::npos)
         continue;
       if (symbol.linkage.contains("D1Ev"))
         add_lifecycle(symbol, Boundary::destroy, false);
-      else if (symbol.linkage.contains("D0Ev"))
+      else if (symbol.linkage.contains("D2Ev") && destructors.count(symbol.range))
+        add_lifecycle(symbol, Boundary::destroy, false);
+      else if (symbol.linkage.contains("D0Ev") && deleting_destructors.count(symbol.range))
         add_lifecycle(symbol, Boundary::destroy, false, true);
     }
     if (std::ranges::none_of(sites, [](const auto &entry) {

@@ -10,6 +10,7 @@
 #include <iterator>
 #include <limits>
 #include <mutex>
+#include <poll.h>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -68,7 +69,7 @@ struct SharedFile {
 }
 
 std::uintptr_t load_agent(injector::Process &process, const std::string &path) {
-  constexpr char export_name[] = "tracer_agent_object_cache_v38";
+  constexpr char export_name[] = "tracer_agent_object_cache_v39";
   const auto size = std::max(path.size() + 1, sizeof(export_name));
   const auto memory = process.remote_allocate(size);
   std::uintptr_t entry = 0;
@@ -327,6 +328,10 @@ api::ModuleMapping code_mapping(const api::ListModulesResponse &maps,
 } // namespace
 
 struct Watch::Impl {
+  struct PidFd {
+    int value = -1;
+    ~PidFd() { if (value >= 0) ::close(value); }
+  } process_handle;
   api::ObjectWatchRequest request;
   std::uint64_t id;
   std::uint32_t pid;
@@ -357,10 +362,13 @@ struct Watch::Impl {
   std::vector<api::ObjectWatchStatus::Redirect> redirects;
   std::atomic<std::uint64_t> head{0}, publish_errors{0}, coverage_gaps{0};
   std::map<std::uint64_t, api::TraceEvent> open_lifetimes;
-  std::uint64_t final_observations = 0;
+  std::atomic<std::uint64_t> final_observations{0};
+  std::atomic<bool> closure_emitted{false};
+  std::atomic<bool> published{false};
   std::jthread pump;
   std::jthread admissions;
   mutable std::mutex admission_mutex;
+  std::mutex finish_mutex;
   std::string admission_failure;
   std::string admission_diagnostic;
   bool installed = false, draining = false;
@@ -376,6 +384,10 @@ struct Watch::Impl {
         event_buffer(spec.event_buffer() ? spec.event_buffer() : default_event_buffer),
         runtime_limit(spec.follow_calls() ? (spec.runtime_limit() ? spec.runtime_limit() :
                                              default_runtime_limit) : 0) {
+#if defined(SYS_pidfd_open)
+    if (request.staged_registration())
+      process_handle.value = static_cast<int>(::syscall(SYS_pidfd_open, pid, 0));
+#endif
     if (event_buffer < 2 || event_buffer > max_event_buffer)
       throw std::runtime_error("invalid code-cache event buffer size");
     if (runtime_limit > max_runtime_limit || (spec.runtime_limit() && !spec.follow_calls()))
@@ -439,8 +451,9 @@ struct Watch::Impl {
           if (inst.size == 1 && inst.bytes[0] == 0xc3)
             inst.hook = Hook::collection_end;
       }
-      if (!plan.caller_start && (!plan.shared_writer() || request.follow_calls())) {
-        fragmented_lifecycle = plan.layout.primary_rtti || plan.virtual_destructor ||
+      if (plan.lifetimes_only ||
+          (!plan.caller_start && (!plan.shared_writer() || request.follow_calls()))) {
+        fragmented_lifecycle = plan.lifetimes_only || plan.layout.primary_rtti || plan.virtual_destructor ||
             !plan.delegating_constructor_tails.empty() || !request.owner_type().empty() ||
             std::any_of(plan.boundaries.begin(), plan.boundaries.end(), [&](const auto &entry) {
               const auto [pc, size] = entry;
@@ -1616,10 +1629,13 @@ struct Watch::Impl {
     if (!channel)
       return;
     channel->activity.fetch_and(~enabled, std::memory_order_acq_rel);
+    channel->registration_active.store(false, std::memory_order_release);
     if (!installed && !draining)
       request_reclaim(*channel);
     admissions = {};
     pump = {};
+    if (request.staged_registration() && published.load(std::memory_order_acquire))
+      close_observations(api::ObjectObservation::WATCH_DETACHED);
     ::munmap(channel, Channel::mapping_size(event_buffer, runtime_limit));
     ::unlink(path.c_str());
   }
@@ -1898,9 +1914,131 @@ struct Watch::Impl {
       coverage_gaps.fetch_add(1, std::memory_order_relaxed);
   }
 
+  bool emit_final(api::TraceEvent &event, api::ObjectObservation::Kind kind,
+                  api::ObjectObservation::ClosureReason reason) noexcept {
+    const auto final = final_observations.load(std::memory_order_acquire);
+    const auto sequence = head.load(std::memory_order_acquire) + final;
+    if (request.max_events() && sequence >= request.max_events())
+      return false;
+    event.set_protocol_version(kProtocolVersion);
+    event.set_session_id(request.session_id());
+    event.set_pid(pid);
+    event.set_probe_id(id);
+    event.set_probe_sequence(sequence + 1);
+    event.set_agent_dropped_events(channel->dropped.load(std::memory_order_relaxed));
+    event.set_function_name("object.trace");
+    event.set_monotonic_time_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    auto &observation = *event.mutable_object_observation();
+    observation.set_kind(kind);
+    observation.set_concrete_type(request.concrete_type());
+    observation.set_source_unavailable(true);
+    observation.set_external_write_order_unknown(shared_file.identity.inode != 0);
+    observation.set_closure_reason(reason);
+    try {
+      publish(std::move(event));
+    } catch (...) {
+      publish_errors.fetch_add(1, std::memory_order_relaxed);
+    }
+    final_observations.fetch_add(1, std::memory_order_release);
+    return true;
+  }
+
+  void close_observations(api::ObjectObservation::ClosureReason reason) noexcept {
+    using Observation = api::ObjectObservation;
+    if (closure_emitted.exchange(true, std::memory_order_acq_rel))
+      return;
+    for (auto &[lifetime_id, event] : open_lifetimes) {
+      event.mutable_object_observation()->set_lifetime_id(lifetime_id);
+      if (!emit_final(event, Observation::OBSERVATION_ENDED, reason))
+        break;
+    }
+    open_lifetimes.clear();
+    if (reason == Observation::TARGET_EXITED ||
+        (request.staged_registration() && published.load(std::memory_order_acquire) &&
+         reason == Observation::WATCH_DETACHED)) {
+      api::TraceEvent event;
+      emit_final(event, Observation::OBSERVATION_ENDED, reason);
+    }
+  }
+
+  bool target_exited() const noexcept {
+    if (process_handle.value >= 0) {
+      pollfd descriptor{process_handle.value, POLLIN, 0};
+      const auto ready = ::poll(&descriptor, 1, 0);
+      if (ready > 0 && (descriptor.revents & (POLLIN | POLLHUP | POLLERR)))
+        return true;
+    }
+    try {
+      const auto stat_path = proc::directory(pid) / "stat";
+      std::ifstream stat(stat_path);
+      std::string line;
+      if (!std::getline(stat, line))
+        return true;
+      const auto close = line.rfind(')');
+      if (close == std::string::npos || close + 2 >= line.size())
+        return true;
+      const auto state = line[close + 2];
+      return state == 'Z' || state == 'X' || proc::start_time(stat_path) != process_start;
+    } catch (...) {
+      return true;
+    }
+  }
+
+  void drain_after_exit(std::uint64_t &next) noexcept {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(40);
+    for (;;) {
+      const auto tail = channel->tail.load(std::memory_order_acquire);
+      if (next >= tail)
+        break;
+      auto &slot = *channel->slot(next % event_buffer);
+      if (slot.turn.load(std::memory_order_acquire) == next + 1) {
+        const auto event = slot.event;
+        slot.turn.store(next + event_buffer, std::memory_order_release);
+        try {
+          deliver(event, next + 1);
+        } catch (...) {
+          publish_errors.fetch_add(1, std::memory_order_relaxed);
+        }
+        head.store(++next, std::memory_order_release);
+        continue;
+      }
+      if (std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        continue;
+      }
+      // A target that died while publishing may leave a reserved but
+      // incomplete sequence. Skip it after the bounded drain so later ready
+      // rows and the closure can still be delivered in order.
+      publish_errors.fetch_add(1, std::memory_order_relaxed);
+      ++next;
+      head.store(next, std::memory_order_release);
+    }
+  }
+
   void collect(std::stop_token stop) noexcept {
     std::uint64_t next = 0;
+    auto next_process_check = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(100);
     for (;;) {
+      const auto now = std::chrono::steady_clock::now();
+      if (request.staged_registration() &&
+          channel->registration_active.load(std::memory_order_acquire) &&
+          now >= next_process_check) {
+        next_process_check = now + std::chrono::milliseconds(100);
+        if (target_exited()) {
+          drain_after_exit(next);
+          channel->registration_active.store(false, std::memory_order_release);
+          channel->activity.fetch_and(~enabled, std::memory_order_acq_rel);
+          close_observations(api::ObjectObservation::TARGET_EXITED);
+          {
+            const std::lock_guard lock(admission_mutex);
+            installed = false;
+            diagnostic = "target exited";
+          }
+          return;
+        }
+      }
       auto &slot = *channel->slot(next % event_buffer);
       if (slot.turn.load(std::memory_order_acquire) != next + 1) {
         if (stop.stop_requested())
@@ -2424,6 +2562,8 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
 }
 
 void Watch::set_registration_active(bool active) noexcept {
+  if (active)
+    impl_->published.store(true, std::memory_order_release);
   if (impl_->channel)
     impl_->channel->registration_active.store(active, std::memory_order_release);
 }
@@ -2536,8 +2676,10 @@ void Watch::finish(std::chrono::steady_clock::time_point deadline,
   const bool process_exited = reason == Observation::TARGET_EXITED;
   const bool mappings_changed = reason == Observation::MAPPING_CHANGED;
   auto &p = *impl_;
+  const std::lock_guard finish_lock(p.finish_mutex);
   {
     const std::lock_guard lock(p.admission_mutex);
+    p.draining = true;
     p.reply_to_admission(RuntimeAdmission::disabled);
   }
   p.admissions = {};
@@ -2554,46 +2696,25 @@ void Watch::finish(std::chrono::steady_clock::time_point deadline,
     }
   }
   p.pump = {};
-  const auto emit_final = [&](api::TraceEvent &event, Observation::Kind kind) {
-    const auto sequence = p.head.load(std::memory_order_acquire) + p.final_observations;
-    if (p.request.max_events() && sequence >= p.request.max_events())
-      return false;
-    event.set_protocol_version(kProtocolVersion);
-    event.set_session_id(p.request.session_id());
-    event.set_pid(p.pid);
-    event.set_probe_id(p.id);
-    event.set_probe_sequence(sequence + 1);
-    event.set_agent_dropped_events(p.channel->dropped.load(std::memory_order_relaxed));
-    event.set_function_name("object.trace");
-    event.set_monotonic_time_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count());
-    auto &observation = *event.mutable_object_observation();
-    observation.set_kind(kind);
-    observation.set_concrete_type(p.request.concrete_type());
-    observation.set_source_unavailable(true);
-    observation.set_external_write_order_unknown(p.shared_file.identity.inode != 0);
-    observation.set_closure_reason(reason);
-    p.publish(std::move(event));
-    ++p.final_observations;
-    return true;
-  };
+  if (process_exited) {
+    auto next = p.head.load(std::memory_order_acquire);
+    p.drain_after_exit(next);
+  }
   if (mappings_changed) {
     p.coverage_gaps.fetch_add(1, std::memory_order_relaxed);
     api::TraceEvent event;
     event.mutable_object_observation()->set_diagnostic("the observed execution mappings changed");
-    emit_final(event, Observation::COVERAGE_GAP);
+    p.emit_final(event, Observation::COVERAGE_GAP, reason);
   }
-  for (auto &[id, event] : p.open_lifetimes) {
-    event.mutable_object_observation()->set_lifetime_id(id);
-    if (!emit_final(event, Observation::OBSERVATION_ENDED))
-      break;
-  }
-  p.open_lifetimes.clear();
-  p.draining = false;
-  if (process_exited || mappings_changed) {
-    p.installed = false;
-    p.diagnostic = mappings_changed ? "execution mapping changed and old redirects are absent" :
-                                     "target exited";
+  p.close_observations(reason);
+  {
+    const std::lock_guard lock(p.admission_mutex);
+    p.draining = false;
+    if (process_exited || mappings_changed) {
+      p.installed = false;
+      p.diagnostic = mappings_changed ? "execution mapping changed and old redirects are absent" :
+                                       "target exited";
+    }
   }
 }
 
@@ -2611,8 +2732,9 @@ api::ObjectWatchStatus Watch::status() const {
   report.set_no_values(p.request.no_values());
   report.set_external_write_order_unknown(p.shared_file.identity.inode != 0);
   const auto received = p.head.load(std::memory_order_acquire);
-  const auto errors = std::min(received, p.publish_errors.load(std::memory_order_relaxed));
-  report.set_observations(received - errors + p.final_observations);
+  const auto total = received + p.final_observations.load(std::memory_order_acquire);
+  const auto errors = std::min(total, p.publish_errors.load(std::memory_order_relaxed));
+  report.set_observations(total - errors);
   report.set_executed_stores(p.channel->executed_stores.load(std::memory_order_relaxed));
   report.set_dropped(p.channel->dropped.load(std::memory_order_relaxed) +
                      p.publish_errors.load(std::memory_order_relaxed));

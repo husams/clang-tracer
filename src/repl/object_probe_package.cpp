@@ -1,10 +1,8 @@
 #include "object_probe_package.hpp"
 #include "tracer/protocol.hpp"
 
-#include <array>
 #include <cerrno>
 #include <fstream>
-#include <limits>
 #include <set>
 #include <stdexcept>
 #include <string_view>
@@ -17,7 +15,8 @@
 
 namespace tracer_repl {
 namespace {
-constexpr std::string_view kMagic = "CTKOPKG1";
+constexpr std::string_view kLegacyMagic = "CTKOPKG1";
+constexpr std::string_view kMagic = "CTKOPKG2";
 constexpr std::size_t kDigestSize = 32;
 constexpr std::size_t kMaximumPackageSize = 64 * 1024 * 1024;
 constexpr std::size_t kMaximumStringSize = 8 * 1024 * 1024;
@@ -26,40 +25,7 @@ constexpr std::size_t kMaximumFields = 256;
 constexpr std::size_t kMaximumWriters = 256;
 constexpr std::size_t kMaximumArguments = 256;
 
-class Encoder {
-public:
-  void u32(std::uint32_t value) {
-    for (int shift = 24; shift >= 0; shift -= 8)
-      bytes_.push_back(static_cast<char>((value >> shift) & 0xff));
-  }
-
-  void string(std::string_view value) {
-    if (value.size() > kMaximumStringSize ||
-        value.size() > std::numeric_limits<std::uint32_t>::max())
-      throw std::invalid_argument("object-probe package field exceeds the size limit");
-    u32(static_cast<std::uint32_t>(value.size()));
-    if (!value.empty())
-      bytes_.append(value.data(), value.size());
-  }
-
-  void strings(const std::vector<std::string> &values) {
-    if (values.size() > std::numeric_limits<std::uint32_t>::max())
-      throw std::invalid_argument("too many object-probe package entries");
-    u32(static_cast<std::uint32_t>(values.size()));
-    for (const auto &value : values)
-      string(value);
-  }
-
-  void raw(std::string_view value) {
-    if (!value.empty())
-      bytes_.append(value.data(), value.size());
-  }
-  std::string take() && { return std::move(bytes_); }
-
-private:
-  std::string bytes_;
-};
-
+// Read packages already produced by the first draft of %object-probe.
 class Decoder {
 public:
   explicit Decoder(std::string_view bytes) : bytes_(bytes) {}
@@ -112,13 +78,6 @@ std::string digest(std::string_view bytes) {
   return {reinterpret_cast<const char *>(value.data()), value.size()};
 }
 
-void encode_compile(Encoder &encoder, const ObjectProbeCompileInputs &compile) {
-  encoder.strings(compile.includes);
-  encoder.string(compile.compilation_database);
-  encoder.string(compile.translation_unit);
-  encoder.strings(compile.extra_arguments);
-}
-
 ObjectProbeCompileInputs decode_compile(Decoder &decoder) {
   ObjectProbeCompileInputs compile;
   compile.includes = decoder.strings(kMaximumArguments);
@@ -126,19 +85,6 @@ ObjectProbeCompileInputs decode_compile(Decoder &decoder) {
   compile.translation_unit = decoder.string();
   compile.extra_arguments = decoder.strings(kMaximumArguments);
   return compile;
-}
-
-std::string encode_input(const ObjectProbePackageInput &input) {
-  Encoder encoder;
-  encoder.u32(input.version);
-  encoder.string(input.qualified_type);
-  encoder.strings(input.methods);
-  encoder.strings(input.fields);
-  encoder.strings(input.writer_selectors);
-  encoder.string(input.callback_source);
-  encoder.u32(input.allow_dwarf_writer_fallback ? 1 : 0);
-  encode_compile(encoder, input.compile);
-  return std::move(encoder).take();
 }
 
 ObjectProbePackageInput decode_input(Decoder &decoder) {
@@ -157,13 +103,6 @@ ObjectProbePackageInput decode_input(Decoder &decoder) {
   return input;
 }
 
-void encode_artifact(Encoder &encoder, const ObjectProbePackage::Artifact &artifact) {
-  std::string bytes;
-  if (!artifact.SerializeToString(&bytes))
-    throw std::runtime_error("cannot serialize prepared method artifact");
-  encoder.string(bytes);
-}
-
 ObjectProbePackage::Artifact decode_artifact(Decoder &decoder) {
   const auto bytes = decoder.string();
   ObjectProbePackage::Artifact artifact;
@@ -174,19 +113,24 @@ ObjectProbePackage::Artifact decode_artifact(Decoder &decoder) {
 
 std::string package_bytes(const ObjectProbePackageInput &input,
                           const std::vector<ObjectProbePackage::Artifact> &artifacts) {
-  Encoder encoder;
-  encoder.raw(kMagic);
-  encoder.u32(ObjectProbePackage::current_version);
-  const auto encoded_input = encode_input(input);
-  encoder.string(encoded_input);
-  if (artifacts.size() > kMaximumMethods)
-    throw std::invalid_argument("object-probe package contains too many prepared methods");
-  encoder.u32(static_cast<std::uint32_t>(artifacts.size()));
-  for (const auto &artifact : artifacts)
-    encode_artifact(encoder, artifact);
-  auto bytes = std::move(encoder).take();
-  if (bytes.size() + kDigestSize > kMaximumPackageSize)
+  clangtracer::v1::ObjectProbePackageData data;
+  data.set_version(input.version);
+  data.set_qualified_type(input.qualified_type);
+  data.mutable_methods()->Assign(input.methods.begin(), input.methods.end());
+  data.mutable_fields()->Assign(input.fields.begin(), input.fields.end());
+  data.mutable_writer_selectors()->Assign(input.writer_selectors.begin(), input.writer_selectors.end());
+  data.set_callback_source(input.callback_source);
+  data.set_allow_dwarf_writer_fallback(input.allow_dwarf_writer_fallback);
+  data.mutable_includes()->Assign(input.compile.includes.begin(), input.compile.includes.end());
+  data.set_compilation_database(input.compile.compilation_database);
+  data.set_translation_unit(input.compile.translation_unit);
+  data.mutable_extra_arguments()->Assign(input.compile.extra_arguments.begin(), input.compile.extra_arguments.end());
+  data.mutable_prepared_methods()->Assign(artifacts.begin(), artifacts.end());
+  if (kMagic.size() + data.ByteSizeLong() + kDigestSize > kMaximumPackageSize)
     throw std::invalid_argument("object-probe package exceeds the total size limit");
+  std::string bytes(kMagic);
+  if (!data.AppendToString(&bytes))
+    throw std::runtime_error("cannot serialize object-probe package");
   bytes += digest(bytes);
   return bytes;
 }
@@ -274,17 +218,18 @@ void ObjectProbePackage::save(const std::filesystem::path &path) const {
   }
   if (::close(fd) != 0 && !failure)
     failure = errno;
-  if (!failure && ::rename(temporary.c_str(), path.c_str()) != 0)
+  if (!failure && ::link(temporary.c_str(), path.c_str()) != 0)
     failure = errno;
-  if (failure) {
-    ::unlink(temporary.c_str());
+  ::unlink(temporary.c_str());
+  if (failure == EEXIST)
+    throw std::runtime_error("object-probe package already exists; select a new --output file");
+  if (failure)
     throw std::system_error(failure, std::generic_category(), "cannot publish object-probe package");
-  }
 }
 
 ObjectProbePackage ObjectProbePackage::load(const std::filesystem::path &path) {
   const auto size = std::filesystem::file_size(path);
-  if (size > kMaximumPackageSize || size < kMagic.size() + 4 + 4 + kDigestSize)
+  if (size > kMaximumPackageSize || size <= kMagic.size() + kDigestSize)
     throw std::runtime_error("object-probe package has invalid size");
   std::ifstream file(path, std::ios::binary);
   if (!file)
@@ -299,15 +244,36 @@ ObjectProbePackage ObjectProbePackage::load(const std::filesystem::path &path) {
   if (digest(payload) != expected_digest)
     throw std::runtime_error("object-probe package integrity check failed");
 
-  if (payload.substr(0, kMagic.size()) != kMagic)
+  ObjectProbePackage package;
+  if (payload.starts_with(kMagic)) {
+    const auto body = payload.substr(kMagic.size());
+    clangtracer::v1::ObjectProbePackageData data;
+    if (!data.ParseFromArray(body.data(), static_cast<int>(body.size())))
+      throw std::runtime_error("invalid object-probe package payload");
+    auto &input = package.input_;
+    input.version = data.version();
+    input.qualified_type = data.qualified_type();
+    input.methods.assign(data.methods().begin(), data.methods().end());
+    input.fields.assign(data.fields().begin(), data.fields().end());
+    input.writer_selectors.assign(data.writer_selectors().begin(), data.writer_selectors().end());
+    input.callback_source = data.callback_source();
+    input.allow_dwarf_writer_fallback = data.allow_dwarf_writer_fallback();
+    input.compile.includes.assign(data.includes().begin(), data.includes().end());
+    input.compile.compilation_database = data.compilation_database();
+    input.compile.translation_unit = data.translation_unit();
+    input.compile.extra_arguments.assign(data.extra_arguments().begin(), data.extra_arguments().end());
+    package.prepared_methods_.assign(data.prepared_methods().begin(), data.prepared_methods().end());
+    validate(input, &package.prepared_methods_);
+    return package;
+  }
+  if (!payload.starts_with(kLegacyMagic))
     throw std::runtime_error("invalid object-probe package magic");
-  Decoder body(payload.substr(kMagic.size()));
+  Decoder body(payload.substr(kLegacyMagic.size()));
   const auto format_version = body.u32();
   if (format_version != current_version)
     throw std::runtime_error("unsupported object-probe package format version");
   const auto input_bytes = body.string();
   Decoder input_decoder(input_bytes);
-  ObjectProbePackage package;
   package.input_ = decode_input(input_decoder);
   if (!input_decoder.done())
     throw std::runtime_error("object-probe package input has trailing data");

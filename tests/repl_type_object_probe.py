@@ -73,6 +73,9 @@ def run(args):
         package = root / "counter.object"
         bad_package = root / "rollback.object"
         fresh_package = root / "fresh.object"
+        overlap = root / "overlap.object"
+        ordinary_callback = root / "ordinary.cpp"
+        ordinary_callback.write_text('extern "C" long long trace_callback(const TraceContext&) { return 7; }\n')
         hidden = root / "hidden-inputs"
         hidden.mkdir()
 
@@ -127,6 +130,7 @@ int main() {
   if (::prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) != 0 ||
       ::fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK) != 0)
     return 2;
+  demo::Counter existing(7);
   std::cout << \"READY\" << std::endl;
   for (;;) {
     char command = 0;
@@ -146,6 +150,8 @@ int main() {
     } else if (command == 'a') {
       cycle(30);
       std::cout << \"ADDED\" << std::endl;
+    } else if (command == 'p') {
+      std::cout << \"EXISTING=\" << existing.add(2) << std::endl;
     } else if (command == 'q') {
       return 0;
     }
@@ -220,10 +226,16 @@ public:
         send(repl, prepare_commands(methods, callbacks, fresh_package))
         fresh_prepared = out.expect(r"^(?:object-probe package=|prepared .*package|error:)")
         assert not fresh_prepared.string.startswith("error:"), fresh_prepared.string
-        for path in (package, bad_package, fresh_package):
-            assert path.is_file() and path.read_bytes().startswith(b"CTKOPKG1"), path
+        send(repl, prepare_commands(("demo::Counter::store(int)",), callbacks, overlap) + writer)
+        out.expect(r"^object-probe package=.*overlap.object")
+        for path in (package, bad_package, fresh_package, overlap):
+            assert path.is_file() and path.read_bytes().startswith(b"CTKOPKG2"), path
+        saved = package.read_bytes()
+        send(repl, prepare_commands(methods, callbacks, package) + writer)
+        out.expect(r"^error: .*package already exists")
+        assert package.read_bytes() == saved
         send(repl, "%quit")
-        assert repl.wait(timeout=10) == 0, "".join(out.seen[-15:])
+        assert repl.wait(timeout=10) == 1, "".join(out.seen[-15:])
 
         # Compile the ELF only after offline preparation, then hide every source
         # input needed by preparation. Runtime preview must use the package.
@@ -255,8 +267,20 @@ public:
         send(repl, f"%attach {target_process.pid}")
         out.expect(rf"^attached session=\S+ pid={target_process.pid}$")
 
-        # First prove the combined lifecycle, field writer, and typed method path.
-        binding = f"--package {quote(package)} --module libcounter.so"
+        binding = f"--package {quote(package)} --module ./build-context/libcounter.so"
+        send(repl, f'%probe inject "demo::Counter::value() const" --callback {quote(ordinary_callback)} '
+                   '--module libcounter.so')
+        ordinary_id = out.expect(r"^installed probe=(\d+)")[1]
+        send(repl, f"%object-probe preview {binding}")
+        out.expect(r"^error: .*remove the session's native probes")
+        send(repl, f"%object-probe start {binding}")
+        out.expect(r"^error: .*remove the session's native probes")
+        send(repl, f"%probe remove {ordinary_id}")
+        out.expect(rf"^removed probe={ordinary_id} restored=true")
+        send(repl, f"%object-probe preview --package {quote(overlap)} --module libcounter.so")
+        out.expect(r"^error: .*overlaps an object lifecycle or writer")
+
+        # Prove the combined lifecycle, field writer, and typed method path.
         send(repl, f"%object-probe preview {binding}")
         preview = out.expect(r"^(?:object-probe preview|binding=|error:)")
         assert not preview.string.startswith("error:"), preview.string
@@ -265,6 +289,8 @@ public:
         started = out.expect(r"^object-probe registration=(\d+) active=yes methods=1")
         registration = started[1]
         method_probe = out.expect(r"method_probe=(\d+) active=yes")
+        send(repl, f"%object-probe preview {binding}")
+        out.expect(r"^showing the verified binding of the active registration$")
         send(repl, "%record counter.db --sqlite --count 10 --after 0 --timeout 10")
         target_process.stdin.write("x\n")
         target_process.stdin.flush()
@@ -307,8 +333,16 @@ public:
         fresh = out.expect(r"^object-probe registration=(\d+) active=yes methods=1")
         fresh_registration = fresh[1]
         fresh_probe = out.expect(r"method_probe=(\d+) active=yes")
-        send(repl, f"%record fresh.db --sqlite --probe {fresh_probe[1]} --count 1 "
+        send(repl, f"%record provisional.db --sqlite --probe {fresh_probe[1]} --count 1 "
                    f"--after {failed_record[2]} --timeout 5")
+        send(target_process, "p")
+        app.expect(r"^EXISTING=9$")
+        provisional = out.expect(r"^received=1 cursor=(\d+) .*complete=true .*recording=provisional.db")
+        send(repl, "%events open provisional.db --as provisional")
+        out.expect(r"^opened events=1 retained=1 evicted=0$")
+        send(repl, "%events export provisional --format json --output provisional.json")
+        send(repl, f"%record fresh.db --sqlite --probe {fresh_probe[1]} --count 1 "
+                   f"--after {provisional[1]} --timeout 5")
         target_process.stdin.write("a\n")
         target_process.stdin.flush()
         app.expect(r"^ADDED$")
@@ -320,13 +354,31 @@ public:
         send(repl, f"%events export fresh --format json --output {quote(fresh_json)}")
         send(repl, f"%object-probe stop {fresh_registration}")
         out.expect(rf"^object-probe registration={fresh_registration} active=no .*restoration_pending=no")
+        send(repl, f"%object-probe start {fresh_binding}")
+        detached_id = out.expect(r"^object-probe registration=(\d+) active=yes methods=1")[1]
         send(repl, "%detach")
         out.expect(r"^detached session=")
-        send(repl, "%quit")
-        repl_status = repl.wait(timeout=10)
-        assert repl_status in (0, 1), (repl_status, "".join(out.seen[-15:]))
+        out.expect(rf"^object-probe registration={detached_id} active=no restoration_pending=no .*session detached")
+
+        send(repl, f"%attach {target_process.pid}")
+        out.expect(rf"^attached session=\S+ pid={target_process.pid}$")
+        send(repl, f"%object-probe start {fresh_binding}")
+        exit_id = out.expect(r"^object-probe registration=(\d+) active=yes methods=1")[1]
+        send(repl, f"%record exit.db --sqlite --probe {exit_id} --count 1 --timeout 5")
         send(target_process, "q")
         assert target_process.wait(timeout=10) == 0
+        out.expect(r"^received=1 .*complete=true .*recording=exit.db")
+        send(repl, f"%object-probe status {exit_id}")
+        out.expect(rf"^object-probe registration={exit_id} active=no .*restoration_pending=no .*target exited")
+        send(repl, "%events open exit.db --as target_exit")
+        out.expect(r"^opened events=1 retained=1 evicted=0$")
+        send(repl, "%events export target_exit --format json --output exit.json")
+        send(repl, "%quit")
+        repl_status = repl.wait(timeout=10)
+        assert repl_status == 1, (repl_status, "".join(out.seen[-15:]))
+        closure = json.loads((root / "exit.json").read_text())[0]["objectObservation"]
+        assert closure["kind"] == "OBSERVATION_ENDED", closure
+        assert closure["closureReason"] == "TARGET_EXITED", closure
 
         fresh_events = json.loads(fresh_json.read_text())
         assert len(fresh_events) == 1, fresh_events
@@ -366,6 +418,12 @@ public:
         def fields(event):
             return {field.get("name"): scalar(field.get("value"))
                     for field in event.get("objectFields", [])}
+
+        provisional_rows = json.loads((root / "provisional.json").read_text())
+        assert len(provisional_rows) == 1, provisional_rows
+        provisional_fields = fields(provisional_rows[0])
+        assert int(provisional_fields["object_id"]) == int(provisional_fields["object_generation"]) == 0
+        assert provisional_fields["identity_verified"] in (False, "false", 0, "0")
 
         callback_rows = [event for event in calls if "demo::Counter::add" in event.get("functionName", "")]
         assert len(callback_rows) >= 2, callback_rows

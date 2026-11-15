@@ -1829,6 +1829,8 @@ public:
       }
       erase_active_pid_if_inactive(session);
       response->CopyFrom(snapshot);
+      if (const auto group = object_probe_group(session->id()))
+        describe_object_probe(session, *group, *response->mutable_object_probe());
       return grpc::Status::OK;
     } catch (const std::exception &error) {
       sync_event_probes(session);
@@ -2580,6 +2582,7 @@ private:
     bool published = false;
     bool finished = false;
     api::ObjectWatchStatus stopped_watch;
+    api::ObjectWatchStatus preview_watch;
     api::ObjectProbeRequest definition;
     api::ObjectProbeBinding binding;
     std::vector<std::uint64_t> methods;
@@ -2883,7 +2886,8 @@ public:
     return group && std::find(group->methods.begin(), group->methods.end(), id) != group->methods.end();
   }
 
-  static api::ObjectWatchRequest object_probe_watch_request(const api::ObjectProbeRequest &request) {
+  static api::ObjectWatchRequest object_probe_watch_request(
+      const api::ObjectProbeRequest &request, const api::Session &session) {
     using Watch = api::ObjectWatchRequest;
     const auto &input = request.watch();
     const auto valid = [](const std::string &value) {
@@ -2923,8 +2927,12 @@ public:
                               watch.synchronization() == Watch::CALLER_LOCK;
     if (!watch.union_tag().empty() && !synchronized)
       throw std::invalid_argument("tagged union capture requires thread-confined or caller-lock synchronization");
-    if (watch.first_seen() && !watch.code_module().empty())
-      throw std::invalid_argument("first-seen capture requires a standalone executable writer");
+    if (watch.first_seen() && !watch.code_module().empty()) {
+      if (watch.code_module() != session.executable() &&
+          watch.code_module() != std::filesystem::path(session.executable()).filename().string())
+        throw std::invalid_argument("first-seen capture requires a standalone executable writer");
+      watch.clear_code_module();
+    }
     for (const auto &writer : input.additional_code_symbols()) {
       if (writer.empty() || !valid(writer))
         throw std::invalid_argument("invalid additional writer selector");
@@ -2944,27 +2952,39 @@ public:
     response.set_registration_id(group.id);
     *response.mutable_binding() = group.binding;
     session->refresh_process_state();
-    const auto current = session->snapshot();
-    const bool exited = current.state() == api::Session::EXITED || current.state() == api::Session::DETACHED;
-    bool methods_live = false;
-    for (const auto &probe : current.probes()) {
-      if (std::find(group.methods.begin(), group.methods.end(), probe.id()) == group.methods.end())
-        continue;
-      *response.add_methods() = probe;
-      methods_live |= probe.active() || probe.draining();
-    }
     if (group.finished)
       *response.mutable_watch() = group.stopped_watch;
-    if (!group.finished && !exited && session->has_object_probe_registration(group.id)) {
+    if (!group.finished && session->has_object_probe_registration(group.id)) {
       Watch watch;
       watch.set_action(Watch::STATUS);
       watch.set_watch_id(group.id);
       *response.mutable_watch() = session->object_watch(watch, 0, {});
     }
-    response.set_active(group.published && !exited && response.watch().active());
-    response.set_restoration_pending(!exited && (response.watch().restoration_pending() ||
+    const auto current = session->snapshot();
+    const bool exited = current.state() == api::Session::EXITED;
+    const bool detached = current.state() == api::Session::DETACHED;
+    const bool terminated = exited || detached;
+    bool methods_live = false;
+    for (const auto &probe : current.probes()) {
+      if (std::find(group.methods.begin(), group.methods.end(), probe.id()) == group.methods.end())
+        continue;
+      auto &reported = *response.add_methods();
+      reported = probe;
+      if (terminated) {
+        reported.set_active(false);
+        reported.set_draining(false);
+      }
+      methods_live |= reported.active() || reported.draining();
+    }
+    if (terminated) {
+      group.published = false;
+      group.finished = true;
+      group.stopped_watch = response.watch();
+    }
+    response.set_active(group.published && response.watch().active());
+    response.set_restoration_pending(!terminated && (response.watch().restoration_pending() ||
         (!response.active() && (methods_live || !group.finished))));
-    response.set_diagnostic(exited ? "target exited or detached" : group.diagnostic);
+    response.set_diagnostic(terminated ? (exited ? "target exited" : "session detached") : group.diagnostic);
     return grpc::Status::OK;
   }
 
@@ -2973,11 +2993,9 @@ public:
     if (group.finished)
       return;
     session->refresh_process_state();
-    if (session->snapshot().state() == api::Session::EXITED) {
-      group.published = false;
-      group.finished = true;
-      return;
-    }
+    const auto state = session->snapshot().state();
+    if (state == api::Session::EXITED || state == api::Session::DETACHED)
+      return; // describe_object_probe retires and reports the terminal registration.
     const bool has_watch = session->has_object_probe_registration(group.id);
     if (has_watch)
       session->set_object_probe_active(group.id, false);
@@ -3020,15 +3038,19 @@ public:
     auto definition = request;
     definition.clear_preview();
     definition.set_action(Request::START);
-    if (starting && previous && !previous->finished) {
-      if (previous->published && previous->definition.SerializeAsString() == definition.SerializeAsString())
-        return describe_object_probe(session, *previous, response);
+    if (previous && !previous->finished) {
+      if (previous->published && previous->definition.SerializeAsString() == definition.SerializeAsString()) {
+        const auto status = describe_object_probe(session, *previous, response);
+        if (!starting && response.active()) {
+          *response.mutable_watch() = previous->preview_watch;
+          response.set_diagnostic("showing the verified binding of the active registration");
+        }
+        return status;
+      }
       return {grpc::StatusCode::FAILED_PRECONDITION, "stop the existing object probe registration first"};
     }
-    auto watch = object_probe_watch_request(request);
-    session->refresh_process_state();
-    if (session->snapshot().state() != api::Session::ATTACHED)
-      return {grpc::StatusCode::FAILED_PRECONDITION, "object probe requires a live attached session"};
+    session->preflight_object_probe();
+    auto watch = object_probe_watch_request(request, session->snapshot());
     watch.set_action(Watch::PREVIEW);
     const auto preview = session->object_watch(watch, 0, {});
     *response.mutable_watch() = preview;
@@ -3050,19 +3072,28 @@ public:
           !info.runtime_entry() || !info.entry_size() ||
           !entries.insert(info.runtime_entry()).second)
         throw std::invalid_argument("method requires a unique exact receiver of the registered type");
-      for (const auto &patch : preview.redirects()) {
-        if ((patch.pc() >= info.runtime_entry() && patch.pc() - info.runtime_entry() < info.entry_size()) ||
-            (patch.pc() < info.runtime_entry() && info.runtime_entry() - patch.pc() < patch.original().size()))
-          throw std::invalid_argument("method overlaps an object lifecycle or writer patch: " + artifact.selector());
-      }
       const auto boundary = object_watch::Plan::method_boundary(
           info.module(), artifact, &info, true, session->pid());
+      const auto method_pc = boundary.binding.runtime_pc();
+      const auto method_width = boundary.binding.patch_size();
+      const auto overlaps_method = [&](std::uint64_t pc, std::size_t size) {
+        return size && (pc >= method_pc ? pc - method_pc < method_width : method_pc - pc < size);
+      };
+      for (const auto &patch : preview.redirects())
+        if (overlaps_method(patch.pc(), patch.original().size()))
+          throw std::invalid_argument("method overlaps an object lifecycle or writer patch: " + artifact.selector());
+      // Even a call-site redirect may translate the entire verified writer
+      // body. A method detour inside that body invalidates the cache's input.
+      for (const auto &entry : preview.plan().bindings())
+        if (overlaps_method(entry.runtime_pc(), entry.original().size()))
+          throw std::invalid_argument("method patch overlaps an object lifecycle or writer body: " + artifact.selector());
       const bool owns_lifetime = std::any_of(binding.watch().bindings().begin(),
           binding.watch().bindings().end(), [&](const auto &entry) {
-        return entry.role() == "construct" && entry.module() == info.module();
+        return (entry.role() == "construct" || entry.role() == "construct (complete/base alias)") &&
+            entry.module() == info.module();
       });
       if (!owns_lifetime)
-        throw std::invalid_argument("method and complete lifetime must be verified in the same image");
+        throw std::invalid_argument("method and its constructor evidence must be verified in the same image");
       *binding.add_methods() = info;
       *binding.add_method_patches() = boundary.binding;
       spec.set_callback_source(request.callback_source());
@@ -3083,6 +3114,7 @@ public:
     do { group->id = next_probe_id_.fetch_add(1); } while (!group->id);
     group->definition = std::move(definition);
     group->binding = binding;
+    group->preview_watch = preview;
     watch.set_action(Watch::START);
     *watch.mutable_prepared_bindings() = binding.watch();
     {

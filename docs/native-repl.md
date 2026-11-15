@@ -391,9 +391,13 @@ For a writer in an attached shared library, pass its mapped name with
 `--module`. `--follow-calls` is available for write-only packages. Follow the
 coverage counts in status when the writer reaches native callees. A combined
 registration requires disjoint method and writer patch windows. The current
-method path admits exact receivers with verified construction and skips
-receivers whose lifetime predates attachment. Lifecycle and write observations
-use the existing event stream.
+method path admits exact receivers with verified construction. An eligible
+receiver whose lifecycle predates attachment is provisional. Its callback
+reports `identity_verified() == false` with zero object ID and generation.
+Lifecycle and write observations use the existing event stream. The native
+method stream and code-cache ring deliver independently. Correlate verified
+observations by registration, object ID and generation.
+Choose a fresh output path for each preparation.
 
 ## Trace object lifetimes and state in a prebuilt binary
 

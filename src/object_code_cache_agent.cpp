@@ -303,6 +303,7 @@ struct State {
   std::map<Address, Lifetime> lifetimes;
   struct AddressHistory {
     std::uint64_t generation = 0;
+    bool observed = false;
     std::atomic<std::uint64_t> write_window{0};
   };
   // Retain address generations and stable write-window storage for in-flight stores.
@@ -318,6 +319,7 @@ struct State {
     if (max_instances && lifetimes.size() >= max_instances)
       return nullptr;
     auto &history = generations[object];
+    history.observed = true;
     auto [entry, inserted] = lifetimes.try_emplace(object);
     if (inserted)
       entry->second = {++next_id, ++history.generation};
@@ -1413,6 +1415,9 @@ void ownership_boundary(State &watch, const Site &site, const Registers &regs) {
 }
 
 void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) {
+  if (watch.identity_watch_id &&
+      !watch.channel->registration_active.load(std::memory_order_acquire))
+    return;
   const auto object = regs.value(rdi);
   if (kind == Hook::create && watch.shared_file.inode &&
       (object > UINT64_MAX - watch.offset || !shared_file_offset(watch, object + watch.offset)))
@@ -1491,6 +1496,14 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
   }
 
   if (entering) {
+    // A staged type-wide watch exists only to be ready for publication; do
+    // not create target-side lifetimes for constructors that began before
+    // the associated method probes became visible. Such receivers may be
+    // admitted provisionally after publication when their exact type is
+    // independently verified.
+    if (watch.identity_watch_id &&
+        !watch.channel->registration_active.load(std::memory_order_acquire))
+      return;
     const auto object = regs.value(rdi);
     if (!object || object > UINT64_MAX - watch.offset)
       return;
@@ -1526,10 +1539,11 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
     const bool uncertain = inst.uncertain_construct &&
         !std::ranges::binary_search(watch.complete_constructor_returns, call, {},
             [](const auto &site) { return std::pair{site.entry, site.return_pc}; });
-    if (constructor && outer && !uncertain) {
+    if (constructor && outer) {
       const std::lock_guard lock(watch.mutex);
+      watch.generations[object].observed = true;
       const auto prior = watch.lifetimes.find(object);
-      if (prior != watch.lifetimes.end() && prior->second.id) {
+      if (!uncertain && prior != watch.lifetimes.end() && prior->second.id) {
         emit_boundary(watch, site, object, prior->second, Hook::lifetime_reused);
         watch.lifetimes.erase(prior);
       }
@@ -1562,6 +1576,9 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
     emit(watch, event);
     return;
   }
+  if (watch.identity_watch_id &&
+      !watch.channel->registration_active.load(std::memory_order_acquire))
+    return;
   if (frame.uncertain || (watch.receiver_typeinfo &&
       !matches_type(event.object, watch.receiver_typeinfo, watch.borrow.base_offset))) {
     event.hook = Hook::construction_uncertain;
@@ -2721,10 +2738,11 @@ void fault(int sig, siginfo_t *info, void *context) {
   }
 }
 
-void install_bridge(std::uint64_t async_signals, bool grouped) {
-  // Grouped JIT preparation runs before the cache is installed. Reacquire a
-  // disposition only when no retained translation can still use the old chain.
-  bool allow_rebind = grouped;
+void install_bridge(std::uint64_t async_signals) {
+  // Reacquire a disposition only when no retained translation or in-flight
+  // execution can still use the previous signal chain. This applies to both
+  // grouped JIT preparation and ordinary object-watch initialization.
+  bool allow_rebind = true;
   for (auto *watch = retained.load(std::memory_order_acquire); allow_rebind && watch;
        watch = watch->previous) {
     if (watch->static_gate.load(std::memory_order_acquire) ||
@@ -2744,8 +2762,6 @@ void install_bridge(std::uint64_t async_signals, bool grouped) {
       continue;
     if (bridge_installed[sig] && !allow_rebind)
       throw std::runtime_error("application replaced the code-cache signal handler");
-    if ((current.sa_flags & SA_RESETHAND) && !grouped)
-      throw std::runtime_error("code cache cannot chain one-shot signal handlers");
     if ((async_signals & (1ULL << (sig - 1))) &&
         (current.sa_handler == SIG_DFL || current.sa_handler == SIG_IGN))
       throw std::runtime_error("asynchronous signal needs an existing application handler");
@@ -5005,7 +5021,7 @@ void initialize(Init &init
     install_static_fragment(*watch, sites, function, xstate);
     first += function.count;
   }
-  install_bridge(watch->async_signals, watch->identity_watch_id != 0);
+  install_bridge(watch->async_signals);
   if (!watch->static_bodies.empty())
     watch->channel->static_fragments.store(watch->static_bodies.size(), std::memory_order_release);
   if (!watch->static_bodies.empty() || (watch->module_pin && watch->runtime_limit)) {
@@ -5018,56 +5034,47 @@ void initialize(Init &init
 } // namespace
 
 namespace identity {
-Identity lookup(std::uint64_t watch_id, std::uint64_t receiver,
-                bool receiver_type_verified) noexcept {
+std::optional<Identity> lookup(std::uint64_t watch_id, std::uint64_t receiver) noexcept {
   try {
     if (!watch_id || !receiver)
-      return {Status::unregistered, 0, 0};
-    State *watch = nullptr;
-    for (auto *candidate = retained.load(std::memory_order_acquire); candidate;
-         candidate = candidate->previous) {
-      if (candidate->identity_watch_id == watch_id) {
-        watch = candidate;
-        break;
-      }
-    }
-    if (!watch || !watch->identity_lifecycle_covered)
-      return {Status::unregistered, 0, 0};
-    if (!(watch->static_gate.load(std::memory_order_acquire) & enabled))
-      return {Status::retired, 0, 0};
+      return std::nullopt;
+    auto *watch = retained.load(std::memory_order_acquire);
+    while (watch && watch->identity_watch_id != watch_id)
+      watch = watch->previous;
+    if (!watch || !watch->identity_lifecycle_covered ||
+        !(watch->static_gate.load(std::memory_order_acquire) & enabled) ||
+        !watch->channel->registration_active.load(std::memory_order_acquire))
+      return std::nullopt;
 
-    // Constructor/destructor frames are thread-local so an invocation on a
-    // different thread cannot borrow partially constructed or tearing-down
-    // storage. The destructor frame owns a copied identity after map erasure.
-    for (auto frame = lifecycle_frames.rbegin(); frame != lifecycle_frames.rend(); ++frame) {
-      if (frame->watch != watch || frame->event.object != receiver)
-        continue;
-      if (frame->constructor)
-        return {watch->channel->registration_active.load(std::memory_order_acquire)
-                    ? Status::provisional : Status::staged, 0, 0};
-      return {Status::destroying, frame->event.id, frame->event.generation};
-    }
+    if (std::ranges::any_of(lifecycle_frames, [&](const auto &frame) {
+          return frame.watch == watch && frame.event.object == receiver;
+        }))
+      return std::nullopt;
 
     std::lock_guard lock(watch->mutex);
+    if (!watch->channel->registration_active.load(std::memory_order_acquire))
+      return std::nullopt;
     if (const auto found = watch->lifetimes.find(receiver); found != watch->lifetimes.end()) {
       const auto &life = found->second;
-      if (!life.id)
-        return {Status::provisional, 0, 0};
-      const auto active = watch->channel->registration_active.load(std::memory_order_acquire);
-      return {active ? Status::active : Status::staged, life.id, life.generation};
+      if (life.id && life.generation)
+        return Identity{life.id, life.generation};
+      return std::nullopt;
     }
     if (const auto history = watch->generations.find(receiver);
-        history != watch->generations.end() && history->second.generation)
-      return {Status::stale, 0, history->second.generation};
-    return {receiver_type_verified ? Status::provisional : Status::absent, 0, 0};
+        history != watch->generations.end() && history->second.observed)
+      return std::nullopt;
+    if (watch->receiver_typeinfo &&
+        !matches_type(receiver, watch->receiver_typeinfo, watch->borrow.base_offset))
+      return std::nullopt;
+    return Identity{};
   } catch (...) {
-    return {Status::unregistered, 0, 0};
+    return std::nullopt;
   }
 }
 } // namespace identity
 } // namespace tracer::object_cache
 
-extern "C" int tracer_agent_object_cache_v38(tracer::object_cache::Init *request) {
+extern "C" int tracer_agent_object_cache_v39(tracer::object_cache::Init *request) {
   try {
     tracer::object_cache::initialize(*request);
     return 0;
