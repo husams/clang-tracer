@@ -4,6 +4,7 @@
 #include "tracer.pb.h"
 
 #include <functional>
+#include <set>
 #include <stdexcept>
 
 namespace tracer::live {
@@ -25,7 +26,8 @@ public:
 
 Plan plan_sources(std::uint32_t pid, const std::string &executable,
                   const clangtracer::v1::LiveUpdateRequest &request,
-                  const Revision &active, const std::function<bool()> &cancelled);
+                  const Revision &active, const std::function<bool()> &cancelled,
+                  const std::set<std::string> *managed_inputs = nullptr);
 
 // Extensions supply generated JIT entry symbols in the same order as entries.
 struct BuildInputs {

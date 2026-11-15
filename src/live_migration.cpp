@@ -202,6 +202,17 @@ std::unique_ptr<Revision> stage(Registry& registry, const JitRequest& request,
       "\n"
       "#include <tracer/live_migration.hpp>\n"
       "namespace managed = tracer::live::managed;\n"
+      "namespace {\n"
+      "template<class T> auto invoke_hook(T &state, managed::Diagnostic &, int)\n"
+      "    -> decltype(static_cast<void (*)(T &)>(&" + hook.function + "), bool{}) {\n"
+      "  static_cast<void (*)(T &)>(&" + hook.function + ")(state);\n"
+      "  return true;\n"
+      "}\n"
+      "template<class T> bool invoke_hook(T &state, managed::Diagnostic &error, long) {\n"
+      "  return static_cast<bool (*)(T &)>(&" + hook.function + ")(state) ||\n"
+      "      error.fail(\"managed hook rejected state\");\n"
+      "}\n"
+      "}\n"
       "extern \"C\" bool " +
       std::string(HookSymbol) +
       "(void *p, managed::Diagnostic &error) noexcept {\n"
@@ -212,20 +223,7 @@ std::unique_ptr<Revision> stage(Registry& registry, const JitRequest& request,
       std::to_string(hook_size) + " && alignof(State) == " + std::to_string(hook_alignment) +
       ");\n"
       "  return managed::checked(error, [&] {\n"
-      "    return [&]<class T>(T *) {\n"
-      "      if constexpr (requires { static_cast<void (*)(T &)>(&" +
-      hook.function +
-      "); }) {\n"
-      "        static_cast<void (*)(T &)>(&" +
-      hook.function +
-      ")(*static_cast<T *>(p));\n"
-      "        return true;\n"
-      "      } else {\n"
-      "        return static_cast<bool (*)(T &)>(&" +
-      hook.function +
-      ")(*static_cast<T *>(p)) || error.fail(\"managed hook rejected state\");\n"
-      "      }\n"
-      "    }(static_cast<State *>(p));\n"
+      "    return invoke_hook(*static_cast<State *>(p), error, 0);\n"
       "  });\n"
       "}\n";
   hook_request.files.push_back({wrapper, hook_body});

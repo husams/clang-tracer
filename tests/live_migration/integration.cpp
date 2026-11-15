@@ -10,7 +10,7 @@
 
 #include "live_migration.hpp"
 #include "live_update.hpp"
-#include "state.hpp"
+#include "state_v2.hpp"
 
 using namespace std::chrono_literals;
 namespace managed = tracer::live::managed;
@@ -110,6 +110,7 @@ int main(int argc, char** argv) try {
   const auto fixtures = std::filesystem::absolute(argv[1]);
   auto request = live::JitRequest{};
   request.files = {source(fixtures / "state.hpp"),
+                   source(fixtures / "state_v2.hpp"),
                    source(fixtures / "update.hpp"),
                    source(fixtures / "after.cpp"),
                    source(fixtures / "helper.cpp"),

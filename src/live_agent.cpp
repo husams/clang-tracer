@@ -70,13 +70,14 @@ std::uint64_t retained_image_count() {
 
 JitRequest decode_jit(const clangtracer::v1::LiveJitInput &input) {
   JitRequest result;
+  result.resolve_standard_runtime = input.resolve_standard_runtime();
   result.compiler_arguments.assign(input.compiler_arguments().begin(), input.compiler_arguments().end());
   for (const auto &source : input.sources())
     result.files.push_back({source.path(), source.contents()});
   for (const auto &unit : input.units())
     result.translation_units.push_back({unit.path(), unit.directory(),
         {unit.compiler_arguments().begin(), unit.compiler_arguments().end()},
-        unit.reuse_stream_initializer()});
+        unit.reuse_stream_initializer(), unit.reuse_global_lifecycle()});
   for (const auto &item : input.imports())
     if (!result.imports.emplace(item.name(), item.address()).second)
       throw std::runtime_error("duplicate live import " + item.name());

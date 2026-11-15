@@ -81,9 +81,10 @@ inputs { path: "pricing.hpp" sha256: "<SHA-256 of original pricing.hpp>" }
 
 Build affected units with debug information, `-O0 -fno-inline`,
 `-fpatchable-function-entry=16,0` and a GNU ELF build ID. The manifest must
-cover project dependencies. The compile database must record a matching
-profile for each new translation unit. The REPL can select the database and
-manifest using `--compdb FILE` and `--build FILE`.
+cover project dependencies. A new translation unit uses its recorded compile
+profile or inherits the common profile when the original units share one.
+The REPL can select the database and manifest using `--compdb FILE` and
+`--build FILE`.
 
 The initial profile admits exact symbols in the main executable and checks
 the original entry padding, source signature and lowered ABI before changing
@@ -104,11 +105,12 @@ Empty string literals and function-local literal arrays can change with
 their code. Changes to existing static storage or record layouts require a
 rebuild or a managed migration. Translation-unit-local functions and data
 require an unambiguous ELF file marker and exact symbol. Each changed function
-also requires a patchable native entry. The JIT reuses the already-run standard
-stream initializer when the recorded build and replacement contain the same
-recognized form. Other module constructors and destructors require a rebuild.
-Runtime imports must match the target image or an admitted Linux runtime
-symbol.
+also requires a patchable native entry. When a recorded unit initialized the
+standard streams, replacement units can reuse them. Existing native storage
+keeps its verified initialization and destruction code. Changes to module
+initialization or destruction require a rebuild. Native updates can use
+symbols exported by the standard Linux runtime libraries already loaded in
+the target.
 
 `--payload-limit BYTES` sets the maximum serialized source and dependency
 snapshot sent to the target for a live operation. The default is 16 MiB.
@@ -148,15 +150,18 @@ Managed migration requires application storage using
 Submit a C++ recipe that exports `clang_tracer_managed_update_v1`, with the
 after hook in its own file if needed. Use `%live update update.hpp --managed true`
 for a recipe with no hook. Include ABI-compatible application source changes
-with the recipe to publish both together.
+and any new layout headers with the recipe to publish them together.
+The hook may return `void` or `bool` and supports C++17.
 
 ```text
-%live update update.hpp cache_code.cpp --after-file after.cpp --after-function fixture::after --for-each Cache
+%live update update.hpp cache_code.cpp state_v2.hpp --after-file after.cpp --after-function fixture::after --for-each Cache
 ```
 
-Calls that depend on the managed state must execute under the same registry
-gate. The tool drains managed access, installs the verified native entries,
-and runs the hook against the migrated instances before releasing access.
+Acquire the registry gate in a stable caller before entering a function that
+will be replaced alongside the managed state. Pass the caller's
+`Registry::Access` into the replaceable function. The tool drains managed access,
+installs the verified native entries, and runs the hook against the migrated
+instances before releasing access.
 If the hook fails, the tool restores the prior entries and state under the
 same gate.
 

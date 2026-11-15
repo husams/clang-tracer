@@ -12,18 +12,18 @@ from tempfile import TemporaryDirectory
 from repl_browser_integration import Transcript, stop
 
 ROOT = Path(__file__).resolve().parent
-FLAGS = ["-std=c++23", "-O0", "-g", "-fno-inline", "-fno-omit-frame-pointer",
-         "-fpatchable-function-entry=16,0"]
+FLAGS = ["-O0", "-g", "-fno-inline", "-fno-omit-frame-pointer"]
 
 
-def build_target(args, root, sources, headers):
+def build_target(args, root, sources, headers, standard="c++23",
+                 entry_flags=("-fpatchable-function-entry=16,0",)):
     target = root / "live-target"
     inputs = [*sources, *headers]
     baseline = root / "baseline"
     baseline.mkdir()
     for name in inputs:
         shutil.copyfile(root / name, baseline / name)
-    command = [args.compiler, *FLAGS, "-I" + args.sdk]
+    command = [args.compiler, "-std=" + standard, *FLAGS, *entry_flags, "-I" + args.sdk]
     subprocess.run(
         [*command, "-Wl,--build-id=sha1", "-pthread", *sources, "-o", str(target)],
         cwd=root, check=True,
@@ -171,16 +171,21 @@ MANAGED_MAIN = r"""
 #include <cstdio>
 #include <iostream>
 #include <string>
+#include <fcntl.h>
 #include <poll.h>
-#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <unistd.h>
+#ifndef PR_SET_PTRACER
+#define PR_SET_PTRACER 0x59616d61
+#define PR_SET_PTRACER_ANY ((unsigned long)-1)
+#endif
 namespace managed = tracer::live::managed;
 using namespace fixture;
 managed::Registry registry;
 extern "C" managed::Registry* clang_tracer_managed_registry_v1() noexcept { return &registry; }
 extern "C" int cache_code();
 extern "C" int cache_other();
+extern "C" void cache_print(managed::Registry::Access&, managed::InstanceId);
 std::array<unsigned char, 16> original_other;
 std::atomic_bool corrupt_restore = false;
 
@@ -189,14 +194,13 @@ void write_other(bool unknown) {
   if (unknown)
     bytes[0] = 0xcc;
   const auto address = reinterpret_cast<std::uintptr_t>(&cache_other);
-  const auto page_size = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
-  const auto begin = address - address % page_size;
-  const auto length = ((address + bytes.size() - 1 - begin) / page_size + 1) * page_size;
-  auto* memory = reinterpret_cast<void*>(begin);
-  if (mprotect(memory, length, PROT_READ | PROT_WRITE | PROT_EXEC))
+  // Inject stale bytes while preserving the target's ELF mapping boundaries.
+  const auto memory = open("/proc/self/mem", O_WRONLY | O_CLOEXEC);
+  if (memory == -1)
     std::abort();
-  std::memcpy(reinterpret_cast<void*>(address), bytes.data(), bytes.size());
-  if (mprotect(memory, length, PROT_READ | PROT_EXEC))
+  const auto written = pwrite(memory, bytes.data(), bytes.size(), static_cast<off_t>(address));
+  close(memory);
+  if (written != static_cast<ssize_t>(bytes.size()))
     std::abort();
 }
 
@@ -248,16 +252,8 @@ int main() {
     auto access = registry.access();
     std::printf("code %d\n", cache_code());
     std::printf("other %d\n", cache_other());
-    for (auto id : ids) {
-      if (command == "old")
-        access.with<CacheV1>("Cache", id, "cache.1", [](const auto& c) {
-          std::printf("old %zu\n", c.entries.size());
-        });
-      else
-        access.with<CacheV2>("Cache", id, "cache.2", [](const auto& c) {
-          std::printf("new %zu %zu %d\n", c.entries.size(), c.max_entries, c.hook_calls);
-        });
-    }
+    for (auto id : ids)
+      cache_print(access, id);
     std::fflush(stdout);
   }
 }
@@ -270,24 +266,51 @@ def migration(args, folder):
         shutil.copyfile(ROOT / "live_migration" / name, folder / name)
     (folder / "main.cpp").write_text(MANAGED_MAIN)
     patch_source = folder / "cache_code.cpp"
-    original_code = ('extern "C" int cache_code() { return 1; }\n'
-                     'extern "C" int cache_other() { return 2; }\n')
+    original_code = r"""
+#include "state.hpp"
+#include <cstdio>
+using namespace fixture;
+#define LIVE_ENTRY __attribute__((patchable_function_entry(16, 0)))
+extern "C" LIVE_ENTRY int cache_code() { return 1; }
+extern "C" LIVE_ENTRY int cache_other() { return 2; }
+extern "C" LIVE_ENTRY void cache_print(managed::Registry::Access& access, managed::InstanceId id) {
+  access.with<CacheV1>("Cache", id, "cache.1", [](const auto& cache) {
+    std::printf("old %zu\n", cache.entries.size());
+  });
+}
+"""
     patch_source.write_text(original_code)
-    target = build_target(args, folder, ["main.cpp", "cache_code.cpp"], ["state.hpp"])
+    target = build_target(args, folder, ["main.cpp", "cache_code.cpp"], ["state.hpp"],
+                          standard="c++17", entry_flags=())
+    shutil.copyfile(ROOT / "live_migration" / "state_v2.hpp", folder / "state_v2.hpp")
     source = (folder / "after.cpp").read_text()
     (folder / "reject.cpp").write_text("#define FAIL_HOOK\n" + source)
     with ExitStack() as cleanup:
-        app, repl, app_line, _ = attach(args, target, cleanup)
+        app, repl, app_line, console_line = attach(args, target, cleanup)
         app("old", r"^old 0$")
-        patch_source.write_text(original_code.replace("return 1", "return 27")
-                                .replace("return 2;", "return 28;"))
+        patched_code = (original_code.replace("return 1;", "return 27;")
+                        .replace("return 2;", "return 28;")
+                        .replace('"state.hpp"', '"state_v2.hpp"')
+                        .replace("CacheV1", "CacheV2").replace('"cache.1"', '"cache.2"')
+                        .replace('"old %zu\\n", cache.entries.size()',
+                                 '"new %zu %zu %d\\n", cache.entries.size(), '
+                                 'cache.max_entries, cache.hook_calls'))
+        update = "%live update update.hpp cache_code.cpp state_v2.hpp"
+        patch_source.write_text(patched_code.replace(
+            "using namespace fixture;", "using namespace fixture;\nextern managed::Registry registry;"
+        ).replace("  access.with<CacheV2>", "  auto late_access = registry.access();\n"
+                  "  late_access.with<CacheV2>"))
+        repl(update + " --managed true", r"^live BLOCKED revision=0 .*incompatible native entry")
+        console_line(r"^  BLOCKED .*acquire the managed registry gate in the caller")
+        app("old", r"^old 0$")
+        patch_source.write_text(patched_code)
         options = " --after-function fixture::after --for-each Cache"
-        repl("%live update update.hpp cache_code.cpp --after-file reject.cpp" + options,
+        repl(update + " --after-file reject.cpp" + options,
              r"^live BLOCKED revision=0 .*second hook failed")
         app("old", r"^code 1$")
         app_line(r"^old 0$")
         app("fault", r"^fault enabled$")
-        repl("%live update update.hpp cache_code.cpp --after-file reject.cpp" + options,
+        repl(update + " --after-file reject.cpp" + options,
              r"^live RESTORATION_REQUIRED revision=0 .*precondition")
         repl("%live status", r"^live RESTORATION_REQUIRED revision=0 .*%live recover")
         repl("%live recover", r"^live RESTORATION_REQUIRED revision=0 .*precondition")
@@ -297,7 +320,7 @@ def migration(args, folder):
         app("old", r"^code 1$")
         app_line(r"^other 2$")
         app_line(r"^old 0$")
-        repl("%live update update.hpp cache_code.cpp --after-file after.cpp" + options,
+        repl(update + " --after-file after.cpp" + options,
              r"^live APPLIED revision=1 .*instances=3")
         app("new", r"^code 27$")
         app_line(r"^new 700 4796 1$")
@@ -306,8 +329,9 @@ def migration(args, folder):
         repl("%live revert", r"^live REVERTED revision=0")
         app("old", r"^code 1$")
         app_line(r"^old 0$")
-        repl("%live update update.hpp --managed true", r"^live APPLIED revision=2 .*instances=3")
-        app("new", r"^new 700 1024 0$")
+        repl(update + " --managed true", r"^live APPLIED revision=2 .*instances=3")
+        app("new", r"^code 27$")
+        app_line(r"^new 700 1024 0$")
         app_line(r"^new 1400 1024 0$")
         app_line(r"^new 0 1024 0$")
         repl("%live revert", r"^live REVERTED revision=0")

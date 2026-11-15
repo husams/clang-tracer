@@ -5,6 +5,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 
 namespace clang { class ASTContext; }
@@ -25,6 +26,7 @@ struct CompiledUnit {
   std::set<std::string> inputs;
   std::map<std::string, std::string> record_layouts;
   std::map<std::string, std::pair<std::string, std::string>> types;
+  std::map<std::string, unsigned> system_definitions;
 };
 
 enum class CompileInspection { native_metadata, ir_only };
@@ -44,6 +46,8 @@ struct Definition {
   bool has_source_abi = false;
   bool supported_abi = false;
   bool local = false;
+  bool discardable = false;
+  std::optional<unsigned> system_definition;
 };
 
 bool mergeable_literal(const llvm::GlobalVariable &global);

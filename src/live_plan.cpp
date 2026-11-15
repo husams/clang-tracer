@@ -8,7 +8,9 @@
 #include <clang/Tooling/ArgumentsAdjusters.h>
 #include <clang/Tooling/JSONCompilationDatabase.h>
 #include <google/protobuf/text_format.h>
+#include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/Demangle/Demangle.h>
+#include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Object/BuildID.h>
@@ -284,18 +286,111 @@ struct Body {
 };
 
 void collect(std::map<std::string, Body> &all, const std::string &path,
-             std::map<std::string, Definition> definitions, std::set<std::string> *affected = nullptr) {
-  for (auto &[name, definition] : definitions) {
+             const std::map<std::string, Definition> &definitions) {
+  for (const auto &[name, definition] : definitions) {
     const auto key = definition.local ? local_import_name(path, name) : name;
-    if (affected)
-      affected->insert(key);
-    const auto item = all.find(key);
-    if (item == all.end())
-      all.emplace(key, Body{name, path, std::move(definition)});
-    else if (item->second.definition.implementation != definition.implementation ||
-             item->second.definition.abi != definition.abi)
-      item->second.inconsistent = true;
+    if (!all.contains(key))
+      all.emplace(key, Body{name, path, definition});
   }
+}
+
+struct Change {
+  Body before;
+  std::optional<Definition> after;
+  bool enters_registry = false;
+};
+
+bool same_definition(const Definition &left, const Definition &right) {
+  return left.implementation == right.implementation && left.abi == right.abi &&
+         left.local == right.local && left.alias_target == right.alias_target;
+}
+
+bool unchanged_system_body(const Definition &before, const Definition &after) {
+  // Retain the linker-selected body when identical system header code was
+  // lowered differently because another declaration was emitted earlier.
+  return before.system_definition && before.system_definition == after.system_definition &&
+         before.path == after.path && before.discardable && after.discardable &&
+         !before.local && !after.local && before.abi == after.abi;
+}
+
+bool enters_registry(const llvm::Module &module, const std::string &name) {
+  const auto *entry = module.getNamedValue(name);
+  if (!entry)
+    return false;
+  const auto *function = llvm::dyn_cast<llvm::Function>(entry->stripPointerCastsAndAliases());
+  if (!function)
+    return false;
+  constexpr llvm::StringLiteral access("_ZN6tracer4live7managed8Registry6accessEv");
+  llvm::SmallPtrSet<const llvm::Function *, 16> visited;
+  std::vector<const llvm::Function *> pending{function};
+  while (!pending.empty()) {
+    const auto *body = pending.back();
+    pending.pop_back();
+    if (!visited.insert(body).second)
+      continue;
+    if (body->getName() == access)
+      return true;
+    for (const auto &block : *body)
+      for (const auto &inst : block)
+        if (const auto *call = llvm::dyn_cast<llvm::CallBase>(&inst))
+          if (const auto *callee = llvm::dyn_cast<llvm::Function>(
+                  call->getCalledOperand()->stripPointerCastsAndAliases()))
+            pending.push_back(callee);
+  }
+  return false;
+}
+
+bool unchanged_global_lifecycle(const llvm::Module &before, const llvm::Module &after,
+    const std::map<std::string, std::string> &old_data,
+    const std::map<std::string, std::string> &new_data,
+    const std::map<std::string, Definition> &old_code,
+    const std::map<std::string, Definition> &new_code) {
+  std::vector<const llvm::Value *> pending;
+  for (const auto *name : {"llvm.global_ctors", "llvm.global_dtors"}) {
+    const auto prior = old_data.find(name);
+    const auto next = new_data.find(name);
+    if (prior == old_data.end() && next == new_data.end())
+      continue;
+    if (prior == old_data.end() || next == new_data.end() || prior->second != next->second)
+      return false;
+    const auto *table = before.getNamedGlobal(name);
+    if (!table->use_empty() || !after.getNamedGlobal(name)->use_empty())
+      return false;
+    pending.push_back(table->getInitializer());
+  }
+  if (pending.empty())
+    return false;
+  // Verify the lifecycle table and the code it references before leaving
+  // initialization and destruction of native storage with the original ELF.
+  llvm::SmallPtrSet<const llvm::Value *, 32> visited;
+  while (!pending.empty()) {
+    const auto *value = pending.back();
+    pending.pop_back();
+    if (!visited.insert(value).second || llvm::isa<llvm::GlobalVariable>(value))
+      continue;
+    if (const auto *function = llvm::dyn_cast<llvm::Function>(value);
+        function && !function->isDeclaration()) {
+      const auto name = function->getName().str();
+      const auto next = new_code.find(name);
+      const auto &prior = old_code.at(name);
+      if (next == new_code.end() ||
+          (!same_definition(prior, next->second) && !unchanged_system_body(prior, next->second)))
+        return false;
+      for (const auto &block : *function)
+        for (const auto &instruction : block)
+          pending.push_back(&instruction);
+    }
+    if (const auto *user = llvm::dyn_cast<llvm::User>(value))
+      for (const auto &operand : user->operands())
+        if (operand)
+          pending.push_back(operand.get());
+  }
+  return true;
+}
+
+bool translation_unit(const fs::path &path) {
+  const auto suffix = path.extension();
+  return suffix == ".cpp" || suffix == ".cc" || suffix == ".cxx" || suffix == ".C";
 }
 
 Entry bind(std::uint32_t pid, const Image &image, const Symbol &symbol,
@@ -577,7 +672,8 @@ void validate_entry(std::uint32_t pid, const Entry &entry) {
 
 Plan plan_sources(std::uint32_t pid, const std::string &executable,
                   const api::LiveUpdateRequest &request, const Revision &active,
-                  const std::function<bool()> &cancelled) {
+                  const std::function<bool()> &cancelled,
+                  const std::set<std::string> *managed_inputs) {
   if (request.sources().empty())
     throw std::runtime_error("submit at least one source or header");
   const auto manifest_path = request.build_manifest();
@@ -615,14 +711,57 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
   }
   if (profiles.empty())
     throw std::runtime_error("no build-bound compilation profiles for the source inventory");
+  const TranslationUnit *inherited = nullptr;
+  bool ambiguous_profile = false;
+  for (const auto &[path, unit] : profiles) {
+    if (!sources.saved.contains(path))
+      continue;
+    if (!inherited)
+      inherited = &unit;
+    else if (unit.directory != inherited->directory ||
+             unit.compiler_arguments != inherited->compiler_arguments)
+      ambiguous_profile = true;
+  }
+  for (const auto &file : sources.current) {
+    if (sources.saved.contains(file.path) || profiles.contains(file.path) ||
+        (managed_inputs && managed_inputs->contains(file.path)) || !translation_unit(file.path))
+      continue;
+    if (!inherited || ambiguous_profile)
+      throw std::runtime_error("new translation unit requires one verified build profile: " + file.path);
+    auto unit = *inherited;
+    unit.path = file.path;
+    profiles.emplace(file.path, std::move(unit));
+  }
+  std::map<std::string, unsigned> source_basenames;
+  for (const auto &[path, contents] : sources.saved) {
+    (void)contents;
+    if (translation_unit(path))
+      ++source_basenames[fs::path(path).filename().string()];
+  }
+  const auto local_symbol = [&](const std::string &name, const std::string &unit) {
+    const auto file = fs::path(unit).filename().string();
+    const auto count = source_basenames.find(file);
+    return count != source_basenames.end() && count->second == 1
+        ? image.find_local(name, unit) : nullptr;
+  };
+  const auto recorded_unit = [&](const std::string &path) {
+    const auto basename = fs::path(path).filename().string();
+    const auto count = source_basenames.find(basename);
+    const auto marker = image.file_markers.find(basename);
+    return sources.saved.count(path) && count != source_basenames.end() && count->second == 1 &&
+        marker != image.file_markers.end() && marker->second == 1;
+  };
 
   JitRequest current;
   current.files = sources.current;
+  current.resolve_standard_runtime = true;
   JitRequest baseline;
   baseline.files = sources.baseline;
   std::map<std::string, Body> old_bodies, new_bodies;
-  std::set<std::string> covered, affected;
+  std::map<std::string, Change> changes;
+  std::set<std::string> covered, unchanged;
   std::map<std::string, std::set<std::string>> native_locals;
+  bool target_initialized_streams = false;
   struct Reference {
     std::string name;
     std::string unit;
@@ -649,6 +788,9 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     std::optional<CompiledUnit> before;
     if (sources.saved.count(path) || active.sources.count(path))
       before.emplace(compile_snapshot(baseline));
+    if (!target_initialized_streams && before && recorded_unit(path) &&
+        has_standard_stream_initializer(*before->module))
+      target_initialized_streams = true;
     // Only submitted inputs differ between the snapshots. Reuse the first
     // compilation when neither the TU nor any of its includes was submitted.
     const bool changed = !before || sources.submitted.count(path) ||
@@ -668,7 +810,9 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       covered.insert(dependency);
     }
     auto after_definitions = definitions(after);
+    bool reuse_global_lifecycle = false;
     if (before) {
+      const auto before_definitions = changed ? definitions(*before) : after_definitions;
       if (sources.saved.count(path))
         for (const auto &value : before->module->global_values())
           if (value.hasName() && value.hasLocalLinkage())
@@ -681,9 +825,16 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         }
         const auto old_data = data_definitions(*before);
         const auto new_data = data_definitions(after);
+        reuse_global_lifecycle = recorded_unit(path) &&
+            unchanged_global_lifecycle(*before->module, *after.module,
+                old_data, new_data, before_definitions, after_definitions);
         for (const auto &[name, storage] : old_data) {
           const auto updated = new_data.find(name);
-          if (updated == new_data.end() || updated->second != storage)
+          const auto *global = before->module->getNamedGlobal(name);
+          const bool omitted_local = updated == new_data.end() && global &&
+              (global->hasLocalLinkage() || global->hasLinkOnceODRLinkage() ||
+               global->hasWeakODRLinkage());
+          if (!omitted_local && (updated == new_data.end() || updated->second != storage))
             block(path, name, "rebuild required: existing data definition changed");
         }
         for (const auto &[name, storage] : new_data) {
@@ -692,8 +843,32 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
             block(path, name, "rebuild required: new persistent data definition");
         }
       }
-      collect(old_bodies, path, changed ? definitions(*before) : after_definitions,
-              changed ? &affected : nullptr);
+      collect(old_bodies, path, before_definitions);
+      // A linker may select one of several differently lowered inline
+      // copies. Detect source changes against the same TU's prior IR first.
+      for (const auto &[name, prior] : before_definitions) {
+        const auto key = prior.local ? local_import_name(path, name) : name;
+        const auto next = after_definitions.find(name);
+        if (next == after_definitions.end() && prior.discardable)
+          continue;
+        if (next != after_definitions.end() &&
+            (same_definition(prior, next->second) ||
+             unchanged_system_body(prior, next->second))) {
+          unchanged.insert(key);
+          continue;
+        }
+        auto replacement = next == after_definitions.end()
+            ? std::nullopt : std::optional<Definition>{next->second};
+        auto [item, inserted] = changes.try_emplace(
+            key, Change{Body{name, path, prior}, replacement});
+        if (managed_inputs && !item->second.enters_registry)
+          item->second.enters_registry =
+              enters_registry(*before->module, name) || enters_registry(*after.module, name);
+        if (!inserted && (item->second.before.definition.abi != prior.abi ||
+            !replacement || !item->second.after ||
+            !same_definition(*item->second.after, *replacement)))
+          item->second.before.inconsistent = true;
+      }
       covered.insert(before->inputs.begin(), before->inputs.end());
     }
     collect(new_bodies, path, std::move(after_definitions));
@@ -701,8 +876,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     // Relink its accepted snapshot so new callers can resolve those helpers.
     if (changed || !sources.saved.count(path)) {
       current.translation_units.push_back(unit);
-      current.translation_units.back().reuse_stream_initializer =
-          sources.saved.count(path) && before && has_standard_stream_initializer(*before->module);
+      current.translation_units.back().reuse_global_lifecycle = reuse_global_lifecycle;
       for (const auto &value : after.module->global_values()) {
         if (!value.hasName())
           continue;
@@ -720,12 +894,14 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     }
   }
   for (const auto &path : sources.submitted)
-    if (!covered.count(path))
+    if (!covered.count(path) && !(managed_inputs && managed_inputs->contains(path)))
       throw std::runtime_error("no verified translation unit profile or dependency uses " + path);
 
   result.jit = std::move(current);
+  for (auto &unit : result.jit.translation_units)
+    unit.reuse_stream_initializer = target_initialized_streams;
   for (const auto &file : result.jit.files)
-    if (sources.submitted.count(file.path))
+    if (sources.submitted.count(file.path) && covered.contains(file.path))
       result.accepted_sources.push_back(file);
   std::set<std::string> replaced;
   std::map<std::uintptr_t, std::string> entries;
@@ -736,16 +912,12 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     return item->second.definition.alias_target.empty()
         ? name : item->second.definition.alias_target;
   };
-  for (const auto &[key, body] : old_bodies) {
-    if (!affected.contains(key))
-      continue;
+  for (const auto &[key, change] : changes) {
+    const auto &body = change.before;
     const auto &name = body.name;
-    const auto next = new_bodies.find(key);
+    const auto &next = change.after;
     const auto &old = body.definition;
-    if (next != new_bodies.end() && old.implementation == next->second.definition.implementation &&
-        old.abi == next->second.definition.abi && !next->second.inconsistent && !body.inconsistent)
-      continue;
-    const auto *symbol = old.local ? image.find_local(name, body.unit) : image.find(name, false);
+    const auto *symbol = old.local ? local_symbol(name, body.unit) : image.find(name, false);
     if (!symbol) {
       if (!within(sources.root, old.path))
         continue;
@@ -763,11 +935,14 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     auto &candidate = result.candidates.emplace_back();
     candidate.set_symbol(name);
     candidate.set_signature(signature(name, old));
-    candidate.set_source(site(next == new_bodies.end() ? old : next->second.definition));
+    candidate.set_source(site(next ? *next : old));
     candidate.set_module(module);
     try {
-      if (!old.has_source_abi || !old.supported_abi || next == new_bodies.end() || body.inconsistent || next->second.inconsistent ||
-          old.abi != next->second.definition.abi || !next->second.definition.supported_abi)
+      if (change.enters_registry)
+        throw std::runtime_error(
+            "rebuild required: acquire the managed registry gate in the caller before entering the updated function");
+      if (!old.has_source_abi || !old.supported_abi || !next || body.inconsistent ||
+          unchanged.contains(key) || old.abi != next->abi || !next->supported_abi)
         throw std::runtime_error("rebuild required: emitted implementations or callable ABI differ");
       const auto callable = llvm::demangle(name);
       for (const auto &alias : image.symbols) {
@@ -799,7 +974,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
                                      alias.name);
         }
       }
-      if (old.local && (!old.alias_target.empty() || !next->second.definition.alias_target.empty()))
+      if (old.local && (!old.alias_target.empty() || !next->alias_target.empty()))
         throw std::runtime_error("rebuild required: local lifecycle alias needs a verified native entry");
       const auto canonical = physical_body(key, new_bodies);
       auto binding = bind(pid, image, *symbol, old, active);
@@ -833,7 +1008,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       if (prior == native_locals.end() || !prior->second.contains(ref.unit))
         continue;
     }
-    const auto *symbol = local ? image.find_local(name, ref.unit) : image.find(name, false);
+    const auto *symbol = local ? local_symbol(name, ref.unit) : image.find(name, false);
     if (local && !symbol && ref.size) {
       block(ref.unit, name, "rebuild required: no exact ELF translation-unit storage");
       continue;

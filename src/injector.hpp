@@ -29,8 +29,10 @@ struct CodePatch {
 struct CodeRange {
   std::uintptr_t address = 0;
   std::size_t size = 0;
-  // A saved return address may equal the end if a call ends there.
+  // Native functions may end with a call whose saved return PC is just past
+  // the symbol. Executable mappings use half-open bounds.
   bool return_at_end = true;
+  bool active_at_start = false;
 };
 
 // The caller owns the ptrace stop and has excluded other executing threads.

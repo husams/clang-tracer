@@ -46,26 +46,37 @@ int main() {
 
 APP = """
 #include <cstdio>
+#include <ctime>
 #include <iostream>
+#include <sstream>
 #include <vector>
 #include <unistd.h>
+#define LIVE_ENTRY __attribute__((patchable_function_entry(16, 0)))
 struct Config { int a; };
 struct Storage { Config config; int adjacent; };
 Storage storage{{1}, 7};
 static const int table[] = {1, 2, 3};
 int lookup(int i) { const char *empty = ""; return table[i] + empty[0]; }
-int first(int i) { return i + 1; }
-int second(int i) { return i + 2; }
+LIVE_ENTRY int first(int i) { return i + 1; }
+LIVE_ENTRY int second(int i) { return i + 2; }
 static int counter = 1;
-int calculate(int i) { int values[] = {1, 2, 3}; return values[i % 3] + counter; }
+LIVE_ENTRY int calculate(int i) { int values[] = {1, 2, 3}; return values[i % 3] + counter; }
 int adjacent_value() { return storage.adjacent; }
 int vector_entry(int i) { std::vector<int> values; values.push_back(i); return values.back(); }
+int formatted(int i) { std::ostringstream out; out << i; return out.str().size(); }
 """
 
 OTHER = """
+#include <string>
+#include <vector>
+#define LIVE_ENTRY __attribute__((patchable_function_entry(16, 0)))
 static int counter = 2;
 static int helper(int i) { return i + 3; }
-int third(int i) { return helper(i) + counter; }
+LIVE_ENTRY int third(int i) { return helper(i) + counter; }
+int names(int i) {
+  std::vector<std::string> values{"entry " + std::to_string(i)};
+  return values.front().size();
+}
 """
 
 
@@ -78,7 +89,7 @@ def run(args, root, cleanup):
         (source / name).write_text(content)
         (baseline / name).write_text(content)
     flags = ["-std=c++17", "-g", "-O0", "-fno-inline", "-fno-omit-frame-pointer",
-             "-fcf-protection=none", "-fpatchable-function-entry=16,0", "-pthread"]
+             "-fcf-protection=none", "-pthread"]
     target = root / "target"
     subprocess.run([args.compiler, *flags, "-Wl,--build-id=sha1", source / "driver.cpp",
                     source / "app.cpp", source / "other.cpp", "-o", target], check=True)
@@ -86,7 +97,7 @@ def run(args, root, cleanup):
     database.write_text(json.dumps([
         {"directory": str(source), "file": str(source / name),
          "arguments": [args.compiler, *flags, "-c", str(source / name), "-o", name + ".o"]}
-        for name in ("driver.cpp", "app.cpp", "other.cpp", "extra.cpp")
+        for name in ("driver.cpp", "app.cpp", "other.cpp")
     ]))
     (root / "clang-tracer-live.textproto").write_text(
         f'source_root: {json.dumps(str(source))}\n'
@@ -135,7 +146,8 @@ def run(args, root, cleanup):
     command("%live update source/app.cpp", "BLOCKED")
     call(11, 12)
 
-    with_local = APP.replace("int first", 'static int helper(int i) { return i * 1000; }\nint first')
+    with_local = APP.replace("LIVE_ENTRY int first",
+                             "static int helper(int i) { return i * 1000; }\nLIVE_ENTRY int first")
     with_local = with_local.replace("return i + 1;", 'return helper(i) + "new"[i % 3];')
     with_local = with_local.replace("return i + 2;", "return i + 20;")
     app_source.write_text(with_local)
@@ -157,13 +169,15 @@ def run(args, root, cleanup):
     command("%live revert 0", "REVERTED")
     app_source.write_text(APP.replace("values[] = {1, 2, 3}", "values[] = {1, 9, 3}")
                          .replace("return i + 1;",
-                                  'usleep(1); std::printf("runtime=%d\\n", i); throw i + 79;'))
+                                  'usleep(1); std::fprintf(stderr, "runtime=%d\\n", i); '
+                                  'if (std::time(nullptr) <= 0) return -1; throw i + 79;'))
     send(repl, "%live update source/app.cpp --payload-limit 1")
     console.expect(r"^live BLOCKED .*exceeds --payload-limit")
     call(11, 12)
     command("%live update source/app.cpp --payload-limit 33554432", "APPLIED")
     call(89, 12, calculated=10, runtime=True)
-    (source / "other.cpp").write_text(OTHER.replace("return i + 3", "return i + 30"))
+    (source / "other.cpp").write_text("#include <iostream>\n" + OTHER.replace(
+        "return helper(i) + counter;", 'std::cerr << ""; return i + 30 + counter;'))
     command("%live update source/other.cpp", "APPLIED")
     call(89, 12, third=42, calculated=10, runtime=True)
     send(repl, "%detach")

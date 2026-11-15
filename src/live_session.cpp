@@ -32,8 +32,9 @@ std::size_t payload_limit(const Action &request) {
   return static_cast<std::size_t>(limit);
 }
 
-std::string payload(const live::JitRequest &request, std::size_t limit) {
+api::LiveJitInput jit_wire(const live::JitRequest &request) {
   api::LiveJitInput wire;
+  wire.set_resolve_standard_runtime(request.resolve_standard_runtime);
   for (const auto &file : request.files) {
     auto *output = wire.add_sources();
     output->set_path(file.path);
@@ -53,6 +54,7 @@ std::string payload(const live::JitRequest &request, std::size_t limit) {
     output->set_path(unit.path);
     output->set_directory(unit.directory);
     output->set_reuse_stream_initializer(unit.reuse_stream_initializer);
+    output->set_reuse_global_lifecycle(unit.reuse_global_lifecycle);
     for (const auto &argument : unit.compiler_arguments)
       output->add_compiler_arguments(argument);
   }
@@ -63,10 +65,14 @@ std::string payload(const live::JitRequest &request, std::size_t limit) {
   }
   for (const auto &name : request.entry_symbols)
     wire.add_entry_symbols(name);
+  return wire;
+}
+
+void check_payload_size(const google::protobuf::MessageLite &wire, std::size_t limit,
+                        std::string_view description) {
   if (wire.ByteSizeLong() > limit)
-    throw std::runtime_error("live JIT snapshot exceeds --payload-limit (" +
+    throw std::runtime_error(std::string(description) + " exceeds --payload-limit (" +
                              std::to_string(limit) + " bytes)");
-  return wire.SerializeAsString();
 }
 
 AgentRequest invoke(injector::Process &process, std::uintptr_t entry, AgentRequest request,
@@ -159,7 +165,7 @@ bool publish(std::uint32_t pid, std::uint64_t process_start,
                       (next != to.entries.end() && next->second.requires_drain);
     affected.push_back({entry.address, entry.function_size, entry.return_at_end});
     if (old != from.entries.end())
-      affected.push_back({old->second.mapping_begin, old->second.mapping_size});
+      affected.push_back({old->second.mapping_begin, old->second.mapping_size, false, true});
   }
   if (registry_gated || !requires_drain)
     affected.clear();
@@ -273,9 +279,7 @@ Status Session::run_live_extension_locked(api::LiveAgentExtension input,
   const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
   input.set_deadline_nanoseconds(std::chrono::duration_cast<std::chrono::nanoseconds>(
       deadline.time_since_epoch()).count());
-  if (input.ByteSizeLong() > input_limit)
-    throw std::runtime_error("live extension snapshots exceed --payload-limit (" +
-                             std::to_string(input_limit) + " bytes)");
+  check_payload_size(input, input_limit, "live extension snapshot");
   const auto bytes = input.SerializeAsString();
   try {
     attach_process(process, deadline);
@@ -441,13 +445,21 @@ Status Session::apply_live_extension_locked(const Action &request, Status result
   if (cancelled && cancelled())
     throw live::Stale("live extension cancelled before launch");
   const auto managed = planned.input.action() == api::LiveAgentExtension::MANAGED_UPDATE;
+  const auto input_limit = payload_limit(request);
+  const auto limit = request.retention_limit() ? request.retention_limit() : live_.limit;
+  if (managed)
+    planned.input.set_retention_limit(limit);
   if (managed && request.action() == Action::PREVIEW) {
+    const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
+    planned.input.set_deadline_nanoseconds(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        deadline.time_since_epoch()).count());
+    check_payload_size(planned.input, input_limit, "live extension snapshot");
     result.set_state(Status::PLANNED);
     result.set_diagnostic("managed layout, instances and hook will be validated in the target");
     return result;
   }
   if (!managed)
-    return run_live_extension_locked(planned.input, {}, payload_limit(request));
+    return run_live_extension_locked(planned.input, {}, input_limit);
 
   const auto next_id = live_.last_committed + 1;
   if (!next_id)
@@ -461,8 +473,6 @@ Status Session::apply_live_extension_locked(const Action &request, Status result
   next.managed_native = !planned.native.entries.empty();
   for (const auto &source : planned.native.accepted_sources)
     next.sources[source.path] = source;
-  const auto limit = request.retention_limit() ? request.retention_limit() : live_.limit;
-  planned.input.set_retention_limit(limit);
   live_.managed_transition.emplace(live::ManagedTransition{previous, next_id, limit, false});
   try {
     result = finish_managed_locked(run_live_extension_locked(planned.input, [&](AgentRequest &phase) {
@@ -476,7 +486,7 @@ Status Session::apply_live_extension_locked(const Action &request, Status result
       } else {
         publish_managed(phase, pid_, process_start_, next, before, {});
       }
-    }, payload_limit(request)));
+    }, input_limit));
   } catch (...) {
     if (!live_.pending_extension) {
       live_.revisions.erase(record);
@@ -573,6 +583,7 @@ clangtracer::v1::LiveUpdateStatus Session::live_update(
       return result;
     }
     if (request.action() == Action::PREVIEW) {
+      check_payload_size(jit_wire(plan.jit), input_limit, "live JIT snapshot");
       result.set_state(Status::PLANNED);
       return result;
     }
@@ -601,7 +612,9 @@ clangtracer::v1::LiveUpdateStatus Session::activate_live_locked(
       plan.validate_sources();
     if (plan.jit.entry_symbols.size() != plan.entries.size())
       throw std::runtime_error("each native entry needs one exact JIT definition");
-    const auto source_bytes = payload(plan.jit, input_limit);
+    const auto wire = jit_wire(plan.jit);
+    check_payload_size(wire, input_limit, "live JIT snapshot");
+    const auto source_bytes = wire.SerializeAsString();
     const auto deadline = std::chrono::steady_clock::now() + operation_timeout_;
     attach_process(process, deadline);
     AgentRequest stage;

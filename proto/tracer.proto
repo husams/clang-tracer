@@ -1055,6 +1055,7 @@ message LiveJitInput {
     string directory = 2;
     repeated string compiler_arguments = 3;
     bool reuse_stream_initializer = 4;
+    bool reuse_global_lifecycle = 5;
   }
   repeated LiveUpdateRequest.Source sources = 1;
   repeated CompileUnit units = 2;
@@ -1065,6 +1066,7 @@ message LiveJitInput {
   repeated Import imports = 3;
   repeated string entry_symbols = 4;
   repeated string compiler_arguments = 5;
+  bool resolve_standard_runtime = 6;
 }
 
 message LiveAgentExtension {

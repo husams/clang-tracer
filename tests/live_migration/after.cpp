@@ -1,7 +1,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-#include "state.hpp"
+#include "state_v2.hpp"
 
 extern "C" void fixture_hook_observe(int);
 

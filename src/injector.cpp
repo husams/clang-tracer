@@ -869,7 +869,7 @@ struct Process::PeerFreeze {
     const auto mappings = read_maps(process.process_id_);
     const auto inside = [&](std::uintptr_t value, bool saved_pc) {
       return std::any_of(ranges.begin(), ranges.end(), [&](const auto &range) {
-        if (value <= range.address)
+        if (value < range.address || (value == range.address && !range.active_at_start))
           return false;
         const auto offset = value - range.address;
         return offset < range.size || (saved_pc && offset == range.size && range.return_at_end);

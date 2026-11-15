@@ -4,6 +4,7 @@
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/Mangle.h>
+#include <clang/AST/ODRHash.h>
 #include <clang/AST/RecordLayout.h>
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/Basic/Diagnostic.h>
@@ -100,28 +101,37 @@ public:
   bool VisitFunctionDecl(clang::FunctionDecl *function) {
     const auto location = context_.getSourceManager().getExpansionLoc(function->getLocation());
     if (!function->isThisDeclarationADefinition() || function->isDependentContext() ||
-        function->isImplicit() || function->isInvalidDecl() ||
-        context_.getSourceManager().isInSystemHeader(location))
+        function->isImplicit() || function->isInvalidDecl())
       return true;
 
-    clang::PrintingPolicy policy(context_.getLangOpts());
-    policy.SuppressTagKeyword = true;
-    policy.FullyQualifiedName = true;
-    const auto type = function->getType().getCanonicalType().getAsString(policy);
     std::string display;
-    llvm::raw_string_ostream text(display);
-    function->getNameForDiagnostic(text, policy, true);
-    text << " [" << type << ']';
-    std::string fingerprint = type;
-    llvm::raw_string_ostream layout(fingerprint);
-    std::set<const clang::RecordDecl *> seen;
-    if (const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(function)) {
-      layout << " static=" << method->isStatic() << " virtual=" << method->isVirtual();
-      append_record(method->getParent(), layout, seen);
+    std::string fingerprint;
+    std::optional<unsigned> system_definition;
+    if (context_.getSourceManager().isInSystemHeader(location)) {
+      if (!function->doesThisDeclarationHaveABody())
+        return true;
+      clang::ODRHash hash;
+      hash.AddFunctionDecl(function);
+      system_definition = hash.CalculateHash();
+    } else {
+      clang::PrintingPolicy policy(context_.getLangOpts());
+      policy.SuppressTagKeyword = true;
+      policy.FullyQualifiedName = true;
+      const auto type = function->getType().getCanonicalType().getAsString(policy);
+      llvm::raw_string_ostream text(display);
+      function->getNameForDiagnostic(text, policy, true);
+      text << " [" << type << ']';
+      fingerprint = type;
+      llvm::raw_string_ostream layout(fingerprint);
+      std::set<const clang::RecordDecl *> seen;
+      if (const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(function)) {
+        layout << " static=" << method->isStatic() << " virtual=" << method->isVirtual();
+        append_record(method->getParent(), layout, seen);
+      }
+      append_type(function->getReturnType(), layout, seen);
+      for (const auto *param : function->parameters())
+        append_type(param->getType(), layout, seen);
     }
-    append_type(function->getReturnType(), layout, seen);
-    for (const auto *param : function->parameters())
-      append_type(param->getType(), layout, seen);
 
     const auto record = [&](clang::GlobalDecl declaration) {
       std::string name;
@@ -130,7 +140,10 @@ public:
         mangler_->mangleName(declaration, symbol);
       else
         symbol << function->getName();
-      unit_.types.insert_or_assign(name, std::pair{display, fingerprint});
+      if (system_definition)
+        unit_.system_definitions.insert_or_assign(name, *system_definition);
+      else
+        unit_.types.insert_or_assign(name, std::pair{display, fingerprint});
     };
     if (const auto *constructor = llvm::dyn_cast<clang::CXXConstructorDecl>(function)) {
       record({constructor, clang::Ctor_Complete});
@@ -368,6 +381,7 @@ std::string local_import_name(std::string_view path, std::string_view name) {
 
 std::map<std::string, std::string> data_definitions(const CompiledUnit &unit) {
   auto module = comparison_module(*unit.module);
+  omit_standard_stream_initializer(*module);
   std::map<std::string, std::string> data;
   for (const auto &global : module->globals()) {
     if (!global.hasInitializer() || mergeable_literal(global))
@@ -468,6 +482,11 @@ std::map<std::string, Definition> definitions(const CompiledUnit &unit) {
     }
     item.supported_abi = supported_entry_abi(function);
     item.local = function.hasLocalLinkage();
+    item.discardable = item.local || function.hasLinkOnceODRLinkage() ||
+                       function.hasWeakODRLinkage() || function.hasAvailableExternallyLinkage();
+    if (const auto source = unit.system_definitions.find(function.getName().str());
+        source != unit.system_definitions.end())
+      item.system_definition = source->second;
     // Parameter lowering can include opaque pointers. Compare the bodies only
     // after independently checking the native declaration and LLVM ABI.
     std::string ir;
@@ -514,6 +533,7 @@ std::map<std::string, Definition> definitions(const CompiledUnit &unit) {
     auto item = body->second;
     item.alias_target = body->first;
     item.local = alias.hasLocalLinkage();
+    item.discardable = item.local || alias.hasLinkOnceODRLinkage() || alias.hasWeakODRLinkage();
     item.abi += " alias " + item.alias_target + " source=" + typed->second.second;
     result.emplace(alias.getName().str(), std::move(item));
   }

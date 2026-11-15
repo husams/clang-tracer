@@ -20,6 +20,7 @@ struct TranslationUnit {
   std::string directory;
   std::vector<std::string> compiler_arguments;
   bool reuse_stream_initializer = false;
+  bool reuse_global_lifecycle = false;
 };
 
 struct JitRequest {
@@ -30,6 +31,7 @@ struct JitRequest {
   // with the shared arguments. Otherwise the list gives each unit its profile.
   std::vector<TranslationUnit> translation_units;
   std::vector<std::string> entry_symbols;
+  bool resolve_standard_runtime = false;
 };
 
 class JitImage {

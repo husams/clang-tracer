@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <set>
 #include <stdexcept>
 
 namespace tracer::live {
@@ -51,6 +52,7 @@ std::string option(const Action &request, const std::string &name) {
 
 api::LiveJitInput encode(const JitRequest &request, const std::vector<std::string> &paths) {
   api::LiveJitInput result;
+  result.set_resolve_standard_runtime(request.resolve_standard_runtime);
   for (const auto &path : paths) {
     for (const auto &unit : request.translation_units) {
       if (unit.path != path)
@@ -59,6 +61,7 @@ api::LiveJitInput encode(const JitRequest &request, const std::vector<std::strin
       output->set_path(unit.path);
       output->set_directory(unit.directory);
       output->set_reuse_stream_initializer(unit.reuse_stream_initializer);
+      output->set_reuse_global_lifecycle(unit.reuse_global_lifecycle);
       for (const auto &argument : unit.compiler_arguments)
         output->add_compiler_arguments(argument);
     }
@@ -153,20 +156,23 @@ ExtensionPlan plan_extension(std::uint32_t pid, std::uint64_t process_start,
   auto sources = extension_sources(pid, module, request, paths, registry);
   if (!registry.empty()) {
     const auto build = open_native_build(module, request);
-    auto native = request;
-    native.clear_sources();
+    std::set<std::string> recipe_inputs;
+    bool native_inputs = false;
     for (const auto &source : request.sources()) {
       const auto known = std::ranges::any_of(build.baseline.files, [&](const SourceFile &file) {
         return file.path == source.path();
       });
       if (known || active.sources.contains(source.path()))
-        *native.add_sources() = source;
+        native_inputs = true;
+      else
+        recipe_inputs.insert(source.path());
     }
-    if (!native.sources().empty()) {
-      result.native = plan_sources(pid, module, native, active, cancelled);
+    if (native_inputs) {
+      result.native = plan_sources(pid, module, request, active, cancelled, &recipe_inputs);
       // Native code sharing the migrated state must enter under the
       // application's registry gate. Its checked layout contract is stable.
       auto &jit = result.native.jit;
+      sources.jit.resolve_standard_runtime = jit.resolve_standard_runtime;
       for (const auto &file : jit.files) {
         const auto found = std::ranges::find(sources.jit.files, file.path, &SourceFile::path);
         if (found == sources.jit.files.end())

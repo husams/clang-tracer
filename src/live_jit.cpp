@@ -17,6 +17,7 @@
 #include <llvm/Transforms/IPO/Internalize.h>
 
 #include <dlfcn.h>
+#include <link.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -98,9 +99,34 @@ std::uintptr_t runtime_import(llvm::StringRef name) {
   return owner.starts_with(expected) ? reinterpret_cast<std::uintptr_t>(address) : 0;
 }
 
+std::uintptr_t standard_runtime_import(llvm::StringRef name) {
+  if (name == "__cxa_atexit" || name == "__cxa_thread_atexit" ||
+      name == "__cxa_thread_atexit_impl")
+    return 0;
+  const auto symbol = name.str();
+  for (const auto *library : {"libc.so.6", "libm.so.6", "libpthread.so.0",
+                              "libstdc++.so.6", "libgcc_s.so.1"}) {
+    std::unique_ptr<void, decltype(&::dlclose)> handle(
+        ::dlopen(library, RTLD_LAZY | RTLD_NOLOAD), &::dlclose);
+    if (!handle)
+      continue;
+    const auto *address = ::dlsym(handle.get(), symbol.c_str());
+    struct link_map *provider = nullptr;
+    void *owner = nullptr;
+    Dl_info info{};
+    if (address && ::dlinfo(handle.get(), RTLD_DI_LINKMAP, &provider) == 0 &&
+        ::dladdr1(address, &info, &owner, RTLD_DL_LINKMAP) &&
+        (owner == provider ||
+         (std::string_view(library) == "libc.so.6" && info.dli_fname &&
+          std::string_view(info.dli_fname) == "linux-vdso.so.1")))
+      return reinterpret_cast<std::uintptr_t>(address);
+  }
+  return 0;
+}
+
 class Image final : public JitImage {
 public:
-  Image() {
+  explicit Image(bool resolve_standard_runtime) {
     jit_ = checked(llvm::orc::LLJITBuilder()
         .setLinkProcessSymbolsByDefault(false)
         .setProcessSymbolsJITDylibSetup(
@@ -123,7 +149,7 @@ public:
       link_error_ = llvm::toString(std::move(failure));
     });
     jit_->getMainJITDylib().addGenerator(
-        std::make_unique<RuntimeGenerator>());
+        std::make_unique<RuntimeGenerator>(resolve_standard_runtime));
   }
 
   void add(std::unique_ptr<llvm::Module> module, std::unique_ptr<llvm::LLVMContext> context,
@@ -154,18 +180,25 @@ public:
 private:
   class RuntimeGenerator final : public llvm::orc::DefinitionGenerator {
   public:
+    explicit RuntimeGenerator(bool resolve_standard_runtime)
+        : resolve_standard_runtime_(resolve_standard_runtime) {}
+
     llvm::Error tryToGenerate(llvm::orc::LookupState &, llvm::orc::LookupKind,
         llvm::orc::JITDylib &dylib, llvm::orc::JITDylibLookupFlags,
         const llvm::orc::SymbolLookupSet &symbols) override {
       llvm::orc::SymbolMap bindings;
       for (const auto &[symbol, flags] : symbols) {
         (void)flags;
-        if (const auto address = runtime_import(*symbol))
+        auto address = runtime_import(*symbol);
+        if (!address && resolve_standard_runtime_)
+          address = standard_runtime_import(*symbol);
+        if (address)
           bindings[symbol] = {llvm::orc::ExecutorAddr(address), llvm::JITSymbolFlags::Exported};
       }
       return dylib.define(llvm::orc::absoluteSymbols(std::move(bindings)));
     }
-
+  private:
+    bool resolve_standard_runtime_;
   };
 
   std::string link_error_;
@@ -281,6 +314,11 @@ std::shared_ptr<JitImage> compile_in_target(const JitRequest &request) {
     auto &module = *compiled.module;
     if (unit.reuse_stream_initializer)
       omit_standard_stream_initializer(module);
+    if (unit.reuse_global_lifecycle) {
+      for (const auto *name : {"llvm.global_ctors", "llvm.global_dtors"})
+        if (auto *table = module.getNamedGlobal(name); table && table->use_empty())
+          table->eraseFromParent();
+    }
     isolate_definitions(module, request, unit);
     for (auto &function : module) {
       // The IR linker can drop unused linkonce_odr instantiations before
@@ -308,7 +346,7 @@ std::shared_ptr<JitImage> compile_in_target(const JitRequest &request) {
     llvm::ModuleAnalysisManager analyses;
     llvm::GlobalDCEPass().run(*linked, analyses);
   }
-  auto image = std::make_shared<Image>();
+  auto image = std::make_shared<Image>(request.resolve_standard_runtime);
   image->add(std::move(linked), std::move(context), request.imports);
   // Materialize selected entrypoints now, before the transaction stops peers.
   for (const auto &entry : request.entry_symbols)
