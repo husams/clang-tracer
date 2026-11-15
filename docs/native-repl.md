@@ -392,7 +392,7 @@ Stop restores the verified instruction bytes. Check `active=no` and `restoration
 - Ptrace can observe stores in a writer that ends in an indirect call or jump when every block in the writer is decoded and any gaps contain only alignment NOPs. It observes the selected writer's stores. An indirect jump with unverified blocks, such as an unresolved jump table, is refused.
 - When the complete and base constructors share an entry, a verified direct call from outside constructor and destructor frames can identify a complete construction. When a known derived type can initialize its base as an aggregate, these shared entries remain uncertain unless stronger evidence is available.
 - On x86-64, scalar watches admit verified 32-bit integer arithmetic, bitwise and shift updates. For locked atomic instructions without a returned old value, code-cache records the write and reports that the values could not be verified. Ptrace can sample the values while target peers are parked.
-- Collection and pointee watches require verified mutation boundaries and supported identities. Unverified inline paths can leave coverage gaps. Tagged-union decoding requires a verified unsigned 32-bit discriminator and supported 32-bit alternatives. Untagged union observations carry storage bytes.
+- Collection and pointee watches require verified mutation boundaries and supported identities. Unverified inline paths can leave coverage gaps. Tagged-union decoding uses a verified integral or enum discriminator and declared cases. Untagged union stores retain the overlapping bytes.
 - Native capture covers admitted code and threads. Generated helper windows can leave signal or stack gaps, including AArch64 scalable signal records that exceed the fixed Linux signal frame. Shared-file identity correlates recordings across processes, where ordering can remain partial.
 - Use `%object status` to check drops, unsupported sites, coverage gaps, and capture limits. Use `%object stop` or `%detach` to retire the watch and restore patches. See the [verification record](../object-watch-progress.md) for the exercised cases and limits.
 
@@ -593,22 +593,17 @@ The diagnostic backend steps the complete instruction, including LOCK.
 At detach it restores the full original bytes and rewinds any owned trap
 that has yet to execute.
 
-## Decode a tagged union write
+## Trace individual writes to a nested union
 
-Pass `--union-tag FIELD` and a `--union-case TAG=MEMBER` for each admitted
-alternative. Use a direct member path such as `--field payload.integer`
-to identify the four-byte storage, and declare `--synchronization thread-confined`
-or `caller-lock` to protect the tag and storage during both samples.
+Select the union itself with a path such as `--field envelope.state.payload`. A path through one of its alternatives resolves to the enclosing union storage. The plan verifies the full extent from DWARF. An untagged watch records only the affected bytes at each original store instruction and leaves the active member unknown.
+
+For a tagged union, supply `--union-tag FIELD`, a `--union-case TAG=MEMBER` for each known alternative, and `--synchronization thread-confined` or `caller-lock`. Use a verified nonoverlapping 8-, 16-, 32- or 64-bit integral or enum tag. Within a vector entry, map value or pointee, specify the tag relative to that entry, value or pointee.
 
 ```text
-%object prepare tagged_test::State --module ./fixture --field payload.integer --code _ZN11tagged_test10write_bitsERNS_5StateEj --union-tag kind --union-case 1=integer --union-case 2=real --synchronization thread-confined --backend code-cache --output watch
+%object prepare union_test::Cell --module ./fixture --field envelope.state.payload --code "union_test::Cell::tagged()" --union-tag envelope.state.kind --union-case 4294967297=number --union-case 4294967298=real --first-seen --synchronization thread-confined --backend code-cache --output watch
 ```
 
-The plan checks the tag offset and each alternative against DWARF. A tag
-can be an unsigned 32-bit field or an enum with that underlying type.
-Signed integers, unsigned integers, and floats are supported as 32-bit
-alternatives. Unknown or unreadable tags retain raw storage bytes.
-`--no-values` skips both the discriminator and storage reads.
+A mapped case can name a record alternative, or a typed leaf such as `wide.last`. When a store touches a supported numeric, enum or bool member under a stable tag, replay includes the typed sample and the affected bytes. Record and array alternatives keep their member name and affected bytes. Unknown or unreadable tags retain bytes without a typed sample. A discriminator store records the switch. After a switch, the next full write to the new scalar exposes its new value, and subsequent writes can pair both values. Replay includes the full tag in `storageWrite`. `--no-values` retains the store and affected range while skipping value reads. Existing four-byte member watches retain their event format.
 
 ## Trace writes in the native code cache
 

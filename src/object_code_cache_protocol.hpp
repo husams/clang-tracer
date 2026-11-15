@@ -160,6 +160,7 @@ struct Observation {
   Address logical_boundary;
   object_watch::ValueWrite storage_write;
   object_watch::ValueStoreBytes storage_before, storage_after;
+  object_watch::UnionWriteState union_before, union_after;
   std::array<Address, stack_limit> frames, stack_pointers;
 };
 

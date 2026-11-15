@@ -44,9 +44,10 @@ struct Source {
   std::vector<clangtracer::v1::ObjectObservation::InlineLocation> inline_chain;
 };
 struct UnionCase {
-  enum class Type { signed_integer, unsigned_integer, real };
+  enum class Type { signed_integer, unsigned_integer, real, boolean, opaque };
   std::string member;
   Type type;
+  unsigned width = 4;
   bool operator==(const UnionCase &) const = default;
 };
 struct Layout {
@@ -58,7 +59,8 @@ struct Layout {
   bool atomic = false;
   bool opaque_union = false;
   std::optional<std::uint64_t> union_tag_offset;
-  std::map<std::uint32_t, UnionCase> union_cases;
+  std::map<std::uint64_t, UnionCase> union_cases;
+  std::string union_path;
   std::uint64_t vector_object = 0, key_offset = 0;
   bool logical_vector = false;
   bool logical_map = false;
@@ -165,6 +167,8 @@ struct ScalarSample {
 };
 void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &layout,
                        ScalarSample old, ScalarSample next);
+void set_union_write(clangtracer::v1::ObjectObservation &event, const Layout &layout,
+                     const UnionWriteState &before, const UnionWriteState &after);
 void set_storage_write(clangtracer::v1::ObjectObservation &event, const ValueWrite &write,
                        const ValueStoreBytes *before, const ValueStoreBytes *after);
 void set_logical_update(clangtracer::v1::ObjectObservation &event, const Layout &layout,
