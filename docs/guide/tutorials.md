@@ -463,7 +463,7 @@ clang-tracer events "$PID" --count 1 --timeout 30
 clang-tracer detach "$PID"
 ```
 
-Expect one entry event with callback value 42. To see the diagnostic, start the target with `CLANG_TRACER_AGENT_LOG="$PWD/agent.log" ./target` before attaching. Stop the server and target when finished.
+Expect one entry event with callback value 42. To see the diagnostic, start the target with `CLANG_TRACER_AGENT_LOG="$PWD/agent.log" ./target` before attaching. Add `CLANG_TRACER_AGENT_LOG_LEVEL=debug` to also log every install stage, the patch state and the call counters, which shows why a probe never fires. Stop the server and target when finished.
 
 ## Run the installed end-to-end JIT demo
 

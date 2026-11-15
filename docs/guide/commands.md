@@ -157,7 +157,7 @@ Without `--listen`, the server creates a private Unix endpoint. Use the reported
 | `--context-event-bytes N` | Shared event byte budget, default 256 KiB. |
 | `--context-transport-memory-bytes N` | Total shared transport memory budget, default 64 MiB. |
 
-Set `CLANG_TRACER_AGENT_LOG` in the target application's environment to enable per-session agent logs. See [callback diagnostics](developer.md#agent-callback-api).
+Set `CLANG_TRACER_AGENT_LOG` in the target application's environment to enable per-session agent logs. Set `CLANG_TRACER_AGENT_LOG_LEVEL` to `error`, `warning`, `info` (default), `debug` or `trace` to choose the verbosity; use `debug` or `trace` to see why a probe never fires. See [callback diagnostics](developer.md#agent-callback-api).
 
 ## Native command-line client
 

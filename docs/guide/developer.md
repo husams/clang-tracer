@@ -255,6 +255,25 @@ For a reusable specialization and a concrete C++ template target, see [Trace a f
 
 Set `CLANG_TRACER_AGENT_LOG` to an absolute writable log path in the **target's environment before launching it**. The target owns the private log. Records include PID, probe ID, call ID and phase where applicable. Messages are capped at 192 bytes and delivered on a best-effort basis.
 
+`CLANG_TRACER_AGENT_LOG_LEVEL` selects the verbosity. It is read once, with the log path, and has no effect unless `CLANG_TRACER_AGENT_LOG` is set. Values are case-insensitive:
+
+| Level | Writes |
+| --- | --- |
+| `error` | Failed prepare and stop operations (with `message=` holding the error text), failed hooks, `tracer::LogLevel::Error` messages. |
+| `warning` | Also `operation=probe stage=runtime outcome=degraded`, `operation=log stage=queue outcome=dropped`, `Warning` messages. |
+| `info` (default, also for an unset, empty or unrecognized value) | Also the `started` records of `validate_request` and `compile_callback`, `ok` finishes, the stop `pending` record, `ok` hooks, `Info` messages. |
+| `debug` | Also a `started` record for every prepare and stop stage, an `outcome=done` record with the facts the stage established, `outcome=retry` for a retryable stop, and about once a second `operation=probe stage=patch` and `stage=runtime outcome=active` records when something changed. |
+| `trace` | Also hex dumps of the original and installed patch bytes (`outcome=bytes`), the live bytes of a modified patch (not a replaced one), and `operation=call outcome=dispatched` for each PRE and POST hook. |
+
+An unrecognized value selects `info` and writes one `operation=log stage=level outcome=invalid` record. Every record has `level=` right after `pid=`. The debug and trace records are for the case where a probe is added but never fires:
+
+1. Follow the prepare stages. A stage with `started` and no `done`, or a `failed` record, is where installation stopped. `resolve_symbol` and `validate_patch` list the resolved address, its source, the mapping, and the patch address, size and backend.
+2. `stage=patch outcome=installed` means the live bytes at the patch address are the prepared detour. `not_installed` means they are still the original bytes. `replaced` (with `by_probe=<id>`) means a newer probe of the same entry, such as a reload, now owns them. `modified` means something else rewrote them, and trace also writes the live bytes. The agent only prepares the detour and the server writes it after prepare returns, so `not_installed` can appear briefly before `installed`. It can also appear just before a probe is removed, because the server restores the entry before it asks the agent to stop.
+3. `stage=runtime outcome=active` reports `calls=` (wrapper entries), `events_sent`, `event_drops` and `callback_errors` whenever they change. No such record while the patch is installed means the application never reaches the wrapper.
+4. At `trace`, each PRE and POST hook the agent dispatches writes `operation=call outcome=dispatched` with its call ID.
+
+Debug and trace records for hooks and calls share the per-probe queue, so a hot function can overflow it and produce `outcome=dropped`. A message logged above the configured level is not queued, and `log(...)` returns false.
+
 With logging enabled, the agent also writes an `operation=hook` record for each PRE and POST hook it runs, after the messages logged by that hook. Its `outcome` is `ok`, or `failed` when the hook threw or could not run. Hook records and callback messages share one queue per probe. When it overflows, the agent writes `operation=log stage=queue outcome=dropped` with the number of lost records.
 
 ### Shared context API

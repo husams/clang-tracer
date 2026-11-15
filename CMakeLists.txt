@@ -257,6 +257,11 @@ if(BUILD_TESTING)
   target_compile_options(native-detour-tests PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME native_detour_relocation COMMAND native-detour-tests)
   set_tests_properties(native_detour_relocation PROPERTIES TIMEOUT 30)
+  add_executable(agent-log-level-tests tests/agent_log_level_tests.cpp)
+  target_include_directories(agent-log-level-tests PRIVATE src)
+  target_compile_options(agent-log-level-tests PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME agent_log_level_parse COMMAND agent-log-level-tests)
+  set_tests_properties(agent_log_level_parse PROPERTIES TIMEOUT 30)
 
   # Exercise a PIE probe reached through a caller with relaxed alignment.
   add_executable(trace-target-pie tests/fixtures/target.cpp)
@@ -380,6 +385,22 @@ if(BUILD_TESTING)
       --agent-logging
       --output-dir ${CMAKE_CURRENT_BINARY_DIR}/pie-test-results)
   set_tests_properties(grpc_native_pie_integration PROPERTIES TIMEOUT 120)
+  add_test(NAME grpc_native_agent_log_trace
+    COMMAND server-integration
+      --server $<TARGET_FILE:clang-tracer-server>
+      --agent $<TARGET_FILE:clang_tracer_agent>
+      --target $<TARGET_FILE:trace-target-pie>
+      --agent-log-level trace
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/agent-log-trace-results)
+  set_tests_properties(grpc_native_agent_log_trace PROPERTIES TIMEOUT 120)
+  add_test(NAME grpc_native_agent_log_error
+    COMMAND server-integration
+      --server $<TARGET_FILE:clang-tracer-server>
+      --agent $<TARGET_FILE:clang_tracer_agent>
+      --target $<TARGET_FILE:trace-target-pie>
+      --agent-log-level error
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/agent-log-error-results)
+  set_tests_properties(grpc_native_agent_log_error PROPERTIES TIMEOUT 120)
   add_test(NAME grpc_client_integration
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/client_integration.py
       --server $<TARGET_FILE:clang-tracer-server>
