@@ -1848,9 +1848,9 @@ bool Controller::execute(const Command &command) {
         if (command.has("--synchronization") || request.mode() == api::ObjectWatchRequest::SNAPSHOTS) {
           if (request.mode() != api::ObjectWatchRequest::SNAPSHOTS && request.vector_field().empty() &&
               request.map_field().empty() && request.pointee_field().empty() &&
-              request.union_tag().empty() && request.owner_type().empty() &&
+              request.union_tag().empty() && request.owner_type().empty() && !request.first_seen() &&
               !request.syscall_output() && !command.has("--shared-file"))
-            throw std::invalid_argument("--synchronization requires a snapshot, collection, ownership, union or syscall watch");
+            throw std::invalid_argument("--synchronization requires a scoped, snapshot, collection, ownership, union or syscall watch");
           const auto synchronization = command.option("--synchronization");
           if (synchronization == "thread-confined")
             request.set_synchronization(api::ObjectWatchRequest::THREAD_CONFINED);

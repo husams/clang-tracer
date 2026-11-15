@@ -434,6 +434,11 @@ std::string event_summary(const api::TraceEvent &event) {
       if (update.has_after_size())
         out << " after_size=" << update.after_size();
     }
+    if (object.has_storage_write()) {
+      const auto &write = object.storage_write();
+      out << ' ' << api::ObjectObservation::StorageWrite::Region_Name(write.region())
+          << " offset=" << write.offset() << " size=" << write.size();
+    }
     if (object.has_old_integer())
       out << " " << object.old_integer() << " ->";
     else if (object.kind() == api::ObjectObservation::FIELD_CHANGED && object.has_new_integer())

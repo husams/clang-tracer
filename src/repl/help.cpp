@@ -105,6 +105,7 @@ const CommandTopic commands[] = {
      "Use --vector with --element-key FIELD=UINT32 or --map with --map-key KEY to track collection storage generations. "
      "Select a verified --mutation SYMBOL and declare --synchronization for native collection capture. "
      "Use --mode logical-writes for keyed collection changes and --mutation destroy=SYMBOL for destruction. "
+     "For libstdc++ string, variant and any storage writes, use --first-seen and declare --synchronization. "
      "Use --owner-add, --owner-get, --owner-remove and --owner-snapshot to select ownership boundaries. "
      "Use --no-values to record every completed write and omit field samples. "
      "Record observations with %record FILE --sqlite --name object.trace."},

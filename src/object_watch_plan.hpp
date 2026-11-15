@@ -1,5 +1,7 @@
 #pragma once
 
+#include "object_value_write.hpp"
+
 #include <array>
 #include <functional>
 #include <map>
@@ -62,10 +64,16 @@ struct Layout {
   bool logical_map = false;
   std::vector<std::uint64_t> pointer_offsets;
   MapLayout map;
+  ValueWriteLayout value_write;
+  std::vector<ValueWriteAlternative> value_alternatives;
+  bool scoped_storage() const { return logical_collection() || value_write.active(); }
+  std::uint64_t field_size() const { return value_write.active() ? value_write.size : field_width; }
   bool logical_collection() const { return logical_vector || logical_map || !pointer_offsets.empty(); }
   bool primary_rtti = false;
   std::uint64_t base_offset = 0;
   bool watch_store(const native_entry::ScalarStore &store) const {
+    if (value_write.active())
+      return store.supports(false) && store.width <= max_value_store_width;
     return store.supports(atomic) && (!atomic || !store.reads_memory_value()) &&
            store.width == field_width;
   }
@@ -157,6 +165,8 @@ struct ScalarSample {
 };
 void set_scalar_values(clangtracer::v1::ObjectObservation &event, const Layout &layout,
                        ScalarSample old, ScalarSample next);
+void set_storage_write(clangtracer::v1::ObjectObservation &event, const ValueWrite &write,
+                       const ValueStoreBytes *before, const ValueStoreBytes *after);
 void set_logical_update(clangtracer::v1::ObjectObservation &event, const Layout &layout,
                         const LogicalRangeSample &before, const LogicalRangeSample &after,
                         LogicalChange change);

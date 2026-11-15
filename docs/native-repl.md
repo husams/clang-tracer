@@ -463,7 +463,20 @@ Use `--mode logical-writes` with `--vector` or `--map` and declare `--synchroniz
 
 A `LOGICAL_UPDATE` includes the mutation selector, the change, available before and after sizes, vector indices, and typed field values. An entry swapped out of the selected container is erased from that container's view, and a subsequent insertion starts a new binding. Vector reallocation and hash rehashing alone leave the logical entry unchanged. A duplicate key, unreadable layout or exceeded traversal budget still produces a coverage gap. With `--no-values`, logical shape changes remain visible and field samples are omitted. Actual stores continue to report their own source instruction.
 
-Individual field watches can capture admitted stores to integers, booleans, enums, floats and doubles within private records, vectors, maps and pointees. Preview reports the verified encoding and the admitted writer sites. For exact writes, replay identifies the store instruction and its source line. Structural changes to containers and changes to strings, variants and `std::any` can be inspected with typed method snapshots at verified boundaries.
+Individual field watches capture admitted stores to integers, booleans, enums, floats, doubles and verified libstdc++ `std::string`, `std::variant` and `std::any` storage. They can follow a nested field within a private record, keyed vector, ordered or unordered map, or verified pointee. Replay shows the original store PC, source location and the before and after bytes for complex values. It retains successive writes that restore the original contents before the function returns.
+
+```text
+%object prepare demo::Portfolio --module ./portfolio --field summary.caption --code "demo::Portfolio::refresh()" --first-seen --synchronization thread-confined --backend code-cache --output ./caption-watch
+%attach PID
+%object preview --plan ./caption-watch
+%object start --plan ./caption-watch
+```
+
+Declare `thread-confined` or `caller-lock` for complex writes. A `storageWrite` event identifies the affected byte range in the value representation, character buffer, or verified out-of-line `std::any` payload. A string's inline and heap buffers are eligible. The active variant index selects any string buffer to follow. For `std::any`, the app's matching ELF and DWARF identify admitted managers and their payload layouts. An unknown manager leaves its payload opaque. When an instruction touches part of a field, only the intersecting bytes appear in the event. With `--no-values`, replay retains the location and range.
+
+Capture covers the selected writer and, with code cache and `--follow-calls` for a standalone watch, its admitted callees. Check preview and status for gaps. A newly allocated buffer becomes eligible when a verified live layout points to it. Use typed method snapshots for a whole string, the active variant value, a registered `std::any` projection, or a recursive value tree.
+
+`std::list`, `std::deque`, `std::set` and `std::unordered_set` have typed snapshot codecs. Keyed individual writes and structural tracking use the verified vector and map adapters. Pointee writes follow a verified raw, default-deleter `std::unique_ptr`, or `std::shared_ptr` path to the static pointee layout. Polymorphic snapshots can resolve derived fields from validated RTTI. Derived-field write attribution requires a separately verified concrete receiver.
 
 ## Trace a Shape through Image
 
