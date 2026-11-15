@@ -98,8 +98,11 @@ inline std::set<std::string> verified_exports(
     llvm::consumeError(entries.takeError());
     return {};
   }
+  // glibc 2.34+ defines DF_1_PIE as a macro and older releases omit it, so
+  // spell the DT_FLAGS_1 bit out.
+  constexpr std::uint64_t position_independent_executable = 0x08000000;
   for (const auto &entry : *entries)
-    if (entry.d_tag == DT_FLAGS_1 && (entry.d_un.d_val & llvm::ELF::DF_1_PIE))
+    if (entry.d_tag == DT_FLAGS_1 && (entry.d_un.d_val & position_independent_executable))
       return {};
 
   llvm::ArrayRef<llvm::object::ELF64LE::Versym> versions;
