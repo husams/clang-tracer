@@ -26,6 +26,7 @@ struct Revision {
 struct Transaction {
   std::uint64_t active = 0;
   std::uint64_t pending_extension = 0;
+  bool pending_managed = false;
   std::uint64_t last_committed = 0;
   std::uint64_t retained = 0;
   std::uint64_t limit = 16;

@@ -208,6 +208,57 @@ void publish_managed(AgentRequest &request, std::uint32_t pid, std::uint64_t sta
 }
 } // namespace
 
+std::optional<Status> Session::read_live_extension_report_locked(
+    injector::Process &process, const AgentRequest &response) {
+  if (!response.output_size)
+    return std::nullopt;
+  AgentRequest poll;
+  poll.action = AgentRequest::Action::poll;
+  poll.token = live_.pending_extension;
+  poll.output_capacity = response.output_size;
+  std::string serialized;
+  const auto filled = invoke(process, live_address_, poll, {}, &serialized);
+  if (!filled.ready)
+    throw std::runtime_error("live agent response changed during retrieval");
+  Status output;
+  if (!output.ParseFromString(serialized))
+    throw std::runtime_error("cannot decode live agent response");
+  output.set_operation_token(live_.pending_extension);
+  live_.pending_extension = 0;
+  live_.pending_managed = false;
+  live_.retained = filled.retained;
+  report_revision(output, live_);
+  if (output.state() == Status::RESTORATION_REQUIRED) {
+    unsafe_target_ = true;
+    set_failed_locked(output.diagnostic());
+  }
+  return output;
+}
+
+std::optional<Status> Session::poll_pending_live_data_locked() {
+  if (!live_.pending_extension || live_.pending_managed)
+    return std::nullopt;
+  injector::Process process;
+  try {
+    attach_process(process, std::chrono::steady_clock::now() + operation_timeout_);
+    AgentRequest poll;
+    poll.action = AgentRequest::Action::poll;
+    poll.token = live_.pending_extension;
+    const auto response = invoke(process, live_address_, poll);
+    if (response.publication != AgentRequest::Publication::none)
+      throw std::runtime_error("unexpected code publication during a live data operation");
+    auto status = read_live_extension_report_locked(process, response);
+    process.detach();
+    return status;
+  } catch (...) {
+    if (process.unsafe()) {
+      unsafe_target_ = true;
+      set_failed_locked("live data rendezvous could not safely restore the target");
+    }
+    throw;
+  }
+}
+
 Status Session::run_live_extension_locked(api::LiveAgentExtension input,
     const std::function<void(AgentRequest &)> &publication) {
   injector::Process process;
@@ -224,6 +275,7 @@ Status Session::run_live_extension_locked(api::LiveAgentExtension input,
     const auto launch = invoke(process, live_address_, start, bytes);
     if (!launch.token)
       throw std::runtime_error("agent did not start the live operation");
+    live_.pending_managed = static_cast<bool>(publication);
     live_.pending_extension = launch.token;
     process.detach();
 
@@ -253,25 +305,9 @@ Status Session::run_live_extension_locked(api::LiveAgentExtension input,
         process.detach();
         continue;
       }
-      if (response.output_size) {
-        std::string serialized;
-        poll.output_capacity = response.output_size;
-        const auto filled = invoke(process, live_address_, poll, {}, &serialized);
-        if (!filled.ready)
-          throw std::runtime_error("live agent response changed during retrieval");
-        Status output;
-        if (!output.ParseFromString(serialized))
-          throw std::runtime_error("cannot decode live agent response");
+      if (auto status = read_live_extension_report_locked(process, response)) {
         process.detach();
-        live_.pending_extension = 0;
-        live_.retained = filled.retained;
-        report_revision(output, live_);
-        if (output.state() == Status::RESTORATION_REQUIRED) {
-          unsafe_target_ = true;
-          set_failed_locked(output.diagnostic());
-        }
-        output.set_operation_token(launch.token);
-        return output;
+        return std::move(*status);
       }
       process.detach();
       if (std::chrono::steady_clock::now() >= report_deadline)
@@ -375,8 +411,15 @@ clangtracer::v1::LiveUpdateStatus Session::live_update(
     check_identity_locked();
     if (state_ != api::Session::ATTACHED)
       throw std::runtime_error("select an attached target for live update");
-    if (live_.pending_extension)
-      throw std::runtime_error("a live extension outcome is unresolved; inspect the target before further updates");
+    if (live_.pending_extension) {
+      if (request.action() == Action::STATUS)
+        if (auto status = poll_pending_live_data_locked())
+          return std::move(*status);
+      result.set_operation_token(live_.pending_extension);
+      throw std::runtime_error(live_.pending_managed
+          ? "a managed live operation outcome is unresolved"
+          : "a live data operation is running; use live status to collect its result");
+    }
     if (request.action() == Action::STATUS) {
       result.set_state(Status::CURRENT);
       for (const auto &[address, active] : live_.revisions.at(live_.active).entries) {
@@ -438,7 +481,7 @@ clangtracer::v1::LiveUpdateStatus Session::live_update(
     return activate_live_locked(plan, expected_revision, request.retention_limit(),
                                 cancelled, std::move(result));
   } catch (const std::exception &error) {
-    result.set_state(unsafe_target_ || live_.pending_extension ? Status::RESTORATION_REQUIRED :
+    result.set_state(unsafe_target_ || live_.pending_managed ? Status::RESTORATION_REQUIRED :
                      dynamic_cast<const live::Stale *>(&error) ? Status::STALE : Status::BLOCKED);
     result.set_diagnostic(error.what());
   }

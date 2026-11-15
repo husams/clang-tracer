@@ -1464,8 +1464,11 @@ void Session::detach() {
                                             : error_);
   }
   check_identity_locked();
-  if (live_.pending_extension)
-    throw std::runtime_error("live operation outcome remains unresolved");
+  if (live_.pending_extension) {
+    poll_pending_live_data_locked();
+    if (live_.pending_extension || unsafe_target_)
+      throw std::runtime_error("live operation outcome remains unresolved");
+  }
   while (live_.active) {
     const auto result = revert_live_locked(live_.revisions.at(live_.active).parent);
     if (result.state() != clangtracer::v1::LiveUpdateStatus::REVERTED)
@@ -1496,8 +1499,16 @@ void Session::shutdown() noexcept {
       state_ == clangtracer::v1::Session::EXITED || unsafe_target_)
     return;
   if (live_.pending_extension) {
-    set_failed_locked("live operation outcome remains unresolved during shutdown");
-    return;
+    try {
+      poll_pending_live_data_locked();
+    } catch (const std::exception &error) {
+      set_failed_locked(error.what());
+      return;
+    }
+    if (live_.pending_extension || unsafe_target_) {
+      set_failed_locked("live operation outcome remains unresolved during shutdown");
+      return;
+    }
   }
   while (live_.active) {
     const auto result = revert_live_locked(live_.revisions.at(live_.active).parent);

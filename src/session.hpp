@@ -142,6 +142,9 @@ private:
   clangtracer::v1::LiveUpdateStatus activate_live_locked(
       const live::Plan &plan, std::uint64_t expected_revision, std::uint64_t retention_limit,
       const std::function<bool()> &cancelled, clangtracer::v1::LiveUpdateStatus result);
+  std::optional<clangtracer::v1::LiveUpdateStatus> read_live_extension_report_locked(
+      injector::Process &process, const live::AgentRequest &response);
+  std::optional<clangtracer::v1::LiveUpdateStatus> poll_pending_live_data_locked();
   clangtracer::v1::LiveUpdateStatus run_live_extension_locked(
       clangtracer::v1::LiveAgentExtension input,
       const std::function<void(live::AgentRequest &)> &publication = {});
