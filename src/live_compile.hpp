@@ -27,9 +27,12 @@ struct CompiledUnit {
   std::map<std::string, std::pair<std::string, std::string>> types;
 };
 
+enum class CompileInspection { native_metadata, ir_only };
+
 CompiledUnit compile_unit(const JitRequest &request, const TranslationUnit &unit,
                           llvm::LLVMContext *context = nullptr,
-                          const std::function<void(clang::ASTContext &)> &inspect = {});
+                          const std::function<void(clang::ASTContext &)> &inspect = {},
+                          CompileInspection inspection = CompileInspection::ir_only);
 
 struct Definition {
   std::string implementation;

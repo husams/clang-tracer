@@ -603,7 +603,21 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
   for (const auto &[path, unit] : profiles) {
     if (cancelled && cancelled())
       throw Stale("live source compilation cancelled");
-    auto after = compile_unit(current, unit);
+    const auto compile_snapshot = [&](const JitRequest &snapshot) {
+      return compile_unit(snapshot, unit, nullptr, {}, CompileInspection::native_metadata);
+    };
+    std::optional<CompiledUnit> before;
+    if (sources.saved.count(path) || active.sources.count(path))
+      before.emplace(compile_snapshot(baseline));
+    // Only submitted inputs differ between the snapshots. Reuse the first
+    // compilation when neither the TU nor any of its includes was submitted.
+    const bool changed = !before || sources.submitted.count(path) ||
+        std::ranges::any_of(before->inputs,
+            [&](const auto &input) { return sources.submitted.count(input); });
+    std::optional<CompiledUnit> updated;
+    if (changed)
+      updated.emplace(compile_snapshot(current));
+    const auto &after = updated ? *updated : *before;
     covered.insert(path);
     for (const auto &dependency : after.inputs) {
       if (within(sources.root, dependency) &&
@@ -613,26 +627,19 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         throw std::runtime_error("unrecorded project dependency: " + dependency);
       covered.insert(dependency);
     }
-    const auto uses_saved_edit = [&](const CompiledUnit &compiled) {
-      return std::ranges::any_of(compiled.inputs,
-          [&](const auto &input) { return sources.submitted.count(input); });
-    };
-    bool changed = sources.submitted.count(path) || uses_saved_edit(after);
-    const bool existing = sources.saved.count(path) || active.sources.count(path);
-    if (existing) {
-      auto before = compile_unit(baseline, unit);
-      changed |= uses_saved_edit(before);
+    auto after_definitions = definitions(after);
+    if (before) {
       if (sources.saved.count(path))
-        for (const auto &value : before.module->global_values())
+        for (const auto &value : before->module->global_values())
           if (value.hasName() && value.hasLocalLinkage())
             native_locals[value.getName().str()].insert(path);
       if (changed) {
-        for (const auto &[name, layout] : before.record_layouts) {
+        for (const auto &[name, layout] : before->record_layouts) {
           const auto updated = after.record_layouts.find(name);
           if (updated != after.record_layouts.end() && updated->second != layout)
             block(path, name, "rebuild required: existing record layout changed");
         }
-        const auto old_data = data_definitions(before);
+        const auto old_data = data_definitions(*before);
         const auto new_data = data_definitions(after);
         for (const auto &[name, storage] : old_data) {
           const auto updated = new_data.find(name);
@@ -645,10 +652,11 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
             block(path, name, "rebuild required: new persistent data definition");
         }
       }
-      collect(old_bodies, path, definitions(before), changed ? &affected : nullptr);
-      covered.insert(before.inputs.begin(), before.inputs.end());
+      collect(old_bodies, path, changed ? definitions(*before) : after_definitions,
+              changed ? &affected : nullptr);
+      covered.insert(before->inputs.begin(), before->inputs.end());
     }
-    collect(new_bodies, path, definitions(after));
+    collect(new_bodies, path, std::move(after_definitions));
     // A previous revision may have supplied a TU with no ELF counterpart.
     // Relink its accepted snapshot so new callers can resolve those helpers.
     if (changed || !sources.saved.count(path)) {

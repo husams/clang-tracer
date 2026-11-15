@@ -298,7 +298,8 @@ std::map<std::string, std::string> data_definitions(const CompiledUnit &unit) {
 
 CompiledUnit compile_unit(const JitRequest &request, const TranslationUnit &unit,
                           llvm::LLVMContext *context,
-                          const std::function<void(clang::ASTContext &)> &inspect) {
+                          const std::function<void(clang::ASTContext &)> &inspect,
+                          CompileInspection inspection) {
   CompiledUnit result;
   if (!context) {
     result.context = std::make_unique<llvm::LLVMContext>();
@@ -324,14 +325,16 @@ CompiledUnit compile_unit(const JitRequest &request, const TranslationUnit &unit
                                      "-fsyntax-only", "-g", "-fno-discard-value-names",
                                      "-x", "c++", unit.path});
   Diagnostics diagnostics;
-  const std::function<void(clang::ASTContext &)> scan = [&](clang::ASTContext &ast) {
-    if (inspect)
-      inspect(ast);
-    if (!ast.getDiagnostics().hasErrorOccurred()) {
-      CallableTypes visitor(ast, result);
-      visitor.TraverseDecl(ast.getTranslationUnitDecl());
-    }
-  };
+  std::function<void(clang::ASTContext &)> scan = inspect;
+  if (inspection == CompileInspection::native_metadata)
+    scan = [&](clang::ASTContext &ast) {
+      if (inspect)
+        inspect(ast);
+      if (!ast.getDiagnostics().hasErrorOccurred()) {
+        CallableTypes visitor(ast, result);
+        visitor.TraverseDecl(ast.getTranslationUnitDecl());
+      }
+    };
   clang::tooling::ToolInvocation invocation(std::move(arguments),
       std::make_unique<CompileAction>(result, context, scan), files.get());
   invocation.setDiagnosticConsumer(&diagnostics);
