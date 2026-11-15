@@ -1667,6 +1667,7 @@ bool Controller::execute(const Command &command) {
   case K::live_watch:
   case K::live_status:
   case K::live_revert:
+  case K::live_recover:
   case K::live_mock:
   case K::live_update_data:
   case K::live_scan_heap: {
@@ -1679,6 +1680,7 @@ bool Controller::execute(const Command &command) {
     case K::live_watch: request.set_action(api::LiveUpdateRequest::PREVIEW); break;
     case K::live_status: request.set_action(api::LiveUpdateRequest::STATUS); break;
     case K::live_revert: request.set_action(api::LiveUpdateRequest::REVERT); break;
+    case K::live_recover: request.set_action(api::LiveUpdateRequest::RECOVER); break;
     case K::live_mock: request.set_action(api::LiveUpdateRequest::MOCK); break;
     case K::live_update_data: request.set_action(api::LiveUpdateRequest::UPDATE_DATA); break;
     case K::live_scan_heap: request.set_action(api::LiveUpdateRequest::SCAN_HEAP); break;
@@ -1717,11 +1719,13 @@ bool Controller::execute(const Command &command) {
           source->set_contents(std::move(contents));
         }
       }
-    } else if (command.kind != K::live_status && command.kind != K::live_revert) {
+    } else if (command.kind != K::live_status && command.kind != K::live_revert &&
+               command.kind != K::live_recover) {
       for (const auto &arg : args)
         request.add_arguments(arg);
     }
-    if (command.kind != K::live_status && command.kind != K::live_revert) {
+    if (command.kind != K::live_status && command.kind != K::live_revert &&
+        command.kind != K::live_recover) {
       request.set_build_manifest(std::filesystem::absolute(
           command.option("--build", "clang-tracer-live.textproto")).string());
       request.set_compilation_database(std::filesystem::absolute(

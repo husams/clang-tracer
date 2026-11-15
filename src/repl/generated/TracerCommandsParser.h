@@ -48,8 +48,8 @@ public:
     T__184 = 185, T__185 = 186, T__186 = 187, T__187 = 188, T__188 = 189,
     T__189 = 190, T__190 = 191, T__191 = 192, UINT = 193, STRING = 194,
     SHELL = 195, METADATA_ONLY = 196, SQLITE = 197, STACK = 198, CWD = 199,
-    SIGNATURE = 200, MEMBER = 201, SNAPSHOT_RETURN_POINTEE = 202, WORD = 203,
-    WS = 204
+    SIGNATURE = 200, MEMBER = 201, SNAPSHOT_RETURN_POINTEE = 202, RECOVER = 203,
+    WORD = 204, WS = 205
   };
 
   enum {
@@ -709,6 +709,7 @@ public:
   public:
     KeywordContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
+    antlr4::tree::TerminalNode *RECOVER();
     antlr4::tree::TerminalNode *STACK();
 
 
@@ -722,6 +723,7 @@ public:
   public:
     LiveUpdateContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
+    antlr4::tree::TerminalNode *RECOVER();
     std::vector<ValueContext *> value();
     ValueContext* value(size_t i);
     std::vector<LiveOptionContext *> liveOption();

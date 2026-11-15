@@ -8,7 +8,8 @@ namespace tracer::live {
 
 inline constexpr std::size_t max_entries = 256;
 inline constexpr std::size_t max_payload_bytes = 16 * 1024 * 1024;
-inline constexpr std::uint64_t agent_magic = 0x4c49564500000003ULL;
+inline constexpr std::uint64_t agent_magic = 0x4c49564500000004ULL;
+inline constexpr auto extension_grace_seconds = 5;
 
 struct AgentRequest {
   enum class Action : std::uint32_t {

@@ -148,6 +148,11 @@ private:
   clangtracer::v1::LiveUpdateStatus run_live_extension_locked(
       clangtracer::v1::LiveAgentExtension input,
       const std::function<void(live::AgentRequest &)> &publication = {});
+  clangtracer::v1::LiveUpdateStatus collect_live_extension_locked(
+      std::chrono::steady_clock::time_point deadline,
+      const std::function<void(live::AgentRequest &)> &publication);
+  clangtracer::v1::LiveUpdateStatus finish_managed_locked(clangtracer::v1::LiveUpdateStatus result);
+  clangtracer::v1::LiveUpdateStatus recover_managed_locked();
   clangtracer::v1::LiveUpdateStatus apply_live_extension_locked(
       const clangtracer::v1::LiveUpdateRequest &request, clangtracer::v1::LiveUpdateStatus result,
       const std::function<bool()> &cancelled);

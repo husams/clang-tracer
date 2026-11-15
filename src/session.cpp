@@ -1464,6 +1464,8 @@ void Session::detach() {
                                             : error_);
   }
   check_identity_locked();
+  if (live_.managed_transition)
+    throw std::runtime_error("managed publication requires %live recover");
   if (live_.pending_extension) {
     poll_pending_live_data_locked();
     if (live_.pending_extension || unsafe_target_)
@@ -1498,6 +1500,10 @@ void Session::shutdown() noexcept {
   if (state_ == clangtracer::v1::Session::DETACHED ||
       state_ == clangtracer::v1::Session::EXITED || unsafe_target_)
     return;
+  if (live_.managed_transition) {
+    set_failed_locked("managed publication still requires recovery during shutdown");
+    return;
+  }
   if (live_.pending_extension) {
     try {
       poll_pending_live_data_locked();

@@ -947,6 +947,7 @@ message LiveUpdateRequest {
     MOCK = 4;
     UPDATE_DATA = 5;
     SCAN_HEAP = 6;
+    RECOVER = 7;
   }
   message Source {
     string path = 1;
@@ -1023,6 +1024,7 @@ message LiveAgentExtension {
     HEAP_SCAN = 1;
     MANAGED_UPDATE = 2;
     MANAGED_REVERT = 3;
+    MANAGED_RECOVER = 4;
   }
   Action action = 1;
   string session = 2;

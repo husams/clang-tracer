@@ -73,6 +73,7 @@ public:
   // After uncertain publication the group stays gated until the coordinator
   // proves recovery to the code that preceded the failed operation.
   Result recover(const CodeAction& restore_code);
+  bool applied() const noexcept { return applied_; }
 
 private:
   friend std::unique_ptr<Revision> stage(Registry&, const JitRequest&, const HookOptions&);

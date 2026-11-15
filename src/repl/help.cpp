@@ -83,6 +83,7 @@ const CommandTopic commands[] = {
     {"live scan-heap", "%live scan-heap --type TYPE [--type TYPE] [--module MODULE]",
      "Find candidate objects in the target heap and report the evidence for each candidate."},
     {"live revert", "%live revert [REVISION]", "Restore the parent or specified revision. Revision 0 is the original build."},
+    {"live recover", "%live recover", "Recover a managed publication in the current server session."},
     {"memory", "", "List, read, or scan mapped memory."},
     {"memory maps", "%memory maps",
      "List all mapped ranges and permissions in the selected session and issue a memory snapshot token."},

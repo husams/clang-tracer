@@ -160,10 +160,16 @@ def live_data(args, folder):
 
 MANAGED_MAIN = r"""
 #include "state.hpp"
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <iostream>
 #include <string>
 #include <poll.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <unistd.h>
 namespace managed = tracer::live::managed;
@@ -171,12 +177,37 @@ using namespace fixture;
 managed::Registry registry;
 extern "C" managed::Registry* clang_tracer_managed_registry_v1() noexcept { return &registry; }
 extern "C" int cache_code();
-extern "C" void fixture_hook_observe(int) {
-  if (cache_code() != 27) throw std::runtime_error("hook saw the old code");
+extern "C" int cache_other();
+std::array<unsigned char, 16> original_other;
+std::atomic_bool corrupt_restore = false;
+
+void write_other(bool unknown) {
+  auto bytes = original_other;
+  if (unknown)
+    bytes[0] = 0xcc;
+  const auto address = reinterpret_cast<std::uintptr_t>(&cache_other);
+  const auto page_size = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
+  const auto begin = address - address % page_size;
+  const auto length = ((address + bytes.size() - 1 - begin) / page_size + 1) * page_size;
+  auto* memory = reinterpret_cast<void*>(begin);
+  if (mprotect(memory, length, PROT_READ | PROT_WRITE | PROT_EXEC))
+    std::abort();
+  std::memcpy(reinterpret_cast<void*>(address), bytes.data(), bytes.size());
+  if (mprotect(memory, length, PROT_READ | PROT_EXEC))
+    std::abort();
+}
+
+extern "C" void fixture_hook_observe(int count) {
+  if (cache_code() != 27 || cache_other() != 28)
+    throw std::runtime_error("hook saw the old code");
+  if (corrupt_restore && count == 1400)
+    write_other(true);
 }
 
 int main() {
   if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)) return 1;
+  std::memcpy(original_other.data(), reinterpret_cast<const void*>(&cache_other),
+              original_other.size());
   managed::InstanceId ids[3];
   {
     auto access = registry.access();
@@ -199,8 +230,21 @@ int main() {
       continue;
     if (!std::getline(std::cin, command))
       break;
+    if (command == "fault") {
+      corrupt_restore = true;
+      std::cout << "fault enabled" << std::endl;
+      continue;
+    }
+    if (command == "repair") {
+      const auto still_installed = cache_code();
+      write_other(false);
+      corrupt_restore = false;
+      std::cout << "repair code " << still_installed << std::endl;
+      continue;
+    }
     auto access = registry.access();
     std::printf("code %d\n", cache_code());
+    std::printf("other %d\n", cache_other());
     for (auto id : ids) {
       if (command == "old")
         access.with<CacheV1>("Cache", id, "cache.1", [](const auto& c) {
@@ -223,18 +267,32 @@ def migration(args, folder):
         shutil.copyfile(ROOT / "live_migration" / name, folder / name)
     (folder / "main.cpp").write_text(MANAGED_MAIN)
     patch_source = folder / "cache_code.cpp"
-    patch_source.write_text('extern "C" int cache_code() { return 1; }\n')
+    original_code = ('extern "C" int cache_code() { return 1; }\n'
+                     'extern "C" int cache_other() { return 2; }\n')
+    patch_source.write_text(original_code)
     target = build_target(args, folder, ["main.cpp", "cache_code.cpp"], ["state.hpp"])
     source = (folder / "after.cpp").read_text()
     (folder / "reject.cpp").write_text("#define FAIL_HOOK\n" + source)
     with ExitStack() as cleanup:
         app, repl, app_line, _ = attach(args, target, cleanup)
         app("old", r"^old 0$")
-        patch_source.write_text('extern "C" int cache_code() { return 27; }\n')
+        patch_source.write_text(original_code.replace("return 1", "return 27")
+                                .replace("return 2;", "return 28;"))
         options = " --after-function fixture::after --for-each Cache"
         repl("%live update update.hpp cache_code.cpp --after-file reject.cpp" + options,
              r"^live BLOCKED revision=0 .*second hook failed")
         app("old", r"^code 1$")
+        app_line(r"^old 0$")
+        app("fault", r"^fault enabled$")
+        repl("%live update update.hpp cache_code.cpp --after-file reject.cpp" + options,
+             r"^live RESTORATION_REQUIRED revision=0 .*precondition")
+        repl("%live status", r"^live RESTORATION_REQUIRED revision=0 .*%live recover")
+        repl("%live recover", r"^live RESTORATION_REQUIRED revision=0 .*precondition")
+        app("repair", r"^repair code 27$")
+        repl("%live recover", r"^live REVERTED revision=0 .*managed publication restored")
+        repl("%live recover", r"^live UNCHANGED revision=0")
+        app("old", r"^code 1$")
+        app_line(r"^other 2$")
         app_line(r"^old 0$")
         repl("%live update update.hpp cache_code.cpp --after-file after.cpp" + options,
              r"^live APPLIED revision=1 .*instances=3")

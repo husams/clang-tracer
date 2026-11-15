@@ -33,6 +33,7 @@ enum class CommandKind {
   live_watch,
   live_status,
   live_revert,
+  live_recover,
   live_mock,
   live_update_data,
   live_scan_heap,

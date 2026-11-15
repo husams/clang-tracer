@@ -1749,7 +1749,8 @@ bool Process::patch_code(std::uintptr_t address, const void *expected,
 bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches,
                                const std::function<void()> &validate_mappings,
                                const std::function<void()> &on_commit,
-                               ::tracer::compat::span<const CodeRange> drained_ranges) {
+                               ::tracer::compat::span<const CodeRange> drained_ranges,
+                               bool allow_already_replaced) {
   ensure_usable();
   if (patches.empty())
     return true;
@@ -1803,14 +1804,19 @@ bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches,
   for (std::size_t i = 0; i < patches.size(); ++i) {
     const auto &patch = patches[i];
     read_remote_into(tid_, patch.address, before[i].data(), patch.size);
-    if (std::memcmp(before[i].data(), patch.expected, patch.size) != 0)
+    if (std::memcmp(before[i].data(), patch.expected, patch.size) != 0 &&
+        (!allow_already_replaced ||
+         std::memcmp(before[i].data(), patch.replacement, patch.size) != 0))
       throw std::runtime_error("patch_code_batch precondition did not match target bytes");
   }
 
-  std::size_t attempted = 0;
+  std::vector<std::size_t> attempted;
+  attempted.reserve(patches.size());
   try {
     for (std::size_t i = 0; i < patches.size(); ++i) {
-      attempted = i + 1; // write_remote can fail after a partial word write.
+      if (std::memcmp(before[i].data(), patches[i].replacement, patches[i].size) == 0)
+        continue;
+      attempted.push_back(i); // write_remote can fail after a partial word write.
       write_remote(tid_, patches[i].address, patches[i].replacement,
                    patches[i].size);
       read_remote_into(tid_, patches[i].address, scratch.data(), patches[i].size);
@@ -1821,8 +1827,9 @@ bool Process::patch_code_batch(::tracer::compat::span<const CodePatch> patches,
   } catch (...) {
     const auto failure = std::current_exception();
     try {
-      while (attempted != 0) {
-        const auto i = --attempted;
+      while (!attempted.empty()) {
+        const auto i = attempted.back();
+        attempted.pop_back();
         write_remote(tid_, patches[i].address, before[i].data(),
                      before[i].size());
         read_remote_into(tid_, patches[i].address, scratch.data(), before[i].size());

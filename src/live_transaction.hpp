@@ -1,8 +1,10 @@
 #pragma once
 
 #include "live_update.hpp"
+#include "live_agent_protocol.hpp"
 
 #include <map>
+#include <optional>
 
 namespace tracer::live {
 
@@ -24,10 +26,19 @@ struct Revision {
   std::map<std::string, SourceFile> sources;
 };
 
+struct ManagedTransition {
+  std::uint64_t before;
+  std::uint64_t after;
+  std::uint64_t limit;
+  bool reverting;
+  std::uint64_t recovery_revision = 0;
+  std::optional<AgentRequest> acknowledgement{};
+};
+
 struct Transaction {
   std::uint64_t active = 0;
   std::uint64_t pending_extension = 0;
-  bool pending_managed = false;
+  std::optional<ManagedTransition> managed_transition;
   std::uint64_t last_committed = 0;
   std::uint64_t retained = 0;
   std::uint64_t limit = 16;

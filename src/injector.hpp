@@ -101,7 +101,8 @@ public:
   [[nodiscard]] bool patch_code_batch(::tracer::compat::span<const CodePatch> patches,
                                      const std::function<void()> &validate_mappings = {},
                                      const std::function<void()> &on_commit = {},
-                                     ::tracer::compat::span<const CodeRange> drained_ranges = {});
+                                     ::tracer::compat::span<const CodeRange> drained_ranges = {},
+                                     bool allow_already_replaced = false);
   void remote_free(std::uintptr_t address, std::size_t size);
 
   [[nodiscard]] std::uintptr_t

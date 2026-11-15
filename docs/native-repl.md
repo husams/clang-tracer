@@ -138,6 +138,13 @@ and runs the hook against the migrated instances before releasing access.
 If the hook fails, the tool restores the prior entries and state under the
 same gate.
 
+If a managed publication reports `RESTORATION_REQUIRED`, run
+`%live recover` in the same server session. Recovery reconciles any pending
+result and restores verified entry bytes when necessary. The registry stays
+gated if any overwrite window contains bytes outside the two verified
+versions. A target stopped after an unverified native rollback, or a target
+whose server session was lost, requires external recovery.
+
 ## Prepare a probe from a binary without headers
 
 Build a module index from a Linux x86-64 ELF executable or shared library.

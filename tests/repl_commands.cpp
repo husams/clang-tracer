@@ -29,6 +29,8 @@ int main() {
   require(parse_command("%object prepare --type demo::State --code f --field value --output watch")
               .option("--output") == "watch");
   require(parse_command("%live revert 0").arguments.front() == "0");
+  require(parse_command("%live recover").kind == CommandKind::live_recover);
+  bad("%live recover 0");
   require(parse_command("%attach 12345").kind == CommandKind::attach);
   require(parse_command("%probe prepare \"demo::compute(int)\" --include api.hpp "
       "--compdb build --translation-unit src/api.cpp --module app --output prepared").kind

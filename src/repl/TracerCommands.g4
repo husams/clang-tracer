@@ -83,8 +83,8 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
         | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview' | 'apply'
         | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | 'object'
-        | 'live' | 'update' | 'revert' | 'mock' | 'update-data' | 'scan-heap' | 'watch' | STACK;
-liveUpdate : 'live' (('update' | 'preview' | 'watch') (value | liveOption)+ | 'status' | 'revert' UINT?
+        | 'live' | 'update' | 'revert' | 'mock' | 'update-data' | 'scan-heap' | 'watch' | RECOVER | STACK;
+liveUpdate : 'live' (('update' | 'preview' | 'watch') (value | liveOption)+ | 'status' | RECOVER | 'revert' UINT?
                    | 'mock' value liveOption+ | 'update-data' value (liveOption | liveScanSelection)*
                    | 'scan-heap' liveOption+);
 liveScanSelection : '--from-scan' value+;
@@ -132,5 +132,6 @@ CWD : '--cwd';
 SIGNATURE : '--signature';
 MEMBER : '--member';
 SNAPSHOT_RETURN_POINTEE : '--snapshot-return-pointee';
+RECOVER : 'recover';
 WORD : ~[ \t\r\n"'\\%`]+;
 WS : [ \t\r\n]+ -> skip;

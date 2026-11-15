@@ -118,7 +118,8 @@ std::string jump_to(std::size_t size, std::uintptr_t address) {
 bool publish(std::uint32_t pid, std::uint64_t process_start,
              injector::Process &process, const live::Revision &from,
              const live::Revision &to, const std::function<void()> &before_write,
-             const std::function<void()> &committed, bool registry_gated = false) {
+             const std::function<void()> &committed, bool registry_gated = false,
+             bool reconcile = false) {
   std::set<std::uintptr_t> addresses;
   for (const auto &[address, value] : from.entries) {
     (void)value;
@@ -166,7 +167,7 @@ bool publish(std::uint32_t pid, std::uint64_t process_start,
     return true;
   }
   process.attach_for_patch(static_cast<pid_t>(pid));
-  if (!process.patch_code_batch(patches, validate, committed, affected))
+  if (!process.patch_code_batch(patches, validate, committed, affected, reconcile))
     return false;
   process.detach();
   return true;
@@ -191,12 +192,13 @@ void read_entries(live::Revision &next, const live::Plan &plan, const AgentReque
 
 void publish_managed(AgentRequest &request, std::uint32_t pid, std::uint64_t start,
                      const live::Revision &before, const live::Revision &after,
-                     const std::function<void()> &validate) {
+                     const std::function<void()> &validate, bool reconcile = false) {
   using Outcome = AgentRequest::CodeOutcome;
   injector::Process process;
   bool written = false;
   try {
-    if (!publish(pid, start, process, before, after, validate, [&] { written = true; }, true))
+    if (!publish(pid, start, process, before, after, validate, [&] { written = true; },
+                 true, reconcile))
       throw std::runtime_error("managed native entry or affected frame is still active");
     request.code_outcome = Outcome::installed;
   } catch (const live::Stale &error) {
@@ -226,18 +228,13 @@ std::optional<Status> Session::read_live_extension_report_locked(
     throw std::runtime_error("cannot decode live agent response");
   output.set_operation_token(live_.pending_extension);
   live_.pending_extension = 0;
-  live_.pending_managed = false;
   live_.retained = filled.retained;
   report_revision(output, live_);
-  if (output.state() == Status::RESTORATION_REQUIRED) {
-    unsafe_target_ = true;
-    set_failed_locked(output.diagnostic());
-  }
   return output;
 }
 
 std::optional<Status> Session::poll_pending_live_data_locked() {
-  if (!live_.pending_extension || live_.pending_managed)
+  if (!live_.pending_extension || live_.managed_transition)
     return std::nullopt;
   injector::Process process;
   try {
@@ -276,44 +273,63 @@ Status Session::run_live_extension_locked(api::LiveAgentExtension input,
     const auto launch = invoke(process, live_address_, start, bytes);
     if (!launch.token)
       throw std::runtime_error("agent did not start the live operation");
-    live_.pending_managed = static_cast<bool>(publication);
     live_.pending_extension = launch.token;
     process.detach();
+  } catch (...) {
+    if (process.unsafe()) {
+      unsafe_target_ = true;
+      set_failed_locked("live extension rendezvous could not safely restore the target");
+    }
+    throw;
+  }
+  return collect_live_extension_locked(deadline + std::chrono::seconds(live::extension_grace_seconds),
+                                       publication);
+}
 
-    AgentRequest poll;
-    poll.action = AgentRequest::Action::poll;
-    poll.token = launch.token;
-    const auto report_deadline = deadline + std::chrono::seconds(5);
+Status Session::collect_live_extension_locked(std::chrono::steady_clock::time_point deadline,
+    const std::function<void(AgentRequest &)> &publication) {
+  injector::Process process;
+  AgentRequest poll;
+  poll.action = AgentRequest::Action::poll;
+  poll.token = live_.pending_extension;
+  try {
     for (;;) {
-      // Reattach briefly to check progress. Application code runs between
-      // polls, including on the thread used to invoke the agent entry.
-      attach_process(process, report_deadline);
+      attach_process(process, deadline);
       const auto response = invoke(process, live_address_, poll);
+      auto *transition = live_.managed_transition ? &*live_.managed_transition : nullptr;
+      auto *saved = transition ? &transition->acknowledgement : nullptr;
       if (response.publication != AgentRequest::Publication::none) {
         process.detach();
-        auto acknowledgement = response;
-        acknowledgement.action = AgentRequest::Action::publication_result;
-        try {
-          if (!publication)
-            throw std::runtime_error("unexpected managed code publication request");
-          publication(acknowledgement);
-        } catch (const std::exception &error) {
-          acknowledgement.code_outcome = AgentRequest::CodeOutcome::unchanged;
-          std::snprintf(acknowledgement.error, sizeof(acknowledgement.error), "%s", error.what());
+        if (!saved)
+          throw std::runtime_error("unexpected managed code publication request");
+        if (!*saved || (*saved)->publication != response.publication) {
+          auto acknowledgement = response;
+          acknowledgement.action = AgentRequest::Action::publication_result;
+          try {
+            publication(acknowledgement);
+          } catch (const std::exception &error) {
+            acknowledgement.code_outcome = AgentRequest::CodeOutcome::unchanged;
+            std::snprintf(acknowledgement.error, sizeof(acknowledgement.error), "%s", error.what());
+          }
+          *saved = acknowledgement;
         }
-        attach_process(process, report_deadline);
-        invoke(process, live_address_, acknowledgement);
+        // Keep the acknowledgement until a later poll proves the phase
+        // advanced. A failed rendezvous must never repeat a native write.
+        attach_process(process, deadline);
+        invoke(process, live_address_, **saved);
         process.detach();
-        continue;
-      }
-      if (auto status = read_live_extension_report_locked(process, response)) {
+      } else {
+        if (auto status = read_live_extension_report_locked(process, response)) {
+          if (saved)
+            saved->reset();
+          process.detach();
+          return std::move(*status);
+        }
         process.detach();
-        return std::move(*status);
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
       }
-      process.detach();
-      if (std::chrono::steady_clock::now() >= report_deadline)
+      if (std::chrono::steady_clock::now() >= deadline)
         throw std::runtime_error("live operation is still running in the target");
-      std::this_thread::sleep_for(std::chrono::milliseconds(15));
     }
   } catch (...) {
     if (process.unsafe()) {
@@ -322,6 +338,76 @@ Status Session::run_live_extension_locked(api::LiveAgentExtension input,
     }
     throw;
   }
+}
+
+Status Session::finish_managed_locked(Status result) {
+  const auto &transition = *live_.managed_transition;
+  const auto restore = transition.recovery_revision != 0;
+  if (restore && result.state() != Status::APPLIED)
+    result.set_state(Status::RESTORATION_REQUIRED);
+  if (result.state() == Status::RESTORATION_REQUIRED) {
+    if (!restore)
+      live_.managed_transition->recovery_revision = transition.reverting
+          ? live_.revisions.at(transition.before).managed : result.operation_token();
+    result.set_diagnostic(result.diagnostic() + " (use %live recover)");
+    report_revision(result, live_);
+    return result;
+  }
+  if (restore) {
+    result.set_state(Status::REVERTED);
+    result.set_diagnostic("managed publication restored");
+  } else if (result.state() == Status::APPLIED) {
+    live_.active = transition.after;
+    if (transition.reverting) {
+      result.set_state(Status::REVERTED);
+    } else {
+      auto &next = live_.revisions.at(transition.after);
+      next.managed = result.operation_token();
+      live_.last_committed = transition.after;
+      if (next.managed_native)
+        live_.limit = transition.limit;
+    }
+  }
+  if (!transition.reverting && live_.active != transition.after)
+    live_.revisions.erase(transition.after);
+  live_.managed_transition.reset();
+  report_revision(result, live_);
+  return result;
+}
+
+Status Session::recover_managed_locked() {
+  if (!live_.managed_transition) {
+    Status result;
+    result.set_state(Status::UNCHANGED);
+    result.set_diagnostic("no managed publication requires recovery");
+    report_revision(result, live_);
+    return result;
+  }
+  const auto &transition = *live_.managed_transition;
+  const auto &before = live_.revisions.at(transition.before);
+  const auto &after = live_.revisions.at(transition.after);
+  const auto restore = [&](AgentRequest &phase) {
+    if (phase.publication == AgentRequest::Publication::install) {
+      // An interrupted request cannot start a new publication. The poll
+      // loop will resend a saved acknowledgement if the write ran already.
+      phase.code_outcome = AgentRequest::CodeOutcome::unchanged;
+      std::snprintf(phase.error, sizeof(phase.error), "%s", "managed publication was interrupted");
+      return;
+    }
+    publish_managed(phase, pid_, process_start_, after, before, {}, true);
+  };
+  if (live_.pending_extension) {
+    const bool already_recovering = transition.recovery_revision != 0;
+    auto result = finish_managed_locked(collect_live_extension_locked(
+        std::chrono::steady_clock::now() + operation_timeout_, restore));
+    if (already_recovering || !live_.managed_transition ||
+        !live_.managed_transition->recovery_revision)
+      return result;
+  }
+  api::LiveAgentExtension input;
+  input.set_action(api::LiveAgentExtension::MANAGED_RECOVER);
+  input.set_revision(live_.managed_transition->recovery_revision);
+  return finish_managed_locked(run_live_extension_locked(std::move(input), restore));
 }
 
 Status Session::apply_live_extension_locked(const Action &request, Status result,
@@ -365,8 +451,9 @@ Status Session::apply_live_extension_locked(const Action &request, Status result
     next.sources[source.path] = source;
   const auto limit = request.retention_limit() ? request.retention_limit() : live_.limit;
   planned.input.set_retention_limit(limit);
+  live_.managed_transition.emplace(live::ManagedTransition{previous, next_id, limit, false});
   try {
-    result = run_live_extension_locked(planned.input, [&](AgentRequest &phase) {
+    result = finish_managed_locked(run_live_extension_locked(planned.input, [&](AgentRequest &phase) {
       if (phase.publication == AgentRequest::Publication::install) {
         read_entries(next, planned.native, phase);
         publish_managed(phase, pid_, process_start_, before, next, [&] {
@@ -377,19 +464,13 @@ Status Session::apply_live_extension_locked(const Action &request, Status result
       } else {
         publish_managed(phase, pid_, process_start_, next, before, {});
       }
-    });
+    }));
   } catch (...) {
-    live_.revisions.erase(record);
+    if (!live_.pending_extension) {
+      live_.revisions.erase(record);
+      live_.managed_transition.reset();
+    }
     throw;
-  }
-  if (result.state() == Status::APPLIED) {
-    record->second.managed = result.operation_token();
-    live_.active = live_.last_committed = next_id;
-    if (!planned.native.entries.empty())
-      live_.limit = limit;
-    report_revision(result, live_);
-  } else if (result.state() != Status::RESTORATION_REQUIRED) {
-    live_.revisions.erase(record);
   }
   for (auto candidate : planned.native.candidates) {
     candidate.set_state(result.state());
@@ -412,14 +493,15 @@ clangtracer::v1::LiveUpdateStatus Session::live_update(
     check_identity_locked();
     if (state_ != api::Session::ATTACHED)
       throw std::runtime_error("select an attached target for live update");
-    if (live_.pending_extension) {
+    const bool recovering = request.action() == Action::RECOVER;
+    if (!recovering && live_.managed_transition)
+      throw std::runtime_error("managed publication requires %live recover");
+    if (!recovering && live_.pending_extension) {
       if (request.action() == Action::STATUS)
         if (auto status = poll_pending_live_data_locked())
           return std::move(*status);
       result.set_operation_token(live_.pending_extension);
-      throw std::runtime_error(live_.pending_managed
-          ? "a managed live operation outcome is unresolved"
-          : "a live data operation is running; use live status to collect its result");
+      throw std::runtime_error("a live data operation is running; use live status to collect its result");
     }
     if (request.action() == Action::STATUS) {
       result.set_state(Status::CURRENT);
@@ -439,6 +521,8 @@ clangtracer::v1::LiveUpdateStatus Session::live_update(
           return item.second.patch_committed || item.second.value.draining();
         }))
       throw std::runtime_error("remove active or draining trace probes before a live code transition");
+    if (recovering)
+      return recover_managed_locked();
     if (request.action() == Action::REVERT)
       return revert_live_locked(request.has_exact_revision() ? request.revision() :
                                     live_.revisions.at(live_.active).parent);
@@ -482,7 +566,7 @@ clangtracer::v1::LiveUpdateStatus Session::live_update(
     return activate_live_locked(plan, expected_revision, request.retention_limit(),
                                 cancelled, std::move(result));
   } catch (const std::exception &error) {
-    result.set_state(unsafe_target_ || live_.pending_managed ? Status::RESTORATION_REQUIRED :
+    result.set_state(unsafe_target_ || live_.managed_transition ? Status::RESTORATION_REQUIRED :
                      dynamic_cast<const live::Stale *>(&error) ? Status::STALE : Status::BLOCKED);
     result.set_diagnostic(error.what());
   }
@@ -627,18 +711,13 @@ clangtracer::v1::LiveUpdateStatus Session::revert_live_locked(std::uint64_t revi
         input.set_revision(current.managed);
         const auto &parent = live_.revisions.at(revision);
         input.set_publish_native(current.managed_native);
-        result = run_live_extension_locked(std::move(input), [&](AgentRequest &phase) {
+        live_.managed_transition.emplace(live::ManagedTransition{previous, revision, live_.limit, true});
+        return finish_managed_locked(run_live_extension_locked(std::move(input), [&](AgentRequest &phase) {
           if (phase.publication == AgentRequest::Publication::install)
             publish_managed(phase, pid_, process_start_, current, parent, {});
           else
             publish_managed(phase, pid_, process_start_, parent, current, {});
-        });
-        if (result.state() == Status::APPLIED) {
-          live_.active = revision;
-          result.set_state(Status::REVERTED);
-          report_revision(result, live_);
-        }
-        return result;
+        }));
       }
       for (auto cursor = previous; cursor && cursor != revision;
            cursor = live_.revisions.at(cursor).parent) {
@@ -657,13 +736,15 @@ clangtracer::v1::LiveUpdateStatus Session::revert_live_locked(std::uint64_t revi
     }
   } catch (const std::exception &error) {
     result.set_diagnostic(error.what());
-    if (process.unsafe() || live_.pending_extension) {
+    if (process.unsafe()) {
       unsafe_target_ = true;
       set_failed_locked(result.diagnostic());
-      result.set_state(Status::RESTORATION_REQUIRED);
-    } else {
-      result.set_state(did_commit ? Status::REVERTED : Status::BLOCKED);
     }
+    if (live_.managed_transition && !live_.pending_extension &&
+        !live_.managed_transition->recovery_revision)
+      live_.managed_transition.reset();
+    result.set_state(unsafe_target_ || live_.managed_transition ? Status::RESTORATION_REQUIRED :
+                     did_commit ? Status::REVERTED : Status::BLOCKED);
   }
   report_revision(result, live_);
   return result;
