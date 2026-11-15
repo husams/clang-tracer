@@ -1,8 +1,11 @@
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 
 #include <unistd.h>
@@ -20,7 +23,8 @@ namespace fs = std::filesystem;
 using tracer::AgentPluginOperation;
 
 const pid_t agent_pid = ::getpid();
-std::mutex plugin_mutex;
+std::shared_mutex plugin_mutex;
+std::atomic<bool> has_observers{false};
 std::map<std::string, tracer::NativePlugins> sessions;
 
 fs::path cache_directory() {
@@ -78,6 +82,7 @@ tracer::NativePlugins::LoadResult load_package(const tracer::AgentPluginCall& re
   for (const auto& file : package.files()) {
     auto path = bundle_path(file.path(), root);
     if (path == sdk || path == root / "clang_tracer_repl_plugin.hpp" ||
+        path == root / "clang_tracer_agent_extension.hpp" ||
         !contents.emplace(path, file.contents()).second) {
       throw std::invalid_argument("duplicate or reserved agent package file");
     }
@@ -104,10 +109,10 @@ tracer::NativePlugins::LoadResult load_package(const tracer::AgentPluginCall& re
     profile.insert(profile.begin(), {"-I", root.string(), "-I", (root / "include").string()});
     profile.insert(profile.end(), flags.begin(), flags.end());
     units.push_back({{path, file->second, tracer::kEmbeddedPluginHeader, sdk,
-                      tracer::kEmbeddedCppPluginHeader, files},
+                      tracer::kEmbeddedCppPluginHeader, files, tracer::kEmbeddedAgentExtensionHeader},
                      std::move(profile)});
   }
-  auto& plugins = sessions.try_emplace(request.session_id).first->second;
+  auto& plugins = sessions.try_emplace(request.session_id, true).first->second;
   return plugins.load_package(request.plugin_id, units, {}, cache_directory(), false);
 }
 
@@ -126,6 +131,13 @@ int agent_plugin(tracer::AgentPluginCall *request, const char *source,
 
     tracer::context_scheduler::ScopedPthreadBypass compiler_threads;
     std::lock_guard lock(plugin_mutex);
+    struct RefreshObservers {
+      ~RefreshObservers() {
+        has_observers.store(std::any_of(sessions.begin(), sessions.end(), [](const auto& session) {
+          return session.second.has_observers();
+        }), std::memory_order_release);
+      }
+    } refresh;
     switch (request->operation) {
     case AgentPluginOperation::Load:
     case AgentPluginOperation::Reload: {
@@ -153,7 +165,7 @@ int agent_plugin(tracer::AgentPluginCall *request, const char *source,
             request->plugin_id,
             {offer.source_path(), contents, tracer::kEmbeddedPluginHeader,
              fs::path(offer.sdk_directory()) / "clang_tracer_repl_plugin.h",
-             tracer::kEmbeddedCppPluginHeader},
+             tracer::kEmbeddedCppPluginHeader, {}, tracer::kEmbeddedAgentExtensionHeader},
             offer_profile, cache, reload,
             {offer.fingerprint(), offer.checksum(), offer.object()});
       }
@@ -164,7 +176,7 @@ int agent_plugin(tracer::AgentPluginCall *request, const char *source,
                                   contents,
                                   tracer::kEmbeddedPluginHeader,
                                   {},
-                                  tracer::kEmbeddedCppPluginHeader},
+                                  tracer::kEmbeddedCppPluginHeader, {}, tracer::kEmbeddedAgentExtensionHeader},
                                  profile, cache, reload);
       request->generation = result.generation;
       request->cache_hit = result.cache_hit;
@@ -196,6 +208,21 @@ int agent_plugin(tracer::AgentPluginCall *request, const char *source,
 }
 
 } // namespace
+
+bool tracer::agent_has_observers() noexcept {
+  return has_observers.load(std::memory_order_acquire) && agent_pid == ::getpid();
+}
+
+void tracer::agent_notify_return(const std::string& id, const agent::ReturnSample& sample,
+                                 void* context, PluginEventPublisher publish) noexcept {
+  // A hot probe never waits while the injector compiles or replaces a generation.
+  std::shared_lock lock(plugin_mutex, std::try_to_lock);
+  if (lock.owns_lock()) {
+    const auto found = sessions.find(id);
+    if (found != sessions.end())
+      found->second.notify_return(sample, context, publish);
+  }
+}
 
 extern "C" int tracer_agent_plugin_v1(tracer::AgentPluginCall *request,
                                       const char *source) noexcept {

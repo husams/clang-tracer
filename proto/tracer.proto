@@ -53,6 +53,7 @@ enum TracePhase {
   TRACE_PHASE_UNSPECIFIED = 0;
   PRE = 1;
   POST = 2;
+  AGENT_OBSERVER = 3;
 }
 message Signature {
   CallableKind kind = 1;
@@ -1030,4 +1031,10 @@ message TraceEvent {
   PreparedInjector replay_types = 24; // Server-supplied declarations and standard headers only.
   ObjectObservation object_observation = 25;
   bool receiver_sampled_at_return = 26;
+  AgentLatencyEvent agent_latency = 27;
+}
+
+message AgentLatencyEvent {
+  string plugin_id = 1;
+  uint64 elapsed_ns = 2;
 }

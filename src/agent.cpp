@@ -8,6 +8,7 @@
 #include "context_stdlib.hpp"
 #include "debug_resolver.hpp"
 #include "event_transport.hpp"
+#include "agent_plugin_observers.hpp"
 #include "native_stack.hpp"
 #include "native_detour.hpp"
 #include "native_entry.hpp"
@@ -488,6 +489,9 @@ void append_diagnostic_text(std::string &error, const std::string &message) {
 
 extern "C" void tracer_probe_enter(unsigned long long) noexcept;
 extern "C" void tracer_probe_leave(unsigned long long) noexcept;
+extern "C" unsigned long long tracer_observer_clock() noexcept;
+extern "C" void tracer_observer_return(unsigned long long, unsigned long long,
+                                       unsigned long long, unsigned long long) noexcept;
 extern "C" unsigned long long tracer_next_call_id(unsigned long long) noexcept;
 extern "C" void tracer_capture_stack(const tracer::TraceContext *, unsigned,
                                      bool) noexcept;
@@ -2863,7 +2867,10 @@ std::string make_wrapper(const tracer::Request &r,
       "tracer_event_dispatch(unsigned long long,const "
       "tracer::TraceContext*,long long) noexcept;\nextern \"C\" void "
       "tracer_probe_enter(unsigned long long) noexcept;\nextern \"C\" void "
-      "tracer_probe_leave(unsigned long long) noexcept;\nextern \"C\" "
+      "tracer_probe_leave(unsigned long long) noexcept;\n"
+      "extern \"C\" unsigned long long tracer_observer_clock() noexcept;\n"
+      "extern \"C\" void tracer_observer_return(unsigned long long,unsigned long long,"
+      "unsigned long long,unsigned long long) noexcept;\nextern \"C\" "
       "unsigned long long tracer_next_call_id(unsigned long long) noexcept;\n";
   code +=
       "extern \"C\" void tracer_stack_enter(tracer::TraceContext*,void*) "
@@ -3009,6 +3016,7 @@ std::string make_wrapper(const tracer::Request &r,
   if (shared_mode && r.result != tracer::ValueType::Void)
     if (r.result != tracer::ValueType::Object)
       code += result_type() + " result;\n";
+  code += "const auto observer_start=tracer_observer_clock();\n";
   if (shared_mode && r.result != tracer::ValueType::Object)
     code += "{ tracer_shared_original_enter(shared_guard.token); struct "
             "OriginalGuard { void* token; ~OriginalGuard() noexcept { "
@@ -3075,6 +3083,7 @@ std::string make_wrapper(const tracer::Request &r,
   }
   if (shared_mode && r.result != tracer::ValueType::Object)
     code += "}\n";
+  code += "const auto observer_end=observer_start?tracer_observer_clock():0;\n";
   if (has_post) {
     if (refresh_receiver)
       code += "auto* entry_receiver_snapshot=ctx.receiver_snapshot;\n"
@@ -3095,6 +3104,8 @@ std::string make_wrapper(const tracer::Request &r,
             "tracer_shared_resume(shared_guard.token); "
             "tracer_shared_release(shared_guard.token); "
             "shared_guard.token=nullptr;\n";
+  code += "if(observer_end)tracer_observer_return(ctx.probe_id,ctx.call_id,"
+          "observer_start,observer_end);\n";
   if (result_sret) {
     if (class_mode)
       code += "tracer_invocation.destroy();\n";
@@ -4629,6 +4640,8 @@ bool bind_probe_symbols(clang::Interpreter &interpreter,
   bind("tracer_event_dispatch", &tracer_event_dispatch);
   bind("tracer_probe_enter", &tracer_probe_enter);
   bind("tracer_probe_leave", &tracer_probe_leave);
+  bind("tracer_observer_clock", &tracer_observer_clock);
+  bind("tracer_observer_return", &tracer_observer_return);
   bind("tracer_next_call_id", &tracer_next_call_id);
   bind("tracer_stack_enter", &tracer_stack_enter);
   bind("tracer_stack_leave", &tracer_stack_leave);
@@ -5560,6 +5573,77 @@ extern "C" void tracer_probe_leave(unsigned long long id) noexcept {
   }
 }
 
+extern "C" unsigned long long tracer_observer_clock() noexcept {
+  if (callback_depth || !tracer::agent_has_observers())
+    return 0;
+  const int saved_errno = errno;
+  timespec now{};
+  const bool valid = ::clock_gettime(CLOCK_MONOTONIC, &now) == 0;
+  errno = saved_errno;
+  return valid ? static_cast<std::uint64_t>(now.tv_sec) * 1000000000ULL + now.tv_nsec : 0;
+}
+
+struct ObservedReturn {
+  Probe& probe;
+  std::uint64_t call;
+  std::uint64_t timestamp;
+};
+
+bool publish_plugin_latency(void* context, const std::string& plugin,
+                            tracer::agent::LatencyEvent latency) noexcept {
+  const auto& call = *static_cast<const ObservedReturn*>(context);
+  auto& p = call.probe;
+  if (latency.probe_id != p.request.probe_id)
+    return false;
+  const auto sequence = p.sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  auto& transport = agent.load(std::memory_order_acquire)->transport;
+  auto* packet = transport.try_acquire(p.delivery);
+  if (!packet)
+    return false;
+  bool valid = false;
+  try {
+    clangtracer::v1::TraceEvent event;
+    event.set_protocol_version(tracer::kProtocolVersion);
+    event.set_session_id(p.session_id);
+    event.set_probe_id(latency.probe_id);
+    event.set_call_id(call.call);
+    event.set_pid(static_cast<std::uint32_t>(::getpid()));
+    event.set_tid(static_cast<std::uint32_t>(::syscall(SYS_gettid)));
+    event.set_phase(clangtracer::v1::AGENT_OBSERVER);
+    event.set_probe_sequence(sequence);
+    event.set_monotonic_time_ns(call.timestamp);
+    event.set_agent_dropped_events(p.delivery.dropped.load(std::memory_order_relaxed));
+    auto& payload = *event.mutable_agent_latency();
+    payload.set_plugin_id(plugin);
+    payload.set_elapsed_ns(latency.elapsed_ns);
+    const auto size = event.ByteSizeLong();
+    packet->bytes.resize(size);
+    valid = event.SerializeToArray(packet->bytes.data(), static_cast<int>(size));
+  } catch (...) {
+    // Unblock subsequent packets if serialization fails.
+  }
+  if (!valid)
+    p.delivery.dropped.fetch_add(1, std::memory_order_relaxed);
+  transport.publish(*packet, valid);
+  return valid;
+}
+
+extern "C" void tracer_observer_return(unsigned long long id, unsigned long long call,
+                                       unsigned long long start, unsigned long long end) noexcept {
+  if (callback_depth || end < start || !tracer::agent_has_observers())
+    return;
+  auto* p = find_probe(id);
+  if (!p || !p->callbacks_active() || p->delivery.socket_fd < 0)
+    return;
+  const int saved_errno = errno;
+  ++callback_depth;
+  ObservedReturn invocation{*p, call, end};
+  tracer::agent_notify_return(p->session_id, {id, end - start}, &invocation,
+                              publish_plugin_latency);
+  --callback_depth;
+  errno = saved_errno;
+}
+
 extern "C" unsigned long long
 tracer_next_call_id(unsigned long long id) noexcept {
   if (auto *p = find_probe(id)) {
@@ -5849,7 +5933,7 @@ bool validate_request(const tracer::Request &r, std::string &error) {
 bool tracer::detail::tracer_enqueue_log(const TraceContext *context,
                                        const char *message, std::size_t size,
                                        LogLevel level) noexcept {
-  auto *owner = agent.load(std::memory_order_acquire);
+  auto *owner = ::agent.load(std::memory_order_acquire);
   if (!owner || !owner->logging_enabled || !context || !message || size == 0)
     return false;
   auto *probe = find_probe(context->probe_id);

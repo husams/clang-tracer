@@ -322,6 +322,12 @@ std::optional<Artifact> plugin_object(llvm::orc::LLJIT& jit, const NativePluginS
                         llvm::MemoryBuffer::getMemBufferCopy(input.cpp_sdk));
       }
     }
+    if (!input.agent_sdk.empty()) {
+      const auto directory = input.sdk_file.empty() ? source.parent_path()
+                                                     : input.sdk_file.parent_path();
+      memory->addFile((directory / "clang_tracer_agent_extension.hpp").string(), 0,
+                      llvm::MemoryBuffer::getMemBufferCopy(input.agent_sdk));
+    }
   } else if (!fs::is_regular_file(source)) {
     throw std::runtime_error("plugin source is not a regular file: " +
                              source.string());
@@ -454,15 +460,17 @@ struct Generation {
   std::uint64_t number;
   std::map<std::string, Handler> handlers;
   std::vector<NativePluginSymbol> exports;
+  agent::detail::Observer observer = nullptr;
 };
 
 std::map<std::string, Handler> read_handlers(llvm::orc::LLJIT &jit,
-                                             llvm::orc::JITDylib &scope) {
+                                             llvm::orc::JITDylib &scope,
+                                             bool has_observer) {
   auto entry = require(jit.lookup(scope, "tracer_repl_plugin_v1"))
                    .toPtr<decltype(&tracer_repl_plugin_v1)>();
   const auto *descriptor = entry();
   if (!descriptor || descriptor->size != sizeof(TracerReplPluginV1) ||
-      !descriptor->commands || !descriptor->command_count)
+      (descriptor->command_count ? !descriptor->commands : !has_observer))
     throw std::runtime_error("invalid v1 plugin descriptor");
   std::map<std::string, Handler> handlers;
   for (size_t i = 0; i < descriptor->command_count; ++i) {
@@ -477,6 +485,20 @@ std::map<std::string, Handler> read_handlers(llvm::orc::LLJIT &jit,
   }
   return handlers;
 }
+
+agent::detail::Observer read_observer(llvm::orc::LLJIT& jit, llvm::orc::JITDylib& scope) {
+  auto entry = jit.lookup(scope, "tracer_agent_extension_v1");
+  if (!entry) {
+    require(llvm::handleErrors(entry.takeError(), [](const llvm::orc::SymbolsNotFound&) {}));
+    return nullptr;
+  }
+  agent::detail::Observer observer = nullptr;
+  auto attachment = agent::detail::Host::attachment(observer);
+  const auto status = entry->toPtr<agent::detail::Attach>()(attachment);
+  if (status != agent::Status::ok || !observer)
+    throw std::runtime_error("agent extension did not register a return observer");
+  return observer;
+}
 } // namespace
 
 struct NativePlugins::Impl {
@@ -484,8 +506,9 @@ struct NativePlugins::Impl {
   std::unique_ptr<llvm::orc::LLJIT> jit;
   std::map<std::string, Generation> active;
   std::uint64_t next_scope = 0;
+  bool allow_observers;
 
-  Impl() {
+  explicit Impl(bool observe) : allow_observers(observe) {
 #ifdef TRACER_RUNTIME_IS_LIBRARY
     std::string error;
     if (!native_detour::initialize_llvm(error))
@@ -556,7 +579,8 @@ struct NativePlugins::Impl {
                           : llvm::MemoryBuffer::getMemBufferCopy(artifact.object->getBuffer());
         require(jit->addObjectFile(scope, std::move(object)));
       }
-      auto handlers = read_handlers(*jit, scope);
+      const auto observer = allow_observers ? read_observer(*jit, scope) : nullptr;
+      auto handlers = read_handlers(*jit, scope, observer != nullptr);
       std::vector<NativePluginSymbol> exports;
       for (const auto& [name, callable] : definitions) {
         exports.push_back(
@@ -576,7 +600,7 @@ struct NativePlugins::Impl {
         }
       }
       active.insert_or_assign(id, Generation{units.front().source.path, &scope, number,
-                                             std::move(handlers), std::move(exports)});
+                                             std::move(handlers), std::move(exports), observer});
     } catch (const std::exception &error) {
       if (auto cleanup = session.removeJITDylib(scope))
         throw std::runtime_error(std::string(error.what()) + "; cleanup: " +
@@ -599,7 +623,7 @@ struct NativePlugins::Impl {
   }
 };
 
-NativePlugins::NativePlugins() = default;
+NativePlugins::NativePlugins(bool allow_observers) : allow_observers_(allow_observers) {}
 NativePlugins::~NativePlugins() = default;
 
 NativePlugins::LoadResult
@@ -611,7 +635,7 @@ NativePlugins::load(const std::string &id, NativePluginSource source,
   if (!impl_ && reload)
     throw std::invalid_argument("plugin is not loaded: " + id);
   if (!impl_)
-    impl_ = std::make_unique<Impl>();
+    impl_ = std::make_unique<Impl>(allow_observers_);
   return *impl_->load(id, {{std::move(source), profile}}, cache, reload);
 }
 
@@ -623,7 +647,7 @@ NativePlugins::load_offered(const std::string &id, NativePluginSource source,
   if (!valid_name(id))
     throw std::invalid_argument("invalid plugin name: " + id);
   if (!impl_)
-    impl_ = std::make_unique<Impl>();
+    impl_ = std::make_unique<Impl>(allow_observers_);
   return impl_->load(id, {{std::move(source), profile}}, cache, reload, offer);
 }
 
@@ -635,9 +659,35 @@ NativePlugins::LoadResult NativePlugins::load_package(const std::string& id,
     throw std::invalid_argument("invalid plugin name or empty source list: " + id);
   }
   if (!impl_) {
-    impl_ = std::make_unique<Impl>();
+    impl_ = std::make_unique<Impl>(allow_observers_);
   }
   return *impl_->load(id, units, cache, reload, {}, include);
+}
+
+bool NativePlugins::has_observers() const noexcept {
+  return impl_ && std::any_of(impl_->active.begin(), impl_->active.end(),
+                             [](const auto& plugin) { return plugin.second.observer != nullptr; });
+}
+
+void NativePlugins::notify_return(const agent::ReturnSample& sample, void* context,
+                                  PluginEventPublisher publish) const noexcept {
+  if (!impl_)
+    return;
+  struct Publisher {
+    void* context;
+    const std::string& id;
+    PluginEventPublisher publish;
+  };
+  for (const auto& [id, generation] : impl_->active) {
+    if (!generation.observer)
+      continue;
+    Publisher publisher{context, id, publish};
+    auto sink = agent::detail::Host::event_sink(&publisher, +[](void* opaque, agent::LatencyEvent event) noexcept {
+      const auto& target = *static_cast<Publisher*>(opaque);
+      return target.publish(target.context, target.id, event);
+    });
+    generation.observer(sample, sink);
+  }
 }
 
 std::vector<NativePluginSymbol> NativePlugins::public_symbols(const std::string& id) const {
@@ -655,7 +705,7 @@ NativePlugins::prepare(NativePluginSource source,
                        const std::vector<std::string> &profile,
                        const fs::path &cache) {
   if (!impl_)
-    impl_ = std::make_unique<Impl>();
+    impl_ = std::make_unique<Impl>(allow_observers_);
   auto artifact = *plugin_object(*impl_->jit, source, profile, cache);
   const auto bytes = artifact.object->getBuffer();
   if (!artifact.reused)

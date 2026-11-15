@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include "agent_plugin_observers.hpp"
+
 namespace tracer {
 std::filesystem::path private_plugin_directory(const std::filesystem::path& directory, bool create,
                                                bool owner_only = true);
@@ -26,6 +28,7 @@ struct NativePluginSource {
   std::filesystem::path sdk_file;
   std::string_view cpp_sdk;
   std::span<const NativePluginFile> files{};
+  std::string_view agent_sdk{};
 };
 
 struct NativePluginUnit {
@@ -54,6 +57,7 @@ struct NativePluginObjectView {
 class NativePlugins {
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  bool allow_observers_;
 
 public:
   struct LoadResult {
@@ -67,7 +71,7 @@ public:
     std::uint64_t generation;
   };
 
-  NativePlugins();
+  explicit NativePlugins(bool allow_observers = false);
   ~NativePlugins();
   LoadResult load(const std::string &id, NativePluginSource source,
                   const std::vector<std::string> &profile,
@@ -80,6 +84,9 @@ public:
   LoadResult load_package(const std::string& id, const std::vector<NativePluginUnit>& units,
                           const std::filesystem::path& include, const std::filesystem::path& cache,
                           bool reload);
+  bool has_observers() const noexcept;
+  void notify_return(const agent::ReturnSample& sample, void* context,
+                     PluginEventPublisher publish) const noexcept;
   std::vector<NativePluginSymbol> public_symbols(const std::string& id) const;
   void discard(const std::string& id);
   NativePluginObject prepare(NativePluginSource source,

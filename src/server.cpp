@@ -1452,10 +1452,20 @@ private:
         valid_phase = event.call_id() != 0 && event.has_result() &&
                       valid_result(event.result());
         break;
+      case clangtracer::v1::AGENT_OBSERVER: {
+        const auto& id = event.agent_latency().plugin_id();
+        valid_phase = event.call_id() != 0 && !event.has_result() &&
+                      event.arguments().empty() && !id.empty() && id.size() < 128 &&
+                      id.front() != '-' &&
+                      id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") ==
+                          std::string::npos;
+        break;
+      }
       default:
         break;
       }
-      if (!valid_phase)
+      if (event.has_agent_latency() != (event.phase() == clangtracer::v1::AGENT_OBSERVER) ||
+          !valid_phase)
         continue;
       // Function names are assigned by the server from the registered ProbeSpec.
       if (!event.function_name().empty())
@@ -1471,7 +1481,7 @@ private:
       event.clear_object_observation();
       event.set_function_name(active->second.function_name);
       const auto snapshot = snapshot_probes_.find(key);
-      if (snapshot == snapshot_probes_.end()) {
+      if (event.phase() == api::AGENT_OBSERVER || snapshot == snapshot_probes_.end()) {
         ++received_[key];
         append_native_locked(std::move(event));
       } else {

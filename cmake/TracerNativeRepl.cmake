@@ -123,6 +123,7 @@ function(tracer_add_native_repl)
   # Each executable uses the facade it was built against, even across upgrades.
   set(_repl_facade_headers "${_repl}/api.hpp" "${_repl}/event_value.hpp"
     "${_repl}/clang_tracer_repl_plugin.h" "${_repl}/clang_tracer_repl_plugin.hpp"
+    "${_repl}/clang_tracer_agent_extension.hpp"
     "${_repl}/event_ranges.hpp" "${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/module_index.hpp")
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_repl_facade_headers}")
   set(_repl_facade_digests "")
@@ -1036,6 +1037,12 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-reload-target>
           "${CMAKE_CURRENT_SOURCE_DIR}/examples/jit-plugin-globals" autoload)
       set_tests_properties(native_repl_agent_plugin_autoload PROPERTIES TIMEOUT 120)
+      add_test(NAME native_repl_agent_observer
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_agent_observer.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-reload-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/examples/repl-agent-observer")
+      set_tests_properties(native_repl_agent_observer PROPERTIES TIMEOUT 120)
       add_executable(repl-bulk-concrete-target
         examples/prepared-injectors/concrete/target.cpp
         examples/prepared-injectors/concrete/virtual.cpp)

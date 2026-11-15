@@ -11,6 +11,7 @@ using Command = TracerReplCommandV1;
 
 template <typename Implementation>
 class PluginInterface {
+protected:
   static Implementation& instance() noexcept {
     static_assert(std::is_trivially_destructible_v<Implementation>,
                   "plugin instances must be trivially destructible");
@@ -18,7 +19,6 @@ class PluginInterface {
     return plugin;
   }
 
-protected:
   template <auto Method>
   static constexpr Command command(const char* name, const char* help) {
     static_assert(noexcept(static_cast<uint64_t>((instance().*Method)())),
@@ -31,9 +31,15 @@ protected:
 namespace detail {
 template <typename Implementation>
 const TracerReplPluginV1* descriptor() {
-  constexpr auto& commands = Implementation::commands;
-  static constexpr TracerReplPluginV1 value{sizeof(TracerReplPluginV1),
-                                            sizeof(commands) / sizeof(commands[0]), commands};
+  static constexpr auto value = [] {
+    if constexpr (requires { Implementation::commands; }) {
+      constexpr auto& commands = Implementation::commands;
+      return TracerReplPluginV1{sizeof(TracerReplPluginV1),
+                                sizeof(commands) / sizeof(commands[0]), commands};
+    } else {
+      return TracerReplPluginV1{sizeof(TracerReplPluginV1), 0, nullptr};
+    }
+  }();
   return &value;
 }
 } // namespace detail
