@@ -3110,7 +3110,8 @@ public:
           throw std::invalid_argument("method patch overlaps an object lifecycle or writer body: " + artifact.selector());
       const bool owns_lifetime = std::any_of(binding.watch().bindings().begin(),
           binding.watch().bindings().end(), [&](const auto &entry) {
-        return (entry.role() == "construct" || entry.role() == "construct (complete/base alias)") &&
+        return (entry.role() == "construct" || entry.role() == "construct (complete/base alias)" ||
+                entry.role() == "construct (provisional: incomplete lifetime coverage)") &&
             entry.module() == info.module();
       });
       if (!owns_lifetime)

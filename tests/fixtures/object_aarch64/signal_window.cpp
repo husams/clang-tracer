@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <ucontext.h>
+#include <unistd.h>
 #if defined(__aarch64__)
 #include <asm/sigcontext.h>
 #include <sys/prctl.h>
@@ -128,6 +130,8 @@ asm(".pushsection .text\n"
 namespace {
 bool after_store;
 bool one_shot;
+bool one_shot_timer;
+int one_shot_count_fd = -1;
 #if !defined(__aarch64__)
 bool at_return;
 #endif
@@ -174,6 +178,8 @@ bool edit_sve(mcontext_t &machine) {
 #endif
 volatile sig_atomic_t correct_pc;
 void handle_signal(int, siginfo_t *, void *raw) {
+  if (one_shot_count_fd >= 0)
+    (void)::write(one_shot_count_fd, "H", 1);
   auto &machine = static_cast<ucontext_t *>(raw)->uc_mcontext;
 #if defined(__aarch64__)
   const auto pc = machine.pc;
@@ -215,7 +221,8 @@ void handle_signal(int, siginfo_t *, void *raw) {
 int main(int argc, char **argv) {
   if (argc != 2)
     return 1;
-  one_shot = !std::strcmp(argv[1], "oneshot");
+  one_shot_timer = !std::strcmp(argv[1], "oneshot-timer");
+  one_shot = !std::strcmp(argv[1], "oneshot") || one_shot_timer;
   after_store = !std::strcmp(argv[1], "after") || one_shot;
 #if defined(__aarch64__)
   streaming = !std::strcmp(argv[1], "sme16");
@@ -237,7 +244,13 @@ int main(int argc, char **argv) {
   struct sigaction action{};
   action.sa_flags = SA_SIGINFO | (one_shot ? SA_RESETHAND : 0);
   action.sa_sigaction = handle_signal;
-  if (::sigaction(SIGUSR1, &action, nullptr))
+  const int watched_signal = one_shot_timer ? SIGALRM : SIGUSR1;
+  if (one_shot) {
+    one_shot_count_fd = ::open("oneshot-count", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (one_shot_count_fd < 0)
+      return 2;
+  }
+  if (::sigaction(watched_signal, &action, nullptr))
     return 2;
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   std::puts("READY");
@@ -273,6 +286,8 @@ int main(int argc, char **argv) {
     std::printf("SVE pc=%d records=%d interrupted=%p\n", int(sve_pc), int(sve_records),
                 reinterpret_cast<void *>(sve_interrupted));
 #endif
+  if (one_shot_timer)
+    ::alarm(1);
   while (::access("stop.now", F_OK))
     ::usleep(1000);
   return !correct_pc || record.value != (after_store ? 23 : 43) || result != 44;

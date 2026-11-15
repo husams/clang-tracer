@@ -27,7 +27,9 @@
 #include <cctype>
 #include <cstdlib>
 #include <cerrno>
+#include <poll.h>
 #include <spawn.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
 #ifdef __linux__
 #include <sys/stat.h>
@@ -881,14 +883,20 @@ void run_preparer(std::vector<std::string> arguments, const char *failure) {
       throw std::system_error(error, std::generic_category(), "cannot secure native preparation diagnostics");
     }
   }
+  if (::fcntl(diagnostic_pipe[0], F_SETFL, O_NONBLOCK) < 0) {
+    const int error = errno;
+    ::close(diagnostic_pipe[0]);
+    ::close(diagnostic_pipe[1]);
+    throw std::system_error(error, std::generic_category(), "cannot configure native preparation diagnostics");
+  }
   posix_spawn_file_actions_t actions;
   int configured = ::posix_spawn_file_actions_init(&actions);
   const bool actions_initialized = configured == 0;
   if (!configured)
     configured = ::posix_spawn_file_actions_adddup2(&actions, diagnostic_pipe[1], STDERR_FILENO);
-  if (!configured)
+  if (!configured && diagnostic_pipe[0] != STDERR_FILENO)
     configured = ::posix_spawn_file_actions_addclose(&actions, diagnostic_pipe[0]);
-  if (!configured)
+  if (!configured && diagnostic_pipe[1] != STDERR_FILENO)
     configured = ::posix_spawn_file_actions_addclose(&actions, diagnostic_pipe[1]);
   if (configured) {
     if (actions_initialized)
@@ -905,31 +913,65 @@ void run_preparer(std::vector<std::string> arguments, const char *failure) {
     ::close(diagnostic_pipe[0]);
     throw std::system_error(started, std::generic_category(), "cannot start native preparer");
   }
+  constexpr std::size_t diagnostic_limit = 16 * 1024;
   std::string diagnostics;
-  std::array<char, 2048> buffer{};
+  std::array<char, 4096> buffer{};
   bool truncated = false;
   int read_error = 0;
-  for (;;) {
-    const auto count = ::read(diagnostic_pipe[0], buffer.data(), buffer.size());
+  const auto drain = [&](std::size_t size) {
+    ssize_t count;
+    do {
+      count = ::read(diagnostic_pipe[0], buffer.data(), std::min(size, buffer.size()));
+    } while (count < 0 && errno == EINTR);
     if (count > 0) {
-      constexpr std::size_t diagnostic_limit = 16 * 1024;
+      std::cerr.write(buffer.data(), count);
       const auto available = diagnostic_limit - diagnostics.size();
       diagnostics.append(buffer.data(), std::min<std::size_t>(available, count));
       truncated |= static_cast<std::size_t>(count) > available;
-      continue;
-    }
-    if (count < 0 && errno == EINTR)
-      continue;
-    if (count < 0) {
+    } else if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
       read_error = errno;
-      break;
     }
-    break;
-  }
-  ::close(diagnostic_pipe[0]);
+    return count;
+  };
+
   int status = 0;
-  while (::waitpid(pid, &status, 0) < 0)
-    if (errno != EINTR) throw std::runtime_error("cannot wait for native preparation");
+  pid_t waited;
+  bool pipe_open = true;
+  do {
+    do {
+      waited = ::waitpid(pid, &status, pipe_open ? WNOHANG : 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != 0)
+      break;
+    const auto count = drain(buffer.size());
+    if (!count || read_error) {
+      ::close(diagnostic_pipe[0]);
+      pipe_open = false;
+    } else if (count < 0) {
+      pollfd ready{diagnostic_pipe[0], POLLIN, 0};
+      // A descendant may keep the pipe open after the preparer exits.
+      // Check the leader's status even when stderr has no new bytes.
+      (void)::poll(&ready, 1, 20);
+    }
+  } while (true);
+  if (pipe_open) {
+    if (waited == pid) {
+      int pending = 0;
+      if (::ioctl(diagnostic_pipe[0], FIONREAD, &pending) == 0) {
+        while (pending > 0) {
+          const auto count = drain(static_cast<std::size_t>(pending));
+          if (count <= 0)
+            break;
+          pending -= static_cast<int>(count);
+        }
+      } else {
+        (void)drain(buffer.size());
+      }
+    }
+    ::close(diagnostic_pipe[0]);
+  }
+  if (waited < 0)
+    throw std::runtime_error("cannot wait for native preparation");
   if (read_error)
     throw std::system_error(read_error, std::generic_category(), "cannot read native preparation diagnostics");
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
@@ -946,8 +988,6 @@ void run_preparer(std::vector<std::string> arguments, const char *failure) {
       detail += " [diagnostics truncated]";
     throw std::runtime_error(std::string(failure) + detail);
   }
-  if (!diagnostics.empty())
-    std::cerr << diagnostics;
 }
 
 class PreparationDirectory {
@@ -1211,6 +1251,8 @@ void Controller::object_probe_command(const Command &command) {
            << " pc=0x" << std::hex << patch.runtime_pc() << std::dec
            << " verified_bytes=" << patch.patch_size() << '\n';
     out_ << result.diagnostic() << '\n';
+    if (!watch.diagnostic().empty())
+      out_ << watch.diagnostic() << '\n';
     return;
   }
   const auto &watch = result.watch();
@@ -1363,6 +1405,17 @@ void Controller::print(const Collection &collection) const {
 RecordResult Controller::watch(const Command &command, bool display,
                                const std::string &record_path) {
   ensure_connected();
+  CallbackErrorFilter callback_errors = CallbackErrorFilter::include;
+  if (command.has("--callback-errors")) {
+    const auto value = command.option("--callback-errors");
+    if (value == "exclude")
+      callback_errors = CallbackErrorFilter::exclude;
+    else if (value == "only")
+      callback_errors = CallbackErrorFilter::only;
+    else if (value != "include")
+      throw std::invalid_argument(
+          "--callback-errors must be include, exclude, or only");
+  }
   api::WatchEventsRequest request;
   if (command.has("--session")) {
     request.add_session_ids(command.option("--session"));
@@ -1441,6 +1494,12 @@ RecordResult Controller::watch(const Command &command, bool display,
         api::TracePhase_Name(event.phase()) != command.option("--phase")) {
       // The server can send the adapter once for a batch. Keep it if the
       // event carrying it is filtered out before the next stored event.
+      if (sqlite && event.has_replay_types())
+        pending_types.insert_or_assign(event.probe_id(),
+                                       std::move(*event.mutable_replay_types()));
+      continue;
+    }
+    if (!callback_error_matches(event, callback_errors)) {
       if (sqlite && event.has_replay_types())
         pending_types.insert_or_assign(event.probe_id(),
                                        std::move(*event.mutable_replay_types()));
@@ -1527,6 +1586,10 @@ RecordResult Controller::record(const std::string &path,
     throw std::invalid_argument("recording session conflicts with all_sessions");
   if (!options.phase.empty() && options.phase != "PRE" && options.phase != "POST")
     throw std::invalid_argument("recording phase must be PRE or POST");
+  if (options.callback_errors != CallbackErrorFilter::include &&
+      options.callback_errors != CallbackErrorFilter::exclude &&
+      options.callback_errors != CallbackErrorFilter::only)
+    throw std::invalid_argument("invalid callback error filter");
   if (options.timeout_seconds > 86400)
     throw std::invalid_argument("recording timeout must be at most 86400 seconds");
 
@@ -1542,6 +1605,10 @@ RecordResult Controller::record(const std::string &path,
     command.options["--name"] = options.names;
   if (!options.phase.empty())
     command.options["--phase"] = {options.phase};
+  if (options.callback_errors == CallbackErrorFilter::exclude)
+    command.options["--callback-errors"] = {"exclude"};
+  else if (options.callback_errors == CallbackErrorFilter::only)
+    command.options["--callback-errors"] = {"only"};
   if (options.probe_id)
     command.options["--probe"] = {std::to_string(options.probe_id)};
   if (options.after_sequence)
@@ -2770,7 +2837,16 @@ public:
       throw std::runtime_error("collection already exists: " + name +
                                "; choose a new name or use %events clear NAME");
     }
-    auto loaded = read_recording(args.at(0), {});
+    EventQuery query;
+    const auto callback_errors = command.option("--callback-errors", "include");
+    if (callback_errors == "exclude")
+      query.callback_errors = CallbackErrorFilter::exclude;
+    else if (callback_errors == "only")
+      query.callback_errors = CallbackErrorFilter::only;
+    else if (callback_errors != "include")
+      throw std::invalid_argument(
+          "--callback-errors must be include, exclude, or only");
+    auto loaded = read_recording(args.at(0), query);
     out_ << "opened events=" << loaded.received
          << " retained=" << loaded.events().size()
          << " evicted=" << loaded.evicted << '\n';

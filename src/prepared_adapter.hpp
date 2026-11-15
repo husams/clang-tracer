@@ -6,6 +6,7 @@
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/Expr.h>
 #include <clang/Basic/SourceManager.h>
+#include <clang/Sema/Sema.h>
 #include <llvm/ADT/StringExtras.h>
 
 #include <algorithm>
@@ -29,7 +30,7 @@ struct AdapterDeclarations {
 
 class AdapterEmitter {
 public:
-  static AdapterDeclarations emit(clang::ASTContext &ast,
+  static AdapterDeclarations emit(clang::ASTContext &ast, clang::Sema &sema,
                                   const clang::HeaderSearch &toolchain_search,
                                   const clang::FunctionDecl &function,
                                   const std::vector<std::string> &headers,
@@ -38,7 +39,7 @@ public:
     std::vector<NestedRequest> late_requests;
     for (;;) {
       const auto reserved = late_requests.size();
-      AdapterEmitter pass(ast, toolchain_search, late_requests);
+      AdapterEmitter pass(ast, sema, toolchain_search, late_requests);
       pass.emit_declarations(function, headers, pointer_layouts, snapshot_types);
       if (!pass.first_late_dependency_)
         return {pass.forwards_ + pass.declarations_, std::move(pass.standard_headers_)};
@@ -56,10 +57,10 @@ private:
     bool complete;
   };
 
-  AdapterEmitter(clang::ASTContext &ast,
+  AdapterEmitter(clang::ASTContext &ast, clang::Sema &sema,
                  const clang::HeaderSearch &toolchain_search,
                  std::vector<NestedRequest> &late_requests)
-      : ast_(ast), policy_(ast.getLangOpts()),
+      : ast_(ast), sema_(sema), policy_(ast.getLangOpts()),
         header_discovery_(ast, toolchain_search), late_requests_(late_requests) {
     policy_.SuppressTagKeyword = true;
     policy_.FullyQualifiedName = true;
@@ -194,6 +195,16 @@ private:
     }
   }
 
+  const char *exception_suffix(const clang::FunctionDecl &decl) {
+    auto *prototype = decl.getType()->castAs<clang::FunctionProtoType>();
+    if (clang::isUnresolvedExceptionSpec(prototype->getExceptionSpecType()))
+      prototype = sema_.ResolveExceptionSpec(decl.getLocation(), prototype);
+    if (!prototype || clang::isUnresolvedExceptionSpec(prototype->getExceptionSpecType()) ||
+        prototype->getExceptionSpecType() == clang::EST_DependentNoexcept)
+      unsupported(decl, "exception specification could not be resolved");
+    return prototype->isNothrow() ? " noexcept" : "";
+  }
+
   std::string callable(const clang::FunctionDecl &decl, bool selected = true) {
     std::string source;
     if (decl.isExternC())
@@ -230,10 +241,7 @@ private:
       if (method->getRefQualifier() == clang::RQ_LValue) name += " &";
       if (method->getRefQualifier() == clang::RQ_RValue) name += " &&";
     }
-    const auto *prototype = decl.getType()->castAs<clang::FunctionProtoType>();
-    if (!clang::isUnresolvedExceptionSpec(prototype->getExceptionSpecType()) &&
-        prototype->isNothrow())
-      name += " noexcept";
+    name += exception_suffix(decl);
     source += (destructor || conversion) ? name : spelling(decl.getReturnType(), name);
     if (!symbol.empty())
       source += " __asm__(\"" + symbol + "\")";
@@ -681,10 +689,7 @@ private:
       source += ")";
       if (custom) {
         // Keep the call ABI without compiling application lifetime code.
-        const auto *prototype = method->getType()->castAs<clang::FunctionProtoType>();
-        if (!clang::isUnresolvedExceptionSpec(prototype->getExceptionSpecType()) &&
-            prototype->isNothrow())
-          source += " noexcept";
+        source += exception_suffix(*method);
       } else {
         source += method->isDeletedAsWritten() ? " = delete" : " = default";
       }
@@ -729,6 +734,7 @@ private:
   }
 
   clang::ASTContext &ast_;
+  clang::Sema &sema_;
   clang::PrintingPolicy policy_;
   HeaderDiscovery header_discovery_;
   const clang::CXXMethodDecl *selected_method_ = nullptr;

@@ -694,10 +694,30 @@ def main() -> int:
             require(latest_shared_child_count(args.output_dir / "target.log") >
                         children_before_failure,
                     "child target did not execute after shared PRE callback failure")
+            shared_failure_rows, event_cursor = wait_binary(
+                args.client, endpoint, target.pid, failed_child_probe,
+                args.output_dir, args.protoc, args.proto, 1, event_cursor)
+            for row in shared_failure_rows:
+                require(re.search(r"^callback_error:\s*true$", row, re.M) and
+                        re.search(r'^callback_error_message:\s*"shared interceptor callback failed"$',
+                                  row, re.M) and
+                        re.search(r"^phase:\s*PRE$", row, re.M) and
+                        re.search(r"^call_id:\s*[1-9]\d*$", row, re.M),
+                        f"shared failure diagnostic did not identify its PRE invocation: {row}")
             remove_after_callback_failure(
                 args.client, endpoint, target.pid, failed_child_probe,
                 args.protoc, args.proto, args.output_dir, "shared-child-pre")
             wait_for_shared_pre_diagnostic(target_log_path, diagnostic_start)
+            original_result_deadline = time.monotonic() + 10
+            original_result_output = ""
+            while time.monotonic() < original_result_deadline:
+                original_result_output = target_log_path.read_text(
+                    encoding="utf-8", errors="replace")[diagnostic_start:]
+                if re.search(r"shared_join=32\b", original_result_output):
+                    break
+                time.sleep(.05)
+            require(re.search(r"shared_join=32\b", original_result_output),
+                    "shared PRE callback failure changed the original joined result")
             require(target.poll() is None,
                     "target did not survive shared child PRE callback failure")
             remove(args.client, endpoint, target.pid, join_probe)
@@ -828,6 +848,50 @@ def main() -> int:
                 remove_after_callback_failure(args.client, endpoint, target.pid, active,
                                               args.protoc, args.proto, args.output_dir, label)
                 require(target.poll() is None, f"target died after {label} callback")
+
+            # A failed interceptor constructor is also an invocation-scoped
+            # diagnostic, and must leave the original method result intact.
+            constructor_hook = args.output_dir / "throwing-constructor.cpp"
+            write_text(constructor_hook, """class Interceptor {
+              public:
+              Interceptor() { throw 7; }
+              long long pre(const Call&) { return 9; }
+            };""")
+            constructor_target_start = (args.output_dir / "target.log").stat().st_size
+            constructor_probe, _ = trace(
+                args.client, endpoint, target.pid, "Fixture::overloaded(int)",
+                constructor_hook, args.compdb, args.source)
+            constructor_rows, event_cursor = wait_binary(
+                args.client, endpoint, target.pid, constructor_probe,
+                args.output_dir, args.protoc, args.proto, 1, event_cursor)
+            for row in constructor_rows:
+                require(re.search(r"^callback_error:\s*true$", row, re.M) and
+                        re.search(r'^callback_error_message:\s*"interceptor construction failed"$',
+                                  row, re.M) and
+                        re.search(r"^phase:\s*PRE$", row, re.M) and
+                        re.search(r"^call_id:\s*[1-9]\d*$", row, re.M),
+                        f"constructor diagnostic did not identify its PRE invocation: {row}")
+            constructor_deadline = time.monotonic() + 5
+            constructor_output = ""
+            constructor_results = []
+            while time.monotonic() < constructor_deadline and not constructor_results:
+                constructor_output = (args.output_dir / "target.log").read_text(
+                    encoding="utf-8", errors="replace")[constructor_target_start:]
+                constructor_results = re.findall(
+                    r"^TARGET pid=(\d+).*?arg=(-?\d+).*?method=(-?\d+)",
+                    constructor_output, re.M)
+                if not constructor_results:
+                    time.sleep(.05)
+            require(constructor_results and all(
+                int(row_pid) == target.pid and int(value) == int(arg) + 11
+                for row_pid, arg, value in constructor_results),
+                "throwing interceptor constructor changed original method results")
+            remove_after_callback_failure(
+                args.client, endpoint, target.pid, constructor_probe,
+                args.protoc, args.proto, args.output_dir, "throwing-constructor")
+            require(target.poll() is None,
+                    "target did not survive interceptor constructor failure")
+            report.append("throwing interceptor constructor emitted a PRE call diagnostic and preserved original results")
             target_rows = (args.output_dir / "target.log").read_text(
                 encoding="utf-8", errors="replace")
             method_rows = re.findall(

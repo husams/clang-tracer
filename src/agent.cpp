@@ -506,7 +506,9 @@ extern "C" long long tracer_callback_dispatch(unsigned long long,
 extern "C" bool tracer_callback_lifecycle_enter(unsigned long long) noexcept;
 extern "C" void tracer_callback_cleanup_enter() noexcept;
 extern "C" void tracer_callback_lifecycle_leave() noexcept;
-extern "C" void tracer_callback_failure(unsigned long long) noexcept;
+extern "C" void tracer_callback_failure(unsigned long long,
+                                         const tracer::TraceContext *,
+                                         const char *) noexcept;
 extern "C" void tracer_event_dispatch(unsigned long long,
                                       const tracer::TraceContext *,
                                       long long) noexcept;
@@ -867,6 +869,9 @@ extern "C" void *tracer_shared_enter(unsigned long long id,
         tracer::context_execution::Action::callback_skipped, raw->call_id);
   }
   --callback_depth;
+  if (!token->constructed)
+    tracer_event_dispatch_impl(id, &token->raw, 0, true,
+                               "shared interceptor construction failed");
   copy_shared_value(raw->stack, token->raw.stack);
   errno = saved_errno;
   return token;
@@ -915,6 +920,10 @@ extern "C" void tracer_shared_dispatch(void *opaque,
         tracer::context_execution::Action::callback_skipped, raw->call_id);
   }
   --callback_depth;
+  if (!hook_succeeded)
+    tracer_event_dispatch_impl(token->probe->request.probe_id,
+                               &token->raw, 0, true,
+                               "shared interceptor callback failed");
   copy_shared_value(raw->stack, token->raw.stack);
   errno = saved_errno;
   tracer_shared_resume(token);
@@ -5718,9 +5727,13 @@ tracer_callback_lifecycle_enter(unsigned long long id) noexcept {
 }
 extern "C" void tracer_callback_cleanup_enter() noexcept { ++callback_depth; }
 extern "C" void tracer_callback_lifecycle_leave() noexcept { --callback_depth; }
-extern "C" void tracer_callback_failure(unsigned long long id) noexcept {
-  if (auto *p = find_probe(id))
+extern "C" void tracer_callback_failure(
+    unsigned long long id, const tracer::TraceContext *ctx,
+    const char *message) noexcept {
+  if (auto *p = find_probe(id)) {
     p->callback_errors.fetch_add(1, std::memory_order_relaxed);
+    tracer_event_dispatch_impl(id, ctx, 0, true, message);
+  }
 }
 
 extern "C" void tracer_capture_stack(const tracer::TraceContext *ctx,

@@ -308,6 +308,7 @@ struct State {
     std::uint64_t generation = 0;
     bool observed = false;
     bool uncertain_live = false;
+    bool provisional_live = false;
     std::atomic<std::uint64_t> write_window{0};
   };
   // Retain address generations and stable write-window storage for in-flight stores.
@@ -325,6 +326,7 @@ struct State {
     auto &history = generations[object];
     history.observed = true;
     history.uncertain_live = false;
+    history.provisional_live = false;
     auto [entry, inserted] = lifetimes.try_emplace(object);
     if (inserted)
       entry->second = {++next_id, ++history.generation};
@@ -346,6 +348,36 @@ Address tail_body(const State &watch, Address entry) noexcept {
 
 std::atomic<State *> retained{nullptr};
 std::mutex install_mutex;
+std::atomic<pid_t *> identity_pid_cache{nullptr};
+void prepare_identity_pid_cache() noexcept {
+#if defined(MADV_WIPEONFORK)
+  if (identity_pid_cache.load(std::memory_order_relaxed))
+    return;
+  const auto page_size = ::sysconf(_SC_PAGESIZE);
+  if (page_size <= 0)
+    return;
+  auto *page = static_cast<pid_t *>(::mmap(nullptr, static_cast<std::size_t>(page_size),
+      PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  if (page == MAP_FAILED)
+    return;
+  if (::madvise(page, static_cast<std::size_t>(page_size), MADV_WIPEONFORK)) {
+    ::munmap(page, static_cast<std::size_t>(page_size));
+    return;
+  }
+  identity_pid_cache.store(page, std::memory_order_release);
+#endif
+}
+pid_t identity_lookup_pid() noexcept {
+  auto *cache = identity_pid_cache.load(std::memory_order_acquire);
+  if (!cache)
+    return ::getpid();
+  auto pid = __atomic_load_n(cache, __ATOMIC_RELAXED);
+  if (!pid) {
+    pid = ::getpid();
+    __atomic_store_n(cache, pid, __ATOMIC_RELAXED);
+  }
+  return pid;
+}
 struct sigaction previous_actions[NSIG]{};
 std::array<std::atomic_flag, NSIG> previous_delivered{};
 std::array<bool, NSIG> bridge_installed{};
@@ -1475,6 +1507,7 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
       auto &history = watch.generations[object];
       history.observed = true;
       history.uncertain_live = false;
+      history.provisional_live = false;
       const auto found = watch.lifetimes.find(object);
       if (found == watch.lifetimes.end() || !found->second.id)
         return;
@@ -1536,6 +1569,7 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
       auto &history = watch.generations[object];
       history.observed = true;
       history.uncertain_live = false;
+      history.provisional_live = false;
       const auto item = watch.lifetimes.find(object);
       if (item == watch.lifetimes.end() || !item->second.id)
         return;
@@ -1560,6 +1594,7 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
       auto &history = watch.generations[object];
       history.observed = true;
       history.uncertain_live = false;
+      history.provisional_live = false;
       const auto prior = watch.lifetimes.find(object);
       if (prior != watch.lifetimes.end() && prior->second.id) {
         emit_boundary(watch, site, object, prior->second, Hook::lifetime_reused);
@@ -1621,6 +1656,8 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
   }
   const auto *life = watch.admit_lifetime(event.object);
   if (!life) {
+    if (watch.identity_watch_id)
+      watch.generations[event.object].provisional_live = true;
     event.hook = Hook::admission_gap;
     emit(watch, event);
     return;
@@ -2681,7 +2718,7 @@ void fault(int sig, siginfo_t *info, void *context) {
   const bool one_shot_consumed = (previous.sa_flags & SA_RESETHAND) &&
       previous_delivered[sig].test_and_set(std::memory_order_relaxed);
   if (one_shot_consumed || previous.sa_handler == SIG_DFL || previous.sa_handler == SIG_IGN) {
-    if (!one_shot_consumed && previous.sa_handler == SIG_IGN && info->si_code <= 0)
+    if (!one_shot_consumed && previous.sa_handler == SIG_IGN && async)
       return;
 
     if (faulting && !async && part == Part::instruction) {
@@ -2697,30 +2734,27 @@ void fault(int sig, siginfo_t *info, void *context) {
         sp = interrupted_sp;
       }
     }
-    // Linux takes the default action on a hardware fault even when the
-    // application ignored the signal. Raised signals must be sent again.
+    // A hardware fault reoccurs when its instruction resumes. Signals already
+    // delivered asynchronously (including kernel-generated timer/child signals)
+    // must be sent again after installing the default disposition.
     struct sigaction action{};
     action.sa_handler = SIG_DFL;
     ::sigaction(sig, &action, nullptr);
-    if (info->si_code <= 0) {
+    if (info->si_code <= 0 || async) {
       bool default_action_delivered = false;
-      if (one_shot_consumed) {
-        // The bridge normally blocks its current signal. Unblock it while the
-        // default disposition is installed so raise() cannot leave a pending
-        // delivery that re-enters the bridge after it is restored.
-        sigset_t one_signal{}, previous_mask{};
-        ::sigemptyset(&one_signal);
-        ::sigaddset(&one_signal, sig);
-        if (!::sigprocmask(SIG_UNBLOCK, &one_signal, &previous_mask)) {
-          default_action_delivered = ::raise(sig) == 0;
-          (void)::sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
-        } else {
-          // Leaving SIG_DFL installed makes a queued raise take the default
-          // action after this bridge frame returns.
-          (void)::raise(sig);
-        }
+      // The bridge blocks its current signal by default. Unblock it while
+      // SIG_DFL is installed so raise() cannot remain pending when the bridge
+      // disposition is restored, including for non-one-shot default handlers.
+      sigset_t one_signal{}, previous_mask{};
+      ::sigemptyset(&one_signal);
+      ::sigaddset(&one_signal, sig);
+      if (!::sigprocmask(SIG_UNBLOCK, &one_signal, &previous_mask)) {
+        default_action_delivered = ::raise(sig) == 0;
+        (void)::sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
       } else {
-        ::raise(sig);
+        // Keep SIG_DFL installed. If raise queues, the action occurs after
+        // this bridge frame returns; do not rearm a handler over that signal.
+        (void)::raise(sig);
       }
       if (default_action_delivered) {
         // Default-ignore and stop/continue actions can return here. Keep the
@@ -4986,6 +5020,7 @@ void initialize(Init &init
     }
   }
 #endif
+  prepare_identity_pid_cache();
   watch->pid = ::getpid();
   watch->identity_watch_id = init.identity_watch_id;
   watch->offset = init.scalar;
@@ -5050,10 +5085,25 @@ void initialize(Init &init
   if (watch->identity_watch_id) {
     bool constructor_entry = false, constructor_return = false;
     bool destructor_entry = false, destructor_return = false;
+    struct ConstructorCoverage {
+      bool entered = false;
+      bool uncertain = true;
+      bool returned = false;
+    };
+    std::map<Address, ConstructorCoverage> constructors;
     for (const auto &site : watch->sites) {
       switch (site.instruction.hook) {
-      case Hook::constructor_enter: constructor_entry = true; break;
-      case Hook::constructor_return: constructor_return = true; break;
+      case Hook::constructor_enter: {
+        constructor_entry = true;
+        auto &coverage = constructors[site.instruction.boundary_pc];
+        coverage.entered = true;
+        coverage.uncertain &= site.instruction.uncertain_construct;
+        break;
+      }
+      case Hook::constructor_return:
+        constructor_return = true;
+        constructors[site.instruction.boundary_pc].returned = true;
+        break;
       case Hook::create:
         constructor_entry = constructor_return = true;
         break;
@@ -5071,8 +5121,20 @@ void initialize(Init &init
       default: break;
       }
     }
-    watch->identity_lifecycle_covered = constructor_entry && constructor_return &&
-        destructor_entry && destructor_return;
+    const bool all_constructors_provisional = !constructors.empty() &&
+        std::ranges::all_of(constructors, [](const auto &entry) {
+          const auto &coverage = entry.second;
+          return coverage.entered && coverage.uncertain && coverage.returned;
+        });
+    // A method-only group may still observe exact constructors when no
+    // destructor boundary is available. It can support provisional calls,
+    // but must never create lifetime IDs from that incomplete coverage.
+    const bool method_only = watch->no_values && !watch->value_write.active();
+    const bool provisional_coverage = method_only && constructor_entry && constructor_return &&
+        !destructor_entry && !destructor_return && all_constructors_provisional &&
+        watch->complete_constructor_returns.empty();
+    watch->identity_lifecycle_covered = (constructor_entry && constructor_return &&
+        destructor_entry && destructor_return) || provisional_coverage;
   }
   const XState xstate;
   std::size_t first = 0;
@@ -5103,7 +5165,7 @@ std::optional<Identity> lookup(std::uint64_t watch_id, std::uint64_t receiver) n
     auto *watch = retained.load(std::memory_order_acquire);
     while (watch && watch->identity_watch_id != watch_id)
       watch = watch->previous;
-    if (!watch || ::getpid() != watch->pid || !watch->identity_lifecycle_covered ||
+    if (!watch || identity_lookup_pid() != watch->pid || !watch->identity_lifecycle_covered ||
         !(watch->static_gate.load(std::memory_order_acquire) & enabled) ||
         !watch->channel->registration_active.load(std::memory_order_acquire))
       return std::nullopt;
@@ -5127,7 +5189,7 @@ std::optional<Identity> lookup(std::uint64_t watch_id, std::uint64_t receiver) n
     }
     if (const auto history = watch->generations.find(receiver);
         history != watch->generations.end() && history->second.observed &&
-        !history->second.uncertain_live)
+        !history->second.uncertain_live && !history->second.provisional_live)
       return std::nullopt;
     return Identity{};
   } catch (...) {

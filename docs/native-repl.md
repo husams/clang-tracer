@@ -374,7 +374,10 @@ package can use the attached process's uniquely mapped method image. Use
 `--method-module` to disambiguate. Start revalidates the binding, stages the
 patches, and admits callbacks only after publication. Record lifetime and write events with `%record --probe
 REGISTRATION_ID`. Start also prints the member probe IDs for selecting normal
-PRE and POST events. A throwing callback records its call ID and phase.
+PRE and POST events. Callback failures record the call ID and phase.
+Use `--callback-errors only` or `--callback-errors exclude` with `%collect`,
+`%record`, or `%events open`. C++ analysis can read
+`Event::callback_error()` and `Event::callback_error_message()`.
 Each callback sees the object ID and generation copied at entry. Borrowed receiver views follow the usual interceptor lifetime.
 
 For individual writes, prepare a field and its writer. Omit `--code` to use
@@ -392,10 +395,13 @@ For a writer in an attached shared library, pass its mapped name with
 `--module`. `--follow-calls` is available for write-only packages.
 Use `--first-seen` with a write-only package and a standalone executable writer. Follow the
 coverage counts in status when the writer reaches native callees. A combined
-registration requires disjoint method and writer patch windows. The current
-method path admits exact receivers with verified construction. An eligible
-receiver whose lifecycle predates attachment is provisional. Its callback
-reports `identity_verified() == false` with zero object ID and generation.
+registration requires disjoint method and writer patch windows. A verified
+identity requires evidence that the constructor built a complete object and
+that the watch covers its destruction. A receiver can have provisional
+identity when construction predates attach, the constructor is ambiguous,
+lifetime symbols also exist in the executable, or no destructor entry can be
+verified. Its callback reports
+`identity_verified() == false` with zero object ID and generation.
 Live method and code-cache events arrive independently. JSON export orders
 each grouped registration's retained events by monotonic observation time.
 The event sequence remains the server's arrival cursor. Correlate verified

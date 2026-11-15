@@ -172,6 +172,30 @@ bool has_virtual_members_or_bases(DWARFDie die, std::set<DWARFDie> &seen) {
   return false;
 }
 
+bool is_ctor_or_dtor_caller(DWARFDie function) {
+  if (function && function.getTag() == dw::DW_TAG_inlined_subroutine) {
+    auto origin = function.getAttributeValueAsReferencedDie(dw::DW_AT_abstract_origin);
+    if (!origin)
+      origin = function.getAttributeValueAsReferencedDie(dw::DW_AT_specification);
+    if (!origin)
+      return true;
+    function = origin;
+  }
+  while (function && function.getTag() != dw::DW_TAG_subprogram)
+    function = function.getParent();
+  if (!function)
+    return true;
+  const auto *linkage = function.getName(llvm::DINameKind::LinkageName);
+  if (!linkage)
+    return true;
+  if (!std::string_view(linkage).starts_with("_Z"))
+    return false;
+  llvm::ItaniumPartialDemangler parsed;
+  if (parsed.partialDemangle(linkage))
+    return true;
+  return parsed.isCtorOrDtor();
+}
+
 bool may_aggregate_initialize_base(DWARFDie derived) {
   const auto class_name = name(derived);
   const auto constructor = class_name.substr(0, class_name.find('<'));
@@ -206,7 +230,10 @@ DerivedTypes derived_types(llvm::DWARFContext &dwarf, const std::string &concret
         if (!result.may_construct_base_directly && may_aggregate_initialize_base(die))
           result.may_construct_base_directly = true;
       }
-      if (record(child) || (child.getTag() == dw::DW_TAG_namespace && name(child) != "std"))
+      const auto tag = child.getTag();
+      if (record(child) || (tag == dw::DW_TAG_namespace && name(child) != "std") ||
+          tag == dw::DW_TAG_subprogram || tag == dw::DW_TAG_lexical_block ||
+          tag == dw::DW_TAG_inlined_subroutine)
         pending.push_back(child);
     }
   }
@@ -454,13 +481,49 @@ void verify_receiver_storage(llvm::DWARFContext &dwarf, llvm::DWARFUnit *unit,
             return item.base() == base && (base ? item.type() : item.name()) == name_key;
           });
       const auto offset = number(child, dw::DW_AT_data_member_location);
-      if (found == layout->members().end() || found->needs_dynamic_location() ||
-          child.find(dw::DW_AT_bit_size) || !offset || *offset > UINT64_MAX / 8 ||
-          *offset * 8 != found->offset_bits() || found->type().find('?') != std::string::npos ||
-          found->type() != member_type || (!base && storage_size(type(child)) != found->bytes()))
-        throw std::runtime_error("source layout differs or is unverified for " + identity + "::" +
-            name_key + " (DWARF type " + member_type + ", source type " +
-            (found == layout->members().end() ? "<absent>" : found->type()) + ")");
+      const bool absent = found == layout->members().end();
+      const auto dwarf_bytes = base ? std::optional<std::uint64_t>{} : storage_size(type(child));
+      const bool dynamic = !absent && found->needs_dynamic_location();
+      const bool bitfield = child.find(dw::DW_AT_bit_size).has_value();
+      const bool bad_offset = !offset || *offset > UINT64_MAX / 8 ||
+          (!absent && *offset * 8 != found->offset_bits());
+      const bool unknown_source_type = !absent && found->type().find('?') != std::string::npos;
+      const bool type_mismatch = !absent && found->type() != member_type;
+      const bool size_mismatch = !base && !absent &&
+          (!dwarf_bytes || *dwarf_bytes != found->bytes());
+      if (absent || dynamic || bitfield || bad_offset || unknown_source_type ||
+          type_mismatch || size_mismatch) {
+        std::ostringstream message;
+        message << "source layout differs or is unverified for " << identity << "::" << name_key
+                << " (DWARF type " << member_type << ", source type "
+                << (absent ? "<absent>" : found->type());
+        if (!absent) {
+          message << ", DWARF offset_bits ";
+          if (!offset || *offset > UINT64_MAX / 8)
+            message << "<unavailable>";
+          else
+            message << *offset * 8;
+          message << ", source offset_bits " << found->offset_bits();
+          if (!base) {
+            message << ", DWARF bytes ";
+            if (dwarf_bytes)
+              message << *dwarf_bytes;
+            else
+              message << "<unavailable>";
+            message << ", source bytes " << found->bytes();
+          }
+          if (dynamic)
+            message << ", source location is dynamic";
+          if (bitfield)
+            message << ", DWARF member is a bitfield";
+          if (unknown_source_type)
+            message << ", source type contains an unverified '?' spelling";
+          if (type_mismatch)
+            message << ", canonical type spellings differ";
+        }
+        message << ')';
+        throw std::runtime_error(message.str());
+      }
     }
     if (actual_members.size() != static_cast<std::size_t>(layout->members_size()))
       throw std::runtime_error("source layout members differ from DWARF: " + identity);
@@ -1967,6 +2030,47 @@ Plan::Plan(std::uint32_t pid, std::string executable,
           (symbol.linkage.contains("C1E") || symbol.linkage.contains("C2E"));
     };
     auto *const lifetime_image = image_.get();
+    std::string duplicate_lifetime_diagnostic;
+    if (main_) {
+      const auto lifetime_definitions = [&](const Image &image) {
+        std::map<std::string, std::set<Range>> result;
+        for (const auto &symbol : image.symbols) {
+          if (symbol.kind != llvm::ELF::STT_FUNC ||
+              (!symbol.demangled.starts_with(constructor_name) &&
+               !symbol.demangled.starts_with(destructor_name)))
+            continue;
+          const bool ctor = symbol.demangled.starts_with(constructor_name) &&
+              (symbol.linkage.contains("C1E") || symbol.linkage.contains("C2E"));
+          const bool dtor = symbol.demangled.starts_with(destructor_name) &&
+              (symbol.linkage.contains("D0Ev") || symbol.linkage.contains("D1Ev") ||
+               symbol.linkage.contains("D2Ev"));
+          if (ctor || dtor)
+            result[symbol.linkage].insert(symbol.range);
+        }
+        return result;
+      };
+      const auto module_lifetimes = lifetime_definitions(*lifetime_image);
+      const auto executable_lifetimes = lifetime_definitions(*main_);
+      std::set<std::string> cross_image_duplicates;
+      std::set<std::string> same_image_duplicates;
+      for (const auto &[linkage, ranges] : module_lifetimes) {
+        if (ranges.size() > 1)
+          same_image_duplicates.insert(linkage);
+        if (executable_lifetimes.contains(linkage))
+          cross_image_duplicates.insert(linkage);
+      }
+      for (const auto &[linkage, ranges] : executable_lifetimes)
+        if (ranges.size() > 1)
+          same_image_duplicates.insert(linkage);
+      if (!cross_image_duplicates.empty()) {
+        duplicate_lifetime_diagnostic = "same lifetime symbol is defined in both the executable and selected "
+            "module (" + llvm::demangle(*cross_image_duplicates.begin()) + "); object identities remain provisional";
+      } else if (!same_image_duplicates.empty()) {
+        duplicate_lifetime_diagnostic = "lifetime symbol has multiple definitions in one image (" +
+            llvm::demangle(*same_image_duplicates.begin()) + "); object identities remain provisional";
+      }
+    }
+    lifetime_coverage_diagnostic = duplicate_lifetime_diagnostic;
     const auto constructor = std::ranges::find_if(lifetime_image->symbols, is_constructor);
     if (constructor == lifetime_image->symbols.end() && main_ &&
         std::ranges::any_of(main_->symbols, is_constructor))
@@ -2019,6 +2123,23 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       else if (symbol.demangled.starts_with(destructor_name) && symbol.linkage.contains("D2Ev"))
         base_destructors.insert(symbol.range);
     }
+    if (destructors.empty())
+      destructors = base_destructors;
+    const bool destructor_coverage = !destructors.empty();
+    if (!destructor_coverage) {
+      if (!lifetime_coverage_diagnostic.empty())
+        lifetime_coverage_diagnostic += "; ";
+      lifetime_coverage_diagnostic += "no verified complete or base destructor entries for " + concrete +
+          "; object identities remain provisional";
+    }
+    bool provisional_lifetime_identity = !lifetime_coverage_diagnostic.empty();
+    std::map<std::string, std::set<std::uint64_t>> base_constructor_entries;
+    for (const auto &symbol : lifetime_image->symbols)
+      if (symbol.kind == llvm::ELF::STT_FUNC &&
+          symbol.demangled.starts_with(constructor_name) &&
+          symbol.linkage.find('.') == std::string::npos && symbol.linkage.contains("C2E"))
+        base_constructor_entries[symbol.demangled].insert(symbol.range.first);
+    std::set<std::uint64_t> caller_proof_constructors;
     std::set<std::string> complete_constructor_overloads;
     for (const auto &symbol : lifetime_image->symbols) {
       if (symbol.kind == llvm::ELF::STT_FUNC &&
@@ -2030,74 +2151,75 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     for (const auto &symbol : lifetime_image->symbols) {
       if (symbol.kind == llvm::ELF::STT_FUNC && symbol.demangled.starts_with(constructor_name) &&
           symbol.linkage.find('.') == std::string::npos && symbol.linkage.contains("C1E")) {
-        add_lifecycle(symbol, Boundary::construct, false);
+        const auto base = base_constructor_entries.find(symbol.demangled);
+        const bool aliases_base_entry = base != base_constructor_entries.end() &&
+            base->second.contains(symbol.range.first);
+        const bool uncertain = aliases_base_entry || provisional_lifetime_identity;
+        add_lifecycle(symbol, Boundary::construct, uncertain);
+        if (aliases_base_entry && !provisional_lifetime_identity)
+          caller_proof_constructors.insert(lifetime_image->bind(pid, symbol.range));
       }
     }
     for (const auto &symbol : lifetime_image->symbols) {
       if (symbol.kind != llvm::ELF::STT_FUNC || symbol.demangled.starts_with(constructor_name) == false ||
           symbol.linkage.find('.') != std::string::npos || !symbol.linkage.contains("C2E"))
         continue;
-      // Match the legacy %object admission rule: when Clang emits only C2 for
-      // an overload, the base variant has the complete-object ABI if there is
-      // no virtual base (and therefore no VTT argument). Exact lifetime-only
-      // admission already rejects polymorphic records and known derived types.
-      const auto site = lifetime_image->dwarf->getDIEsForAddress(symbol.range.first);
-      const auto type = find_record(*lifetime_image->dwarf, concrete, site.CompileUnit);
-      std::set<DWARFDie> seen;
-      const bool complete_abi = !complete_constructor_overloads.contains(symbol.demangled) &&
-          type && !has_virtual_bases(type, seen);
-      add_lifecycle(symbol, Boundary::construct, !complete_abi);
+      // A C2 entry is not proof of complete-object construction, even when
+      // this class has no virtual bases: a derived constructor can call the
+      // same entry for its base subobject. A separate C1 entry can establish
+      // complete construction; C2 remains uncertain.
+      add_lifecycle(symbol, Boundary::construct, true);
+      const auto complete = std::ranges::find_if(lifetime_image->symbols, [&](const auto &candidate) {
+        return candidate.kind == llvm::ELF::STT_FUNC &&
+            candidate.demangled == symbol.demangled &&
+            candidate.linkage.find('.') == std::string::npos &&
+            candidate.linkage.contains("C1E") && candidate.range.first == symbol.range.first;
+      });
+      if (!provisional_lifetime_identity && complete == lifetime_image->symbols.end() &&
+          !complete_constructor_overloads.contains(symbol.demangled))
+        caller_proof_constructors.insert(lifetime_image->bind(pid, symbol.range));
     }
-    std::vector<std::uint64_t> uncertain_constructors;
-    for (const auto &[pc, site] : sites)
-      if (site.boundary == Boundary::construct && site.uncertain_complete)
-        uncertain_constructors.push_back(pc);
-    for (const auto &[entry, calls] : direct_redirects(uncertain_constructors, true, false)) {
+    const std::vector<std::uint64_t> constructors_requiring_caller_proof(
+        caller_proof_constructors.begin(), caller_proof_constructors.end());
+    std::set<std::uint64_t> proven_complete_callers;
+    for (const auto &[entry, calls] : direct_redirects(constructors_requiring_caller_proof, true, false)) {
       for (const auto call : calls) {
         const auto *caller_image = image_for(call);
         if (!caller_image || !caller_image->bias)
           continue;
         const auto address = call - *caller_image->bias;
         const auto debug = caller_image->dwarf->getDIEsForAddress(address);
-        if (!debug.CompileUnit)
-          continue;
-        llvm::SmallVector<DWARFDie, 4> chain;
-        debug.CompileUnit->getInlinedChainForAddress(address, chain);
-        if (chain.empty() || std::ranges::any_of(chain, [](const auto die) {
-              const auto *linkage = die.getName(llvm::DINameKind::LinkageName);
-              if (!linkage)
-                return true;
-              llvm::ItaniumPartialDemangler parsed;
-              return parsed.partialDemangle(linkage) ? std::string_view(linkage).starts_with("_Z") :
-                  parsed.isCtorOrDtor();
-            }))
+        llvm::SmallVector<DWARFDie, 4> inlined;
+        if (debug.CompileUnit)
+          debug.CompileUnit->getInlinedChainForAddress(address, inlined);
+        if (!debug.CompileUnit || !debug.FunctionDIE || is_ctor_or_dtor_caller(debug.FunctionDIE) ||
+            std::ranges::any_of(inlined, is_ctor_or_dtor_caller))
           continue;
         complete_constructor_returns.emplace(entry, call + object_cache::direct_call_width);
+        proven_complete_callers.insert(entry);
       }
     }
     const bool has_complete_constructor_entry = std::ranges::any_of(sites, [](const auto &entry) {
       return entry.second.boundary == Boundary::construct && !entry.second.uncertain_complete;
     });
-    if (!uncertain_constructors.empty() && complete_constructor_returns.empty() &&
-        !has_complete_constructor_entry)
-      throw std::runtime_error("lifetime-only C2 constructor has no verified complete-object caller evidence: " +
-                               concrete);
-    if (destructors.empty())
-      destructors = std::move(base_destructors);
-    if (destructors.empty())
-      throw std::runtime_error("no verified complete or base destructor entries for lifetime-only type " + concrete);
+    if (!provisional_lifetime_identity && proven_complete_callers.empty() &&
+        !has_complete_constructor_entry) {
+      lifetime_coverage_diagnostic = "no verified complete-object constructor calls for " + concrete +
+          "; object identities remain provisional";
+      provisional_lifetime_identity = true;
+    }
     for (const auto &symbol : lifetime_image->symbols) {
       if (symbol.kind != llvm::ELF::STT_FUNC || !symbol.demangled.starts_with(destructor_name) ||
           symbol.linkage.find('.') != std::string::npos)
         continue;
       if (symbol.linkage.contains("D1Ev"))
-        add_lifecycle(symbol, Boundary::destroy, false);
+        add_lifecycle(symbol, Boundary::destroy, provisional_lifetime_identity);
       else if (symbol.linkage.contains("D2Ev") && destructors.count(symbol.range))
-        add_lifecycle(symbol, Boundary::destroy, false);
+        add_lifecycle(symbol, Boundary::destroy, provisional_lifetime_identity);
       else if (symbol.linkage.contains("D0Ev") && deleting_destructors.count(symbol.range))
-        add_lifecycle(symbol, Boundary::destroy, false, true);
+        add_lifecycle(symbol, Boundary::destroy, provisional_lifetime_identity, true);
     }
-    if (std::ranges::none_of(sites, [](const auto &entry) {
+    if (!provisional_lifetime_identity && std::ranges::none_of(sites, [](const auto &entry) {
           return entry.second.boundary == Boundary::destroy && !entry.second.deleting_destructor;
         }))
       throw std::runtime_error("lifetime-only type has no complete destructor entry: " + concrete);
@@ -3435,10 +3557,18 @@ clangtracer::v1::ObjectWatchPlan Plan::describe(bool live) const {
       continue;
     constexpr const char *roles[] = {"construct", "destroy", "owner add", "get", "remove", "snapshot",
                                     "writer scope", "container mutation"};
-    add(pc, code(pc).substr(0, boundaries.at(pc)),
-        site.uncertain_complete ? "construct (complete/base alias)" :
-        site.deleting_destructor ? "destroy (deleting)" :
-                                  roles[static_cast<unsigned>(*site.boundary)]);
+    std::string role;
+    if (!lifetime_coverage_diagnostic.empty() && *site.boundary == Boundary::construct)
+      role = "construct (provisional: incomplete lifetime coverage)";
+    else if (!lifetime_coverage_diagnostic.empty() && *site.boundary == Boundary::destroy)
+      role = "destroy (coverage incomplete)";
+    else if (site.uncertain_complete)
+      role = "construct (complete/base alias)";
+    else if (site.deleting_destructor)
+      role = "destroy (deleting)";
+    else
+      role = roles[static_cast<unsigned>(*site.boundary)];
+    add(pc, code(pc).substr(0, boundaries.at(pc)), role.c_str());
   }
   return plan;
 }

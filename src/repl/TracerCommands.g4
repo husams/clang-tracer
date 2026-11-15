@@ -52,12 +52,13 @@ events : 'events' (streamOption*
        | 'diff' value '--pre' UINT '--post' UINT ('--key' value)*
        | STACK value '--index' UINT
        | 'calls' value | 'stats' value | 'clear' value
-       | 'open' value '--as' value
+       | 'open' value '--as' value ('--callback-errors' value)?
        | 'export' value '--format' 'json' '--output' value);
 collect : 'collect' streamOption*;
 record : 'record' value (streamOption | SQLITE)*;
 streamOption : ('--count' | '--timeout' | '--after' | '--probe') UINT
              | '--phase' ('PRE' | 'POST')
+             | '--callback-errors' value
              | ('--as' | '--name' | '--session') value | '--all';
 cpp : 'cpp' ('load' value | 'reset'
             | ('import' | 'generate') value (('--type' | '--output') value)*

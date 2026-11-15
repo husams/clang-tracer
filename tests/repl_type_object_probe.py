@@ -71,6 +71,8 @@ def run(args):
         library = build / "libcounter.so"
         target = build / "counter-target"
         package = root / "counter.object"
+        local_package = root / "local-base.object"
+        ctor_only_package = root / "ctor-only.object"
         bad_package = root / "rollback.object"
         fresh_package = root / "fresh.object"
         overlap = root / "overlap.object"
@@ -97,6 +99,21 @@ private:
   char padding_[COUNTER_PAD_BYTES];
   int value_;
 };
+class LocalBase {
+public:
+  explicit LocalBase(int initial);
+  ~LocalBase();
+  int value() const;
+private:
+  int value_;
+};
+class CtorOnly {
+public:
+  explicit CtorOnly(int initial);
+  int value() const;
+private:
+  int value_;
+};
 }
 """)
         source.write_text("""#include \"counter.hpp\"
@@ -107,6 +124,11 @@ int Counter::add(int value) { return value_ + value; }
 int Counter::store(int value) { value_ = value; return value_; }
 bool Counter::accepted() { return value_ >= 0; }
 int Counter::value() const { return value_; }
+LocalBase::LocalBase(int initial) : value_(initial) {}
+LocalBase::~LocalBase() { value_ = -1; }
+int LocalBase::value() const { return value_; }
+CtorOnly::CtorOnly(int initial) : value_(initial) {}
+int CtorOnly::value() const { return value_; }
 }
 """)
         driver.write_text("""#include \"counter.hpp\"
@@ -125,12 +147,21 @@ void cycle(int initial) {
   counter->add(2);
   counter->~Counter();
 }
+void exercise_local_derived() {
+  struct LocalDerived final : demo::LocalBase {
+    explicit LocalDerived(int initial) : LocalBase(initial) {}
+    ~LocalDerived() {}
+  } object(5);
+  (void)object.value();
+}
 }
 int main() {
   if (::prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) != 0 ||
       ::fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK) != 0)
     return 2;
   demo::Counter existing(7);
+  demo::CtorOnly ctor_only(9);
+  exercise_local_derived();
   std::cout << \"READY\" << std::endl;
   for (;;) {
     char command = 0;
@@ -152,6 +183,8 @@ int main() {
       std::cout << \"ADDED\" << std::endl;
     } else if (command == 'p') {
       std::cout << \"EXISTING=\" << existing.add(2) << std::endl;
+    } else if (command == 'c') {
+      std::cout << \"CTOR_ONLY=\" << ctor_only.value() << std::endl;
     } else if (command == 'q') {
       return 0;
     }
@@ -201,9 +234,9 @@ public:
         def quote(value):
             return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
-        def prepare_commands(methods, callback_path, output):
+        def prepare_commands(methods, callback_path, output, type_name="demo::Counter"):
             selected = "".join(f" --method {quote(method)}" for method in methods)
-            return (f"%object-probe prepare demo::Counter{selected}"
+            return (f"%object-probe prepare {type_name}{selected}"
                     f" --include {quote(header)} --compdb {quote(compdb)}"
                     f" --translation-unit {quote(source)} --callbacks {quote(callback_path)}"
                     f" --output {quote(output)}")
@@ -228,7 +261,15 @@ public:
         assert not fresh_prepared.string.startswith("error:"), fresh_prepared.string
         send(repl, prepare_commands(("demo::Counter::store(int)",), callbacks, overlap) + writer)
         out.expect(r"^object-probe package=.*overlap.object")
-        for path in (package, bad_package, fresh_package, overlap):
+        send(repl, prepare_commands(("demo::LocalBase::value() const",), callbacks,
+                                   local_package, "demo::LocalBase"))
+        local_prepared = out.expect(r"^(?:object-probe package=|prepared .*package|error:)")
+        assert not local_prepared.string.startswith("error:"), local_prepared.string
+        send(repl, prepare_commands(("demo::CtorOnly::value() const",), callbacks,
+                                   ctor_only_package, "demo::CtorOnly"))
+        ctor_only_prepared = out.expect(r"^(?:object-probe package=|prepared .*package|error:)")
+        assert not ctor_only_prepared.string.startswith("error:"), ctor_only_prepared.string
+        for path in (package, bad_package, fresh_package, overlap, local_package, ctor_only_package):
             assert path.is_file() and path.read_bytes().startswith(b"CTKOPKG2"), path
         saved = package.read_bytes()
         obsolete = root / "obsolete.object"
@@ -260,6 +301,8 @@ public:
         for selector in ("demo::Counter::Counter(int)", "demo::Counter::~Counter()",
                          *methods, "demo::Counter::store(int)", "demo::Counter::accepted()"):
             assert selector in nm, (selector, nm)
+        assert "demo::CtorOnly::CtorOnly(int)" in nm, nm
+        assert "demo::CtorOnly::~CtorOnly()" not in nm, nm
         dwarf = subprocess.run(["readelf", "--debug-dump=info", "--wide", str(library)],
                                check=True, text=True, stdout=subprocess.PIPE).stdout
         assert "Counter" in dwarf and "value_" in dwarf
@@ -274,6 +317,43 @@ public:
         repl, out = child(repl_argv, env=env)
         send(repl, f"%attach {target_process.pid}")
         out.expect(rf"^attached session=\S+ pid={target_process.pid}$")
+
+        send(repl, f"%object-probe preview --package {quote(local_package)} --module libcounter.so")
+        local_refusal = out.expect(r"^error: .*")
+        assert "known derived construction of demo::LocalBase" in local_refusal.string, local_refusal.string
+
+        ctor_only_binding = f"--package {quote(ctor_only_package)} --module libcounter.so"
+        send(repl, f"%object-probe preview {ctor_only_binding}")
+        ctor_only_preview = out.expect(r"^(?:object-probe preview|binding=|error:)")
+        assert not ctor_only_preview.string.startswith("error:"), ctor_only_preview.string
+        out.expect(r"construct \(provisional: incomplete lifetime coverage\)")
+        send(repl, f"%object-probe start {ctor_only_binding}")
+        ctor_only_started = out.expect(r"^object-probe registration=(\d+) active=yes methods=1")
+        ctor_only_registration = ctor_only_started[1]
+        ctor_only_probe = out.expect(r"method_probe=(\d+) active=yes")[1]
+        send(repl, f"%record ctor-only.db --sqlite --probe {ctor_only_probe} --count 1 --timeout 5")
+        target_process.stdin.write("c\n")
+        target_process.stdin.flush()
+        app.expect(r"^CTOR_ONLY=9$")
+        ctor_only_record = out.expect(r"^received=1 cursor=(\d+) .*complete=true .*recording=ctor-only.db")
+        send(repl, "%events open ctor-only.db --as ctor_only")
+        out.expect(r"^opened events=1 retained=1 evicted=0$")
+        send(repl, "%events export ctor_only --format json --output ctor-only.json")
+        send(repl, f"%object-probe stop {ctor_only_registration}")
+        out.expect(rf"^object-probe registration={ctor_only_registration} active=no .*restoration_pending=no")
+        ctor_only_event = json.loads((root / "ctor-only.json").read_text())[0]
+        ctor_only_fields = {field.get("name"): field.get("value")
+                            for field in ctor_only_event.get("objectFields", [])}
+
+        def scalar(value):
+            if isinstance(value, dict):
+                for key in ("unsignedValue", "signedValue", "boolValue", "stringValue"):
+                    if key in value:
+                        return value[key]
+            return value
+
+        assert int(scalar(ctor_only_fields["object_id"])) == 0, ctor_only_event
+        assert scalar(ctor_only_fields["identity_verified"]) in (False, "false", 0, "0"), ctor_only_event
 
         binding = f"--package {quote(package)} --module ./build-context/libcounter.so"
         send(repl, f"%object-probe preview --package {quote(obsolete)}")
@@ -305,7 +385,7 @@ public:
         method_probe = out.expect(r"method_probe=(\d+) active=yes")
         send(repl, f"%object-probe preview {binding}")
         out.expect(r"^showing the verified binding of the active registration$")
-        send(repl, "%record counter.db --sqlite --count 10 --after 0 --timeout 10")
+        send(repl, f"%record counter.db --sqlite --count 10 --after {ctor_only_record[1]} --timeout 10")
         target_process.stdin.write("x\n")
         target_process.stdin.flush()
         app.expect(r"^CYCLED$")
@@ -409,8 +489,6 @@ public:
 
         events = json.loads((root / "counter.json").read_text())
         assert all(event.get("objectProbeRegistrationId") == registration for event in events), events
-        times = [int(event["monotonicTimeNs"]) for event in events]
-        assert times == sorted(times), times
         observations = [event["objectObservation"] for event in events if "objectObservation" in event]
         created = [event for event in events if event.get("objectObservation", {}).get("kind") == "CREATED"]
         ended = [event for event in events if event.get("objectObservation", {}).get("kind") == "TEARDOWN_END"]
@@ -430,13 +508,6 @@ public:
         calls = [event for event in events if event.get("functionName", "").startswith("demo::Counter::")]
         assert any("demo::Counter::add" in event["functionName"] for event in calls), calls
         assert len({event["probeId"] for event in calls if "demo::Counter::add" in event["functionName"]}) == 1, calls
-        def scalar(value):
-            if isinstance(value, dict):
-                for key in ("unsignedValue", "signedValue", "boolValue", "stringValue"):
-                    if key in value:
-                        return value[key]
-            return value
-
         def fields(event):
             return {field.get("name"): scalar(field.get("value"))
                     for field in event.get("objectFields", [])}

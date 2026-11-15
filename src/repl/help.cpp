@@ -188,8 +188,8 @@ const CommandTopic commands[] = {
      R"example(%interceptor upload hook --target "demo::compute(int)")example"},
 
     {"events", "%events [STREAM OPTIONS] [--as NAME]",
-     "Print live events and keep a bounded collection named live by default.",
-     "%events --count 5 --phase POST"},
+     "Print live events and keep a bounded collection named live by default. Use --callback-errors exclude or only to select callback outcomes.",
+     "%events --count 5 --phase POST --callback-errors only"},
     {"events list", "%events list NAME [--limit N]", "List retained events with their zero-based indexes. The default limit is 20."},
     {"events show", "%events show NAME --index N", "Print one retained event and its captured values.", "%events show batch --index 0"},
     {"events diff", "%events diff NAME --pre N --post N [--key PATH=MEMBER]...",
@@ -201,16 +201,16 @@ const CommandTopic commands[] = {
     {"events stats", "%events stats NAME",
      "Summarize live or replayed calls per probe, with duration histograms, caller edges and loss."},
     {"events clear", "%events clear NAME", "Remove a named collection and release its buffer space."},
-    {"events open", "%events open FILE --as NAME",
+    {"events open", "%events open FILE --as NAME [--callback-errors include|exclude|only]",
      "Open a Protobuf or SQLite recording offline as a bounded, named collection. Compatible C++ types stored in SQLite load automatically.",
-     "%events open capture.db --as saved"},
+     "%events open capture.db --as saved --callback-errors only"},
     {"events export", "%events export NAME --format json --output NEW_FILE.json",
      "Write the retained events to a new JSON file."},
-    {"collect", "%collect [STREAM OPTIONS] [--as NAME]", "Capture events into a bounded collection named batch by default.",
-     "%collect --count 10 --timeout 15 --phase POST --as results"},
+    {"collect", "%collect [STREAM OPTIONS] [--as NAME]", "Capture events into a bounded collection named batch by default. Use --callback-errors exclude or only to select successful callbacks or callback failures.",
+     "%collect --count 10 --timeout 15 --phase POST --callback-errors only --as failures"},
     {"record", "%record FILE [--sqlite] [STREAM OPTIONS]",
-     "Record framed Protobuf by default. With --sqlite, create or append to a SQLite recording and save available prepared C++ types for replay.",
-     "%record capture.db --sqlite --name account.adjusted --count 12"},
+     "Record framed Protobuf by default. With --sqlite, create or append to a SQLite recording and save available prepared C++ types for replay. Use --callback-errors exclude or only to select callback outcomes.",
+     "%record capture.db --sqlite --name account.adjusted --callback-errors only --count 12"},
 
     {"cpp", "", "Load C++, configure the local compiler, or generate mappings for captured values."},
     {"cpp load", "%cpp load FILE", "Evaluate a local C++ source file in the current interpreter."},
@@ -267,6 +267,7 @@ if (data.size()) {
   auto e = data.at(0);
   std::cout << e.phase() << ' ' << e.function_name() << '\n';
 })",
+     "Use callback_error() and callback_error_message() to inspect callback failures. "
      "Use argument_as<T>(index) or result_as<T>() when T matches the captured type. "
      "has_result() includes void returns. Use argument_snapshot(), receiver_snapshot(), or state_snapshot() "
      "to inspect captured fields without rebuilding an application type.", "Event"},
@@ -370,7 +371,7 @@ query.names = {"account.adjusted"};
 query.count = 20;
 auto data = tracer.replay("capture.db", query);
 if (data.size()) tracer.print(data.at(0));)",
-     "Set names, phase, pid, session_id, or count to narrow the read. Names match exact function "
+     "Set names, phase, pid, session_id, callback_errors, or count to narrow the read. Names match exact function "
      "selectors or custom event names. Count zero reads all matches and retains the latest that fit. "
      "SQLite replay loads compatible recorded C++ types and generates their mappings before the next input."},
     {"batch", "Get a Collection from a named capture or replay.",

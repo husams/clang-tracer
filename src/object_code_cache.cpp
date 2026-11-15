@@ -2563,6 +2563,8 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
           (p.request.staged_registration() ? "" : " (use --writer-entry to require entry coverage)") :
       "in-process x86-64 leaf translation with atomic MOV/XADD/CMPXCHG and verified writer entry redirects";
 #endif
+  if (!p.plan.lifetime_coverage_diagnostic.empty())
+    p.diagnostic += ". " + p.plan.lifetime_coverage_diagnostic;
 }
 
 void Watch::set_registration_active(bool active) noexcept {
@@ -2789,6 +2791,8 @@ api::ObjectWatchStatus Watch::preview() const {
       std::string("verified direct writer call sites only") +
           (p.request.staged_registration() ? "" : " (use --writer-entry to require entry coverage)") :
                         "verified leaf translations and candidate redirect windows");
+  if (!p.plan.lifetime_coverage_diagnostic.empty())
+    *report.mutable_diagnostic() += ". " + p.plan.lifetime_coverage_diagnostic;
   *report.mutable_plan() = p.plan.describe(p.pid != 0);
   if (p.pid) {
     for (const auto &[entry, sites] : p.incoming)

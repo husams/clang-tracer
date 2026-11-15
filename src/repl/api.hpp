@@ -44,6 +44,8 @@ public:
   std::uint64_t call_id() const;
   std::string phase() const;
   std::string function_name() const;
+  bool callback_error() const;
+  std::string callback_error_message() const;
   // Presence includes VOID results; reading void as a value is rejected.
   bool has_result() const;
   // Values own their scalar data and do not retain target addresses.
@@ -72,6 +74,8 @@ public:
   std::string result() const;
   std::string describe() const;
 };
+
+enum class CallbackErrorFilter { include, exclude, only };
 
 struct Collection {
   Collection() = default;
@@ -106,6 +110,7 @@ struct EventQuery {
   std::string session_id;
   // Zero reads all matches, subject to the collection's retention limits.
   std::uint64_t count = 0;
+  CallbackErrorFilter callback_errors = CallbackErrorFilter::include;
 };
 
 struct RecordOptions {
@@ -121,6 +126,7 @@ struct RecordOptions {
   std::uint64_t count = 0;
   // Zero uses the console timeout for counted recordings.
   unsigned timeout_seconds = 0;
+  CallbackErrorFilter callback_errors = CallbackErrorFilter::include;
 };
 
 struct RecordResult {

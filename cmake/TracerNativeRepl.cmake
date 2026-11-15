@@ -534,6 +534,11 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-signal-window-target>)
       set_tests_properties(native_repl_object_signal_window PROPERTIES TIMEOUT 180)
+      add_test(NAME native_repl_object_signal_window_oneshot_kernel
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_signal_window.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-signal-window-target> oneshot-kernel)
+      set_tests_properties(native_repl_object_signal_window_oneshot_kernel PROPERTIES TIMEOUT 60)
       foreach(_shared_kind storage scalar)
         set(_shared_fixture repl-object-shared-${_shared_kind}-target)
         set(_shared_args)

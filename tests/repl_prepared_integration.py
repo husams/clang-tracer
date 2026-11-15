@@ -6,8 +6,51 @@ from pathlib import Path
 import re
 import select
 import subprocess
+import sys
 import tempfile
 import time
+
+
+def verify_preparer_diagnostics(repl, root, header, env):
+    preparer = root / "held-stderr-preparer"
+    proceed = root / "preparer-proceed"
+    release = root / "preparer-release-stderr"
+    preparer.write_text(f'''#!{sys.executable}
+import os
+from pathlib import Path
+import sys
+import time
+
+print("preparer progress marker", file=sys.stderr, flush=True)
+while not Path({str(proceed)!r}).exists():
+    time.sleep(0.02)
+if os.fork() == 0:
+    os.close(1)
+    deadline = time.monotonic() + 25
+    while not Path({str(release)!r}).exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    os._exit(0)
+print("preparer diagnostic marker", file=sys.stderr, flush=True)
+sys.exit(7)
+''')
+    preparer.chmod(0o700)
+    probe_env = dict(env, TRACER_PREPARE_EXECUTABLE=str(preparer))
+    with subprocess.Popen([str(repl), "--fail-fast"], cwd=root, env=probe_env,
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True) as console:
+        try:
+            console.stdin.write(f'%probe prepare "prepared_demo::compute(int)" '
+                                f'--include "{header}" --output "{root / "unused-package"}"\n')
+            console.stdin.flush()
+            assert select.select([console.stderr], [], [], 10)[0], "prepare progress was buffered"
+            assert "preparer progress marker" in console.stderr.readline()
+            proceed.touch()
+            stdout, stderr = console.communicate(timeout=10)
+            assert console.returncode == 1 and "preparer diagnostic marker" in stderr, (stdout, stderr)
+            assert "preparer exited with status 7" in stderr, (stdout, stderr)
+        finally:
+            proceed.touch()
+            release.touch()
 
 
 def main():
@@ -94,9 +137,45 @@ def main():
                 console = None
                 return text
 
+            verify_preparer_diagnostics(args.repl, root, local_header, env)
             offline = prepare(local_header, package)
             assert offline.returncode == 0 and "prepared directory=" in offline.stdout, (
                 offline.stdout + offline.stderr)
+
+            exception_header = root / "exception.hpp"
+            exception_header.write_text("""
+namespace exception_fixture {
+template <int Size> struct Item {
+  int value;
+  Item(Item &&other) noexcept(Size == 3) : value(other.value) {}
+};
+struct Box {
+  Item<3> small;
+  Item<8> large;
+  int get() const;
+};
+}
+""")
+            exception_source = root / "exception.cpp"
+            exception_source.write_text(
+                '#include "exception.hpp"\n'
+                'int exception_fixture::Box::get() const { return small.value + large.value; }\n')
+            exception_db = root / "exception-commands.json"
+            exception_db.write_text(json.dumps([{
+                "directory": str(root), "file": str(exception_source),
+                "arguments": [args.compiler, "-std=c++20", "-c", str(exception_source)],
+            }]))
+            exception_package = root / "exception-package"
+            resolved = prepare(exception_header, exception_package,
+                               '"exception_fixture::Box::get() const"',
+                               exception_db, exception_source)
+            assert resolved.returncode == 0, resolved.stderr
+            subprocess.run([args.compiler, "-std=c++20", "-fsyntax-only", "-x", "c++", "-"],
+                           input=f'''#include "{exception_package / "generated/adapter.cpp"}"
+#include <type_traits>
+static_assert(std::is_nothrow_move_constructible_v<exception_fixture::Item<3>>);
+static_assert(!std::is_nothrow_move_constructible_v<exception_fixture::Item<8>>);
+''', text=True, check=True, cwd=root, timeout=10)
 
             cl_header = root / "headers" / "cl.hpp"
             cl_header.write_text(
