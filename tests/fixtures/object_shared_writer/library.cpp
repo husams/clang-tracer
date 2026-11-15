@@ -1,9 +1,5 @@
 #include "record.hpp"
 
-namespace {
-volatile int active_records = 0;
-}
-
 namespace shared_writer {
 
 __attribute__((noinline)) int adjust(Record &record, int value, bool store) {
@@ -13,8 +9,8 @@ __attribute__((noinline)) int adjust(Record &record, int value, bool store) {
   return adjusted;
 }
 
-Record::Record(int initial) : value(initial) { active_records = active_records + 1; }
-Record::~Record() { active_records = active_records - 1; }
+Record::Record(int initial) : value(initial) {}
+Record::~Record() = default;
 
 __attribute__((noinline)) void write(Record &record, int value, bool store) {
   (void)adjust(record, value, store);
