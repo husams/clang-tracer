@@ -249,16 +249,21 @@ DerivedTypes derived_types(llvm::DWARFContext &dwarf, const std::string &concret
     const auto die = pending.back();
     pending.pop_back();
     for (const auto child : die.children()) {
-      // DWARF4 type-unit inheritance commonly uses a signature reference.
-      // Resolve it through the type-unit table rather than treating it as a
-      // local DIE reference, then compare its qualified record name.
-      const auto base = child.resolveReferencedType(dw::DW_AT_type);
-      if (child.getTag() == dw::DW_TAG_inheritance && qualified(base) == concrete) {
-        result.present = true;
-        if (!result.may_construct_base_directly && may_aggregate_initialize_base(die))
-          result.may_construct_base_directly = true;
-      }
       const auto tag = child.getTag();
+      if (tag == dw::DW_TAG_inheritance) {
+        // Signature references can resolve to a definition at the type-unit
+        // root. Its specification retains the enclosing namespace.
+        auto base = child.resolveReferencedType(dw::DW_AT_type);
+        if (const auto declaration = base ? base.getAttributeValueAsReferencedDie(dw::DW_AT_specification)
+                                          : DWARFDie{};
+            record(declaration))
+          base = declaration;
+        if (qualified(base) == concrete) {
+          result.present = true;
+          if (!result.may_construct_base_directly && may_aggregate_initialize_base(die))
+            result.may_construct_base_directly = true;
+        }
+      }
       if (record(child) || (tag == dw::DW_TAG_namespace && name(child) != "std") ||
           tag == dw::DW_TAG_subprogram || tag == dw::DW_TAG_lexical_block ||
           tag == dw::DW_TAG_inlined_subroutine)
