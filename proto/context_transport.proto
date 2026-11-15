@@ -138,6 +138,11 @@ message ValueSnapshot {
   string detail = 6;
   repeated string container_roles = 7;
   repeated string record_types = 8; // protobuf message name=C++ canonical name
+  repeated SnapshotMember members = 9; // Independently captured record members.
+}
+message SnapshotMember {
+  string name = 1;
+  ValueSnapshot snapshot = 2;
 }
 message TraceArgument {
   uint32 index = 1;

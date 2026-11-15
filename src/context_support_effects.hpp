@@ -4,6 +4,8 @@
 
 #include <clang/Basic/SourceLocation.h>
 
+#include "context_prepared_adapter.hpp"
+
 namespace clang {
 class ASTUnit;
 class SourceManager;
@@ -13,7 +15,8 @@ namespace tracer {
 
 // Validate the bounded exception and cleanup effects used by native support
 // admission. Empty means the AST has a finite proof within the fixed reserve.
-std::string validate_context_support_effects(clang::ASTUnit &);
+std::string validate_context_support_effects(
+    clang::ASTUnit &, const PreparedAdapterRegion * = nullptr);
 
 // Returns true only for the engine's physical compiler/stdlib headers or its
 // installed private headers; -isystem and namespace spelling do not confer

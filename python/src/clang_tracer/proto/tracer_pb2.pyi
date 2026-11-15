@@ -261,8 +261,28 @@ class HeaderContext(_message.Message):
     inference: str
     def __init__(self, working_directory: _Optional[str] = ..., compiler_arguments: _Optional[_Iterable[str]] = ..., inference: _Optional[str] = ...) -> None: ...
 
+class PreparedSnapshotMember(_message.Message):
+    __slots__ = ("field", "dynamic_types")
+    FIELD_FIELD_NUMBER: _ClassVar[int]
+    DYNAMIC_TYPES_FIELD_NUMBER: _ClassVar[int]
+    field: str
+    dynamic_types: _containers.RepeatedScalarFieldContainer[int]
+    def __init__(self, field: _Optional[str] = ..., dynamic_types: _Optional[_Iterable[int]] = ...) -> None: ...
+
+class PreparedSnapshotRecord(_message.Message):
+    __slots__ = ("type_index", "dynamic_types", "members", "automatic_members")
+    TYPE_INDEX_FIELD_NUMBER: _ClassVar[int]
+    DYNAMIC_TYPES_FIELD_NUMBER: _ClassVar[int]
+    MEMBERS_FIELD_NUMBER: _ClassVar[int]
+    AUTOMATIC_MEMBERS_FIELD_NUMBER: _ClassVar[int]
+    type_index: int
+    dynamic_types: _containers.RepeatedScalarFieldContainer[int]
+    members: _containers.RepeatedCompositeFieldContainer[PreparedSnapshotMember]
+    automatic_members: _containers.RepeatedCompositeFieldContainer[PreparedSnapshotMember]
+    def __init__(self, type_index: _Optional[int] = ..., dynamic_types: _Optional[_Iterable[int]] = ..., members: _Optional[_Iterable[_Union[PreparedSnapshotMember, _Mapping]]] = ..., automatic_members: _Optional[_Iterable[_Union[PreparedSnapshotMember, _Mapping]]] = ...) -> None: ...
+
 class PreparedInjector(_message.Message):
-    __slots__ = ("format_version", "module_sha256", "module_name", "selector", "symbol", "signature", "argument_names", "target_triple", "header_types", "include_headers", "header_context", "adapter_declarations", "adapter_standard_headers", "adapter_abi_options", "adapter_toolchain_options", "adapter_uses_default_toolchain", "source_translation_unit")
+    __slots__ = ("format_version", "module_sha256", "module_name", "selector", "symbol", "signature", "argument_names", "target_triple", "header_types", "include_headers", "header_context", "adapter_declarations", "adapter_standard_headers", "adapter_abi_options", "adapter_toolchain_options", "adapter_uses_default_toolchain", "source_translation_unit", "snapshot_return_type", "snapshot_return_member", "snapshot_return_types", "snapshot_types", "snapshot_records")
     FORMAT_VERSION_FIELD_NUMBER: _ClassVar[int]
     MODULE_SHA256_FIELD_NUMBER: _ClassVar[int]
     MODULE_NAME_FIELD_NUMBER: _ClassVar[int]
@@ -280,6 +300,11 @@ class PreparedInjector(_message.Message):
     ADAPTER_TOOLCHAIN_OPTIONS_FIELD_NUMBER: _ClassVar[int]
     ADAPTER_USES_DEFAULT_TOOLCHAIN_FIELD_NUMBER: _ClassVar[int]
     SOURCE_TRANSLATION_UNIT_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_RETURN_TYPE_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_RETURN_MEMBER_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_RETURN_TYPES_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_TYPES_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_RECORDS_FIELD_NUMBER: _ClassVar[int]
     format_version: int
     module_sha256: bytes
     module_name: str
@@ -297,10 +322,15 @@ class PreparedInjector(_message.Message):
     adapter_toolchain_options: _containers.RepeatedScalarFieldContainer[str]
     adapter_uses_default_toolchain: bool
     source_translation_unit: str
-    def __init__(self, format_version: _Optional[int] = ..., module_sha256: _Optional[bytes] = ..., module_name: _Optional[str] = ..., selector: _Optional[str] = ..., symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., target_triple: _Optional[str] = ..., header_types: _Optional[_Union[DebugInfo, _Mapping]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., adapter_declarations: _Optional[str] = ..., adapter_standard_headers: _Optional[_Iterable[str]] = ..., adapter_abi_options: _Optional[_Iterable[str]] = ..., adapter_toolchain_options: _Optional[_Iterable[str]] = ..., adapter_uses_default_toolchain: bool = ..., source_translation_unit: _Optional[str] = ...) -> None: ...
+    snapshot_return_type: DebugInfo
+    snapshot_return_member: str
+    snapshot_return_types: _containers.RepeatedCompositeFieldContainer[DebugInfo]
+    snapshot_types: _containers.RepeatedCompositeFieldContainer[DebugInfo]
+    snapshot_records: _containers.RepeatedCompositeFieldContainer[PreparedSnapshotRecord]
+    def __init__(self, format_version: _Optional[int] = ..., module_sha256: _Optional[bytes] = ..., module_name: _Optional[str] = ..., selector: _Optional[str] = ..., symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., target_triple: _Optional[str] = ..., header_types: _Optional[_Union[DebugInfo, _Mapping]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., adapter_declarations: _Optional[str] = ..., adapter_standard_headers: _Optional[_Iterable[str]] = ..., adapter_abi_options: _Optional[_Iterable[str]] = ..., adapter_toolchain_options: _Optional[_Iterable[str]] = ..., adapter_uses_default_toolchain: bool = ..., source_translation_unit: _Optional[str] = ..., snapshot_return_type: _Optional[_Union[DebugInfo, _Mapping]] = ..., snapshot_return_member: _Optional[str] = ..., snapshot_return_types: _Optional[_Iterable[_Union[DebugInfo, _Mapping]]] = ..., snapshot_types: _Optional[_Iterable[_Union[DebugInfo, _Mapping]]] = ..., snapshot_records: _Optional[_Iterable[_Union[PreparedSnapshotRecord, _Mapping]]] = ...) -> None: ...
 
 class ProbeSpec(_message.Message):
-    __slots__ = ("symbol", "signature", "callback_source", "receiver", "receiver_unavailable_reason", "debug_info", "argument_names", "include_headers", "header_context", "stack_depth", "include_internal_stack_frames", "print_arguments", "print_result", "callback_package_path", "compile_options", "prepared", "extra_compile_arguments", "extra_compile_arguments_checked")
+    __slots__ = ("symbol", "signature", "callback_source", "receiver", "receiver_unavailable_reason", "debug_info", "argument_names", "include_headers", "header_context", "stack_depth", "include_internal_stack_frames", "print_arguments", "print_result", "callback_package_path", "compile_options", "prepared", "extra_compile_arguments", "extra_compile_arguments_checked", "snapshot_return_pointee")
     SYMBOL_FIELD_NUMBER: _ClassVar[int]
     SIGNATURE_FIELD_NUMBER: _ClassVar[int]
     CALLBACK_SOURCE_FIELD_NUMBER: _ClassVar[int]
@@ -319,6 +349,7 @@ class ProbeSpec(_message.Message):
     PREPARED_FIELD_NUMBER: _ClassVar[int]
     EXTRA_COMPILE_ARGUMENTS_FIELD_NUMBER: _ClassVar[int]
     EXTRA_COMPILE_ARGUMENTS_CHECKED_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_RETURN_POINTEE_FIELD_NUMBER: _ClassVar[int]
     symbol: str
     signature: Signature
     callback_source: str
@@ -337,7 +368,8 @@ class ProbeSpec(_message.Message):
     prepared: PreparedInjector
     extra_compile_arguments: _containers.RepeatedScalarFieldContainer[str]
     extra_compile_arguments_checked: bool
-    def __init__(self, symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., callback_source: _Optional[str] = ..., receiver: _Optional[_Union[ReceiverContext, _Mapping]] = ..., receiver_unavailable_reason: _Optional[str] = ..., debug_info: _Optional[_Union[DebugInfo, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., stack_depth: _Optional[int] = ..., include_internal_stack_frames: bool = ..., print_arguments: bool = ..., print_result: bool = ..., callback_package_path: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ..., extra_compile_arguments: _Optional[_Iterable[str]] = ..., extra_compile_arguments_checked: bool = ...) -> None: ...
+    snapshot_return_pointee: bool
+    def __init__(self, symbol: _Optional[str] = ..., signature: _Optional[_Union[Signature, _Mapping]] = ..., callback_source: _Optional[str] = ..., receiver: _Optional[_Union[ReceiverContext, _Mapping]] = ..., receiver_unavailable_reason: _Optional[str] = ..., debug_info: _Optional[_Union[DebugInfo, _Mapping]] = ..., argument_names: _Optional[_Iterable[str]] = ..., include_headers: _Optional[_Iterable[str]] = ..., header_context: _Optional[_Union[HeaderContext, _Mapping]] = ..., stack_depth: _Optional[int] = ..., include_internal_stack_frames: bool = ..., print_arguments: bool = ..., print_result: bool = ..., callback_package_path: _Optional[str] = ..., compile_options: _Optional[_Iterable[str]] = ..., prepared: _Optional[_Union[PreparedInjector, _Mapping]] = ..., extra_compile_arguments: _Optional[_Iterable[str]] = ..., extra_compile_arguments_checked: bool = ..., snapshot_return_pointee: bool = ...) -> None: ...
 
 class AttachRequest(_message.Message):
     __slots__ = ("pid", "expected_process_start_time", "expected_executable")

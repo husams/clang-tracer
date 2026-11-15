@@ -9,16 +9,16 @@ import sys
 import tempfile
 
 from repl_browser_integration import Transcript, stop
+from elf_split_fixture import link_split_fixture
 
 
-def main(repl, server, names_fixture, concrete, browser, library, objcopy):
+def main(repl, server, names_source, concrete, browser, library, compiler):
     with tempfile.TemporaryDirectory(prefix="ct-bulk-") as directory, ExitStack() as stack:
         root = Path(directory)
         target = root / "cpp-name-fixture"
-        shutil.copy2(names_fixture, target)
-        subprocess.run([objcopy, "--only-keep-debug", target, root / "target.debug"], check=True)
-        subprocess.run([objcopy, "--strip-debug", target], check=True)
-        subprocess.run([objcopy, "--add-gnu-debuglink=target.debug", target], cwd=root, check=True)
+        link_split_fixture(compiler, names_source, root, target.name, "target.debug",
+                           ["-std=c++20", "-O0", "-fPIE", "-fno-omit-frame-pointer",
+                            "-fcf-protection=none"], ["-pie"])
 
         def start(*args):
             process = subprocess.Popen(args, stdout=subprocess.PIPE, text=True)

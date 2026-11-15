@@ -24,6 +24,7 @@ def main():
                               stderr=subprocess.PIPE, text=True)
     workspace = tempfile.TemporaryDirectory(prefix="tracer-repl-editor-")
     work = Path(workspace.name)
+    home = tempfile.TemporaryDirectory(prefix="tracer-repl-home-")
     headers = work / "editör headers"
     headers.mkdir()
     changed_header = work / "changed.hpp"
@@ -73,7 +74,8 @@ def main():
     try:
         assert server.stdout.readline().strip() == "ready"
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 160, 0, 0))
-        env = dict(os.environ, TERM="xterm-256color")
+        # Keep editor history out of the real home directory.
+        env = dict(os.environ, TERM="xterm-256color", HOME=home.name)
         env.pop("NO_COLOR", None)
         child = subprocess.Popen([console, "--endpoint", endpoint],
                                  stdin=slave, stdout=slave, stderr=slave,
@@ -127,7 +129,7 @@ def main():
         changed_header.write_bytes(original_header + b"// changed during editing\n")
         send("for (int x = 1; x < 2; ++x) {\rstd::cou\t")
         until(rb"C\+\+ completion: C\+\+ header changed: [^\n]*changed.hpp;[^\n]*\n"
-              rb"tracer\[7\]> \n?for \(int x = 1; x < 2; \+\+x\) \{\n +std::cou")
+              rb"tracer\[7\]> (?:f)?\n?for \(int x = 1; x < 2; \+\+x\) \{\n +std::cou")
         assert b"\x1b[JC++ completion:" in transcript
         changed_header.write_bytes(original_header)
         os.utime(changed_header, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
@@ -249,6 +251,7 @@ def main():
         server.terminate()
         server.communicate(timeout=10)
         workspace.cleanup()
+        home.cleanup()
     print("native terminal print/completion checks passed")
 
 

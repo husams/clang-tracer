@@ -186,6 +186,116 @@ This variant restores its hook by detaching through `tracer.detach(session)`.
 
 Set `CLANG_TRACER_PREPARED_BUILD` to use a different CMake build directory.
 
+## Automatic snapshots for returned pointers
+
+Build and run the Linux x86-64 pointee example:
+
+```bash
+cmake --build build --target clang-tracer-repl clang-tracer-server clang_tracer_agent prepared-pointee-target
+./examples/prepared-injectors/run-native.sh --pointee
+```
+
+At the native prompt, prepare the declared return type and inject with the
+opt-in pointee snapshot flag:
+
+```text
+%probe prepare "prepared_pointee::HfwManager::createItem(int)" --include demo/pointee/item.hpp --output prepared
+%probe inject "prepared_pointee::HfwManager::createItem(int)" --prepared prepared --prepared-mode require --snapshot-return-pointee
+%collect --count 4 --timeout 15 --phase POST --as captured
+auto captured = tracer.batch("captured");
+auto event = captured.at(captured.at(0).result() == "0x0" ? 1 : 0);
+auto item = event.result_as<prepared_pointee::HfwItem>();
+auto snapshot = event.result_snapshot();
+std::cout << item.label << " " << snapshot.field("details").field("revision").as<int>() << std::endl;
+%quit
+```
+
+The target alternates between returning an `HfwItem*` and `nullptr`.
+For non-null returns, `result_snapshot()` includes `id`, `label`, and nested
+`details` fields. The prepared package imports the mapping automatically, so
+`result_as<prepared_pointee::HfwItem>()` returns an owned copy.
+`receiver_snapshot()` contains the manager's fields. Null returns display
+`0x0`. Run the same capture as a smoke test with this command.
+
+```bash
+./examples/prepared-injectors/run-native.sh --pointee --smoke
+```
+
+The corresponding CTest is `native_repl_prepared_pointee`.
+
+### Polymorphic pointer returns
+
+Build `prepared-polymorphic-pointee-target` and start the example.
+
+```bash
+./examples/prepared-injectors/run-native.sh --polymorphic-pointee
+```
+
+The launcher prints the commands in
+[`inspect.repl`](polymorphic-pointee/inspect.repl). The target returns a
+`Base*` to a `Child` whose base subobject sits at a nonzero offset. Source
+preparation discovers `Child` and captures `Child::x` as `42` without a
+type-specific command option.
+The example also reads `x` through `result_as<ChildFields>()` with a local
+decoder. Add `--smoke` to check the child, base and null cases.
+
+### PImpl return snapshots
+
+Build the C++17 PImpl fixture and run either return form in its own native REPL
+session:
+
+```bash
+cmake --build build --target clang-tracer-repl clang-tracer-server clang_tracer_agent prepared-pimpl-target
+./examples/prepared-injectors/run-native.sh --pimpl-pointer
+./examples/prepared-injectors/run-native.sh --pimpl-reference
+```
+
+The public [`Item` declaration](pimpl/item.hpp) keeps its pointer fields private
+and forward-declares `ItemImp`. The internal header defines `ItemV1`, `ItemV2`,
+and `ItemV3`. The pointer and reference demos prepare from the two application
+headers without a pointer policy; source discovery follows the polymorphic
+`_imp` and `_other` members and captures each concrete implementation. The
+complete non-polymorphic `_stamp` record remains address-only without an
+explicit policy. The pointer probe uses the existing
+`--snapshot-return-pointee` opt-in, while the reference probe captures its
+`Item` directly.
+
+Both sessions inspect private and nested fields for all three known
+implementations and use `result_as<LocalFields>()` to read an owned typed value.
+The fourth implementation is defined only in `item.cpp`, so the snapshot keeps
+its `_imp` address. An `_unreadable` member points to a `PROT_NONE` page and the
+guarded lookup leaves its address in the snapshot. Both sessions check null
+members. Pointer mode also checks a null outer result. The `--pimpl-custom`
+and `--pimpl-roles` examples use the explicit
+[`FollowPointers` policy](pimpl/snapshot-policy.hpp) to cover `_stamp`,
+arguments, and receivers.
+
+Run the automated cases with:
+
+```bash
+./examples/prepared-injectors/run-native.sh --pimpl-pointer --smoke
+./examples/prepared-injectors/run-native.sh --pimpl-reference --smoke
+./examples/prepared-injectors/run-native.sh --pimpl-roles --smoke
+```
+
+CTest registers these as `native_repl_prepared_pimpl_pointer` and
+`native_repl_prepared_pimpl_reference`; `native_repl_prepared_pimpl_roles`
+checks that the same policy also captures arguments and receivers. Separate
+sessions avoid re-importing the same application declarations into one REPL
+process.
+
+The `--pimpl-custom` mode demonstrates a user encoder for ItemV2. It replaces
+the automatic ItemV2 fields with a single `summary` projection while preserving
+the `HFW::ItemV2` result type; ItemV1 and ItemV3 remain automatic. Its callback
+has no PRE or POST hook:
+
+```bash
+./examples/prepared-injectors/run-native.sh --pimpl-custom
+./examples/prepared-injectors/run-native.sh --pimpl-custom --smoke
+```
+
+CTest registers this as `native_repl_prepared_pimpl_custom`.
+
 ## Typed method example
 
 Build `prepared-methods-target` and launch with `--methods`. The method demo

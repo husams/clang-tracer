@@ -1,6 +1,6 @@
 ---
 name: clang-tracer-native-repl
-description: Use clang-tracer-repl for native C++ tracing, prepared probes, bulk tracing, observer reload, read-only target inspection, typed SQLite recording and offline replay, and reusable .repl scripts. Use for native tracing and replay unless the user requests the Python client.
+description: Use clang-tracer-repl for native C++ tracing, prebuilt object lifetimes and field writes, method snapshots, prepared probes, bulk tracing, observer reload, read-only inspection, typed SQLite replay, and reusable .repl scripts. Use unless the user requests the Python client.
 ---
 
 # Clang Tracer native REPL
@@ -185,6 +185,16 @@ in the same order. To override the compile flags in C++, pass the compilation
 database and translation unit after the output directory. Use
 `%help api tracer.prepare` for an example and `%type tracer.prepare` for the
 installed overloads.
+
+## Trace object lifetimes and state
+
+Use the matching Linux x86-64 or AArch64 REPL, server, and agent with the existing ELF and matching DWARF. For individual writes, use `%object prepare TYPE --module ELF --field FIELD --code SELECTOR --backend code-cache --output DIRECTORY`. Choose `ptrace` for diagnostic single-stepping. The backend is saved in the plan. For net method changes, prepare with `--on METHOD`, the original `--include` and compile command, and a verified `--synchronization` policy.
+
+Attach, run `%object preview --plan DIRECTORY`, and check the binding and admitted sites. Use `%object start --plan DIRECTORY` to arm the watch. Writes capture values by default. Add `--no-values` to a write watch to record completed stores, including same-value stores, without samples. Record while the workload runs with `%record capture.db --sqlite --name object.trace --probe WATCH_ID --count N --timeout SECONDS`. Check `%object status WATCH_ID`, then stop with `%object stop WATCH_ID` and confirm restoration before `%detach`. Open the recording with `%events open capture.db --as saved` and inspect it with `%events list saved` or `%events show saved --index 0`.
+
+For an exact writer line, select a typed leaf of a nested record with `--field`. Follow keyed vector entries with `--vector` and `--element-key`, ordered or unordered map entries with `--map` and `--map-key`, or verified pointer paths with `--pointee`. Supply each storage-changing boundary with `--mutation` and verify rebinding and writer coverage in replay. For logical entry changes at verified mutation boundaries, add `--mode logical-writes` and declare synchronization. Repeat `--mutation` for insert, erase, move, swap and resize functions. Use `--mutation "destroy=SYMBOL"` for a directly called function that ends the selected container's lifetime. Inspect `LOGICAL_UPDATE` for the mutation, before and after indices or sizes, and typed values alongside actual store events. For individual writes to verified libstdc++ strings, variants and any payloads, select the complex field itself with `--first-seen` and a declared synchronization policy. Inspect `storageWrite` for the affected representation, character buffer or payload bytes and confirm original store PCs in replay. Select nested union storage with a path such as `--field state.payload`. For tagged capture, provide a verified `--union-tag`, `--union-case TAG=MEMBER` mappings and synchronization. Inspect `storageWrite` for byte ranges and discriminator writes, and typed samples where the tag stays stable. For complete value trees and typed complex projections, use method snapshots with `--field` and a verified `--key PATH=MEMBER` where applicable. Added and removed entries carry the captured value tree in `snapshotAfter` or `snapshotBefore`.
+
+Report gaps and drops as partial evidence. Lifecycle and ownership require verified boundaries, and unadmitted writers, unsafe reads, generated helper windows, and external writers can limit what the trace establishes. Follow the [runnable example and coverage limits in the native REPL guide](../../../docs/native-repl.md#trace-object-lifetimes-and-state-in-a-prebuilt-binary) for detailed commands and collection, union, and shared-library cases.
 
 ## Record and replay events
 

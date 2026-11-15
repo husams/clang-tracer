@@ -33,12 +33,13 @@ public:
                                   const clang::HeaderSearch &toolchain_search,
                                   const clang::FunctionDecl &function,
                                   const std::vector<std::string> &headers,
-                                  bool pointer_layouts) {
+                                  bool pointer_layouts,
+                                  const std::vector<const clang::CXXRecordDecl *> &snapshot_types = {}) {
     std::vector<NestedRequest> late_requests;
     for (;;) {
       const auto reserved = late_requests.size();
       AdapterEmitter pass(ast, toolchain_search, late_requests);
-      pass.emit_declarations(function, headers, pointer_layouts);
+      pass.emit_declarations(function, headers, pointer_layouts, snapshot_types);
       if (!pass.first_late_dependency_)
         return {pass.forwards_ + pass.declarations_, std::move(pass.standard_headers_)};
       // Each retry must discover another dependency. Reuse the original
@@ -66,11 +67,15 @@ private:
 
   void emit_declarations(const clang::FunctionDecl &function,
                          const std::vector<std::string> &headers,
-                         bool pointer_layouts) {
+                         bool pointer_layouts,
+                         const std::vector<const clang::CXXRecordDecl *> &snapshot_types) {
     selected_method_ = llvm::dyn_cast<clang::CXXMethodDecl>(&function);
     const bool linkage_alias = nested_static_method(selected_method_);
     if (selected_method_ && !linkage_alias)
       register_nested(*selected_method_->getParent());
+    for (const auto *snapshot_type : snapshot_types)
+      if (snapshot_type)
+        register_nested(*snapshot_type);
     register_nested_type(function.getReturnType(), pointer_layouts);
     for (const auto *parameter : function.parameters())
       register_nested_type(parameter->getType(), pointer_layouts);
@@ -101,6 +106,14 @@ private:
         if (const auto *record = prepared_pointer_record(parameter->getType()))
           if (!llvm::isa<clang::CXXRecordDecl>(record->getDeclContext()))
             emit_record(*record);
+    }
+    for (std::size_t i = 0; i < snapshot_types.size(); ++i) {
+      const auto *snapshot_type = snapshot_types[i];
+      if (!snapshot_type)
+        continue;
+      emit_record(*snapshot_type);
+      declarations_ += "namespace tracer_prepared { using SnapshotType" +
+          std::to_string(i) + " = " + spelling(record_type(ast_, snapshot_type)) + "; }\n";
     }
   }
 
@@ -244,7 +257,8 @@ private:
         continue;
       if (const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(decl);
           record && record->isCompleteDefinition() && !record->isImplicit() &&
-          record->getIdentifier() && !record->getDescribedClassTemplate())
+          record->getIdentifier() && !record->getDescribedClassTemplate() &&
+          !is_snapshot_policy_specialization(record))
         emit_record(*record);
       if (const auto *enumeration = llvm::dyn_cast<clang::EnumDecl>(decl);
           enumeration && enumeration->isCompleteDefinition() && enumeration->getIdentifier())
@@ -252,6 +266,16 @@ private:
       if (const auto *alias = llvm::dyn_cast<clang::TypedefNameDecl>(decl))
         emit_alias(*alias);
     }
+  }
+
+  static bool is_snapshot_policy_specialization(const clang::CXXRecordDecl *record) {
+    const auto *specialization =
+        llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record);
+    const auto *templ = specialization ? specialization->getSpecializedTemplate() : nullptr;
+    if (!templ)
+      return false;
+    const auto name = templ->getQualifiedNameAsString();
+    return name == "tracer_snapshot::FollowPointers" || name == "tracer_snapshot::AnyPayloads";
   }
 
   void emit_alias(const clang::TypedefNameDecl &alias) {
@@ -624,6 +648,14 @@ private:
         visit_signature(*method, selected);
         source += access(method->getAccess()) + ": " + callable(*method, selected);
         emitted_selected |= selected;
+        continue;
+      }
+      if (method->isCopyAssignmentOperator() || method->isMoveAssignmentOperator()) {
+        visit_signature(*method);
+        auto declaration = callable(*method);
+        if (method->isExplicitlyDefaulted() && !method->isDeletedAsWritten())
+          declaration.insert(declaration.rfind(';'), " = default");
+        source += access(method->getAccess()) + ": " + declaration;
         continue;
       }
       const auto *ctor = llvm::dyn_cast<clang::CXXConstructorDecl>(method);

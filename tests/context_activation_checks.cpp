@@ -215,9 +215,15 @@ void verify_context_activation() {
     tracer::ContextActivationRequest context_only_request = request;
     context_only_request.source_lineage_id[0] = 0x78;
     context_only_request.file_name = "context-only-activation.cc";
+    static int post_logs = 0;
+    post_logs = 0;
     context_only_request.callback_log =
         [](const tracer::TraceContext *context, const char *text,
            std::size_t size, tracer::LogLevel level) noexcept {
+          if (std::string_view(text, size) == "post log") {
+            ++post_logs;
+            return true;
+          }
           return context && context->call_id == 42 &&
                  std::string_view(text, size) == "context log" &&
                  level == tracer::LogLevel::Warning;
@@ -229,6 +235,7 @@ struct EventInterceptor {
     if (!call.log("context log", tracer::LogLevel::Warning)) throw 7;
     call.context().event("context.only");
   }
+  void post(const Call& call) { call.log("post log"); }
 };
 }
 )CPP";
@@ -248,6 +255,8 @@ struct EventInterceptor {
         reinterpret_cast<Entry>(context_only.generation->construct_entry());
     const auto emitter_pre =
         reinterpret_cast<Entry>(context_only.generation->pre_entry());
+    const auto emitter_post =
+        reinterpret_cast<Entry>(context_only.generation->post_entry());
     const auto emitter_destroy =
         reinterpret_cast<Destroy>(context_only.generation->destroy_entry());
     alignas(64) std::array<std::byte, 4096> emitter_object{};
@@ -267,6 +276,11 @@ struct EventInterceptor {
                   sink.batches.back().event().name() == "context.only" &&
                   sink.batches.back().event().states_size() == 1,
               "context-only emitter could not capture a foreign live state");
+      require(context_only.generation->has_hook(tracer::TracePhase::Post) &&
+                  guarded_entry(*context_only.generation, emitter_post,
+                                emitter_object.data(), &trace) &&
+                  post_logs == 1,
+              "context-only POST hook without context use did not run");
       require(guarded_destroy(*context_only.generation, emitter_destroy,
                               emitter_object.data()),
               "context-only destroy entrypoint failed");
@@ -311,6 +325,64 @@ struct Interceptor {
           shared_child.generation->scopes()[0]->states.size() == 2,
       "two-state private owner with shared nested codec did not activate: " +
           shared_child.error);
+
+  {
+    // The generated adapter label is admitted only inside its declared region,
+    // and the region must follow the parse copy's placeholder insertions: the
+    // shorthand hook precedes the region, so its marker shifts the offsets.
+    const std::string hook = R"CPP(
+namespace adapted {
+struct Scope {};
+struct Data : shared_state<Scope> { int value = 0; };
+struct Interceptor {
+  Interceptor(State<Data>);
+  void pre(const Call&) { state.value++; }
+};
+}
+)CPP";
+    const std::string adapter =
+        "namespace adapter_probe {\n"
+        "int target(int) __asm__(\"adapter_target_symbol\");\n"
+        "}\n";
+    tracer::ContextActivationRequest adapter_request = request;
+    adapter_request.source_lineage_id[0] = 0x7b;
+    adapter_request.file_name = "prepared-adapter-activation.cc";
+    adapter_request.source = hook + adapter;
+    adapter_request.prepared_adapter = {hook.size(), adapter.size(),
+                                        "adapter_target_symbol"};
+    const auto admitted = tracer::preflight_context_source(adapter_request, true);
+    require(static_cast<bool>(admitted),
+            "generated adapter label was not admitted: " + admitted.error);
+
+    auto wrong_symbol = adapter_request;
+    wrong_symbol.prepared_adapter.symbol = "other_symbol";
+    const auto wrong = tracer::preflight_context_source(wrong_symbol, true);
+    require(!wrong && wrong.error.find("unsupported_context_native_declaration:") !=
+                          std::string::npos,
+            "adapter label for a different symbol was admitted: " + wrong.error);
+
+    auto no_region = adapter_request;
+    no_region.prepared_adapter = {};
+    const auto unmarked = tracer::preflight_context_source(no_region, true);
+    require(!unmarked && unmarked.error.find(
+                             "unsupported_context_native_declaration:") !=
+                             std::string::npos,
+            "adapter label without a region was admitted: " + unmarked.error);
+
+    auto out_of_bounds = adapter_request;
+    out_of_bounds.prepared_adapter.size = adapter_request.source.size();
+    const auto bounds = tracer::preflight_context_source(out_of_bounds, true);
+    require(!bounds && bounds.error.find("invalid_context_activation:") !=
+                           std::string::npos,
+            "out-of-bounds adapter region was accepted: " + bounds.error);
+
+    auto empty_symbol = adapter_request;
+    empty_symbol.prepared_adapter.symbol.clear();
+    const auto empty = tracer::preflight_context_source(empty_symbol, true);
+    require(!empty && empty.error.find("invalid_context_activation:") !=
+                          std::string::npos,
+            "adapter region with an empty symbol was accepted: " + empty.error);
+  }
 
   tracer::ContextActivationRequest generic_value_request = request;
   generic_value_request.source_lineage_id[0] = 0x7a;

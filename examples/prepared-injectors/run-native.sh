@@ -9,7 +9,16 @@ server=${CLANG_TRACER_SERVER:-$build/clang-tracer-server}
 agent=${CLANG_TRACER_AGENT:-$build/libclang_tracer_agent.so}
 example=prepared-injectors-target
 demo_mode=${1:-}
-if [[ $demo_mode == --methods || $demo_mode == --state ]]; then
+if [[ $demo_mode == --pointee ]]; then
+  example=prepared-pointee-target
+  shift
+elif [[ $demo_mode == --polymorphic-pointee ]]; then
+  example=prepared-polymorphic-pointee-target
+  shift
+elif [[ $demo_mode == --pimpl-pointer || $demo_mode == --pimpl-reference || $demo_mode == --pimpl-custom || $demo_mode == --pimpl-roles ]]; then
+  example=prepared-pimpl-target
+  shift
+elif [[ $demo_mode == --methods || $demo_mode == --state ]]; then
   example=prepared-methods-target
   shift
 fi
@@ -17,11 +26,11 @@ target=${CLANG_TRACER_PREPARED_TARGET:-$build/examples/prepared-injectors/$examp
 compdb=${CLANG_TRACER_PREPARED_COMPDB:-$build/compile_commands.json}
 
 if [[ ${1:-} == --help ]]; then
-  printf '%s\n' 'Use --methods for typed method snapshots or --state for a named event with typed state. Add --smoke for automation.'
+  printf '%s\n' 'Use --methods, --state, --pointee, --polymorphic-pointee, --pimpl-pointer, --pimpl-reference, --pimpl-custom, or --pimpl-roles to select an example. Add --smoke for automation.'
   exit 0
 fi
 if [[ $# -gt 1 || ( $# == 1 && $1 != --smoke ) ]]; then
-  printf '%s\n' 'Usage: run-native.sh [--methods|--state] [--smoke|--help]' >&2
+  printf '%s\n' 'Usage: run-native.sh [--methods|--state|--pointee|--polymorphic-pointee|--pimpl-pointer|--pimpl-reference|--pimpl-custom|--pimpl-roles] [--smoke|--help]' >&2
   exit 2
 fi
 for required in "$repl" "$server" "$agent" "$target" "$compdb"; do
@@ -44,7 +53,105 @@ cd -- "$run"
 unset CLANG_TRACER_ENDPOINT
 
 printf 'Native C++ REPL example: %s\nTarget PID: %s\n' "$run" "$target_pid"
-if [[ $demo_mode == --state ]]; then
+if [[ $demo_mode == --pointee ]]; then
+  if [[ ${1:-} == --smoke ]]; then
+    "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60 --fail-fast <<'REPL' | tee "$run/smoke.log"
+%probe prepare "prepared_pointee::HfwManager::createItem(int)" --include demo/pointee/item.hpp --output prepared
+%probe inject "prepared_pointee::HfwManager::createItem(int)" --prepared prepared --prepared-mode require --snapshot-return-pointee
+%collect --count 4 --timeout 15 --phase POST --as captured
+auto captured = tracer.batch("captured");
+tracer.detach(session);
+unsigned nulls = 0;
+for (const auto &event : captured) { if (event.result() == "0x0") ++nulls; }
+auto event = captured.at(captured.at(0).result() == "0x0" ? 1 : 0);
+auto item = event.result_as<prepared_pointee::HfwItem>();
+auto snapshot = event.result_snapshot();
+auto manager = event.receiver_snapshot();
+bool correct = captured.size() == 4 && nulls == 2;
+correct = correct && item.id == 42 && item.label == "heap-backed HfwItem label";
+correct = correct && item.details.revision == 7 && item.details.active;
+correct = correct && snapshot.field("id").as<int>() == 42 && snapshot.field("label").as<std::string>() == item.label;
+correct = correct && snapshot.field("details").field("revision").as<int>() == 7 && snapshot.field("details").field("active").as<bool>();
+correct = correct && manager.field("manager_id").as<int>() == 11 && manager.field("name").as<std::string>() == "items manager";
+std::cout << "NATIVE_POINTEE_RESULTS=" << correct << std::endl;
+%quit
+REPL
+    grep -q '^NATIVE_POINTEE_RESULTS=1$' "$run/smoke.log"
+  else
+    cat <<'STEPS'
+Paste these commands at the native tracer prompt:
+
+%probe prepare "prepared_pointee::HfwManager::createItem(int)" --include demo/pointee/item.hpp --output prepared
+%probe inject "prepared_pointee::HfwManager::createItem(int)" --prepared prepared --prepared-mode require --snapshot-return-pointee
+%collect --count 4 --timeout 15 --phase POST --as captured
+auto captured = tracer.batch("captured");
+auto event = captured.at(captured.at(0).result() == "0x0" ? 1 : 0);
+auto item = event.result_as<prepared_pointee::HfwItem>();
+auto snapshot = event.result_snapshot();
+std::cout << item.label << " " << snapshot.field("details").field("revision").as<int>() << std::endl;
+%quit
+
+The non-null event owns a copied HfwItem value and an automatic field snapshot.
+Null returns keep the raw `0x0` result and have no pointee snapshot.
+STEPS
+    "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60
+  fi
+elif [[ $demo_mode == --pimpl-pointer || $demo_mode == --pimpl-reference || $demo_mode == --pimpl-custom || $demo_mode == --pimpl-roles ]]; then
+  repl_script=demo/pimpl/pointer.repl
+  inspect_source=demo/pimpl/inspect-auto.cpp
+  check_function=check_auto_pimpl
+  check_args=", true"
+  result_label=NATIVE_PIMPL_POINTER
+  if [[ $demo_mode == --pimpl-reference ]]; then
+    repl_script=demo/pimpl/reference.repl
+    check_args=", false"
+    result_label=NATIVE_PIMPL_REFERENCE
+  elif [[ $demo_mode == --pimpl-custom ]]; then
+    repl_script=demo/pimpl/custom.repl
+    inspect_source=demo/pimpl/inspect-custom.cpp
+    check_function=check_custom_pimpl
+    check_args=
+    result_label=NATIVE_PIMPL_CUSTOM
+  elif [[ $demo_mode == --pimpl-roles ]]; then
+    repl_script=demo/pimpl/roles.repl
+    inspect_source=demo/pimpl/inspect.cpp
+    check_function=check_item_roles
+    check_args=
+    result_label=NATIVE_PIMPL_ROLES
+  fi
+  cat "$repl_script" > inspect.repl
+  printf '%%cpp load %s\nbool correct = %s(tracer.batch("captured")%s);\n' \
+    "$inspect_source" "$check_function" "$check_args" >> inspect.repl
+  printf 'std::cout << "%s=" << correct << std::endl;\n%%quit\n' "$result_label" >> inspect.repl
+  if [[ ${1:-} == --smoke ]]; then
+    "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60 --fail-fast < inspect.repl | tee "$run/smoke.log"
+    grep -qx "$result_label=1" "$run/smoke.log"
+  else
+    printf 'Paste these commands at the native tracer prompt.\n\n'
+    cat inspect.repl
+    "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60
+  fi
+elif [[ $demo_mode == --polymorphic-pointee ]]; then
+  if [[ ${1:-} == --smoke ]]; then
+    {
+      cat demo/polymorphic-pointee/inspect.repl
+      cat <<'REPL'
+auto base = captured.at((child_index + 1) % captured.size()).result_snapshot();
+auto null_event = captured.at((child_index + 2) % captured.size());
+bool correct = captured.size() == 3 && item.x == 42 && snapshot.field("prefix").as<int>() == 12;
+correct = correct && base.cpp_type() == "HFW::Base" && base.field("id").as<int>() == 11 && null_event.result() == "0x0";
+std::cout << "NATIVE_POLYMORPHIC_RESULT=" << correct << '\n';
+%quit
+REPL
+    } | "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60 --fail-fast | tee "$run/smoke.log"
+    grep -qx 'NATIVE_POLYMORPHIC_RESULT=1' "$run/smoke.log"
+  else
+    printf 'Paste these commands at the native tracer prompt.\n\n'
+    cat demo/polymorphic-pointee/inspect.repl
+    printf '\n%%quit exits the REPL.\n'
+    "$repl" --server "$server" --agent "$agent" --attach "$target_pid" --timeout 60
+  fi
+elif [[ $demo_mode == --state ]]; then
   if [[ ${1:-} == --smoke ]]; then
     mkdir -p application/include application/build
     cp demo/methods/account.hpp demo/methods/reading.hpp application/include/

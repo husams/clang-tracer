@@ -30,7 +30,7 @@ constexpr string_view resolution_options =
     "--prepared DIRECTORY --prepared-mode off|prefer|require";
 constexpr string_view deployment_options =
     "--stack-depth N|full --stack-application-only true|false\n"
-    "--print-arguments --print-result";
+    "--print-arguments --print-result --snapshot-return-pointee";
 
 const CommandTopic commands[] = {
     {"server", "", "Start, connect to, inspect, or stop a tracing server."},
@@ -45,10 +45,15 @@ const CommandTopic commands[] = {
     {"attach", "%attach [PID [--start-time TICKS]]", "Attach to a target. Omit PID for the local picker, or supply the observed start time with a PID.",
      "%attach 12345"},
     {"processes", "%processes [--filter TEXT]", "List local target processes that match the filter."},
-    {"sessions", "%sessions", "List sessions known to the connected server."},
-    {"use", "%use SESSION", "Select an attached session for subsequent commands.", "%use s1"},
+    {"sessions", "%sessions",
+     "List sessions known to the connected server, one per line with ID, PID and state. "
+     "The selected session is marked with *."},
+    {"use", "%use SESSION",
+     "Select an attached session for subsequent commands. SESSION is an ID from %sessions or a unique prefix of one.",
+     "%use s1"},
     {"status", "%status", "Show connection details, the selected session, and retained collections."},
-    {"detach", "%detach [SESSION]", "Detach the selected or named session and remove its probes."},
+    {"detach", "%detach [SESSION]",
+     "Detach the selected or named session and remove its probes. SESSION may be a unique ID prefix."},
     {"modules", "%modules [--details]", "List application modules. Details show executable mappings, file identity, and a mapping token."},
     {"module", "", "Index ELF modules and browse or export recovered types and symbols."},
     {"module index", "%module index (--file ELF | --module PATH --mapping TOKEN) [--output INDEX] [--debug-file FILE] [--max-entries N] [--max-depth N]",
@@ -77,6 +82,40 @@ const CommandTopic commands[] = {
      "Find masked byte patterns in a readable range up to 1 MiB. Use ? for wildcard nibbles. "
      "The default result limit is 64 and the maximum is 1024.",
      R"(%memory scan 0xADDRESS --mapping TOKEN --count 4096 --pattern "48 8? ?? ff")"},
+    {"object", "", "Watch object lifetimes, ownership, method snapshots and stores on Linux."},
+    {"object prepare", "%object prepare TYPE [--executable APP] --module ELF --field FIELD --code SELECTOR --output DIRECTORY",
+     "Save a reusable object definition and verified ELF bindings without attaching. "
+     "For a shared-library writer, add --executable APP and keep --module LIB; a lone shared object "
+     "has no process interpreter. Use --on METHOD, --include HEADER, and --synchronization for a typed method watch."},
+    {"object preview", "%object preview --plan DIRECTORY",
+     "Resolve the plan against the selected process and check live code bytes without installing patches."},
+    {"object start", "%object start --type TYPE --field FIELD --code SELECTOR "
+     "[--base BASE --owner OWNER --collection FIELD] [--snapshot-field FIELD] "
+     "[--module MODULE] [--caller SELECTOR] [--rendezvous SYMBOL] "
+     "[--backend ptrace|code-cache] [--no-values] [--stack-depth N] [--max-elements N] [--max-string-bytes N]",
+     "Start a native watch with matching DWARF. Ptrace is the diagnostic default. "
+     "Code cache translates supported writers and lifecycle fragments. "
+     "Repeat --code to select multiple writers for a standalone main-image field. "
+     "For an eligible standalone write scope, use --follow-calls to resolve callees at runtime, with --runtime-limit N to bound translations. "
+     "A non-leaf shared writer in that scope requires --follow-calls. If its writer is not in the main executable, name its ELF with --module. "
+     "--follow-calls is limited to standalone writes; it cannot be combined with --owner, collection or caller scopes, "
+     "--writer-entry, or --first-seen unless the watched value has a supported structured layout. "
+     "Use --shared-file PATH to correlate shared storage across live processes. "
+     "Use --pointee PATH with a verified --mutation to follow a DWARF-resolved pointer path. "
+     "On AArch64, --rendezvous selects an existing single-threaded userspace checkpoint. "
+     "On x86-64, use --module for a shared writer and "
+     "--caller to verify an Image::get borrow followed by an indirect call. "
+     "Use --writer-entry for all entries into an admitted standalone leaf. "
+     "Use --vector with --element-key FIELD=UINT32 or --map with --map-key KEY to track collection storage generations. "
+     "Select a verified --mutation SYMBOL and declare --synchronization for native collection capture. "
+     "Use --mode logical-writes for keyed collection changes and --mutation destroy=SYMBOL for destruction. "
+     "For libstdc++ string, variant and any storage writes, use --first-seen and declare --synchronization. "
+     "Select a nested union with --field PATH and supply --union-tag PATH and --union-case TAG=MEMBER for typed capture. "
+     "Use --owner-add, --owner-get, --owner-remove and --owner-snapshot to select ownership boundaries. "
+     "Use --no-values to record every completed write and omit field samples. "
+     "Record observations with %record FILE --sqlite --name object.trace."},
+    {"object status", "%object status [WATCH_ID]", "Show admitted store sites, observations and restoration status."},
+    {"object stop", "%object stop [WATCH_ID]", "Restore the watch's patches and release execution control."},
 
     {"trace", "", "Preview, apply, or remove a bulk C++ trace."},
     {"trace preview", "%trace preview [--module GLOB] [--include GLOB] [--exclude GLOB] [--exact SIGNATURE]\n"
@@ -104,18 +143,25 @@ const CommandTopic commands[] = {
      "Preparation uses compile_commands.json in the command's working directory by default. "
      "It prefers the first include's recorded compile command and falls back to the first source beside it. "
      "Use --module to pin the package to a specific build. "
+     "Prepared headers can declare tracer_snapshot::FollowPointers<Record> specializations listing direct raw pointer fields to follow; pointee types and polymorphic implementations are discovered from the included source inputs. This policy applies to prepared argument, receiver and result records. "
+     "Use --snapshot-return-pointee when injecting a raw pointer-return probe. "
      "Use --metadata-only to skip the separate C++ adapter files. "
      "With --signature, supply the C++ result and explicit parameter types, for example 'const int&()'. "
      "Qualified methods receive an opaque receiver. Pass --member for an unqualified instance method.",
-     R"example(%probe prepare "demo::compute(int)" --include demo.hpp --output prepared)example"},
+     R"example(%probe prepare "HFW::Item::create()" --include item.hpp --include item-impl.hpp --include item-snapshot-policy.hpp --output prepared)example"},
     {"probe resolve", "%probe resolve SELECTOR [RESOLUTION OPTIONS] [--cwd DIRECTORY]",
      "Resolve a selector in the selected target and show the available metadata.",
      R"(%probe resolve "Calculator::multiply(int, int) const")"},
     {"probe validate", "%probe validate SELECTOR --callback FILE [RESOLUTION OPTIONS] [--cwd DIRECTORY]",
      "Check whether the callback can be deployed for the selected function."},
     {"probe inject", "%probe inject SELECTOR [--callback FILE] [RESOLUTION OPTIONS] [DEPLOYMENT OPTIONS] [--cwd DIRECTORY]",
-     "Install a probe on the selected target. Omit --callback to capture events with the built-in observer.",
-     R"example(%probe inject "demo::compute(int)" --prepared prepared)example"},
+     "Install a probe on the selected target. Omit --callback to capture events with the built-in observer. "
+     "The auto backend tries the verified entry first, then a verified --caller or an entry trap for supported short getters. "
+     "Use --backend entry to require an entry jump. "
+     "For prepared implementation member snapshots, a callback file can define tracer_snapshot::encode(const Implementation&) noexcept to return a custom record by value. "
+     "Use --snapshot-return-pointee with a matching record layout and live, stable pointees immediately after return. "
+     "result() gives the address and result_as<T>() decodes an owned copy.",
+     R"example(%probe inject "prepared_pointee::HfwManager::createItem(int)" --prepared prepared --snapshot-return-pointee)example"},
     {"probe remove", "%probe remove ID [--cwd DIRECTORY]", "Remove a probe from the selected session and restore the original code."},
     {"probe reload", "%probe reload ID --callback FILE [--cwd DIRECTORY]",
      "Switch an active probe to a new observer generation while existing calls finish on their original generation."},
@@ -135,6 +181,8 @@ const CommandTopic commands[] = {
      "%events --count 5 --phase POST"},
     {"events list", "%events list NAME [--limit N]", "List retained events with their zero-based indexes. The default limit is 20."},
     {"events show", "%events show NAME --index N", "Print one retained event and its captured values.", "%events show batch --index 0"},
+    {"events diff", "%events diff NAME --pre N --post N [--key PATH=MEMBER]...",
+     "Compare owned receiver snapshots for one call. Use --key for a verified element identity."},
     {"events stack", "%events stack NAME --index N",
      "Print all captured stack frames for one retained event.",
      "%events stack fullstack --index 0"},

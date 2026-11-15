@@ -41,10 +41,11 @@ void emit_context_diagnostic(void *,
 } // namespace
 
 EventTransport::EventTransport(void (*suppress_callbacks)(),
-                               void (*report_diagnostics)() noexcept)
+                               void (*report_diagnostics)() noexcept,
+                               void (*write_logs)() noexcept)
     : slots_(std::make_unique<Packet[]>(kCapacity)),
       suppress_callbacks_(suppress_callbacks),
-      report_diagnostics_(report_diagnostics) {
+      report_diagnostics_(report_diagnostics), write_logs_(write_logs) {
   for (std::size_t i = 0; i < kCapacity; ++i)
     slots_[i].turn.store(i, std::memory_order_relaxed);
   wake_fd_ = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -133,6 +134,8 @@ bool EventTransport::begin_drain(EventDelivery &delivery) noexcept {
 }
 
 void EventTransport::report_agent_diagnostics_if_due() noexcept {
+  if (write_logs_)
+    write_logs_();
   if (!report_diagnostics_)
     return;
   const auto now = std::chrono::steady_clock::now();

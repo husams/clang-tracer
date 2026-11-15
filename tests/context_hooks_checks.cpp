@@ -278,6 +278,10 @@ void verify_context_hooks() {
                                         std::string::npos ||
       shorthand.find("PLACEHOLDER") != std::string::npos)
     throw std::runtime_error("shorthand speculative parser copy was not prepared");
+  // The copy's own include occupies line 1, so the hook body is on line 2.
+  if (parser_copy.source.find("PLACEHOLDER_END__*/\n#line 2 \"shorthand.cc\"\n") ==
+      std::string::npos)
+    throw std::runtime_error("shorthand placeholder shifted the source lines");
   auto shorthand_ast = clang::tooling::buildASTFromCodeWithArgs(
       parser_copy.source, args, "shorthand-prepared.cc");
   if (!shorthand_ast || shorthand_ast->getDiagnostics().hasErrorOccurred())

@@ -10,6 +10,7 @@
 #include "event_transport.hpp"
 #include "native_stack.hpp"
 #include "native_detour.hpp"
+#include "native_entry.hpp"
 #include "runtime_paths.hpp"
 
 #include <algorithm>
@@ -38,6 +39,7 @@
 #include <unordered_set>
 #include <vector>
 #include "value_snapshot_codegen.hpp"
+#include "snapshot_encoder.hpp"
 #include "value_snapshot_storage.hpp"
 #include "context_paths.hpp"
 #include "prepared_types.hpp"
@@ -117,7 +119,6 @@
 #include "debug_resolver.hpp"
 #include "event_transport.hpp"
 #include "linux_syscalls.hpp"
-#include "native_detour.hpp"
 #include "native_stack.hpp"
 #include "runtime_identity.hpp"
 #include "runtime_paths.hpp"
@@ -242,6 +243,7 @@ private:
 };
 
 void report_agent_failures() noexcept;
+void write_agent_logs() noexcept;
 
 struct CallbackLog {
   static constexpr std::size_t kCapacity = 16;
@@ -250,12 +252,19 @@ struct CallbackLog {
     std::uint64_t call_id;
     tracer::TracePhase phase;
     tracer::LogLevel level;
+    // Outcome of a hook the agent ran. Null for a callback's own message.
+    const char *hook_outcome;
     char message[kMessageSize + 1];
   };
   // Producers try once. The sender releases this before writing any records.
   std::atomic_flag busy = ATOMIC_FLAG_INIT;
   std::size_t count = 0;
   std::array<Entry, kCapacity> entries{};
+  // Set after queueing so the sender skips probes with nothing to write.
+  std::atomic<bool> pending{false};
+  std::atomic<std::uint64_t> dropped{0};
+  // Only the event sender reads and updates the reported total.
+  std::uint64_t reported_dropped = 0;
 };
 
 struct DebugRecord {
@@ -310,6 +319,8 @@ struct Probe {
   bool class_callback = false;
   bool has_pre = false;
   bool has_post = false;
+  bool receiver_sampled_at_return = false;
+  bool object_snapshot = false;
   bool transport_active = false;
   bool scheduler_counted = false;
   void *wrapper = nullptr;
@@ -350,7 +361,8 @@ struct Agent {
 
   Agent()
       : transport([] { ++callback_depth; },
-                  logging_enabled ? &report_agent_failures : nullptr) {
+                  logging_enabled ? &report_agent_failures : nullptr,
+                  logging_enabled ? &write_agent_logs : nullptr) {
     for (auto &slot : probe_slots) {
       slot.store(nullptr, std::memory_order_relaxed);
     }
@@ -442,6 +454,20 @@ void append_diagnostics(clangtracer::v1::ValidationReport &report,
   }
 }
 
+void append_source_errors(
+    clangtracer::v1::ValidationReport &report,
+    const std::vector<tracer::ContextSourceError> &errors) {
+  for (const auto &error : errors) {
+    auto *output = report.add_diagnostics();
+    output->set_stage("syntax");
+    output->set_severity("error");
+    output->set_file(error.file);
+    output->set_line(error.line);
+    output->set_column(error.column);
+    output->set_message(error.message);
+  }
+}
+
 void append_failure(clangtracer::v1::ValidationReport &report,
                     const char *stage, const std::string &message) {
   if (message.empty())
@@ -521,22 +547,93 @@ void report_agent_failures() noexcept {
       probe->reported_callback_errors = errors;
       probe->reported_event_drops = drops;
     }
-    auto &log = probe->log;
-    if (log.busy.test_and_set(std::memory_order_acquire))
+  }
+}
+
+// Writes queued hook records and callback messages in the order they ran.
+void write_agent_logs() noexcept {
+  auto *current = agent.load(std::memory_order_acquire);
+  if (!current)
+    return;
+  for (const auto &slot : current->probe_slots) {
+    auto *probe = slot.load(std::memory_order_acquire);
+    if (!probe)
       continue;
-    std::array<CallbackLog::Entry, CallbackLog::kCapacity> pending;
-    const auto count = log.count;
-    std::copy_n(log.entries.begin(), count, pending.begin());
-    log.count = 0;
-    log.busy.clear(std::memory_order_release);
-    for (std::size_t i = 0; i < count; ++i) {
-      const auto &entry = pending[i];
-      log_agent("callback", entry.phase == tracer::TracePhase::Pre ? "pre"
-                                                                  : "post",
-                probe->request.probe_id, log_level_name(entry.level), 0, 0, 0,
-                entry.call_id, entry.message);
+    auto &log = probe->log;
+    if (log.pending.exchange(false, std::memory_order_acq_rel)) {
+      if (log.busy.test_and_set(std::memory_order_acquire)) {
+        // A producer holds the queue. Leave its entries for the next pass.
+        log.pending.store(true, std::memory_order_release);
+        continue;
+      }
+      std::array<CallbackLog::Entry, CallbackLog::kCapacity> pending;
+      const auto count = log.count;
+      std::copy_n(log.entries.begin(), count, pending.begin());
+      log.count = 0;
+      log.busy.clear(std::memory_order_release);
+      for (std::size_t i = 0; i < count; ++i) {
+        const auto &entry = pending[i];
+        const char *phase =
+            entry.phase == tracer::TracePhase::Pre ? "pre" : "post";
+        if (entry.hook_outcome)
+          log_agent("hook", phase, probe->request.probe_id, entry.hook_outcome,
+                    0, 0, 0, entry.call_id);
+        else
+          log_agent("callback", phase, probe->request.probe_id,
+                    log_level_name(entry.level), 0, 0, 0, entry.call_id,
+                    entry.message);
+      }
+    }
+    const auto dropped = log.dropped.load(std::memory_order_relaxed);
+    if (dropped != log.reported_dropped) {
+      char lost[48];
+      std::snprintf(lost, sizeof(lost), "%llu records lost",
+                    static_cast<unsigned long long>(dropped -
+                                                    log.reported_dropped));
+      log_agent("log", "queue", probe->request.probe_id, "dropped", 0, 0, 0, 0,
+                lost);
+      log.reported_dropped = dropped;
     }
   }
+}
+
+// Queues one record for the sender. A full or contended queue drops it.
+bool enqueue_agent_log(Probe &probe, const tracer::TraceContext &context,
+                       tracer::LogLevel level, const char *hook_outcome,
+                       const char *message, std::size_t size) noexcept {
+  auto &log = probe.log;
+  bool queued = false;
+  if (!log.busy.test_and_set(std::memory_order_acquire)) {
+    queued = log.count < log.entries.size();
+    if (queued) {
+      auto &entry = log.entries[log.count++];
+      entry.call_id = context.call_id;
+      entry.phase = context.phase;
+      entry.level = level;
+      entry.hook_outcome = hook_outcome;
+      size = std::min(size, CallbackLog::kMessageSize);
+      for (std::size_t i = 0; i < size; ++i) {
+        const auto byte = static_cast<unsigned char>(message[i]);
+        entry.message[i] = byte < 32 || byte == 127 ? '?' : message[i];
+      }
+      entry.message[size] = '\0';
+    }
+    log.busy.clear(std::memory_order_release);
+  }
+  if (queued)
+    log.pending.store(true, std::memory_order_release);
+  else
+    log.dropped.fetch_add(1, std::memory_order_relaxed);
+  return queued;
+}
+
+// Records that the agent ran a PRE or POST hook, when logging is enabled.
+void log_hook(Probe &probe, const tracer::TraceContext &context,
+              bool succeeded) noexcept {
+  auto *owner = agent.load(std::memory_order_acquire);
+  if (owner && owner->logging_enabled)
+    (void)enqueue_agent_log(probe, context, tracer::LogLevel::Info,
+                            succeeded ? "ok" : "failed", nullptr, 0);
 }
 
 Probe *find_probe(std::uint64_t id) noexcept {
@@ -793,7 +890,10 @@ extern "C" void tracer_shared_dispatch(void *opaque,
   const auto entry = raw->phase == tracer::TracePhase::Pre
                          ? token->probe->shared_generation->pre_entry()
                          : token->probe->shared_generation->post_entry();
-  if (!invoke_shared(*token, entry)) {
+  const bool hook_succeeded = invoke_shared(*token, entry);
+  if (token->probe->shared_generation->has_hook(raw->phase))
+    log_hook(*token->probe, token->raw, hook_succeeded);
+  if (!hook_succeeded) {
     token->enabled = false;
     token->probe->callback_errors.fetch_add(1, std::memory_order_relaxed);
     tracer::context_execution::runtime_diagnostics().record(
@@ -1167,7 +1267,7 @@ bool debug_record_identity_matches(clang::ASTContext &context,
   // inside hash/equal_to. Preserve ABI-bearing inline namespaces throughout.
   policy.PrintAsCanonical = true;
   policy.UsePreferredNames = false;
-  const auto actual = context.getRecordType(record).getAsString(policy);
+  const auto actual = tracer::prepared::record_type(context, record).getAsString(policy);
   if (normalized_cpp_type(actual) == normalized_cpp_type(expected))
     return true;
   if (!standard_library_record_name(expected))
@@ -1398,7 +1498,7 @@ DebugRecord construct_debug_record(clang::ASTUnit &unit,
   if (!finder.found && unit.hasSema()) {
     for (auto *candidate : finder.incomplete) {
       if (unit.getSema().isCompleteType(candidate->getLocation(),
-                                      context.getRecordType(candidate))) {
+                                      tracer::prepared::record_type(context, candidate))) {
         auto *definition = candidate->getDefinition();
         if (definition &&
             debug_record_identity_matches(context, definition, finder.selected)) {
@@ -1784,7 +1884,8 @@ std::uint64_t validate_debug_entry(const clangtracer::v1::ProbeSpec &spec) {
     const auto *current = agent.load(std::memory_order_acquire);
     if (current) {
       for (const auto &probe : current->probes) {
-        if (!probe || !probe->active.load() || probe->request.original_entry != address)
+        if (!probe || !probe->active.load() || probe->request.patch_address != address ||
+            probe->request.original_entry != address)
           continue;
         const auto &patch = probe->request;
         std::array<unsigned char, tracer::kMaxPatchBytes> live{};
@@ -2429,6 +2530,89 @@ bool decode_patch(const std::uint8_t *entry, tracer::Request &req,
   return true;
 }
 
+struct DirectCaller {
+  std::uint64_t pc;
+  std::string bytes;
+};
+
+std::optional<DirectCaller> verified_direct_caller(
+    const clangtracer::v1::ProbeSpec &spec, std::uint64_t callee) {
+  tracer::client::DebugLookupOptions lookup;
+  lookup.module = spec.debug_info().module();
+  const auto resolved = tracer::client::resolve_debug_callable(
+      ::getpid(), spec.direct_caller(), lookup);
+  const auto &caller = resolved.spec.debug_info();
+  const auto code = tracer::client::verified_function_code(::getpid(), caller, 64 * 1024);
+  const auto decoded = tracer::native_entry::scan(caller.runtime_entry(), code);
+  if (decoded.decode_failed || !decoded.diagnostic.empty())
+    return std::nullopt;
+  std::optional<DirectCaller> result;
+  std::uint64_t last_end = 0;
+  for (const auto &inst : decoded.instructions) {
+    if (inst.address < last_end)
+      return std::nullopt;
+    last_end = inst.address + inst.size;
+    const auto offset = inst.address - caller.runtime_entry();
+    if (inst.flow == tracer::native_entry::Flow::call && inst.target == callee &&
+        inst.size == 5 && code[offset] == '\xe8') {
+      if (result)
+        return std::nullopt;
+      result = DirectCaller{inst.address, code.substr(offset, inst.size)};
+    }
+  }
+  return result;
+}
+
+bool prepare_getter_fallback(Probe &probe, const clangtracer::v1::ProbeSpec &spec) {
+  namespace api = clangtracer::v1;
+  auto &request = probe.request;
+  if (!spec.has_debug_info() || spec.signature().kind() != api::METHOD ||
+      spec.signature().result() != api::INT32 || spec.signature().arguments_size() ||
+      spec.debug_info().entry_size() > tracer::kMaxPatchBytes)
+    return false;
+  std::string code, error;
+  try {
+    code = tracer::client::verified_function_code(::getpid(), spec.debug_info(), tracer::kMaxPatchBytes);
+  } catch (const std::exception &) {
+    return false;
+  }
+  std::size_t trap_offset = 0;
+  if (!tracer::native_detour::decode_getter(code, trap_offset, error))
+    return false;
+  request.verified_size = code.size();
+  std::memcpy(request.verified_bytes, code.data(), code.size());
+  std::optional<DirectCaller> caller;
+  const char *reason = trap_offset ? "landing_pad_requires_trap" : "no_verified_caller";
+  if (!trap_offset && !spec.direct_caller().empty()) {
+    try {
+      caller = verified_direct_caller(spec, request.original_entry);
+    } catch (const std::exception &) {
+      // The explicit caller could not be proved. A verified entry trap can
+      // still cover the getter and reports why the call-site path was skipped.
+    }
+    reason = caller ? "no_reachable_relay" : "caller_not_verified";
+  }
+  if (caller && tracer::native_detour::create_getter_copy(
+                    code, caller->pc, probe.trampoline, probe.mapping_size, error)) {
+    request.patch_backend = tracer::NativePatch::CallSite;
+    request.patch_address = caller->pc;
+    request.patch_size = caller->bytes.size();
+    std::memcpy(request.original, caller->bytes.data(), caller->bytes.size());
+    std::strcpy(request.patch_reason, "entry_jump_unavailable");
+    return true;
+  }
+  if (!tracer::native_detour::create_getter_copy(
+          code, 0, probe.trampoline, probe.mapping_size, error))
+    return false;
+  request.patch_backend = tracer::NativePatch::Trap;
+  request.patch_address = request.original_entry + trap_offset;
+  request.patch_size = 1;
+  request.original[0] = static_cast<std::uint8_t>(code[trap_offset]);
+  request.installed[0] = 0xcc;
+  std::strcpy(request.patch_reason, reason);
+  return true;
+}
+
 using PthreadCreate = tracer::context_scheduler::PthreadCreate;
 template <class> struct PthreadCreateSignature;
 template <class Result, class... Arguments>
@@ -2572,7 +2756,7 @@ bool prepare_context_pthread(Agent &owner, Probe &probe, std::string &error) {
     return false;
   patch.pthread_create_patch_size = patch.patch_size;
   std::memcpy(patch.pthread_create_original, patch.original, patch.patch_size);
-  const auto probe_begin = probe.request.original_entry;
+  const auto probe_begin = probe.request.patch_address;
   const auto probe_end = probe_begin + probe.request.patch_size;
   const auto scheduler_end = patch.pthread_create_entry + patch.patch_size;
   if (probe_begin < scheduler_end && patch.pthread_create_entry < probe_end) {
@@ -2583,7 +2767,7 @@ bool prepare_context_pthread(Agent &owner, Probe &probe, std::string &error) {
     const auto *existing = owner.probes[i].get();
     if (!existing || !existing->active.load(std::memory_order_acquire))
       continue;
-    const auto existing_begin = existing->request.original_entry;
+    const auto existing_begin = existing->request.patch_address;
     const auto existing_end = existing_begin + existing->request.patch_size;
     if (existing_begin < scheduler_end &&
         patch.pthread_create_entry < existing_end) {
@@ -2641,6 +2825,11 @@ std::string make_wrapper(const tracer::Request &r,
                          const tracer::ValueSnapshotCode *snapshots = nullptr) {
   const bool typed = spec && tracer::prepared::is_typed_version(
                                   spec->prepared().format_version());
+  const bool refresh_receiver = spec && spec->snapshot_receiver_at_return();
+  if (refresh_receiver && (!typed || r.kind != tracer::CallableKind::Method ||
+                           shared_mode || !has_pre || !has_post || !snapshots ||
+                           snapshots->receiver.empty()))
+    throw std::invalid_argument("receiver return sampling requires a typed prepared method with PRE and POST capture");
   const auto indirect_argument = [&](unsigned i) {
     return typed && r.arguments[i] == tracer::ValueType::Object &&
            spec->debug_info().arguments(i).object_type().record_pass_by_reference();
@@ -2775,7 +2964,7 @@ std::string make_wrapper(const tracer::Request &r,
   for (unsigned i = 0; i < r.argument_count; ++i) {
     fill_value(code, i, r.arguments[i], indirect_argument(i));
   }
-  if (snapshots) code += snapshots->arguments;
+  if (snapshots) code += snapshots->arguments + snapshots->receiver;
   if (!shared_mode && spec && spec->stack_depth())
     code += "tracer_capture_entry_stack(&ctx," +
             std::to_string(spec->stack_depth()) + ");\n";
@@ -2887,6 +3076,9 @@ std::string make_wrapper(const tracer::Request &r,
   if (shared_mode && r.result != tracer::ValueType::Object)
     code += "}\n";
   if (has_post) {
+    if (refresh_receiver)
+      code += "auto* entry_receiver_snapshot=ctx.receiver_snapshot;\n"
+              "{ tracer_snapshot_detail::Scope return_receiver_scope;\n" + snapshots->receiver;
     if (snapshots) code += "ctx.phase=tracer::TracePhase::Post;\n" + snapshots->result;
     if (shared_mode)
       code += "ctx.phase=tracer::TracePhase::Post; "
@@ -2895,6 +3087,8 @@ std::string make_wrapper(const tracer::Request &r,
       code += "ctx.phase=tracer::TracePhase::Post; "
               "(void)tracer_callback_dispatch(" +
               std::to_string(r.probe_id) + "ULL,&ctx," + instance + ");\n";
+    if (refresh_receiver)
+      code += "} ctx.receiver_snapshot=entry_receiver_snapshot;\n";
   }
   if (shared_mode)
     code += "tracer_shared_leave(shared_guard.token); "
@@ -2928,6 +3122,7 @@ struct CallbackShape {
   bool class_mode = false;
   bool has_pre = false;
   bool has_post = false;
+  bool encoder_only = false;
   bool signature_specialization = false;
   std::string interceptor_type = "Interceptor";
   std::string specialized_signature_spelling;
@@ -3016,7 +3211,7 @@ bool inspect_callback_shape(clang::ASTContext &context, CallbackShape &shape,
           shape.specialized_signature_spelling =
               shape.specialized_signature.getAsString(policy);
           shape.interceptor_type =
-              context.getRecordType(specialization).getAsString(policy);
+              tracer::prepared::record_type(context, specialization).getAsString(policy);
         }
       }
     }
@@ -3086,6 +3281,11 @@ bool inspect_callback_shape(clang::ASTContext &context, CallbackShape &shape,
     return true;
   }
   if (!legacy) {
+    if (!saw_legacy && tracer::find_snapshot_encoders(context).requested) {
+      shape.encoder_only = true;
+      shape.has_pre = shape.has_post = true;
+      return true;
+    }
     error = "callback source must define Interceptor or trace_callback";
     return false;
   }
@@ -3095,6 +3295,20 @@ bool inspect_callback_shape(clang::ASTContext &context, CallbackShape &shape,
       !is_call_reference(legacy->getParamDecl(0)->getType(),
                          "tracer::TraceContext")) {
     error = "trace_callback must be defined as long long(const TraceContext&)";
+    return false;
+  }
+  return true;
+}
+
+bool validate_snapshot_encoder(const CallbackShape &shape,
+                               const tracer::ValueSnapshotCode &snapshots,
+                               std::string &error) {
+  if (!snapshots.error.empty()) {
+    error = snapshots.error;
+    return false;
+  }
+  if (snapshots.has_custom_encoder && !shape.has_post) {
+    error = "tracer_snapshot::encode requires a POST hook when combined with an Interceptor";
     return false;
   }
   return true;
@@ -3343,6 +3557,20 @@ struct ReceiverCallbackShape {
 
 std::string make_class_bridge(const CallbackShape &shape);
 
+std::string make_invocation_bridge(const CallbackShape &shape) {
+  if (shape.class_mode)
+    return make_class_bridge(shape);
+  if (shape.encoder_only)
+    return R"CPP(
+extern "C" long long tracer_user_dispatch(const tracer::TraceContext *,
+                                          void *, bool *ran) {
+  *ran = true;
+  return 0;
+}
+)CPP";
+  return tracer::make_legacy_callback_bridge();
+}
+
 class ReceiverShapeConsumer final : public clang::ASTConsumer {
 public:
   ReceiverShapeConsumer(ReceiverCallbackShape &result,
@@ -3357,6 +3585,8 @@ public:
     if (!validate_specialized_signature(context, shape, spec_, result_.error))
       return;
     result_.snapshots = tracer::make_value_snapshot_code(context, spec_);
+    if (!validate_snapshot_encoder(shape, result_.snapshots, result_.error))
+      return;
     class Fields : public clang::RecursiveASTVisitor<Fields> {
     public:
       Fields(clang::ASTContext &c, ReceiverCallbackShape &r)
@@ -3430,11 +3660,7 @@ public:
     result_.has_post = shape.has_post;
     result_.signature_specialization = shape.signature_specialization;
     result_.interceptor_type = shape.interceptor_type;
-    if (shape.class_mode) {
-      result_.bridge = make_class_bridge(shape);
-    } else {
-      result_.bridge = tracer::make_legacy_callback_bridge();
-    }
+    result_.bridge = make_invocation_bridge(shape);
     result_.valid = true;
   }
 
@@ -4202,6 +4428,12 @@ bool compile_shared_probe(Probe &p,
       specification.prepared().format_version());
   std::string requested_header_source = typed_prepared
       ? tracer::prepared::adapter_source(specification.prepared()) : std::string();
+  if (typed_prepared) {
+    activation.prepared_adapter.offset =
+        forced_include_source.size() + callback_includes.size();
+    activation.prepared_adapter.size = requested_header_source.size();
+    activation.prepared_adapter.symbol = specification.symbol();
+  }
   for (const auto &header : specification.include_headers())
     requested_header_source += "#include \"" + header + "\"\n";
   const bool has_real_headers = typed_prepared || specification.has_header_context() ||
@@ -4215,6 +4447,7 @@ bool compile_shared_probe(Probe &p,
                            : recovered_record_declarations(specification)) +
                       argument_aliases(specification) +
                       interceptor_template_prelude(specification.callback_source()) +
+                      "#line 1 \"callback_source\"\n" +
                       callback_body + "\n" + signature_assert;
   // Scalar shared wrappers need no user declarations. Recompiling their full
   // callback headers here can consume the operation deadline before admission.
@@ -4234,6 +4467,8 @@ bool compile_shared_probe(Probe &p,
         tracer::preflight_context_source(activation, syntax_only);
     if (!preflight) {
       error = preflight.error;
+      if (report)
+        append_source_errors(*report, preflight.source_errors);
       return false;
     }
     const auto generated_wrapper =
@@ -4399,6 +4634,10 @@ bool bind_probe_symbols(clang::Interpreter &interpreter,
   bind("tracer_stack_leave", &tracer_stack_leave);
   bind("tracer_capture_stack", &tracer_capture_stack);
   bind("tracer_snapshot_mark", &tracer_snapshot_mark);
+  bind("tracer_snapshot_read_rtti", &tracer_snapshot_read_rtti);
+  bind("tracer_snapshot_read_rtti_provider", &tracer_snapshot_read_rtti_provider);
+  bind("tracer_snapshot_readable", &tracer_snapshot_readable);
+  bind("tracer_snapshot_rtti_matches", &tracer_snapshot_rtti_matches);
   bind("tracer_snapshot_reset", &tracer_snapshot_reset);
   bind("tracer_snapshot_storage", &tracer_snapshot_storage);
   bind("tracer_snapshot_commit", &tracer_snapshot_commit);
@@ -4756,6 +4995,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       (typed_prepared && specification.signature().kind() == clangtracer::v1::METHOD) ||
       snapshot_debug.result_is_reference() ||
       snapshot_debug.result_is_object_value() ||
+      specification.snapshot_return_pointee() ||
       std::any_of(snapshot_debug.arguments().begin(), snapshot_debug.arguments().end(),
                   [](const auto &argument) {
                     return argument.is_reference() || argument.is_object_value();
@@ -4928,6 +5168,14 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   DiagnosticCapture user_capture(nullptr);
   auto user_ast =
       build_callback_ast(user_source, "clang-tracer-callback.cc", user_capture);
+  // A callback that failed to parse explains the later generic rejections.
+  const auto prefer_parse_errors = [&] {
+    if (!user_capture.had_error())
+      return;
+    if (report)
+      append_diagnostics(*report, user_capture, "syntax");
+    error = user_capture.message();
+  };
   bool shape_valid = false;
   if (user_ast) {
     if (prepared_callback_context) {
@@ -4941,11 +5189,20 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
         }
       }
     }
-    if (typed_prepared && !validate_prepared_types(*user_ast, specification, result_sret, error))
-      return false;
     const auto context_declarations =
         tracer::analyze_context_declarations(user_ast->getASTContext());
+    if (typed_prepared && !validate_prepared_types(*user_ast, specification, result_sret, error)) {
+      // State shorthand fails this plain parse by design, so a context
+      // callback keeps the specific rejection.
+      if (!context_declarations.requires_context)
+        prefer_parse_errors();
+      return false;
+    }
     if (context_declarations.requires_context) {
+      if (tracer::find_snapshot_encoders(user_ast->getASTContext()).requested) {
+        error = "tracer_snapshot::encode requires an invocation-scoped callback";
+        return false;
+      }
       std::string signature_assert;
       if (!interceptor_template_prelude(source).empty()) {
         shape_valid = inspect_callback_shape(user_ast->getASTContext(), shape,
@@ -4975,7 +5232,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   } else {
     baseline_error = user_capture.message();
   }
-  if (!user_capture.message().empty() && baseline_error.empty()) {
+  if (!user_capture.message().empty() &&
+      (baseline_error.empty() || user_capture.had_error())) {
     baseline_error = user_capture.message();
   }
 
@@ -4985,12 +5243,10 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
     if (!validate_specialized_signature(user_ast->getASTContext(), shape,
                                         specification, error))
       return false;
-    if (shape.class_mode) {
-      bridge = make_class_bridge(shape);
-    } else {
-      bridge = tracer::make_legacy_callback_bridge();
-    }
     const auto snapshots = tracer::make_value_snapshot_code(user_ast->getASTContext(), specification);
+    if (!validate_snapshot_encoder(shape, snapshots, error))
+      return false;
+    bridge = make_invocation_bridge(shape);
     const std::string generated = make_wrapper(
         p.request, reinterpret_cast<std::uintptr_t>(p.trampoline),
         shape.has_pre, shape.has_post, &specification, shape.class_mode,
@@ -5230,30 +5486,47 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   return true;
 }
 
+void copy_value_snapshot(const tracer::ValueSnapshot &in,
+                         clangtracer::context::v1::ValueSnapshot &out,
+                         bool include_members) {
+  using Snapshot = clangtracer::context::v1::ValueSnapshot;
+  out.set_status(static_cast<Snapshot::Status>(in.status));
+  if (in.cpp_type) out.set_cpp_type(in.cpp_type);
+  if (in.detail) out.set_detail(in.detail);
+  if (in.status != tracer::ValueSnapshot::Complete)
+    return;
+  if (!in.descriptor || !in.root_type || in.descriptor_size > 4096 ||
+      in.payload_size > tracer::max_snapshot_bytes || (!in.payload && in.payload_size != 0) ||
+      in.container_role_count > 128 || in.record_type_count > 128 ||
+      (in.member_count && (!include_members || !in.members ||
+                           in.member_count > tracer::kMaxSnapshotMembers))) {
+    out.set_status(Snapshot::FAILED);
+    out.set_detail("invalid snapshot storage or capture bounds");
+    return;
+  }
+  out.set_root_type(in.root_type);
+  out.set_descriptor_set(in.descriptor, in.descriptor_size);
+  if (in.payload_size)
+    out.set_payload(in.payload, in.payload_size);
+  for (std::size_t i = 0; i < in.container_role_count; ++i)
+    out.add_container_roles(in.container_roles[i]);
+  for (std::size_t i = 0; i < in.record_type_count; ++i)
+    out.add_record_types(in.record_types[i]);
+  for (std::size_t i = 0; i < in.member_count; ++i) {
+    const auto &member = in.members[i];
+    if (!member.name || !member.snapshot)
+      continue;
+    auto &encoded = *out.add_members();
+    encoded.set_name(member.name);
+    copy_value_snapshot(*member.snapshot, *encoded.mutable_snapshot(), false);
+  }
+}
+
 clangtracer::v1::Value to_proto_value(const tracer::TraceValue &v) {
   clangtracer::v1::Value out;
   out.set_type(static_cast<clangtracer::v1::ValueType>(v.type));
-  if (v.snapshot) {
-    const auto &in = *v.snapshot;
-    auto *snapshot = out.mutable_snapshot();
-    snapshot->set_status(static_cast<clangtracer::context::v1::ValueSnapshot::Status>(in.status));
-    if (in.cpp_type) snapshot->set_cpp_type(in.cpp_type);
-    if (in.detail) snapshot->set_detail(in.detail);
-    if (in.status == tracer::ValueSnapshot::Complete && in.descriptor &&
-        in.root_type && in.descriptor_size <= 4096 && in.payload_size <= 4096 &&
-        (in.payload || in.payload_size == 0) && in.container_role_count <= 128 && in.record_type_count <= 128) {
-      snapshot->set_root_type(in.root_type);
-      snapshot->set_descriptor_set(in.descriptor, in.descriptor_size);
-      snapshot->set_payload(in.payload, in.payload_size);
-      for (std::size_t i = 0; i < in.container_role_count; ++i)
-        snapshot->add_container_roles(in.container_roles[i]);
-      for (std::size_t i = 0; i < in.record_type_count; ++i)
-        snapshot->add_record_types(in.record_types[i]);
-    } else if (in.status == tracer::ValueSnapshot::Complete) {
-      snapshot->set_status(clangtracer::context::v1::ValueSnapshot::FAILED);
-      snapshot->set_detail("invalid snapshot storage or capture bounds");
-    }
-  }
+  if (v.snapshot)
+    copy_value_snapshot(*v.snapshot, *out.mutable_snapshot(), true);
   switch (v.type) {
   case tracer::ValueType::Int32:
   case tracer::ValueType::Bool:
@@ -5316,8 +5589,12 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
         i < p->argument_names.size() ? p->argument_names[i].c_str() : nullptr;
   try {
     value = p->callback(&invocation, instance, &succeeded);
+    // The bridge reports whether a hook exists for this phase and ran.
+    if (succeeded)
+      log_hook(*p, invocation, true);
   } catch (...) {
     succeeded = false;
+    log_hook(*p, invocation, false);
     // Class adapters disable only their failed invocation. Legacy callbacks
     // retain their existing probe-wide failure behavior.
     if (!p->class_callback)
@@ -5413,6 +5690,8 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
       tracer::TraceValue receiver;
       receiver.snapshot = ctx->receiver_snapshot;
       *event.mutable_receiver_snapshot() = to_proto_value(receiver).snapshot();
+      event.set_receiver_sampled_at_return(
+          ctx->phase == tracer::TracePhase::Post && p->receiver_sampled_at_return);
     }
     for (std::uint32_t i = 0;
          i < ctx->argument_count && i < tracer::kMaxArguments; ++i) {
@@ -5455,26 +5734,60 @@ extern "C" void tracer_event_dispatch(unsigned long long id,
         p->delivery.dropped.load(std::memory_order_relaxed));
     // Preserve the event when positional/named snapshot duplication exceeds
     // the native packet budget; the typed getter reports explicit truncation.
+    auto size = event.ByteSizeLong();
+    const auto exceeds_packet = [&] {
+      return size > (p->object_snapshot ? tracer::max_snapshot_wire_bytes :
+                                          tracer::EventTransport::kInlineEventBytes);
+    };
+    const auto sync_named_argument = [&](int index) {
+      for (auto &named : *event.mutable_named_arguments())
+        if (named.argument_index() == static_cast<unsigned>(index))
+          *named.mutable_value() = event.arguments(index);
+    };
+    // Dropping followed members first keeps the original record fields and
+    // the pointer addresses available within the existing event budget.
+    for (int i = 0; i < event.arguments_size() && exceeds_packet(); ++i) {
+      auto &value = *event.mutable_arguments(i);
+      if (value.has_snapshot() && !value.snapshot().members().empty()) {
+        value.mutable_snapshot()->clear_members();
+        sync_named_argument(i);
+        size = event.ByteSizeLong();
+      }
+    }
+    if (exceeds_packet() && event.has_result() &&
+        !event.result().snapshot().members().empty()) {
+      event.mutable_result()->mutable_snapshot()->clear_members();
+      size = event.ByteSizeLong();
+    }
+    if (exceeds_packet() && !event.receiver_snapshot().members().empty()) {
+      event.mutable_receiver_snapshot()->clear_members();
+      size = event.ByteSizeLong();
+    }
     const auto discard_snapshot = [](clangtracer::context::v1::ValueSnapshot *snapshot) {
       snapshot->Clear();
       snapshot->set_status(clangtracer::context::v1::ValueSnapshot::LIMIT_EXCEEDED);
       snapshot->set_detail("snapshot exceeds native event packet budget");
     };
-    for (int i = 0; i < event.arguments_size() && event.ByteSizeLong() > tracer::EventTransport::kInlineEventBytes; ++i) {
+    for (int i = 0; i < event.arguments_size() && exceeds_packet(); ++i) {
       auto &value = *event.mutable_arguments(i);
       if (!value.has_snapshot()) continue;
       discard_snapshot(value.mutable_snapshot());
-      for (auto &named : *event.mutable_named_arguments())
-        if (named.argument_index() == static_cast<unsigned>(i)) *named.mutable_value() = value;
+      sync_named_argument(i);
+      size = event.ByteSizeLong();
     }
-    if (event.ByteSizeLong() > tracer::EventTransport::kInlineEventBytes && event.has_result() && event.result().has_snapshot())
+    if (exceeds_packet() && event.has_result() && event.result().has_snapshot()) {
       discard_snapshot(event.mutable_result()->mutable_snapshot());
-    if (event.ByteSizeLong() > tracer::EventTransport::kInlineEventBytes && event.has_receiver_snapshot())
+      size = event.ByteSizeLong();
+    }
+    if (exceeds_packet() && event.has_receiver_snapshot()) {
       discard_snapshot(event.mutable_receiver_snapshot());
-    const bool base_fits = event.ByteSizeLong() <= tracer::EventTransport::kInlineEventBytes;
-    if (ctx->stack.status != tracer::StackStatus::Disabled)
+      size = event.ByteSizeLong();
+    }
+    const bool base_fits = !exceeds_packet();
+    if (ctx->stack.status != tracer::StackStatus::Disabled) {
       tracer::serialize_native_stack(ctx->stack, *event.mutable_stack());
-    const auto size = event.ByteSizeLong();
+      size = event.ByteSizeLong();
+    }
     if (base_fits && size <= static_cast<std::size_t>(std::numeric_limits<int>::max())) {
       packet->bytes.resize(size);
       valid =
@@ -5540,26 +5853,8 @@ bool tracer::detail::tracer_enqueue_log(const TraceContext *context,
   if (!owner || !owner->logging_enabled || !context || !message || size == 0)
     return false;
   auto *probe = find_probe(context->probe_id);
-  if (!probe)
-    return false;
-  auto &log = probe->log;
-  if (log.busy.test_and_set(std::memory_order_acquire))
-    return false;
-  const bool queued = log.count < log.entries.size();
-  if (queued) {
-    auto &entry = log.entries[log.count++];
-    entry.call_id = context->call_id;
-    entry.phase = context->phase;
-    entry.level = level;
-    size = std::min(size, CallbackLog::kMessageSize);
-    for (std::size_t i = 0; i < size; ++i) {
-      const auto byte = static_cast<unsigned char>(message[i]);
-      entry.message[i] = byte < 32 || byte == 127 ? '?' : message[i];
-    }
-    entry.message[size] = '\0';
-  }
-  log.busy.clear(std::memory_order_release);
-  return queued;
+  return probe &&
+         enqueue_agent_log(*probe, *context, level, nullptr, message, size);
 }
 
 extern "C" {
@@ -5630,6 +5925,8 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, error.c_str());
       return operation.finish(-1);
     }
+    p->receiver_sampled_at_return = specification.snapshot_receiver_at_return();
+    p->object_snapshot = specification.snapshot_report_unavailable();
     // Named tracing uses the target's own independently re-read DWARF and ELF
     // mappings. No dynamic symbol lookup is involved, including for local and
     // hidden functions. Raw-symbol requests retain their explicit dlsym path.
@@ -5649,6 +5946,8 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     }
     operation.stage = "validate_patch";
     p->request.original_entry = reinterpret_cast<std::uintptr_t>(entry);
+    p->request.patch_address = p->request.original_entry;
+    std::strcpy(p->request.patch_reason, "verified_entry_window");
     int prot = 0;
     std::uintptr_t map_lo = 0, map_hi = 0;
     if (!mapping(entry, map_lo, map_hi, prot) ||
@@ -5663,6 +5962,10 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       if (other && other->active.load() &&
           other->request.original_entry == p->request.original_entry) {
         const auto &prior = other->request;
+        if (prior.patch_backend != tracer::NativePatch::Entry) {
+          set_error(request, "target already has an active call-site or trap probe");
+          return operation.finish(-1);
+        }
         if (prior.patch_size > map_hi - p->request.original_entry) {
           set_error(request,
                     "target symbol address is already hooked by another probe");
@@ -5690,6 +5993,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       return operation.finish(-1);
     }
     tracer::native_detour::Patch target_patch;
+    bool entry_decoded = true;
     if (replaced) {
       // The live entry contains our jump. Decode the saved prologue at its
       // original address so RIP-relative operands keep their original targets.
@@ -5704,16 +6008,25 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
         set_error(request, error.c_str());
         return operation.finish(-1);
       }
-    } else if (!decode_patch(static_cast<const std::uint8_t *>(entry), p->request,
-                             target_patch, error,
-                             specification.debug_info().entry_size())) {
-      set_error(request, error.c_str());
-      return operation.finish(-1);
+    } else {
+      entry_decoded = decode_patch(static_cast<const std::uint8_t *>(entry), p->request,
+                                  target_patch, error,
+                                  specification.debug_info().entry_size());
     }
-    if (specification.has_debug_info() &&
+    if (entry_decoded && specification.has_debug_info() &&
         p->request.patch_size > specification.debug_info().entry_size()) {
       set_error(request, "safe patch window exceeds the verified function range");
       return operation.finish(-1);
+    }
+    operation.stage = "create_trampoline";
+    if (!entry_decoded || !tracer::native_detour::create_trampoline(
+                              target_patch, p->trampoline, p->mapping_size, error)) {
+      if (replaced || specification.native_backend() != "auto" ||
+          !prepare_getter_fallback(*p, specification)) {
+        set_error(request, error.c_str());
+        return operation.finish(-1);
+      }
+      error.clear();
     }
     for (std::size_t i = 0; i < a.retained; ++i) {
       auto *other = a.probes[i].get();
@@ -5721,23 +6034,33 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
         continue;
       }
       const auto &prior = other->request;
-      if (prior.original_entry == p->request.original_entry &&
+      const auto x = prior.patch_address, y = p->request.patch_address;
+      const auto xe = x + prior.patch_size, ye = y + p->request.patch_size;
+      const auto verified_start = p->request.original_entry;
+      const auto other_verified_start = prior.original_entry;
+      const bool overlaps = (x < ye && y < xe) ||
+          (p->request.verified_size && x < verified_start + p->request.verified_size &&
+           verified_start < xe) ||
+          (prior.verified_size && y < other_verified_start + prior.verified_size &&
+           other_verified_start < ye);
+      if (!overlaps)
+        continue;
+      // Older observers can outlive the detour that routed calls to them.
+      if (replaced && prior.patch_backend == tracer::NativePatch::Entry &&
+          prior.original_entry == p->request.original_entry &&
+          prior.patch_address == p->request.patch_address &&
           prior.patch_size == p->request.patch_size &&
           std::memcmp(prior.original, p->request.original, prior.patch_size) == 0)
         continue;
-      const auto x = other->request.original_entry,
-                 y = p->request.original_entry;
-      const auto xe = x + other->request.patch_size,
-                 ye = y + p->request.patch_size;
-      if (x < ye && y < xe) {
-        set_error(request, "target patch overlaps an already hooked function");
-        return operation.finish(-1);
-      }
-    }
-    operation.stage = "create_trampoline";
-    if (!tracer::native_detour::create_trampoline(
-            target_patch, p->trampoline, p->mapping_size, error)) {
-      set_error(request, error.c_str());
+      const auto *previous_entry = reinterpret_cast<const void *>(x);
+      std::uintptr_t previous_lo = 0, previous_hi = 0;
+      int previous_protection = 0;
+      if (mapping(previous_entry, previous_lo, previous_hi, previous_protection) &&
+          (previous_protection & (PROT_READ | PROT_EXEC)) == (PROT_READ | PROT_EXEC) &&
+          prior.patch_size <= previous_hi - x &&
+          std::memcmp(previous_entry, prior.original, prior.patch_size) == 0)
+        continue;
+      set_error(request, "target patch overlaps an already hooked function");
       return operation.finish(-1);
     }
     operation.progress("compile_callback");
@@ -5748,13 +6071,22 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, error.c_str());
       return operation.finish(-1);
     }
-    if (!tracer::native_detour::prepare_entry_jump(
-            target_patch, p->trampoline, p->mapping_size, p->wrapper,
-            {p->request.installed, p->request.patch_size}, error)) {
-      set_error(request, error.c_str());
-      return operation.finish(-1);
+    if (p->request.patch_backend == tracer::NativePatch::CallSite) {
+      if (!tracer::native_detour::prepare_call_relay(
+              p->request.patch_address, p->trampoline, p->mapping_size, p->wrapper,
+              {p->request.installed, p->request.patch_size}, p->request.relay_address, error)) {
+        set_error(request, error.c_str());
+        return operation.finish(-1);
+      }
+    } else if (p->request.patch_backend == tracer::NativePatch::Entry) {
+      if (!tracer::native_detour::prepare_entry_jump(
+              target_patch, p->trampoline, p->mapping_size, p->wrapper,
+              {p->request.installed, p->request.patch_size}, error)) {
+        set_error(request, error.c_str());
+        return operation.finish(-1);
+      }
+      p->entry_jump_size = target_patch.jump_size;
     }
-    p->entry_jump_size = target_patch.jump_size;
     p->request.jit_compile_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - compile_started).count();
@@ -6004,7 +6336,7 @@ extern "C" int tracer_agent_stop(tracer::Request *request) {
       return operation.finish(-1);
     }
     operation.stage = "verify_original_patch";
-    void *entry = reinterpret_cast<void *>(p->request.original_entry);
+    void *entry = reinterpret_cast<void *>(p->request.patch_address);
     std::uintptr_t lo = 0, hi = 0;
     int prot = 0;
     if (!mapping(entry, lo, hi, prot) ||
@@ -6018,6 +6350,7 @@ extern "C" int tracer_agent_stop(tracer::Request *request) {
         a.probes.begin(), a.probes.end(), [&](const auto &other) {
       return other && other.get() != p && other->active.load() &&
              other->session_id == p->session_id &&
+             other->request.patch_address == p->request.patch_address &&
              other->request.original_entry == p->request.original_entry &&
              other->request.patch_size == p->request.patch_size &&
              std::memcmp(other->request.original, p->request.original, p->request.patch_size) == 0 &&

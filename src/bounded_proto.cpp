@@ -153,7 +153,7 @@ bool BoundedProtoWriter::container_items(std::uint64_t total, std::size_t cap,
   selected = 0;
   if (status_ != CaptureStatus::ok)
     return false;
-  if (cap > 4096)
+  if (cap > std::min(limits_.item_cap, max_capture_items))
     return fail(CaptureStatus::invalid_cap);
   const auto count =
       static_cast<std::size_t>(std::min<std::uint64_t>(total, cap));

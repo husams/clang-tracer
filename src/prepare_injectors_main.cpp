@@ -9,6 +9,7 @@
 
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -25,8 +26,9 @@ namespace api = clangtracer::v1;
 namespace {
 std::string image_digest(
     const fs::path &path,
-    const std::function<void(const llvm::object::ELF64LEObjectFile &)> &inspect = {}) {
-  return llvm::fromHex(tracer::module_index::inspect_elf(path, inspect));
+    const std::function<void(const llvm::object::ELF64LEObjectFile &)> &inspect,
+    bool allow_aarch64) {
+  return llvm::fromHex(tracer::module_index::inspect_elf(path, inspect, {}, allow_aarch64));
 }
 
 } // namespace
@@ -37,6 +39,8 @@ int main(int argc, char **argv) {
     std::vector<std::string> headers;
     std::vector<std::string> extra_arguments;
     bool metadata_only = false;
+    bool receiver_storage = false;
+    std::vector<std::string> translation_units;
     bool member = false;
     for (int i = 1; i < argc; ++i) {
       const std::string option = argv[i];
@@ -55,8 +59,9 @@ int main(int argc, char **argv) {
                      "--module pins the package to an ELF image.\n";
         return 0;
       }
-      if (option == "--metadata-only" || option == "--member") {
-        auto &flag = option == "--metadata-only" ? metadata_only : member;
+      if (option == "--metadata-only" || option == "--member" || option == "--receiver-storage") {
+        auto &flag = option == "--metadata-only" ? metadata_only :
+                     option == "--member" ? member : receiver_storage;
         if (flag)
           throw std::runtime_error("duplicate option: " + option);
         flag = true;
@@ -66,7 +71,7 @@ int main(int argc, char **argv) {
           option != "--include" && option != "--selector" &&
           option != "--compdb" && option != "--translation-unit" &&
           option != "--module" && option != "--output" && option != "--extra-arg" &&
-          option != "--signature")
+          option != "--signature" && option != "--write-candidates")
         throw std::runtime_error("unknown option: " + option);
       if (++i == argc || std::string(argv[i]).empty())
         throw std::runtime_error("missing value for " + option);
@@ -74,9 +79,35 @@ int main(int argc, char **argv) {
         headers.push_back(fs::canonical(argv[i]).string());
       else if (option == "--extra-arg")
         extra_arguments.emplace_back(argv[i]);
+      else if (option == "--translation-unit") {
+        translation_units.emplace_back(argv[i]);
+        options.emplace(option, argv[i]);
+      }
       else if (!options.emplace(option, argv[i]).second)
         throw std::runtime_error("duplicate option: " + option);
     }
+    if (const auto writer = options.find("--write-candidates"); writer != options.end()) {
+      const auto separator = writer->second.rfind("::");
+      if (separator == std::string::npos || !options.count("--compdb") ||
+          !options.count("--output") || translation_units.empty())
+        throw std::invalid_argument("writer discovery requires TYPE::FIELD, --compdb, --translation-unit and --output");
+      for (auto &source : translation_units)
+        source = fs::canonical(source).string();
+      auto type = writer->second.substr(0, separator);
+      if (type.starts_with("::"))
+        type.erase(0, 2);
+      const auto candidates = tracer::client::discover_object_writers(type,
+          writer->second.substr(separator + 2), options.at("--compdb"), translation_units);
+      api::ObjectWatchRequest result;
+      for (const auto &candidate : candidates)
+        *result.add_source_writers() = candidate;
+      std::ofstream output(options.at("--output"), std::ios::binary);
+      if (!output || !result.SerializeToOstream(&output))
+        throw std::runtime_error("cannot write source writer candidates");
+      return 0;
+    }
+    if (translation_units.size() > 1)
+      throw std::invalid_argument("duplicate option: --translation-unit");
     for (const auto *option : {"--selector", "--output"})
       if (!options.count(option))
         throw std::runtime_error(std::string("missing required option: ") +
@@ -149,7 +180,7 @@ int main(int argc, char **argv) {
         if (elf_mode)
           elf_callable = tracer::client::resolve_elf_signature(
               object, options.at("--selector"), signature_option->second, member);
-      });
+      }, receiver_storage && !elf_mode);
     }
     std::string translation_unit;
     bool cl_driver = false;
@@ -169,7 +200,7 @@ int main(int argc, char **argv) {
         command.arguments.push_back(cl_driver ? "/clang:" + argument : argument);
       const auto resolve_adapter = [&](bool pointer_layouts) {
         auto callable = tracer::client::resolve_header_callable(
-            options.at("--selector"), context, command, pointer_layouts);
+            options.at("--selector"), context, command, pointer_layouts, receiver_storage);
         auto &adapter = *callable.spec.mutable_prepared();
         tracer::client::verify_prepared_adapter(options.at("--selector"), adapter,
                                                 callable, pointer_layouts);

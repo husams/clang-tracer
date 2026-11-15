@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import signal
 import subprocess
@@ -321,8 +322,10 @@ def main() -> int:
         target = server = threaded = None
         report: list[str] = []
         try:
+            drain_gate = Path(root, "pthread-drain.wait")
             target = subprocess.Popen([str(args.target)], stdout=target_log,
-                                      stderr=target_log)
+                                      stderr=target_log,
+                                      env={**os.environ, "TRACER_TEST_PTHREAD_DRAIN_GATE": str(drain_gate)})
             # Match the REPL's operation budget: installed schema preparation
             # includes parsing the complete target and standard-library types.
             server = subprocess.Popen([str(args.server), "--agent", str(args.agent),
@@ -599,11 +602,35 @@ def main() -> int:
                     re.search(r"shared_early=48\b", target_output),
                     "original join/early-return target functions did not preserve their results")
             remove(args.client, endpoint, target.pid, child_probe)
-            drain_started = time.monotonic()
             remove(args.client, endpoint, target.pid, join_probe)
-            task_drain_seconds = time.monotonic() - drain_started
-            require(task_drain_seconds >= .25,
-                    f"removal did not wait for accepted child tasks ({task_drain_seconds:.3f}s)")
+            early_probe, _ = trace_shared("shared_context_spawn_early(int)")
+            target_log_path = args.output_dir / "target.log"
+            drain_gate.touch()
+            drain = None
+            try:
+                deadline = time.monotonic() + 10
+                while "shared drain child blocked" not in target_log_path.read_text(
+                        encoding="utf-8", errors="replace"):
+                    require(time.monotonic() < deadline, "the traced child did not reach its drain gate")
+                    time.sleep(.025)
+                drain = subprocess.Popen(
+                    [str(args.client), "--endpoint", endpoint, "remove", str(target.pid), str(early_probe)],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                try:
+                    drain.wait(timeout=.25)
+                except subprocess.TimeoutExpired:
+                    pass
+                else:
+                    raise RuntimeError("probe removal finished while its accepted child was blocked")
+                drain_gate.unlink()
+                detail, _ = drain.communicate(timeout=30)
+                require(drain.returncode == 0, f"probe removal failed: {detail.decode(errors='replace')}")
+                require("shared drain child finished" in target_log_path.read_text(
+                    encoding="utf-8", errors="replace"),
+                    "probe removal returned before the accepted child finished")
+            finally:
+                drain_gate.unlink(missing_ok=True)
+                stop(drain)
             report.append("shared aliases, nested map/vector state, typed event decode, cross-probe order, and accepted pthread drain passed")
 
             # Stack metadata must survive the shared-context wire envelope and
@@ -629,6 +656,7 @@ def main() -> int:
             # A PRE callback failure on the child must not cancel the original
             # pthread target. Keep the outer shared-state probe active so the
             # child crosses the real scheduler propagation path.
+            join_probe, _ = trace_shared("shared_context_spawn_join(int)")
             failing_hook = shared_package / "shared-context-failing-pre.cpp"
             write_text(failing_hook, state_hook.read_text(encoding="utf-8").replace(
                 'state.request_id = "request-42";', 'throw 7;'))

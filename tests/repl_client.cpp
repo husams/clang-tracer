@@ -364,6 +364,22 @@ int main(int argc, char **argv) {
       Controller controller(settings, out);
       auto session = controller.attach(7);
       require(session.pid == 7, "selected session");
+      {
+        const auto listing_start = out.str().size();
+        controller.execute(parse_command("%sessions"));
+        require(out.str().substr(listing_start) == "* s1 pid=7 state=ATTACHED probes=0\n",
+                "sessions are listed one per line with the selection marked");
+        controller.execute(parse_command("%use s"));
+        require(out.str().find("selected session=s1\n", listing_start) != std::string::npos,
+                "a unique ID prefix selects a session");
+        try {
+          controller.execute(parse_command("%use missing"));
+          throw std::logic_error("selected an unknown session");
+        } catch (const std::runtime_error &error) {
+          require(std::string(error.what()).find("unknown session: missing") != std::string::npos,
+                  "unknown session IDs are reported");
+        }
+      }
       controller.inject(session, "multiply(int, int)",
                         "// client-only interceptor\n", Command{});
       require(service.installed == 1, "upload source by value");
@@ -575,7 +591,16 @@ int main(int argc, char **argv) {
         wait_for([&] { return !quiet.running(); });
         require(quiet.snapshot().timed_out && quiet.error().empty(),
                 "quiet stream deadline is reported");
+        // The finished range is still in scope but retained nothing, so it
+        // no longer holds the storage a new range needs.
+        auto next = tracer.events_async(session);
+        try {
+          (void)tracer.events_async(session);
+          throw std::logic_error("a running range shared its storage reservation");
+        } catch (const std::runtime_error&) {
+        }
       }
+      wait_for([&] { return service.active_watches == 0; });
       {
         auto abandoned = tracer.events_async(session);
         wait_for([&] { return service.active_watches == 1; });

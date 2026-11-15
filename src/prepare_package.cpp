@@ -51,7 +51,12 @@ api::PreparedInjector write_prepared_package(
   prepared.set_symbol(resolved.spec.symbol());
   *prepared.mutable_signature() = resolved.spec.signature();
   *prepared.mutable_argument_names() = resolved.spec.argument_names();
-  if (!module.empty() && module_index::inspect_elf(module) != llvm::toHex(llvm::ArrayRef<std::uint8_t>(
+  const bool arm_snapshot = !prepared.receiver_storage().empty() &&
+      prepared.target_triple().starts_with("aarch64-");
+  if (!module.empty() && module_index::inspect_elf(module, [&](const module_index::Elf &image) {
+        if (arm_snapshot != (image.getArch() == llvm::Triple::aarch64))
+          throw std::runtime_error("prepared receiver ABI does not match the ELF architecture");
+      }, {}, arm_snapshot) != llvm::toHex(llvm::ArrayRef<std::uint8_t>(
       reinterpret_cast<const std::uint8_t *>(digest.data()), digest.size()), true))
     throw std::runtime_error("module changed during preparation");
   if (prepared.ByteSizeLong() > 64 * 1024)

@@ -896,7 +896,9 @@ void run(const std::filesystem::path &server_path,
     do {
       lines = read_file(agent_log);
       if (lines.find("message=class?callback\n") != std::string::npos &&
-          lines.find("stage=runtime outcome=degraded") != std::string::npos)
+          lines.find("stage=runtime outcome=degraded") != std::string::npos &&
+          lines.find("operation=hook stage=pre outcome=failed") !=
+              std::string::npos)
         break;
       std::this_thread::sleep_for(50ms);
     } while (std::chrono::steady_clock::now() < deadline);
@@ -906,7 +908,9 @@ void run(const std::filesystem::path &server_path,
                                  "operation=stop stage=drain outcome=ok",
                                  "stage=runtime outcome=degraded",
                                  "message=legacy callback\n",
-                                 "message=class?callback\n"})
+                                 "message=class?callback\n",
+                                 "operation=hook stage=pre outcome=ok",
+                                 "operation=hook stage=pre outcome=failed"})
       require(lines.find(expected) != std::string::npos,
               std::string("missing agent diagnostic: ") + expected);
   }

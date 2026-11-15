@@ -45,3 +45,20 @@ add_executable(prepared-methods-target methods/target.cpp methods/account.cpp)
 # linkage and its typed metadata comes from account.hpp.
 target_compile_options(prepared-methods-target PRIVATE
   -g0 -O0 -fno-omit-frame-pointer -fcf-protection=none)
+
+add_executable(prepared-pointee-target pointee/target.cpp pointee/item.cpp)
+target_compile_options(prepared-pointee-target PRIVATE
+  -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
+
+add_executable(prepared-polymorphic-pointee-target
+  polymorphic-pointee/target.cpp polymorphic-pointee/item.cpp)
+set_target_properties(prepared-polymorphic-pointee-target PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+target_compile_options(prepared-polymorphic-pointee-target PRIVATE
+  -g -O0 -fno-omit-frame-pointer -fcf-protection=none -fvisibility=hidden)
+
+add_executable(prepared-pimpl-target pimpl/target.cpp pimpl/item.cpp)
+set_target_properties(prepared-pimpl-target PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+target_compile_options(prepared-pimpl-target PRIVATE
+  -g -O0 -fno-omit-frame-pointer -fcf-protection=none)

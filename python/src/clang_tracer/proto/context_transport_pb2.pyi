@@ -249,7 +249,7 @@ class TypedTraceValue(_message.Message):
     def __init__(self, value_type: _Optional[int] = ..., signed_value: _Optional[int] = ..., unsigned_value: _Optional[int] = ..., real_value: _Optional[float] = ..., snapshot: _Optional[_Union[ValueSnapshot, _Mapping]] = ...) -> None: ...
 
 class ValueSnapshot(_message.Message):
-    __slots__ = ("cpp_type", "root_type", "descriptor_set", "payload", "status", "detail", "container_roles", "record_types")
+    __slots__ = ("cpp_type", "root_type", "descriptor_set", "payload", "status", "detail", "container_roles", "record_types", "members")
     class Status(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         UNSPECIFIED: _ClassVar[ValueSnapshot.Status]
@@ -270,6 +270,7 @@ class ValueSnapshot(_message.Message):
     DETAIL_FIELD_NUMBER: _ClassVar[int]
     CONTAINER_ROLES_FIELD_NUMBER: _ClassVar[int]
     RECORD_TYPES_FIELD_NUMBER: _ClassVar[int]
+    MEMBERS_FIELD_NUMBER: _ClassVar[int]
     cpp_type: str
     root_type: str
     descriptor_set: bytes
@@ -278,7 +279,16 @@ class ValueSnapshot(_message.Message):
     detail: str
     container_roles: _containers.RepeatedScalarFieldContainer[str]
     record_types: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, cpp_type: _Optional[str] = ..., root_type: _Optional[str] = ..., descriptor_set: _Optional[bytes] = ..., payload: _Optional[bytes] = ..., status: _Optional[_Union[ValueSnapshot.Status, str]] = ..., detail: _Optional[str] = ..., container_roles: _Optional[_Iterable[str]] = ..., record_types: _Optional[_Iterable[str]] = ...) -> None: ...
+    members: _containers.RepeatedCompositeFieldContainer[SnapshotMember]
+    def __init__(self, cpp_type: _Optional[str] = ..., root_type: _Optional[str] = ..., descriptor_set: _Optional[bytes] = ..., payload: _Optional[bytes] = ..., status: _Optional[_Union[ValueSnapshot.Status, str]] = ..., detail: _Optional[str] = ..., container_roles: _Optional[_Iterable[str]] = ..., record_types: _Optional[_Iterable[str]] = ..., members: _Optional[_Iterable[_Union[SnapshotMember, _Mapping]]] = ...) -> None: ...
+
+class SnapshotMember(_message.Message):
+    __slots__ = ("name", "snapshot")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    snapshot: ValueSnapshot
+    def __init__(self, name: _Optional[str] = ..., snapshot: _Optional[_Union[ValueSnapshot, _Mapping]] = ...) -> None: ...
 
 class TraceArgument(_message.Message):
     __slots__ = ("index", "name", "value")

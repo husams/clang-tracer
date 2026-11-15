@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <string_view>
 
 #include <clang/AST/DeclCXX.h>
 #include <clang/AST/RecursiveASTVisitor.h>
@@ -153,6 +154,16 @@ public:
         marker += "};\n";
       }
       marker += "#pragma clang diagnostic pop\n/*__TRACER_CONTEXT_PLACEHOLDER_END__*/\n";
+      // The marker adds lines. Restore the numbering so diagnostics for the
+      // rest of the body name the lines the user wrote.
+      if (const auto presumed = sm.getPresumedLoc(body); presumed.isValid()) {
+        marker += "#line " + std::to_string(presumed.getLine()) + " \"";
+        for (const char c : std::string_view(presumed.getFilename())) {
+          if (c == '"' || c == '\\') marker += '\\';
+          marker += c;
+        }
+        marker += "\"\n";
+      }
       inserts.push_back({sm.getFileOffset(body) + 1, std::move(marker)});
     }
     return true;
@@ -392,11 +403,13 @@ private:
 ContextHookParseCopy prepare_context_hook_parse_copy(
     const std::string &source,
     const std::vector<std::string> &compiler_arguments,
-    const std::string &file_name) {
+    const std::string &file_name,
+    const PreparedAdapterRegion &prepared_adapter) {
   ContextHookParseCopy result;
+  const std::string prefix = "#include \"tracer/callback.hpp\"\n";
   clang::IgnoringDiagConsumer ignore_diagnostics;
   auto ast = clang::tooling::buildASTFromCodeWithArgs(
-      "#include \"tracer/callback.hpp\"\n" + source,
+      prefix + source,
       clang_driver_arguments(compiler_arguments), file_name,
       "clang-context-preparse",
       std::make_shared<clang::PCHContainerOperations>(),
@@ -411,6 +424,23 @@ ContextHookParseCopy prepare_context_hook_parse_copy(
   if (!discovery.error.empty()) { result.error = discovery.error; return result; }
   auto &sm = ast->getSourceManager();
   result.source = sm.getBufferData(sm.getMainFileID()).str();
+  // Insert offsets and the region both live in the prefixed buffer. Translate
+  // the region from those original offsets before any insert is applied.
+  std::size_t shift = prefix.size();
+  const std::size_t region_begin = prepared_adapter.offset + prefix.size();
+  const std::size_t region_end = region_begin + prepared_adapter.size;
+  if (prepared_adapter.size != 0) {
+    for (const auto &insert : discovery.inserts) {
+      if (insert.offset > region_begin && insert.offset < region_end) {
+        result.error = "invalid_context_parse: placeholder insertion inside "
+                       "the prepared adapter region";
+        return result;
+      }
+      if (insert.offset <= region_begin) shift += insert.text.size();
+    }
+    result.prepared_adapter = prepared_adapter;
+    result.prepared_adapter.offset = prepared_adapter.offset + shift;
+  }
   std::sort(discovery.inserts.begin(), discovery.inserts.end(),
       [](const auto &a, const auto &b) { return a.offset > b.offset; });
   for (const auto &insert : discovery.inserts)
