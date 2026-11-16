@@ -1,0 +1,44 @@
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+
+namespace tracer::live {
+
+inline constexpr std::size_t max_entries = 256;
+inline constexpr std::size_t default_payload_bytes = 16 * 1024 * 1024;
+inline constexpr std::size_t max_report_bytes = 16 * 1024 * 1024;
+inline constexpr auto max_input_bytes = std::numeric_limits<int>::max();
+inline constexpr std::uint64_t agent_magic = 0x4c49564500000005ULL;
+inline constexpr auto extension_grace_seconds = 5;
+
+struct AgentRequest {
+  enum class Action : std::uint32_t {
+    stage, discard, status, launch, poll, publication_result, stage_poll, stage_abandon
+  };
+  enum class Publication : std::uint32_t { none, install, restore };
+  enum class CodeOutcome : std::uint32_t { unchanged, installed, stale, uncertain };
+  std::uint64_t version = agent_magic;
+  Action action = Action::status;
+  std::uint32_t count = 0;
+  std::uint64_t input = 0;
+  std::uint64_t input_size = 0;
+  std::uint64_t input_limit = default_payload_bytes;
+  std::uint64_t token = 0;
+  std::uint64_t output = 0;
+  std::uint64_t output_capacity = 0;
+  std::uint64_t output_size = 0;
+  std::uint32_t ready = 0;
+  Publication publication = Publication::none;
+  CodeOutcome code_outcome = CodeOutcome::unchanged;
+  std::uint64_t retained = 0;
+  std::uint64_t limit = 0;
+  std::array<std::uint64_t, max_entries> addresses{};
+  std::array<std::uint64_t, max_entries> mapping_begin{};
+  std::array<std::uint64_t, max_entries> mapping_size{};
+  char error[2048]{};
+};
+
+} // namespace tracer::live

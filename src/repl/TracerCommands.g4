@@ -4,7 +4,7 @@ line : '%' command EOF;
 command : server | attach | processes | sessions | use | status | detach
         | modules | moduleIndex | threads | symbols | probe | interceptor | events | collect | record
         | cpp | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload
-        | objectWatch | objectProbe;
+        | objectWatch | objectProbe | liveUpdate;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
 serverOption : ('--executable' | '--agent') value | contextEventBytes;
 attach : 'attach' (UINT ('--start-time' UINT)?)?;
@@ -83,7 +83,8 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'import'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
         | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview' | 'apply'
-        | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | 'object' | 'object-probe' | STACK;
+        | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | 'object' | 'object-probe'
+        | 'live' | 'update' | 'revert' | 'mock' | 'update-data' | 'scan-heap' | 'watch' | RECOVER | STACK;
 objectProbe : 'object-probe' ('prepare' value objectProbePrepareOption+
                             | ('preview' | 'start') objectProbeBindOption+
                             | ('status' | 'stop') UINT?);
@@ -93,6 +94,15 @@ objectProbePrepareOption : ('--include' | '--compdb' | '--translation-unit' | '-
 objectProbeBindOption : ('--package' | '--module' | '--method-module'
                          | '--union-tag' | '--union-case' | '--synchronization') value
                       | '--follow-calls' | '--no-values' | '--first-seen';
+liveUpdate : 'live' (('update' | 'preview' | 'watch') (value | liveOption)+ | 'status' | RECOVER | 'revert' UINT?
+                   | 'mock' value liveOption+ | 'update-data' value (liveOption | liveScanSelection)*
+                   | 'scan-heap' liveOption+);
+liveScanSelection : '--from-scan' value+;
+liveOption : ('--build' | '--compdb' | '--file' | '--function' | '--fixture' | '--bind'
+              | '--recursion' | '--discover-file' | '--discover-function' | '--module'
+              | '--address' | '--type'
+              | '--after-file' | '--after-function' | '--for-each' | '--managed') value
+           | ('--retention-limit' | PAYLOAD_LIMIT) UINT;
 objectWatch : 'object' ('prepare' value? objectOption+ | ('start' | 'preview') objectOption+
                         | ('stop' | 'status') UINT?);
 objectOption : ('--type' | '--base' | '--owner' | '--field' | '--collection'
@@ -132,5 +142,7 @@ CWD : '--cwd';
 SIGNATURE : '--signature';
 MEMBER : '--member';
 SNAPSHOT_RETURN_POINTEE : '--snapshot-return-pointee';
+RECOVER : 'recover';
+PAYLOAD_LIMIT : '--payload-limit';
 WORD : ~[ \t\r\n"'\\%`]+;
 WS : [ \t\r\n]+ -> skip;
