@@ -70,6 +70,9 @@ def event_fields(event):
 
 
 def run(args):
+    def dwarf_dump(path, *sections):
+        return subprocess.check_output([args.dwarfdump, *sections, str(path)], text=True)
+
     with tempfile.TemporaryDirectory(prefix="ct-type-object-probe-") as temporary, ExitStack() as cleanup:
         root = Path(temporary).resolve()
         build = root / "build-context"
@@ -430,7 +433,7 @@ public:
 };
 """)
 
-        debug_flag = "-gdwarf-4" if args.legacy_dwarf4 else "-g"
+        debug_flag = "-gdwarf-5"
         compile_args = [str(args.cxx), "-std=c++20", debug_flag, "-O0", "-fPIC", "-fno-inline",
                         "-fpatchable-function-entry=8",
                         f"-I{generated}", f"-I{root}", "-DCOUNTER_PAD_BYTES=13",
@@ -563,43 +566,39 @@ public:
         assert "demo::CtorOnly::~CtorOnly()" not in nm, nm
         assert "demo::IdentityC1EBase::IdentityC1EBase(int)" in nm, nm
         assert "demo::IdentityC1EBase::get() const" in nm, nm
-        dwarf = subprocess.run(["readelf", "--debug-dump=info", "--wide", str(library)],
-                               check=True, text=True, stdout=subprocess.PIPE).stdout
+        dwarf = dwarf_dump(library, "--debug-info", "--debug-types")
         assert "Counter" in dwarf and "value_" in dwarf
-        assert "Contents of the .debug_types section" in dwarf and "UnitDerived" in dwarf, dwarf
-        hidden_dwarf = subprocess.run(["readelf", "--debug-dump=info", "--wide",
-                                       str(hidden_object)], check=True, text=True,
-                                      stdout=subprocess.PIPE).stdout
+        assert ".debug_types contents:" in dwarf and "UnitDerived" in dwarf, dwarf
+        hidden_dwarf = dwarf_dump(hidden_object, "--debug-info")
         assert "DW_TAG_compile_unit" in hidden_dwarf and "DW_AT_stmt_list" in hidden_dwarf, hidden_dwarf
         assert not re.search(r"DW_TAG_(?:class_type|structure_type)", hidden_dwarf), hidden_dwarf
         if clang:
             top_level = re.findall(
-                r"^ *<1><[0-9a-f]+>:[^\n]*\(DW_TAG_subprogram\)\n(.*?)(?=^ *<\d+><|\Z)",
+                r"^0x[0-9a-f]+: {3}DW_TAG_subprogram\n(.*?)(?=^0x[0-9a-f]+:|\Z)",
                 hidden_dwarf, re.M | re.S)
-            assert any(re.search(r"DW_AT_name[^\n]*\bHiddenDerived$", fields, re.M)
+            assert any(re.search(r'DW_AT_name\s+\("HiddenDerived"\)', fields)
                        and "DW_AT_linkage_name" not in fields
                        and "DW_AT_object_pointer" not in fields
                        for fields in top_level), hidden_dwarf
-            nodebug_dwarf = subprocess.check_output(
-                ["readelf", "--debug-dump=info", "--wide", str(nodebug_object)], text=True)
+            nodebug_dwarf = dwarf_dump(nodebug_object, "--debug-info")
             records = re.findall(
-                r"\(DW_TAG_(?:class|structure)_type\)\n(.*?)(?=^ *<\d+><|\Z)",
+                r"DW_TAG_(?:class|structure)_type\n(.*?)(?=^0x[0-9a-f]+:|\Z)",
                 nodebug_dwarf, re.M | re.S)
             for name in ("NodebugDerived", "hash", "exception", "_IO_FILE",
                          "basic_ostream", "tm", "__dirstream", "runtime_error"):
                 matches = [fields for fields in records
-                           if re.search(rf"DW_AT_name[^\n]*\b{re.escape(name)}$", fields, re.M)]
-                assert matches and all("DW_AT_declaration" in fields for fields in matches), (name, matches)
-            assert re.search(r"DW_AT_name[^\n]*\bhash\n[^\n]*DW_AT_declaration[^\n]*\n"
-                             r"[^\n]*DW_TAG_template_type_param[^\n]*\n"
-                             r"[^\n]*DW_AT_type[^\n]*\bNodebugHashKey$", nodebug_dwarf, re.M)
+                           if re.search(rf'DW_AT_name\s+\("{re.escape(name)}"\)', fields)]
+                assert matches and all(re.search(r"DW_AT_declaration\s+\(true\)", fields)
+                                       for fields in matches), (name, matches)
+            assert re.search(r'DW_AT_name\s+\("hash"\)\s*DW_AT_declaration\s+\(true\)\s*'
+                             r'0x[0-9a-f]+: +DW_TAG_template_type_parameter\s+'
+                             r'DW_AT_type[^\n]*"NodebugHashKey"', nodebug_dwarf)
             nodebug_symbols = subprocess.check_output(["nm", "-C", str(nodebug_object)], text=True)
             assert "NodebugDerived::NodebugDerived" not in nodebug_symbols, nodebug_symbols
             assert "std::hash<NodebugHashKey>::hash(" not in nodebug_symbols, nodebug_symbols
-        hidden_lines = subprocess.run(["readelf", "--debug-dump=decodedline", "--wide",
-                                       str(hidden_object)], check=True, text=True,
-                                      stdout=subprocess.PIPE).stdout
-        assert "hidden-derived.cpp" in hidden_lines and re.search(r"\b[1-9]\d*\s+0x[0-9a-f]+", hidden_lines), hidden_lines
+        hidden_lines = dwarf_dump(hidden_object, "--debug-line")
+        assert "hidden-derived.cpp" in hidden_lines and re.search(
+            r"^0x[0-9a-f]+ +[1-9]\d*\s", hidden_lines, re.M), hidden_lines
         target_relocations = subprocess.run(["readelf", "--relocs", "--wide", str(target)],
                                             check=True, text=True,
                                             stdout=subprocess.PIPE).stdout
@@ -619,8 +618,7 @@ public:
             r"^[0-9a-f]+ <[^\n>]*HiddenDerived::HiddenDerived[^\n>]*>:\n"
             r"(?:(?!\n\n)[\s\S])*?\b(?:callq?|bl)\s+[^\n]*"
             r"<demo::IdentityC1EBase::IdentityC1EBase\(int\)>", disassembly, re.M), disassembly
-        target_dwarf = subprocess.run(["readelf", "--debug-dump=info", "--wide", str(target)],
-                                      check=True, text=True, stdout=subprocess.PIPE).stdout
+        target_dwarf = dwarf_dump(target, "--debug-info")
         for caller in ("identity_main_roundtrip", "identity_set_through_c",
                        "cycle",
                        "identity_get_through_c"):
@@ -1222,6 +1220,5 @@ if __name__ == "__main__":
     for name in ("repl", "server", "agent"):
         parser.add_argument(name, type=lambda path: Path(path).resolve())
     parser.add_argument("cxx")
-    parser.add_argument("--legacy-dwarf4", action="store_true",
-                        help="use DWARF 4 for SDK linkers that cannot preserve DWARF 5 forms")
+    parser.add_argument("--dwarfdump", default="llvm-dwarfdump")
     run(parser.parse_args())
