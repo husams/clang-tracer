@@ -954,7 +954,9 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     for (const auto &external : external_recipe_inputs)
       for (const auto &dependency : unit.inputs) {
         std::error_code error;
-        if (external == dependency || fs::equivalent(external, dependency, error))
+        const auto canonical_external = fs::canonical(external, error);
+        const bool same_path = !error && canonical_external == fs::canonical(dependency, error) && !error;
+        if (external == dependency || same_path)
           throw std::runtime_error("native dependency outside the build source root cannot be updated: " +
                                    external);
       }

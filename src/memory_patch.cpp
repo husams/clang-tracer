@@ -39,8 +39,8 @@ void verify_patch_mappings(std::uint32_t pid, const std::vector<api::MemoryMappi
     std::getline(row >> std::ws, path);
     for (const auto &mapping : mappings) {
       if (mapping.begin_address() == begin && mapping.end_address() == end &&
-          mapping.file_offset() == offset && mapping.inode() == inode &&
-          mapping.permissions() == permissions && mapping.device() == device &&
+          mapping.file_offset() == offset &&
+          mapping.permissions() == permissions &&
           mapping.path() == path)
         ++matched;
     }
@@ -58,12 +58,6 @@ std::size_t page_extent(std::uint32_t size) {
   return (size + page - 1) / page * page;
 }
 
-std::string device_string(dev_t device) {
-  std::ostringstream out;
-  out << std::hex << std::setfill('0') << std::setw(2) << major(device)
-      << ':' << std::setw(2) << minor(device);
-  return out.str();
-}
 } // namespace
 
 void Session::write_memory_patch_locked(MemoryPatchRecord &record, bool restore,
@@ -149,18 +143,15 @@ api::MemoryAllocation Session::allocate_memory(std::uint32_t size) {
   if (allocations_.size() >= 64)
     throw std::runtime_error("session allocation history reached its limit of 64");
   constexpr long memfd_create = 319; // Linux x86-64 syscall number.
-  const FileDescriptor file{static_cast<int>(::syscall(memfd_create, "clang-tracer-memory", 1u /* MFD_CLOEXEC */))};
+  const auto name = "clang-tracer-memory-" + id_ + "-" + std::to_string(allocations_.size() + 1);
+  const FileDescriptor file{static_cast<int>(::syscall(memfd_create, name.c_str(), 1u /* MFD_CLOEXEC */))};
   if (file.fd < 0 || ::ftruncate(file.fd, page_extent(size)) < 0)
     throw std::system_error(errno, std::generic_category(), "create target allocation backing");
-  struct stat info {};
-  if (::fstat(file.fd, &info) < 0)
-    throw std::system_error(errno, std::generic_category(), "identify target allocation backing");
   const auto path = proc::directory(::getpid()) / "fd" / std::to_string(file.fd);
   AllocationRecord record;
   record.value.set_id(allocations_.size() + 1);
   record.value.set_size(size);
-  record.device = device_string(info.st_dev);
-  record.inode = info.st_ino;
+  record.path = "/memfd:" + name + " (deleted)";
   allocations_.push_back(std::move(record));
   auto &pending = allocations_.back();
   injector::Process process;
@@ -196,9 +187,7 @@ void Session::free_memory_locked(AllocationRecord &record,
   mapping.set_begin_address(address);
   mapping.set_end_address(address + size);
   mapping.set_permissions("rw-p");
-  mapping.set_device(record.device);
-  mapping.set_inode(record.inode);
-  mapping.set_path("/memfd:clang-tracer-memory (deleted)");
+  mapping.set_path(record.path);
   injector::Process process;
   try {
     attach_process(process, deadline);
@@ -244,10 +233,30 @@ api::TargetLibrary Session::load_target_library(std::string path) {
   if (state_ != api::Session::ATTACHED || unsafe_target_ || instructions_ || page_monitor_)
     throw std::runtime_error("library injection requires an attached session with no active instruction or page capture");
   const auto target_path = proc::directory(pid_) / "root" / path.substr(1);
+  const FileDescriptor target_file{::open(target_path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK)};
   struct stat target {};
-  if (::stat(target_path.c_str(), &target) < 0 ||
-      target.st_ino != library.st_ino || target.st_dev != library.st_dev)
-    throw std::invalid_argument("library is not the same file in the target filesystem");
+  if (target_file.fd < 0 || ::fstat(target_file.fd, &target) < 0 ||
+      !S_ISREG(target.st_mode) || target.st_size != library.st_size)
+    throw std::invalid_argument("library content differs in the target filesystem");
+  std::array<char, 65536> local_bytes{}, target_bytes{};
+  for (off_t offset = 0; offset < library.st_size;) {
+    const auto count = std::min<off_t>(local_bytes.size(), library.st_size - offset);
+    if (::pread(file.fd, local_bytes.data(), count, offset) != count ||
+        ::pread(target_file.fd, target_bytes.data(), count, offset) != count ||
+        std::memcmp(local_bytes.data(), target_bytes.data(), count))
+      throw std::invalid_argument("library content differs in the target filesystem");
+    offset += count;
+  }
+  const auto unchanged = [](int fd, const struct stat &before) {
+    struct stat after{};
+    return !::fstat(fd, &after) && after.st_size == before.st_size &&
+        after.st_mtim.tv_sec == before.st_mtim.tv_sec &&
+        after.st_mtim.tv_nsec == before.st_mtim.tv_nsec &&
+        after.st_ctim.tv_sec == before.st_ctim.tv_sec &&
+        after.st_ctim.tv_nsec == before.st_ctim.tv_nsec;
+  };
+  if (!unchanged(file.fd, library) || !unchanged(target_file.fd, target))
+    throw std::invalid_argument("library changed while comparing target filesystem content");
   api::TargetLibrary result;
   result.set_path(path);
   if (resident_libraries_.count(path))

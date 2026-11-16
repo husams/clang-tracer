@@ -418,6 +418,14 @@ if(BUILD_TESTING)
       --expected-module ${CMAKE_CURRENT_BINARY_DIR}/stripped-modules/$<TARGET_FILE_NAME:trace-stack-a>
       --expected-module ${CMAKE_CURRENT_BINARY_DIR}/stripped-modules/$<TARGET_FILE_NAME:trace-stack-b>)
   set_tests_properties(native_admission_stripped_integration PROPERTIES TIMEOUT 30)
+  add_executable(mapped-elf-checks tests/mapped_elf_checks.cpp)
+  target_include_directories(mapped-elf-checks PRIVATE ${LLVM_INCLUDE_DIRS})
+  target_link_libraries(mapped-elf-checks PRIVATE tracer_compat LLVM ${CMAKE_DL_LIBS})
+  add_library(mapped-elf-no-id SHARED tests/fixtures/object_shared_writer/library.cpp)
+  target_link_options(mapped-elf-no-id PRIVATE "LINKER:--build-id=none")
+  add_test(NAME mapped_elf_content_identity COMMAND mapped-elf-checks
+    $<TARGET_FILE:call-stacks-calculator> $<TARGET_FILE:mapped-elf-no-id>)
+
   add_executable(module-identity-integration tests/module_identity_integration.cpp src/admission.cpp)
   target_include_directories(module-identity-integration PRIVATE src ${LLVM_INCLUDE_DIRS})
   target_link_libraries(module-identity-integration PRIVATE tracer_compat LLVM ${CMAKE_DL_LIBS})

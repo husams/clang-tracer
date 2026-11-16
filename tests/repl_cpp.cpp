@@ -60,6 +60,8 @@ void check_confirmed_local_mappings() {
       "7f000000b000-zz r--p 00000000 08:11 55 /bad/range.so\n";
   const auto exact = module_mapping(0x7f0000001000, 0x7f0000003000, 0x1000, "fd:01", 1234, "/lib/libx.so");
   require(confirmed_count(exact, maps) == 1, "exact mapping is confirmed");
+  require(confirmed_count(module_mapping(0x7f0000001000, 0x7f0000003000, 0x1000, "00:00", 0,
+                                         "/lib/libx.so"), maps) == 1, "zero inode is display metadata only");
   require(confirmed_count(module_mapping(0x7f0000001000, 0x7f0000003000, 0x1000, "fd:01", 1234,
                                          "/lib/libx.so"), "") == 0,
           "empty maps confirm nothing");
@@ -70,9 +72,9 @@ void check_confirmed_local_mappings() {
   require(confirmed_count(module_mapping(0x7f0000001000, 0x7f0000003000, 0x2000, "fd:01", 1234,
                                          "/lib/libx.so"), maps) == 0, "offset must match");
   require(confirmed_count(module_mapping(0x7f0000001000, 0x7f0000003000, 0x1000, "fd:02", 1234,
-                                         "/lib/libx.so"), maps) == 0, "device must match");
+                                         "/lib/libx.so"), maps) == 1, "device mismatch does not reject a path/range match");
   require(confirmed_count(module_mapping(0x7f0000001000, 0x7f0000003000, 0x1000, "fd:01", 1235,
-                                         "/lib/libx.so"), maps) == 0, "inode must match");
+                                         "/lib/libx.so"), maps) == 1, "inode mismatch does not reject a path/range match");
   require(confirmed_count(module_mapping(0x7f0000001000, 0x7f0000003000, 0x1000, "fd:01", 1234,
                                          "/lib/liby.so"), maps) == 0, "path must match");
   require(confirmed_count(module_mapping(0x7f0000001000, 0x7f0000003000, 0x1000, "fd:01", 1234,

@@ -4,6 +4,9 @@
 
 #if defined(__linux__) && defined(__x86_64__)
 #include "../proc_identity.hpp"
+#include "../mapped_elf.hpp"
+#include "../linux_syscalls.hpp"
+#include <sys/uio.h>
 
 #include <algorithm>
 #include <array>
@@ -117,18 +120,17 @@ std::vector<EventSource> allocator_sources(const std::filesystem::path &process)
   if (!(std::ifstream("/sys/bus/event_source/devices/uprobe/type") >> pmu_type) || !pmu_type)
     throw std::runtime_error("Linux uprobe PMU is unavailable");
   struct Image {
-    std::uint64_t inode;
-    unsigned major, minor;
+    std::uint64_t begin = 0, end = 0, offset = 0;
   };
   std::map<std::string, Image> images;
   std::ifstream maps(process / "maps");
   for (std::string line; std::getline(maps, line);) {
     std::istringstream row(line);
-    std::string range, perms, offset;
+    std::string perms, device, inode;
     Image image{};
-    char colon;
-    if (!(row >> range >> perms >> offset >> std::hex >> image.major >> colon >>
-          image.minor >> std::dec >> image.inode) || colon != ':' || perms != "r-xp")
+    char dash;
+    if (!(row >> std::hex >> image.begin >> dash >> image.end >> perms >> image.offset >>
+          device >> inode) || dash != '-' || perms != "r-xp")
       continue;
     std::string path;
     std::getline(row >> std::ws, path);
@@ -146,8 +148,7 @@ std::vector<EventSource> allocator_sources(const std::filesystem::path &process)
   const auto target = (process / "root" / path.substr(1)).string();
   struct stat info{};
   if (::stat(target.c_str(), &info) != 0 || !S_ISREG(info.st_mode) ||
-      info.st_ino != identity.inode || major(info.st_dev) != identity.major ||
-      minor(info.st_dev) != identity.minor || info.st_size <= 0 || info.st_size > 64 * 1024 * 1024)
+      info.st_size <= 0 || info.st_size > 64 * 1024 * 1024)
     throw std::runtime_error("cannot verify mapped glibc file for allocation profiling");
   auto binary = llvm::object::createBinary(target);
   if (!binary) {
@@ -157,6 +158,23 @@ std::vector<EventSource> allocator_sources(const std::filesystem::path &process)
   const auto *object = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(binary->getBinary());
   if (!object || object->getArch() != llvm::Triple::x86_64)
     throw std::runtime_error("allocation profiling requires an x86-64 glibc ELF");
+  const auto bias = tracer::detail::mapped_elf_bias(*object, identity.begin, identity.end, identity.offset);
+  const auto pid = std::stoul(process.filename().string());
+  if (!bias || !tracer::detail::matches_mapped_elf(*object, *bias, [&](auto address, auto expected) {
+        std::array<char, 4096> bytes;
+        while (!expected.empty()) {
+          const auto size = std::min(expected.size(), bytes.size());
+          iovec local{bytes.data(), size}, remote{reinterpret_cast<void *>(address), size};
+          if (tracer::linux_api::process_vm_readv(pid, &local, 1, &remote, 1, 0) !=
+                  static_cast<ssize_t>(size) ||
+              std::string_view(bytes.data(), size) != expected.substr(0, size))
+            return false;
+          address += size;
+          expected.remove_prefix(size);
+        }
+        return true;
+      }))
+    throw std::runtime_error("mapped glibc content differs from the profiling ELF");
   const auto &elf = object->getELFFile();
   auto programs = elf.program_headers();
   if (!programs) {

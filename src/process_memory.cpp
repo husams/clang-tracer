@@ -1,6 +1,7 @@
 #include "process_memory.hpp"
 
 #include "debug_resolver.hpp"
+#include "mapped_elf.hpp"
 #include "linux_syscalls.hpp"
 #include "native_entry.hpp"
 #include "proc_identity.hpp"
@@ -227,9 +228,23 @@ api::ListMemoryMappingsResponse parse_mappings(const std::string &text,
 
 std::string token_prefix(const Session &session) { return session.id() + ":mem:"; }
 
+std::string mapping_layout(const std::string &maps) {
+  std::istringstream input(maps);
+  std::string result, line;
+  while (std::getline(input, line)) {
+    std::istringstream row(line);
+    std::string range, permissions, offset, device, inode, path;
+    if (!(row >> range >> permissions >> offset >> device >> inode))
+      throw MemoryError(Code::ABORTED, "cannot parse target mapping snapshot");
+    std::getline(row >> std::ws, path);
+    result += range + " " + permissions + " " + offset + " " + path + "\n";
+  }
+  return result;
+}
+
 std::string mapping_token(const Session &session, const std::string &maps) {
   llvm::SHA256 hash;
-  hash.update(maps);
+  hash.update(mapping_layout(maps));
   return token_prefix(session) + llvm::toHex(hash.final(), true);
 }
 
@@ -279,7 +294,7 @@ grpc::Status inspect_snapshot(grpc::ServerContext &context, Session &session,
     if (mapping_token(session, maps) != token)
       throw MemoryError(Code::ABORTED, "memory mapping snapshot is stale; run %memory maps again");
     operation(target, parse_mappings(maps, target));
-    if (maps != target.maps())
+    if (mapping_layout(maps) != mapping_layout(target.maps()))
       throw MemoryError(Code::ABORTED, "target mappings changed during inspection; run %memory maps again");
     target.verify_live();
   });
@@ -350,46 +365,20 @@ std::pair<std::uint64_t, Entry::Boundary> function_boundary(
   return {*sizes.begin(), Entry::EH_FRAME};
 }
 
-bool mapped_build_id_matches(const Target &target,
-                             const api::ListMemoryMappingsResponse &snapshot,
-                             const Object &object, const api::MemoryMapping &entry,
-                             std::uint64_t bias) {
-  const auto id = llvm::object::getBuildID(&object);
-  if (id.empty() || id.size() > 64)
-    return false;
-  const auto *file = reinterpret_cast<const std::uint8_t *>(
-      object.getMemoryBufferRef().getBufferStart());
-  const auto offset = static_cast<std::uint64_t>(id.data() - file);
-  auto programs = object.getELFFile().program_headers();
-  if (!programs) {
-    llvm::consumeError(programs.takeError());
-    return false;
-  }
-  for (const auto &segment : *programs) {
-    if (segment.p_type != llvm::ELF::PT_LOAD || offset < segment.p_offset)
-      continue;
-    const auto delta = offset - segment.p_offset;
-    if (delta >= segment.p_filesz || id.size() > segment.p_filesz - delta ||
-        segment.p_vaddr > UINT64_MAX - bias ||
-        delta > UINT64_MAX - bias - segment.p_vaddr)
-      continue;
-    const auto address = bias + segment.p_vaddr + delta;
-    if (id.size() > UINT64_MAX - address)
-      continue;
-    const auto note_mapping = std::find_if(snapshot.mappings().begin(), snapshot.mappings().end(),
-                                           [&](const auto &mapping) {
-      return mapping.path() == entry.path() && mapping.inode() == entry.inode() &&
-             mapping.device() == entry.device() && mapping.permissions().front() == 'r' &&
-             mapping.begin_address() <= address && address + id.size() <= mapping.end_address() &&
-             offset >= mapping.file_offset() &&
-             offset - mapping.file_offset() == address - mapping.begin_address();
+bool mapped_image_matches(const Target &target,
+                          const api::ListMemoryMappingsResponse &snapshot,
+                          const Object &object, const api::MemoryMapping &entry,
+                          std::uint64_t bias) {
+  return tracer::detail::matches_mapped_elf(object, bias, [&](auto address, auto bytes) {
+    if (bytes.size() > UINT64_MAX - address)
+      return false;
+    const auto mapping = std::find_if(snapshot.mappings().begin(), snapshot.mappings().end(),
+                                      [&](const auto &m) {
+      return m.path() == entry.path() && m.permissions().front() == 'r' &&
+             m.begin_address() <= address && address + bytes.size() <= m.end_address();
     });
-    if (note_mapping != snapshot.mappings().end() &&
-        target.read_bytes(address, id.size()) ==
-        std::string_view(reinterpret_cast<const char *>(id.data()), id.size()))
-      return true;
-  }
-  return false;
+    return mapping != snapshot.mappings().end() && target.read_bytes(address, bytes.size()) == bytes;
+  });
 }
 
 void verify_entry_image(const Target &target,
@@ -397,7 +386,7 @@ void verify_entry_image(const Target &target,
   const auto &path = result.module();
   if (std::none_of(snapshot.mappings().begin(), snapshot.mappings().end(),
                    [&](const auto &mapping) {
-    return mapping.path() == path && mapping.inode() && mapping.permissions()[2] == 'x';
+    return mapping.path() == path && mapping.permissions()[2] == 'x';
   }))
     throw MemoryError(Code::FAILED_PRECONDITION, "module path has no live executable mapping");
 
@@ -461,7 +450,7 @@ void verify_entry_image(const Target &target,
     const auto offset = segment.p_offset + delta;
     for (const auto &mapping : snapshot.mappings()) {
       target.checkpoint();
-      if (mapping.path() != path || mapping.inode() != before.st_ino ||
+      if (mapping.path() != path ||
           mapping.permissions()[0] != 'r' || mapping.permissions()[2] != 'x' ||
           offset < mapping.file_offset())
         continue;
@@ -474,16 +463,7 @@ void verify_entry_image(const Target &target,
           (elf_type == llvm::ELF::ET_EXEC && runtime != elf_address) ||
           (result.runtime_address() && runtime != result.runtime_address()))
         continue;
-      const auto colon = mapping.device().find(':');
-      if (colon == std::string::npos)
-        continue;
-      const std::string_view device(mapping.device());
-      const bool same_device = parse_number(device.substr(0, colon), 16) == major(before.st_dev) &&
-          parse_number(device.substr(colon + 1), 16) == minor(before.st_dev);
-      // OverlayFS can report a different device for the same inode. Require
-      // independent live build-ID evidence before accepting that mapping.
-      if (!same_device &&
-          !mapped_build_id_matches(target, snapshot, *object, mapping, runtime - elf_address))
+      if (!mapped_image_matches(target, snapshot, *object, mapping, runtime - elf_address))
         continue;
       locations.emplace(runtime, offset);
     }
@@ -547,13 +527,7 @@ std::uint64_t import_slot_address(const Target &target,
     throw MemoryError(Code::FAILED_PRECONDITION, llvm::toString(programs.takeError()));
   if (page <= 0)
     throw MemoryError(Code::INTERNAL, "cannot determine the ELF page size");
-  const auto same_file = [&](const auto &mapping) {
-    const std::string_view device(mapping.device());
-    const auto colon = device.find(':');
-    return mapping.path() == path && mapping.inode() == file.st_ino && colon != device.npos &&
-           parse_number(device.substr(0, colon), 16) == major(file.st_dev) &&
-           parse_number(device.substr(colon + 1), 16) == minor(file.st_dev);
-  };
+  const auto same_file = [&](const auto &mapping) { return mapping.path() == path; };
   std::set<std::uint64_t> biases;
   for (const auto &segment : *programs) {
     if (segment.p_type != llvm::ELF::PT_LOAD || !(segment.p_flags & llvm::ELF::PF_X))
@@ -562,7 +536,8 @@ std::uint64_t import_slot_address(const Target &target,
     const auto address = segment.p_vaddr - segment.p_vaddr % page;
     for (const auto &mapping : snapshot.mappings()) {
       if (mapping.permissions()[2] == 'x' && same_file(mapping) &&
-          mapping.file_offset() == offset && mapping.begin_address() >= address)
+          mapping.file_offset() == offset && mapping.begin_address() >= address &&
+          mapped_image_matches(target, snapshot, *elf, mapping, mapping.begin_address() - address))
         biases.insert(mapping.begin_address() - address);
     }
   }
@@ -636,26 +611,40 @@ void find_matches(const Target &target, std::string_view bytes, std::uint64_t ad
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>>
 readonly_image_data(Session &session, const std::string &image, std::chrono::seconds timeout) {
-  struct stat info{};
-  if (::stat(image.c_str(), &info) != 0)
+  auto binary = llvm::object::createBinary(image);
+  if (!binary) {
+    llvm::consumeError(binary.takeError());
     throw std::runtime_error("cannot verify the RTTI provider file");
+  }
+  const auto *object = llvm::dyn_cast<Object>(binary->getBinary());
+  if (!object)
+    throw std::runtime_error("RTTI provider is not an ELF image");
   grpc::ServerContext context;
   const Target target(context, session, std::chrono::steady_clock::now() + timeout);
   const auto maps = target.maps();
   const auto snapshot = parse_mappings(maps, target);
+  std::set<std::uint64_t> biases;
+  for (const auto &mapping : snapshot.mappings()) {
+    if (mapping.path() != image || mapping.permissions() != "r-xp")
+      continue;
+    const auto bias = tracer::detail::mapped_elf_bias(*object, mapping.begin_address(),
+        mapping.end_address(), mapping.file_offset());
+    if (bias && mapped_image_matches(target, snapshot, *object, mapping, *bias))
+      biases.insert(*bias);
+  }
+  if (biases.size() != 1)
+    throw std::runtime_error("RTTI provider has no unique content-verified load bias");
   std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
   for (const auto &mapping : snapshot.mappings()) {
-    if (mapping.path() != image || mapping.inode() != info.st_ino ||
+    if (mapping.path() != image ||
         (mapping.permissions() != "r--p" && mapping.permissions() != "r-xp"))
       continue;
-    const std::string_view device = mapping.device();
-    const auto separator = device.find(':');
-    if (separator != std::string_view::npos &&
-        parse_number(device.substr(0, separator), 16) == major(info.st_dev) &&
-        parse_number(device.substr(separator + 1), 16) == minor(info.st_dev))
+    const auto bias = tracer::detail::mapped_elf_bias(*object, mapping.begin_address(),
+        mapping.end_address(), mapping.file_offset(), false, *biases.begin());
+    if (bias && mapped_image_matches(target, snapshot, *object, mapping, *bias))
       ranges.emplace_back(mapping.begin_address(), mapping.end_address());
   }
-  if (target.maps() != maps)
+  if (mapping_layout(target.maps()) != mapping_layout(maps))
     throw std::runtime_error("target changed mappings during RTTI provider verification");
   target.verify_live();
   return ranges;
@@ -667,7 +656,7 @@ grpc::Status list_mappings(grpc::ServerContext &context, Session &session,
   return inspect(context, session, timeout, [&](const Target &target) {
     const auto maps = target.maps();
     auto result = parse_mappings(maps, target);
-    if (maps != target.maps())
+    if (mapping_layout(maps) != mapping_layout(target.maps()))
       throw MemoryError(Code::ABORTED, "target mappings changed during listing; retry");
     target.verify_live();
     result.set_mapping_token(mapping_token(session, maps));
@@ -737,7 +726,7 @@ grpc::Status apply_patch(grpc::ServerContext &context, Session &session, std::ch
          (request.has_writable() || patch_mapping.permissions() != "r--p")))
       throw MemoryError(Code::FAILED_PRECONDITION, "patch requires a private mapping with expected permissions");
     required.push_back(patch_mapping);
-    if (maps != target.maps() || target.read_bytes(address, before.size()) != before)
+    if (mapping_layout(maps) != mapping_layout(target.maps()) || target.read_bytes(address, before.size()) != before)
       throw MemoryError(Code::ABORTED, "target mapping or expected patch bytes changed");
     target.verify_live();
     response = session.apply_memory_patch(address, std::move(before), std::move(after), std::move(required));
@@ -762,7 +751,7 @@ grpc::Status start_page_monitor(grpc::ServerContext &context, Session &session,
       throw MemoryError(Code::ABORTED, "memory mapping snapshot is stale; run %memory maps again");
     const auto snapshot = parse_mappings(maps, target);
     const auto &mapping = mapping_at(snapshot, address, size);
-    if (mapping.permissions() != "rw-p" || mapping.inode() || !mapping.path().empty() ||
+    if (mapping.permissions() != "rw-p" || !mapping.path().empty() ||
         mapping.begin_address() != address || mapping.end_address() != address + size)
       throw MemoryError(Code::FAILED_PRECONDITION,
                         "page monitoring requires one entire dedicated anonymous rw-p mapping");
@@ -798,7 +787,7 @@ grpc::Status start_instruction_trace(
     const auto executable = std::any_of(snapshot.mappings().begin(), snapshot.mappings().end(),
                                        [&](const auto &mapping) {
       return mapping.begin_address() <= begin && begin + size <= mapping.end_address() &&
-             mapping.inode() != 0 && mapping.permissions().at(0) == 'r' &&
+             !mapping.path().empty() && mapping.path().front() == '/' && mapping.permissions().at(0) == 'r' &&
              mapping.permissions().at(1) == '-' && mapping.permissions().at(2) == 'x';
     });
     if (!executable)
@@ -816,7 +805,7 @@ grpc::Status start_instruction_trace(
                           "monitored data must fit one readable mapping");
     }
     const auto bytes = target.read_bytes(begin, size);
-    if (maps != target.maps())
+    if (mapping_layout(maps) != mapping_layout(target.maps()))
       throw MemoryError(Code::ABORTED, "target mappings changed during setup; run %memory maps again");
     target.verify_live();
     try {

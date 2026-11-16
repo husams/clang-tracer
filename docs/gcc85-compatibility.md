@@ -53,10 +53,18 @@ when changing SDK, sysroot or loader so cached compiler/linker settings cannot
 silently retain the previous profile.
 
 Binaries and debug files are fixed for each tracing session. Rebuilding or
-replacing one requires a new session. Module lookup uses canonical mapped paths
-and ELF load offsets/ranges, without comparing filesystem device/inode numbers
-or polling binary timestamps. OverlayFS builds do not require a bind-mounted
-filesystem to satisfy file identity checks.
+replacing one requires a new session. Mapping validation uses canonical paths,
+ELF load offsets/address ranges, and live build IDs. Without a build ID, it
+compares the loaded ELF header and immutable non-code sections; patch admission
+also checks live function bytes. File size and timestamps detect changes during
+inspection and invalidate symbol-listing snapshots. Device/inode values remain
+available as display/recording metadata and do not decide mapping validity.
+OverlayFS builds do not require staging on another filesystem.
+
+Shared-storage watches match the pathname of their pinned backing-file
+descriptor and the mapped file offset. Different hard-link names are distinct
+paths for this purpose. Private channels use their unique paths and address
+ranges; target allocations receive a unique memfd name per session/allocation.
 
 The script preserves the scratch tree and refuses to replace an existing gRPC
 checkout if it does not match the pin. It rejects dirty root and recursive

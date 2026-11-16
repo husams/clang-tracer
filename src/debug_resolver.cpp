@@ -40,6 +40,7 @@
 #include "tracer/override_target.hpp"
 #include "linux_syscalls.hpp"
 #include "mapped_path.hpp"
+#include "mapped_elf.hpp"
 #include "prepared_contract.hpp"
 
 namespace tracer::client {
@@ -313,12 +314,6 @@ struct ExecutableMapping {
   unsigned device_major = 0;
   unsigned device_minor = 0;
   std::string device;
-
-  bool matches(const struct stat &file) const {
-    return inode != 0 && inode == file.st_ino &&
-           device_major == major(file.st_dev) &&
-           device_minor == minor(file.st_dev);
-  }
 };
 
 std::vector<ExecutableMapping> read_executable_mappings(
@@ -381,17 +376,16 @@ std::string mapping_fingerprint(
       throw std::runtime_error("cannot stat mapped debug image");
     }
     std::ostringstream identity;
-    identity << path << '\0' << st.st_dev << ':' << st.st_ino << ':'
-             << st.st_size << ':' << st.st_mtim.tv_sec << ':'
+    identity << path << '\0' << st.st_size << ':' << st.st_mtim.tv_sec << ':'
              << st.st_mtim.tv_nsec << ':' << st.st_ctim.tv_sec << ':'
              << st.st_ctim.tv_nsec << '\0';
     hash.update(identity.str());
   }
 
   for (const auto& mapping : executable_mappings) {
-    std::string record = mapping.raw;
-    record.push_back('\0');
-    hash.update(record);
+    std::ostringstream record;
+    record << mapping.path << '\0' << mapping.begin << ':' << mapping.end << ':' << mapping.offset;
+    hash.update(record.str());
   }
 
   const auto digest = hash.final();
@@ -608,6 +602,13 @@ std::optional<bool> matches_mapped_build_id(
       return true;
   }
   return loadable ? std::optional<bool>(false) : std::nullopt;
+}
+
+bool verified_mapping(std::uint32_t pid, const ExecutableMapping &mapping,
+                      const llvm::object::ELF64LEObjectFile &object) {
+  const auto bias = tracer::detail::mapped_elf_bias(object, mapping.begin, mapping.end, mapping.offset);
+  return bias && tracer::detail::matches_mapped_elf(object, *bias,
+      [pid](auto address, auto bytes) { return matches_process_bytes(pid, address, bytes); });
 }
 
 void describe_record(DWARFDie record, api::DebugInfo& info) {
@@ -1331,13 +1332,12 @@ std::uint64_t bind_live_executable(std::uint32_t pid, const std::string &path,
     if (!*build_id)
       throw std::runtime_error("mapped executable build ID differs from ELF");
   } else {
-    struct stat executable{};
     const auto image = "/proc/" + std::to_string(pid) + "/exe";
-    if (!allow_main_without_build_id || ::stat(image.c_str(), &executable) != 0)
+    if (!allow_main_without_build_id || tracer::detail::canonical_mapped_path(image) != path)
       throw std::runtime_error("cannot verify the mapped executable build ID");
     const auto mappings = read_executable_mappings(pid, {path});
     if (std::none_of(mappings.begin(), mappings.end(), [&](const auto &map) {
-          return map.matches(executable) && live >= map.begin && live < map.end &&
+          return verified_mapping(pid, map, *elf) && live >= map.begin && live < map.end &&
                  size <= map.end - live && offset >= map.offset &&
                  offset - map.offset == live - map.begin;
         }))
@@ -1425,12 +1425,11 @@ std::string verified_function_code(std::uint32_t pid, const api::DebugInfo &info
       throw std::runtime_error("verified function image digest changed before patching");
     const auto mappings = read_executable_mappings(pid, {info.module()});
     const bool mapped = std::any_of(mappings.begin(), mappings.end(), [&](const auto &map) {
-      return map.matches(before) && live >= map.begin && live < map.end &&
+      return verified_mapping(pid, map, *elf) && live >= map.begin && live < map.end &&
           size <= map.end - live && offset >= map.offset && offset - map.offset == live - map.begin;
     });
     struct stat after{};
     if (!mapped || ::stat(info.module().c_str(), &after) != 0 ||
-        before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
         before.st_size != after.st_size || before.st_ctim.tv_sec != after.st_ctim.tv_sec ||
         before.st_ctim.tv_nsec != after.st_ctim.tv_nsec)
       throw std::runtime_error("prepared image no longer identifies the live mapping");
@@ -1457,12 +1456,6 @@ api::ListModulesResponse list_debug_module_mappings(std::uint32_t pid,
   std::map<std::string, std::string> build_ids;
   for (const auto &path : paths) {
     result.add_modules(path);
-    struct stat file{};
-    if (::stat(path.c_str(), &file) != 0 ||
-        std::none_of(mappings.begin(), mappings.end(), [&](const auto &entry) {
-          return entry.path == path && entry.matches(file);
-        }))
-      continue;
     auto binary = llvm::object::createBinary(path);
     if (!binary) {
       llvm::consumeError(binary.takeError());
@@ -1470,7 +1463,9 @@ api::ListModulesResponse list_debug_module_mappings(std::uint32_t pid,
     }
     if (const auto *elf = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(
             binary->getBinary())) {
-      build_ids.emplace(path, llvm::toHex(llvm::object::getBuildID(elf), true));
+      for (const auto &mapping : mappings)
+        if (mapping.path == path && verified_mapping(pid, mapping, *elf))
+          build_ids.emplace(mapping.raw, llvm::toHex(llvm::object::getBuildID(elf), true));
       if (path != elf_path)
         continue;
       const auto checked = [](auto value) {
@@ -1505,7 +1500,9 @@ api::ListModulesResponse list_debug_module_mappings(std::uint32_t pid,
             section.getAddress(), section.getSize());
     }
   }
-  if (!elf_path.empty() && !build_ids.count(elf_path))
+  if (!elf_path.empty() && std::none_of(mappings.begin(), mappings.end(), [&](const auto &mapping) {
+        return mapping.path == elf_path && build_ids.count(mapping.raw);
+      }))
     throw std::runtime_error("ELF backing file no longer matches the mapped image");
   for (const auto &mapping : mappings) {
     auto &entry = *result.add_mappings();
@@ -1515,10 +1512,8 @@ api::ListModulesResponse list_debug_module_mappings(std::uint32_t pid,
     entry.set_file_offset(mapping.offset);
     entry.set_device(mapping.device);
     entry.set_inode(mapping.inode);
-    const auto id = build_ids.find(mapping.path);
-    struct stat file{};
-    if (id != build_ids.end() && ::stat(mapping.path.c_str(), &file) == 0 &&
-        mapping.matches(file))
+    const auto id = build_ids.find(mapping.raw);
+    if (id != build_ids.end())
       entry.set_build_id(id->second);
   }
   const auto current = modules(pid, include_runtime);
@@ -1624,7 +1619,7 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
       throw std::invalid_argument("mapped images changed during preview; retry");
     std::vector<ExecutableMapping> verified;
     std::copy_if(mappings.begin(), mappings.end(), std::back_inserter(verified),
-                 [&](const auto &m) { return m.path == path && m.matches(file); });
+                 [&](const auto &m) { return m.path == path && verified_mapping(pid, m, *object); });
     const auto ranges = mapped_executable_ranges(*object, image,
                                                   executable_segments(*object), verified);
     const auto emit = [&](const PreviewName &name, const std::string &canonical,
@@ -2327,7 +2322,7 @@ DebugSymbolPage list_debug_symbols(
       if (::stat(path.c_str(), &file) == 0) {
         module_mappings.erase(
             std::remove_if(module_mappings.begin(), module_mappings.end(),
-                           [&](const auto &mapping) { return !mapping.matches(file); }),
+                           [&](const auto &mapping) { return !verified_mapping(pid, mapping, *object); }),
             module_mappings.end());
         verified_ranges = mapped_executable_ranges(
             *object, module_identity, segments, module_mappings);
