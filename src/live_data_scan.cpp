@@ -327,13 +327,15 @@ struct TargetImage::Image {
     if (!headers) {
       throw std::runtime_error(llvm::toString(headers.takeError()));
     }
+    bool has_text = false;
     for (const auto& segment : *headers) {
       if (segment.p_type == PT_LOAD && (segment.p_flags & PF_X) &&
-          segment.p_filesz && !text) {
+          segment.p_filesz && !has_text) {
         text = segment.p_vaddr;
+        has_text = true;
       }
     }
-    if (!text) {
+    if (!has_text) {
       throw std::runtime_error("live data ELF has no executable anchor");
     }
     bias = client::bind_live_executable(::getpid(), target.module, elf, text, 1);
