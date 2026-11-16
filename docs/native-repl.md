@@ -2354,6 +2354,187 @@ guaranteed interruption. Ctrl+C also cancels tracing operations.
 Completion covers command names and local C++ declarations/members. Dynamic
 completion of remote tracing symbols remains follow-up work.
 
+## Install a local C++ plugin package
+
+Copy the trusted `examples/repl-public-plugin` directory to
+`~/.local/share/clang-tracer/plugins/my-api/`. If `XDG_DATA_HOME` is set,
+use `$XDG_DATA_HOME/clang-tracer/plugins/my-api/`. Keep `plugin.toml`,
+`src/`, and `include/` together. Launch `clang-tracer-repl` normally and
+enter C++ at the prompt.
+
+```cpp
+#include <my_api/my_type.hpp>
+my_api::my_instance.add(3);
+my_api::MyType local{};
+local.add(5);
+std::cout << my_api::my_instance.count << " " << local.count << std::endl;
+```
+
+The first startup reports `compiled` and prints `3 5` for the sample.
+A fresh startup with the same compiler inputs reports `cache hit` and
+starts with fresh plugin state. The REPL loads the manifest’s `[repl]`
+`sources` into one private JIT scope. Its public `include/` directory
+provides C++ declarations to the REPL and its checker. External definitions
+declared in those headers can link to the plugin’s code and storage.
+The class in `src/plugin.cpp` registers commands and stays in the plugin scope.
+
+The package manifest supports `id`, `[repl]` `sources`, and optional
+`compile_commands`, `translation_unit`, and `extra_flags` in that section.
+Paths to sources and compilation databases are relative to the manifest
+unless a database path is absolute. Keep the entire package owned by the REPL
+user, with group and other write permissions disabled. Package symlinks must
+resolve within the package. Use trusted paths for external compiler inputs.
+Restart the REPL to replace a package with public headers. A live C++ expression can retain addresses from that
+generation.
+
+## Load local C++ plugins
+
+Load a trusted C++ source file with `%plugin load FILE --as NAME`. The REPL
+compiles it with its current local C++ compiler profile, so include paths and
+defines can come from `--cpp-arg` or `%cpp options compdb`. Use
+`%plugin enable FILE --as NAME` to load a plugin now and on future launches.
+
+```text
+%plugin enable examples/jit-plugin-globals/plugin_a.cpp --as a
+%plugin enable examples/jit-plugin-globals/plugin_b.cpp --as b
+%plugin commands a
+%plugin run a tick
+%plugin run b tick
+%plugin reload a
+%plugin run a value
+%plugin run b value
+```
+
+Enabled plugins load before the prompt or any `--startup` script. The REPL
+saves absolute source paths under `$XDG_CONFIG_HOME/clang-tracer/repl/enabled-plugins`
+or `~/.config/clang-tracer/repl/enabled-plugins`. Startup uses the launcher's
+C++ options, including any `--cpp-arg` flags. A plugin that fails to load is
+reported by name and startup continues. `%plugin disable NAME` removes its
+startup registration and the current session can keep using the loaded plugin.
+Use `%plugin load FILE --as NAME` for a single session.
+
+The first load reports `compiled`. A later load of the same source and compiler
+inputs reports `cache hit`. The REPL preprocesses the source to check the
+effective inputs, then reuses native code generation on a hit. Cached objects
+live under `$XDG_CACHE_HOME/clang-tracer/repl/plugins` or
+`~/.cache/clang-tracer/repl/plugins` when XDG_CACHE_HOME is unset. Each load
+links into a fresh JIT scope. A successful reload resets that plugin's globals
+and leaves peer plugins active. A failed reload keeps the prior generation.
+
+Include `clang_tracer_repl_plugin.hpp` and define `tracer::repl::Plugin` in
+one C++ source file. List your commands in a static array. The SDK supplies
+the entry point and dispatches each command to the same instance of your
+class.
+
+```cpp
+#include "clang_tracer_repl_plugin.hpp"
+
+class tracer::repl::Plugin : public tracer::repl::PluginInterface<Plugin> {
+  uint64_t count_ = 0;
+
+public:
+  uint64_t tick() noexcept { return ++count_; }
+  uint64_t value() const noexcept { return count_; }
+
+  static constexpr Command commands[] = {
+      command<&Plugin::tick>("tick", "Increment the count."),
+      command<&Plugin::value>("value", "Read the count."),
+  };
+};
+```
+
+Commands are `noexcept`, take no arguments, and return a value convertible
+to `uint64_t`. Use constant initialization and trivial destruction for plugin
+state. Each load creates a fresh instance. Existing plugins using the V1 C entry point
+in `clang_tracer_repl_plugin.h` can still load.
+
+A plugin JIT scope resolves definitions from its own compiled sources. Calls
+that require symbols from libc, the C++ runtime, the host process, or another
+plugin fail with the unresolved symbol names. Header-only C++ operations work
+when they generate self-contained code. Mark local helpers `noexcept`. A
+potentially throwing call at `-O0` can introduce C++ exception runtime symbols.
+For code that requires no exception handling, `-fno-exceptions` can avoid those
+references. Optimization can also inline a helper. Use trusted plugin sources
+because they execute native code in the REPL or target process.
+
+## Install an agent extension for automatic attachment
+
+On the REPL machine, copy a trusted extension package to
+`~/.local/share/clang-tracer/plugins/agent-counter/` (or the corresponding
+`XDG_DATA_HOME` path). Save `examples/jit-plugin-globals/plugin_b.cpp` as
+`src/plugin.cpp` in that package. Put the following `plugin.toml` at its
+root and set the executable to the exact absolute path reported by the
+target's Linux host.
+
+```toml
+id = "agent-counter"
+sdk = 1
+
+[agent]
+sources = ["src/plugin.cpp"]
+
+[agent.target]
+executable = "/absolute/path/to/application"
+```
+
+Start the server with `CLANG_TRACER_ALLOW_AGENT_PLUGINS=1` in its environment
+and attach to the application as usual. A new matching attachment activates
+the package before returning to the REPL prompt. Selecting an existing
+attachment preserves its plugin state. Approval or load failures identify the
+package and leave the attachment available.
+
+Single-file extensions use the existing REPL-object compatibility check.
+The agent compiles from source on a cache miss. Multi-file packages send
+their translation units and bundled headers for compilation in one target JIT
+scope. Optional `compile_commands`, `translation_unit`, and `extra_flags`
+under `[agent]` apply to target compilation. Use target-host paths for
+external build inputs. The agent caches the resulting objects and links a fresh
+instance for each matching attachment.
+
+The latency extension in `examples/repl-agent-observer` registers its return
+observer on attach. Add native probes after the observer loads. Reload an
+installed observer with `%plugin agent reload NAME`. The manifest supplies
+the sources and compiler settings for the new generation.
+
+## Load plugins in an injected agent
+
+Start a local managed server with agent plugins enabled and attach to a Linux
+x86-64 target. For a remote REPL, set the same environment variable on the
+server before starting it.
+
+```sh
+CLANG_TRACER_ALLOW_AGENT_PLUGINS=1 clang-tracer-repl --attach "$pid"
+```
+
+```text
+%plugin agent load examples/jit-plugin-globals/plugin_a.cpp --as a
+%plugin agent load examples/jit-plugin-globals/plugin_b.cpp --as b
+%plugin agent run a tick
+%plugin agent run b tick
+%plugin agent reload a examples/jit-plugin-globals/plugin_a.cpp
+%plugin agent run a value
+%plugin agent run b value
+```
+
+On a Linux x86-64 REPL, loading or reloading automatically offers an object
+from the REPL cache or compiles one if needed. The agent checks the compiler
+profile, target and CPU, resolved source and headers, and object integrity
+before linking an offer. It reports `REPL object` when it accepts the offer,
+`cache hit` when it uses its own cache, or `compiled` when it compiles the
+source in the target. The same commands handle all three cases.
+
+The same V1 command descriptor works in both runtimes. The agent supplies
+the SDK header and resolves other includes from its compiler environment.
+The target's cache is under
+`$XDG_CACHE_HOME/clang-tracer/agent/plugins` or
+`~/.cache/clang-tracer/agent/plugins` when XDG_CACHE_HOME is unset.
+
+The server opt-in authorizes its clients to supply trusted plugin source and
+objects that execute with the target process's permissions. Each attachment
+owns its plugin instances. A reload links a fresh generation of the named plugin and
+preserves its peers. Detaching releases the attachment's instances, and the
+compiled objects remain available for reuse.
+
 ## Cleanup and scripted use
 
 ```text

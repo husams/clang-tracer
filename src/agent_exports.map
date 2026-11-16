@@ -5,6 +5,8 @@
     tracer_agent_start;
     tracer_agent_stop;
     tracer_agent_validate;
+    tracer_agent_plugin_v1;
+    tracer_agent_plugin_v2;
     tracer_agent_runtime_profile_v1;
     tracer_agent_capacity_v1;
     tracer_agent_reclaim_v1;

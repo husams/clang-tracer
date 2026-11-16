@@ -60,10 +60,11 @@ public:
     T__244 = 245, T__245 = 246, T__246 = 247, T__247 = 248, T__248 = 249, 
     T__249 = 250, T__250 = 251, T__251 = 252, T__252 = 253, T__253 = 254, 
     T__254 = 255, T__255 = 256, T__256 = 257, T__257 = 258, T__258 = 259, 
-    T__259 = 260, UINT = 261, STRING = 262, SHELL = 263, METADATA_ONLY = 264, 
-    SQLITE = 265, STACK = 266, CWD = 267, SIGNATURE = 268, MEMBER = 269, 
-    SNAPSHOT_RETURN_POINTEE = 270, RECOVER = 271, PAYLOAD_LIMIT = 272, WORD = 273, 
-    WS = 274
+    T__259 = 260, T__260 = 261, T__261 = 262, T__262 = 263, T__263 = 264, 
+    T__264 = 265, T__265 = 266, UINT = 267, STRING = 268, SHELL = 269, METADATA_ONLY = 270, 
+    SQLITE = 271, STACK = 272, CWD = 273, SIGNATURE = 274, MEMBER = 275, 
+    SNAPSHOT_RETURN_POINTEE = 276, RECOVER = 277, PAYLOAD_LIMIT = 278, WORD = 279, 
+    WS = 280
   };
 
   enum {
@@ -84,7 +85,7 @@ public:
     RuleChildList = 53, RuleTargetCall = 54, RuleLocalPerf = 55, RuleTargetLibrary = 56, 
     RuleInstructions = 57, RuleInstructionOption = 58, RuleWatchpoint = 59, 
     RuleStackFilter = 60, RuleContextEventBytes = 61, RuleExtraCompileOption = 62, 
-    RuleCwdOption = 63
+    RuleCwdOption = 63, RulePlugin = 64, RulePluginKeyword = 65
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -167,7 +168,9 @@ public:
   class StackFilterContext;
   class ContextEventBytesContext;
   class ExtraCompileOptionContext;
-  class CwdOptionContext; 
+  class CwdOptionContext;
+  class PluginContext;
+  class PluginKeywordContext; 
 
   class  LineContext : public antlr4::ParserRuleContext {
   public:
@@ -204,6 +207,7 @@ public:
     CollectContext *collect();
     RecordContext *record();
     CppContext *cpp();
+    PluginContext *plugin();
     ShellContext *shell();
     CompleteContext *complete();
     TypeContext *type();
@@ -787,6 +791,7 @@ public:
     virtual size_t getRuleIndex() const override;
     antlr4::tree::TerminalNode *RECOVER();
     antlr4::tree::TerminalNode *STACK();
+    PluginKeywordContext *pluginKeyword();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -1153,6 +1158,32 @@ public:
   };
 
   CwdOptionContext* cwdOption();
+
+  class  PluginContext : public antlr4::ParserRuleContext {
+  public:
+    PluginContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    std::vector<ValueContext *> value();
+    ValueContext* value(size_t i);
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+   
+  };
+
+  PluginContext* plugin();
+
+  class  PluginKeywordContext : public antlr4::ParserRuleContext {
+  public:
+    PluginKeywordContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+   
+  };
+
+  PluginKeywordContext* pluginKeyword();
 
 
   // By default the static state used to implement the parser is lazily initialized during the first

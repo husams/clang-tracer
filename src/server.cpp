@@ -1455,10 +1455,20 @@ private:
         valid_phase = event.call_id() != 0 && event.has_result() &&
                       valid_result(event.result());
         break;
+      case clangtracer::v1::AGENT_OBSERVER: {
+        const auto& id = event.agent_latency().plugin_id();
+        valid_phase = event.call_id() != 0 && !event.has_result() &&
+                      event.arguments().empty() && !id.empty() && id.size() < 128 &&
+                      id.front() != '-' &&
+                      id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") ==
+                          std::string::npos;
+        break;
+      }
       default:
         break;
       }
-      if (!valid_phase)
+      if (event.has_agent_latency() != (event.phase() == clangtracer::v1::AGENT_OBSERVER) ||
+          !valid_phase)
         continue;
       // Function names are assigned by the server from the registered ProbeSpec.
       if (!event.function_name().empty())
@@ -1475,7 +1485,7 @@ private:
       event.set_function_name(active->second.function_name);
       event.set_object_probe_registration_id(active->second.object_probe_registration_id);
       const auto snapshot = snapshot_probes_.find(key);
-      if (snapshot == snapshot_probes_.end()) {
+      if (event.phase() == api::AGENT_OBSERVER || snapshot == snapshot_probes_.end()) {
         ++received_[key];
         append_native_locked(std::move(event));
       } else {
@@ -1805,6 +1815,27 @@ public:
       return {grpc::StatusCode::NOT_FOUND, error.what()};
     } catch (const std::exception &error) {
       return {grpc::StatusCode::FAILED_PRECONDITION, error.what()};
+    }
+  }
+
+  grpc::Status AgentPlugin(grpc::ServerContext *,
+                           const api::AgentPluginRequest *request,
+                           api::AgentPluginResponse *response) override {
+    const auto *enabled = std::getenv("CLANG_TRACER_ALLOW_AGENT_PLUGINS");
+    if (!enabled || std::string_view(enabled) != "1")
+      return {grpc::StatusCode::PERMISSION_DENIED,
+              "agent plugins require CLANG_TRACER_ALLOW_AGENT_PLUGINS=1 on the server"};
+    auto session = find_session(request->session_id());
+    if (!session)
+      return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
+    std::lock_guard operation_lock(session->operation_mutex());
+    try {
+      *response = session->agent_plugin(*request);
+      return grpc::Status::OK;
+    } catch (const std::invalid_argument &error) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, error.what()};
+    } catch (const std::exception &error) {
+      return status_for(error);
     }
   }
 

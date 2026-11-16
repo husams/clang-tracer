@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "admission.hpp"
+#include "agent_plugin_protocol.hpp"
 #include "live_transaction.hpp"
 
 #include "tracer.grpc.pb.h"
@@ -75,6 +76,8 @@ public:
   clangtracer::v1::PageMonitorResult start_page_monitor(
       const clangtracer::v1::StartPageMonitorRequest &request);
   clangtracer::v1::PageMonitorResult stop_page_monitor();
+  clangtracer::v1::AgentPluginResponse
+  agent_plugin(const clangtracer::v1::AgentPluginRequest &request);
   void detach();
   clangtracer::v1::ObjectWatchStatus object_watch(
       const clangtracer::v1::ObjectWatchRequest &request, std::uint64_t id,
@@ -159,6 +162,9 @@ private:
   std::uintptr_t start_address_ = 0;
   std::uintptr_t stop_address_ = 0;
   std::uintptr_t validate_address_ = 0;
+  std::uintptr_t plugin_address_ = 0;
+  std::uintptr_t plugin_v2_address_ = 0;
+  bool plugins_may_be_active_ = false;
   std::uintptr_t capacity_address_ = 0;
   std::uintptr_t reclaim_address_ = 0;
   std::uintptr_t start_page_monitor_address_ = 0;
@@ -221,6 +227,11 @@ private:
       const std::function<bool()> &cancelled);
   clangtracer::v1::LiveUpdateStatus revert_live_locked(std::uint64_t revision);
   void check_identity_locked();
+  bool invoke_agent_plugin_locked(AgentPluginCall& request, const std::string& source,
+                                  std::chrono::steady_clock::time_point deadline,
+                                  const std::string& offer = {},
+                                  const std::string& expected_executable = {});
+  void clear_agent_plugins_locked(std::chrono::steady_clock::time_point deadline);
   void require_probe_control_locked(std::uint64_t removing = 0,
                                     std::uint64_t registration = 0) const;
   void require_object_watch_sites_locked(std::uint64_t registration) const;

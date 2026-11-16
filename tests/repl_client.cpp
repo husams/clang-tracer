@@ -127,6 +127,7 @@ public:
   std::atomic<bool> failed{false};
   std::atomic<int> attach_mode{0};
   std::atomic<unsigned> attach_calls{0};
+  std::atomic<bool> agent_source{false}, agent_bundle{false};
   std::atomic<unsigned> installed{0}, detached{0};
   std::atomic<bool> pair_created{false}, detached_s1{false}, detached_s2{false};
   std::function<void()> on_watch;
@@ -157,6 +158,8 @@ public:
   grpc::Status Attach(grpc::ServerContext *, const api::AttachRequest *q,
                       api::Session *r) override {
     ++attach_calls;
+    agent_source = false;
+    agent_bundle = false;
     const int mode = attach_mode.load();
     if (mode == 3)
       std::this_thread::sleep_for(std::chrono::milliseconds(1250));
@@ -166,6 +169,7 @@ public:
       pair_created = true;
     r->set_id("s1");
     r->set_pid(q->pid());
+    r->set_executable("/test/application");
     r->set_state(api::Session::ATTACHED);
     if (mode == 1)
       return {grpc::StatusCode::INTERNAL, "retained attach failure"};
@@ -173,6 +177,43 @@ public:
       return {grpc::StatusCode::DEADLINE_EXCEEDED, "lost attach reply"};
     if (mode == 4)
       return {grpc::StatusCode::INTERNAL, "ambiguous concurrent attach"};
+    return grpc::Status::OK;
+  }
+
+  grpc::Status AgentPlugin(grpc::ServerContext*, const api::AgentPluginRequest* q,
+                           api::AgentPluginResponse* r) override {
+    using Request = api::AgentPluginRequest;
+    if (!attached || q->session_id() != "s1" ||
+        (q->plugin_id() != "source" && q->plugin_id() != "bundle")) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "unexpected agent plugin target"};
+    }
+    auto& active = q->plugin_id() == "source" ? agent_source : agent_bundle;
+    if (q->operation() == Request::RUN) {
+      if (!active || q->command() != "tick") {
+        return {grpc::StatusCode::FAILED_PRECONDITION, "agent plugin was not activated"};
+      }
+      r->set_value(1);
+      return grpc::Status::OK;
+    }
+    if (q->expected_executable() != "/test/application") {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "expected executable was not forwarded"};
+    }
+    if (q->plugin_id() == "source") {
+      if (q->operation() != Request::LOAD || q->source() != "// automatic agent fixture\n") {
+        return {grpc::StatusCode::INVALID_ARGUMENT, "source was not forwarded"};
+      }
+    } else if (q->operation() != Request::LOAD_PACKAGE || q->package().sources_size() != 1 ||
+               q->package().sources(0) != "src/plugin.cpp" ||
+               q->package().extra_flags_size() != 1 ||
+               q->package().extra_flags(0) != "-DTEST_VALUE=7" || q->package().files_size() != 1 ||
+               q->package().files(0).path() != "src/plugin.cpp" ||
+               q->package().files(0).contents() != "// automatic agent fixture\n") {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "package was not forwarded"};
+    }
+    if (active.exchange(true)) {
+      return {grpc::StatusCode::ALREADY_EXISTS, "agent plugin was activated twice"};
+    }
+    r->set_generation(1);
     return grpc::Status::OK;
   }
 

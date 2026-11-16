@@ -146,6 +146,16 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"cpp import", K::cpp_import},
                                         {"cpp generate", K::cpp_generate},
                                         {"cpp options", K::cpp_options},
+                                        {"plugin load", K::plugin_load},
+                                        {"plugin enable", K::plugin_enable},
+                                        {"plugin disable", K::plugin_disable},
+                                        {"plugin reload", K::plugin_reload},
+                                        {"plugin list", K::plugin_list},
+                                        {"plugin run", K::plugin_run},
+                                        {"plugin commands", K::plugin_commands},
+                                        {"plugin agent load", K::agent_plugin_load},
+                                        {"plugin agent reload", K::agent_plugin_reload},
+                                        {"plugin agent run", K::agent_plugin_run},
                                         {"shell", K::shell},
                                         {"complete", K::complete},
                                         {"type", K::type},
@@ -208,7 +218,10 @@ public:
     const auto ts = tokens_.getTokens();
     std::size_t i = 1;
     std::string name = ts.at(i++)->getText();
-    if (i + 1 < ts.size() && kinds.count(name + " " + ts[i]->getText())) {
+    if (name == "plugin" && ts[i]->getText() == "agent") {
+      name += " agent " + ts[i + 1]->getText();
+      i += 2;
+    } else if (i + 1 < ts.size() && kinds.count(name + " " + ts[i]->getText())) {
       name += " " + ts[i++]->getText();
     }
     result.kind = kinds.at(name);

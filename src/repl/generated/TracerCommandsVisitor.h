@@ -147,6 +147,10 @@ public:
 
     virtual std::any visitCwdOption(TracerCommandsParser::CwdOptionContext *context) = 0;
 
+    virtual std::any visitPlugin(TracerCommandsParser::PluginContext *context) = 0;
+
+    virtual std::any visitPluginKeyword(TracerCommandsParser::PluginKeywordContext *context) = 0;
+
 
 };
 
