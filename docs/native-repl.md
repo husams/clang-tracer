@@ -474,6 +474,92 @@ stays in place and selects the trap path. The trap owns execution control for it
 restores its byte at stop, detach, or a thread or process creation stop.
 Remove a fallback probe before replacing it.
 
+## Register a C++ type for object probing
+
+`%object-probe` prepares a package, binds it to a Linux x86-64 process,
+and controls its admitted lifetime hooks and typed method observers under one
+registration ID. The target's ELF remains on disk and the tracer verifies live
+patch windows before activation.
+
+Prepare without an executable or an attachment. Pass the original header,
+compilation database and translation unit and select each exact method with
+`--method`. The package embeds the callback source and prepared method
+adapters. For example, an interceptor for a `Counter` method can use the
+registered lifetime ID alongside its ordinary call ID.
+
+```cpp
+template <> class Interceptor<tracer::ResolvedSignature> {
+public:
+  long long pre(const Call& call) {
+    return static_cast<long long>(call.object_id());
+  }
+  long long post(const Call& call) {
+    return static_cast<long long>(call.object_generation());
+  }
+};
+```
+
+```text
+%object-probe prepare demo::Counter --include ./counter.hpp --compdb ./compile_commands.json --translation-unit ./counter.cpp --method "demo::Counter::add(int)" --callbacks ./callbacks.cpp --output ./counter.object
+%attach PID
+%object-probe preview --package ./counter.object
+%object-probe start --package ./counter.object
+%object-probe status REGISTRATION_ID
+%object-probe stop REGISTRATION_ID
+```
+
+The preview shows verified lifecycle and method patch windows. A method-only
+package can use the attached process's uniquely mapped method image. Use
+`--method-module` to disambiguate. Start revalidates the binding, stages the
+patches, and admits callbacks only after publication. Record lifetime and write events with `%record --probe
+REGISTRATION_ID`. Start also prints the member probe IDs for selecting normal
+PRE and POST events. Callback failures record the call ID and phase.
+Use `--callback-errors only` or `--callback-errors exclude` with `%collect`,
+`%record`, or `%events open`. C++ analysis can read
+`Event::callback_error()` and `Event::callback_error_message()`.
+Each callback sees the object ID and generation copied at entry. Borrowed receiver views follow the usual interceptor lifetime.
+
+For individual writes, prepare a field and its writer. Omit `--code` to use
+writer discovery from the original compilation database. When the writer is
+already known, select it explicitly and use `--dwarf-writers` for a write-only
+package prepared without a compilation database.
+
+```text
+%object-probe prepare demo::Counter --field value --code "demo::Counter::set(int)" --dwarf-writers --output ./writes.object
+%object-probe preview --package ./writes.object
+%object-probe start --package ./writes.object
+```
+
+For a writer in an attached shared library, pass its mapped name with
+`--module`. `--follow-calls` is available for write-only packages.
+Use `--first-seen` with a write-only package and a standalone executable writer. Follow the
+coverage counts in status when the writer reaches native callees. A combined
+registration requires disjoint method and writer patch windows. A verified
+identity requires evidence that the constructor built a complete object and
+that the watch covers its destruction. Evidence can come from a distinct
+complete-constructor entry, a verified caller outside constructors and destructors,
+or a call through a verified PLT entry for the complete-constructor symbol.
+Caller proof for a shared constructor entry relies on debug information that
+describes inlined construction. `__attribute__((nodebug))`,
+`-gno-inline-line-tables`, or link-time inlining from a unit without debug
+information can hide an initializer and make base-subobject construction
+appear complete.
+A receiver can have provisional identity when construction predates attach
+or bypasses a watched constructor, as with a trivial copy. Ambiguous
+construction, duplicate lifetime symbols and incomplete destructor coverage
+can also leave identity provisional. Its callback reports
+`identity_verified() == false` with zero object ID and generation. An observed
+destructor in a registration with methods can report zero-ID teardown for a
+receiver already observed with provisional identity at the same address.
+Duplicate lifetime checks use the application mappings present at binding.
+An unreadable mapped application file leaves coverage incomplete. A fresh
+binding evaluates libraries the target loaded later.
+Live method and code-cache events arrive independently. JSON export orders
+each grouped registration's retained events by monotonic observation time.
+The event sequence remains the server's arrival cursor. Correlate verified
+observations by registration, object ID and generation.
+Choose a fresh output path for each preparation.
+
 ## Trace object lifetimes and state in a prebuilt binary
 
 Use the full Linux build on x86-64 or AArch64, with the REPL, server, and agent from the same build. Supply the existing ELF and its matching DWARF, either embedded or in a matching separate debug file. The watch installs patches in process memory. The application executable and source files stay intact.

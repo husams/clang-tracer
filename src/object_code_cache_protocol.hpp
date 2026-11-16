@@ -36,6 +36,9 @@ enum class Hook : std::uint8_t {
   dispatch_gap, shared_mapping_gap, post_store_signal, scope_signal, snapshot_entry, snapshot_return,
   lifetime_reused, admission_gap, rmw, collection_update
 };
+enum class ProvisionalReason : std::uint8_t {
+  none, uncertain_construction, instance_limit, unobserved_construction
+};
 inline bool writer(Hook hook) noexcept {
   return hook == Hook::move || hook == Hook::xadd || hook == Hook::cas || hook == Hook::rmw;
 }
@@ -108,6 +111,8 @@ struct SharedFileIdentity {
 struct ConstructorReturn { Address entry, return_pc; };
 
 struct Init {
+  std::uint64_t identity_watch_id = 0;
+  bool provisional_method_watch = false;
   char path[4096]{};
   char module[4096]{};
   char error[512]{};
@@ -153,6 +158,7 @@ struct Observation {
   std::uint32_t owner_index_plus_one;
   std::uint32_t runtime_module;
   Hook hook;
+  ProvisionalReason provisional_reason = ProvisionalReason::none;
   std::uint8_t values, depth, stack_status;
   std::uint8_t gap;
   bool has_shared_file_offset;
@@ -200,6 +206,7 @@ struct Channel {
   alignas(64) std::atomic<std::uint64_t> activity{0};
   std::atomic<std::uint64_t> runtime_prefix_gate{0};
   std::atomic<std::uint32_t> reclaim_request{0};
+  std::atomic<bool> registration_active{true};
   std::atomic<std::uint32_t> runtime_translations{0}, runtime_reclaimed{0};
   std::atomic<std::uint32_t> static_fragments{0}, static_reclaimed{0};
   RuntimeAdmission admission;

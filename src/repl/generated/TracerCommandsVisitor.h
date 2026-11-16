@@ -95,6 +95,12 @@ public:
 
     virtual std::any visitKeyword(TracerCommandsParser::KeywordContext *context) = 0;
 
+    virtual std::any visitObjectProbe(TracerCommandsParser::ObjectProbeContext *context) = 0;
+
+    virtual std::any visitObjectProbePrepareOption(TracerCommandsParser::ObjectProbePrepareOptionContext *context) = 0;
+
+    virtual std::any visitObjectProbeBindOption(TracerCommandsParser::ObjectProbeBindOptionContext *context) = 0;
+
     virtual std::any visitLiveUpdate(TracerCommandsParser::LiveUpdateContext *context) = 0;
 
     virtual std::any visitLiveScanSelection(TracerCommandsParser::LiveScanSelectionContext *context) = 0;

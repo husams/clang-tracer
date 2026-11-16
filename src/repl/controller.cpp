@@ -1,5 +1,7 @@
 #include "controller.hpp"
+#include "object_probe_package.hpp"
 #include "../prepared_contract.hpp"
+#include "../preparer_diagnostics.hpp"
 #include "../module_index_format.hpp"
 #include "../proc_identity.hpp"
 #include "../sqlite_events.hpp"
@@ -27,7 +29,9 @@
 #include <cctype>
 #include <cstdlib>
 #include <cerrno>
+#include <poll.h>
 #include <spawn.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
 #ifdef __linux__
 #include <sys/stat.h>
@@ -434,6 +438,7 @@ void Controller::start_server(const Command &command) {
 void Controller::disconnect() {
   stop_background();
   stub_.reset();
+  object_probe_preview_.reset();
   selected_ = {};
   ++connection_;
   endpoint_.clear();
@@ -648,6 +653,13 @@ void Controller::detach(const SessionHandle &session) {
     selected_ = {};
   }
   out_ << "detached session=" << request.session_id() << '\n';
+  if (response.has_object_probe()) {
+    const auto &group = response.object_probe();
+    out_ << "object-probe registration=" << group.registration_id()
+         << " active=" << (group.active() ? "yes" : "no")
+         << " restoration_pending=" << (group.restoration_pending() ? "yes" : "no")
+         << " | " << group.diagnostic() << '\n';
+  }
 }
 
 api::ProbeSpec Controller::resolve(const std::string &selector,
@@ -861,15 +873,151 @@ void run_preparer(std::vector<std::string> arguments, const char *failure) {
   std::vector<char *> argv;
   for (auto &argument : arguments) argv.push_back(argument.data());
   argv.push_back(nullptr);
+  int diagnostic_pipe[2]{};
+  if (::pipe(diagnostic_pipe) != 0)
+    throw std::system_error(errno, std::generic_category(), "cannot capture native preparation diagnostics");
+  for (const auto fd : diagnostic_pipe) {
+    const int flags = ::fcntl(fd, F_GETFD);
+    if (flags < 0 || ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
+      const int error = errno;
+      ::close(diagnostic_pipe[0]);
+      ::close(diagnostic_pipe[1]);
+      throw std::system_error(error, std::generic_category(), "cannot secure native preparation diagnostics");
+    }
+  }
+  if (::fcntl(diagnostic_pipe[0], F_SETFL, O_NONBLOCK) < 0) {
+    const int error = errno;
+    ::close(diagnostic_pipe[0]);
+    ::close(diagnostic_pipe[1]);
+    throw std::system_error(error, std::generic_category(), "cannot configure native preparation diagnostics");
+  }
+  posix_spawn_file_actions_t actions;
+  int configured = ::posix_spawn_file_actions_init(&actions);
+  const bool actions_initialized = configured == 0;
+  if (!configured)
+    configured = ::posix_spawn_file_actions_adddup2(&actions, diagnostic_pipe[1], STDERR_FILENO);
+  if (!configured && diagnostic_pipe[0] != STDERR_FILENO)
+    configured = ::posix_spawn_file_actions_addclose(&actions, diagnostic_pipe[0]);
+  if (!configured && diagnostic_pipe[1] != STDERR_FILENO)
+    configured = ::posix_spawn_file_actions_addclose(&actions, diagnostic_pipe[1]);
+  if (configured) {
+    if (actions_initialized)
+      ::posix_spawn_file_actions_destroy(&actions);
+    ::close(diagnostic_pipe[0]);
+    ::close(diagnostic_pipe[1]);
+    throw std::system_error(configured, std::generic_category(), "cannot configure native preparation diagnostics");
+  }
   pid_t pid = 0;
-  const int started = ::posix_spawnp(&pid, argv.front(), nullptr, nullptr, argv.data(), environ);
-  if (started)
+  const int started = ::posix_spawnp(&pid, argv.front(), &actions, nullptr, argv.data(), environ);
+  ::posix_spawn_file_actions_destroy(&actions);
+  ::close(diagnostic_pipe[1]);
+  if (started) {
+    ::close(diagnostic_pipe[0]);
     throw std::system_error(started, std::generic_category(), "cannot start native preparer");
+  }
+  std::array<char, 4096> buffer{};
+  // The preparer's terminal reason belongs in the REPL error. Its other
+  // output continues to stream while the child is running.
+  const auto failure_prefix = tracer::prepared::preparer_failure_prefix;
+  std::string line_prefix, failure_reason;
+  bool at_line_start = true, saw_failure = false, capturing_reason = false;
+  const auto relay_stderr = [&](std::string_view bytes) {
+    while (!bytes.empty()) {
+      const auto newline = bytes.find('\n');
+      const bool complete_line = newline != bytes.npos;
+      const auto length = complete_line ? newline + 1 : bytes.size();
+      const auto part = bytes.substr(0, length);
+      bytes.remove_prefix(length);
+      if (capturing_reason) {
+        failure_reason.append(part);
+        capturing_reason = !complete_line;
+      } else if (at_line_start && !saw_failure) {
+        line_prefix.append(part);
+        if (failure_prefix.starts_with(line_prefix) && line_prefix.size() < failure_prefix.size())
+          continue;
+        if (line_prefix.starts_with(failure_prefix)) {
+          saw_failure = true;
+          capturing_reason = !complete_line;
+          failure_reason.assign(line_prefix, failure_prefix.size());
+        } else {
+          std::cerr << line_prefix;
+        }
+        line_prefix.clear();
+      } else {
+        std::cerr << part;
+      }
+      at_line_start = complete_line;
+    }
+  };
+  int read_error = 0;
+  const auto drain = [&](std::size_t size) {
+    ssize_t count;
+    do {
+      count = ::read(diagnostic_pipe[0], buffer.data(), std::min(size, buffer.size()));
+    } while (count < 0 && errno == EINTR);
+    if (count > 0) {
+      relay_stderr({buffer.data(), static_cast<std::size_t>(count)});
+    } else if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+      read_error = errno;
+    }
+    return count;
+  };
+
   int status = 0;
-  while (::waitpid(pid, &status, 0) < 0)
-    if (errno != EINTR) throw std::runtime_error("cannot wait for native preparation");
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-    throw std::runtime_error(failure);
+  pid_t waited;
+  bool pipe_open = true;
+  do {
+    do {
+      waited = ::waitpid(pid, &status, pipe_open ? WNOHANG : 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != 0)
+      break;
+    const auto count = drain(buffer.size());
+    if (!count || read_error) {
+      ::close(diagnostic_pipe[0]);
+      pipe_open = false;
+    } else if (count < 0) {
+      pollfd ready{diagnostic_pipe[0], POLLIN, 0};
+      // A descendant may keep the pipe open after the preparer exits.
+      // Check the leader's status even when stderr has no new bytes.
+      (void)::poll(&ready, 1, 20);
+    }
+  } while (true);
+  if (pipe_open) {
+    if (waited == pid) {
+      int pending = 0;
+      if (::ioctl(diagnostic_pipe[0], FIONREAD, &pending) == 0) {
+        while (pending > 0) {
+          const auto count = drain(static_cast<std::size_t>(pending));
+          if (count <= 0)
+            break;
+          pending -= static_cast<int>(count);
+        }
+      } else {
+        (void)drain(buffer.size());
+      }
+    }
+    ::close(diagnostic_pipe[0]);
+  }
+  if (!line_prefix.empty())
+    std::cerr << line_prefix;
+  if (waited < 0)
+    throw std::runtime_error("cannot wait for native preparation");
+  if (read_error)
+    throw std::system_error(read_error, std::generic_category(), "cannot read native preparation diagnostics");
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+    if (saw_failure)
+      std::cerr << failure_prefix << failure_reason;
+    return;
+  }
+  while (!failure_reason.empty() && (failure_reason.back() == '\n' || failure_reason.back() == '\r'))
+    failure_reason.pop_back();
+  const auto status_message = WIFSIGNALED(status)
+      ? "preparer terminated by signal " + std::to_string(WTERMSIG(status))
+      : WIFEXITED(status) ? "preparer exited with status " + std::to_string(WEXITSTATUS(status))
+                         : std::string("unexpected preparer status");
+  throw std::runtime_error(std::string(failure) + ": " + status_message +
+                           (failure_reason.empty() ? "" : ": " + failure_reason));
 }
 
 class PreparationDirectory {
@@ -976,6 +1124,182 @@ Controller::PreparedPackage Controller::prepare_package(const std::string &selec
     throw std::runtime_error("cannot read newly generated prepared package");
   out_ << "prepared directory=" << directory << '\n';
   return package;
+}
+
+void Controller::object_probe_command(const Command &command) {
+  using K = CommandKind;
+  using Request = api::ObjectProbeRequest;
+  const auto values = [&](const char *name) {
+    const auto found = command.options.find(name);
+    return found == command.options.end() ? std::vector<std::string>{} : found->second;
+  };
+  if (command.kind == K::object_probe_prepare) {
+    if (!command.has("--output"))
+      throw std::invalid_argument("object probe preparation requires --output FILE");
+    const auto output = command.option("--output");
+    if (std::filesystem::exists(std::filesystem::symlink_status(output)))
+      throw std::invalid_argument("object-probe package already exists; select a new --output file");
+    ObjectProbePackageInput input;
+    input.qualified_type = command.arguments.at(0);
+    input.methods = values("--method");
+    input.fields = values("--field");
+    input.writer_selectors = values("--code");
+    input.allow_dwarf_writer_fallback = command.has("--dwarf-writers");
+    input.compile.includes = values("--include");
+    input.compile.compilation_database = command.option("--compdb");
+    input.compile.translation_unit = command.option("--translation-unit");
+    input.compile.extra_arguments = probe_extra_arguments(command, settings_);
+    if (command.has("--callbacks"))
+      input.callback_source = read_source(command.option("--callbacks"));
+    if (input.fields.size() > 1)
+      throw std::invalid_argument("select one field per object probe");
+    if (!input.fields.empty() && input.writer_selectors.empty()) {
+      api::ObjectWatchRequest discovery;
+      discovery.set_concrete_type(input.qualified_type);
+      discovery.set_field(input.fields.front());
+      discover_writers(command, discovery);
+      input.writer_selectors.push_back(discovery.code_symbol());
+      for (const auto &additional : discovery.additional_code_symbols())
+        input.writer_selectors.push_back(additional);
+    }
+    if (!input.fields.empty() && input.methods.empty() && !input.allow_dwarf_writer_fallback &&
+        (!command.has("--compdb") || !command.has("--translation-unit")))
+      throw std::invalid_argument("supply original compilation context or select --dwarf-writers");
+    PreparationDirectory staging;
+    std::size_t method_index = 0;
+    const auto package = ObjectProbePackage::prepare(input,
+        [&](const std::string &selector, const ObjectProbeCompileInputs &compile) {
+      Command options;
+      options.options["--receiver-storage"] = {"true"};
+      options.options["--include"] = compile.includes;
+      options.options["--compdb"] = {compile.compilation_database};
+      options.options["--translation-unit"] = {compile.translation_unit};
+      options.options["--output"] = {staging.file(std::to_string(method_index++)).string()};
+      options.extra_compile_argument_inputs = command.extra_compile_argument_inputs;
+      options.extra_compile_arguments = command.extra_compile_arguments;
+      try {
+        return prepare_package(selector, options).artifact;
+      } catch (const std::exception &error) {
+        throw std::runtime_error("cannot prepare object probe method " + selector + " | " + error.what());
+      }
+    });
+    package.save(output);
+    out_ << "object-probe package=" << command.option("--output")
+         << " type=" << input.qualified_type << " methods=" << input.methods.size()
+         << " writers=" << input.writer_selectors.size() << '\n';
+    return;
+  }
+
+  const bool inspecting = command.kind == K::object_probe_status || command.kind == K::object_probe_stop;
+  if (!inspecting)
+    require_session(selected_);
+  else if (!stub_ || selected_.id.empty() || selected_.connection != connection_)
+    throw std::runtime_error("no valid selected session; use %attach PID or %use SESSION");
+  Request request;
+  request.set_session_id(selected_.id);
+  std::string definition;
+  if (inspecting) {
+    request.set_action(command.kind == K::object_probe_status ? Request::STATUS : Request::STOP);
+    if (!command.arguments.empty())
+      request.set_registration_id(unsigned_number(command.arguments.front(), "registration id"));
+  } else {
+    if (!command.has("--package"))
+      throw std::invalid_argument("object probe requires --package FILE");
+    const auto package = ObjectProbePackage::load(command.option("--package"));
+    const auto &input = package.input();
+    const auto starting = command.kind == K::object_probe_start;
+    request.set_action(Request::START);
+    for (const auto &artifact : package.prepared_methods())
+      *request.add_methods() = artifact;
+    request.set_callback_source(input.callback_source);
+    const auto module_path = [](const std::string &selector) {
+      const std::filesystem::path path(selector);
+      return path.has_parent_path() ? std::filesystem::absolute(path).lexically_normal().string() : selector;
+    };
+    request.set_method_module(module_path(command.option("--method-module", command.option("--module"))));
+    auto &watch = *request.mutable_watch();
+    watch.set_concrete_type(input.qualified_type);
+    watch.set_code_module(module_path(command.option("--module")));
+    if (!input.fields.empty()) {
+      watch.set_field(input.fields.front());
+      watch.set_code_symbol(input.writer_selectors.front());
+      for (std::size_t i = 1; i < input.writer_selectors.size(); ++i)
+        watch.add_additional_code_symbols(input.writer_selectors[i]);
+    }
+    watch.set_follow_calls(command.has("--follow-calls"));
+    watch.set_no_values(command.has("--no-values"));
+    watch.set_first_seen(command.has("--first-seen"));
+    watch.set_union_tag(command.option("--union-tag"));
+    if (command.has("--synchronization")) {
+      const auto policy = command.option("--synchronization");
+      if (policy == "thread-confined")
+        watch.set_synchronization(api::ObjectWatchRequest::THREAD_CONFINED);
+      else if (policy == "caller-lock")
+        watch.set_synchronization(api::ObjectWatchRequest::CALLER_LOCK);
+      else
+        throw std::invalid_argument("synchronization must be thread-confined or caller-lock");
+    }
+    for (const auto &mapping : values("--union-case")) {
+      const auto split = mapping.find('=');
+      if (split == std::string::npos || !split || split + 1 == mapping.size())
+        throw std::invalid_argument("--union-case requires TAG=MEMBER");
+      const auto literal = mapping.substr(0, split);
+      auto *item = watch.add_union_cases();
+      if (literal.front() == '-') {
+        std::size_t consumed = 0;
+        const auto tag = std::stoll(literal, &consumed);
+        if (consumed != literal.size())
+          throw std::invalid_argument("invalid signed union discriminator");
+        item->set_tag_bits(static_cast<std::uint64_t>(tag));
+      } else {
+        item->set_tag_bits(unsigned_number(literal, "union discriminator"));
+      }
+      item->set_member(mapping.substr(split + 1));
+    }
+    definition = request.SerializeAsString();
+    if (starting && object_probe_preview_ && object_probe_preview_->definition == definition)
+      *request.mutable_preview() = object_probe_preview_->binding;
+    if (!starting)
+      request.set_action(Request::PREVIEW);
+  }
+  const auto result = unary<api::ObjectProbeStatus>(
+      [&](auto &context, auto &reply) { return stub_->ObjectProbe(&context, request, &reply); },
+      settings_.timeout_seconds);
+  if (request.action() == Request::PREVIEW) {
+    object_probe_preview_ = ObjectProbePreview{std::move(definition), result.binding()};
+    const auto &watch = result.watch();
+    out_ << "object-probe preview build_id=" << watch.plan().executable_build_id()
+         << " writer_build_id=" << watch.plan().writer_build_id()
+         << " sites=" << watch.store_sites() << " unsupported=" << watch.unsupported_sites()
+         << " redirects=" << watch.redirects_size() << '\n';
+    for (const auto &binding : watch.plan().bindings())
+      out_ << "  " << binding.role() << " " << binding.function()
+           << " module=" << binding.module() << " pc=0x" << std::hex << binding.runtime_pc()
+           << std::dec << '\n';
+    for (const auto &patch : result.binding().method_patches())
+      out_ << "  method " << patch.function() << " module=" << patch.module()
+           << " pc=0x" << std::hex << patch.runtime_pc() << std::dec
+           << " verified_bytes=" << patch.patch_size() << '\n';
+    out_ << result.diagnostic() << '\n';
+    if (!watch.diagnostic().empty())
+      out_ << watch.diagnostic() << '\n';
+    return;
+  }
+  const auto &watch = result.watch();
+  out_ << "object-probe registration=" << result.registration_id()
+       << " active=" << (result.active() ? "yes" : "no")
+       << " methods=" << result.methods_size()
+       << " observations=" << watch.observations() << " dropped=" << watch.dropped()
+       << " coverage_gaps=" << watch.coverage_gaps()
+       << " runtime_gap_hits=" << watch.runtime_gap_hits()
+       << " restoration_pending=" << (result.restoration_pending() ? "yes" : "no")
+       << " | " << result.diagnostic() << '\n';
+  for (const auto &method : result.methods())
+    out_ << "  method_probe=" << method.id()
+         << " active=" << (method.active() ? "yes" : "no")
+         << " restored=" << (method.original_bytes_restored() ? "yes" : "no") << '\n';
+  if (result.restoration_pending())
+    throw std::runtime_error("retry %object-probe stop with the registration id");
 }
 
 void Controller::prepare(const std::string &selector, const Command &options) {
@@ -1111,6 +1435,17 @@ void Controller::print(const Collection &collection) const {
 RecordResult Controller::watch(const Command &command, bool display,
                                const std::string &record_path) {
   ensure_connected();
+  CallbackErrorFilter callback_errors = CallbackErrorFilter::include;
+  if (command.has("--callback-errors")) {
+    const auto value = command.option("--callback-errors");
+    if (value == "exclude")
+      callback_errors = CallbackErrorFilter::exclude;
+    else if (value == "only")
+      callback_errors = CallbackErrorFilter::only;
+    else if (value != "include")
+      throw std::invalid_argument(
+          "--callback-errors must be include, exclude, or only");
+  }
   api::WatchEventsRequest request;
   if (command.has("--session")) {
     request.add_session_ids(command.option("--session"));
@@ -1189,6 +1524,12 @@ RecordResult Controller::watch(const Command &command, bool display,
         api::TracePhase_Name(event.phase()) != command.option("--phase")) {
       // The server can send the adapter once for a batch. Keep it if the
       // event carrying it is filtered out before the next stored event.
+      if (sqlite && event.has_replay_types())
+        pending_types.insert_or_assign(event.probe_id(),
+                                       std::move(*event.mutable_replay_types()));
+      continue;
+    }
+    if (!callback_error_matches(event, callback_errors)) {
       if (sqlite && event.has_replay_types())
         pending_types.insert_or_assign(event.probe_id(),
                                        std::move(*event.mutable_replay_types()));
@@ -1275,6 +1616,10 @@ RecordResult Controller::record(const std::string &path,
     throw std::invalid_argument("recording session conflicts with all_sessions");
   if (!options.phase.empty() && options.phase != "PRE" && options.phase != "POST")
     throw std::invalid_argument("recording phase must be PRE or POST");
+  if (options.callback_errors != CallbackErrorFilter::include &&
+      options.callback_errors != CallbackErrorFilter::exclude &&
+      options.callback_errors != CallbackErrorFilter::only)
+    throw std::invalid_argument("invalid callback error filter");
   if (options.timeout_seconds > 86400)
     throw std::invalid_argument("recording timeout must be at most 86400 seconds");
 
@@ -1290,6 +1635,10 @@ RecordResult Controller::record(const std::string &path,
     command.options["--name"] = options.names;
   if (!options.phase.empty())
     command.options["--phase"] = {options.phase};
+  if (options.callback_errors == CallbackErrorFilter::exclude)
+    command.options["--callback-errors"] = {"exclude"};
+  else if (options.callback_errors == CallbackErrorFilter::only)
+    command.options["--callback-errors"] = {"only"};
   if (options.probe_id)
     command.options["--probe"] = {std::to_string(options.probe_id)};
   if (options.after_sequence)
@@ -1719,6 +2068,13 @@ bool Controller::execute(const Command &command) {
     detach(session);
     return true;
   }
+  case K::object_probe_prepare:
+  case K::object_probe_preview:
+  case K::object_probe_start:
+  case K::object_probe_status:
+  case K::object_probe_stop:
+    object_probe_command(command);
+    return true;
   case K::live_update:
   case K::live_preview:
   case K::live_watch:
@@ -2683,7 +3039,16 @@ public:
       throw std::runtime_error("collection already exists: " + name +
                                "; choose a new name or use %events clear NAME");
     }
-    auto loaded = read_recording(args.at(0), {});
+    EventQuery query;
+    const auto callback_errors = command.option("--callback-errors", "include");
+    if (callback_errors == "exclude")
+      query.callback_errors = CallbackErrorFilter::exclude;
+    else if (callback_errors == "only")
+      query.callback_errors = CallbackErrorFilter::only;
+    else if (callback_errors != "include")
+      throw std::invalid_argument(
+          "--callback-errors must be include, exclude, or only");
+    auto loaded = read_recording(args.at(0), query);
     out_ << "opened events=" << loaded.received
          << " retained=" << loaded.events().size()
          << " evicted=" << loaded.evicted << '\n';

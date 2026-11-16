@@ -697,7 +697,8 @@ struct Scope { std::size_t mark = tracer_snapshot_mark(); bool active=true;
   ~Scope(){release();} };
 }
 )";
-  code.arguments = "tracer_snapshot_detail::Scope snapshot_scope;\n";
+  code.scope = "tracer_snapshot_detail::Scope snapshot_scope;\n";
+  code.storage = code.scope;
   std::vector<clang::QualType> types;
   std::vector<context_engine::SnapshotMemberAccessor> member_accessors;
   for (auto &entry : entries)
@@ -913,9 +914,19 @@ inline bool verified_vtable(const void* address) noexcept {
                                : result ? "ctx.result.snapshot"
                                         : "ctx.arguments[" + std::to_string(entry.index) + "].snapshot";
     auto &body = receiver ? code.receiver : result ? code.result : code.arguments;
-    body += "tracer::ValueSnapshot snapshot_" + id + ";\n";
+    auto &storage = receiver ? code.receiver_storage
+                             : result ? code.result_storage : code.argument_storage;
+    const std::string snapshot_storage = "tracer::ValueSnapshot snapshot_" + id + ";\n";
+    storage += snapshot_storage;
+    code.storage += snapshot_storage;
     if (!entry.members.empty())
-      body += "tracer::ValueSnapshot child_snapshots_" + id + "[" +
+      storage += "tracer::ValueSnapshot child_snapshots_" + id + "[" +
+              std::to_string(entry.members.size()) + "]{};\n"
+              "tracer::ValueSnapshotMember child_members_" + id + "[" +
+              std::to_string(entry.members.size()) + "]{};\n"
+              "std::size_t child_member_count_" + id + "=0;\n";
+    if (!entry.members.empty())
+      code.storage += "tracer::ValueSnapshot child_snapshots_" + id + "[" +
               std::to_string(entry.members.size()) + "]{};\n"
               "tracer::ValueSnapshotMember child_members_" + id + "[" +
               std::to_string(entry.members.size()) + "]{};\n"

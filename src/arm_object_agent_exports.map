@@ -1,7 +1,7 @@
 {
   global:
-    tracer_agent_object_cache_v38;
-    tracer_agent_arm_snapshot_v2;
+    tracer_agent_object_cache_v40;
+    tracer_agent_arm_snapshot_v3;
   local:
     *;
 };

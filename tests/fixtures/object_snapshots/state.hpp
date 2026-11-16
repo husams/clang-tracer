@@ -32,6 +32,10 @@ struct MoveBomb {
 struct Registered {
   int value;
 };
+struct LargeResult {
+  int marker;
+  long long payload[3];
+};
 class Risk {
   std::string label_;
   std::vector<int> limits_;
@@ -54,6 +58,7 @@ class State {
   std::any extension_{Registered{12}};
   Secondary *child_;
   Secondary *alias_;
+  int result_calls_ = 0;
 
 public:
   explicit State(Secondary &child);
@@ -62,5 +67,6 @@ public:
   void mutate();
   void make_valueless();
   void replace_child();
+  LargeResult make_result();
 };
 } // namespace snapshot_test

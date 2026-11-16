@@ -41,7 +41,7 @@ def wait_stop(pid, expected):
     assert os.WIFSTOPPED(status) and os.WSTOPSIG(status) == expected, (status, expected)
 
 
-def signal_at(pid, address, start):
+def signal_at(pid, address, start, signal_number=signal.SIGUSR1):
     ptrace(0x4206, pid)  # PTRACE_SEIZE
     ptrace(0x4207, pid)  # PTRACE_INTERRUPT
     wait_stop(pid, signal.SIGTRAP)
@@ -62,15 +62,15 @@ def signal_at(pid, address, start):
     assert registers[pc] == address + (0 if ARM else 1)
     registers[pc] = address
     ptrace(0x4205, pid, 1, c.byref(iov))
-    assert libc.syscall(131 if ARM else 234, pid, pid, signal.SIGUSR1) == 0
+    assert libc.syscall(131 if ARM else 234, pid, pid, signal_number) == 0
     ptrace(7, pid)
     _, status = os.waitpid(pid, 0)
-    if os.WIFSTOPPED(status) and os.WSTOPSIG(status) != signal.SIGUSR1:
+    if os.WIFSTOPPED(status) and os.WSTOPSIG(status) != signal_number:
         ptrace(0x4204, pid, 1, c.byref(iov))
         raise AssertionError(f"signal delivery stopped with {os.WSTOPSIG(status)} at "
                              f"{registers[pc]:#x} after trap {address:#x}")
     assert os.WIFSTOPPED(status), status
-    ptrace(17, pid, 0, signal.SIGUSR1)  # PTRACE_DETACH
+    ptrace(17, pid, 0, signal_number)  # PTRACE_DETACH
 
 
 def hook_pc(redirects, read, phase, dispatch_pc=None):
@@ -139,7 +139,9 @@ def run(repl, server, agent, fixture, phase, no_values):
             position = phase
         elif phase == "exit" and not ARM:
             position = "return"
-        target, app = start([fixture, position])
+        fixture_mode = ("oneshot" if phase == "oneshot" else
+                        "oneshot-timer" if phase == "oneshot-kernel" else position)
+        target, app = start([fixture, fixture_mode])
         app.expect(r"^READY$")
         memory = cleanup.enter_context(Path(f"/proc/{target.pid}/mem").open("rb", buffering=0))
 
@@ -158,8 +160,9 @@ def run(repl, server, agent, fixture, phase, no_values):
             options += " --no-values"
         writer = {"dispatch": "signal_window_dispatch", "tail": "signal_window_tail", "sve16": "signal_window_sve",
                   "sve64": "signal_window_sve", "sme16": "signal_window_sme"}.get(phase, "signal_window_write")
+        async_signal = signal.SIGALRM if phase == "oneshot-kernel" else signal.SIGUSR1
         definition = (f"--type signal_test::Record --field value --code {writer} "
-                      f"--backend code-cache --async-signal {int(signal.SIGUSR1)}" + options)
+                      f"--backend code-cache --async-signal {int(async_signal)}" + options)
         dispatch_pc = None
         if dispatch:
             send(control, "%object preview " + definition)
@@ -200,9 +203,32 @@ def run(repl, server, agent, fixture, phase, no_values):
         else:
             interrupt = hook_pc(redirects, read, phase, dispatch_pc)
             send(control, record)
-        signal_at(target.pid, interrupt, root / ("tail.now" if phase == "tail" else "write.now"))
+        signal_at(target.pid, interrupt, root / ("tail.now" if phase == "tail" else "write.now"),
+                  async_signal)
         app.expect(rf"^DONE pc_ok=1 value={23 if after else 43} result=44$")
         out.expect(rf"^received={count} .*complete=true")
+        if phase == "oneshot":
+            # The bridge must honor the application's SA_RESETHAND disposition:
+            # the second signal takes SIGUSR1's default action instead of
+            # calling the application's one-shot handler again.
+            target.send_signal(signal.SIGUSR1)
+            assert target.wait(timeout=10) == -signal.SIGUSR1
+            assert (root / "oneshot-count").read_bytes() == b"H"
+            send(control, "%detach")
+            out.expect(r"^detached session=")
+            send(control, "%quit")
+            assert control.wait(timeout=10) == 0
+            return
+        if phase == "oneshot-kernel":
+            # The second delivery comes from alarm(2), with a kernel timer
+            # si_code. Its default action terminates after one app-handler call.
+            assert target.wait(timeout=10) == -signal.SIGALRM
+            assert (root / "oneshot-count").read_bytes() == b"H"
+            send(control, "%detach")
+            out.expect(r"^detached session=")
+            send(control, "%quit")
+            assert control.wait(timeout=10) == 0
+            return
         send(control, f"%object stop {watch[1]}")
         status = out.expect(rf"^watch={watch[1]} active=no .*restoration_pending=no ")
         if phase != "after":
@@ -239,7 +265,8 @@ if __name__ == "__main__":
     repl, server, agent, fixture = (Path(arg).resolve() for arg in sys.argv[1:5])
     digest = hashlib.sha256(fixture.read_bytes()).digest()
     scalable_state = ARM and (libc.getauxval(16) & (1 << 22) or libc.getauxval(26) & (1 << 23))
-    phases = ("entry", "gate", "after", "exit", "recovered" if scalable_state else "deferred")
+    phases = ("entry", "gate", "after", "exit", "recovered" if scalable_state else "deferred",
+              "oneshot")
     if not scalable_state or libc.getauxval(16) & (1 << 22):
         phases += ("dispatch", "tail")
     if ARM and libc.getauxval(16) & (1 << 22):
@@ -249,6 +276,6 @@ if __name__ == "__main__":
     if len(sys.argv) > 5:
         phases = tuple(sys.argv[5:])
     for phase in phases:
-        for no_values in (False, True):
+        for no_values in ((False,) if phase == "oneshot-kernel" else (False, True)):
             run(repl, server, agent, fixture, phase, no_values)
     assert hashlib.sha256(fixture.read_bytes()).digest() == digest

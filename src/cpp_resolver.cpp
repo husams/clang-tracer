@@ -1062,7 +1062,7 @@ public:
             candidate.spec, sema_, nullptr, invocation_.pointer_layouts);
         if (!invocation_.prepared_headers.empty()) {
           const auto snapshots = prepare_snapshot_roots(*context_, *declaration, method);
-          auto adapter = tracer::prepared::AdapterEmitter::emit(*context_, *header_search_,
+          auto adapter = tracer::prepared::AdapterEmitter::emit(*context_, *sema_, *header_search_,
               *declaration, invocation_.prepared_headers, invocation_.pointer_layouts,
               snapshots.types);
           auto &package = *candidate.spec.mutable_prepared();

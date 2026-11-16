@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -177,6 +178,52 @@ void native_values() {
   require(!event.has_result(), "missing result is discoverable");
   rejects<std::runtime_error>([&] { event.result_as<int>(); },
                               "missing result does not become zero");
+}
+
+void callback_error_events() {
+  api::TraceEvent message;
+  message.set_phase(api::PRE);
+  message.set_function_name("Widget::update()");
+  message.set_callback_error(true);
+  message.set_callback_error_message("interceptor threw");
+  const auto event = snapshot(message);
+  require(event.callback_error(), "typed callback error accessor is true");
+  require(event.callback_error_message() == "interceptor threw",
+          "typed callback error message is retained");
+  require(callback_error_matches(message, CallbackErrorFilter::include) &&
+              callback_error_matches(message, CallbackErrorFilter::only) &&
+              !callback_error_matches(message, CallbackErrorFilter::exclude),
+          "callback error filters select error events");
+  const auto summary = event_summary(message);
+  require(summary.find("callback_error_message") != std::string::npos &&
+              summary.find("interceptor threw") != std::string::npos,
+          "callback failure is visible in event summaries");
+  message.set_callback_error(false);
+  require(callback_error_matches(message, CallbackErrorFilter::include) &&
+              callback_error_matches(message, CallbackErrorFilter::exclude) &&
+              !callback_error_matches(message, CallbackErrorFilter::only),
+          "success events follow callback error filter mode");
+
+  char path[] = "/tmp/clang-tracer-callback-errors-XXXXXX";
+  const int fd = ::mkstemp(path);
+  if (fd < 0)
+    throw std::runtime_error("cannot create callback error recording fixture");
+  api::TraceEvent success;
+  success.set_function_name("Widget::update()");
+  api::TraceEvent failure = message;
+  failure.set_callback_error(true);
+  failure.set_callback_error_message("interceptor threw");
+  write_record(fd, success);
+  write_record(fd, failure);
+  write_record(fd, success);
+  ::close(fd);
+  EventQuery query;
+  query.callback_errors = CallbackErrorFilter::only;
+  query.count = 1;
+  const auto selected = open_recording(path, 8, 1024 * 1024, query).snapshot();
+  ::unlink(path);
+  require(selected.size() == 1 && selected.at(0).callback_error(),
+          "recording query counts matching callback failures");
 }
 
 void context_values() {
@@ -474,6 +521,7 @@ void complex_values() {
 int main() {
   try {
     native_values();
+    callback_error_events();
     context_values();
     complex_values();
     std::cout << "typed event value checks passed\n";

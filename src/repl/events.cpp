@@ -224,6 +224,14 @@ std::string Event::function_name() const {
   return data_->message.function_name();
 }
 
+bool Event::callback_error() const {
+  return data_->message.callback_error();
+}
+
+std::string Event::callback_error_message() const {
+  return data_->message.callback_error_message();
+}
+
 bool Event::has_result() const {
   const auto &event = data_->message;
   return (event.has_context() && event.context().event().has_result()) ||
@@ -393,6 +401,19 @@ std::string value_text(const api::Value &value) {
   return scalar_text(value, value.type());
 }
 
+bool callback_error_matches(const api::TraceEvent &event,
+                            CallbackErrorFilter filter) {
+  switch (filter) {
+  case CallbackErrorFilter::include:
+    return true;
+  case CallbackErrorFilter::exclude:
+    return !event.callback_error();
+  case CallbackErrorFilter::only:
+    return event.callback_error();
+  }
+  return false;
+}
+
 std::string event_summary(const api::TraceEvent &event) {
   std::ostringstream out;
   if (event.has_object_observation()) {
@@ -535,6 +556,12 @@ std::string event_summary(const api::TraceEvent &event) {
     } else if (event.has_result()) {
       out << " result=" << value_text(event.result());
     }
+  }
+  if (event.callback_error()) {
+    out << " callback_error=true";
+    if (!event.callback_error_message().empty())
+      out << " callback_error_message="
+          << std::quoted(event.callback_error_message());
   }
   out << " lost(agent=" << event.agent_dropped_events()
       << ",server=" << event.server_dropped_events() << ')';
@@ -1021,6 +1048,8 @@ void read_sqlite_recording(const std::string &path, const EventQuery &query,
     if (size <= 0 || size > static_cast<int>(max_frame) ||
         !event.ParseFromArray(sqlite3_column_blob(rows.get(), 0), size))
       throw std::runtime_error("invalid event payload in SQLite recording: " + path);
+    if (!callback_error_matches(event, query.callback_errors))
+      continue;
     buffer.push(event);
   }
   read_recorded_types(db.get(), buffer);
@@ -1029,6 +1058,10 @@ void read_sqlite_recording(const std::string &path, const EventQuery &query,
 
 EventBuffer open_recording(const std::string &path, std::size_t max_events,
                            std::size_t max_bytes, const EventQuery &query) {
+  if (query.callback_errors != CallbackErrorFilter::include &&
+      query.callback_errors != CallbackErrorFilter::exclude &&
+      query.callback_errors != CallbackErrorFilter::only)
+    throw std::invalid_argument("invalid callback error filter");
   api::TracePhase phase = api::TRACE_PHASE_UNSPECIFIED;
   if (!query.phase.empty() && !api::TracePhase_Parse(query.phase, &phase))
     throw std::invalid_argument("unknown event phase: " + query.phase);
@@ -1086,7 +1119,7 @@ EventBuffer open_recording(const std::string &path, std::size_t max_events,
         (!query.names.empty() &&
          std::none_of(query.names.begin(), query.names.end(), [&](const auto &name) {
            return name == event.function_name() || name == event.context().event().name();
-         })))
+         })) || !callback_error_matches(event, query.callback_errors))
       continue;
     buffer.push(event);
   }
@@ -1098,14 +1131,41 @@ EventBuffer open_recording(const std::string &path, std::size_t max_events,
 }
 
 void export_json(const EventBuffer &buffer, const std::string &path) {
+  // Lifecycle samples and method events arrive on different transports. Both
+  // use the target's monotonic clock. Keep the original sequence as a cursor,
+  // and order each registration's exported subsequence by observation time.
+  using Registration = std::pair<std::string, std::uint64_t>;
+  const auto registration_of = [](const api::TraceEvent &event) -> Registration {
+    return {event.session_id(), event.object_probe_registration_id()};
+  };
+  const auto orderable = [](const api::TraceEvent &event) {
+    return event.object_probe_registration_id() && event.monotonic_time_ns();
+  };
+  std::map<Registration, std::vector<const api::TraceEvent *>> registrations;
+  for (const auto &event : buffer.events())
+    if (orderable(event->message))
+      registrations[registration_of(event->message)].push_back(&event->message);
+  for (auto &registration : registrations) {
+    auto &events = registration.second;
+    std::stable_sort(events.begin(), events.end(), [](const auto *a, const auto *b) {
+      return a->monotonic_time_ns() < b->monotonic_time_ns();
+    });
+    std::reverse(events.begin(), events.end());
+  }
+
   const int fd = create_recording(path);
   try {
     write_all(fd, "[\n", 2);
     bool first = true;
     for (const auto &event : buffer.events()) {
+      const auto *message = &event->message;
+      if (orderable(*message)) {
+        auto &events = registrations.at(registration_of(*message));
+        message = events.back();
+        events.pop_back();
+      }
       std::string json;
-      const auto status =
-          google::protobuf::util::MessageToJsonString(event->message, &json);
+      const auto status = google::protobuf::util::MessageToJsonString(*message, &json);
       if (!status.ok()) {
         throw std::runtime_error("cannot encode event as JSON");
       }
