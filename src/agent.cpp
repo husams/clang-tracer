@@ -2830,6 +2830,7 @@ std::string make_wrapper(const tracer::Request &r,
   const bool typed = spec && tracer::prepared::is_typed_version(
                                   spec->prepared().format_version());
   const bool refresh_receiver = spec && spec->snapshot_receiver_at_return();
+  const bool observe_returns = tracer::agent_has_observers(r.session_id);
   if (refresh_receiver && (!typed || r.kind != tracer::CallableKind::Method ||
                            shared_mode || !has_pre || !has_post || !snapshots ||
                            snapshots->receiver.empty()))
@@ -2867,11 +2868,12 @@ std::string make_wrapper(const tracer::Request &r,
       "tracer_event_dispatch(unsigned long long,const "
       "tracer::TraceContext*,long long) noexcept;\nextern \"C\" void "
       "tracer_probe_enter(unsigned long long) noexcept;\nextern \"C\" void "
-      "tracer_probe_leave(unsigned long long) noexcept;\n"
-      "extern \"C\" unsigned long long tracer_observer_clock() noexcept;\n"
-      "extern \"C\" void tracer_observer_return(unsigned long long,unsigned long long,"
-      "unsigned long long,unsigned long long) noexcept;\nextern \"C\" "
+      "tracer_probe_leave(unsigned long long) noexcept;\nextern \"C\" "
       "unsigned long long tracer_next_call_id(unsigned long long) noexcept;\n";
+  if (observe_returns)
+    code += "extern \"C\" unsigned long long tracer_observer_clock() noexcept;\n"
+            "extern \"C\" void tracer_observer_return(unsigned long long,unsigned long long,"
+            "unsigned long long,unsigned long long) noexcept;\n";
   code +=
       "extern \"C\" void tracer_stack_enter(tracer::TraceContext*,void*) "
       "noexcept;\n"
@@ -3016,7 +3018,8 @@ std::string make_wrapper(const tracer::Request &r,
   if (shared_mode && r.result != tracer::ValueType::Void)
     if (r.result != tracer::ValueType::Object)
       code += result_type() + " result;\n";
-  code += "const auto observer_start=tracer_observer_clock();\n";
+  if (observe_returns)
+    code += "const auto observer_start=tracer_observer_clock();\n";
   if (shared_mode && r.result != tracer::ValueType::Object)
     code += "{ tracer_shared_original_enter(shared_guard.token); struct "
             "OriginalGuard { void* token; ~OriginalGuard() noexcept { "
@@ -3083,7 +3086,8 @@ std::string make_wrapper(const tracer::Request &r,
   }
   if (shared_mode && r.result != tracer::ValueType::Object)
     code += "}\n";
-  code += "const auto observer_end=observer_start?tracer_observer_clock():0;\n";
+  if (observe_returns)
+    code += "const auto observer_end=observer_start?tracer_observer_clock():0;\n";
   if (has_post) {
     if (refresh_receiver)
       code += "auto* entry_receiver_snapshot=ctx.receiver_snapshot;\n"
@@ -3104,8 +3108,9 @@ std::string make_wrapper(const tracer::Request &r,
             "tracer_shared_resume(shared_guard.token); "
             "tracer_shared_release(shared_guard.token); "
             "shared_guard.token=nullptr;\n";
-  code += "if(observer_end)tracer_observer_return(ctx.probe_id,ctx.call_id,"
-          "observer_start,observer_end);\n";
+  if (observe_returns)
+    code += "if(observer_end)tracer_observer_return(ctx.probe_id,ctx.call_id,"
+            "observer_start,observer_end);\n";
   if (result_sret) {
     if (class_mode)
       code += "tracer_invocation.destroy();\n";

@@ -25,7 +25,7 @@ using tracer::AgentPluginOperation;
 const pid_t agent_pid = ::getpid();
 std::shared_mutex plugin_mutex;
 std::atomic<bool> has_observers{false};
-std::map<std::string, tracer::NativePlugins> sessions;
+std::map<std::string, tracer::NativePlugins, std::less<>> sessions;
 
 fs::path cache_directory() {
   if (const auto *xdg = std::getenv("XDG_CACHE_HOME");
@@ -144,7 +144,7 @@ int agent_plugin(tracer::AgentPluginCall *request, const char *source,
       if (!source || !request->source_size)
         throw std::invalid_argument("agent plugin source is required");
       auto profile = target_profile();
-      auto &plugins = sessions.try_emplace(request->session_id).first->second;
+      auto &plugins = sessions.try_emplace(request->session_id, true).first->second;
       const bool reload = request->operation == AgentPluginOperation::Reload;
       const std::string_view contents(source, request->source_size);
       const auto cache = cache_directory();
@@ -213,6 +213,14 @@ int agent_plugin(tracer::AgentPluginCall *request, const char *source,
 
 bool tracer::agent_has_observers() noexcept {
   return has_observers.load(std::memory_order_acquire) && agent_pid == ::getpid();
+}
+
+bool tracer::agent_has_observers(std::string_view id) {
+  if (!agent_has_observers())
+    return false;
+  std::shared_lock lock(plugin_mutex);
+  const auto found = sessions.find(id);
+  return found != sessions.end() && found->second.has_observers();
 }
 
 void tracer::agent_notify_return(const std::string& id, const agent::ReturnSample& sample,
