@@ -1,6 +1,6 @@
 {
   global:
-    tracer_agent_object_cache_v39;
+    tracer_agent_object_cache_v40;
     tracer_agent_arm_snapshot_v2;
   local:
     *;

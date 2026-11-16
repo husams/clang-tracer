@@ -30,7 +30,10 @@ if os.fork() == 0:
     while not Path({str(release)!r}).exists() and time.monotonic() < deadline:
         time.sleep(0.02)
     os._exit(0)
-print("preparer diagnostic marker", file=sys.stderr, flush=True)
+sys.stderr.write("prepare: er")
+sys.stderr.flush()
+time.sleep(0.05)
+print("ror: preparer diagnostic marker", file=sys.stderr, flush=True)
 sys.exit(7)
 ''')
     preparer.chmod(0o700)
@@ -49,7 +52,8 @@ sys.exit(7)
             assert console.returncode == 1, (stdout, stderr)
             assert stderr.count("preparer diagnostic marker") == 1, (stdout, stderr)
             assert "preparer progress marker" not in stderr, (stdout, stderr)
-            assert "preparer exited with status 7" in stderr, (stdout, stderr)
+            assert re.search(r"^error: .*preparer exited with status 7: preparer diagnostic marker$",
+                             stderr, re.M), (stdout, stderr)
         finally:
             proceed.touch()
             release.touch()

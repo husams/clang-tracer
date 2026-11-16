@@ -4,6 +4,7 @@
 #include <llvm/Support/LEB128.h>
 
 #include "debug_resolver.hpp"
+#include "admission.hpp"
 #include "proc_identity.hpp"
 #include "linux_syscalls.hpp"
 #include "native_detour.hpp"
@@ -70,14 +71,34 @@ std::string leaf_name(const std::string &qualified_name) {
 std::string qualified(DWARFDie die) {
   if (!die)
     return {};
-  std::string result = name(die);
-  for (auto parent = die.getParent(); parent; parent = parent.getParent()) {
-    if (parent.getTag() == dw::DW_TAG_namespace || parent.getTag() == dw::DW_TAG_class_type ||
-        parent.getTag() == dw::DW_TAG_structure_type || parent.getTag() == dw::DW_TAG_union_type) {
-      result = name(parent) + "::" + result;
-    } else if (parent.getTag() != dw::DW_TAG_compile_unit &&
-               parent.getTag() != dw::DW_TAG_type_unit) {
-      return {};
+  const auto from_scope = [](DWARFDie current) {
+    std::string result = name(current);
+    for (auto parent = current.getParent(); parent; parent = parent.getParent()) {
+      if (parent.getTag() == dw::DW_TAG_namespace || parent.getTag() == dw::DW_TAG_class_type ||
+          parent.getTag() == dw::DW_TAG_structure_type || parent.getTag() == dw::DW_TAG_union_type) {
+        result = name(parent) + "::" + result;
+      } else if (parent.getTag() != dw::DW_TAG_compile_unit &&
+                 parent.getTag() != dw::DW_TAG_type_unit) {
+        return std::string{};
+      }
+    }
+    return result;
+  };
+  auto result = from_scope(die);
+  // A DWARF4 type-unit DIE may be rooted at the type unit, with the source
+  // namespace recorded only on its specification in .debug_info.
+  llvm::SmallVector<DWARFDie, 4> pending{die};
+  std::set<DWARFDie> seen{die};
+  for (std::size_t index = 0; index < pending.size(); ++index) {
+    for (const auto attr : {dw::DW_AT_specification, dw::DW_AT_abstract_origin}) {
+      const auto related = pending[index].getAttributeValueAsReferencedDie(attr);
+      if (!related || !seen.insert(related).second)
+        continue;
+      pending.push_back(related);
+      const auto candidate = from_scope(related);
+      if (name(related) == name(die) && candidate.find("::") != std::string::npos &&
+          (result.find("::") == std::string::npos || candidate.size() > result.size()))
+        result = candidate;
     }
   }
   return result;
@@ -173,25 +194,38 @@ bool has_virtual_members_or_bases(DWARFDie die, std::set<DWARFDie> &seen) {
   return false;
 }
 
-bool is_ctor_or_dtor_caller(DWARFDie function) {
+enum class CallerKind { unknown, constructor_or_destructor, ordinary };
+
+CallerKind classify_linkage_name(std::string_view linkage) {
+  if (!linkage.starts_with("_Z")) {
+    if (linkage.empty() ||
+        !(std::isalpha(static_cast<unsigned char>(linkage.front())) || linkage.front() == '_') ||
+        !std::all_of(linkage.begin() + 1, linkage.end(), [](unsigned char c) {
+          return std::isalnum(c) || c == '_';
+        }))
+      return CallerKind::unknown;
+    return CallerKind::ordinary;
+  }
+  const std::string storage(linkage);
+  llvm::ItaniumPartialDemangler parsed;
+  if (parsed.partialDemangle(storage.c_str()))
+    return CallerKind::unknown;
+  return parsed.isCtorOrDtor() ? CallerKind::constructor_or_destructor : CallerKind::ordinary;
+}
+
+CallerKind classify_dwarf_caller(DWARFDie function) {
   if (function && function.getTag() == dw::DW_TAG_inlined_subroutine) {
     auto origin = function.getAttributeValueAsReferencedDie(dw::DW_AT_abstract_origin);
     if (!origin)
       origin = function.getAttributeValueAsReferencedDie(dw::DW_AT_specification);
     if (!origin)
-      return true;
+      return CallerKind::unknown;
     function = origin;
   }
   while (function && function.getTag() != dw::DW_TAG_subprogram)
     function = function.getParent();
   if (!function)
-    return true;
-  if (const auto *linkage = function.getLinkageName()) {
-    if (!std::string_view(linkage).starts_with("_Z"))
-      return false;
-    llvm::ItaniumPartialDemangler parsed;
-    return parsed.partialDemangle(linkage) || parsed.isCtorOrDtor();
-  }
+    return CallerKind::unknown;
   llvm::SmallVector<DWARFDie, 4> declarations{function};
   for (std::size_t index = 0; index < declarations.size(); ++index) {
     const auto die = declarations[index];
@@ -200,24 +234,25 @@ bool is_ctor_or_dtor_caller(DWARFDie function) {
           related && std::find(declarations.begin(), declarations.end(), related) == declarations.end())
         declarations.push_back(related);
   }
-  // A missing linkage name is not positive evidence that a caller is
-  // ordinary. Accept it only when the concrete/declaration DIEs prove this
-  // is not a class member (main and extern "C" often lack linkage names).
-  bool has_nonmember_scope_proof = false;
+  for (const auto declaration : declarations)
+    if (const auto *linkage = declaration.getLinkageName())
+      return classify_linkage_name(linkage);
+  // A missing linkage name is not enough to classify the caller. The caller
+  // proof can fall back to one ELF function symbol covering the call site.
   for (const auto declaration : declarations) {
     if (declaration.findRecursively({dw::DW_AT_object_pointer}))
-      return true;
+      return CallerKind::unknown;
     auto parent = declaration.getParent();
     while (parent && parent.getTag() == dw::DW_TAG_namespace)
       parent = parent.getParent();
-    if (record(parent))
-      return true;
-    if (parent && (parent.getTag() == dw::DW_TAG_compile_unit ||
-                   parent.getTag() == dw::DW_TAG_partial_unit ||
-                   parent.getTag() == dw::DW_TAG_type_unit))
-      has_nonmember_scope_proof = true;
+    if (record(parent)) {
+      const auto scope = name(parent);
+      const auto function_name = name(declaration);
+      if (function_name == scope || function_name == "~" + scope)
+        return CallerKind::constructor_or_destructor;
+    }
   }
-  return !has_nonmember_scope_proof;
+  return CallerKind::unknown;
 }
 
 bool may_aggregate_initialize_base(DWARFDie derived) {
@@ -2096,8 +2131,6 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   const auto constructor_name = concrete_type + "::" + concrete_leaf + "(";
   const auto destructor_name = concrete_type + "::~" + concrete_leaf + "(";
   const auto duplicate_lifetime_coverage = [&] {
-    if (!main_)
-      return std::string{};
     const auto definitions = [&](const Image &image) {
       std::map<std::string, std::set<Range>> result;
       for (const auto &symbol : image.symbols) {
@@ -2115,25 +2148,103 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       }
       return result;
     };
-    const auto module_definitions = definitions(*image_);
-    const auto executable_definitions = definitions(*main_);
-    std::set<std::string> cross_image_duplicates;
+    const auto normalize_path = [](const std::string &path) {
+      std::error_code error;
+      const auto canonical = std::filesystem::weakly_canonical(path, error);
+      return error ? path : canonical.string();
+    };
+    const auto selected_path = normalize_path(image_->path);
+    const auto selected_definitions = definitions(*image_);
+    if (selected_definitions.empty())
+      return std::string{};
     std::set<std::string> same_image_duplicates;
-    for (const auto &[linkage, ranges] : module_definitions) {
+    std::set<std::pair<std::string, std::string>> cross_image_duplicates;
+    for (const auto &[linkage, ranges] : selected_definitions)
       if (ranges.size() > 1)
         same_image_duplicates.insert(linkage);
-      if (executable_definitions.contains(linkage))
-        cross_image_duplicates.insert(linkage);
+
+    std::set<std::string> wanted;
+    for (const auto &[linkage, ranges] : selected_definitions)
+      wanted.insert(linkage);
+    std::string incomplete_scan;
+    const auto check_other_image = [&](const std::string &path,
+                                       const std::map<std::string, std::set<Range>> &other) {
+      for (const auto &definition : selected_definitions) {
+        const auto &linkage = definition.first;
+        const auto found = other.find(linkage);
+        if (found != other.end())
+          cross_image_duplicates.emplace(linkage, path);
+      }
+      for (const auto &[linkage, ranges] : other)
+        if (wanted.contains(linkage) && ranges.size() > 1)
+          same_image_duplicates.insert(linkage);
+    };
+    if (main_ && normalize_path(main_->path) != selected_path) {
+      const auto main_definitions = definitions(*main_);
+      check_other_image(main_->path, main_definitions);
     }
-    for (const auto &[linkage, ranges] : executable_definitions)
-      if (ranges.size() > 1)
-        same_image_duplicates.insert(linkage);
-    if (!cross_image_duplicates.empty())
-      return "same lifetime symbol is defined in both the executable and selected module (" +
-          llvm::demangle(*cross_image_duplicates.begin()) + "); object identities remain provisional";
+    const auto app_module_definitions = [&](const std::string &path) {
+      std::map<std::string, std::set<Range>> result;
+      auto binary = open_elf(path);
+      const auto &object = llvm::cast<llvm::object::ELF64LEObjectFile>(*binary.getBinary());
+      const auto add = [&](const auto &symbol) {
+        const llvm::object::ELFSymbolRef elf(symbol);
+        if (elf.getELFType() != llvm::ELF::STT_FUNC || !elf.getSize())
+          return;
+        auto linkage = symbol.getName();
+        auto address = symbol.getAddress();
+        auto flags = symbol.getFlags();
+        if (!linkage || !address || !flags) {
+          if (!linkage) llvm::consumeError(linkage.takeError());
+          if (!address) llvm::consumeError(address.takeError());
+          if (!flags) llvm::consumeError(flags.takeError());
+          return;
+        }
+        const auto name = linkage->str();
+        if (!wanted.contains(name) || !*address ||
+            (*flags & llvm::object::SymbolRef::SF_Undefined))
+          return;
+        result[name].insert({*address, elf.getSize()});
+      };
+      for (const auto &symbol : object.symbols())
+        add(symbol);
+      for (const auto &symbol : object.getDynamicSymbolIterators())
+        add(symbol);
+      return result;
+    };
+    if (pid) {
+      try {
+        const auto application_modules = injector::discover_application_modules(static_cast<pid_t>(pid));
+        for (const auto &module : application_modules) {
+          const auto path = module.path();
+          const auto normalized = normalize_path(path);
+          if (normalized == selected_path || (main_ && normalized == normalize_path(main_->path)))
+            continue;
+          try {
+            check_other_image(path, app_module_definitions(path));
+          } catch (const std::exception &error) {
+            if (incomplete_scan.empty())
+              incomplete_scan = "could not inspect mapped application module " + path + ": " + error.what();
+          }
+        }
+      } catch (const std::exception &error) {
+        incomplete_scan = "could not enumerate mapped application modules: " + std::string(error.what());
+      }
+    }
+    if (!cross_image_duplicates.empty()) {
+      const auto &[linkage, path] = *cross_image_duplicates.begin();
+      if (main_ && normalize_path(path) == normalize_path(main_->path))
+        return "same lifetime symbol is defined in both the executable and selected module (" +
+            llvm::demangle(linkage) + "); object identities remain provisional";
+      return "same lifetime symbol is defined in selected module " + image_->path +
+          " and mapped application module " + path + " (" + llvm::demangle(linkage) +
+          "); object identities remain provisional";
+    }
     if (!same_image_duplicates.empty())
       return "lifetime symbol has multiple definitions in one image (" +
           llvm::demangle(*same_image_duplicates.begin()) + "); object identities remain provisional";
+    if (!incomplete_scan.empty())
+      return incomplete_scan + "; object identities remain provisional";
     return std::string{};
   };
   if (request.lifetimes_only() || (request.staged_registration() && verify_method_lifetimes))
@@ -2151,31 +2262,67 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       const auto symbol = std::ranges::find_if(main_->symbols, [](const auto &candidate) {
         return candidate.kind == llvm::ELF::STT_FUNC && candidate.range.second;
       });
-      if (symbol != main_->symbols.end())
-        main_->bind(pid, symbol->range);
+      if (symbol != main_->symbols.end()) {
+        try {
+          main_->bind(pid, symbol->range);
+        } catch (const std::exception &) {
+          // Executable binding supplies optional caller/PLT evidence. Failure
+          // must leave that evidence unavailable rather than reject the watch.
+        }
+      }
     }
+    const auto classify_elf_caller = [](const Image &caller_image, std::uint64_t call) {
+      if (!caller_image.bias || call < *caller_image.bias)
+        return CallerKind::unknown;
+      const auto address = call - *caller_image.bias;
+      std::set<std::pair<std::string, Range>> symbols;
+      for (const auto &symbol : caller_image.symbols) {
+        if (symbol.kind == llvm::ELF::STT_FUNC && symbol.range.second &&
+            address >= symbol.range.first && address - symbol.range.first < symbol.range.second) {
+          if (classify_linkage_name(symbol.linkage) == CallerKind::constructor_or_destructor)
+            return CallerKind::constructor_or_destructor;
+          symbols.emplace(symbol.linkage, symbol.range);
+        }
+      }
+      if (symbols.size() != 1)
+        return CallerKind::unknown;
+      return classify_linkage_name(symbols.begin()->first);
+    };
     std::set<std::uint64_t> verified_plt_calls;
     for (const auto &[entry, calls] : direct_redirects(entries, true, false, true,
                                                         &verified_plt_calls)) {
       for (const auto call : calls) {
-        if (verified_plt_calls.contains(call)) {
-          const auto return_pc = call + object_cache::direct_call_width;
-          complete_constructor_returns.emplace(entry, return_pc);
-          if (const auto target = constructor_tail_target(entry))
-            complete_constructor_returns.emplace(target, return_pc);
-          proven.insert(entry);
-          continue;
-        }
         const auto *caller_image = image_for(call);
-        if (!caller_image || !caller_image->bias || call < *caller_image->bias)
+        if (!caller_image)
           continue;
-        const auto address = call - *caller_image->bias;
+        const auto address = caller_image->bias && call >= *caller_image->bias ?
+            call - *caller_image->bias : 0;
         const auto debug = caller_image->dwarf->getDIEsForAddress(address);
+        const bool complete_plt_call = verified_plt_calls.contains(call);
+        // A direct call to an aliased entry may come from an inlined base
+        // initializer. A physical symbol alone cannot rule that out.
+        if (!complete_plt_call && (!debug.CompileUnit || !debug.FunctionDIE))
+          continue;
         llvm::SmallVector<DWARFDie, 4> inlined;
         if (debug.CompileUnit)
           debug.CompileUnit->getInlinedChainForAddress(address, inlined);
-        if (!debug.CompileUnit || !debug.FunctionDIE || is_ctor_or_dtor_caller(debug.FunctionDIE) ||
-            std::ranges::any_of(inlined, is_ctor_or_dtor_caller))
+        const auto elf_kind = classify_elf_caller(*caller_image, call);
+        if (elf_kind == CallerKind::constructor_or_destructor)
+          continue;
+        auto caller_kind = debug.FunctionDIE ? classify_dwarf_caller(debug.FunctionDIE) : CallerKind::unknown;
+        if (caller_kind == CallerKind::unknown) {
+          if (!complete_plt_call &&
+              !debug.FunctionDIE.findRecursively({dw::DW_AT_type, dw::DW_AT_prototyped}))
+            continue;
+          caller_kind = elf_kind;
+        }
+        if (caller_kind != CallerKind::ordinary ||
+            std::ranges::any_of(inlined, [](DWARFDie frame) {
+              // A physical caller symbol cannot identify an inlined frame.
+              // Require positive DWARF identity for every inlined frame.
+              return frame.getTag() == dw::DW_TAG_inlined_subroutine &&
+                  classify_dwarf_caller(frame) != CallerKind::ordinary;
+            }))
           continue;
         const auto return_pc = call + object_cache::direct_call_width;
         complete_constructor_returns.emplace(entry, return_pc);

@@ -1,6 +1,7 @@
 #include "controller.hpp"
 #include "object_probe_package.hpp"
 #include "../prepared_contract.hpp"
+#include "../preparer_diagnostics.hpp"
 #include "../module_index_format.hpp"
 #include "../proc_identity.hpp"
 #include "../sqlite_events.hpp"
@@ -914,6 +915,38 @@ void run_preparer(std::vector<std::string> arguments, const char *failure) {
     throw std::system_error(started, std::generic_category(), "cannot start native preparer");
   }
   std::array<char, 4096> buffer{};
+  // The preparer's terminal reason belongs in the REPL error. Its other
+  // output continues to stream while the child is running.
+  const auto failure_prefix = tracer::prepared::preparer_failure_prefix;
+  std::string line_prefix, failure_reason;
+  bool at_line_start = true, terminal_diagnostic = false;
+  const auto relay_stderr = [&](std::string_view bytes) {
+    while (!bytes.empty()) {
+      if (terminal_diagnostic) {
+        failure_reason.append(bytes);
+        return;
+      }
+      const auto newline = bytes.find('\n');
+      const auto length = newline == bytes.npos ? bytes.size() : newline + 1;
+      const auto part = bytes.substr(0, length);
+      bytes.remove_prefix(length);
+      if (at_line_start) {
+        line_prefix.append(part);
+        if (failure_prefix.starts_with(line_prefix) && line_prefix.size() < failure_prefix.size())
+          continue;
+        if (line_prefix.starts_with(failure_prefix)) {
+          terminal_diagnostic = true;
+          failure_reason.assign(line_prefix, failure_prefix.size());
+        } else {
+          std::cerr << line_prefix;
+        }
+        line_prefix.clear();
+      } else {
+        std::cerr << part;
+      }
+      at_line_start = newline != bytes.npos;
+    }
+  };
   int read_error = 0;
   const auto drain = [&](std::size_t size) {
     ssize_t count;
@@ -921,7 +954,7 @@ void run_preparer(std::vector<std::string> arguments, const char *failure) {
       count = ::read(diagnostic_pipe[0], buffer.data(), std::min(size, buffer.size()));
     } while (count < 0 && errno == EINTR);
     if (count > 0) {
-      std::cerr.write(buffer.data(), count);
+      relay_stderr({buffer.data(), static_cast<std::size_t>(count)});
     } else if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
       read_error = errno;
     }
@@ -964,18 +997,25 @@ void run_preparer(std::vector<std::string> arguments, const char *failure) {
     }
     ::close(diagnostic_pipe[0]);
   }
+  if (!line_prefix.empty())
+    std::cerr << line_prefix;
   if (waited < 0)
     throw std::runtime_error("cannot wait for native preparation");
   if (read_error)
     throw std::system_error(read_error, std::generic_category(), "cannot read native preparation diagnostics");
-  if (WIFSIGNALED(status))
-    throw std::runtime_error(std::string(failure) + ": preparer terminated by signal " +
-                             std::to_string(WTERMSIG(status)));
-  if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
-    throw std::runtime_error(std::string(failure) + ": preparer exited with status " +
-                             std::to_string(WEXITSTATUS(status)));
-  if (!WIFEXITED(status))
-    throw std::runtime_error(std::string(failure) + ": unexpected preparer status");
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+    if (terminal_diagnostic)
+      std::cerr << failure_prefix << failure_reason;
+    return;
+  }
+  while (!failure_reason.empty() && (failure_reason.back() == '\n' || failure_reason.back() == '\r'))
+    failure_reason.pop_back();
+  const auto status_message = WIFSIGNALED(status)
+      ? "preparer terminated by signal " + std::to_string(WTERMSIG(status))
+      : WIFEXITED(status) ? "preparer exited with status " + std::to_string(WEXITSTATUS(status))
+                         : std::string("unexpected preparer status");
+  throw std::runtime_error(std::string(failure) + ": " + status_message +
+                           (failure_reason.empty() ? "" : ": " + failure_reason));
 }
 
 class PreparationDirectory {

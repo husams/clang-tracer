@@ -69,7 +69,7 @@ struct SharedFile {
 }
 
 std::uintptr_t load_agent(injector::Process &process, const std::string &path) {
-  constexpr char export_name[] = "tracer_agent_object_cache_v39";
+  constexpr char export_name[] = "tracer_agent_object_cache_v40";
   const auto size = std::max(path.size() + 1, sizeof(export_name));
   const auto memory = process.remote_allocate(size);
   std::uintptr_t entry = 0;
@@ -335,6 +335,7 @@ struct Watch::Impl {
   api::ObjectWatchRequest request;
   std::uint64_t id;
   std::uint32_t pid;
+  const bool verify_method_lifetimes;
   const std::uint64_t process_start;
   const std::string executable;
   std::function<void(api::TraceEvent)> publish;
@@ -378,6 +379,7 @@ struct Watch::Impl {
        const std::string &executable, const std::string &event_path,
        std::function<void(api::TraceEvent)> sink, bool verify_method_lifetimes)
       : request(spec), id(watch_id), pid(target),
+        verify_method_lifetimes(verify_method_lifetimes),
         process_start(pid ? proc::start_time(proc::directory(pid) / "stat") : 0),
         executable(executable), publish(std::move(sink)),
         plan(target, executable, spec, verify_method_lifetimes), shared_file(spec.shared_file()),
@@ -1740,8 +1742,18 @@ struct Watch::Impl {
     } else if (sample.hook == Hook::destroy_begin || sample.hook == Hook::destroy_end) {
       if (sample.hook == Hook::destroy_end)
         item.set_closure_reason(Observation::DESTRUCTOR_RETURN);
-      if (request.staged_registration() && !sample.id)
-        item.set_diagnostic("provisional destructor boundary with unverified complete-object identity");
+      if (request.staged_registration() && !sample.id) {
+        if (sample.provisional_reason == ProvisionalReason::instance_limit)
+          item.set_diagnostic(
+              "provisional destructor boundary after receiver admission limit; "
+              "complete-object construction was verified");
+        else if (sample.provisional_reason == ProvisionalReason::uncertain_construction)
+          item.set_diagnostic(
+              "provisional destructor boundary with unverified complete-object construction");
+        else
+          item.set_diagnostic(
+              "provisional destructor boundary without a verified lifetime identity");
+      }
     } else if (sample.hook == Hook::lifetime_reused) {
       item.set_closure_reason(Observation::SCOPE_CHANGED);
       item.set_diagnostic("receiver storage reused without an observed destructor");
@@ -2317,6 +2329,8 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
   p.verify_live(process);
   Init init;
   init.identity_watch_id = p.request.staged_registration() ? p.id : 0;
+  init.provisional_method_watch = p.request.staged_registration() &&
+      p.verify_method_lifetimes;
   if (p.path.size() >= sizeof(init.path))
     throw std::runtime_error("code-cache event channel path is too long");
   std::memcpy(init.path, p.path.c_str(), p.path.size() + 1);

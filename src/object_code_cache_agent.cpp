@@ -309,6 +309,7 @@ struct State {
     bool observed = false;
     bool uncertain_live = false;
     bool provisional_live = false;
+    ProvisionalReason provisional_reason = ProvisionalReason::none;
     std::atomic<std::uint64_t> write_window{0};
   };
   // Retain address generations and stable write-window storage for in-flight stores.
@@ -317,6 +318,7 @@ struct State {
   std::uint64_t next_id = 0;
   std::uint64_t next_borrow = 0;
   std::uint64_t identity_watch_id = 0;
+  bool provisional_method_watch = false;
   bool identity_lifecycle_covered = false;
 
   // Call with mutex and identity_mutex held and no current lifetime here.
@@ -327,6 +329,7 @@ struct State {
     history.observed = true;
     history.uncertain_live = false;
     history.provisional_live = false;
+    history.provisional_reason = ProvisionalReason::none;
     auto [entry, inserted] = lifetimes.try_emplace(object);
     if (inserted)
       entry->second = {++next_id, ++history.generation};
@@ -475,6 +478,7 @@ struct Sample {
   const Site *site = nullptr;
   Address stack = 0, destination = 0;
   Lifetime life{};
+  ProvisionalReason provisional_reason = ProvisionalReason::none;
   std::uint32_t input = 0, expected = 0;
   std::uint64_t old = 0;
   bool has_old = false;
@@ -1215,7 +1219,8 @@ std::optional<bool> contains(const State &watch, Address owner, Address object) 
 
 void emit_boundary(State &watch, const Site &site, Address object, const Lifetime &life,
                    Hook hook, std::uint64_t borrow_id = 0, std::uint32_t owner_index_plus_one = 0,
-                   bool transfer = false) noexcept {
+                   bool transfer = false,
+                   ProvisionalReason provisional_reason = ProvisionalReason::none) noexcept {
   Observation event{};
   event.owner = life.owner;
   event.object = object;
@@ -1225,6 +1230,7 @@ void emit_boundary(State &watch, const Site &site, Address object, const Lifetim
   event.borrow_id = borrow_id;
   event.owner_index_plus_one = owner_index_plus_one;
   event.hook = hook;
+  event.provisional_reason = provisional_reason;
   event.gap = transfer;
   if (watch.shared_file.inode && object <= UINT64_MAX - watch.offset) {
     if (const auto offset = shared_file_offset(watch, object + watch.offset)) {
@@ -1485,11 +1491,13 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
       if (const auto *life = watch.admit_lifetime(object))
         emit_boundary(watch, site, object, *life, kind);
       else {
-        if (watch.identity_watch_id && identity_type_matches) {
+        if (watch.identity_watch_id && watch.provisional_method_watch &&
+            identity_type_matches) {
           auto &history = watch.generations[object];
           history.observed = true;
           history.uncertain_live = false;
           history.provisional_live = true;
+          history.provisional_reason = ProvisionalReason::instance_limit;
         }
         emit_boundary(watch, site, object, {}, Hook::admission_gap);
       }
@@ -1497,12 +1505,14 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
     }
   }
   Lifetime life;
+  ProvisionalReason provisional_reason = ProvisionalReason::none;
   if (kind == Hook::destroy_end) {
     const auto sample = destroying;
     destroying = {};
     if (!sample.site || sample.site->watch != &watch || sample.stack != regs.value(rsp))
       return;
     life = sample.life;
+    provisional_reason = sample.provisional_reason;
   } else {
     const std::lock_guard lock(watch.mutex);
     const std::unique_lock identity_lock(watch.identity_mutex);
@@ -1513,11 +1523,13 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
       }
       const auto *item = watch.admit_lifetime(object);
       if (!item) {
-        if (watch.identity_watch_id && identity_type_matches) {
+        if (watch.identity_watch_id && watch.provisional_method_watch &&
+            identity_type_matches) {
           auto &history = watch.generations[object];
           history.observed = true;
           history.uncertain_live = false;
           history.provisional_live = true;
+          history.provisional_reason = ProvisionalReason::instance_limit;
         }
         emit_boundary(watch, site, object, {}, Hook::admission_gap);
         return;
@@ -1528,11 +1540,15 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
       auto &history = watch.generations[object];
       // A verified address/type observation can support destructor boundaries
       // without claiming a complete-object lifetime identity.
-      const bool provisional = watch.identity_watch_id && history.observed &&
+      const bool provisional = watch.identity_watch_id && watch.provisional_method_watch &&
+          history.observed &&
           (history.uncertain_live || history.provisional_live) && identity_type_matches;
+      provisional_reason = provisional ? history.provisional_reason :
+          ProvisionalReason::none;
       history.observed = true;
       history.uncertain_live = false;
       history.provisional_live = false;
+      history.provisional_reason = ProvisionalReason::none;
       const auto found = watch.lifetimes.find(object);
       if (found == watch.lifetimes.end() || !found->second.id) {
         if (!provisional)
@@ -1542,9 +1558,10 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
         watch.lifetimes.erase(found);
       }
       destroying = {&site, regs.value(rsp), object, life};
+      destroying.provisional_reason = provisional_reason;
     }
   }
-  emit_boundary(watch, site, object, life, kind);
+  emit_boundary(watch, site, object, life, kind, 0, 0, false, provisional_reason);
 }
 
 void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
@@ -1600,11 +1617,15 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
       const std::unique_lock identity_lock(watch.identity_mutex);
       auto &history = watch.generations[object];
       // Keep provisional observations visible, but never attach a fabricated ID.
-      const bool provisional = watch.identity_watch_id && history.observed &&
+      const bool provisional = watch.identity_watch_id && watch.provisional_method_watch &&
+          history.observed &&
           (history.uncertain_live || history.provisional_live) && exact_type;
+      event.provisional_reason = provisional ? history.provisional_reason :
+          ProvisionalReason::none;
       history.observed = true;
       history.uncertain_live = false;
       history.provisional_live = false;
+      history.provisional_reason = ProvisionalReason::none;
       const auto item = watch.lifetimes.find(object);
       if (item == watch.lifetimes.end() || !item->second.id) {
         if (!provisional)
@@ -1633,6 +1654,7 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
       history.observed = true;
       history.uncertain_live = false;
       history.provisional_live = false;
+      history.provisional_reason = ProvisionalReason::none;
       const auto prior = watch.lifetimes.find(object);
       if (prior != watch.lifetimes.end() && prior->second.id) {
         emit_boundary(watch, site, object, prior->second, Hook::lifetime_reused);
@@ -1675,12 +1697,15 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
   if (frame.uncertain || !exact_type) {
     event.hook = Hook::construction_uncertain;
     event.gap = frame.uncertain;
-    if (watch.identity_watch_id && frame.uncertain && exact_type) {
+    if (watch.identity_watch_id && watch.provisional_method_watch &&
+        frame.uncertain && exact_type) {
       const std::lock_guard lock(watch.mutex);
       const std::unique_lock identity_lock(watch.identity_mutex);
       auto &history = watch.generations[event.object];
       history.observed = true;
       history.uncertain_live = true;
+      history.provisional_live = false;
+      history.provisional_reason = ProvisionalReason::uncertain_construction;
     }
     emit(watch, event);
     return;
@@ -1694,8 +1719,13 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
   }
   const auto *life = watch.admit_lifetime(event.object);
   if (!life) {
-    if (watch.identity_watch_id)
-      watch.generations[event.object].provisional_live = true;
+    if (watch.identity_watch_id && watch.provisional_method_watch) {
+      auto &history = watch.generations[event.object];
+      history.observed = true;
+      history.provisional_live = true;
+      history.uncertain_live = false;
+      history.provisional_reason = ProvisionalReason::instance_limit;
+    }
     event.hook = Hook::admission_gap;
     emit(watch, event);
     return;
@@ -5061,6 +5091,7 @@ void initialize(Init &init
   prepare_identity_pid_cache();
   watch->pid = ::getpid();
   watch->identity_watch_id = init.identity_watch_id;
+  watch->provisional_method_watch = init.provisional_method_watch;
   watch->offset = init.scalar;
   if (init.field_width != 1 && init.field_width != 2 && init.field_width != 4 && init.field_width != 8)
     throw std::runtime_error("invalid native write field width");
@@ -5237,7 +5268,7 @@ std::optional<Identity> lookup(std::uint64_t watch_id, std::uint64_t receiver) n
 } // namespace identity
 } // namespace tracer::object_cache
 
-extern "C" int tracer_agent_object_cache_v39(tracer::object_cache::Init *request) {
+extern "C" int tracer_agent_object_cache_v40(tracer::object_cache::Init *request) {
   try {
     tracer::object_cache::initialize(*request);
     return 0;

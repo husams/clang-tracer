@@ -56,6 +56,19 @@ def stop(process):
             process.wait(timeout=5)
 
 
+def scalar(value):
+    if isinstance(value, dict):
+        for key in ("unsignedValue", "signedValue", "boolValue", "stringValue"):
+            if key in value:
+                return value[key]
+    return value
+
+
+def event_fields(event):
+    return {field.get("name"): scalar(field.get("value"))
+            for field in event.get("objectFields", [])}
+
+
 def run(args):
     with tempfile.TemporaryDirectory(prefix="ct-type-object-probe-") as temporary, ExitStack() as cleanup:
         root = Path(temporary).resolve()
@@ -70,6 +83,7 @@ def run(args):
         compdb = build / "compile_commands.json"
         library = build / "libcounter.so"
         target = build / "counter-target"
+        single_image_target = build / "counter-target-single-image"
         hidden_source = root / "hidden-derived.cpp"
         hidden_object = build / "hidden-derived.o"
         unit_source = root / "type-unit.cpp"
@@ -164,18 +178,26 @@ void IdentityC1EBase::set(int value) { value_ = value; }
 """)
         hidden_source.write_text("""#include "counter.hpp"
 namespace demo {
+volatile int hidden_seed = 3;
+__attribute__((always_inline)) inline int hidden_member(int value) {
+  return value * hidden_seed + 1;
+}
 class HiddenDerived final : public IdentityC1EBase {
 public:
-  explicit HiddenDerived(int initial) : IdentityC1EBase(initial), hidden_(initial + 1) {}
+  __attribute__((noinline)) explicit HiddenDerived(int initial)
+      : IdentityC1EBase(initial), hidden_(hidden_member(initial)) {}
   ~HiddenDerived() {}
+  __attribute__((always_inline)) inline int roundtrip(int value) {
+    set(value);
+    return get();
+  }
   int hidden_;
 };
 }
 extern "C" __attribute__((visibility("default"), noinline)) int
 hidden_derived_roundtrip(int initial) {
   demo::HiddenDerived object(initial);
-  object.set(initial + 1);
-  return object.get();
+  return object.roundtrip(initial + 1);
 }
 """)
         unit_source.write_text("""#include "counter.hpp"
@@ -393,13 +415,16 @@ public:
         # Compile the ELF only after offline preparation, then hide every source
         # input needed by preparation. Runtime preview must use the package.
         subprocess.run(compile_args, cwd=build, check=True)
-        subprocess.run([str(args.cxx), "-std=c++20", "-g0", "-O0", "-fPIC", "-fno-inline",
+        compiler_version = subprocess.run([str(args.cxx), "--version"], check=True, text=True,
+                                           stdout=subprocess.PIPE).stdout.lower()
+        line_table_flag = "-gline-tables-only" if "clang" in compiler_version else "-g1"
+        subprocess.run([str(args.cxx), "-std=c++20", line_table_flag, "-O2", "-fPIC",
                         "-fpatchable-function-entry=8", f"-I{generated}", f"-I{root}",
                         "-DCOUNTER_PAD_BYTES=13", "-c", str(hidden_source),
                         "-o", str(hidden_object)], cwd=build, check=True)
         subprocess.run([*compile_args[:-4], "-gdwarf-4", "-fdebug-types-section",
                         "-c", str(unit_source), "-o", str(unit_object)], cwd=build, check=True)
-        subprocess.run([str(args.cxx), "-shared", str(build / "counter.o"),
+        subprocess.run([str(args.cxx), "-shared", "-Wl,-Bsymbolic-functions", str(build / "counter.o"),
                         str(hidden_object), str(unit_object), "-o", str(library)],
                        cwd=build, check=True)
         subprocess.run([str(args.cxx), "-std=c++20", "-g", "-O0", "-fno-inline",
@@ -407,6 +432,11 @@ public:
                         f"-I{generated}", f"-I{root}", "-DCOUNTER_PAD_BYTES=13",
                         str(driver), "-L", str(build), "-Wl,-rpath," + str(build),
                         "-lcounter", "-o", str(target)], cwd=build, check=True)
+        subprocess.run([str(args.cxx), "-std=c++20", "-g", "-O0", "-fno-inline",
+                        "-fpatchable-function-entry=8", f"-I{generated}", f"-I{root}",
+                        "-DCOUNTER_PAD_BYTES=13", str(driver), str(build / "counter.o"),
+                        str(hidden_object), str(unit_object), "-o", str(single_image_target)],
+                       cwd=build, check=True)
         nm = subprocess.run(["nm", "-D", "-C", "--defined-only", str(library)],
                             check=True, text=True, stdout=subprocess.PIPE).stdout
         for selector in ("demo::Counter::Counter(int)", "demo::Counter::~Counter()",
@@ -423,8 +453,20 @@ public:
         hidden_dwarf = subprocess.run(["readelf", "--debug-dump=info", "--wide",
                                        str(hidden_object)], check=True, text=True,
                                       stdout=subprocess.PIPE).stdout
+        assert "DW_TAG_compile_unit" in hidden_dwarf and "DW_AT_stmt_list" in hidden_dwarf, hidden_dwarf
         assert not re.search(r"DW_TAG_(?:class_type|structure_type)", hidden_dwarf), hidden_dwarf
-        assert "HiddenDerived" not in dwarf, dwarf
+        if line_table_flag == "-gline-tables-only":
+            top_level = re.findall(
+                r"^ *<1><[0-9a-f]+>:[^\n]*\(DW_TAG_subprogram\)\n(.*?)(?=^ *<\d+><|\Z)",
+                hidden_dwarf, re.M | re.S)
+            assert any(re.search(r"DW_AT_name[^\n]*\bHiddenDerived$", fields, re.M)
+                       and "DW_AT_linkage_name" not in fields
+                       and "DW_AT_object_pointer" not in fields
+                       for fields in top_level), hidden_dwarf
+        hidden_lines = subprocess.run(["readelf", "--debug-dump=decodedline", "--wide",
+                                       str(hidden_object)], check=True, text=True,
+                                      stdout=subprocess.PIPE).stdout
+        assert "hidden-derived.cpp" in hidden_lines and re.search(r"\b[1-9]\d*\s+0x[0-9a-f]+", hidden_lines), hidden_lines
         target_relocations = subprocess.run(["readelf", "--relocs", "--wide", str(target)],
                                             check=True, text=True,
                                             stdout=subprocess.PIPE).stdout
@@ -435,19 +477,173 @@ public:
             ["readelf", "--relocs", "--wide", str(hidden_object)], check=True,
             text=True, stdout=subprocess.PIPE).stdout
         assert "_ZN4demo15IdentityC1EBaseC2Ei" in hidden_relocations, hidden_relocations
+        hidden_symbols = subprocess.run(["nm", "-C", str(hidden_object)], check=True, text=True,
+                                        stdout=subprocess.PIPE).stdout
+        assert "HiddenDerived::HiddenDerived(int)" in hidden_symbols, hidden_symbols
+        assert "HiddenDerived::roundtrip(int)" not in hidden_symbols, hidden_symbols
         target_dwarf = subprocess.run(["readelf", "--debug-dump=info", "--wide", str(target)],
                                       check=True, text=True, stdout=subprocess.PIPE).stdout
         for caller in ("identity_main_roundtrip", "identity_set_through_c",
                        "cycle",
                        "identity_get_through_c"):
             assert caller in target_dwarf, (caller, target_dwarf)
+        single_image_relocations = subprocess.run(
+            ["readelf", "--relocs", "--wide", str(single_image_target)], check=True,
+            text=True, stdout=subprocess.PIPE).stdout
+        assert c1_symbol not in single_image_relocations, single_image_relocations
         for path in (header, source, hidden_source, unit_source, callbacks, bad_callbacks,
                      generated / "counter_build_config.hpp"):
             shutil.move(path, hidden / path.name)
             assert not path.exists()
 
-        target_hashes = {path: hashlib.sha256(path.read_bytes()).digest() for path in (target, library)}
+        target_hashes = {path: hashlib.sha256(path.read_bytes()).digest()
+                         for path in (target, library, single_image_target)}
         run_env = dict(env, LD_LIBRARY_PATH=str(build))
+
+        # In this executable, the constructor, methods, main caller, and
+        # extern-C caller share one image.  The build-time relocation check
+        # above proves that this path does not rely on a C1 PLT relocation.
+        single_process, single_app = child([str(single_image_target)], stdin=subprocess.PIPE,
+                                           env=run_env)
+        single_app.expect(r"^READY$")
+        single_repl, single_out = child(repl_argv, env=env)
+        send(single_repl, f"%attach {single_process.pid}")
+        single_out.expect(rf"^attached session=\S+ pid={single_process.pid}$")
+        single_method_binding = (f"--package {quote(identity_method_package)} "
+                                 f"--module {quote(single_image_target)}")
+        send(single_repl, f"%object-probe start {single_method_binding}")
+        single_method_started = single_out.expect(
+            r"^object-probe registration=(\d+) active=yes methods=1")
+        single_method_registration = single_method_started[1]
+        single_method_probe = single_out.expect(r"method_probe=(\d+) active=yes")[1]
+        send(single_repl, "%record single-method.db --sqlite --timeout 2")
+        send(single_process, "m")
+        single_app.expect(r"^IDENTITY_MAIN=42 EXTERN_C=62$")
+        single_method_record = single_out.expect(
+            r"^received=(\d+) cursor=(\d+) .*timed_out=true .*recording=single-method.db")
+        assert int(single_method_record[1]) > 0, single_method_record.string
+        send(single_repl, "%events open single-method.db --as single_method")
+        single_method_opened = single_out.expect(r"^opened events=(\d+) retained=\d+ evicted=0$")
+        send(single_repl, "%events export single_method --format json --output single-method.json")
+        send(single_repl, f"%object-probe stop {single_method_registration}")
+        single_out.expect(
+            rf"^object-probe registration={single_method_registration} active=no .*restoration_pending=no")
+        single_method_events = json.loads((root / "single-method.json").read_text())
+        assert len(single_method_events) == int(single_method_opened[1]), single_method_events
+        assert all(event.get("objectProbeRegistrationId") == single_method_registration
+                   for event in single_method_events), single_method_events
+        single_method_times = [int(event["monotonicTimeNs"]) for event in single_method_events]
+        assert single_method_times == sorted(single_method_times), single_method_events
+        single_created = [event for event in single_method_events
+                          if event.get("objectObservation", {}).get("kind") == "CREATED"]
+        single_ended = [event for event in single_method_events
+                        if event.get("objectObservation", {}).get("kind") == "TEARDOWN_END"]
+        single_calls = [event for event in single_method_events
+                        if event.get("probeId") == single_method_probe]
+        assert len(single_created) == len(single_ended) == 2 and len(single_calls) == 4, single_method_events
+        single_identities = {
+            (int(event["objectObservation"]["lifetimeId"]),
+             int(event["objectObservation"]["generation"])): single_method_events.index(event)
+            for event in single_created
+        }
+        single_end_positions = {
+            (int(event["objectObservation"]["lifetimeId"]),
+             int(event["objectObservation"]["generation"])): single_method_events.index(event)
+            for event in single_ended
+        }
+        assert len(single_identities) == 2 and set(single_end_positions) == set(single_identities)
+        for event in single_calls:
+            values = event_fields(event)
+            identity = int(values["object_id"]), int(values["object_generation"])
+            assert identity in single_identities and single_identities[identity] < single_method_events.index(event)
+            assert single_method_events.index(event) < single_end_positions[identity]
+            assert values["identity_verified"] in (True, "true", 1, "1"), event
+
+        single_combined_binding = (f"--package {quote(identity_combined_package)} "
+                                   f"--module {quote(single_image_target)}")
+        send(single_repl, f"%object-probe start {single_combined_binding}")
+        single_combined_started = single_out.expect(
+            r"^object-probe registration=(\d+) active=yes methods=1")
+        single_combined_registration = single_combined_started[1]
+        single_combined_probe = single_out.expect(r"method_probe=(\d+) active=yes")[1]
+        send(single_repl,
+             f"%record single-combined.db --sqlite --after {single_method_record[2]} --timeout 2")
+        send(single_process, "m")
+        single_app.expect(r"^IDENTITY_MAIN=42 EXTERN_C=62$")
+        single_combined_record = single_out.expect(
+            r"^received=(\d+) cursor=(\d+) .*timed_out=true .*recording=single-combined.db")
+        assert int(single_combined_record[1]) > 0, single_combined_record.string
+        send(single_repl, "%events open single-combined.db --as single_combined")
+        single_combined_opened = single_out.expect(
+            r"^opened events=(\d+) retained=\d+ evicted=0$")
+        send(single_repl, "%events export single_combined --format json --output single-combined.json")
+        send(single_repl, f"%object-probe stop {single_combined_registration}")
+        single_out.expect(
+            rf"^object-probe registration={single_combined_registration} active=no .*restoration_pending=no")
+        single_combined_events = json.loads((root / "single-combined.json").read_text())
+        assert len(single_combined_events) == int(single_combined_opened[1]), single_combined_events
+        assert all(event.get("objectProbeRegistrationId") == single_combined_registration
+                   for event in single_combined_events), single_combined_events
+        combined_times = [int(event["monotonicTimeNs"]) for event in single_combined_events]
+        assert combined_times == sorted(combined_times), single_combined_events
+        combined_created = [event for event in single_combined_events
+                            if event.get("objectObservation", {}).get("kind") == "CREATED"]
+        combined_destroy_begins = [event for event in single_combined_events
+                                   if event.get("objectObservation", {}).get("kind") == "DESTROY_BEGIN"]
+        combined_ended = [event for event in single_combined_events
+                          if event.get("objectObservation", {}).get("kind") == "TEARDOWN_END"]
+        combined_writes = [event for event in single_combined_events
+                           if event.get("objectObservation", {}).get("kind") == "FIELD_CHANGED"]
+        combined_calls = [event for event in single_combined_events
+                          if event.get("probeId") == single_combined_probe]
+        assert len(combined_created) == len(combined_destroy_begins) == len(combined_ended) == 2, single_combined_events
+        assert len(combined_writes) == 2, single_combined_events
+        assert len(combined_calls) == 4, single_combined_events
+        write_observations = [event["objectObservation"] for event in combined_writes]
+        assert [(observation["oldInteger"], observation["newInteger"])
+                for observation in write_observations] == [
+            (40, 42), (60, 62)], combined_writes
+        combined_lifetimes = {
+            (int(event["objectObservation"]["lifetimeId"]),
+             int(event["objectObservation"]["generation"])): single_combined_events.index(event)
+            for event in combined_created
+        }
+        combined_teardowns = {
+            (int(event["objectObservation"]["lifetimeId"]),
+             int(event["objectObservation"]["generation"])): single_combined_events.index(event)
+            for event in combined_ended
+        }
+        combined_destroy_positions = {
+            (int(event["objectObservation"]["lifetimeId"]),
+             int(event["objectObservation"]["generation"])): single_combined_events.index(event)
+            for event in combined_destroy_begins
+        }
+        assert (len(combined_lifetimes) == 2 and set(combined_teardowns) == set(combined_lifetimes)
+                and set(combined_destroy_positions) == set(combined_lifetimes))
+        for event in combined_destroy_begins:
+            identity = (int(event["objectObservation"]["lifetimeId"]),
+                        int(event["objectObservation"]["generation"]))
+            matching_end = next(item for item in combined_ended
+                                if (int(item["objectObservation"]["lifetimeId"]),
+                                    int(item["objectObservation"]["generation"])) == identity)
+            assert event["objectAddress"] == matching_end["objectAddress"], single_combined_events
+            assert combined_destroy_positions[identity] < combined_teardowns[identity]
+        for event in combined_calls:
+            values = event_fields(event)
+            identity = int(values["object_id"]), int(values["object_generation"])
+            assert identity in combined_lifetimes
+            assert combined_lifetimes[identity] < single_combined_events.index(event) < combined_teardowns[identity]
+            assert values["identity_verified"] in (True, "true", 1, "1"), event
+        for event in combined_writes:
+            observation = event["objectObservation"]
+            identity = int(observation["lifetimeId"]), int(observation["generation"])
+            assert identity in combined_lifetimes
+            assert combined_lifetimes[identity] < single_combined_events.index(event) < combined_teardowns[identity]
+
+        send(single_process, "q")
+        send(single_repl, "%quit")
+        assert single_repl.wait(timeout=10) == 0, "".join(single_out.seen[-15:])
+
         target_process, app = child([str(target)], stdin=subprocess.PIPE, env=run_env)
         app.expect(r"^READY$")
         repl, out = child(repl_argv, env=env)
@@ -483,19 +679,8 @@ public:
         ctor_only_fields = {field.get("name"): field.get("value")
                             for field in ctor_only_event.get("objectFields", [])}
 
-        def scalar(value):
-            if isinstance(value, dict):
-                for key in ("unsignedValue", "signedValue", "boolValue", "stringValue"):
-                    if key in value:
-                        return value[key]
-            return value
-
         assert int(scalar(ctor_only_fields["object_id"])) == 0, ctor_only_event
         assert scalar(ctor_only_fields["identity_verified"]) in (False, "false", 0, "0"), ctor_only_event
-
-        def event_fields(event):
-            return {field.get("name"): scalar(field.get("value"))
-                    for field in event.get("objectFields", [])}
 
         # Both main and a nonmember extern-C function construct IdentityC1EBase
         # via its C1 PLT relocation, which is checked above at build time.
@@ -553,9 +738,56 @@ public:
             call_counts[identity] += 1
         assert all(count == 2 for count in call_counts.values()), identity_events
 
-        # A derived class compiled without DWARF has only a Base subobject
-        # constructor call. Combined method+writer observation must leave it
-        # provisional and must not publish a false complete-object CREATED.
+        # A hidden derived class has only line-table information. Method-only
+        # observation must not promote its Base subobject to a complete object.
+        hidden_method_binding = (f"--package {quote(identity_method_package)} "
+                                 "--module libcounter.so")
+        send(repl, f"%object-probe start {hidden_method_binding}")
+        hidden_method_started = out.expect(
+            r"^object-probe registration=(\d+) active=yes methods=1")
+        hidden_method_registration = hidden_method_started[1]
+        hidden_method_probe = out.expect(r"method_probe=(\d+) active=yes")[1]
+        send(repl, f"%record hidden-method-only.db --sqlite --timeout 2 --after {identity_record[1]}")
+        send(target_process, "h")
+        app.expect(r"^HIDDEN_DERIVED=51$")
+        hidden_method_record = out.expect(
+            r"^received=(\d+) cursor=(\d+) .*timed_out=true .*recording=hidden-method-only.db")
+        assert int(hidden_method_record[1]) > 0, hidden_method_record.string
+        send(repl, "%events open hidden-method-only.db --as hidden_method_only")
+        hidden_method_opened = out.expect(r"^opened events=(\d+) retained=\d+ evicted=0$")
+        send(repl, "%events export hidden_method_only --format json --output hidden-method-only.json")
+        send(repl, f"%object-probe stop {hidden_method_registration}")
+        out.expect(rf"^object-probe registration={hidden_method_registration} active=no .*restoration_pending=no")
+        hidden_method_events = json.loads((root / "hidden-method-only.json").read_text())
+        assert len(hidden_method_events) == int(hidden_method_opened[1]), hidden_method_events
+        assert all(event.get("objectProbeRegistrationId") == hidden_method_registration
+                   for event in hidden_method_events), hidden_method_events
+        hidden_method_observations = [event.get("objectObservation", {})
+                                      for event in hidden_method_events]
+        assert not any(observation.get("kind") == "CREATED"
+                       for observation in hidden_method_observations), hidden_method_events
+        hidden_method_calls = [event for event in hidden_method_events
+                               if event.get("probeId") == hidden_method_probe]
+        assert hidden_method_calls, hidden_method_events
+        for event in hidden_method_calls:
+            values = event_fields(event)
+            assert int(values["object_id"]) == int(values["object_generation"]) == 0, event
+            assert values["identity_verified"] in (False, "false", 0, "0"), event
+        hidden_method_destroy_begin = [event for event in hidden_method_events
+                                       if event.get("objectObservation", {}).get("kind") == "DESTROY_BEGIN"]
+        hidden_method_teardown_end = [event for event in hidden_method_events
+                                      if event.get("objectObservation", {}).get("kind") == "TEARDOWN_END"]
+        assert len(hidden_method_destroy_begin) == len(hidden_method_teardown_end) == 1, hidden_method_events
+        assert hidden_method_destroy_begin[0]["objectAddress"] == hidden_method_teardown_end[0]["objectAddress"]
+        assert hidden_method_teardown_end[0]["objectObservation"].get("closureReason") == "DESTRUCTOR_RETURN"
+        for event in (hidden_method_destroy_begin[0], hidden_method_teardown_end[0]):
+            observation = event["objectObservation"]
+            assert int(observation.get("lifetimeId", 0)) == int(observation.get("generation", 0)) == 0
+            assert observation.get("diagnostic") == (
+                "provisional destructor boundary with unverified complete-object construction"), event
+
+        # Combined method+writer observation must also leave the hidden Base
+        # subobject provisional and must not publish a false complete CREATED.
         hidden_binding = (f"--package {quote(identity_combined_package)} "
                          "--module libcounter.so")
         send(repl, f"%object-probe preview {hidden_binding}")
@@ -565,7 +797,7 @@ public:
         hidden_started = out.expect(r"^object-probe registration=(\d+) active=yes methods=1")
         hidden_registration = hidden_started[1]
         hidden_probe = out.expect(r"method_probe=(\d+) active=yes")[1]
-        send(repl, f"%record hidden-derived.db --sqlite --timeout 2 --after {identity_record[1]}")
+        send(repl, f"%record hidden-derived.db --sqlite --timeout 2 --after {hidden_method_record[2]}")
         send(target_process, "h")
         app.expect(r"^HIDDEN_DERIVED=51$")
         hidden_record = out.expect(
@@ -596,7 +828,7 @@ public:
             assert int(observation.get("lifetimeId", 0)) == 0, observation
             assert int(observation.get("generation", 0)) == 0, observation
             assert observation.get("diagnostic") == (
-                "provisional destructor boundary with unverified complete-object identity"), observation
+                "provisional destructor boundary with unverified complete-object construction"), observation
         assert teardown_observation.get("closureReason") == "DESTRUCTOR_RETURN", teardown_observation
         hidden_calls = [event for event in hidden_events
                         if event.get("probeId") == hidden_probe and
@@ -794,7 +1026,7 @@ public:
         for original, destination in ((header, hidden / header.name), (source, hidden / source.name),
                                       (callbacks, hidden / callbacks.name)):
             assert destination.is_file() and not original.exists()
-        assert {path: hashlib.sha256(path.read_bytes()).digest() for path in (target, library)} == target_hashes
+        assert {path: hashlib.sha256(path.read_bytes()).digest() for path in target_hashes} == target_hashes
         print("offline package prepared before ELF; hidden headers; same-address lifetimes; "
               "failed second method rolled back; fresh registration succeeded")
 
