@@ -26,6 +26,15 @@ struct CodePatch {
   std::size_t size = 0;
 };
 
+struct CodeRange {
+  std::uintptr_t address = 0;
+  std::size_t size = 0;
+  // Native functions may end with a call whose saved return PC is just past
+  // the symbol. Executable mappings use half-open bounds.
+  bool return_at_end = true;
+  bool active_at_start = false;
+};
+
 // The caller owns the ptrace stop and has excluded other executing threads.
 // Used by the object watch for a one-byte, word-preserving breakpoint patch.
 void write_stopped_code_byte(pid_t tid, std::uintptr_t address, unsigned char value);
@@ -93,7 +102,9 @@ public:
   // It must not throw.
   [[nodiscard]] bool patch_code_batch(::tracer::compat::span<const CodePatch> patches,
                                      const std::function<void()> &validate_mappings = {},
-                                     const std::function<void()> &on_commit = {});
+                                     const std::function<void()> &on_commit = {},
+                                     ::tracer::compat::span<const CodeRange> drained_ranges = {},
+                                     bool allow_already_replaced = false);
   void remote_free(std::uintptr_t address, std::size_t size);
 
   [[nodiscard]] std::uintptr_t

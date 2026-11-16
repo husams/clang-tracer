@@ -1,0 +1,65 @@
+#pragma once
+
+#include "live_transaction.hpp"
+#include "tracer.pb.h"
+
+#include <functional>
+#include <set>
+#include <stdexcept>
+
+namespace tracer::live {
+
+struct Plan {
+  JitRequest jit;
+  std::vector<Entry> entries;
+  std::vector<clangtracer::v1::LiveUpdateStatus::Candidate> candidates;
+  std::vector<SourceFile> accepted_sources;
+  std::map<std::string, std::set<std::string>> private_closures;
+  SafePoint safe_point = SafePoint::independent_entry;
+  std::uintptr_t mock_original = 0;
+  bool has_native_mock_alternate = false;
+  std::set<std::uintptr_t> restore_mock_originals;
+  std::function<void()> validate_sources;
+
+  bool publishes_code() const { return !entries.empty() || !restore_mock_originals.empty(); }
+};
+
+class Stale : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
+Plan plan_sources(std::uint32_t pid, const std::string &executable,
+                  const clangtracer::v1::LiveUpdateRequest &request,
+                  const Revision &active, const std::function<bool()> &cancelled,
+                  const std::set<std::string> *managed_inputs = nullptr);
+
+// Extensions supply generated JIT entry symbols in the same order as entries.
+struct BuildInputs {
+  std::string module;
+  std::string source_root;
+  JitRequest baseline;
+  std::function<void()> revalidate;
+};
+
+BuildInputs open_native_build(const std::string &executable,
+                             const clangtracer::v1::LiveUpdateRequest &request);
+std::string live_build_module(const std::string &manifest_path);
+
+Entry bind_native_entry(std::uint32_t pid, const std::string &module,
+                        const std::string &linkage, const Revision &active, bool overwrite = true);
+
+struct ExtensionSources {
+  JitRequest jit;
+  std::string build_id;
+  std::uintptr_t entry = 0;
+  std::function<void()> validate;
+};
+
+ExtensionSources extension_sources(std::uint32_t pid, const std::string &module,
+    const clangtracer::v1::LiveUpdateRequest &request, const std::vector<std::string> &paths,
+    const std::string &registry);
+
+void validate_entry(std::uint32_t pid, const Entry &entry);
+
+} // namespace tracer::live
