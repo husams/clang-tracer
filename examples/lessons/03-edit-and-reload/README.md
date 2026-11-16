@@ -40,7 +40,8 @@ Press Enter in the target terminal while `%collect` waits. Expected: the POST
 event has `new_sum=42`, and the target still prints 42. A reload compiles the
 new observer first and switches generations, so calls already running finish on the old one.
 
-Finish by restoring the original code:
+`%probes` now lists the old generation as inactive and the new one with
+`active: true`. Finish by restoring the original code with the active ID:
 
 ```bash
 %probe remove PROBE_ID
