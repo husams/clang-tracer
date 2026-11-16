@@ -18,7 +18,8 @@ inline constexpr std::uint32_t kProtocolVersion = 2;
 // Version 27 configures the shared-context event budget in the bootstrap.
 // Version 28 also carries the shared transport memory budget.
 // Version 30 combines scalar control and native patch ownership.
-inline constexpr std::uint32_t kBootstrapVersion = 30;
+// Version 31 carries the type registration ID for grouped method callbacks.
+inline constexpr std::uint32_t kBootstrapVersion = 31;
 inline constexpr std::uint32_t kDefaultContextEventBytes = 256 * 1024;
 inline constexpr std::uint64_t kDefaultContextTransportMemoryBytes = 64ull * 1024 * 1024;
 struct ContextTransportBudget {
@@ -171,6 +172,13 @@ extern "C" bool tracer_enqueue_log(const TraceContext *, const char *,
 struct TraceContext {
   std::uint64_t probe_id = 0;
   std::uint64_t object_address = 0;
+  // Populated only when the receiver matched a published object-watch
+  // registration at this invocation's entry. These values are copied into
+  // the invocation so PRE and POST refer to the same lifetime generation.
+  std::uint64_t object_watch_id = 0;
+  std::uint64_t object_id = 0;
+  std::uint64_t object_generation = 0;
+  bool object_identity_verified = false;
   const ValueSnapshot *receiver_snapshot = nullptr;
   std::uint32_t argument_count = 0;
   std::uint32_t reserved = 0;
@@ -226,6 +234,7 @@ struct Request {
   std::uint32_t argument_count = 0;
   ValueType arguments[kMaxArguments]{};
   std::uint64_t probe_id = 0;
+  std::uint64_t object_watch_id = 0;
   char session_id[64]{};
   char symbol[512]{};
   char source_path[1024]{};

@@ -877,7 +877,8 @@ struct Scope { std::size_t mark = (tracer_snapshot_configure(@ARENA@u, @SLICE@u,
   scope.replace(scope.find("@MEMBERS@"), 9, std::to_string(limits.follow_members));
   // The root counts as a level of the event's snapshot nesting.
   scope.replace(scope.find("@DEPTH@"), 7, std::to_string(limits.follow_depth + 1));
-  code.arguments = "tracer_snapshot_detail::Scope snapshot_scope;\n";
+  code.scope = "tracer_snapshot_detail::Scope snapshot_scope;\n";
+  code.storage = code.scope;
   std::vector<clang::QualType> types;
   std::vector<context_engine::SnapshotMemberAccessor> member_accessors;
   for (auto &entry : entries)
@@ -1439,16 +1440,26 @@ inline bool verified_vtable(const void* address) noexcept {
                                : result ? "ctx.result.snapshot"
                                         : "ctx.arguments[" + std::to_string(entry.index) + "].snapshot";
     auto &body = receiver ? code.receiver : result ? code.result : code.arguments;
-    body += "tracer::ValueSnapshot snapshot_" + id + ";\n";
-    if (report_unavailable && top_members.count(entry_index))
-      body += "tracer::context_engine::EncodeBudget::PointerGraph child_graph_" + id +
-              "(tracer_snapshot_detail::snapshot_items);\n";
+    auto &storage = receiver ? code.receiver_storage
+                             : result ? code.result_storage : code.argument_storage;
+    const std::string snapshot_storage = "tracer::ValueSnapshot snapshot_" + id + ";\n";
+    storage += snapshot_storage;
+    code.storage += snapshot_storage;
     if (top_members.count(entry_index))
-      body += "tracer::ValueSnapshot child_snapshots_" + id + "[" +
+      storage += "tracer::ValueSnapshot child_snapshots_" + id + "[" +
               std::to_string(top_members[entry_index]) + "]{};\n"
               "tracer::ValueSnapshotMember child_members_" + id + "[" +
               std::to_string(top_members[entry_index]) + "]{};\n"
               "std::size_t child_member_count_" + id + "=0;\n";
+    if (top_members.count(entry_index))
+      code.storage += "tracer::ValueSnapshot child_snapshots_" + id + "[" +
+              std::to_string(top_members[entry_index]) + "]{};\n"
+              "tracer::ValueSnapshotMember child_members_" + id + "[" +
+              std::to_string(top_members[entry_index]) + "]{};\n"
+              "std::size_t child_member_count_" + id + "=0;\n";
+    if (report_unavailable && top_members.count(entry_index))
+      body += "tracer::context_engine::EncodeBudget::PointerGraph child_graph_" + id +
+              "(tracer_snapshot_detail::snapshot_items);\n";
     if (entry.result_pointee) {
       // These are read again after the block closes, when the call returns.
       for (std::size_t n = 0; n < nodes.size(); ++n)

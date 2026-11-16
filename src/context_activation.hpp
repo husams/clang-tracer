@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "context_binding.hpp"
+#include "context_prepared_adapter.hpp"
 #include "context_registry.hpp"
 #include "tracer/protocol.hpp"
 
@@ -18,6 +19,7 @@ struct ContextActivationRequest final {
   std::vector<std::string> compiler_arguments;
   std::array<std::uint8_t, 16> source_lineage_id{};
   std::string interceptor_class;
+  PreparedAdapterRegion prepared_adapter;
   std::string file_name = "context-activation-input.cc";
   std::size_t maximum_object_bytes = 4096;
   std::size_t maximum_object_alignment = 64;

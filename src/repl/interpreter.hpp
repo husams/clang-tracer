@@ -1,9 +1,11 @@
 #pragma once
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "../native_plugins.hpp"
 #include "api.hpp"
 
 namespace clangtracer::v1 {
@@ -29,6 +31,9 @@ class CppEngine {
   std::unique_ptr<Impl> impl_;
   Facade &facade_;
   std::vector<std::string> arguments_;
+  std::vector<std::string> plugin_includes_;
+  std::map<std::string, tracer::NativePluginSymbol> plugin_symbols_;
+  std::vector<std::string> with_plugin_headers(std::vector<std::string> arguments) const;
   void initialize();
   MappingHeader mapping_header(const std::vector<std::string> &headers,
                              const std::vector<std::string> &types,
@@ -61,6 +66,8 @@ public:
   std::string generate_header(const std::string &header,
                               const std::vector<std::string> &types = {},
                               const std::string &output = {});
+  void add_plugin_api(const std::filesystem::path& include,
+                      const std::vector<tracer::NativePluginSymbol>& symbols);
   void reset();
 };
 } // namespace tracer_repl

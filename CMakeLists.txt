@@ -56,7 +56,7 @@ include(CTest)
 include(cmake/TracerContextEngine.cmake)
 include(cmake/TracerToolchain.cmake)
 if(NOT LLVM_ENABLE_RTTI)
-  set_source_files_properties(src/debug_resolver.cpp src/native_stack.cpp src/admission.cpp
+  set_source_files_properties(src/debug_resolver.cpp src/native_stack.cpp src/admission.cpp src/native_plugins.cpp
     PROPERTIES COMPILE_OPTIONS "-fno-rtti")
 endif()
 include(cmake/TracerContextAnalysis.cmake)
@@ -70,12 +70,18 @@ file(MAKE_DIRECTORY ${TRACER_PROTO_DIR})
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/callback.hpp
   ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/context.hpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/repl/clang_tracer_repl_plugin.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/repl/clang_tracer_repl_plugin.hpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/repl/clang_tracer_agent_extension.hpp
   ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/protocol.hpp)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/protocol.hpp TRACER_PROTOCOL_HEADER)
 # Incremental input is a synthetic main file, not an includable disk header.
 string(REPLACE "#pragma once" "" TRACER_PROTOCOL_HEADER "${TRACER_PROTOCOL_HEADER}")
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/callback.hpp TRACER_CALLBACK_HEADER)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/context.hpp TRACER_CONTEXT_HEADER)
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/repl/clang_tracer_repl_plugin.h TRACER_PLUGIN_HEADER)
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/repl/clang_tracer_repl_plugin.hpp TRACER_CPP_PLUGIN_HEADER)
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/repl/clang_tracer_agent_extension.hpp TRACER_AGENT_EXTENSION_HEADER)
 configure_file(src/callback_source.hpp.in
   ${TRACER_PROTO_DIR}/callback_source.hpp @ONLY)
 add_custom_command(
@@ -99,6 +105,11 @@ target_link_libraries(tracer_grpc PUBLIC tracer_proto gRPC::grpc++)
 
 add_library(clang_tracer_agent SHARED src/agent.cpp src/native_detour.cpp src/native_entry.cpp src/page_monitor_agent.cpp
   src/object_code_cache_agent.cpp
+  src/agent_plugins.cpp src/native_plugins.cpp
+  src/repl/compiler_profile.cpp
+  src/live_compile.cpp src/live_jit.cpp src/live_agent.cpp
+  src/live_agent_extension.cpp src/live_data.cpp src/live_data_jit.cpp src/live_data_scan.cpp
+  src/live_migration.cpp src/live_mock_recursion.cpp
   src/value_snapshot_codegen.cpp src/value_snapshot_storage.cpp src/snapshot_encoder.cpp src/callback_pch.cpp
   src/debug_resolver.cpp src/native_stack.cpp src/event_transport.cpp
   src/context_agent_delivery.cpp src/agent_runtime_profile.cpp)
@@ -123,9 +134,19 @@ add_custom_command(TARGET clang_tracer_agent POST_BUILD
 add_executable(clang-tracer-server src/main.cpp src/server.cpp src/session.cpp src/injector.cpp src/admission.cpp src/memory_patch.cpp src/page_monitor.cpp
   src/debug_resolver.cpp src/header_context.cpp src/process_memory.cpp src/native_entry.cpp src/native_detour.cpp
   src/object_watch.cpp src/object_watch_plan.cpp src/object_snapshot.cpp src/object_launch.cpp
-  src/object_code_cache.cpp src/entry_trap.cpp src/instruction_trace.cpp)
+  src/object_code_cache.cpp src/entry_trap.cpp src/instruction_trace.cpp
+  src/live_compile.cpp src/live_plan.cpp src/live_session.cpp
+  src/live_data_command.cpp src/live_extension_plan.cpp src/live_mock.cpp src/live_mock_command.cpp
+  src/live_mock_plan.cpp src/live_mock_types.cpp)
 target_include_directories(clang-tracer-server PRIVATE include ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
-target_compile_definitions(clang-tracer-server PRIVATE TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
+target_compile_definitions(clang-tracer-server PRIVATE
+  TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}"
+  TRACER_LIVE_SDK_DIR="${CMAKE_INSTALL_FULL_INCLUDEDIR}"
+  TRACER_LIVE_BUILD_SDK_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include")
+install(FILES include/clang_tracer/live.hpp
+  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/clang_tracer" COMPONENT Runtime)
+install(FILES include/tracer/live_migration.hpp
+  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/tracer" COMPONENT Runtime)
 target_link_libraries(clang-tracer-server PRIVATE tracer_grpc tracer_context_collector
   tracer_context_analysis clang-cpp LLVM ${CMAKE_DL_LIBS} Threads::Threads)
 target_compile_options(clang-tracer-server PRIVATE -Wall -Wextra -Wpedantic)
@@ -264,12 +285,41 @@ if(BUILD_TESTING)
   add_test(NAME callback_pch_unavailable
     COMMAND callback-pch-tests "${_tracer_resource_dir}" --unavailable-cache)
   set_tests_properties(callback_pch_reuse callback_pch_unavailable PROPERTIES TIMEOUT 60)
-  add_executable(native-detour-tests tests/native_detour_tests.cpp src/native_detour.cpp)
+  add_executable(native-detour-tests tests/native_detour_tests.cpp
+    src/native_detour.cpp src/native_entry.cpp)
   target_include_directories(native-detour-tests PRIVATE include src ${LLVM_INCLUDE_DIRS})
   target_link_libraries(native-detour-tests PRIVATE LLVM tracer_compat)
   target_compile_options(native-detour-tests PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME native_detour_relocation COMMAND native-detour-tests)
   set_tests_properties(native_detour_relocation PROPERTIES TIMEOUT 30)
+
+  add_library(live-test-jit STATIC src/live_compile.cpp src/live_jit.cpp)
+  target_include_directories(live-test-jit SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
+  target_include_directories(live-test-jit PRIVATE include)
+  target_compile_definitions(live-test-jit PRIVATE
+    TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
+  target_link_libraries(live-test-jit PUBLIC clang-cpp LLVM ${CMAKE_DL_LIBS})
+
+  add_executable(live-data-target-tests tests/live_data_target.cpp
+    tests/fixtures/live_data/model.cpp src/live_data.cpp src/live_data_jit.cpp
+    src/live_data_scan.cpp src/debug_resolver.cpp)
+  target_include_directories(live-data-target-tests PRIVATE src ${LLVM_INCLUDE_DIRS})
+  target_compile_definitions(live-data-target-tests PRIVATE
+    TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
+  target_link_libraries(live-data-target-tests PRIVATE
+    live-test-jit tracer_proto Threads::Threads)
+  target_compile_options(live-data-target-tests PRIVATE -g -O0)
+  target_link_options(live-data-target-tests PRIVATE "LINKER:--build-id=sha1")
+  set_target_properties(live-data-target-tests PROPERTIES ENABLE_EXPORTS ON)
+  add_test(NAME live_data_target COMMAND live-data-target-tests
+    "${PROJECT_SOURCE_DIR}/tests/fixtures/live_data" "${PROJECT_SOURCE_DIR}/include")
+
+  add_executable(live-migration-tests tests/live_migration/integration.cpp src/live_migration.cpp)
+  target_include_directories(live-migration-tests PRIVATE src include)
+  target_link_libraries(live-migration-tests PRIVATE live-test-jit Threads::Threads)
+  add_test(NAME live_migration_target COMMAND live-migration-tests
+    "${PROJECT_SOURCE_DIR}/tests/live_migration" "${PROJECT_SOURCE_DIR}/include")
+  set_tests_properties(live_data_target live_migration_target PROPERTIES TIMEOUT 120)
 
   # Exercise a PIE probe reached through a caller with relaxed alignment.
   add_executable(trace-target-pie tests/fixtures/target.cpp)

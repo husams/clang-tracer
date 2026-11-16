@@ -1349,6 +1349,23 @@ std::vector<std::string> target_runtime_companions(
   return paths;
 }
 
+std::vector<std::string> mapped_application_files(pid_t pid) {
+  const auto maps = read_mappings(pid);
+  const auto executable = load_executable(pid, maps);
+  const auto libc = load_libc(maps);
+  const auto protected_files = protected_runtime_identities(maps, libc, loader_identity(executable, maps));
+  std::set<std::string> paths;
+  for (const auto &mapping : maps) {
+    if (!mapping.executable || mapping.path.empty() || mapping.path.front() != '/')
+      continue;
+    const auto &path = mapping.canonical_path.empty() ? mapping.path : mapping.canonical_path;
+    if (path != executable.path &&
+        std::find(protected_files.begin(), protected_files.end(), path) == protected_files.end())
+      paths.insert(path);
+  }
+  return {paths.begin(), paths.end()};
+}
+
 std::vector<ApplicationModule> discover_application_modules(pid_t pid) {
   if (pid <= 0) {
     throw std::invalid_argument("application module process id is invalid");

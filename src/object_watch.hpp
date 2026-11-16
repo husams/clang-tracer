@@ -12,7 +12,7 @@
 namespace tracer::object_watch {
 clangtracer::v1::ObjectWatchStatus preview(
     const clangtracer::v1::ObjectWatchRequest &request, std::uint32_t pid,
-    const std::string &executable);
+    const std::string &executable, bool verify_method_lifetimes = false);
 
 class Watch {
   struct Worker;

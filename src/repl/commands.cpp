@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "commands.hpp"
 #include "local_perf.hpp"
 #include "tracer/instruction_trace.h"
@@ -94,11 +95,25 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"memory import-hook", K::memory_import_hook},
                                         {"memory monitor-start", K::page_monitor_start},
                                         {"memory monitor-stop", K::page_monitor_stop},
+                                        {"live update", K::live_update},
+                                        {"live preview", K::live_preview},
+                                        {"live watch", K::live_watch},
+                                        {"live status", K::live_status},
+                                        {"live revert", K::live_revert},
+                                        {"live recover", K::live_recover},
+                                        {"live mock", K::live_mock},
+                                        {"live update-data", K::live_update_data},
+                                        {"live scan-heap", K::live_scan_heap},
                                         {"object start", K::object_start},
                                         {"object prepare", K::object_prepare},
                                         {"object preview", K::object_preview},
                                         {"object status", K::object_status},
                                         {"object stop", K::object_stop},
+                                        {"object-probe prepare", K::object_probe_prepare},
+                                        {"object-probe preview", K::object_probe_preview},
+                                        {"object-probe start", K::object_probe_start},
+                                        {"object-probe status", K::object_probe_status},
+                                        {"object-probe stop", K::object_probe_stop},
                                         {"trace preview", K::bulk_preview},
                                         {"trace apply", K::bulk_apply},
                                         {"trace remove", K::bulk_remove},
@@ -132,6 +147,16 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"cpp import", K::cpp_import},
                                         {"cpp generate", K::cpp_generate},
                                         {"cpp options", K::cpp_options},
+                                        {"plugin load", K::plugin_load},
+                                        {"plugin enable", K::plugin_enable},
+                                        {"plugin disable", K::plugin_disable},
+                                        {"plugin reload", K::plugin_reload},
+                                        {"plugin list", K::plugin_list},
+                                        {"plugin run", K::plugin_run},
+                                        {"plugin commands", K::plugin_commands},
+                                        {"plugin agent load", K::agent_plugin_load},
+                                        {"plugin agent reload", K::agent_plugin_reload},
+                                        {"plugin agent run", K::agent_plugin_run},
                                         {"shell", K::shell},
                                         {"complete", K::complete},
                                         {"type", K::type},
@@ -194,7 +219,10 @@ public:
     const auto ts = tokens_.getTokens();
     std::size_t i = 1;
     std::string name = ts.at(i++)->getText();
-    if (i + 1 < ts.size() && kinds.count(name + " " + ts[i]->getText())) {
+    if (name == "plugin" && ts[i]->getText() == "agent") {
+      name += " agent " + ts[i + 1]->getText();
+      i += 2;
+    } else if (i + 1 < ts.size() && kinds.count(name + " " + ts[i]->getText())) {
       name += " " + ts[i++]->getText();
     }
     result.kind = kinds.at(name);
@@ -211,9 +239,9 @@ public:
         "--registers", "--discover", "--watch", "--supervise", "--gate-children", "--allow-replacement", "--allow-call-original",
         "--trace-exceptions", "--reclaimable", "--snapshot-return-pointee",
         "--no-automatic-members", "--snapshot-receiver-at-return", "--no-values",
-        "--first-seen", "--writer-entry", "--discover-writers", "--syscall-output", "--stack-cfi", "--follow-calls"};
+        "--first-seen", "--writer-entry", "--discover-writers", "--syscall-output", "--stack-cfi", "--follow-calls", "--dwarf-writers"};
     const std::set<std::string> repeated = {"--include", "--compile-option",
-                                           "--name", "--type", "--arg", "--env", "--key"};
+                                           "--name", "--type", "--arg", "--env", "--key", "--method", "--bind", "--from-scan"};
     const std::set<std::string> bulk_repeated = {"--module", "--exclude", "--exact"};
     const std::set<std::string> object_repeated = {"--field", "--on", "--include", "--key", "--union-case", "--code",
                                                   "--translation-unit", "--async-signal", "--mutation"};
@@ -225,6 +253,11 @@ public:
         continue;
       }
       const auto text = ts[i]->getText();
+      if (result.kind == K::live_update_data && text == "--from-scan") {
+        while (i + 2 < ts.size() && !::tracer::compat::starts_with(ts[i + 1]->getText(), "--"))
+          result.options[text].push_back(decode(ts[++i]->getText()));
+        continue;
+      }
       const bool profile_add = result.kind == K::cpp_options &&
                                !result.arguments.empty() && result.arguments.front() == "add";
       if (!profile_add && ts[i]->getType() != TracerCommandsLexer::STRING &&
@@ -235,7 +268,12 @@ public:
         const bool object = result.kind == K::object_start || result.kind == K::object_prepare ||
                             result.kind == K::object_preview;
         const bool normal_repeat = object ? object_repeated.count(text) : repeated.count(text);
-        if (result.has(text) && !normal_repeat && !bulk_repeat && !module_repeat) {
+        const bool object_probe_repeat =
+            (result.kind == K::object_probe_prepare && text == "--code") ||
+            ((result.kind == K::object_probe_start || result.kind == K::object_probe_preview) &&
+             text == "--union-case");
+        if (result.has(text) && !normal_repeat && !bulk_repeat && !module_repeat &&
+            !object_probe_repeat) {
           throw std::invalid_argument("duplicate option: " + text);
         }
         result.options[text].push_back(

@@ -99,6 +99,18 @@ public:
 
     virtual std::any visitKeyword(TracerCommandsParser::KeywordContext *context) = 0;
 
+    virtual std::any visitObjectProbe(TracerCommandsParser::ObjectProbeContext *context) = 0;
+
+    virtual std::any visitObjectProbePrepareOption(TracerCommandsParser::ObjectProbePrepareOptionContext *context) = 0;
+
+    virtual std::any visitObjectProbeBindOption(TracerCommandsParser::ObjectProbeBindOptionContext *context) = 0;
+
+    virtual std::any visitLiveUpdate(TracerCommandsParser::LiveUpdateContext *context) = 0;
+
+    virtual std::any visitLiveScanSelection(TracerCommandsParser::LiveScanSelectionContext *context) = 0;
+
+    virtual std::any visitLiveOption(TracerCommandsParser::LiveOptionContext *context) = 0;
+
     virtual std::any visitObjectWatch(TracerCommandsParser::ObjectWatchContext *context) = 0;
 
     virtual std::any visitObjectOption(TracerCommandsParser::ObjectOptionContext *context) = 0;
@@ -134,6 +146,10 @@ public:
     virtual std::any visitExtraCompileOption(TracerCommandsParser::ExtraCompileOptionContext *context) = 0;
 
     virtual std::any visitCwdOption(TracerCommandsParser::CwdOptionContext *context) = 0;
+
+    virtual std::any visitPlugin(TracerCommandsParser::PluginContext *context) = 0;
+
+    virtual std::any visitPluginKeyword(TracerCommandsParser::PluginKeywordContext *context) = 0;
 
 
 };

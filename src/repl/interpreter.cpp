@@ -162,7 +162,7 @@ public:
     // Keep the compiler's indirect EH personality cell with its own CIE.
     // Undo may release that cell while other incremental objects are live.
     for (auto *symbol : graph.defined_symbols()) {
-      if (symbol->hasName() && (*symbol->getName()).starts_with("DW.ref.") &&
+      if (symbol->hasName() && ::tracer::compat::starts_with((*symbol->getName()), "DW.ref.") &&
           symbol->getScope() == llvm::jitlink::Scope::Hidden &&
           symbol->getLinkage() == llvm::jitlink::Linkage::Weak) {
         symbol->setLinkage(llvm::jitlink::Linkage::Strong);
@@ -381,6 +381,29 @@ std::vector<std::string> CppEngine::effective_compiler_options() const {
   return profile_arguments(arguments_);
 }
 
+std::vector<std::string> CppEngine::with_plugin_headers(std::vector<std::string> arguments) const {
+  arguments.insert(arguments.end(), plugin_includes_.begin(), plugin_includes_.end());
+  return arguments;
+}
+
+void CppEngine::add_plugin_api(const std::filesystem::path& include,
+                               const std::vector<tracer::NativePluginSymbol>& symbols) {
+  if (impl_) {
+    throw std::logic_error("plugin APIs must be installed before starting C++");
+  }
+  for (const auto& symbol : symbols) {
+    if (::tracer::compat::contains(plugin_symbols_, symbol.name)) {
+      throw std::runtime_error("duplicate public plugin symbol: " + symbol.name);
+    }
+  }
+  for (const auto& symbol : symbols) {
+    plugin_symbols_.emplace(symbol.name, symbol);
+  }
+  if (!include.empty()) {
+    plugin_includes_.insert(plugin_includes_.end(), {"-I", include.string()});
+  }
+}
+
 void CppEngine::require_compiler_options_mutable() const {
   if (impl_ && impl_->user_cells)
     throw std::runtime_error(
@@ -401,7 +424,7 @@ void CppEngine::set_compiler_options(std::vector<std::string> arguments) {
   const auto helper = std::filesystem::path(executable_path()).parent_path() /
                       "clang-tracer-repl-check";
   const auto checked =
-      run_cpp_analysis(helper.string(), "check", profile_arguments(arguments),
+      run_cpp_analysis(helper.string(), "check", with_plugin_headers(profile_arguments(arguments)),
                        "", "#include \"" + api_header() + "\"\n");
   if (checked.status != 0)
     throw std::runtime_error(
@@ -416,7 +439,7 @@ CppEngine::MappingHeader CppEngine::mapping_header(const std::vector<std::string
     bool standalone, const PreparedModules &modules) {
   if (impl_) impl_->verify_inputs();
   const bool independent = standalone || !impl_ || !impl_->user_cells;
-  const auto arguments = profile_arguments(arguments_);
+  const auto arguments = with_plugin_headers(effective_compiler_options());
   const auto api = api_header();
   const auto helper = std::filesystem::path(executable_path()).parent_path() /
                       "clang-tracer-repl-check";
@@ -588,7 +611,7 @@ std::string CppEngine::import_recorded_types(const clangtracer::v1::PreparedInje
   const auto helper = std::filesystem::path(executable_path()).parent_path() /
                       "clang-tracer-repl-check";
   const auto checked = run_cpp_analysis(
-      helper.string(), "replay-types", profile_arguments(arguments_),
+      helper.string(), "replay-types", with_plugin_headers(effective_compiler_options()),
       source.substr(0, source.size() - declarations.size()), declarations);
   if (checked.status != 0)
     throw std::runtime_error("recorded adapter must contain declarations only\n" +
@@ -607,7 +630,7 @@ void CppEngine::initialize() {
     llvm::InitializeNativeTargetAsmParser();
     llvm::sys::DynamicLibrary::LoadLibraryPermanently(nullptr);
   });
-  auto args = profile_arguments(arguments_);
+  auto args = with_plugin_headers(effective_compiler_options());
 #if defined(__linux__) && defined(__aarch64__)
   // The in-process JIT cannot resolve compiler runtime outline-atomic helpers.
   args.emplace_back("-mno-outline-atomics");
@@ -662,6 +685,22 @@ void CppEngine::initialize() {
   auto engine = (*interpreter)->getExecutionEngine();
   if (!engine) {
     throw std::runtime_error(llvm::toString(engine.takeError()));
+  }
+  if (!plugin_symbols_.empty()) {
+    auto& session = (*jit)->getExecutionSession();
+    auto& exports = session.createBareJITDylib("clang-tracer-plugin-exports");
+    llvm::orc::SymbolMap symbols;
+    for (const auto& [name, symbol] : plugin_symbols_) {
+      llvm::JITSymbolFlags flags = llvm::JITSymbolFlags::Exported;
+      if (symbol.callable) {
+        flags |= llvm::JITSymbolFlags::Callable;
+      }
+      symbols[session.intern(name)] = {llvm::orc::ExecutorAddr(symbol.address), flags};
+    }
+    if (auto error = exports.define(llvm::orc::absoluteSymbols(std::move(symbols)))) {
+      throw std::runtime_error(llvm::toString(std::move(error)));
+    }
+    (*jit)->getMainJITDylib().addToLinkOrder(exports);
   }
   std::vector<std::string> initial_cells;
   // The public factory parses its own runtime declarations before user input.

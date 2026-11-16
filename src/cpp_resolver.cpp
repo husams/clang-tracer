@@ -1195,7 +1195,7 @@ public:
               invocation_.pointer_layouts ? invocation_.member_level
                                           : std::min(invocation_.member_level, 1),
               tracer::resolve_limits(&invocation_.limits, nullptr));
-          auto adapter = tracer::prepared::AdapterEmitter::emit(*context_, *header_search_,
+          auto adapter = tracer::prepared::AdapterEmitter::emit(*context_, *sema_, *header_search_,
               *declaration, invocation_.prepared_headers, invocation_.pointer_layouts,
               snapshots.types);
           auto &package = *candidate.spec.mutable_prepared();

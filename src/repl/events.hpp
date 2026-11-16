@@ -34,6 +34,8 @@ public:
 };
 
 std::string value_text(const clangtracer::v1::Value &value);
+bool callback_error_matches(const clangtracer::v1::TraceEvent &event,
+                            CallbackErrorFilter filter);
 std::string event_summary(const clangtracer::v1::TraceEvent &event);
 void print_event_stack(const clangtracer::v1::TraceEvent &event, std::ostream &out);
 void event_statistics(const EventBuffer &buffer, std::ostream &out, bool calls);

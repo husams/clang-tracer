@@ -5,6 +5,7 @@
 #include <llvm/Support/LEB128.h>
 
 #include "debug_resolver.hpp"
+#include "admission.hpp"
 #include "proc_identity.hpp"
 #include "linux_syscalls.hpp"
 #include "native_detour.hpp"
@@ -70,13 +71,34 @@ std::string leaf_name(const std::string &qualified_name) {
 std::string qualified(DWARFDie die) {
   if (!die)
     return {};
-  std::string result = name(die);
-  for (auto parent = die.getParent(); parent; parent = parent.getParent()) {
-    if (parent.getTag() == dw::DW_TAG_namespace || parent.getTag() == dw::DW_TAG_class_type ||
-        parent.getTag() == dw::DW_TAG_structure_type || parent.getTag() == dw::DW_TAG_union_type) {
-      result = name(parent) + "::" + result;
-    } else if (parent.getTag() != dw::DW_TAG_compile_unit) {
-      return {};
+  const auto from_scope = [](DWARFDie current) {
+    std::string result = name(current);
+    for (auto parent = current.getParent(); parent; parent = parent.getParent()) {
+      if (parent.getTag() == dw::DW_TAG_namespace || parent.getTag() == dw::DW_TAG_class_type ||
+          parent.getTag() == dw::DW_TAG_structure_type || parent.getTag() == dw::DW_TAG_union_type) {
+        result = name(parent) + "::" + result;
+      } else if (parent.getTag() != dw::DW_TAG_compile_unit &&
+                 parent.getTag() != dw::DW_TAG_type_unit) {
+        return std::string{};
+      }
+    }
+    return result;
+  };
+  auto result = from_scope(die);
+  // A DWARF4 type-unit DIE may be rooted at the type unit, with the source
+  // namespace recorded only on its specification in .debug_info.
+  llvm::SmallVector<DWARFDie, 4> pending{die};
+  std::set<DWARFDie> seen{die};
+  for (std::size_t index = 0; index < pending.size(); ++index) {
+    for (const auto attr : {dw::DW_AT_specification, dw::DW_AT_abstract_origin}) {
+      const auto related = pending[index].getAttributeValueAsReferencedDie(attr);
+      if (!related || !seen.insert(related).second)
+        continue;
+      pending.push_back(related);
+      const auto candidate = from_scope(related);
+      if (name(related) == name(die) && candidate.find("::") != std::string::npos &&
+          (result.find("::") == std::string::npos || candidate.size() > result.size()))
+        result = candidate;
     }
   }
   return result;
@@ -172,6 +194,69 @@ bool has_virtual_members_or_bases(DWARFDie die, std::set<DWARFDie> &seen) {
   return false;
 }
 
+enum class CallerKind { unknown, constructor_or_destructor, ordinary };
+
+CallerKind classify_linkage_name(std::string_view linkage) {
+  if (!::tracer::compat::starts_with(linkage, "_Z")) {
+    if (linkage.empty() ||
+        !(std::isalpha(static_cast<unsigned char>(linkage.front())) || linkage.front() == '_') ||
+        !std::all_of(linkage.begin() + 1, linkage.end(), [](unsigned char c) {
+          return std::isalnum(c) || c == '_';
+        }))
+      return CallerKind::unknown;
+    return CallerKind::ordinary;
+  }
+  // Compiler-created cold and specialized clones keep the mangled callable
+  // before the first suffix, including its constructor/destructor variant.
+  const std::string storage(linkage.substr(0, linkage.find('.')));
+  llvm::ItaniumPartialDemangler parsed;
+  if (parsed.partialDemangle(storage.c_str()))
+    return CallerKind::unknown;
+  return parsed.isCtorOrDtor() ? CallerKind::constructor_or_destructor : CallerKind::ordinary;
+}
+
+CallerKind classify_dwarf_caller(DWARFDie function) {
+  if (function && function.getTag() == dw::DW_TAG_inlined_subroutine) {
+    auto origin = function.getAttributeValueAsReferencedDie(dw::DW_AT_abstract_origin);
+    if (!origin)
+      origin = function.getAttributeValueAsReferencedDie(dw::DW_AT_specification);
+    if (!origin)
+      return CallerKind::unknown;
+    function = origin;
+  }
+  while (function && function.getTag() != dw::DW_TAG_subprogram)
+    function = function.getParent();
+  if (!function)
+    return CallerKind::unknown;
+  llvm::SmallVector<DWARFDie, 4> declarations{function};
+  for (std::size_t index = 0; index < declarations.size(); ++index) {
+    const auto die = declarations[index];
+    for (const auto attr : {dw::DW_AT_abstract_origin, dw::DW_AT_specification})
+      if (auto related = die.getAttributeValueAsReferencedDie(attr);
+          related && std::find(declarations.begin(), declarations.end(), related) == declarations.end())
+        declarations.push_back(related);
+  }
+  for (const auto declaration : declarations)
+    if (const auto *linkage = declaration.getLinkageName())
+      return classify_linkage_name(linkage);
+  // A missing linkage name is not enough to classify the caller. The caller
+  // proof can fall back to one ELF function symbol covering the call site.
+  for (const auto declaration : declarations) {
+    if (declaration.findRecursively({dw::DW_AT_object_pointer}))
+      return CallerKind::unknown;
+    auto parent = declaration.getParent();
+    while (parent && parent.getTag() == dw::DW_TAG_namespace)
+      parent = parent.getParent();
+    if (record(parent)) {
+      const auto scope = name(parent);
+      const auto function_name = name(declaration);
+      if (function_name == scope || function_name == "~" + scope)
+        return CallerKind::constructor_or_destructor;
+    }
+  }
+  return CallerKind::unknown;
+}
+
 bool may_aggregate_initialize_base(DWARFDie derived) {
   const auto class_name = name(derived);
   const auto constructor = class_name.substr(0, class_name.find('<'));
@@ -195,18 +280,30 @@ bool may_aggregate_initialize_base(DWARFDie derived) {
 DerivedTypes derived_types(llvm::DWARFContext &dwarf, const std::string &concrete) {
   DerivedTypes result;
   std::vector<DWARFDie> pending;
-  for (const auto &unit : dwarf.compile_units())
+  for (const auto &unit : dwarf.normal_units())
     pending.push_back(unit->getUnitDIE(false));
   while (!pending.empty()) {
     const auto die = pending.back();
     pending.pop_back();
     for (const auto child : die.children()) {
-      if (child.getTag() == dw::DW_TAG_inheritance && qualified(type(child)) == concrete) {
-        result.present = true;
-        if (!result.may_construct_base_directly && may_aggregate_initialize_base(die))
-          result.may_construct_base_directly = true;
+      const auto tag = child.getTag();
+      if (tag == dw::DW_TAG_inheritance) {
+        // Signature references can resolve to a definition at the type-unit
+        // root. Its specification retains the enclosing namespace.
+        auto base = child.resolveReferencedType(dw::DW_AT_type);
+        if (const auto declaration = base ? base.getAttributeValueAsReferencedDie(dw::DW_AT_specification)
+                                          : DWARFDie{};
+            record(declaration))
+          base = declaration;
+        if (qualified(base) == concrete) {
+          result.present = true;
+          if (!result.may_construct_base_directly && may_aggregate_initialize_base(die))
+            result.may_construct_base_directly = true;
+        }
       }
-      if (record(child) || (child.getTag() == dw::DW_TAG_namespace && name(child) != "std"))
+      if (record(child) || (tag == dw::DW_TAG_namespace && name(child) != "std") ||
+          tag == dw::DW_TAG_subprogram || tag == dw::DW_TAG_lexical_block ||
+          tag == dw::DW_TAG_inlined_subroutine)
         pending.push_back(child);
     }
   }
@@ -454,13 +551,49 @@ void verify_receiver_storage(llvm::DWARFContext &dwarf, llvm::DWARFUnit *unit,
             return item.base() == base && (base ? item.type() : item.name()) == name_key;
           });
       const auto offset = number(child, dw::DW_AT_data_member_location);
-      if (found == layout->members().end() || found->needs_dynamic_location() ||
-          child.find(dw::DW_AT_bit_size) || !offset || *offset > UINT64_MAX / 8 ||
-          *offset * 8 != found->offset_bits() || found->type().find('?') != std::string::npos ||
-          found->type() != member_type || (!base && storage_size(type(child)) != found->bytes()))
-        throw std::runtime_error("source layout differs or is unverified for " + identity + "::" +
-            name_key + " (DWARF type " + member_type + ", source type " +
-            (found == layout->members().end() ? "<absent>" : found->type()) + ")");
+      const bool absent = found == layout->members().end();
+      const auto dwarf_bytes = base ? std::optional<std::uint64_t>{} : storage_size(type(child));
+      const bool dynamic = !absent && found->needs_dynamic_location();
+      const bool bitfield = child.find(dw::DW_AT_bit_size).has_value();
+      const bool bad_offset = !offset || *offset > UINT64_MAX / 8 ||
+          (!absent && *offset * 8 != found->offset_bits());
+      const bool unknown_source_type = !absent && found->type().find('?') != std::string::npos;
+      const bool type_mismatch = !absent && found->type() != member_type;
+      const bool size_mismatch = !base && !absent &&
+          (!dwarf_bytes || *dwarf_bytes != found->bytes());
+      if (absent || dynamic || bitfield || bad_offset || unknown_source_type ||
+          type_mismatch || size_mismatch) {
+        std::ostringstream message;
+        message << "source layout differs or is unverified for " << identity << "::" << name_key
+                << " (DWARF type " << member_type << ", source type "
+                << (absent ? "<absent>" : found->type());
+        if (!absent) {
+          message << ", DWARF offset_bits ";
+          if (!offset || *offset > UINT64_MAX / 8)
+            message << "<unavailable>";
+          else
+            message << *offset * 8;
+          message << ", source offset_bits " << found->offset_bits();
+          if (!base) {
+            message << ", DWARF bytes ";
+            if (dwarf_bytes)
+              message << *dwarf_bytes;
+            else
+              message << "<unavailable>";
+            message << ", source bytes " << found->bytes();
+          }
+          if (dynamic)
+            message << ", source location is dynamic";
+          if (bitfield)
+            message << ", DWARF member is a bitfield";
+          if (unknown_source_type)
+            message << ", source type contains an unverified '?' spelling";
+          if (type_mismatch)
+            message << ", canonical type spellings differ";
+        }
+        message << ')';
+        throw std::runtime_error(message.str());
+      }
     }
     if (actual_members.size() != static_cast<std::size_t>(layout->members_size()))
       throw std::runtime_error("source layout members differ from DWARF: " + identity);
@@ -1474,6 +1607,19 @@ struct Symbol {
   unsigned kind;
 };
 
+bool has_constructor_variant(const Symbol &symbol, std::string_view variant) {
+  for (auto position = symbol.linkage.find(variant); position != std::string::npos;
+       position = symbol.linkage.find(variant, position + variant.size())) {
+    auto other = symbol.linkage;
+    other[position + 1] = variant == "C1E" ? '2' : '1';
+    // The C1/C2 discriminator does not affect the demangled signature.
+    // A matching substring inside a C++ identifier does.
+    if (llvm::demangle(other) == symbol.demangled)
+      return true;
+  }
+  return false;
+}
+
 bool operator_delete_name(std::string_view linkage) {
   const auto name = llvm::demangle(linkage);
   return ::tracer::compat::starts_with(name, "operator delete(") || name.find("::operator delete(") != std::string::npos;
@@ -1787,6 +1933,33 @@ struct Plan::Image {
   }
 #endif
 
+  std::map<std::string, std::uint64_t> plt_entries() const {
+    std::map<std::string, std::uint64_t> result;
+    if (!bias)
+      return result;
+    const auto &object = llvm::cast<llvm::object::ELF64LEObjectFile>(*executable.getBinary());
+    const auto triple = llvm::sys::getDefaultTargetTriple();
+    std::string error;
+    const auto *target = llvm::TargetRegistry::lookupTarget(triple, error);
+    if (!target)
+      return result;
+    const std::unique_ptr<llvm::MCSubtargetInfo> sub(target->createMCSubtargetInfo(triple, "generic", ""));
+    if (!sub)
+      return result;
+    for (const auto &entry : object.getPltEntries(*sub)) {
+      if (!entry.Symbol || entry.Address > std::numeric_limits<std::uint64_t>::max() - *bias)
+        continue;
+      llvm::object::SymbolRef symbol(*entry.Symbol, &object);
+      auto name = symbol.getName();
+      if (!name) {
+        llvm::consumeError(name.takeError());
+        continue;
+      }
+      result.emplace(name->str(), *bias + entry.Address);
+    }
+    return result;
+  }
+
   bool is_delete_target(std::uint64_t address) const {
     if (std::any_of(std::begin(symbols), std::end(symbols), [&](const auto &symbol) {
           return symbol.kind == llvm::ELF::STT_FUNC && symbol.range.first == address &&
@@ -1929,7 +2102,8 @@ std::pair<std::uint64_t, std::size_t> Plan::application_range(
 }
 
 Plan::Plan(std::uint32_t pid, std::string executable,
-           const clangtracer::v1::ObjectWatchRequest &request)
+           const clangtracer::v1::ObjectWatchRequest &request,
+           bool verify_method_lifetimes)
     : module(writer_module(pid, executable, request.code_module())) {
   using Request = clangtracer::v1::ObjectWatchRequest;
   if (!pid && request.code_module().empty()) {
@@ -1954,6 +2128,411 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   image_ = std::make_unique<Image>(pid, module, module == executable);
   if (module != executable)
     main_ = std::make_unique<Image>(pid, executable, true);
+  const auto &concrete_type = request.concrete_type();
+  const auto concrete_leaf = leaf_name(concrete_type);
+  const auto constructor_name = concrete_type + "::" + concrete_leaf + "(";
+  const auto destructor_name = concrete_type + "::~" + concrete_leaf + "(";
+  const auto duplicate_lifetime_coverage = [&] {
+    const auto definitions = [&](const Image &image) {
+      std::map<std::string, std::set<Range>> result;
+      for (const auto &symbol : image.symbols) {
+        if (symbol.kind != llvm::ELF::STT_FUNC ||
+            (!::tracer::compat::starts_with(symbol.demangled, constructor_name) &&
+             !::tracer::compat::starts_with(symbol.demangled, destructor_name)))
+          continue;
+        const bool ctor = ::tracer::compat::starts_with(symbol.demangled, constructor_name) &&
+            (has_constructor_variant(symbol, "C1E") || has_constructor_variant(symbol, "C2E"));
+        const bool dtor = ::tracer::compat::starts_with(symbol.demangled, destructor_name) &&
+            (::tracer::compat::contains(symbol.linkage, "D0Ev") || ::tracer::compat::contains(symbol.linkage, "D1Ev") ||
+             ::tracer::compat::contains(symbol.linkage, "D2Ev"));
+        if (ctor || dtor)
+          result[symbol.linkage].insert(symbol.range);
+      }
+      return result;
+    };
+    const auto normalize_path = [](const std::string &path) {
+      std::error_code error;
+      const auto canonical = std::filesystem::weakly_canonical(path, error);
+      return error ? path : canonical.string();
+    };
+    const auto selected_path = normalize_path(image_->path);
+    const auto selected_definitions = definitions(*image_);
+    if (selected_definitions.empty())
+      return std::string{};
+    std::set<std::string> same_image_duplicates;
+    std::set<std::pair<std::string, std::string>> cross_image_duplicates;
+    for (const auto &[linkage, ranges] : selected_definitions)
+      if (ranges.size() > 1)
+        same_image_duplicates.insert(linkage);
+
+    std::set<std::string> wanted;
+    for (const auto &[linkage, ranges] : selected_definitions)
+      wanted.insert(linkage);
+    std::string incomplete_scan;
+    const auto check_other_image = [&](const std::string &path,
+                                       const std::map<std::string, std::set<Range>> &other) {
+      for (const auto &definition : selected_definitions) {
+        const auto &linkage = definition.first;
+        const auto found = other.find(linkage);
+        if (found != other.end())
+          cross_image_duplicates.emplace(linkage, path);
+      }
+      for (const auto &[linkage, ranges] : other)
+        if (::tracer::compat::contains(wanted, linkage) && ranges.size() > 1)
+          same_image_duplicates.insert(linkage);
+    };
+    if (main_ && normalize_path(main_->path) != selected_path) {
+      const auto main_definitions = definitions(*main_);
+      check_other_image(main_->path, main_definitions);
+    }
+    const auto app_module_definitions = [&](const std::string &path) {
+      std::map<std::string, std::set<Range>> result;
+      auto binary = open_elf(path);
+      const auto &object = llvm::cast<llvm::object::ELF64LEObjectFile>(*binary.getBinary());
+      const auto add = [&](const auto &symbol) {
+        const llvm::object::ELFSymbolRef elf(symbol);
+        if (elf.getELFType() != llvm::ELF::STT_FUNC || !elf.getSize())
+          return;
+        auto linkage = symbol.getName();
+        auto address = symbol.getAddress();
+        auto flags = symbol.getFlags();
+        if (!linkage || !address || !flags) {
+          if (!linkage) llvm::consumeError(linkage.takeError());
+          if (!address) llvm::consumeError(address.takeError());
+          if (!flags) llvm::consumeError(flags.takeError());
+          return;
+        }
+        const auto name = linkage->str();
+        if (!::tracer::compat::contains(wanted, name) || !*address ||
+            (*flags & llvm::object::SymbolRef::SF_Undefined))
+          return;
+        result[name].insert({*address, elf.getSize()});
+      };
+      for (const auto &symbol : object.symbols())
+        add(symbol);
+      for (const auto &symbol : object.getDynamicSymbolIterators())
+        add(symbol);
+      return result;
+    };
+    if (pid) {
+      try {
+        for (const auto &path : injector::mapped_application_files(static_cast<pid_t>(pid))) {
+          const auto normalized = normalize_path(path);
+          if (normalized == selected_path || (main_ && normalized == normalize_path(main_->path)))
+            continue;
+          try {
+            check_other_image(path, app_module_definitions(path));
+          } catch (const std::exception &error) {
+            if (incomplete_scan.empty())
+              incomplete_scan = "could not inspect mapped application module " + path + ": " + error.what();
+          }
+        }
+      } catch (const std::exception &error) {
+        incomplete_scan = "could not enumerate mapped application modules: " + std::string(error.what());
+      }
+    }
+    if (!cross_image_duplicates.empty()) {
+      const auto &[linkage, path] = *cross_image_duplicates.begin();
+      if (main_ && normalize_path(path) == normalize_path(main_->path))
+        return "same lifetime symbol is defined in both the executable and selected module (" +
+            llvm::demangle(linkage) + "); object identities remain provisional";
+      return "same lifetime symbol is defined in selected module " + image_->path +
+          " and mapped application module " + path + " (" + llvm::demangle(linkage) +
+          "); object identities remain provisional";
+    }
+    if (!same_image_duplicates.empty())
+      return "lifetime symbol has multiple definitions in one image (" +
+          llvm::demangle(*same_image_duplicates.begin()) + "); object identities remain provisional";
+    if (!incomplete_scan.empty())
+      return incomplete_scan + "; object identities remain provisional";
+    return std::string{};
+  };
+  if (request.lifetimes_only() || (request.staged_registration() && verify_method_lifetimes))
+    lifetime_coverage_diagnostic = duplicate_lifetime_coverage();
+
+  const auto prove_complete_constructor_callers = [&](const std::vector<std::uint64_t> &entries,
+                                                       bool aggregate_base_possible) {
+    std::set<std::uint64_t> proven;
+    if (entries.empty() || aggregate_base_possible || !lifetime_coverage_diagnostic.empty())
+      return proven;
+    // PLT symbol enumeration needs the executable's runtime bias. A method
+    // registration may reach this proof before any executable boundary has
+    // otherwise caused its image to be bound.
+    if (main_ && !main_->bias) {
+      const auto symbol = ::tracer::compat::ranges::find_if(main_->symbols, [](const auto &candidate) {
+        return candidate.kind == llvm::ELF::STT_FUNC && candidate.range.second;
+      });
+      if (symbol != main_->symbols.end()) {
+        try {
+          main_->bind(pid, symbol->range);
+        } catch (const std::exception &) {
+          // Executable binding supplies optional caller/PLT evidence. Failure
+          // must leave that evidence unavailable rather than reject the watch.
+        }
+      }
+    }
+    const auto classify_elf_caller = [](const Image &caller_image, std::uint64_t call) {
+      if (!caller_image.bias || call < *caller_image.bias)
+        return CallerKind::unknown;
+      const auto address = call - *caller_image.bias;
+      std::set<std::pair<std::string, Range>> symbols;
+      for (const auto &symbol : caller_image.symbols) {
+        if (symbol.kind == llvm::ELF::STT_FUNC && symbol.range.second &&
+            address >= symbol.range.first && address - symbol.range.first < symbol.range.second) {
+          if (classify_linkage_name(symbol.linkage) == CallerKind::constructor_or_destructor)
+            return CallerKind::constructor_or_destructor;
+          symbols.emplace(symbol.linkage, symbol.range);
+        }
+      }
+      if (symbols.size() != 1)
+        return CallerKind::unknown;
+      return classify_linkage_name(symbols.begin()->first);
+    };
+    std::map<std::string, bool> defined_records;
+    const auto unresolved_records = [&](DWARFDie function) {
+      std::vector<DWARFDie> scopes{function};
+      while (!scopes.empty()) {
+        const auto scope = scopes.back();
+        scopes.pop_back();
+        for (const auto child : scope.children()) {
+          const auto tag = child.getTag();
+          if (tag == dw::DW_TAG_lexical_block || tag == dw::DW_TAG_inlined_subroutine)
+            scopes.push_back(child);
+          if (tag != dw::DW_TAG_variable && tag != dw::DW_TAG_formal_parameter)
+            continue;
+          auto referred = child.resolveReferencedType(dw::DW_AT_type);
+          std::set<DWARFDie> seen;
+          while (referred && seen.insert(referred).second) {
+            const auto kind = referred.getTag();
+            if (kind != dw::DW_TAG_typedef && kind != dw::DW_TAG_const_type &&
+                kind != dw::DW_TAG_volatile_type && kind != dw::DW_TAG_array_type &&
+                kind != dw::DW_TAG_pointer_type && kind != dw::DW_TAG_reference_type &&
+                kind != dw::DW_TAG_rvalue_reference_type)
+              break;
+            referred = referred.resolveReferencedType(dw::DW_AT_type);
+          }
+          if (!record(referred) || !referred.find(dw::DW_AT_declaration))
+            continue;
+          const auto identity = qualified(referred);
+          if (identity.empty())
+            return true;
+          auto [known, inserted] = defined_records.try_emplace(identity, false);
+          if (inserted) {
+            for (const auto *image : {image_.get(), main_.get()}) {
+              if (!image)
+                continue;
+              try {
+                known->second = static_cast<bool>(find_record(*image->dwarf, identity));
+              } catch (const std::runtime_error &) {
+                continue;
+              }
+              if (known->second)
+                break;
+            }
+          }
+          if (!known->second)
+            return true;
+        }
+      }
+      return false;
+    };
+    std::set<std::uint64_t> verified_plt_calls;
+    for (const auto &[entry, calls] : direct_redirects(entries, true, false, true,
+                                                        &verified_plt_calls)) {
+      for (const auto call : calls) {
+        const auto *caller_image = image_for(call);
+        if (!caller_image)
+          continue;
+        const auto address = caller_image->bias && call >= *caller_image->bias ?
+            call - *caller_image->bias : 0;
+        const auto debug = caller_image->dwarf->getDIEsForAddress(address);
+        const bool complete_plt_call = ::tracer::compat::contains(verified_plt_calls, call);
+        // A direct call to an aliased entry may come from an inlined base
+        // initializer. A physical symbol alone cannot rule that out.
+        if (!complete_plt_call && (!debug.CompileUnit || !debug.FunctionDIE))
+          continue;
+        llvm::SmallVector<DWARFDie, 4> inlined;
+        if (debug.CompileUnit)
+          debug.CompileUnit->getInlinedChainForAddress(address, inlined);
+        const auto elf_kind = classify_elf_caller(*caller_image, call);
+        if (elf_kind == CallerKind::constructor_or_destructor)
+          continue;
+        auto caller_kind = debug.FunctionDIE ? classify_dwarf_caller(debug.FunctionDIE) : CallerKind::unknown;
+        if (caller_kind == CallerKind::unknown) {
+          if (!complete_plt_call &&
+              !debug.FunctionDIE.findRecursively({dw::DW_AT_type, dw::DW_AT_prototyped,
+                                                 dw::DW_AT_frame_base}))
+            continue;
+          caller_kind = elf_kind;
+        }
+        if (caller_kind != CallerKind::ordinary ||
+            ::tracer::compat::ranges::any_of(inlined, [](DWARFDie frame) {
+              // A physical caller symbol cannot identify an inlined frame.
+              // Require positive DWARF identity for every inlined frame.
+              return frame.getTag() == dw::DW_TAG_inlined_subroutine &&
+                  classify_dwarf_caller(frame) != CallerKind::ordinary;
+            }) || (!complete_plt_call && unresolved_records(debug.FunctionDIE)))
+          continue;
+        const auto return_pc = call + object_cache::direct_call_width;
+        complete_constructor_returns.emplace(entry, return_pc);
+        if (const auto target = constructor_tail_target(entry))
+          complete_constructor_returns.emplace(target, return_pc);
+        proven.insert(entry);
+      }
+    }
+    return proven;
+  };
+
+  if (request.lifetimes_only()) {
+    lifetimes_only = true;
+    const auto &concrete = concrete_type;
+    const auto leaf = leaf_name(concrete);
+    const auto is_constructor = [&](const Symbol &symbol) {
+      return symbol.kind == llvm::ELF::STT_FUNC && ::tracer::compat::starts_with(symbol.demangled, constructor_name) &&
+          symbol.linkage.find('.') == std::string::npos &&
+          (has_constructor_variant(symbol, "C1E") || has_constructor_variant(symbol, "C2E"));
+    };
+    auto *const lifetime_image = image_.get();
+    const auto constructor = ::tracer::compat::ranges::find_if(lifetime_image->symbols, is_constructor);
+    if (constructor == lifetime_image->symbols.end() && main_ &&
+        ::tracer::compat::ranges::any_of(main_->symbols, is_constructor))
+      throw std::runtime_error("lifetime-only constructor is defined in the executable, not the selected module; "
+                               "cross-image admission is not enabled for " + concrete);
+    if (constructor == lifetime_image->symbols.end())
+      throw std::runtime_error("no verified constructor entries for lifetime-only type " + concrete);
+    for (const auto &entry : lifetime_image->symbols) {
+      if (!is_constructor(entry))
+        continue;
+      const auto site = lifetime_image->dwarf->getDIEsForAddress(entry.range.first);
+      const auto type = find_record(*lifetime_image->dwarf, concrete, site.CompileUnit);
+      std::set<DWARFDie> seen;
+      if (has_virtual_members_or_bases(type, seen))
+        throw std::runtime_error("lifetime-only identity cannot establish complete-object ownership for a polymorphic type");
+    }
+    if (derived_types(*lifetime_image->dwarf, concrete).present ||
+        (main_ && derived_types(*main_->dwarf, concrete).present))
+      throw std::runtime_error("lifetime-only identity cannot disambiguate known derived construction of " +
+                               concrete + "; register the complete derived type until constructor coverage is available");
+    const auto add_lifecycle = [&](const Symbol &symbol, Boundary role, bool uncertain,
+                                   bool deleting = false) {
+      const auto pc = lifetime_image->bind(pid, symbol.range);
+      const auto decoded = native_entry::scan(pc,
+          lifetime_image->code(pc).substr(0, std::min<std::uint64_t>(symbol.range.second, 15)));
+      if (decoded.instructions.empty())
+        throw std::runtime_error("cannot decode a verified object lifetime entry: " + symbol.demangled);
+      auto [site, inserted] = sites.try_emplace(pc,
+          Site{std::string(lifetime_image->code(pc).substr(0, decoded.instructions.front().size)),
+               role, std::nullopt, uncertain, 0, deleting});
+      if (!inserted) {
+        if (site->second.boundary != role)
+          throw std::runtime_error("constructor and destructor entries overlap");
+        site->second.uncertain_complete &= uncertain;
+        site->second.deleting_destructor |= deleting;
+      }
+      boundaries.emplace(pc, symbol.range.second);
+      virtual_destructor |= deleting;
+    };
+
+    std::set<Range> destructors, deleting_destructors;
+    std::set<Range> base_destructors;
+    for (const auto &symbol : lifetime_image->symbols) {
+      if (symbol.kind != llvm::ELF::STT_FUNC || symbol.linkage.find('.') != std::string::npos)
+        continue;
+      if (::tracer::compat::starts_with(symbol.demangled, destructor_name) && ::tracer::compat::contains(symbol.linkage, "D1Ev"))
+        destructors.insert(symbol.range);
+      else if (::tracer::compat::starts_with(symbol.demangled, destructor_name) && ::tracer::compat::contains(symbol.linkage, "D0Ev"))
+        deleting_destructors.insert(symbol.range);
+      else if (::tracer::compat::starts_with(symbol.demangled, destructor_name) && ::tracer::compat::contains(symbol.linkage, "D2Ev"))
+        base_destructors.insert(symbol.range);
+    }
+    if (destructors.empty())
+      destructors = base_destructors;
+    const bool destructor_coverage = !destructors.empty();
+    if (!destructor_coverage) {
+      if (!lifetime_coverage_diagnostic.empty())
+        lifetime_coverage_diagnostic += "; ";
+      lifetime_coverage_diagnostic += "no verified complete or base destructor entries for " + concrete +
+          "; object identities remain provisional";
+    }
+    bool provisional_lifetime_identity = !lifetime_coverage_diagnostic.empty();
+    std::map<std::string, std::set<std::uint64_t>> base_constructor_entries;
+    for (const auto &symbol : lifetime_image->symbols)
+      if (symbol.kind == llvm::ELF::STT_FUNC &&
+          ::tracer::compat::starts_with(symbol.demangled, constructor_name) &&
+          symbol.linkage.find('.') == std::string::npos && has_constructor_variant(symbol, "C2E"))
+        base_constructor_entries[symbol.demangled].insert(symbol.range.first);
+    std::set<std::uint64_t> caller_proof_constructors;
+    std::set<std::string> complete_constructor_overloads;
+    for (const auto &symbol : lifetime_image->symbols) {
+      if (symbol.kind == llvm::ELF::STT_FUNC &&
+          ::tracer::compat::starts_with(symbol.demangled, constructor_name) &&
+          symbol.linkage.find('.') == std::string::npos &&
+          has_constructor_variant(symbol, "C1E"))
+        complete_constructor_overloads.insert(symbol.demangled);
+    }
+    for (const auto &symbol : lifetime_image->symbols) {
+      if (symbol.kind == llvm::ELF::STT_FUNC && ::tracer::compat::starts_with(symbol.demangled, constructor_name) &&
+          symbol.linkage.find('.') == std::string::npos && has_constructor_variant(symbol, "C1E")) {
+        const auto base = base_constructor_entries.find(symbol.demangled);
+        const bool aliases_base_entry = base != base_constructor_entries.end() &&
+            ::tracer::compat::contains(base->second, symbol.range.first);
+        const bool uncertain = aliases_base_entry || provisional_lifetime_identity;
+        add_lifecycle(symbol, Boundary::construct, uncertain);
+        if (aliases_base_entry && !provisional_lifetime_identity)
+          caller_proof_constructors.insert(lifetime_image->bind(pid, symbol.range));
+      }
+    }
+    for (const auto &symbol : lifetime_image->symbols) {
+      if (symbol.kind != llvm::ELF::STT_FUNC || ::tracer::compat::starts_with(symbol.demangled, constructor_name) == false ||
+          symbol.linkage.find('.') != std::string::npos || !has_constructor_variant(symbol, "C2E"))
+        continue;
+      // A C2 entry is not proof of complete-object construction, even when
+      // this class has no virtual bases: a derived constructor can call the
+      // same entry for its base subobject. A separate C1 entry can establish
+      // complete construction; C2 remains uncertain.
+      add_lifecycle(symbol, Boundary::construct, true);
+      const auto complete = ::tracer::compat::ranges::find_if(lifetime_image->symbols, [&](const auto &candidate) {
+        return candidate.kind == llvm::ELF::STT_FUNC &&
+            candidate.demangled == symbol.demangled &&
+            candidate.linkage.find('.') == std::string::npos &&
+            has_constructor_variant(candidate, "C1E") && candidate.range.first == symbol.range.first;
+      });
+      if (!provisional_lifetime_identity && complete == lifetime_image->symbols.end() &&
+          !::tracer::compat::contains(complete_constructor_overloads, symbol.demangled))
+        caller_proof_constructors.insert(lifetime_image->bind(pid, symbol.range));
+    }
+    const std::vector<std::uint64_t> constructors_requiring_caller_proof(
+        caller_proof_constructors.begin(), caller_proof_constructors.end());
+    const auto proven_complete_callers = prove_complete_constructor_callers(
+        constructors_requiring_caller_proof, false);
+    const bool has_complete_constructor_entry = ::tracer::compat::ranges::any_of(sites, [](const auto &entry) {
+      return entry.second.boundary == Boundary::construct && !entry.second.uncertain_complete;
+    });
+    if (!provisional_lifetime_identity && proven_complete_callers.empty() &&
+        !has_complete_constructor_entry) {
+      lifetime_coverage_diagnostic = "no verified complete-object constructor calls for " + concrete +
+          "; object identities remain provisional";
+      provisional_lifetime_identity = true;
+    }
+    for (const auto &symbol : lifetime_image->symbols) {
+      if (symbol.kind != llvm::ELF::STT_FUNC || !::tracer::compat::starts_with(symbol.demangled, destructor_name) ||
+          symbol.linkage.find('.') != std::string::npos)
+        continue;
+      if (::tracer::compat::contains(symbol.linkage, "D1Ev"))
+        add_lifecycle(symbol, Boundary::destroy, provisional_lifetime_identity);
+      else if (::tracer::compat::contains(symbol.linkage, "D2Ev") && destructors.count(symbol.range))
+        add_lifecycle(symbol, Boundary::destroy, provisional_lifetime_identity);
+      else if (::tracer::compat::contains(symbol.linkage, "D0Ev") && deleting_destructors.count(symbol.range))
+        add_lifecycle(symbol, Boundary::destroy, provisional_lifetime_identity, true);
+    }
+    if (!provisional_lifetime_identity && ::tracer::compat::ranges::none_of(sites, [](const auto &entry) {
+          return entry.second.boundary == Boundary::destroy && !entry.second.deleting_destructor;
+        }))
+      throw std::runtime_error("lifetime-only type has no complete destructor entry: " + concrete);
+    bias = *lifetime_image->bias;
+    return;
+  }
+
   Range writer;
   try {
     writer = image_->function(pid, request.code_symbol(),
@@ -2156,25 +2735,31 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       return symbol.kind == llvm::ELF::STT_FUNC && ::tracer::compat::starts_with(symbol.demangled, prefix + "(") &&
           symbol.linkage.find('.') == std::string::npos;
     };
+    const auto matches_variant = [&](const Symbol &symbol, std::string_view value) {
+      if (verify_method_lifetimes && role == Boundary::construct && !value.empty())
+        return has_constructor_variant(symbol, value);
+      return ::tracer::compat::contains(symbol.linkage, value);
+    };
     const auto base_variant = variant == "C1E" ? "C2E" : variant == "D1Ev" ? "D2Ev" : "";
     std::set<Range> ranges, base_aliases;
     std::set<std::string_view> complete_overloads;
     for (const auto &symbol : boundary_image.symbols) {
       if (!matches_prefix(symbol))
         continue;
-      if (variant.empty() || symbol.linkage.find(variant) != std::string::npos) {
+      if (variant.empty() || matches_variant(symbol, variant)) {
         ranges.insert(symbol.range);
         complete_overloads.insert(symbol.demangled);
       }
-      if (known_derived && role == Boundary::construct &&
-          symbol.linkage.find("C2E") != std::string::npos)
+      if ((known_derived || (request.staged_registration() && verify_method_lifetimes)) &&
+          role == Boundary::construct &&
+          matches_variant(symbol, "C2E"))
         base_aliases.insert(symbol.range);
     }
     if (*base_variant) {
       // Clang may emit only the base variant for an inline definition. It
       // has the complete-object ABI only when there is no virtual base/VTT.
       const auto missing_complete = [&](const Symbol &symbol) {
-        return matches_prefix(symbol) && symbol.linkage.find(base_variant) != std::string::npos &&
+        return matches_prefix(symbol) && matches_variant(symbol, base_variant) &&
             !complete_overloads.count(symbol.demangled);
       };
       if (std::any_of(std::begin(boundary_image.symbols), std::end(boundary_image.symbols), missing_complete)) {
@@ -2189,7 +2774,10 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     if ((required && ranges.empty()) || (role != Boundary::construct && ranges.size() > 1))
       throw std::runtime_error("object watch boundary is missing or ambiguous: " + prefix);
     for (const auto &range : ranges) {
-      const auto pc = install_boundary(boundary_image, role, range, prefix, base_aliases.count(range) != 0);
+      const bool incomplete_staged_coverage = request.staged_registration() && verify_method_lifetimes &&
+          role == Boundary::construct && !lifetime_coverage_diagnostic.empty();
+      const auto pc = install_boundary(boundary_image, role, range, prefix,
+          incomplete_staged_coverage || base_aliases.count(range) != 0);
       if (variant == "D0Ev") {
         virtual_destructor = true;
         sites.at(pc).deleting_destructor = true;
@@ -2309,7 +2897,26 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         }))
       delegating_constructor_tails.emplace(pc, *tail.target);
   }
-  if (known_derived && !writer_derived.may_construct_base_directly &&
+  if (request.staged_registration() && verify_method_lifetimes) {
+    std::vector<std::uint64_t> caller_proof_constructors;
+    for (const auto &[pc, site] : sites)
+      if (site.boundary == Boundary::construct &&
+          (site.uncertain_complete || delegating_constructor_tails.count(pc)))
+        caller_proof_constructors.push_back(pc);
+    const auto proven = prove_complete_constructor_callers(caller_proof_constructors,
+        writer_derived.may_construct_base_directly || main_derived.may_construct_base_directly);
+    const bool has_complete_constructor_entry = ::tracer::compat::ranges::any_of(sites, [](const auto &entry) {
+      return entry.second.boundary == Boundary::construct && !entry.second.uncertain_complete;
+    });
+    if (lifetime_coverage_diagnostic.empty() && proven.empty() && !has_complete_constructor_entry &&
+        !caller_proof_constructors.empty())
+      lifetime_coverage_diagnostic = "no verified complete-object constructor calls for " + concrete +
+          "; object identities remain provisional";
+    if (!lifetime_coverage_diagnostic.empty())
+      for (auto &[pc, site] : sites)
+        if (site.boundary == Boundary::construct)
+          site.uncertain_complete = true;
+  } else if (known_derived && !writer_derived.may_construct_base_directly &&
       !main_derived.may_construct_base_directly) {
     std::vector<std::uint64_t> aliases;
     for (const auto &[pc, site] : sites)
@@ -2735,14 +3342,52 @@ void find_direct_redirects(const auto &callers, Redirects &result, DirectEdges e
 
 std::map<std::uint64_t, std::vector<std::uint64_t>>
 Plan::direct_redirects(const std::vector<std::uint64_t> &entries, bool calls_only,
-                       bool require_complete) const {
+                       bool require_complete, bool match_constructor_plt,
+                       std::set<std::uint64_t> *verified_plt_calls) const {
   Redirects result;
   for (auto entry : entries)
     result.try_emplace(entry);
+  std::map<std::string, std::uint64_t> complete_constructor_targets;
+  if (match_constructor_plt) {
+    for (const auto entry : entries) {
+      const auto *image = image_for(entry);
+      if (!image || !image->bias || entry < *image->bias)
+        continue;
+      const auto address = entry - *image->bias;
+      for (const auto &symbol : image->symbols)
+        if (symbol.kind == llvm::ELF::STT_FUNC && symbol.range.first == address &&
+            symbol.linkage.find('.') == std::string::npos && has_constructor_variant(symbol, "C1E"))
+          complete_constructor_targets.emplace(symbol.linkage, entry);
+    }
+  }
+  std::map<std::uint64_t, std::uint64_t> plt_aliases;
+  if (match_constructor_plt && !complete_constructor_targets.empty()) {
+    for (const auto *callers : {image_.get(), main_.get()}) {
+      if (!callers)
+        continue;
+      for (const auto &[linkage, address] : callers->plt_entries()) {
+        const auto target = complete_constructor_targets.find(linkage);
+        if (target == complete_constructor_targets.end() || ::tracer::compat::contains(result, address))
+          continue;
+        plt_aliases.emplace(address, target->second);
+        result.try_emplace(address);
+      }
+    }
+  }
   const auto edges = calls_only ? DirectEdges::calls : DirectEdges::redirects;
   find_direct_redirects(*image_, result, edges, require_complete);
   if (main_)
     find_direct_redirects(*main_, result, edges, require_complete);
+  for (const auto &[alias, target] : plt_aliases) {
+    auto found = result.find(alias);
+    if (found == result.end())
+      continue;
+    if (verified_plt_calls)
+      verified_plt_calls->insert(found->second.begin(), found->second.end());
+    auto &calls = result[target];
+    calls.insert(calls.end(), found->second.begin(), found->second.end());
+    result.erase(found);
+  }
   for (auto &[entry, sites] : result) {
     std::sort(sites.begin(), sites.end());
     sites.erase(std::unique(sites.begin(), sites.end()), sites.end());
@@ -3239,9 +3884,11 @@ Plan::MethodBoundary Plan::method_boundary(const std::string &module,
 clangtracer::v1::ObjectWatchPlan Plan::describe(bool live) const {
   clangtracer::v1::ObjectWatchPlan plan;
   plan.set_executable_build_id((main_ ? *main_ : *image_).build_id);
-  plan.set_writer_build_id(image_->build_id);
   plan.set_executable_sha256((main_ ? *main_ : *image_).sha256);
-  plan.set_binary_sha256(image_->sha256);
+  const auto *binding_image = lifetimes_only && !boundaries.empty() ?
+      image_for(boundaries.begin()->first) : image_.get();
+  plan.set_writer_build_id(binding_image ? binding_image->build_id : image_->build_id);
+  plan.set_binary_sha256(binding_image ? binding_image->sha256 : image_->sha256);
   *plan.mutable_source_writers() = source_writers;
   plan.set_field_offset(layout.scalar);
   for (const auto offset : layout.pointer_offsets)
@@ -3250,7 +3897,7 @@ clangtracer::v1::ObjectWatchPlan Plan::describe(bool live) const {
                                 "boolean", "floating point"};
   constexpr const char *complex_types[]{"", "std::string storage", "std::variant storage",
                                         "std::any storage", "union storage"};
-  plan.set_field_encoding(layout.value_write.active() ?
+  plan.set_field_encoding(lifetimes_only ? "lifetime identity only" : layout.value_write.active() ?
       complex_types[static_cast<unsigned>(layout.value_write.kind)] :
       layout.union_tag_offset ? "tagged union" :
       layout.opaque_union ? "opaque union bytes" :
@@ -3283,10 +3930,18 @@ clangtracer::v1::ObjectWatchPlan Plan::describe(bool live) const {
       continue;
     constexpr const char *roles[] = {"construct", "destroy", "owner add", "get", "remove", "snapshot",
                                     "writer scope", "container mutation"};
-    add(pc, code(pc).substr(0, boundaries.at(pc)),
-        site.uncertain_complete ? "construct (complete/base alias)" :
-        site.deleting_destructor ? "destroy (deleting)" :
-                                  roles[static_cast<unsigned>(*site.boundary)]);
+    std::string role;
+    if (!lifetime_coverage_diagnostic.empty() && *site.boundary == Boundary::construct)
+      role = "construct (provisional: incomplete lifetime coverage)";
+    else if (!lifetime_coverage_diagnostic.empty() && *site.boundary == Boundary::destroy)
+      role = "destroy (coverage incomplete)";
+    else if (site.uncertain_complete)
+      role = "construct (complete/base alias)";
+    else if (site.deleting_destructor)
+      role = "destroy (deleting)";
+    else
+      role = roles[static_cast<unsigned>(*site.boundary)];
+    add(pc, code(pc).substr(0, boundaries.at(pc)), role.c_str());
   }
   return plan;
 }

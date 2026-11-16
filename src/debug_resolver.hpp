@@ -20,6 +20,14 @@ std::uint64_t bind_live_executable(std::uint32_t pid, const std::string &path,
                                   const llvm::object::ObjectFile &object,
                                   std::uint64_t entry, std::uint64_t size,
                                   bool allow_main_without_build_id = false);
+// Reuse one executable map after binding an anchor to the exact ELF build.
+struct LiveCodeMappings {
+  std::function<bool(std::uint64_t, std::uint64_t)> contains;
+  std::function<bool()> current;
+};
+LiveCodeMappings snapshot_live_code_mappings(
+    std::uint32_t pid, const std::string &path,
+    const llvm::object::ObjectFile &object, std::uint64_t bias);
 std::optional<std::string> find_matching_debug_file(
     const std::string &path, const llvm::object::ObjectFile &object);
 // Read the verified ELF range and require an exact match with live text.

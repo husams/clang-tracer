@@ -571,11 +571,30 @@ std::size_t nop_prefix(std::uint64_t address, std::string_view bytes, std::size_
     llvm::MCInst inst;
     std::uint64_t size = 0;
     if (!decode(decoder, inst, size, address + used, bytes.substr(used)) ||
-        !decoder.ins->getName(inst.getOpcode()).starts_with("NOOP"))
+        !::tracer::compat::starts_with(decoder.ins->getName(inst.getOpcode()), "NOOP"))
       return 0;
     used += size;
   }
   return used >= minimum ? used : 0;
+}
+
+bool may_return_at_end(std::uint64_t address, std::string_view bytes) {
+  Decoder decoder;
+  std::string diagnostic;
+  if (!make_decoder(decoder, diagnostic))
+    return true;
+  // Test every possible start of an x86 instruction ending at the boundary.
+  // This includes call sites reached through an indirect jump or a landing pad.
+  constexpr std::size_t max_instruction_size = 15;
+  const auto first = bytes.size() - std::min(bytes.size(), max_instruction_size);
+  for (std::size_t offset = first; offset < bytes.size(); ++offset) {
+    llvm::MCInst instruction;
+    std::uint64_t size = 0;
+    if (decode(decoder, instruction, size, address + offset, bytes.substr(offset)) &&
+        size == bytes.size() - offset && decoder.analysis->isCall(instruction))
+      return true;
+  }
+  return false;
 }
 
 bool forwards_receiver(std::uint64_t address, std::string_view prefix) {

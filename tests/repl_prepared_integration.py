@@ -6,8 +6,66 @@ from pathlib import Path
 import re
 import select
 import subprocess
+import sys
 import tempfile
 import time
+
+
+def verify_preparer_diagnostics(repl, root, header, env):
+    preparer = root / "held-stderr-preparer"
+    proceed = root / "preparer-proceed"
+    finish = root / "preparer-finish"
+    release = root / "preparer-release-stderr"
+    preparer.write_text(f'''#!{sys.executable}
+import os
+from pathlib import Path
+import sys
+import time
+
+print("preparer progress marker", file=sys.stderr, flush=True)
+while not Path({str(proceed)!r}).exists():
+    time.sleep(0.02)
+if os.fork() == 0:
+    os.close(1)
+    deadline = time.monotonic() + 25
+    while not Path({str(release)!r}).exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    os._exit(0)
+sys.stderr.write("prepare: er")
+sys.stderr.flush()
+time.sleep(0.05)
+print("ror: preparer diagnostic marker", file=sys.stderr, flush=True)
+print("preparer stderr after reason", file=sys.stderr, flush=True)
+while not Path({str(finish)!r}).exists():
+    time.sleep(0.02)
+sys.exit(7)
+''')
+    preparer.chmod(0o700)
+    probe_env = dict(env, TRACER_PREPARE_EXECUTABLE=str(preparer))
+    with subprocess.Popen([str(repl), "--fail-fast"], cwd=root, env=probe_env,
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True) as console:
+        try:
+            console.stdin.write(f'%probe prepare "prepared_demo::compute(int)" '
+                                f'--include "{header}" --output "{root / "unused-package"}"\n')
+            console.stdin.flush()
+            assert select.select([console.stderr], [], [], 10)[0], "prepare progress was buffered"
+            assert "preparer progress marker" in console.stderr.readline()
+            proceed.touch()
+            assert select.select([console.stderr], [], [], 10)[0], "late preparer stderr was buffered"
+            assert console.stderr.readline().strip() == "preparer stderr after reason"
+            finish.touch()
+            stdout, stderr = console.communicate(timeout=10)
+            assert console.returncode == 1, (stdout, stderr)
+            assert stderr.count("preparer diagnostic marker") == 1, (stdout, stderr)
+            assert "preparer progress marker" not in stderr, (stdout, stderr)
+            assert "preparer stderr after reason" not in stderr, (stdout, stderr)
+            assert re.search(r"^error: .*preparer exited with status 7: preparer diagnostic marker$",
+                             stderr, re.M), (stdout, stderr)
+        finally:
+            proceed.touch()
+            finish.touch()
+            release.touch()
 
 
 def main():
@@ -20,6 +78,7 @@ def main():
     env.pop("CLANG_TRACER_ENDPOINT", None)
     env["TRACER_PREPARE_EXECUTABLE"] = str(args.repl.parent / "clang-tracer-prepare-injectors-native")
     selector = '"prepared_demo::compute(int)"'
+    struct_selector = '"prepared_demo::compute_struct(int)"'
     with tempfile.TemporaryDirectory(prefix="native-prepared-test-") as directory:
         root = Path(directory)
         header = args.example / "calculator.hpp"
@@ -53,8 +112,14 @@ def main():
         changed = None
         console = None
         try:
-            def prepare(include, output):
-                command = f'%probe prepare {selector} --include "{include}" --output "{output}"'
+            def prepare(include, output, selected=selector, database=None, source_file=None):
+                context = ""
+                if database is not None:
+                    context += f' --compdb "{database}"'
+                if source_file is not None:
+                    context += f' --translation-unit "{source_file}"'
+                command = (f'%probe prepare {selected} --include "{include}"'
+                           f'{context} --output "{output}"')
                 return subprocess.run([args.repl, "--fail-fast"], input=command + "\n%quit\n",
                                       text=True, capture_output=True, cwd=root, env=env, timeout=30)
 
@@ -87,9 +152,45 @@ def main():
                 console = None
                 return text
 
+            verify_preparer_diagnostics(args.repl, root, local_header, env)
             offline = prepare(local_header, package)
             assert offline.returncode == 0 and "prepared directory=" in offline.stdout, (
                 offline.stdout + offline.stderr)
+
+            exception_header = root / "exception.hpp"
+            exception_header.write_text("""
+namespace exception_fixture {
+template <int Size> struct Item {
+  int value;
+  Item(Item &&other) noexcept(Size == 3) : value(other.value) {}
+};
+struct Box {
+  Item<3> small;
+  Item<8> large;
+  int get() const;
+};
+}
+""")
+            exception_source = root / "exception.cpp"
+            exception_source.write_text(
+                '#include "exception.hpp"\n'
+                'int exception_fixture::Box::get() const { return small.value + large.value; }\n')
+            exception_db = root / "exception-commands.json"
+            exception_db.write_text(json.dumps([{
+                "directory": str(root), "file": str(exception_source),
+                "arguments": [args.compiler, "-std=c++20", "-c", str(exception_source)],
+            }]))
+            exception_package = root / "exception-package"
+            resolved = prepare(exception_header, exception_package,
+                               '"exception_fixture::Box::get() const"',
+                               exception_db, exception_source)
+            assert resolved.returncode == 0, resolved.stderr
+            subprocess.run([args.compiler, "-std=c++20", "-fsyntax-only", "-x", "c++", "-"],
+                           input=f'''#include "{exception_package / "generated/adapter.cpp"}"
+#include <type_traits>
+static_assert(std::is_nothrow_move_constructible_v<exception_fixture::Item<3>>);
+static_assert(!std::is_nothrow_move_constructible_v<exception_fixture::Item<8>>);
+''', text=True, check=True, cwd=root, timeout=10)
 
             cl_header = root / "headers" / "cl.hpp"
             cl_header.write_text(
@@ -182,6 +283,34 @@ std::cout << "PREPARED_TYPED_RESULTS=" << correct << std::endl;
             subprocess.run([args.compiler, "-std=c++17", "-DFIRST_DIRECTORY_ENTRY", "-fsyntax-only",
                             package / "generated/adapter.cpp"], check=True)
             assert not (package / "interceptor.cpp").exists()
+
+            # A 32-byte result forces the x86-64 sret ABI. Verify the generated
+            # callback retains and serializes the full result snapshot.
+            struct_package = root / "prepared_struct"
+            # Use the fixture's real compilation context; the synthetic SDK
+            # intentionally supplies a fake sysroot for driver tests.
+            offline = prepare(header, struct_package, struct_selector,
+                              args.compdb, donor)
+            assert offline.returncode == 0 and "prepared directory=" in offline.stdout, (
+                offline.stdout + offline.stderr)
+            struct_callback = root / "struct-interceptor.cpp"
+            struct_callback.write_text(
+                'template <> class Interceptor<prepared_demo::LargeResult(int)> { public: '
+                'long long post(const Call &call) { return call.result().marker; } };\n')
+            struct_args = f'--prepared "{struct_package}" --prepared-mode require'
+            struct_prefix = (
+                f'%probe resolve {struct_selector} {struct_args}\n'
+                f'%probe inject {struct_selector} --callback "{struct_callback}" {struct_args}\n')
+            struct_suffix = '''%collect --count 4 --timeout 15 --phase POST --as captured
+auto captured = tracer.batch("captured");
+bool correct = captured.size() == 4;
+for (const auto& e : captured) { correct = correct && e.result_snapshot().field("marker").as<int>() == e.argument_as<int>(0) + 7; }
+std::cout << "PREPARED_SRET_SNAPSHOTS=" << correct << std::endl;
+%probe remove PROBE_ID
+%quit
+'''
+            text = interact(struct_prefix, struct_suffix, target)
+            assert "PREPARED_SRET_SNAPSHOTS=1" in text, text
 
             default_compdb.write_text("invalid compilation database\n")
             cpp_package = root / "prepared_cpp"

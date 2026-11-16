@@ -881,13 +881,26 @@ void run(const std::filesystem::path &server_path,
   std::filesystem::create_directories(output_dir / "reattach");
   const auto rebound_events =
       read_events(*stub, rebound_request, 2, output_dir / "reattach");
+  bool saw_rebound_callback = false;
+  bool saw_rebound_error = false;
   for (const auto &event : rebound_events) {
     require(event.probe_id() == rebound_probe.id(),
             "reattached PID emitted an unexpected probe");
     require(event.pid() == static_cast<std::uint32_t>(target_a.pid()),
             "reattached probe event came from wrong PID");
-    verify_callback_result(event);
+    if (event.callback_error()) {
+      require(agent_logging && event.phase() == api::PRE &&
+                  event.call_id() != 0 && event.call_id() % 2 == 0 &&
+                  event.callback_error_message() == "callback threw",
+              "unexpected callback failure on the reattached PID");
+      saw_rebound_error = true;
+    } else {
+      verify_callback_result(event);
+      saw_rebound_callback = true;
+    }
   }
+  require(saw_rebound_callback && (!agent_logging || saw_rebound_error),
+          "reattached probe did not report the expected callback outcomes");
   report(report_file, "same live PID detached and reattached with a fresh "
                       "session and working hook");
   if (agent_logging) {

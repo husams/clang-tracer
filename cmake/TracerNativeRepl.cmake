@@ -68,12 +68,13 @@ function(tracer_add_native_repl)
     "${_generated}/tracer.grpc.pb.cc" "${_generated}/context_transport.pb.cc")
   target_include_directories(tracer_repl_rpc PUBLIC "${_generated}")
   target_link_libraries(tracer_repl_rpc PUBLIC gRPC::grpc++ protobuf::libprotobuf)
-  add_library(tracer_repl_client STATIC "${_repl}/controller.cpp" "${_repl}/server_process.cpp" "${_repl}/owned_target.cpp" "${_repl}/local_perf.cpp" "${_repl}/events.cpp" "${_repl}/../object_snapshot.cpp" "${_repl}/background_events.cpp")
+  add_library(tracer_repl_client STATIC "${CMAKE_CURRENT_SOURCE_DIR}/src/live_mock_command.cpp" "${_repl}/controller.cpp" "${_repl}/server_process.cpp" "${_repl}/owned_target.cpp" "${_repl}/local_perf.cpp" "${_repl}/events.cpp" "${_repl}/../object_snapshot.cpp" "${_repl}/background_events.cpp" "${_repl}/object_probe_package.cpp")
   target_include_directories(tracer_repl_client PUBLIC "${_repl}"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
   target_include_directories(tracer_repl_client SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
   target_link_libraries(tracer_repl_client PUBLIC tracer_repl_rpc tracer_repl_commands Threads::Threads
     PRIVATE SQLite::SQLite3 LLVM)
+  target_include_directories(tracer_repl_client SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
   target_compile_options(tracer_repl_client PRIVATE -Wall -Wextra -Wpedantic)
   include(CheckCXXSourceCompiles)
   set(_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
@@ -91,6 +92,7 @@ function(tracer_add_native_repl)
   set(CMAKE_REQUIRED_FLAGS "${_saved_required_flags}")
   set(CMAKE_REQUIRED_LIBRARIES "${_saved_required_libraries}")
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/TracerToolchain.cmake")
+  target_include_directories(tracer_repl_client SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/TracerJitConfig.cmake")
   set(_src "${CMAKE_CURRENT_SOURCE_DIR}/src")
   add_library(tracer_module_index SHARED
@@ -114,7 +116,7 @@ function(tracer_add_native_repl)
   add_executable(clang-tracer-module "${_src}/module_index_cli.cpp")
   target_include_directories(clang-tracer-module SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
   target_link_libraries(clang-tracer-module PRIVATE tracer_module_index LLVM)
-  target_link_libraries(tracer_repl_client PUBLIC tracer_module_index)
+  target_link_libraries(tracer_repl_client PUBLIC tracer_module_index PRIVATE LLVM)
   install(TARGETS tracer_module_index clang-tracer-module
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Runtime
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT Runtime)
@@ -160,6 +162,8 @@ function(tracer_add_native_repl)
   install(TARGETS clang-tracer-prepare-injectors-native RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Runtime)
   # Each executable uses the facade it was built against, even across upgrades.
   set(_repl_facade_headers "${_repl}/api.hpp" "${_repl}/event_value.hpp"
+    "${_repl}/clang_tracer_repl_plugin.h" "${_repl}/clang_tracer_repl_plugin.hpp"
+    "${_repl}/clang_tracer_agent_extension.hpp"
     "${_repl}/event_ranges.hpp" "${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/module_index.hpp")
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_repl_facade_headers}")
   set(_repl_facade_digests "")
@@ -189,7 +193,7 @@ function(tracer_add_native_repl)
   configure_file("${_repl}/repl_config.hpp.in" "${_generated}/repl_config.hpp" @ONLY)
   add_executable(clang-tracer-repl-check "${_repl}/check.cpp" "${_repl}/completion.cpp" "${_repl}/record_mappings.cpp" "${_repl}/mapping_cache.cpp")
   target_include_directories(clang-tracer-repl-check SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
-  target_include_directories(clang-tracer-repl-check PRIVATE "${_repl}")
+  target_include_directories(clang-tracer-repl-check PRIVATE "${_repl}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
   target_link_libraries(clang-tracer-repl-check PRIVATE clang-cpp LLVM)
   if(NOT TRACER_REPL_FILESYSTEM_LINKS)
     target_link_libraries(clang-tracer-repl-check PRIVATE stdc++fs)
@@ -201,7 +205,9 @@ function(tracer_add_native_repl)
   endif()
   set_target_properties(clang-tracer-repl-check PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
   add_executable(clang-tracer-repl "${_repl}/main.cpp" "${_repl}/interpreter.cpp" "${_repl}/completion.cpp" "${_repl}/record_mappings.cpp" "${_repl}/check_process.cpp" "${_repl}/check_session.cpp" "${_repl}/shell.cpp" "${_repl}/compiler_profile.cpp" "${_repl}/mapping_cache.cpp")
-  target_sources(clang-tracer-repl PRIVATE "${_repl}/help.cpp" "${_repl}/syntax.cpp"
+  target_sources(clang-tracer-repl PRIVATE "${_repl}/help.cpp" "${_repl}/syntax.cpp" "${_repl}/plugins.cpp"
+    "${_repl}/plugin_package.cpp"
+    "${_src}/native_plugins.cpp"
     "${_repl}/editor.cpp" "${_repl}/editor_completion.cpp")
   add_dependencies(clang-tracer-repl clang-tracer-repl-check clang-tracer-prepare-injectors-native)
   target_include_directories(clang-tracer-repl SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
@@ -212,7 +218,8 @@ function(tracer_add_native_repl)
     CXX_EXTENSIONS OFF ENABLE_EXPORTS ON INSTALL_RPATH_USE_LINK_PATH TRUE
     INSTALL_RPATH "${_module_origin}/${_module_lib_relative}")
   if(NOT LLVM_ENABLE_RTTI)
-    set_source_files_properties("${_repl}/interpreter.cpp" "${_repl}/completion.cpp" PROPERTIES COMPILE_OPTIONS "-fno-rtti")
+    set_source_files_properties("${_repl}/interpreter.cpp" "${_repl}/completion.cpp"
+      "${_src}/native_plugins.cpp" PROPERTIES COMPILE_OPTIONS "-fno-rtti")
   endif()
   install(FILES ${_repl_facade_headers} DESTINATION "${_repl_facade_directory}" COMPONENT Runtime)
   install(TARGETS clang-tracer-repl clang-tracer-repl-check RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Runtime)
@@ -267,6 +274,14 @@ function(tracer_add_native_repl)
     add_test(NAME native_repl_cpp COMMAND repl-cpp-tests)
     set_tests_properties(native_repl_cpp PROPERTIES TIMEOUT 60)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME native_repl_plugins
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_plugins.py"
+        $<TARGET_FILE:clang-tracer-repl> "${CMAKE_CURRENT_SOURCE_DIR}/examples/jit-plugin-globals")
+    set_tests_properties(native_repl_plugins PROPERTIES TIMEOUT 90)
+    add_test(NAME native_repl_agent_attach_rpc
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_agent_attach_rpc.py"
+        $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:repl-client-tests>)
+    set_tests_properties(native_repl_agent_attach_rpc PROPERTIES TIMEOUT 45)
     add_test(NAME native_repl_checker_session
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_checker_session.py"
         $<TARGET_FILE:clang-tracer-repl-check>)
@@ -279,6 +294,10 @@ function(tracer_add_native_repl)
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_terminal.py"
         $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:repl-client-tests>)
     set_tests_properties(native_repl_terminal PROPERTIES TIMEOUT 120)
+    add_test(NAME native_repl_history
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_history.py"
+        $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:repl-client-tests>)
+    set_tests_properties(native_repl_history PROPERTIES TIMEOUT 120)
     add_test(NAME native_repl_auto_records
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_auto_records.py"
         $<TARGET_FILE:clang-tracer-repl>)
@@ -586,6 +605,11 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-signal-window-target>)
       set_tests_properties(native_repl_object_signal_window PROPERTIES TIMEOUT 180)
+      add_test(NAME native_repl_object_signal_window_oneshot_kernel
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_signal_window.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:${_object_cache_agent}> $<TARGET_FILE:repl-object-signal-window-target> oneshot-kernel)
+      set_tests_properties(native_repl_object_signal_window_oneshot_kernel PROPERTIES TIMEOUT 60)
       foreach(_shared_kind storage scalar)
         set(_shared_fixture repl-object-shared-${_shared_kind}-target)
         set(_shared_args)
@@ -1006,6 +1030,11 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:repl-shared-shapes-library>)
       set_tests_properties(native_repl_code_cache_shared PROPERTIES TIMEOUT 120)
       if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+        add_test(NAME native_repl_type_object_probe
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_type_object_probe.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:clang_tracer_agent> "${CMAKE_CXX_COMPILER}")
+        set_tests_properties(native_repl_type_object_probe PROPERTIES TIMEOUT 180)
         add_library(repl-object-shared-writer-library SHARED
           tests/fixtures/object_shared_writer/library.cpp)
         add_executable(repl-object-shared-writer-target
@@ -1115,6 +1144,30 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:repl-reload-target>)
       set_tests_properties(native_repl_reload_integration PROPERTIES TIMEOUT 240)
+      add_test(NAME native_repl_agent_plugins
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_agent_plugins.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-reload-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/examples/jit-plugin-globals")
+      set_tests_properties(native_repl_agent_plugins PROPERTIES TIMEOUT 120)
+      add_test(NAME native_repl_agent_plugin_fallback
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_agent_plugins.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-reload-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/examples/jit-plugin-globals" fallback)
+      set_tests_properties(native_repl_agent_plugin_fallback PROPERTIES TIMEOUT 120)
+      add_test(NAME native_repl_agent_plugin_autoload
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_agent_plugins.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-reload-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/examples/jit-plugin-globals" autoload)
+      set_tests_properties(native_repl_agent_plugin_autoload PROPERTIES TIMEOUT 120)
+      add_test(NAME native_repl_agent_observer
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_agent_observer.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-reload-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/examples/repl-agent-observer")
+      set_tests_properties(native_repl_agent_observer PROPERTIES TIMEOUT 120)
       add_executable(repl-bulk-concrete-target
         examples/prepared-injectors/concrete/target.cpp
         examples/prepared-injectors/concrete/virtual.cpp)
@@ -1231,6 +1284,32 @@ function(tracer_add_native_repl)
             bash "${CMAKE_CURRENT_SOURCE_DIR}/examples/prepared-injectors/run-native.sh"
             --${_example} --smoke)
         set_tests_properties(native_repl_prepared_${_test_suffix} PROPERTIES TIMEOUT 120)
+      endforeach()
+      add_test(NAME native_repl_live_update
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_live_update.py"
+          --compiler "${CMAKE_CXX_COMPILER}"
+          --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+          --agent $<TARGET_FILE:clang_tracer_agent>)
+      set_tests_properties(native_repl_live_update PROPERTIES TIMEOUT 240)
+      add_test(NAME native_repl_live_review
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_live_review.py"
+          --compiler "${CMAKE_CXX_COMPILER}"
+          --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+          --agent $<TARGET_FILE:clang_tracer_agent>)
+      set_tests_properties(native_repl_live_review PROPERTIES TIMEOUT 300)
+      add_test(NAME native_repl_live_mock
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_live_mock.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> "${CMAKE_CXX_COMPILER}")
+      set_tests_properties(native_repl_live_mock PROPERTIES TIMEOUT 300)
+      foreach(_live_case IN ITEMS data migration)
+        add_test(NAME native_repl_live_${_live_case}
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_live_data_and_migration.py"
+            --case "${_live_case}" --compiler "${CMAKE_CXX_COMPILER}"
+            --sdk "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+            --agent $<TARGET_FILE:clang_tracer_agent>)
+        set_tests_properties(native_repl_live_${_live_case} PROPERTIES TIMEOUT 240)
       endforeach()
       add_test(NAME native_repl_integration
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_native_integration.py"

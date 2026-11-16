@@ -3,6 +3,7 @@
 #include <functional>
 #include <iosfwd>
 #include <map>
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -39,7 +40,9 @@ class Controller {
   std::string endpoint_;
   std::uint64_t connection_ = 1;
   SessionHandle selected_;
+  std::function<void(const clangtracer::v1::Session&)> attachment_hook_;
   std::set<std::string> owned_sessions_;
+  std::map<std::string, std::map<std::string, std::filesystem::path>> agent_packages_;
   struct PendingAttach {
     std::set<std::string> previous_ids;
     std::set<std::string> candidate_ids;
@@ -56,6 +59,12 @@ class Controller {
     clangtracer::v1::PreparedInjector artifact;
   };
   std::map<std::string, PreparedPackage> prepared_packages_;
+  struct ObjectProbePreview {
+    std::string definition;
+    clangtracer::v1::ObjectProbeBinding binding;
+  };
+  std::optional<ObjectProbePreview> object_probe_preview_;
+  void object_probe_command(const Command &command);
   std::filesystem::path default_module_index_;
   clangtracer::v1::ListModulesResponse module_snapshot(bool include_mappings);
   clangtracer::v1::ListModulesResponse module_snapshot(const SessionHandle &session,
@@ -104,7 +113,13 @@ class Controller {
 public:
   explicit Controller(Settings settings, std::ostream &out);
   ~Controller();
-  bool execute(const Command &command);
+  using PrepareAgentPlugin = std::function<void(clangtracer::v1::AgentPluginRequest&,
+                                                const std::string&)>;
+  bool execute(const Command& command, const PrepareAgentPlugin& prepare_agent = {});
+  void on_attach(std::function<void(const clangtracer::v1::Session&)> hook);
+  void agent_plugin(const clangtracer::v1::AgentPluginRequest& request,
+                    const std::filesystem::path& manifest = {});
+  std::filesystem::path agent_plugin_manifest(const clangtracer::v1::AgentPluginRequest& request) const;
   void shutdown();
 
   const SessionHandle &selected_session() const { return selected_; }

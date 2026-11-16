@@ -58,6 +58,145 @@ standard-library include roots. Installing the client alone does not install a
 Linux server or agent.
 
 
+## Live code replacement on Linux x86-64
+
+Use `%live preview FILE...` to inspect the exact native entries. `%live update FILE...`
+previews the same saved snapshot and automatically applies an admitted group.
+`%live status` lists active entries. `%live revert` restores the parent revision,
+and `%live revert 0` restores the build's original entries. Run
+`%live watch source/checkout.cpp source/pricer.cpp` to preview and apply saved
+edits as you test. Press Ctrl-C to return to the prompt.
+
+At build time preserve the original project files under a separate snapshot root.
+Record their relative paths and SHA-256 hashes alongside the executable and exact
+compilation database hashes in `clang-tracer-live.textproto`. Example shape:
+
+```textproto
+source_root: "/project/src"
+snapshot_root: "/project/live-build-snapshot"
+module: "/project/build/app"
+module_sha256: "<SHA-256 of app>"
+compilation_database_sha256: "<SHA-256 of compile_commands.json>"
+inputs { path: "app.cpp" sha256: "<SHA-256 of original app.cpp>" }
+inputs { path: "pricing.hpp" sha256: "<SHA-256 of original pricing.hpp>" }
+```
+
+Build affected units with debug information, `-O0 -fno-inline`,
+`-fpatchable-function-entry=16,0` and a GNU ELF build ID. The manifest must
+cover project dependencies. A new translation unit uses its recorded compile
+profile or inherits the common profile when the original units share one.
+The REPL can select the database and manifest using `--compdb FILE` and
+`--build FILE`.
+
+The initial profile admits exact symbols in the main executable and checks
+the original entry padding, source signature and lowered ABI before changing
+text. Related entries need a drained stack or the managed registry gate.
+Each submission publishes as a single group. When preview reports a blocker,
+submit independent edits separately. Optimized targets and automatic
+partitioning into independently publishable groups require further coverage
+verification.
+The ABI check covers SysV variadic bodies, fixed-argument Win64 bodies,
+non-trivial returns, and compiler-emitted lifecycle variants. An unresolved
+thunk, unproven alias, or missing call coverage requires a rebuild. Revisions
+keep JIT code mapped for escaped pointers and active calls.
+`--retention-limit N` sets the maximum number of retained JIT generations,
+including reverted generations. Reconnect to the same server to inspect
+the active revision.
+
+Empty string literals and function-local literal arrays can change with
+their code. A replacement that would expose a different address for a
+compiler-generated constant requires a rebuild. Changes to existing static
+storage or record ABI require a rebuild or a managed migration. The ABI check
+includes changes to copy, move, and destruction triviality.
+Translation-unit-local functions and data require an unambiguous ELF file
+marker and exact symbol. Live replacements use a patchable native entry.
+A body-only edit to an existing
+lambda can update already-registered callbacks when its source identity and
+capture ABI match the native entry, including which variables it captures
+and their order. A live update can replace a lambda and its private template
+instantiations together when every call stays within the enclosing function.
+If adding or removing a lambda shifts an existing capture layout to a
+different compiler symbol, the update must identify the closure at both positions.
+Changes to an escaping lambda with unverified identity or captures require
+a rebuild. The lifetime check can be inconclusive for calls through
+`std::function`, `std::ref`, range adaptors, and C callbacks.
+When a recorded unit initialized the
+standard streams, replacement units can reuse them. Existing native storage
+keeps its verified initialization and destruction code. Changes to module
+initialization or destruction require a rebuild. Native updates can use
+symbols exported by standard Linux runtime libraries in the target, including
+definitions interposed in its dynamic lookup scope.
+
+`--payload-limit BYTES` sets the maximum serialized source and dependency
+snapshot sent to the target for a live operation. The default is 16 MiB.
+The REPL also enforces its 32 MiB limit on an outgoing RPC. Apply can reuse
+the preview's plan for the same input and revision after rechecking the
+saved files and executable mappings. Set `CLANG_TRACER_LIVE_COMPILE_JOBS`
+in the server environment to choose how many translation units it compiles
+concurrently. The default is half the reported hardware threads, rounded
+down with a minimum of one. Large submissions and a busy host may need a
+longer REPL `--timeout`.
+
+```text
+%live mock "ProductStore::load(int)" --file product_fixture.cpp --function load_fixture --fixture products.txt
+%live update-data shared.cpp --discover-file discover.cpp --discover-function discover
+%live scan-heap --type example::Cache --type example::Account
+%live update update.hpp --after-file after.cpp --after-function fixture::after --for-each Cache
+```
+
+Live mocks use exact signatures, with source-style or demangled qualifiers.
+`--bind "ALIAS=SIGNATURE"` binds a verified
+application callable. `ctx.original(...)` calls the unmocked implementation,
+including any active live update. Replacing a mock preserves that underlying
+implementation. A direct source edit to a mocked callable replaces the mock
+and reports this in the candidate row. Restoring an omitted callable to its
+built body restores that body behind an installed mock. Use `--recursion original`
+to route recursive calls through it. `%live revert` restores the previous dispatch.
+
+Object callbacks use a discovery function with `clang_tracer::ObjectSink`
+from `<clang_tracer/live.hpp>`. A callback may take shared owners, borrowed
+pointers, or per-type reference overloads. Discovery supplies each object's
+existing owner or guarded borrow. Heap scans report candidates and their
+evidence. With libstdc++ and matching DWARF, the scanner also discovers static
+`std::atomic<std::shared_ptr<T>>` roots and atomically loads their owners.
+Automatic discovery admits recognized `make_shared` storage for the exact
+pointee. Other owners can use an explicit discovery callback. For a write
+using `--from-scan ID ...`, the updater reacquires each candidate's original
+owner. Heap addresses with unknown ownership remain read-only.
+For `%live update-data`, `--module MODULE` filters against the build
+manifest's verified ELF. A different mapped module is rejected before
+the callback runs.
+
+Managed migration requires application storage using
+`<tracer/live_migration.hpp>` and an exported
+`extern "C" tracer::live::managed::Registry* clang_tracer_managed_registry_v1() noexcept`.
+Submit a C++ recipe that exports `clang_tracer_managed_update_v1`, with the
+after hook in its own file if needed. Use `%live update update.hpp --managed true`
+for a recipe with no hook. Include ABI-compatible application source changes
+and any new layout headers with the recipe to publish them together.
+Recipe and hook files can live outside the recorded source root. An
+application dependency outside that root requires a rebuild to update it.
+The hook may return `void` or `bool` and supports C++17.
+
+```text
+%live update update.hpp cache_code.cpp state_v2.hpp --after-file after.cpp --after-function fixture::after --for-each Cache
+```
+
+Acquire the registry gate in a stable caller before entering a function that
+will be replaced alongside the managed state. Pass the caller's
+`Registry::Access` into the replaceable function. The tool drains managed access,
+installs the verified native entries, and runs the hook against the migrated
+instances before releasing access.
+If the hook fails, the tool restores the prior entries and state under the
+same gate.
+
+If a managed publication reports `RESTORATION_REQUIRED`, run
+`%live recover` in the same server session. Recovery reconciles any pending
+result and restores verified entry bytes when necessary. The registry stays
+gated if any overwrite window contains bytes outside the two verified
+versions. A target stopped after an unverified native rollback, or a target
+whose server session was lost, requires external recovery.
+
 ## Prepare a probe from a binary without headers
 
 Build a module index from a Linux x86-64 ELF executable or shared library.
@@ -493,6 +632,92 @@ a 32-bit load from the receiver followed by `ret`. An existing ENDBR64
 stays in place and selects the trap path. The trap owns execution control for its session and
 restores its byte at stop, detach, or a thread or process creation stop.
 Remove a fallback probe before replacing it.
+
+## Register a C++ type for object probing
+
+`%object-probe` prepares a package, binds it to a Linux x86-64 process,
+and controls its admitted lifetime hooks and typed method observers under one
+registration ID. The target's ELF remains on disk and the tracer verifies live
+patch windows before activation.
+
+Prepare without an executable or an attachment. Pass the original header,
+compilation database and translation unit and select each exact method with
+`--method`. The package embeds the callback source and prepared method
+adapters. For example, an interceptor for a `Counter` method can use the
+registered lifetime ID alongside its ordinary call ID.
+
+```cpp
+template <> class Interceptor<tracer::ResolvedSignature> {
+public:
+  long long pre(const Call& call) {
+    return static_cast<long long>(call.object_id());
+  }
+  long long post(const Call& call) {
+    return static_cast<long long>(call.object_generation());
+  }
+};
+```
+
+```text
+%object-probe prepare demo::Counter --include ./counter.hpp --compdb ./compile_commands.json --translation-unit ./counter.cpp --method "demo::Counter::add(int)" --callbacks ./callbacks.cpp --output ./counter.object
+%attach PID
+%object-probe preview --package ./counter.object
+%object-probe start --package ./counter.object
+%object-probe status REGISTRATION_ID
+%object-probe stop REGISTRATION_ID
+```
+
+The preview shows verified lifecycle and method patch windows. A method-only
+package can use the attached process's uniquely mapped method image. Use
+`--method-module` to disambiguate. Start revalidates the binding, stages the
+patches, and admits callbacks only after publication. Record lifetime and write events with `%record --probe
+REGISTRATION_ID`. Start also prints the member probe IDs for selecting normal
+PRE and POST events. Callback failures record the call ID and phase.
+Use `--callback-errors only` or `--callback-errors exclude` with `%collect`,
+`%record`, or `%events open`. C++ analysis can read
+`Event::callback_error()` and `Event::callback_error_message()`.
+Each callback sees the object ID and generation copied at entry. Borrowed receiver views follow the usual interceptor lifetime.
+
+For individual writes, prepare a field and its writer. Omit `--code` to use
+writer discovery from the original compilation database. When the writer is
+already known, select it explicitly and use `--dwarf-writers` for a write-only
+package prepared without a compilation database.
+
+```text
+%object-probe prepare demo::Counter --field value --code "demo::Counter::set(int)" --dwarf-writers --output ./writes.object
+%object-probe preview --package ./writes.object
+%object-probe start --package ./writes.object
+```
+
+For a writer in an attached shared library, pass its mapped name with
+`--module`. `--follow-calls` is available for write-only packages.
+Use `--first-seen` with a write-only package and a standalone executable writer. Follow the
+coverage counts in status when the writer reaches native callees. A combined
+registration requires disjoint method and writer patch windows. A verified
+identity requires evidence that the constructor built a complete object and
+that the watch covers its destruction. Evidence can come from a distinct
+complete-constructor entry, a verified caller outside constructors and destructors,
+or a call through a verified PLT entry for the complete-constructor symbol.
+Caller proof for a shared constructor entry relies on debug information that
+describes inlined construction. `__attribute__((nodebug))`,
+`-gno-inline-line-tables`, or link-time inlining from a unit without debug
+information can hide an initializer and make base-subobject construction
+appear complete.
+A receiver can have provisional identity when construction predates attach
+or bypasses a watched constructor, as with a trivial copy. Ambiguous
+construction, duplicate lifetime symbols and incomplete destructor coverage
+can also leave identity provisional. Its callback reports
+`identity_verified() == false` with zero object ID and generation. An observed
+destructor in a registration with methods can report zero-ID teardown for a
+receiver already observed with provisional identity at the same address.
+Duplicate lifetime checks use the application mappings present at binding.
+An unreadable mapped application file leaves coverage incomplete. A fresh
+binding evaluates libraries the target loaded later.
+Live method and code-cache events arrive independently. JSON export orders
+each grouped registration's retained events by monotonic observation time.
+The event sequence remains the server's arrival cursor. Correlate verified
+observations by registration, object ID and generation.
+Choose a fresh output path for each preparation.
 
 ## Trace object lifetimes and state in a prebuilt binary
 
@@ -2097,6 +2322,12 @@ and `--startup` files.
   --file ./app
 ```
 
+In an interactive terminal the editor history persists in
+`$HOME/.clang-tracer-history` (mode 0600) and reloads at startup. Each accepted
+entry is merged into the file as it is entered, so concurrent REPLs share it and
+a crash loses nothing; a multiline cell stays one entry. Piped input and an
+unset or empty `HOME` leave history in memory only.
+
 Every submitted C++ cell is checked in a disposable `clang-tracer-repl-check`
 process before the live interpreter parses or executes it. The checker parses
 the accepted cells in their original order without executing them, preserving
@@ -2122,6 +2353,187 @@ cannot be rolled back, and arbitrary native loops or crashes do not have
 guaranteed interruption. Ctrl+C also cancels tracing operations.
 Completion covers command names and local C++ declarations/members. Dynamic
 completion of remote tracing symbols remains follow-up work.
+
+## Install a local C++ plugin package
+
+Copy the trusted `examples/repl-public-plugin` directory to
+`~/.local/share/clang-tracer/plugins/my-api/`. If `XDG_DATA_HOME` is set,
+use `$XDG_DATA_HOME/clang-tracer/plugins/my-api/`. Keep `plugin.toml`,
+`src/`, and `include/` together. Launch `clang-tracer-repl` normally and
+enter C++ at the prompt.
+
+```cpp
+#include <my_api/my_type.hpp>
+my_api::my_instance.add(3);
+my_api::MyType local{};
+local.add(5);
+std::cout << my_api::my_instance.count << " " << local.count << std::endl;
+```
+
+The first startup reports `compiled` and prints `3 5` for the sample.
+A fresh startup with the same compiler inputs reports `cache hit` and
+starts with fresh plugin state. The REPL loads the manifest’s `[repl]`
+`sources` into one private JIT scope. Its public `include/` directory
+provides C++ declarations to the REPL and its checker. External definitions
+declared in those headers can link to the plugin’s code and storage.
+The class in `src/plugin.cpp` registers commands and stays in the plugin scope.
+
+The package manifest supports `id`, `[repl]` `sources`, and optional
+`compile_commands`, `translation_unit`, and `extra_flags` in that section.
+Paths to sources and compilation databases are relative to the manifest
+unless a database path is absolute. Keep the entire package owned by the REPL
+user, with group and other write permissions disabled. Package symlinks must
+resolve within the package. Use trusted paths for external compiler inputs.
+Restart the REPL to replace a package with public headers. A live C++ expression can retain addresses from that
+generation.
+
+## Load local C++ plugins
+
+Load a trusted C++ source file with `%plugin load FILE --as NAME`. The REPL
+compiles it with its current local C++ compiler profile, so include paths and
+defines can come from `--cpp-arg` or `%cpp options compdb`. Use
+`%plugin enable FILE --as NAME` to load a plugin now and on future launches.
+
+```text
+%plugin enable examples/jit-plugin-globals/plugin_a.cpp --as a
+%plugin enable examples/jit-plugin-globals/plugin_b.cpp --as b
+%plugin commands a
+%plugin run a tick
+%plugin run b tick
+%plugin reload a
+%plugin run a value
+%plugin run b value
+```
+
+Enabled plugins load before the prompt or any `--startup` script. The REPL
+saves absolute source paths under `$XDG_CONFIG_HOME/clang-tracer/repl/enabled-plugins`
+or `~/.config/clang-tracer/repl/enabled-plugins`. Startup uses the launcher's
+C++ options, including any `--cpp-arg` flags. A plugin that fails to load is
+reported by name and startup continues. `%plugin disable NAME` removes its
+startup registration and the current session can keep using the loaded plugin.
+Use `%plugin load FILE --as NAME` for a single session.
+
+The first load reports `compiled`. A later load of the same source and compiler
+inputs reports `cache hit`. The REPL preprocesses the source to check the
+effective inputs, then reuses native code generation on a hit. Cached objects
+live under `$XDG_CACHE_HOME/clang-tracer/repl/plugins` or
+`~/.cache/clang-tracer/repl/plugins` when XDG_CACHE_HOME is unset. Each load
+links into a fresh JIT scope. A successful reload resets that plugin's globals
+and leaves peer plugins active. A failed reload keeps the prior generation.
+
+Include `clang_tracer_repl_plugin.hpp` and define `tracer::repl::Plugin` in
+one C++ source file. List your commands in a static array. The SDK supplies
+the entry point and dispatches each command to the same instance of your
+class.
+
+```cpp
+#include "clang_tracer_repl_plugin.hpp"
+
+class tracer::repl::Plugin : public tracer::repl::PluginInterface<Plugin> {
+  uint64_t count_ = 0;
+
+public:
+  uint64_t tick() noexcept { return ++count_; }
+  uint64_t value() const noexcept { return count_; }
+
+  static constexpr Command commands[] = {
+      command<&Plugin::tick>("tick", "Increment the count."),
+      command<&Plugin::value>("value", "Read the count."),
+  };
+};
+```
+
+Commands are `noexcept`, take no arguments, and return a value convertible
+to `uint64_t`. Use constant initialization and trivial destruction for plugin
+state. Each load creates a fresh instance. Existing plugins using the V1 C entry point
+in `clang_tracer_repl_plugin.h` can still load.
+
+A plugin JIT scope resolves definitions from its own compiled sources. Calls
+that require symbols from libc, the C++ runtime, the host process, or another
+plugin fail with the unresolved symbol names. Header-only C++ operations work
+when they generate self-contained code. Mark local helpers `noexcept`. A
+potentially throwing call at `-O0` can introduce C++ exception runtime symbols.
+For code that requires no exception handling, `-fno-exceptions` can avoid those
+references. Optimization can also inline a helper. Use trusted plugin sources
+because they execute native code in the REPL or target process.
+
+## Install an agent extension for automatic attachment
+
+On the REPL machine, copy a trusted extension package to
+`~/.local/share/clang-tracer/plugins/agent-counter/` (or the corresponding
+`XDG_DATA_HOME` path). Save `examples/jit-plugin-globals/plugin_b.cpp` as
+`src/plugin.cpp` in that package. Put the following `plugin.toml` at its
+root and set the executable to the exact absolute path reported by the
+target's Linux host.
+
+```toml
+id = "agent-counter"
+sdk = 1
+
+[agent]
+sources = ["src/plugin.cpp"]
+
+[agent.target]
+executable = "/absolute/path/to/application"
+```
+
+Start the server with `CLANG_TRACER_ALLOW_AGENT_PLUGINS=1` in its environment
+and attach to the application as usual. A new matching attachment activates
+the package before returning to the REPL prompt. Selecting an existing
+attachment preserves its plugin state. Approval or load failures identify the
+package and leave the attachment available.
+
+Single-file extensions use the existing REPL-object compatibility check.
+The agent compiles from source on a cache miss. Multi-file packages send
+their translation units and bundled headers for compilation in one target JIT
+scope. Optional `compile_commands`, `translation_unit`, and `extra_flags`
+under `[agent]` apply to target compilation. Use target-host paths for
+external build inputs. The agent caches the resulting objects and links a fresh
+instance for each matching attachment.
+
+The latency extension in `examples/repl-agent-observer` registers its return
+observer on attach. Add native probes after the observer loads. Reload an
+installed observer with `%plugin agent reload NAME`. The manifest supplies
+the sources and compiler settings for the new generation.
+
+## Load plugins in an injected agent
+
+Start a local managed server with agent plugins enabled and attach to a Linux
+x86-64 target. For a remote REPL, set the same environment variable on the
+server before starting it.
+
+```sh
+CLANG_TRACER_ALLOW_AGENT_PLUGINS=1 clang-tracer-repl --attach "$pid"
+```
+
+```text
+%plugin agent load examples/jit-plugin-globals/plugin_a.cpp --as a
+%plugin agent load examples/jit-plugin-globals/plugin_b.cpp --as b
+%plugin agent run a tick
+%plugin agent run b tick
+%plugin agent reload a examples/jit-plugin-globals/plugin_a.cpp
+%plugin agent run a value
+%plugin agent run b value
+```
+
+On a Linux x86-64 REPL, loading or reloading automatically offers an object
+from the REPL cache or compiles one if needed. The agent checks the compiler
+profile, target and CPU, resolved source and headers, and object integrity
+before linking an offer. It reports `REPL object` when it accepts the offer,
+`cache hit` when it uses its own cache, or `compiled` when it compiles the
+source in the target. The same commands handle all three cases.
+
+The same V1 command descriptor works in both runtimes. The agent supplies
+the SDK header and resolves other includes from its compiler environment.
+The target's cache is under
+`$XDG_CACHE_HOME/clang-tracer/agent/plugins` or
+`~/.cache/clang-tracer/agent/plugins` when XDG_CACHE_HOME is unset.
+
+The server opt-in authorizes its clients to supply trusted plugin source and
+objects that execute with the target process's permissions. Each attachment
+owns its plugin instances. A reload links a fresh generation of the named plugin and
+preserves its peers. Detaching releases the attachment's instances, and the
+compiled objects remain available for reuse.
 
 ## Cleanup and scripted use
 
