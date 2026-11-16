@@ -5,10 +5,18 @@ description: Use the clang_tracer Python API or clang-tracer-console when the ta
 
 # Clang Tracer Python
 
-For native demos, prepared injection, typed C++ inspection, and runnable
-`.repl` scripts, use the [native REPL skill](../clang-tracer-native-repl/SKILL.md).
-For Python automation, operate the public `clang_tracer` API directly.
-`clang-tracer-console` is the interactive Python client.
+For Python automation, use the public `clang_tracer` API directly.
+`clang-tracer-console` is the interactive Python client. Use C++17 for
+callback sources on a `c++17` runtime.
+
+For object watch plans, typed C++ replay, and scalar mocks, use the
+[native REPL skill](../clang-tracer-native-repl/SKILL.md#choose-the-workflow-on-c17).
+The public `c++17` Python client can stream and record events from an object
+watch armed in the native REPL. Filter by the attached session and
+`names=["object.trace"]` in `watch_events` or `record_sqlite`. Keep the
+watch ID for filtering records by `event.probe_id` and for stopping it
+in the REPL. Use the native REPL for application live replacement,
+native mocks, type-wide registrations, and plugins on `c++17`.
 
 ## Find the environment and target
 
@@ -46,7 +54,7 @@ is needed. Consult the wiki manuals first for project facts when available:
    `messages.ProbeSpec`, then call `add_probe()`. Keep its inferred ABI/debug
    metadata intact unless the user actually requests low-level ABI work.
 4. Preserve returned probe IDs for removal and event filtering. `stack_depth`
-   is 0–64; application-only frames are the default.
+   accepts 0–64 or `"full"`; application-only frames are the default.
 
 Use `list_modules(session.id)` and `list_symbols(session.id, query=..., page_size=20)`
 to find the mapped image and exact selector. Pass `module=...` to resolution
@@ -54,6 +62,14 @@ and injection when the selector is ambiguous across images. When the client
 and server support `ValidateProbe`, call `validate_probe(session.id, selector, source)`
 to compile-check the callback before installing it. Check `report.success`
 and its diagnostics.
+
+To reload a Python-managed probe on a server that supports it, call
+`client.reload_probe(session.id, probe.id, callback_source)`. Use the response's
+`probe.id` after successful reload. In-flight calls can still emit the earlier ID.
+The client also exposes `allow_call_original` and `trace_exceptions` on
+`validate_probe` and `inject`; apply the same options to both. Check the
+[scalar callback requirements](../clang-tracer-native-repl/references/mocking.md#mock-a-scalar-free-function)
+before enabling original-call control.
 
 Callback source is transmitted **by value**. `include_headers`,
 `compilation_database` and optional `callback_package_path` are paths on the
