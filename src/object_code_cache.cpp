@@ -360,6 +360,8 @@ struct Watch::Impl {
   std::map<Address, Address> resume_targets;
   std::map<Address, object_watch::Source> sources;
   std::string path;
+  // Retain procfs's pathname after the channel is unlinked and path is cleared.
+  std::string mapped_channel_path;
   Channel *channel = nullptr;
   const SharedFile shared_file;
   const std::size_t event_buffer;
@@ -707,6 +709,7 @@ struct Watch::Impl {
       ::unlink(path.c_str());
       throw std::runtime_error("cannot map the code-cache event channel");
     }
+    mapped_channel_path = path;
     channel = new (memory) Channel;
     channel->registration_active.store(!request.staged_registration(), std::memory_order_relaxed);
     for (std::size_t index = 0; index < event_buffer; ++index) {
@@ -2252,7 +2255,7 @@ struct Watch::Impl {
                           &path_offset) != 7)
             continue;
           const auto mapped_path = tracer::detail::canonical_mapped_path(line.substr(path_offset));
-          same_channel |= mapped_path == path && offset == 0 &&
+          same_channel |= line.substr(path_offset) == mapped_channel_path && offset == 0 &&
               end - begin >= Channel::mapping_size(event_buffer, runtime_limit) &&
               std::string_view(permissions) == "rw-s";
           same_code |= begin <= start && start < end && width <= end - start &&
@@ -2482,8 +2485,10 @@ void Watch::install(injector::Process &process, std::uintptr_t agent_entry,
     throw;
   }
   process.remote_free(remote, size);
-  ::unlink(p.path.c_str());
-  p.path.clear();
+  if (::unlink(p.path.c_str()) == 0) {
+    p.mapped_channel_path += " (deleted)";
+    p.path.clear();
+  }
 
   for (unsigned index = 0; index < p.functions.size(); ++index) {
     if (p.functions[index].empty())
@@ -2686,7 +2691,7 @@ bool Watch::retire_if_mapping_changed(std::chrono::steady_clock::time_point dead
                     &path_offset) != 7)
       return false;
     live_ranges.emplace_back(begin, end);
-    if (tracer::detail::canonical_mapped_path(line.substr(path_offset)) == p.path)
+    if (line.substr(path_offset) == p.mapped_channel_path)
       return false;
     if (permissions[2] == 'x' && std::any_of(std::begin(p.redirects), std::end(p.redirects), [&](const auto &redirect) {
           return redirect.translated_pc() >= begin && redirect.translated_pc() < end;
