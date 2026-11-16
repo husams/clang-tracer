@@ -1846,8 +1846,13 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   std::error_code path_error;
   const bool installed_driver = fs::path(command.driver).is_absolute() &&
       fs::is_regular_file(command.driver, path_error);
-  const bool alternate_driver = installed_driver &&
-      !fs::equivalent(command.driver, TRACER_PREPARE_BUILD_CXX, path_error) && !path_error;
+  const bool alternate_driver = installed_driver && [&] {
+    const auto selected = fs::canonical(command.driver, path_error);
+    if (path_error)
+      return false;
+    const auto builtin = fs::canonical(TRACER_PREPARE_BUILD_CXX, path_error);
+    return !path_error && selected != builtin;
+  }();
   FrozenInvocation invocation;
   auto &profile = invocation.prepared_profile;
   profile.set_format_version(tracer::prepared::typed_version);

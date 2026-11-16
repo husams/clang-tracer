@@ -337,7 +337,7 @@ struct TargetImage::Image {
       throw std::runtime_error("live data ELF has no executable anchor");
     }
     bias = client::bind_live_executable(::getpid(), target.module, elf, text, 1);
-    if (fs::equivalent(target.module, "/proc/self/exe")) {
+    if (fs::canonical(target.module) == fs::canonical("/proc/self/exe")) {
       loader.reset(::dlopen(nullptr, RTLD_NOW));
     } else {
       loader.reset(::dlopen(target.module.c_str(), RTLD_NOW | RTLD_NOLOAD));
