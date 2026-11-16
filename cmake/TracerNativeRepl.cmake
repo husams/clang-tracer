@@ -876,6 +876,14 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-object-plan-target>
           $<TARGET_FILE:repl-object-plan-rebuilt-target>)
       set_tests_properties(native_repl_object_plan PROPERTIES TIMEOUT 120)
+      foreach(_template_backend IN ITEMS ptrace code-cache)
+        add_test(NAME native_repl_object_template_${_template_backend}
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_template.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:object-watch-template-fixture>
+            --backend ${_template_backend})
+        set_tests_properties(native_repl_object_template_${_template_backend} PROPERTIES TIMEOUT 180)
+      endforeach()
       add_test(NAME native_repl_object_union
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_object_union.py"
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
