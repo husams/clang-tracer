@@ -43,7 +43,9 @@ struct MappedFile {
   std::string path;
   std::size_t size;
   void *data = nullptr;
-  MappedFile(const std::string &name, std::size_t width) : path(name + "-XXXXXX"), size(width) {
+  MappedFile(const std::string &name, std::size_t width)
+      : path((fs::canonical(fs::absolute(name).parent_path()) / fs::path(name).filename()).string() + "-XXXXXX"),
+        size(width) {
     const int fd = ::mkstemp(path.data());
     if (fd < 0)
       throw std::runtime_error("cannot create private method snapshot channel");

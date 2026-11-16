@@ -693,7 +693,8 @@ struct Watch::Impl {
     }
     if (event_path.empty())
       return;
-    path = (std::filesystem::path(event_path).parent_path() / "object-cache-XXXXXX").string();
+    path = (std::filesystem::canonical(std::filesystem::absolute(event_path).parent_path()) /
+            "object-cache-XXXXXX").string();
     const auto fd = ::mkostemp(path.data(), O_CLOEXEC);
     if (fd < 0)
       throw std::runtime_error("cannot create a private code-cache event channel");
