@@ -973,12 +973,13 @@ extern "C" void tracer_shared_release(void *opaque) noexcept {
   }
 }
 
-std::uint64_t address_value(auto address) {
-  if constexpr (requires { address.getValue(); }) {
-    return address.getValue();
-  } else {
-    return static_cast<std::uint64_t>(address);
-  }
+template <class Address>
+auto address_value(Address address) -> decltype(address.getValue()) {
+  return address.getValue();
+}
+
+std::uint64_t address_value(std::uint64_t address) {
+  return address;
 }
 
 void set_error(tracer::Request *request, const char *text) noexcept {

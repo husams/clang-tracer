@@ -29,7 +29,11 @@ struct ContextTypeLayout {
   std::string definition;
   std::uint64_t bytes = 0;
   std::uint64_t alignment = 0;
-  bool operator==(const ContextTypeLayout &) const = default;
+  bool operator==(const ContextTypeLayout &other) const {
+    return name == other.name && definition == other.definition &&
+        bytes == other.bytes && alignment == other.alignment;
+  }
+  bool operator!=(const ContextTypeLayout &other) const { return !(*this == other); }
 };
 
 struct ContextCompilationContract {
@@ -45,7 +49,11 @@ struct ContextCompilationContract {
     std::string source_name;
     std::string type;
     std::vector<ContextTypeLayout> records;
-    bool operator==(const Bridge &) const = default;
+    bool operator==(const Bridge &other) const {
+      return symbol == other.symbol && source_name == other.source_name &&
+          type == other.type && records == other.records;
+    }
+    bool operator!=(const Bridge &other) const { return !(*this == other); }
   };
 
   std::vector<Bridge> bridges;
@@ -60,6 +68,7 @@ struct ContextCompilationContract {
            compiler == other.compiler && language == other.language &&
            standard_library == other.standard_library && types == other.types;
   }
+  bool operator!=(const ContextCompilationContract &other) const { return !(*this == other); }
 };
 
 llvm::Expected<std::vector<std::string>>

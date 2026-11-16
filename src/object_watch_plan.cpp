@@ -64,7 +64,20 @@ std::string name(DWARFDie die) {
 }
 
 std::string leaf_name(const std::string &qualified_name) {
-  const auto scope = qualified_name.rfind("::");
+  std::size_t scope = std::string::npos;
+  unsigned depth = 0;
+  for (std::size_t index = 0; index < qualified_name.size(); ++index) {
+    const auto character = qualified_name[index];
+    if (character == '<')
+      ++depth;
+    else if (character == '>' && depth)
+      --depth;
+    else if (character == ':' && !depth && index + 1 < qualified_name.size() &&
+             qualified_name[index + 1] == ':') {
+      // A scope in a template argument is part of the record's leaf name.
+      scope = index++;
+    }
+  }
   return scope == std::string::npos ? qualified_name : qualified_name.substr(scope + 2);
 }
 
@@ -135,6 +148,7 @@ std::optional<std::uint64_t> size_of(DWARFDie die) {
 
 DWARFDie find_record(llvm::DWARFContext &dwarf, const std::string &wanted,
                      llvm::DWARFUnit *preferred = nullptr) {
+  const auto wanted_leaf = leaf_name(wanted);
   std::vector<DWARFDie> pending;
   if (preferred) {
     pending.push_back(preferred->getUnitDIE(false));
@@ -147,7 +161,7 @@ DWARFDie find_record(llvm::DWARFContext &dwarf, const std::string &wanted,
     const auto die = pending.back();
     pending.pop_back();
     for (const auto child : die.children()) {
-      if (record(child) && name(child) == leaf_name(wanted) &&
+      if (record(child) && name(child) == wanted_leaf &&
           qualified(child) == wanted && number(child, dw::DW_AT_byte_size)) {
         if (result)
           throw std::runtime_error("ambiguous DWARF record: " + wanted);
