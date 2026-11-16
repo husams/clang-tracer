@@ -230,9 +230,10 @@ JitRequest build_live_mock(const MockCommand& command, const MockCompileContext&
   };
   add_native_import(context.target);
 
+  const std::string context_original = std::string(prefix) + "original_entry";
   std::string methods;
   methods += target.result + " original(" + target.context_parameters + ") const" +
-             target.exception_spec + " { return " + (alternate ? "original_entry" : original) +
+             target.exception_spec + " { return " + (alternate ? context_original : original) +
              "(" + target.context_arguments +
              "); }\n";
   std::set<std::string> aliases{"original", "fixture_text"};
@@ -260,7 +261,7 @@ JitRequest build_live_mock(const MockCommand& command, const MockCompileContext&
       command.fixture ? std::string_view(command.fixture->contents) : std::string_view{};
   header += "struct Context {\n";
   if (alternate)
-    header += "decltype(&" + original + ") original_entry = &" + original + ";\n";
+    header += "decltype(&" + original + ") " + context_original + " = &" + original + ";\n";
   header += methods +
             "std::string_view fixture_text() const noexcept { return {" + quote(fixture) + ", " +
             std::to_string(fixture.size()) + "}; }\n};\n}\n" +

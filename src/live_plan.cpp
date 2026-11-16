@@ -1305,8 +1305,12 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
           continue;
         const bool captured_state = !prior.has_source_abi || llvm::StringRef(prior.abi).contains(" capture ") ||
             (next != after_definitions.end() && llvm::StringRef(next->second.abi).contains(" capture "));
+        // Insertion can move the old closure away from this ordinal, and
+        // deletion can move a different existing closure into it. In either
+        // direction, still prove that all calls and captures stay local.
         if (captured_state && next != after_definitions.end() && prior.abi != next->second.abi &&
-            !lambda_was_renumbered(name, prior, owner, before_definitions, after_definitions)) {
+            !lambda_was_renumbered(name, prior, owner, before_definitions, after_definitions) &&
+            !lambda_was_renumbered(name, next->second, owner, after_definitions, before_definitions)) {
           block(path, name, "rebuild required: lambda capture layout or callable ABI changed");
         } else if (!closure_is_local_to(*before->module, name, owner)) {
           block(path, name, "rebuild required: cannot prove the existing lambda's calls stay within its enclosing function");
@@ -1494,6 +1498,9 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       } else if (entries.at(address) != canonical) {
         throw std::runtime_error("rebuild required: multiple definitions name one native entry");
       }
+      if (const auto slot = active.entries.find(address);
+          slot != active.entries.end() && slot->second.mock_original)
+        candidate.set_diagnostic("source update replaces the installed mock");
       replaced.insert(key);
       replaced.insert(canonical);
       result.jit.imports.emplace(native_entry_import_name(key), address);

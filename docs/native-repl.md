@@ -113,8 +113,8 @@ lambda can update already-registered callbacks when its source identity and
 capture ABI match the native entry, including which variables it captures
 and their order. A live update can replace a lambda and its private template
 instantiations together when every call stays within the enclosing function.
-If adding a lambda shifts an existing capture layout to a new compiler
-symbol, the update must identify the same closure at the new position.
+If adding or removing a lambda shifts an existing capture layout to a
+different compiler symbol, the update must identify the closure at both positions.
 Changes to an escaping lambda with unverified identity or captures require
 a rebuild. The lifetime check can be inconclusive for calls through
 `std::function`, `std::ref`, range adaptors, and C callbacks.
@@ -146,9 +146,10 @@ Live mocks use exact signatures, with source-style or demangled qualifiers.
 `--bind "ALIAS=SIGNATURE"` binds a verified
 application callable. `ctx.original(...)` calls the unmocked implementation,
 including any active live update. Replacing a mock preserves that underlying
-implementation. Restoring an omitted callable to its built body also restores
-that body behind an installed mock. Use `--recursion original` to route recursive calls through
-it. `%live revert` restores the previous dispatch.
+implementation. A direct source edit to a mocked callable replaces the mock
+and reports this in the candidate row. Restoring an omitted callable to its
+built body restores that body behind an installed mock. Use `--recursion original`
+to route recursive calls through it. `%live revert` restores the previous dispatch.
 
 Object callbacks use a discovery function with `clang_tracer::ObjectSink`
 from `<clang_tracer/live.hpp>`. A callback may take shared owners, borrowed
