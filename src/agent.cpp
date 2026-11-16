@@ -4353,6 +4353,8 @@ bool extract_forced_includes(std::vector<std::string> &arguments,
 
 void resolve_callback_option_paths(std::vector<std::string> &arguments,
                                    const std::filesystem::path &directory) {
+  // Called after preflight validation: -iprefix, -iwithprefix and -isysroot
+  // are rejected there. Keep this aligned with the accepted path options.
   for (std::size_t i = 0; i < arguments.size(); ++i) {
     for (const llvm::StringRef option : {"-isystem-after", "-isystem", "-iquote",
                                         "-idirafter", "--gcc-toolchain=", "--sysroot=",
@@ -5019,7 +5021,10 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       }
     }
   }
-  // The legacy header context already includes the explicit probe options.
+  // resolve_header_context() appends compile_options verbatim as the suffix
+  // of a legacy context's compiler_arguments. Check that suffix before adding
+  // them again; prepared contexts use a different builder and need the append.
+  // Keep this check before path normalization, which can change those strings.
   const auto &explicit_options = target_specification.compile_options();
   if (typed_prepared || user_options.size() < static_cast<std::size_t>(explicit_options.size()) ||
       !std::equal(explicit_options.rbegin(), explicit_options.rend(), user_options.rbegin()))
@@ -5434,7 +5439,10 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   bool baseline_preflight_succeeded = false;
   bool followed_members_disabled = false;
   DiagnosticCapture complete_capture(nullptr);
-  if (shape_valid) {
+  // Clang can recover a legacy function declaration even when its body has
+  // errors. Re-parsing that body with the wrapper only repeats its diagnostics.
+  // Class callbacks still need the wrapper/receiver-inference recovery path.
+  if (shape_valid && (shape.class_mode || !user_capture.had_error())) {
     if (overrides &&
         (!shape.class_mode ||
          ((specification.allow_argument_overrides() || specification.allow_replacement() ||

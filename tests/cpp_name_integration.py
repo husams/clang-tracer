@@ -337,6 +337,19 @@ def main() -> int:
             write_text(negative_db, json.dumps([entry]))
             header_options = ("--compdb", str(negative_db), "--include", str(header))
             selector = "HeaderReceiver::read(int) const"
+            # These path families are rejected before compilation, so the agent's
+            # donor-relative path normalizer must never receive them.
+            for option in ("-iprefix", "-iwithprefix", "-isysroot"):
+                unsupported_entry = dict(entry)
+                unsupported_entry["arguments"] = [*entry["arguments"][:-1], option,
+                                                   "relative-path", entry["arguments"][-1]]
+                write_text(negative_db, json.dumps([unsupported_entry]))
+                unsupported = save_output(output_dir / f"reject-compdb{option}.txt", client.run(
+                    "validate", str(negative_target.pid), selector, "--callback", str(callback),
+                    *header_options, expected_ok=False, timeout=45))
+                require("unsupported option: " + option in unsupported,
+                        f"unsupported donor path option was not identified:\n{unsupported}")
+            write_text(negative_db, json.dumps([entry]))
             invalid_callback = temp_dir / "invalid-callback.cpp"
             write_text(invalid_callback,
                        'extern "C" long long trace_callback(const TraceContext&) {\n'
@@ -348,6 +361,8 @@ def main() -> int:
             require("validation success=false" in rejected and "callback_source:2:" in rejected and
                     "missing_callback_value" in rejected,
                     f"invalid callback did not report its Clang diagnostic:\n{rejected}")
+            require(rejected.count("use of undeclared identifier 'missing_callback_value'") == 1,
+                    f"invalid callback diagnostic was repeated:\n{rejected}")
             require_fixture_progress(negative_target, negative_log_path)
 
             warning_callback = temp_dir / "warning-callback.cpp"
@@ -362,7 +377,16 @@ def main() -> int:
             require("validation success=false" in rejected_warning and
                     "different signs" in rejected_warning,
                     f"callback did not retain the donor's warning policy:\n{rejected_warning}")
+            require(rejected_warning.count("different signs") == 1,
+                    f"callback warning diagnostic was repeated:\n{rejected_warning}")
             require_fixture_progress(negative_target, negative_log_path)
+
+            relaxed_warning = save_output(output_dir / "validate-compdb-warning-override.txt", client.run(
+                "validate", str(negative_target.pid), selector, "--callback", str(warning_callback),
+                *header_options, "--compile-option", "-Wno-error=sign-compare", timeout=45))
+            require("validation success=true" in relaxed_warning and
+                    "warning [wrapper]" in relaxed_warning and "different signs" in relaxed_warning,
+                    f"explicit callback option did not override the donor's warning policy:\n{relaxed_warning}")
 
             valid_callback = temp_dir / "valid-callback.cpp"
             write_text(valid_callback,
