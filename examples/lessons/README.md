@@ -29,6 +29,8 @@ run the section's commands without typing the sources first.
 | [21-logical-updates](21-logical-updates/README.md) | [Follow logical collection entries during writes](../../docs/native-repl.md#follow-logical-collection-entries-during-writes) (REPL walkthrough), `--mode logical-writes` |
 | [22-string-storage-writes](22-string-storage-writes/README.md) | [Follow logical collection entries during writes](../../docs/native-repl.md#follow-logical-collection-entries-during-writes) (REPL walkthrough), string and variant storage |
 | [23-union-writes](23-union-writes/README.md) | [Trace individual writes to a nested union](../../docs/native-repl.md#trace-individual-writes-to-a-nested-union) (REPL walkthrough) |
+| [24-repl-plugin](24-repl-plugin/README.md) | [Load local C++ plugins](../../docs/native-repl.md#load-local-c-plugins) (REPL walkthrough) |
+| [25-object-observer](25-object-observer/README.md) | [Register a C++ type for object probing](../../docs/native-repl.md#register-a-c-type-for-object-probing) (REPL walkthrough) |
 
 The remaining sections need no project. "Install and check the tools" and
 "Open the interactive guide" only run installed commands, and "Run the
@@ -44,6 +46,8 @@ You need the Clang Tracer tools on `PATH`, a C++ compiler, and `make`.
 3. Enter the lesson's commands. Replace `12345` with the printed PID. Press
    Enter in terminal one whenever a `%collect` or `%record` is waiting.
 4. Finish with `%detach` and `%quit`, then stop the target with Ctrl+C.
+
+Lesson 24 has no target: it only needs the REPL, so skip steps 1 and 4.
 
 `make clean` removes the binary and everything the lesson generated. Lessons
 are independent: each has its own copy of the target and observer, so you can
