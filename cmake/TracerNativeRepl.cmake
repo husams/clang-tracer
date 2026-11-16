@@ -1030,10 +1030,14 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:repl-shared-shapes-library>)
       set_tests_properties(native_repl_code_cache_shared PROPERTIES TIMEOUT 120)
       if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+        set(_object_probe_dwarf_flag)
+        if(TRACER_SDK_ROOT)
+          set(_object_probe_dwarf_flag --legacy-dwarf4)
+        endif()
         add_test(NAME native_repl_type_object_probe
           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_type_object_probe.py"
             $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
-            $<TARGET_FILE:clang_tracer_agent> "${CMAKE_CXX_COMPILER}")
+            $<TARGET_FILE:clang_tracer_agent> "${CMAKE_CXX_COMPILER}" ${_object_probe_dwarf_flag})
         set_tests_properties(native_repl_type_object_probe PROPERTIES TIMEOUT 180)
         add_library(repl-object-shared-writer-library SHARED
           tests/fixtures/object_shared_writer/library.cpp)

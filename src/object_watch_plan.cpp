@@ -124,6 +124,64 @@ bool record(DWARFDie die) {
                  die.getTag() == dw::DW_TAG_union_type);
 }
 
+// A standard-library specialization can contain program-defined code when it
+// depends on an application type. Inspect the DWARF arguments and enclosing
+// records even when Clang emits simple template names.
+bool standard_library_type(DWARFDie die, unsigned depth = 0) {
+  if (!die || depth == 16)
+    return false;
+  switch (die.getTag()) {
+  case dw::DW_TAG_base_type:
+    return true;
+  case dw::DW_TAG_pointer_type:
+    if (!die.find(dw::DW_AT_type))
+      return true; // void *
+    [[fallthrough]];
+  case dw::DW_TAG_typedef:
+  case dw::DW_TAG_const_type:
+  case dw::DW_TAG_volatile_type:
+  case dw::DW_TAG_array_type:
+  case dw::DW_TAG_reference_type:
+  case dw::DW_TAG_rvalue_reference_type:
+  case dw::DW_TAG_template_type_parameter:
+    return standard_library_type(die.resolveReferencedType(dw::DW_AT_type), depth + 1);
+  case dw::DW_TAG_template_value_parameter:
+    return die.find(dw::DW_AT_const_value) &&
+        standard_library_type(die.resolveReferencedType(dw::DW_AT_type), depth + 1);
+  case dw::DW_TAG_GNU_template_parameter_pack:
+    return ::tracer::compat::ranges::all_of(die.children(), [&](DWARFDie argument) {
+      return standard_library_type(argument, depth + 1);
+    });
+  default:
+    break;
+  }
+  for (auto scope = die; scope; scope = scope.getParent()) {
+    if (scope.getTag() == dw::DW_TAG_namespace) {
+      if (name(scope) == "std" && scope.getParent().getTag() == dw::DW_TAG_compile_unit)
+        return true;
+      continue;
+    }
+    if (!record(scope) && scope.getTag() != dw::DW_TAG_enumeration_type)
+      return false;
+    bool saw_arguments = false;
+    for (const auto child : scope.children()) {
+      const auto tag = child.getTag();
+      if (tag == dw::DW_TAG_GNU_template_template_param)
+        return false;
+      if (tag != dw::DW_TAG_template_type_parameter &&
+          tag != dw::DW_TAG_template_value_parameter &&
+          tag != dw::DW_TAG_GNU_template_parameter_pack)
+        continue;
+      if (!standard_library_type(child, depth + 1))
+        return false;
+      saw_arguments = true;
+    }
+    if (!saw_arguments && name(scope).find('<') != std::string::npos)
+      return false;
+  }
+  return false;
+}
+
 std::optional<std::uint64_t> size_of(DWARFDie die) {
   if (!die)
     return std::nullopt;
@@ -2288,6 +2346,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         return CallerKind::unknown;
       return classify_linkage_name(symbols.begin()->first);
     };
+    const bool application_type = !::tracer::compat::starts_with(concrete_type, "std::");
     std::map<std::string, bool> defined_records;
     const auto unresolved_records = [&](DWARFDie function) {
       std::vector<DWARFDie> scopes{function};
@@ -2301,14 +2360,17 @@ Plan::Plan(std::uint32_t pid, std::string executable,
           if (tag != dw::DW_TAG_variable && tag != dw::DW_TAG_formal_parameter)
             continue;
           auto referred = child.resolveReferencedType(dw::DW_AT_type);
+          bool indirect = false;
           std::set<DWARFDie> seen;
           while (referred && seen.insert(referred).second) {
             const auto kind = referred.getTag();
-            if (kind != dw::DW_TAG_typedef && kind != dw::DW_TAG_const_type &&
-                kind != dw::DW_TAG_volatile_type && kind != dw::DW_TAG_array_type &&
-                kind != dw::DW_TAG_pointer_type && kind != dw::DW_TAG_reference_type &&
-                kind != dw::DW_TAG_rvalue_reference_type)
+            if (kind == dw::DW_TAG_pointer_type || kind == dw::DW_TAG_reference_type ||
+                kind == dw::DW_TAG_rvalue_reference_type) {
+              indirect = true;
+            } else if (kind != dw::DW_TAG_typedef && kind != dw::DW_TAG_const_type &&
+                       kind != dw::DW_TAG_volatile_type && kind != dw::DW_TAG_array_type) {
               break;
+            }
             referred = referred.resolveReferencedType(dw::DW_AT_type);
           }
           if (!record(referred) || !referred.find(dw::DW_AT_declaration))
@@ -2316,6 +2378,18 @@ Plan::Plan(std::uint32_t pid, std::string executable,
           const auto identity = qualified(referred);
           if (identity.empty())
             return true;
+          // ::tm is reserved by the C++ library. The other two names are
+          // glibc's reserved global record tags for FILE and DIR.
+          if (indirect && (identity == "tm" || identity == "_IO_FILE" ||
+                           identity == "__dirstream"))
+            continue;
+          if (application_type && ::tracer::compat::starts_with(identity, "std::")) {
+            if (standard_library_type(referred))
+              continue;
+            // A same-named DIE can describe another specialization when
+            // the producer omits template arguments from DW_AT_name.
+            return true;
+          }
           auto [known, inserted] = defined_records.try_emplace(identity, false);
           if (inserted) {
             for (const auto *image : {image_.get(), main_.get()}) {
