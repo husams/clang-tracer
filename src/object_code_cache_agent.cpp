@@ -1,6 +1,7 @@
 #include "tracer/compat.hpp"
 #include "object_code_cache_protocol.hpp"
 #include "object_code_cache_identity.hpp"
+#include "mapped_elf.hpp"
 
 #include "object_code_cache_decode.hpp"
 #if defined(__aarch64__)
@@ -214,15 +215,13 @@ struct RuntimeBlock {
 
 struct RuntimeLocation {
   Address bias = 0, end = 0, offset = 0;
-  dev_t device = 0;
-  ino_t inode = 0;
   std::uint64_t unload_generation = 0;
   bool main_image = false;
   Lmid_t name_space = LM_ID_BASE;
   std::string path;
 };
 
-using RuntimeImageKey = std::tuple<dev_t, ino_t, Address, std::uint64_t>;
+using RuntimeImageKey = std::tuple<std::string, Address, std::uint64_t>;
 
 struct RuntimeImage {
   llvm::object::OwningBinary<llvm::object::Binary> binary;
@@ -291,7 +290,7 @@ struct State {
   std::map<RuntimeImageKey, RuntimeImage> runtime_images;
   std::map<std::pair<RuntimeImageKey, Address>, RuntimeImage::PltStub> runtime_plt_stubs;
   std::map<std::pair<RuntimeImageKey, Address>, RuntimeBlock *> runtime_targets;
-  std::map<std::tuple<dev_t, ino_t, Address, Address>, RuntimeBlock *> runtime_scopes;
+  std::map<std::tuple<std::string, Address, Address>, RuntimeBlock *> runtime_scopes;
   struct RuntimeRejection {
     DispatchGap reason = DispatchGap::translation_failed;
     bool plt_only = false;
@@ -679,8 +678,13 @@ bool supported_store(const State &watch, const native_entry::ScalarStore &store)
 
 std::optional<std::uint64_t> shared_file_offset_from_maps(int fd, const SharedFileIdentity &file,
                                                         Address destination) noexcept {
-  // All numeric fields and permissions fit in this prefix. Paths can span reads.
-  std::array<char, 160> prefix;
+  std::array<char, 4096> pinned_path;
+  const auto path_size = ::readlink(file.reference.data(), pinned_path.data(), pinned_path.size());
+  if (path_size <= 0 || static_cast<std::size_t>(path_size) == pinned_path.size())
+    return std::nullopt;
+  const std::string_view selected(pinned_path.data(), path_size);
+  // Keep the pathname as well as the numeric fields, including across reads.
+  std::array<char, 4096 + 160> prefix;
   std::size_t used = 0;
   std::array<char, 4096> buffer;
   for (;;) {
@@ -724,8 +728,11 @@ std::optional<std::uint64_t> shared_file_offset_from_maps(int fd, const SharedFi
       unsigned major_id = 0, minor_id = 0;
       if (!number(offset, 16, ' ') || !number(major_id, 16, ':') ||
           !number(minor_id, 16, ' ') || !number(inode, 10, ' ') ||
-          inode != file.inode || makedev(major_id, minor_id) != file.device ||
           destination - begin > UINT64_MAX - offset)
+        return std::nullopt;
+      while (cursor != limit && *cursor == ' ')
+        ++cursor;
+      if (std::string_view(cursor, limit - cursor) != selected)
         return std::nullopt;
       return offset + (destination - begin);
     }
@@ -752,15 +759,23 @@ std::optional<std::uint64_t> shared_file_offset(const State &watch, Address dest
   } close_maps{fd};
   static thread_local bool query_unavailable = false;
   if (!query_unavailable) {
+    std::array<char, 4096> name{}, pinned_path{};
+    const auto path_size = ::readlink(watch.shared_file.reference.data(), pinned_path.data(), pinned_path.size());
+    if (path_size <= 0 || static_cast<std::size_t>(path_size) == pinned_path.size())
+      return std::nullopt;
     MappingQuery query{};
+    query.name_size = name.size();
+    query.name_address = reinterpret_cast<std::uintptr_t>(name.data());
     query.size = sizeof(query);
     query.flags = required | 0x20; // file-backed VMA
     query.address = destination;
     if (::ioctl(fd, query_mapping, &query) == 0) {
       if (query.begin <= destination && destination < query.end &&
           query.end - destination >= sizeof(std::int32_t) &&
-          query.inode == watch.shared_file.inode &&
-          makedev(query.device_major, query.device_minor) == watch.shared_file.device &&
+          query.name_size > 0 && query.name_size <= name.size() &&
+          name[query.name_size - 1] == '\0' &&
+          std::string_view(name.data(), query.name_size - 1) ==
+              std::string_view(pinned_path.data(), path_size) &&
           destination - query.begin <= UINT64_MAX - query.offset)
         return query.offset + (destination - query.begin);
       return std::nullopt;
@@ -1254,14 +1269,14 @@ void emit_boundary(State &watch, const Site &site, Address object, const Lifetim
   event.hook = hook;
   event.provisional_reason = provisional_reason;
   event.gap = transfer;
-  if (watch.shared_file.inode && object <= UINT64_MAX - watch.offset) {
+  if (watch.shared_file.active() && object <= UINT64_MAX - watch.offset) {
     if (const auto offset = shared_file_offset(watch, object + watch.offset)) {
       event.has_shared_file_offset = true;
       event.shared_file_offset = *offset;
     }
   }
   if (hook == Hook::create && !watch.no_values && !watch.value_write.active() &&
-      !watch.shared_file.inode && read_field(watch, object + watch.offset, event.new_value)) {
+      !watch.shared_file.active() && read_field(watch, object + watch.offset, event.new_value)) {
     event.values = 2;
     if (const auto tag = union_tag(watch, object)) {
       event.new_tag = *tag;
@@ -1493,7 +1508,7 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
       (kind == Hook::create || kind == Hook::destroy_begin) &&
       !identity_type_matches)
     return;
-  if (kind == Hook::create && watch.shared_file.inode &&
+  if (kind == Hook::create && watch.shared_file.active() &&
       (object > UINT64_MAX - watch.offset || !shared_file_offset(watch, object + watch.offset)))
     return;
   if (watch.borrow.dispatch_return) {
@@ -1622,7 +1637,7 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
     Observation event{};
     event.object = object;
     event.pc = inst.boundary_pc;
-    if (constructor && watch.shared_file.inode) {
+    if (constructor && watch.shared_file.active()) {
       const auto offset = shared_file_offset(watch, object + watch.offset);
       if (!offset)
         return;
@@ -1757,7 +1772,7 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
   event.id = life->id;
   event.generation = life->generation;
   event.hook = Hook::create;
-  if (!watch.no_values && !watch.value_write.active() && !watch.shared_file.inode &&
+  if (!watch.no_values && !watch.value_write.active() && !watch.shared_file.active() &&
       read_field(watch, event.object + watch.offset, event.new_value)) {
     event.values = 2;
     if (const auto tag = union_tag(watch, event.object)) {
@@ -2023,7 +2038,7 @@ void before(const Site *site, const Registers *regs) noexcept {
       sample.storage_receiver = receiver;
       sample.storage_field = receiver + watch.offset;
     }
-    if (watch.shared_file.inode) {
+    if (watch.shared_file.active()) {
       sample.shared_file_offset = shared_file_offset(watch, destination);
       if (!sample.shared_file_offset)
         return;
@@ -4227,13 +4242,11 @@ RuntimeLocation locate_runtime_target(Address target) {
         target < begin || target >= end)
       continue;
     if (permissions[0] != 'r' || permissions[2] != 'x' || permissions[1] == 'w' ||
-        !inode || line.size() <= static_cast<std::size_t>(path_offset) || line[path_offset] != '/' ||
+        line.size() <= static_cast<std::size_t>(path_offset) || line[path_offset] != '/' ||
         ::tracer::compat::ends_with(line, " (deleted)") || target - begin > UINT64_MAX - offset)
       break;
     location.end = end;
     location.offset = offset + target - begin;
-    location.device = makedev(dev_major, dev_minor);
-    location.inode = inode;
     location.path = line.substr(path_offset);
     break;
   }
@@ -4304,7 +4317,6 @@ RuntimeImage::RuntimeImage(const RuntimeLocation &location) {
   } file{::open(location.path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK)};
   struct stat before{}, after{};
   if (file.fd < 0 || ::fstat(file.fd, &before) || !S_ISREG(before.st_mode) ||
-      before.st_dev != location.device || before.st_ino != location.inode ||
       before.st_size < static_cast<off_t>(sizeof(Elf64_Ehdr)))
     throw std::runtime_error("cannot identify the mapped runtime ELF file");
   auto buffer = llvm::WritableMemoryBuffer::getNewUninitMemBuffer(before.st_size, location.path);
@@ -4335,6 +4347,21 @@ RuntimeImage::RuntimeImage(const RuntimeLocation &location) {
 #endif
   if (!object || object->getArch() != native_arch)
     throw std::runtime_error("runtime callee is outside a native ELF image");
+  if (!tracer::detail::matches_mapped_elf(*object, location.bias, [](auto address, auto bytes) {
+        std::array<char, 4096> copy;
+        if (bytes.size() > UINT64_MAX - address)
+          return false;
+        while (!bytes.empty()) {
+          const auto size = std::min(bytes.size(), copy.size());
+          if (!read_self_memory(address, copy.data(), size) ||
+              std::string_view(copy.data(), size) != bytes.substr(0, size))
+            return false;
+          address += size;
+          bytes.remove_prefix(size);
+        }
+        return true;
+      }))
+    throw std::runtime_error("mapped runtime ELF content differs from the file");
   binary = {std::move(*elf), std::move(buffer)};
 }
 
@@ -4683,8 +4710,6 @@ bool request_runtime_scope(State &watch, RuntimeBlock &block, Address target,
   admission.scope = block.scope_index;
   admission.width = block.bytes.size();
   admission.module = block.sites.front().runtime_module;
-  admission.device = location.device;
-  admission.inode = location.inode;
   admission.file_offset = location.offset;
   unsigned idle = RuntimeAdmission::idle;
   if (!admission.phase.compare_exchange_strong(idle, RuntimeAdmission::ready, std::memory_order_release))
@@ -4761,7 +4786,7 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
       // Query the loader before taking the watch lock. Loader callbacks can
       // enter application code on a different thread.
       auto location = locate_runtime_target(target);
-      RuntimeImageKey image_key{location.device, location.inode, location.bias,
+      RuntimeImageKey image_key{location.path, location.bias,
                                 location.unload_generation};
       std::unique_lock lock(watch.runtime_mutex);
       const auto enter = [&](const RuntimeBlock &block) {
@@ -4856,7 +4881,7 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
         location = locate_runtime_target(slot_value);
         lock.lock();
         target = slot_value;
-        image_key = {location.device, location.inode, location.bias, location.unload_generation};
+        image_key = {location.path, location.bias, location.unload_generation};
         if (image_key != stub_key.first)
           fresh.reset();
         if (watch.channel->reclaim_request.load(std::memory_order_acquire) ||
@@ -4867,7 +4892,7 @@ Address resolve_runtime_target(const Site *site, Address target) noexcept {
       // The resolved target key uses the current GOT value for PLT calls.
       const auto target_key = std::pair{image_key, target};
       const bool outside_plt_scope = from_plt && !location.main_image && image_key != plt_owner_key;
-      const auto scope_key = std::tuple{location.device, location.inode, location.bias, target};
+      const auto scope_key = std::tuple{location.path, location.bias, target};
       if (const auto cached = watch.runtime_scopes.find(scope_key); cached != watch.runtime_scopes.end()) {
         const auto &scope = *cached->second;
         if (watch.channel->scope_status(watch.event_buffer, watch.runtime_limit, scope.scope_index)
@@ -5313,7 +5338,7 @@ std::optional<Identity> lookup(std::uint64_t watch_id, std::uint64_t receiver) n
 } // namespace identity
 } // namespace tracer::object_cache
 
-extern "C" int tracer_agent_object_cache_v40(tracer::object_cache::Init *request) {
+extern "C" int tracer_agent_object_cache_v41(tracer::object_cache::Init *request) {
   try {
     tracer::object_cache::initialize(*request);
     return 0;

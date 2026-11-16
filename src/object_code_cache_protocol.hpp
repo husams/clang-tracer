@@ -104,8 +104,12 @@ struct CollectionPlan {
 };
 
 struct SharedFileIdentity {
+  // Display metadata only. Mapping validation uses the pathname of the pinned
+  // descriptor, including procfs's deleted suffix after unlink/replacement.
   std::uint64_t device = 0;
   std::uint64_t inode = 0;
+  std::array<char, 64> reference{};
+  bool active() const { return reference.front() != '\0'; }
 };
 
 struct ConstructorReturn { Address entry, return_pc; };
@@ -198,7 +202,7 @@ struct RuntimeAdmission {
   Address function = 0, patches = 0;
   std::size_t count = 0, scope = 0, width = 0;
   std::uint32_t module = 0;
-  Address device = 0, inode = 0, file_offset = 0;
+  Address file_offset = 0;
 };
 
 struct Channel {

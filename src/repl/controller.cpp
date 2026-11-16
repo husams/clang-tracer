@@ -1020,12 +1020,7 @@ void Controller::module_command(const Command &command) {
       if (::stat(mapped.c_str(), &file) != 0)
         throw std::invalid_argument("mapped ELF is unavailable locally");
       for (const auto &entry : reply.mappings()) {
-        if (entry.path() != mapped || entry.inode() != file.st_ino) continue;
-        const auto colon = entry.device().find(':');
-        if (colon == std::string::npos ||
-            std::stoul(entry.device().substr(0, colon), nullptr, 16) != major(file.st_dev) ||
-            std::stoul(entry.device().substr(colon + 1), nullptr, 16) != minor(file.st_dev))
-          continue;
+        if (entry.path() != mapped || entry.build_id().empty()) continue;
         build_id = entry.build_id();
         break;
       }

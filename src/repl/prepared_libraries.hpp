@@ -43,19 +43,6 @@ struct PreparedLibrary {
 #if defined(__linux__) && defined(__x86_64__)
 namespace prepared_library_detail {
 
-inline bool matches_device(std::string_view device, dev_t file_device) {
-  const auto colon = device.find(':');
-  if (colon == device.npos) return false;
-  const auto matches = [](std::string_view component, unsigned expected) {
-    unsigned number = 0;
-    const auto end = component.data() + component.size();
-    const auto parsed = std::from_chars(component.data(), end, number, 16);
-    return parsed.ec == std::errc{} && parsed.ptr == end && number == expected;
-  };
-  return matches(device.substr(0, colon), major(file_device)) &&
-         matches(device.substr(colon + 1), minor(file_device));
-}
-
 inline std::set<std::string> verified_exports(
     const std::string &path,
     const std::vector<const clangtracer::v1::ModuleMapping *> &mappings,
@@ -65,11 +52,6 @@ inline std::set<std::string> verified_exports(
   const auto close = llvm::make_scope_exit([fd] { ::close(fd); });
   struct stat file{};
   if (::fstat(fd, &file) != 0 || !S_ISREG(file.st_mode) || file.st_size <= 0) return {};
-  const auto mapping = std::find_if(mappings.begin(), mappings.end(), [&](const auto *entry) {
-    return entry->inode() == file.st_ino && matches_device(entry->device(), file.st_dev);
-  });
-  if (mapping == mappings.end()) return {};
-
   auto buffer = llvm::MemoryBuffer::getOpenFile(fd, path, file.st_size);
   if (!buffer) return {};
   auto binary = llvm::object::createBinary((*buffer)->getMemBufferRef());
@@ -80,8 +62,11 @@ inline std::set<std::string> verified_exports(
   const auto *object = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(binary->get());
   if (!object || object->getArch() != llvm::Triple::x86_64) return {};
   const auto &elf = object->getELFFile();
-  if (elf.getHeader().e_type != ET_DYN ||
-      llvm::toHex(llvm::object::getBuildID(object), true) != (*mapping)->build_id())
+  const auto id = llvm::toHex(llvm::object::getBuildID(object), true);
+  const auto mapping = std::find_if(mappings.begin(), mappings.end(), [&](const auto *entry) {
+    return entry->path() == path && !id.empty() && entry->build_id() == id;
+  });
+  if (elf.getHeader().e_type != ET_DYN || mapping == mappings.end())
     return {};
 
   auto programs = elf.program_headers();
@@ -169,7 +154,7 @@ inline std::map<std::vector<std::string>, PreparedLibrary> find_prepared_librari
   std::map<std::string, std::vector<const clangtracer::v1::ModuleMapping *>> candidates;
   for (const auto &entry : modules.mappings()) {
     const auto &path = entry.path();
-    if (entry.inode() && !entry.build_id().empty() && !path.empty() && path.front() == '/' &&
+    if (!entry.build_id().empty() && !path.empty() && path.front() == '/' &&
         path.find('\0') == path.npos)
       candidates[path].push_back(&entry);
   }
@@ -201,7 +186,7 @@ inline std::map<std::vector<std::string>, PreparedLibrary> find_prepared_librari
 inline clangtracer::v1::ListModulesResponse confirmed_local_mappings(
     clangtracer::v1::ListModulesResponse modules, std::istream &process_maps) {
 #if defined(__linux__) && defined(__x86_64__)
-  using Key = std::tuple<std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::string>;
+  using Key = std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>;
   const auto number = [](const std::string &text, int base, std::uint64_t &value) {
     const auto end = text.data() + text.size();
     const auto parsed = std::from_chars(text.data(), end, value, base);
@@ -216,18 +201,18 @@ inline clangtracer::v1::ListModulesResponse confirmed_local_mappings(
     if (!(row >> range >> permissions >> offset >> device >> inode)) continue;
     std::getline(row >> std::ws, path);
     const auto dash = range.find('-');
-    std::uint64_t begin = 0, end = 0, file_offset = 0, file_inode = 0;
+    std::uint64_t begin = 0, end = 0, file_offset = 0;
     if (path.empty() || path.front() != '/' || dash == range.npos ||
         !number(range.substr(0, dash), 16, begin) || !number(range.substr(dash + 1), 16, end) ||
-        !number(offset, 16, file_offset) || !number(inode, 10, file_inode))
+        !number(offset, 16, file_offset))
       continue;
-    local[Key{begin, end, file_offset, file_inode, std::move(device)}].push_back(std::move(path));
+    local[Key{begin, end, file_offset}].push_back(std::move(path));
   }
   std::vector<clangtracer::v1::ModuleMapping> kept;
   for (const auto &entry : modules.mappings()) {
-    if (entry.path().empty() || entry.inode() == 0) continue;
+    if (entry.path().empty()) continue;
     const auto candidates = local.find(Key{entry.begin_address(), entry.end_address(),
-                                           entry.file_offset(), entry.inode(), entry.device()});
+                                           entry.file_offset()});
     if (candidates == local.end()) continue;
     const auto &raw = candidates->second;
     if (std::find(raw.begin(), raw.end(), entry.path()) != raw.end() ||

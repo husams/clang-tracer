@@ -1,4 +1,5 @@
 #include "admission.hpp"
+#include "mapped_elf.hpp"
 
 #include <algorithm>
 #include <array>
@@ -141,12 +142,6 @@ struct Mapping {
   std::string path;
   std::string canonical_path;
 };
-
-bool matches_file(const Mapping &mapping, const struct stat &file) {
-  return mapping.inode == file.st_ino &&
-         mapping.device_major == major(file.st_dev) &&
-         mapping.device_minor == minor(file.st_dev);
-}
 
 std::vector<Mapping> read_mappings(pid_t pid) {
   std::ifstream input("/proc/" + std::to_string(pid) + "/maps");
@@ -506,46 +501,42 @@ load_image_fd(const std::string &path, int fd, const std::vector<Mapping> &maps,
       fd, file_size, names.sh_offset, names.sh_size, "ELF section names");
   const char *strtab = reinterpret_cast<const char *>(section_names.data());
   const bool runtime = startup_symbols == StartupSymbolSet::runtime;
-  const auto first_mapping = std::find_if(maps.begin(), maps.end(), same_file);
-  bool runtime_identity = !runtime || matches_file(*first_mapping, st);
-  if (runtime && std::any_of(first_mapping, maps.end(), [&](const Mapping &m) {
-        return same_file(m) &&
-               (m.inode != first_mapping->inode ||
-                m.device_major != first_mapping->device_major ||
-                m.device_minor != first_mapping->device_minor);
-      })) {
-    unavailable("target glibc path refers to multiple mapped files");
+  bool runtime_identity = !runtime;
+  if (runtime && runtime_pid > 0) {
+    const auto bytes = read_file_bytes(fd, file_size, 0, file_size, "runtime ELF content");
+    const llvm::StringRef contents(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+    auto binary = llvm::object::createBinary(llvm::MemoryBufferRef(contents, path));
+    if (!binary)
+      unavailable(llvm::toString(binary.takeError()));
+    const auto *object = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(binary->get());
+    runtime_identity = object && ::tracer::detail::matches_mapped_elf(*object, image.bias,
+        [&](auto address, auto expected) {
+          const auto offset = static_cast<std::uint64_t>(expected.data() - contents.data());
+          const auto mapping = std::find_if(maps.begin(), maps.end(), [&](const Mapping &m) {
+            return same_file(m) && m.readable && address >= m.begin && address < m.end &&
+                expected.size() <= m.end - address && offset >= m.offset &&
+                offset - m.offset == address - m.begin;
+          });
+          if (mapping == maps.end())
+            return false;
+          std::array<char, 4096> live{};
+          while (!expected.empty()) {
+            const auto size = std::min(expected.size(), live.size());
+            iovec local{live.data(), size}, remote{reinterpret_cast<void *>(address), size};
+            if (::tracer::linux_api::process_vm_readv(runtime_pid, &local, 1, &remote, 1, 0) !=
+                    static_cast<ssize_t>(size) ||
+                std::string_view(live.data(), size) != expected.substr(0, size))
+              return false;
+            address += size;
+            expected.remove_prefix(size);
+          }
+          return true;
+        });
   }
   for (unsigned i = 0; i < eh.e_shnum; ++i) {
     if (sh[i].sh_name < names.sh_size) {
       const char *name = strtab + sh[i].sh_name;
       const auto rem = names.sh_size - sh[i].sh_name;
-      // OverlayFS may expose the backing device or inode in /proc/maps.
-      // In that case corroborate the ELF against the mapped GNU build ID.
-      const auto &section = sh[i];
-      if (!runtime_identity && runtime_pid > 0 &&
-          std::memchr(name, 0, rem) && std::strcmp(name, ".note.gnu.build-id") == 0 &&
-          section.sh_type == SHT_NOTE && section.sh_size >= 32 && section.sh_size <= 128 &&
-          section.sh_addr <= std::numeric_limits<std::uint64_t>::max() - image.bias) {
-        const auto address = image.bias + section.sh_addr;
-        const auto mapping = std::find_if(maps.begin(), maps.end(), [&](const Mapping &m) {
-          return same_file(m) && m.readable && address >= m.begin && address < m.end &&
-                 section.sh_size <= m.end - address && section.sh_offset >= m.offset &&
-                 section.sh_offset - m.offset == address - m.begin;
-        });
-        if (mapping != maps.end()) {
-          const auto note = read_file_bytes(fd, file_size, section.sh_offset,
-                                            section.sh_size, "runtime ELF build ID");
-          std::array<unsigned char, 128> live{};
-          iovec local{live.data(), note.size()};
-          iovec remote{reinterpret_cast<void *>(address), note.size()};
-          runtime_identity =
-              ::tracer::linux_api::process_vm_readv(runtime_pid, &local, 1,
-                                                   &remote, 1, 0) ==
-                  static_cast<ssize_t>(note.size()) &&
-              std::equal(note.begin(), note.end(), live.begin());
-        }
-      }
       if (std::memchr(name, 0, rem) && std::strcmp(name, ".eh_frame") == 0 &&
           sh[i].sh_type != SHT_NOBITS) {
         if (sh[i].sh_offset > file_size ||
@@ -1336,7 +1327,7 @@ std::vector<std::string> target_runtime_companions(
         throw std::runtime_error("target already maps a different " +
                                  std::string(soname));
       }
-      if (!mapped && !matches_file(mapping, file) &&
+      if (!mapped &&
           load_image(canonical, maps, StartupSymbolSet::runtime, pid).soname != soname) {
         throw std::runtime_error("cannot verify mapped glibc companion " + path);
       }

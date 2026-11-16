@@ -185,8 +185,7 @@ private:
   std::vector<MemoryPatchRecord> memory_patches_;
   struct AllocationRecord {
     clangtracer::v1::MemoryAllocation value;
-    std::string device;
-    std::uint64_t inode = 0;
+    std::string path;
   };
   std::vector<AllocationRecord> allocations_;
   std::map<std::string, std::uintptr_t> resident_libraries_;

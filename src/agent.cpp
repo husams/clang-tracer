@@ -2740,7 +2740,7 @@ bool prepare_context_pthread(Agent &owner, Probe &probe, std::string &error) {
   }
   struct stat module_status{};
   if (::stat(module.dli_fname, &module_status) != 0 ||
-      !S_ISREG(module_status.st_mode) || module_status.st_ino == 0) {
+      !S_ISREG(module_status.st_mode)) {
     error = "pthread_create ELF module identity could not be verified";
     return false;
   }

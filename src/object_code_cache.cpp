@@ -36,6 +36,7 @@
 #include "object_watch_plan.hpp"
 #include "object_watch.hpp"
 #include "proc_identity.hpp"
+#include "mapped_path.hpp"
 #include "tracer/protocol.hpp"
 
 namespace tracer::object_cache {
@@ -53,12 +54,15 @@ struct SharedFile {
       throw std::invalid_argument("shared-file capture requires an absolute server-local path");
     descriptor = ::open(path.c_str(), O_PATH | O_CLOEXEC);
     struct stat info{};
-    if (descriptor < 0 || ::fstat(descriptor, &info) || !S_ISREG(info.st_mode) || !info.st_ino) {
+    if (descriptor < 0 || ::fstat(descriptor, &info) || !S_ISREG(info.st_mode)) {
       if (descriptor >= 0)
         ::close(descriptor);
       throw std::invalid_argument("cannot pin the regular file selected for shared storage");
     }
-    identity = {info.st_dev, info.st_ino};
+    identity.device = info.st_dev;
+    identity.inode = info.st_ino;
+    const auto reference = "/proc/" + std::to_string(::getpid()) + "/fd/" + std::to_string(descriptor);
+    std::copy(reference.begin(), reference.end(), identity.reference.begin());
   }
   ~SharedFile() {
     if (descriptor >= 0)
@@ -70,7 +74,7 @@ struct SharedFile {
 }
 
 std::uintptr_t load_agent(injector::Process &process, const std::string &path) {
-  constexpr char export_name[] = "tracer_agent_object_cache_v40";
+  constexpr char export_name[] = "tracer_agent_object_cache_v41";
   const auto size = std::max(path.size() + 1, sizeof(export_name));
   const auto memory = process.remote_allocate(size);
   std::uintptr_t entry = 0;
@@ -322,7 +326,7 @@ api::ModuleMapping code_mapping(const api::ListModulesResponse &maps,
   for (const auto &mapping : maps.mappings())
     if (mapping.path() == path && mapping.begin_address() <= pc &&
         pc < mapping.end_address() && size <= mapping.end_address() - pc &&
-        mapping.inode() && (allow_without_build_id || !mapping.build_id().empty()))
+        (allow_without_build_id || !mapping.build_id().empty()))
       return mapping;
   throw std::runtime_error("code-cache patch has no verified live file-backed executable mapping");
 }
@@ -357,7 +361,6 @@ struct Watch::Impl {
   std::map<Address, object_watch::Source> sources;
   std::string path;
   Channel *channel = nullptr;
-  struct stat channel_identity{};
   const SharedFile shared_file;
   const std::size_t event_buffer;
   const std::size_t runtime_limit;
@@ -696,7 +699,7 @@ struct Watch::Impl {
       throw std::runtime_error("cannot create a private code-cache event channel");
     void *memory = MAP_FAILED;
     const auto size = Channel::mapping_size(event_buffer, runtime_limit);
-    if (::fstat(fd, &channel_identity) == 0 && ::ftruncate(fd, size) == 0)
+    if (::ftruncate(fd, size) == 0)
       memory = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     ::close(fd);
     if (memory == MAP_FAILED) {
@@ -1714,7 +1717,7 @@ struct Watch::Impl {
     item.set_borrow_id(sample.borrow_id);
     item.set_storage_generation(sample.storage_generation);
     item.set_concrete_type(request.concrete_type());
-    item.set_external_write_order_unknown(shared_file.identity.inode != 0);
+    item.set_external_write_order_unknown(shared_file.identity.active());
     if (sample.has_shared_file_offset) {
       auto &storage = *item.mutable_shared_storage();
       storage.set_device(shared_file.identity.device);
@@ -1826,7 +1829,7 @@ struct Watch::Impl {
       item.set_diagnostic("receiver admission limit reached");
     if (sample.hook == Hook::owner_remove && sample.gap)
       item.set_diagnostic("previous membership absent at transfer boundary");
-    if (plan.layout.scoped_storage() || plan.layout.union_tag_offset || shared_file.identity.inode)
+    if (plan.layout.scoped_storage() || plan.layout.union_tag_offset || shared_file.identity.active())
       item.set_synchronization(request.synchronization());
     if (sample.hook == Hook::collection_bound || sample.hook == Hook::collection_suspend) {
       item.set_destination(sample.destination);
@@ -1974,7 +1977,7 @@ struct Watch::Impl {
     observation.set_kind(kind);
     observation.set_concrete_type(request.concrete_type());
     observation.set_source_unavailable(true);
-    observation.set_external_write_order_unknown(shared_file.identity.inode != 0);
+    observation.set_external_write_order_unknown(shared_file.identity.active());
     observation.set_closure_reason(reason);
     try {
       publish(std::move(event));
@@ -2242,18 +2245,21 @@ struct Watch::Impl {
           unsigned long long begin, end, offset, inode;
           unsigned device_major, device_minor;
           char permissions[5]{};
-          if (std::sscanf(line.c_str(), "%llx-%llx %4s %llx %x:%x %llu",
-                          &begin, &end, permissions, &offset, &device_major, &device_minor, &inode) != 7)
+          int path_offset = 0;
+          if (std::sscanf(line.c_str(), "%llx-%llx %4s %llx %x:%x %llu %n",
+                          &begin, &end, permissions, &offset, &device_major, &device_minor, &inode,
+                          &path_offset) != 7)
             continue;
-          same_channel |= inode == channel_identity.st_ino &&
-              device_major == major(channel_identity.st_dev) && device_minor == minor(channel_identity.st_dev);
+          const auto mapped_path = tracer::detail::canonical_mapped_path(line.substr(path_offset));
+          same_channel |= mapped_path == path && offset == 0 &&
+              end - begin >= Channel::mapping_size(event_buffer, runtime_limit) &&
+              std::string_view(permissions) == "rw-s";
           same_code |= begin <= start && start < end && width <= end - start &&
               permissions[0] == 'r' && permissions[1] == '-' && permissions[2] == 'x' &&
-              inode == admission.inode && device_major == major(admission.device) &&
-              device_minor == minor(admission.device) && start - begin <= admission.file_offset &&
+              mapped_path == module_path && start - begin <= admission.file_offset &&
               admission.file_offset - (start - begin) == offset;
           if (permissions[0] == 'r' && permissions[1] == '-' &&
-              permissions[2] == 'x' && permissions[3] == 'p' && !inode)
+              permissions[2] == 'x' && permissions[3] == 'p' && line.substr(path_offset).empty())
             gateways.emplace_back(begin, end);
         }
         if (!same_channel || !same_code)
@@ -2318,7 +2324,6 @@ struct Watch::Impl {
       if (current.begin_address() != prior.begin_address() ||
           current.end_address() != prior.end_address() ||
           current.file_offset() != prior.file_offset() ||
-          current.device() != prior.device() || current.inode() != prior.inode() ||
           current.build_id() != prior.build_id())
         throw std::runtime_error("live mapping identity changed at a code-cache redirect");
     }
@@ -2674,12 +2679,13 @@ bool Watch::retire_if_mapping_changed(std::chrono::steady_clock::time_point dead
     unsigned long long begin, end, offset, inode;
     unsigned dev_major, dev_minor;
     char permissions[5]{};
-    if (std::sscanf(line.c_str(), "%llx-%llx %4s %llx %x:%x %llu",
-                    &begin, &end, permissions, &offset, &dev_major, &dev_minor, &inode) != 7)
+    int path_offset = 0;
+    if (std::sscanf(line.c_str(), "%llx-%llx %4s %llx %x:%x %llu %n",
+                    &begin, &end, permissions, &offset, &dev_major, &dev_minor, &inode,
+                    &path_offset) != 7)
       return false;
     live_ranges.emplace_back(begin, end);
-    if (inode == p.channel_identity.st_ino && dev_major == major(p.channel_identity.st_dev) &&
-        dev_minor == minor(p.channel_identity.st_dev))
+    if (tracer::detail::canonical_mapped_path(line.substr(path_offset)) == p.path)
       return false;
     if (permissions[2] == 'x' && std::any_of(std::begin(p.redirects), std::end(p.redirects), [&](const auto &redirect) {
           return redirect.translated_pc() >= begin && redirect.translated_pc() < end;
@@ -2777,7 +2783,7 @@ api::ObjectWatchStatus Watch::status() const {
   report.set_store_sites(p.admitted_stores);
   report.set_unsupported_sites(p.plan.unsupported);
   report.set_no_values(p.request.no_values());
-  report.set_external_write_order_unknown(p.shared_file.identity.inode != 0);
+  report.set_external_write_order_unknown(p.shared_file.identity.active());
   const auto received = p.head.load(std::memory_order_acquire);
   const auto total = received + p.final_observations.load(std::memory_order_acquire);
   const auto errors = std::min(total, p.publish_errors.load(std::memory_order_relaxed));
@@ -2824,7 +2830,7 @@ api::ObjectWatchStatus Watch::preview() const {
   report.set_store_sites(p.admitted_stores);
   report.set_unsupported_sites(p.plan.unsupported);
   report.set_no_values(p.request.no_values());
-  report.set_external_write_order_unknown(p.shared_file.identity.inode != 0);
+  report.set_external_write_order_unknown(p.shared_file.identity.active());
   report.set_diagnostic(!p.runtime_calls.empty() ? "verified call redirects; callees resolve at runtime" :
       p.fragmented_writer ? "verified native writer fragments and redirect windows" :
       p.plan.layout.scoped_storage() ? "verified native scoped storage and redirect windows" :

@@ -809,6 +809,24 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:repl-browser-target> $<TARGET_FILE:call-stacks-calculator>)
       set_tests_properties(native_repl_browser_integration PROPERTIES TIMEOUT 100)
+      add_library(stat-identity-shim SHARED tests/stat_identity_shim.cpp)
+      target_link_libraries(stat-identity-shim PRIVATE ${CMAKE_DL_LIBS})
+      # Older glibc headers inline stat/fstat at optimized call sites.
+      target_compile_options(stat-identity-shim PRIVATE -O0)
+      foreach(_identity_case device device_inode)
+        set(_identity_env "TRACER_TEST_IDENTITY_SHIM=$<TARGET_FILE:stat-identity-shim>"
+          "TRACER_TEST_REPL=$<TARGET_FILE:clang-tracer-repl>")
+        if(_identity_case STREQUAL "device_inode")
+          list(APPEND _identity_env "TRACER_TEST_DIFFERENT_INODE=1")
+        endif()
+        add_test(NAME native_repl_mapping_${_identity_case}_mismatch
+          COMMAND "${CMAKE_COMMAND}" -E env ${_identity_env}
+            "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_browser_integration.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/identity_mismatch_repl.sh" $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:repl-browser-target> $<TARGET_FILE:call-stacks-calculator>)
+        set_tests_properties(native_repl_mapping_${_identity_case}_mismatch PROPERTIES TIMEOUT 100)
+      endforeach()
+
       add_executable(repl-memory-target tests/fixtures/repl_memory.cpp)
       add_test(NAME native_repl_memory_integration
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_memory_integration.py"
