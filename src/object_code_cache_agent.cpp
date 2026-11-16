@@ -5256,10 +5256,33 @@ std::optional<Identity> lookup(std::uint64_t watch_id, std::uint64_t receiver) n
         return Identity{life.id, life.generation};
       return std::nullopt;
     }
+    if (!watch->provisional_method_watch)
+      return Identity{};
     if (const auto history = watch->generations.find(receiver);
-        history != watch->generations.end() && history->second.observed &&
-        !history->second.uncertain_live && !history->second.provisional_live)
+        history != watch->generations.end() &&
+        (history->second.uncertain_live || history->second.provisional_live))
+      return Identity{};
+
+    // A method can observe a receiver constructed without a hooked entry,
+    // including a trivial copy in storage used by an earlier lifetime.
+    identity_lock.unlock();
+    const std::lock_guard lock(watch->mutex);
+    const std::unique_lock exclusive_lock(watch->identity_mutex);
+    if (!(watch->static_gate.load(std::memory_order_acquire) & enabled) ||
+        !watch->channel->registration_active.load(std::memory_order_acquire))
       return std::nullopt;
+    if (const auto found = watch->lifetimes.find(receiver); found != watch->lifetimes.end()) {
+      const auto &life = found->second;
+      if (life.id && life.generation)
+        return Identity{life.id, life.generation};
+      return std::nullopt;
+    }
+    auto &history = watch->generations[receiver];
+    if (!history.uncertain_live && !history.provisional_live) {
+      history.observed = true;
+      history.provisional_live = true;
+      history.provisional_reason = ProvisionalReason::unobserved_construction;
+    }
     return Identity{};
   } catch (...) {
     return std::nullopt;
@@ -5279,7 +5302,7 @@ extern "C" int tracer_agent_object_cache_v40(tracer::object_cache::Init *request
 }
 
 #if defined(__aarch64__)
-extern "C" int tracer_agent_arm_snapshot_v2(tracer::arm_snapshot::Init *request) {
+extern "C" int tracer_agent_arm_snapshot_v3(tracer::arm_snapshot::Init *request) {
   try {
     tracer::object_cache::initialize(request->code, request);
     return 0;

@@ -919,23 +919,24 @@ void run_preparer(std::vector<std::string> arguments, const char *failure) {
   // output continues to stream while the child is running.
   const auto failure_prefix = tracer::prepared::preparer_failure_prefix;
   std::string line_prefix, failure_reason;
-  bool at_line_start = true, terminal_diagnostic = false;
+  bool at_line_start = true, saw_failure = false, capturing_reason = false;
   const auto relay_stderr = [&](std::string_view bytes) {
     while (!bytes.empty()) {
-      if (terminal_diagnostic) {
-        failure_reason.append(bytes);
-        return;
-      }
       const auto newline = bytes.find('\n');
-      const auto length = newline == bytes.npos ? bytes.size() : newline + 1;
+      const bool complete_line = newline != bytes.npos;
+      const auto length = complete_line ? newline + 1 : bytes.size();
       const auto part = bytes.substr(0, length);
       bytes.remove_prefix(length);
-      if (at_line_start) {
+      if (capturing_reason) {
+        failure_reason.append(part);
+        capturing_reason = !complete_line;
+      } else if (at_line_start && !saw_failure) {
         line_prefix.append(part);
         if (failure_prefix.starts_with(line_prefix) && line_prefix.size() < failure_prefix.size())
           continue;
         if (line_prefix.starts_with(failure_prefix)) {
-          terminal_diagnostic = true;
+          saw_failure = true;
+          capturing_reason = !complete_line;
           failure_reason.assign(line_prefix, failure_prefix.size());
         } else {
           std::cerr << line_prefix;
@@ -944,7 +945,7 @@ void run_preparer(std::vector<std::string> arguments, const char *failure) {
       } else {
         std::cerr << part;
       }
-      at_line_start = newline != bytes.npos;
+      at_line_start = complete_line;
     }
   };
   int read_error = 0;
@@ -1004,7 +1005,7 @@ void run_preparer(std::vector<std::string> arguments, const char *failure) {
   if (read_error)
     throw std::system_error(read_error, std::generic_category(), "cannot read native preparation diagnostics");
   if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-    if (terminal_diagnostic)
+    if (saw_failure)
       std::cerr << failure_prefix << failure_reason;
     return;
   }

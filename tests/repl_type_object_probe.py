@@ -86,6 +86,8 @@ def run(args):
         single_image_target = build / "counter-target-single-image"
         hidden_source = root / "hidden-derived.cpp"
         hidden_object = build / "hidden-derived.o"
+        nodebug_source = root / "nodebug-derived.cpp"
+        nodebug_object = build / "nodebug-derived.o"
         unit_source = root / "type-unit.cpp"
         unit_object = build / "type-unit.o"
         package = root / "counter.object"
@@ -200,6 +202,23 @@ hidden_derived_roundtrip(int initial) {
   return object.roundtrip(initial + 1);
 }
 """)
+        nodebug_source.write_text("""#include "counter.hpp"
+#ifdef __clang__
+namespace {
+struct NodebugDerived : demo::IdentityC1EBase {
+  int extra;
+  __attribute__((nodebug, always_inline)) NodebugDerived()
+      : demo::IdentityC1EBase(2), extra(3) {}
+};
+}
+extern "C" int nodebug_derived_roundtrip() {
+  NodebugDerived object;
+  return object.get() + object.extra;
+}
+#else
+extern "C" int nodebug_derived_roundtrip() { return 5; }
+#endif
+""")
         unit_source.write_text("""#include "counter.hpp"
 namespace demo {
 struct UnitDerived : UnitBase { int extra; };
@@ -250,6 +269,13 @@ identity_main_roundtrip(int initial) {
   return identity_get_through_c(&object);
 }
 extern "C" int hidden_derived_roundtrip(int);
+extern "C" int nodebug_derived_roundtrip();
+extern "C" __attribute__((noinline)) void copy_reused_receiver(int *sum) {
+  demo::IdentityC1EBase original(5);
+  demo::IdentityC1EBase copied = original;
+  copied.set(7);
+  *sum += original.get() + copied.get();
+}
 int main() {
   if (::prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) != 0 ||
       ::fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK) != 0)
@@ -290,8 +316,15 @@ int main() {
       }
       std::cout << \"IDENTITY_MAIN=\" << result
                 << \" EXTERN_C=\" << identity_main_roundtrip(60) << std::endl;
+    } else if (command == 't') {
+      int sum = 0;
+      for (int iteration = 0; iteration < 7; ++iteration)
+        copy_reused_receiver(&sum);
+      std::cout << "COPIED=" << sum << std::endl;
     } else if (command == 'h') {
       std::cout << \"HIDDEN_DERIVED=\" << hidden_derived_roundtrip(50) << std::endl;
+    } else if (command == 'n') {
+      std::cout << "NODEBUG_DERIVED=" << nodebug_derived_roundtrip() << std::endl;
     } else if (command == 'u') {
       delete unobserved_identity;
       unobserved_identity = nullptr;
@@ -417,15 +450,20 @@ public:
         subprocess.run(compile_args, cwd=build, check=True)
         compiler_version = subprocess.run([str(args.cxx), "--version"], check=True, text=True,
                                            stdout=subprocess.PIPE).stdout.lower()
-        line_table_flag = "-gline-tables-only" if "clang" in compiler_version else "-g1"
+        clang = "clang" in compiler_version
+        line_table_flag = "-gline-tables-only" if clang else "-g1"
         subprocess.run([str(args.cxx), "-std=c++20", line_table_flag, "-O2", "-fPIC",
                         "-fpatchable-function-entry=8", f"-I{generated}", f"-I{root}",
                         "-DCOUNTER_PAD_BYTES=13", "-c", str(hidden_source),
                         "-o", str(hidden_object)], cwd=build, check=True)
+        nodebug_flags = ["-fno-standalone-debug"] if clang else []
+        subprocess.run([str(args.cxx), "-std=c++20", "-g", "-O2", "-fPIC", *nodebug_flags,
+                        f"-I{generated}", f"-I{root}", "-c", str(nodebug_source),
+                        "-o", str(nodebug_object)], cwd=build, check=True)
         subprocess.run([*compile_args[:-4], "-gdwarf-4", "-fdebug-types-section",
                         "-c", str(unit_source), "-o", str(unit_object)], cwd=build, check=True)
         subprocess.run([str(args.cxx), "-shared", "-Wl,-Bsymbolic-functions", str(build / "counter.o"),
-                        str(hidden_object), str(unit_object), "-o", str(library)],
+                        str(hidden_object), str(nodebug_object), str(unit_object), "-o", str(library)],
                        cwd=build, check=True)
         subprocess.run([str(args.cxx), "-std=c++20", "-g", "-O0", "-fno-inline",
                         "-fpatchable-function-entry=8",
@@ -435,7 +473,8 @@ public:
         subprocess.run([str(args.cxx), "-std=c++20", "-g", "-O0", "-fno-inline",
                         "-fpatchable-function-entry=8", f"-I{generated}", f"-I{root}",
                         "-DCOUNTER_PAD_BYTES=13", str(driver), str(build / "counter.o"),
-                        str(hidden_object), str(unit_object), "-o", str(single_image_target)],
+                        str(hidden_object), str(nodebug_object), str(unit_object),
+                        "-o", str(single_image_target)],
                        cwd=build, check=True)
         nm = subprocess.run(["nm", "-D", "-C", "--defined-only", str(library)],
                             check=True, text=True, stdout=subprocess.PIPE).stdout
@@ -455,7 +494,7 @@ public:
                                       stdout=subprocess.PIPE).stdout
         assert "DW_TAG_compile_unit" in hidden_dwarf and "DW_AT_stmt_list" in hidden_dwarf, hidden_dwarf
         assert not re.search(r"DW_TAG_(?:class_type|structure_type)", hidden_dwarf), hidden_dwarf
-        if line_table_flag == "-gline-tables-only":
+        if clang:
             top_level = re.findall(
                 r"^ *<1><[0-9a-f]+>:[^\n]*\(DW_TAG_subprogram\)\n(.*?)(?=^ *<\d+><|\Z)",
                 hidden_dwarf, re.M | re.S)
@@ -463,6 +502,16 @@ public:
                        and "DW_AT_linkage_name" not in fields
                        and "DW_AT_object_pointer" not in fields
                        for fields in top_level), hidden_dwarf
+            nodebug_dwarf = subprocess.check_output(
+                ["readelf", "--debug-dump=info", "--wide", str(nodebug_object)], text=True)
+            nodebug_structs = re.findall(
+                r"\(DW_TAG_structure_type\)\n(.*?)(?=^ *<\d+><|\Z)", nodebug_dwarf, re.M | re.S)
+            nodebug_declarations = [
+                fields for fields in nodebug_structs
+                if re.search(r"DW_AT_name[^\n]*\bNodebugDerived$", fields, re.M)]
+            assert len(nodebug_declarations) == 1 and "DW_AT_declaration" in nodebug_declarations[0], nodebug_dwarf
+            nodebug_symbols = subprocess.check_output(["nm", "-C", str(nodebug_object)], text=True)
+            assert "NodebugDerived::NodebugDerived" not in nodebug_symbols, nodebug_symbols
         hidden_lines = subprocess.run(["readelf", "--debug-dump=decodedline", "--wide",
                                        str(hidden_object)], check=True, text=True,
                                       stdout=subprocess.PIPE).stdout
@@ -481,6 +530,11 @@ public:
                                         stdout=subprocess.PIPE).stdout
         assert "HiddenDerived::HiddenDerived(int)" in hidden_symbols, hidden_symbols
         assert "HiddenDerived::roundtrip(int)" not in hidden_symbols, hidden_symbols
+        disassembly = subprocess.check_output(["objdump", "-d", "-C", str(library)], text=True)
+        assert re.search(
+            r"^[0-9a-f]+ <[^\n>]*HiddenDerived::HiddenDerived[^\n>]*>:\n"
+            r"(?:(?!\n\n)[\s\S])*?\b(?:callq?|bl)\s+[^\n]*"
+            r"<demo::IdentityC1EBase::IdentityC1EBase\(int\)>", disassembly, re.M), disassembly
         target_dwarf = subprocess.run(["readelf", "--debug-dump=info", "--wide", str(target)],
                                       check=True, text=True, stdout=subprocess.PIPE).stdout
         for caller in ("identity_main_roundtrip", "identity_set_through_c",
@@ -491,7 +545,7 @@ public:
             ["readelf", "--relocs", "--wide", str(single_image_target)], check=True,
             text=True, stdout=subprocess.PIPE).stdout
         assert c1_symbol not in single_image_relocations, single_image_relocations
-        for path in (header, source, hidden_source, unit_source, callbacks, bad_callbacks,
+        for path in (header, source, hidden_source, nodebug_source, unit_source, callbacks, bad_callbacks,
                      generated / "counter_build_config.hpp"):
             shutil.move(path, hidden / path.name)
             assert not path.exists()
@@ -640,6 +694,40 @@ public:
             assert identity in combined_lifetimes
             assert combined_lifetimes[identity] < single_combined_events.index(event) < combined_teardowns[identity]
 
+        copy_cursor = single_combined_record[2]
+        for case, copy_binding in (("method", single_method_binding), ("combined", single_combined_binding)):
+            send(single_repl, f"%object-probe start {copy_binding}")
+            copy_registration = single_out.expect(r"^object-probe registration=(\d+) active=yes methods=1")[1]
+            copy_probe = single_out.expect(r"method_probe=(\d+) active=yes")[1]
+            send(single_repl, f"%record {case}-copies.db --sqlite --after {copy_cursor} --timeout 2")
+            send(single_process, "t")
+            single_app.expect(r"^COPIED=84$")
+            copy_cursor = single_out.expect(
+                rf"^received=\d+ cursor=(\d+) .*timed_out=true .*recording={case}-copies.db")[1]
+            send(single_repl, f"%events open {case}-copies.db --as copies_{case}")
+            single_out.expect(r"^opened events=[1-9]\d* ")
+            send(single_repl, f"%events export copies_{case} --format json --output {case}-copies.json")
+            send(single_repl, f"%object-probe stop {copy_registration}")
+            single_out.expect(rf"^object-probe registration={copy_registration} active=no .*restoration_pending=no")
+            copy_events = json.loads((root / f"{case}-copies.json").read_text())
+            invocations = [event for event in copy_events if event.get("probeId") == copy_probe]
+            originals = [event for event in invocations if int(scalar(event["result"])) == 5]
+            copies = [event for event in invocations if int(scalar(event["result"])) == 7]
+            assert len(originals) == len(copies) == 7, invocations
+            assert all(int(event_fields(event)["object_id"]) > 0
+                       and int(event_fields(event)["identity_verified"]) == 1
+                       for event in originals), originals
+            assert all(int(event_fields(event)[field]) == 0 for event in copies
+                       for field in ("object_id", "object_generation", "identity_verified")), copies
+            addresses = {event["objectAddress"] for event in copies}
+            assert len(addresses) == 1, copies
+            teardown = [event["objectObservation"] for event in copy_events
+                        if event.get("objectAddress") in addresses and "objectObservation" in event]
+            assert [event["kind"] for event in teardown] == ["DESTROY_BEGIN", "TEARDOWN_END"] * 7, teardown
+            assert all(not int(event.get("lifetimeId", 0)) and not int(event.get("generation", 0))
+                       and event["diagnostic"] == "provisional destructor boundary for a receiver whose construction was not observed"
+                       for event in teardown), teardown
+
         send(single_process, "q")
         send(single_repl, "%quit")
         assert single_repl.wait(timeout=10) == 0, "".join(single_out.seen[-15:])
@@ -750,6 +838,9 @@ public:
         send(repl, f"%record hidden-method-only.db --sqlite --timeout 2 --after {identity_record[1]}")
         send(target_process, "h")
         app.expect(r"^HIDDEN_DERIVED=51$")
+        if clang:
+            send(target_process, "n")
+            app.expect(r"^NODEBUG_DERIVED=5$")
         hidden_method_record = out.expect(
             r"^received=(\d+) cursor=(\d+) .*timed_out=true .*recording=hidden-method-only.db")
         assert int(hidden_method_record[1]) > 0, hidden_method_record.string
@@ -768,7 +859,7 @@ public:
                        for observation in hidden_method_observations), hidden_method_events
         hidden_method_calls = [event for event in hidden_method_events
                                if event.get("probeId") == hidden_method_probe]
-        assert hidden_method_calls, hidden_method_events
+        assert len(hidden_method_calls) == (2 if clang else 1), hidden_method_events
         for event in hidden_method_calls:
             values = event_fields(event)
             assert int(values["object_id"]) == int(values["object_generation"]) == 0, event
@@ -777,10 +868,12 @@ public:
                                        if event.get("objectObservation", {}).get("kind") == "DESTROY_BEGIN"]
         hidden_method_teardown_end = [event for event in hidden_method_events
                                       if event.get("objectObservation", {}).get("kind") == "TEARDOWN_END"]
-        assert len(hidden_method_destroy_begin) == len(hidden_method_teardown_end) == 1, hidden_method_events
-        assert hidden_method_destroy_begin[0]["objectAddress"] == hidden_method_teardown_end[0]["objectAddress"]
-        assert hidden_method_teardown_end[0]["objectObservation"].get("closureReason") == "DESTRUCTOR_RETURN"
-        for event in (hidden_method_destroy_begin[0], hidden_method_teardown_end[0]):
+        assert len(hidden_method_destroy_begin) == len(hidden_method_teardown_end) == len(hidden_method_calls)
+        assert [event["objectAddress"] for event in hidden_method_destroy_begin] == [
+            event["objectAddress"] for event in hidden_method_teardown_end]
+        assert all(event["objectObservation"].get("closureReason") == "DESTRUCTOR_RETURN"
+                   for event in hidden_method_teardown_end), hidden_method_events
+        for event in hidden_method_destroy_begin + hidden_method_teardown_end:
             observation = event["objectObservation"]
             assert int(observation.get("lifetimeId", 0)) == int(observation.get("generation", 0)) == 0
             assert observation.get("diagnostic") == (

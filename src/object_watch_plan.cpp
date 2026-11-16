@@ -206,7 +206,9 @@ CallerKind classify_linkage_name(std::string_view linkage) {
       return CallerKind::unknown;
     return CallerKind::ordinary;
   }
-  const std::string storage(linkage);
+  // Compiler-created cold and specialized clones keep the mangled callable
+  // before the first suffix, including its constructor/destructor variant.
+  const std::string storage(linkage.substr(0, linkage.find('.')));
   llvm::ItaniumPartialDemangler parsed;
   if (parsed.partialDemangle(storage.c_str()))
     return CallerKind::unknown;
@@ -2214,9 +2216,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     };
     if (pid) {
       try {
-        const auto application_modules = injector::discover_application_modules(static_cast<pid_t>(pid));
-        for (const auto &module : application_modules) {
-          const auto path = module.path();
+        for (const auto &path : injector::mapped_application_files(static_cast<pid_t>(pid))) {
           const auto normalized = normalize_path(path);
           if (normalized == selected_path || (main_ && normalized == normalize_path(main_->path)))
             continue;
@@ -2288,6 +2288,54 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         return CallerKind::unknown;
       return classify_linkage_name(symbols.begin()->first);
     };
+    std::map<std::string, bool> defined_records;
+    const auto unresolved_records = [&](DWARFDie function) {
+      std::vector<DWARFDie> scopes{function};
+      while (!scopes.empty()) {
+        const auto scope = scopes.back();
+        scopes.pop_back();
+        for (const auto child : scope.children()) {
+          const auto tag = child.getTag();
+          if (tag == dw::DW_TAG_lexical_block || tag == dw::DW_TAG_inlined_subroutine)
+            scopes.push_back(child);
+          if (tag != dw::DW_TAG_variable && tag != dw::DW_TAG_formal_parameter)
+            continue;
+          auto referred = child.resolveReferencedType(dw::DW_AT_type);
+          std::set<DWARFDie> seen;
+          while (referred && seen.insert(referred).second) {
+            const auto kind = referred.getTag();
+            if (kind != dw::DW_TAG_typedef && kind != dw::DW_TAG_const_type &&
+                kind != dw::DW_TAG_volatile_type && kind != dw::DW_TAG_array_type &&
+                kind != dw::DW_TAG_pointer_type && kind != dw::DW_TAG_reference_type &&
+                kind != dw::DW_TAG_rvalue_reference_type)
+              break;
+            referred = referred.resolveReferencedType(dw::DW_AT_type);
+          }
+          if (!record(referred) || !referred.find(dw::DW_AT_declaration))
+            continue;
+          const auto identity = qualified(referred);
+          if (identity.empty())
+            return true;
+          auto [known, inserted] = defined_records.try_emplace(identity, false);
+          if (inserted) {
+            for (const auto *image : {image_.get(), main_.get()}) {
+              if (!image)
+                continue;
+              try {
+                known->second = static_cast<bool>(find_record(*image->dwarf, identity));
+              } catch (const std::runtime_error &) {
+                continue;
+              }
+              if (known->second)
+                break;
+            }
+          }
+          if (!known->second)
+            return true;
+        }
+      }
+      return false;
+    };
     std::set<std::uint64_t> verified_plt_calls;
     for (const auto &[entry, calls] : direct_redirects(entries, true, false, true,
                                                         &verified_plt_calls)) {
@@ -2312,7 +2360,8 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         auto caller_kind = debug.FunctionDIE ? classify_dwarf_caller(debug.FunctionDIE) : CallerKind::unknown;
         if (caller_kind == CallerKind::unknown) {
           if (!complete_plt_call &&
-              !debug.FunctionDIE.findRecursively({dw::DW_AT_type, dw::DW_AT_prototyped}))
+              !debug.FunctionDIE.findRecursively({dw::DW_AT_type, dw::DW_AT_prototyped,
+                                                 dw::DW_AT_frame_base}))
             continue;
           caller_kind = elf_kind;
         }
@@ -2322,7 +2371,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
               // Require positive DWARF identity for every inlined frame.
               return frame.getTag() == dw::DW_TAG_inlined_subroutine &&
                   classify_dwarf_caller(frame) != CallerKind::ordinary;
-            }))
+            }) || (!complete_plt_call && unresolved_records(debug.FunctionDIE)))
           continue;
         const auto return_pc = call + object_cache::direct_call_width;
         complete_constructor_returns.emplace(entry, return_pc);

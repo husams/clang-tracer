@@ -400,12 +400,21 @@ identity requires evidence that the constructor built a complete object and
 that the watch covers its destruction. Evidence can come from a distinct
 complete-constructor entry, a verified caller outside constructors and destructors,
 or a call through a verified PLT entry for the complete-constructor symbol.
-A receiver can have provisional identity when construction predates attach,
-the constructor is ambiguous, another mapped application image also defines
-a lifetime symbol, or no destructor entry can be verified. Its callback reports
+Caller proof for a shared constructor entry relies on debug information that
+describes inlined construction. `__attribute__((nodebug))`,
+`-gno-inline-line-tables`, or link-time inlining from a unit without debug
+information can hide an initializer and make base-subobject construction
+appear complete.
+A receiver can have provisional identity when construction predates attach
+or bypasses a watched constructor, as with a trivial copy. Ambiguous
+construction, duplicate lifetime symbols and incomplete destructor coverage
+can also leave identity provisional. Its callback reports
 `identity_verified() == false` with zero object ID and generation. An observed
-destructor in a registration with methods can report zero-ID teardown
-boundaries for an earlier provisional construction of the same receiver address.
+destructor in a registration with methods can report zero-ID teardown for a
+receiver already observed with provisional identity at the same address.
+Duplicate lifetime checks use the application mappings present at binding.
+An unreadable mapped application file leaves coverage incomplete. A fresh
+binding evaluates libraries the target loaded later.
 Live method and code-cache events arrive independently. JSON export orders
 each grouped registration's retained events by monotonic observation time.
 The event sequence remains the server's arrival cursor. Correlate verified

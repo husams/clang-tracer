@@ -14,6 +14,7 @@ import time
 def verify_preparer_diagnostics(repl, root, header, env):
     preparer = root / "held-stderr-preparer"
     proceed = root / "preparer-proceed"
+    finish = root / "preparer-finish"
     release = root / "preparer-release-stderr"
     preparer.write_text(f'''#!{sys.executable}
 import os
@@ -34,6 +35,9 @@ sys.stderr.write("prepare: er")
 sys.stderr.flush()
 time.sleep(0.05)
 print("ror: preparer diagnostic marker", file=sys.stderr, flush=True)
+print("preparer stderr after reason", file=sys.stderr, flush=True)
+while not Path({str(finish)!r}).exists():
+    time.sleep(0.02)
 sys.exit(7)
 ''')
     preparer.chmod(0o700)
@@ -48,14 +52,19 @@ sys.exit(7)
             assert select.select([console.stderr], [], [], 10)[0], "prepare progress was buffered"
             assert "preparer progress marker" in console.stderr.readline()
             proceed.touch()
+            assert select.select([console.stderr], [], [], 10)[0], "late preparer stderr was buffered"
+            assert console.stderr.readline().strip() == "preparer stderr after reason"
+            finish.touch()
             stdout, stderr = console.communicate(timeout=10)
             assert console.returncode == 1, (stdout, stderr)
             assert stderr.count("preparer diagnostic marker") == 1, (stdout, stderr)
             assert "preparer progress marker" not in stderr, (stdout, stderr)
+            assert "preparer stderr after reason" not in stderr, (stdout, stderr)
             assert re.search(r"^error: .*preparer exited with status 7: preparer diagnostic marker$",
                              stderr, re.M), (stdout, stderr)
         finally:
             proceed.touch()
+            finish.touch()
             release.touch()
 
 

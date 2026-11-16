@@ -1750,6 +1750,9 @@ struct Watch::Impl {
         else if (sample.provisional_reason == ProvisionalReason::uncertain_construction)
           item.set_diagnostic(
               "provisional destructor boundary with unverified complete-object construction");
+        else if (sample.provisional_reason == ProvisionalReason::unobserved_construction)
+          item.set_diagnostic(
+              "provisional destructor boundary for a receiver whose construction was not observed");
         else
           item.set_diagnostic(
               "provisional destructor boundary without a verified lifetime identity");

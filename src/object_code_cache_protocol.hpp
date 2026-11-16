@@ -37,7 +37,7 @@ enum class Hook : std::uint8_t {
   lifetime_reused, admission_gap, rmw, collection_update
 };
 enum class ProvisionalReason : std::uint8_t {
-  none, uncertain_construction, instance_limit
+  none, uncertain_construction, instance_limit, unobserved_construction
 };
 inline bool writer(Hook hook) noexcept {
   return hook == Hook::move || hook == Hook::xadd || hook == Hook::cas || hook == Hook::rmw;
