@@ -379,7 +379,9 @@ std::optional<Artifact> plugin_object(llvm::orc::LLJIT& jit, const NativePluginS
       auto contents = metadata->getBuffer();
       if (contents.consume_front("exports-v1\n")) {
         contents.split(entries, '\n', -1, false);
-        std::set<std::string> declarations(entries.begin(), entries.end());
+        std::set<std::string> declarations;
+        for (const auto entry : entries)
+          declarations.insert(entry.str());
         return Artifact{std::move(path), std::move(object), true, false, std::move(declarations)};
       }
     }
