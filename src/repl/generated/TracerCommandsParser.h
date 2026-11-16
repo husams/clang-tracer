@@ -12,71 +12,76 @@
 class  TracerCommandsParser : public antlr4::Parser {
 public:
   enum {
-    T__0 = 1, T__1 = 2, T__2 = 3, T__3 = 4, T__4 = 5, T__5 = 6, T__6 = 7,
-    T__7 = 8, T__8 = 9, T__9 = 10, T__10 = 11, T__11 = 12, T__12 = 13, T__13 = 14,
-    T__14 = 15, T__15 = 16, T__16 = 17, T__17 = 18, T__18 = 19, T__19 = 20,
-    T__20 = 21, T__21 = 22, T__22 = 23, T__23 = 24, T__24 = 25, T__25 = 26,
-    T__26 = 27, T__27 = 28, T__28 = 29, T__29 = 30, T__30 = 31, T__31 = 32,
-    T__32 = 33, T__33 = 34, T__34 = 35, T__35 = 36, T__36 = 37, T__37 = 38,
-    T__38 = 39, T__39 = 40, T__40 = 41, T__41 = 42, T__42 = 43, T__43 = 44,
-    T__44 = 45, T__45 = 46, T__46 = 47, T__47 = 48, T__48 = 49, T__49 = 50,
-    T__50 = 51, T__51 = 52, T__52 = 53, T__53 = 54, T__54 = 55, T__55 = 56,
-    T__56 = 57, T__57 = 58, T__58 = 59, T__59 = 60, T__60 = 61, T__61 = 62,
-    T__62 = 63, T__63 = 64, T__64 = 65, T__65 = 66, T__66 = 67, T__67 = 68,
-    T__68 = 69, T__69 = 70, T__70 = 71, T__71 = 72, T__72 = 73, T__73 = 74,
-    T__74 = 75, T__75 = 76, T__76 = 77, T__77 = 78, T__78 = 79, T__79 = 80,
-    T__80 = 81, T__81 = 82, T__82 = 83, T__83 = 84, T__84 = 85, T__85 = 86,
-    T__86 = 87, T__87 = 88, T__88 = 89, T__89 = 90, T__90 = 91, T__91 = 92,
-    T__92 = 93, T__93 = 94, T__94 = 95, T__95 = 96, T__96 = 97, T__97 = 98,
-    T__98 = 99, T__99 = 100, T__100 = 101, T__101 = 102, T__102 = 103, T__103 = 104,
-    T__104 = 105, T__105 = 106, T__106 = 107, T__107 = 108, T__108 = 109,
-    T__109 = 110, T__110 = 111, T__111 = 112, T__112 = 113, T__113 = 114,
-    T__114 = 115, T__115 = 116, T__116 = 117, T__117 = 118, T__118 = 119,
-    T__119 = 120, T__120 = 121, T__121 = 122, T__122 = 123, T__123 = 124,
-    T__124 = 125, T__125 = 126, T__126 = 127, T__127 = 128, T__128 = 129,
-    T__129 = 130, T__130 = 131, T__131 = 132, T__132 = 133, T__133 = 134,
-    T__134 = 135, T__135 = 136, T__136 = 137, T__137 = 138, T__138 = 139,
-    T__139 = 140, T__140 = 141, T__141 = 142, T__142 = 143, T__143 = 144,
-    T__144 = 145, T__145 = 146, T__146 = 147, T__147 = 148, T__148 = 149,
-    T__149 = 150, T__150 = 151, T__151 = 152, T__152 = 153, T__153 = 154,
-    T__154 = 155, T__155 = 156, T__156 = 157, T__157 = 158, T__158 = 159,
-    T__159 = 160, T__160 = 161, T__161 = 162, T__162 = 163, T__163 = 164,
-    T__164 = 165, T__165 = 166, T__166 = 167, T__167 = 168, T__168 = 169,
-    T__169 = 170, T__170 = 171, T__171 = 172, T__172 = 173, T__173 = 174,
-    T__174 = 175, T__175 = 176, T__176 = 177, T__177 = 178, T__178 = 179,
-    T__179 = 180, T__180 = 181, T__181 = 182, T__182 = 183, T__183 = 184,
-    T__184 = 185, T__185 = 186, T__186 = 187, T__187 = 188, T__188 = 189,
-    T__189 = 190, T__190 = 191, T__191 = 192, T__192 = 193, T__193 = 194,
-    T__194 = 195, T__195 = 196, T__196 = 197, T__197 = 198, T__198 = 199,
-    T__199 = 200, T__200 = 201, T__201 = 202, T__202 = 203, T__203 = 204,
-    T__204 = 205, T__205 = 206, T__206 = 207, T__207 = 208, T__208 = 209,
-    T__209 = 210, T__210 = 211, T__211 = 212, T__212 = 213, T__213 = 214,
-    T__214 = 215, T__215 = 216, T__216 = 217, T__217 = 218, T__218 = 219,
-    T__219 = 220, T__220 = 221, T__221 = 222, T__222 = 223, T__223 = 224,
-    T__224 = 225, T__225 = 226, T__226 = 227, T__227 = 228, T__228 = 229,
-    T__229 = 230, T__230 = 231, T__231 = 232, T__232 = 233, UINT = 234,
-    STRING = 235, SHELL = 236, METADATA_ONLY = 237, SQLITE = 238, STACK = 239,
-    CWD = 240, SIGNATURE = 241, MEMBER = 242, SNAPSHOT_RETURN_POINTEE = 243,
-    WORD = 244, WS = 245
+    T__0 = 1, T__1 = 2, T__2 = 3, T__3 = 4, T__4 = 5, T__5 = 6, T__6 = 7, 
+    T__7 = 8, T__8 = 9, T__9 = 10, T__10 = 11, T__11 = 12, T__12 = 13, T__13 = 14, 
+    T__14 = 15, T__15 = 16, T__16 = 17, T__17 = 18, T__18 = 19, T__19 = 20, 
+    T__20 = 21, T__21 = 22, T__22 = 23, T__23 = 24, T__24 = 25, T__25 = 26, 
+    T__26 = 27, T__27 = 28, T__28 = 29, T__29 = 30, T__30 = 31, T__31 = 32, 
+    T__32 = 33, T__33 = 34, T__34 = 35, T__35 = 36, T__36 = 37, T__37 = 38, 
+    T__38 = 39, T__39 = 40, T__40 = 41, T__41 = 42, T__42 = 43, T__43 = 44, 
+    T__44 = 45, T__45 = 46, T__46 = 47, T__47 = 48, T__48 = 49, T__49 = 50, 
+    T__50 = 51, T__51 = 52, T__52 = 53, T__53 = 54, T__54 = 55, T__55 = 56, 
+    T__56 = 57, T__57 = 58, T__58 = 59, T__59 = 60, T__60 = 61, T__61 = 62, 
+    T__62 = 63, T__63 = 64, T__64 = 65, T__65 = 66, T__66 = 67, T__67 = 68, 
+    T__68 = 69, T__69 = 70, T__70 = 71, T__71 = 72, T__72 = 73, T__73 = 74, 
+    T__74 = 75, T__75 = 76, T__76 = 77, T__77 = 78, T__78 = 79, T__79 = 80, 
+    T__80 = 81, T__81 = 82, T__82 = 83, T__83 = 84, T__84 = 85, T__85 = 86, 
+    T__86 = 87, T__87 = 88, T__88 = 89, T__89 = 90, T__90 = 91, T__91 = 92, 
+    T__92 = 93, T__93 = 94, T__94 = 95, T__95 = 96, T__96 = 97, T__97 = 98, 
+    T__98 = 99, T__99 = 100, T__100 = 101, T__101 = 102, T__102 = 103, T__103 = 104, 
+    T__104 = 105, T__105 = 106, T__106 = 107, T__107 = 108, T__108 = 109, 
+    T__109 = 110, T__110 = 111, T__111 = 112, T__112 = 113, T__113 = 114, 
+    T__114 = 115, T__115 = 116, T__116 = 117, T__117 = 118, T__118 = 119, 
+    T__119 = 120, T__120 = 121, T__121 = 122, T__122 = 123, T__123 = 124, 
+    T__124 = 125, T__125 = 126, T__126 = 127, T__127 = 128, T__128 = 129, 
+    T__129 = 130, T__130 = 131, T__131 = 132, T__132 = 133, T__133 = 134, 
+    T__134 = 135, T__135 = 136, T__136 = 137, T__137 = 138, T__138 = 139, 
+    T__139 = 140, T__140 = 141, T__141 = 142, T__142 = 143, T__143 = 144, 
+    T__144 = 145, T__145 = 146, T__146 = 147, T__147 = 148, T__148 = 149, 
+    T__149 = 150, T__150 = 151, T__151 = 152, T__152 = 153, T__153 = 154, 
+    T__154 = 155, T__155 = 156, T__156 = 157, T__157 = 158, T__158 = 159, 
+    T__159 = 160, T__160 = 161, T__161 = 162, T__162 = 163, T__163 = 164, 
+    T__164 = 165, T__165 = 166, T__166 = 167, T__167 = 168, T__168 = 169, 
+    T__169 = 170, T__170 = 171, T__171 = 172, T__172 = 173, T__173 = 174, 
+    T__174 = 175, T__175 = 176, T__176 = 177, T__177 = 178, T__178 = 179, 
+    T__179 = 180, T__180 = 181, T__181 = 182, T__182 = 183, T__183 = 184, 
+    T__184 = 185, T__185 = 186, T__186 = 187, T__187 = 188, T__188 = 189, 
+    T__189 = 190, T__190 = 191, T__191 = 192, T__192 = 193, T__193 = 194, 
+    T__194 = 195, T__195 = 196, T__196 = 197, T__197 = 198, T__198 = 199, 
+    T__199 = 200, T__200 = 201, T__201 = 202, T__202 = 203, T__203 = 204, 
+    T__204 = 205, T__205 = 206, T__206 = 207, T__207 = 208, T__208 = 209, 
+    T__209 = 210, T__210 = 211, T__211 = 212, T__212 = 213, T__213 = 214, 
+    T__214 = 215, T__215 = 216, T__216 = 217, T__217 = 218, T__218 = 219, 
+    T__219 = 220, T__220 = 221, T__221 = 222, T__222 = 223, T__223 = 224, 
+    T__224 = 225, T__225 = 226, T__226 = 227, T__227 = 228, T__228 = 229, 
+    T__229 = 230, T__230 = 231, T__231 = 232, T__232 = 233, T__233 = 234, 
+    T__234 = 235, T__235 = 236, T__236 = 237, T__237 = 238, T__238 = 239, 
+    T__239 = 240, T__240 = 241, T__241 = 242, T__242 = 243, T__243 = 244, 
+    T__244 = 245, T__245 = 246, T__246 = 247, T__247 = 248, T__248 = 249, 
+    T__249 = 250, T__250 = 251, T__251 = 252, T__252 = 253, UINT = 254, 
+    STRING = 255, SHELL = 256, METADATA_ONLY = 257, SQLITE = 258, STACK = 259, 
+    CWD = 260, SIGNATURE = 261, MEMBER = 262, SNAPSHOT_RETURN_POINTEE = 263, 
+    RECOVER = 264, PAYLOAD_LIMIT = 265, WORD = 266, WS = 267
   };
 
   enum {
-    RuleLine = 0, RuleCommand = 1, RuleServer = 2, RuleServerOption = 3,
-    RuleAttach = 4, RuleProcesses = 5, RuleSessions = 6, RuleUse = 7, RuleStatus = 8,
-    RuleDetach = 9, RuleModules = 10, RuleModuleIndex = 11, RuleModuleBuildOption = 12,
-    RuleModuleQueryOption = 13, RuleModuleShowOption = 14, RuleModuleEmitOption = 15,
-    RuleThreads = 16, RuleSymbols = 17, RuleSymbolOption = 18, RuleProbe = 19,
-    RulePrepareOption = 20, RuleLimitOption = 21, RuleResolveOption = 22,
-    RuleValidateOption = 23, RuleDeployOption = 24, RuleInterceptor = 25,
-    RuleEvents = 26, RuleCollect = 27, RuleRecord = 28, RuleStreamOption = 29,
-    RuleCpp = 30, RuleShell = 31, RuleComplete = 32, RuleType = 33, RuleHelp = 34,
-    RuleQuit = 35, RuleBulkTrace = 36, RuleBulkTraceOption = 37, RuleValue = 38,
-    RuleKeyword = 39, RuleObjectWatch = 40, RuleObjectOption = 41, RuleMemory = 42,
-    RuleProbeEntry = 43, RuleProbeReload = 44, RuleTargetLaunch = 45, RuleLaunchOption = 46,
-    RuleChildList = 47, RuleTargetCall = 48, RuleLocalPerf = 49, RuleTargetLibrary = 50,
-    RuleInstructions = 51, RuleInstructionOption = 52, RuleWatchpoint = 53,
-    RuleStackFilter = 54, RuleContextEventBytes = 55, RuleExtraCompileOption = 56,
-    RuleCwdOption = 57
+    RuleLine = 0, RuleCommand = 1, RuleServer = 2, RuleServerOption = 3, 
+    RuleAttach = 4, RuleProcesses = 5, RuleSessions = 6, RuleUse = 7, RuleStatus = 8, 
+    RuleDetach = 9, RuleModules = 10, RuleModuleIndex = 11, RuleModuleBuildOption = 12, 
+    RuleModuleQueryOption = 13, RuleModuleShowOption = 14, RuleModuleEmitOption = 15, 
+    RuleThreads = 16, RuleSymbols = 17, RuleSymbolOption = 18, RuleProbe = 19, 
+    RulePrepareOption = 20, RuleLimitOption = 21, RuleResolveOption = 22, 
+    RuleValidateOption = 23, RuleDeployOption = 24, RuleInterceptor = 25, 
+    RuleEvents = 26, RuleCollect = 27, RuleRecord = 28, RuleStreamOption = 29, 
+    RuleCpp = 30, RuleShell = 31, RuleComplete = 32, RuleType = 33, RuleHelp = 34, 
+    RuleQuit = 35, RuleBulkTrace = 36, RuleBulkTraceOption = 37, RuleValue = 38, 
+    RuleKeyword = 39, RuleLiveUpdate = 40, RuleLiveScanSelection = 41, RuleLiveOption = 42, 
+    RuleObjectWatch = 43, RuleObjectOption = 44, RuleMemory = 45, RuleProbeEntry = 46, 
+    RuleProbeReload = 47, RuleTargetLaunch = 48, RuleLaunchOption = 49, 
+    RuleChildList = 50, RuleTargetCall = 51, RuleLocalPerf = 52, RuleTargetLibrary = 53, 
+    RuleInstructions = 54, RuleInstructionOption = 55, RuleWatchpoint = 56, 
+    RuleStackFilter = 57, RuleContextEventBytes = 58, RuleExtraCompileOption = 59, 
+    RuleCwdOption = 60
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -136,6 +141,9 @@ public:
   class BulkTraceOptionContext;
   class ValueContext;
   class KeywordContext;
+  class LiveUpdateContext;
+  class LiveScanSelectionContext;
+  class LiveOptionContext;
   class ObjectWatchContext;
   class ObjectOptionContext;
   class MemoryContext;
@@ -153,7 +161,7 @@ public:
   class StackFilterContext;
   class ContextEventBytesContext;
   class ExtraCompileOptionContext;
-  class CwdOptionContext;
+  class CwdOptionContext; 
 
   class  LineContext : public antlr4::ParserRuleContext {
   public:
@@ -164,7 +172,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   LineContext* line();
@@ -207,10 +215,11 @@ public:
     TargetLibraryContext *targetLibrary();
     ChildListContext *childList();
     ObjectWatchContext *objectWatch();
+    LiveUpdateContext *liveUpdate();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   CommandContext* command();
@@ -225,7 +234,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ServerContext* server();
@@ -239,7 +248,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ServerOptionContext* serverOption();
@@ -253,7 +262,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   AttachContext* attach();
@@ -266,7 +275,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ProcessesContext* processes();
@@ -278,7 +287,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   SessionsContext* sessions();
@@ -291,7 +300,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   UseContext* use();
@@ -303,7 +312,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   StatusContext* status();
@@ -316,7 +325,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   DetachContext* detach();
@@ -332,7 +341,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ModulesContext* modules();
@@ -353,7 +362,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ModuleIndexContext* moduleIndex();
@@ -367,7 +376,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ModuleBuildOptionContext* moduleBuildOption();
@@ -381,7 +390,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ModuleQueryOptionContext* moduleQueryOption();
@@ -394,7 +403,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ModuleShowOptionContext* moduleShowOption();
@@ -408,7 +417,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ModuleEmitOptionContext* moduleEmitOption();
@@ -420,7 +429,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ThreadsContext* threads();
@@ -434,7 +443,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   SymbolsContext* symbols();
@@ -448,7 +457,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   SymbolOptionContext* symbolOption();
@@ -473,7 +482,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ProbeContext* probe();
@@ -492,7 +501,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   PrepareOptionContext* prepareOption();
@@ -506,7 +515,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   LimitOptionContext* limitOption();
@@ -520,7 +529,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ResolveOptionContext* resolveOption();
@@ -534,7 +543,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ValidateOptionContext* validateOption();
@@ -552,7 +561,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   DeployOptionContext* deployOption();
@@ -570,7 +579,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   InterceptorContext* interceptor();
@@ -589,7 +598,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   EventsContext* events();
@@ -603,7 +612,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   CollectContext* collect();
@@ -620,7 +629,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   RecordContext* record();
@@ -634,7 +643,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   StreamOptionContext* streamOption();
@@ -650,7 +659,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   CppContext* cpp();
@@ -663,7 +672,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ShellContext* shell();
@@ -676,7 +685,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   CompleteContext* complete();
@@ -689,7 +698,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   TypeContext* type();
@@ -703,7 +712,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   HelpContext* help();
@@ -715,7 +724,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   QuitContext* quit();
@@ -731,7 +740,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   BulkTraceContext* bulkTrace();
@@ -744,7 +753,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   BulkTraceOptionContext* bulkTraceOption();
@@ -760,7 +769,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ValueContext* value();
@@ -769,14 +778,64 @@ public:
   public:
     KeywordContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
+    antlr4::tree::TerminalNode *RECOVER();
     antlr4::tree::TerminalNode *STACK();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   KeywordContext* keyword();
+
+  class  LiveUpdateContext : public antlr4::ParserRuleContext {
+  public:
+    LiveUpdateContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    antlr4::tree::TerminalNode *RECOVER();
+    std::vector<ValueContext *> value();
+    ValueContext* value(size_t i);
+    std::vector<LiveOptionContext *> liveOption();
+    LiveOptionContext* liveOption(size_t i);
+    antlr4::tree::TerminalNode *UINT();
+    std::vector<LiveScanSelectionContext *> liveScanSelection();
+    LiveScanSelectionContext* liveScanSelection(size_t i);
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+   
+  };
+
+  LiveUpdateContext* liveUpdate();
+
+  class  LiveScanSelectionContext : public antlr4::ParserRuleContext {
+  public:
+    LiveScanSelectionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    std::vector<ValueContext *> value();
+    ValueContext* value(size_t i);
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+   
+  };
+
+  LiveScanSelectionContext* liveScanSelection();
+
+  class  LiveOptionContext : public antlr4::ParserRuleContext {
+  public:
+    LiveOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+    antlr4::tree::TerminalNode *UINT();
+    antlr4::tree::TerminalNode *PAYLOAD_LIMIT();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+   
+  };
+
+  LiveOptionContext* liveOption();
 
   class  ObjectWatchContext : public antlr4::ParserRuleContext {
   public:
@@ -789,7 +848,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ObjectWatchContext* objectWatch();
@@ -803,7 +862,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ObjectOptionContext* objectOption();
@@ -819,7 +878,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   MemoryContext* memory();
@@ -834,7 +893,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ProbeEntryContext* probeEntry();
@@ -851,7 +910,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ProbeReloadContext* probeReload();
@@ -867,7 +926,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   TargetLaunchContext* targetLaunch();
@@ -882,7 +941,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   LaunchOptionContext* launchOption();
@@ -894,7 +953,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ChildListContext* childList();
@@ -910,7 +969,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   TargetCallContext* targetCall();
@@ -924,7 +983,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   LocalPerfContext* localPerf();
@@ -937,7 +996,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   TargetLibraryContext* targetLibrary();
@@ -952,7 +1011,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   InstructionsContext* instructions();
@@ -966,7 +1025,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   InstructionOptionContext* instructionOption();
@@ -982,7 +1041,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   WatchpointContext* watchpoint();
@@ -995,7 +1054,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   StackFilterContext* stackFilter();
@@ -1008,7 +1067,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ContextEventBytesContext* contextEventBytes();
@@ -1024,7 +1083,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   ExtraCompileOptionContext* extraCompileOption();
@@ -1038,7 +1097,7 @@ public:
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-
+   
   };
 
   CwdOptionContext* cwdOption();

@@ -94,6 +94,15 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"memory import-hook", K::memory_import_hook},
                                         {"memory monitor-start", K::page_monitor_start},
                                         {"memory monitor-stop", K::page_monitor_stop},
+                                        {"live update", K::live_update},
+                                        {"live preview", K::live_preview},
+                                        {"live watch", K::live_watch},
+                                        {"live status", K::live_status},
+                                        {"live revert", K::live_revert},
+                                        {"live recover", K::live_recover},
+                                        {"live mock", K::live_mock},
+                                        {"live update-data", K::live_update_data},
+                                        {"live scan-heap", K::live_scan_heap},
                                         {"object start", K::object_start},
                                         {"object prepare", K::object_prepare},
                                         {"object preview", K::object_preview},
@@ -213,7 +222,7 @@ public:
         "--no-automatic-members", "--snapshot-receiver-at-return", "--no-values",
         "--first-seen", "--writer-entry", "--discover-writers", "--syscall-output", "--stack-cfi", "--follow-calls"};
     const std::set<std::string> repeated = {"--include", "--compile-option",
-                                           "--name", "--type", "--arg", "--env", "--key"};
+                                           "--name", "--type", "--arg", "--env", "--key", "--bind", "--from-scan"};
     const std::set<std::string> bulk_repeated = {"--module", "--exclude", "--exact"};
     const std::set<std::string> object_repeated = {"--field", "--on", "--include", "--key", "--union-case", "--code",
                                                   "--translation-unit", "--async-signal", "--mutation"};
@@ -225,6 +234,11 @@ public:
         continue;
       }
       const auto text = ts[i]->getText();
+      if (result.kind == K::live_update_data && text == "--from-scan") {
+        while (i + 2 < ts.size() && !ts[i + 1]->getText().starts_with("--"))
+          result.options[text].push_back(decode(ts[++i]->getText()));
+        continue;
+      }
       const bool profile_add = result.kind == K::cpp_options &&
                                !result.arguments.empty() && result.arguments.front() == "add";
       if (!profile_add && ts[i]->getType() != TracerCommandsLexer::STRING &&

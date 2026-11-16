@@ -66,5 +66,6 @@ Preview scan(std::uint64_t address, std::string_view bytes,
 bool compatible_patch(std::uint64_t address, std::string_view before, std::string_view after);
 std::size_t nop_prefix(std::uint64_t address, std::string_view bytes, std::size_t minimum);
 bool forwards_receiver(std::uint64_t address, std::string_view prefix);
+bool may_return_at_end(std::uint64_t address, std::string_view bytes);
 #endif
 } // namespace tracer::native_entry

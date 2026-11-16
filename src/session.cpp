@@ -289,6 +289,8 @@ clangtracer::v1::ObjectWatchStatus Session::object_watch(
   if (request.has_prepared_bindings())
     binding_status = object_watch::preview(request, pid_, executable_).binding_status();
   require_probe_control_locked();
+  if (live_.active)
+    throw std::runtime_error("revert live replacements before installing a trace");
   if (pthread_create_patch_committed_ ||
       std::any_of(probes_.begin(), probes_.end(), [](const auto &item) {
         return item.second.patch_committed || item.second.value.active() ||
@@ -560,6 +562,7 @@ void Session::attach(const std::string &expected_executable) {
     const auto page_start = agent_symbol("tracer_agent_page_monitor_start_v1");
     const auto page_stop = agent_symbol("tracer_agent_page_monitor_stop_v1");
     const auto object_cache = agent_symbol("tracer_agent_object_cache_v38");
+    const auto live = agent_symbol("tracer_agent_live_v1");
     const auto pthread_detour =
         agent_symbol("tracer_context_pthread_create_detour");
     if (!start || !stop) {
@@ -577,6 +580,7 @@ void Session::attach(const std::string &expected_executable) {
     start_page_monitor_address_ = page_start;
     stop_page_monitor_address_ = page_stop;
     object_cache_address_ = object_cache;
+    live_address_ = live;
     pthread_detour_address_ = pthread_detour;
   } catch (...) {
     if (!process.unsafe()) {
@@ -606,6 +610,8 @@ Session::validate_probe(const clangtracer::v1::ProbeSpec &spec,
                         clangtracer::v1::ValidateProbeRequest::Level level) {
   std::lock_guard lock(mutex_);
   require_probe_control_locked();
+  if (live_.active)
+    throw std::runtime_error("revert live replacements before installing a trace");
   check_identity_locked();
   if (state_ != clangtracer::v1::Session::ATTACHED) {
     throw std::runtime_error("session is not attached");
@@ -686,6 +692,8 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
                    const std::function<bool()> &cancelled) {
   std::lock_guard lock(mutex_);
   require_probe_control_locked();
+  if (live_.active)
+    throw std::runtime_error("revert live replacements before installing a trace");
   check_identity_locked();
   if (state_ != clangtracer::v1::Session::ATTACHED) {
     throw std::runtime_error("session is not attached");
@@ -1639,6 +1647,18 @@ void Session::detach() {
   for (auto &patch : memory_patches_)
     if (!patch.value.restored())
       write_memory_patch_locked(patch, true, std::chrono::steady_clock::now() + operation_timeout_);
+  if (live_.managed_transition)
+    throw std::runtime_error("managed publication requires %live recover");
+  if (live_.pending_extension) {
+    poll_pending_live_data_locked();
+    if (live_.pending_extension || unsafe_target_)
+      throw std::runtime_error("live operation outcome remains unresolved");
+  }
+  while (live_.active) {
+    const auto result = revert_live_locked(live_.revisions.at(live_.active).parent);
+    if (result.state() != clangtracer::v1::LiveUpdateStatus::REVERTED)
+      throw std::runtime_error("live restoration incomplete: " + result.diagnostic());
+  }
   for (auto &[id, probe] : probes_) {
     (void)id;
     if (probe.value.active() || probe.value.draining())
@@ -1665,6 +1685,29 @@ void Session::shutdown() noexcept {
   if (state_ == clangtracer::v1::Session::DETACHED ||
       state_ == clangtracer::v1::Session::EXITED || unsafe_target_)
     return;
+  if (live_.managed_transition) {
+    set_failed_locked("managed publication still requires recovery during shutdown");
+    return;
+  }
+  if (live_.pending_extension) {
+    try {
+      poll_pending_live_data_locked();
+    } catch (const std::exception &error) {
+      set_failed_locked(error.what());
+      return;
+    }
+    if (live_.pending_extension || unsafe_target_) {
+      set_failed_locked("live operation outcome remains unresolved during shutdown");
+      return;
+    }
+  }
+  while (live_.active) {
+    const auto result = revert_live_locked(live_.revisions.at(live_.active).parent);
+    if (result.state() != clangtracer::v1::LiveUpdateStatus::REVERTED) {
+      set_failed_locked("live restoration incomplete: " + result.diagnostic());
+      return;
+    }
+  }
   std::string first_error =
       state_ == clangtracer::v1::Session::FAILED ? error_ : std::string{};
   const auto shutdown_deadline =

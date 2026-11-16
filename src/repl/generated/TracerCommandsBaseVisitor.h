@@ -175,6 +175,18 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitLiveUpdate(TracerCommandsParser::LiveUpdateContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitLiveScanSelection(TracerCommandsParser::LiveScanSelectionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitLiveOption(TracerCommandsParser::LiveOptionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitObjectWatch(TracerCommandsParser::ObjectWatchContext *ctx) override {
     return visitChildren(ctx);
   }
