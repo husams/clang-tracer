@@ -10,4 +10,10 @@ inline constexpr char kEmbeddedCallbackHeader[] = R"TRACER_API(
 inline constexpr char kEmbeddedContextHeader[] = R"TRACER_CONTEXT(
 @TRACER_CONTEXT_HEADER@
 )TRACER_CONTEXT";
+inline constexpr char kEmbeddedPluginHeader[] =
+    R"TRACER_PLUGIN(@TRACER_PLUGIN_HEADER@)TRACER_PLUGIN";
+inline constexpr char kEmbeddedCppPluginHeader[] =
+    R"TRACER_PLUGIN(@TRACER_CPP_PLUGIN_HEADER@)TRACER_PLUGIN";
+inline constexpr char kEmbeddedAgentExtensionHeader[] =
+    R"TRACER_PLUGIN(@TRACER_AGENT_EXTENSION_HEADER@)TRACER_PLUGIN";
 } // namespace tracer

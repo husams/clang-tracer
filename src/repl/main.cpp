@@ -18,6 +18,7 @@
 #include "help.hpp"
 #include "interpreter.hpp"
 #include "compiler_profile.hpp"
+#include "plugins.hpp"
 #include "shell.hpp"
 #include "syntax.hpp"
 
@@ -197,20 +198,23 @@ int main(int argc, char **argv) {
     tr::Input input(color);
     tr::Controller controller(settings, std::cout);
     tr::Facade facade(controller);
+    tr::Plugins plugins;
     tr::CppEngine cpp(facade, std::move(cpp_args));
-    input.use_cpp(cpp);
-    auto choose = [&](const std::string &prompt) {
-      return input.read(prompt).value_or("");
-    };
+    auto choose = [&](const std::string& prompt) { return input.read(prompt).value_or(""); };
+    if (input.terminal()) {
+      std::cout << "Clang Tracer native C++23 REPL. %help lists commands; "
+                   "%help api lists C++ APIs. Tab completes commands, paths, and C++.\n";
+    }
+    plugins.load_installed(cpp, std::cout, std::cerr);
+    plugins.load_enabled(cpp, std::cout, std::cerr);
+    controller.on_attach(
+        [&](const auto& session) { plugins.load_attached(controller, session, cpp, std::cerr); });
     if (pid) {
       controller.attach(pid);
     } else if (!process.empty()) {
       controller.select_process(process, choose);
     }
-    if (input.terminal()) {
-      std::cout << "Clang Tracer native C++23 REPL. %help lists commands; "
-                   "%help api lists C++ APIs. Tab completes commands, paths, and C++.\n";
-    }
+    input.use_cpp(cpp);
     bool failed = false;
     while (true) {
       // tracer.inject() can execute inside a JIT cell. Import after the cell
@@ -276,6 +280,13 @@ int main(int argc, char **argv) {
         expand_extra_compile_arguments(command);
         if (command.kind == tr::CommandKind::help) {
           tr::print_help(std::cout, command.arguments, cpp, color);
+        } else if (tr::is_plugin_command(command.kind)) {
+          plugins.execute(command, cpp, std::cout);
+        } else if (command.kind == tr::CommandKind::agent_plugin_load ||
+                   command.kind == tr::CommandKind::agent_plugin_reload) {
+          controller.execute(command, [&](auto &request, const auto &path) {
+            plugins.prepare_agent_plugin(request, path, controller.agent_plugin_manifest(request), cpp);
+          });
         } else if (command.kind == tr::CommandKind::type) {
           tr::print_code(std::cout, cpp.describe_symbol(command.arguments.at(0)),
                          tr::Syntax::cpp, color);

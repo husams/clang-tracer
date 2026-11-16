@@ -140,6 +140,13 @@ int main() {
   require(parse_command("%help Event").arguments.at(0) == "Event");
   require(parse_command("%help api tracer_repl::Event").arguments ==
           std::vector<std::string>{"api", "tracer_repl::Event"});
+  const auto agent_reload = parse_command("%plugin agent reload a");
+  require(agent_reload.kind == CommandKind::agent_plugin_reload &&
+          agent_reload.arguments == std::vector<std::string>{"a"});
+  require(parse_command("%plugin agent reload a \"plugin source.cpp\"").arguments ==
+          std::vector<std::string>{"a", "plugin source.cpp"});
+  bad("%plugin agent reload");
+  bad("%plugin agent reload a first.cpp second.cpp");
   require(parse_command("%help %probe inject").arguments ==
           std::vector<std::string>{"probe", "inject"});
   bad("%help %");

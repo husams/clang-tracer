@@ -411,6 +411,7 @@ void Controller::connect(const std::string &endpoint) {
   endpoint_ = endpoint;
   stop_background();
   stub_ = std::move(next);
+  agent_packages_.clear();
   selected_ = {};
   ++connection_;
 }
@@ -438,6 +439,7 @@ void Controller::start_server(const Command &command) {
 void Controller::disconnect() {
   stop_background();
   stub_.reset();
+  agent_packages_.clear();
   object_probe_preview_.reset();
   selected_ = {};
   ++connection_;
@@ -511,6 +513,38 @@ void Controller::require_session(const SessionHandle &session) {
     }
   }
   throw std::runtime_error("session is no longer attached: " + session.id);
+}
+
+void Controller::on_attach(std::function<void(const api::Session&)> hook) {
+  attachment_hook_ = std::move(hook);
+}
+
+std::filesystem::path Controller::agent_plugin_manifest(const api::AgentPluginRequest& request) const {
+  if (const auto session = agent_packages_.find(request.session_id()); session != agent_packages_.end()) {
+    if (const auto package = session->second.find(request.plugin_id()); package != session->second.end())
+      return package->second;
+  }
+  return {};
+}
+
+void Controller::agent_plugin(const api::AgentPluginRequest& request,
+                              const std::filesystem::path& manifest) {
+  const auto response = unary<api::AgentPluginResponse>(
+      [&](auto& context, auto& reply) { return stub_->AgentPlugin(&context, request, &reply); },
+      settings_.timeout_seconds);
+  if (!manifest.empty())
+    agent_packages_[request.session_id()].insert_or_assign(request.plugin_id(), manifest);
+  if (request.operation() == api::AgentPluginRequest::RUN) {
+    out_ << "agent " << request.plugin_id() << '.' << request.command() << " = " << response.value()
+         << '\n';
+  } else {
+    out_ << "agent " << request.plugin_id() << " generation " << response.generation()
+         << " active ("
+         << (response.reused_repl_object() ? "REPL object"
+             : response.cache_hit()        ? "cache hit"
+                                           : "compiled")
+         << ")\n";
+  }
 }
 
 SessionHandle Controller::attach(std::uint32_t pid,
@@ -590,6 +624,9 @@ SessionHandle Controller::attach(std::uint32_t pid,
     out_ << "target JIT runtime " << response.jit_runtime().ShortDebugString()
          << '\n';
   }
+  if (attachment_hook_) {
+    attachment_hook_(response);
+  }
   return selected_;
 }
 
@@ -638,6 +675,7 @@ void Controller::detach(const SessionHandle &session) {
                              " " + response.error());
   }
   owned_sessions_.erase(session.id);
+  agent_packages_.erase(session.id);
   for (auto it = pending_attaches_.begin(); it != pending_attaches_.end();) {
     const bool identified = it->second.candidate_ids.erase(session.id) != 0 ||
                             (response.pid() == it->first &&
@@ -1931,7 +1969,7 @@ void Controller::remove_bulk_trace(const std::string &batch_id) {
     throw std::runtime_error(report.diagnostic() + " | retry with %trace remove " + batch_id);
 }
 
-bool Controller::execute(const Command &command) {
+bool Controller::execute(const Command& command, const PrepareAgentPlugin& prepare_agent) {
   const auto &args = command.arguments;
   using K = CommandKind;
   switch (command.kind) {
@@ -2930,6 +2968,36 @@ public:
       throw std::runtime_error("server and agent do not support extra compiler arguments");
     return true;
   }
+  case K::agent_plugin_load:
+  case K::agent_plugin_reload:
+  case K::agent_plugin_run: {
+    require_session(selected_);
+    using Request = api::AgentPluginRequest;
+    const bool run = command.kind == K::agent_plugin_run;
+    const bool load = command.kind == K::agent_plugin_load;
+    const auto id = load ? command.option("--as") : args.at(0);
+    Request request;
+    request.set_session_id(selected_.id);
+    request.set_plugin_id(id);
+    request.set_operation(run ? Request::RUN : load ? Request::LOAD : Request::RELOAD);
+    if (run)
+      request.set_command(args.at(1));
+    else {
+      const auto path_index = load ? 0u : 1u;
+      const bool has_path = path_index < args.size();
+      const auto path = has_path ? args[path_index] : std::string{};
+      if (has_path && path.empty())
+        throw std::invalid_argument("agent plugin source path is empty");
+      if (prepare_agent)
+        prepare_agent(request, path);
+      else if (has_path)
+        request.set_source(read_source(path));
+      else
+        throw std::invalid_argument("agent plugin reload requires FILE or an installed package");
+    }
+    agent_plugin(request);
+    return true;
+  }
   case K::probe_reload: {
     require_session(selected_);
     api::ReloadProbeRequest request;
@@ -3072,6 +3140,13 @@ public:
   case K::cpp_import:
   case K::cpp_options:
   case K::cpp_generate:
+  case K::plugin_load:
+  case K::plugin_enable:
+  case K::plugin_disable:
+  case K::plugin_reload:
+  case K::plugin_list:
+  case K::plugin_run:
+  case K::plugin_commands:
   case K::shell:
   case K::complete:
   case K::type:

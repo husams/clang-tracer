@@ -3,7 +3,7 @@ grammar TracerCommands;
 line : '%' command EOF;
 command : server | attach | processes | sessions | use | status | detach
         | modules | moduleIndex | threads | symbols | probe | interceptor | events | collect | record
-        | cpp | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload
+        | cpp | plugin | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload
         | objectWatch | objectProbe | liveUpdate;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
 serverOption : ('--executable' | '--agent') value | contextEventBytes;
@@ -84,7 +84,7 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
         | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview' | 'apply'
         | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | 'object' | 'object-probe'
-        | 'live' | 'update' | 'revert' | 'mock' | 'update-data' | 'scan-heap' | 'watch' | RECOVER | STACK;
+        | 'live' | 'update' | 'revert' | 'mock' | 'update-data' | 'scan-heap' | 'watch' | RECOVER | STACK | pluginKeyword;
 objectProbe : 'object-probe' ('prepare' value objectProbePrepareOption+
                             | ('preview' | 'start') objectProbeBindOption+
                             | ('status' | 'stop') UINT?);
@@ -131,6 +131,12 @@ stackFilter : '--stack-application-only' value;
 contextEventBytes : ('--context-event-bytes' | '--context-transport-memory-bytes') UINT;
 extraCompileOption : '--extra-arg' value | '--extra-args' (value | SHELL)+;
 cwdOption : CWD value;
+plugin : 'plugin' (('load' | 'enable') value '--as' value | 'disable' value
+                  | 'reload' value | 'list'
+                  | 'run' value value | 'commands' value
+                  | 'agent' ('load' value '--as' value | 'reload' value value?
+                            | 'run' value value));
+pluginKeyword : 'plugin' | 'run' | 'commands' | 'agent' | 'enable' | 'disable';
 UINT : [0-9]+;
 STRING : '"' ('\\' ["\\nrt] | ~["\\\r\n])* '"'
        | '\'' ('\\' ['\\nrt] | ~['\\\r\n])* '\'';

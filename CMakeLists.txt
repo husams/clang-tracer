@@ -52,7 +52,7 @@ include(CTest)
 include(cmake/TracerContextEngine.cmake)
 include(cmake/TracerToolchain.cmake)
 if(NOT LLVM_ENABLE_RTTI)
-  set_source_files_properties(src/debug_resolver.cpp src/native_stack.cpp src/admission.cpp
+  set_source_files_properties(src/debug_resolver.cpp src/native_stack.cpp src/admission.cpp src/native_plugins.cpp
     PROPERTIES COMPILE_OPTIONS "-fno-rtti")
 endif()
 include(cmake/TracerContextAnalysis.cmake)
@@ -66,12 +66,18 @@ file(MAKE_DIRECTORY ${TRACER_PROTO_DIR})
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/callback.hpp
   ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/context.hpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/repl/clang_tracer_repl_plugin.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/repl/clang_tracer_repl_plugin.hpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/repl/clang_tracer_agent_extension.hpp
   ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/protocol.hpp)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/protocol.hpp TRACER_PROTOCOL_HEADER)
 # Incremental input is a synthetic main file, not an includable disk header.
 string(REPLACE "#pragma once" "" TRACER_PROTOCOL_HEADER "${TRACER_PROTOCOL_HEADER}")
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/callback.hpp TRACER_CALLBACK_HEADER)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/context.hpp TRACER_CONTEXT_HEADER)
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/repl/clang_tracer_repl_plugin.h TRACER_PLUGIN_HEADER)
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/repl/clang_tracer_repl_plugin.hpp TRACER_CPP_PLUGIN_HEADER)
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/repl/clang_tracer_agent_extension.hpp TRACER_AGENT_EXTENSION_HEADER)
 configure_file(src/callback_source.hpp.in
   ${TRACER_PROTO_DIR}/callback_source.hpp @ONLY)
 add_custom_command(
@@ -94,7 +100,9 @@ add_library(tracer_grpc STATIC ${TRACER_PROTO_DIR}/tracer.grpc.pb.cc)
 target_link_libraries(tracer_grpc PUBLIC tracer_proto gRPC::grpc++)
 
 add_library(clang_tracer_agent SHARED src/agent.cpp src/native_detour.cpp src/native_entry.cpp
-  src/object_code_cache_agent.cpp src/live_compile.cpp src/live_jit.cpp src/live_agent.cpp
+  src/object_code_cache_agent.cpp src/agent_plugins.cpp src/native_plugins.cpp
+  src/repl/compiler_profile.cpp
+  src/live_compile.cpp src/live_jit.cpp src/live_agent.cpp
   src/live_agent_extension.cpp src/live_data.cpp src/live_data_jit.cpp src/live_data_scan.cpp
   src/live_migration.cpp src/live_mock_recursion.cpp
   src/value_snapshot_codegen.cpp src/value_snapshot_storage.cpp src/snapshot_encoder.cpp src/callback_pch.cpp

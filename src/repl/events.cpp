@@ -518,6 +518,14 @@ std::string event_summary(const api::TraceEvent &event) {
       out << " | " << object.diagnostic();
     return out.str();
   }
+  if (event.has_agent_latency()) {
+    out << "cursor=" << event.sequence() << " probe=" << event.probe_id()
+        << " phase=AGENT_OBSERVER call=" << event.call_id()
+        << " plugin=" << event.agent_latency().plugin_id()
+        << " elapsed_ns=" << event.agent_latency().elapsed_ns()
+        << " function=" << event.function_name();
+    return out.str();
+  }
   out << "cursor=" << event.sequence() << " session=" << event.session_id()
       << " pid=" << event.pid() << " tid=" << event.tid()
       << " probe=" << event.probe_id()

@@ -1,0 +1,9 @@
+id = "my-api"
+version = "1.0.0"
+sdk = 2
+
+[repl]
+sources = [
+  "src/plugin.cpp",
+  "src/my_type.cpp",
+]
