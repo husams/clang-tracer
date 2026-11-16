@@ -36,8 +36,8 @@ def run(args):
         app.expect(r"^READY$")
         repl, out = start([args.repl, "--server", args.server, "--agent", args.agent])
         field_names = ["items_", "large_", "nested_", "map_", "risk_", "hash_", "unmatched_", "note_",
-                       "extension_", "child__snapshot"]
-        method_names = ["rehash_only", "mutate", "make_valueless", "replace_child"]
+                       "extension_", "child__snapshot", "result_calls_"]
+        method_names = ["rehash_only", "mutate", "make_valueless", "replace_child", "make_result"]
         if args.registered_any:
             field_names.extend(("extension__snapshot", "alias__snapshot"))
             method_names.append("update_registered")
@@ -141,6 +141,9 @@ def run(args):
             assert ("extension_", "string -> opaque") in mutate, mutate
         assert mutate["extension_", "opaque std::any payload"]["kind"] == "COVERAGE_GAP", mutate
         assert ("child__snapshot.visible", "11 -> 17") in mutate, mutate
+        assert any(item["function"].endswith("::make_result()") and
+                   item["field"] == "result_calls_" and item["diagnostic"] == "0 -> 1"
+                   for item in records), records
         assert any(item["function"].endswith("::make_valueless()") and item["field"] == "note_" and
                    item["diagnostic"] == "index 1 -> valueless" for item in records), records
         assert any(item["function"].endswith("::replace_child()") and item["field"] == "child__snapshot" and

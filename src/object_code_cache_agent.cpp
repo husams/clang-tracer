@@ -1,4 +1,5 @@
 #include "object_code_cache_protocol.hpp"
+#include "object_code_cache_identity.hpp"
 
 #include "object_code_cache_decode.hpp"
 #if defined(__aarch64__)
@@ -25,6 +26,7 @@
 #include <numeric>
 #include <optional>
 #include <set>
+#include <shared_mutex>
 #include <span>
 #include <stdexcept>
 #include <thread>
@@ -299,9 +301,15 @@ struct State {
   std::atomic<RuntimeBlock *> runtime_blocks{nullptr};
   State *previous = nullptr;
   std::mutex mutex;
+  // Keep typed identity reads independent from collection and event work.
+  std::shared_mutex identity_mutex;
   std::map<Address, Lifetime> lifetimes;
   struct AddressHistory {
     std::uint64_t generation = 0;
+    bool observed = false;
+    bool uncertain_live = false;
+    bool provisional_live = false;
+    ProvisionalReason provisional_reason = ProvisionalReason::none;
     std::atomic<std::uint64_t> write_window{0};
   };
   // Retain address generations and stable write-window storage for in-flight stores.
@@ -309,12 +317,19 @@ struct State {
   std::map<Address, pid_t> active_collections;
   std::uint64_t next_id = 0;
   std::uint64_t next_borrow = 0;
+  std::uint64_t identity_watch_id = 0;
+  bool provisional_method_watch = false;
+  bool identity_lifecycle_covered = false;
 
-  // Call with mutex held and no current lifetime at this address.
+  // Call with mutex and identity_mutex held and no current lifetime here.
   Lifetime *admit_lifetime(Address object) {
     if (max_instances && lifetimes.size() >= max_instances)
       return nullptr;
     auto &history = generations[object];
+    history.observed = true;
+    history.uncertain_live = false;
+    history.provisional_live = false;
+    history.provisional_reason = ProvisionalReason::none;
     auto [entry, inserted] = lifetimes.try_emplace(object);
     if (inserted)
       entry->second = {++next_id, ++history.generation};
@@ -336,7 +351,38 @@ Address tail_body(const State &watch, Address entry) noexcept {
 
 std::atomic<State *> retained{nullptr};
 std::mutex install_mutex;
+std::atomic<pid_t *> identity_pid_cache{nullptr};
+void prepare_identity_pid_cache() noexcept {
+#if defined(MADV_WIPEONFORK)
+  if (identity_pid_cache.load(std::memory_order_relaxed))
+    return;
+  const auto page_size = ::sysconf(_SC_PAGESIZE);
+  if (page_size <= 0)
+    return;
+  auto *page = static_cast<pid_t *>(::mmap(nullptr, static_cast<std::size_t>(page_size),
+      PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  if (page == MAP_FAILED)
+    return;
+  if (::madvise(page, static_cast<std::size_t>(page_size), MADV_WIPEONFORK)) {
+    ::munmap(page, static_cast<std::size_t>(page_size));
+    return;
+  }
+  identity_pid_cache.store(page, std::memory_order_release);
+#endif
+}
+pid_t identity_lookup_pid() noexcept {
+  auto *cache = identity_pid_cache.load(std::memory_order_acquire);
+  if (!cache)
+    return ::getpid();
+  auto pid = __atomic_load_n(cache, __ATOMIC_RELAXED);
+  if (!pid) {
+    pid = ::getpid();
+    __atomic_store_n(cache, pid, __ATOMIC_RELAXED);
+  }
+  return pid;
+}
 struct sigaction previous_actions[NSIG]{};
+std::array<std::atomic_flag, NSIG> previous_delivered{};
 std::array<bool, NSIG> bridge_installed{};
 
 void finish_runtime_prefix(State &watch) noexcept {
@@ -432,6 +478,7 @@ struct Sample {
   const Site *site = nullptr;
   Address stack = 0, destination = 0;
   Lifetime life{};
+  ProvisionalReason provisional_reason = ProvisionalReason::none;
   std::uint32_t input = 0, expected = 0;
   std::uint64_t old = 0;
   bool has_old = false;
@@ -791,6 +838,15 @@ void stack(State &watch, Observation &event, const Registers &regs,
 
 void emit(State &watch, Observation &event) noexcept {
   auto &channel = *watch.channel;
+  // A type-wide registration stages its lifecycle redirects before method
+  // probes are ready. Keep target-side identity accounting active, but never
+  // reserve an event slot that could be published after group activation.
+  // Ordinary ObjectWatch instances have no identity_watch_id and keep their
+  // existing event behavior.
+  if (watch.identity_watch_id &&
+      (!channel.registration_active.load(std::memory_order_acquire) ||
+       !(watch.static_gate.load(std::memory_order_acquire) & enabled)))
+    return;
   if (capture_exhausted(channel))
     return;
   auto position = channel.tail.load(std::memory_order_relaxed);
@@ -1163,7 +1219,8 @@ std::optional<bool> contains(const State &watch, Address owner, Address object) 
 
 void emit_boundary(State &watch, const Site &site, Address object, const Lifetime &life,
                    Hook hook, std::uint64_t borrow_id = 0, std::uint32_t owner_index_plus_one = 0,
-                   bool transfer = false) noexcept {
+                   bool transfer = false,
+                   ProvisionalReason provisional_reason = ProvisionalReason::none) noexcept {
   Observation event{};
   event.owner = life.owner;
   event.object = object;
@@ -1173,6 +1230,7 @@ void emit_boundary(State &watch, const Site &site, Address object, const Lifetim
   event.borrow_id = borrow_id;
   event.owner_index_plus_one = owner_index_plus_one;
   event.hook = hook;
+  event.provisional_reason = provisional_reason;
   event.gap = transfer;
   if (watch.shared_file.inode && object <= UINT64_MAX - watch.offset) {
     if (const auto offset = shared_file_offset(watch, object + watch.offset)) {
@@ -1208,6 +1266,7 @@ void observe_owner(State &watch, const Site &site, const Registers &regs) {
 
 void retire_owned(State &watch, const Site &site, Address object) {
   const std::lock_guard lock(watch.mutex);
+  const std::unique_lock identity_lock(watch.identity_mutex);
   const auto found = watch.lifetimes.find(object);
   if (found == watch.lifetimes.end() || !found->second.id)
     return; // A deleting destructor may enter the complete destructor next.
@@ -1400,7 +1459,18 @@ void ownership_boundary(State &watch, const Site &site, const Registers &regs) {
 }
 
 void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) {
+  if (watch.identity_watch_id &&
+      !watch.channel->registration_active.load(std::memory_order_acquire))
+    return;
   const auto object = regs.value(rdi);
+  const bool identity_type_matches = !watch.identity_watch_id ||
+      !watch.receiver_typeinfo ||
+      ((kind == Hook::create || kind == Hook::destroy_begin) &&
+       matches_type(object, watch.receiver_typeinfo, watch.borrow.base_offset));
+  if (watch.identity_watch_id &&
+      (kind == Hook::create || kind == Hook::destroy_begin) &&
+      !identity_type_matches)
+    return;
   if (kind == Hook::create && watch.shared_file.inode &&
       (object > UINT64_MAX - watch.offset || !shared_file_offset(watch, object + watch.offset)))
     return;
@@ -1413,26 +1483,39 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
       if (!matches_type(object, watch.borrow.typeinfo, watch.borrow.base_offset))
         return;
       const std::lock_guard lock(watch.mutex);
+      const std::unique_lock identity_lock(watch.identity_mutex);
       if (const auto prior = watch.lifetimes.find(object); prior != watch.lifetimes.end()) {
         emit_boundary(watch, site, object, prior->second, Hook::lifetime_reused);
         watch.lifetimes.erase(prior);
       }
       if (const auto *life = watch.admit_lifetime(object))
         emit_boundary(watch, site, object, *life, kind);
-      else
+      else {
+        if (watch.identity_watch_id && watch.provisional_method_watch &&
+            identity_type_matches) {
+          auto &history = watch.generations[object];
+          history.observed = true;
+          history.uncertain_live = false;
+          history.provisional_live = true;
+          history.provisional_reason = ProvisionalReason::instance_limit;
+        }
         emit_boundary(watch, site, object, {}, Hook::admission_gap);
+      }
       return;
     }
   }
   Lifetime life;
+  ProvisionalReason provisional_reason = ProvisionalReason::none;
   if (kind == Hook::destroy_end) {
     const auto sample = destroying;
     destroying = {};
     if (!sample.site || sample.site->watch != &watch || sample.stack != regs.value(rsp))
       return;
     life = sample.life;
+    provisional_reason = sample.provisional_reason;
   } else {
     const std::lock_guard lock(watch.mutex);
+    const std::unique_lock identity_lock(watch.identity_mutex);
     if (kind == Hook::create) {
       if (const auto prior = watch.lifetimes.find(object); prior != watch.lifetimes.end()) {
         emit_boundary(watch, site, object, prior->second, Hook::lifetime_reused);
@@ -1440,21 +1523,45 @@ void boundary(State &watch, const Site &site, const Registers &regs, Hook kind) 
       }
       const auto *item = watch.admit_lifetime(object);
       if (!item) {
+        if (watch.identity_watch_id && watch.provisional_method_watch &&
+            identity_type_matches) {
+          auto &history = watch.generations[object];
+          history.observed = true;
+          history.uncertain_live = false;
+          history.provisional_live = true;
+          history.provisional_reason = ProvisionalReason::instance_limit;
+        }
         emit_boundary(watch, site, object, {}, Hook::admission_gap);
         return;
       }
       life = *item;
     } else {
       destroying = {};
+      auto &history = watch.generations[object];
+      // A verified address/type observation can support destructor boundaries
+      // without claiming a complete-object lifetime identity.
+      const bool provisional = watch.identity_watch_id && watch.provisional_method_watch &&
+          history.observed &&
+          (history.uncertain_live || history.provisional_live) && identity_type_matches;
+      provisional_reason = provisional ? history.provisional_reason :
+          ProvisionalReason::none;
+      history.observed = true;
+      history.uncertain_live = false;
+      history.provisional_live = false;
+      history.provisional_reason = ProvisionalReason::none;
       const auto found = watch.lifetimes.find(object);
-      if (found == watch.lifetimes.end() || !found->second.id)
-        return;
-      life = found->second;
-      watch.lifetimes.erase(found);
+      if (found == watch.lifetimes.end() || !found->second.id) {
+        if (!provisional)
+          return;
+      } else {
+        life = found->second;
+        watch.lifetimes.erase(found);
+      }
       destroying = {&site, regs.value(rsp), object, life};
+      destroying.provisional_reason = provisional_reason;
     }
   }
-  emit_boundary(watch, site, object, life, kind);
+  emit_boundary(watch, site, object, life, kind, 0, 0, false, provisional_reason);
 }
 
 void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
@@ -1478,6 +1585,14 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
   }
 
   if (entering) {
+    // A staged type-wide watch exists only to be ready for publication; do
+    // not create target-side lifetimes for constructors that began before
+    // the associated method probes became visible. Such receivers may be
+    // admitted provisionally after publication when their exact type is
+    // independently verified.
+    if (watch.identity_watch_id &&
+        !watch.channel->registration_active.load(std::memory_order_acquire))
+      return;
     const auto object = regs.value(rdi);
     if (!object || object > UINT64_MAX - watch.offset)
       return;
@@ -1494,14 +1609,33 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
     }
     stack(watch, event, regs);
     if (!constructor) {
-      const std::lock_guard lock(watch.mutex);
-      const auto item = watch.lifetimes.find(object);
-      if (item == watch.lifetimes.end() || !item->second.id)
+      const bool exact_type = !watch.receiver_typeinfo ||
+          matches_type(object, watch.receiver_typeinfo, watch.borrow.base_offset);
+      if (watch.identity_watch_id && !exact_type)
         return;
-      event.id = item->second.id;
-      event.generation = item->second.generation;
-      event.owner = item->second.owner;
-      watch.lifetimes.erase(item);
+      const std::lock_guard lock(watch.mutex);
+      const std::unique_lock identity_lock(watch.identity_mutex);
+      auto &history = watch.generations[object];
+      // Keep provisional observations visible, but never attach a fabricated ID.
+      const bool provisional = watch.identity_watch_id && watch.provisional_method_watch &&
+          history.observed &&
+          (history.uncertain_live || history.provisional_live) && exact_type;
+      event.provisional_reason = provisional ? history.provisional_reason :
+          ProvisionalReason::none;
+      history.observed = true;
+      history.uncertain_live = false;
+      history.provisional_live = false;
+      history.provisional_reason = ProvisionalReason::none;
+      const auto item = watch.lifetimes.find(object);
+      if (item == watch.lifetimes.end() || !item->second.id) {
+        if (!provisional)
+          return;
+      } else {
+        event.id = item->second.id;
+        event.generation = item->second.generation;
+        event.owner = item->second.owner;
+        watch.lifetimes.erase(item);
+      }
       event.hook = Hook::destroy_begin;
       emit(watch, event);
     }
@@ -1513,8 +1647,14 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
     const bool uncertain = inst.uncertain_construct &&
         !std::ranges::binary_search(watch.complete_constructor_returns, call, {},
             [](const auto &site) { return std::pair{site.entry, site.return_pc}; });
-    if (constructor && outer && !uncertain) {
+    if (constructor && outer) {
       const std::lock_guard lock(watch.mutex);
+      const std::unique_lock identity_lock(watch.identity_mutex);
+      auto &history = watch.generations[object];
+      history.observed = true;
+      history.uncertain_live = false;
+      history.provisional_live = false;
+      history.provisional_reason = ProvisionalReason::none;
       const auto prior = watch.lifetimes.find(object);
       if (prior != watch.lifetimes.end() && prior->second.id) {
         emit_boundary(watch, site, object, prior->second, Hook::lifetime_reused);
@@ -1549,14 +1689,29 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
     emit(watch, event);
     return;
   }
-  if (frame.uncertain || (watch.receiver_typeinfo &&
-      !matches_type(event.object, watch.receiver_typeinfo, watch.borrow.base_offset))) {
+  if (watch.identity_watch_id &&
+      !watch.channel->registration_active.load(std::memory_order_acquire))
+    return;
+  const bool exact_type = !watch.receiver_typeinfo ||
+      matches_type(event.object, watch.receiver_typeinfo, watch.borrow.base_offset);
+  if (frame.uncertain || !exact_type) {
     event.hook = Hook::construction_uncertain;
     event.gap = frame.uncertain;
+    if (watch.identity_watch_id && watch.provisional_method_watch &&
+        frame.uncertain && exact_type) {
+      const std::lock_guard lock(watch.mutex);
+      const std::unique_lock identity_lock(watch.identity_mutex);
+      auto &history = watch.generations[event.object];
+      history.observed = true;
+      history.uncertain_live = true;
+      history.provisional_live = false;
+      history.provisional_reason = ProvisionalReason::uncertain_construction;
+    }
     emit(watch, event);
     return;
   }
   const std::lock_guard lock(watch.mutex);
+  const std::unique_lock identity_lock(watch.identity_mutex);
   if (watch.lifetimes.contains(event.object)) {
     event.hook = Hook::construction_uncertain;
     emit(watch, event);
@@ -1564,6 +1719,13 @@ void lifecycle_boundary(State &watch, const Site &site, const Registers &regs) {
   }
   const auto *life = watch.admit_lifetime(event.object);
   if (!life) {
+    if (watch.identity_watch_id && watch.provisional_method_watch) {
+      auto &history = watch.generations[event.object];
+      history.observed = true;
+      history.provisional_live = true;
+      history.uncertain_live = false;
+      history.provisional_reason = ProvisionalReason::instance_limit;
+    }
     event.hook = Hook::admission_gap;
     emit(watch, event);
     return;
@@ -2617,8 +2779,14 @@ void fault(int sig, siginfo_t *info, void *context) {
     }
   }
   const auto &previous = previous_actions[sig];
-  if (previous.sa_handler == SIG_DFL || previous.sa_handler == SIG_IGN) {
-    if (previous.sa_handler == SIG_IGN && info->si_code <= 0)
+  // SA_RESETHAND is emulated in the bridge because the process-wide handler
+  // remains installed for translated code. Claim the application handler
+  // atomically before chaining so a nested or concurrent delivery observes
+  // the default disposition instead of invoking the one-shot handler twice.
+  const bool one_shot_consumed = (previous.sa_flags & SA_RESETHAND) &&
+      previous_delivered[sig].test_and_set(std::memory_order_relaxed);
+  if (one_shot_consumed || previous.sa_handler == SIG_DFL || previous.sa_handler == SIG_IGN) {
+    if (!one_shot_consumed && previous.sa_handler == SIG_IGN && async)
       return;
 
     if (faulting && !async && part == Part::instruction) {
@@ -2634,13 +2802,43 @@ void fault(int sig, siginfo_t *info, void *context) {
         sp = interrupted_sp;
       }
     }
-    // Linux takes the default action on a hardware fault even when the
-    // application ignored the signal. Raised signals must be sent again.
+    // A hardware fault reoccurs when its instruction resumes. Signals already
+    // delivered asynchronously (including kernel-generated timer/child signals)
+    // must be sent again after installing the default disposition.
     struct sigaction action{};
     action.sa_handler = SIG_DFL;
     ::sigaction(sig, &action, nullptr);
-    if (info->si_code <= 0)
-      ::raise(sig);
+    if (info->si_code <= 0 || async) {
+      bool default_action_delivered = false;
+      // The bridge blocks its current signal by default. Unblock it while
+      // SIG_DFL is installed so raise() cannot remain pending when the bridge
+      // disposition is restored, including for non-one-shot default handlers.
+      sigset_t one_signal{}, previous_mask{};
+      ::sigemptyset(&one_signal);
+      ::sigaddset(&one_signal, sig);
+      if (!::sigprocmask(SIG_UNBLOCK, &one_signal, &previous_mask)) {
+        default_action_delivered = ::raise(sig) == 0;
+        (void)::sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
+      } else {
+        // Keep SIG_DFL installed. If raise queues, the action occurs after
+        // this bridge frame returns; do not rearm a handler over that signal.
+        (void)::raise(sig);
+      }
+      if (default_action_delivered) {
+        // Default-ignore and stop/continue actions can return here. Keep the
+        // bridge for translated code, but do not overwrite a handler that the
+        // application installed while the default action was running.
+        struct sigaction current{};
+        if (!::sigaction(sig, nullptr, &current) && current.sa_handler == SIG_DFL) {
+          struct sigaction bridge{};
+          bridge.sa_mask = previous.sa_mask;
+          bridge.sa_flags = SA_SIGINFO |
+              (previous.sa_flags & (SA_ONSTACK | SA_NODEFER | SA_RESTART));
+          bridge.sa_sigaction = fault;
+          (void)::sigaction(sig, &bridge, nullptr);
+        }
+      }
+    }
     return;
   }
   auto application_info = *info;
@@ -2707,6 +2905,16 @@ void fault(int sig, siginfo_t *info, void *context) {
 }
 
 void install_bridge(std::uint64_t async_signals) {
+  // Reacquire a disposition only when no retained translation or in-flight
+  // execution can still use the previous signal chain. This applies to both
+  // grouped JIT preparation and ordinary object-watch initialization.
+  bool allow_rebind = true;
+  for (auto *watch = retained.load(std::memory_order_acquire); allow_rebind && watch;
+       watch = watch->previous) {
+    if (watch->static_gate.load(std::memory_order_acquire) ||
+        watch->runtime_inflight.load(std::memory_order_acquire))
+      allow_rebind = false;
+  }
   std::vector<int> signals{SIGSEGV, SIGBUS, SIGFPE, SIGILL};
   for (int sig = 1; sig < NSIG && sig <= 64; ++sig)
     if (!synchronous_fault_signal(sig) && (async_signals & (1ULL << (sig - 1))))
@@ -2716,18 +2924,16 @@ void install_bridge(std::uint64_t async_signals) {
     struct sigaction current{};
     if (::sigaction(sig, nullptr, &current))
       throw std::runtime_error("cannot read application signal disposition");
-    if (bridge_installed[sig]) {
-      if (!(current.sa_flags & SA_SIGINFO) || current.sa_sigaction != fault)
-        throw std::runtime_error("application replaced the code-cache signal handler");
-    } else {
-      if (current.sa_flags & SA_RESETHAND)
-        throw std::runtime_error("code cache cannot chain one-shot signal handlers");
-      if ((async_signals & (1ULL << (sig - 1))) &&
-          (current.sa_handler == SIG_DFL || current.sa_handler == SIG_IGN))
-        throw std::runtime_error("asynchronous signal needs an existing application handler");
-      previous_actions[sig] = current;
-      missing.push_back(sig);
-    }
+    if (bridge_installed[sig] && (current.sa_flags & SA_SIGINFO) && current.sa_sigaction == fault)
+      continue;
+    if (bridge_installed[sig] && !allow_rebind)
+      throw std::runtime_error("application replaced the code-cache signal handler");
+    if ((async_signals & (1ULL << (sig - 1))) &&
+        (current.sa_handler == SIG_DFL || current.sa_handler == SIG_IGN))
+      throw std::runtime_error("asynchronous signal needs an existing application handler");
+    previous_actions[sig] = current;
+    previous_delivered[sig].clear(std::memory_order_relaxed);
+    missing.push_back(sig);
   }
   for (const auto sig : missing) {
     struct sigaction action{};
@@ -4882,7 +5088,10 @@ void initialize(Init &init
     }
   }
 #endif
+  prepare_identity_pid_cache();
   watch->pid = ::getpid();
+  watch->identity_watch_id = init.identity_watch_id;
+  watch->provisional_method_watch = init.provisional_method_watch;
   watch->offset = init.scalar;
   if (init.field_width != 1 && init.field_width != 2 && init.field_width != 4 && init.field_width != 8)
     throw std::runtime_error("invalid native write field width");
@@ -4942,6 +5151,60 @@ void initialize(Init &init
   for (const auto &function : functions)
     for (std::size_t i = 0; i < function.count; ++i)
       watch->sites.push_back({function.instructions[i], watch.get(), function.instructions[0].pc});
+  if (watch->identity_watch_id) {
+    bool constructor_entry = false, constructor_return = false;
+    bool destructor_entry = false, destructor_return = false;
+    struct ConstructorCoverage {
+      bool entered = false;
+      bool uncertain = true;
+      bool returned = false;
+    };
+    std::map<Address, ConstructorCoverage> constructors;
+    for (const auto &site : watch->sites) {
+      switch (site.instruction.hook) {
+      case Hook::constructor_enter: {
+        constructor_entry = true;
+        auto &coverage = constructors[site.instruction.boundary_pc];
+        coverage.entered = true;
+        coverage.uncertain &= site.instruction.uncertain_construct;
+        break;
+      }
+      case Hook::constructor_return:
+        constructor_return = true;
+        constructors[site.instruction.boundary_pc].returned = true;
+        break;
+      case Hook::create:
+        constructor_entry = constructor_return = true;
+        break;
+      case Hook::destructor_enter:
+      case Hook::destroy_begin:
+        destructor_entry = true;
+        break;
+      case Hook::destructor_return:
+      case Hook::destroy_end:
+        destructor_return = true;
+        break;
+      case Hook::destroy_both:
+        destructor_entry = destructor_return = true;
+        break;
+      default: break;
+      }
+    }
+    const bool all_constructors_provisional = !constructors.empty() &&
+        std::ranges::all_of(constructors, [](const auto &entry) {
+          const auto &coverage = entry.second;
+          return coverage.entered && coverage.uncertain && coverage.returned;
+        });
+    // A method-only group may still observe exact constructors when no
+    // destructor boundary is available. It can support provisional calls,
+    // but must never create lifetime IDs from that incomplete coverage.
+    const bool method_only = watch->no_values && !watch->value_write.active();
+    const bool provisional_coverage = method_only && constructor_entry && constructor_return &&
+        !destructor_entry && !destructor_return && all_constructors_provisional &&
+        watch->complete_constructor_returns.empty();
+    watch->identity_lifecycle_covered = (constructor_entry && constructor_return &&
+        destructor_entry && destructor_return) || provisional_coverage;
+  }
   const XState xstate;
   std::size_t first = 0;
   for (auto &function : functions) {
@@ -4962,9 +5225,73 @@ void initialize(Init &init
   retained.store(watch.release(), std::memory_order_release);
 }
 } // namespace
+
+namespace identity {
+std::optional<Identity> lookup(std::uint64_t watch_id, std::uint64_t receiver) noexcept {
+  try {
+    if (!watch_id || !receiver)
+      return std::nullopt;
+    auto *watch = retained.load(std::memory_order_acquire);
+    while (watch && watch->identity_watch_id != watch_id)
+      watch = watch->previous;
+    if (!watch || identity_lookup_pid() != watch->pid || !watch->identity_lifecycle_covered ||
+        !(watch->static_gate.load(std::memory_order_acquire) & enabled) ||
+        !watch->channel->registration_active.load(std::memory_order_acquire))
+      return std::nullopt;
+
+    if (std::ranges::any_of(lifecycle_frames, [&](const auto &frame) {
+          return frame.watch == watch && frame.event.object == receiver;
+        }))
+      return std::nullopt;
+
+    if (watch->receiver_typeinfo &&
+        !matches_type(receiver, watch->receiver_typeinfo, watch->borrow.base_offset))
+      return std::nullopt;
+    std::shared_lock identity_lock(watch->identity_mutex);
+    if (!watch->channel->registration_active.load(std::memory_order_acquire))
+      return std::nullopt;
+    if (const auto found = watch->lifetimes.find(receiver); found != watch->lifetimes.end()) {
+      const auto &life = found->second;
+      if (life.id && life.generation)
+        return Identity{life.id, life.generation};
+      return std::nullopt;
+    }
+    if (!watch->provisional_method_watch)
+      return Identity{};
+    if (const auto history = watch->generations.find(receiver);
+        history != watch->generations.end() &&
+        (history->second.uncertain_live || history->second.provisional_live))
+      return Identity{};
+
+    // A method can observe a receiver constructed without a hooked entry,
+    // including a trivial copy in storage used by an earlier lifetime.
+    identity_lock.unlock();
+    const std::lock_guard lock(watch->mutex);
+    const std::unique_lock exclusive_lock(watch->identity_mutex);
+    if (!(watch->static_gate.load(std::memory_order_acquire) & enabled) ||
+        !watch->channel->registration_active.load(std::memory_order_acquire))
+      return std::nullopt;
+    if (const auto found = watch->lifetimes.find(receiver); found != watch->lifetimes.end()) {
+      const auto &life = found->second;
+      if (life.id && life.generation)
+        return Identity{life.id, life.generation};
+      return std::nullopt;
+    }
+    auto &history = watch->generations[receiver];
+    if (!history.uncertain_live && !history.provisional_live) {
+      history.observed = true;
+      history.provisional_live = true;
+      history.provisional_reason = ProvisionalReason::unobserved_construction;
+    }
+    return Identity{};
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+} // namespace identity
 } // namespace tracer::object_cache
 
-extern "C" int tracer_agent_object_cache_v38(tracer::object_cache::Init *request) {
+extern "C" int tracer_agent_object_cache_v40(tracer::object_cache::Init *request) {
   try {
     tracer::object_cache::initialize(*request);
     return 0;
@@ -4975,7 +5302,7 @@ extern "C" int tracer_agent_object_cache_v38(tracer::object_cache::Init *request
 }
 
 #if defined(__aarch64__)
-extern "C" int tracer_agent_arm_snapshot_v2(tracer::arm_snapshot::Init *request) {
+extern "C" int tracer_agent_arm_snapshot_v3(tracer::arm_snapshot::Init *request) {
   try {
     tracer::object_cache::initialize(request->code, request);
     return 0;

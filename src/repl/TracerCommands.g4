@@ -4,7 +4,7 @@ line : '%' command EOF;
 command : server | attach | processes | sessions | use | status | detach
         | modules | moduleIndex | threads | symbols | probe | interceptor | events | collect | record
         | cpp | plugin | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload
-        | objectWatch;
+        | objectWatch | objectProbe | liveUpdate;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
 serverOption : ('--executable' | '--agent') value | contextEventBytes;
 attach : 'attach' (UINT ('--start-time' UINT)?)?;
@@ -52,12 +52,13 @@ events : 'events' (streamOption*
        | 'diff' value '--pre' UINT '--post' UINT ('--key' value)*
        | STACK value '--index' UINT
        | 'calls' value | 'stats' value | 'clear' value
-       | 'open' value '--as' value
+       | 'open' value '--as' value ('--callback-errors' value)?
        | 'export' value '--format' 'json' '--output' value);
 collect : 'collect' streamOption*;
 record : 'record' value (streamOption | SQLITE)*;
 streamOption : ('--count' | '--timeout' | '--after' | '--probe') UINT
              | '--phase' ('PRE' | 'POST')
+             | '--callback-errors' value
              | ('--as' | '--name' | '--session') value | '--all';
 cpp : 'cpp' ('load' value | 'reset'
             | ('import' | 'generate') value (('--type' | '--output') value)*
@@ -82,7 +83,26 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'collect' | 'record' | 'PRE' | 'POST' | 'cpp' | 'reset' | 'import'
         | 'generate' | 'options' | 'add' | 'compdb' | 'shell'
         | 'complete' | 'type' | 'help' | 'quit' | 'exit' | 'trace' | 'preview' | 'apply'
-        | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | 'object' | STACK | pluginKeyword;
+        | 'memory' | 'maps' | 'read' | 'scan' | 'entry' | 'reload' | 'object' | 'object-probe'
+        | 'live' | 'update' | 'revert' | 'mock' | 'update-data' | 'scan-heap' | 'watch' | RECOVER | STACK | pluginKeyword;
+objectProbe : 'object-probe' ('prepare' value objectProbePrepareOption+
+                            | ('preview' | 'start') objectProbeBindOption+
+                            | ('status' | 'stop') UINT?);
+objectProbePrepareOption : ('--include' | '--compdb' | '--translation-unit' | '--callbacks'
+                            | '--output' | '--method' | '--field' | '--code') value
+                         | '--dwarf-writers' | extraCompileOption;
+objectProbeBindOption : ('--package' | '--module' | '--method-module'
+                         | '--union-tag' | '--union-case' | '--synchronization') value
+                      | '--follow-calls' | '--no-values' | '--first-seen';
+liveUpdate : 'live' (('update' | 'preview' | 'watch') (value | liveOption)+ | 'status' | RECOVER | 'revert' UINT?
+                   | 'mock' value liveOption+ | 'update-data' value (liveOption | liveScanSelection)*
+                   | 'scan-heap' liveOption+);
+liveScanSelection : '--from-scan' value+;
+liveOption : ('--build' | '--compdb' | '--file' | '--function' | '--fixture' | '--bind'
+              | '--recursion' | '--discover-file' | '--discover-function' | '--module'
+              | '--address' | '--type'
+              | '--after-file' | '--after-function' | '--for-each' | '--managed') value
+           | ('--retention-limit' | PAYLOAD_LIMIT) UINT;
 objectWatch : 'object' ('prepare' value? objectOption+ | ('start' | 'preview') objectOption+
                         | ('stop' | 'status') UINT?);
 objectOption : ('--type' | '--base' | '--owner' | '--field' | '--collection'
@@ -128,5 +148,7 @@ CWD : '--cwd';
 SIGNATURE : '--signature';
 MEMBER : '--member';
 SNAPSHOT_RETURN_POINTEE : '--snapshot-return-pointee';
+RECOVER : 'recover';
+PAYLOAD_LIMIT : '--payload-limit';
 WORD : ~[ \t\r\n"'\\%`]+;
 WS : [ \t\r\n]+ -> skip;

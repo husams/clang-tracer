@@ -72,6 +72,23 @@ const CommandTopic commands[] = {
      "  [--addresses] [--mapping TOKEN] [--address PC]",
      "Find supported C++ callables. Use --addresses for verified entries or --address with the mapping token to look up a PC.",
      "%symbols --filter Calculator --limit 20 --addresses"},
+    {"live", "", "Preview, apply, inspect, and revert verified native code replacements."},
+    {"live update", "%live update FILE... [--compdb FILE] [--build MANIFEST] [--retention-limit N] [--payload-limit BYTES]\n"
+     "  [--managed true | --after-file FILE --after-function NAME --for-each TYPE]",
+     "Publish a verified -O0 group. Local entries need a unique ELF file marker and a patchable entry."},
+    {"live preview", "%live preview FILE... [--compdb FILE] [--build MANIFEST]",
+     "Show the exact native entries and blockers for a saved source snapshot."},
+    {"live status", "%live status", "List the active revision and retained JIT generation count."},
+    {"live watch", "%live watch FILE [FILE ...] [--build FILE] [--compdb FILE]",
+     "Watch saved files and automatically preview and apply eligible changes. Press Ctrl-C to stop watching."},
+    {"live mock", "%live mock SIGNATURE --file FILE --function FUNCTION [--fixture FILE] [--bind ALIAS=SIGNATURE] [--recursion original]",
+     "Compile a typed replacement into the target and activate it as a live revision."},
+    {"live update-data", "%live update-data FILE [--discover-file FILE --discover-function NAME] [--module MODULE] [--address ADDRESS] [--from-scan ID ...]",
+     "Run a C++ callback once per selected object with verified ownership or borrowing."},
+    {"live scan-heap", "%live scan-heap --type TYPE [--type TYPE] [--module MODULE]",
+     "Find candidate objects in the target heap and report the evidence for each candidate."},
+    {"live revert", "%live revert [REVISION]", "Restore the parent or specified revision. Revision 0 is the original build."},
+    {"live recover", "%live recover", "Recover a managed publication in the current server session."},
     {"memory", "", "List, read, or scan mapped memory."},
     {"memory maps", "%memory maps",
      "List all mapped ranges and permissions in the selected session and issue a memory snapshot token."},
@@ -116,6 +133,17 @@ const CommandTopic commands[] = {
      "Record observations with %record FILE --sqlite --name object.trace."},
     {"object status", "%object status [WATCH_ID]", "Show admitted store sites, observations and restoration status."},
     {"object stop", "%object stop [WATCH_ID]", "Restore the watch's patches and release execution control."},
+    {"object-probe prepare", "%object-probe prepare TYPE --method METHOD --include HEADER --compdb FILE --translation-unit TU --callbacks SOURCE --output FILE",
+      "Prepare an offline type package. A field write package uses --field FIELD --code WRITER."},
+    {"object-probe preview", "%object-probe preview --package FILE [--module MAPPING] [start options]",
+      "Bind an attached target and check patch windows. Use the same options for preview and start."},
+    {"object-probe start", "%object-probe start --package FILE [--module MAPPING] [--method-module MAPPING] "
+        "[--follow-calls] [--no-values] [--first-seen] [--union-tag FIELD --union-case TAG=MEMBER "
+        "--synchronization thread-confined|caller-lock]",
+      "Activate the verified object probe. Follow calls for write-only registrations. "
+      "Use first-seen with a standalone writer and a write-only package. Repeat union-case for each admitted tag."},
+    {"object-probe status", "%object-probe status [ID]", "Report group coverage and restoration."},
+    {"object-probe stop", "%object-probe stop [ID]", "Close callback admission and restore the group's patches."},
 
     {"trace", "", "Preview, apply, or remove a bulk C++ trace."},
     {"trace preview", "%trace preview [--module GLOB] [--include GLOB] [--exclude GLOB] [--exact SIGNATURE]\n"
@@ -177,8 +205,8 @@ const CommandTopic commands[] = {
      R"example(%interceptor upload hook --target "demo::compute(int)")example"},
 
     {"events", "%events [STREAM OPTIONS] [--as NAME]",
-     "Print live events and keep a bounded collection named live by default.",
-     "%events --count 5 --phase POST"},
+     "Print live events and keep a bounded collection named live by default. Use --callback-errors exclude or only to select callback outcomes.",
+     "%events --count 5 --phase POST --callback-errors only"},
     {"events list", "%events list NAME [--limit N]", "List retained events with their zero-based indexes. The default limit is 20."},
     {"events show", "%events show NAME --index N", "Print one retained event and its captured values.", "%events show batch --index 0"},
     {"events diff", "%events diff NAME --pre N --post N [--key PATH=MEMBER]...",
@@ -190,16 +218,16 @@ const CommandTopic commands[] = {
     {"events stats", "%events stats NAME",
      "Summarize live or replayed calls per probe, with duration histograms, caller edges and loss."},
     {"events clear", "%events clear NAME", "Remove a named collection and release its buffer space."},
-    {"events open", "%events open FILE --as NAME",
+    {"events open", "%events open FILE --as NAME [--callback-errors include|exclude|only]",
      "Open a Protobuf or SQLite recording offline as a bounded, named collection. Compatible C++ types stored in SQLite load automatically.",
-     "%events open capture.db --as saved"},
+     "%events open capture.db --as saved --callback-errors only"},
     {"events export", "%events export NAME --format json --output NEW_FILE.json",
      "Write the retained events to a new JSON file."},
-    {"collect", "%collect [STREAM OPTIONS] [--as NAME]", "Capture events into a bounded collection named batch by default.",
-     "%collect --count 10 --timeout 15 --phase POST --as results"},
+    {"collect", "%collect [STREAM OPTIONS] [--as NAME]", "Capture events into a bounded collection named batch by default. Use --callback-errors exclude or only to select successful callbacks or callback failures.",
+     "%collect --count 10 --timeout 15 --phase POST --callback-errors only --as failures"},
     {"record", "%record FILE [--sqlite] [STREAM OPTIONS]",
-     "Record framed Protobuf by default. With --sqlite, create or append to a SQLite recording and save available prepared C++ types for replay.",
-     "%record capture.db --sqlite --name account.adjusted --count 12"},
+     "Record framed Protobuf by default. With --sqlite, create or append to a SQLite recording and save available prepared C++ types for replay. Use --callback-errors exclude or only to select callback outcomes.",
+     "%record capture.db --sqlite --name account.adjusted --callback-errors only --count 12"},
 
     {"cpp", "", "Load C++, configure the local compiler, or generate mappings for captured values."},
     {"cpp load", "%cpp load FILE", "Evaluate a local C++ source file in the current interpreter."},
@@ -268,6 +296,7 @@ if (data.size()) {
   auto e = data.at(0);
   std::cout << e.phase() << ' ' << e.function_name() << '\n';
 })",
+     "Use callback_error() and callback_error_message() to inspect callback failures. "
      "Use argument_as<T>(index) or result_as<T>() when T matches the captured type. "
      "has_result() includes void returns. Use argument_snapshot(), receiver_snapshot(), or state_snapshot() "
      "to inspect captured fields without rebuilding an application type.", "Event"},
@@ -371,7 +400,7 @@ query.names = {"account.adjusted"};
 query.count = 20;
 auto data = tracer.replay("capture.db", query);
 if (data.size()) tracer.print(data.at(0));)",
-     "Set names, phase, pid, session_id, or count to narrow the read. Names match exact function "
+     "Set names, phase, pid, session_id, callback_errors, or count to narrow the read. Names match exact function "
      "selectors or custom event names. Count zero reads all matches and retains the latest that fit. "
      "SQLite replay loads compatible recorded C++ types and generates their mappings before the next input."},
     {"batch", "Get a Collection from a named capture or replay.",

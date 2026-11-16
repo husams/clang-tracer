@@ -19,6 +19,18 @@ int main() {
     }
     throw std::runtime_error("accepted malformed command: " + s);
   };
+  const auto live = parse_command("%live update \"source one.cpp\" source-two.cpp "
+                                  "--build inputs.textproto --retention-limit 3");
+  require(live.kind == CommandKind::live_update && live.arguments.size() == 2 &&
+          live.arguments.front() == "source one.cpp" && live.number("--retention-limit", 0) == 3);
+  require(parse_command("%live preview source.cpp").kind == CommandKind::live_preview);
+  require(parse_command("%live status").kind == CommandKind::live_status);
+  require(parse_command("%live watch source.cpp").kind == CommandKind::live_watch);
+  require(parse_command("%object prepare --type demo::State --code f --field value --output watch")
+              .option("--output") == "watch");
+  require(parse_command("%live revert 0").arguments.front() == "0");
+  require(parse_command("%live recover").kind == CommandKind::live_recover);
+  bad("%live recover 0");
   require(parse_command("%attach 12345").kind == CommandKind::attach);
   require(parse_command("%probe prepare \"demo::compute(int)\" --include api.hpp "
       "--compdb build --translation-unit src/api.cpp --module app --output prepared").kind
@@ -115,6 +127,16 @@ int main() {
   require(!parse_command("%events").has("--count"));
   require(!parse_command("%collect --as live").has("--count"));
   require(parse_command("%collect --as cpp").option("--as") == "cpp");
+  const auto failures = parse_command(
+      "%collect --callback-errors only --count 4");
+  require(failures.option("--callback-errors") == "only");
+  const auto record_failures = parse_command(
+      "%record failures.pb --callback-errors exclude --count 2");
+  require(record_failures.option("--callback-errors") == "exclude");
+  const auto opened = parse_command(
+      "%events open capture.pb --as saved --callback-errors exclude");
+  require(opened.kind == CommandKind::event_open &&
+              opened.option("--callback-errors") == "exclude");
   require(parse_command("%help Event").arguments.at(0) == "Event");
   require(parse_command("%help api tracer_repl::Event").arguments ==
           std::vector<std::string>{"api", "tracer_repl::Event"});

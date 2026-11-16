@@ -1,0 +1,2 @@
+42 "Desk lamp" 1999
+43 "Notebook" 450

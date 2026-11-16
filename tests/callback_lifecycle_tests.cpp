@@ -37,7 +37,8 @@ extern "C" void tracer_callback_cleanup_enter() noexcept { ++suppression; }
 
 extern "C" void tracer_callback_lifecycle_leave() noexcept { --suppression; }
 
-extern "C" void tracer_callback_failure(unsigned long long) noexcept {
+extern "C" void tracer_callback_failure(
+    unsigned long long, const tracer::TraceContext *, const char *) noexcept {
   ++failures;
 }
 

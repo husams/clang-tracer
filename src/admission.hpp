@@ -37,6 +37,9 @@ private:
 // values retain the ELF path and load bias for later mapping validation.
 std::vector<ApplicationModule> discover_application_modules(pid_t pid);
 
+// Snapshot mapped application filenames for ELF inspection without requiring CFI.
+std::vector<std::string> mapped_application_files(pid_t pid);
+
 // Revalidate the session's module paths and ELF mappings after each target stop.
 void validate_application_modules(pid_t pid,
                                   ::tracer::compat::span<const ApplicationModule> modules);

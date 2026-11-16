@@ -135,6 +135,21 @@ public:
     return static_cast<std::uintptr_t>(context_.object_address);
   }
 
+  // Registration identity is available only for a receiver verified live at
+  // entry. The copied generation remains stable across this invocation.
+  bool identity_verified() const noexcept {
+    return context_.object_identity_verified;
+  }
+  std::uint64_t object_watch_id() const noexcept {
+    return context_.object_watch_id;
+  }
+  std::uint64_t object_id() const noexcept {
+    return context_.object_id;
+  }
+  std::uint64_t object_generation() const noexcept {
+    return context_.object_generation;
+  }
+
 #if defined(CLANG_TRACER_HAS_TYPED_RECEIVER)
   const ResolvedTarget *self() const {
     if (context_.object_address == 0) {

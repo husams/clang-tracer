@@ -101,7 +101,8 @@ public:
       std::uint32_t pid = 0);
 
   Plan(std::uint32_t pid, std::string executable,
-       const clangtracer::v1::ObjectWatchRequest &request);
+       const clangtracer::v1::ObjectWatchRequest &request,
+       bool verify_method_lifetimes = false);
   ~Plan();
 
   const std::string module;
@@ -118,6 +119,8 @@ public:
   std::set<std::pair<std::uint64_t, std::uint64_t>> complete_constructor_returns;
   std::map<std::uint64_t, std::uint64_t> delegating_constructor_tails;
   bool virtual_destructor = false;
+  bool lifetimes_only = false;
+  std::string lifetime_coverage_diagnostic;
   std::map<std::uint64_t, InlineMutation> inline_mutations;
   std::set<std::uint64_t> destruction_mutations;
   std::map<std::uint64_t, std::string> mutation_selectors;
@@ -154,7 +157,8 @@ public:
   std::pair<std::uint64_t, std::size_t> containing_function(std::uint64_t pc) const;
   std::map<std::uint64_t, std::vector<std::uint64_t>>
   direct_redirects(const std::vector<std::uint64_t> &entries, bool calls_only = false,
-                   bool require_complete = true) const;
+                   bool require_complete = true, bool match_constructor_plt = false,
+                   std::set<std::uint64_t> *verified_plt_calls = nullptr) const;
   std::string runtime_scope_code(const std::string &path,
       std::uint64_t bias, std::uint64_t start, const std::array<std::uint8_t, 32> &sha256,
       std::size_t width,
