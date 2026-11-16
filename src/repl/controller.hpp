@@ -3,6 +3,7 @@
 #include <functional>
 #include <iosfwd>
 #include <map>
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -56,6 +57,12 @@ class Controller {
     clangtracer::v1::PreparedInjector artifact;
   };
   std::map<std::string, PreparedPackage> prepared_packages_;
+  struct ObjectProbePreview {
+    std::string definition;
+    clangtracer::v1::ObjectProbeBinding binding;
+  };
+  std::optional<ObjectProbePreview> object_probe_preview_;
+  void object_probe_command(const Command &command);
   std::filesystem::path default_module_index_;
   clangtracer::v1::ListModulesResponse module_snapshot(bool include_mappings);
   clangtracer::v1::ListModulesResponse module_snapshot(const SessionHandle &session,

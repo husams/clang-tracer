@@ -58,10 +58,12 @@ public:
     T__234 = 235, T__235 = 236, T__236 = 237, T__237 = 238, T__238 = 239, 
     T__239 = 240, T__240 = 241, T__241 = 242, T__242 = 243, T__243 = 244, 
     T__244 = 245, T__245 = 246, T__246 = 247, T__247 = 248, T__248 = 249, 
-    T__249 = 250, T__250 = 251, T__251 = 252, T__252 = 253, UINT = 254, 
-    STRING = 255, SHELL = 256, METADATA_ONLY = 257, SQLITE = 258, STACK = 259, 
-    CWD = 260, SIGNATURE = 261, MEMBER = 262, SNAPSHOT_RETURN_POINTEE = 263, 
-    RECOVER = 264, PAYLOAD_LIMIT = 265, WORD = 266, WS = 267
+    T__249 = 250, T__250 = 251, T__251 = 252, T__252 = 253, T__253 = 254, 
+    T__254 = 255, T__255 = 256, T__256 = 257, T__257 = 258, T__258 = 259, 
+    T__259 = 260, UINT = 261, STRING = 262, SHELL = 263, METADATA_ONLY = 264, 
+    SQLITE = 265, STACK = 266, CWD = 267, SIGNATURE = 268, MEMBER = 269, 
+    SNAPSHOT_RETURN_POINTEE = 270, RECOVER = 271, PAYLOAD_LIMIT = 272, WORD = 273, 
+    WS = 274
   };
 
   enum {
@@ -75,13 +77,14 @@ public:
     RuleEvents = 26, RuleCollect = 27, RuleRecord = 28, RuleStreamOption = 29, 
     RuleCpp = 30, RuleShell = 31, RuleComplete = 32, RuleType = 33, RuleHelp = 34, 
     RuleQuit = 35, RuleBulkTrace = 36, RuleBulkTraceOption = 37, RuleValue = 38, 
-    RuleKeyword = 39, RuleLiveUpdate = 40, RuleLiveScanSelection = 41, RuleLiveOption = 42, 
-    RuleObjectWatch = 43, RuleObjectOption = 44, RuleMemory = 45, RuleProbeEntry = 46, 
-    RuleProbeReload = 47, RuleTargetLaunch = 48, RuleLaunchOption = 49, 
-    RuleChildList = 50, RuleTargetCall = 51, RuleLocalPerf = 52, RuleTargetLibrary = 53, 
-    RuleInstructions = 54, RuleInstructionOption = 55, RuleWatchpoint = 56, 
-    RuleStackFilter = 57, RuleContextEventBytes = 58, RuleExtraCompileOption = 59, 
-    RuleCwdOption = 60
+    RuleKeyword = 39, RuleObjectProbe = 40, RuleObjectProbePrepareOption = 41, 
+    RuleObjectProbeBindOption = 42, RuleLiveUpdate = 43, RuleLiveScanSelection = 44, 
+    RuleLiveOption = 45, RuleObjectWatch = 46, RuleObjectOption = 47, RuleMemory = 48, 
+    RuleProbeEntry = 49, RuleProbeReload = 50, RuleTargetLaunch = 51, RuleLaunchOption = 52, 
+    RuleChildList = 53, RuleTargetCall = 54, RuleLocalPerf = 55, RuleTargetLibrary = 56, 
+    RuleInstructions = 57, RuleInstructionOption = 58, RuleWatchpoint = 59, 
+    RuleStackFilter = 60, RuleContextEventBytes = 61, RuleExtraCompileOption = 62, 
+    RuleCwdOption = 63
   };
 
   explicit TracerCommandsParser(antlr4::TokenStream *input);
@@ -141,6 +144,9 @@ public:
   class BulkTraceOptionContext;
   class ValueContext;
   class KeywordContext;
+  class ObjectProbeContext;
+  class ObjectProbePrepareOptionContext;
+  class ObjectProbeBindOptionContext;
   class LiveUpdateContext;
   class LiveScanSelectionContext;
   class LiveOptionContext;
@@ -215,6 +221,7 @@ public:
     TargetLibraryContext *targetLibrary();
     ChildListContext *childList();
     ObjectWatchContext *objectWatch();
+    ObjectProbeContext *objectProbe();
     LiveUpdateContext *liveUpdate();
 
 
@@ -787,6 +794,51 @@ public:
   };
 
   KeywordContext* keyword();
+
+  class  ObjectProbeContext : public antlr4::ParserRuleContext {
+  public:
+    ObjectProbeContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+    std::vector<ObjectProbePrepareOptionContext *> objectProbePrepareOption();
+    ObjectProbePrepareOptionContext* objectProbePrepareOption(size_t i);
+    std::vector<ObjectProbeBindOptionContext *> objectProbeBindOption();
+    ObjectProbeBindOptionContext* objectProbeBindOption(size_t i);
+    antlr4::tree::TerminalNode *UINT();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+   
+  };
+
+  ObjectProbeContext* objectProbe();
+
+  class  ObjectProbePrepareOptionContext : public antlr4::ParserRuleContext {
+  public:
+    ObjectProbePrepareOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+    ExtraCompileOptionContext *extraCompileOption();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+   
+  };
+
+  ObjectProbePrepareOptionContext* objectProbePrepareOption();
+
+  class  ObjectProbeBindOptionContext : public antlr4::ParserRuleContext {
+  public:
+    ObjectProbeBindOptionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    ValueContext *value();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+   
+  };
+
+  ObjectProbeBindOptionContext* objectProbeBindOption();
 
   class  LiveUpdateContext : public antlr4::ParserRuleContext {
   public:

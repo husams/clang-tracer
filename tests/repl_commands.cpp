@@ -197,6 +197,16 @@ int main() {
   require(!parse_command("%events").has("--count"));
   require(!parse_command("%collect --as live").has("--count"));
   require(parse_command("%collect --as cpp").option("--as") == "cpp");
+  const auto failures = parse_command(
+      "%collect --callback-errors only --count 4");
+  require(failures.option("--callback-errors") == "only");
+  const auto record_failures = parse_command(
+      "%record failures.pb --callback-errors exclude --count 2");
+  require(record_failures.option("--callback-errors") == "exclude");
+  const auto opened = parse_command(
+      "%events open capture.pb --as saved --callback-errors exclude");
+  require(opened.kind == CommandKind::event_open &&
+              opened.option("--callback-errors") == "exclude");
   require(parse_command("%help Event").arguments.at(0) == "Event");
   require(parse_command("%help api tracer_repl::Event").arguments ==
           std::vector<std::string>{"api", "tracer_repl::Event"});

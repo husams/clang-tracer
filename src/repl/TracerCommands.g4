@@ -5,7 +5,7 @@ command : server | attach | processes | sessions | use | status | detach
         | modules | moduleIndex | threads | symbols | probe | interceptor | events | collect | record
         | cpp | shell | complete | type | help | quit | bulkTrace | memory | probeEntry | probeReload
         | targetLaunch | targetCall | localPerf | instructions | watchpoint
-        | targetLibrary | childList | objectWatch | liveUpdate;
+        | targetLibrary | childList | objectWatch | objectProbe | liveUpdate;
 server : 'server' ('start' serverOption* | 'connect' value | 'status' | 'stop');
 serverOption : ('--executable' | '--agent') value | contextEventBytes;
 attach : 'attach' (UINT ('--start-time' UINT)?)?;
@@ -60,12 +60,13 @@ events : 'events' (streamOption*
        | 'diff' value '--pre' UINT '--post' UINT ('--key' value)*
        | STACK value '--index' UINT
        | 'calls' value | 'stats' value | 'clear' value
-       | 'open' value '--as' value
+       | 'open' value '--as' value ('--callback-errors' value)?
        | 'export' value '--format' 'json' '--output' value);
 collect : 'collect' streamOption*;
 record : 'record' value (streamOption | SQLITE)*;
 streamOption : ('--count' | '--timeout' | '--after' | '--probe') UINT
              | '--phase' ('PRE' | 'POST' | 'EXCEPTION')
+             | '--callback-errors' value
              | ('--as' | '--name' | '--session') value | '--all';
 cpp : 'cpp' ('load' value | 'reset'
             | ('import' | 'generate') value (('--type' | '--output') value)*
@@ -94,8 +95,17 @@ keyword : 'server' | 'start' | 'connect' | 'status' | 'stop' | 'attach'
         | 'monitor-start' | 'monitor-stop'
         | 'entry' | 'reload' | 'launch' | 'resume' | 'terminate'
         | 'call' | 'call-result' | 'syscalls' | 'sample' | 'cpu' | 'instructions' | 'watchpoint'
-        | 'library' | 'allocate' | 'free' | 'write' | 'replay' | 'children' | 'faults' | 'allocations' | 'object'
+        | 'library' | 'allocate' | 'free' | 'write' | 'replay' | 'children' | 'faults' | 'allocations' | 'object' | 'object-probe'
         | 'live' | 'update' | 'revert' | 'mock' | 'update-data' | 'scan-heap' | 'watch' | RECOVER | STACK;
+objectProbe : 'object-probe' ('prepare' value objectProbePrepareOption+
+                            | ('preview' | 'start') objectProbeBindOption+
+                            | ('status' | 'stop') UINT?);
+objectProbePrepareOption : ('--include' | '--compdb' | '--translation-unit' | '--callbacks'
+                            | '--output' | '--method' | '--field' | '--code') value
+                         | '--dwarf-writers' | extraCompileOption;
+objectProbeBindOption : ('--package' | '--module' | '--method-module'
+                         | '--union-tag' | '--union-case' | '--synchronization') value
+                      | '--follow-calls' | '--no-values' | '--first-seen';
 liveUpdate : 'live' (('update' | 'preview' | 'watch') (value | liveOption)+ | 'status' | RECOVER | 'revert' UINT?
                    | 'mock' value liveOption+ | 'update-data' value (liveOption | liveScanSelection)*
                    | 'scan-heap' liveOption+);

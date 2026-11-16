@@ -11,6 +11,12 @@ class ProbeSpec;
 namespace tracer {
 struct ValueSnapshotCode {
   std::string declarations;
+  std::string scope;
+  std::string argument_storage;
+  std::string receiver_storage;
+  std::string result_storage;
+  // Grouped object-watch snapshots keep storage alive through both phases.
+  std::string storage;
   std::string arguments;
   std::string receiver;
   std::string result;

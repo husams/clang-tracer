@@ -108,6 +108,11 @@ const std::map<std::string, K> kinds = {{"server start", K::server_start},
                                         {"object preview", K::object_preview},
                                         {"object status", K::object_status},
                                         {"object stop", K::object_stop},
+                                        {"object-probe prepare", K::object_probe_prepare},
+                                        {"object-probe preview", K::object_probe_preview},
+                                        {"object-probe start", K::object_probe_start},
+                                        {"object-probe status", K::object_probe_status},
+                                        {"object-probe stop", K::object_probe_stop},
                                         {"trace preview", K::bulk_preview},
                                         {"trace apply", K::bulk_apply},
                                         {"trace remove", K::bulk_remove},
@@ -220,9 +225,9 @@ public:
         "--registers", "--discover", "--watch", "--supervise", "--gate-children", "--allow-replacement", "--allow-call-original",
         "--trace-exceptions", "--reclaimable", "--snapshot-return-pointee",
         "--no-automatic-members", "--snapshot-receiver-at-return", "--no-values",
-        "--first-seen", "--writer-entry", "--discover-writers", "--syscall-output", "--stack-cfi", "--follow-calls"};
+        "--first-seen", "--writer-entry", "--discover-writers", "--syscall-output", "--stack-cfi", "--follow-calls", "--dwarf-writers"};
     const std::set<std::string> repeated = {"--include", "--compile-option",
-                                           "--name", "--type", "--arg", "--env", "--key", "--bind", "--from-scan"};
+                                           "--name", "--type", "--arg", "--env", "--key", "--method", "--bind", "--from-scan"};
     const std::set<std::string> bulk_repeated = {"--module", "--exclude", "--exact"};
     const std::set<std::string> object_repeated = {"--field", "--on", "--include", "--key", "--union-case", "--code",
                                                   "--translation-unit", "--async-signal", "--mutation"};
@@ -249,7 +254,12 @@ public:
         const bool object = result.kind == K::object_start || result.kind == K::object_prepare ||
                             result.kind == K::object_preview;
         const bool normal_repeat = object ? object_repeated.count(text) : repeated.count(text);
-        if (result.has(text) && !normal_repeat && !bulk_repeat && !module_repeat) {
+        const bool object_probe_repeat =
+            (result.kind == K::object_probe_prepare && text == "--code") ||
+            ((result.kind == K::object_probe_start || result.kind == K::object_probe_preview) &&
+             text == "--union-case");
+        if (result.has(text) && !normal_repeat && !bulk_repeat && !module_repeat &&
+            !object_probe_repeat) {
           throw std::invalid_argument("duplicate option: " + text);
         }
         result.options[text].push_back(

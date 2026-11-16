@@ -99,6 +99,8 @@ public:
   std::string function_name() const;
   // Owned frames in capture order. Empty when the event has no stored frames.
   std::vector<StackFrame> stack() const;
+  bool callback_error() const;
+  std::string callback_error_message() const;
   // Presence includes VOID results; reading void as a value is rejected.
   bool has_result() const;
   // Values own their scalar data and do not retain target addresses.
@@ -146,6 +148,8 @@ public:
   std::string describe() const;
 };
 
+enum class CallbackErrorFilter { include, exclude, only };
+
 struct Collection {
   Collection() = default;
   Collection(const Collection &) = default;
@@ -179,6 +183,7 @@ struct EventQuery {
   std::string session_id;
   // Zero reads all matches, subject to the collection's retention limits.
   std::uint64_t count = 0;
+  CallbackErrorFilter callback_errors = CallbackErrorFilter::include;
 };
 
 struct RecordOptions {
@@ -194,6 +199,7 @@ struct RecordOptions {
   std::uint64_t count = 0;
   // Zero uses the console timeout for counted recordings.
   unsigned timeout_seconds = 0;
+  CallbackErrorFilter callback_errors = CallbackErrorFilter::include;
 };
 
 struct RecordResult {

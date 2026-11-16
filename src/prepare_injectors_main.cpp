@@ -7,6 +7,7 @@
 #include "snapshot_limits.hpp"
 #include "prepare_elf_signature.hpp"
 #include "prepared_contract.hpp"
+#include "preparer_diagnostics.hpp"
 #include "tracer/compiler_options.hpp"
 
 #include <cstdlib>
@@ -277,7 +278,7 @@ int main(int argc, char **argv) {
               << "\n";
     return 0;
   } catch (const std::exception &error) {
-    std::cerr << "prepare: " << error.what() << '\n';
+    std::cerr << tracer::prepared::preparer_failure_prefix << error.what() << '\n';
     return 1;
   }
 }
