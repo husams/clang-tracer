@@ -20,8 +20,8 @@ make
 %memory maps
 ```
 
-Copy the memory snapshot token printed by `%memory maps` and use it below as
-`MEMORY_TOKEN`.
+Copy the token on the first line of `%memory maps` (it looks like
+`SESSION:mem:HASH`) and use it below as `MEMORY_TOKEN`.
 
 ```bash
 %probe entry "add(int, int)" --mapping MEMORY_TOKEN
@@ -32,8 +32,8 @@ Copy the memory snapshot token printed by `%memory maps` and use it below as
 `ENTRY_ADDRESS` is the runtime address `%probe entry` prints. Replace the first
 byte of the pattern with the first byte `%memory read` showed; `??` matches any byte.
 
-To go from an address back to a function, take the module token from
-`%modules --details` and run:
+To go from an address back to a function, take the `mapping=` token that
+`%symbols --filter "add(" --addresses` printed (it looks like `SESSION:HASH`) and run:
 
 ```bash
 %symbols --address ENTRY_ADDRESS --mapping MODULE_TOKEN
