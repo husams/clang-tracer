@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "live_extension_plan.hpp"
 
 #include "debug_resolver.hpp"
@@ -160,10 +161,10 @@ ExtensionPlan plan_extension(std::uint32_t pid, std::uint64_t process_start,
     bool check_native_inputs = false;
     for (const auto &source : request.sources()) {
       const auto path = fs::canonical(source.path()).string();
-      const auto known = std::ranges::any_of(build.baseline.files, [&](const SourceFile &file) {
+      const auto known = ::tracer::compat::ranges::any_of(build.baseline.files, [&](const SourceFile &file) {
         return file.path == path;
       });
-      if (known || active.sources.contains(path)) {
+      if (known || ::tracer::compat::contains(active.sources, path)) {
         check_native_inputs = true;
       } else {
         recipe_inputs.insert(path);
@@ -179,20 +180,20 @@ ExtensionPlan plan_extension(std::uint32_t pid, std::uint64_t process_start,
       auto &jit = result.native.jit;
       sources.jit.resolve_standard_runtime = jit.resolve_standard_runtime;
       for (const auto &file : jit.files) {
-        const auto found = std::ranges::find(sources.jit.files, file.path, &SourceFile::path);
+        const auto found = ::tracer::compat::ranges::find(sources.jit.files, file.path, &SourceFile::path);
         if (found == sources.jit.files.end())
           sources.jit.files.push_back(file);
         else
           found->contents = file.contents;
       }
       for (const auto &unit : jit.translation_units) {
-        const auto found = std::ranges::find(sources.jit.translation_units, unit.path,
+        const auto found = ::tracer::compat::ranges::find(sources.jit.translation_units, unit.path,
                                              &TranslationUnit::path);
         if (found == sources.jit.translation_units.end())
           sources.jit.translation_units.push_back(unit);
         else
           *found = unit;
-        if (std::ranges::find(update_paths, unit.path) == update_paths.end())
+        if (::tracer::compat::ranges::find(update_paths, unit.path) == update_paths.end())
           update_paths.push_back(unit.path);
       }
       for (const auto &[name, address] : jit.imports)
@@ -218,7 +219,7 @@ ExtensionPlan plan_extension(std::uint32_t pid, std::uint64_t process_start,
         const auto suffix = fs::path(path).extension();
         const bool header = suffix == ".h" || suffix == ".hpp" || suffix == ".hh" || suffix == ".hxx";
         if (header && path != input.hook_file() &&
-            std::ranges::none_of(result.native.accepted_sources,
+            ::tracer::compat::ranges::none_of(result.native.accepted_sources,
                 [&](const SourceFile &file) { return file.path == path; }))
           recipe_headers.push_back(path);
       }

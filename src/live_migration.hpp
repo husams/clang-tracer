@@ -1,7 +1,7 @@
 #pragma once
 
 #include <functional>
-#include <span>
+#include "tracer/compat.hpp"
 #include <vector>
 
 #include "tracer/live_migration.hpp"
@@ -24,7 +24,7 @@ struct UpdateOptions {
   HookOptions hook;
 };
 
-UpdateOptions parse_update(std::span<const std::string> arguments);
+UpdateOptions parse_update(::tracer::compat::span<const std::string> arguments);
 
 // The code callback is the coordinator's existing checked publication path.
 // It runs with cooperative access gated. It must return after any OS thread

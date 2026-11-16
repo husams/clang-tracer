@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "live_compile.hpp"
 
 #include <clang/AST/ASTConsumer.h>
@@ -608,10 +609,10 @@ std::string body_text(llvm::Function &body, const IRTypeNames &types) {
   llvm::StringRef(ir).split(lines, '\n');
   std::string result;
   for (auto line : lines) {
-    if (line.trim().starts_with("#dbg_") || line.starts_with("; Function Attrs:"))
+    if (line.trim().starts_with("#dbg_") || ::tracer::compat::starts_with(line, "; Function Attrs:"))
       continue;
     line = line.split(", !dbg !").first.split(" !dbg !").first.split(", !DIAssignID !").first;
-    if (line.starts_with("define "))
+    if (::tracer::compat::starts_with(line, "define "))
       line = line.split(" #").first;
     result += line;
     result += '\n';
@@ -738,12 +739,12 @@ bool standard_inline_constant(const llvm::GlobalVariable &global) {
   if (!global.isConstant() || global.isThreadLocal())
     return false;
   if (global.hasLocalLinkage())
-    return name.starts_with("_ZZNSt8__format") || name.starts_with("_ZNSt9__unicode");
+    return ::tracer::compat::starts_with(name, "_ZZNSt8__format") || ::tracer::compat::starts_with(name, "_ZNSt9__unicode");
   return (global.hasLinkOnceODRLinkage() || global.hasWeakODRLinkage()) &&
-      (name.starts_with("_ZSt") || name.starts_with("_ZNSt") || name.starts_with("_ZZNSt8__format") ||
-       name.starts_with("_ZTVNSt") || name.starts_with("_ZTINSt") ||
-       name.starts_with("_ZTSNSt") || name.starts_with("_ZTVSt") ||
-       name.starts_with("_ZTISt") || name.starts_with("_ZTSSt"));
+      (::tracer::compat::starts_with(name, "_ZSt") || ::tracer::compat::starts_with(name, "_ZNSt") || ::tracer::compat::starts_with(name, "_ZZNSt8__format") ||
+       ::tracer::compat::starts_with(name, "_ZTVNSt") || ::tracer::compat::starts_with(name, "_ZTINSt") ||
+       ::tracer::compat::starts_with(name, "_ZTSNSt") || ::tracer::compat::starts_with(name, "_ZTVSt") ||
+       ::tracer::compat::starts_with(name, "_ZTISt") || ::tracer::compat::starts_with(name, "_ZTSSt"));
 }
 
 bool has_standard_stream_initializer(llvm::Module &module) {
@@ -823,9 +824,9 @@ CompiledUnit compile_unit(const JitRequest &request, const TranslationUnit &unit
       if (inspect)
         inspect(ast);
       if (inspection == CompileInspection::native_metadata && !ast.getDiagnostics().hasErrorOccurred() &&
-          (!changed_inputs || changed_inputs->contains(unit.path) ||
-           std::ranges::any_of(result.inputs,
-               [&](const auto &input) { return changed_inputs->contains(input); }))) {
+          (!changed_inputs || ::tracer::compat::contains((*changed_inputs), unit.path) ||
+           ::tracer::compat::ranges::any_of(result.inputs,
+               [&](const auto &input) { return ::tracer::compat::contains((*changed_inputs), input); }))) {
         CallableTypes visitor(ast, generator, result);
         visitor.TraverseDecl(ast.getTranslationUnitDecl());
       }
@@ -938,7 +939,7 @@ std::map<std::string, Definition> definitions(const CompiledUnit &unit) {
     result.emplace(alias.getName().str(), std::move(item));
   }
   for (auto &[symbol, item] : result) {
-    if (item.has_source_abi || !std::string_view(symbol).starts_with("_ZT"))
+    if (item.has_source_abi || !::tracer::compat::starts_with(std::string_view(symbol), "_ZT"))
       continue;
     const auto description = llvm::demangle(symbol);
     const auto delimiter = description.find(" thunk to ");

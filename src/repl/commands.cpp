@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "commands.hpp"
 #include "local_perf.hpp"
 #include "tracer/instruction_trace.h"
@@ -253,7 +254,7 @@ public:
       }
       const auto text = ts[i]->getText();
       if (result.kind == K::live_update_data && text == "--from-scan") {
-        while (i + 2 < ts.size() && !ts[i + 1]->getText().starts_with("--"))
+        while (i + 2 < ts.size() && !::tracer::compat::starts_with(ts[i + 1]->getText(), "--"))
           result.options[text].push_back(decode(ts[++i]->getText()));
         continue;
       }

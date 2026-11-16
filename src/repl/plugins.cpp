@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "plugins.hpp"
 
 #include <algorithm>
@@ -184,7 +185,7 @@ void Plugins::load_installed(CppEngine& cpp, std::ostream& out, std::ostream& er
             }
             if (fs::is_regular_file(entry.symlink_status())) {
               const auto relative = entry.path().lexically_relative(package->include);
-              if (public_headers_.contains(relative)) {
+              if (::tracer::compat::contains(public_headers_, relative)) {
                 throw std::runtime_error("duplicate public plugin header: " + relative.string());
               }
               headers.push_back(relative);

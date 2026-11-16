@@ -1180,9 +1180,9 @@ void run_preparer(std::vector<std::string> arguments, const char *failure) {
         capturing_reason = !complete_line;
       } else if (at_line_start && !saw_failure) {
         line_prefix.append(part);
-        if (failure_prefix.starts_with(line_prefix) && line_prefix.size() < failure_prefix.size())
+        if (::tracer::compat::starts_with(failure_prefix, line_prefix) && line_prefix.size() < failure_prefix.size())
           continue;
-        if (line_prefix.starts_with(failure_prefix)) {
+        if (::tracer::compat::starts_with(line_prefix, failure_prefix)) {
           saw_failure = true;
           capturing_reason = !complete_line;
           failure_reason.assign(line_prefix, failure_prefix.size());

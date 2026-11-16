@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include <filesystem>
 #include <fstream>
 #include <set>
@@ -21,7 +22,7 @@ bool identifier(std::string_view value) {
 }
 
 bool qualified_identifier(std::string_view value) {
-  if (value.starts_with("::")) {
+  if (::tracer::compat::starts_with(value, "::")) {
     value.remove_prefix(2);
   }
   while (true) {
@@ -69,7 +70,7 @@ std::vector<std::string> tokens(const clangtracer::v1::LiveUpdateRequest& reques
 }
 } // namespace
 
-MockCommand parse_live_mock(std::span<const std::string> arguments) {
+MockCommand parse_live_mock(::tracer::compat::span<const std::string> arguments) {
   if (arguments.empty() || arguments.front().find('(') == std::string::npos ||
       arguments.front().find(')') == std::string::npos) {
     throw std::invalid_argument("%live mock requires an exact callable signature");
@@ -82,7 +83,7 @@ MockCommand parse_live_mock(std::span<const std::string> arguments) {
   for (std::size_t i = 1; i < arguments.size();) {
     const auto& option = arguments[i++];
     const auto next = [&]() -> const std::string& {
-      if (i == arguments.size() || arguments[i].empty() || arguments[i].starts_with("--")) {
+      if (i == arguments.size() || arguments[i].empty() || ::tracer::compat::starts_with(arguments[i], "--")) {
         throw std::invalid_argument("missing value for mock option " + option);
       }
       return arguments[i++];
@@ -92,7 +93,7 @@ MockCommand parse_live_mock(std::span<const std::string> arguments) {
       const auto separator = binding.find('=');
       const auto alias = binding.substr(0, separator);
       if (separator == std::string::npos || separator + 1 == binding.size() || !identifier(alias) ||
-          alias.starts_with(prefix) || !aliases.insert(alias).second) {
+          ::tracer::compat::starts_with(alias, prefix) || !aliases.insert(alias).second) {
         throw std::invalid_argument("invalid or duplicate mock binding: " + binding);
       }
       result.bindings.push_back({alias, binding.substr(separator + 1)});
@@ -128,7 +129,7 @@ MockCommand parse_live_mock(std::span<const std::string> arguments) {
   return result;
 }
 
-MockCommand snapshot_live_mock(std::span<const std::string> arguments) {
+MockCommand snapshot_live_mock(::tracer::compat::span<const std::string> arguments) {
   auto result = parse_live_mock(arguments);
   result.source = snapshot(result.source.path, "source");
   if (result.fixture) {
@@ -141,7 +142,8 @@ void snapshot_live_mock(clangtracer::v1::LiveUpdateRequest& request) {
   if (!request.sources().empty()) {
     throw std::invalid_argument("mock source snapshots already supplied");
   }
-  const auto command = snapshot_live_mock(tokens(request));
+  const auto arguments = tokens(request);
+  const auto command = snapshot_live_mock(arguments);
   const auto append = [&](const SourceFile& snapshot) {
     auto* source = request.add_sources();
     source->set_path(snapshot.path);
@@ -162,7 +164,8 @@ void snapshot_live_mock(clangtracer::v1::LiveUpdateRequest& request) {
 }
 
 MockCommand read_live_mock(const clangtracer::v1::LiveUpdateRequest& request) {
-  auto command = parse_live_mock(tokens(request));
+  const auto arguments = tokens(request);
+  auto command = parse_live_mock(arguments);
   if (request.sources_size() != (command.fixture ? 2 : 1) ||
       request.sources(0).path() != command.source.path ||
       (command.fixture && request.sources(1).path() != command.fixture->path)) {

@@ -4415,11 +4415,11 @@ std::optional<RuntimeImage::PltStub> RuntimeImage::plt_stub(Address address) con
   const auto offset = address - entry_section->getAddress();
   const auto entry = contents->substr(offset);
   auto jump = entry;
-  if (jump.starts_with("\xf3\x0f\x1e\xfa")) // ENDBR64
+  if (::tracer::compat::starts_with(jump, "\xf3\x0f\x1e\xfa")) // ENDBR64
     jump = jump.drop_front(4);
-  if (jump.starts_with("\xf2\xff\x25")) // BND-prefixed indirect jump
+  if (::tracer::compat::starts_with(jump, "\xf2\xff\x25")) // BND-prefixed indirect jump
     jump = jump.drop_front(1);
-  if (jump.size() < 6 || !jump.starts_with("\xff\x25"))
+  if (jump.size() < 6 || !::tracer::compat::starts_with(jump, "\xff\x25"))
     return std::nullopt;
   std::int32_t displacement = 0;
   std::memcpy(&displacement, jump.data() + 2, sizeof(displacement));
@@ -5214,7 +5214,7 @@ void initialize(Init &init
       }
     }
     const bool all_constructors_provisional = !constructors.empty() &&
-        std::ranges::all_of(constructors, [](const auto &entry) {
+        ::tracer::compat::ranges::all_of(constructors, [](const auto &entry) {
           const auto &coverage = entry.second;
           return coverage.entered && coverage.uncertain && coverage.returned;
         });
@@ -5261,7 +5261,7 @@ std::optional<Identity> lookup(std::uint64_t watch_id, std::uint64_t receiver) n
         !watch->channel->registration_active.load(std::memory_order_acquire))
       return std::nullopt;
 
-    if (std::ranges::any_of(lifecycle_frames, [&](const auto &frame) {
+    if (::tracer::compat::ranges::any_of(lifecycle_frames, [&](const auto &frame) {
           return frame.watch == watch && frame.event.object == receiver;
         }))
       return std::nullopt;

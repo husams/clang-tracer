@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "live_compile.hpp"
 
 #include <llvm/ADT/SmallPtrSet.h>
@@ -53,8 +54,8 @@ std::uintptr_t runtime_import(llvm::StringRef name) {
       .Cases("malloc", "calloc", "free", "realloc", true)
       .Cases("aligned_alloc", "posix_memalign", "memalign", "valloc", "pvalloc", true)
       .Default(false);
-  const auto new_delete = name.starts_with("_Znw") || name.starts_with("_Zna") ||
-                         name.starts_with("_Zdl") || name.starts_with("_Zda");
+  const auto new_delete = ::tracer::compat::starts_with(name, "_Znw") || ::tracer::compat::starts_with(name, "_Zna") ||
+                         ::tracer::compat::starts_with(name, "_Zdl") || ::tracer::compat::starts_with(name, "_Zda");
   if (malloc_family || new_delete) {
     // Use the target's interposed allocator so objects can cross the boundary
     // between native code and the JIT in either direction.
@@ -66,7 +67,7 @@ std::uintptr_t runtime_import(llvm::StringRef name) {
       .Cases("printf", "snprintf", "getenv", "strncmp", "usleep", true)
       .Cases("pthread_mutex_lock", "pthread_mutex_unlock", "__libc_single_threaded", true)
       .Default(false);
-  const auto is_cxx = name.starts_with("__cxa_") && name != "__cxa_atexit" &&
+  const auto is_cxx = ::tracer::compat::starts_with(name, "__cxa_") && name != "__cxa_atexit" &&
                       name != "__cxa_thread_atexit" && name != "__cxa_thread_atexit_impl";
   const auto fundamental_rtti = llvm::StringSwitch<bool>(name)
       .Cases("_ZTIb", "_ZTIc", "_ZTIa", "_ZTIh", "_ZTIs", "_ZTIt", true)
@@ -74,14 +75,14 @@ std::uintptr_t runtime_import(llvm::StringRef name) {
       .Cases("_ZTIf", "_ZTId", "_ZTIe", "_ZTIw", "_ZTIv", true)
       .Default(false);
   const auto is_cpp = is_cxx || fundamental_rtti || name == "__gxx_personality_v0" ||
-                      name.starts_with("_ZSt") || name.starts_with("_ZNSt") ||
-                      name.starts_with("_ZNKSt") || name.starts_with("_ZTVSt") ||
-                      name.starts_with("_ZNSa") || name.starts_with("_ZNKSa") ||
-                      name.starts_with("_ZNSi") || name.starts_with("_ZNSo") ||
+                      ::tracer::compat::starts_with(name, "_ZSt") || ::tracer::compat::starts_with(name, "_ZNSt") ||
+                      ::tracer::compat::starts_with(name, "_ZNKSt") || ::tracer::compat::starts_with(name, "_ZTVSt") ||
+                      ::tracer::compat::starts_with(name, "_ZNSa") || ::tracer::compat::starts_with(name, "_ZNKSa") ||
+                      ::tracer::compat::starts_with(name, "_ZNSi") || ::tracer::compat::starts_with(name, "_ZNSo") ||
                       name == "__dynamic_cast" ||
-                      name.starts_with("_ZTISt") || name.starts_with("_ZTSSt") ||
-                      name.starts_with("_ZTVN10__cxxabiv1");
-  const auto is_unwind = name.starts_with("_Unwind_");
+                      ::tracer::compat::starts_with(name, "_ZTISt") || ::tracer::compat::starts_with(name, "_ZTSSt") ||
+                      ::tracer::compat::starts_with(name, "_ZTVN10__cxxabiv1");
+  const auto is_unwind = ::tracer::compat::starts_with(name, "_Unwind_");
   if (!is_c && !is_cpp && !is_unwind)
     return 0;
   const auto symbol = name.str();
@@ -100,7 +101,7 @@ std::uintptr_t runtime_import(llvm::StringRef name) {
     return 0;
   const auto owner = llvm::sys::path::filename(info.dli_fname);
   const auto expected = is_c ? "libc.so." : is_unwind ? "libgcc_s.so." : "libstdc++.so.";
-  if (!owner.starts_with(expected))
+  if (!::tracer::compat::starts_with(owner, expected))
     return 0;
   auto *visible = ::dlsym(RTLD_DEFAULT, symbol.c_str());
   return reinterpret_cast<std::uintptr_t>(visible ? visible : address);
@@ -254,13 +255,13 @@ void isolate_definitions(llvm::Module &module, const JitRequest &request,
       continue;
     const auto import = local_import_name(unit.path, value.getName().str());
     if (auto *function = llvm::dyn_cast<llvm::Function>(&value);
-        function && std::ranges::find(request.entry_symbols, import) != request.entry_symbols.end()) {
+        function && ::tracer::compat::ranges::find(request.entry_symbols, import) != request.entry_symbols.end()) {
       function->setName(import);
       function->setLinkage(llvm::GlobalValue::ExternalLinkage);
       function->setDSOLocal(false);
-    } else if (request.imports.contains(import))
+    } else if (::tracer::compat::contains(request.imports, import))
       value.setName(import);
-    else if (request.imports.contains(value.getName().str()))
+    else if (::tracer::compat::contains(request.imports, value.getName().str()))
       throw std::runtime_error("unscoped import collides with local symbol: " + value.getName().str());
   }
   // Keep calls in a retained image on the native dispatch path, including
@@ -268,7 +269,7 @@ void isolate_definitions(llvm::Module &module, const JitRequest &request,
   std::vector<llvm::GlobalValue *> dispatches;
   for (auto &value : module.global_values())
     if (llvm::isa<llvm::FunctionType>(value.getValueType()) &&
-        request.imports.contains(native_entry_import_name(value.getName().str())))
+        ::tracer::compat::contains(request.imports, native_entry_import_name(value.getName().str())))
       dispatches.push_back(&value);
   for (auto *entry : dispatches) {
     const auto import = native_entry_import_name(entry->getName().str());
@@ -377,7 +378,7 @@ std::shared_ptr<JitImage> compile_in_target(const JitRequest &request) {
     for (auto &function : module) {
       // The IR linker can drop unused linkonce_odr instantiations before
       // ORC sees the caller's exact requested export.
-      if (function.hasLinkOnceODRLinkage() && entries.contains(function.getName().str()))
+      if (function.hasLinkOnceODRLinkage() && ::tracer::compat::contains(entries, function.getName().str()))
         function.setLinkage(llvm::GlobalValue::WeakODRLinkage);
       if (!function.isDeclaration() && function.hasExternalLinkage() &&
           !definitions.insert(function.getName().str()).second)

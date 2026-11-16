@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "compiler_profile.hpp"
 
 #include <algorithm>
@@ -168,7 +169,7 @@ std::vector<std::string> resolve_plugin_flag_paths(const std::vector<std::string
     const auto path = (directory / value).lexically_normal().string();
     if (flag == arg->getSpelling()) {
       result.at(arg->getIndex() + 1) = path;
-    } else if (flag.ends_with(value)) {
+    } else if (::tracer::compat::ends_with(flag, value)) {
       flag.replace(flag.size() - value.size(), value.size(), path);
     }
   }

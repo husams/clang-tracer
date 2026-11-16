@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -198,11 +199,11 @@ void read_atomic_roots(llvm::DWARFDie scope, std::vector<AtomicRoot>& roots) {
     if (tag != dw::DW_TAG_variable)
       continue;
     const auto atomic = type_of(item);
-    if (!atomic || !qualified_name(atomic).starts_with("std::atomic<") ||
+    if (!atomic || !::tracer::compat::starts_with(qualified_name(atomic), "std::atomic<") ||
         number(atomic, dw::DW_AT_byte_size) != sizeof(std::atomic<std::shared_ptr<void>>))
       continue;
     const auto shared = template_type(atomic);
-    if (!shared || !qualified_name(shared).starts_with("std::shared_ptr<") ||
+    if (!shared || !::tracer::compat::starts_with(qualified_name(shared), "std::shared_ptr<") ||
         number(shared, dw::DW_AT_byte_size) != sizeof(std::shared_ptr<void>))
       continue;
     const auto pointee = template_type(shared);
@@ -233,7 +234,7 @@ void collect_symbols(const Elf& elf, Symbols& wanted) {
         llvm::consumeError(name.takeError());
         continue;
       }
-      if (!name->starts_with("_ZTV") && !name->starts_with("_ZTI")) {
+      if (!::tracer::compat::starts_with((*name), "_ZTV") && !::tracer::compat::starts_with((*name), "_ZTI")) {
         continue;
       }
       const auto found = wanted.find(llvm::demangle(*name));
@@ -259,7 +260,7 @@ void collect_symbols(const Elf& elf, Symbols& wanted) {
 }
 
 bool readable(const std::vector<Mapping>& maps, Address address, std::size_t size) {
-  return std::ranges::any_of(maps, [&](const auto& map) {
+  return ::tracer::compat::ranges::any_of(maps, [&](const auto& map) {
     return map.permissions[0] == 'r' && map.contains(address, size);
   });
 }
@@ -279,7 +280,7 @@ std::map<Address, TypeEvidence> address_points(const std::vector<TypeEvidence>& 
       if (!read(point - 2 * sizeof(Address), words) || words[0] || words[1] != type.rtti) {
         continue;
       }
-      if (std::ranges::any_of(maps, [&](const auto& map) {
+      if (::tracer::compat::ranges::any_of(maps, [&](const auto& map) {
             return map.permissions[2] == 'x' && map.contains(words[2], 1);
           })) {
         result.emplace(point, type);
@@ -480,7 +481,7 @@ void TargetImage::discover_owners(const std::vector<std::string>& types,
   }
   std::set<Address> visited;
   for (const auto& root : image_->roots) {
-    if (std::ranges::find(types, root.type) == types.end())
+    if (::tracer::compat::ranges::find(types, root.type) == types.end())
       continue;
     const auto skip = [&](const char* reason, void* object = nullptr) {
       sink.register_verified({root.type, root.name, object, nullptr, reason});
@@ -493,8 +494,8 @@ void TargetImage::discover_owners(const std::vector<std::string>& types,
       skip("root pointee lacks a verified DWARF layout");
       continue;
     }
-    if (!storage.contains(root.offset) || address % alignof(AtomicOwner) ||
-        !std::ranges::any_of(maps, [&](const Mapping& map) {
+    if (!::tracer::compat::contains(storage, root.offset) || address % alignof(AtomicOwner) ||
+        !::tracer::compat::ranges::any_of(maps, [&](const Mapping& map) {
           return map.permissions[1] == 'w' && map.name == image_->target.module &&
                  map.contains(address, sizeof(AtomicOwner));
         })) {
@@ -531,7 +532,7 @@ bool TargetImage::matches(const Candidate& candidate) const {
     return false;
   }
   const auto maps = mappings();
-  if (std::ranges::none_of(maps, [&](const auto& map) {
+  if (::tracer::compat::ranges::none_of(maps, [&](const auto& map) {
         return map.name == "[heap]" && map.permissions[0] == 'r' &&
                map.contains(record.address, candidate.size);
       })) {

@@ -571,7 +571,7 @@ std::size_t nop_prefix(std::uint64_t address, std::string_view bytes, std::size_
     llvm::MCInst inst;
     std::uint64_t size = 0;
     if (!decode(decoder, inst, size, address + used, bytes.substr(used)) ||
-        !decoder.ins->getName(inst.getOpcode()).starts_with("NOOP"))
+        !::tracer::compat::starts_with(decoder.ins->getName(inst.getOpcode()), "NOOP"))
       return 0;
     used += size;
   }

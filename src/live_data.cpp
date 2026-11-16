@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include <algorithm>
 #include <mutex>
 #include <set>
@@ -60,9 +61,8 @@ struct UpdateRun {
   std::map<std::pair<std::string, std::uintptr_t>, std::weak_ptr<void>> seen;
 
   void attempt(const ObjectView& object, const std::string& root, std::string id = {}) {
-    using enum LiveObjectOutcome;
     const auto address = reinterpret_cast<std::uintptr_t>(object.object);
-    LiveObjectResult result{skipped, std::move(id), std::string(object.type), root, {}, address};
+    LiveObjectResult result{LiveObjectOutcome::skipped, std::move(id), std::string(object.type), root, {}, address};
     const auto callback = program.callbacks.find(object.type);
     if (object.skip_reason) {
       result.detail = object.skip_reason;
@@ -91,12 +91,12 @@ struct UpdateRun {
         try {
           target.verify();
           callback->second.invoke(object.object, object.owner);
-          result.outcome = updated;
+          result.outcome = LiveObjectOutcome::updated;
         } catch (const std::exception& error) {
-          result.outcome = failed;
+          result.outcome = LiveObjectOutcome::failed;
           result.detail = error.what();
         } catch (...) {
-          result.outcome = failed;
+          result.outcome = LiveObjectOutcome::failed;
           result.detail = "callback threw an unknown exception";
         }
       }
@@ -105,7 +105,7 @@ struct UpdateRun {
   }
 
   void register_object(const ObjectView& object, const std::string& root) {
-    if (std::ranges::find(report.roots, root) == report.roots.end()) {
+    if (::tracer::compat::ranges::find(report.roots, root) == report.roots.end()) {
       report.roots.push_back(root);
     }
     if (scope != Scope::selected) {
@@ -301,7 +301,7 @@ LiveHeapReport LiveDataSession::scan_heap(const LiveDataTarget& selection_target
     const auto key = std::make_pair(report.type, report.address);
     std::weak_ptr<void> owner;
     const auto found = owners.find(key);
-    if (found != owners.end() && !ambiguous.contains(key)) {
+    if (found != owners.end() && !::tracer::compat::contains(ambiguous, key)) {
       // Re-read candidate memory while the acquired owner keeps the view alive.
       if (const auto hold = found->second.lock(); hold && target.matches(candidate)) {
         owner = found->second;

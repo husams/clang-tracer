@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "live_migration.hpp"
 
 #include <algorithm>
@@ -69,11 +70,11 @@ bool same_layout(const auto& layout, const auto& binding) {
 }
 } // namespace
 
-UpdateOptions parse_update(std::span<const std::string> arguments) {
+UpdateOptions parse_update(::tracer::compat::span<const std::string> arguments) {
   UpdateOptions result;
   for (std::size_t i = 0; i != arguments.size(); ++i) {
     const auto& argument = arguments[i];
-    if (!argument.starts_with("--")) {
+    if (!::tracer::compat::starts_with(argument, "--")) {
       result.paths.push_back(argument);
       continue;
     }
@@ -86,7 +87,7 @@ UpdateOptions parse_update(std::span<const std::string> arguments) {
       value = &result.hook.type;
     }
     if (!value || !value->empty() || ++i == arguments.size() || arguments[i].empty() ||
-        arguments[i].starts_with("--")) {
+        ::tracer::compat::starts_with(arguments[i], "--")) {
       throw std::invalid_argument("invalid managed update option: " + argument);
     }
     *value = arguments[i];
@@ -120,8 +121,8 @@ std::unique_ptr<Revision> stage(Registry& registry, const JitRequest& request,
   const auto generation = registry.generation();
   auto migration = request;
   // Require exact exported lifecycle symbols in the shared ORC image.
-  if (migration.imports.contains(std::string(RecipeSymbol)) ||
-      migration.imports.contains(std::string(HookSymbol))) {
+  if (::tracer::compat::contains(migration.imports, std::string(RecipeSymbol)) ||
+      ::tracer::compat::contains(migration.imports, std::string(HookSymbol))) {
     throw std::invalid_argument(
         "managed lifecycle symbols must be defined by the submitted source");
   }
@@ -134,8 +135,8 @@ std::unique_ptr<Revision> stage(Registry& registry, const JitRequest& request,
     if (std::none_of(migration.files.begin(), migration.files.end(), in_hook)) {
       throw std::invalid_argument("managed hook source snapshot is missing");
     }
-    std::erase_if(migration.files, in_hook);
-    std::erase_if(migration.translation_units, in_hook);
+    ::tracer::compat::erase_if(migration.files, in_hook);
+    ::tracer::compat::erase_if(migration.translation_units, in_hook);
   }
   if (migration.translation_units.empty() && migration.files.size() == 1) {
     const auto& source = migration.files.front();

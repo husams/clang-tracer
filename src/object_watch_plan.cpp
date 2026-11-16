@@ -197,7 +197,7 @@ bool has_virtual_members_or_bases(DWARFDie die, std::set<DWARFDie> &seen) {
 enum class CallerKind { unknown, constructor_or_destructor, ordinary };
 
 CallerKind classify_linkage_name(std::string_view linkage) {
-  if (!linkage.starts_with("_Z")) {
+  if (!::tracer::compat::starts_with(linkage, "_Z")) {
     if (linkage.empty() ||
         !(std::isalpha(static_cast<unsigned char>(linkage.front())) || linkage.front() == '_') ||
         !std::all_of(linkage.begin() + 1, linkage.end(), [](unsigned char c) {
@@ -2137,14 +2137,14 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       std::map<std::string, std::set<Range>> result;
       for (const auto &symbol : image.symbols) {
         if (symbol.kind != llvm::ELF::STT_FUNC ||
-            (!symbol.demangled.starts_with(constructor_name) &&
-             !symbol.demangled.starts_with(destructor_name)))
+            (!::tracer::compat::starts_with(symbol.demangled, constructor_name) &&
+             !::tracer::compat::starts_with(symbol.demangled, destructor_name)))
           continue;
-        const bool ctor = symbol.demangled.starts_with(constructor_name) &&
+        const bool ctor = ::tracer::compat::starts_with(symbol.demangled, constructor_name) &&
             (has_constructor_variant(symbol, "C1E") || has_constructor_variant(symbol, "C2E"));
-        const bool dtor = symbol.demangled.starts_with(destructor_name) &&
-            (symbol.linkage.contains("D0Ev") || symbol.linkage.contains("D1Ev") ||
-             symbol.linkage.contains("D2Ev"));
+        const bool dtor = ::tracer::compat::starts_with(symbol.demangled, destructor_name) &&
+            (::tracer::compat::contains(symbol.linkage, "D0Ev") || ::tracer::compat::contains(symbol.linkage, "D1Ev") ||
+             ::tracer::compat::contains(symbol.linkage, "D2Ev"));
         if (ctor || dtor)
           result[symbol.linkage].insert(symbol.range);
       }
@@ -2178,7 +2178,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
           cross_image_duplicates.emplace(linkage, path);
       }
       for (const auto &[linkage, ranges] : other)
-        if (wanted.contains(linkage) && ranges.size() > 1)
+        if (::tracer::compat::contains(wanted, linkage) && ranges.size() > 1)
           same_image_duplicates.insert(linkage);
     };
     if (main_ && normalize_path(main_->path) != selected_path) {
@@ -2203,7 +2203,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
           return;
         }
         const auto name = linkage->str();
-        if (!wanted.contains(name) || !*address ||
+        if (!::tracer::compat::contains(wanted, name) || !*address ||
             (*flags & llvm::object::SymbolRef::SF_Undefined))
           return;
         result[name].insert({*address, elf.getSize()});
@@ -2259,7 +2259,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     // registration may reach this proof before any executable boundary has
     // otherwise caused its image to be bound.
     if (main_ && !main_->bias) {
-      const auto symbol = std::ranges::find_if(main_->symbols, [](const auto &candidate) {
+      const auto symbol = ::tracer::compat::ranges::find_if(main_->symbols, [](const auto &candidate) {
         return candidate.kind == llvm::ELF::STT_FUNC && candidate.range.second;
       });
       if (symbol != main_->symbols.end()) {
@@ -2346,7 +2346,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         const auto address = caller_image->bias && call >= *caller_image->bias ?
             call - *caller_image->bias : 0;
         const auto debug = caller_image->dwarf->getDIEsForAddress(address);
-        const bool complete_plt_call = verified_plt_calls.contains(call);
+        const bool complete_plt_call = ::tracer::compat::contains(verified_plt_calls, call);
         // A direct call to an aliased entry may come from an inlined base
         // initializer. A physical symbol alone cannot rule that out.
         if (!complete_plt_call && (!debug.CompileUnit || !debug.FunctionDIE))
@@ -2366,7 +2366,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
           caller_kind = elf_kind;
         }
         if (caller_kind != CallerKind::ordinary ||
-            std::ranges::any_of(inlined, [](DWARFDie frame) {
+            ::tracer::compat::ranges::any_of(inlined, [](DWARFDie frame) {
               // A physical caller symbol cannot identify an inlined frame.
               // Require positive DWARF identity for every inlined frame.
               return frame.getTag() == dw::DW_TAG_inlined_subroutine &&
@@ -2388,14 +2388,14 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     const auto &concrete = concrete_type;
     const auto leaf = leaf_name(concrete);
     const auto is_constructor = [&](const Symbol &symbol) {
-      return symbol.kind == llvm::ELF::STT_FUNC && symbol.demangled.starts_with(constructor_name) &&
+      return symbol.kind == llvm::ELF::STT_FUNC && ::tracer::compat::starts_with(symbol.demangled, constructor_name) &&
           symbol.linkage.find('.') == std::string::npos &&
           (has_constructor_variant(symbol, "C1E") || has_constructor_variant(symbol, "C2E"));
     };
     auto *const lifetime_image = image_.get();
-    const auto constructor = std::ranges::find_if(lifetime_image->symbols, is_constructor);
+    const auto constructor = ::tracer::compat::ranges::find_if(lifetime_image->symbols, is_constructor);
     if (constructor == lifetime_image->symbols.end() && main_ &&
-        std::ranges::any_of(main_->symbols, is_constructor))
+        ::tracer::compat::ranges::any_of(main_->symbols, is_constructor))
       throw std::runtime_error("lifetime-only constructor is defined in the executable, not the selected module; "
                                "cross-image admission is not enabled for " + concrete);
     if (constructor == lifetime_image->symbols.end())
@@ -2438,11 +2438,11 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     for (const auto &symbol : lifetime_image->symbols) {
       if (symbol.kind != llvm::ELF::STT_FUNC || symbol.linkage.find('.') != std::string::npos)
         continue;
-      if (symbol.demangled.starts_with(destructor_name) && symbol.linkage.contains("D1Ev"))
+      if (::tracer::compat::starts_with(symbol.demangled, destructor_name) && ::tracer::compat::contains(symbol.linkage, "D1Ev"))
         destructors.insert(symbol.range);
-      else if (symbol.demangled.starts_with(destructor_name) && symbol.linkage.contains("D0Ev"))
+      else if (::tracer::compat::starts_with(symbol.demangled, destructor_name) && ::tracer::compat::contains(symbol.linkage, "D0Ev"))
         deleting_destructors.insert(symbol.range);
-      else if (symbol.demangled.starts_with(destructor_name) && symbol.linkage.contains("D2Ev"))
+      else if (::tracer::compat::starts_with(symbol.demangled, destructor_name) && ::tracer::compat::contains(symbol.linkage, "D2Ev"))
         base_destructors.insert(symbol.range);
     }
     if (destructors.empty())
@@ -2458,24 +2458,24 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     std::map<std::string, std::set<std::uint64_t>> base_constructor_entries;
     for (const auto &symbol : lifetime_image->symbols)
       if (symbol.kind == llvm::ELF::STT_FUNC &&
-          symbol.demangled.starts_with(constructor_name) &&
+          ::tracer::compat::starts_with(symbol.demangled, constructor_name) &&
           symbol.linkage.find('.') == std::string::npos && has_constructor_variant(symbol, "C2E"))
         base_constructor_entries[symbol.demangled].insert(symbol.range.first);
     std::set<std::uint64_t> caller_proof_constructors;
     std::set<std::string> complete_constructor_overloads;
     for (const auto &symbol : lifetime_image->symbols) {
       if (symbol.kind == llvm::ELF::STT_FUNC &&
-          symbol.demangled.starts_with(constructor_name) &&
+          ::tracer::compat::starts_with(symbol.demangled, constructor_name) &&
           symbol.linkage.find('.') == std::string::npos &&
           has_constructor_variant(symbol, "C1E"))
         complete_constructor_overloads.insert(symbol.demangled);
     }
     for (const auto &symbol : lifetime_image->symbols) {
-      if (symbol.kind == llvm::ELF::STT_FUNC && symbol.demangled.starts_with(constructor_name) &&
+      if (symbol.kind == llvm::ELF::STT_FUNC && ::tracer::compat::starts_with(symbol.demangled, constructor_name) &&
           symbol.linkage.find('.') == std::string::npos && has_constructor_variant(symbol, "C1E")) {
         const auto base = base_constructor_entries.find(symbol.demangled);
         const bool aliases_base_entry = base != base_constructor_entries.end() &&
-            base->second.contains(symbol.range.first);
+            ::tracer::compat::contains(base->second, symbol.range.first);
         const bool uncertain = aliases_base_entry || provisional_lifetime_identity;
         add_lifecycle(symbol, Boundary::construct, uncertain);
         if (aliases_base_entry && !provisional_lifetime_identity)
@@ -2483,7 +2483,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       }
     }
     for (const auto &symbol : lifetime_image->symbols) {
-      if (symbol.kind != llvm::ELF::STT_FUNC || symbol.demangled.starts_with(constructor_name) == false ||
+      if (symbol.kind != llvm::ELF::STT_FUNC || ::tracer::compat::starts_with(symbol.demangled, constructor_name) == false ||
           symbol.linkage.find('.') != std::string::npos || !has_constructor_variant(symbol, "C2E"))
         continue;
       // A C2 entry is not proof of complete-object construction, even when
@@ -2491,21 +2491,21 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       // same entry for its base subobject. A separate C1 entry can establish
       // complete construction; C2 remains uncertain.
       add_lifecycle(symbol, Boundary::construct, true);
-      const auto complete = std::ranges::find_if(lifetime_image->symbols, [&](const auto &candidate) {
+      const auto complete = ::tracer::compat::ranges::find_if(lifetime_image->symbols, [&](const auto &candidate) {
         return candidate.kind == llvm::ELF::STT_FUNC &&
             candidate.demangled == symbol.demangled &&
             candidate.linkage.find('.') == std::string::npos &&
             has_constructor_variant(candidate, "C1E") && candidate.range.first == symbol.range.first;
       });
       if (!provisional_lifetime_identity && complete == lifetime_image->symbols.end() &&
-          !complete_constructor_overloads.contains(symbol.demangled))
+          !::tracer::compat::contains(complete_constructor_overloads, symbol.demangled))
         caller_proof_constructors.insert(lifetime_image->bind(pid, symbol.range));
     }
     const std::vector<std::uint64_t> constructors_requiring_caller_proof(
         caller_proof_constructors.begin(), caller_proof_constructors.end());
     const auto proven_complete_callers = prove_complete_constructor_callers(
         constructors_requiring_caller_proof, false);
-    const bool has_complete_constructor_entry = std::ranges::any_of(sites, [](const auto &entry) {
+    const bool has_complete_constructor_entry = ::tracer::compat::ranges::any_of(sites, [](const auto &entry) {
       return entry.second.boundary == Boundary::construct && !entry.second.uncertain_complete;
     });
     if (!provisional_lifetime_identity && proven_complete_callers.empty() &&
@@ -2515,17 +2515,17 @@ Plan::Plan(std::uint32_t pid, std::string executable,
       provisional_lifetime_identity = true;
     }
     for (const auto &symbol : lifetime_image->symbols) {
-      if (symbol.kind != llvm::ELF::STT_FUNC || !symbol.demangled.starts_with(destructor_name) ||
+      if (symbol.kind != llvm::ELF::STT_FUNC || !::tracer::compat::starts_with(symbol.demangled, destructor_name) ||
           symbol.linkage.find('.') != std::string::npos)
         continue;
-      if (symbol.linkage.contains("D1Ev"))
+      if (::tracer::compat::contains(symbol.linkage, "D1Ev"))
         add_lifecycle(symbol, Boundary::destroy, provisional_lifetime_identity);
-      else if (symbol.linkage.contains("D2Ev") && destructors.count(symbol.range))
+      else if (::tracer::compat::contains(symbol.linkage, "D2Ev") && destructors.count(symbol.range))
         add_lifecycle(symbol, Boundary::destroy, provisional_lifetime_identity);
-      else if (symbol.linkage.contains("D0Ev") && deleting_destructors.count(symbol.range))
+      else if (::tracer::compat::contains(symbol.linkage, "D0Ev") && deleting_destructors.count(symbol.range))
         add_lifecycle(symbol, Boundary::destroy, provisional_lifetime_identity, true);
     }
-    if (!provisional_lifetime_identity && std::ranges::none_of(sites, [](const auto &entry) {
+    if (!provisional_lifetime_identity && ::tracer::compat::ranges::none_of(sites, [](const auto &entry) {
           return entry.second.boundary == Boundary::destroy && !entry.second.deleting_destructor;
         }))
       throw std::runtime_error("lifetime-only type has no complete destructor entry: " + concrete);
@@ -2738,7 +2738,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     const auto matches_variant = [&](const Symbol &symbol, std::string_view value) {
       if (verify_method_lifetimes && role == Boundary::construct && !value.empty())
         return has_constructor_variant(symbol, value);
-      return symbol.linkage.contains(value);
+      return ::tracer::compat::contains(symbol.linkage, value);
     };
     const auto base_variant = variant == "C1E" ? "C2E" : variant == "D1Ev" ? "D2Ev" : "";
     std::set<Range> ranges, base_aliases;
@@ -2905,7 +2905,7 @@ Plan::Plan(std::uint32_t pid, std::string executable,
         caller_proof_constructors.push_back(pc);
     const auto proven = prove_complete_constructor_callers(caller_proof_constructors,
         writer_derived.may_construct_base_directly || main_derived.may_construct_base_directly);
-    const bool has_complete_constructor_entry = std::ranges::any_of(sites, [](const auto &entry) {
+    const bool has_complete_constructor_entry = ::tracer::compat::ranges::any_of(sites, [](const auto &entry) {
       return entry.second.boundary == Boundary::construct && !entry.second.uncertain_complete;
     });
     if (lifetime_coverage_diagnostic.empty() && proven.empty() && !has_complete_constructor_entry &&
@@ -3367,7 +3367,7 @@ Plan::direct_redirects(const std::vector<std::uint64_t> &entries, bool calls_onl
         continue;
       for (const auto &[linkage, address] : callers->plt_entries()) {
         const auto target = complete_constructor_targets.find(linkage);
-        if (target == complete_constructor_targets.end() || result.contains(address))
+        if (target == complete_constructor_targets.end() || ::tracer::compat::contains(result, address))
           continue;
         plt_aliases.emplace(address, target->second);
         result.try_emplace(address);

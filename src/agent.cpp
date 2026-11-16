@@ -634,54 +634,6 @@ void log_hook(Probe &probe, const tracer::TraceContext &context,
                             succeeded ? "ok" : "failed", nullptr, 0);
 }
 
-const char *log_level_name(tracer::LogLevel level) noexcept {
-  switch (level) {
-  case tracer::LogLevel::Info:
-    return "info";
-  case tracer::LogLevel::Warning:
-    return "warning";
-  case tracer::LogLevel::Error:
-    return "error";
-  }
-  return "unknown";
-}
-
-void report_agent_failures() noexcept {
-  auto *current = agent.load(std::memory_order_acquire);
-  if (!current)
-    return;
-  for (const auto &slot : current->probe_slots) {
-    auto *probe = slot.load(std::memory_order_acquire);
-    if (!probe)
-      continue;
-    const auto errors = probe->callback_errors.load(std::memory_order_relaxed);
-    const auto drops = probe->delivery.dropped.load(std::memory_order_acquire);
-    if (errors != probe->reported_callback_errors ||
-        drops != probe->reported_event_drops) {
-      log_agent("probe", "runtime", probe->request.probe_id, "degraded",
-                probe->delivery.last_send_errno.load(std::memory_order_relaxed),
-                errors, drops);
-      probe->reported_callback_errors = errors;
-      probe->reported_event_drops = drops;
-    }
-    auto &log = probe->log;
-    if (log.busy.test_and_set(std::memory_order_acquire))
-      continue;
-    std::array<CallbackLog::Entry, CallbackLog::kCapacity> pending;
-    const auto count = log.count;
-    std::copy_n(log.entries.begin(), count, pending.begin());
-    log.count = 0;
-    log.busy.clear(std::memory_order_release);
-    for (std::size_t i = 0; i < count; ++i) {
-      const auto &entry = pending[i];
-      log_agent("callback", entry.phase == tracer::TracePhase::Pre ? "pre"
-                                                                  : "post",
-                probe->request.probe_id, log_level_name(entry.level), 0, 0, 0,
-                entry.call_id, entry.message);
-    }
-  }
-}
-
 Probe *find_probe(std::uint64_t id) noexcept {
   Agent *current = agent.load(std::memory_order_acquire);
   if (!current) {
@@ -4513,8 +4465,8 @@ void resolve_callback_option_paths(std::vector<std::string> &arguments,
         argument = &arguments[++i];
         value = *argument;
       }
-      if (!value.empty() && !value.starts_with("=") && !value.starts_with("$SYSROOT") &&
-          !value.starts_with("-") && std::filesystem::path(value.str()).is_relative())
+      if (!value.empty() && !::tracer::compat::starts_with(value, "=") && !::tracer::compat::starts_with(value, "$SYSROOT") &&
+          !::tracer::compat::starts_with(value, "-") && std::filesystem::path(value.str()).is_relative())
         argument->replace(argument->size() - value.size(), value.size(),
                           (directory / value.str()).string());
       break;

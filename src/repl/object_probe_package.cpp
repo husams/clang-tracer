@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "object_probe_package.hpp"
 #include "tracer/protocol.hpp"
 
@@ -163,7 +164,7 @@ ObjectProbePackage ObjectProbePackage::load(const std::filesystem::path &path) {
   if (digest(payload) != expected_digest)
     throw std::runtime_error("object-probe package integrity check failed");
 
-  if (!payload.starts_with(kMagic))
+  if (!::tracer::compat::starts_with(payload, kMagic))
     throw std::runtime_error("unsupported object-probe package format; prepare a new package");
 
   ObjectProbePackage package;

@@ -297,7 +297,7 @@ int main(int argc, char** argv) try {
   require(unsupported.status == managed::Status::rebuild_required, "unmanaged type was admitted");
   auto header_only = request;
   header_only.translation_units.clear();
-  std::erase_if(header_only.files,
+  ::tracer::compat::erase_if(header_only.files,
                 [&](const auto& file) { return file.path != (fixtures / "update.hpp").string(); });
   auto no_hook = managed::stage(second.registry, header_only);
   require(apply(*no_hook).status == managed::Status::applied, "declared init without a hook");

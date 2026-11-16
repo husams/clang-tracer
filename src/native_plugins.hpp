@@ -4,7 +4,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
-#include <span>
+#include "tracer/compat.hpp"
 #include <string>
 #include <string_view>
 #include <utility>
@@ -27,7 +27,7 @@ struct NativePluginSource {
   std::string_view sdk;
   std::filesystem::path sdk_file;
   std::string_view cpp_sdk;
-  std::span<const NativePluginFile> files{};
+  ::tracer::compat::span<const NativePluginFile> files{};
   std::string_view agent_sdk{};
 };
 

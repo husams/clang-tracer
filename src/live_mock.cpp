@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "live_mock.hpp"
 
 #include <filesystem>
@@ -29,7 +30,7 @@ bool identifier(std::string_view value) {
 }
 
 bool qualified_identifier(std::string_view value) {
-  if (value.starts_with("::")) {
+  if (::tracer::compat::starts_with(value, "::")) {
     value.remove_prefix(2);
   }
   while (true) {
@@ -220,7 +221,7 @@ JitRequest build_live_mock(const MockCommand& command, const MockCompileContext&
   }
   const auto add_native_import = [&](const MockCallable& callable) {
     const auto linkage = callable.native_definition->getName().str();
-    if (std::string_view(linkage).starts_with(prefix)) {
+    if (::tracer::compat::starts_with(std::string_view(linkage), prefix)) {
       throw std::invalid_argument("native mock binding uses a reserved linkage: " + linkage);
     }
     const auto [item, inserted] = request.imports.emplace(linkage, callable.address);
@@ -241,7 +242,7 @@ JitRequest build_live_mock(const MockCommand& command, const MockCompileContext&
   for (std::size_t i = 0; i < context.bindings.size(); ++i) {
     const auto& option = command.bindings[i];
     const auto& binding = context.bindings[i];
-    if (!identifier(option.alias) || option.alias.starts_with(prefix) ||
+    if (!identifier(option.alias) || ::tracer::compat::starts_with(option.alias, prefix) ||
         !aliases.insert(option.alias).second || option.selector.empty()) {
       throw std::invalid_argument("invalid or duplicate mock binding alias: " + option.alias);
     }
@@ -305,7 +306,7 @@ struct FrameScope {
               "FrameScope scope(key, top);\n";
     }
     const auto callback =
-        command.callback.starts_with("::") ? command.callback : "::" + command.callback;
+        ::tracer::compat::starts_with(command.callback, "::") ? command.callback : "::" + command.callback;
     code += "using WithContext = " + target.result + " (*)(" +
             joined("const Context &", target.callback_types) + ")" + target.exception_spec +
             ";\n"
@@ -367,7 +368,7 @@ struct FrameScope {
       const auto relative = fs::path(dependency).lexically_relative(root);
       return !root.empty() && !relative.empty() && *relative.begin() != "..";
     };
-    if (!snapshotted.contains(dependency) &&
+    if (!::tracer::compat::contains(snapshotted, dependency) &&
         (inside(context.source_root) || inside(fs::path(command.source.path).parent_path()))) {
       throw std::invalid_argument("mock has an unsnapshotted application include: " + dependency);
     }

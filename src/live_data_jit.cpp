@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include <algorithm>
 #include <filesystem>
 #include <mutex>
@@ -62,8 +63,8 @@ struct Snapshot {
     auto& unit = request.translation_units.front();
     arguments = unit.compiler_arguments;
     // Entry padding and inlining controls affect emitted code, not this AST.
-    std::erase_if(arguments, [](const std::string &argument) {
-      return argument == "-fno-inline" || argument.starts_with("-fpatchable-function-entry=");
+    ::tracer::compat::erase_if(arguments, [](const std::string &argument) {
+      return argument == "-fno-inline" || ::tracer::compat::starts_with(argument, "-fpatchable-function-entry=");
     });
     std::string unsupported;
     if (!std::filesystem::path(unit.directory).is_absolute() ||
@@ -225,7 +226,7 @@ UpdateProgram compile_update(const JitRequest& request) {
     const Form form = args.front().form;
     if ((form == Form::reference && args.size() != 1) ||
         (form != Form::reference && definitions.size() != 1) ||
-        std::ranges::any_of(args, [form](const auto& arg) { return arg.form != form; })) {
+        ::tracer::compat::ranges::any_of(args, [form](const auto& arg) { return arg.form != form; })) {
       throw std::invalid_argument("use one nullable update signature or distinct T& overloads");
     }
 

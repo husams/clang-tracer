@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "plugin_package.hpp"
 
 #include <algorithm>
@@ -26,7 +27,7 @@ class Manifest {
   void skip_array_space() {
     while (true) {
       input_ = input_.ltrim();
-      if (!input_.starts_with("#")) {
+      if (!::tracer::compat::starts_with(input_, "#")) {
         return;
       }
       next_line();
@@ -86,7 +87,7 @@ public:
         throw std::invalid_argument(llvm::toString(parsed.takeError()));
       }
       const auto value = parsed->getAsString();
-      if (!value || value->contains('\0')) {
+      if (!value || ::tracer::compat::contains((*value), '\0')) {
         throw std::invalid_argument("invalid manifest string");
       }
       return value->str();
@@ -118,7 +119,7 @@ public:
 
   void end_value() {
     const auto remainder = line();
-    if (!remainder.empty() && !remainder.starts_with("#")) {
+    if (!remainder.empty() && !::tracer::compat::starts_with(remainder, "#")) {
       throw std::invalid_argument("unexpected text after manifest value");
     }
     next_line();
@@ -216,7 +217,7 @@ std::optional<PluginPackage> read_plugin_package(const fs::path& manifest,
   bool at_root = true;
   while (!reader.empty()) {
     const auto line = reader.line();
-    if (line.starts_with("[")) {
+    if (::tracer::compat::starts_with(line, "[")) {
       at_root = false;
       const auto name = line.split('#').first.trim();
       in_component = name == section;

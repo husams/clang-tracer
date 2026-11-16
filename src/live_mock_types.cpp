@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include <filesystem>
 #include <set>
 #include <stdexcept>
@@ -16,8 +17,8 @@
 namespace tracer::live {
 
 std::string normalize_mock_selector(std::string spelling) {
-  std::erase_if(spelling, [](unsigned char ch) { return ch == ' ' || ch == '\t'; });
-  if (spelling.starts_with("::")) {
+  ::tracer::compat::erase_if(spelling, [](unsigned char ch) { return ch == ' ' || ch == '\t'; });
+  if (::tracer::compat::starts_with(spelling, "::")) {
     spelling.erase(0, 2);
   }
   return spelling;
@@ -26,7 +27,7 @@ std::string normalize_mock_selector(std::string spelling) {
 namespace {
 class MockDeclarations : public clang::RecursiveASTVisitor<MockDeclarations> {
 public:
-  MockDeclarations(clang::ASTContext& ast, std::span<const std::string> selectors)
+  MockDeclarations(clang::ASTContext& ast, ::tracer::compat::span<const std::string> selectors)
       : ast_(ast)
       , selectors_(selectors.begin(), selectors.end())
       , mangler_(ast.createMangleContext()) {}
@@ -61,7 +62,7 @@ public:
       signature += ')';
     }
     auto key = normalize_mock_selector(signature);
-    if (!selectors_.contains(key)) {
+    if (!::tracer::compat::contains(selectors_, key)) {
       const auto written = [&](bool canonical) {
         std::string spelling = decl->getQualifiedNameAsString() + '(';
         for (const auto *parameter : decl->parameters()) {
@@ -80,13 +81,13 @@ public:
         return normalize_mock_selector(std::move(spelling));
       };
       key = written(false);
-      if (!selectors_.contains(key)) {
+      if (!::tracer::compat::contains(selectors_, key)) {
         key = written(true);
-        if (!selectors_.contains(key))
+        if (!::tracer::compat::contains(selectors_, key))
           return true;
       }
     }
-    if (declarations.contains(key)) {
+    if (::tracer::compat::contains(declarations, key)) {
       throw std::invalid_argument("ambiguous mock declaration for " + signature);
     }
 
@@ -157,7 +158,7 @@ private:
 } // namespace
 
 std::map<std::string, MockDeclaration>
-describe_mock_callables(clang::ASTContext& ast, std::span<const std::string> selectors) {
+describe_mock_callables(clang::ASTContext& ast, ::tracer::compat::span<const std::string> selectors) {
   MockDeclarations visitor(ast, selectors);
   visitor.TraverseDecl(ast.getTranslationUnitDecl());
   return std::move(visitor.declarations);

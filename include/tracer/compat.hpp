@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <new>
@@ -92,7 +93,7 @@ public:
                   typename std::remove_cv<typename std::remove_reference<Container>::type>::type,
                   span>::value,
           int>::type = 0>
-  span(Container& container) noexcept
+  span(Container&& container) noexcept
       : data_(container.data())
       , size_(static_cast<size_type>(container.size())) {}
 
@@ -318,6 +319,41 @@ template <class T, class... Args>
 T* construct_at(T* location, Args&&... args) {
   return ::new (static_cast<void*>(location)) T(std::forward<Args>(args)...);
 }
+
+
+namespace ranges {
+template <class Range, class Predicate>
+bool any_of(Range&& range, Predicate predicate) {
+  return std::any_of(std::begin(range), std::end(range), predicate);
+}
+template <class Range, class Predicate>
+bool all_of(Range&& range, Predicate predicate) {
+  return std::all_of(std::begin(range), std::end(range), predicate);
+}
+template <class Range, class Predicate>
+bool none_of(Range&& range, Predicate predicate) {
+  return std::none_of(std::begin(range), std::end(range), predicate);
+}
+template <class Range, class Predicate>
+auto find_if(Range&& range, Predicate predicate) -> decltype(std::begin(range)) {
+  return std::find_if(std::begin(range), std::end(range), predicate);
+}
+template <class Range, class Predicate>
+auto count_if(Range&& range, Predicate predicate)
+    -> typename std::iterator_traits<decltype(std::begin(range))>::difference_type {
+  return std::count_if(std::begin(range), std::end(range), predicate);
+}
+// The optional projection may be a member pointer, as with std::ranges::find.
+template <class Range, class Value, class Projection>
+auto find(Range&& range, const Value& value, Projection projection) -> decltype(std::begin(range)) {
+  return std::find_if(std::begin(range), std::end(range),
+                      [&](const auto& item) { return std::invoke(projection, item) == value; });
+}
+template <class Range, class Value>
+auto find(Range&& range, const Value& value) -> decltype(std::begin(range)) {
+  return std::find(std::begin(range), std::end(range), value);
+}
+} // namespace ranges
 
 template <class Sequence, class Predicate>
 typename Sequence::size_type erase_if(Sequence& values, Predicate predicate) {

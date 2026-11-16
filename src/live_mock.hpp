@@ -1,7 +1,7 @@
 #pragma once
 
 #include <optional>
-#include <span>
+#include "tracer/compat.hpp"
 
 #include "live_update.hpp"
 
@@ -34,10 +34,10 @@ struct MockCommand {
 };
 
 // Tokens after `mock`. The REPL has already decoded quoted arguments.
-MockCommand parse_live_mock(std::span<const std::string> arguments);
+MockCommand parse_live_mock(::tracer::compat::span<const std::string> arguments);
 
 // Read source and fixture bytes before sending either to the stage operation.
-MockCommand snapshot_live_mock(std::span<const std::string> arguments);
+MockCommand snapshot_live_mock(::tracer::compat::span<const std::string> arguments);
 
 // The REPL calls the first overload before RPC. The server calls the second
 // to validate metadata and retrieve the exact transferred bytes.
@@ -71,7 +71,7 @@ struct MockDeclaration {
 std::string normalize_mock_selector(std::string spelling);
 
 std::map<std::string, MockDeclaration>
-describe_mock_callables(clang::ASTContext& ast, std::span<const std::string> selectors);
+describe_mock_callables(clang::ASTContext& ast, ::tracer::compat::span<const std::string> selectors);
 
 struct MockCompileContext {
   MockCallable target;

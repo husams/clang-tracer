@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include <charconv>
 #include <stdexcept>
 #include <string_view>
@@ -8,7 +9,7 @@ namespace tracer::live {
 namespace {
 const std::string& value(const std::vector<std::string>& args, std::size_t& index) {
   const auto& option = args[index++];
-  if (index == args.size() || args[index].empty() || args[index].starts_with("--")) {
+  if (index == args.size() || args[index].empty() || ::tracer::compat::starts_with(args[index], "--")) {
     throw std::invalid_argument(option + " requires a value");
   }
   return args[index++];
@@ -29,7 +30,7 @@ void validate_discovery(const std::string& file, const std::string& function) {
 } // namespace
 
 LiveDataUpdateCommand parse_live_data_update(const std::vector<std::string>& args) {
-  if (args.empty() || args.front().empty() || args.front().starts_with("--")) {
+  if (args.empty() || args.front().empty() || ::tracer::compat::starts_with(args.front(), "--")) {
     throw std::invalid_argument("update-data requires an update source file");
   }
   LiveDataUpdateCommand command;
@@ -47,7 +48,7 @@ LiveDataUpdateCommand parse_live_data_update(const std::vector<std::string>& arg
         throw std::invalid_argument("duplicate --address");
       }
       std::string_view spelling = value(args, index);
-      const bool hex = spelling.starts_with("0x") || spelling.starts_with("0X");
+      const bool hex = ::tracer::compat::starts_with(spelling, "0x") || ::tracer::compat::starts_with(spelling, "0X");
       if (hex) {
         spelling.remove_prefix(2);
       }
@@ -60,7 +61,7 @@ LiveDataUpdateCommand parse_live_data_update(const std::vector<std::string>& arg
       command.selection.address = address;
     } else if (option == "--from-scan") {
       command.selection.scan_ids.push_back(value(args, index));
-      while (index < args.size() && !args[index].starts_with("--")) {
+      while (index < args.size() && !::tracer::compat::starts_with(args[index], "--")) {
         command.selection.scan_ids.push_back(args[index++]);
       }
     } else {

@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "live_plan.hpp"
 
 #include "debug_resolver.hpp"
@@ -66,7 +67,13 @@ struct Symbol {
   unsigned type;
   bool local;
   std::string file;
-  auto operator<=>(const Symbol &) const = default;
+  auto key() const { return std::tie(name, address, size, type, local, file); }
+  bool operator==(const Symbol &other) const { return key() == other.key(); }
+  bool operator!=(const Symbol &other) const { return !(*this == other); }
+  bool operator<(const Symbol &other) const { return key() < other.key(); }
+  bool operator>(const Symbol &other) const { return other < *this; }
+  bool operator<=(const Symbol &other) const { return !(other < *this); }
+  bool operator>=(const Symbol &other) const { return !(*this < other); }
 };
 
 struct Image {
@@ -200,19 +207,19 @@ TranslationUnit profile(const clang::tooling::CompileCommand &command, const std
   if (arguments.empty())
     throw std::runtime_error("empty compile profile: " + path);
   const auto driver = fs::path(arguments.front()).filename().string();
-  if (!driver.starts_with("clang++") && driver != "g++" && !driver.starts_with("g++-") &&
-      !driver.ends_with("-linux-gnu-g++") && driver != "c++")
+  if (!::tracer::compat::starts_with(driver, "clang++") && driver != "g++" && !::tracer::compat::starts_with(driver, "g++-") &&
+      !::tracer::compat::ends_with(driver, "-linux-gnu-g++") && driver != "c++")
     throw std::runtime_error("unverified C++ compiler profile: " + driver);
   arguments.erase(arguments.begin());
   std::string optimization = "-O0";
-  std::erase_if(arguments, [&](const std::string &argument) {
-    if (argument.starts_with("-O"))
+  ::tracer::compat::erase_if(arguments, [&](const std::string &argument) {
+    if (::tracer::compat::starts_with(argument, "-O"))
       optimization = argument;
-    if (argument.starts_with("@") || argument.starts_with("-flto") ||
-        argument.starts_with("-fplugin") || argument.starts_with("-fsanitize") ||
-        argument.starts_with("-mabi") || argument.starts_with("-fabi-version") ||
+    if (::tracer::compat::starts_with(argument, "@") || ::tracer::compat::starts_with(argument, "-flto") ||
+        ::tracer::compat::starts_with(argument, "-fplugin") || ::tracer::compat::starts_with(argument, "-fsanitize") ||
+        ::tracer::compat::starts_with(argument, "-mabi") || ::tracer::compat::starts_with(argument, "-fabi-version") ||
         argument == "-Xclang" || argument == "-include-pch" || argument == "-ftime-trace" ||
-        argument.starts_with("-fprofile"))
+        ::tracer::compat::starts_with(argument, "-fprofile"))
       throw std::runtime_error("unverified compile flag: " + argument);
     return argument == "-c" || argument == command.Filename ||
            (!argument.empty() && argument.front() != '-' &&
@@ -260,7 +267,7 @@ Sources snapshot_inputs(const api::LiveBuildManifest &manifest,
   std::map<std::string, std::string> overrides;
   for (const auto &source : request.sources()) {
     const auto path = fs::canonical(source.path()).string();
-    if ((!within(result.root, path) && !(managed_inputs && managed_inputs->contains(path))) ||
+    if ((!within(result.root, path) && !(managed_inputs && ::tracer::compat::contains((*managed_inputs), path))) ||
         !result.submitted.insert(path).second)
       throw std::runtime_error("invalid or duplicate submitted source: " + path);
     if (read_file(path) != source.contents())
@@ -300,7 +307,7 @@ void collect(std::map<std::string, Body> &all, const std::string &path,
              const std::map<std::string, Definition> &definitions) {
   for (const auto &[name, definition] : definitions) {
     const auto key = definition.local ? local_import_name(path, name) : name;
-    if (!all.contains(key))
+    if (!::tracer::compat::contains(all, key))
       all.emplace(key, Body{name, path, definition});
   }
 }
@@ -358,7 +365,7 @@ ClosureScope closure_scope(std::string_view symbol, const std::map<std::string, 
     return {};
   for (auto start = symbol.find('Z', 2); start < suffix; start = symbol.find('Z', start + 1)) {
     auto owner = "_Z" + std::string(symbol.substr(start + 1, suffix - start - 1));
-    if (code.contains(owner))
+    if (::tracer::compat::contains(code, owner))
       return {std::move(owner), std::string(symbol.substr(marker, end - marker))};
   }
   return {};
@@ -384,9 +391,9 @@ bool lambda_was_renumbered(const std::string &name, const Definition &original,
   };
   // Finding the same closure declaration at a unique new ordinal proves the
   // capture layout at the old ordinal now belongs to a different closure.
-  if (std::ranges::count_if(before, matches) != 1 || std::ranges::count_if(after, matches) != 1)
+  if (::tracer::compat::ranges::count_if(before, matches) != 1 || ::tracer::compat::ranges::count_if(after, matches) != 1)
     return false;
-  const auto moved = std::ranges::find_if(after, matches);
+  const auto moved = ::tracer::compat::ranges::find_if(after, matches);
   return moved->first != name && moved->second.abi == original.abi;
 }
 
@@ -595,7 +602,7 @@ bool unchanged_global_lifecycle(const llvm::Module &before, const llvm::Module &
       if (next == new_code.end())
         return false;
       if (!equivalent_body(prior, next->second)) {
-        if (!native_closures.contains(name) || prior.abi != next->second.abi)
+        if (!::tracer::compat::contains(native_closures, name) || prior.abi != next->second.abi)
           return false;
         if (!lifecycle_entries) {
           lifecycle_entries.emplace();
@@ -603,7 +610,7 @@ bool unchanged_global_lifecycle(const llvm::Module &before, const llvm::Module &
               !lifecycle_calls(after, *lifecycle_entries))
             return false;
         }
-        if (lifecycle_entries->contains(name))
+        if (::tracer::compat::contains((*lifecycle_entries), name))
           return false;
         continue;
       }
@@ -650,7 +657,7 @@ Entry bind(std::uint32_t pid, const Image &image, const Symbol &symbol,
 }
 
 bool thunk_for(const std::string &symbol, const std::string &demangled) {
-  return symbol.starts_with("_ZT") && llvm::demangle(symbol).ends_with(" thunk to " + demangled);
+  return ::tracer::compat::starts_with(symbol, "_ZT") && ::tracer::compat::ends_with(llvm::demangle(symbol), " thunk to " + demangled);
 }
 
 bool forwards_to_body(const Image &image, const Symbol &thunk, const Symbol &body,
@@ -664,7 +671,7 @@ bool forwards_to_body(const Image &image, const Symbol &thunk, const Symbol &bod
   const auto forwards = [&](std::uint64_t address) {
     if (address == body.address)
       return true;
-    const auto next = std::ranges::find_if(image.symbols, [&](const Symbol &symbol) {
+    const auto next = ::tracer::compat::ranges::find_if(image.symbols, [&](const Symbol &symbol) {
       return symbol.address == address && symbol.size && symbol.type == llvm::ELF::STT_FUNC &&
              thunk_for(symbol.name, callable);
     });
@@ -681,8 +688,11 @@ bool forwards_to_body(const Image &image, const Symbol &thunk, const Symbol &bod
   while (!pending.empty()) {
     auto [pc, forwarded] = *pending.begin();
     pending.erase(pending.begin());
-    const auto current = std::ranges::lower_bound(decoded.instructions, pc, {},
-                                                   &native_entry::Instruction::address);
+    const auto current = std::lower_bound(
+        decoded.instructions.begin(), decoded.instructions.end(), pc,
+        [](const native_entry::Instruction &instruction, std::uint64_t address) {
+          return instruction.address < address;
+        });
     if (current == decoded.instructions.end() || current->address != pc)
       return false;
     if (current->flow == Flow::returns) {
@@ -964,7 +974,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
   const TranslationUnit *inherited = nullptr;
   bool ambiguous_profile = false;
   for (const auto &[path, unit] : profiles) {
-    if (!sources.saved.contains(path))
+    if (!::tracer::compat::contains(sources.saved, path))
       continue;
     if (!inherited)
       inherited = &unit;
@@ -973,8 +983,8 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       ambiguous_profile = true;
   }
   for (const auto &file : sources.current) {
-    if (sources.saved.contains(file.path) || profiles.contains(file.path) ||
-        (managed_inputs && managed_inputs->contains(file.path)) || !translation_unit(file.path))
+    if (::tracer::compat::contains(sources.saved, file.path) || ::tracer::compat::contains(profiles, file.path) ||
+        (managed_inputs && ::tracer::compat::contains((*managed_inputs), file.path)) || !translation_unit(file.path))
       continue;
     if (!inherited || ambiguous_profile)
       throw std::runtime_error("new translation unit requires one verified build profile: " + file.path);
@@ -1040,16 +1050,16 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
   };
   const auto compile_snapshots = [&](const TranslationUnit &unit) {
     Snapshots compiled;
-    if (sources.saved.contains(unit.path) || active.sources.contains(unit.path))
+    if (::tracer::compat::contains(sources.saved, unit.path) || ::tracer::compat::contains(active.sources, unit.path))
       compiled.before.emplace(compile_unit(baseline, unit, nullptr, {},
                                            CompileInspection::native_metadata,
-                                           sources.saved.contains(unit.path)
+                                           ::tracer::compat::contains(sources.saved, unit.path)
                                                ? &sources.submitted : nullptr));
     if (compiled.before)
       verify_recipe_inputs(*compiled.before);
-    if (!compiled.before || sources.submitted.contains(unit.path) ||
-        std::ranges::any_of(compiled.before->inputs,
-            [&](const auto &input) { return sources.submitted.contains(input); }))
+    if (!compiled.before || ::tracer::compat::contains(sources.submitted, unit.path) ||
+        ::tracer::compat::ranges::any_of(compiled.before->inputs,
+            [&](const auto &input) { return ::tracer::compat::contains(sources.submitted, input); }))
       compiled.updated.emplace(compile_unit(current, unit, nullptr, {},
                                             CompileInspection::native_metadata));
     if (compiled.updated)
@@ -1099,7 +1109,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         throw std::runtime_error("unrecorded project dependency: " + dependency);
       covered.insert(dependency);
     }
-    if (!changed && sources.saved.contains(path)) {
+    if (!changed && ::tracer::compat::contains(sources.saved, path)) {
       // No submitted file reaches this TU. Its emitted names still provide
       // coverage evidence for shared symbols, without fingerprinting bodies.
       const auto mark_unchanged = [&](const llvm::GlobalValue &value) {
@@ -1129,7 +1139,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     // when an enclosing function is recompiled for a different edit.
     if (const auto prior = active.private_closures.find(path); prior != active.private_closures.end())
       for (const auto &name : prior->second)
-        if (after_definitions.contains(name))
+        if (::tracer::compat::contains(after_definitions, name))
           revision_closures.insert(name);
     std::set<ClosureScope> private_families;
     for (const auto &name : revision_closures)
@@ -1141,7 +1151,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     // An algorithm may disappear for one revision while the predicate stays
     // private. Its re-emitted instantiation must use that private predicate.
     for (const auto &[name, body] : after_definitions)
-      if (body.local && private_families.contains(closure_scope(name, after_definitions)))
+      if (body.local && ::tracer::compat::contains(private_families, closure_scope(name, after_definitions)))
         revision_closures.insert(name);
     if (before) {
       auto before_definitions = changed ? definitions(*before) : after_definitions;
@@ -1157,27 +1167,30 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       // Dropping the last use can stop Clang emitting a callable while its
       // native entry still exists. Compare a reappearing body with the exact
       // build snapshot and keep calls routed through that entry.
-      if (changed && sources.saved.contains(path) && !original.files.empty() &&
-          std::ranges::any_of(after_definitions, [&](const auto &entry) {
-            if (before_definitions.contains(entry.first))
+      if (changed && ::tracer::compat::contains(sources.saved, path) && !original.files.empty() &&
+          ::tracer::compat::ranges::any_of(after_definitions, [&](const auto &entry) {
+            if (::tracer::compat::contains(before_definitions, entry.first))
               return false;
             return entry.second.local ? local_symbol(entry.first, path) != nullptr
                                       : image.find(entry.first, false) != nullptr;
           })) {
         inspect_build();
         auto vanished = built_definitions;
-        std::erase_if(vanished, [&](const auto &entry) {
-          return !after_definitions.contains(entry.first);
-        });
+        for (auto item = vanished.begin(); item != vanished.end();) {
+          if (!::tracer::compat::contains(after_definitions, item->first))
+            item = vanished.erase(item);
+          else
+            ++item;
+        }
         // The built definition proves identity, but the current native entry
         // may still dispatch to an earlier live replacement.
         for (const auto &[name, definition] : vanished) {
-          if (before_definitions.contains(name))
+          if (::tracer::compat::contains(before_definitions, name))
             continue;
           const auto *symbol = definition.local ? local_symbol(name, path) : image.find(name, false);
           if (!symbol)
             continue;
-          const auto installed = std::ranges::find_if(active.entries, [&](const auto &entry) {
+          const auto installed = ::tracer::compat::ranges::find_if(active.entries, [&](const auto &entry) {
             const auto &binding = entry.second.binding;
             return binding.module == module && binding.elf_address == symbol->address;
           });
@@ -1210,8 +1223,8 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         const auto next = after_definitions.find(name);
         if (!prior.lambda_site || prior.lambda_site->empty() || next == after_definitions.end() ||
             prior.lambda_site != next->second.lambda_site || prior.abi != next->second.abi ||
-            revision_closures.contains(name) ||
-            (!reappeared_patched.contains(name) && equivalent_body(prior, next->second)))
+            ::tracer::compat::contains(revision_closures, name) ||
+            (!::tracer::compat::contains(reappeared_patched, name) && equivalent_body(prior, next->second)))
           continue;
         const auto *symbol = prior.local ? local_symbol(name, path) : image.find(name, false);
         if (!symbol || symbol->type != llvm::ELF::STT_FUNC || !symbol->size ||
@@ -1252,9 +1265,9 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         std::optional<std::map<std::string, std::string>> built_data;
         for (const auto &[name, storage] : new_data) {
           const auto *global = after.module->getNamedGlobal(name);
-          if (old_data.contains(name) || (global && standard_inline_constant(*global)))
+          if (::tracer::compat::contains(old_data, name) || (global && standard_inline_constant(*global)))
             continue;
-          if (global && sources.saved.contains(path) && !original.files.empty()) {
+          if (global && ::tracer::compat::contains(sources.saved, path) && !original.files.empty()) {
             const auto *symbol = global->hasLocalLinkage() ? local_symbol(name, path)
                                                            : image.find(name, false);
             if (symbol && symbol->type == llvm::ELF::STT_OBJECT && symbol->size) {
@@ -1280,10 +1293,10 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       std::set<ClosureScope> changed_families;
       const auto compare_closures = [&](const auto &left, const auto &right) {
         for (const auto &[name, body] : left) {
-          if (!body.local || native_closures.contains(name))
+          if (!body.local || ::tracer::compat::contains(native_closures, name))
             continue;
           auto scope = closure_scope(name, before_definitions);
-          if (scope.first.empty() || !after_definitions.contains(scope.first))
+          if (scope.first.empty() || !::tracer::compat::contains(after_definitions, scope.first))
             continue;
           const auto other = right.find(name);
           if (other == right.end() || !equivalent_body(body, other->second)) {
@@ -1295,10 +1308,10 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       compare_closures(before_definitions, after_definitions);
       compare_closures(after_definitions, before_definitions);
       for (const auto &[name, prior] : before_definitions) {
-        if (!prior.lambda_site || native_closures.contains(name))
+        if (!prior.lambda_site || ::tracer::compat::contains(native_closures, name))
           continue;
         const auto [owner, ordinal] = closure_scope(name, before_definitions);
-        if (owner.empty() || !changed_owners.contains(owner))
+        if (owner.empty() || !::tracer::compat::contains(changed_owners, owner))
           continue;
         const auto next = after_definitions.find(name);
         if (next != after_definitions.end() && equivalent_body(prior, next->second))
@@ -1327,10 +1340,10 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         }
       }
       for (const auto &[name, body] : after_definitions) {
-        if (!body.local || native_closures.contains(name))
+        if (!body.local || ::tracer::compat::contains(native_closures, name))
           continue;
         const auto scope = closure_scope(name, before_definitions);
-        if (!changed_families.contains(scope))
+        if (!::tracer::compat::contains(changed_families, scope))
           continue;
         const auto prior = before_definitions.find(name);
         if (body.lambda_site && prior != before_definitions.end() &&
@@ -1344,14 +1357,14 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       // A linker may select one of several differently lowered inline
       // copies. Detect source changes against the same TU's prior IR first.
       for (const auto &[name, prior] : before_definitions) {
-        if (revision_closures.contains(name))
+        if (::tracer::compat::contains(revision_closures, name))
           continue;
         const auto key = prior.local ? local_import_name(path, name) : name;
         const auto next = after_definitions.find(name);
         if (next == after_definitions.end() && prior.discardable)
           continue;
-        if (next != after_definitions.end() && !changed_owners.contains(name) &&
-            !reappeared_patched.contains(name) &&
+        if (next != after_definitions.end() && !::tracer::compat::contains(changed_owners, name) &&
+            !::tracer::compat::contains(reappeared_patched, name) &&
             equivalent_body(prior, next->second)) {
           unchanged.insert(key);
           continue;
@@ -1382,7 +1395,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         if (global && private_constant(*global))
           continue;
         const auto name = value.getName().str();
-        if (value.hasLocalLinkage() && revision_closures.contains(name))
+        if (value.hasLocalLinkage() && ::tracer::compat::contains(revision_closures, name))
           continue;
         const auto import = value.hasLocalLinkage() ? local_import_name(path, name) : name;
         std::optional<std::uint64_t> size;
@@ -1394,11 +1407,11 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     }
   }
   for (const auto &path : sources.submitted)
-    if (!covered.count(path) && !(managed_inputs && managed_inputs->contains(path)))
+    if (!covered.count(path) && !(managed_inputs && ::tracer::compat::contains((*managed_inputs), path)))
       throw std::runtime_error("no verified translation unit profile or dependency uses " + path);
   if (managed_inputs && changes.empty() && result.candidates.empty() &&
-      std::ranges::all_of(sources.submitted, [&](const auto &path) {
-        return managed_inputs->contains(path) && !covered.contains(path);
+      ::tracer::compat::ranges::all_of(sources.submitted, [&](const auto &path) {
+        return ::tracer::compat::contains((*managed_inputs), path) && !::tracer::compat::contains(covered, path);
       }))
     return result;
 
@@ -1406,7 +1419,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
   for (auto &unit : result.jit.translation_units)
     unit.reuse_stream_initializer = target_initialized_streams;
   for (const auto &file : result.jit.files)
-    if (sources.submitted.count(file.path) && covered.contains(file.path))
+    if (sources.submitted.count(file.path) && ::tracer::compat::contains(covered, file.path))
       result.accepted_sources.push_back(file);
   std::set<std::string> replaced;
   std::map<std::uintptr_t, std::string> entries;
@@ -1446,10 +1459,10 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       if (managed_inputs && (enters_registry(before_calls, key) || enters_registry(after_calls, key)))
         throw std::runtime_error(
             "rebuild required: acquire the managed registry gate in the caller before entering the updated function");
-      if (old.lambda_site && !verified_lambdas.contains(key))
+      if (old.lambda_site && !::tracer::compat::contains(verified_lambdas, key))
         throw std::runtime_error("rebuild required: cannot verify that the native lambda is the same closure");
       if (!old.has_source_abi || !old.supported_abi || !next || body.inconsistent ||
-          unchanged.contains(key) || old.abi != next->abi || !next->supported_abi)
+          ::tracer::compat::contains(unchanged, key) || old.abi != next->abi || !next->supported_abi)
         throw std::runtime_error("rebuild required: emitted implementations or callable ABI differ");
       const auto callable = llvm::demangle(name);
       for (const auto &alias : image.symbols) {
@@ -1485,7 +1498,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
         throw std::runtime_error("rebuild required: local lifecycle alias needs a verified native entry");
       const auto canonical = physical_body(key, new_bodies);
       auto binding = bind(pid, image, *symbol, old, active);
-      if (result.restore_mock_originals.contains(binding.address))
+      if (::tracer::compat::contains(result.restore_mock_originals, binding.address))
         throw std::runtime_error("competing native replacement for a restored mock");
       candidate.set_address(binding.address);
       candidate.set_state(api::LiveUpdateStatus::PLANNED);
@@ -1522,7 +1535,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
       continue;
     if (local) {
       const auto prior = native_locals.find(name);
-      if (prior == native_locals.end() || !prior->second.contains(ref.unit))
+      if (prior == native_locals.end() || !::tracer::compat::contains(prior->second, ref.unit))
         continue;
     }
     const auto *symbol = local ? local_symbol(name, ref.unit) : image.find(name, false);
@@ -1533,7 +1546,7 @@ Plan plan_sources(std::uint32_t pid, const std::string &executable,
     if (!symbol || !symbol->size ||
         (symbol->type != llvm::ELF::STT_FUNC && symbol->type != llvm::ELF::STT_OBJECT))
       continue;
-    if (symbol->type == llvm::ELF::STT_FUNC && !result.jit.imports.contains(import)) {
+    if (symbol->type == llvm::ELF::STT_FUNC && !::tracer::compat::contains(result.jit.imports, import)) {
       if (!mappings.contains(symbol->address, symbol->size))
         throw Stale("import moved across ELF instances: " + name);
     }

@@ -886,7 +886,7 @@ struct Process::PeerFreeze {
       // share a mapping, with the FS base above the stack. Require this
       // evidence before treating an unnamed mapping as the regular stack.
       const bool pthread_stack = mapping->private_writable &&
-          (mapping->path.empty() || mapping->path.starts_with("[anon:glibc: pthread stack")) &&
+          (mapping->path.empty() || ::tracer::compat::starts_with(mapping->path, "[anon:glibc: pthread stack")) &&
           regs.fs_base > regs.rsp && regs.fs_base < mapping->end;
       if (mapping->path != "[stack]" && !pthread_stack)
         return true;

@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "live_mock_plan.hpp"
 
 #include <algorithm>
@@ -49,7 +50,7 @@ Plan plan_live_mock(std::uint32_t pid, const std::string& executable,
     for (const auto& dependency : compiled->inputs) {
       const auto relative =
           std::filesystem::path(dependency).lexically_relative(native.source_root);
-      if (!relative.empty() && *relative.begin() != ".." && !inputs.contains(dependency)) {
+      if (!relative.empty() && *relative.begin() != ".." && !::tracer::compat::contains(inputs, dependency)) {
         throw std::runtime_error("unrecorded mock build dependency: " + dependency);
       }
     }
@@ -60,7 +61,7 @@ Plan plan_live_mock(std::uint32_t pid, const std::string& executable,
       }
       declaration.callable.native_definition = definition;
       for (const auto& header : declaration.headers) {
-        if (!inputs.contains(header)) {
+        if (!::tracer::compat::contains(inputs, header)) {
           throw std::runtime_error("mock declaration header is outside the build inventory: " +
                                    header);
         }

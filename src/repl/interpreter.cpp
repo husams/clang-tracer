@@ -162,7 +162,7 @@ public:
     // Keep the compiler's indirect EH personality cell with its own CIE.
     // Undo may release that cell while other incremental objects are live.
     for (auto *symbol : graph.defined_symbols()) {
-      if (symbol->hasName() && (*symbol->getName()).starts_with("DW.ref.") &&
+      if (symbol->hasName() && ::tracer::compat::starts_with((*symbol->getName()), "DW.ref.") &&
           symbol->getScope() == llvm::jitlink::Scope::Hidden &&
           symbol->getLinkage() == llvm::jitlink::Linkage::Weak) {
         symbol->setLinkage(llvm::jitlink::Linkage::Strong);
@@ -392,7 +392,7 @@ void CppEngine::add_plugin_api(const std::filesystem::path& include,
     throw std::logic_error("plugin APIs must be installed before starting C++");
   }
   for (const auto& symbol : symbols) {
-    if (plugin_symbols_.contains(symbol.name)) {
+    if (::tracer::compat::contains(plugin_symbols_, symbol.name)) {
       throw std::runtime_error("duplicate public plugin symbol: " + symbol.name);
     }
   }

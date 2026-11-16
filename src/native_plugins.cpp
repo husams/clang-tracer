@@ -1,3 +1,4 @@
+#include "tracer/compat.hpp"
 #include "native_plugins.hpp"
 
 #include "repl/clang_tracer_repl_plugin.h"
@@ -283,7 +284,7 @@ std::map<std::string, bool> public_definitions(llvm::orc::LLJIT& jit,
         continue;
       }
       auto name = require(symbol.getName()).str();
-      if (declared.contains(name)) {
+      if (::tracer::compat::contains(declared, name)) {
         result.emplace(std::move(name), require(symbol.getType()) == Symbol::ST_Function);
       }
     }

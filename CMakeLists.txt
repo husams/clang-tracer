@@ -295,6 +295,7 @@ if(BUILD_TESTING)
 
   add_library(live-test-jit STATIC src/live_compile.cpp src/live_jit.cpp)
   target_include_directories(live-test-jit SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
+  target_include_directories(live-test-jit PRIVATE include)
   target_compile_definitions(live-test-jit PRIVATE
     TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
   target_link_libraries(live-test-jit PUBLIC clang-cpp LLVM ${CMAKE_DL_LIBS})

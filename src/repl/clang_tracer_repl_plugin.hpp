@@ -15,7 +15,7 @@ protected:
   static Implementation& instance() noexcept {
     static_assert(std::is_trivially_destructible_v<Implementation>,
                   "plugin instances must be trivially destructible");
-    static constinit Implementation plugin{};
+    static Implementation plugin{};
     return plugin;
   }
 
@@ -29,10 +29,16 @@ protected:
 };
 
 namespace detail {
+template <typename Implementation, typename = void>
+struct has_commands : std::false_type {};
+template <typename Implementation>
+struct has_commands<Implementation, std::void_t<decltype(Implementation::commands)>>
+    : std::true_type {};
+
 template <typename Implementation>
 const TracerReplPluginV1* descriptor() {
   static constexpr auto value = [] {
-    if constexpr (requires { Implementation::commands; }) {
+    if constexpr (has_commands<Implementation>::value) {
       constexpr auto& commands = Implementation::commands;
       return TracerReplPluginV1{sizeof(TracerReplPluginV1),
                                 sizeof(commands) / sizeof(commands[0]), commands};
