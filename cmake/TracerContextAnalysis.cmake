@@ -106,6 +106,7 @@ if(BUILD_TESTING)
   target_link_libraries(context-delivery-tests PRIVATE tracer_context_analysis
     tracer_context_collector)
   add_test(NAME shared_context_declarations COMMAND context-analysis-tests)
-  set_tests_properties(shared_context_declarations PROPERTIES TIMEOUT 180)
+  # Repeated embedded-Clang parses can take almost 180 seconds on the GCC 8 SDK.
+  set_tests_properties(shared_context_declarations PROPERTIES TIMEOUT 360)
   include(${CMAKE_CURRENT_LIST_DIR}/TracerContextSchemaTests.cmake)
 endif()

@@ -381,10 +381,9 @@ public:
             : (level == clang::DiagnosticsEngine::Warning ? "warning"
                                                           : "note");
     diagnostic.message.assign(formatted.begin(), formatted.end());
-    const auto &source_manager = info.getSourceManager();
     const auto location = info.getLocation();
-    if (location.isValid()) {
-      const auto presumed = source_manager.getPresumedLoc(location);
+    if (location.isValid() && info.hasSourceManager()) {
+      const auto presumed = info.getSourceManager().getPresumedLoc(location);
       if (presumed.isValid()) {
         diagnostic.file = presumed.getFilename();
         diagnostic.line = presumed.getLine();
@@ -1965,7 +1964,7 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
       headers += recovered_record_declarations(spec);
     if (!callback_includes.empty())
       headers = callback_includes + headers;
-    DiagnosticCapture capture(nullptr);
+    auto capture = std::make_unique<DiagnosticCapture>(nullptr);
     if (spec.has_header_context()) {
       const auto &header_context = spec.header_context();
       const auto &directory = header_context.working_directory();
@@ -1991,8 +1990,7 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
       if (!resource_dir)
         arguments.push_back(std::string("-resource-dir=") +
                             tracer::runtime::clang_resource_dir());
-      arguments.insert(arguments.end(), {"-x", "c++", "-fsyntax-only"});
-      clang::tooling::FixedCompilationDatabase database(directory, arguments);
+      arguments.insert(arguments.end(), {"-x", "c++"});
       auto physical_fs = llvm::vfs::createPhysicalFileSystem();
       llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> private_fs(
           physical_fs.release());
@@ -2004,20 +2002,11 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
       const auto input =
           (std::filesystem::path(directory) / "clang-tracer-debug-types.cc")
               .string();
-      clang::tooling::ClangTool tool(
-          database, {input}, std::make_shared<clang::PCHContainerOperations>(),
-          private_fs);
-      tool.mapVirtualFile(input, headers);
-      tool.setDiagnosticConsumer(&capture);
-      tool.appendArgumentsAdjuster(
-          clang::tooling::getClangStripOutputAdjuster());
-      tool.appendArgumentsAdjuster(
-          clang::tooling::getClangStripDependencyFileAdjuster());
-      std::vector<std::unique_ptr<clang::ASTUnit>> units;
-      if (tool.buildASTs(units) != 0 || units.size() != 1)
-        throw std::runtime_error("cannot parse optional headers: " +
-                                 capture.message());
-      output = std::move(units.front());
+      output = clang::tooling::buildASTFromCodeWithArgs(
+          headers, arguments, input, "clang-tracer",
+          std::make_shared<clang::PCHContainerOperations>(),
+          clang::tooling::getClangStripDependencyFileAdjuster(), {},
+          capture.get(), std::move(private_fs));
     } else {
       auto arguments = tracer::runtime::jit_arguments();
       arguments.insert(arguments.end(),
@@ -2031,11 +2020,16 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
       output = clang::tooling::buildASTFromCodeWithArgs(
           headers, arguments, "clang-tracer-debug-types.cc", "clang-tracer",
           std::make_shared<clang::PCHContainerOperations>(),
-          clang::tooling::getClangStripOutputAdjuster(), {}, &capture);
+          clang::tooling::getClangStripOutputAdjuster(), {}, capture.get());
     }
-    if (!output || capture.had_error())
+    auto *diagnostics = capture.get();
+    // AST import can report diagnostics after this function returns. Clang's
+    // tooling APIs borrow the consumer, so give the retained AST ownership.
+    if (output)
+      output->getDiagnostics().setClient(capture.release(), true);
+    if (!output || diagnostics->had_error())
       throw std::runtime_error("cannot create debug type AST: " +
-                               capture.message());
+                               diagnostics->message());
     auto &context = output->getASTContext();
     const auto &triple = context.getTargetInfo().getTriple();
     if (triple.getArch() != llvm::Triple::x86_64 || !triple.isOSLinux() ||
@@ -2179,19 +2173,20 @@ bool build_and_validate_receiver_ast(clangtracer::v1::ProbeSpec &spec,
   clang::tooling::ClangTool tool(
       database, {receiver.translation_unit()},
       std::make_shared<clang::PCHContainerOperations>(), private_fs);
-  DiagnosticCapture diagnostics(nullptr);
-  tool.setDiagnosticConsumer(&diagnostics);
+  auto diagnostics = std::make_unique<DiagnosticCapture>(nullptr);
+  tool.setDiagnosticConsumer(diagnostics.get());
   tool.appendArgumentsAdjuster(clang::tooling::getClangStripOutputAdjuster());
   std::vector<std::unique_ptr<clang::ASTUnit>> units;
-  if (tool.buildASTs(units) != 0 || diagnostics.had_error() ||
+  if (tool.buildASTs(units) != 0 || diagnostics->had_error() ||
       units.size() != 1) {
-    error = diagnostics.message();
+    error = diagnostics->message();
     if (error.empty()) {
       error = "cannot parse receiver translation unit with its frozen compiler "
               "context";
     }
     return false;
   }
+  units.front()->getDiagnostics().setClient(diagnostics.release(), true);
   auto &context = units.front()->getASTContext();
   const auto triple = context.getTargetInfo().getTriple();
   if (triple.getArch() != llvm::Triple::x86_64 || !triple.isOSLinux() ||
@@ -2952,8 +2947,8 @@ std::string make_wrapper(const tracer::Request &r,
               std::to_string(static_cast<unsigned>(r.result)) + ");\n";
   }
   code += "ctx.target_entry=" + std::to_string(r.original_entry) +
-          "ULL; ctx.bridge_begin=reinterpret_cast<uintptr_t>(&&original_begin);"
-          "ctx.bridge_end=reinterpret_cast<uintptr_t>(&&original_end);"
+          "ULL; ctx.bridge_begin=__extension__ reinterpret_cast<uintptr_t>(&&original_begin);"
+          "ctx.bridge_end=__extension__ reinterpret_cast<uintptr_t>(&&original_end);"
           "ctx.stack_capture=&tracer_capture_stack;"
           "tracer_stack_enter(&ctx,__builtin_frame_address(0));"
           "struct StackGuard { tracer::TraceContext *ctx;"
@@ -4301,7 +4296,8 @@ split_callback_includes(const std::string &source) {
 }
 
 bool extract_forced_includes(std::vector<std::string> &arguments,
-                             std::string &source, std::string &error) {
+                             std::string &source, std::string &error,
+                             const std::filesystem::path &directory = {}) {
   std::vector<std::string> filtered;
   filtered.reserve(arguments.size());
   for (std::size_t i = 0; i < arguments.size(); ++i) {
@@ -4316,7 +4312,15 @@ bool extract_forced_includes(std::vector<std::string> &arguments,
         error = "-include requires a header path";
         return false;
       }
-      const auto &path = arguments[i];
+      auto path = arguments[i];
+      // Compilers search from the compile command's directory for -include.
+      // The JIT does not change the target process's working directory.
+      if (!directory.empty() && std::filesystem::path(path).is_relative()) {
+        const auto candidate = directory / path;
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(candidate, ec))
+          path = candidate.string();
+      }
       if (path.empty() || path.find_first_of("\"\r\n") != std::string::npos ||
           path.find('\0') != std::string::npos) {
         error = "-include has an invalid header path";
@@ -4345,6 +4349,33 @@ bool extract_forced_includes(std::vector<std::string> &arguments,
   }
   arguments.swap(filtered);
   return true;
+}
+
+void resolve_callback_option_paths(std::vector<std::string> &arguments,
+                                   const std::filesystem::path &directory) {
+  // Called after preflight validation: -iprefix, -iwithprefix and -isysroot
+  // are rejected there. Keep this aligned with the accepted path options.
+  for (std::size_t i = 0; i < arguments.size(); ++i) {
+    for (const llvm::StringRef option : {"-isystem-after", "-isystem", "-iquote",
+                                        "-idirafter", "--gcc-toolchain=", "--sysroot=",
+                                        "--gcc-toolchain", "--sysroot", "-I"}) {
+      auto value = llvm::StringRef(arguments[i]);
+      if (!value.consume_front(option))
+        continue;
+      auto *argument = &arguments[i];
+      if (value.empty()) {
+        if (i + 1 == arguments.size())
+          break;
+        argument = &arguments[++i];
+        value = *argument;
+      }
+      if (!value.empty() && !value.starts_with("=") && !value.starts_with("$SYSROOT") &&
+          !value.starts_with("-") && std::filesystem::path(value.str()).is_relative())
+        argument->replace(argument->size() - value.size(), value.size(),
+                          (directory / value.str()).string());
+      break;
+    }
+  }
 }
 
 bool parse_and_materialize(Probe &probe, clang::Interpreter &interpreter,
@@ -4888,7 +4919,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
                    const VerifiedDebugEntry *verified_entry = nullptr) {
   const bool typed_prepared = tracer::prepared::is_typed_version(
       target_specification.prepared().format_version());
-  const bool prepared_callback_context = typed_prepared && target_specification.has_header_context();
+  const bool has_header_context = target_specification.has_header_context();
+  const bool prepared_callback_context = typed_prepared && has_header_context;
   if (const auto *invalid = tracer::scalar_override_error(target_specification)) {
     error = invalid;
     return false;
@@ -4971,9 +5003,11 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   const auto [callback_includes, callback_body] =
       split_callback_includes(source);
   std::vector<std::string> user_options;
-  if (prepared_callback_context) {
+  if (has_header_context) {
     const auto &options = target_specification.header_context().compiler_arguments();
     user_options.assign(options.begin(), options.end());
+  }
+  if (prepared_callback_context) {
     const auto &explicit_options = target_specification.compile_options();
     for (auto it = explicit_options.begin(); it != explicit_options.end(); ++it) {
       const std::string_view option(*it);
@@ -4987,11 +5021,22 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       }
     }
   }
-  user_options.insert(user_options.end(), target_specification.compile_options().begin(),
-                      target_specification.compile_options().end());
+  // resolve_header_context() appends compile_options verbatim as the suffix
+  // of a legacy context's compiler_arguments. Check that suffix before adding
+  // them again; prepared contexts use a different builder and need the append.
+  // Keep this check before path normalization, which can change those strings.
+  const auto &explicit_options = target_specification.compile_options();
+  if (typed_prepared || user_options.size() < static_cast<std::size_t>(explicit_options.size()) ||
+      !std::equal(explicit_options.rbegin(), explicit_options.rend(), user_options.rbegin()))
+    user_options.insert(user_options.end(), explicit_options.begin(), explicit_options.end());
+  std::filesystem::path callback_directory;
+  if (!typed_prepared && has_header_context) {
+    callback_directory = target_specification.header_context().working_directory();
+    resolve_callback_option_paths(user_options, callback_directory);
+  }
   user_options.insert(user_options.end(), extra.begin(), extra.end());
   std::string forced_include_source;
-  if (!extract_forced_includes(user_options, forced_include_source, error))
+  if (!extract_forced_includes(user_options, forced_include_source, error, callback_directory))
     return false;
   const std::string type_header_prefix =
       forced_include_source + callback_includes;
@@ -5061,7 +5106,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   if (!typed_prepared &&
       !build_and_validate_receiver_ast(specification, p.request, p.receiver_ast,
                                        receiver_record, error,
-                                       p.debug_records, type_header_prefix,
+                                       p.debug_records,
+                                       has_header_context ? callback_includes : type_header_prefix,
                                        verified_entry)) {
     return false;
   }
@@ -5191,7 +5237,18 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
               "creation";
       return false;
     }
-    auto created = clang::Interpreter::create(std::move(*compiler));
+    const auto create_interpreter = [](std::unique_ptr<clang::CompilerInstance> ci) {
+      // Clang parses its own runtime here (including a signed/unsigned loop).
+      // A donor's -Werror must apply to callbacks, not this generated runtime.
+      const bool ignore_warnings = ci->getDiagnostics().getIgnoreAllWarnings();
+      ci->getDiagnostics().setIgnoreAllWarnings(true);
+      auto result = clang::Interpreter::create(std::move(ci));
+      if (result)
+        (*result)->getCompilerInstance()->getDiagnostics().setIgnoreAllWarnings(
+            ignore_warnings);
+      return result;
+    };
+    auto created = create_interpreter(std::move(*compiler));
     if (!created && interpreter_pch) {
       llvm::consumeError(created.takeError());
       tracer::callback_pch::disable(*interpreter_pch);
@@ -5203,7 +5260,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
         error = llvm::toString(fallback_compiler.takeError());
         return false;
       }
-      created = clang::Interpreter::create(std::move(*fallback_compiler));
+      created = create_interpreter(std::move(*fallback_compiler));
     }
     if (!created) {
       error = llvm::toString(created.takeError());
@@ -5382,7 +5439,10 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   bool baseline_preflight_succeeded = false;
   bool followed_members_disabled = false;
   DiagnosticCapture complete_capture(nullptr);
-  if (shape_valid) {
+  // Clang can recover a legacy function declaration even when its body has
+  // errors. Re-parsing that body with the wrapper only repeats its diagnostics.
+  // Class callbacks still need the wrapper/receiver-inference recovery path.
+  if (shape_valid && (shape.class_mode || !user_capture.had_error())) {
     if (overrides &&
         (!shape.class_mode ||
          ((specification.allow_argument_overrides() || specification.allow_replacement() ||
@@ -5451,7 +5511,10 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   }
 
   if (!baseline_preflight_succeeded) {
-    if (!p.receiver_ast) {
+    // Legacy callbacks do not need receiver-field inference. Re-importing a
+    // header AST after a syntax error duplicates standard-library declarations
+    // and can crash Clang instead of returning the original diagnostic.
+    if (!p.receiver_ast || (has_header_context && !shape.class_mode)) {
       if (report) {
         append_diagnostics(*report, user_capture, "syntax");
         append_diagnostics(*report, complete_capture, "wrapper");
@@ -5479,6 +5542,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
         continue;
       if (auto err = importer.ImportDefinition(entry.decl)) {
         error = llvm::toString(std::move(err));
+        if (has_header_context)
+          prefer_parse_errors();
         return false;
       }
       auto imported = importer.Import(entry.decl);
@@ -5522,7 +5587,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
     }
 
     std::string typed_user_source =
-        prelude + context_prelude +
+        forced_include_source + prelude + context_prelude +
         (receiver_record && p.request.kind == tracer::CallableKind::Method
              ? "#define CLANG_TRACER_HAS_TYPED_RECEIVER 1\n"
              : "") +
@@ -5557,6 +5622,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       if (error.empty()) {
         error = "typed receiver callback failed Clang syntax validation";
       }
+      if (has_header_context)
+        prefer_parse_errors();
       return false;
     }
     std::sort(receiver_shape.inferred_fields.rbegin(),

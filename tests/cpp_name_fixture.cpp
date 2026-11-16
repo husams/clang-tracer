@@ -48,12 +48,16 @@ int main() {
   HeaderReceiver header_receiver;
   std::printf("CPP_NAME_FIXTURE pid=%ld\n", static_cast<long>(::getpid()));
   std::fflush(stdout);
-  for (;;) {
+  for (unsigned iteration = 0;; ++iteration) {
     (void)unsupported.unsupported(1.0L);
     (void)bool_only.b(false);
     volatile int result = overloads.f(1) + overloads.f(2L) + virtual_only.f(3) +
                           volatile_only.v(4) + unsigned_only.u(5) + header_receiver.read(6);
     (void)result;
+    if (iteration % 4 == 0) {
+      std::printf("CPP_NAME_PROGRESS %u\n", iteration);
+      std::fflush(stdout);
+    }
     ::usleep(50000);
   }
 }

@@ -1053,6 +1053,16 @@ the server host. Source files are limited to 4 MiB. Uploaded interceptors are
 compiled by the server/agent; local REPL variables, pointers and lambdas are not
 implicitly transferred into the target.
 
+For non-prepared probes using `--include` with a compilation database, the
+selected command's compiler options now apply to the callback as well as the
+header. This includes warning policies: a legacy callback that previously
+compiled may fail with donor flags such as `-Wextra -Werror` if it has an unused
+parameter. Omit an unused parameter's name (`const TraceContext&`) or explicitly
+use it (`(void)context;`). To relax that specific policy for a probe, append
+`--compile-option -Wno-error=unused-parameter`; explicit options follow the
+database options. Generated interpreter initialization does not change the
+callback's warning policy.
+
 ### Probe working directory
 
 Add `--cwd DIRECTORY` to any `%probe` subcommand or to `%probes`.

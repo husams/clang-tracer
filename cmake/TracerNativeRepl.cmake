@@ -1155,7 +1155,9 @@ function(tracer_add_native_repl)
           --preparer $<TARGET_FILE:clang-tracer-prepare-injectors-native>
           --compiler "${CMAKE_CXX_COMPILER}"
           --example "${CMAKE_CURRENT_SOURCE_DIR}/examples/prepared-injectors/handle")
-      set_tests_properties(native_repl_prepared_handle_return PROPERTIES TIMEOUT 900)
+      # This runs 52 capture scenarios, including their collection waits and
+      # fixture builds; the complete matrix exceeds 15 minutes on the GCC 8 SDK.
+      set_tests_properties(native_repl_prepared_handle_return PROPERTIES TIMEOUT 1800)
       foreach(_templates_target repl-headerless-templates-target repl-elf-signature-target)
         add_executable(${_templates_target} tests/fixtures/repl_headerless_templates.cpp)
         target_compile_options(${_templates_target} PRIVATE -g -O0
