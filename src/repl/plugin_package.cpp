@@ -125,11 +125,36 @@ public:
   }
 };
 
+void validate_package_tree(const fs::path& root) {
+  for (const auto& entry : fs::recursive_directory_iterator(root)) {
+    const auto& path = entry.path();
+    struct stat info{};
+    if (::lstat(path.c_str(), &info) || info.st_uid != ::geteuid() ||
+        (!S_ISLNK(info.st_mode) && (info.st_mode & 0022))) {
+      throw std::runtime_error("plugin package entry must be controlled by its owner: " +
+                               path.string());
+    }
+    if (S_ISLNK(info.st_mode)) {
+      const auto relative = fs::canonical(path).lexically_relative(root);
+      if (relative.empty() || *relative.begin() == "..")
+        throw std::runtime_error("plugin package symlink must stay inside the package: " +
+                                 path.string());
+    } else if (!S_ISDIR(info.st_mode) && !S_ISREG(info.st_mode)) {
+      throw std::runtime_error("plugin package entry must be a regular file or directory: " +
+                               path.string());
+    }
+  }
+}
+
 fs::path package_source(const fs::path& root, const std::string& source) {
   if (source.empty() || fs::path(source).is_absolute() || source.find('\0') != source.npos) {
     throw std::invalid_argument("plugin source must be relative to the package");
   }
-  const auto path = fs::canonical(root / source);
+  std::error_code error;
+  const auto path = fs::canonical(root / source, error);
+  if (error) {
+    throw std::invalid_argument("cannot resolve plugin source " + source + ": " + error.message());
+  }
   const auto relative = path.lexically_relative(root);
   if (relative.empty() || *relative.begin() == ".." || !fs::is_regular_file(path)) {
     throw std::invalid_argument("plugin source must be a file inside the package");
@@ -248,6 +273,7 @@ std::optional<PluginPackage> read_plugin_package(const fs::path& manifest,
                 package.executable.find('\0') != std::string::npos)) {
     throw std::invalid_argument("agent.target.executable must be an absolute target path");
   }
+  validate_package_tree(directory);
   for (const auto& source : sources) {
     package.sources.push_back(package_source(directory, source));
   }

@@ -171,6 +171,10 @@ void Plugins::load_installed(CppEngine& cpp, std::ostream& out, std::ostream& er
         if (!package) {
           continue;
         }
+        if (const auto previous = installed_.find(package->id); previous != installed_.end()) {
+          throw std::runtime_error("duplicate plugin id " + package->id + " from " +
+                                   previous->second.manifest.string());
+        }
         std::vector<fs::path> headers;
         if (!package->include.empty()) {
           for (const auto& entry : fs::recursive_directory_iterator(package->include)) {
@@ -223,6 +227,10 @@ void Plugins::load_attached(Controller& controller, const clangtracer::v1::Sessi
         clangtracer::v1::AgentPluginRequest request;
         request.set_session_id(session.id());
         request.set_plugin_id(package->id);
+        if (const auto previous = controller.agent_plugin_manifest(request); !previous.empty()) {
+          throw std::runtime_error("duplicate agent plugin id " + package->id + " from " +
+                                   previous.string());
+        }
         request.set_operation(clangtracer::v1::AgentPluginRequest::LOAD);
         prepare_agent_package(request, *package, {}, cpp);
         controller.agent_plugin(request, manifest);

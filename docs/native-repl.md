@@ -1705,8 +1705,10 @@ The class in `src/plugin.cpp` registers commands and stays in the plugin scope.
 The package manifest supports `id`, `[repl]` `sources`, and optional
 `compile_commands`, `translation_unit`, and `extra_flags` in that section.
 Paths to sources and compilation databases are relative to the manifest
-unless a database path is absolute. Restart the REPL to replace a package
-with public headers. A live C++ expression can retain addresses from that
+unless a database path is absolute. Keep the entire package owned by the REPL
+user, with group and other write permissions disabled. Package symlinks must
+resolve within the package. Use trusted paths for external compiler inputs.
+Restart the REPL to replace a package with public headers. A live C++ expression can retain addresses from that
 generation.
 
 ## Load local C++ plugins
@@ -1768,9 +1770,16 @@ public:
 Commands are `noexcept`, take no arguments, and return a value convertible
 to `uint64_t`. Use constant initialization and trivial destruction for plugin
 state. Each load creates a fresh instance. Existing plugins using the V1 C entry point
-in `clang_tracer_repl_plugin.h` can still load. The JIT scope resolves its own
-symbols. Run plugins from trusted sources because they execute native code
-in the REPL process.
+in `clang_tracer_repl_plugin.h` can still load.
+
+A plugin JIT scope resolves definitions from its own compiled sources. Calls
+that require symbols from libc, the C++ runtime, the host process, or another
+plugin fail with the unresolved symbol names. Header-only C++ operations work
+when they generate self-contained code. Mark local helpers `noexcept`. A
+potentially throwing call at `-O0` can introduce C++ exception runtime symbols.
+For code that requires no exception handling, `-fno-exceptions` can avoid those
+references. Optimization can also inline a helper. Use trusted plugin sources
+because they execute native code in the REPL or target process.
 
 ## Install an agent extension for automatic attachment
 
@@ -1805,6 +1814,11 @@ scope. Optional `compile_commands`, `translation_unit`, and `extra_flags`
 under `[agent]` apply to target compilation. Use target-host paths for
 external build inputs. The agent caches the resulting objects and links a fresh
 instance for each matching attachment.
+
+The latency extension in `examples/repl-agent-observer` registers its return
+observer on attach. Add native probes after the observer loads. Reload an
+installed observer with `%plugin agent reload NAME`. The manifest supplies
+the sources and compiler settings for the new generation.
 
 ## Load plugins in an injected agent
 

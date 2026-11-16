@@ -176,6 +176,7 @@ void clang_action(std::vector<std::string> arguments,
   std::string diagnostics;
   llvm::raw_string_ostream diagnostic_output(diagnostics);
   clang::DiagnosticOptions options;
+  options.ShowPresumedLoc = true;
   clang::TextDiagnosticPrinter printer(diagnostic_output, options);
   invocation.setDiagnosticConsumer(&printer);
   if (!invocation.run())
@@ -503,6 +504,7 @@ agent::detail::Observer read_observer(llvm::orc::LLJIT& jit, llvm::orc::JITDylib
 
 struct NativePlugins::Impl {
   std::string jit_error;
+  std::set<std::string> missing_symbols;
   std::unique_ptr<llvm::orc::LLJIT> jit;
   std::map<std::string, Generation> active;
   std::uint64_t next_scope = 0;
@@ -526,7 +528,12 @@ struct NativePlugins::Impl {
                       .setPlatformSetUp(llvm::orc::setUpInactivePlatform)
                       .create());
     jit->getExecutionSession().setErrorReporter([this](llvm::Error error) {
-      jit_error = llvm::toString(std::move(error));
+      auto other = llvm::handleErrors(std::move(error), [this](const llvm::orc::SymbolsNotFound& missing) {
+        for (const auto& symbol : missing.getSymbols())
+          missing_symbols.insert((*symbol).str());
+      });
+      if (other)
+        jit_error = llvm::toString(std::move(other));
     });
   }
 
@@ -563,6 +570,7 @@ struct NativePlugins::Impl {
     }
     const auto definitions = public_definitions(*jit, artifacts);
     jit_error.clear();
+    missing_symbols.clear();
     auto &session = jit->getExecutionSession();
     // Bare scopes see only their own object. Peers and host process symbols
     // are intentionally absent from the link order.
@@ -607,6 +615,13 @@ struct NativePlugins::Impl {
                                  llvm::toString(std::move(cleanup)));
       if (offer)
         return {};
+      if (!missing_symbols.empty()) {
+        std::string message = "unresolved symbols in plugin " + id +
+            " (libc, the C++ runtime, the host process, and other plugins are outside its JIT scope):";
+        for (const auto& symbol : missing_symbols)
+          message += " " + symbol;
+        throw std::runtime_error(message);
+      }
       if (!jit_error.empty())
         throw std::runtime_error(std::string(error.what()) + ": " + jit_error);
       throw;

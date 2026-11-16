@@ -237,3 +237,35 @@ std::cout << tracer_repl_plugin_v1() << std::endl;
     configured = run(usage, cwd=startup_cwd)
     assert "my-api generation 1 active (compiled)" in configured, configured
     assert "shared=13 local=15" in configured, configured
+
+    # Reject mutable installed sources, headers and their containing directories.
+    for entry in (package / "src", source, package / "include/my_api/my_type.hpp"):
+        original_mode = entry.stat().st_mode & 0o777
+        entry.chmod(original_mode | 0o022)
+        try:
+            unsafe = run("%plugin list", cwd=startup_cwd)
+            assert "plugin package entry must be controlled by its owner" in unsafe, unsafe
+            assert str(entry) in unsafe and "my-api generation" not in unsafe, unsafe
+        finally:
+            entry.chmod(original_mode)
+
+    (root / "requires-libc.cpp").write_text("""#include <cstdio>
+#include "clang_tracer_repl_plugin.hpp"
+
+class tracer::repl::Plugin : public tracer::repl::PluginInterface<Plugin> {
+  uint64_t greet() noexcept { return std::puts("hello"); }
+
+public:
+  static constexpr Command commands[] = {
+    command<&Plugin::greet>("greet", "Print a greeting."),
+  };
+};
+""")
+    unresolved = run(f'%plugin load "{root / "requires-libc.cpp"}" --as external', expected_status=1)
+    assert "unresolved symbols in plugin external" in unresolved and "puts" in unresolved, unresolved
+    assert "Failed to materialize symbols" not in unresolved, unresolved
+
+    invalid = root / "bad-location.cpp"
+    invalid.write_text('#include "clang_tracer_repl_plugin.hpp"\nint broken = missing_name;\n')
+    compile_error = run(f'%plugin load "{invalid}" --as invalid', expected_status=1)
+    assert "bad-location.cpp:2:" in compile_error, compile_error
