@@ -24,6 +24,15 @@ scripts/gcc85-build.sh /path/to/toolchain /var/tmp/clang-tracer-overlay 3 \
   --overlay-tests
 ```
 
+Dependencies are reused when already installed for the same SDK profile and
+built from the pinned sources otherwise. `--deps-prefix DIR` chooses where they
+are installed and found (default `<scratch>/deps`), so one prefix can serve
+several scratch roots. To use an existing installation instead, pass
+`--grpc-prefix DIR` (gRPC with protobuf and `protoc`) and/or
+`--sqlite-prefix DIR`; those are used as they are, never built or changed, and
+must match the SDK. `--skip-tests` omits the CTest run and `--deps-only` stops once the
+dependencies are available.
+
 The first argument is the absolute SDK path; the second is the absolute scratch
 path. The third argument is optional and defaults to three jobs. CMake runs from the
 build host, not the SDK; set `TRACER_CMAKE` if it is not available under the

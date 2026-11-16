@@ -17,6 +17,7 @@
 #include "fixtures/live_data/model.hpp"
 #include "live_data.hpp"
 #include "proc_identity.hpp"
+#include "tracer/compat.hpp"
 
 using namespace tracer::live;
 using namespace example;
@@ -167,7 +168,7 @@ void run_scan(Harness& harness, Account* unowned, const void* spoof, const void*
   // while ending the prior C++ object lifetime and replacing its owner.
   auto* same_address = g_active_account.get();
   g_active_account.reset();
-  auto* replacement = std::construct_at(same_address, 9);
+  auto* replacement = ::tracer::compat::construct_at(same_address, 9);
   g_active_account = std::shared_ptr<Account>(replacement, [](Account* p) { std::destroy_at(p); });
   check(count(harness.update("shared.cpp", "", {{}, {}, {stale}}), LiveObjectOutcome::skipped) ==
                 1 &&
@@ -202,7 +203,7 @@ int main(int argc, char** argv) try {
   } reset_account;
 
   g_active_account =
-      std::shared_ptr<Account>(std::construct_at(static_cast<Account*>(slot.get()), 1),
+      std::shared_ptr<Account>(::tracer::compat::construct_at(static_cast<Account*>(slot.get()), 1),
                                [](Account* p) { std::destroy_at(p); });
   accounts = {std::make_shared<Account>(2), std::make_shared<Account>(3)};
   old_owner = std::make_shared<Account>(4);

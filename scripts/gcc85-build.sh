@@ -5,7 +5,8 @@ usage() {
   cat <<'EOF'
 Usage: scripts/gcc85-build.sh ABSOLUTE_SDK_ROOT ABSOLUTE_SCRATCH_ROOT [JOBS]
        [--sysroot ABSOLUTE_SYSROOT] [--dynamic-loader ABSOLUTE_LOADER]
-       [--overlay-tests]
+       [--deps-prefix ABSOLUTE_DIR] [--grpc-prefix ABSOLUTE_DIR]
+       [--sqlite-prefix ABSOLUTE_DIR] [--deps-only] [--skip-tests] [--overlay-tests]
 
 Build dependencies and clang-tracer with the GCC 8.5-era SDK sysroot. The
 scratch root is preserved; existing dependency checkouts must match their pins.
@@ -14,7 +15,17 @@ Sysroot and dynamic loader default to the supplied SDK's layout; both can be
 overridden explicitly. Use a fresh scratch directory when changing the profile.
 Host CMake defaults to `cmake` and can be overridden with
 TRACER_CMAKE. Jobs defaults to 3.
-The normal CTest suite runs after the application build and before install.
+Dependencies (gRPC, protobuf, SQLite) are installed in --deps-prefix, which
+defaults to <scratch>/deps. Each one that is already installed there for the
+same SDK, sysroot, loader and pinned version is reused; any other is built from
+its pinned source, so a prefix can be shared by several scratch roots. A prefix
+built for a different SDK profile is refused.
+--grpc-prefix and --sqlite-prefix name an existing installation to use as it
+is (gRPC with protobuf and protoc; SQLite): it is never built or modified, and
+the caller is responsible for it matching the SDK. Each is checked for its
+files, and the other dependency is still reused or built in --deps-prefix.
+The normal CTest suite runs after the application build and before install;
+--skip-tests omits it. --deps-only stops once the dependencies are available.
 OverlayFS tests are opt-in with --overlay-tests.
 EOF
 }
@@ -39,19 +50,34 @@ fi
 SDK_SYSROOT=''
 SDK_LOADER=''
 OVERLAY_TESTS=0
+SKIP_TESTS=0
+DEPS_ONLY=0
+DEPS_PREFIX=''
+OPT_GRPC_PREFIX=''
+OPT_SQLITE_PREFIX=''
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --sysroot|--dynamic-loader)
+    --sysroot|--dynamic-loader|--deps-prefix|--grpc-prefix|--sqlite-prefix)
       if [[ $# -lt 2 || -z $2 ]]; then
         echo "Missing path for $1" >&2
         exit 2
       fi
-      if [[ $1 == --sysroot ]]; then
-        SDK_SYSROOT=$2
-      else
-        SDK_LOADER=$2
-      fi
+      case $1 in
+        --sysroot) SDK_SYSROOT=$2 ;;
+        --dynamic-loader) SDK_LOADER=$2 ;;
+        --deps-prefix) DEPS_PREFIX=$2 ;;
+        --grpc-prefix) OPT_GRPC_PREFIX=$2 ;;
+        --sqlite-prefix) OPT_SQLITE_PREFIX=$2 ;;
+      esac
       shift 2
+      ;;
+    --skip-tests)
+      SKIP_TESTS=1
+      shift
+      ;;
+    --deps-only)
+      DEPS_ONLY=1
+      shift
       ;;
     --overlay-tests)
       OVERLAY_TESTS=1
@@ -86,13 +112,34 @@ fi
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 SOURCE_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
 SDK=$(cd -- "$SDK" && pwd -P)
-DEPS="$SCRATCH/deps"
+DEPS="${DEPS_PREFIX:-$SCRATCH/deps}"
+DEP_SRC="$SCRATCH/deps/src"
+STAMPS="$DEPS/.tracer-deps"
+for opt in DEPS_PREFIX OPT_GRPC_PREFIX OPT_SQLITE_PREFIX; do
+  if [[ -n ${!opt} && ${!opt} != /* ]]; then
+    echo "Dependency prefix must be an absolute path: ${!opt}" >&2
+    exit 2
+  fi
+done
+GRPC_ROOT="${OPT_GRPC_PREFIX:-$DEPS}"
+SQLITE_ROOT="${OPT_SQLITE_PREFIX:-$DEPS}"
+# Every prefix the application may find dependencies in, without repeats.
+DEP_ROOTS=()
+for root in "$GRPC_ROOT" "$SQLITE_ROOT" "$DEPS"; do
+  [[ " ${DEP_ROOTS[*]:-} " == *" $root "* ]] || DEP_ROOTS+=("$root")
+done
+DEP_PREFIX_PATH=$(IFS=';'; printf '%s' "${DEP_ROOTS[*]}")
+DEP_RPATH_SEMI=''; DEP_RPATH_COLON=''
+for root in "${DEP_ROOTS[@]}"; do
+  DEP_RPATH_SEMI+="$root/lib;$root/lib64;"
+  DEP_RPATH_COLON+="$root/lib:$root/lib64:"
+done
 BUILD="$SCRATCH/build"
 LOGS="$SCRATCH/logs"
-GRPC_SOURCE="$DEPS/src/grpc"
+GRPC_SOURCE="$DEP_SRC/grpc"
 GRPC_BUILD="$BUILD/grpc"
-SQLITE_SOURCE="$DEPS/src/sqlite-autoconf-3340100"
-SQLITE_ARCHIVE="$DEPS/src/sqlite-autoconf-3340100.tar.gz"
+SQLITE_SOURCE="$DEP_SRC/sqlite-autoconf-3340100"
+SQLITE_ARCHIVE="$DEP_SRC/sqlite-autoconf-3340100.tar.gz"
 SQLITE_PREFIX="$DEPS"
 APP_BUILD="$BUILD/clang-tracer"
 APP_PREFIX="$SCRATCH/install"
@@ -141,7 +188,7 @@ for tool in git python3 curl sha256sum make; do
   fi
 done
 
-mkdir -p "$DEPS/src" "$BUILD" "$LOGS" "$APP_PREFIX"
+mkdir -p "$DEP_SRC" "$STAMPS" "$BUILD" "$LOGS" "$APP_PREFIX"
 {
   printf 'host_cmake %s\n' "$("$CMAKE_BIN" --version | head -n 1)"
   printf 'host_ctest %s\n' "$CTEST_BIN"
@@ -150,7 +197,9 @@ mkdir -p "$DEPS/src" "$BUILD" "$LOGS" "$APP_PREFIX"
   printf 'sysroot %s\n' "$SDK_SYSROOT"
   printf 'dynamic_loader %s\n' "$SDK_LOADER"
   printf 'scratch %s\n' "$SCRATCH"
+  printf 'deps_prefix %s\n' "$DEPS"
   printf 'jobs %s\n' "$JOBS"
+  printf 'skip_tests %s\n' "$SKIP_TESTS"
   if [[ $OVERLAY_TESTS == 1 ]]; then
     printf 'overlay_tests enabled\n'
   else
@@ -159,8 +208,26 @@ mkdir -p "$DEPS/src" "$BUILD" "$LOGS" "$APP_PREFIX"
 } > "$SCRATCH/build-environment.txt"
 RPATH="$DEPS/lib;$DEPS/lib64;$SDK_TRIPLE/lib64;$SDK_SYSROOT/lib64"
 EXE_LINKER_FLAGS="-Wl,--dynamic-linker=$SDK_LOADER -Wl,-rpath,$DEPS/lib:$DEPS/lib64:$SDK_TRIPLE/lib64:$SDK_SYSROOT/lib64"
-export PATH="$DEPS/bin:$SDK/bin:$PATH"
+export PATH="$GRPC_ROOT/bin:$DEPS/bin:$SDK/bin:$PATH"
 
+# A dependency is reusable only when it was installed here for this exact SDK
+# profile and pin. A stamp for another profile is refused rather than mixed.
+PROFILE="sdk=$SDK
+sysroot=$SDK_SYSROOT
+loader=$SDK_LOADER
+clang=$("$SDK/bin/clang" --version | head -n 1)"
+dep_ready() {
+  local stamp="$STAMPS/$1.stamp" pin=$2
+  [[ -f $stamp ]] || return 1
+  if [[ $(<"$stamp") != "$PROFILE"$'\n'"$pin" ]]; then
+    echo "Dependency $1 in $DEPS was built for a different SDK profile or pin;" \
+         "use a fresh --deps-prefix." >&2
+    exit 1
+  fi
+}
+dep_stamp() { printf '%s\n%s' "$PROFILE" "$2" > "$STAMPS/$1.stamp"; }
+
+build_grpc() {
 if [[ ! -d $GRPC_SOURCE/.git ]]; then
   if [[ -e $GRPC_SOURCE ]]; then
     echo "Refusing to replace non-git path: $GRPC_SOURCE" >&2
@@ -372,6 +439,9 @@ PY
   2>&1 | tee "$LOGS/grpc-build.log"
 "$CMAKE_BIN" --install "$GRPC_BUILD" \
   2>&1 | tee "$LOGS/grpc-install.log"
+}
+
+build_sqlite() {
 
 if [[ ! -f $SQLITE_ARCHIVE ]]; then
   curl --fail --location --retry 3 "$SQLITE_URL" --output "$SQLITE_ARCHIVE" \
@@ -385,7 +455,7 @@ fi
 printf '%s  %s\nURL: %s\n' "$SQLITE_SHA256" "$(basename -- "$SQLITE_ARCHIVE")" "$SQLITE_URL" \
   > "$SCRATCH/sqlite3-checksum.txt"
 if [[ ! -f $SQLITE_SOURCE/configure ]]; then
-  tar -xzf "$SQLITE_ARCHIVE" -C "$DEPS/src"
+  tar -xzf "$SQLITE_ARCHIVE" -C "$DEP_SRC"
 fi
 (
   cd "$SQLITE_SOURCE"
@@ -396,15 +466,42 @@ fi
   make -j"$JOBS"
   make install
 ) 2>&1 | tee "$LOGS/sqlite-build-install.log"
+}
 
-"$DEPS/bin/protoc" --version | tee "$LOGS/protoc-version.log"
-APP_RPATH="$DEPS/lib;$DEPS/lib64;$SDK_TRIPLE/lib64;$SDK_SYSROOT/lib64;$SDK/lib.llvm;$SDK/lib.llvm/lib"
+has_grpc() { [[ -x $1/bin/protoc && ( -f $1/lib/cmake/grpc/gRPCConfig.cmake ||
+                                       -f $1/lib64/cmake/grpc/gRPCConfig.cmake ) ]]; }
+has_sqlite() { [[ -f $1/include/sqlite3.h && ( -e $1/lib/libsqlite3.so.0 ||
+                                              -e $1/lib64/libsqlite3.so.0 ) ]]; }
+if [[ -n $OPT_GRPC_PREFIX ]]; then
+  has_grpc "$GRPC_ROOT" || { echo "No gRPC, protobuf and protoc installation in $GRPC_ROOT" >&2; exit 1; }
+  echo "Using existing gRPC and protobuf in $GRPC_ROOT"
+elif dep_ready grpc "grpc=$GRPC_COMMIT" && has_grpc "$DEPS"; then
+  echo "Reusing gRPC $GRPC_TAG and protobuf installed in $DEPS"
+else
+  build_grpc
+  dep_stamp grpc "grpc=$GRPC_COMMIT"
+fi
+if [[ -n $OPT_SQLITE_PREFIX ]]; then
+  has_sqlite "$SQLITE_ROOT" || { echo "No SQLite installation in $SQLITE_ROOT" >&2; exit 1; }
+  echo "Using existing SQLite in $SQLITE_ROOT"
+elif dep_ready sqlite "sqlite=$SQLITE_EXPECTED_SHA256" && has_sqlite "$DEPS"; then
+  echo "Reusing SQLite installed in $DEPS"
+else
+  build_sqlite
+  dep_stamp sqlite "sqlite=$SQLITE_EXPECTED_SHA256"
+fi
+"$GRPC_ROOT/bin/protoc" --version | tee "$LOGS/protoc-version.log"
+if [[ $DEPS_ONLY == 1 ]]; then
+  printf 'Dependencies are ready: gRPC %s, SQLite %s\n' "$GRPC_ROOT" "$SQLITE_ROOT"
+  exit 0
+fi
+APP_RPATH="${DEP_RPATH_SEMI}$SDK_TRIPLE/lib64;$SDK_SYSROOT/lib64;$SDK/lib.llvm;$SDK/lib.llvm/lib"
 "$CMAKE_BIN" -S "$SOURCE_ROOT" -B "$APP_BUILD" "${GENERATOR_ARGS[@]}" \
   -DCMAKE_TOOLCHAIN_FILE="$SOURCE_ROOT/cmake/toolchains/gcc85-sdk.cmake" \
   -DTRACER_SDK_ROOT="$SDK" \
   -DCMAKE_SYSROOT="$SDK_SYSROOT" \
   -DTRACER_DYNAMIC_LOADER="$SDK_LOADER" \
-  -DCMAKE_PREFIX_PATH="$DEPS" \
+  -DCMAKE_PREFIX_PATH="$DEP_PREFIX_PATH" \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DProtobuf_USE_STATIC_LIBS=ON \
   -DCMAKE_INSTALL_PREFIX="$APP_PREFIX" \
@@ -414,8 +511,10 @@ APP_RPATH="$DEPS/lib;$DEPS/lib64;$SDK_TRIPLE/lib64;$SDK_SYSROOT/lib64;$SDK/lib.l
   2>&1 | tee "$LOGS/tracer-configure.log"
 "$CMAKE_BIN" --build "$APP_BUILD" --parallel "$JOBS" \
   2>&1 | tee "$LOGS/tracer-build.log"
-"$CTEST_BIN" --test-dir "$APP_BUILD" --output-on-failure \
-  2>&1 | tee "$LOGS/tracer-tests.log"
+if [[ $SKIP_TESTS == 0 ]]; then
+  "$CTEST_BIN" --test-dir "$APP_BUILD" --output-on-failure \
+    2>&1 | tee "$LOGS/tracer-tests.log"
+fi
 if [[ $OVERLAY_TESTS == 1 ]]; then
   PATH="$(dirname -- "$CTEST_BIN"):$PATH" \
     "$SOURCE_ROOT/tests/overlay_integration.sh" "$APP_BUILD" \

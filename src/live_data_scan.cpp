@@ -188,6 +188,20 @@ std::optional<Address> static_address(llvm::DWARFDie die) {
   return std::nullopt;
 }
 
+// std::atomic<std::shared_ptr<T>> is a C++20 library feature (libstdc++ 12+).
+// Older libstdc++ runtimes, such as the GCC 8.5 SDK, cannot read such an owner
+// with the target's own lock protocol, so discovery reports a limitation there.
+#if defined(__GLIBCXX__) && defined(__cpp_lib_atomic_shared_ptr)
+#define TRACER_LIVE_ATOMIC_OWNERS 1
+using AtomicOwnerStorage = std::atomic<std::shared_ptr<void>>;
+#else
+#define TRACER_LIVE_ATOMIC_OWNERS 0
+// libstdc++ stores a pointer and a tagged reference-count pointer.
+struct AtomicOwnerStorage {
+  alignas(void*) unsigned char bytes[2 * sizeof(void*)];
+};
+#endif
+
 void read_atomic_roots(llvm::DWARFDie scope, std::vector<AtomicRoot>& roots) {
   for (const auto item : scope.children()) {
     const auto tag = item.getTag();
@@ -200,7 +214,7 @@ void read_atomic_roots(llvm::DWARFDie scope, std::vector<AtomicRoot>& roots) {
       continue;
     const auto atomic = type_of(item);
     if (!atomic || !::tracer::compat::starts_with(qualified_name(atomic), "std::atomic<") ||
-        number(atomic, dw::DW_AT_byte_size) != sizeof(std::atomic<std::shared_ptr<void>>))
+        number(atomic, dw::DW_AT_byte_size) != sizeof(AtomicOwnerStorage))
       continue;
     const auto shared = template_type(atomic);
     if (!shared || !::tracer::compat::starts_with(qualified_name(shared), "std::shared_ptr<") ||
@@ -467,7 +481,17 @@ void TargetImage::discover_owners(const std::vector<std::string>& types,
 #if defined(__GLIBCXX__)
   const auto& records = image_->records();
   const auto maps = mappings();
-  using AtomicOwner = std::atomic<std::shared_ptr<void>>;
+  using AtomicOwner = AtomicOwnerStorage;
+#if !TRACER_LIVE_ATOMIC_OWNERS
+  for (const auto& root : image_->roots) {
+    if (::tracer::compat::ranges::find(types, root.type) != types.end())
+      sink.register_verified({root.type, root.name, nullptr, nullptr,
+                              "atomic owner discovery needs a libstdc++ with std::atomic<std::shared_ptr>"});
+  }
+  (void)records;
+  (void)maps;
+  return;
+#else
   std::set<Address> storage;
   for (const auto symbol : image_->elf.symbols()) {
     const llvm::object::ELFSymbolRef entry(symbol);
@@ -520,6 +544,7 @@ void TargetImage::discover_owners(const std::vector<std::string>& types,
     sink.register_verified({root.type, root.name, owner.get(), &owner, nullptr,
                             layout->second->size, layout->second->alignment, false});
   }
+#endif
 #else
   (void)types;
   (void)sink;

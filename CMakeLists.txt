@@ -57,6 +57,7 @@ include(cmake/TracerContextEngine.cmake)
 include(cmake/TracerToolchain.cmake)
 if(NOT LLVM_ENABLE_RTTI)
   set_source_files_properties(src/debug_resolver.cpp src/native_stack.cpp src/admission.cpp src/native_plugins.cpp
+    src/live_compile.cpp src/live_jit.cpp src/live_data_scan.cpp
     PROPERTIES COMPILE_OPTIONS "-fno-rtti")
 endif()
 include(cmake/TracerContextAnalysis.cmake)
@@ -64,6 +65,17 @@ find_package(Threads REQUIRED)
 find_package(Protobuf REQUIRED)
 find_package(gRPC REQUIRED CONFIG)
 find_package(SQLite3 REQUIRED)
+if(TRACER_SDK_ROOT)
+  # The SDK linker does not search an executable's rpath for the shared
+  # libraries that its own libraries need, so name the dependency directories.
+  foreach(_prefix IN LISTS CMAKE_PREFIX_PATH)
+    foreach(_libdir lib lib64)
+      if(IS_DIRECTORY "${_prefix}/${_libdir}")
+        add_link_options("-Wl,-rpath-link,${_prefix}/${_libdir}")
+      endif()
+    endforeach()
+  endforeach()
+endif()
 
 set(TRACER_PROTO_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 file(MAKE_DIRECTORY ${TRACER_PROTO_DIR})
@@ -298,7 +310,7 @@ if(BUILD_TESTING)
   target_include_directories(live-test-jit PRIVATE include)
   target_compile_definitions(live-test-jit PRIVATE
     TRACER_CLANG_RESOURCE_DIR="${_tracer_resource_dir}")
-  target_link_libraries(live-test-jit PUBLIC clang-cpp LLVM ${CMAKE_DL_LIBS})
+  target_link_libraries(live-test-jit PUBLIC clang-cpp LLVM tracer_compat ${CMAKE_DL_LIBS})
 
   add_executable(live-data-target-tests tests/live_data_target.cpp
     tests/fixtures/live_data/model.cpp src/live_data.cpp src/live_data_jit.cpp
