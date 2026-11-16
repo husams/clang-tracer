@@ -16,7 +16,10 @@ struct ContextTypeProvenance final {
   std::string canonical_type;
   std::array<std::uint8_t, 16> source_lineage_id{};
 
-  bool operator==(const ContextTypeProvenance&) const = default;
+  bool operator==(const ContextTypeProvenance &other) const {
+    return canonical_type == other.canonical_type && source_lineage_id == other.source_lineage_id;
+  }
+  bool operator!=(const ContextTypeProvenance &other) const { return !(*this == other); }
 };
 
 struct GeneratedOwnerState {

@@ -105,7 +105,10 @@ std::optional<std::uint64_t> number(llvm::DWARFDie die, dw::Attribute attr) {
 
 struct Layout {
   std::size_t size, alignment;
-  bool operator==(const Layout&) const = default;
+  constexpr bool operator==(const Layout &other) const noexcept {
+    return size == other.size && alignment == other.alignment;
+  }
+  constexpr bool operator!=(const Layout &other) const noexcept { return !(*this == other); }
 };
 
 using Layouts = std::map<std::string, std::optional<Layout>, std::less<>>;

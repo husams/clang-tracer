@@ -48,7 +48,10 @@ struct UnionCase {
   std::string member;
   Type type;
   unsigned width = 4;
-  bool operator==(const UnionCase &) const = default;
+  bool operator==(const UnionCase &other) const {
+    return member == other.member && type == other.type && width == other.width;
+  }
+  bool operator!=(const UnionCase &other) const { return !(*this == other); }
 };
 struct Layout {
   enum class FieldType { int32, signed_integer, unsigned_integer, boolean, real };
