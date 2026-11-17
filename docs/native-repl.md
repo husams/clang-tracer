@@ -703,6 +703,12 @@ describes inlined construction. `__attribute__((nodebug))`,
 `-gno-inline-line-tables`, or link-time inlining from a unit without debug
 information can hide an initializer and make base-subobject construction
 appear complete.
+An incomplete application type in the caller's debug information can leave
+identity provisional, including when a pointer could refer to a derived heap
+object. For application classes, caller proof ignores standard C++ library
+records whose DWARF shows only built-in or standard-library template arguments.
+It also ignores pointers and references to the glibc records for `FILE`, `tm`
+and `DIR`. Incomplete template argument information keeps identity provisional.
 A receiver can have provisional identity when construction predates attach
 or bypasses a watched constructor, as with a trivial copy. Ambiguous
 construction, duplicate lifetime symbols and incomplete destructor coverage

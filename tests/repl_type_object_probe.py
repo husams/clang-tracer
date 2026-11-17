@@ -70,6 +70,9 @@ def event_fields(event):
 
 
 def run(args):
+    def dwarf_dump(path, *sections):
+        return subprocess.check_output([args.dwarfdump, *sections, str(path)], text=True)
+
     with tempfile.TemporaryDirectory(prefix="ct-type-object-probe-") as temporary, ExitStack() as cleanup:
         root = Path(temporary).resolve()
         build = root / "build-context"
@@ -203,6 +206,49 @@ hidden_derived_roundtrip(int initial) {
 }
 """)
         nodebug_source.write_text("""#include "counter.hpp"
+#include <cstdio>
+#include <ctime>
+#include <dirent.h>
+#include <exception>
+#include <functional>
+#include <iosfwd>
+#include <stdexcept>
+
+__attribute__((noinline)) int identity_with_catch() {
+  demo::IdentityC1EBase object(61);
+  try {
+    return object.get();
+  } catch (const std::exception &) {
+    return -1;
+  }
+}
+__attribute__((noinline)) int identity_with_file(FILE *out) {
+  demo::IdentityC1EBase object(62);
+  return object.get() + (out != nullptr);
+}
+__attribute__((noinline)) int identity_with_stream(std::ostream &) {
+  demo::IdentityC1EBase object(63);
+  return object.get();
+}
+__attribute__((noinline)) int identity_with_time(const tm *time) {
+  demo::IdentityC1EBase object(64);
+  return object.get() + (time != nullptr);
+}
+__attribute__((noinline)) int identity_with_directory(DIR *directory) {
+  demo::IdentityC1EBase object(65);
+  return object.get() + (directory != nullptr);
+}
+__attribute__((noinline)) int identity_with_error() {
+  demo::IdentityC1EBase object(66);
+  std::runtime_error error("fixture");
+  return object.get() + (error.what() == nullptr);
+}
+int identity_library_roundtrips(std::ostream &stream) {
+  return identity_with_catch() + identity_with_file(nullptr) +
+         identity_with_stream(stream) + identity_with_time(nullptr) +
+         identity_with_directory(nullptr) + identity_with_error();
+}
+
 #ifdef __clang__
 namespace {
 struct NodebugDerived : demo::IdentityC1EBase {
@@ -215,8 +261,27 @@ extern "C" int nodebug_derived_roundtrip() {
   NodebugDerived object;
   return object.get() + object.extra;
 }
+extern "C" int nodebug_heap_roundtrip() {
+  NodebugDerived *object = new NodebugDerived;
+  const int result = object->get() + object->extra;
+  delete object;
+  return result;
+}
+struct NodebugHashKey { int value; };
+template <> struct std::hash<NodebugHashKey> : demo::IdentityC1EBase {
+  __attribute__((nodebug, always_inline)) hash() : IdentityC1EBase(5) {}
+  std::size_t operator()(const NodebugHashKey &key) const { return key.value; }
+};
+extern "C" int nodebug_hash_roundtrip() {
+  std::hash<NodebugHashKey> *object = new std::hash<NodebugHashKey>;
+  const int result = object->get();
+  delete object;
+  return result;
+}
 #else
 extern "C" int nodebug_derived_roundtrip() { return 5; }
+extern "C" int nodebug_heap_roundtrip() { return 5; }
+extern "C" int nodebug_hash_roundtrip() { return 5; }
 #endif
 """)
         unit_source.write_text("""#include "counter.hpp"
@@ -236,6 +301,12 @@ int use_type_unit() {
 #include <fcntl.h>
 #include <sys/prctl.h>
 #include <unistd.h>
+#ifndef PR_SET_PTRACER
+#define PR_SET_PTRACER 0x59616d61
+#endif
+#ifndef PR_SET_PTRACER_ANY
+#define PR_SET_PTRACER_ANY (~0UL)
+#endif
 namespace {
 alignas(demo::Counter) unsigned char storage[sizeof(demo::Counter)];
 void cycle(int initial) {
@@ -270,6 +341,9 @@ identity_main_roundtrip(int initial) {
 }
 extern "C" int hidden_derived_roundtrip(int);
 extern "C" int nodebug_derived_roundtrip();
+extern "C" int nodebug_heap_roundtrip();
+extern "C" int nodebug_hash_roundtrip();
+int identity_library_roundtrips(std::ostream &);
 extern "C" __attribute__((noinline)) void copy_reused_receiver(int *sum) {
   demo::IdentityC1EBase original(5);
   demo::IdentityC1EBase copied = original;
@@ -316,6 +390,8 @@ int main() {
       }
       std::cout << \"IDENTITY_MAIN=\" << result
                 << \" EXTERN_C=\" << identity_main_roundtrip(60) << std::endl;
+    } else if (command == 'l') {
+      std::cout << \"LIBRARY_ROUNDTRIPS=\" << identity_library_roundtrips(std::cout) << std::endl;
     } else if (command == 't') {
       int sum = 0;
       for (int iteration = 0; iteration < 7; ++iteration)
@@ -324,7 +400,9 @@ int main() {
     } else if (command == 'h') {
       std::cout << \"HIDDEN_DERIVED=\" << hidden_derived_roundtrip(50) << std::endl;
     } else if (command == 'n') {
-      std::cout << "NODEBUG_DERIVED=" << nodebug_derived_roundtrip() << std::endl;
+      std::cout << "NODEBUG_DERIVED=" << nodebug_derived_roundtrip()
+                << " NODEBUG_HEAP=" << nodebug_heap_roundtrip()
+                << " NODEBUG_HASH=" << nodebug_hash_roundtrip() << std::endl;
     } else if (command == 'u') {
       delete unobserved_identity;
       unobserved_identity = nullptr;
@@ -355,7 +433,8 @@ public:
 };
 """)
 
-        compile_args = [str(args.cxx), "-std=c++20", "-g", "-O0", "-fPIC", "-fno-inline",
+        debug_flag = "-gdwarf-5"
+        compile_args = [str(args.cxx), "-std=c++20", debug_flag, "-O0", "-fPIC", "-fno-inline",
                         "-fpatchable-function-entry=8",
                         f"-I{generated}", f"-I{root}", "-DCOUNTER_PAD_BYTES=13",
                         "-c", str(source), "-o", str(build / "counter.o")]
@@ -452,29 +531,31 @@ public:
                                            stdout=subprocess.PIPE).stdout.lower()
         clang = "clang" in compiler_version
         line_table_flag = "-gline-tables-only" if clang else "-g1"
-        subprocess.run([str(args.cxx), "-std=c++20", line_table_flag, "-O2", "-fPIC",
+        subprocess.run([str(args.cxx), "-std=c++20", debug_flag, line_table_flag, "-O2", "-fPIC",
                         "-fpatchable-function-entry=8", f"-I{generated}", f"-I{root}",
                         "-DCOUNTER_PAD_BYTES=13", "-c", str(hidden_source),
                         "-o", str(hidden_object)], cwd=build, check=True)
-        nodebug_flags = ["-fno-standalone-debug"] if clang else []
-        subprocess.run([str(args.cxx), "-std=c++20", "-g", "-O2", "-fPIC", *nodebug_flags,
+        nodebug_flags = ["-fno-standalone-debug", "-gsimple-template-names"] if clang else []
+        # Clang can emit a complete FILE record in optimized debug info.
+        subprocess.run([str(args.cxx), "-std=c++20", debug_flag, "-O0", "-fPIC", *nodebug_flags,
                         f"-I{generated}", f"-I{root}", "-c", str(nodebug_source),
                         "-o", str(nodebug_object)], cwd=build, check=True)
         subprocess.run([*compile_args[:-4], "-gdwarf-4", "-fdebug-types-section",
                         "-c", str(unit_source), "-o", str(unit_object)], cwd=build, check=True)
-        subprocess.run([str(args.cxx), "-shared", "-Wl,-Bsymbolic-functions", str(build / "counter.o"),
+        subprocess.run([str(args.cxx), "-shared", "-Wl,-Bsymbolic-functions", "-Wl,--build-id=sha1",
+                        str(build / "counter.o"),
                         str(hidden_object), str(nodebug_object), str(unit_object), "-o", str(library)],
                        cwd=build, check=True)
-        subprocess.run([str(args.cxx), "-std=c++20", "-g", "-O0", "-fno-inline",
+        subprocess.run([str(args.cxx), "-std=c++20", debug_flag, "-O0", "-fno-inline",
                         "-fpatchable-function-entry=8",
                         f"-I{generated}", f"-I{root}", "-DCOUNTER_PAD_BYTES=13",
                         str(driver), "-L", str(build), "-Wl,-rpath," + str(build),
-                        "-lcounter", "-o", str(target)], cwd=build, check=True)
-        subprocess.run([str(args.cxx), "-std=c++20", "-g", "-O0", "-fno-inline",
+                        "-Wl,--build-id=sha1", "-lcounter", "-o", str(target)], cwd=build, check=True)
+        subprocess.run([str(args.cxx), "-std=c++20", debug_flag, "-O0", "-fno-inline",
                         "-fpatchable-function-entry=8", f"-I{generated}", f"-I{root}",
                         "-DCOUNTER_PAD_BYTES=13", str(driver), str(build / "counter.o"),
                         str(hidden_object), str(nodebug_object), str(unit_object),
-                        "-o", str(single_image_target)],
+                        "-Wl,--build-id=sha1", "-o", str(single_image_target)],
                        cwd=build, check=True)
         nm = subprocess.run(["nm", "-D", "-C", "--defined-only", str(library)],
                             check=True, text=True, stdout=subprocess.PIPE).stdout
@@ -485,37 +566,39 @@ public:
         assert "demo::CtorOnly::~CtorOnly()" not in nm, nm
         assert "demo::IdentityC1EBase::IdentityC1EBase(int)" in nm, nm
         assert "demo::IdentityC1EBase::get() const" in nm, nm
-        dwarf = subprocess.run(["readelf", "--debug-dump=info", "--wide", str(library)],
-                               check=True, text=True, stdout=subprocess.PIPE).stdout
+        dwarf = dwarf_dump(library, "--debug-info", "--debug-types")
         assert "Counter" in dwarf and "value_" in dwarf
-        assert "Contents of the .debug_types section" in dwarf and "UnitDerived" in dwarf, dwarf
-        hidden_dwarf = subprocess.run(["readelf", "--debug-dump=info", "--wide",
-                                       str(hidden_object)], check=True, text=True,
-                                      stdout=subprocess.PIPE).stdout
+        assert ".debug_types contents:" in dwarf and "UnitDerived" in dwarf, dwarf
+        hidden_dwarf = dwarf_dump(hidden_object, "--debug-info")
         assert "DW_TAG_compile_unit" in hidden_dwarf and "DW_AT_stmt_list" in hidden_dwarf, hidden_dwarf
         assert not re.search(r"DW_TAG_(?:class_type|structure_type)", hidden_dwarf), hidden_dwarf
         if clang:
             top_level = re.findall(
-                r"^ *<1><[0-9a-f]+>:[^\n]*\(DW_TAG_subprogram\)\n(.*?)(?=^ *<\d+><|\Z)",
+                r"^0x[0-9a-f]+: {3}DW_TAG_subprogram\n(.*?)(?=^0x[0-9a-f]+:|\Z)",
                 hidden_dwarf, re.M | re.S)
-            assert any(re.search(r"DW_AT_name[^\n]*\bHiddenDerived$", fields, re.M)
+            assert any(re.search(r'DW_AT_name\s+\("HiddenDerived"\)', fields)
                        and "DW_AT_linkage_name" not in fields
                        and "DW_AT_object_pointer" not in fields
                        for fields in top_level), hidden_dwarf
-            nodebug_dwarf = subprocess.check_output(
-                ["readelf", "--debug-dump=info", "--wide", str(nodebug_object)], text=True)
-            nodebug_structs = re.findall(
-                r"\(DW_TAG_structure_type\)\n(.*?)(?=^ *<\d+><|\Z)", nodebug_dwarf, re.M | re.S)
-            nodebug_declarations = [
-                fields for fields in nodebug_structs
-                if re.search(r"DW_AT_name[^\n]*\bNodebugDerived$", fields, re.M)]
-            assert len(nodebug_declarations) == 1 and "DW_AT_declaration" in nodebug_declarations[0], nodebug_dwarf
+            nodebug_dwarf = dwarf_dump(nodebug_object, "--debug-info")
+            records = re.findall(
+                r"DW_TAG_(?:class|structure)_type\n(.*?)(?=^0x[0-9a-f]+:|\Z)",
+                nodebug_dwarf, re.M | re.S)
+            for name in ("NodebugDerived", "hash", "exception", "_IO_FILE",
+                         "basic_ostream", "tm", "__dirstream", "runtime_error"):
+                matches = [fields for fields in records
+                           if re.search(rf'DW_AT_name\s+\("{re.escape(name)}"\)', fields)]
+                assert matches and all(re.search(r"DW_AT_declaration\s+\(true\)", fields)
+                                       for fields in matches), (name, matches)
+            assert re.search(r'DW_AT_name\s+\("hash"\)\s*DW_AT_declaration\s+\(true\)\s*'
+                             r'0x[0-9a-f]+: +DW_TAG_template_type_parameter\s+'
+                             r'DW_AT_type[^\n]*"NodebugHashKey"', nodebug_dwarf)
             nodebug_symbols = subprocess.check_output(["nm", "-C", str(nodebug_object)], text=True)
             assert "NodebugDerived::NodebugDerived" not in nodebug_symbols, nodebug_symbols
-        hidden_lines = subprocess.run(["readelf", "--debug-dump=decodedline", "--wide",
-                                       str(hidden_object)], check=True, text=True,
-                                      stdout=subprocess.PIPE).stdout
-        assert "hidden-derived.cpp" in hidden_lines and re.search(r"\b[1-9]\d*\s+0x[0-9a-f]+", hidden_lines), hidden_lines
+            assert "std::hash<NodebugHashKey>::hash(" not in nodebug_symbols, nodebug_symbols
+        hidden_lines = dwarf_dump(hidden_object, "--debug-line")
+        assert "hidden-derived.cpp" in hidden_lines and re.search(
+            r"^0x[0-9a-f]+ +[1-9]\d*\s", hidden_lines, re.M), hidden_lines
         target_relocations = subprocess.run(["readelf", "--relocs", "--wide", str(target)],
                                             check=True, text=True,
                                             stdout=subprocess.PIPE).stdout
@@ -535,8 +618,7 @@ public:
             r"^[0-9a-f]+ <[^\n>]*HiddenDerived::HiddenDerived[^\n>]*>:\n"
             r"(?:(?!\n\n)[\s\S])*?\b(?:callq?|bl)\s+[^\n]*"
             r"<demo::IdentityC1EBase::IdentityC1EBase\(int\)>", disassembly, re.M), disassembly
-        target_dwarf = subprocess.run(["readelf", "--debug-dump=info", "--wide", str(target)],
-                                      check=True, text=True, stdout=subprocess.PIPE).stdout
+        target_dwarf = dwarf_dump(target, "--debug-info")
         for caller in ("identity_main_roundtrip", "identity_set_through_c",
                        "cycle",
                        "identity_get_through_c"):
@@ -770,8 +852,8 @@ public:
         assert int(scalar(ctor_only_fields["object_id"])) == 0, ctor_only_event
         assert scalar(ctor_only_fields["identity_verified"]) in (False, "false", 0, "0"), ctor_only_event
 
-        # Both main and a nonmember extern-C function construct IdentityC1EBase
-        # via its C1 PLT relocation, which is checked above at build time.
+        # The executable callers use the verified C1 PLT relocation.
+        # The library callers use the direct shared entry.
         identity_binding = (f"--package {quote(identity_method_package)} "
                             "--module libcounter.so")
         send(repl, f"%object-probe preview {identity_binding}")
@@ -790,32 +872,39 @@ public:
         send(repl, f"%record identity-main.db --sqlite --after {identity_after} --timeout 2")
         send(target_process, "m")
         app.expect(r"^IDENTITY_MAIN=42 EXTERN_C=62$")
+        send(target_process, "l")
+        app.expect(r"^LIBRARY_ROUNDTRIPS=381$")
         identity_record = out.expect(
-            r"^received=10 cursor=(\d+) .*timed_out=true .*recording=identity-main.db")
+            r"^received=34 cursor=(\d+) .*timed_out=true .*recording=identity-main.db")
         send(repl, "%events open identity-main.db --as identity_main")
-        out.expect(r"^opened events=10 retained=10 evicted=0$")
+        out.expect(r"^opened events=34 retained=34 evicted=0$")
         send(repl, "%events export identity_main --format json --output identity-main.json")
         send(repl, f"%object-probe stop {identity_registration}")
         out.expect(rf"^object-probe registration={identity_registration} active=no .*restoration_pending=no")
         identity_events = json.loads((root / "identity-main.json").read_text())
-        assert len(identity_events) == 10, identity_events
+        assert len(identity_events) == 34, identity_events
         assert all(event.get("objectProbeRegistrationId") == identity_registration
                    for event in identity_events), identity_events
         identity_times = [int(event["monotonicTimeNs"]) for event in identity_events]
         assert identity_times == sorted(identity_times), identity_events
         identity_created = [event for event in identity_events
                             if event.get("objectObservation", {}).get("kind") == "CREATED"]
+        identity_destroyed = [event for event in identity_events
+                              if event.get("objectObservation", {}).get("kind") == "DESTROY_BEGIN"]
         identity_ended = [event for event in identity_events
                           if event.get("objectObservation", {}).get("kind") == "TEARDOWN_END"]
         identity_calls = [event for event in identity_events if event.get("probeId") == identity_probe]
-        assert len(identity_created) == len(identity_ended) == 2 and len(identity_calls) == 4, identity_events
+        assert len(identity_created) == len(identity_destroyed) == len(identity_ended) == 8, identity_events
+        assert len(identity_calls) == 10, identity_events
 
         def recorded_identity(event):
             observation = event["objectObservation"]
             return int(observation["lifetimeId"]), int(observation["generation"])
 
         identities = {recorded_identity(event): identity_events.index(event) for event in identity_created}
-        assert len(identities) == 2 and {recorded_identity(event) for event in identity_ended} == set(identities)
+        assert len(identities) == 8, identity_events
+        assert {recorded_identity(event) for event in identity_destroyed} == set(identities), identity_events
+        assert {recorded_identity(event) for event in identity_ended} == set(identities), identity_events
         assert all(object_id > 0 and generation > 0 for object_id, generation in identities)
         call_counts = dict.fromkeys(identities, 0)
         for event in identity_calls:
@@ -824,7 +913,7 @@ public:
             assert identity in identities and identities[identity] < identity_events.index(event), event
             assert values["identity_verified"] in (True, "true", 1, "1")
             call_counts[identity] += 1
-        assert all(count == 2 for count in call_counts.values()), identity_events
+        assert list(call_counts.values()) == [2, 2] + [1] * 6, identity_events
 
         # A hidden derived class has only line-table information. Method-only
         # observation must not promote its Base subobject to a complete object.
@@ -840,7 +929,7 @@ public:
         app.expect(r"^HIDDEN_DERIVED=51$")
         if clang:
             send(target_process, "n")
-            app.expect(r"^NODEBUG_DERIVED=5$")
+            app.expect(r"^NODEBUG_DERIVED=5 NODEBUG_HEAP=5 NODEBUG_HASH=5$")
         hidden_method_record = out.expect(
             r"^received=(\d+) cursor=(\d+) .*timed_out=true .*recording=hidden-method-only.db")
         assert int(hidden_method_record[1]) > 0, hidden_method_record.string
@@ -859,7 +948,7 @@ public:
                        for observation in hidden_method_observations), hidden_method_events
         hidden_method_calls = [event for event in hidden_method_events
                                if event.get("probeId") == hidden_method_probe]
-        assert len(hidden_method_calls) == (2 if clang else 1), hidden_method_events
+        assert len(hidden_method_calls) == (4 if clang else 1), hidden_method_events
         for event in hidden_method_calls:
             values = event_fields(event)
             assert int(values["object_id"]) == int(values["object_generation"]) == 0, event
@@ -1131,4 +1220,5 @@ if __name__ == "__main__":
     for name in ("repl", "server", "agent"):
         parser.add_argument(name, type=lambda path: Path(path).resolve())
     parser.add_argument("cxx")
+    parser.add_argument("--dwarfdump", default="llvm-dwarfdump")
     run(parser.parse_args())
