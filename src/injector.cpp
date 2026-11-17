@@ -2008,19 +2008,34 @@ Process::remote_syscall(long number,
     verify();
   const auto saved = read_registers(tid_);
   const auto saved_signal_mask = read_signal_mask(tid_);
-  const auto ip = register_ip(saved.general);
   constexpr auto stub = syscall_stub;
+  const auto saved_ip = register_ip(saved.general);
+#if defined(__x86_64__)
+  // A stopped syscall can leave RIP at the very end of executable memory.
+  // Keep both the temporary stub and the ptrace read inside that word.
+  constexpr auto read_size = sizeof(long);
+  static_assert(stub.size() <= read_size);
+  const auto read_address = saved_ip - saved_ip % read_size;
+  const auto ip = saved_ip - read_address + stub.size() <= read_size
+                      ? saved_ip
+                      : read_address;
+#else
+  const auto ip = saved_ip;
+  const auto read_address = ip;
+  constexpr auto read_size = stub.size();
+#endif
   if (peers.contains_instruction(ip, stub.size())) {
     throw std::runtime_error("cannot install native syscall stub while a "
                              "thread is inside its bytes");
   }
-  const auto original = read_remote(tid_, ip, stub.size());
+  const auto original = read_remote(tid_, read_address, read_size);
   auto modified = saved;
 #if defined(__aarch64__)
   modified.syscall_number = -1;
   std::copy(arguments.begin(), arguments.end(), modified.general.regs);
   modified.general.regs[8] = static_cast<std::uint64_t>(number);
 #else
+  modified.general.rip = ip;
   modified.general.rax = static_cast<unsigned long long>(number);
   modified.general.orig_rax = static_cast<unsigned long long>(-1);
   modified.general.rdi = arguments[0];
@@ -2112,7 +2127,7 @@ Process::remote_syscall(long number,
       write_signal_mask(tid_, saved_signal_mask);
     }
     if (code_changed) {
-      write_remote(tid_, ip, original.data(), original.size());
+      write_remote(tid_, ip, original.data() + (ip - read_address), stub.size());
     }
     write_registers(tid_, saved);
   } catch (const std::exception &error) {
