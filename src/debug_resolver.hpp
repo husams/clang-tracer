@@ -56,6 +56,9 @@ clangtracer::v1::ListModulesResponse list_debug_module_mappings(
 clangtracer::v1::PreviewBulkTraceResponse preview_bulk_trace(
     std::uint32_t pid, const clangtracer::v1::BulkTraceRules &rules,
     const std::function<bool()> &is_cancelled);
+// True when a mangled symbol names a constructor (C1/C2/C3) or destructor (D0/D1/D2) entry point.
+bool is_constructor_symbol(const std::string &linkage);
+bool is_destructor_symbol(const std::string &linkage);
 ResolvedCallable resolve_debug_callable(
     std::uint32_t pid, const std::string &selector,
     const DebugLookupOptions &options = {});

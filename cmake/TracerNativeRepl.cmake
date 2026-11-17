@@ -875,6 +875,19 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
           $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-small-getter-target>)
       set_tests_properties(native_repl_small_getter PROPERTIES TIMEOUT 120)
+      add_executable(repl-cdtor-target tests/fixtures/repl_cdtor.cpp tests/fixtures/repl_cdtor_main.cpp)
+      set_target_properties(repl-cdtor-target PROPERTIES CXX_STANDARD 17)
+      target_compile_options(repl-cdtor-target PRIVATE -g -O0 -fno-inline -fno-omit-frame-pointer
+        -fcf-protection=none -fno-pie)
+      target_link_options(repl-cdtor-target PRIVATE -no-pie "LINKER:--build-id=sha1")
+      add_test(NAME native_repl_cdtor
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_cdtor.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-cdtor-target>
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/repl_cdtor.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/repl_cdtor.cpp"
+          "${CMAKE_CXX_COMPILER}")
+      set_tests_properties(native_repl_cdtor PROPERTIES TIMEOUT 300)
       add_executable(repl-person-target tests/fixtures/person/person.cpp tests/fixtures/person/driver.cpp)
       set_target_properties(repl-person-target PROPERTIES CXX_STANDARD 17 INTERPROCEDURAL_OPTIMIZATION OFF)
       target_compile_options(repl-person-target PRIVATE -g -O2 -fno-omit-frame-pointer -fcf-protection=none -fno-pie)

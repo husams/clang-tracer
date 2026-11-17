@@ -851,13 +851,14 @@ struct CallableShape {
 
 CallableShape describe_callable(DWARFDie die, DWARFDie decl,
                                 const PreviewName &display = {}, bool allow_virtual_entry = false) {
-  if (::tracer::compat::starts_with(name(decl), "~") || name(decl) == name(decl.getParent())) {
-    throw std::runtime_error("debug constructors/destructors are unsupported");
-  }
+  // Constructors and destructors are concrete entry points (C1/C2, D0/D1/D2) even when the
+  // destructor is virtual; a caller chooses one by its linkage symbol.
+  const bool special_member = ::tracer::compat::starts_with(name(decl), "~") ||
+                              name(decl) == name(decl.getParent());
   if (number(decl, dw::DW_AT_calling_convention, dw::DW_CC_normal) != dw::DW_CC_normal) {
     throw std::runtime_error("nondefault debug calling convention is unsupported");
   }
-  if (!allow_virtual_entry && number(decl, dw::DW_AT_virtuality)) {
+  if (!allow_virtual_entry && !special_member && number(decl, dw::DW_AT_virtuality)) {
     throw std::runtime_error("virtual debug methods are unsupported");
   }
 
@@ -905,7 +906,14 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl,
       result.receiver = type;
       continue;
     }
-    if (number(parameter, dw::DW_AT_artificial)) {
+    // The base-object variants (C2/D2) of a class with virtual bases receive a hidden VTT
+    // pointer after `this`, and some compilers add an in-charge flag. They are real register
+    // arguments, so they stay in the argument list, but they are not part of the selector.
+    const bool hidden = number(parameter, dw::DW_AT_artificial) != 0;
+    // GCC names these `__vtt_parm` and `__in_chrg`, Clang names the VTT pointer `vtt`.
+    if (hidden && !(special_member && (name(parameter) == "__vtt_parm" ||
+                                       name(parameter) == "__in_chrg" ||
+                                       name(parameter) == "vtt"))) {
       throw std::runtime_error("unsupported artificial debug parameter");
     }
     const auto type = read_type(type_of(parameter));
@@ -913,7 +921,7 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl,
       throw std::runtime_error("unsupported debug parameter ABI");
     }
     api::DebugArgument argument;
-    argument.set_index(types.size());
+    argument.set_index(result.arguments.size());
     argument.set_cpp_type(type.spelling);
     argument.set_is_reference(type.reference);
     argument.set_is_object_value(type.value == api::OBJECT);
@@ -923,9 +931,10 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl,
     }
     result.arguments.push_back(std::move(argument));
     result.signature.add_arguments(type.value);
-    types.push_back(type.spelling);
+    if (!hidden)
+      types.push_back(type.spelling);
     result.argument_names.push_back(
-        name(parameter).empty() ? "arg" + std::to_string(types.size() - 1)
+        name(parameter).empty() ? "arg" + std::to_string(result.arguments.size() - 1)
                                 : name(parameter));
   }
   for (auto child : decl.children()) {
@@ -1041,6 +1050,19 @@ std::uint64_t elf_function_address(const llvm::object::ELF64LEObjectFile &object
   for (const auto &symbol : object.getDynamicSymbolIterators())
     visit(symbol);
   return result;
+}
+
+// 0 for anything else, 1 for a constructor entry point (C1/C2/C3), 2 for a destructor entry
+// point (D0/D1/D2). Decided from the mangled name, so it also works for ELF-only symbols.
+int cdtor_kind(const std::string &linkage) {
+  if (linkage.size() < 3 || linkage.compare(0, 2, "_Z") != 0)
+    return 0;
+  llvm::ItaniumPartialDemangler demangler;
+  if (demangler.partialDemangle(linkage.c_str()) || !demangler.isCtorOrDtor())
+    return 0;
+  const std::unique_ptr<char, decltype(&std::free)> base(
+      demangler.getFunctionBaseName(nullptr, nullptr), &std::free);
+  return base && base.get()[0] == '~' ? 2 : 1;
 }
 
 std::pair<std::uint64_t, std::uint64_t> callable_code_range(DWARFDie die) {
@@ -1832,7 +1854,8 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
         std::string diagnostic;
         try {
           callable_code_range(die);
-          if (number(decl, dw::DW_AT_virtuality)) {
+          // C1/C2/D0/D1/D2 are concrete entry points even for a virtual destructor.
+          if (number(decl, dw::DW_AT_virtuality) && !cdtor_kind(linkage)) {
             status = PreviewCandidate::PREPARED_REQUIRED;
             diagnostic = "virtual implementation requires a compatible prepared package";
           } else {
@@ -1910,10 +1933,25 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
     if (function.runtime_address())
       by_address[function.runtime_address()].push_back(&key);
   }
+  // Entry points of one constructor or destructor at different addresses (C1/C2, D0/D1/D2) are
+  // expected; each is its own candidate, told apart by its linkage symbol. Entry points that
+  // share an address are aliases and go through the alias rows below.
+  std::map<std::string, bool> variants_only;
+  for (const auto &[key, candidate] : candidates) {
+    auto [slot, added] = variants_only.try_emplace(std::get<0>(key), true);
+    if (!cdtor_kind(candidate.function().linkage_symbol()))
+      slot->second = false;
+  }
   for (auto &[key, candidate] : candidates) {
     if (selector_entries.at(std::get<0>(key)).size() > 1) {
-      candidate.set_abi_status(PreviewCandidate::AMBIGUOUS);
-      candidate.set_diagnostic("selector identifies multiple entries; narrow the module selection");
+      if (variants_only.at(std::get<0>(key))) {
+        if (candidate.diagnostic().empty())
+          candidate.set_diagnostic("constructor/destructor variant " +
+                                   candidate.function().linkage_symbol());
+      } else {
+        candidate.set_abi_status(PreviewCandidate::AMBIGUOUS);
+        candidate.set_diagnostic("selector identifies multiple entries; narrow the module selection");
+      }
     }
   }
   // Symbols that share one runtime entry are names for the same code: identical C1/C2 bodies,
@@ -2324,10 +2362,6 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
                            selects_name(selected, name(decl)) ||
                            selects_name(selected, symbol_name)))) {
           try {
-            if (::tracer::compat::starts_with(name(decl), "~") ||
-                name(decl) == name(decl.getParent())) {
-              throw std::runtime_error("debug constructors/destructors are unsupported");
-            }
             if (number(decl, dw::DW_AT_calling_convention, dw::DW_CC_normal) != dw::DW_CC_normal) {
               throw std::runtime_error("nondefault debug calling convention is unsupported");
             }
@@ -2503,7 +2537,8 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
       error += ": " + rejected;
     }
     for (const auto& [key, c] : matches) {
-      error += "\n  " + c.declaration;
+      // The linkage symbol tells constructor/destructor variants (C1/C2, D0/D1/D2) apart.
+      error += "\n  " + c.declaration + " [" + c.spec.symbol() + "]";
     }
     throw std::runtime_error(error);
   }
@@ -2709,4 +2744,9 @@ DebugSymbolPage list_debug_symbols(
   }
   return page;
 }
+
+bool is_constructor_symbol(const std::string &linkage) { return cdtor_kind(linkage) == 1; }
+
+bool is_destructor_symbol(const std::string &linkage) { return cdtor_kind(linkage) == 2; }
+
 } // namespace tracer::client

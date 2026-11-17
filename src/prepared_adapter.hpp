@@ -264,6 +264,7 @@ private:
     if (method && method->isVirtual())
       source += "virtual ";
     const bool destructor = llvm::isa<clang::CXXDestructorDecl>(decl);
+    const bool constructor = llvm::isa<clang::CXXConstructorDecl>(decl);
     const auto *conversion = llvm::dyn_cast<clang::CXXConversionDecl>(&decl);
     std::string name;
     if (linkage_alias)
@@ -288,7 +289,8 @@ private:
       if (method->getRefQualifier() == clang::RQ_RValue) name += " &&";
     }
     name += exception_suffix(decl);
-    source += (destructor || conversion) ? name : spelling(decl.getReturnType(), name);
+    // Constructors and destructors have no return type to spell.
+    source += (destructor || constructor || conversion) ? name : spelling(decl.getReturnType(), name);
     if (!symbol.empty())
       source += " __asm__(\"" + symbol + "\")";
     if (decl.isPureVirtual())
@@ -743,6 +745,9 @@ private:
       } else {
         source += method->isDeletedAsWritten() ? " = delete" : " = default";
       }
+      // This lifetime declaration already is the selected constructor or destructor.
+      emitted_selected |= selected_method_ &&
+          method->getCanonicalDecl() == selected_method_->getCanonicalDecl();
       source += ";\n";
     }
     if (const auto recipe = record_factory::infer(record)) {

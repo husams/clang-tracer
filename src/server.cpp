@@ -2516,7 +2516,12 @@ public:
       const auto &function = row.function();
       lookup.module = function.module_path();
       try {
-        auto spec = client::resolve_debug_callable(session->pid(), function.selector(), lookup).spec;
+        // The entry points of one constructor or destructor (C1/C2, D0/D1/D2) share a selector;
+        // bind the previewed one by its linkage symbol.
+        const bool cdtor = client::is_constructor_symbol(function.linkage_symbol()) ||
+                           client::is_destructor_symbol(function.linkage_symbol());
+        auto spec = client::resolve_debug_callable(
+            session->pid(), cdtor ? function.linkage_symbol() : function.selector(), lookup).spec;
         const auto &info = spec.debug_info();
         if (info.module() != function.module_path() || spec.symbol() != function.linkage_symbol() ||
             info.runtime_entry() != function.runtime_address() ||
@@ -2526,6 +2531,8 @@ public:
         const auto validation = validate_probe(spec);
         if (!validation.ok())
           throw std::runtime_error(validation.error_message());
+        if (cdtor)  // rows of one declaration differ only by entry point
+          row.set_diagnostic("constructor/destructor entry " + function.linkage_symbol());
         specs.push_back(std::move(spec));
         installing.push_back(index);
       } catch (const std::exception &error) {

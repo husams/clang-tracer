@@ -604,6 +604,63 @@ original session.
 Removal and rollback restore entry bytes. The agent still retains compiled
 slots until the target exits.
 
+## Observe constructors and destructors
+
+Constructors and destructors are ordinary callables with several entry points.
+The Itanium ABI gives one source constructor a complete-object entry (`C1`) and
+a base-object entry (`C2`), and one destructor a complete-object (`D1`),
+base-object (`D2`) and deleting (`D0`) entry. A compiler often emits one body
+for both names (aliases at one address). A class with virtual bases needs
+distinct code: its base-object entries receive a hidden second argument, the
+VTT pointer, and `delete` through a base pointer reaches `D0` through a virtual
+thunk.
+
+```text
+%probe inject "app::Account::Account(int)"
+%probe inject _ZN3app4LeafC1Ei
+%probe inject _ZN3app4LeafD0Ev
+%trace preview --include 'app::Leaf::*'
+```
+
+On the DWARF path a selector that names one entry point installs like any
+other callable. When one declaration has several entry points at different
+addresses the selector is ambiguous and the error lists each entry point with
+its linkage symbol (`void app::Leaf::Leaf(int) [_ZN3app4LeafC1Ei]`). Pass that
+symbol as the selector to probe exactly that entry point. Naming the other
+variant of an aliased pair (for example `C1` when DWARF describes the shared
+body as `C2`) selects the same code. Every variant can be probed this way,
+including `D0` for a destructor reached through a base pointer.
+
+The hidden VTT pointer is a real register argument. Events show it ahead of the
+declared arguments (`__vtt_parm=0x401810, x=35` with GCC, `vtt` with Clang) so
+`Call::argument<N>()` keeps the machine argument order, but it is not part of
+the selector. Nested construction fires one PRE/POST pair per level for one
+object: `Leaf::Leaf` (`C1`) calls `Mid::Mid` (`C2`), which calls
+`VBase::VBase` (`C2`).
+
+`%trace preview` reports a selector with several entry points as one
+`DWARF_SUPPORTED` row each (`reason="constructor/destructor variant SYMBOL"`),
+and one row for names that share a body. `%trace apply` installs one probe per
+row and tells the rows apart with `reason="constructor/destructor entry SYMBOL"`.
+A virtual destructor is concrete here, so it is not `PREPARED_REQUIRED`.
+
+A prepared package binds the complete-object entry point (`C1` or `D1`) of the
+C++ selector, the one called for a most-derived object, and spells constructors
+without a return type. A constructor or destructor of a class template is
+selected from an explicit instantiation, for example
+`%probe prepare "app::Box<int>::Box(int)" --include box.hpp`. The receiver of a
+constructor is raw storage on entry, so the built-in receiver snapshot is taken
+when the constructor returns (`receiver_sampled_at_return`) and there is none in
+the PRE event. The deleting destructor (`D0`) and the base-object entries
+(`C2`/`D2`) cannot be called from source; preparing a linkage symbol for one is
+refused with a message that points to `%probe inject SYMBOL` on the DWARF path.
+`%probe prepare ... --signature ... --member` accepts a constructor or
+destructor from ELF symbols; two names for the same code are one callable and
+entry points at different addresses stay ambiguous.
+
+Constructors and destructors that the compiler inlined have no symbol and
+cannot be observed.
+
 ## Read and scan mapped memory
 
 ```text

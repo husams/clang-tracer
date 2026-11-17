@@ -12,6 +12,8 @@
 #include "tracer/compat.hpp"
 #include "tracer/compiler_options.hpp"
 
+#include <llvm/Demangle/Demangle.h>
+
 #ifndef TRACER_CLANG_RESOURCE_DIR
 #error                                                                                             \
     "clang-tracer must be built with TRACER_CLANG_RESOURCE_DIR set to its Clang resource directory"
@@ -824,6 +826,36 @@ std::vector<std::string> split_parameters(std::string_view text) {
   return result;
 }
 
+// The class of a template class constructor or destructor selector ("ns::Box<int>::Box" and
+// "ns::Box<int>::~Box" give "ns::Box<int>"), or an empty string for any other selector.
+std::string template_cdtor_class(const std::string &qualified) {
+  int depth = 0;
+  std::vector<std::size_t> cuts;
+  for (std::size_t i = 0; i + 1 < qualified.size(); ++i) {
+    if (qualified[i] == '<') ++depth;
+    else if (qualified[i] == '>') --depth;
+    else if (depth == 0 && qualified[i] == ':' && qualified[i + 1] == ':') {
+      cuts.push_back(i);
+      ++i;
+    }
+  }
+  if (cuts.empty())
+    return {};
+  const auto last = qualified.substr(cuts.back() + 2);
+  const auto owner = qualified.substr(0, cuts.back());
+  auto previous = owner.substr(cuts.size() > 1 ? cuts[cuts.size() - 2] + 2 : 0);
+  if (const auto lt = previous.find('<'); lt != std::string::npos)
+    previous.resize(lt);
+  return (!last.empty() && last[0] == '~') || last == previous ? owner : std::string();
+}
+
+// A linkage symbol that names a constructor or destructor entry point.
+bool cdtor_linkage_symbol(const std::string &text) {
+  llvm::ItaniumPartialDemangler demangler;
+  return text.size() > 2 && text.compare(0, 2, "_Z") == 0 &&
+         !demangler.partialDemangle(text.c_str()) && demangler.isCtorOrDtor();
+}
+
 Selector parse_selector(const std::string& text) {
   Selector selector;
   auto open = std::string::npos;
@@ -922,6 +954,7 @@ struct FrozenInvocation {
   api::PreparedInjector prepared_profile;
   std::string adapter_symbol;
   bool select_template = false;
+  bool instantiate_members = false;  // template class constructor/destructor selection
   bool pointer_layouts = true;
   int member_level = 3;
   api::SnapshotLimits limits;
@@ -1041,6 +1074,9 @@ public:
       , translation_unit_(std::move(translation_unit))
       , target_triple_(std::move(target_triple)), sema_(sema) {}
 
+  // A constructor or destructor of a class template is found in an explicit instantiation.
+  bool shouldVisitTemplateInstantiations() const { return invocation_.instantiate_members; }
+
   bool VisitFunctionDecl(clang::FunctionDecl* declaration) {
     if (invocation_.select_template)
       return true;
@@ -1141,10 +1177,6 @@ public:
       }
       if (!sema_ && method && method->isVirtual()) {
         throw std::runtime_error("virtual methods and their possible thunks are unsupported");
-      }
-      if (llvm::isa<clang::CXXConstructorDecl>(declaration) ||
-          llvm::isa<clang::CXXDestructorDecl>(declaration)) {
-        throw std::runtime_error("constructors and destructors are unsupported");
       }
       if (declaration->getFormalLinkage() != clang::Linkage::External) {
         throw std::runtime_error("callables with internal or non-external linkage are unsupported");
@@ -1801,6 +1833,12 @@ ResolvedCallable resolve_header_callable(const std::string& name,
                                          bool pointer_layouts, int member_level,
                                          const api::SnapshotLimits& limits, bool receiver_storage) {
   const auto selector = parse_selector(name);
+  if (cdtor_linkage_symbol(selector.qualified_name))
+    throw std::invalid_argument(
+        "a prepared package binds the complete-object constructor or destructor (C1/D1) of a C++ "
+        "selector; the deleting destructor (D0) and base-object (C2/D2) entry points cannot be "
+        "prepared from source. Probe them by linkage symbol on the DWARF path "
+        "(%probe inject SYMBOL)");
   if (!selector.has_parameters || headers.include_headers().empty())
     throw std::runtime_error("prepared generation requires an explicit selector and header context");
   // Use the SDK fallback unless the database names a different installed
@@ -1879,7 +1917,16 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   const auto angle = selector.qualified_name.find('<');
   const bool select_template = angle != std::string::npos &&
       selector.qualified_name.find('>', angle) != std::string::npos;
-  if (select_template) {
+  // `&Class<T>::Class` and `&Class<T>::~Class` are ill-formed, so a constructor or destructor
+  // of a class template is selected from an explicit instantiation instead.
+  const auto cdtor_class = select_template ? template_cdtor_class(selector.qualified_name)
+                                           : std::string();
+  const bool cdtor_selector = !cdtor_class.empty();
+  if (select_template && cdtor_selector) {
+    const auto qualified = cdtor_class.rfind("::", 0) == 0 ? cdtor_class : "::" + cdtor_class;
+    code += "\ntemplate struct " + qualified + ";\n";
+    arguments.push_back(clang_cl ? "/clang:-fno-access-control" : "-fno-access-control");
+  } else if (select_template) {
     if (name.find_first_of("#;{}\\\r\n") != std::string::npos)
       throw std::invalid_argument("invalid character in prepared template selector");
     std::string parameters;
@@ -1912,7 +1959,8 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   tool.mapVirtualFile(source, code);
   std::vector<Candidate> candidates;
   std::string target_error, invocation_error;
-  invocation.select_template = select_template;
+  invocation.select_template = select_template && !cdtor_selector;
+  invocation.instantiate_members = select_template && cdtor_selector;
   invocation.pointer_layouts = pointer_layouts;
   invocation.member_level = member_level;
   invocation.limits = limits;
