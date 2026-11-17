@@ -514,9 +514,9 @@ concrete virtual implementation that needs a compatible prepared package.
 Unsupported entries and ambiguous selections show a reason. Narrow a
 duplicate signature with `--module`.
 
-The capacity line shows retained slots and whether the DWARF-supported
-selection fits. It is a snapshot and reserves no slots. The preview runs
-without installing probes, stopping target threads or executing code inside
+The capacity line reports retained probes and `limit=unlimited`. Probe storage
+grows as needed; allocation can still fail when process resources are exhausted.
+The preview runs without installing probes, stopping target threads or executing code inside
 the target. `--save` creates a new versioned text-protobuf file with selection
 rules. Reusing it resolves against the current session and mappings.
 
@@ -531,7 +531,7 @@ rules. Reusing it resolves against the current session and mappings.
 Apply re-resolves the manifest against the selected session. The default
 Clang JIT observer records typed PRE and POST events. With `--callback`, the
 same C++ source is compiled for each matched function. Every match must be
-DWARF-supported and fit in the available retained slots. Ambiguous or
+DWARF-supported. There is no fixed probe-count limit. Ambiguous or
 unmatched selections, entries requiring prepared packages, and entries with
 active probes block installation.
 
@@ -1368,9 +1368,9 @@ observer in place. Cancellation is checked up to the entry switch. Use
 The entry switches directly to the new wrapper. Calls that already entered
 the previous wrapper finish there, with both PRE and POST tagged by the
 previous probe ID. A successful reload reports the new ID and retained
-capacity. The 32-slot process limit includes retired wrappers, which stay
-resident for safe late arrivals. Remove the active generation to restore the
-original entry. Removing a superseded generation drains it while leaving the
+count. There is no fixed probe-count limit; retired wrappers stay
+resident for safe late arrivals, so repeated reloads consume memory. Remove the
+active generation to restore the original entry. Removing a superseded generation drains it while leaving the
 successor in place. Detach drains all generations.
 
 Borrow target pointers and references only during the callback. Use owned

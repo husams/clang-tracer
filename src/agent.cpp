@@ -326,10 +326,17 @@ struct Probe {
   }
 };
 
+// Registry nodes outlive reclaimed probes so readers can traverse a stable chain.
+struct ProbeSlot {
+  ProbeSlot *next = nullptr; // Immutable after publication.
+  std::atomic<Probe *> probe{nullptr};
+  std::atomic<std::uint64_t> id{0};
+};
+
 struct Agent {
-  std::array<std::unique_ptr<Probe>, tracer::kMaxProbes> probes{};
-  std::array<std::atomic<Probe *>, tracer::kMaxProbes> probe_slots{};
-  std::array<std::atomic<std::uint64_t>, tracer::kMaxProbes> slot_ids{};
+  std::vector<std::unique_ptr<Probe>> probes;
+  std::vector<std::unique_ptr<ProbeSlot>> probe_slots;
+  std::atomic<ProbeSlot *> published_slots{nullptr};
   std::size_t retained = 0;
   pid_t pid = 0;
   tracer::ContextRegistry context_registry;
@@ -348,11 +355,7 @@ struct Agent {
   Agent()
       : transport([] { ++callback_depth; },
                   logging_enabled ? &report_agent_failures : nullptr,
-                  logging_enabled ? &write_agent_logs : nullptr) {
-    for (auto &slot : probe_slots) {
-      slot.store(nullptr, std::memory_order_relaxed);
-    }
-  }
+                  logging_enabled ? &write_agent_logs : nullptr) {}
 };
 
 struct CapturedDiagnostic {
@@ -531,8 +534,9 @@ void report_agent_failures() noexcept {
   auto *current = agent.load(std::memory_order_acquire);
   if (!current)
     return;
-  for (const auto &slot : current->probe_slots) {
-    auto *probe = slot.load(std::memory_order_acquire);
+  for (auto *slot = current->published_slots.load(std::memory_order_acquire);
+       slot; slot = slot->next) {
+    auto *probe = slot->probe.load(std::memory_order_acquire);
     if (!probe)
       continue;
     const auto errors = probe->callback_errors.load(std::memory_order_relaxed);
@@ -553,8 +557,9 @@ void write_agent_logs() noexcept {
   auto *current = agent.load(std::memory_order_acquire);
   if (!current)
     return;
-  for (const auto &slot : current->probe_slots) {
-    auto *probe = slot.load(std::memory_order_acquire);
+  for (auto *slot = current->published_slots.load(std::memory_order_acquire);
+       slot; slot = slot->next) {
+    auto *probe = slot->probe.load(std::memory_order_acquire);
     if (!probe)
       continue;
     auto &log = probe->log;
@@ -639,9 +644,11 @@ Probe *find_probe(std::uint64_t id) noexcept {
   if (!current) {
     return nullptr;
   }
-  for (std::size_t i = 0; i < current->slot_ids.size(); ++i)
-    if (id && current->slot_ids[i].load(std::memory_order_acquire) == id)
-      return current->probe_slots[i].load(std::memory_order_acquire);
+  for (auto *slot = current->published_slots.load(std::memory_order_acquire);
+       slot; slot = slot->next) {
+    if (id && slot->id.load(std::memory_order_acquire) == id)
+      return slot->probe.load(std::memory_order_acquire);
+  }
   return nullptr;
 }
 
@@ -6403,10 +6410,13 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, "probe_id has already been used in this process");
       return operation.finish(-1);
     }
-    if (a.retained >= tracer::kMaxProbes) {
-      set_error(request, "the process has reached its 32 retained-probe limit");
-      return operation.finish(-1);
-    }
+    // Allocate ownership storage before enabling transport or scheduler state.
+    // Readers traverse stable registry nodes, never the ownership vectors.
+    if (a.probes.size() == a.probes.capacity())
+      a.probes.reserve(a.probes.empty() ? 1 : a.probes.size() * 2);
+    if (a.probe_slots.size() == a.probe_slots.capacity())
+      a.probe_slots.reserve(a.probe_slots.empty() ? 1 : a.probe_slots.size() * 2);
+    auto slot = std::make_unique<ProbeSlot>();
     // A durable collector can reconnect while old probes are still active.
     // Keep their shared metadata alive; refresh a new session only after the
     // previous callback cohort has drained.
@@ -6647,17 +6657,20 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     operation.stage = "publish_probe";
     p->session_id = request->session_id;
     a.pid = ::getpid();
-    const auto slot = static_cast<std::size_t>(std::find_if(a.probes.begin(), a.probes.end(),
-        [](const auto &probe) { return !probe; }) - a.probes.begin());
     a.transport.activate();
     p->transport_active = true;
     p->active.store(true, std::memory_order_seq_cst);
-    a.probes[slot] = std::move(p);
-    Probe *installed_probe = a.probes[slot].get();
-    a.probe_slots[slot].store(installed_probe, std::memory_order_release);
-    a.slot_ids[slot].store(installed_probe->request.probe_id, std::memory_order_release);
+    Probe *installed_probe = p.get();
+    slot->next = a.published_slots.load(std::memory_order_relaxed);
+    slot->probe.store(installed_probe, std::memory_order_relaxed);
+    slot->id.store(installed_probe->request.probe_id, std::memory_order_relaxed);
+    auto *published = slot.get();
+    a.probes.push_back(std::move(p));
+    a.probe_slots.push_back(std::move(slot));
+    a.published_slots.store(published, std::memory_order_release);
     ++a.retained;
-    tracer_agent_capacity_v1.store(tracer::kAgentCapacityTag | a.retained,
+    tracer_agent_capacity_v1.store(tracer::kAgentCapacityTag |
+                                      std::min<std::size_t>(a.retained, UINT32_MAX),
                                   std::memory_order_relaxed);
     *request = installed_probe->request;
     return operation.finish(0);
@@ -6697,11 +6710,12 @@ extern "C" int tracer_agent_reclaim_v1(std::uint64_t id, TracerRetiredCode *code
           code->ranges[j] = {begin, end};
         }
       } else {
-        owner->slot_ids[i].store(0, std::memory_order_release);
-        owner->probe_slots[i].store(nullptr, std::memory_order_release);
+        owner->probe_slots[i]->id.store(0, std::memory_order_release);
+        owner->probe_slots[i]->probe.store(nullptr, std::memory_order_release);
         owner->probes[i].reset();
         --owner->retained;
-        tracer_agent_capacity_v1.store(tracer::kAgentCapacityTag | owner->retained,
+        tracer_agent_capacity_v1.store(tracer::kAgentCapacityTag |
+                                          std::min<std::size_t>(owner->retained, UINT32_MAX),
                                        std::memory_order_relaxed);
       }
       return 0;

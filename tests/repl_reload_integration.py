@@ -2,6 +2,7 @@
 
 from contextlib import ExitStack
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -16,19 +17,22 @@ def main(repl, server, fixture):
         files = [root / f"observer-{n}.cpp" for n in (1, 2)]
         for version, path in enumerate(files, start=1):
             path.write_text(f"""struct Interceptor {{
-  void pre(const Call &call) {{ call.field("observer", {version}); }}
+  void pre(const Call &call) {{ call.field("observer", {version}); call.log("probe-cap-check"); }}
   void post(const Call &call) {{ call.field("observer", {version}); }}
 }};
 """)
         broken = root / "broken.cpp"
         broken.write_text("struct Interceptor { void pre(const Call &) { missing_function(); } };")
-        child = subprocess.Popen([fixture], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        agent_log = root / "agent.log"
+        target_env = dict(os.environ, CLANG_TRACER_AGENT_LOG=str(agent_log))
+        child = subprocess.Popen([fixture], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 text=True, env=target_env)
         stack.callback(stop, child)
         target_out = Transcript(child.stdout)
         address = int(target_out.expect(r"^ready entry=(0x[0-9a-f]+)$")[1], 16)
         memory = stack.enter_context(open(f"/proc/{child.pid}/mem", "rb", buffering=0))
         console = subprocess.Popen(
-            [repl, "--server", server, "--attach", str(child.pid)],
+            [repl, "--server", server, "--timeout", "300", "--attach", str(child.pid)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True,
         )
@@ -64,7 +68,7 @@ def main(repl, server, fixture):
         def reload(probe, path, retained):
             send(f'%probe reload {probe} --callback "{path.name}" --cwd "{path.parent}"')
             return output.expect(
-                rf"^reloaded probe=(\d+) replaces={probe} retained_limit=32 agent_retained={retained}$"
+                rf"^reloaded probe=(\d+) replaces={probe} retained_limit=unlimited agent_retained={retained}$"
             )[1]
 
         output.expect(rf"^attached session=\S+ pid={child.pid}$")
@@ -105,18 +109,17 @@ def main(repl, server, fixture):
         output.expect(rf"^removed probe={old} restored=false$")
         assert read_code() == current_patch
 
-        for retained in range(3, 33):
+        for retained in range(3, 41):
             current = reload(current, files[1], retained)
-        last_patch = read_code()
-        send(f'%probe reload {current} --callback "{files[0]}"')
-        output.expect(r"RPC 8: reload reached the 32 retained-probe limit")
-        assert read_code() == last_patch
         short()
         events(current, 2, post_seq, ["PRE", "POST"], 2)
         send("%detach")
         output.expect(r"^detached session=")
         assert read_code() == original
         short()
+        logs = agent_log.read_text()
+        assert re.search(rf"probe_id={current} .*operation=callback .*message=probe-cap-check$",
+                         logs, re.MULTILINE), logs
         send("%quit")
         assert console.wait(timeout=15) == 1, "".join(output.seen)
         assert child.poll() is None

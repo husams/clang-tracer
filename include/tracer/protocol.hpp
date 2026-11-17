@@ -19,7 +19,8 @@ inline constexpr std::uint32_t kProtocolVersion = 2;
 // Version 28 also carries the shared transport memory budget.
 // Version 30 combines scalar control and native patch ownership.
 // Version 31 carries the type registration ID for grouped method callbacks.
-inline constexpr std::uint32_t kBootstrapVersion = 31;
+// Version 32 requires dynamically growing probe storage in the target agent.
+inline constexpr std::uint32_t kBootstrapVersion = 32;
 inline constexpr std::uint32_t kDefaultContextEventBytes = 256 * 1024;
 inline constexpr std::uint64_t kDefaultContextTransportMemoryBytes = 64ull * 1024 * 1024;
 struct ContextTransportBudget {
@@ -28,7 +29,6 @@ struct ContextTransportBudget {
 };
 inline constexpr unsigned kMaxPatchBytes = 64;
 inline constexpr unsigned kMaxArguments = 8;
-inline constexpr unsigned kMaxProbes = 32;
 inline constexpr std::uint32_t kUnlimitedStackDepth = UINT32_MAX;
 
 enum class StackStatus : std::uint32_t {

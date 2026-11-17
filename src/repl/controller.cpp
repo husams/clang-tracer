@@ -2172,11 +2172,16 @@ void Controller::preview_bulk_trace(const Command &command) {
          << " reason=\"no matching concrete entry after module and exclusion rules\"\n";
   out_ << "dry-run matched=" << response.candidates_size()
        << " dwarf_supported=" << supported
-       << " limit=" << response.retained_limit()
+       << " limit=" << (response.retained_limit()
+                            ? std::to_string(response.retained_limit())
+                            : "unlimited")
        << " session_retained=" << response.session_retained();
-  if (response.has_available_slots())
-    out_ << " agent_retained=" << response.agent_retained()
-         << " available=" << response.available_slots()
+  if (response.has_agent_retained())
+    out_ << " agent_retained=" << response.agent_retained();
+  if (!response.retained_limit())
+    out_ << " available=unlimited fits=yes";
+  else if (response.has_available_slots())
+    out_ << " available=" << response.available_slots()
          << " fits=" << (supported <= response.available_slots() ? "yes" : "no");
   else
     out_ << " available=unknown fits=unknown";
@@ -3665,7 +3670,9 @@ public:
         settings_.timeout_seconds);
       out_ << "reloaded probe=" << response.probe().id()
            << " replaces=" << response.probe().replaces_probe_id()
-           << " retained_limit=" << response.retained_limit();
+           << " retained_limit=" << (response.retained_limit()
+                                        ? std::to_string(response.retained_limit())
+                                        : "unlimited");
       if (response.has_agent_retained())
         out_ << " agent_retained=" << response.agent_retained();
       else

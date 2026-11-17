@@ -26,8 +26,8 @@ class Transcript:
 
         threading.Thread(target=read, daemon=True).start()
 
-    def expect(self, pattern):
-        deadline = time.monotonic() + 25
+    def expect(self, pattern, timeout=25):
+        deadline = time.monotonic() + timeout
         while True:
             try:
                 line = self.lines.get(timeout=max(0, deadline - time.monotonic()))

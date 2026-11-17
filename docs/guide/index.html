@@ -2182,8 +2182,8 @@ and installation checks run separately. <code>PREPARED_REQUIRED</code> identifie
 concrete virtual implementation that needs a compatible prepared package.
 Unsupported entries and ambiguous selections show a reason. Narrow a
 duplicate signature with <code>--module</code>.</p>
-<p>The capacity line shows retained slots and whether the DWARF-supported
-selection fits. It is a snapshot and reserves no slots. The preview runs
+<p>The capacity line reports retained probes and <code>limit=unlimited</code>. Probe storage
+grows as needed; allocation can still fail when process resources are exhausted. The preview runs
 without installing probes, stopping target threads or executing code inside
 the target. <code>--save</code> creates a new versioned text-protobuf file with selection
 rules. Reusing it resolves against the current session and mappings.</p>
@@ -2195,7 +2195,7 @@ rules. Reusing it resolves against the current session and mappings.</p>
 <p>Apply re-resolves the manifest against the selected session. The default
 Clang JIT observer records typed PRE and POST events. With <code>--callback</code>, the
 same C++ source is compiled for each matched function. Every match must be
-DWARF-supported and fit in the available retained slots. Ambiguous or
+DWARF-supported. There is no fixed probe-count limit. Ambiguous or
 unmatched selections, entries requiring prepared packages, and entries with
 active probes block installation.</p>
 <p>The REPL prints the batch ID before applying and reports the status of each
@@ -2862,8 +2862,8 @@ observer in place. Cancellation is checked up to the entry switch. Use
 <p>The entry switches directly to the new wrapper. Calls that already entered
 the previous wrapper finish there, with both PRE and POST tagged by the
 previous probe ID. A successful reload reports the new ID and retained
-capacity. The 32-slot process limit includes retired wrappers, which stay
-resident for safe late arrivals. Remove the active generation to restore the
+count. There is no fixed probe-count limit; retired wrappers stay
+resident for safe late arrivals, so repeated reloads consume memory. Remove the active generation to restore the
 original entry. Removing a superseded generation drains it while leaving the
 successor in place. Detach drains all generations.</p>
 <p>Borrow target pointers and references only during the callback. Use owned
@@ -6442,8 +6442,8 @@ server from this revision before using it; an older server returns gRPC
 <p>Injecting a target already hooked in the same session replaces that probe with
 a new ID. Compilation failure leaves the existing hook active. A successful
 replacement restores and drains the old hook before installing the new one, so
-there is a brief interval without tracing. The existing 32 retained-probe limit
-also counts replaced versions. Rebuild the server and agent together for this
+there is a brief interval without tracing. Probe storage grows as needed without
+a fixed count limit; replaced versions remain resident for safe late arrivals. Rebuild the server and agent together for this
 behavior; an already loaded older agent requires restarting the target.</p>
 <p>The console decodes shared-state payloads using each event's bundled schema and
 shows field values, including strings, nested records, and containers, beneath

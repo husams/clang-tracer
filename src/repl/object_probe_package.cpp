@@ -19,7 +19,6 @@ namespace {
 constexpr std::string_view kMagic = "CTKOPKG2";
 constexpr std::size_t kDigestSize = 32;
 constexpr std::size_t kMaximumPackageSize = 64 * 1024 * 1024;
-constexpr std::size_t kMaximumMethods = tracer::kMaxProbes;
 constexpr std::size_t kMaximumFields = 256;
 constexpr std::size_t kMaximumWriters = 256;
 constexpr std::size_t kMaximumArguments = 256;
@@ -62,8 +61,6 @@ void ObjectProbePackage::validate(const ObjectProbePackageInput &input,
     throw std::invalid_argument("unsupported object-probe package version");
   if (input.qualified_type.empty())
     throw std::invalid_argument("object-probe package requires a qualified type");
-  if (input.methods.size() > kMaximumMethods)
-    throw std::invalid_argument("object-probe package exceeds the native method probe limit");
   if (input.fields.size() > kMaximumFields || input.writer_selectors.size() > kMaximumWriters)
     throw std::invalid_argument("object-probe package has too many field or writer selectors");
   if (input.fields.empty() != input.writer_selectors.empty() || input.fields.size() > 1)

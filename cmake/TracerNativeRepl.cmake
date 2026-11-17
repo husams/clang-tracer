@@ -1197,6 +1197,11 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-reload-target>
           "${CMAKE_CURRENT_SOURCE_DIR}/examples/repl-agent-observer")
       set_tests_properties(native_repl_agent_observer PROPERTIES TIMEOUT 120)
+      add_test(NAME native_repl_many_probes
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_many_probes.py"
+          $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+          $<TARGET_FILE:repl-reload-target>)
+      set_tests_properties(native_repl_many_probes PROPERTIES TIMEOUT 600)
       add_executable(repl-bulk-concrete-target
         examples/prepared-injectors/concrete/target.cpp
         examples/prepared-injectors/concrete/virtual.cpp)

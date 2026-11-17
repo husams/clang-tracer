@@ -139,8 +139,8 @@ server from this revision before using it; an older server returns gRPC
 Injecting a target already hooked in the same session replaces that probe with
 a new ID. Compilation failure leaves the existing hook active. A successful
 replacement restores and drains the old hook before installing the new one, so
-there is a brief interval without tracing. The existing 32 retained-probe limit
-also counts replaced versions. Rebuild the server and agent together for this
+there is a brief interval without tracing. Probe storage grows as needed without
+a fixed count limit; replaced versions remain resident for safe late arrivals. Rebuild the server and agent together for this
 behavior; an already loaded older agent requires restarting the target.
 
 The console decodes shared-state payloads using each event's bundled schema and

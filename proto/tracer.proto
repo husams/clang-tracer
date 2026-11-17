@@ -424,7 +424,7 @@ message ReloadProbeRequest {
 }
 message ReloadProbeResponse {
   Probe probe = 1;
-  uint32 retained_limit = 2;
+  uint32 retained_limit = 2; // Zero means no fixed probe limit.
   optional uint32 agent_retained = 3;
 }
 message RemoveProbeRequest {
@@ -768,10 +768,10 @@ message BulkTraceCandidate {
 message PreviewBulkTraceResponse {
   repeated BulkTraceCandidate candidates = 1;
   repeated string unmatched_exact_selectors = 2;
-  uint32 retained_limit = 3;
+  uint32 retained_limit = 3; // Zero means no fixed probe limit.
   uint32 session_retained = 4;
   optional uint32 agent_retained = 5;
-  optional uint32 available_slots = 6;
+  optional uint32 available_slots = 6; // Unset when there is no fixed limit.
 }
 message ApplyBulkTraceRequest {
   string session_id = 1;

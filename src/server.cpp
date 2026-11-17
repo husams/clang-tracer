@@ -1794,12 +1794,6 @@ public:
       const auto validation = validate_probe(spec);
       if (!validation.ok())
         return validation;
-      const auto retained = session->agent_retained_count();
-      const auto snapshot = session->snapshot();
-      const auto session_retained = std::count_if(snapshot.probes().begin(), snapshot.probes().end(),
-          [](const auto &probe) { return !probe.reclaimed(); });
-      if (!spec.reclaimable() && (retained == kMaxProbes || session_retained >= kMaxProbes))
-        return {grpc::StatusCode::RESOURCE_EXHAUSTED, "reload reached the 32 retained-probe limit"};
       std::uint64_t pending_id = 0;
       const auto status = install_probe(session, spec, {}, pending_id, response->mutable_probe(),
                                         request->probe_id(), [&] {
@@ -1807,7 +1801,7 @@ public:
       });
       if (!status.ok())
         return status;
-      response->set_retained_limit(kMaxProbes);
+      response->set_retained_limit(0); // No fixed probe limit.
       if (const auto used = session->agent_retained_count())
         response->set_agent_retained(*used);
       return grpc::Status::OK;
@@ -2508,8 +2502,6 @@ public:
       return status;
     response->set_batch_id(batch_id);
     *response->mutable_unmatched_exact_selectors() = preview.unmatched_exact_selectors();
-    if (preview.has_available_slots())
-      response->set_available_slots(preview.available_slots());
 
     bool blocked = !preview.unmatched_exact_selectors().empty();
     std::set<std::uint64_t> entries;
@@ -2537,10 +2529,6 @@ public:
       response->set_diagnostic("selection contains blocked or unmatched entries");
     else if (response->entries().empty())
       response->set_diagnostic("selection matched no entries");
-    else if (!preview.has_available_slots())
-      response->set_diagnostic("agent capacity could not be verified");
-    else if (static_cast<unsigned>(response->entries_size()) > preview.available_slots())
-      response->set_diagnostic("selection exceeds available retained probe slots");
     if (!response->diagnostic().empty())
       return grpc::Status::OK;
 
@@ -3222,8 +3210,7 @@ public:
     using Request = api::ObjectProbeRequest;
     using Watch = api::ObjectWatchRequest;
     const bool starting = request.action() == Request::START;
-    if (request.methods_size() > static_cast<int>(kMaxProbes) ||
-        (request.methods().empty() != request.callback_source().empty()) ||
+    if ((request.methods().empty() != request.callback_source().empty()) ||
         request.callback_source().size() > kMaxCallbackSource ||
         request.callback_source().find('\0') != std::string::npos ||
         request.method_module().size() > 4096 || request.method_module().find('\0') != std::string::npos)
@@ -3495,14 +3482,11 @@ public:
       if (snapshot.state() != clangtracer::v1::Session::ATTACHED)
         return {grpc::StatusCode::FAILED_PRECONDITION,
                 "target process exited during bulk preview"};
-      preview.set_retained_limit(kMaxProbes);
+      preview.set_retained_limit(0); // No fixed probe limit.
       preview.set_session_retained(std::count_if(snapshot.probes().begin(), snapshot.probes().end(),
           [](const auto &probe) { return !probe.reclaimed(); }));
-      if (agent_retained) {
+      if (agent_retained)
         preview.set_agent_retained(*agent_retained);
-        const auto retained = std::max(*agent_retained, preview.session_retained());
-        preview.set_available_slots(kMaxProbes - std::min(kMaxProbes, retained));
-      }
       response->Swap(&preview);
       return grpc::Status::OK;
     } catch (const client::DebugLookupLimit &error) {
@@ -3752,9 +3736,6 @@ public:
     }
     if (message.find("target symbol was not found") != std::string::npos) {
       return {grpc::StatusCode::NOT_FOUND, message};
-    }
-    if (message.find("retained-probe limit") != std::string::npos) {
-      return {grpc::StatusCode::RESOURCE_EXHAUSTED, message};
     }
     if (message.find("unsupported or PC-relative") != std::string::npos ||
         message.find("CET landing") != std::string::npos) {

@@ -901,12 +901,6 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
         throw;
     }
   }
-  const auto retained = std::count_if(probes_.begin(), probes_.end(),
-      [](const auto &entry) { return !entry.second.value.reclaimed(); });
-  if (retained >= kMaxProbes)
-    throw std::runtime_error("session reached the 32 retained-probe limit");
-  if (probes_.size() >= 1024)
-    throw std::runtime_error("session reached the 1024 probe history limit");
   if (probe_id == 0 || probes_.count(probe_id) != 0) {
     throw std::invalid_argument("probe id is invalid or already used");
   }
@@ -2008,8 +2002,7 @@ std::optional<unsigned> Session::agent_retained_count() const {
   iovec remote{reinterpret_cast<void *>(capacity_address_), sizeof(word)};
   if (linux_api::process_vm_readv(pid_, &local, 1, &remote, 1, 0) !=
           static_cast<ssize_t>(sizeof(word)) ||
-      (word & 0xffffffff00000000ULL) != kAgentCapacityTag ||
-      (word & 0xffffffffULL) > kMaxProbes)
+      (word & 0xffffffff00000000ULL) != kAgentCapacityTag)
     return std::nullopt;
   return static_cast<unsigned>(word & 0xffffffffULL);
 }
