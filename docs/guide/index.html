@@ -172,9 +172,9 @@ span.linenos.special { color: #e6edf3; background-color: #6e7681; padding-left: 
   <input id="nav-filter" type="search" placeholder="Probe, replay, Python…" autocomplete="off">
   <p id="no-sections" role="status" hidden>No sections match.</p>
   <nav aria-label="Chapters">
-  <div class="nav-group"><h2>Get started</h2><ul><li><details><summary>Clang Tracer user guide</summary><div class="subnav"><a href="#user">Overview</a><a href="#user--install-and-check-the-tools">Install and check the tools</a><a href="#user--open-the-interactive-guide">Open the interactive guide</a><a href="#user--create-a-target-and-a-basic-probe">Create a target and a basic probe</a><a href="#user--index-debug-information-and-prepare-a-probe-from-a-binary">Index debug information and prepare a probe from a binary</a><a href="#user--trace-changes-to-c-objects">Trace changes to C++ objects</a><a href="#user--related-documentation">Related documentation</a></div></details></li><li><details><summary>Clang Tracer tutorials</summary><div class="subnav"><a href="#tutorials">Overview</a><a href="#tutorials--inspect-a-process-and-a-function-entry">Inspect a process and a function entry</a><a href="#tutorials--edit-validate-reload-and-restore">Edit, validate, reload, and restore</a><a href="#tutorials--trace-a-function-template-instantiation">Trace a function template instantiation</a><a href="#tutorials--preview-and-apply-bulk-tracing">Preview and apply bulk tracing</a><a href="#tutorials--capture-and-inspect-complete-native-stacks">Capture and inspect complete native stacks</a><a href="#tutorials--capture-in-the-background-and-query-in-c">Capture in the background and query in C++</a><a href="#tutorials--record-and-replay-offline">Record and replay offline</a><a href="#tutorials--prepare-a-reusable-probe">Prepare a reusable probe</a><a href="#tutorials--decode-objects-containers-and-method-receivers">Decode objects, containers, and method receivers</a><a href="#tutorials--observe-shared-context-and-thread-propagation">Observe shared context and thread propagation</a><a href="#tutorials--collect-every-call-of-one-request">Collect every call of one request</a><a href="#tutorials--trace-from-the-native-cli">Trace from the native CLI</a><a href="#tutorials--run-the-installed-end-to-end-jit-demo">Run the installed end-to-end JIT demo</a><a href="#tutorials--lesson-16-follow-polymorphic-items-through-two-probes">Lesson 16: follow polymorphic items through two probes</a><a href="#tutorials--lesson-17-trace-writes-without-rebuilding-the-target">Lesson 17: trace writes without rebuilding the target</a><a href="#tutorials--lesson-18-stream-and-release-a-counted-range">Lesson 18: stream and release a counted range</a></div></details></li></ul></div>
+  <div class="nav-group"><h2>Get started</h2><ul><li><details><summary>Clang Tracer user guide</summary><div class="subnav"><a href="#user">Overview</a><a href="#user--install-and-check-the-tools">Install and check the tools</a><a href="#user--open-the-interactive-guide">Open the interactive guide</a><a href="#user--create-a-target-and-a-basic-probe">Create a target and a basic probe</a><a href="#user--index-debug-information-and-prepare-a-probe-from-a-binary">Index debug information and prepare a probe from a binary</a><a href="#user--trace-changes-to-c-objects">Trace changes to C++ objects</a><a href="#user--observe-objects-and-prepare-custom-watch-plans">Observe objects and prepare custom watch plans</a><a href="#user--register-custom-object-probes">Register custom object probes</a><a href="#user--apply-live-updates">Apply live updates</a><a href="#user--mock-a-native-function">Mock a native function</a><a href="#user--extend-the-client-and-agent-with-c-plugins">Extend the client and agent with C++ plugins</a><a href="#user--related-documentation">Related documentation</a></div></details></li><li><details><summary>Clang Tracer tutorials</summary><div class="subnav"><a href="#tutorials">Overview</a><a href="#tutorials--inspect-a-process-and-a-function-entry">Inspect a process and a function entry</a><a href="#tutorials--edit-validate-reload-and-restore">Edit, validate, reload, and restore</a><a href="#tutorials--trace-a-function-template-instantiation">Trace a function template instantiation</a><a href="#tutorials--preview-and-apply-bulk-tracing">Preview and apply bulk tracing</a><a href="#tutorials--capture-and-inspect-complete-native-stacks">Capture and inspect complete native stacks</a><a href="#tutorials--capture-in-the-background-and-query-in-c">Capture in the background and query in C++</a><a href="#tutorials--record-and-replay-offline">Record and replay offline</a><a href="#tutorials--prepare-a-reusable-probe">Prepare a reusable probe</a><a href="#tutorials--decode-objects-containers-and-method-receivers">Decode objects, containers, and method receivers</a><a href="#tutorials--observe-shared-context-and-thread-propagation">Observe shared context and thread propagation</a><a href="#tutorials--collect-every-call-of-one-request">Collect every call of one request</a><a href="#tutorials--trace-from-the-native-cli">Trace from the native CLI</a><a href="#tutorials--run-the-installed-end-to-end-jit-demo">Run the installed end-to-end JIT demo</a><a href="#tutorials--lesson-16-follow-polymorphic-items-through-two-probes">Lesson 16: follow polymorphic items through two probes</a><a href="#tutorials--lesson-17-trace-writes-without-rebuilding-the-target">Lesson 17: trace writes without rebuilding the target</a><a href="#tutorials--lesson-18-stream-and-release-a-counted-range">Lesson 18: stream and release a counted range</a></div></details></li></ul></div>
 <div class="nav-group"><h2>Advanced</h2><ul><li><details><summary>Advanced capture and custom adapters</summary><div class="subnav"><a href="#advanced">Overview</a><a href="#advanced--write-a-followpointers-policy">Write a FollowPointers policy</a><a href="#advanced--write-a-target-side-snapshot-encoder">Write a target-side snapshot encoder</a><a href="#advanced--write-a-client-side-decoder">Write a client-side decoder</a><a href="#advanced--watch-logical-state-at-method-boundaries">Watch logical state at method boundaries</a></div></details></li></ul></div>
-<div class="nav-group"><h2>Walkthroughs</h2><ul><li><details><summary>Build and deploy on RHEL-compatible Linux</summary><div class="subnav"><a href="#install">Overview</a><a href="#install--dependencies">Dependencies</a><a href="#install--select-the-compiler-and-llvm-installation">Select the compiler and LLVM installation</a><a href="#install--installation-layout">Installation layout</a><a href="#install--archives-and-rpms">Archives and RPMs</a><a href="#install--verification">Verification</a></div></details></li><li><details><summary>GCC 8.5 SDK compatibility build</summary><div class="subnav"><a href="#gcc85">Overview</a><a href="#gcc85--build">Build</a><a href="#gcc85--tests">Tests</a><a href="#gcc85--compatibility-details">Compatibility details</a></div></details></li><li><details><summary>GCC 8.5 runtime compatibility validation — 2026-11-02</summary><div class="subnav"><a href="#gcc85-results">Overview</a><a href="#gcc85-results--build-and-application-validation">Build and application validation</a><a href="#gcc85-results--benchmark-comparison-and-limits">Benchmark comparison and limits</a><a href="#gcc85-results--measured-overhead">Measured overhead</a><a href="#gcc85-results--evidence-and-reproduction">Evidence and reproduction</a><a href="#gcc85-results--external-machine-failure-follow-up">External-machine failure follow-up</a><a href="#gcc85-results--session-fixed-binary-policy">Session-fixed binary policy</a><a href="#gcc85-results--blocked-main-attach-backport">Blocked-main attach backport</a></div></details></li><li><details><summary>Native C++17 REPL</summary><div class="subnav"><a href="#repl">Overview</a><a href="#repl--build">Build</a><a href="#repl--prepare-a-probe-from-a-binary-without-headers">Prepare a probe from a binary without headers</a><a href="#repl--start-and-attach">Start and attach</a><a href="#repl--browse-a-local-c-target">Browse a local C++ target</a><a href="#repl--capture-local-syscalls-or-cpu-samples">Capture local syscalls or CPU samples</a><a href="#repl--preview-a-bulk-trace">Preview a bulk trace</a><a href="#repl--apply-and-remove-a-bulk-trace">Apply and remove a bulk trace</a><a href="#repl--read-and-scan-mapped-memory">Read and scan mapped memory</a><a href="#repl--preview-a-verified-function-entry">Preview a verified function entry</a><a href="#repl--probe-a-short-getter">Probe a short getter</a><a href="#repl--trace-object-lifetimes-and-state-in-a-prebuilt-binary">Trace object lifetimes and state in a prebuilt binary</a><a href="#repl--prepare-an-object-watch-for-method-snapshots">Prepare an object watch for method snapshots</a><a href="#repl--follow-logical-collection-entries-during-writes">Follow logical collection entries during writes</a><a href="#repl--trace-a-shape-through-image">Trace a Shape through Image</a><a href="#repl--trace-a-direct-integer-assignment">Trace a direct integer assignment</a><a href="#repl--trace-atomic-integer-updates">Trace atomic integer updates</a><a href="#repl--trace-individual-writes-to-a-nested-union">Trace individual writes to a nested union</a><a href="#repl--trace-writes-in-the-native-code-cache">Trace writes in the native code cache</a><a href="#repl--interceptor-upload">Interceptor upload</a><a href="#repl--collect-and-inspect">Collect and inspect</a><a href="#repl--analyze-in-c">Analyze in C++</a><a href="#repl--cleanup-and-scripted-use">Cleanup and scripted use</a><a href="#repl--regenerate-the-grammar">Regenerate the grammar</a><a href="#repl--validation">Validation</a></div></details></li><li><details><summary>Event retention and SQLite storage</summary><div class="subnav"><a href="#storage">Overview</a><a href="#storage--configure-retained-history">Configure retained history</a><a href="#storage--save-or-drain">Save or drain</a><a href="#storage--sqlite-format-and-failure-handling">SQLite format and failure handling</a><a href="#storage--verification">Verification</a></div></details></li><li><details><summary>Shared context</summary><div class="subnav"><a href="#context">Overview</a><a href="#context--declare-and-use-state">Declare and use state</a><a href="#context--thread-propagation">Thread propagation</a><a href="#context--events-and-field-queries">Events and field queries</a><a href="#context--package-lineage">Package lineage</a><a href="#context--build-and-recording">Build and recording</a><a href="#context--acceptance-source">Acceptance source</a></div></details></li></ul></div>
+<div class="nav-group"><h2>Walkthroughs</h2><ul><li><details><summary>Build and deploy on RHEL-compatible Linux</summary><div class="subnav"><a href="#install">Overview</a><a href="#install--dependencies">Dependencies</a><a href="#install--select-the-compiler-and-llvm-installation">Select the compiler and LLVM installation</a><a href="#install--installation-layout">Installation layout</a><a href="#install--archives-and-rpms">Archives and RPMs</a><a href="#install--verification">Verification</a></div></details></li><li><details><summary>GCC 8.5 SDK compatibility build</summary><div class="subnav"><a href="#gcc85">Overview</a><a href="#gcc85--build">Build</a><a href="#gcc85--tests">Tests</a><a href="#gcc85--compatibility-details">Compatibility details</a></div></details></li><li><details><summary>GCC 8.5 runtime compatibility validation — 2026-11-02</summary><div class="subnav"><a href="#gcc85-results">Overview</a><a href="#gcc85-results--build-and-application-validation">Build and application validation</a><a href="#gcc85-results--benchmark-comparison-and-limits">Benchmark comparison and limits</a><a href="#gcc85-results--measured-overhead">Measured overhead</a><a href="#gcc85-results--evidence-and-reproduction">Evidence and reproduction</a><a href="#gcc85-results--external-machine-failure-follow-up">External-machine failure follow-up</a><a href="#gcc85-results--session-fixed-binary-policy">Session-fixed binary policy</a><a href="#gcc85-results--blocked-main-attach-backport">Blocked-main attach backport</a></div></details></li><li><details><summary>Native C++17 REPL</summary><div class="subnav"><a href="#repl">Overview</a><a href="#repl--build">Build</a><a href="#repl--live-code-replacement-on-linux-x86-64">Live code replacement on Linux x86-64</a><a href="#repl--prepare-a-probe-from-a-binary-without-headers">Prepare a probe from a binary without headers</a><a href="#repl--start-and-attach">Start and attach</a><a href="#repl--browse-a-local-c-target">Browse a local C++ target</a><a href="#repl--capture-local-syscalls-or-cpu-samples">Capture local syscalls or CPU samples</a><a href="#repl--preview-a-bulk-trace">Preview a bulk trace</a><a href="#repl--apply-and-remove-a-bulk-trace">Apply and remove a bulk trace</a><a href="#repl--read-and-scan-mapped-memory">Read and scan mapped memory</a><a href="#repl--preview-a-verified-function-entry">Preview a verified function entry</a><a href="#repl--probe-a-short-getter">Probe a short getter</a><a href="#repl--register-a-c-type-for-object-probing">Register a C++ type for object probing</a><a href="#repl--trace-object-lifetimes-and-state-in-a-prebuilt-binary">Trace object lifetimes and state in a prebuilt binary</a><a href="#repl--prepare-an-object-watch-for-method-snapshots">Prepare an object watch for method snapshots</a><a href="#repl--follow-logical-collection-entries-during-writes">Follow logical collection entries during writes</a><a href="#repl--trace-a-shape-through-image">Trace a Shape through Image</a><a href="#repl--trace-a-direct-integer-assignment">Trace a direct integer assignment</a><a href="#repl--trace-atomic-integer-updates">Trace atomic integer updates</a><a href="#repl--trace-individual-writes-to-a-nested-union">Trace individual writes to a nested union</a><a href="#repl--trace-writes-in-the-native-code-cache">Trace writes in the native code cache</a><a href="#repl--interceptor-upload">Interceptor upload</a><a href="#repl--collect-and-inspect">Collect and inspect</a><a href="#repl--analyze-in-c">Analyze in C++</a><a href="#repl--install-a-local-c-plugin-package">Install a local C++ plugin package</a><a href="#repl--load-local-c-plugins">Load local C++ plugins</a><a href="#repl--install-an-agent-extension-for-automatic-attachment">Install an agent extension for automatic attachment</a><a href="#repl--load-plugins-in-an-injected-agent">Load plugins in an injected agent</a><a href="#repl--cleanup-and-scripted-use">Cleanup and scripted use</a><a href="#repl--regenerate-the-grammar">Regenerate the grammar</a><a href="#repl--validation">Validation</a></div></details></li><li><details><summary>Event retention and SQLite storage</summary><div class="subnav"><a href="#storage">Overview</a><a href="#storage--configure-retained-history">Configure retained history</a><a href="#storage--save-or-drain">Save or drain</a><a href="#storage--sqlite-format-and-failure-handling">SQLite format and failure handling</a><a href="#storage--verification">Verification</a></div></details></li><li><details><summary>Shared context</summary><div class="subnav"><a href="#context">Overview</a><a href="#context--declare-and-use-state">Declare and use state</a><a href="#context--thread-propagation">Thread propagation</a><a href="#context--events-and-field-queries">Events and field queries</a><a href="#context--package-lineage">Package lineage</a><a href="#context--build-and-recording">Build and recording</a><a href="#context--acceptance-source">Acceptance source</a></div></details></li></ul></div>
 <div class="nav-group"><h2>Runnable examples</h2><ul><li><details><summary>Lesson 16: capture polymorphic items and their containers</summary><div class="subnav"><a href="#lesson-items">Overview</a><a href="#lesson-items--part-1-the-items-the-factory-returns">Part 1: the items the factory returns</a><a href="#lesson-items--part-2-the-item-a-method-is-called-on">Part 2: the item a method is called on</a><a href="#lesson-items--how-the-capture-works">How the capture works</a><a href="#lesson-items--things-to-try">Things to try</a></div></details></li><li><details><summary>Basic PRE and POST callbacks</summary><div class="subnav"><a href="#example-callback">Overview</a></div></details></li><li><details><summary>Legacy entry-only callback</summary><div class="subnav"><a href="#example-legacy">Overview</a></div></details></li><li><details><summary>Complete native C++ interceptor example</summary><div class="subnav"><a href="#example-interceptor">Overview</a><a href="#example-interceptor--targetcpp">target.cpp</a><a href="#example-interceptor--methodcpp">method.cpp</a><a href="#example-interceptor--free_functioncpp">free_function.cpp</a><a href="#example-interceptor--run-the-normal-cli">Run the normal CLI</a><a href="#example-interceptor--recorded-normal-cli-run">Recorded normal CLI run</a></div></details></li><li><details><summary>DWARF-typed class-instance arguments</summary><div class="subnav"><a href="#example-arguments">Overview</a><a href="#example-arguments--orderhpp-target-owned-optional-for-tracing">order.hpp (target-owned, optional for tracing)</a><a href="#example-arguments--targetcpp">target.cpp</a><a href="#example-arguments--interceptorcpp">interceptor.cpp</a><a href="#example-arguments--pointercpp">pointer.cpp</a><a href="#example-arguments--run-using-the-normal-cli">Run using the normal CLI</a><a href="#example-arguments--optional-headers-and-compile_commandsjson">Optional headers and compile_commands.json</a><a href="#example-arguments--supported-boundary">Supported boundary</a></div></details></li><li><details><summary>Generate and inject from the native C++ REPL</summary><div class="subnav"><a href="#example-prepared">Overview</a><a href="#example-prepared--1-generate-the-package-from-the-header">1. Generate the package from the header</a><a href="#example-prepared--2-validate-against-the-running-application">2. Validate against the running application</a><a href="#example-prepared--3-inject-and-collect">3. Inject and collect</a><a href="#example-prepared--4-restore-and-exit">4. Restore and exit</a><a href="#example-prepared--equivalent-native-c-api">Equivalent native C++ API</a><a href="#example-prepared--modes-and-scope-of-this-draft">Modes and scope of this draft</a><a href="#example-prepared--automatic-snapshots-for-returned-pointers">Automatic snapshots for returned pointers</a><a href="#example-prepared--handle-return-with-a-private-implementation-pointer">Handle return with a private implementation pointer</a><a href="#example-prepared--typed-method-example">Typed method example</a><a href="#example-prepared--typed-custom-event">Typed custom event</a></div></details></li><li><details><summary>Typed values in the native C++17 REPL</summary><div class="subnav"><a href="#example-values">Overview</a><a href="#example-values--1-user-defined-structs-and-classes">1. User-defined structs and classes</a><a href="#example-values--2-scalars-and-simple-standard-types">2. Scalars and simple standard types</a><a href="#example-values--3-sequence-containers-and-nested-records">3. Sequence containers and nested records</a><a href="#example-values--4-associative-containers">4. Associative containers</a><a href="#example-values--capture-boundaries">Capture boundaries</a></div></details></li><li><details><summary>Capture native C++ call stacks</summary><div class="subnav"><a href="#example-stack">Overview</a><a href="#example-stack--measured-overhead">Measured overhead</a><a href="#example-stack--optional-pre-arguments-and-post-return-value">Optional PRE arguments and POST return value</a><a href="#example-stack--read-names-modules-and-source-lines-inside-both-hooks">Read names, modules and source lines inside both hooks</a></div></details></li><li><details><summary>Shared context: one request, two probes, one worker</summary><div class="subnav"><a href="#example-shared">Overview</a><a href="#example-shared--run-manually">Run manually</a></div></details></li><li><details><summary>Local JIT tracing in the native REPL</summary><div class="subnav"><a href="#example-jit">Overview</a><a href="#example-jit--inspect-and-reload-interactively">Inspect and reload interactively</a></div></details></li><li><details><summary>Validation and benchmark notes</summary><div class="subnav"><a href="#validation">Overview</a><a href="#validation--reproduce-the-checks">Reproduce the checks</a><a href="#validation--pie-detour-regression-checks">PIE detour regression checks</a><a href="#validation--measured-tracing-overhead">Measured tracing overhead</a></div></details></li></ul></div>
 <div class="nav-group"><h2>Optional Python</h2><ul><li><details><summary>Optional Python client and console</summary><div class="subnav"><a href="#python-client">Overview</a><a href="#python-client--install-the-python-client">Install the Python client</a><a href="#python-client--python-client-api">Python client API</a><a href="#python-client--python-console-startup-and-server-commands">Python console startup and server commands</a><a href="#python-client--automate-tracing-with-python">Automate tracing with Python</a><a href="#python-client--trace-from-the-python-console">Trace from the Python console</a><a href="#python-client--use-the-generated-python-grpc-stub">Use the generated Python gRPC stub</a><a href="#python-client--test-the-python-client">Test the Python client</a><a href="#python-client--c17-branch-python-extensions">C++17 branch Python extensions</a></div></details></li><li><details><summary>Clang Tracer Python client</summary><div class="subnav"><a href="#python">Overview</a><a href="#python--install-and-open-the-console">Install and open the console</a><a href="#python--index-a-module-and-prepare-a-probe-without-application-headers">Index a module and prepare a probe without application headers</a><a href="#python--programmatic-tracing">Programmatic tracing</a><a href="#python--discover-functions-and-methods">Discover functions and methods</a><a href="#python--receiving-and-recording-traces">Receiving and recording traces</a><a href="#python--launch-status-and-shutdown">Launch, status and shutdown</a><a href="#python--console-commands">Console commands</a><a href="#python--development">Development</a></div></details></li><li><details><summary>Python API examples</summary><div class="subnav"><a href="#example-python">Overview</a><a href="#example-python--run-the-installed-examples">Run the installed examples</a><a href="#example-python--run-from-a-source-checkout">Run from a source checkout</a></div></details></li></ul></div>
 <div class="nav-group"><h2>References</h2><ul><li><details><summary>Command reference</summary><div class="subnav"><a href="#commands">Overview</a><a href="#commands--native-repl-startup">Native REPL startup</a><a href="#commands--native-repl-session-and-discovery-commands">Native REPL session and discovery commands</a><a href="#commands--native-repl-module-index-commands">Native REPL module index commands</a><a href="#commands--standalone-module-index-cli">Standalone module index CLI</a><a href="#commands--native-repl-probe-and-bulk-trace-commands">Native REPL probe and bulk trace commands</a><a href="#commands--native-repl-memory-and-c-commands">Native REPL memory and C++ commands</a><a href="#commands--native-repl-capture-and-recording-commands">Native REPL capture and recording commands</a><a href="#commands--native-server">Native server</a><a href="#commands--native-command-line-client">Native command-line client</a><a href="#commands--offline-probe-preparation">Offline probe preparation</a><a href="#commands--build-and-deployment-scripts">Build and deployment scripts</a></div></details></li><li><details><summary>Clang Tracer developer guide</summary><div class="subnav"><a href="#developer">Overview</a><a href="#developer--native-repl-c-client-api">Native REPL C++ client API</a><a href="#developer--native-c-module-index-api">Native C++ module index API</a><a href="#developer--agent-callback-api">Agent callback API</a><a href="#developer--grpc-control-api">gRPC control API</a><a href="#developer--build-and-validate-changes">Build and validate changes</a></div></details></li><li><details><summary>C++17 branch reference</summary><div class="subnav"><a href="#cpp17">Overview</a><a href="#cpp17--launch-control-and-profile-a-target">Launch, control, and profile a target</a><a href="#cpp17--inspect-and-change-target-memory">Inspect and change target memory</a><a href="#cpp17--capture-instructions-and-replay-them">Capture instructions and replay them</a><a href="#cpp17--probe-options-and-callback-methods">Probe options and callback methods</a><a href="#cpp17--additional-client-and-callback-apis">Additional client and callback APIs</a></div></details></li></ul></div>
@@ -393,6 +393,137 @@ before and after bytes. Nested unions also report their affected storage
 bytes, with typed samples for verified tagged alternatives. For keyed vectors and maps,
 <code>--mode logical-writes</code> also records changes at verified mutation and
 destruction boundaries. See the <a href="#repl--prepare-an-object-watch-for-method-snapshots">native REPL object watch walkthrough</a>.</p>
+<h3 id="user--observe-objects-and-prepare-custom-watch-plans">Observe objects and prepare custom watch plans</h3>
+<p>Object observation follows lifetimes and state, rather than only function arguments. Choose <strong>individual writes</strong> to observe admitted stores to a field, or <strong>method snapshots</strong> to compare receiver state at entry and return. A snapshot reports the net change during the call; it cannot show a change that was undone before return. Both paths report coverage gaps rather than guaranteeing every write in the process.</p>
+<p>Use matching REPL, server, and agent builds and the target's matching ELF/DWARF. The following uses the repository's <code>repl-object-plan-target</code> fixture, built with <code>cmake --build build --target repl-object-plan-target</code>. Start <code>./build/repl-object-plan-target</code> in another terminal, then prepare a reusable plan and attach to its PID:</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%object<span class="w"> </span>prepare<span class="w"> </span>demo::PlanRecord<span class="w"> </span>--module<span class="w"> </span>./build/repl-object-plan-target<span class="w"> </span>--field<span class="w"> </span>value<span class="w"> </span>--code<span class="w"> </span><span class="s2">&quot;demo::write_value(demo::PlanRecord &amp;)&quot;</span><span class="w"> </span>--backend<span class="w"> </span>code-cache<span class="w"> </span>--output<span class="w"> </span>./record-watch
+%attach<span class="w"> </span>PID
+%object<span class="w"> </span>preview<span class="w"> </span>--plan<span class="w"> </span>./record-watch
+%object<span class="w"> </span>start<span class="w"> </span>--plan<span class="w"> </span>./record-watch<span class="w"> </span>--stack-depth<span class="w"> </span><span class="m">4</span>
+%record<span class="w"> </span>object-writes.db<span class="w"> </span>--sqlite<span class="w"> </span>--name<span class="w"> </span>object.trace<span class="w"> </span>--probe<span class="w"> </span>WATCH_ID<span class="w"> </span>--count<span class="w"> </span><span class="m">2</span><span class="w"> </span>--timeout<span class="w"> </span><span class="m">30</span>
+</code></pre></div>
+<p>Replace <code>WATCH_ID</code> with the printed watch ID. Enter <code>g</code> in the target while recording: the fixture changes <code>value</code> from 17 to 23. Inspect coverage and restore the patches before detaching:</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%object<span class="w"> </span>status<span class="w"> </span>WATCH_ID
+%object<span class="w"> </span>stop<span class="w"> </span>WATCH_ID
+%detach
+%events<span class="w"> </span>open<span class="w"> </span>object-writes.db<span class="w"> </span>--as<span class="w"> </span>objects
+%events<span class="w"> </span>list<span class="w"> </span>objects
+%events<span class="w"> </span>show<span class="w"> </span>objects<span class="w"> </span>--index<span class="w"> </span><span class="m">1</span>
+%events<span class="w"> </span>stack<span class="w"> </span>objects<span class="w"> </span>--index<span class="w"> </span><span class="m">1</span>
+</code></pre></div>
+<p>Check <code>active=no</code> and <code>restoration_pending=no</code>; retry stop with the same ID if restoration is pending. Use fresh plan and recording paths for another run. Add <code>--no-values</code> to start a saved write plan when you need <code>FIELD_WRITTEN</code> events, including same-value stores, without value samples. <code>code-cache</code> executes supported stores in the target; the default <code>ptrace</code> backend steps verified stores for diagnostic use.</p>
+<h4 id="user--customize-fields-methods-and-collection-identity">Customize fields, methods, and collection identity</h4>
+<p>For your own class, supply its original headers and compilation database. This illustrative plan observes <code>Portfolio::rebalance()</code> and compares the selected collection fields, using stable element keys:</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%object<span class="w"> </span>prepare<span class="w"> </span>demo::Portfolio<span class="w"> </span>--module<span class="w"> </span>./portfolio<span class="w"> </span>--include<span class="w"> </span>./portfolio.hpp<span class="w"> </span>--policy<span class="w"> </span>./snapshot-policy.hpp<span class="w"> </span>--compdb<span class="w"> </span>./compile_commands.json<span class="w"> </span>--translation-unit<span class="w"> </span>./portfolio.cpp<span class="w"> </span>--on<span class="w"> </span><span class="s2">&quot;demo::Portfolio::rebalance()&quot;</span><span class="w"> </span>--field<span class="w"> </span>legs<span class="w"> </span>--field<span class="w"> </span>risk<span class="w"> </span>--key<span class="w"> </span><span class="nv">legs</span><span class="o">=</span>id<span class="w"> </span>--key<span class="w"> </span><span class="nv">risk</span><span class="o">=</span>key<span class="w"> </span>--synchronization<span class="w"> </span>thread-confined<span class="w"> </span>--output<span class="w"> </span>./portfolio-watch<span class="w"> </span>--emit-source<span class="w"> </span>./generated
+%object<span class="w"> </span>preview<span class="w"> </span>--plan<span class="w"> </span>./portfolio-watch
+%object<span class="w"> </span>start<span class="w"> </span>--plan<span class="w"> </span>./portfolio-watch
+</code></pre></div>
+<p>Run preview and start after attaching to the Portfolio process. Replace the example files, method, fields, and keys with your application's definitions. The policy header controls supported snapshot customization. Declare the actual synchronization: <code>thread-confined</code> for single-thread access, <code>caller-lock</code> when the caller holds the protecting lock across both samples, or <code>stable-at-boundaries</code> when the application guarantees safe samples. These declarations do not add locking. Configure <code>--max-elements</code>, <code>--max-string-bytes</code>, <code>--max-depth</code>, <code>--max-snapshot-bytes</code>, and <code>--max-instances</code> for your capture needs. Record and stop using the returned watch ID as above.</p>
+<p>Read <a href="#repl--trace-object-lifetimes-and-state-in-a-prebuilt-binary">the object observation walkthrough</a> and <a href="#repl--prepare-an-object-watch-for-method-snapshots">method snapshot details</a> for coverage, synchronization, and supported layouts.</p>
+<h3 id="user--register-custom-object-probes">Register custom object probes</h3>
+<p>Use matching REPL, server, and agent builds. See <a href="#repl--register-a-c-type-for-object-probing">the custom object-probe walkthrough</a> and <a href="#repl--live-code-replacement-on-linux-x86-64">live-update documentation</a> for complete options and supported target profiles.</p>
+<p>A custom object-probe package groups admitted lifetime hooks and typed method callbacks under one registration. Prepare from the original header and compile command; use a fresh output directory. Save this observer as <code>callbacks.cpp</code>:</p>
+<div class="code-block"><div class="code-bar"><span>cpp</span><button class="copy" type="button">Copy</button></div><pre><code><span class="k">template</span><span class="w"> </span><span class="o">&lt;&gt;</span><span class="w"> </span><span class="k">class</span><span class="w"> </span><span class="nc">Interceptor</span><span class="o">&lt;</span><span class="n">tracer</span><span class="o">::</span><span class="n">ResolvedSignature</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="k">public</span><span class="o">:</span>
+<span class="w">  </span><span class="kt">long</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="k">pre</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">Call</span><span class="o">&amp;</span><span class="w"> </span><span class="n">call</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="k">static_cast</span><span class="o">&lt;</span><span class="kt">long</span><span class="w"> </span><span class="kt">long</span><span class="o">&gt;</span><span class="p">(</span><span class="n">call</span><span class="p">.</span><span class="n">object_id</span><span class="p">());</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="w">  </span><span class="kt">long</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="k">post</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">Call</span><span class="o">&amp;</span><span class="w"> </span><span class="n">call</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="k">static_cast</span><span class="o">&lt;</span><span class="kt">long</span><span class="w"> </span><span class="kt">long</span><span class="o">&gt;</span><span class="p">(</span><span class="n">call</span><span class="p">.</span><span class="n">object_generation</span><span class="p">());</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">};</span>
+</code></pre></div>
+<p>For an application defining <code>demo::Counter::add(int)</code>:</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%object-probe<span class="w"> </span>prepare<span class="w"> </span>demo::Counter<span class="w"> </span>--include<span class="w"> </span>./counter.hpp<span class="w"> </span>--compdb<span class="w"> </span>./compile_commands.json<span class="w"> </span>--translation-unit<span class="w"> </span>./counter.cpp<span class="w"> </span>--method<span class="w"> </span><span class="s2">&quot;demo::Counter::add(int)&quot;</span><span class="w"> </span>--callbacks<span class="w"> </span>./callbacks.cpp<span class="w"> </span>--output<span class="w"> </span>./counter.object
+%attach<span class="w"> </span>PID
+%object-probe<span class="w"> </span>preview<span class="w"> </span>--package<span class="w"> </span>./counter.object
+%object-probe<span class="w"> </span>start<span class="w"> </span>--package<span class="w"> </span>./counter.object
+%object-probe<span class="w"> </span>status<span class="w"> </span>REGISTRATION_ID
+%object-probe<span class="w"> </span>stop<span class="w"> </span>REGISTRATION_ID
+</code></pre></div>
+<p>Use the printed registration ID for lifetime/write recording and the printed member probe IDs for ordinary PRE/POST events. A receiver whose lifetime was not verified can have provisional identity: <code>identity_verified()</code> is false and its object ID and generation are zero. Do not treat its address as proof of a complete lifetime. Correlate verified observations by registration, object ID, and generation. Check coverage and cleanup status before detaching.</p>
+<p>A write-only package can select a field and known writer with <code>--field value --code &quot;demo::Counter::set(int)&quot; --dwarf-writers</code>. With the original compilation database, omitting <code>--code</code> enables writer discovery. Preview the package before activation; combined method and writer patches must not overlap.</p>
+<h3 id="user--apply-live-updates">Apply live updates</h3>
+<p>On a build providing <code>%live</code>, live replacement changes admitted native function bodies in a running Linux x86-64 process. It requires build provenance: preserve original source files in a separate snapshot directory and create <code>clang-tracer-live.textproto</code> containing the source root, snapshot root, module path, module and compilation-database SHA-256 hashes, and each input path and original hash. Build affected units with debug information, <code>-O0 -fno-inline</code>, <code>-fpatchable-function-entry=16,0</code>, and a GNU ELF build ID. See the linked integration documentation for the manifest format and admission limits.</p>
+<p>Attach to that build, save a body edit, and select the matching database and manifest:</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%live<span class="w"> </span>preview<span class="w"> </span>./pricing.cpp<span class="w"> </span>--compdb<span class="w"> </span>./compile_commands.json<span class="w"> </span>--build<span class="w"> </span>./clang-tracer-live.textproto
+%live<span class="w"> </span>update<span class="w"> </span>./pricing.cpp<span class="w"> </span>--compdb<span class="w"> </span>./compile_commands.json<span class="w"> </span>--build<span class="w"> </span>./clang-tracer-live.textproto
+%live<span class="w"> </span>status
+%live<span class="w"> </span>revert
+</code></pre></div>
+<p>Preview lists exact entries and blockers; update previews and applies an admitted group. Check the application's behavior in the same process after publication. <code>%live revert</code> restores the parent revision and <code>%live revert 0</code> restores original build entries. <code>%live watch ./pricing.cpp</code> previews and applies saved edits continuously; Ctrl+C returns to the prompt. Watch mode applies changes automatically.</p>
+<p>The initial profile checks exact symbols in the main executable, entry bytes, source signatures, and ABI. Unsupported call coverage, static-storage changes, or incompatible layouts can require a rebuild. Reverted JIT generations remain mapped; <code>--retention-limit N</code> controls the retained-generation limit. Updating an observer alone uses <code>%probe reload PROBE_ID --callback hook.cpp</code>, which is separate from replacing application code.</p>
+<h4 id="user--update-existing-object-state">Update existing object state</h4>
+<p>Use explicit discovery to supply owned objects or guarded borrows to an update callback:</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%live<span class="w"> </span>update-data<span class="w"> </span>shared.cpp<span class="w"> </span>--discover-file<span class="w"> </span>discover.cpp<span class="w"> </span>--discover-function<span class="w"> </span>discover
+%live<span class="w"> </span>scan-heap<span class="w"> </span>--type<span class="w"> </span>example::Cache<span class="w"> </span>--type<span class="w"> </span>example::Account
+</code></pre></div>
+<p>The discovery function uses <code>clang_tracer::ObjectSink</code> from <code>&lt;clang_tracer/live.hpp&gt;</code>. Heap scan results are candidates with evidence, not automatically writable objects; unknown ownership remains read-only. Updates from scans reacquire the original owner. Changing layout requires application-managed storage, the exported managed registry, and a migration recipe; ordinary object observation does not enable migration. For a managed publication reporting <code>RESTORATION_REQUIRED</code>, use <code>%live recover</code> in the same server session and inspect recovery status.</p>
+<h3 id="user--mock-a-native-function">Mock a native function</h3>
+<p>On a live-update build, provide a fixture implementation with the supported callback interface and select the exact target signature:</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%live<span class="w"> </span>mock<span class="w"> </span><span class="s2">&quot;ProductStore::load(int)&quot;</span><span class="w"> </span>--file<span class="w"> </span>product_fixture.cpp<span class="w"> </span>--function<span class="w"> </span>load_fixture<span class="w"> </span>--fixture<span class="w"> </span>products.txt
+%live<span class="w"> </span>status
+%live<span class="w"> </span>revert
+</code></pre></div>
+<p>The source file must define <code>load_fixture</code> for the target's signature; <code>products.txt</code> supplies its fixture data. Follow the linked live-update documentation and matching build examples for callback types. Use <code>--bind &quot;ALIAS=SIGNATURE&quot;</code> to bind verified application helpers. Inside the mock, <code>ctx.original(...)</code> calls the unmocked implementation, including an active live update. <code>--recursion original</code> routes recursive calls through that implementation. Replacing a mock preserves the underlying implementation; a direct source update to the mocked callable replaces the mock and reports that change in preview. Exercise the application while the mock is active, then revert and verify the original behavior returns.</p>
+<h3 id="user--extend-the-client-and-agent-with-c-plugins">Extend the client and agent with C++ plugins</h3>
+<p>Use matching plugin-enabled REPL, server, and agent builds and check <code>%help</code> for installed commands. See <a href="#repl--load-local-c-plugins">the plugin walkthrough</a>. Client plugins execute in the native REPL; agent plugins execute inside the attached target. Load trusted source only.</p>
+<h4 id="user--load-a-client-plugin">Load a client plugin</h4>
+<p>Save this self-contained counter as <code>counter-plugin.cpp</code>. The installed SDK supplies the entry point and dispatches commands to one plugin instance:</p>
+<div class="code-block"><div class="code-bar"><span>cpp</span><button class="copy" type="button">Copy</button></div><pre><code><span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;clang_tracer_repl_plugin.hpp&quot;</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">tracer</span><span class="o">::</span><span class="n">repl</span><span class="o">::</span><span class="n">Plugin</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="k">public</span><span class="w"> </span><span class="n">tracer</span><span class="o">::</span><span class="n">repl</span><span class="o">::</span><span class="n">PluginInterface</span><span class="o">&lt;</span><span class="n">Plugin</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">count_</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="k">public</span><span class="o">:</span>
+<span class="w">  </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">tick</span><span class="p">()</span><span class="w"> </span><span class="k">noexcept</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="o">++</span><span class="n">count_</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">  </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">value</span><span class="p">()</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="k">noexcept</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">count_</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">  </span><span class="k">static</span><span class="w"> </span><span class="k">constexpr</span><span class="w"> </span><span class="n">Command</span><span class="w"> </span><span class="n">commands</span><span class="p">[]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="n">command</span><span class="o">&lt;&amp;</span><span class="n">Plugin</span><span class="o">::</span><span class="n">tick</span><span class="o">&gt;</span><span class="p">(</span><span class="s">&quot;tick&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;Increment the count.&quot;</span><span class="p">),</span>
+<span class="w">      </span><span class="n">command</span><span class="o">&lt;&amp;</span><span class="n">Plugin</span><span class="o">::</span><span class="n">value</span><span class="o">&gt;</span><span class="p">(</span><span class="s">&quot;value&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;Read the count.&quot;</span><span class="p">),</span>
+<span class="w">  </span><span class="p">};</span>
+<span class="p">};</span>
+</code></pre></div>
+<p>At the REPL prompt:</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%plugin<span class="w"> </span>load<span class="w"> </span>counter-plugin.cpp<span class="w"> </span>--as<span class="w"> </span>counter
+%plugin<span class="w"> </span>commands<span class="w"> </span>counter
+%plugin<span class="w"> </span>run<span class="w"> </span>counter<span class="w"> </span>tick
+%plugin<span class="w"> </span>run<span class="w"> </span>counter<span class="w"> </span>value
+%plugin<span class="w"> </span>reload<span class="w"> </span>counter
+%plugin<span class="w"> </span>run<span class="w"> </span>counter<span class="w"> </span>value
+</code></pre></div>
+<p>The first two runs return 1; the value after successful reload is 0. Reload creates fresh state for that plugin and leaves peer plugins active. A failed reload retains the previous generation. Commands take no arguments, are <code>noexcept</code>, and return a value convertible to <code>uint64_t</code>. Keep plugin state constant-initializable and trivially destructible. Plugin scopes resolve their own definitions; external runtime or other-plugin dependencies can fail with unresolved symbols, so begin with self-contained code like this example.</p>
+<p>Use <code>%plugin enable counter-plugin.cpp --as counter</code> to load now and on future launches; <code>%plugin disable counter</code> removes startup registration but does not unload the current instance. Enabled sources load before the prompt and startup scripts. Compiler inputs come from the local C++ profile, including <code>--cpp-arg</code> or <code>%cpp options compdb</code>. First compilation reports <code>compiled</code>; compatible later loads report <code>cache hit</code>. Cached code is reused, but each load gets fresh state.</p>
+<h4 id="user--load-an-agent-plugin">Load an agent plugin</h4>
+<p>For a local managed server, enable agent plugins before launching the REPL; replace the PID with your target's PID:</p>
+<div class="code-block"><div class="code-bar"><span>sh</span><button class="copy" type="button">Copy</button></div><pre><code><span class="nv">CLANG_TRACER_ALLOW_AGENT_PLUGINS</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>clang-tracer-repl<span class="w"> </span>--attach<span class="w"> </span><span class="m">12345</span>
+</code></pre></div>
+<p>For an external server, set that variable in the server's environment before starting it. This opt-in permits its clients to submit native plugin code to the target. On a supported Linux x86-64 target, use the same counter source:</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%plugin<span class="w"> </span>agent<span class="w"> </span>load<span class="w"> </span>counter-plugin.cpp<span class="w"> </span>--as<span class="w"> </span>target-counter
+%plugin<span class="w"> </span>agent<span class="w"> </span>run<span class="w"> </span>target-counter<span class="w"> </span>tick
+%plugin<span class="w"> </span>agent<span class="w"> </span>run<span class="w"> </span>target-counter<span class="w"> </span>value
+%plugin<span class="w"> </span>agent<span class="w"> </span>reload<span class="w"> </span>target-counter<span class="w"> </span>counter-plugin.cpp
+%plugin<span class="w"> </span>agent<span class="w"> </span>run<span class="w"> </span>target-counter<span class="w"> </span>value
+%detach
+</code></pre></div>
+<p>The counter lives in the target and is separate from the client counter. Successful reload resets its state while preserving peer plugins. Loading reports <code>REPL object</code> when it accepts a compatible client-compiled object, <code>cache hit</code> for the agent's cached object, or <code>compiled</code> for target compilation. The agent verifies compatibility before linking. Each attachment owns its instances; detach releases them while leaving compiled objects cached for reuse.</p>
+<h4 id="user--install-a-package-for-startup-and-attachment">Install a package for startup and attachment</h4>
+<p>For automatic loading, create <code>~/.local/share/clang-tracer/plugins/counter/</code> (or <code>$XDG_DATA_HOME/clang-tracer/plugins/counter/</code>) on the REPL machine. Copy the counter source to <code>src/plugin.cpp</code> and save this <code>plugin.toml</code> alongside <code>src/</code>:</p>
+<div class="code-block"><div class="code-bar"><span>toml</span><button class="copy" type="button">Copy</button></div><pre><code><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;counter&quot;</span>
+<span class="n">sdk</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span>
+
+<span class="k">[repl]</span>
+<span class="n">sources</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;src/plugin.cpp&quot;</span><span class="p">]</span>
+
+<span class="k">[agent]</span>
+<span class="n">sources</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;src/plugin.cpp&quot;</span><span class="p">]</span>
+
+<span class="k">[agent.target]</span>
+<span class="n">executable</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/absolute/path/to/application&quot;</span>
+</code></pre></div>
+<p>Set <code>executable</code> to the target host's exact executable path. The <code>[repl]</code> component loads at startup; with the server opt-in enabled, <code>[agent]</code> activates on a new matching attachment. Selecting an existing attachment preserves its state. Load failures identify the package and leave the attachment available. Omit a component section for a client-only or agent-only package.</p>
+<p>Each component supports optional <code>compile_commands</code>, <code>translation_unit</code>, and <code>extra_flags</code>. Package source paths are relative to the manifest; external agent compiler inputs must use target-host paths. Keep the package owned by the REPL user, disable group/other write permissions, and keep package symlinks within its directory.</p>
+<p>For public client C++ APIs, include declarations under the package's <code>include/</code> directory; users can include those headers at the prompt and call the package's definitions. Restart the REPL to replace packages with public headers. For an in-target return observer, see <a href="https://github.com/husams/clang-tracer/tree/c%2B%2B17/examples/repl-agent-observer">the agent observer example</a>: load it on attach before adding native probes, and reload the installed package with <code>%plugin agent reload NAME</code>.</p>
+<p>Client object caches live under <code>$XDG_CACHE_HOME/clang-tracer/repl/plugins</code> and target caches under <code>$XDG_CACHE_HOME/clang-tracer/agent/plugins</code>, defaulting to the corresponding paths below <code>~/.cache</code>. Enabled single-file client registrations live under <code>$XDG_CONFIG_HOME/clang-tracer/repl/enabled-plugins</code>, defaulting to <code>~/.config/clang-tracer/repl/enabled-plugins</code>.</p>
 <h3 id="user--related-documentation">Related documentation</h3>
 <ul>
 <li><a href="#commands">Command reference</a></li>
@@ -1120,6 +1251,14 @@ scripts/gcc85-build.sh<span class="w"> </span>/path/to/toolchain<span class="w">
 scripts/gcc85-build.sh<span class="w"> </span>/path/to/toolchain<span class="w"> </span>/var/tmp/clang-tracer-overlay<span class="w"> </span><span class="m">3</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--overlay-tests
 </code></pre></div>
+<p>Dependencies are reused when already installed for the same SDK profile and
+built from the pinned sources otherwise. <code>--deps-prefix DIR</code> chooses where they
+are installed and found (default <code>&lt;scratch&gt;/deps</code>), so one prefix can serve
+several scratch roots. To use an existing installation instead, pass
+<code>--grpc-prefix DIR</code> (gRPC with protobuf and <code>protoc</code>) and/or
+<code>--sqlite-prefix DIR</code>; those are used as they are, never built or changed, and
+must match the SDK. <code>--skip-tests</code> omits the CTest run and <code>--deps-only</code> stops once the
+dependencies are available.</p>
 <p>The first argument is the absolute SDK path; the second is the absolute scratch
 path. The third argument is optional and defaults to three jobs. CMake runs from the
 build host, not the SDK; set <code>TRACER_CMAKE</code> if it is not available under the
@@ -1138,10 +1277,17 @@ the selected host CTest path, and the OverlayFS test mode are recorded in
 when changing SDK, sysroot or loader so cached compiler/linker settings cannot
 silently retain the previous profile.</p>
 <p>Binaries and debug files are fixed for each tracing session. Rebuilding or
-replacing one requires a new session. Module lookup uses canonical mapped paths
-and ELF load offsets/ranges, without comparing filesystem device/inode numbers
-or polling binary timestamps. OverlayFS builds do not require a bind-mounted
-filesystem to satisfy file identity checks.</p>
+replacing one requires a new session. Mapping validation uses canonical paths,
+ELF load offsets/address ranges, and live build IDs. Without a build ID, it
+compares the loaded ELF header and immutable non-code sections; patch admission
+also checks live function bytes. File size and timestamps detect changes during
+inspection and invalidate symbol-listing snapshots. Device/inode values remain
+available as display/recording metadata and do not decide mapping validity.
+OverlayFS builds do not require staging on another filesystem.</p>
+<p>Shared-storage watches match the pathname of their pinned backing-file
+descriptor and the mapped file offset. Different hard-link names are distinct
+paths for this purpose. Private channels use their unique paths and address
+ranges; target allocations receive a unique memfd name per session/allocation.</p>
 <p>The script preserves the scratch tree and refuses to replace an existing gRPC
 checkout if it does not match the pin. It rejects dirty root and recursive
 submodule sources, allowing only its exact gRPC CPU fallback and protobuf
@@ -1666,6 +1812,127 @@ available. <code>--cpp-arg ARG</code> adds an interpreter compiler argument; rep
 include directories or other options. The prelude uses the build compiler's
 standard-library include roots. Installing the client alone does not install a
 Linux server or agent.</p>
+<h3 id="repl--live-code-replacement-on-linux-x86-64">Live code replacement on Linux x86-64</h3>
+<p>Use <code>%live preview FILE...</code> to inspect the exact native entries. <code>%live update FILE...</code>
+previews the same saved snapshot and automatically applies an admitted group.
+<code>%live status</code> lists active entries. <code>%live revert</code> restores the parent revision,
+and <code>%live revert 0</code> restores the build's original entries. Run
+<code>%live watch source/checkout.cpp source/pricer.cpp</code> to preview and apply saved
+edits as you test. Press Ctrl-C to return to the prompt.</p>
+<p>At build time preserve the original project files under a separate snapshot root.
+Record their relative paths and SHA-256 hashes alongside the executable and exact
+compilation database hashes in <code>clang-tracer-live.textproto</code>. Example shape:</p>
+<div class="code-block"><div class="code-bar"><span>textproto</span><button class="copy" type="button">Copy</button></div><pre><code>source_root: &quot;/project/src&quot;
+snapshot_root: &quot;/project/live-build-snapshot&quot;
+module: &quot;/project/build/app&quot;
+module_sha256: &quot;&lt;SHA-256 of app&gt;&quot;
+compilation_database_sha256: &quot;&lt;SHA-256 of compile_commands.json&gt;&quot;
+inputs { path: &quot;app.cpp&quot; sha256: &quot;&lt;SHA-256 of original app.cpp&gt;&quot; }
+inputs { path: &quot;pricing.hpp&quot; sha256: &quot;&lt;SHA-256 of original pricing.hpp&gt;&quot; }
+</code></pre></div>
+<p>Build affected units with debug information, <code>-O0 -fno-inline</code>,
+<code>-fpatchable-function-entry=16,0</code> and a GNU ELF build ID. The manifest must
+cover project dependencies. A new translation unit uses its recorded compile
+profile or inherits the common profile when the original units share one.
+The REPL can select the database and manifest using <code>--compdb FILE</code> and
+<code>--build FILE</code>.</p>
+<p>The initial profile admits exact symbols in the main executable and checks
+the original entry padding, source signature and lowered ABI before changing
+text. Related entries need a drained stack or the managed registry gate.
+Each submission publishes as a single group. When preview reports a blocker,
+submit independent edits separately. Optimized targets and automatic
+partitioning into independently publishable groups require further coverage
+verification.
+The ABI check covers SysV variadic bodies, fixed-argument Win64 bodies,
+non-trivial returns, and compiler-emitted lifecycle variants. An unresolved
+thunk, unproven alias, or missing call coverage requires a rebuild. Revisions
+keep JIT code mapped for escaped pointers and active calls.
+<code>--retention-limit N</code> sets the maximum number of retained JIT generations,
+including reverted generations. Reconnect to the same server to inspect
+the active revision.</p>
+<p>Empty string literals and function-local literal arrays can change with
+their code. A replacement that would expose a different address for a
+compiler-generated constant requires a rebuild. Changes to existing static
+storage or record ABI require a rebuild or a managed migration. The ABI check
+includes changes to copy, move, and destruction triviality.
+Translation-unit-local functions and data require an unambiguous ELF file
+marker and exact symbol. Live replacements use a patchable native entry.
+A body-only edit to an existing
+lambda can update already-registered callbacks when its source identity and
+capture ABI match the native entry, including which variables it captures
+and their order. A live update can replace a lambda and its private template
+instantiations together when every call stays within the enclosing function.
+If adding or removing a lambda shifts an existing capture layout to a
+different compiler symbol, the update must identify the closure at both positions.
+Changes to an escaping lambda with unverified identity or captures require
+a rebuild. The lifetime check can be inconclusive for calls through
+<code>std::function</code>, <code>std::ref</code>, range adaptors, and C callbacks.
+When a recorded unit initialized the
+standard streams, replacement units can reuse them. Existing native storage
+keeps its verified initialization and destruction code. Changes to module
+initialization or destruction require a rebuild. Native updates can use
+symbols exported by standard Linux runtime libraries in the target, including
+definitions interposed in its dynamic lookup scope.</p>
+<p><code>--payload-limit BYTES</code> sets the maximum serialized source and dependency
+snapshot sent to the target for a live operation. The default is 16 MiB.
+The REPL also enforces its 32 MiB limit on an outgoing RPC. Apply can reuse
+the preview's plan for the same input and revision after rechecking the
+saved files and executable mappings. Set <code>CLANG_TRACER_LIVE_COMPILE_JOBS</code>
+in the server environment to choose how many translation units it compiles
+concurrently. The default is half the reported hardware threads, rounded
+down with a minimum of one. Large submissions and a busy host may need a
+longer REPL <code>--timeout</code>.</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%live<span class="w"> </span>mock<span class="w"> </span><span class="s2">&quot;ProductStore::load(int)&quot;</span><span class="w"> </span>--file<span class="w"> </span>product_fixture.cpp<span class="w"> </span>--function<span class="w"> </span>load_fixture<span class="w"> </span>--fixture<span class="w"> </span>products.txt
+%live<span class="w"> </span>update-data<span class="w"> </span>shared.cpp<span class="w"> </span>--discover-file<span class="w"> </span>discover.cpp<span class="w"> </span>--discover-function<span class="w"> </span>discover
+%live<span class="w"> </span>scan-heap<span class="w"> </span>--type<span class="w"> </span>example::Cache<span class="w"> </span>--type<span class="w"> </span>example::Account
+%live<span class="w"> </span>update<span class="w"> </span>update.hpp<span class="w"> </span>--after-file<span class="w"> </span>after.cpp<span class="w"> </span>--after-function<span class="w"> </span>fixture::after<span class="w"> </span>--for-each<span class="w"> </span>Cache
+</code></pre></div>
+<p>Live mocks use exact signatures, with source-style or demangled qualifiers.
+<code>--bind &quot;ALIAS=SIGNATURE&quot;</code> binds a verified
+application callable. <code>ctx.original(...)</code> calls the unmocked implementation,
+including any active live update. Replacing a mock preserves that underlying
+implementation. A direct source edit to a mocked callable replaces the mock
+and reports this in the candidate row. Restoring an omitted callable to its
+built body restores that body behind an installed mock. Use <code>--recursion original</code>
+to route recursive calls through it. <code>%live revert</code> restores the previous dispatch.</p>
+<p>Object callbacks use a discovery function with <code>clang_tracer::ObjectSink</code>
+from <code>&lt;clang_tracer/live.hpp&gt;</code>. A callback may take shared owners, borrowed
+pointers, or per-type reference overloads. Discovery supplies each object's
+existing owner or guarded borrow. Heap scans report candidates and their
+evidence. With libstdc++ and matching DWARF, the scanner also discovers static
+<code>std::atomic&lt;std::shared_ptr&lt;T&gt;&gt;</code> roots and atomically loads their owners.
+Automatic discovery admits recognized <code>make_shared</code> storage for the exact
+pointee. Other owners can use an explicit discovery callback. For a write
+using <code>--from-scan ID ...</code>, the updater reacquires each candidate's original
+owner. Heap addresses with unknown ownership remain read-only.
+For <code>%live update-data</code>, <code>--module MODULE</code> filters against the build
+manifest's verified ELF. A different mapped module is rejected before
+the callback runs.</p>
+<p>Managed migration requires application storage using
+<code>&lt;tracer/live_migration.hpp&gt;</code> and an exported
+<code>extern &quot;C&quot; tracer::live::managed::Registry* clang_tracer_managed_registry_v1() noexcept</code>.
+Submit a C++ recipe that exports <code>clang_tracer_managed_update_v1</code>, with the
+after hook in its own file if needed. Use <code>%live update update.hpp --managed true</code>
+for a recipe with no hook. Include ABI-compatible application source changes
+and any new layout headers with the recipe to publish them together.
+Recipe and hook files can live outside the recorded source root. An
+application dependency outside that root requires a rebuild to update it.
+The hook may return <code>void</code> or <code>bool</code> and supports C++17.</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%live<span class="w"> </span>update<span class="w"> </span>update.hpp<span class="w"> </span>cache_code.cpp<span class="w"> </span>state_v2.hpp<span class="w"> </span>--after-file<span class="w"> </span>after.cpp<span class="w"> </span>--after-function<span class="w"> </span>fixture::after<span class="w"> </span>--for-each<span class="w"> </span>Cache
+</code></pre></div>
+<p>Acquire the registry gate in a stable caller before entering a function that
+will be replaced alongside the managed state. Pass the caller's
+<code>Registry::Access</code> into the replaceable function. The tool drains managed access,
+installs the verified native entries, and runs the hook against the migrated
+instances before releasing access.
+If the hook fails, the tool restores the prior entries and state under the
+same gate.</p>
+<p>If a managed publication reports <code>RESTORATION_REQUIRED</code>, run
+<code>%live recover</code> in the same server session. Recovery reconciles any pending
+result and restores verified entry bytes when necessary. The registry stays
+gated if any overwrite window contains bytes outside the two verified
+versions. A target stopped after an unverified native rollback, or a target
+whose server session was lost, requires external recovery.</p>
 <h3 id="repl--prepare-a-probe-from-a-binary-without-headers">Prepare a probe from a binary without headers</h3>
 <p>Build a module index from a Linux x86-64 ELF executable or shared library.
 Embedded DWARF and matching separate debug files provide type and signature
@@ -2009,6 +2276,85 @@ a 32-bit load from the receiver followed by <code>ret</code>. An existing ENDBR6
 stays in place and selects the trap path. The trap owns execution control for its session and
 restores its byte at stop, detach, or a thread or process creation stop.
 Remove a fallback probe before replacing it.</p>
+<h3 id="repl--register-a-c-type-for-object-probing">Register a C++ type for object probing</h3>
+<p><code>%object-probe</code> prepares a package, binds it to a Linux x86-64 process,
+and controls its admitted lifetime hooks and typed method observers under one
+registration ID. The target's ELF remains on disk and the tracer verifies live
+patch windows before activation.</p>
+<p>Prepare without an executable or an attachment. Pass the original header,
+compilation database and translation unit and select each exact method with
+<code>--method</code>. The package embeds the callback source and prepared method
+adapters. For example, an interceptor for a <code>Counter</code> method can use the
+registered lifetime ID alongside its ordinary call ID.</p>
+<div class="code-block"><div class="code-bar"><span>cpp</span><button class="copy" type="button">Copy</button></div><pre><code><span class="k">template</span><span class="w"> </span><span class="o">&lt;&gt;</span><span class="w"> </span><span class="k">class</span><span class="w"> </span><span class="nc">Interceptor</span><span class="o">&lt;</span><span class="n">tracer</span><span class="o">::</span><span class="n">ResolvedSignature</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="k">public</span><span class="o">:</span>
+<span class="w">  </span><span class="kt">long</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="k">pre</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">Call</span><span class="o">&amp;</span><span class="w"> </span><span class="n">call</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="k">static_cast</span><span class="o">&lt;</span><span class="kt">long</span><span class="w"> </span><span class="kt">long</span><span class="o">&gt;</span><span class="p">(</span><span class="n">call</span><span class="p">.</span><span class="n">object_id</span><span class="p">());</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="w">  </span><span class="kt">long</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="k">post</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">Call</span><span class="o">&amp;</span><span class="w"> </span><span class="n">call</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="k">static_cast</span><span class="o">&lt;</span><span class="kt">long</span><span class="w"> </span><span class="kt">long</span><span class="o">&gt;</span><span class="p">(</span><span class="n">call</span><span class="p">.</span><span class="n">object_generation</span><span class="p">());</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">};</span>
+</code></pre></div>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%object-probe<span class="w"> </span>prepare<span class="w"> </span>demo::Counter<span class="w"> </span>--include<span class="w"> </span>./counter.hpp<span class="w"> </span>--compdb<span class="w"> </span>./compile_commands.json<span class="w"> </span>--translation-unit<span class="w"> </span>./counter.cpp<span class="w"> </span>--method<span class="w"> </span><span class="s2">&quot;demo::Counter::add(int)&quot;</span><span class="w"> </span>--callbacks<span class="w"> </span>./callbacks.cpp<span class="w"> </span>--output<span class="w"> </span>./counter.object
+%attach<span class="w"> </span>PID
+%object-probe<span class="w"> </span>preview<span class="w"> </span>--package<span class="w"> </span>./counter.object
+%object-probe<span class="w"> </span>start<span class="w"> </span>--package<span class="w"> </span>./counter.object
+%object-probe<span class="w"> </span>status<span class="w"> </span>REGISTRATION_ID
+%object-probe<span class="w"> </span>stop<span class="w"> </span>REGISTRATION_ID
+</code></pre></div>
+<p>The preview shows verified lifecycle and method patch windows. A method-only
+package can use the attached process's uniquely mapped method image. Use
+<code>--method-module</code> to disambiguate. Start revalidates the binding, stages the
+patches, and admits callbacks only after publication. Record lifetime and write events with <code>%record --probe REGISTRATION_ID</code>. Start also prints the member probe IDs for selecting normal
+PRE and POST events. Callback failures record the call ID and phase.
+Use <code>--callback-errors only</code> or <code>--callback-errors exclude</code> with <code>%collect</code>,
+<code>%record</code>, or <code>%events open</code>. C++ analysis can read
+<code>Event::callback_error()</code> and <code>Event::callback_error_message()</code>.
+Each callback sees the object ID and generation copied at entry. Borrowed receiver views follow the usual interceptor lifetime.</p>
+<p>For individual writes, prepare a field and its writer. Omit <code>--code</code> to use
+writer discovery from the original compilation database. When the writer is
+already known, select it explicitly and use <code>--dwarf-writers</code> for a write-only
+package prepared without a compilation database.</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%object-probe<span class="w"> </span>prepare<span class="w"> </span>demo::Counter<span class="w"> </span>--field<span class="w"> </span>value<span class="w"> </span>--code<span class="w"> </span><span class="s2">&quot;demo::Counter::set(int)&quot;</span><span class="w"> </span>--dwarf-writers<span class="w"> </span>--output<span class="w"> </span>./writes.object
+%object-probe<span class="w"> </span>preview<span class="w"> </span>--package<span class="w"> </span>./writes.object
+%object-probe<span class="w"> </span>start<span class="w"> </span>--package<span class="w"> </span>./writes.object
+</code></pre></div>
+<p>For a writer in an attached shared library, pass its mapped name with
+<code>--module</code>. <code>--follow-calls</code> is available for write-only packages.
+Use <code>--first-seen</code> with a write-only package and a standalone executable writer. Follow the
+coverage counts in status when the writer reaches native callees. A combined
+registration requires disjoint method and writer patch windows. A verified
+identity requires evidence that the constructor built a complete object and
+that the watch covers its destruction. Evidence can come from a distinct
+complete-constructor entry, a verified caller outside constructors and destructors,
+or a call through a verified PLT entry for the complete-constructor symbol.
+Caller proof for a shared constructor entry relies on debug information that
+describes inlined construction. <code>__attribute__((nodebug))</code>,
+<code>-gno-inline-line-tables</code>, or link-time inlining from a unit without debug
+information can hide an initializer and make base-subobject construction
+appear complete.
+An incomplete application type in the caller's debug information can leave
+identity provisional, including when a pointer could refer to a derived heap
+object. For application classes, caller proof ignores standard C++ library
+records whose DWARF shows only built-in or standard-library template arguments.
+It also ignores pointers and references to the glibc records for <code>FILE</code>, <code>tm</code>
+and <code>DIR</code>. Incomplete template argument information keeps identity provisional.
+A receiver can have provisional identity when construction predates attach
+or bypasses a watched constructor, as with a trivial copy. Ambiguous
+construction, duplicate lifetime symbols and incomplete destructor coverage
+can also leave identity provisional. Its callback reports
+<code>identity_verified() == false</code> with zero object ID and generation. An observed
+destructor in a registration with methods can report zero-ID teardown for a
+receiver already observed with provisional identity at the same address.
+Duplicate lifetime checks use the application mappings present at binding.
+An unreadable mapped application file leaves coverage incomplete. A fresh
+binding evaluates libraries the target loaded later.
+Live method and code-cache events arrive independently. JSON export orders
+each grouped registration's retained events by monotonic observation time.
+The event sequence remains the server's arrival cursor. Correlate verified
+observations by registration, object ID and generation.
+Choose a fresh output path for each preparation.</p>
 <h3 id="repl--trace-object-lifetimes-and-state-in-a-prebuilt-binary">Trace object lifetimes and state in a prebuilt binary</h3>
 <p>Use the full Linux build on x86-64 or AArch64, with the REPL, server, and agent from the same build. Supply the existing ELF and its matching DWARF, either embedded or in a matching separate debug file. The watch installs patches in process memory. The application executable and source files stay intact.</p>
 <p>On <code>c++17</code>, use that branch's preparation tools to generate typed adapters and object watch plans from the existing binary and its original compile commands. Regenerate typed adapters created on <code>main</code> before preparing a watch on <code>c++17</code>.</p>
@@ -2042,6 +2388,19 @@ sh<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;printf
 %events<span class="w"> </span>stack<span class="w"> </span>saved<span class="w"> </span>--index<span class="w"> </span><span class="m">1</span>
 </code></pre></div>
 <p>Stop restores the verified instruction bytes. Check <code>active=no</code> and <code>restoration_pending=no</code> before detaching. If restoration is pending, retry stop using the same ID. Replay works after detach, including in a fresh REPL. Enter <code>q</code> in the first terminal to exit the fixture. To repeat with <code>--no-values</code>, restart the fixture, reuse the write plan, add the flag to <code>%object start</code>, and use a fresh recording path. The two events are still creation and a store, with the store shown as <code>FIELD_WRITTEN</code>.</p>
+<p>For a writer in a shared library, prepare against both the main executable and
+the library that contains the writer. A lone <code>--module</code> path that names a shared
+object is not an executable and is rejected. For example:</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%object<span class="w"> </span>prepare<span class="w"> </span>demo::Record<span class="w"> </span>--executable<span class="w"> </span>./build/app<span class="w"> </span>--module<span class="w"> </span>./build/libdemo.so<span class="w"> </span>--field<span class="w"> </span>value<span class="w"> </span>--code<span class="w"> </span><span class="s2">&quot;demo::write_value(demo::Record &amp;)&quot;</span><span class="w"> </span>--backend<span class="w"> </span>code-cache<span class="w"> </span>--follow-calls<span class="w"> </span>--output<span class="w"> </span>./record-watch
+</code></pre></div>
+<p>Use the same <code>--module</code> when starting or previewing the plan if the mapped
+library has a different path. Without <code>--module</code>, writer lookup first checks
+the main executable; if the writer is found in exactly one mapped shared ELF,
+the error names that module and the option to use. Shared writers with calls
+need <code>--follow-calls</code>; the diagnostic names the selected module and the flag.
+Call following is available only for standalone writes: it cannot be combined
+with owner or collection scopes, <code>--caller</code>, <code>--writer-entry</code>, or <code>--first-seen</code>
+unless first-seen has a supported structured value layout.</p>
 <h4 id="repl--read-coverage-and-cleanup-status">Read coverage and cleanup status</h4>
 <ul>
 <li>Review the resolved fields, writer sites, and binding status in preview. Preview is read-only. A same-build restart resolves fresh live addresses. A compatible rebuild requires verifiable field and code bindings. Missing or mismatched evidence can prevent a watch from starting.</li>
@@ -2227,7 +2586,9 @@ window. Short leaves can use verified alignment padding. A symbol export
 alone allows a fallback to direct call sites when no entry window verifies.
 Preview and status report partial coverage for direct call sites alone.
 For a shared writer, <code>--module</code> takes a unique mapped ELF basename or
-absolute path. A shared leaf that uses an entry redirect needs a verified
+absolute path. A shared writer containing calls requires <code>--follow-calls</code>;
+otherwise code-cache setup rejects it before translating the writer and tells
+you which module and flag to use. A shared leaf that uses an entry redirect needs a verified
 nonfaulting overwrite window.
 Native watches capture virtual destruction at the destructor entry, including
 deleting destructors that inline the complete destructor. A watch fails to
@@ -2316,6 +2677,21 @@ watched address and lifetime even when the callee receives it through an
 alias. Replayed stores include the mapped ELF identity and the runtime
 module generation. A shared library can load after arming and unload
 between calls.</p>
+<p>On x86-64, a verified PLT stub can lead to a leaf translation in any bound ELF.
+In-place redirects for a nonleaf callee reached through a PLT call are limited
+to the ELF that owns that PLT stub and the process executable. Nonleaf callees
+with dynamically exported weak symbols run natively to keep process-wide
+runtime entry points safe for the tracer and other callers. These scope limits
+produce explicit coverage gaps. An unbound lazy PLT
+slot also runs natively and produces one explicit gap for that slot while the
+loader binds it; subsequent calls use the current GOT target. These lazy-binding
+gaps have their own diagnostic. Other dispatch gaps are reported once per call
+site and reason. <code>runtime_gap_hits</code> tracks every occurrence, and
+<code>helper_reentries</code> counts tracer-internal traffic. On AArch64, PLT stubs that
+cannot be translated produce coverage gaps.</p>
+<p>On x86-64, an entry redirect requires a verified five-byte nonfaulting patch
+window. A trivial one-store constructor in a library can have a shorter entry,
+which prevents the watch from starting.</p>
 <p>Use <code>--runtime-limit N</code> to bound nested scope discovery and retained translations. The default is
 1,024. When a callee exceeds the limit or its code cannot be verified and
 translated, the original call runs and the watch records a coverage gap.
@@ -2421,6 +2797,15 @@ repeatable <code>--compile-option</code>. Headers and compilation-database paths
 the server host. Source files are limited to 4 MiB. Uploaded interceptors are
 compiled by the server/agent; local REPL variables, pointers and lambdas are not
 implicitly transferred into the target.</p>
+<p>For non-prepared probes using <code>--include</code> with a compilation database, the
+selected command's compiler options now apply to the callback as well as the
+header. This includes warning policies: a legacy callback that previously
+compiled may fail with donor flags such as <code>-Wextra -Werror</code> if it has an unused
+parameter. Omit an unused parameter's name (<code>const TraceContext&amp;</code>) or explicitly
+use it (<code>(void)context;</code>). To relax that specific policy for a probe, append
+<code>--compile-option -Wno-error=unused-parameter</code>; explicit options follow the
+database options. Generated interpreter initialization does not change the
+callback's warning policy.</p>
 <h4 id="repl--probe-working-directory">Probe working directory</h4>
 <p>Add <code>--cwd DIRECTORY</code> to any <code>%probe</code> subcommand or to <code>%probes</code>.
 Relative paths for that command use the specified directory on the REPL host.
@@ -3424,6 +3809,11 @@ and <code>--startup</code> files.</p>
 <div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%module<span class="w"> </span>index<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--file<span class="w"> </span>./app
 </code></pre></div>
+<p>In an interactive terminal the editor history persists in
+<code>$HOME/.clang-tracer-history</code> (mode 0600) and reloads at startup. Each accepted
+entry is merged into the file as it is entered, so concurrent REPLs share it and
+a crash loses nothing; a multiline cell stays one entry. Piped input and an
+unset or empty <code>HOME</code> leave history in memory only.</p>
 <p>Every submitted C++ cell is checked in a disposable <code>clang-tracer-repl-check</code>
 process before the live interpreter parses or executes it. The checker parses
 the accepted cells in their original order without executing them, preserving
@@ -3447,6 +3837,154 @@ cannot be rolled back, and arbitrary native loops or crashes do not have
 guaranteed interruption. Ctrl+C also cancels tracing operations.
 Completion covers command names and local C++ declarations/members. Dynamic
 completion of remote tracing symbols remains follow-up work.</p>
+<h3 id="repl--install-a-local-c-plugin-package">Install a local C++ plugin package</h3>
+<p>Copy the trusted <code>examples/repl-public-plugin</code> directory to
+<code>~/.local/share/clang-tracer/plugins/my-api/</code>. If <code>XDG_DATA_HOME</code> is set,
+use <code>$XDG_DATA_HOME/clang-tracer/plugins/my-api/</code>. Keep <code>plugin.toml</code>,
+<code>src/</code>, and <code>include/</code> together. Launch <code>clang-tracer-repl</code> normally and
+enter C++ at the prompt.</p>
+<div class="code-block"><div class="code-bar"><span>cpp</span><button class="copy" type="button">Copy</button></div><pre><code><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;my_api/my_type.hpp&gt;</span>
+<span class="n">my_api</span><span class="o">::</span><span class="n">my_instance</span><span class="p">.</span><span class="n">add</span><span class="p">(</span><span class="mi">3</span><span class="p">);</span>
+<span class="n">my_api</span><span class="o">::</span><span class="n">MyType</span><span class="w"> </span><span class="n">local</span><span class="p">{};</span>
+<span class="n">local</span><span class="p">.</span><span class="n">add</span><span class="p">(</span><span class="mi">5</span><span class="p">);</span>
+<span class="n">std</span><span class="o">::</span><span class="n">cout</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="n">my_api</span><span class="o">::</span><span class="n">my_instance</span><span class="p">.</span><span class="n">count</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="s">&quot; &quot;</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="n">local</span><span class="p">.</span><span class="n">count</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">endl</span><span class="p">;</span>
+</code></pre></div>
+<p>The first startup reports <code>compiled</code> and prints <code>3 5</code> for the sample.
+A fresh startup with the same compiler inputs reports <code>cache hit</code> and
+starts with fresh plugin state. The REPL loads the manifest’s <code>[repl]</code>
+<code>sources</code> into one private JIT scope. Its public <code>include/</code> directory
+provides C++ declarations to the REPL and its checker. External definitions
+declared in those headers can link to the plugin’s code and storage.
+The class in <code>src/plugin.cpp</code> registers commands and stays in the plugin scope.</p>
+<p>The package manifest supports <code>id</code>, <code>[repl]</code> <code>sources</code>, and optional
+<code>compile_commands</code>, <code>translation_unit</code>, and <code>extra_flags</code> in that section.
+Paths to sources and compilation databases are relative to the manifest
+unless a database path is absolute. Keep the entire package owned by the REPL
+user, with group and other write permissions disabled. Package symlinks must
+resolve within the package. Use trusted paths for external compiler inputs.
+Restart the REPL to replace a package with public headers. A live C++ expression can retain addresses from that
+generation.</p>
+<h3 id="repl--load-local-c-plugins">Load local C++ plugins</h3>
+<p>Load a trusted C++ source file with <code>%plugin load FILE --as NAME</code>. The REPL
+compiles it with its current local C++ compiler profile, so include paths and
+defines can come from <code>--cpp-arg</code> or <code>%cpp options compdb</code>. Use
+<code>%plugin enable FILE --as NAME</code> to load a plugin now and on future launches.</p>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%plugin<span class="w"> </span><span class="nb">enable</span><span class="w"> </span>examples/jit-plugin-globals/plugin_a.cpp<span class="w"> </span>--as<span class="w"> </span>a
+%plugin<span class="w"> </span><span class="nb">enable</span><span class="w"> </span>examples/jit-plugin-globals/plugin_b.cpp<span class="w"> </span>--as<span class="w"> </span>b
+%plugin<span class="w"> </span>commands<span class="w"> </span>a
+%plugin<span class="w"> </span>run<span class="w"> </span>a<span class="w"> </span>tick
+%plugin<span class="w"> </span>run<span class="w"> </span>b<span class="w"> </span>tick
+%plugin<span class="w"> </span>reload<span class="w"> </span>a
+%plugin<span class="w"> </span>run<span class="w"> </span>a<span class="w"> </span>value
+%plugin<span class="w"> </span>run<span class="w"> </span>b<span class="w"> </span>value
+</code></pre></div>
+<p>Enabled plugins load before the prompt or any <code>--startup</code> script. The REPL
+saves absolute source paths under <code>$XDG_CONFIG_HOME/clang-tracer/repl/enabled-plugins</code>
+or <code>~/.config/clang-tracer/repl/enabled-plugins</code>. Startup uses the launcher's
+C++ options, including any <code>--cpp-arg</code> flags. A plugin that fails to load is
+reported by name and startup continues. <code>%plugin disable NAME</code> removes its
+startup registration and the current session can keep using the loaded plugin.
+Use <code>%plugin load FILE --as NAME</code> for a single session.</p>
+<p>The first load reports <code>compiled</code>. A later load of the same source and compiler
+inputs reports <code>cache hit</code>. The REPL preprocesses the source to check the
+effective inputs, then reuses native code generation on a hit. Cached objects
+live under <code>$XDG_CACHE_HOME/clang-tracer/repl/plugins</code> or
+<code>~/.cache/clang-tracer/repl/plugins</code> when XDG_CACHE_HOME is unset. Each load
+links into a fresh JIT scope. A successful reload resets that plugin's globals
+and leaves peer plugins active. A failed reload keeps the prior generation.</p>
+<p>Include <code>clang_tracer_repl_plugin.hpp</code> and define <code>tracer::repl::Plugin</code> in
+one C++ source file. List your commands in a static array. The SDK supplies
+the entry point and dispatches each command to the same instance of your
+class.</p>
+<div class="code-block"><div class="code-bar"><span>cpp</span><button class="copy" type="button">Copy</button></div><pre><code><span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;clang_tracer_repl_plugin.hpp&quot;</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">tracer</span><span class="o">::</span><span class="n">repl</span><span class="o">::</span><span class="n">Plugin</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="k">public</span><span class="w"> </span><span class="n">tracer</span><span class="o">::</span><span class="n">repl</span><span class="o">::</span><span class="n">PluginInterface</span><span class="o">&lt;</span><span class="n">Plugin</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">count_</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+
+<span class="k">public</span><span class="o">:</span>
+<span class="w">  </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">tick</span><span class="p">()</span><span class="w"> </span><span class="k">noexcept</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="o">++</span><span class="n">count_</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">  </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">value</span><span class="p">()</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="k">noexcept</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">count_</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+
+<span class="w">  </span><span class="k">static</span><span class="w"> </span><span class="k">constexpr</span><span class="w"> </span><span class="n">Command</span><span class="w"> </span><span class="n">commands</span><span class="p">[]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="n">command</span><span class="o">&lt;&amp;</span><span class="n">Plugin</span><span class="o">::</span><span class="n">tick</span><span class="o">&gt;</span><span class="p">(</span><span class="s">&quot;tick&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;Increment the count.&quot;</span><span class="p">),</span>
+<span class="w">      </span><span class="n">command</span><span class="o">&lt;&amp;</span><span class="n">Plugin</span><span class="o">::</span><span class="n">value</span><span class="o">&gt;</span><span class="p">(</span><span class="s">&quot;value&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;Read the count.&quot;</span><span class="p">),</span>
+<span class="w">  </span><span class="p">};</span>
+<span class="p">};</span>
+</code></pre></div>
+<p>Commands are <code>noexcept</code>, take no arguments, and return a value convertible
+to <code>uint64_t</code>. Use constant initialization and trivial destruction for plugin
+state. Each load creates a fresh instance. Existing plugins using the V1 C entry point
+in <code>clang_tracer_repl_plugin.h</code> can still load.</p>
+<p>A plugin JIT scope resolves definitions from its own compiled sources. Calls
+that require symbols from libc, the C++ runtime, the host process, or another
+plugin fail with the unresolved symbol names. Header-only C++ operations work
+when they generate self-contained code. Mark local helpers <code>noexcept</code>. A
+potentially throwing call at <code>-O0</code> can introduce C++ exception runtime symbols.
+For code that requires no exception handling, <code>-fno-exceptions</code> can avoid those
+references. Optimization can also inline a helper. Use trusted plugin sources
+because they execute native code in the REPL or target process.</p>
+<h3 id="repl--install-an-agent-extension-for-automatic-attachment">Install an agent extension for automatic attachment</h3>
+<p>On the REPL machine, copy a trusted extension package to
+<code>~/.local/share/clang-tracer/plugins/agent-counter/</code> (or the corresponding
+<code>XDG_DATA_HOME</code> path). Save <code>examples/jit-plugin-globals/plugin_b.cpp</code> as
+<code>src/plugin.cpp</code> in that package. Put the following <code>plugin.toml</code> at its
+root and set the executable to the exact absolute path reported by the
+target's Linux host.</p>
+<div class="code-block"><div class="code-bar"><span>toml</span><button class="copy" type="button">Copy</button></div><pre><code><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;agent-counter&quot;</span>
+<span class="n">sdk</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span>
+
+<span class="k">[agent]</span>
+<span class="n">sources</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;src/plugin.cpp&quot;</span><span class="p">]</span>
+
+<span class="k">[agent.target]</span>
+<span class="n">executable</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/absolute/path/to/application&quot;</span>
+</code></pre></div>
+<p>Start the server with <code>CLANG_TRACER_ALLOW_AGENT_PLUGINS=1</code> in its environment
+and attach to the application as usual. A new matching attachment activates
+the package before returning to the REPL prompt. Selecting an existing
+attachment preserves its plugin state. Approval or load failures identify the
+package and leave the attachment available.</p>
+<p>Single-file extensions use the existing REPL-object compatibility check.
+The agent compiles from source on a cache miss. Multi-file packages send
+their translation units and bundled headers for compilation in one target JIT
+scope. Optional <code>compile_commands</code>, <code>translation_unit</code>, and <code>extra_flags</code>
+under <code>[agent]</code> apply to target compilation. Use target-host paths for
+external build inputs. The agent caches the resulting objects and links a fresh
+instance for each matching attachment.</p>
+<p>The latency extension in <code>examples/repl-agent-observer</code> registers its return
+observer on attach. Add native probes after the observer loads. Reload an
+installed observer with <code>%plugin agent reload NAME</code>. The manifest supplies
+the sources and compiler settings for the new generation.</p>
+<h3 id="repl--load-plugins-in-an-injected-agent">Load plugins in an injected agent</h3>
+<p>Start a local managed server with agent plugins enabled and attach to a Linux
+x86-64 target. For a remote REPL, set the same environment variable on the
+server before starting it.</p>
+<div class="code-block"><div class="code-bar"><span>sh</span><button class="copy" type="button">Copy</button></div><pre><code><span class="nv">CLANG_TRACER_ALLOW_AGENT_PLUGINS</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>clang-tracer-repl<span class="w"> </span>--attach<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$pid</span><span class="s2">&quot;</span>
+</code></pre></div>
+<div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%plugin<span class="w"> </span>agent<span class="w"> </span>load<span class="w"> </span>examples/jit-plugin-globals/plugin_a.cpp<span class="w"> </span>--as<span class="w"> </span>a
+%plugin<span class="w"> </span>agent<span class="w"> </span>load<span class="w"> </span>examples/jit-plugin-globals/plugin_b.cpp<span class="w"> </span>--as<span class="w"> </span>b
+%plugin<span class="w"> </span>agent<span class="w"> </span>run<span class="w"> </span>a<span class="w"> </span>tick
+%plugin<span class="w"> </span>agent<span class="w"> </span>run<span class="w"> </span>b<span class="w"> </span>tick
+%plugin<span class="w"> </span>agent<span class="w"> </span>reload<span class="w"> </span>a<span class="w"> </span>examples/jit-plugin-globals/plugin_a.cpp
+%plugin<span class="w"> </span>agent<span class="w"> </span>run<span class="w"> </span>a<span class="w"> </span>value
+%plugin<span class="w"> </span>agent<span class="w"> </span>run<span class="w"> </span>b<span class="w"> </span>value
+</code></pre></div>
+<p>On a Linux x86-64 REPL, loading or reloading automatically offers an object
+from the REPL cache or compiles one if needed. The agent checks the compiler
+profile, target and CPU, resolved source and headers, and object integrity
+before linking an offer. It reports <code>REPL object</code> when it accepts the offer,
+<code>cache hit</code> when it uses its own cache, or <code>compiled</code> when it compiles the
+source in the target. The same commands handle all three cases.</p>
+<p>The same V1 command descriptor works in both runtimes. The agent supplies
+the SDK header and resolves other includes from its compiler environment.
+The target's cache is under
+<code>$XDG_CACHE_HOME/clang-tracer/agent/plugins</code> or
+<code>~/.cache/clang-tracer/agent/plugins</code> when XDG_CACHE_HOME is unset.</p>
+<p>The server opt-in authorizes its clients to supply trusted plugin source and
+objects that execute with the target process's permissions. Each attachment
+owns its plugin instances. A reload links a fresh generation of the named plugin and
+preserves its peers. Detaching releases the attachment's instances, and the
+compiled objects remain available for reuse.</p>
 <h3 id="repl--cleanup-and-scripted-use">Cleanup and scripted use</h3>
 <div class="code-block"><div class="code-bar"><span>bash</span><button class="copy" type="button">Copy</button></div><pre><code>%probe<span class="w"> </span>remove<span class="w"> </span><span class="m">1</span>
 %detach
@@ -8160,12 +8698,17 @@ ctest<span class="w"> </span>--test-dir<span class="w"> </span>build-rhel<span c
 <h4 id="command-reference--command-object-prepare">Command object prepare</h4>
 <p>Save a reusable object definition and verified ELF bindings without attaching. Use --on METHOD, --include HEADER, and --synchronization for a typed method watch.</p>
 <p><strong>Usage</strong></p>
-<pre class="syntax"><code>%object prepare TYPE --module ELF --field FIELD --code SELECTOR --output DIRECTORY
+<pre class="syntax"><code>%object prepare TYPE [--executable APP] --module ELF --field FIELD --code SELECTOR --output DIRECTORY
 </code></pre>
 <p><strong>Example</strong></p>
 <pre class="syntax"><code>%object prepare demo::PlanRecord --module ./build/repl-object-plan-target --field value --code &quot;demo::write_value(demo::PlanRecord &amp;)&quot; --backend code-cache --output record-watch
 </code></pre>
-<p>Use a fresh plan directory for prepare. Preview and start accept a saved plan; method plans use <code>--on METHOD --include HEADER --policy HEADER --synchronization MODE</code> at preparation.</p>
+<p>For a shared-library writer, pass the process executable as <code>--executable APP</code>
+and the writer library as <code>--module LIB</code>. Add <code>--follow-calls</code> for a non-leaf
+shared writer using standalone code-cache write capture.</p>
+<pre class="syntax"><code>%object prepare demo::Record --executable ./app --module ./libdemo.so --field value --code &quot;demo::write_value(demo::Record &amp;)&quot; --backend code-cache --follow-calls --output record-watch
+</code></pre>
+<p>Use a fresh plan directory for prepare. Preview and start accept a saved plan. At preparation, method plans use <code>--on METHOD --include HEADER --policy HEADER --synchronization MODE</code>.</p>
 <p><a href="#tutorials--lesson-17-trace-writes-without-rebuilding-the-target">Object-watch lesson</a> and <a href="#advanced--watch-logical-state-at-method-boundaries">method snapshots</a>.</p>
 <h4 id="command-reference--command-object-preview">Command object preview</h4>
 <p>Resolve the plan against the selected process and check live code bytes without installing patches.</p>
@@ -8178,6 +8721,13 @@ ctest<span class="w"> </span>--test-dir<span class="w"> </span>build-rhel<span c
 <p>Use a fresh plan directory for prepare. Preview and start accept a saved plan; method plans use <code>--on METHOD --include HEADER --policy HEADER --synchronization MODE</code> at preparation.</p>
 <p><a href="#tutorials--lesson-17-trace-writes-without-rebuilding-the-target">Object-watch lesson</a> and <a href="#advanced--watch-logical-state-at-method-boundaries">method snapshots</a>.</p>
 <h4 id="command-reference--command-object-start">Command object start</h4>
+<p><code>--follow-calls</code> requires standalone code-cache write capture. It is unavailable
+for owner scopes, logical collections, <code>--caller</code>, and <code>--writer-entry</code>. With
+<code>--first-seen</code>, it requires a supported structured value layout.</p>
+<p>On x86-64, an unbound lazy PLT slot runs natively and emits a distinct coverage
+gap. <code>runtime_gap_hits</code> counts dispatch gaps including repeated occurrences,
+while <code>helper_reentries</code> counts tracer-internal traffic separately. See
+<a href="#repl--follow-live-callees">native call following</a> for module limits.</p>
 <p>Start a native watch with matching DWARF. Ptrace is the diagnostic default. Code cache translates supported writers and lifecycle fragments. Repeat --code to select multiple writers for a standalone main-image field. Use --follow-calls to resolve callees at runtime from the selected scope, with --runtime-limit N to bound translations. Use --shared-file PATH to correlate shared storage across live processes. Use --pointee PATH with a verified --mutation to follow a DWARF-resolved pointer path. On AArch64, --rendezvous selects an existing single-threaded userspace checkpoint. On x86-64, use --module for a shared writer and --caller to verify an Image::get borrow followed by an indirect call. Use --writer-entry for all entries into an admitted standalone leaf. Use --vector with --element-key FIELD=UINT32 or --map with --map-key KEY to track collection storage generations. Select a verified --mutation SYMBOL and declare --synchronization for native collection capture. Use --owner-add, --owner-get, --owner-remove and --owner-snapshot to select ownership boundaries. Use --no-values to record every completed write and omit field samples. Record observations with %record FILE --sqlite --name object.trace.</p>
 <p><strong>Usage</strong></p>
 <pre class="syntax"><code>%object start --type TYPE --field FIELD --code SELECTOR [--base BASE --owner OWNER --collection FIELD] [--snapshot-field FIELD] [--module MODULE] [--caller SELECTOR] [--rendezvous SYMBOL] [--backend ptrace|code-cache] [--no-values] [--stack-depth N] [--max-elements N] [--max-string-bytes N]
