@@ -227,7 +227,10 @@ When `--module` is omitted, it uses the ELF path recorded in the index.
 
 List commands accept glob filters, `--format json`, and optional
 `--limit N` and `--page TOKEN`. Use the full C++ signature to select an
-overload, or `--id ID` when a name is ambiguous. The index preserves missing
+overload, or `--id ID` when a name is ambiguous. Symbols that share one address
+and kind (the `C1` and `C2` constructors of a class, folded or aliased
+functions) are one callable, so a lookup by name returns the one with debug
+information instead of reporting `ambiguous_symbol`. The index preserves missing
 type and layout information. Symbols with incomplete signatures can still be
 looked up. Supported indexed signatures use scalar, pointer and borrowed
 reference parameters and results. The generated `views.hpp` contains read-only
@@ -524,6 +527,22 @@ concrete virtual implementation that needs a compatible prepared package.
 Unsupported entries and ambiguous selections show a reason. Narrow a
 duplicate signature with `--module`.
 
+Several symbols can name the same code: an explicit alias, functions that the
+linker folded (identical code folding), or the identical `C1` and `C2`
+constructor bodies. When selected symbols share one runtime entry, the preview
+picks the first `DWARF_SUPPORTED` one (in selector order) as the primary and
+reports each other name as `ALIAS` with `reason="alias of <primary symbol>"`.
+Rows show `symbol=` so the names can be told apart. One probe on the entry
+observes every name, so aliases are not ambiguous and get no probe of their own. Select
+the primary together with its aliases; an alias alone has no DWARF description
+of its own and stays `UNSUPPORTED` in a bulk selection. Symbols at one entry
+without a `DWARF_SUPPORTED` primary stay `AMBIGUOUS`. `%probe inject` accepts
+an alias by its demangled signature or by its mangled linkage name (for example
+`_ZNK4demo4Twin7aliasedEi`) and binds it to the DWARF subprogram at the same
+address, so the probe sits on the shared entry and sees calls through every
+name. A symbol that owns a subprogram of its own, as linker-folded functions do,
+keeps that description.
+
 The capacity line reports retained probes and `limit=unlimited`. Probe storage
 grows as needed; allocation can still fail when process resources are exhausted.
 
@@ -559,7 +578,10 @@ Clang JIT observer records typed PRE and POST events. With `--callback`, the
 same C++ source is compiled for each matched function. Every match must be
 DWARF-supported. There is no fixed probe-count limit. Ambiguous or
 unmatched selections, entries requiring prepared packages, and entries with
-active probes block installation.
+active probes block installation. An `ALIAS` row gets no probe of its own: apply installs
+one probe on the primary and reports the alias as `ALIASED` with that probe, so
+calls through any of the names produce events. The events carry the primary's
+selector, because the entry cannot tell which name the caller used.
 
 The REPL prints the batch ID before applying and reports the status of each
 entry. Apply has a 120-second default deadline. Starting the REPL with

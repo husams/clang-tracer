@@ -2472,6 +2472,12 @@ public:
       auto &row = *response->add_entries();
       const auto &function = candidate.function();
       *row.mutable_function() = function;
+      if (candidate.abi_status() == api::BulkTraceCandidate::ALIAS) {
+        // Same code as a primary selected in this batch: its probe covers this name.
+        row.set_status(Entry::ALIASED);
+        row.set_diagnostic(candidate.diagnostic());
+        continue;
+      }
       if (candidate.abi_status() != api::BulkTraceCandidate::DWARF_SUPPORTED) {
         row.set_status(Entry::BLOCKED);
         row.set_diagnostic(api::BulkTraceCandidate::AbiStatus_Name(candidate.abi_status()) +
@@ -2498,10 +2504,15 @@ public:
     // Resolve all exact bindings before changing target code. The agent checks
     // the binding again at installation, including the mapped image identity.
     std::vector<api::ProbeSpec> specs;
+    std::vector<int> installing; // entry index of each spec; aliases get no probe of their own
     specs.reserve(response->entries_size());
     client::DebugLookupOptions lookup;
     lookup.is_cancelled = cancelled;
+    int index = -1;
     for (auto &row : *response->mutable_entries()) {
+      ++index;
+      if (row.status() == Entry::ALIASED)
+        continue;
       const auto &function = row.function();
       lookup.module = function.module_path();
       try {
@@ -2516,6 +2527,7 @@ public:
         if (!validation.ok())
           throw std::runtime_error(validation.error_message());
         specs.push_back(std::move(spec));
+        installing.push_back(index);
       } catch (const std::exception &error) {
         if (cancelled())
           return {grpc::StatusCode::CANCELLED, "bulk trace apply cancelled during preflight"};
@@ -2531,12 +2543,12 @@ public:
 
     // Keep the attempted IDs even when installation throws after preparing
     // or writing an entry. Only IDs retained by this batch can be restored.
-    std::vector<std::uint64_t> attempted(specs.size());
+    std::vector<std::uint64_t> attempted(response->entries_size());
     for (std::size_t i = 0; i < specs.size() && !cancelled(); ++i) {
-      auto &row = *response->mutable_entries(i);
+      auto &row = *response->mutable_entries(installing[i]);
       api::Probe probe;
-      const auto result = install_probe(session, specs[i], batch_id, attempted[i], &probe,
-                                        0, cancelled);
+      const auto result = install_probe(session, specs[i], batch_id, attempted[installing[i]],
+                                        &probe, 0, cancelled);
       if (!result.ok()) {
         row.set_status(Entry::INSTALL_FAILED);
         row.set_diagnostic(result.error_message());
@@ -2550,6 +2562,18 @@ public:
     if (cancelled() && response->diagnostic().empty())
       response->set_diagnostic("bulk trace apply cancelled");
     if (response->diagnostic().empty()) {
+      // An alias reports the probe that covers it.
+      for (auto &alias : *response->mutable_entries()) {
+        if (alias.status() != Entry::ALIASED)
+          continue;
+        for (const auto &primary : response->entries())
+          if (primary.status() == Entry::INSTALLED &&
+              primary.function().runtime_address() == alias.function().runtime_address() &&
+              primary.function().module_path() == alias.function().module_path()) {
+            *alias.mutable_probe() = primary.probe();
+            break;
+          }
+      }
       response->set_complete(true);
       return grpc::Status::OK;
     }

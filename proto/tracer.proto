@@ -760,6 +760,8 @@ message BulkTraceCandidate {
     PREPARED_REQUIRED = 2;
     UNSUPPORTED = 3;
     AMBIGUOUS = 4;
+    // Another selected symbol at the same runtime entry is the primary and gets the probe.
+    ALIAS = 5;
   }
   FunctionSymbol function = 1;
   AbiStatus abi_status = 2;
@@ -794,6 +796,7 @@ message BulkTraceEntry {
     ROLLED_BACK = 4;
     REMOVED = 5;
     RESTORE_PENDING = 6;
+    ALIASED = 7; // Covered by the probe on the primary symbol at the same entry.
   }
   FunctionSymbol function = 1;
   Status status = 2;

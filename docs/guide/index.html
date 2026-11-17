@@ -1957,7 +1957,10 @@ selected index, then <code>module-index.sqlite</code> in the command's working d
 When <code>--module</code> is omitted, it uses the ELF path recorded in the index.</p>
 <p>List commands accept glob filters, <code>--format json</code>, and optional
 <code>--limit N</code> and <code>--page TOKEN</code>. Use the full C++ signature to select an
-overload, or <code>--id ID</code> when a name is ambiguous. The index preserves missing
+overload, or <code>--id ID</code> when a name is ambiguous. Symbols that share one address
+and kind (the <code>C1</code> and <code>C2</code> constructors of a class, folded or aliased
+functions) are one callable, so a lookup by name returns the one with debug
+information instead of reporting <code>ambiguous_symbol</code>. The index preserves missing
 type and layout information. Symbols with incomplete signatures can still be
 looked up. Supported indexed signatures use scalar, pointer and borrowed
 reference parameters and results. The generated <code>views.hpp</code> contains read-only
@@ -2182,6 +2185,21 @@ and installation checks run separately. <code>PREPARED_REQUIRED</code> identifie
 concrete virtual implementation that needs a compatible prepared package.
 Unsupported entries and ambiguous selections show a reason. Narrow a
 duplicate signature with <code>--module</code>.</p>
+<p>Several symbols can name the same code: an explicit alias, functions that the
+linker folded (identical code folding), or the identical <code>C1</code> and <code>C2</code>
+constructor bodies. When selected symbols share one runtime entry, the preview
+picks the first <code>DWARF_SUPPORTED</code> one (in selector order) as the primary and
+reports each other name as <code>ALIAS</code> with <code>reason=&quot;alias of &lt;primary symbol&gt;&quot;</code>.
+Rows show <code>symbol=</code> so the names can be told apart. One probe on the entry
+observes every name, so aliases are not ambiguous and get no probe of their own. Select
+the primary together with its aliases; an alias alone has no DWARF description
+of its own and stays <code>UNSUPPORTED</code> in a bulk selection. Symbols at one entry
+without a <code>DWARF_SUPPORTED</code> primary stay <code>AMBIGUOUS</code>. <code>%probe inject</code> accepts
+an alias by its demangled signature or by its mangled linkage name (for example
+<code>_ZNK4demo4Twin7aliasedEi</code>) and binds it to the DWARF subprogram at the same
+address, so the probe sits on the shared entry and sees calls through every
+name. A symbol that owns a subprogram of its own, as linker-folded functions do,
+keeps that description.</p>
 <p>The capacity line reports retained probes and <code>limit=unlimited</code>. Probe storage
 grows as needed; allocation can still fail when process resources are exhausted. The preview runs
 without installing probes, stopping target threads or executing code inside
@@ -2197,7 +2215,10 @@ Clang JIT observer records typed PRE and POST events. With <code>--callback</cod
 same C++ source is compiled for each matched function. Every match must be
 DWARF-supported. There is no fixed probe-count limit. Ambiguous or
 unmatched selections, entries requiring prepared packages, and entries with
-active probes block installation.</p>
+active probes block installation. An <code>ALIAS</code> row gets no probe of its own: apply installs
+one probe on the primary and reports the alias as <code>ALIASED</code> with that probe, so
+calls through any of the names produce events. The events carry the primary's
+selector, because the entry cannot tell which name the caller used.</p>
 <p>The REPL prints the batch ID before applying and reports the status of each
 entry. If an install fails, the server restores this batch's probes in
 reverse order. Use the same batch ID with <code>%trace remove</code> to retry entries

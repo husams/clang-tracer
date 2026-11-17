@@ -1919,7 +1919,11 @@ std::uint64_t validate_debug_entry(const clangtracer::v1::ProbeSpec &spec) {
   };
   const auto checked = spec.has_prepared()
       ? tracer::client::bind_prepared_callable(::getpid(), spec.prepared(), lookup, live_patch)
-      : tracer::client::resolve_debug_callable(::getpid(), info.selector(), lookup);
+      : tracer::client::resolve_debug_callable(
+            ::getpid(),
+            // Bind by linkage name when the entry has one: an alias shares the primary's
+            // selector but is installed under its own symbol.
+            spec.symbol().compare(0, 2, "_Z") == 0 ? spec.symbol() : info.selector(), lookup);
   if (!info.runtime_entry() || !info.entry_size() ||
       checked.spec.debug_info().SerializeAsString() !=
           info.SerializeAsString() ||
