@@ -289,7 +289,7 @@ bool is_startup_symbol(StartupSymbolSet set, std::string_view name) {
     return name == "dlopen" || name == "dlsym" || name == "dlclose" ||
            name == "__libc_dlopen_mode" || name == "__libc_dlsym" ||
            name == "__libc_dlclose" || name == "__errno_location" ||
-           name == "pthread_create";
+           name == "pthread_create" || name == "getenv";
   case StartupSymbolSet::none:
     return false;
   }
@@ -1255,7 +1255,11 @@ user_regs_struct unwind_one(pid_t pid, const FileImage &image, std::uint64_t pc,
 RuntimeEntry target_runtime_entry(pid_t pid, std::string_view name) {
   const auto maps = read_mappings(pid);
   const auto libc = load_libc(maps, StartupSymbolSet::runtime, pid);
-  if (name == "__errno_location" || name == "pthread_create") {
+  if (name == "getenv") {
+    if (const auto *function = libc.named(name)) {
+      return function->entry;
+    }
+  } else if (name == "__errno_location" || name == "pthread_create") {
     // Merged glibc keeps the active implementations in libc. On legacy
     // glibc the pthread image can override libc's errno accessor.
     if (libc.named("dlopen")) {

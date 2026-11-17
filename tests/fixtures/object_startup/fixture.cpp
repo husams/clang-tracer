@@ -1,4 +1,6 @@
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <unistd.h>
 
 namespace startup_test {
@@ -42,11 +44,16 @@ __attribute__((constructor)) void initialize() { run_before_main(); }
 }
 
 #if !defined(TRACE_TEST_STARTUP_LIBRARY)
-int main(int argc, char **) {
+int main(int argc, char **argv) {
+  const auto *stop_file = std::getenv("TRACER_TEST_STARTUP_STOP_FILE");
+  if (argc > 1 && (!stop_file || std::strcmp(stop_file, argv[1]) != 0)) {
+    std::fputs("MAIN did not inherit the expected stop file\n", stderr);
+    return 6;
+  }
   std::printf("MAIN value=%d\n", startup_test::result);
   std::fflush(stdout);
   if (argc > 1)
-    while (::access("stop.now", F_OK))
+    while (::access(stop_file, F_OK))
       ::usleep(1000);
   return startup_test::result == 23 ? 0 : 5;
 }

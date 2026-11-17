@@ -1,4 +1,5 @@
 #include "injector.hpp"
+#include "mapped_elf.hpp"
 #include "ptrace_wait.hpp"
 
 #include <algorithm>
@@ -590,7 +591,122 @@ struct ExecutableEntry {
   std::vector<unsigned char> bytes;
   std::uintptr_t debug = 0;
   std::uintptr_t loader = 0;
+  std::uintptr_t environment = 0;
 };
+
+std::uintptr_t map_load_bias(const std::vector<MapEntry> &maps, const std::string &path);
+
+std::uintptr_t initial_environment(pid_t pid, const std::vector<MapEntry> &maps) {
+  // The exec stop precedes any loader code. The initial stack begins with
+  // argc, followed by argv, its null terminator, and then envp.
+  const auto sp = object_target::sp(object_target::read_registers(pid));
+  const auto stack = std::find_if(maps.begin(), maps.end(), [&](const MapEntry &map) {
+    return map.path == "[stack]" && map.readable && map.start <= sp && sp < map.end;
+  });
+  constexpr auto word = sizeof(std::uintptr_t);
+  if (stack == maps.end() || (stack->end - sp) / word < 3)
+    throw std::runtime_error("cannot locate the initial environment on the exec stack");
+  std::uintptr_t argc = 0, terminator = 0;
+  read_remote_into(pid, sp, &argc, word);
+  if (argc > (stack->end - sp) / word - 3)
+    throw std::runtime_error("initial argument vector exceeds the exec stack");
+  const auto envp = sp + (argc + 2) * word;
+  read_remote_into(pid, envp - word, &terminator, word);
+  if (terminator)
+    throw std::runtime_error("initial argument vector is missing its terminator");
+  return envp;
+}
+
+void initialize_loader_environment(pid_t pid, std::uintptr_t envp) {
+  // An early dlopen passes libc's current __environ to its dependency
+  // initializers, which can include libc itself. Supply the exec environment
+  // before that call so the initializers see it and libc retains it for main.
+  const auto maps = read_maps(pid);
+#if defined(__aarch64__)
+  const auto libc = ::dlopen("libc.so.6", RTLD_NOLOAD | RTLD_LAZY);
+  if (!libc)
+    throw std::runtime_error("cannot locate glibc for the loader-ready environment");
+  const auto symbol = ::dlsym(libc, "getenv");
+  ::dlclose(libc);
+  Dl_info info{};
+  if (!symbol || !tracer::runtime::has_soname(symbol, "libc.so.6") ||
+      !::dladdr(symbol, &info) || !info.dli_fname)
+    throw std::runtime_error("cannot identify glibc for the loader-ready environment");
+  const auto path = tracer::detail::canonical_mapped_path(info.dli_fname);
+#else
+  const auto getenv_entry = target_runtime_entry(pid, "getenv");
+  const auto mapping = std::find_if(maps.begin(), maps.end(), [&](const MapEntry &map) {
+    return map.executable && !map.module_path.empty() &&
+           map.start <= getenv_entry.address && getenv_entry.address < map.end;
+  });
+  if (mapping == maps.end())
+    throw std::runtime_error("cannot identify target glibc for the loader-ready environment");
+  const auto &path = mapping->module_path;
+#endif
+  auto binary = llvm::object::createBinary(path);
+  if (!binary)
+    throw std::runtime_error(llvm::toString(binary.takeError()));
+  const auto *object = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(binary->getBinary());
+  const auto in_libc = [&](std::uintptr_t address, std::size_t size) {
+    return std::any_of(maps.begin(), maps.end(), [&](const MapEntry &map) {
+      return map.module_path == path && map.readable && map.start <= address &&
+             address < map.end && size <= map.end - address;
+    });
+  };
+  const auto bias = map_load_bias(maps, path);
+  if (!object || object->getELFFile().getHeader().e_machine != native_machine ||
+      !tracer::detail::matches_mapped_elf(*object, bias, [&](auto address, std::string_view expected) {
+        if (!in_libc(address, expected.size()))
+          return false;
+        std::vector<char> bytes(expected.size());
+        iovec local{bytes.data(), bytes.size()}, remote{reinterpret_cast<void *>(address), bytes.size()};
+        return linux_api::process_vm_readv(pid, &local, 1, &remote, 1, 0) ==
+                   static_cast<ssize_t>(bytes.size()) &&
+               std::string_view(bytes.data(), bytes.size()) == expected;
+      }))
+    throw std::runtime_error("cannot verify the glibc image for the loader-ready environment");
+
+#if defined(__aarch64__)
+  constexpr auto glob_dat = R_AARCH64_GLOB_DAT;
+#else
+  constexpr auto glob_dat = R_X86_64_GLOB_DAT;
+#endif
+  // Read libc's relocated reference rather than assuming its own BSS owns
+  // the pointer. The executable may have a copy relocation for __environ.
+  std::optional<std::uintptr_t> relocation_slot;
+  for (const auto &section : object->sections()) {
+    if (!(llvm::object::ELFSectionRef(section).getFlags() & SHF_ALLOC))
+      continue;
+    for (const auto &relocation : section.relocations()) {
+      if (relocation.getType() != glob_dat)
+        continue;
+      const auto symbol = relocation.getSymbol();
+      if (symbol == object->symbol_end())
+        continue;
+      auto name = symbol->getName();
+      if (!name)
+        throw std::runtime_error(llvm::toString(name.takeError()));
+      if (*name != "__environ")
+        continue;
+      if (relocation_slot || relocation.getOffset() > UINTPTR_MAX - bias)
+        throw std::runtime_error("invalid glibc __environ relocation");
+      relocation_slot = bias + relocation.getOffset();
+    }
+  }
+  std::uintptr_t slot = 0, current = 0;
+  if (!relocation_slot || !in_libc(*relocation_slot, sizeof(slot)))
+    throw std::runtime_error("cannot locate the relocated glibc __environ pointer");
+  read_remote_into(pid, *relocation_slot, &slot, sizeof(slot));
+  if (slot % alignof(std::uintptr_t) ||
+      std::none_of(maps.begin(), maps.end(), [&](const MapEntry &map) {
+        return map.readable && map.private_writable && !map.executable &&
+               map.start <= slot && slot < map.end && sizeof(current) <= map.end - slot;
+      }))
+    throw std::runtime_error("glibc __environ is outside writable target data");
+  read_remote_into(pid, slot, &current, sizeof(current));
+  if (!current)
+    write_remote(pid, slot, &envp, sizeof(envp));
+}
 
 bool startup_dependency(pid_t pid, const link_map *first, std::string_view selected) {
   std::set<std::uintptr_t> seen;
@@ -621,8 +737,6 @@ bool startup_dependency(pid_t pid, const link_map *first, std::string_view selec
   }
   return false;
 }
-
-std::uintptr_t map_load_bias(const std::vector<MapEntry> &maps, const std::string &path);
 
 ExecutableEntry verify_launch_entry(pid_t pid, bool loader_ready) {
   verify_target_executable(pid);
@@ -703,7 +817,8 @@ ExecutableEntry verify_launch_entry(pid_t pid, bool loader_ready) {
   if (image.empty() || mapping == maps.end())
     throw std::runtime_error("AT_ENTRY disagrees with the executable ELF mapping");
   executable.seekg(static_cast<std::streamoff>(*entry_offset));
-  ExecutableEntry result{entry, std::vector<unsigned char>(syscall_stub.size()), debug_address, interpreter};
+  ExecutableEntry result{entry, std::vector<unsigned char>(syscall_stub.size()), debug_address,
+                         interpreter, loader_ready ? initial_environment(pid, maps) : 0};
   if (!executable.read(reinterpret_cast<char *>(result.bytes.data()), result.bytes.size()) ||
       read_remote(pid, entry, result.bytes.size()) != result.bytes)
     throw std::runtime_error("live executable entry differs from verified ELF bytes");
@@ -1289,6 +1404,7 @@ void Process::adopt_executable_entry(object_launch::Child &child,
       }
       if (!startup_module.empty() && !startup_dependency(pid, debug.r_map, startup_module))
         throw std::runtime_error("selected startup module is outside the initial glibc link map");
+      initialize_loader_environment(pid, entry.environment);
     }
     ptrace_checked(PTRACE_SETOPTIONS, pid, nullptr,
                    reinterpret_cast<void *>(static_cast<std::uintptr_t>(PTRACE_O_EXITKILL)),
