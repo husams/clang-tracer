@@ -19,10 +19,13 @@
 namespace tracer_repl {
 extern std::atomic<bool> interrupted;
 
+inline constexpr unsigned default_bulk_apply_timeout_seconds = 120;
+
 struct Settings {
   std::string endpoint, server, agent;
   std::vector<std::string> extra_compile_arguments;
   unsigned timeout_seconds = 30;
+  unsigned bulk_apply_timeout_seconds = default_bulk_apply_timeout_seconds;
   std::uint32_t context_event_bytes = 0;
   std::uint64_t context_transport_memory_bytes = 0;
   std::size_t max_events = 4096, max_bytes = 64 * 1024 * 1024;

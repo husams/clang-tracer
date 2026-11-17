@@ -4,9 +4,11 @@ from contextlib import ExitStack
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 from repl_browser_integration import Transcript, stop
 
@@ -103,6 +105,18 @@ def main(repl, server, target):
             output.expect(rf"^REMOVED .*probe={int_probe} restored=true$")
             output.expect(rf"^bulk remove batch={batch} complete=true$")
             assert code() == prior
+
+        send(f'%trace apply --manifest "{manifest}"')
+        interrupted = output.expect(r"^bulk apply starting batch=([0-9a-f]{32})$")[1]
+        deadline = time.monotonic() + 15
+        while code()["X::f(int)"] == original["X::f(int)"]:
+            assert time.monotonic() < deadline, "first probe did not install"
+            time.sleep(0.005)
+        console.send_signal(signal.SIGINT)
+        output.expect(rf"^bulk restore batch={interrupted} complete=true$")
+        output.expect(r"^error: bulk trace apply: .* \| batch restored$")
+        assert code() == prior
+
         send(f"%collect --probe {prior_probe} --count 2 --timeout 10")
         output.expect(r"received=2")
         send("%detach")

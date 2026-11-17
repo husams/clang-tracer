@@ -154,6 +154,7 @@ int main(int argc, char **argv) {
       } else if (option == "--timeout") {
         settings.timeout_seconds =
             static_cast<unsigned>(tr::unsigned_number(value, "timeout", 300));
+        settings.bulk_apply_timeout_seconds = settings.timeout_seconds;
       } else if (option == "--context-event-bytes") {
         settings.context_event_bytes = static_cast<std::uint32_t>(
             tr::unsigned_number(value, option, UINT32_MAX));

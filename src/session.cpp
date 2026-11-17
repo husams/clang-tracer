@@ -911,7 +911,8 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     throw std::invalid_argument("probe id is invalid or already used");
   }
   if (cancelled && cancelled())
-    throw std::runtime_error("reload cancelled before preparing the replacement");
+    throw std::runtime_error(reload_probe_id ? "reload cancelled before preparing the replacement"
+                                            : "probe install cancelled before preparation");
   const auto batch_id = reload_probe_id ? find_probe_locked(reload_probe_id).value.bulk_batch_id()
                                         : bulk_batch_id;
   const auto source_file =
@@ -1199,7 +1200,16 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
         throw std::runtime_error("native probe overlaps an active memory patch");
     }
     const auto patch_started = std::chrono::steady_clock::now();
+    const auto check_commit_cancelled = [&] {
+      if (!cancelled || !cancelled())
+        return;
+      if (!reload_probe_id)
+        discard_prepared();
+      throw std::runtime_error(reload_probe_id ? "reload cancelled before switching the active observer"
+                                              : "probe install cancelled before patching");
+    };
     if (trap) {
+      check_commit_cancelled();
       if (scheduler_patch || pthread_create_patch_committed_ || previous ||
           std::any_of(probes_.begin(), probes_.end(), [&](const auto &other) {
             return other.first != probe_id &&
@@ -1239,8 +1249,7 @@ Session::add_probe(const clangtracer::v1::ProbeSpec &spec,
     unsigned patch_attempts = 0;
     std::exception_ptr switch_error;
     for (unsigned attempt = 0; attempt < kPatchAttempts; ++attempt) {
-      if (cancelled && cancelled())
-        throw std::runtime_error("reload cancelled before switching the active observer");
+      check_commit_cancelled();
       if (std::chrono::steady_clock::now() >= deadline)
         break;
       ++patch_attempts;
