@@ -491,6 +491,16 @@ them at each syscall boundary and compete with the injector for ptrace ownership
 [perf_event_open](https://man7.org/linux/man-pages/man2/perf_event_open.2.html) ·
 [ptrace](https://man7.org/linux/man-pages/man2/ptrace.2.html)
 
+The syscall integration test accepts an optional CMake
+`TRACER_SYSCALL_TEST_LAUNCHER` path. `tests/perf_test_launcher.c` provides a Linux
+launcher that keeps the calling user's UID and carries only `CAP_PERFMON` into
+the test and its children. Install it root-owned, executable only by the intended
+user/group, with `cap_perfmon=ep`. That group also needs traversal of tracefs and
+read access to `events/raw_syscalls/{sys_enter,sys_exit}/{id,format}`; no trace
+control write access is needed. This allows ordinary CTest execution without
+sudo or lowering `kernel.perf_event_paranoid`. The default test command is
+unchanged when no launcher is configured.
+
 ## Preview a bulk trace
 
 ```text

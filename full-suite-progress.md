@@ -19,3 +19,10 @@ Validation:
 - Full rebuild passed. No configurable limit changes were needed.
 
 Evidence files are under linux-dev:/tmp/clang-tracer-remove-limits/.
+
+Non-sudo syscall follow-up on linux-dev:
+- Normal user CTest now passes native_repl_local_perf_syscalls (10.15 seconds).
+- Root-owned /usr/local/libexec/clang-tracer-perf-test is executable by the husam group and has only cap_perfmon=ep; UID 1000 and the exact effective/permitted/inheritable/ambient capability sets were verified.
+- TRACER_SYSCALL_TEST_LAUNCHER selects that helper for the syscall test only.
+- Enabled clang-tracer-perf-access.service restores group traversal and read-only raw-syscall metadata access after tracefs mounts.
+- kernel.perf_event_paranoid remains 2. Configurable product limits are unchanged.
