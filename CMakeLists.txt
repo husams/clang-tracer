@@ -528,6 +528,20 @@ if(BUILD_TESTING)
       --callback ${CMAKE_CURRENT_SOURCE_DIR}/examples/cpp-interceptors/method.cpp
       --output-dir ${CMAKE_CURRENT_BINARY_DIR}/typed-this-results)
   set_tests_properties(grpc_typed_this_integration PROPERTIES TIMEOUT 180)
+  if(TARGET clang-tracer-repl)
+    add_executable(receiver-header-fixture tests/fixtures/receiver_header/main.cpp)
+    set_target_properties(receiver-header-fixture PROPERTIES CXX_STANDARD 17 ENABLE_EXPORTS ON)
+    target_compile_options(receiver-header-fixture PRIVATE -g -O0 -fno-omit-frame-pointer
+      -fcf-protection=none)
+    target_compile_definitions(receiver-header-fixture PRIVATE RECEIVER_HEADER_FLAG=73)
+    add_test(NAME native_repl_receiver_header
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_receiver_header.py
+        $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+        $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:receiver-header-fixture>
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/receiver_header/main.cpp
+        ${CMAKE_CURRENT_BINARY_DIR})
+    set_tests_properties(native_repl_receiver_header PROPERTIES TIMEOUT 360)
+  endif()
   add_executable(blocked-main-fixture tests/fixtures/blocked_main.cpp)
   target_link_libraries(blocked-main-fixture PRIVATE Threads::Threads)
   set_target_properties(blocked-main-fixture PROPERTIES ENABLE_EXPORTS ON)

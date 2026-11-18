@@ -3923,6 +3923,29 @@ public:
   std::unordered_set<const clang::Decl *> declarations;
 };
 
+clang::CXXRecordDecl *find_callback_record(clang::ASTContext &context,
+                                           llvm::StringRef name) {
+  class Finder final : public clang::RecursiveASTVisitor<Finder> {
+  public:
+    Finder(clang::ASTContext &context, llvm::StringRef name)
+        : context_(context), name_(name) {}
+    bool shouldVisitTemplateInstantiations() const { return true; }
+    bool VisitCXXRecordDecl(clang::CXXRecordDecl *record) {
+      if (record->isCompleteDefinition() && !record->isDependentType() &&
+          debug_record_identity_matches(context_, record, name_))
+        found = record;
+      return true;
+    }
+    clang::CXXRecordDecl *found = nullptr;
+
+  private:
+    clang::ASTContext &context_;
+    llvm::StringRef name_;
+  } finder(context, name);
+  finder.TraverseDecl(context.getTranslationUnitDecl());
+  return finder.found;
+}
+
 class ReceiverImportAction final : public clang::ASTFrontendAction {
 public:
   ReceiverImportAction(clang::ASTContext &donor_context,
@@ -3933,11 +3956,13 @@ public:
                        clang::CXXRecordDecl *target_record,
                        std::string *validation_error,
                        const DebugRecords *records = nullptr,
-                       const clangtracer::v1::ProbeSpec *spec = nullptr)
+                       const clangtracer::v1::ProbeSpec *spec = nullptr,
+                       bool header_types = false)
       : records_(records), donor_context_(donor_context),
         donor_files_(donor_files), donor_record_(donor_record), shape_(shape),
         receiver_context_(receiver_context), target_record_(target_record),
-        validation_error_(validation_error), spec_(spec) {}
+        validation_error_(validation_error), spec_(spec),
+        header_types_(header_types) {}
 
   bool BeginSourceFileAction(clang::CompilerInstance &compiler) override {
     if (!clang::ASTFrontendAction::BeginSourceFileAction(compiler)) {
@@ -3967,6 +3992,10 @@ public:
     clang::CXXRecordDecl *selected_imported_record = nullptr;
     if (records_)
       for (const auto &entry : *records_) {
+        // Real header definitions are parsed below. Import only synthesized
+        // DWARF records here, otherwise the later #include redefines them.
+        if (header_types_ && entry.decl->getLocation().isValid())
+          continue;
         if (auto err = importer.ImportDefinition(entry.decl)) {
           *validation_error_ = llvm::toString(std::move(err));
           return;
@@ -3983,7 +4012,8 @@ public:
           return;
         imported_targets.push_back(target);
       }
-    if (donor_record_) {
+    if (donor_record_ &&
+        !(header_types_ && donor_record_->getLocation().isValid())) {
       if (llvm::Error import_error = importer.ImportDefinition(donor_record_)) {
         *validation_error_ = llvm::toString(std::move(import_error));
         return;
@@ -4017,15 +4047,51 @@ public:
         return;
       }
     }
+    clang::ParseAST(compiler.getSema());
+    if (diagnostic_capture_ && diagnostic_capture_->had_error()) {
+      *validation_error_ = diagnostic_capture_->message();
+      if (header_types_)
+        return;
+    }
+    if (header_types_ && records_)
+      for (const auto &entry : *records_) {
+        if (entry.decl->getLocation().isInvalid())
+          continue;
+        auto &context = compiler.getASTContext();
+        auto *record =
+            find_callback_record(context, entry.layout.record_name());
+        if (!record) {
+          *validation_error_ = "callback header record is unavailable: " +
+                               entry.layout.record_name();
+          return;
+        }
+        if (entry.opaque) {
+          const auto &layout = context.getASTRecordLayout(record);
+          if ((entry.layout.size() &&
+               static_cast<std::uint64_t>(layout.getSize().getQuantity()) !=
+                   entry.layout.size()) ||
+              (entry.layout.alignment() &&
+               static_cast<std::uint64_t>(
+                   layout.getAlignment().getQuantity()) !=
+                   entry.layout.alignment())) {
+            *validation_error_ =
+                "callback header record size or alignment changed";
+            return;
+          }
+        } else if (!validate_receiver_layout(context, record, entry.layout,
+                                             *validation_error_)) {
+          return;
+        }
+        imported_targets.push_back(record);
+        if (donor_record_ &&
+            entry.decl->getCanonicalDecl() == donor_record_->getCanonicalDecl())
+          selected_imported_record = record;
+      }
     if (target_record_ && donor_record_ && selected_imported_record) {
       // Skip imported receiver method bodies while checking callback and
       // included helper code for ODR uses of the selected target.
       visitor_ = std::make_unique<ForbiddenReceiverUseVisitor>(
           selected_imported_record, importer.declarations, imported_targets);
-    }
-    clang::ParseAST(compiler.getSema());
-    if (diagnostic_capture_ && diagnostic_capture_->had_error()) {
-      *validation_error_ = diagnostic_capture_->message();
     }
     if (validation_error_->empty() && !shape_.error.empty()) {
       *validation_error_ = shape_.error;
@@ -4201,6 +4267,7 @@ private:
   clang::CXXRecordDecl *target_record_;
   std::string *validation_error_;
   const clangtracer::v1::ProbeSpec *spec_;
+  bool header_types_;
   std::unique_ptr<ForbiddenReceiverUseVisitor> visitor_;
   std::unique_ptr<DiagnosticCaptureScope> diagnostic_capture_;
 };
@@ -5228,6 +5295,21 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
                                        verified_entry)) {
     return false;
   }
+  // Header-backed records must be compiled from those headers in every
+  // callback TU. Only records synthesized from DWARF need AST import.
+  const bool callback_header_types = !typed_prepared &&
+                                     specification.has_debug_info() &&
+                                     callback_headers_available;
+  const bool callback_header_receiver =
+      callback_header_types && receiver_record &&
+      receiver_record->getLocation().isValid();
+  const std::string header_receiver_alias =
+      callback_header_receiver
+          ? "namespace tracer { using ResolvedTarget = const " +
+                std::string(specification.receiver().is_volatile() ? "volatile "
+                                                                   : "") +
+                "::" + specification.receiver().record_name() + "; }\n"
+          : std::string();
   bool result_sret = false;
   if (!typed_prepared &&
       !determine_object_result_sret(specification, p.debug_records,
@@ -5657,6 +5739,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       // again creates duplicate specializations and builtin declarations.
       if (standard_library_record_name(entry.layout.record_name()))
         continue;
+      if (callback_header_types && entry.decl->getLocation().isValid())
+        continue;
       if (auto err = importer.ImportDefinition(entry.decl)) {
         error = llvm::toString(std::move(err));
         if (has_header_context)
@@ -5675,7 +5759,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
               error))
         return false;
     }
-    if (receiver_record) {
+    if (receiver_record && !callback_header_receiver) {
       if (llvm::Error import_error = importer.ImportDefinition(receiver_record)) {
         error = "cannot import selected receiver declaration: " +
                 llvm::toString(std::move(import_error));
@@ -5709,7 +5793,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
              ? "#define CLANG_TRACER_HAS_TYPED_RECEIVER 1\n"
              : "") +
         "#define CLANG_TRACER_FIELD_INFERENCE 1\n" +
-        callback_header_source +
+        callback_header_source + header_receiver_alias +
         (callback_headers_available
              ? std::string()
              : missing_recovered_record_declarations(
@@ -5728,7 +5812,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       return std::make_unique<ReceiverImportAction>(
           p.receiver_ast->getASTContext(), p.receiver_ast->getFileManager(),
           receiver_record, receiver_shape, &specification.receiver(),
-          receiver_record, &import_error, &p.debug_records, &specification);
+          receiver_record, &import_error, &p.debug_records, &specification,
+          callback_header_types);
     };
     const bool user_syntax_ok =
         run_callback_tool(make_user_action, typed_user_source, [&] {
@@ -5786,7 +5871,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       return std::make_unique<ReceiverImportAction>(
           p.receiver_ast->getASTContext(), p.receiver_ast->getFileManager(),
           receiver_record, final_shape, &specification.receiver(),
-          receiver_record, &import_error, &p.debug_records, &specification);
+          receiver_record, &import_error, &p.debug_records, &specification,
+          callback_header_types);
     };
     bool complete_syntax_ok =
         run_callback_tool(make_final_action, complete_source, [&] {
