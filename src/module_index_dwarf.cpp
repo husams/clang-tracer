@@ -270,8 +270,11 @@ void describe_symbol(DWARFDie die, ModuleSymbol &symbol) {
   symbol.line = decl.getDeclLine();
   symbol.diagnostic.clear();
   if (die.getTag() != dw::DW_TAG_subprogram) return;
+  // A destructor entry (D0/D1/D2) is a concrete function even when the destructor is virtual;
+  // its hidden parameters are checked below.
+  const bool destructor = name(decl).rfind("~", 0) == 0;
   if (number(decl, dw::DW_AT_calling_convention).value_or(dw::DW_CC_normal) != dw::DW_CC_normal ||
-      flag(decl, dw::DW_AT_virtuality))
+      (flag(decl, dw::DW_AT_virtuality) && !destructor))
     symbol.diagnostic = "unsupported_call_abi";
   auto parameters = die;
   const auto children = die.children();

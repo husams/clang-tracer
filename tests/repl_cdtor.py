@@ -28,6 +28,7 @@ PLAIN_DTOR = "cdtor::Plain::~Plain()"
 BOX_CTOR = "cdtor::Box<int>::Box(int)"
 BOX_DTOR = "cdtor::Box<int>::~Box()"
 LEAF_CTOR = "cdtor::Leaf::Leaf(int)"
+HOLDER = "cdtor::Holder<std::unique_ptr<int>>"
 
 
 class Output(Transcript):
@@ -320,6 +321,10 @@ def prepared_phase(session, repl, root, header, source, compiler):
     assert prepare("box-dtor", BOX_DTOR).startswith("_ZN5cdtor3BoxIiED1Ev")
     assert prepare("leaf", LEAF_CTOR) == "_ZN5cdtor4LeafC1Ei"
     assert prepare("leaf-dtor", "cdtor::Leaf::~Leaf()") == "_ZN5cdtor4LeafD1Ev"
+    # Only the selected lifetime member of a class template is instantiated: Holder<unique_ptr>
+    # has a copy() that is ill-formed for a move-only type and must not be compiled.
+    assert prepare("holder", f"{HOLDER}::Holder(int)").endswith("EC1Ei")
+    assert prepare("holder-dtor", f"{HOLDER}::~Holder()").endswith("ED1Ev")
 
     # The deleting destructor and the base-object variants cannot be called from source.
     for symbol in ("_ZN5cdtor4LeafD0Ev", "_ZN5cdtor3MidC2Ei", "_ZN5cdtor3MidD2Ev"):
@@ -332,6 +337,7 @@ def prepared_phase(session, repl, root, header, source, compiler):
     selectors = {
         "plain": PLAIN_CTOR, "plain-dtor": PLAIN_DTOR, "box": BOX_CTOR,
         "box-dtor": BOX_DTOR, "leaf": LEAF_CTOR, "leaf-dtor": "cdtor::Leaf::~Leaf()",
+        "holder": f"{HOLDER}::Holder(int)", "holder-dtor": f"{HOLDER}::~Holder()",
     }
     probes = {}
     for name, selector in selectors.items():
@@ -354,6 +360,9 @@ def prepared_phase(session, repl, root, header, source, compiler):
     assert len(session.events(probes["box-dtor"], "POST", n, "pbox-dtor")) == n
     assert len(session.events(probes["plain-dtor"], "POST", 2 * n, "pplain-dtor")) == 2 * n
     assert len(session.events(probes["leaf-dtor"], "POST", n, "pleaf-dtor")) >= n
+    assert [argument(e, "t") for e in session.events(probes["holder"], "POST", n, "pholder")] == \
+        list(range(n))
+    assert len(session.events(probes["holder-dtor"], "POST", n, "pholder-dtor")) == n
     session.run_passes(1)
     assert session.target.process.poll() is None
     session.detach()
@@ -386,6 +395,33 @@ def elf_phase(session, fixture):
     session.detach()
 
 
+def index_phase(session, fixture):
+    """Indexed preparation: concrete destructor entries are admitted whatever the compiler's
+    DWARF says about virtuality; the base-object entry with a hidden VTT argument is not."""
+    work = session.root / "index"
+    work.mkdir()
+    index = work / "fixture.sqlite"
+    session.command(f'%module index --file "{fixture}" --output "{index}"')
+    session.output.expect(r"^module index=")
+    session.command(f"%module symbols --index \"{index}\" --filter 'cdtor::Leaf::~Leaf*' "
+                    "--format json")
+    entries = json.loads(session.output.expect(r"^(\{\"entries\":.*)$")[1])["entries"]
+    by_symbol = {entry["linkage"]: entry for entry in entries}
+    assert by_symbol["_ZN5cdtor4LeafD0Ev"]["diagnostic"] == "", by_symbol
+    assert by_symbol["_ZN5cdtor4LeafD1Ev"]["diagnostic"] == "", by_symbol
+    assert by_symbol["_ZN5cdtor4LeafD2Ev"]["diagnostic"] == "unsupported_artificial_parameter"
+    identifier = by_symbol["_ZN5cdtor4LeafD1Ev"]["id"]
+    session.command(f'%probe prepare "cdtor::Leaf::~Leaf()" --module "{fixture}" '
+                    f'--module-index "{index}" --id {identifier} --output "{work / "d1"}"')
+    line = session.output.expect(r"^symbol=(\S+)|^error: (.*)")
+    assert line.group(1) == "_ZN5cdtor4LeafD1Ev", line.group(2)
+    probe, _ = session.inject('"cdtor::Leaf::~Leaf()"', f'--prepared "{work / "d1"}"',
+                              "--prepared-mode require")
+    session.run_passes()
+    assert len(session.events(probe, "POST", PASSES, "indexed-d1")) == PASSES
+    session.detach()
+
+
 def main(repl, server, agent, fixture, header, source, compiler):
     fixture = Path(fixture).resolve()
     os.environ.pop("CLANG_TRACER_ENDPOINT", None)
@@ -400,7 +436,7 @@ def main(repl, server, agent, fixture, header, source, compiler):
         assert match, symbol
         entries[symbol] = int(match.group(1), 16)
     # A fixture process per phase: an agent keeps a fixed number of probe slots per process.
-    for phase in (dwarf_phase, bulk_phase, prepared_phase, elf_phase):
+    for phase in (dwarf_phase, bulk_phase, prepared_phase, elf_phase, index_phase):
         with tempfile.TemporaryDirectory(prefix="ct-cdtor-") as directory, ExitStack() as stack:
             root = Path(directory)
             target = Target(fixture, stack)
@@ -411,11 +447,13 @@ def main(repl, server, agent, fixture, header, source, compiler):
                 bulk_phase(session, entries)
             elif phase is prepared_phase:
                 prepared_phase(session, repl, root, header, source, compiler)
-            else:
+            elif phase is elf_phase:
                 elf_phase(session, fixture)
+            else:
+                index_phase(session, fixture)
             send(target.process, "q")
             target.process.wait(timeout=10)
-    print("constructors and destructors observed: dwarf, bulk, prepared, elf")
+    print("constructors and destructors observed: dwarf, bulk, prepared, elf, index")
 
 
 if __name__ == "__main__":

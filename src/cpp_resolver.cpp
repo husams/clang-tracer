@@ -1918,13 +1918,15 @@ ResolvedCallable resolve_header_callable(const std::string& name,
   const bool select_template = angle != std::string::npos &&
       selector.qualified_name.find('>', angle) != std::string::npos;
   // `&Class<T>::Class` and `&Class<T>::~Class` are ill-formed, so a constructor or destructor
-  // of a class template is selected from an explicit instantiation instead.
+  // of a class template is selected from the implicit instantiation of the class. That declares
+  // the members without compiling the bodies of unrelated ones, which an explicit instantiation
+  // would (an unused `T copy() const` of a move-only `T` is valid until it is instantiated).
   const auto cdtor_class = select_template ? template_cdtor_class(selector.qualified_name)
                                            : std::string();
   const bool cdtor_selector = !cdtor_class.empty();
   if (select_template && cdtor_selector) {
     const auto qualified = cdtor_class.rfind("::", 0) == 0 ? cdtor_class : "::" + cdtor_class;
-    code += "\ntemplate struct " + qualified + ";\n";
+    code += "\nstatic_assert(sizeof(" + qualified + ") > 0);\n";
     arguments.push_back(clang_cl ? "/clang:-fno-access-control" : "-fno-access-control");
   } else if (select_template) {
     if (name.find_first_of("#;{}\\\r\n") != std::string::npos)

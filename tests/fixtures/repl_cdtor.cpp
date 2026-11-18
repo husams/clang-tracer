@@ -9,6 +9,11 @@ template <class T> Box<T>::~Box() {}
 template <class T> T Box<T>::get() const { return v; }
 template struct Box<int>;
 template struct Box<double>;
+template <class T> Holder<T>::Holder(int t) : tag(t) {}
+template <class T> Holder<T>::~Holder() {}
+// Only the lifetime members: instantiating copy() for a unique_ptr would not compile.
+template Holder<std::unique_ptr<int>>::Holder(int);
+template Holder<std::unique_ptr<int>>::~Holder();
 VBase::VBase(int x) : b(x) {}
 VBase::~VBase() {}
 int VBase::id() const { return b; }
@@ -30,6 +35,10 @@ int run_once(int n) {
     Box<int> i(n);
     Box<double> d(n + 0.5);
     sum += i.get() + static_cast<int>(d.get());
+  }
+  {
+    Holder<std::unique_ptr<int>> holder(n);
+    sum += holder.tag;
   }
   {
     Leaf stack(n);

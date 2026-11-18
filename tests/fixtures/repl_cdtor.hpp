@@ -1,4 +1,5 @@
 #pragma once
+#include <memory>
 // Constructors and destructors in every shape the Itanium ABI gives them:
 //  - Plain: C1/C2 and D1/D2 are one body (aliases), copy constructor;
 //  - Box<T>: class template, constructor and destructor of an explicit instantiation;
@@ -20,6 +21,15 @@ template <class T> struct Box {
 };
 extern template struct Box<int>;
 extern template struct Box<double>;
+// A class template whose unused member needs a copyable T: only a move-only T makes the
+// body of copy() ill-formed, and nothing may instantiate it just to observe the lifetime members.
+template <class T> struct Holder {
+  T value{};
+  int tag;
+  explicit Holder(int t);
+  ~Holder();
+  T copy() const { return value; }
+};
 struct VBase {
   int b;
   explicit VBase(int x);
