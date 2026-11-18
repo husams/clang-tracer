@@ -1,4 +1,5 @@
 #include "context_paths.hpp"
+#include "tracer/protocol.hpp"
 #include <dlfcn.h>
 #include <filesystem>
 #include <stdexcept>
@@ -23,6 +24,9 @@ std::string context_header_directory() {
     return fs::canonical(TRACER_CONTEXT_ENGINE_ROOT).string();
   throw std::runtime_error(
       "the packaged shared-context compiler headers are unavailable");
+}
+std::string context_argument_limit_option() {
+  return "-DTRACER_MAX_ARGUMENTS=" + std::to_string(kMaxArguments);
 }
 std::string context_standard_library_path() {
   const auto installed =

@@ -90,7 +90,7 @@ Codec compile(const clangtracer::v1::ProbeSpec &spec) {
   auto options = prepared::toolchain_arguments(method,
       {runtime::jit_flags.begin(), runtime::jit_flags.end()});
   options.insert(options.end(), {"-std=c++23", "-fPIC", "-O1", "-I" + root,
-      "-I" + root + "/../include", "-resource-dir=" TRACER_CLANG_RESOURCE_DIR});
+      "-I" + root + "/../include", context_argument_limit_option(), "-resource-dir=" TRACER_CLANG_RESOURCE_DIR});
   options.insert(options.end(), method.adapter_abi_options().begin(), method.adapter_abi_options().end());
   const auto arguments = clang_driver_arguments(options);
   const auto &types = spec.debug_info();

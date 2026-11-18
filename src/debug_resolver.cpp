@@ -2230,7 +2230,10 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
             const auto key = path + ":" + std::to_string(low);
             matches[key] = std::move(found);
           } catch (const std::exception& e) {
-            rejected = e.what();
+            // Keep a rejection that names the argument-limit option: a declaration of the same
+            // callable examined later fails for an unrelated, less useful reason.
+            if (rejected.find("TRACER_MAX_ARGUMENTS") == std::string::npos)
+              rejected = e.what();
           }
         }
       }

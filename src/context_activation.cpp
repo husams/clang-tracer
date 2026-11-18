@@ -218,6 +218,8 @@ activation_arguments(const std::vector<std::string> &arguments) {
   // Build-tree public headers are beside src; installed copies are nested in
   // the private compiler-header directory itself.
   result.emplace_back("-I" + headers + "/../include");
+  // The on-disk callback.hpp must see the same TRACER_MAX_ARGUMENTS as the native owner.
+  result.emplace_back(context_argument_limit_option());
   llvm::StringRef roots(TRACER_CONTEXT_SYSTEM_ROOTS);
   while (!roots.empty()) {
     const auto pair = roots.split('|');

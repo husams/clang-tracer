@@ -3116,7 +3116,7 @@ std::string make_wrapper(const tracer::Request &r,
     for (unsigned i = 0; i < r.argument_count; ++i) {
       const auto index = std::to_string(i);
       const auto argument = "a" + index;
-      code += "if (overrides.argument_mask & (1u<<" + index + ")) { " +
+      code += "if (overrides.argument_mask & (1ull<<" + index + ")) { " +
               argument + "=tracer::ScalarOverrides::unpack<decltype(" + argument +
               ")>(overrides.arguments[" + index + "]);\n";
       fill_value(code, i, r.arguments[i], false);
@@ -5292,6 +5292,7 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       const auto snapshot_headers = tracer::context_header_directory();
       compiler_arguments.push_back("-I" + snapshot_headers);
       compiler_arguments.push_back("-I" + snapshot_headers + "/../include");
+      compiler_arguments.push_back(tracer::context_argument_limit_option());
     } catch (const std::exception &) {
       // Scalar/legacy hooks use embedded headers and need no snapshot codecs.
     }

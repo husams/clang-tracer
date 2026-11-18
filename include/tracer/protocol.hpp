@@ -152,7 +152,7 @@ struct ScalarOverrides {
   bool allow_arguments = false;
   bool allow_result = false;
   bool allow_replacement = false;
-  std::uint32_t argument_mask = 0;
+  std::uint64_t argument_mask = 0;  // one bit per argument; kMaxArguments is at most 64
   bool result_set = false;
   bool replacement_set = false;
   std::uint64_t arguments[kMaxArguments]{};

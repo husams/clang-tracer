@@ -105,7 +105,7 @@ public:
       throw std::out_of_range("callback argument index is out of range");
     require_type(context_.arguments[index], override_type<T>());
     overrides->arguments[index] = ScalarOverrides::pack(value);
-    overrides->argument_mask |= std::uint32_t{1} << index;
+    overrides->argument_mask |= std::uint64_t{1} << index;
   }
 
   template <class T> void override_result(T value) const {

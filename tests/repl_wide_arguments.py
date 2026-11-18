@@ -16,6 +16,19 @@ import tempfile
 from elf_split_fixture import link_split_fixture
 
 
+SHARED_CALLBACK = """struct Scope {};
+struct ReviewState : shared_state<Scope> { int calls = 0; };
+struct Interceptor {
+  Interceptor(State<ReviewState>);
+  void pre(const Call& call, ReviewState& state) { ++state.calls; }
+  void post(const Call& call, ReviewState& state) {
+    call.field("review", 7);
+    call.context().event("review.step");
+  }
+};
+"""
+
+
 def parameters(count, type_name="int", prefix="a"):
     return ", ".join(f"{type_name} {prefix}{i}" for i in range(1, count + 1))
 
@@ -41,6 +54,7 @@ struct Holder {{
   int base;
   int method_nine({parameters(9)}) const;
   int method_limit({parameters(limit - 1)}) const;
+  int method_over({parameters(over)}) const;
 }};
 }}
 """
@@ -51,6 +65,7 @@ int sum_over({parameters(over)}) {{ return {" + ".join(names(over))}; }}
 int sum_nine({parameters(9)}) {{ return {" + ".join(names(9))}; }}
 double mixed({mixed_parameters}) {{ return {" + ".join(names(len(mixed), "m"))}; }}
 int Holder::method_nine({parameters(9)}) const {{ return base + {" + ".join(names(9))}; }}
+int Holder::method_over({parameters(over)}) const {{ return base + {" + ".join(names(over))}; }}
 int Holder::method_limit({parameters(limit - 1)}) const {{ return base + {" + ".join(names(limit - 1))}; }}
 }}
 """
@@ -77,6 +92,7 @@ int main() {{
     wide::mixed({mixed_values});
     holder.method_nine({leading(9)}n);
     holder.method_limit({leading(limit - 1)}n);
+    holder.method_over({leading(over)}n);
     usleep(100000);
   }}
 }}
@@ -103,6 +119,7 @@ def main():
     nine_selector = f"wide::sum_nine({ints(9)})"
     mixed_selector = f"wide::mixed({', '.join(mixed)})"
     method_selector = f"wide::Holder::method_nine({ints(9)}) const"
+    method_over_selector = f"wide::Holder::method_over({ints(limit + 1)}) const"
     method_limit_selector = f"wide::Holder::method_limit({ints(limit - 1)}) const"
 
     with tempfile.TemporaryDirectory(prefix="ct-wide-") as path:
@@ -199,36 +216,50 @@ def main():
 
         # 1. Debug information only, no prepared package. The nine argument method has a
         # receiver and the mixed callable puts integers and doubles on the stack.
-        lines = observe("target", [(limit_selector, ""), (nine_selector, ""),
-                                   (mixed_selector, ""), (method_selector, ""),
-                                   (method_limit_selector, "")])
+        # The nine argument callables fit only when the build allows at least nine arguments;
+        # the supported minimum of eight must reject them instead.
+        nine_fits = limit >= 9
+        probes = [(limit_selector, ""), (mixed_selector, ""), (method_limit_selector, "")]
+        if nine_fits:
+            probes += [(nine_selector, ""), (method_selector, "")]
+        lines = observe("target", probes)
         check_integers(event(lines, "wide::sum_limit"), limit)
-        check_integers(event(lines, "wide::sum_nine"), 9)
         check_mixed(event(lines, "wide::mixed"))
-        method = event(lines, "wide::Holder::method_nine")
-        check_integers(method, 9, base=1000)
         check_integers(event(lines, "wide::Holder::method_limit"), limit - 1, base=1000)
+        if nine_fits:
+            check_integers(event(lines, "wide::sum_nine"), 9)
+            check_integers(event(lines, "wide::Holder::method_nine"), 9, base=1000)
 
         # 2. One argument more than the limit is refused and the message names the option.
-        refused = attached("target", f"""%probe inject "{over_selector}"
+        too_wide = [(over_selector, limit), (method_over_selector, limit)]
+        if not nine_fits:
+            too_wide += [(nine_selector, limit), (method_selector, limit)]
+        for selector, allowed in too_wide:
+            refused = attached("target", f"""%probe inject "{selector}"
 %detach
 %quit
 """, expected_error="TRACER_MAX_ARGUMENTS")
-        assert "installed probe=" not in refused, refused
-        assert re.search(r"error: .*TRACER_MAX_ARGUMENTS", refused), refused
-        assert f"more than {limit} arguments" in refused, refused
+            assert "installed probe=" not in refused, refused
+            assert re.search(r"error: .*TRACER_MAX_ARGUMENTS", refused), refused
+            assert f"more than {allowed} arguments" in refused, refused
 
         # 3. Prepared package built from the header (source based resolution).
         repl(f'%probe prepare "{limit_selector}" --include wide.hpp{context} --output prepared-limit\n')
-        repl(f'%probe prepare "{nine_selector}" --include wide.hpp{context} --output prepared-nine\n')
+        if nine_fits:
+            repl(f'%probe prepare "{nine_selector}" --include wide.hpp{context} --output prepared-nine\n')
+        else:
+            repl(f'%probe prepare "{nine_selector}" --include wide.hpp{context} --output prepared-nine\n',
+                 expected_error="TRACER_MAX_ARGUMENTS")
         repl(f'%probe prepare "{over_selector}" --include wide.hpp{context} --output prepared-over\n',
              expected_error="TRACER_MAX_ARGUMENTS")
         assert not (root / "prepared-over").exists()
-        lines = observe("target", [
-            (limit_selector, " --prepared prepared-limit --prepared-mode require"),
-            (nine_selector, " --prepared prepared-nine --prepared-mode require")])
+        prepared = [(limit_selector, " --prepared prepared-limit --prepared-mode require")]
+        if nine_fits:
+            prepared.append((nine_selector, " --prepared prepared-nine --prepared-mode require"))
+        lines = observe("target", prepared)
         check_integers(event(lines, "wide::sum_limit"), limit)
-        check_integers(event(lines, "wide::sum_nine"), 9)
+        if nine_fits:
+            check_integers(event(lines, "wide::sum_nine"), 9)
 
         # 4. Module index: ELF symbols with split debug information and no application headers.
         repl(f"""%module index --file ./libwide.so
@@ -249,6 +280,19 @@ def main():
         check_integers(event(lines, "wide::Holder::method_limit"), limit - 1, base=1000)
         repl(f'%probe prepare "{over_selector}" --module ./libwide.so --generated recovered-over '
              '--output prepared-module-over\n', expected_error="TRACER_MAX_ARGUMENTS")
+        # 5. A shared-context callback is compiled against the on-disk headers: it must agree
+        # with the tracer on the argument limit, or the fields it records are lost.
+        (root / "shared.cpp").write_text(SHARED_CALLBACK)
+        shared = attached("target", f"""%probe inject "{limit_selector}" --callback shared.cpp --print-arguments
+%collect --count 4 --timeout 30 --phase POST --as post
+%events list post
+%detach
+%quit
+""")
+        events = [line for line in shared.splitlines() if " phase=POST " in line]
+        assert len(events) == 4, shared
+        for line in events:
+            assert f"a{limit}=" in line and line.count("review=7") == 1, line
         print(f"ok limit={limit}")
 
 
