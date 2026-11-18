@@ -1166,6 +1166,7 @@ function(tracer_add_native_repl)
       set_tests_properties(native_repl_code_cache_atomic native_repl_code_cache_live_detach
         PROPERTIES TIMEOUT 120)
       add_executable(repl-reload-target tests/fixtures/repl_reload.cpp)
+      target_include_directories(repl-reload-target PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
       target_compile_options(repl-reload-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
       target_link_libraries(repl-reload-target PRIVATE Threads::Threads)
       add_test(NAME native_repl_reload_integration
@@ -1197,6 +1198,13 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-reload-target>
           "${CMAKE_CURRENT_SOURCE_DIR}/examples/repl-agent-observer")
       set_tests_properties(native_repl_agent_observer PROPERTIES TIMEOUT 120)
+      if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        add_test(NAME native_repl_fixed_limits
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_fixed_limits.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:repl-reload-target>)
+        set_tests_properties(native_repl_fixed_limits PROPERTIES TIMEOUT 600)
+      endif()
       add_test(NAME native_repl_many_probes
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_many_probes.py"
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>

@@ -667,7 +667,7 @@ void describe_record(DWARFDie record, api::DebugInfo& info) {
       continue;
     }
     auto offset = location->getAsUnsignedConstant();
-    if (!offset || name(member).empty() || info.fields_size() == 128) {
+    if (!offset || name(member).empty()) {
       opaque = true;
       continue;
     }
@@ -730,8 +730,9 @@ void describe_methods(DWARFDie record, api::DebugInfo &info) {
                                                  : dw::DW_ACCESS_public);
     const char *linkage = method_die.getName(llvm::DINameKind::LinkageName);
     if (accessibility != dw::DW_ACCESS_public || !linkage || !*linkage ||
-        info.methods_size() >= 128 || !seen.insert(linkage).second)
+        !seen.insert(linkage).second) {
       continue;
+    }
     api::DebugMethod described;
     described.set_name(name(method));
     described.set_linkage_symbol(linkage);
@@ -799,8 +800,7 @@ void describe_methods(DWARFDie record, api::DebugInfo &info) {
         }
         continue;
       }
-      if (number(parameter, dw::DW_AT_artificial) ||
-          described.cpp_parameter_types_size() >= 8) {
+      if (number(parameter, dw::DW_AT_artificial)) {
         unsupported = true;
         break;
       }
@@ -909,8 +909,7 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl,
       throw std::runtime_error("unsupported artificial debug parameter");
     }
     const auto type = read_type(type_of(parameter));
-    if (type.value == api::VALUE_TYPE_UNSPECIFIED || type.value == api::VOID ||
-        types.size() == 8) {
+    if (type.value == api::VALUE_TYPE_UNSPECIFIED || type.value == api::VOID) {
       throw std::runtime_error("unsupported debug parameter ABI");
     }
     api::DebugArgument argument;
@@ -1828,7 +1827,6 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
       prepared.target_triple().find("gnux32") != std::string::npos ||
       (signature.kind() != api::FUNCTION && !(typed && signature.kind() == api::METHOD)) ||
       !supported(signature.result(), true) ||
-      signature.arguments_size() > 8 ||
       prepared.argument_names_size() != signature.arguments_size())
     throw std::invalid_argument(
         "invalid or unsupported prepared injector contract");

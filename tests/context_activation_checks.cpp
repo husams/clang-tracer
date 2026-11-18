@@ -193,6 +193,8 @@ void verify_context_activation() {
   tracer::context_runtime::SharedSourceRuntime runtime(
       generation.generation->scopes(), pool, metadata, &capture_batch, &sink);
   tracer::TraceContext trace{};
+  tracer::detail::NamedValueStorage native_named_values;
+  trace.named_storage = &native_named_values;
   trace.call_id = 42;
   tracer::Call call(trace);
   const auto construct =
@@ -233,6 +235,7 @@ namespace emitter {
 struct EventInterceptor {
   void pre(const Call& call) {
     if (!call.log("context log", tracer::LogLevel::Warning)) throw 7;
+    call.field("shared_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 42);
     call.context().event("context.only");
   }
   void post(const Call& call) { call.log("post log"); }
@@ -248,6 +251,7 @@ struct EventInterceptor {
     tracer::context_runtime::EventMetadata emitter_metadata = metadata;
     emitter_metadata.source_id.assign(16, 'e');
     emitter_metadata.capture_hook_id = 2;
+    emitter_metadata.print_arguments = true;
     tracer::context_runtime::SharedSourceRuntime emitter_runtime(
         context_only.generation->scopes(), pool, emitter_metadata,
         &capture_batch, &sink);
@@ -276,6 +280,15 @@ struct EventInterceptor {
                   sink.batches.back().event().name() == "context.only" &&
                   sink.batches.back().event().states_size() == 1,
               "context-only emitter could not capture a foreign live state");
+      require(native_named_values.values.size() == 1 && trace.named_count == 1 &&
+                  std::string(native_named_values.values[0].name) ==
+                      "shared_"
+                      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                      "xxxxxxxxxxxxxxxxxxxxxxxx" &&
+                  sink.batches.back().event().named_values_size() == 1 &&
+                  sink.batches.back().event().named_values(0).name() ==
+                      native_named_values.values[0].name,
+              "shared callback named values did not use native-owned dynamic storage");
       require(context_only.generation->has_hook(tracer::TracePhase::Post) &&
                   guarded_entry(*context_only.generation, emitter_post,
                                 emitter_object.data(), &trace) &&

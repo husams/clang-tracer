@@ -65,8 +65,6 @@ namespace tracer {
 namespace {
 namespace api = clangtracer::v1;
 
-constexpr std::size_t kSessionLimit = 64;
-constexpr std::size_t kMaxCallbackSource = 64 * 1024;
 
 void set_probe_extra_compile_arguments(
     api::ProbeSpec &spec, const google::protobuf::RepeatedPtrField<std::string> &options) {
@@ -109,26 +107,15 @@ grpc::Status validate_resolution_inputs(std::string_view selector,
     return {grpc::StatusCode::INVALID_ARGUMENT,
             "prepared injection requires --compdb to use --include"};
   }
-  if (headers.size() > 16) {
-    return {grpc::StatusCode::INVALID_ARGUMENT,
-            "at most 16 include headers are allowed"};
-  }
   for (const auto &header : headers) {
     if (!valid_text(header, 4095) || header.front() != '/' ||
         header.find_first_of("\"\r\n") != std::string::npos) {
       return {grpc::StatusCode::INVALID_ARGUMENT, "invalid optional include"};
     }
   }
-  if (options.size() > 128) {
-    return {grpc::StatusCode::INVALID_ARGUMENT,
-            "at most 128 compiler options are allowed"};
-  }
-  std::size_t option_bytes = 0;
   for (const auto &option : options) {
-    option_bytes += option.size() + 1;
-    if (!valid_text(option, 4096) || option_bytes > 65536) {
-      return {grpc::StatusCode::INVALID_ARGUMENT,
-              "compiler options must be nonempty and total at most 64 KiB"};
+    if (!valid_text(option, SIZE_MAX)) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "compiler options must be nonempty without NUL"};
     }
   }
   if (!safe_preflight_compiler_arguments(options.begin(), options.end())) {
@@ -213,8 +200,6 @@ public:
         return existing;
       stores_.erase(found);
     }
-    if (stores_.size() >= kStoreLimit)
-      return {};
 
     const auto directory = root_ / digest_directory_name(key);
     std::error_code error;
@@ -228,7 +213,6 @@ public:
   }
 
 private:
-  static constexpr std::size_t kStoreLimit = 64;
 
   static std::string digest_directory_name(std::string_view key) {
     llvm::SHA256 hash;
@@ -555,21 +539,7 @@ public:
       ProbeIdentity identity{pid, std::move(function_name), std::move(replay_types),
                              object_probe_registration_id};
       active_probes_[key] = identity;
-      constexpr std::size_t kKnownProbeLimit = 4096;
-      bool retain_probe_identity = true;
-      if (!::tracer::compat::contains(known_probes_, key) &&
-          known_probes_.size() >= kKnownProbeLimit) {
-        const auto stale =
-            std::find_if(known_probes_.begin(), known_probes_.end(), [&](const auto& entry) {
-              return !::tracer::compat::contains(active_probes_, entry.first);
-            });
-        if (stale != known_probes_.end())
-          known_probes_.erase(stale);
-        else
-          retain_probe_identity = false;
-      }
-      if (retain_probe_identity)
-        known_probes_[key] = std::move(identity);
+      known_probes_[key] = std::move(identity);
       received_.try_emplace(key, 0);
     } else {
       flush_snapshot_probe_locked(key);
@@ -1322,11 +1292,8 @@ private:
       } else {
         parsed = event.ParseFromArray(bytes.data(), static_cast<int>(count));
       }
-      if (!parsed ||
-          event.protocol_version() != kProtocolVersion ||
-          event.session_id().empty() || event.probe_id() == 0 ||
-          event.pid() == 0 || event.tid() == 0 ||
-          event.arguments_size() > static_cast<int>(kMaxArguments)) {
+      if (!parsed || event.protocol_version() != kProtocolVersion || event.session_id().empty() ||
+          event.probe_id() == 0 || event.pid() == 0 || event.tid() == 0) {
         continue;
       }
       bool valid_arguments = true;
@@ -1368,18 +1335,17 @@ private:
                  type == clangtracer::v1::FLOAT64) &&
                 data == clangtracer::v1::Value::kRealValue);
       };
-      // Bound named snapshots and reject ambiguous or unsafe terminal names.
-      bool valid_named =
-          event.named_arguments_size() + event.object_fields_size() <= 16;
+      // Reject ambiguous or unsafe terminal names.
+      bool valid_named = true;
       std::set<std::string> argument_names, field_names;
       std::set<std::uint32_t> indices;
       const auto check_named = [&](const clangtracer::v1::NamedValue &item,
                                    std::set<std::string> &names) {
         const auto &name = item.name();
-        if (name.empty() || name.size() > 63 || !names.insert(name).second ||
-            !item.has_value() || item.value().type() == clangtracer::v1::VOID ||
-            !valid_result(item.value()))
+        if (name.empty() || !names.insert(name).second || !item.has_value() ||
+            item.value().type() == clangtracer::v1::VOID || !valid_result(item.value())) {
           return false;
+        }
         for (std::size_t i = 0; i < name.size(); ++i) {
           const char c = name[i];
           if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' ||
@@ -1580,12 +1546,6 @@ public:
         return {grpc::StatusCode::ALREADY_EXISTS,
                 "a session already owns this PID"};
       }
-      if (sessions_.size() + pending_pids_.size() >= kSessionLimit &&
-          !evict_finished_session_locked()) {
-        return {grpc::StatusCode::RESOURCE_EXHAUSTED,
-                "session limit reached: " + std::to_string(kSessionLimit) +
-                    " sessions are attached, attaching, or failed; detach one first"};
-      }
       if (!pending_pids_.insert(pid).second) {
         return {grpc::StatusCode::ALREADY_EXISTS,
                 "an attach for this PID is in progress"};
@@ -1691,7 +1651,6 @@ public:
     if (request->selector().empty() ||
         request->selector().find('\0') != std::string::npos ||
         request->callback_source().empty() ||
-        request->callback_source().size() > kMaxCallbackSource ||
         request->callback_source().find('\0') != std::string::npos) {
       return {grpc::StatusCode::INVALID_ARGUMENT,
               "selector and callback source must be nonempty and contain no NUL"};
@@ -2482,10 +2441,9 @@ public:
     const std::string callback = request->has_callback_source()
         ? request->callback_source()
         : "struct Interceptor { void pre(const Call&) {} void post(const Call&) {} };";
-    if (callback.empty() || callback.size() > kMaxCallbackSource ||
-        callback.find('\0') != std::string::npos)
-      return {grpc::StatusCode::INVALID_ARGUMENT,
-              "callback source must be 1 to 65536 bytes without NUL"};
+    if (callback.empty() || callback.find('\0') != std::string::npos) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "callback source must be nonempty without NUL"};
+    }
 
     auto session = find_session(request->session_id());
     if (!session)
@@ -2832,33 +2790,32 @@ private:
   std::vector<SnapshotMethod> prepare_snapshot_watch(const api::ObjectWatchRequest &request,
                                                      Session *session,
                                                      api::ObjectWatchStatus &response) {
-    if (request.methods().empty() || request.methods_size() > 16 ||
-        request.concrete_type().empty() || request.concrete_type().size() > 512 ||
-        request.stack_depth() > 64 || request.no_values() || !request.base_type().empty() ||
-        request.first_seen() || request.writer_entry() || request.writer_tid() || request.event_buffer() ||
-        !request.vector_field().empty() ||
+    if (request.methods().empty() || request.concrete_type().empty() ||
+        request.concrete_type().size() > 512 || request.stack_depth() > 64 || request.no_values() ||
+        !request.base_type().empty() || request.first_seen() || request.writer_entry() ||
+        request.writer_tid() || request.event_buffer() || !request.vector_field().empty() ||
         request.has_element_key() || !request.map_field().empty() || !request.map_key().empty() ||
-        !request.pointee_field().empty() ||
-        !request.union_tag().empty() || !request.union_cases().empty() ||
-        !request.async_signals().empty() ||
+        !request.pointee_field().empty() || !request.union_tag().empty() ||
+        !request.union_cases().empty() || !request.async_signals().empty() ||
         !request.element_key_field().empty() || !request.mutation_symbol().empty() ||
-        !request.additional_mutation_symbols().empty() ||
-        !request.owner_type().empty() || !request.collection().empty() ||
-        !request.owner_add().empty() || !request.owner_get().empty() ||
-        !request.owner_remove().empty() || !request.owner_snapshot().empty() ||
-        !request.code_symbol().empty() || !request.code_module().empty() ||
-        !request.additional_code_symbols().empty() || request.syscall_output() || request.cfi_stack() ||
-        request.serialize_wait_us() || request.follow_calls() || request.runtime_limit() ||
-        !request.shared_file().empty() ||
+        !request.additional_mutation_symbols().empty() || !request.owner_type().empty() ||
+        !request.collection().empty() || !request.owner_add().empty() ||
+        !request.owner_get().empty() || !request.owner_remove().empty() ||
+        !request.owner_snapshot().empty() || !request.code_symbol().empty() ||
+        !request.code_module().empty() || !request.additional_code_symbols().empty() ||
+        request.syscall_output() || request.cfi_stack() || request.serialize_wait_us() ||
+        request.follow_calls() || request.runtime_limit() || !request.shared_file().empty() ||
         request.overflow_policy() != api::ObjectWatchRequest::DROP_NEW ||
         !request.borrow_caller().empty() || !request.snapshot_field().empty() ||
-        request.backend() != api::ObjectWatchRequest::PTRACE ||
-        !request.max_elements() || request.max_elements() > context_engine::max_capture_items ||
-        !request.max_string_bytes() || request.max_string_bytes() > max_snapshot_bytes ||
-        !request.snapshot_max_bytes() || request.snapshot_max_bytes() > max_snapshot_bytes ||
-        !request.snapshot_max_depth() || request.snapshot_max_depth() > context_engine::max_capture_depth ||
-        !request.max_instances() || request.max_instances() > 65536)
-      throw std::invalid_argument("snapshot watches require 1 to 16 prepared methods and a concrete receiver type");
+        request.backend() != api::ObjectWatchRequest::PTRACE || !request.max_elements() ||
+        request.max_elements() > context_engine::max_capture_items || !request.max_string_bytes() ||
+        request.max_string_bytes() > max_snapshot_bytes || !request.snapshot_max_bytes() ||
+        request.snapshot_max_bytes() > max_snapshot_bytes || !request.snapshot_max_depth() ||
+        request.snapshot_max_depth() > context_engine::max_capture_depth ||
+        !request.max_instances() || request.max_instances() > 65536) {
+      throw std::invalid_argument(
+          "snapshot watches require prepared methods and a concrete receiver type");
+    }
     if (request.snapshot_module().size() > 4096 ||
         request.snapshot_module().find('\0') != std::string::npos ||
         (!session && !request.snapshot_module().empty()))
@@ -2867,8 +2824,6 @@ private:
         request.synchronization() != api::ObjectWatchRequest::CALLER_LOCK &&
         request.synchronization() != api::ObjectWatchRequest::STABLE_AT_BOUNDARIES)
       throw std::invalid_argument("snapshot watch requires a declared receiver synchronization policy");
-    if (request.snapshot_fields_size() > 128 || request.snapshot_keys_size() > 128)
-      throw std::invalid_argument("too many selected snapshot paths or identity rules");
     std::set<std::string> fields;
     for (const auto &field : request.snapshot_fields())
       if (field.empty() || field.size() > 512 || field.find('\0') != std::string::npos ||
@@ -2891,10 +2846,12 @@ private:
       std::string_view type = request.concrete_type();
       if (::tracer::compat::starts_with(type, "::"))
         type.remove_prefix(2);
-      if (prepared.ByteSizeLong() > 65536 || prepared.module_sha256().size() != 32 ||
+      if (prepared.module_sha256().size() != 32 ||
           !tracer::prepared::is_typed_version(prepared.format_version()) ||
-          prepared.signature().kind() != api::METHOD || receiver != type)
-        throw std::invalid_argument("snapshot method requires a pinned typed adapter for the selected receiver");
+          prepared.signature().kind() != api::METHOD || receiver != type) {
+        throw std::invalid_argument(
+            "snapshot method requires a pinned typed adapter for the selected receiver");
+      }
       api::ProbeSpec spec;
       std::string module = request.executable_file();
       if (session) {
@@ -3218,7 +3175,6 @@ public:
     using Watch = api::ObjectWatchRequest;
     const bool starting = request.action() == Request::START;
     if ((request.methods().empty() != request.callback_source().empty()) ||
-        request.callback_source().size() > kMaxCallbackSource ||
         request.callback_source().find('\0') != std::string::npos ||
         request.method_module().size() > 4096 || request.method_module().find('\0') != std::string::npos)
       throw std::invalid_argument("invalid object probe methods or callback source");
@@ -3543,10 +3499,6 @@ public:
     const bool typed_prepared = tracer::prepared::is_typed_version(spec.prepared().format_version());
     if (typed_prepared && !spec.include_headers().empty() && !spec.has_header_context())
       return {grpc::StatusCode::INVALID_ARGUMENT, "prepared injection requires a callback compilation context for optional includes"};
-    if (spec.ByteSizeLong() > 256 * 1024) {
-      return {grpc::StatusCode::INVALID_ARGUMENT,
-              "probe specification exceeds 256 KiB"};
-    }
     if (spec.symbol().empty() ||
         spec.symbol().size() >= sizeof(Request{}.symbol) ||
         spec.symbol().find('\0') != std::string::npos) {
@@ -3554,10 +3506,8 @@ public:
               "symbol must be 1 to 511 bytes without NUL"};
     }
     if (spec.callback_source().empty() ||
-        spec.callback_source().size() > kMaxCallbackSource ||
         spec.callback_source().find('\0') != std::string::npos) {
-      return {grpc::StatusCode::INVALID_ARGUMENT,
-              "callback source must be 1 to 65536 bytes without NUL"};
+      return {grpc::StatusCode::INVALID_ARGUMENT, "callback source must be nonempty without NUL"};
     }
     const auto &signature = spec.signature();
     if (signature.kind() != clangtracer::v1::FUNCTION &&
@@ -3580,16 +3530,10 @@ public:
       return {grpc::StatusCode::INVALID_ARGUMENT,
               "invalid receiver diagnostic"};
     }
-    if (spec.compile_options_size() > 128) {
-      return {grpc::StatusCode::INVALID_ARGUMENT,
-              "at most 128 compiler options are allowed"};
-    }
-    std::size_t compile_option_bytes = 0;
     for (const auto &option : spec.compile_options()) {
-      compile_option_bytes += option.size() + 1;
-      if (!valid_text(option, 4096) || compile_option_bytes > 65536) {
+      if (!valid_text(option, SIZE_MAX)) {
         return {grpc::StatusCode::INVALID_ARGUMENT,
-                "compiler options must be nonempty and total at most 64 KiB"};
+                "compiler options must be nonempty without NUL"};
       }
     }
     if (!safe_preflight_compiler_arguments(spec.compile_options().begin(),
@@ -3607,29 +3551,22 @@ public:
         return {grpc::StatusCode::INVALID_ARGUMENT, error.what()};
       }
     }
-    if (spec.argument_names_size() > 8 || spec.include_headers_size() > 16 ||
-        (spec.has_debug_info() &&
-         (spec.debug_info().ByteSizeLong() > 64 * 1024 ||
-          spec.debug_info().module().empty() ||
-          spec.debug_info().selector().empty() ||
-          spec.debug_info().runtime_entry() == 0 ||
-          spec.debug_info().entry_size() == 0 ||
-          spec.debug_info().entry_size() >
-              std::numeric_limits<std::uint64_t>::max() -
-                  spec.debug_info().runtime_entry() ||
-          spec.debug_info().record_calling_convention() <
-              clangtracer::v1::RECORD_CALLING_CONVENTION_UNSPECIFIED ||
-          spec.debug_info().record_calling_convention() >
-              clangtracer::v1::RECORD_PASS_BY_REFERENCE ||
-          spec.debug_info().fields_size() > 128 ||
-          spec.debug_info().arguments_size() > 8))) {
+    if (spec.has_debug_info() &&
+        (spec.debug_info().module().empty() || spec.debug_info().selector().empty() ||
+         spec.debug_info().runtime_entry() == 0 || spec.debug_info().entry_size() == 0 ||
+         spec.debug_info().entry_size() >
+             std::numeric_limits<std::uint64_t>::max() - spec.debug_info().runtime_entry() ||
+         spec.debug_info().record_calling_convention() <
+             clangtracer::v1::RECORD_CALLING_CONVENTION_UNSPECIFIED ||
+         spec.debug_info().record_calling_convention() >
+             clangtracer::v1::RECORD_PASS_BY_REFERENCE)) {
       return {grpc::StatusCode::INVALID_ARGUMENT,
               "invalid debug callable metadata"};
     }
     for (const auto &name : spec.argument_names()) {
-      if (!valid_text(name, 63))
-        return {grpc::StatusCode::INVALID_ARGUMENT,
-                "invalid debug argument name"};
+      if (!valid_text(name, SIZE_MAX)) {
+        return {grpc::StatusCode::INVALID_ARGUMENT, "invalid debug argument name"};
+      }
     }
     for (const auto &header : spec.include_headers()) {
       if (!valid_text(header, 4095) || header.front() != '/' ||
@@ -3641,15 +3578,13 @@ public:
       if (!spec.has_debug_info() || (!typed_prepared && spec.include_headers().empty()) ||
           !valid_text(context.working_directory(), 4095) ||
           context.working_directory().front() != '/' ||
-          !valid_text(context.inference(), 4096, true) ||
-          context.ByteSizeLong() > 64 * 1024 ||
-          context.compiler_arguments_size() > 512)
-        return {grpc::StatusCode::INVALID_ARGUMENT,
-                "invalid header compilation context"};
+          !valid_text(context.inference(), SIZE_MAX, true)) {
+        return {grpc::StatusCode::INVALID_ARGUMENT, "invalid header compilation context"};
+      }
       for (const auto &argument : context.compiler_arguments())
-        if (!valid_text(argument, 65536, true))
-          return {grpc::StatusCode::INVALID_ARGUMENT,
-                  "invalid header compiler argument"};
+        if (!valid_text(argument, SIZE_MAX, true)) {
+          return {grpc::StatusCode::INVALID_ARGUMENT, "invalid header compiler argument"};
+        }
       const auto begin = context.compiler_arguments().begin();
       const auto end = context.compiler_arguments().end();
       if (typed_prepared ? !safe_prepared_callback_compiler_arguments(begin, end)
@@ -3661,32 +3596,24 @@ public:
       const auto &receiver = spec.receiver();
       if (signature.kind() != clangtracer::v1::METHOD ||
           !spec.receiver_unavailable_reason().empty() ||
-          receiver.ByteSizeLong() > 64 * 1024 ||
           !valid_text(receiver.translation_unit(), 4095) ||
           receiver.translation_unit().front() != '/' ||
           !valid_text(receiver.working_directory(), 4095) ||
           receiver.working_directory().front() != '/' ||
-          !valid_text(receiver.record_name(), 4096) ||
-          !valid_text(receiver.clang_version(), 256) ||
-          !valid_text(receiver.target_triple(), 256) ||
-          receiver.compiler_arguments_size() == 0 ||
-          receiver.compiler_arguments_size() > 512 ||
-          receiver.fields_size() > 128 || receiver.size() == 0 ||
-          receiver.alignment() == 0) {
+          !valid_text(receiver.record_name(), 4096) || !valid_text(receiver.clang_version(), 256) ||
+          !valid_text(receiver.target_triple(), 256) || receiver.compiler_arguments_size() == 0 ||
+          receiver.size() == 0 || receiver.alignment() == 0) {
         return {grpc::StatusCode::INVALID_ARGUMENT,
                 "invalid Clang receiver context"};
       }
-      std::size_t argument_bytes = 0;
       for (const auto &argument : receiver.compiler_arguments()) {
-        if (!valid_text(argument, 65536, true)) {
+        if (!valid_text(argument, SIZE_MAX, true)) {
           return {grpc::StatusCode::INVALID_ARGUMENT,
                   "invalid receiver compiler argument"};
         }
-        argument_bytes += argument.size() + 1;
       }
-      if (argument_bytes > 65536 || receiver.compiler_arguments(0).empty()) {
-        return {grpc::StatusCode::INVALID_ARGUMENT,
-                "receiver compiler arguments exceed 64 KiB or omit driver"};
+      if (receiver.compiler_arguments(0).empty()) {
+        return {grpc::StatusCode::INVALID_ARGUMENT, "receiver compiler arguments omit driver"};
       }
       if (!safe_preflight_compiler_arguments(
               receiver.compiler_arguments().begin() + 1,
@@ -3717,10 +3644,8 @@ public:
         !spec.debug_info().result_cpp_type().empty() &&
         spec.debug_info().has_result_object_type() &&
         !spec.debug_info().result_object_type().record_name().empty();
-    if ((!valid_value(signature.result(), true) && !object_result_proven) ||
-        signature.arguments_size() > static_cast<int>(kMaxArguments)) {
-      return {grpc::StatusCode::INVALID_ARGUMENT,
-              "signature has unsupported result or too many arguments"};
+    if (!valid_value(signature.result(), true) && !object_result_proven) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "signature has unsupported result"};
     }
     for (const int type_value : signature.arguments()) {
       const auto type = static_cast<clangtracer::v1::ValueType>(type_value);

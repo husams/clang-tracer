@@ -168,24 +168,25 @@ void log_agent(const char *operation, const char *stage,
   if (fd >= 0) {
     timespec now{};
     ::clock_gettime(CLOCK_REALTIME, &now);
-    char line[512];
-    const int size = std::snprintf(
-        line, sizeof(line),
-        "clang-tracer agent time=%lld.%09ld pid=%ld probe_id=%llu call_id=%llu "
-        "operation=%s stage=%s outcome=%s errno=%d callback_errors=%llu "
-        "event_drops=%llu%s%s\n",
-        static_cast<long long>(now.tv_sec), now.tv_nsec,
-        static_cast<long>(::getpid()),
-        static_cast<unsigned long long>(probe_id),
-        static_cast<unsigned long long>(call_id), operation, stage, outcome,
-        error_number, static_cast<unsigned long long>(callback_errors),
-        static_cast<unsigned long long>(event_drops),
-        message ? " message=" : "", message ? message : "");
-    // Linux appends pwrite on an O_APPEND descriptor. The positional write
-    // also avoids a SIGPIPE if the application replaces this descriptor.
-    if (size > 0 && static_cast<std::size_t>(size) < sizeof(line))
-      (void)::syscall(SYS_pwrite64, fd, line, static_cast<std::size_t>(size),
-                      0LL);
+    try {
+      std::string line(512 + (message ? std::strlen(message) : 0), '\0');
+      const int size = std::snprintf(
+          line.data(), line.size(),
+          "clang-tracer agent time=%lld.%09ld pid=%ld probe_id=%llu call_id=%llu "
+          "operation=%s stage=%s outcome=%s errno=%d callback_errors=%llu "
+          "event_drops=%llu%s%s\n",
+          static_cast<long long>(now.tv_sec), now.tv_nsec, static_cast<long>(::getpid()),
+          static_cast<unsigned long long>(probe_id), static_cast<unsigned long long>(call_id),
+          operation, stage, outcome, error_number, static_cast<unsigned long long>(callback_errors),
+          static_cast<unsigned long long>(event_drops), message ? " message=" : "",
+          message ? message : "");
+      // Linux appends pwrite on an O_APPEND descriptor. The positional write
+      // also avoids a SIGPIPE if the application replaces this descriptor.
+      if (size > 0 && static_cast<std::size_t>(size) < line.size()) {
+        (void)::syscall(SYS_pwrite64, fd, line.data(), static_cast<std::size_t>(size), 0LL);
+      }
+    } catch (...) {
+    }
     (void)::syscall(SYS_close, fd);
   }
   --callback_depth;
@@ -230,20 +231,17 @@ void report_agent_failures() noexcept;
 void write_agent_logs() noexcept;
 
 struct CallbackLog {
-  static constexpr std::size_t kCapacity = 16;
-  static constexpr std::size_t kMessageSize = 192;
   struct Entry {
     std::uint64_t call_id;
     tracer::TracePhase phase;
     tracer::LogLevel level;
     // Outcome of a hook the agent ran. Null for a callback's own message.
     const char *hook_outcome;
-    char message[kMessageSize + 1];
+    std::string message;
   };
   // Producers try once. The sender releases this before writing any records.
   std::atomic_flag busy = ATOMIC_FLAG_INIT;
-  std::size_t count = 0;
-  std::array<Entry, kCapacity> entries{};
+  std::vector<Entry> entries;
   // Set after queueing so the sender skips probes with nothing to write.
   std::atomic<bool> pending{false};
   std::atomic<std::uint64_t> dropped{0};
@@ -272,6 +270,7 @@ struct VerifiedDebugEntry {
 struct Probe {
   static constexpr std::uint64_t admission_closed = std::uint64_t{1} << 63;
   tracer::Request request{};
+  std::vector<tracer::ValueType> signature_arguments;
   std::shared_ptr<OrcErrorCapture> orc_errors;
   std::unique_ptr<clang::Interpreter> interpreter;
   std::unique_ptr<clang::ASTUnit> receiver_ast;
@@ -341,7 +340,7 @@ struct Agent {
   pid_t pid = 0;
   tracer::ContextRegistry context_registry;
   std::shared_ptr<tracer::context_engine::ContextCapturePool> context_capture;
-  unsigned next_context_hook = 0;
+  std::uint64_t next_context_hook = 0;
   const bool logging_enabled = agent_log_path()[0] != '\0';
   tracer::EventTransport transport;
   std::shared_ptr<tracer::context_engine::PropagationLedger> propagation_ledger;
@@ -569,10 +568,9 @@ void write_agent_logs() noexcept {
         log.pending.store(true, std::memory_order_release);
         continue;
       }
-      std::array<CallbackLog::Entry, CallbackLog::kCapacity> pending;
-      const auto count = log.count;
-      std::copy_n(log.entries.begin(), count, pending.begin());
-      log.count = 0;
+      std::vector<CallbackLog::Entry> pending;
+      pending.swap(log.entries);
+      const auto count = pending.size();
       log.busy.clear(std::memory_order_release);
       for (std::size_t i = 0; i < count; ++i) {
         const auto &entry = pending[i];
@@ -582,9 +580,8 @@ void write_agent_logs() noexcept {
           log_agent("hook", phase, probe->request.probe_id, entry.hook_outcome,
                     0, 0, 0, entry.call_id);
         else
-          log_agent("callback", phase, probe->request.probe_id,
-                    log_level_name(entry.level), 0, 0, 0, entry.call_id,
-                    entry.message);
+          log_agent("callback", phase, probe->request.probe_id, log_level_name(entry.level), 0, 0,
+                    0, entry.call_id, entry.message.c_str());
       }
     }
     const auto dropped = log.dropped.load(std::memory_order_relaxed);
@@ -607,19 +604,21 @@ bool enqueue_agent_log(Probe &probe, const tracer::TraceContext &context,
   auto &log = probe.log;
   bool queued = false;
   if (!log.busy.test_and_set(std::memory_order_acquire)) {
-    queued = log.count < log.entries.size();
-    if (queued) {
-      auto &entry = log.entries[log.count++];
+    try {
+      CallbackLog::Entry entry{};
       entry.call_id = context.call_id;
       entry.phase = context.phase;
       entry.level = level;
       entry.hook_outcome = hook_outcome;
-      size = std::min(size, CallbackLog::kMessageSize);
+      entry.message.resize(size);
       for (std::size_t i = 0; i < size; ++i) {
         const auto byte = static_cast<unsigned char>(message[i]);
         entry.message[i] = byte < 32 || byte == 127 ? '?' : message[i];
       }
-      entry.message[size] = '\0';
+      log.entries.push_back(std::move(entry));
+      queued = true;
+    } catch (...) {
+      queued = false;
     }
     log.busy.clear(std::memory_order_release);
   }
@@ -653,6 +652,7 @@ Probe *find_probe(std::uint64_t id) noexcept {
 }
 
 struct SharedInvocationToken {
+  tracer::detail::NamedValueStorage named;
   Probe *probe = nullptr;
   tracer::TraceContext raw{};
   tracer::TraceContext entry_context{};
@@ -668,9 +668,18 @@ struct SharedInvocationToken {
   bool cancel_disabled = false, constructed = false, enabled = false,
        finished = false;
 };
-std::array<SharedInvocationToken, 256> shared_invocations;
-static_assert(sizeof(shared_invocations) <=
-              tracer::context_engine::kCaptureInvocationWorkspaceBytes);
+
+struct SharedInvocationStorage {
+  std::vector<std::unique_ptr<SharedInvocationToken>> tokens;
+
+  ~SharedInvocationStorage() {
+    ++callback_depth;
+    std::vector<std::unique_ptr<SharedInvocationToken>>().swap(tokens);
+    --callback_depth;
+  }
+};
+
+thread_local SharedInvocationStorage shared_invocation_storage;
 
 template <class T>
 void copy_shared_value(T &destination, const T &source) noexcept {
@@ -690,7 +699,8 @@ void copy_shared_value(T &destination, const T &source) noexcept {
 // from the immutable invocation-entry snapshot prepared before scope access.
 void shared_capture_stack(const tracer::TraceContext *context, unsigned depth,
                           bool application_only) noexcept {
-  for (auto &token : shared_invocations) {
+  for (auto& owned : shared_invocation_storage.tokens) {
+    auto& token = *owned;
     if (&token.raw != context ||
         !token.occupied.load(std::memory_order_acquire))
       continue;
@@ -787,13 +797,26 @@ extern "C" void *tracer_shared_enter(unsigned long long id,
     return nullptr;
   }
   SharedInvocationToken *token = nullptr;
-  for (auto &candidate : shared_invocations) {
+  for (auto& owned : shared_invocation_storage.tokens) {
+    auto& candidate = *owned;
     bool free = false;
     if (candidate.occupied.compare_exchange_strong(free, true,
                                                    std::memory_order_acq_rel)) {
       token = &candidate;
       break;
     }
+  }
+  if (!token) {
+    ++callback_depth;
+    try {
+      auto owned = std::make_unique<SharedInvocationToken>();
+      token = owned.get();
+      shared_invocation_storage.tokens.push_back(std::move(owned));
+      token->occupied.store(true, std::memory_order_release);
+    } catch (...) {
+      token = nullptr;
+    }
+    --callback_depth;
   }
   if (!token) {
     tracer::context_execution::runtime_diagnostics().record(
@@ -807,12 +830,17 @@ extern "C" void *tracer_shared_enter(unsigned long long id,
   token->finished = false;
   token->probe = probe;
   copy_shared_value(token->raw, *raw);
+  ++callback_depth;
+  token->named.clear();
+  --callback_depth;
+  token->raw.named_storage = &token->named;
+  token->raw.named_values = nullptr;
   token->raw.named_count = 0;
-  for (unsigned i = 0;
-       i < token->raw.argument_count && i < tracer::kMaxArguments; ++i)
-    token->raw.argument_names[i] = i < probe->argument_names.size()
-                                       ? probe->argument_names[i].c_str()
-                                       : nullptr;
+  token->raw.append_named = &tracer::detail::append_named_value;
+  for (unsigned i = 0; i < token->raw.argument_count; ++i) {
+    token->raw.argument_names[i] =
+        i < probe->argument_names.size() ? probe->argument_names[i].c_str() : nullptr;
+  }
   ::pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &token->cancel_state);
   token->cancel_disabled = true;
   ++callback_depth;
@@ -885,12 +913,17 @@ extern "C" void tracer_shared_dispatch(void *opaque,
   token->cancel_disabled = true;
   copy_shared_value(token->raw, *raw);
   token->raw.stack_capture = &shared_capture_stack;
+  ++callback_depth;
+  token->named.clear();
+  --callback_depth;
+  token->raw.named_storage = &token->named;
+  token->raw.named_values = nullptr;
   token->raw.named_count = 0;
-  for (unsigned i = 0;
-       i < token->raw.argument_count && i < tracer::kMaxArguments; ++i)
-    token->raw.argument_names[i] = i < token->probe->argument_names.size()
-                                       ? token->probe->argument_names[i].c_str()
-                                       : nullptr;
+  token->raw.append_named = &tracer::detail::append_named_value;
+  for (unsigned i = 0; i < token->raw.argument_count; ++i) {
+    token->raw.argument_names[i] =
+        i < token->probe->argument_names.size() ? token->probe->argument_names[i].c_str() : nullptr;
+  }
   ++callback_depth;
   const auto entry = raw->phase == tracer::TracePhase::Pre
                          ? token->probe->shared_generation->pre_entry()
@@ -995,82 +1028,45 @@ void set_error(tracer::Request *request, const char *text) noexcept {
   }
 }
 
-constexpr std::size_t kMaxSerializedProbeSpec = 256 * 1024;
-constexpr std::size_t kMaxCallbackSource = 64 * 1024;
-constexpr std::size_t kMaxReceiverFields = 128;
+bool valid_type(tracer::ValueType type, bool result);
 
-bool read_probe_spec(const tracer::Request &request,
-                     clangtracer::v1::ProbeSpec &spec, std::string &error) {
+bool read_probe_spec(tracer::Request& request, std::vector<tracer::ValueType>& arguments,
+                     clangtracer::v1::ProbeSpec& spec, std::string& error) {
   std::ifstream input(request.source_path, std::ios::binary);
-  if (!input) {
-    error = "cannot open serialized probe specification";
-    return false;
-  }
-  std::string bytes(kMaxSerializedProbeSpec + 1, '\0');
-  input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-  const auto count = static_cast<std::size_t>(input.gcount());
-  if (count > kMaxSerializedProbeSpec) {
-    error = "serialized probe specification exceeds 256 KiB";
-    return false;
-  }
-  bytes.resize(count);
-  if (!spec.ParseFromArray(bytes.data(), static_cast<int>(bytes.size()))) {
+  if (!input || !spec.ParseFromIstream(&input)) {
     error = "cannot parse serialized probe specification";
     return false;
   }
   if (spec.symbol() != request.symbol || !spec.has_signature() ||
       spec.object_watch_id() != request.object_watch_id ||
-      static_cast<unsigned>(spec.signature().kind()) !=
-          static_cast<unsigned>(request.kind) ||
-      static_cast<unsigned>(spec.signature().result()) !=
-          static_cast<unsigned>(request.result) ||
-      spec.signature().arguments_size() !=
-          static_cast<int>(request.argument_count) ||
-      request.argument_count > tracer::kMaxArguments) {
-    error =
-        "serialized probe specification does not match the prepared request";
+      static_cast<unsigned>(spec.signature().kind()) != static_cast<unsigned>(request.kind) ||
+      static_cast<unsigned>(spec.signature().result()) != static_cast<unsigned>(request.result) ||
+      spec.signature().arguments_size() != static_cast<int>(request.argument_count)) {
+    error = "serialized probe specification does not match the prepared request";
     return false;
   }
   if (request.object_watch_id &&
-      (request.kind != tracer::CallableKind::Method ||
-       !spec.has_debug_info() || spec.debug_info().record_name().empty() ||
+      (request.kind != tracer::CallableKind::Method || !spec.has_debug_info() ||
+       spec.debug_info().record_name().empty() ||
        !tracer::prepared::is_typed_version(spec.prepared().format_version()))) {
     error = "object-watch method requires verified receiver type metadata";
     return false;
   }
-  for (unsigned i = 0; i < request.argument_count; ++i) {
-    if (static_cast<unsigned>(spec.signature().arguments(static_cast<int>(
-            i))) != static_cast<unsigned>(request.arguments[i])) {
-      error = "serialized probe signature does not match the prepared request";
+  arguments.clear();
+  for (const auto type : spec.signature().arguments()) {
+    if (!valid_type(static_cast<tracer::ValueType>(type), false)) {
+      error = "unsupported argument type";
       return false;
     }
+    arguments.push_back(static_cast<tracer::ValueType>(type));
   }
-  if (spec.callback_source().size() > kMaxCallbackSource) {
-    error = "callback source exceeds 64 KiB";
-    return false;
-  }
+  request.arguments = arguments.data();
   if (spec.has_receiver()) {
     const auto &receiver = spec.receiver();
-    if (receiver.ByteSizeLong() > kMaxCallbackSource) {
-      error = "receiver compilation context exceeds 64 KiB";
+    if (receiver.translation_unit().empty() || receiver.working_directory().empty() ||
+        receiver.compiler_arguments().empty() || receiver.record_name().empty()) {
+      error = "receiver compilation context is incomplete";
       return false;
-    }
-    if (receiver.translation_unit().empty() ||
-        receiver.working_directory().empty() ||
-        receiver.compiler_arguments().empty() ||
-        receiver.record_name().empty() ||
-        receiver.fields_size() > static_cast<int>(kMaxReceiverFields)) {
-      error =
-          "receiver compilation context is incomplete or exceeds its limits";
-      return false;
-    }
-    std::size_t arguments_size = 0;
-    for (const auto &argument : receiver.compiler_arguments()) {
-      arguments_size += argument.size();
-      if (arguments_size > kMaxCallbackSource) {
-        error = "receiver compiler arguments exceed 64 KiB";
-        return false;
-      }
     }
   }
   return true;
@@ -1988,8 +1984,6 @@ bool build_debug_receiver(clangtracer::v1::ProbeSpec &spec,
       return false;
     }
     std::string headers;
-    if (spec.include_headers_size() > 16)
-      throw std::runtime_error("at most 16 optional includes");
     for (const auto &header : spec.include_headers()) {
       if (header.empty() || header.size() > 4095 || header.front() != '/' ||
           header.find_first_of("\"\r\n") != std::string::npos ||
@@ -2903,6 +2897,7 @@ std::string make_wrapper(const tracer::Request &r,
       "extern \"C\" void tracer_capture_stack(const "
       "tracer::TraceContext*,unsigned,bool) noexcept;\n";
   code += "extern \"C\" void tracer_context_check_entry();\n";
+
   if (shared_mode || trace_exceptions || callable_original)
     code += "#include <bits/cxxabi_forced.h>\n";
   if (callable_original)
@@ -2980,8 +2975,14 @@ std::string make_wrapper(const tracer::Request &r,
           std::to_string(r.probe_id) +
           "ULL); ctx.argument_count=" + std::to_string(r.argument_count) +
           "; ctx.phase=tracer::TracePhase::Pre;\n";
+  code += "tracer::TraceValue arguments[" + std::to_string(std::max(1u, r.argument_count)) +
+          "]{}; const char *argument_names[" + std::to_string(std::max(1u, r.argument_count)) +
+          "]{}; ctx.arguments=arguments; ctx.argument_names=argument_names;\n";
   if (overrides) {
-    code += "tracer::ScalarOverrides overrides{}; ctx.scalar_overrides=&overrides;\n";
+    code += "std::uint64_t override_values[" + std::to_string(std::max(1u, r.argument_count)) +
+            "]{}; unsigned char override_set[" + std::to_string(std::max(1u, r.argument_count)) +
+            "]{}; tracer::ScalarOverrides overrides{}; overrides.arguments=override_values; "
+            "overrides.argument_set=override_set; ctx.scalar_overrides=&overrides;\n";
     if (override_arguments)
       code += "overrides.allow_arguments=true;\n";
     if (override_result)
@@ -3123,9 +3124,9 @@ std::string make_wrapper(const tracer::Request &r,
     for (unsigned i = 0; i < r.argument_count; ++i) {
       const auto index = std::to_string(i);
       const auto argument = "a" + index;
-      code += "if (overrides.argument_mask & (1u<<" + index + ")) { " +
-              argument + "=tracer::ScalarOverrides::unpack<decltype(" + argument +
-              ")>(overrides.arguments[" + index + "]);\n";
+      code += "if (overrides.argument_set[" + index + "]) { " + argument +
+              "=tracer::ScalarOverrides::unpack<decltype(" + argument + ")>(overrides.arguments[" +
+              index + "]);\n";
       fill_value(code, i, r.arguments[i], false);
       code += "}\n";
     }
@@ -4763,9 +4764,12 @@ bool compile_shared_probe(Probe &p,
     return true;
   }
   auto *owner = agent.load(std::memory_order_acquire);
-  if (!owner ||
-      owner->next_context_hook >= tracer::context_engine::kCaptureHooks) {
-    error = "shared-context generation capacity exceeded";
+  if (!owner) {
+    error = "shared-context agent is unavailable";
+    return false;
+  }
+  if (owner->next_context_hook == std::numeric_limits<std::uint64_t>::max()) {
+    error = "shared-context hook identity space exhausted";
     return false;
   }
   if (std::all_of(activation.source_lineage_id.begin(),
@@ -6055,24 +6059,41 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
     staged->allow_replacement = ctx->scalar_overrides->allow_replacement;
     invocation.scalar_overrides = &*staged;
   }
+  tracer::detail::NamedValueStorage named;
+  invocation.named_storage = &named;
+  invocation.named_values = nullptr;
   invocation.named_count = 0;
-  for (unsigned i = 0;
-       i < invocation.argument_count && i < tracer::kMaxArguments; ++i)
+  invocation.append_named = &tracer::detail::append_named_value;
+  for (unsigned i = 0; i < invocation.argument_count; ++i) {
     invocation.argument_names[i] =
         i < p->argument_names.size() ? p->argument_names[i].c_str() : nullptr;
+  }
   ++callback_depth;
   struct DispatchGuard {
     tracer::TraceContext &context;
+    tracer::detail::NamedValueStorage& named;
     int saved_errno;
     bool depth_active = true;
     ~DispatchGuard() {
-      if (depth_active)
-        --callback_depth;
+      if (!depth_active) {
+        ++callback_depth;
+      }
+      named.clear();
       tracer::release_native_stack(context);
+      --callback_depth;
       errno = saved_errno;
     }
-  } dispatch_guard{invocation, saved_errno};
+  } dispatch_guard{invocation, named, saved_errno};
+
+  std::vector<std::uint64_t> staged_arguments;
+  std::vector<unsigned char> staged_set;
   try {
+    if (staged) {
+      staged_arguments.resize(ctx->argument_count);
+      staged_set.resize(ctx->argument_count);
+      staged->arguments = staged_arguments.data();
+      staged->argument_set = staged_set.data();
+    }
     value = p->callback(&invocation, instance, &succeeded);
     // The bridge reports whether a hook exists for this phase and ran.
     if (succeeded)
@@ -6091,11 +6112,22 @@ extern "C" long long tracer_callback_dispatch(unsigned long long id,
       p->callback_enabled.store(false, std::memory_order_relaxed);
     p->callback_errors.fetch_add(1, std::memory_order_relaxed);
   }
+  if (succeeded) {
+    if (staged) {
+      auto* values = ctx->scalar_overrides->arguments;
+      auto* set = ctx->scalar_overrides->argument_set;
+      std::copy(staged_arguments.begin(), staged_arguments.end(), values);
+      std::copy(staged_set.begin(), staged_set.end(), set);
+      *ctx->scalar_overrides = *staged;
+      ctx->scalar_overrides->arguments = values;
+      ctx->scalar_overrides->argument_set = set;
+    }
+  }
+  std::vector<std::uint64_t>().swap(staged_arguments);
+  std::vector<unsigned char>().swap(staged_set);
   --callback_depth;
   dispatch_guard.depth_active = false;
   if (succeeded) {
-    if (staged)
-      *ctx->scalar_overrides = *staged;
     tracer_event_dispatch(id, &invocation, value);
   } else if (callback_failed) {
     // Publish a bounded diagnostic after leaving callback admission so the
@@ -6193,18 +6225,16 @@ static void tracer_event_dispatch_impl(unsigned long long id,
       event.set_receiver_sampled_at_return(
           ctx->phase == tracer::TracePhase::Post && p->receiver_sampled_at_return);
     }
-    for (std::uint32_t i = 0;
-         i < ctx->argument_count && i < tracer::kMaxArguments; ++i) {
+    for (std::uint32_t i = 0; i < ctx->argument_count; ++i) {
       *event.add_arguments() = to_proto_value(ctx->arguments[i]);
     }
-    if (ctx->named_count > 16) {
+    if (ctx->named_count && !ctx->named_values) {
       throw std::invalid_argument("invalid named value count");
     }
     for (std::uint32_t i = 0; i < ctx->named_count; ++i) {
-      const auto &value = ctx->named_values[i];
-      const auto length = ::strnlen(value.name, sizeof(value.name));
-      if (length == 0 || length == sizeof(value.name) ||
-          (value.kind != 1 && value.kind != 2)) {
+      const auto& value = ctx->named_values[i];
+      const auto length = value.name_size;
+      if (length == 0 || (value.kind != 1 && value.kind != 2)) {
         throw std::invalid_argument("invalid named value");
       }
       auto *named = value.kind == 1 ? event.add_named_arguments()
@@ -6236,63 +6266,14 @@ static void tracer_event_dispatch_impl(unsigned long long id,
     }
     event.set_agent_dropped_events(
         p->delivery.dropped.load(std::memory_order_relaxed));
-    // Preserve the event when positional/named snapshot duplication exceeds
-    // the native packet budget; the typed getter reports explicit truncation.
+    // Large events use the transport's sealed-file path; snapshot budgets
+    // are enforced at capture, not by an unrelated inline datagram ceiling.
     auto size = event.ByteSizeLong();
-    const auto exceeds_packet = [&] {
-      return size > (p->object_snapshot ? tracer::max_snapshot_wire_bytes :
-                                          tracer::EventTransport::kInlineEventBytes);
-    };
-    const auto sync_named_argument = [&](int index) {
-      for (auto &named : *event.mutable_named_arguments())
-        if (named.argument_index() == static_cast<unsigned>(index))
-          *named.mutable_value() = event.arguments(index);
-    };
-    // Dropping followed members first keeps the original record fields and
-    // the pointer addresses available within the existing event budget.
-    for (int i = 0; i < event.arguments_size() && exceeds_packet(); ++i) {
-      auto &value = *event.mutable_arguments(i);
-      if (value.has_snapshot() && !value.snapshot().members().empty()) {
-        value.mutable_snapshot()->clear_members();
-        sync_named_argument(i);
-        size = event.ByteSizeLong();
-      }
-    }
-    if (exceeds_packet() && event.has_result() &&
-        !event.result().snapshot().members().empty()) {
-      event.mutable_result()->mutable_snapshot()->clear_members();
-      size = event.ByteSizeLong();
-    }
-    if (exceeds_packet() && !event.receiver_snapshot().members().empty()) {
-      event.mutable_receiver_snapshot()->clear_members();
-      size = event.ByteSizeLong();
-    }
-    const auto discard_snapshot = [](clangtracer::context::v1::ValueSnapshot *snapshot) {
-      snapshot->Clear();
-      snapshot->set_status(clangtracer::context::v1::ValueSnapshot::LIMIT_EXCEEDED);
-      snapshot->set_detail("snapshot exceeds native event packet budget");
-    };
-    for (int i = 0; i < event.arguments_size() && exceeds_packet(); ++i) {
-      auto &value = *event.mutable_arguments(i);
-      if (!value.has_snapshot()) continue;
-      discard_snapshot(value.mutable_snapshot());
-      sync_named_argument(i);
-      size = event.ByteSizeLong();
-    }
-    if (exceeds_packet() && event.has_result() && event.result().has_snapshot()) {
-      discard_snapshot(event.mutable_result()->mutable_snapshot());
-      size = event.ByteSizeLong();
-    }
-    if (exceeds_packet() && event.has_receiver_snapshot()) {
-      discard_snapshot(event.mutable_receiver_snapshot());
-      size = event.ByteSizeLong();
-    }
-    const bool base_fits = !exceeds_packet();
     if (ctx->stack.status != tracer::StackStatus::Disabled) {
       tracer::serialize_native_stack(ctx->stack, *event.mutable_stack());
       size = event.ByteSizeLong();
     }
-    if (base_fits && size <= static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    if (size <= static_cast<std::size_t>(std::numeric_limits<int>::max())) {
       packet->bytes.resize(size);
       valid =
           event.SerializeToArray(packet->bytes.data(), static_cast<int>(size));
@@ -6332,19 +6313,9 @@ bool validate_request(const tracer::Request &r, std::string &error) {
     error = "object-watch identity requires a non-static method";
     return false;
   }
-  if (r.argument_count > tracer::kMaxArguments) {
-    error = "at most eight explicit arguments are supported";
-    return false;
-  }
   if (!valid_type(r.result, true)) {
     error = "unsupported result type";
     return false;
-  }
-  for (unsigned i = 0; i < r.argument_count; ++i) {
-    if (!valid_type(r.arguments[i], false)) {
-      error = "unsupported argument type";
-      return false;
-    }
   }
   if (!std::memchr(r.session_id, '\0', sizeof(r.session_id)) ||
       !r.session_id[0] || !std::memchr(r.symbol, '\0', sizeof(r.symbol)) ||
@@ -6438,7 +6409,7 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
     p->request = *request;
     clangtracer::v1::ProbeSpec specification;
     operation.stage = "read_probe_spec";
-    if (!read_probe_spec(p->request, specification, error)) {
+    if (!read_probe_spec(p->request, p->signature_arguments, specification, error)) {
       set_error(request, error.c_str());
       return operation.finish(-1);
     }
@@ -6754,18 +6725,8 @@ extern "C" int tracer_agent_validate(tracer::ValidationRequest *request) {
       set_error("cannot open serialized validation ProbeSpec");
       return -1;
     }
-    std::string serialized(kMaxSerializedProbeSpec + 1, '\0');
-    input.read(serialized.data(), static_cast<std::streamsize>(serialized.size()));
-    const auto serialized_size = static_cast<std::size_t>(input.gcount());
-    if (serialized_size > kMaxSerializedProbeSpec) {
-      set_error("serialized validation ProbeSpec exceeds 256 KiB");
-      return -1;
-    }
-    serialized.resize(serialized_size);
     clangtracer::v1::ProbeSpec spec;
-    if (!spec.ParseFromArray(serialized.data(),
-                             static_cast<int>(serialized.size())) ||
-        !spec.has_signature() || spec.callback_source().empty() ||
+    if (!spec.ParseFromIstream(&input) || !spec.has_signature() || spec.callback_source().empty() ||
         spec.symbol().empty() || !spec.has_debug_info()) {
       set_error("validation ProbeSpec is incomplete or malformed");
       return -1;
@@ -6792,9 +6753,11 @@ extern "C" int tracer_agent_validate(tracer::ValidationRequest *request) {
                  sizeof(native_request.source_path) - 1);
     std::strncpy(native_request.event_socket, "/tmp/clang-tracer-validation",
                  sizeof(native_request.event_socket) - 1);
-    for (int i = 0; i < spec.signature().arguments_size(); ++i)
-      native_request.arguments[i] = static_cast<tracer::ValueType>(
-          spec.signature().arguments(i));
+    std::vector<tracer::ValueType> signature_arguments;
+    for (const auto type : spec.signature().arguments()) {
+      signature_arguments.push_back(static_cast<tracer::ValueType>(type));
+    }
+    native_request.arguments = signature_arguments.data();
     if (tracer::prepared::is_typed_version(spec.prepared().format_version())) {
       for (const auto &option : spec.prepared().adapter_toolchain_options())
         if (::tracer::compat::starts_with(option, "--driver-mode="))

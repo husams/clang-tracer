@@ -32,7 +32,7 @@ namespace tracer_repl {
 namespace api = clangtracer::v1;
 
 namespace {
-constexpr std::uint32_t max_frame = 32 * 1024 * 1024;
+constexpr std::uint32_t max_frame = INT32_MAX; // Protobuf ParseFromArray takes int.
 
 void write_all(int fd, const void *data, std::size_t size) {
   auto *next = static_cast<const char *>(data);

@@ -321,12 +321,21 @@ void verify_context_runtime() {
   trace.call_id = 0x1020304050607080ULL;
   trace.phase = TracePhase::Pre;
   trace.probe_id = 7;
+  tracer::TraceValue argument_storage[1]{};
+  const char* argument_names[1]{};
+  tracer::detail::NamedValueStorage named_storage;
+  named_storage.values.resize(1);
+  trace.arguments = argument_storage;
+  trace.argument_names = argument_names;
+  trace.named_values = named_storage.values.data();
+  trace.named_storage = &named_storage;
   trace.argument_count = 1;
   trace.argument_names[0] = "delta";
   trace.arguments[0] = {ValueType::Int64, 0, 5, 0, 0};
   trace.named_count = 1;
   trace.named_values[0].kind = 2;
-  std::memcpy(trace.named_values[0].name, "field", 6);
+  trace.named_values[0].name = "field";
+  trace.named_values[0].name_size = 5;
   trace.named_values[0].value = {ValueType::Int64, 0, 8, 0, 0};
   Call call(trace);
 

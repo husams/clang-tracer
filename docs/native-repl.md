@@ -129,7 +129,7 @@ definitions interposed in its dynamic lookup scope.
 
 `--payload-limit BYTES` sets the maximum serialized source and dependency
 snapshot sent to the target for a live operation. The default is 16 MiB.
-The REPL also enforces its 32 MiB limit on an outgoing RPC. Apply can reuse
+The REPL does not impose an additional outgoing RPC size ceiling. Apply can reuse
 the preview's plan for the same input and revision after rechecking the
 saved files and executable mappings. Set `CLANG_TRACER_LIVE_COMPILE_JOBS`
 in the server environment to choose how many translation units it compiles
@@ -516,6 +516,22 @@ duplicate signature with `--module`.
 
 The capacity line reports retained probes and `limit=unlimited`. Probe storage
 grows as needed; allocation can still fail when process resources are exhausted.
+
+Sessions, snapshot-watch method lists, shared-context hook registrations,
+invocation bookkeeping, probe arguments, and named callback values use growing
+storage. Callback source, compiler metadata, plugins, and prepared packages have
+no separate application size ceiling; transport representation and allocation
+failures still apply. Native event and callback-log queues grow with pending
+work. Large native events use sealed file descriptors instead of truncating to
+the inline datagram threshold. Log messages are not shortened to 192 bytes.
+
+Existing configurable budgets and their defaults are unchanged: snapshot
+sizes/depths, history and REPL retention, shared-context transport memory,
+operation timeouts, and memory read/scan requests retain their settings.
+Growing queues may use more memory when consumers are slow. Allocation,
+transport, and callback failures still report through existing diagnostics.
+The native bootstrap is version 33; update the server and agent together.
+
 The preview runs without installing probes, stopping target threads or executing code inside
 the target. `--save` creates a new versioned text-protobuf file with selection
 rules. Reusing it resolves against the current session and mappings.
@@ -573,7 +589,7 @@ The target keeps running during inspection, so bytes can change while
 they are copied. An unmap and remap with identical visible metadata between
 checks can produce the same snapshot.
 
-Scans accept 1 to 1048576 bytes and patterns of 1 to 256 bytes. Separate hex
+Scans accept 1 to 1048576 bytes and nonempty patterns. Separate hex
 bytes with spaces. Use `??` for an entire wildcard byte, or `8?` or `?f`
 for a wildcard nibble. To choose individual bits, append a colon and a
 same-length hex mask, as in `"13 37 : 1f ff"`. A bit participates only
@@ -1641,7 +1657,7 @@ Agent and server loss counters are cumulative samples from retained events.
 They and local buffer evictions are reported separately from incomplete calls.
 
 By default, `%record` uses four-byte little-endian lengths and Protobuf
-TraceEvent frames, with a 32 MiB per-frame limit. Framed recording and export
+TraceEvent frames, bounded by the Protobuf representation rather than a separate 32 MiB policy. Framed recording and export
 create new files exclusively. `%record FILE --sqlite` creates or appends to a
 SQLite recording and deduplicates events by server instance and sequence.
 Replay rejects truncated headers/bodies and invalid messages. A failed

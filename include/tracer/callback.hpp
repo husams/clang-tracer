@@ -91,7 +91,7 @@ public:
   const Context &context() const;
 
   template <class T> T arg(std::size_t index) const {
-    if (index >= context_.argument_count || index >= kMaxArguments) {
+    if (index >= context_.argument_count) {
       throw std::out_of_range("callback argument index is out of range");
     }
     return decode<T>(context_.arguments[index]);
@@ -101,11 +101,12 @@ public:
     auto *overrides = context_.scalar_overrides;
     if (context_.phase != TracePhase::Pre || !overrides || !overrides->allow_arguments)
       throw std::logic_error("argument overrides require an opted-in pre() hook");
-    if (index >= context_.argument_count || index >= kMaxArguments)
+    if (index >= context_.argument_count) {
       throw std::out_of_range("callback argument index is out of range");
+    }
     require_type(context_.arguments[index], override_type<T>());
     overrides->arguments[index] = ScalarOverrides::pack(value);
-    overrides->argument_mask |= std::uint32_t{1} << index;
+    overrides->argument_set[index] = 1;
   }
 
   template <class T> void override_result(T value) const {
@@ -240,16 +241,20 @@ public:
     return context_.argument_count;
   }
   const TraceValue &argument_value(std::size_t index) const {
-    if (index >= context_.argument_count || index >= kMaxArguments)
+    if (index >= context_.argument_count) {
       throw std::out_of_range("callback argument index is out of range");
+    }
     return context_.arguments[index];
   }
   const char *argument_name(std::size_t index) const {
     (void)argument_value(index);
-    static constexpr const char *fallback[kMaxArguments] = {
-        "arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6", "arg7"};
     const char *name = context_.argument_names[index];
-    return name && name[0] ? name : fallback[index];
+    if (name && name[0]) {
+      return name;
+    }
+    thread_local std::string fallback;
+    fallback = "arg" + std::to_string(index);
+    return fallback.c_str();
   }
   const TraceValue &result_value() const {
     if (context_.phase != TracePhase::Post)
@@ -275,8 +280,6 @@ public:
 
   // Types and passing modes are supplied by the validated DWARF description.
   template <std::size_t Index> decltype(auto) argument() const {
-    static_assert(Index < kMaxArguments,
-                  "argument index exceeds the supported limit");
     using T = typename ArgumentType<Index>::type;
     if constexpr (std::is_reference_v<T>) {
       if (Index >= context_.argument_count)
@@ -327,28 +330,15 @@ private:
     std::size_t length = 0;
     while (name[length]) {
       const char c = name[length];
-      if (length >= 63 ||
-          !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' ||
+      if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' ||
             (length && name[length - 1] != '.' && c >= '0' && c <= '9') ||
-            (c == '.' && length && name[length - 1] != '.' &&
-             name[length + 1]))) {
-        throw std::invalid_argument(
-            "event value name must be an identifier of at most 63 bytes");
+            (c == '.' && length && name[length - 1] != '.' && name[length + 1]))) {
+        throw std::invalid_argument("event value name must be an identifier");
       }
       ++length;
     }
-    unsigned field_count = 0;
-    for (std::uint32_t i = 0; i < context_.named_count && i < 16; ++i)
-      if (context_.named_values[i].kind == 2)
-        ++field_count;
-    if (kind == 2 && field_count + context_.argument_count >= 16)
-      throw std::out_of_range(
-          "at most 16 arguments and fields combined per hook");
-    if (context_.named_count >= 16) {
-      throw std::out_of_range("at most 16 named values per hook are supported");
-    }
     for (std::uint32_t i = 0; i < context_.named_count; ++i) {
-      const auto &previous = context_.named_values[i];
+      const auto& previous = context_.named_values[i];
       if (previous.kind != kind)
         continue;
       std::size_t j = 0;
@@ -360,13 +350,13 @@ private:
             "duplicate event value name or argument index");
       }
     }
-    auto &entry = context_.named_values[context_.named_count++];
-    entry.kind = kind;
-    entry.argument_index = index;
-    for (std::size_t i = 0; i < length; ++i)
-      entry.name[i] = name[i];
-    entry.name[length] = '\0';
-    entry.value = value;
+    if (!context_.named_storage) {
+      throw std::logic_error("named-value storage is unavailable");
+    }
+    if (!context_.append_named ||
+        !context_.append_named(&context_, name, length, value, kind, index)) {
+      throw std::runtime_error("cannot store named callback value");
+    }
   }
 
   template <class T> static TraceValue encode(T value) {

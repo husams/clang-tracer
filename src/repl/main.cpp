@@ -383,9 +383,6 @@ int main(int argc, char **argv) {
               break;
             }
             source += *part + '\n';
-            if (source.size() > 4 * 1024 * 1024) {
-              throw std::runtime_error("interceptor exceeds 4 MiB");
-            }
           }
           if (save) {
             controller.draft(command.arguments.at(0), std::move(source));
