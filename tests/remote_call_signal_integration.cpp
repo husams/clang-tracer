@@ -49,6 +49,7 @@ void require(bool condition, const std::string &message) {
     throw std::runtime_error(message);
 }
 
+#if defined(__x86_64__)
 [[noreturn]] void sleep_at_page_edge() {
   const long page_size = ::sysconf(_SC_PAGESIZE);
   if (page_size <= 0)
@@ -71,6 +72,7 @@ void require(bool condition, const std::string &message) {
   for (;;)
     sleep(&delay);
 }
+#endif
 
 class Sleeper {
 public:
@@ -81,8 +83,12 @@ public:
       if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 ||
           ::setrlimit(RLIMIT_CORE, &no_core) != 0)
         ::_exit(120);
+#if defined(__x86_64__)
       if (page_edge)
         sleep_at_page_edge();
+#else
+      (void)page_edge;
+#endif
       for (;;) {
         const timespec delay{0, 50 * 1000 * 1000};
         ::nanosleep(&delay, nullptr);
@@ -150,6 +156,7 @@ void attach(Process &process, pid_t pid) {
   }
 }
 
+#if defined(__x86_64__)
 void run_page_edge_case() {
   Sleeper child(true);
   Process process;
@@ -181,6 +188,7 @@ void run_page_edge_case() {
   child.wait_for_signal(SIGTERM);
   std::cout << "remote syscall at the executable page boundary: restored" << std::endl;
 }
+#endif
 
 std::uintptr_t send_process_signal(int signal) {
   sigset_t mask;
@@ -225,7 +233,9 @@ void run_case(const char *name, int signal, bool suppress, Call call) {
 
 int main() {
   try {
+#if defined(__x86_64__)
     run_page_edge_case();
+#endif
     const auto fault = [](Process &process) { (void)process.remote_call(1); };
     run_case("confirmed synchronous SIGSEGV", SIGSEGV, true, fault);
     fail_fault_attribution = true;

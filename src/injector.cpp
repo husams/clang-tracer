@@ -2011,8 +2011,9 @@ Process::remote_syscall(long number,
   constexpr auto stub = syscall_stub;
   const auto saved_ip = register_ip(saved.general);
 #if defined(__x86_64__)
-  // A stopped syscall can leave RIP at the very end of executable memory.
-  // Keep both the temporary stub and the ptrace read inside that word.
+  // Keep the stub and ptrace read inside the word containing RIP. Move the
+  // stub to the word's start whenever it would cross a word boundary, which
+  // also prevents crossing an executable page boundary.
   constexpr auto read_size = sizeof(long);
   static_assert(stub.size() <= read_size);
   const auto read_address = saved_ip - saved_ip % read_size;
