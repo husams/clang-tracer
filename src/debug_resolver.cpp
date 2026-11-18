@@ -962,6 +962,53 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl,
   return result;
 }
 
+// An entry detour executes for every folded name, including names outside the
+// selection. Compare the typed contract without function or parameter names.
+std::string callable_abi(DWARFDie die) {
+  const auto decl = declaration(die);
+  const auto shape = describe_callable(die, decl, {}, true);
+  api::ProbeSpec abi;
+  *abi.mutable_signature() = shape.signature;
+  auto &info = *abi.mutable_debug_info();
+  if (shape.receiver) {
+    describe_record(shape.receiver, info);
+    info.set_receiver_volatile(shape.receiver_volatile);
+  }
+  for (const auto &argument : shape.arguments)
+    *info.add_arguments() = argument;
+  const auto result = read_type(type_of(decl));
+  info.set_result_cpp_type(result.spelling);
+  info.set_result_is_reference(result.reference);
+  info.set_result_is_object_value(result.value == api::OBJECT);
+  if (result.record)
+    describe_record(result.record, *info.mutable_result_object_type());
+  return abi.SerializeAsString();
+}
+
+bool incompatible_entry_abis(const std::vector<DWARFDie> &entries,
+                             const std::function<void()> &check_cancelled) {
+  if (entries.size() < 2)
+    return false;
+  std::optional<std::string> expected;
+  for (const auto die : entries) {
+    check_cancelled();
+    try {
+      const auto abi = callable_abi(die);
+      if (expected && abi != *expected)
+        return true;
+      expected = abi;
+    } catch (const std::exception &) {
+      // A second concrete subprogram with an unsupported contract cannot safely
+      // inherit the primary's ABI. ELF-only aliases have no such subprogram.
+      return true;
+    }
+  }
+  return false;
+}
+
+constexpr const char *incompatible_entry_diagnostic =
+    "shared runtime entry has incompatible or unsupported DWARF callable ABIs";
+
 std::uint64_t die_low_pc(DWARFDie die) {
   std::uint64_t low = 0, high = 0, section = 0;
   return die.getLowAndHighPC(low, high, section) ? low : 0;
@@ -1602,6 +1649,45 @@ open_debug_companion(const std::string &path,
   return std::move(*binary);
 }
 
+void verify_prepared_entry_abis(const std::string &path,
+    const llvm::object::ELF64LEObjectFile &object, std::uint64_t entry,
+    const DebugLookupOptions &options) {
+  // Source-only packages also install typed detours. Use available DWARF to
+  // check their folded peers, while preserving preparation without DWARF.
+  auto companion = open_debug_companion(path, object);
+  const auto *debug_object = companion
+      ? llvm::cast<llvm::object::ELF64LEObjectFile>(companion->getBinary()) : &object;
+  auto dwarf = llvm::DWARFContext::create(*debug_object);
+  const auto check_cancelled = [&] {
+    if (options.is_cancelled())
+      throw std::runtime_error("prepared lookup cancelled");
+  };
+  std::vector<DWARFDie> entries;
+  std::uint64_t visited = 0;
+  for (const auto &unit : dwarf->compile_units()) {
+    std::vector<std::pair<DWARFDie, std::size_t>> pending{{unit->getUnitDIE(false), 0}};
+    while (!pending.empty()) {
+      const auto [die, depth] = pending.back();
+      pending.pop_back();
+      if (!die)
+        continue;
+      if ((visited++ % 128) == 0)
+        check_cancelled();
+      if (options.max_entries && visited > options.max_entries)
+        throw DebugLookupLimit("debug entry limit exceeded; increase --debug-max-entries or use 0");
+      if (options.max_depth && depth > options.max_depth)
+        throw DebugLookupLimit("debug depth limit exceeded; increase --debug-max-depth or use 0");
+      if (die.getTag() == dw::DW_TAG_subprogram && die_low_pc(die) == entry)
+        entries.push_back(die);
+      for (auto child : die.children())
+        pending.emplace_back(child, depth + 1);
+    }
+  }
+  check_cancelled();
+  if (incompatible_entry_abis(entries, check_cancelled))
+    throw std::runtime_error(incompatible_entry_diagnostic);
+}
+
 } // namespace
 
 api::PreviewBulkTraceResponse preview_bulk_trace(
@@ -1705,6 +1791,7 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
         ? llvm::cast<llvm::object::ELF64LEObjectFile>(companion->getBinary())
         : object;
     auto dwarf = llvm::DWARFContext::create(*debug_object);
+    std::map<std::uint64_t, std::vector<DWARFDie>> entry_dies;
     std::size_t visited = 0;
     for (const auto &unit : dwarf->compile_units()) {
       std::vector<DWARFDie> pending{unit->getUnitDIE(false)};
@@ -1722,6 +1809,7 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
         std::uint64_t low = 0, high = 0, section = 0;
         if (!die.getLowAndHighPC(low, high, section) || high <= low)
           continue;
+        entry_dies[low].push_back(die);
         const auto decl = declaration(die);
         const auto qname = qualified(decl);
         if (qname.empty())
@@ -1791,6 +1879,23 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
       visit_elf(symbol);
     for (const auto &symbol : object->getDynamicSymbolIterators())
       visit_elf(symbol);
+    // Check all concrete descriptions at each selected entry, not just the
+    // selected names: unselected callers also run through the typed detour.
+    std::map<std::uint64_t, bool> incompatible;
+    for (auto &[key, candidate] : candidates) {
+      const auto &function = candidate.function();
+      if (function.module_path() != path)
+        continue;
+      check_cancelled();
+      const auto address = function.elf_address();
+      auto [checked, added] = incompatible.try_emplace(address, false);
+      if (added)
+        checked->second = incompatible_entry_abis(entry_dies[address], check_cancelled);
+      if (checked->second) {
+        candidate.set_abi_status(PreviewCandidate::AMBIGUOUS);
+        candidate.set_diagnostic(incompatible_entry_diagnostic);
+      }
+    }
   }
   check_cancelled();
   const auto current = modules(pid);
@@ -2053,6 +2158,7 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
     info.set_module(path);
     info.set_file_size(bytes.size());
     const auto [entry, size] = *ranges.begin();
+    verify_prepared_entry_abis(path, *object, entry, options);
     std::uint64_t file_offset = 0;
     const auto address = runtime_entry(pid, *object, info, entry, entry + size,
                                        &file_offset);
@@ -2174,6 +2280,7 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
       }
     }
     auto dwarf = llvm::DWARFContext::create(*dwarf_object);
+    std::map<std::uint64_t, std::vector<DWARFDie>> entry_dies;
     // Set by the second pass over a module when `selected` is an alias without a subprogram.
     std::uint64_t alias_address = 0;
     bool owns_subprogram = false;
@@ -2195,6 +2302,10 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
         throw DebugLookupLimit("debug depth limit exceeded; increase --debug-max-depth or use 0");
       }
       if (die.getTag() == dw::DW_TAG_subprogram) {
+        if (!alias_address) {
+          if (const auto entry = die_low_pc(die))
+            entry_dies[entry].push_back(die);
+        }
         auto decl = declaration(die);
         const auto qname = qualified(decl);
         const char *linkage = die.getName(llvm::DINameKind::LinkageName);
@@ -2327,6 +2438,16 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
       if (alias_address)
         traverse();
     }
+    for (auto match = matches.begin(); match != matches.end();) {
+      const auto &found = match->second;
+      if (found.source == path && incompatible_entry_abis(
+              entry_dies[found.spec.debug_info().entry_virtual_address()], check_cancelled)) {
+        rejected = incompatible_entry_diagnostic;
+        match = matches.erase(match);
+      } else {
+        ++match;
+      }
+    }
   }
   check_cancelled();
   // A demangled declaration of an ELF-only alias finds no subprogram. Map it to the ELF symbols
@@ -2368,7 +2489,8 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
         matches.emplace(resolved.source + ":" +
                             std::to_string(resolved.spec.debug_info().entry_virtual_address()),
                         std::move(resolved));
-      } catch (const std::exception &) {
+      } catch (const std::exception &error) {
+        rejected = error.what();
       }
     }
   }

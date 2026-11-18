@@ -14,6 +14,7 @@ from elf_split_fixture import link_split_fixture
 from repl_browser_integration import Transcript, stop
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "repl_aliases.cpp"
+INCOMPATIBLE_FIXTURE = FIXTURE.with_name("repl_aliases_incompatible.cpp")
 TWIN = "alias_demo::Twin"
 FOLDED = "alias_demo::Folded"
 ALIASED_SYMBOL = "_ZNK10alias_demo4Twin7aliasedEi"
@@ -26,9 +27,11 @@ class Live:
     """A running fixture with an attached REPL console."""
 
     def __init__(self, stack, args, target):
-        self.child = subprocess.Popen([target], stdout=subprocess.PIPE, text=True)
+        self.child = subprocess.Popen([target], stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, text=True)
         stack.callback(stop, self.child)
-        Transcript(self.child.stdout).expect(r"^ALIAS_FIXTURE pid=")
+        self.target_output = Transcript(self.child.stdout)
+        self.target_output.expect(r"^ALIAS_FIXTURE pid=")
         self.console = subprocess.Popen(
             [args.repl, "--server", args.server, "--attach", str(self.child.pid)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -75,7 +78,10 @@ class Live:
 
 
 def row_for(rows, status, selector):
-    found = [row for row in rows if row.startswith(status + " ") and f'"{selector}"' in row]
+    # GCC DWARF spells this builtin "long int" where Clang uses "long".
+    expected = re.sub(r"\blong int\b", "long", selector)
+    found = [row for row in rows if row.startswith(status + " ") and
+             f'"{expected}"' in re.sub(r"\blong int\b", "long", row)]
     assert len(found) == 1, (status, selector, rows)
     return found[0]
 
@@ -237,6 +243,132 @@ def constructor_names(root, args):
     assert shown["id"] in {entry["id"] for entry in entries}, shown
 
 
+def incompatible_folded_functions(stack, root, args):
+    """Reject an entry whose other, possibly unselected name has a different ABI."""
+    target = root / "incompatible-icf-target"
+    try:
+        subprocess.run(
+            [args.compiler, "-std=c++17", "-g", "-O2", "-ffunction-sections", "-fno-inline",
+             "-fno-omit-frame-pointer", "-fcf-protection=none", "-fPIE", "-pie",
+             "-fuse-ld=gold", "-Wl,--icf=all", str(INCOMPATIBLE_FIXTURE), "-o", str(target)],
+            check=True, timeout=60, capture_output=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as error:
+        print("SKIP incompatible folded functions: cannot link with gold --icf=all:",
+              getattr(error, "stderr", b"")[-200:])
+        return
+
+    live = Live(stack, args, target)
+    addresses = live.target_output.expect(
+        r"^ICF_ENTRIES identity_float=(0x[0-9a-f]+) identity_double=(0x[0-9a-f]+) "
+        r"return_float=(0x[0-9a-f]+) return_double=(0x[0-9a-f]+)$")
+    identity_float, identity_double, return_float, return_double = (
+        int(address, 16) for address in addresses.groups())
+    # Determine whether folding happened from the target itself, never from the
+    # ALIAS status being tested: a broken guard must fail rather than skip.
+    assert identity_float == identity_double, "gold did not fold the identity pair"
+    assert return_float == return_double, "gold did not fold the return-only pair"
+    assert identity_float != return_float, "the two different bodies unexpectedly share an entry"
+    originals = {address: live.code(address) for address in (identity_float, return_float)}
+    checks = 0
+
+    def unchanged_and_healthy():
+        nonlocal checks
+        assert all(live.code(address) == original for address, original in originals.items())
+        assert live.child.poll() is None, "incompatible ICF target exited"
+        live.child.stdin.write("\n")
+        live.child.stdin.flush()
+        checks += 1
+        health = live.target_output.expect(r"^ICF_(?:OK count=(\d+)|CORRUPT .*)$")
+        assert health[1] is not None and int(health[1]) == checks, "".join(live.target_output.seen)
+        assert live.child.poll() is None
+
+    def incompatible_diagnostic(text):
+        lower = text.lower()
+        assert "abi" in lower and ("incompatible" in lower or "conflict" in lower), text
+
+    unchanged_and_healthy()
+    pairs = [
+        (("a_float(float)", "_Z7a_floatf"), ("z_double(double)", "_Z8z_doubled")),
+        (("a_return_float()", "_Z14a_return_floatv"),
+         ("z_return_double()", "_Z15z_return_doublev")),
+    ]
+    header = root / "incompatible.hpp"
+    header.write_text("float a_float(float);\ndouble z_double(double);\n"
+                      "float a_return_float();\ndouble z_return_double();\n")
+    donor = root / "incompatible.cpp"
+    donor.write_text('#include "incompatible.hpp"\n')
+    database = root / "incompatible-compile_commands.json"
+    database.write_text(json.dumps([{
+        "directory": str(root), "file": str(donor),
+        "arguments": [args.compiler, "-std=c++17", "-g", "-O2", "-fPIE",
+                      "-c", str(donor), "-o", str(root / "incompatible.o")],
+    }]))
+    for pair in pairs:
+        # The check must examine every DWARF description at an entry, not merely
+        # the selected rows: either name alone still detours calls through both.
+        for selected in (pair, pair[:1], pair[1:]):
+            selection = " ".join(f'--exact "{name}"' for name, _ in selected)
+            manifest = root / f"incompatible-{checks}.textproto"
+            rows = live.preview(
+                f'%trace preview {selection} --save "{manifest}"',
+                rf"matched={len(selected)} dwarf_supported=0 .*"
+                r"session_retained=0 agent_retained=0 available=32 fits=yes$")
+            live.output.expect(r"^manifest=")
+            assert len(rows) == len(selected), rows
+            assert all(row.startswith(("UNSUPPORTED ", "AMBIGUOUS ")) for row in rows), rows
+            for row in rows:
+                incompatible_diagnostic(row)
+            unchanged_and_healthy()
+
+            rows, _, complete = live.report(f'%trace apply --manifest "{manifest}"', "apply")
+            assert not complete, rows
+            assert not any(row.startswith(("INSTALLED ", "ALIASED ")) for row in rows), rows
+            blocked = [row for row in rows if row.startswith("BLOCKED ")]
+            assert len(blocked) == len(selected) and all("probe=" not in row for row in blocked), rows
+            for row in blocked:
+                incompatible_diagnostic(row)
+            # The CLI reports its command error after printing the bulk rows.
+            live.output.expect(r"^error: selection contains blocked or unmatched entries$")
+            unchanged_and_healthy()
+
+        for name, linkage in pair:
+            for selector in (name, linkage):
+                live.send(f'%probe inject "{selector}"')
+                result = live.output.expect(r"^error: .*|^installed probe=.*")
+                assert result[0].startswith("error:"), result[0]
+                incompatible_diagnostic(result[0])
+                unchanged_and_healthy()
+
+        # A source-prepared package carries a trustworthy signature for its own
+        # name, but must not bypass conflicting DWARF at the shared live entry.
+        # Test both argument/result widths and the return-only conflict.
+        prepared_selector = pair[0][0]
+        package = root / ("prepared-" + prepared_selector.split("(")[0])
+        live.send(f'%probe prepare "{prepared_selector}" --include "{header}" '
+                  f'--compdb "{database}" --translation-unit "{donor}" --output "{package}"')
+        prepared = live.output.expect(r"^prepared directory=.*|^error: .*")
+        assert prepared[0].startswith("prepared directory="), prepared[0]
+        assert (package / "prepared.pb").is_file()
+        unchanged_and_healthy()
+        live.send(f'%probe inject "{prepared_selector}" --prepared "{package}" '
+                  '--prepared-mode require')
+        result = live.output.expect(r"^error: .*|^installed probe=.*")
+        assert result[0].startswith("error:"), result[0]
+        incompatible_diagnostic(result[0])
+        unchanged_and_healthy()
+
+        # Confirm no failed operation retained a probe or consumed a slot.
+        live.preview(f'%trace preview --exact "{pair[0][0]}"',
+                     r"matched=1 dwarf_supported=0 .*session_retained=0 "
+                     r"agent_retained=0 available=32 fits=yes$")
+    live.send("%quit")
+    # Expected injection errors mark the piped session unsuccessful without
+    # terminating it before the subsequent safety checks.
+    assert live.console.wait(timeout=15) == 1, "".join(live.output.seen)
+    unchanged_and_healthy()
+    print(f"Incompatible ICF entries rejected in bulk, direct and prepared injection; health checks={checks}.")
+
+
 def main():
     parser = argparse.ArgumentParser()
     for name in ("repl", "server", "module-tool", "compiler"):
@@ -251,6 +383,7 @@ def main():
         explicit_alias(stack, root, args, target)
         folded_functions(stack, root, args, args.compiler)
         constructor_names(root, args)
+        incompatible_folded_functions(stack, root, args)
     print("Aliased names were previewed as ALIAS, observed through one probe and restored.")
 
 

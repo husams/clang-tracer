@@ -543,6 +543,16 @@ address, so the probe sits on the shared entry and sees calls through every
 name. A symbol that owns a subprogram of its own, as linker-folded functions do,
 keeps that description.
 
+Sharing code does not prove that two names have compatible typed contracts.
+The preview checks every concrete DWARF description at a selected entry,
+including names outside the selection. Different argument or result types,
+receiver or object layouts, or unsupported peer descriptions make the entry
+`AMBIGUOUS` with an incompatible-ABI diagnostic. Bulk apply and single-probe
+injection refuse the entry before modifying code. Prepared injection performs
+the same check when matching DWARF is available; packages remain usable without
+DWARF. This check conservatively requires matching complete typed descriptions,
+not merely identical instructions or register assignments.
+
 The capacity line reports retained probes and `limit=unlimited`. Probe storage
 grows as needed; allocation can still fail when process resources are exhausted.
 
