@@ -528,6 +528,14 @@ if(BUILD_TESTING)
       --callback ${CMAKE_CURRENT_SOURCE_DIR}/examples/cpp-interceptors/method.cpp
       --output-dir ${CMAKE_CURRENT_BINARY_DIR}/typed-this-results)
   set_tests_properties(grpc_typed_this_integration PROPERTIES TIMEOUT 180)
+  add_test(NAME grpc_callback_syntax_diagnostics
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/callback_syntax_diagnostics.py
+      --server $<TARGET_FILE:clang-tracer-server>
+      --client $<TARGET_FILE:clang-tracer>
+      --agent $<TARGET_FILE:clang_tracer_agent>
+      --target $<TARGET_FILE:typed-this-fixture>
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/callback-syntax-results)
+  set_tests_properties(grpc_callback_syntax_diagnostics PROPERTIES TIMEOUT 120)
   if(TARGET clang-tracer-repl)
     add_executable(receiver-header-fixture tests/fixtures/receiver_header/main.cpp)
     set_target_properties(receiver-header-fixture PROPERTIES CXX_STANDARD 17 ENABLE_EXPORTS ON)

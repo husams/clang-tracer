@@ -41,20 +41,35 @@ int PointerCalculator::read(int value) const {
   return value + bias + (text && *text != L'\0' ? 1 : 0);
 }
 
+union RecordResult {
+  int value;
+  double ratio;
+};
+
+class RecordCalculator {
+public:
+  __attribute__((visibility("default"), noinline)) RecordResult result() const;
+};
+
+RecordResult RecordCalculator::result() const { return {42}; }
+
 int main() {
   std::signal(SIGINT, stop_target);
   std::signal(SIGTERM, stop_target);
   InheritedCalculator calculator;
   wchar_t sample[] = L"T";
   PointerCalculator pointer_calculator;
+  RecordCalculator record_calculator;
   pointer_calculator.text = sample;
   std::printf("TYPED_THIS_FIXTURE pid=%ld\n", static_cast<long>(::getpid()));
   std::fflush(stdout);
   while (keep_running != 0) {
     volatile int result = calculator.read(1);
     volatile int pointer_result = pointer_calculator.read(2);
+    const auto record_result = record_calculator.result();
     (void)result;
     (void)pointer_result;
+    (void)record_result;
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
 }
