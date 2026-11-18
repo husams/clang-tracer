@@ -962,6 +962,87 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl,
   return result;
 }
 
+// An entry detour executes for every folded name, including names outside the
+// selection. Compare the typed contract without function or parameter names.
+std::string callable_abi(DWARFDie die) {
+  const auto decl = declaration(die);
+  const auto shape = describe_callable(die, decl, {}, true);
+  api::ProbeSpec abi;
+  *abi.mutable_signature() = shape.signature;
+  auto &info = *abi.mutable_debug_info();
+  if (shape.receiver) {
+    describe_record(shape.receiver, info);
+    info.set_receiver_volatile(shape.receiver_volatile);
+  }
+  for (const auto &argument : shape.arguments)
+    *info.add_arguments() = argument;
+  const auto result = read_type(type_of(decl));
+  info.set_result_cpp_type(result.spelling);
+  info.set_result_is_reference(result.reference);
+  info.set_result_is_object_value(result.value == api::OBJECT);
+  if (result.record)
+    describe_record(result.record, *info.mutable_result_object_type());
+  return abi.SerializeAsString();
+}
+
+bool incompatible_entry_abis(const std::vector<DWARFDie> &entries,
+                             const std::function<void()> &check_cancelled) {
+  if (entries.size() < 2)
+    return false;
+  std::optional<std::string> expected;
+  for (const auto die : entries) {
+    check_cancelled();
+    try {
+      const auto abi = callable_abi(die);
+      if (expected && abi != *expected)
+        return true;
+      expected = abi;
+    } catch (const std::exception &) {
+      // A second concrete subprogram with an unsupported contract cannot safely
+      // inherit the primary's ABI. ELF-only aliases have no such subprogram.
+      return true;
+    }
+  }
+  return false;
+}
+
+constexpr const char *incompatible_entry_diagnostic =
+    "shared runtime entry has incompatible or unsupported DWARF callable ABIs";
+
+std::uint64_t die_low_pc(DWARFDie die) {
+  std::uint64_t low = 0, high = 0, section = 0;
+  return die.getLowAndHighPC(low, high, section) ? low : 0;
+}
+
+// Address of a defined function symbol with this exact linkage name, or zero.
+std::uint64_t elf_function_address(const llvm::object::ELF64LEObjectFile &object,
+                                   const std::string &linkage) {
+  std::uint64_t result = 0;
+  const auto visit = [&](const llvm::object::SymbolRef &symbol) {
+    if (result)
+      return;
+    const llvm::object::ELFSymbolRef elf(symbol);
+    auto name = symbol.getName();
+    if (!name) {
+      llvm::consumeError(name.takeError());
+      return;
+    }
+    if (*name != linkage || elf.getELFType() != llvm::ELF::STT_FUNC || !elf.getSize())
+      return;
+    auto address = symbol.getAddress();
+    if (!address) {
+      llvm::consumeError(address.takeError());
+      return;
+    }
+    result = *address;
+  };
+  for (const auto &symbol : object.symbols())
+    visit(symbol);
+  for (const auto &symbol : object.getDynamicSymbolIterators())
+    visit(symbol);
+  return result;
+}
+
 std::pair<std::uint64_t, std::uint64_t> callable_code_range(DWARFDie die) {
   std::uint64_t low = 0, high = 0, section = 0;
   if (!die.getLowAndHighPC(low, high, section) || high <= low) {
@@ -1568,6 +1649,45 @@ open_debug_companion(const std::string &path,
   return std::move(*binary);
 }
 
+void verify_prepared_entry_abis(const std::string &path,
+    const llvm::object::ELF64LEObjectFile &object, std::uint64_t entry,
+    const DebugLookupOptions &options) {
+  // Source-only packages also install typed detours. Use available DWARF to
+  // check their folded peers, while preserving preparation without DWARF.
+  auto companion = open_debug_companion(path, object);
+  const auto *debug_object = companion
+      ? llvm::cast<llvm::object::ELF64LEObjectFile>(companion->getBinary()) : &object;
+  auto dwarf = llvm::DWARFContext::create(*debug_object);
+  const auto check_cancelled = [&] {
+    if (options.is_cancelled())
+      throw std::runtime_error("prepared lookup cancelled");
+  };
+  std::vector<DWARFDie> entries;
+  std::uint64_t visited = 0;
+  for (const auto &unit : dwarf->compile_units()) {
+    std::vector<std::pair<DWARFDie, std::size_t>> pending{{unit->getUnitDIE(false), 0}};
+    while (!pending.empty()) {
+      const auto [die, depth] = pending.back();
+      pending.pop_back();
+      if (!die)
+        continue;
+      if ((visited++ % 128) == 0)
+        check_cancelled();
+      if (options.max_entries && visited > options.max_entries)
+        throw DebugLookupLimit("debug entry limit exceeded; increase --debug-max-entries or use 0");
+      if (options.max_depth && depth > options.max_depth)
+        throw DebugLookupLimit("debug depth limit exceeded; increase --debug-max-depth or use 0");
+      if (die.getTag() == dw::DW_TAG_subprogram && die_low_pc(die) == entry)
+        entries.push_back(die);
+      for (auto child : die.children())
+        pending.emplace_back(child, depth + 1);
+    }
+  }
+  check_cancelled();
+  if (incompatible_entry_abis(entries, check_cancelled))
+    throw std::runtime_error(incompatible_entry_diagnostic);
+}
+
 } // namespace
 
 api::PreviewBulkTraceResponse preview_bulk_trace(
@@ -1671,6 +1791,7 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
         ? llvm::cast<llvm::object::ELF64LEObjectFile>(companion->getBinary())
         : object;
     auto dwarf = llvm::DWARFContext::create(*debug_object);
+    std::map<std::uint64_t, std::vector<DWARFDie>> entry_dies;
     std::size_t visited = 0;
     for (const auto &unit : dwarf->compile_units()) {
       std::vector<DWARFDie> pending{unit->getUnitDIE(false)};
@@ -1688,6 +1809,7 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
         std::uint64_t low = 0, high = 0, section = 0;
         if (!die.getLowAndHighPC(low, high, section) || high <= low)
           continue;
+        entry_dies[low].push_back(die);
         const auto decl = declaration(die);
         const auto qname = qualified(decl);
         if (qname.empty())
@@ -1757,6 +1879,23 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
       visit_elf(symbol);
     for (const auto &symbol : object->getDynamicSymbolIterators())
       visit_elf(symbol);
+    // Check all concrete descriptions at each selected entry, not just the
+    // selected names: unselected callers also run through the typed detour.
+    std::map<std::uint64_t, bool> incompatible;
+    for (auto &[key, candidate] : candidates) {
+      const auto &function = candidate.function();
+      if (function.module_path() != path)
+        continue;
+      check_cancelled();
+      const auto address = function.elf_address();
+      auto [checked, added] = incompatible.try_emplace(address, false);
+      if (added)
+        checked->second = incompatible_entry_abis(entry_dies[address], check_cancelled);
+      if (checked->second) {
+        candidate.set_abi_status(PreviewCandidate::AMBIGUOUS);
+        candidate.set_diagnostic(incompatible_entry_diagnostic);
+      }
+    }
   }
   check_cancelled();
   const auto current = modules(pid);
@@ -1764,25 +1903,49 @@ api::PreviewBulkTraceResponse preview_bulk_trace(
     throw std::invalid_argument("mapped images changed during preview; retry");
 
   std::map<std::string, std::set<std::pair<std::string, std::uint64_t>>> selector_entries;
-  std::map<std::uint64_t, unsigned> address_counts;
+  std::map<std::uint64_t, std::vector<const Key *>> by_address;
   for (const auto &[key, candidate] : candidates) {
     const auto &function = candidate.function();
     selector_entries[std::get<0>(key)].emplace(function.module_path(), function.elf_address());
     if (function.runtime_address())
-      ++address_counts[function.runtime_address()];
+      by_address[function.runtime_address()].push_back(&key);
   }
-  api::PreviewBulkTraceResponse result;
   for (auto &[key, candidate] : candidates) {
     if (selector_entries.at(std::get<0>(key)).size() > 1) {
       candidate.set_abi_status(PreviewCandidate::AMBIGUOUS);
       candidate.set_diagnostic("selector identifies multiple entries; narrow the module selection");
-    } else if (candidate.function().runtime_address() &&
-               address_counts.at(candidate.function().runtime_address()) > 1) {
-      candidate.set_abi_status(PreviewCandidate::AMBIGUOUS);
-      candidate.set_diagnostic("multiple selected symbols share this runtime entry");
     }
-    result.add_candidates()->Swap(&candidate);
   }
+  // Symbols that share one runtime entry are names for the same code: identical C1/C2 bodies,
+  // linker identical-code folding, explicit aliases. One supported candidate (the first in
+  // key order) is the primary and gets the probe; the others are reported as ALIAS so a bulk
+  // apply installs one probe and still covers every name. Without a supported primary the
+  // names cannot be probed, so they stay ambiguous.
+  for (const auto &[address, keys] : by_address) {
+    if (keys.size() < 2)
+      continue;
+    const Key *primary = nullptr;
+    for (const auto *key : keys)
+      if (candidates.at(*key).abi_status() == PreviewCandidate::DWARF_SUPPORTED) {
+        primary = key;
+        break;
+      }
+    for (const auto *key : keys) {
+      auto &candidate = candidates.at(*key);
+      if (key == primary || candidate.abi_status() == PreviewCandidate::AMBIGUOUS)
+        continue;
+      if (primary) {
+        candidate.set_abi_status(PreviewCandidate::ALIAS);
+        candidate.set_diagnostic("alias of " + candidates.at(*primary).function().linkage_symbol());
+      } else {
+        candidate.set_abi_status(PreviewCandidate::AMBIGUOUS);
+        candidate.set_diagnostic("multiple selected symbols share this runtime entry");
+      }
+    }
+  }
+  api::PreviewBulkTraceResponse result;
+  for (auto &[key, candidate] : candidates)
+    result.add_candidates()->Swap(&candidate);
   for (const auto &[key, selector] : exacts)
     if (!matched_exacts.count(key))
       result.add_unmatched_exact_selectors(selector);
@@ -1995,6 +2158,7 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
     info.set_module(path);
     info.set_file_size(bytes.size());
     const auto [entry, size] = *ranges.begin();
+    verify_prepared_entry_abis(path, *object, entry, options);
     std::uint64_t file_offset = 0;
     const auto address = runtime_entry(pid, *object, info, entry, entry + size,
                                        &file_offset);
@@ -2066,6 +2230,10 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
   const auto selected = compact(selector);
   const auto paren = selected.find('(');
   const auto selected_name = selected.substr(0, paren);
+  // A mangled selector names exactly one ELF symbol. The symbol either owns a concrete DWARF
+  // subprogram or is an alias (explicit alias, folded function) for code described by another
+  // subprogram at the same address.
+  const bool by_linkage = selected.size() > 2 && selected.compare(0, 2, "_Z") == 0;
   std::map<std::string, ResolvedCallable> matches;
   std::string rejected;
   std::uint64_t visited = 0;
@@ -2112,6 +2280,10 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
       }
     }
     auto dwarf = llvm::DWARFContext::create(*dwarf_object);
+    std::map<std::uint64_t, std::vector<DWARFDie>> entry_dies;
+    // Set by the second pass over a module when `selected` is an alias without a subprogram.
+    std::uint64_t alias_address = 0;
+    bool owns_subprogram = false;
     const auto visit = [&](DWARFDie die, std::size_t depth) {
       if (!die) {
         return;
@@ -2130,6 +2302,10 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
         throw DebugLookupLimit("debug depth limit exceeded; increase --debug-max-depth or use 0");
       }
       if (die.getTag() == dw::DW_TAG_subprogram) {
+        if (!alias_address) {
+          if (const auto entry = die_low_pc(die))
+            entry_dies[entry].push_back(die);
+        }
         auto decl = declaration(die);
         const auto qname = qualified(decl);
         const char *linkage = die.getName(llvm::DINameKind::LinkageName);
@@ -2139,10 +2315,14 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
             ? preview_name(symbol, qname) : PreviewName{};
         const auto dwarf_name = compact(qname);
         const auto symbol_name = compact(display.qualified);
+        if (by_linkage && symbol == selected && die_low_pc(die))
+          owns_subprogram = true;
         if (!qname.empty() &&
-            (selects_name(selected, dwarf_name) ||
-             selects_name(selected, name(decl)) ||
-             selects_name(selected, symbol_name))) {
+            (by_linkage ? (symbol == selected ||
+                           (alias_address && die_low_pc(die) == alias_address))
+                        : (selects_name(selected, dwarf_name) ||
+                           selects_name(selected, name(decl)) ||
+                           selects_name(selected, symbol_name)))) {
           try {
             if (::tracer::compat::starts_with(name(decl), "~") ||
                 name(decl) == name(decl.getParent())) {
@@ -2153,7 +2333,7 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
             }
             ResolvedCallable found;
             const auto shape = describe_callable(die, decl, display, options.allow_virtual_entry);
-            const bool bare_name = selected == dwarf_name ||
+            const bool bare_name = by_linkage || selected == dwarf_name ||
                                    selected == name(decl) || selected == symbol_name;
             if (!bare_name && compact(shape.selector) != selected &&
                 compact(shape.dwarf_selector) != selected &&
@@ -2219,7 +2399,8 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
             if (info->has_result_object_type())
               resolve_method_symbols(*object, pid, before,
                                      *info->mutable_result_object_type());
-            found.spec.set_symbol(symbol);
+            // An alias keeps its own linkage name; the DWARF description is the primary's.
+            found.spec.set_symbol(by_linkage ? selected : symbol);
             found.declaration = shape.result_spelling + " " + shape.selector;
             found.source = path;
             const auto key = path + ":" + std::to_string(low);
@@ -2230,23 +2411,89 @@ ResolvedCallable resolve_debug_callable(std::uint32_t pid, const std::string& se
         }
       }
     };
-    for (const auto& unit : dwarf->compile_units()) {
-      check_cancelled();
-      std::vector<std::pair<DWARFDie, std::size_t>> pending{{unit->getUnitDIE(false), 0}};
-      while (!pending.empty()) {
-        const auto [die, depth] = pending.back();
-        pending.pop_back();
-        visit(die, depth);
-        if (die) {
-          const auto children_begin = pending.size();
-          for (auto child : die.children())
-            pending.emplace_back(child, depth + 1);
-          std::reverse(pending.begin() + children_begin, pending.end());
+    const auto traverse = [&] {
+      for (const auto& unit : dwarf->compile_units()) {
+        check_cancelled();
+        std::vector<std::pair<DWARFDie, std::size_t>> pending{{unit->getUnitDIE(false), 0}};
+        while (!pending.empty()) {
+          const auto [die, depth] = pending.back();
+          pending.pop_back();
+          visit(die, depth);
+          if (die) {
+            const auto children_begin = pending.size();
+            for (auto child : die.children())
+              pending.emplace_back(child, depth + 1);
+            std::reverse(pending.begin() + children_begin, pending.end());
+          }
         }
+      }
+    };
+    const auto matched_before = matches.size();
+    traverse();
+    // An ELF-only alias has no subprogram of its own: bind it to the subprogram at the same
+    // address. A symbol that owns a subprogram is never treated as an alias, so linker-folded
+    // functions (one subprogram per name at one address) keep their own description.
+    if (by_linkage && !owns_subprogram && matches.size() == matched_before) {
+      alias_address = elf_function_address(*object, selected);
+      if (alias_address)
+        traverse();
+    }
+    for (auto match = matches.begin(); match != matches.end();) {
+      const auto &found = match->second;
+      if (found.source == path && incompatible_entry_abis(
+              entry_dies[found.spec.debug_info().entry_virtual_address()], check_cancelled)) {
+        rejected = incompatible_entry_diagnostic;
+        match = matches.erase(match);
+      } else {
+        ++match;
       }
     }
   }
   check_cancelled();
+  // A demangled declaration of an ELF-only alias finds no subprogram. Map it to the ELF symbols
+  // with that demangled name and bind each one by linkage name.
+  if (matches.empty() && !by_linkage && paren != std::string::npos) {
+    std::set<std::string> linkages;
+    for (const auto &path : modules(pid)) {
+      check_cancelled();
+      if (!options.module.empty() &&
+          (options.module.front() == '/' ? path != options.module
+                                        : path.find(options.module) == std::string::npos))
+        continue;
+      auto binary = llvm::object::createBinary(path);
+      if (!binary) {
+        llvm::consumeError(binary.takeError());
+        continue;
+      }
+      const auto *object = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(binary->getBinary());
+      if (!object || object->getArch() != llvm::Triple::x86_64)
+        continue;
+      const auto collect = [&](const llvm::object::SymbolRef &symbol) {
+        auto symbol_name = symbol.getName();
+        if (!symbol_name) {
+          llvm::consumeError(symbol_name.takeError());
+          return;
+        }
+        if (symbol_name->size() > 2 && symbol_name->starts_with("_Z") &&
+            compact(llvm::demangle(symbol_name->str())) == selected)
+          linkages.insert(symbol_name->str());
+      };
+      for (const auto &symbol : object->symbols())
+        collect(symbol);
+      for (const auto &symbol : object->getDynamicSymbolIterators())
+        collect(symbol);
+    }
+    for (const auto &linkage : linkages) {
+      try {
+        auto resolved = resolve_debug_callable(pid, linkage, options);
+        matches.emplace(resolved.source + ":" +
+                            std::to_string(resolved.spec.debug_info().entry_virtual_address()),
+                        std::move(resolved));
+      } catch (const std::exception &error) {
+        rejected = error.what();
+      }
+    }
+  }
   if (matches.size() != 1) {
     std::string error = matches.empty()
                             ? "no supported matching callable in mapped ELF debug information; "

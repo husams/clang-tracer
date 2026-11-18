@@ -56,8 +56,10 @@ include(CTest)
 include(cmake/TracerContextEngine.cmake)
 include(cmake/TracerToolchain.cmake)
 if(NOT LLVM_ENABLE_RTTI)
+  # GCC can emit LLVM ErrorInfo RTTI references unless these units also opt out.
   set_source_files_properties(src/debug_resolver.cpp src/native_stack.cpp src/admission.cpp src/native_plugins.cpp
-    src/live_compile.cpp src/live_jit.cpp src/live_data_scan.cpp
+    src/live_compile.cpp src/live_jit.cpp src/live_data_scan.cpp src/process_memory.cpp
+    src/object_code_cache_agent.cpp src/object_watch_plan.cpp src/live_plan.cpp
     PROPERTIES COMPILE_OPTIONS "-fno-rtti")
 endif()
 include(cmake/TracerContextAnalysis.cmake)

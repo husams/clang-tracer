@@ -214,6 +214,8 @@ void print_bulk_report(std::ostream &out, const char *operation,
     out << api::BulkTraceEntry::Status_Name(row.status()) << ' '
         << std::quoted(printable_proc_text(function.selector().empty()
                            ? function.linkage_symbol() : function.selector()));
+    if (!function.linkage_symbol().empty())
+      out << " symbol=" << printable_proc_text(function.linkage_symbol());
     if (!function.module_path().empty())
       out << " module=" << std::quoted(printable_proc_text(function.module_path()));
     if (row.has_probe())
@@ -2156,6 +2158,7 @@ void Controller::preview_bulk_trace(const Command &command) {
     else
       out_ << "address=unavailable";
     out_ << " " << std::quoted(printable_proc_text(function.selector()))
+         << " symbol=" << printable_proc_text(function.linkage_symbol())
          << " module=" << std::quoted(printable_proc_text(function.module_path()));
     if (!candidate.diagnostic().empty())
       out_ << " reason=" << std::quoted(printable_proc_text(candidate.diagnostic()));

@@ -216,6 +216,7 @@ function(tracer_add_native_repl)
     INSTALL_RPATH "${_module_origin}/${_module_lib_relative}")
   if(NOT LLVM_ENABLE_RTTI)
     set_source_files_properties("${_repl}/interpreter.cpp" "${_repl}/completion.cpp"
+      "${_repl}/controller.cpp" "${_repl}/local_perf.cpp" "${_repl}/plugins.cpp"
       "${_src}/native_plugins.cpp" PROPERTIES COMPILE_OPTIONS "-fno-rtti")
   endif()
   install(FILES ${_repl_facade_headers} DESTINATION "${_repl_facade_directory}" COMPONENT Runtime)
@@ -743,6 +744,11 @@ function(tracer_add_native_repl)
           --agent $<TARGET_FILE:clang_tracer_agent> --module-tool $<TARGET_FILE:clang-tracer-module>
           --compiler "${CMAKE_CXX_COMPILER}")
       set_tests_properties(native_repl_module_index PROPERTIES TIMEOUT 240)
+      add_test(NAME native_repl_aliases
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_aliases.py"
+          --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+          --module-tool $<TARGET_FILE:clang-tracer-module> --compiler "${CMAKE_CXX_COMPILER}")
+      set_tests_properties(native_repl_aliases PROPERTIES TIMEOUT 240)
       add_executable(repl-launch-target tests/fixtures/repl_launch.cpp)
       target_include_directories(repl-launch-target PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
       target_compile_options(repl-launch-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
