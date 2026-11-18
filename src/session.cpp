@@ -90,9 +90,6 @@ void copy_signature(const clangtracer::v1::Signature &signature,
   request.result = static_cast<ValueType>(signature.result());
   request.argument_count =
       static_cast<std::uint32_t>(signature.arguments_size());
-  for (int i = 0; i < signature.arguments_size(); ++i) {
-    request.arguments[i] = static_cast<ValueType>(signature.arguments(i));
-  }
 }
 
 struct AgentBootstrap {
@@ -803,7 +800,7 @@ Session::agent_plugin(const clangtracer::v1::AgentPluginRequest &rpc) {
     if (rpc.source().empty() || rpc.source().size() > kMaxAgentPluginSource ||
         !rpc.command().empty())
       throw std::invalid_argument(
-          "load and reload require plugin source up to 4 MiB");
+          "load and reload require nonempty plugin source within the wire format range");
     if (rpc.has_package()) {
       throw std::invalid_argument("source load cannot include a plugin package");
     }
@@ -816,7 +813,8 @@ Session::agent_plugin(const clangtracer::v1::AgentPluginRequest &rpc) {
     if (expected.empty() || !rpc.has_package() || rpc.package().sources().empty() ||
         rpc.package().ByteSizeLong() > kMaxAgentPluginSource || !rpc.source().empty() ||
         !rpc.command().empty() || rpc.has_repl_object()) {
-      throw std::invalid_argument("package load or reload requires an executable and package up to 4 MiB");
+      throw std::invalid_argument(
+          "package load or reload requires an executable and package within the wire format range");
     }
     request.operation = rpc.operation() == Rpc::RELOAD_PACKAGE ? AgentPluginOperation::ReloadPackage
                                                                : AgentPluginOperation::LoadPackage;

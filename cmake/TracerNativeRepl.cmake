@@ -178,12 +178,9 @@ function(tracer_add_native_repl)
     "${CMAKE_INSTALL_FULL_DATADIR}/clang-tracer/repl/facade-${_repl_facade_id}/api.hpp")
   file(RELATIVE_PATH _repl_resource_relative "${CMAKE_INSTALL_FULL_BINDIR}"
     "${CMAKE_INSTALL_FULL_DATADIR}/clang-tracer/clang-resource")
-  set(_repl_compiler_arguments "  \"-nostdinc++\",\n")
-  foreach(_directory IN LISTS CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES)
-    string(REPLACE "\\" "\\\\" _directory "${_directory}")
-    string(REPLACE "\"" "\\\"" _directory "${_directory}")
-    string(APPEND _repl_compiler_arguments "  \"-isystem\", \"${_directory}\",\n")
-  endforeach()
+  # Use the same configured SDK/sysroot/include profile as the injected agent.
+  # Offered plugin objects are admitted only when the complete profiles match.
+  set(_repl_compiler_arguments "${_tracer_jit_entries}")
   if(APPLE)
     execute_process(COMMAND xcrun --show-sdk-path OUTPUT_VARIABLE _sdk OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE _sdk_status)
     if(_sdk_status EQUAL 0)
@@ -773,9 +770,15 @@ function(tracer_add_native_repl)
       add_executable(repl-local-perf-target tests/fixtures/repl_local_perf.cpp)
       target_include_directories(repl-local-perf-target PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
       target_link_libraries(repl-local-perf-target PRIVATE Threads::Threads)
+      set(TRACER_SYSCALL_TEST_LAUNCHER "" CACHE FILEPATH
+        "Optional CAP_PERFMON launcher for the syscall tracing integration test")
       foreach(mode cpu syscalls)
+        set(_perf_test_launcher "")
+        if(mode STREQUAL "syscalls" AND TRACER_SYSCALL_TEST_LAUNCHER)
+          set(_perf_test_launcher "${TRACER_SYSCALL_TEST_LAUNCHER}")
+        endif()
         add_test(NAME native_repl_local_perf_${mode}
-          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_local_perf_integration.py"
+          COMMAND ${_perf_test_launcher} "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_local_perf_integration.py"
             $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
             $<TARGET_FILE:repl-local-perf-target> ${mode})
         set_tests_properties(native_repl_local_perf_${mode} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
@@ -1166,6 +1169,7 @@ function(tracer_add_native_repl)
       set_tests_properties(native_repl_code_cache_atomic native_repl_code_cache_live_detach
         PROPERTIES TIMEOUT 120)
       add_executable(repl-reload-target tests/fixtures/repl_reload.cpp)
+      target_include_directories(repl-reload-target PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
       target_compile_options(repl-reload-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)
       target_link_libraries(repl-reload-target PRIVATE Threads::Threads)
       add_test(NAME native_repl_reload_integration
@@ -1197,6 +1201,13 @@ function(tracer_add_native_repl)
           $<TARGET_FILE:clang_tracer_agent> $<TARGET_FILE:repl-reload-target>
           "${CMAKE_CURRENT_SOURCE_DIR}/examples/repl-agent-observer")
       set_tests_properties(native_repl_agent_observer PROPERTIES TIMEOUT 120)
+      if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        add_test(NAME native_repl_fixed_limits
+          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_fixed_limits.py"
+            $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+            $<TARGET_FILE:repl-reload-target>)
+        set_tests_properties(native_repl_fixed_limits PROPERTIES TIMEOUT 600)
+      endif()
       add_test(NAME native_repl_many_probes
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_many_probes.py"
           $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>

@@ -15,6 +15,13 @@ target_compile_options(tracer_context_engine PRIVATE -Wall -Wextra -Wpedantic)
 # preemption points when this archive is linked into the injected agent.
 target_compile_options(tracer_context_engine PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
 if(BUILD_TESTING)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(event-transport-growth tests/event_transport_growth.cpp src/event_transport.cpp)
+    target_link_libraries(event-transport-growth PRIVATE tracer_context_engine)
+    target_compile_options(event-transport-growth PRIVATE -UNDEBUG)
+    add_test(NAME event_transport_growth COMMAND event-transport-growth)
+    set_tests_properties(event_transport_growth PROPERTIES TIMEOUT 15)
+  endif()
   foreach(result_kind IN ITEMS scalar object)
     add_executable(inferred-${result_kind}-cpp17 tests/inferred_call_checks.cpp)
     set_target_properties(inferred-${result_kind}-cpp17 PROPERTIES CXX_STANDARD 17

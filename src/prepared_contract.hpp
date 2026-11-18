@@ -14,7 +14,7 @@ namespace tracer::prepared {
 
 inline constexpr unsigned legacy_typed_version = 4;
 inline constexpr unsigned typed_version = 5;
-inline constexpr unsigned max_replay_type_bytes = 64 * 1024;
+inline constexpr unsigned max_replay_type_bytes = INT32_MAX;
 inline bool is_typed_version(unsigned version) {
   return version == legacy_typed_version || version == typed_version;
 }

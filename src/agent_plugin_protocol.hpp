@@ -4,7 +4,8 @@
 #include <cstdint>
 
 namespace tracer {
-inline constexpr std::size_t kMaxAgentPluginSource = 4 * 1024 * 1024;
+// Protobuf parsing accepts a signed int byte count.
+inline constexpr std::size_t kMaxAgentPluginSource = INT32_MAX;
 inline constexpr std::size_t kMaxAgentPluginOffer = kMaxAgentPluginSource;
 
 enum class AgentPluginOperation : std::uint32_t { Load, Reload, Run, Clear, LoadPackage, ReloadPackage };

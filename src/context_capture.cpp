@@ -1,82 +1,70 @@
 #include "context_capture.hpp"
-#include "snapshot_runtime_limits.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "context_schema.hpp"
+#include "snapshot_runtime_limits.hpp"
 #include "tracer/compat.hpp"
 #include "tracer/protocol.hpp"
 
 namespace tracer::context_engine {
 struct CaptureArena {
-  explicit CaptureArena(std::size_t event_bytes)
-      : block_bytes(event_bytes <= kCapturePoolBytes
-                        ? kCaptureEventBytes
-                        : (event_bytes - 1) / (kCaptureSlots / 2) + 1) {
-    if (block_bytes > storage.max_size() / kCaptureSlots)
-      throw std::length_error("shared capture arena exceeds addressable storage");
-    storage.resize(block_bytes * kCaptureSlots);
-  }
-  const std::size_t block_bytes;
-  std::vector<std::byte> storage;
-  std::array<std::atomic<std::uint8_t>, kCaptureHooks> hook_outstanding{};
-  std::array<std::atomic<bool>, kCaptureSlots> occupied{};
+  explicit CaptureArena(std::size_t bytes)
+      : event_bytes(bytes) {}
 
-  void release_blocks(std::size_t start, std::size_t count) noexcept {
-    // Release the first block last, as it identifies the lease metadata.
-    while (count)
-      occupied[start + --count].store(false, std::memory_order_release);
-  }
-
-  void release(CaptureSlotState &, std::uint32_t) noexcept;
+  const std::size_t event_bytes;
+  mutable std::mutex mutex;
+  std::unordered_map<std::uint64_t, std::size_t> hook_outstanding;
+  void release(CaptureSlotState&, std::uint64_t) noexcept;
 };
 
 struct CaptureSlotState {
-  CaptureSlotState(std::shared_ptr<CaptureArena> storage_arena,
-                   std::size_t slot_index)
-      : arena(std::move(storage_arena)), slot(slot_index) {
+  CaptureSlotState(std::shared_ptr<CaptureArena> storage_arena, std::size_t bytes)
+      : arena(std::move(storage_arena))
+      , event_capacity(bytes)
+      , storage(bytes) {
     schema_set.arena_ = arena.get();
     schema_set.owner_ = this;
-    schema_set.slot_ = slot;
   }
 
-  void prepare(std::uint32_t hook) noexcept {
+  ~CaptureSlotState() { arena->release(*this, schema_set.hook_); }
+
+  void prepare(std::uint64_t hook) noexcept {
     schema_set.size_ = 0;
     schema_set.event_bytes_size_ = 0;
     schema_set.hook_ = hook;
     schema_set.published_ = false;
-    for (auto &record : schema_set.records_)
-      record.reset();
-    schema_set.epoch_schema_ids_.fill(0);
+    schema_set.records_.clear();
+    schema_set.epoch_schema_ids_.clear();
   }
 
-  bool retain(std::shared_ptr<const SchemaRecord> record,
-              std::uint64_t epoch_id) noexcept {
-    if (schema_set.size_ == CaptureSchemaSetLease::capacity)
+  bool retain(std::shared_ptr<const SchemaRecord> record, std::uint64_t epoch_id) noexcept {
+    try {
+      schema_set.records_.push_back(std::move(record));
+      schema_set.epoch_schema_ids_.push_back(epoch_id);
+      ++schema_set.size_;
+      return true;
+    } catch (...) {
       return false;
-    schema_set.records_[schema_set.size_] = std::move(record);
-    schema_set.epoch_schema_ids_[schema_set.size_] = epoch_id;
-    ++schema_set.size_;
-    return true;
+    }
   }
-
   void mark_published(bool value) noexcept { schema_set.published_ = value; }
-  void set_event_bytes_size(std::size_t bytes) noexcept {
-    schema_set.event_bytes_size_ = bytes;
-  }
 
+  void set_event_bytes_size(std::size_t bytes) noexcept { schema_set.event_bytes_size_ = bytes; }
   std::shared_ptr<CaptureArena> arena;
   std::atomic<bool> active{false};
-  std::size_t slot = 0, event_capacity = 0, blocks = 0;
-  ::tracer::compat::span<std::byte> buffer() const noexcept {
-    return {arena->storage.data() + slot * arena->block_bytes, event_capacity};
-  }
+  std::size_t event_capacity = 0;
+  std::vector<std::byte> storage;
+
+  ::tracer::compat::span<std::byte> buffer() noexcept { return {storage.data(), storage.size()}; }
   CaptureSchemaSetLease schema_set;
 };
 
@@ -267,34 +255,30 @@ std::size_t bounded_text_length(const char *text,
 bool write_trace_context(BoundedProtoWriter &writer,
                          const tracer::TraceContext &context,
                          bool print_arguments, bool print_result) noexcept {
-  const auto argument_count =
-      std::min<std::uint32_t>(context.argument_count, tracer::kMaxArguments);
+  const auto argument_count = context.argument_count;
   for (std::uint32_t i = 0; print_arguments && i < argument_count; ++i) {
     if (!writer.begin_message(13) || !writer.u64(1, i))
       return false;
     const char *name = context.argument_names[i];
     if (name) {
-      const auto length =
-          std::min<std::size_t>(bounded_text_length(name, 64), 63);
-      if (!writer.string(2, std::string_view(name, length)))
+      if (!writer.string(2, name)) {
         return false;
+      }
     }
     if (!write_typed_trace_value(writer, 3, context.arguments[i]) ||
         !writer.end_message())
       return false;
   }
-  const auto named_count = std::min<std::uint32_t>(context.named_count, 16);
+  const auto named_count = context.named_count;
   for (std::uint32_t i = 0; print_arguments && i < named_count; ++i) {
-    const auto &named = context.named_values[i];
+    const auto& named = context.named_values[i];
     if (!writer.begin_message(14) || !writer.u64(1, named.kind) ||
         !writer.u64(2, named.argument_index))
       return false;
-    const auto name_length = std::min<std::size_t>(
-        bounded_text_length(named.name, sizeof(named.name)), 63);
-    if (!writer.string(3, std::string_view(named.name, name_length)) ||
-        !write_typed_trace_value(writer, 4, named.value) ||
-        !writer.end_message())
+    if (!writer.string(3, std::string_view(named.name, named.name_size)) ||
+        !write_typed_trace_value(writer, 4, named.value) || !writer.end_message()) {
       return false;
+    }
   }
   if (print_result && context.phase == tracer::TracePhase::Post &&
       !write_typed_trace_value(writer, 15, context.result))
@@ -359,26 +343,22 @@ CaptureStatus budget_status(const EncodeBudget &budget) noexcept {
 } // namespace
 
 ContextCapturePool::ContextCapturePool(std::size_t event_bytes)
-    : arena_(std::make_shared<CaptureArena>(event_bytes)) {
-  for (std::size_t i = 0; i < slots_.size(); ++i)
-    slots_[i] = std::make_shared<CaptureSlotState>(arena_, i);
-}
+    : arena_(std::make_shared<CaptureArena>(event_bytes)) {}
 
 ContextCapturePool::~ContextCapturePool() = default;
 
 std::size_t ContextCapturePool::capacity() const noexcept {
-  return arena_->storage.size();
+  return arena_->event_bytes;
 }
 
 ContextCapturePool::Lease::Lease(std::shared_ptr<CaptureSlotState> slot_state,
-                                 std::uint32_t hook) noexcept
-    : slot_state_(std::move(slot_state)),
-      schema_token_(
-          slot_state_ ? std::shared_ptr<const void>(
-                            slot_state_,
-                            static_cast<const void *>(&slot_state_->schema_set))
-                      : std::shared_ptr<const void>{}),
-      hook_(hook) {}
+                                 std::uint64_t hook) noexcept
+    : slot_state_(std::move(slot_state))
+    , schema_token_(slot_state_
+                        ? std::shared_ptr<const void>(
+                              slot_state_, static_cast<const void*>(&slot_state_->schema_set))
+                        : std::shared_ptr<const void>{})
+    , hook_(hook) {}
 
 ContextCapturePool::Lease::~Lease() noexcept { reset(); }
 
@@ -423,8 +403,6 @@ ContextCapturePool::Lease::capture(const CaptureEventMetadata& event,
       !valid_identifier(event.invocation_id, true) ||
       !valid_identifier(event.probe_id, true) ||
       event.effective_max_items > 4096)
-    return {CaptureStatus::invalid_field, 0};
-  if (schemas.size() > CaptureSchemaSetLease::capacity || states.size() > 64)
     return {CaptureStatus::invalid_field, 0};
   slot_state_->prepare(hook_);
   for (std::size_t i = 0; i < schemas.size(); ++i) {
@@ -599,64 +577,57 @@ ContextCapturePool::Lease::schema_lease_token() const noexcept {
   return slot_state_->buffer().first(bytes_);
 }
 
-ContextCapturePool::Lease
-ContextCapturePool::try_reserve(std::uint32_t hook_id,
-                                std::size_t event_bytes) noexcept {
-  if (hook_id >= kCaptureHooks || !event_bytes || event_bytes > capacity())
+ContextCapturePool::Lease ContextCapturePool::try_reserve(std::uint64_t hook_id,
+                                                          std::size_t event_bytes) noexcept {
+  if (!event_bytes || event_bytes > capacity()) {
     return {};
-  auto &outstanding = arena_->hook_outstanding[hook_id];
-  auto count = outstanding.load(std::memory_order_relaxed);
-  do {
-    if (count >= kCaptureEventsPerHook)
-      return {};
-  } while (!outstanding.compare_exchange_weak(
-      count, static_cast<std::uint8_t>(count + 1), std::memory_order_acq_rel,
-      std::memory_order_relaxed));
-  const auto blocks = (event_bytes - 1) / arena_->block_bytes + 1;
-  for (std::size_t i = 0; i <= slots_.size() - blocks;) {
-    std::size_t reserved = 0;
-    for (; reserved < blocks; ++reserved) {
-      bool free = false;
-      if (!arena_->occupied[i + reserved].compare_exchange_strong(
-              free, true, std::memory_order_acq_rel, std::memory_order_relaxed))
-        break;
-    }
-    if (reserved == blocks) {
-      auto &slot = *slots_[i];
-      slot.blocks = blocks;
-      slot.event_capacity = event_bytes;
-      slot.active.store(true, std::memory_order_release);
-      return Lease(slots_[i], hook_id);
-    }
-    arena_->release_blocks(i, reserved);
-    i += reserved + 1;
   }
-  outstanding.fetch_sub(1, std::memory_order_release);
-  return {};
-}
-
-std::size_t
-ContextCapturePool::outstanding(std::uint32_t hook_id) const noexcept {
-  if (hook_id >= kCaptureHooks)
+  try {
+    std::lock_guard lock(arena_->mutex);
+    std::shared_ptr<CaptureSlotState> slot;
+    for (const auto& candidate : slots_) {
+      if (candidate.use_count() == 1 && !candidate->active.load(std::memory_order_acquire)) {
+        slot = candidate;
+        break;
+      }
+    }
+    if (!slot) {
+      slot = std::make_shared<CaptureSlotState>(arena_, event_bytes);
+      slots_.push_back(slot);
+    } else if (slot->storage.size() < event_bytes) {
+      slot->storage.resize(event_bytes);
+    }
+    slot->event_capacity = event_bytes;
+    slot->prepare(hook_id);
+    ++arena_->hook_outstanding[hook_id];
+    slot->active.store(true, std::memory_order_release);
+    return Lease(std::move(slot), hook_id);
+  } catch (...) {
     return {};
-  return arena_->hook_outstanding[hook_id].load(std::memory_order_acquire);
+  }
 }
 
-void CaptureArena::release(CaptureSlotState &slot,
-                           std::uint32_t hook) noexcept {
-  if (hook >= hook_outstanding.size())
+std::size_t ContextCapturePool::outstanding(std::uint64_t hook_id) const noexcept {
+  std::lock_guard lock(arena_->mutex);
+  const auto found = arena_->hook_outstanding.find(hook_id);
+  return found == arena_->hook_outstanding.end() ? 0 : found->second;
+}
+
+void CaptureArena::release(CaptureSlotState& slot, std::uint64_t hook) noexcept {
+  if (!slot.active.exchange(false, std::memory_order_acq_rel)) {
     return;
+  }
   auto &schema_set = slot.schema_set;
   schema_set.size_ = 0;
   schema_set.event_bytes_size_ = 0;
   schema_set.published_ = false;
-  for (auto &record : schema_set.records_)
-    record.reset();
-  schema_set.epoch_schema_ids_.fill(0);
-  if (!slot.active.exchange(false, std::memory_order_acq_rel))
-    return;
-  release_blocks(slot.slot, slot.blocks);
-  hook_outstanding[hook].fetch_sub(1, std::memory_order_release);
+  schema_set.records_.clear();
+  schema_set.epoch_schema_ids_.clear();
+  std::lock_guard lock(mutex);
+  const auto found = hook_outstanding.find(hook);
+  if (found != hook_outstanding.end() && --found->second == 0) {
+    hook_outstanding.erase(found);
+  }
 }
 
 std::uint64_t
@@ -684,9 +655,9 @@ capture_schema_set(const std::shared_ptr<const void> &token) noexcept {
 void release_capture_schema_set(
     const std::shared_ptr<const void> &token) noexcept {
   const auto *lease = capture_schema_set(token);
-  if (!lease || !lease->arena_ || !lease->owner_ ||
-      lease->slot_ >= kCaptureSlots || !lease->published_)
+  if (!lease || !lease->arena_ || !lease->owner_ || !lease->published_) {
     return;
+  }
   auto *mutable_lease = const_cast<CaptureSchemaSetLease *>(lease);
   mutable_lease->published_ = false;
   mutable_lease->arena_->release(*mutable_lease->owner_, mutable_lease->hook_);

@@ -47,6 +47,14 @@ void verify_context_capture() {
   const auto invocation_id = id('I');
   const auto probe_id = id('Q');
   tracer::TraceContext trace{};
+  tracer::TraceValue argument_storage[3]{};
+  const char* argument_names[3]{};
+  tracer::detail::NamedValueStorage named_storage;
+  named_storage.values.resize(1);
+  trace.arguments = argument_storage;
+  trace.argument_names = argument_names;
+  trace.named_values = named_storage.values.data();
+  trace.named_storage = &named_storage;
   trace.argument_count = 3;
   trace.argument_names[0] = "count";
   trace.arguments[0] = {tracer::ValueType::Int32, 0, -7, 0, 0.0};
@@ -56,8 +64,8 @@ void verify_context_capture() {
   trace.arguments[2] = {tracer::ValueType::Bool, 0, 1, 0, 0.0};
   trace.named_count = 1;
   trace.named_values[0].kind = 2;
-  trace.named_values[0].name[0] = 'f';
-  trace.named_values[0].name[1] = '\0';
+  trace.named_values[0].name = "f";
+  trace.named_values[0].name_size = 1;
   trace.named_values[0].value = {tracer::ValueType::Float64, 0, 0, 0, 2.5};
   trace.phase = tracer::TracePhase::Post;
   trace.result = {tracer::ValueType::UInt64, 0, 0, 42, 0};
@@ -172,37 +180,26 @@ void verify_context_capture() {
           "terminal schema lease did not release capture reservation");
   sink.token.reset();
 
-  auto second = pool->try_reserve(3);
-  require(bool(second), "same hook quota rejected an available slot");
-  std::array<ContextCapturePool::Lease, 14> more;
-  for (auto &entry : more) {
-    entry = pool->try_reserve(3);
-    require(bool(entry), "hook quota rejected one of its 16 slots");
+  // Cross the old per-hook (16), global slot (190), and hook-ID (256) caps.
+  std::vector<ContextCapturePool::Lease> held;
+  for (unsigned i = 0; i < 300; ++i) {
+    auto lease = pool->try_reserve(1000, 1024);
+    require(bool(lease), "dynamic capture reservation failed");
+    held.push_back(std::move(lease));
   }
-  auto sixteenth = pool->try_reserve(3);
-  require(bool(sixteenth), "hook quota rejected its sixteenth reservation");
-  require(!pool->try_reserve(3), "hook admitted more than 16 reservations");
-  require(pool->outstanding(3) == 16, "hook outstanding count mismatch");
-  sixteenth = {};
-  require(pool->outstanding(3) == 15, "lease release did not free quota");
-  require(bool(pool->try_reserve(3)), "released quota was not reusable");
-  require(!pool->try_reserve(kCaptureHooks), "invalid hook id was accepted");
-  second = {};
-  for (auto &entry : more)
-    entry = {};
+  require(pool->outstanding(1000) == 300, "dynamic outstanding count mismatch");
+  held.clear();
+  require(pool->outstanding(1000) == 0, "capture accounting leaked");
+  require(!pool->try_reserve(3, pool->capacity() + 1), "configured per-event budget was ignored");
   pool.reset();
 
   {
-    const auto event_bytes = kCapturePoolBytes + 1;
+    const auto event_bytes = 49u * 1024 * 1024;
     ContextCapturePool expanded(event_bytes);
     auto first = expanded.try_reserve(3, event_bytes);
     auto second = expanded.try_reserve(4, event_bytes);
-    require(bool(first) && bool(second),
-            "expanded arena cannot reserve two events above the default arena size");
-    require(!expanded.try_reserve(5, event_bytes), "expanded arena overlapped reservations");
-    first = {};
-    require(bool(expanded.try_reserve(5, event_bytes)),
-            "expanded arena did not reuse released blocks");
+    auto third = expanded.try_reserve(5, event_bytes);
+    require(bool(first) && bool(second) && bool(third), "large dynamic captures could not coexist");
   }
 
   auto short_lived_pool = std::make_unique<ContextCapturePool>();

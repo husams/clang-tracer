@@ -18,10 +18,8 @@ namespace tracer_repl {
 namespace {
 constexpr std::string_view kMagic = "CTKOPKG2";
 constexpr std::size_t kDigestSize = 32;
-constexpr std::size_t kMaximumPackageSize = 64 * 1024 * 1024;
-constexpr std::size_t kMaximumFields = 256;
-constexpr std::size_t kMaximumWriters = 256;
-constexpr std::size_t kMaximumArguments = 256;
+constexpr std::size_t kMaximumPackageSize = static_cast<std::size_t>(INT32_MAX) + kMagic.size() +
+                                            kDigestSize; // Protobuf wire representation.
 
 std::string digest(std::string_view bytes) {
   llvm::SHA256 hash;
@@ -61,8 +59,6 @@ void ObjectProbePackage::validate(const ObjectProbePackageInput &input,
     throw std::invalid_argument("unsupported object-probe package version");
   if (input.qualified_type.empty())
     throw std::invalid_argument("object-probe package requires a qualified type");
-  if (input.fields.size() > kMaximumFields || input.writer_selectors.size() > kMaximumWriters)
-    throw std::invalid_argument("object-probe package has too many field or writer selectors");
   if (input.fields.empty() != input.writer_selectors.empty() || input.fields.size() > 1)
     throw std::invalid_argument("select one field together with its writer scopes");
   if (input.methods.empty()) {
@@ -78,10 +74,6 @@ void ObjectProbePackage::validate(const ObjectProbePackageInput &input,
         input.compile.translation_unit.empty())
       throw std::invalid_argument("method object-probe package requires include, compdb, and translation unit");
   }
-  if (input.compile.includes.size() > kMaximumArguments)
-    throw std::invalid_argument("object-probe package has too many includes");
-  if (input.compile.extra_arguments.size() > kMaximumArguments)
-    throw std::invalid_argument("object-probe package has too many compile arguments");
 
   const auto unique_nonempty = [](const std::vector<std::string> &values, const char *what) {
     std::set<std::string> seen;

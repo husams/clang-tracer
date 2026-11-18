@@ -336,7 +336,10 @@ std::optional<Artifact> plugin_object(llvm::orc::LLJIT& jit, const NativePluginS
   }
   auto arguments = profile;
   arguments.insert(arguments.begin(), "clang++");
-  arguments.insert(arguments.end(), {"-E", "-x", "c++", "--", source.string()});
+  // Preprocessing does not consume every SDK driver option (for example,
+  // --gcc-toolchain with explicit includes); code generation uses the same profile.
+  arguments.insert(arguments.end(),
+                   {"-Qunused-arguments", "-E", "-x", "c++", "--", source.string()});
   llvm::SmallVector<char, 0> preprocessed;
   clang_action(std::move(arguments),
                std::make_unique<PreprocessPlugin>(preprocessed), overlay,

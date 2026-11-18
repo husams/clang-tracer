@@ -15,8 +15,6 @@
 
 namespace tracer::context_engine {
 
-inline constexpr std::size_t kMaxSlots = 64;
-inline constexpr std::size_t kMaxBindings = 256;
 using Identity = std::uint64_t;
 // Native dispatch calls this after releasing its execution-mode guard leases.
 void drain_lifecycle() noexcept;
@@ -167,7 +165,7 @@ private:
 
   Diagnostics &diagnostics_;
   Identity domain_;
-  std::array<Binding, kMaxBindings> bindings_{};
+  std::vector<Binding> bindings_{};
   std::size_t size_ = 0;
   InvocationFrame *frame_ = nullptr;
   HookAccess *access_ = nullptr;
@@ -223,7 +221,7 @@ private:
 
   void add(std::shared_ptr<ScopeRecord>, Identity);
   Context &context_;
-  std::array<Entry, kMaxSlots> entries_{};
+  std::vector<Entry> entries_{};
   std::size_t size_ = 0;
   Kind kind_;
 };
@@ -293,7 +291,8 @@ private:
   void finish() noexcept;
   const std::shared_ptr<PropagationLedger> ledger_;
   std::atomic<Phase> phase_{Phase::prepared};
-  std::array<std::shared_ptr<ScopeRecord>, kMaxSlots> records_{};
+  std::size_t charged_bytes_ = 0;
+  std::vector<std::shared_ptr<ScopeRecord>> records_{};
   std::size_t size_ = 0;
 };
 
@@ -309,7 +308,7 @@ public:
 private:
   Context &context_;
   std::shared_ptr<TaskCapture> task_;
-  std::array<Context::Binding, kMaxBindings> saved_{};
+  std::vector<Context::Binding> saved_{};
   std::size_t saved_size_ = 0;
   InvocationFrame *saved_frame_ = nullptr;
 };

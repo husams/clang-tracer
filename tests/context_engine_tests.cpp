@@ -650,6 +650,47 @@ void metadata_limit_reserves_complete_task_restoration() {
               ledger->outstanding() == 0,
           "task without complete metadata capacity was admitted");
 }
+
+void dynamic_context_storage_crosses_former_caps() {
+  ce::Diagnostics diagnostics;
+  ce::Context context(diagnostics);
+  {
+    ce::InvocationFrame frame(context);
+    std::vector<ce::StateRegistration> states;
+    for (unsigned i = 0; i < 100; ++i) {
+      states.push_back(slot<Data>(1000 + i));
+    }
+    const auto wide = registration(999, std::move(states));
+    frame.create_or_attach(wide);
+    for (unsigned i = 0; i < 300; ++i) {
+      frame.create_or_attach(registration(2000 + i, {slot<Data>(3000 + i)}));
+    }
+    require(context.binding_count() == 301, "binding storage stopped growing");
+    {
+      ce::HookExit hook(context);
+      ce::HookAccess access(context, {}, true, ce::HookAccess::Kind::direct);
+      unsigned count = 0;
+      require(access.visit_all([](void* opaque, ce::Identity, ce::Identity,
+                                  const ce::ScopeRegistration&,
+                                  void*) noexcept { ++*static_cast<unsigned*>(opaque); },
+                               &count) &&
+                  count == 400,
+              "hook state storage stopped growing");
+    }
+    auto ledger = std::make_shared<ce::PropagationLedger>(
+        ce::PropagationLimits{64, 4096, 4 * 1024 * 1024, 1000});
+    auto captured = ce::TaskCapture::capture(context, ledger);
+    require(bool(captured), "configured ancestry beyond 64 was rejected");
+    ce::Context worker(diagnostics);
+    {
+      ce::TaskAttachment attached(worker, captured);
+      require(worker.binding_count() == 301, "dynamic task lost bindings");
+    }
+    require(worker.binding_count() == 0 && ledger->outstanding() == 0,
+            "dynamic task did not restore worker context");
+  }
+  require(context.binding_count() == 0, "dynamic bindings leaked");
+}
 } // namespace
 
 int main() {
@@ -664,6 +705,7 @@ int main() {
     verify_context_scheduler();
     verify_context_packages();
     verify_engine_storage();
+    dynamic_context_storage_crosses_former_caps();
     nested_invocations_share_and_restore();
     constructor_rollback_is_transactional();
     generations_do_not_reinterpret_live_records();

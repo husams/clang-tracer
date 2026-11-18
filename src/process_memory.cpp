@@ -42,7 +42,6 @@ namespace {
 constexpr std::size_t max_maps_bytes = 1024 * 1024;
 constexpr std::size_t max_read_bytes = 64 * 1024;
 constexpr std::size_t max_scan_bytes = 1024 * 1024;
-constexpr std::size_t max_pattern_bytes = 256;
 constexpr int default_match_limit = 64;
 constexpr int max_match_limit = 1024;
 
@@ -714,9 +713,11 @@ grpc::Status apply_patch(grpc::ServerContext &context, Session &session, std::ch
       address = patch.address();
       before = patch.expected();
       after = patch.replacement();
-      if (!request.module().empty() || before.empty() || before.size() > max_pattern_bytes ||
-          before.size() != after.size() || before == after)
-        throw MemoryError(Code::INVALID_ARGUMENT, "memory write requires distinct equal-length bytes up to 256");
+      if (!request.module().empty() || before.empty() || before.size() > 256 ||
+          before.size() != after.size() || before == after) {
+        throw MemoryError(Code::INVALID_ARGUMENT,
+                          "memory write requires distinct equal-length bytes up to 256");
+      }
     } else {
       throw MemoryError(Code::INVALID_ARGUMENT, "memory patch operation is required");
     }
@@ -841,8 +842,10 @@ grpc::Status scan(grpc::ServerContext &context, Session &session,
     return {Code::INVALID_ARGUMENT, "memory scan size must be between 1 and 1048576 bytes"};
   const auto &pattern = request.pattern();
   const auto &mask = request.mask();
-  if (pattern.empty() || pattern.size() > max_pattern_bytes || mask.size() != pattern.size())
-    return {Code::INVALID_ARGUMENT, "memory scan pattern and mask must have the same length of 1 to 256 bytes"};
+  if (pattern.empty() || mask.size() != pattern.size()) {
+    return {Code::INVALID_ARGUMENT,
+            "memory scan pattern and mask must have the same nonzero length"};
+  }
   if (request.max_matches() > max_match_limit)
     return {Code::INVALID_ARGUMENT, "memory scan match limit must be at most 1024"};
   const int limit = request.max_matches() ? static_cast<int>(request.max_matches())

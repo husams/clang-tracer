@@ -68,13 +68,7 @@ namespace {
 namespace fs = std::filesystem;
 namespace api = clangtracer::v1;
 
-constexpr std::size_t kMaxTranslationUnits = 256;
-constexpr std::size_t kMaxExplicitSources = 128;
-constexpr std::size_t kMaxArguments = 8;
-constexpr std::size_t kMaxReceiverFields = 128;
 constexpr std::size_t kMaxReceiverSourcePath = 4096;
-constexpr std::size_t kMaxReceiverArguments = 512;
-constexpr std::size_t kMaxReceiverArgumentBytes = 65536;
 
 std::string trim(std::string value) {
   const auto first =
@@ -1169,9 +1163,6 @@ public:
       if (prototype->isVariadic()) {
         throw std::runtime_error("variadic callables are unsupported");
       }
-      if (declaration->getNumParams() > kMaxArguments) {
-        throw std::runtime_error("callables with more than eight arguments are unsupported");
-      }
       if (prototype->hasExtParameterInfos()) {
         for (const auto& info : prototype->getExtParameterInfos()) {
           if (info != clang::FunctionProtoType::ExtParameterInfo{}) {
@@ -1282,12 +1273,6 @@ private:
       return;
     }
     const auto fields = record->fields();
-    if (std::distance(fields.begin(), fields.end()) >
-        static_cast<std::ptrdiff_t>(kMaxReceiverFields)) {
-      unavailable("receiver class has more than 128 fields");
-      return;
-    }
-
     const auto& source_manager = context_->getSourceManager();
     const auto main_file = source_manager.getMainFileID();
     const auto main_location = source_manager.getLocForStartOfFile(main_file);
@@ -1298,19 +1283,9 @@ private:
       unavailable("resolver did not capture the translation unit compiler invocation");
       return;
     }
-    std::size_t total_argument_bytes = 0;
-    for (const auto& argument : invocation_.arguments) {
-      if (argument.size() + 1 > kMaxReceiverArgumentBytes - total_argument_bytes) {
-        unavailable("translation unit invocation exceeds receiver metadata limits");
-        return;
-      }
-      total_argument_bytes += argument.size() + 1;
-    }
     if (source_path.empty() || source_path.size() >= kMaxReceiverSourcePath ||
-        invocation_.working_directory.empty() || invocation_.source_argument.empty() ||
-        invocation_.arguments.size() > kMaxReceiverArguments ||
-        total_argument_bytes > kMaxReceiverArgumentBytes) {
-      unavailable("translation unit invocation exceeds receiver metadata limits");
+        invocation_.working_directory.empty() || invocation_.source_argument.empty()) {
+      unavailable("translation unit invocation is incomplete");
       return;
     }
     for (const auto* field : fields) {
@@ -1359,10 +1334,6 @@ private:
         resolved_field->set_access(record->isClass() ? "private" : "public");
         break;
       }
-    }
-    if (receiver->ByteSizeLong() > kMaxReceiverArgumentBytes) {
-      candidate.spec.clear_receiver();
-      candidate.spec.set_receiver_unavailable_reason("receiver metadata exceeds 64 KiB");
     }
   }
 
@@ -1633,9 +1604,6 @@ ResolvedCallable resolve_cpp_callable(const std::string& name,
                                       const std::string& compilation_database,
                                       const std::vector<std::string>& sources) {
   const auto selector = parse_selector(name);
-  if (sources.size() > kMaxExplicitSources) {
-    throw std::runtime_error("too many --source entries (maximum 128)");
-  }
   auto database = load_database(compilation_database);
   std::vector<std::string> source_files;
   if (sources.empty()) {
@@ -1667,10 +1635,6 @@ ResolvedCallable resolve_cpp_callable(const std::string& name,
   source_files.erase(std::unique(source_files.begin(), source_files.end()), source_files.end());
   if (source_files.empty()) {
     throw std::runtime_error("compilation database contains no source files");
-  }
-  if (source_files.size() > kMaxTranslationUnits) {
-    throw std::runtime_error("compilation database has more than 256 source "
-                             "files; restrict with --source");
   }
 
   const fs::path resource_dir(TRACER_CLANG_RESOURCE_DIR);

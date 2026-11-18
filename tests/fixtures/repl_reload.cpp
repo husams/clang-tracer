@@ -1,3 +1,5 @@
+#include <tracer/override_target.hpp>
+
 #include <atomic>
 #include <cstdio>
 #include <thread>
@@ -67,6 +69,21 @@ MANY_PROBE(38)
 MANY_PROBE(39)
 #undef MANY_PROBE
 
+#if defined(TRACER_SCALAR_OVERRIDE_TARGET)
+TRACER_SCALAR_OVERRIDE_TARGET
+#else
+__attribute__((noinline))
+#endif
+int wide_probe(int a0, int a1, int a2, int a3, int a4, int a5, int a6, int a7, int a8, int a9, int a10,
+           int a11, int a12, int a13, int a14, int a15, int a16, int a17, int a18, int a19, int a20,
+           int a21, int a22, int a23, int a24, int a25, int a26, int a27, int a28, int a29, int a30,
+           int a31, int a32, int a33, int a34, int a35, int a36, int a37, int a38, int a39) {
+  asm volatile(".rept 16\n\tnop\n\t.endr" ::: "memory");
+  return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13 + a14 + a15 + a16 +
+         a17 + a18 + a19 + a20 + a21 + a22 + a23 + a24 + a25 + a26 + a27 + a28 + a29 + a30 + a31 +
+         a32 + a33 + a34 + a35 + a36 + a37 + a38 + a39;
+}
+
 int main() {
   if (::fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK) == -1)
     return 1;
@@ -85,7 +102,13 @@ int main() {
       hold_call.store(true, std::memory_order_relaxed);
     else if (command == 'r')
       release_call.store(true, std::memory_order_relaxed);
-    else if (command == 'm') {
+    else if (command == 'w') {
+      std::printf("wide call returned %d\n",
+                  wide_probe(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                             20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37,
+                             38, 39));
+      std::fflush(stdout);
+    } else if (command == 'm') {
       int total = 0;
       total += many_probe_0(1);
       total += many_probe_1(1);
@@ -129,8 +152,7 @@ int main() {
       total += many_probe_39(1);
       std::printf("many calls returned %d\n", total);
       std::fflush(stdout);
-    }
-    else if (command == 's') {
+    } else if (command == 's') {
       std::printf("short call returned %d\n", observed(2));
       std::fflush(stdout);
     }

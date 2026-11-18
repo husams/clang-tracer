@@ -8,6 +8,8 @@
 #include <string_view>
 #include <vector>
 
+#include <dlfcn.h>
+
 #include "live_migration.hpp"
 #include "live_update.hpp"
 #include "state_v2.hpp"
@@ -108,6 +110,23 @@ extern "C" void fixture_hook_observe(int entries) {
 int main(int argc, char** argv) try {
   require(argc == 3, "expected fixture and SDK paths");
   const auto fixtures = std::filesystem::absolute(argv[1]);
+  live::JitRequest pthread_request;
+  pthread_request.files = {{(fixtures / "pthread_predicate.cpp").string(), R"CPP(
+extern "C" int __pthread_key_create(unsigned*, void (*)(void*));
+extern "C" __UINTPTR_TYPE__ pthread_predicate() {
+  return reinterpret_cast<__UINTPTR_TYPE__>(&__pthread_key_create);
+}
+)CPP"}};
+  pthread_request.compiler_arguments = {"-std=c++17"};
+  pthread_request.entry_symbols = {"pthread_predicate"};
+  const auto pthread_image = live::compile_in_target(pthread_request);
+  const auto predicate =
+      reinterpret_cast<std::uintptr_t (*)()>(pthread_image->lookup("pthread_predicate"));
+  const auto expected_pthread =
+      reinterpret_cast<std::uintptr_t>(::dlsym(RTLD_DEFAULT, "__pthread_key_create"));
+  require(expected_pthread && predicate() == expected_pthread,
+          "SDK gthread predicate must bind the target's pthread runtime");
+
   auto request = live::JitRequest{};
   request.files = {source(fixtures / "state.hpp"),
                    source(fixtures / "state_v2.hpp"),

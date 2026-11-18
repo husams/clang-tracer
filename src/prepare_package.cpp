@@ -60,8 +60,6 @@ api::PreparedInjector write_prepared_package(
       }, {}, arm_snapshot) != llvm::toHex(llvm::ArrayRef<std::uint8_t>(
       reinterpret_cast<const std::uint8_t *>(digest.data()), digest.size()), true))
     throw std::runtime_error("module changed during preparation");
-  if (prepared.ByteSizeLong() > 64 * 1024)
-    throw std::runtime_error("prepared metadata exceeds 64 KiB");
   std::string arguments;
   for (const auto &arg : types.arguments()) {
     if (!arguments.empty())

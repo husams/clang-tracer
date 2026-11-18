@@ -74,15 +74,9 @@ profile_arguments(const std::vector<std::string> &user) {
   }
   if (!std::filesystem::is_regular_file(resource / "include/stddef.h"))
     throw std::runtime_error("Clang builtin headers are unavailable");
-  std::vector<std::string> result{"-std=c++17", "-fPIC", "-O0", "-resource-dir",
-                                  resource.string()};
-  for (const auto *argument : repl_compiler_arguments)
-    result.emplace_back(argument);
-  result.insert(result.end(), user.begin(), user.end());
-  // Use the same access rules for entered code, mapping generation, and the
-  // syntax checker, including when a compilation database enables checking.
-  result.emplace_back("-fno-access-control");
-  return result;
+  return tracer::native_plugin_compiler_arguments(
+      std::filesystem::canonical(resource).string(),
+      {std::begin(repl_compiler_arguments), std::end(repl_compiler_arguments)}, user);
 }
 std::string api_header() {
   auto header = std::filesystem::path(executable_path()).parent_path() /
@@ -416,10 +410,9 @@ void CppEngine::set_compiler_options(std::vector<std::string> arguments) {
   std::size_t bytes = 0;
   for (const auto &argument : arguments) {
     bytes += argument.size();
-    if (argument.empty() || argument.find('\0') != std::string::npos ||
-        bytes > 65536 || arguments.size() > 128)
-      throw std::invalid_argument("compiler options must be nonempty and total "
-                                  "at most 128 arguments / 64 KiB");
+    if (argument.empty() || argument.find('\0') != std::string::npos) {
+      throw std::invalid_argument("compiler options must be nonempty without NUL");
+    }
   }
   const auto helper = std::filesystem::path(executable_path()).parent_path() /
                       "clang-tracer-repl-check";

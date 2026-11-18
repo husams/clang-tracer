@@ -83,9 +83,6 @@ std::string read_source(const std::string &path) {
   char block[8192];
   while (in.read(block, sizeof(block)) || in.gcount()) {
     source.append(block, static_cast<std::size_t>(in.gcount()));
-    if (source.size() > 4 * 1024 * 1024) {
-      throw std::runtime_error("source exceeds 4 MiB: " + path);
-    }
   }
   if (in.bad()) {
     throw std::runtime_error("source read failed: " + path);

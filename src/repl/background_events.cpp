@@ -30,7 +30,7 @@ BackgroundEvents::~BackgroundEvents() {
 void BackgroundEvents::run(const std::string& endpoint, std::uint64_t count) noexcept {
   try {
     grpc::ChannelArguments arguments;
-    arguments.SetMaxReceiveMessageSize(32 * 1024 * 1024);
+    arguments.SetMaxReceiveMessageSize(-1);
     auto stub = api::Tracer::NewStub(
         grpc::CreateCustomChannel(endpoint, grpc::InsecureChannelCredentials(), arguments));
     api::WatchEventsRequest request;

@@ -1,10 +1,10 @@
-"""Verify that finished sessions never block an attach once the server history is full."""
+"""Verify that session history grows beyond the former fixed limit without eviction."""
 import argparse
 import os
 import re
 import subprocess
 
-SESSION_LIMIT = 64
+FORMER_SESSION_LIMIT = 64
 
 
 def main():
@@ -12,11 +12,11 @@ def main():
     for name in ("repl", "server", "target"):
         parser.add_argument("--" + name, required=True)
     args = parser.parse_args()
-    cycles = SESSION_LIMIT + 3
+    cycles = FORMER_SESSION_LIMIT + 3
     target = subprocess.Popen([args.target], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     try:
         commands = f"%attach {target.pid}\n%detach\n" * cycles
-        # The next attach evicts one more finished session and stays attached.
+        # The next attach crosses the old boundary and keeps all prior sessions.
         commands += f"%attach {target.pid}\n%sessions\n%detach\n%sessions\n%quit\n"
         # Use the server under test even when the caller's shell names a live endpoint.
         env = {name: value for name, value in os.environ.items() if name != "CLANG_TRACER_ENDPOINT"}
@@ -29,18 +29,18 @@ def main():
         assert "limit reached" not in result.stdout + result.stderr
 
         listed = re.findall(r"^([* ]) (\S+) pid=(\d+) state=(\w+) probes=\d+", result.stdout, re.M)
-        live, final = listed[:SESSION_LIMIT], listed[SESSION_LIMIT:]
-        assert len(live) == len(final) == SESSION_LIMIT, (len(listed), result.stdout[-4000:])
+        total = cycles + 1
+        live, final = listed[:total], listed[total:]
+        assert len(live) == len(final) == total, (len(listed), result.stdout[-4000:])
         ids = {entry[1] for entry in live}
-        # The oldest sessions leave first; the newest stay listed.
-        assert not ids & set(attached[:cycles + 1 - SESSION_LIMIT]), "oldest history was retained"
-        assert ids == set(attached[-SESSION_LIMIT:]), "recent history was evicted"
+        assert ids == set(attached), "session history was evicted"
+        assert {entry[1] for entry in final} == ids, "detaching evicted session history"
         assert [e for e in live if e[3] == "ATTACHED"] == [("*", attached[-1], str(target.pid), "ATTACHED")], live
         assert all(e[0] == " " and e[3] == "DETACHED" for e in final), final
     finally:
         target.kill()
         target.wait()
-    print(f"{cycles + 1} attaches succeeded with a {SESSION_LIMIT}-session history")
+    print(f"{cycles + 1} attaches succeeded with all session history retained")
 
 
 if __name__ == "__main__":

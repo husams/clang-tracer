@@ -35,6 +35,14 @@ void verify_generated_owner() {
               !data.has_value(),
           "owner invented root-call initialization data");
   tracer::TraceContext raw;
+  tracer::TraceValue argument_storage[1]{};
+  const char* argument_names[1]{};
+  tracer::detail::NamedValueStorage named_storage;
+  named_storage.values.resize(1);
+  raw.arguments = argument_storage;
+  raw.argument_names = argument_names;
+  raw.named_values = named_storage.values.data();
+  raw.named_storage = &named_storage;
   raw.argument_count = 1;
   raw.arguments[0].type = tracer::ValueType::Int32;
   raw.arguments[0].signed_value = 42;

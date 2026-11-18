@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <string_view>
+#include <vector>
 
 #include "bounded_proto.hpp"
 #include "context_codec.hpp"
@@ -24,31 +25,11 @@ struct TraceContext;
 
 namespace tracer::context_engine {
 
-// The default event arena, queued attachments, and native workspace fit
-// within the default process capture-storage budget.
-// Allocation quantum and default event size. Larger events reserve adjacent blocks.
+// Event bytes remain the configured per-capture budget. Storage and hook
+// identities grow on demand; there is no global slot or per-hook count cap.
 inline constexpr std::size_t kCaptureEventBytes = tracer::kDefaultContextEventBytes;
-inline constexpr std::size_t kCaptureGlobalBudgetBytes = 128ull * 1024 * 1024;
 inline constexpr std::size_t kCaptureQueueBudgetBytes = tracer::kDefaultContextTransportMemoryBytes;
-inline constexpr std::size_t kCaptureInvocationWorkspaceBytes =
-    7ull * 1024 * 1024;
-inline constexpr std::size_t kCaptureRuntimeWorkspaceBytes = 4ull * 1024 * 1024;
 inline constexpr std::size_t kCaptureGuardedWorkspaceBytes = 5ull * 1024 * 1024;
-inline constexpr std::size_t kCaptureArenaBytes = 48ull * 1024 * 1024;
-static_assert(kCaptureArenaBytes + kCaptureQueueBudgetBytes +
-                  kCaptureInvocationWorkspaceBytes +
-                  kCaptureRuntimeWorkspaceBytes +
-                  kCaptureGuardedWorkspaceBytes ==
-              kCaptureGlobalBudgetBytes);
-inline constexpr std::size_t kCaptureSlotMetadataReserve = 512ull * 1024;
-inline constexpr std::size_t kCaptureSlots =
-    (kCaptureArenaBytes - kCaptureSlotMetadataReserve) / kCaptureEventBytes;
-inline constexpr std::size_t kCapturePoolBytes =
-    kCaptureSlots * kCaptureEventBytes;
-inline constexpr std::size_t kCaptureHooks = 256;
-inline constexpr std::size_t kCaptureEventsPerHook = 16;
-inline constexpr std::size_t kCaptureBytesPerHook =
-    kCaptureEventsPerHook * kCaptureEventBytes;
 
 struct CaptureSchemaView {
   std::string_view identity;
@@ -63,11 +44,10 @@ struct CaptureSchemaView {
   std::shared_ptr<const SchemaRecord> retained_record;
 };
 
-// Fixed per-event schema references. Instances live in ContextCapturePool
-// slots; the delivery worker reads them while it holds the associated token.
+// Per-event schema references remain alive while the delivery worker holds
+// the associated token.
 class CaptureSchemaSetLease final {
 public:
-  static constexpr std::size_t capacity = 64;
   std::size_t size() const noexcept { return size_; }
   std::uint64_t epoch_schema_id(std::size_t) const noexcept;
   const SchemaRecord *record(std::size_t) const noexcept;
@@ -78,14 +58,13 @@ private:
   friend struct CaptureArena;
   friend void
   release_capture_schema_set(const std::shared_ptr<const void> &) noexcept;
-  std::array<std::shared_ptr<const SchemaRecord>, capacity> records_{};
-  std::array<std::uint64_t, capacity> epoch_schema_ids_{};
+  std::vector<std::shared_ptr<const SchemaRecord>> records_{};
+  std::vector<std::uint64_t> epoch_schema_ids_{};
   std::size_t size_ = 0;
   std::size_t event_bytes_size_ = 0;
   CaptureArena *arena_ = nullptr;
   CaptureSlotState *owner_ = nullptr;
-  std::size_t slot_ = 0;
-  std::uint32_t hook_ = 0;
+  std::uint64_t hook_ = 0;
   bool published_ = false;
 };
 
@@ -149,8 +128,7 @@ struct CaptureResult {
   }
 };
 
-// Owns fixed-capacity capture storage. Construct during hook registration,
-// before any guarded interval; reservation and capture perform no allocation.
+// Owns capture accounting; individual leases own their storage.
 class ContextCapturePool final {
 public:
   class Lease final {
@@ -179,11 +157,11 @@ public:
 
   private:
     friend class ContextCapturePool;
-    Lease(std::shared_ptr<CaptureSlotState>, std::uint32_t) noexcept;
+    Lease(std::shared_ptr<CaptureSlotState>, std::uint64_t) noexcept;
     void reset() noexcept;
     std::shared_ptr<CaptureSlotState> slot_state_;
     std::shared_ptr<const void> schema_token_;
-    std::uint32_t hook_ = 0;
+    std::uint64_t hook_ = 0;
     std::size_t bytes_ = 0;
     bool captured_ = false;
     bool published_ = false;
@@ -195,30 +173,15 @@ public:
   ContextCapturePool(const ContextCapturePool &) = delete;
   ContextCapturePool &operator=(const ContextCapturePool &) = delete;
 
-  // Hook identifiers are assigned at setup. try_reserve is nonblocking and
-  // enforces the per-hook event quota and the shared arena budget.
-  Lease try_reserve(std::uint32_t hook_id,
-                    std::size_t event_bytes = kCaptureEventBytes) noexcept;
-  std::size_t outstanding(std::uint32_t hook_id) const noexcept;
+  // Hook identifiers are assigned at setup. Reservations honor the configured
+  // event-size budget and fail explicitly if allocation fails.
+  Lease try_reserve(std::uint64_t hook_id, std::size_t event_bytes = kCaptureEventBytes) noexcept;
+  std::size_t outstanding(std::uint64_t hook_id) const noexcept;
 
 private:
   std::shared_ptr<CaptureArena> arena_;
-  std::array<std::shared_ptr<CaptureSlotState>, kCaptureSlots> slots_{};
+  // Stable slots are reused only after every external schema token is gone.
+  std::vector<std::shared_ptr<CaptureSlotState>> slots_;
 };
-
-// CaptureSlotState consists of the schema lease, arena shared_ptr, active
-// flag and slot index. The extra 64 bytes per slot conservatively includes
-// the make_shared control block; 512 bytes accounts for the arena header and
-// its shared control block. Keep this bookkeeping inside the 48MiB arena cap.
-inline constexpr std::size_t kCaptureSlotControlBlockEstimate = 64;
-inline constexpr std::size_t kCaptureArenaHeaderEstimate = 512;
-static_assert(
-    kCaptureSlots * (sizeof(CaptureSchemaSetLease) +
-                     sizeof(std::shared_ptr<CaptureArena>) +
-                     2 * sizeof(std::atomic<bool>) + 3 * sizeof(std::size_t) +
-                     kCaptureSlotControlBlockEstimate) +
-            sizeof(ContextCapturePool) + kCaptureArenaHeaderEstimate <=
-        kCaptureSlotMetadataReserve,
-    "capture slot lease/control-block metadata exceeds its reserved budget");
 
 } // namespace tracer::context_engine

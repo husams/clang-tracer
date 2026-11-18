@@ -109,7 +109,7 @@ def main(repl, server, target):
         scan(base, token, 1, "??", limit=0, error="memory scan match limit must be positive")
         scan(base, token, 1, "12 34 : ff", error="pattern and explicit mask must have the same length")
         scan(base, token, 1, "G?", error="invalid hex digit in memory pattern")
-        scan(base, token, 1, "AA " * 257, error="memory pattern must be at most 256 bytes")
+        scan(base, token, 1, "AA " * 257)
         scan(2**64 - 2, token, 4, "??", error="RPC 3: invalid or overflowing")
 
         change("permissions changed")

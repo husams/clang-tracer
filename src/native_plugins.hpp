@@ -13,6 +13,19 @@
 #include "agent_plugin_observers.hpp"
 
 namespace tracer {
+// Keep local compilation and target-side offered-object validation identical.
+inline std::vector<std::string>
+native_plugin_compiler_arguments(const std::string& resource_directory,
+                                 const std::vector<std::string>& platform,
+                                 const std::vector<std::string>& user = {}) {
+  std::vector<std::string> arguments{"-std=c++17", "-fPIC", "-O0", "-resource-dir",
+                                     resource_directory};
+  arguments.insert(arguments.end(), platform.begin(), platform.end());
+  arguments.insert(arguments.end(), user.begin(), user.end());
+  arguments.emplace_back("-fno-access-control");
+  return arguments;
+}
+
 std::filesystem::path private_plugin_directory(const std::filesystem::path& directory, bool create,
                                                bool owner_only = true);
 

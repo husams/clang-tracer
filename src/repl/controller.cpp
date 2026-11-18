@@ -143,8 +143,6 @@ std::pair<std::string, std::string> parse_memory_pattern(std::string_view text) 
     while (input >> token) {
       if (token.size() != 2)
         throw std::invalid_argument("memory pattern needs two hex digits or wildcards per byte");
-      if (bytes.size() == 256)
-        throw std::invalid_argument("memory pattern must be at most 256 bytes");
       unsigned value = 0, bits = 0;
       for (const unsigned char ch : token) {
         value <<= 4;
@@ -359,8 +357,6 @@ PreparedMode prepared_options(Request &request, const Command &options,
       throw std::invalid_argument(
           "No prepared package for this selector. Run %probe prepare or pass --prepared DIRECTORY.");
     const auto file = std::filesystem::path(directory) / "prepared.pb";
-    if (std::filesystem::file_size(file) > 65536)
-      throw std::runtime_error("prepared metadata exceeds 64 KiB");
     std::ifstream input(file, std::ios::binary);
     api::PreparedInjector prepared;
     if (!input || !prepared.ParseFromIstream(&input))
@@ -404,7 +400,7 @@ Controller::~Controller() {
 void Controller::connect(const std::string &endpoint) {
   grpc::ChannelArguments arguments;
   arguments.SetMaxReceiveMessageSize(-1);
-  arguments.SetMaxSendMessageSize(32 * 1024 * 1024);
+  arguments.SetMaxSendMessageSize(-1);
   auto next = api::Tracer::NewStub(grpc::CreateCustomChannel(
       endpoint, grpc::InsecureChannelCredentials(), arguments));
   api::ListSessionsRequest request;
@@ -1367,9 +1363,9 @@ Controller::PreparedPackage Controller::prepare_package(const std::string &selec
   PreparedPackage package{directory.string(), {}};
   const auto file = directory / "prepared.pb";
   std::ifstream input(file, std::ios::binary);
-  if (!input || std::filesystem::file_size(file) > 65536 ||
-      !package.artifact.ParseFromIstream(&input))
+  if (!input || !package.artifact.ParseFromIstream(&input)) {
     throw std::runtime_error("cannot read newly generated prepared package");
+  }
   out_ << "prepared directory=" << directory << '\n';
   return package;
 }
@@ -1704,8 +1700,8 @@ std::uint64_t Controller::inject(const SessionHandle &session,
 }
 
 void Controller::draft(const std::string &name, std::string source) {
-  if (source.empty() || source.size() > 4 * 1024 * 1024) {
-    throw std::invalid_argument("draft must contain between 1 byte and 4 MiB");
+  if (source.empty()) {
+    throw std::invalid_argument("draft must contain nonempty source");
   }
   drafts_[name] = std::move(source);
 }
@@ -2679,10 +2675,10 @@ bool Controller::execute(const Command& command, const PrepareAgentPlugin& prepa
         api::ObjectWatchPackage package;
         const auto file = std::filesystem::path(command.option("--plan")) / "object-plan.pb";
         std::ifstream input(file, std::ios::binary);
-        if (!input || std::filesystem::file_size(file) > 4 * 1024 * 1024 ||
-            !package.ParseFromIstream(&input) ||
-            package.version() != 1 || !package.has_definition() || !package.has_plan())
+        if (!input || !package.ParseFromIstream(&input) || package.version() != 1 ||
+            !package.has_definition() || !package.has_plan()) {
           throw std::runtime_error("cannot read object watch package: " + file.string());
+        }
         request = package.definition();
         *request.mutable_prepared_bindings() = package.plan();
         if (command.has("--module")) {
@@ -3230,7 +3226,7 @@ bool Controller::execute(const Command& command, const PrepareAgentPlugin& prepa
   case K::instructions_replay:
   case K::instructions_stop: {
     constexpr std::uint64_t magic = 0x3145434152545443ULL; // CTTRACE1
-    constexpr std::size_t max_bytes = 4 * 1024 * 1024;
+    constexpr int max_bytes = INT32_MAX; // Protobuf CodedInputStream uses signed int sizes.
     api::InstructionRecording recording;
     if (command.kind == K::instructions_replay) {
       const int fd = ::open(args.at(0).c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
@@ -3241,7 +3237,7 @@ bool Controller::execute(const Command& command, const PrepareAgentPlugin& prepa
       struct stat status {};
       if (::fstat(fd, &status) < 0 || !S_ISREG(status.st_mode) || status.st_size <= 0 ||
           static_cast<std::uint64_t>(status.st_size) > max_bytes)
-        throw std::invalid_argument("instruction recording must be a regular file up to 4 MiB");
+        throw std::invalid_argument("instruction recording must be a regular file within the Protobuf size range");
       google::protobuf::io::CodedInputStream bytes(&input);
       bytes.SetTotalBytesLimit(max_bytes);
       const auto end = bytes.PushLimit(static_cast<int>(status.st_size));
@@ -3283,7 +3279,7 @@ bool Controller::execute(const Command& command, const PrepareAgentPlugin& prepa
       recording.set_version(1);
       const auto path = command.option("--save");
       if (recording.ByteSizeLong() > max_bytes)
-        throw std::runtime_error("instruction recording exceeds 4 MiB");
+        throw std::runtime_error("instruction recording exceeds the Protobuf size range");
       const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
       if (fd < 0)
         throw std::system_error(errno, std::generic_category(), "create instruction recording");

@@ -223,8 +223,6 @@ ResolvedCallable resolve_elf_signature(
     parameters += argument + " arg" + std::to_string(i);
   }
   declarations += "Result target(" + parameters + ") __asm__(\"" + target.symbol + "\");\n}\n";
-  if (supplied->getNumParams() + !target.receiver.empty() > kMaxArguments)
-    throw std::invalid_argument("ELF signature has too many ABI arguments");
 
   auto adapter = parse(declarations);
   auto &adapter_ast = adapter->getASTContext();
