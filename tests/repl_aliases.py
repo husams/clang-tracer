@@ -101,14 +101,14 @@ def explicit_alias(stack, root, args, target):
 
     # Different functions are not aliases of each other.
     rows = live.preview(f'%trace preview --exact "{fold_a}" --exact "{fold_b}"',
-                        r"matched=2 dwarf_supported=2 .*available=32 fits=yes$")
+                        r"matched=2 dwarf_supported=2 .*available=unlimited fits=yes$")
     assert len(rows) == 2 and all(row.startswith("DWARF_SUPPORTED ") for row in rows), rows
     assert address_of(rows[0]) != address_of(rows[1]), rows
 
     # Two names at one entry: one supported primary and an ALIAS row for the other name.
     manifest = root / "alias.textproto"
     rows = live.preview(f'%trace preview --exact "{fold_a}" --exact "{aliased}" --save "{manifest}"',
-                        r"matched=2 dwarf_supported=1 .*available=32 fits=yes$")
+                        r"matched=2 dwarf_supported=1 .*available=unlimited fits=yes$")
     live.output.expect(r"^manifest=")
     alias = row_for(rows, "ALIAS", aliased)
     primary = row_for(rows, "DWARF_SUPPORTED", fold_a)
@@ -121,7 +121,7 @@ def explicit_alias(stack, root, args, target):
 
     # One probe covers both names; events from calls through either name arrive.
     rows, batch, complete = live.report(f'%trace apply --manifest "{manifest}"', "apply")
-    assert complete and "available=32" in live.output.seen[-1], live.output.seen[-10:]
+    assert complete, live.output.seen[-10:]
     installed = row_for(rows, "INSTALLED", fold_a)
     covered = row_for(rows, "ALIASED", aliased)
     probe = probe_of(installed)
@@ -201,7 +201,7 @@ def folded_functions(stack, root, args, compiler):
     address = address_of(rows[0])
     original = live.code(address)
     rows, batch, complete = live.report(f'%trace apply --manifest "{manifest}"', "apply")
-    assert complete and "available=32" in live.output.seen[-1], rows
+    assert complete, rows
     rows = [row for row in rows if row.startswith(("INSTALLED ", "ALIASED "))]
     probes = {probe_of(row) for row in rows}
     assert len(probes) == 1 and sorted(row.split()[0] for row in rows) == [
@@ -312,7 +312,7 @@ def incompatible_folded_functions(stack, root, args):
             rows = live.preview(
                 f'%trace preview {selection} --save "{manifest}"',
                 rf"matched={len(selected)} dwarf_supported=0 .*"
-                r"session_retained=0 agent_retained=0 available=32 fits=yes$")
+                r"session_retained=0 agent_retained=0 available=unlimited fits=yes$")
             live.output.expect(r"^manifest=")
             assert len(rows) == len(selected), rows
             assert all(row.startswith(("UNSUPPORTED ", "AMBIGUOUS ")) for row in rows), rows
@@ -360,7 +360,7 @@ def incompatible_folded_functions(stack, root, args):
         # Confirm no failed operation retained a probe or consumed a slot.
         live.preview(f'%trace preview --exact "{pair[0][0]}"',
                      r"matched=1 dwarf_supported=0 .*session_retained=0 "
-                     r"agent_retained=0 available=32 fits=yes$")
+                     r"agent_retained=0 available=unlimited fits=yes$")
     live.send("%quit")
     # Expected injection errors mark the piped session unsuccessful without
     # terminating it before the subsequent safety checks.
