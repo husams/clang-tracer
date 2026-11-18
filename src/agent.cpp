@@ -45,6 +45,7 @@
 #include <clang/AST/RecordLayout.h>
 #include <clang/AST/RecursiveASTVisitor.h>
 #include <clang/Basic/Diagnostic.h>
+#include <clang/Basic/DiagnosticCategories.h>
 #include <clang/Basic/Version.h>
 #include <clang/CodeGen/CGFunctionInfo.h>
 #include <clang/CodeGen/CodeGenABITypes.h>
@@ -376,6 +377,11 @@ public:
     clang::DiagnosticConsumer::HandleDiagnostic(level, info);
     if (level >= clang::DiagnosticsEngine::Error) {
       had_error_ = true;
+      const auto category =
+          clang::DiagnosticIDs::getCategoryNumberForDiag(info.getID());
+      had_syntax_error_ |=
+          category == clang::diag::DiagCat_Parse_Issue ||
+          category == clang::diag::DiagCat_Lexical_or_Preprocessor_Issue;
     }
     llvm::SmallString<256> formatted;
     info.FormatDiagnostic(formatted);
@@ -411,6 +417,7 @@ public:
   const std::string &message() const { return message_; }
 
   bool had_error() const { return had_error_; }
+  bool had_syntax_error() const { return had_syntax_error_; }
   const std::vector<CapturedDiagnostic> &diagnostics() const {
     return diagnostics_;
   }
@@ -419,6 +426,7 @@ public:
     message_.clear();
     diagnostics_.clear();
     had_error_ = false;
+    had_syntax_error_ = false;
   }
 
 private:
@@ -426,6 +434,7 @@ private:
   std::string message_;
   std::vector<CapturedDiagnostic> diagnostics_;
   bool had_error_ = false;
+  bool had_syntax_error_ = false;
 };
 
 void append_diagnostics(clangtracer::v1::ValidationReport &report,
@@ -5210,25 +5219,8 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
       return false;
     }
   }
-  if (!typed_prepared && !validate_object_abi_evidence(specification, callback_includes,
-                                    forced_include_source, error))
-    return false;
   p.argument_names.assign(specification.argument_names().begin(),
                           specification.argument_names().end());
-  clang::CXXRecordDecl *receiver_record = nullptr;
-  if (!typed_prepared &&
-      !build_and_validate_receiver_ast(specification, p.request, p.receiver_ast,
-                                       receiver_record, error,
-                                       p.debug_records,
-                                       has_header_context ? callback_includes : type_header_prefix,
-                                       verified_entry)) {
-    return false;
-  }
-  bool result_sret = false;
-  if (!typed_prepared &&
-      !determine_object_result_sret(specification, p.debug_records,
-                                    result_sret, error))
-    return false;
   if (!initialize_llvm(error)) {
     return false;
   }
@@ -5383,9 +5375,6 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   }
   if (!capture_orc_errors(p, error))
     return false;
-  if (!bind_probe_symbols(*p.interpreter, specification, error)) {
-    return false;
-  }
   const std::string prelude =
       std::string(tracer::kEmbeddedProtocolHeader) +
       "\nusing int32_t=std::int32_t; using int64_t=std::int64_t; "
@@ -5473,6 +5462,35 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   DiagnosticCapture user_capture(nullptr);
   auto user_ast =
       build_callback_ast(user_source, "clang-tracer-callback.cc", user_capture);
+  // Receiver/field inference can repair semantic errors in this plain parse,
+  // but cannot repair malformed C++. Keep its diagnostics ahead of ABI checks
+  // and AST import, which can otherwise mask the callback's syntax failure.
+  if (user_capture.had_syntax_error()) {
+    if (report)
+      append_diagnostics(*report, user_capture, "syntax");
+    error = user_capture.message();
+    return false;
+  }
+  if (!typed_prepared &&
+      !validate_object_abi_evidence(specification, callback_includes,
+                                    forced_include_source, error))
+    return false;
+  clang::CXXRecordDecl *receiver_record = nullptr;
+  if (!typed_prepared &&
+      !build_and_validate_receiver_ast(specification, p.request, p.receiver_ast,
+                                       receiver_record, error, p.debug_records,
+                                       has_header_context ? callback_includes
+                                                          : type_header_prefix,
+                                       verified_entry)) {
+    return false;
+  }
+  bool result_sret = false;
+  if (!typed_prepared &&
+      !determine_object_result_sret(specification, p.debug_records,
+                                    result_sret, error))
+    return false;
+  if (!bind_probe_symbols(*p.interpreter, specification, error))
+    return false;
   // A callback that failed to parse explains the later generic rejections.
   const auto prefer_parse_errors = [&] {
     if (!user_capture.had_error())

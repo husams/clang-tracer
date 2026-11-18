@@ -257,6 +257,45 @@ def main() -> int:
                 attached = text(run(args.client, endpoint, "attach", str(inherited.pid)))
                 require(re.search(r"state=ATTACHED", attached, re.I),
                         f"could not attach to inheritance fixture: {attached}")
+
+                # Syntax failures must precede receiver import/layout and
+                # headerless by-value ABI rejection (issue #95).
+                syntax_hook = output_dir / "syntax-error.cpp"
+                syntax_hook.write_text(
+                    'class Interceptor {\npublic:\n'
+                    '  void pre(const Call &call) { call.field("x", 1 }\n};\n',
+                    encoding="utf-8")
+                for selector in ("InheritedCalculator::read(int) const",
+                                 "RecordCalculator::label() const"):
+                    for level in ("syntax", "compile"):
+                        diagnostic = text(run(
+                            args.client, endpoint, "validate", str(inherited.pid),
+                            selector, "--callback", str(syntax_hook),
+                            "--level", level, ok=False, timeout=45))
+                        require("expected ')'" in diagnostic and
+                                re.search(r"callback_source:3:\d+", diagnostic),
+                                f"{selector} {level} hid callback syntax/location: {diagnostic}")
+                        require("layout changed" not in diagnostic and
+                                "record ABI" not in diagnostic,
+                                f"ABI error masked callback syntax: {diagnostic}")
+
+                plain_hook = output_dir / "plain-observer.cpp"
+                plain_hook.write_text(
+                    "class Interceptor { public: void pre(const Call&) {} };\n",
+                    encoding="utf-8")
+                valid = text(run(
+                    args.client, endpoint, "validate", str(inherited.pid),
+                    "PointerCalculator::read(int) const", "--callback", str(plain_hook),
+                    timeout=45))
+                require("validation success=true" in valid,
+                        f"valid method callback failed after syntax rejection: {valid}")
+                abi_error = text(run(
+                    args.client, endpoint, "validate", str(inherited.pid),
+                    "RecordCalculator::label() const", "--callback", str(plain_hook),
+                    ok=False, timeout=45))
+                require("record ABI" in abi_error or
+                        "standard-library record types require their real headers" in abi_error,
+                        f"valid callback lost its legitimate ABI diagnostic: {abi_error}")
                 inheritance_error = text(run(
                     args.client, endpoint, "trace", str(inherited.pid),
                     "InheritedCalculator::read(int) const", "--callback", str(args.callback),
