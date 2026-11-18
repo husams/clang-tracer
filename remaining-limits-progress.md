@@ -16,7 +16,7 @@ Validation:
 - 27 targeted Linux tests passed across the final suite and corrected-fixture rerun: 26/27 in tests-final.log, then native_repl_fixed_limits passed in fixed-final.log after adding its required scalar-override target annotation.
 - Coverage includes 40 arguments/overrides, 40 named values, source over 4 MiB, complete long log messages, 40 simultaneous probes, 5,000 pending event packets, growing context storage, reload, snapshots, memory scans and instruction recording/replay.
 - macOS context engine: 9/9 passed under AddressSanitizer and UndefinedBehaviorSanitizer.
-- Known unrelated SDK plugin test failure reproduced on baseline 7d389b67: compiled fallback instead of the expected REPL-object loading path.
+- SDK plugin fallback mismatch subsequently fixed by sharing C++17/default compiler options, configured SDK flags and canonical resource paths between REPL and agent; all nine targeted plugin/REPL tests pass, including intentional fallback.
 
 Deployment uses a versioned release with installed dependency and fixed-limit regression checks before changing the current symlink; its installation.json records the deployed commit and binary hashes.
 

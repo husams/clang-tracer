@@ -14,6 +14,14 @@ from repl_browser_integration import Transcript, stop
 def main(repl, server, agent, fixture, examples, mode="reuse"):
     with tempfile.TemporaryDirectory(prefix="ct-agent-plugins-") as directory, ExitStack() as stack:
         root = Path(directory)
+        sources = root / "sources"
+        sources.mkdir()
+        for name in ("a", "b"):
+            source = examples / f"plugin_{name}.cpp"
+            (sources / source.name).write_text(
+                'static_assert(__cplusplus == 201703L, "plugin profile must use C++17");\n'
+                + source.read_text())
+        examples = sources
         env = dict(os.environ, XDG_CACHE_HOME=str(root / "cache"),
                    XDG_CONFIG_HOME=str(root / "config"), XDG_DATA_HOME=str(root / "data"),
                    CLANG_TRACER_ALLOW_AGENT_PLUGINS="1")

@@ -178,12 +178,9 @@ function(tracer_add_native_repl)
     "${CMAKE_INSTALL_FULL_DATADIR}/clang-tracer/repl/facade-${_repl_facade_id}/api.hpp")
   file(RELATIVE_PATH _repl_resource_relative "${CMAKE_INSTALL_FULL_BINDIR}"
     "${CMAKE_INSTALL_FULL_DATADIR}/clang-tracer/clang-resource")
-  set(_repl_compiler_arguments "  \"-nostdinc++\",\n")
-  foreach(_directory IN LISTS CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES)
-    string(REPLACE "\\" "\\\\" _directory "${_directory}")
-    string(REPLACE "\"" "\\\"" _directory "${_directory}")
-    string(APPEND _repl_compiler_arguments "  \"-isystem\", \"${_directory}\",\n")
-  endforeach()
+  # Use the same configured SDK/sysroot/include profile as the injected agent.
+  # Offered plugin objects are admitted only when the complete profiles match.
+  set(_repl_compiler_arguments "${_tracer_jit_entries}")
   if(APPLE)
     execute_process(COMMAND xcrun --show-sdk-path OUTPUT_VARIABLE _sdk OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE _sdk_status)
     if(_sdk_status EQUAL 0)

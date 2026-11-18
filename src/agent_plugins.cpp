@@ -57,10 +57,8 @@ fs::path bundle_path(const std::string& path, const fs::path& root) {
 }
 
 std::vector<std::string> target_profile() {
-  auto profile = tracer::runtime::jit_arguments();
-  profile.insert(profile.begin(), {"-std=c++23", "-O0", "-fPIC", "-resource-dir",
-                                   tracer::runtime::clang_resource_dir()});
-  return profile;
+  return tracer::native_plugin_compiler_arguments(tracer::runtime::clang_resource_dir(),
+                                                   tracer::runtime::jit_arguments());
 }
 
 tracer::NativePlugins::LoadResult load_package(const tracer::AgentPluginCall& request,
@@ -158,7 +156,6 @@ int agent_plugin(tracer::AgentPluginCall *request, const char *source,
         // Mirror the REPL's driver arguments and file names, using the
         // target's own profile, headers and embedded SDK to check the key.
         auto offer_profile = profile;
-        std::swap(offer_profile[1], offer_profile[2]);
         offer_profile.insert(offer_profile.begin(),
                              {"-I", offer.sdk_directory()});
         offered = plugins.load_offered(

@@ -2548,6 +2548,11 @@ before linking an offer. It reports `REPL object` when it accepts the offer,
 `cache hit` when it uses its own cache, or `compiled` when it compiles the
 source in the target. The same commands handle all three cases.
 
+The C++17 build uses the same default language, SDK/sysroot, include and access
+options for REPL compilation and agent validation. Resource directory paths are
+canonicalized so installed paths also match. User compiler options remain part
+of the cache identity; incompatible profiles still fall back to target compilation.
+
 The same V1 command descriptor works in both runtimes. The agent supplies
 the SDK header and resolves other includes from its compiler environment.
 The target's cache is under
