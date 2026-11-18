@@ -1384,6 +1384,7 @@ struct Watch::Impl {
     }
   }
 
+#if defined(__x86_64__)
   void prepare_collection_fragments() {
     using NativeInstruction = native_entry::Instruction;
     const auto writer_body = native_entry::scan(plan.writer_start, plan.writer_bytes);
@@ -1634,6 +1635,8 @@ struct Watch::Impl {
     });
     plan.unsupported += stores_in_writer - admitted_stores;
   }
+
+#endif
 
   std::size_t patch_size(Address pc) const {
     const auto window = entry_windows.find(pc);

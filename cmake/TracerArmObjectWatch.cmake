@@ -40,6 +40,7 @@ add_executable(clang-tracer-object-watch src/object_watch_main.cpp)
 target_link_libraries(clang-tracer-object-watch PRIVATE tracer_arm_object_watch)
 add_executable(clang-tracer-server src/arm_object_server.cpp)
 target_link_libraries(clang-tracer-server PRIVATE tracer_arm_object_watch)
+target_include_directories(clang-tracer-server SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
 target_sources(clang-tracer-server PRIVATE src/arm_method_watch.cpp)
 file(RELATIVE_PATH arm_agent_relative "${CMAKE_INSTALL_FULL_BINDIR}"
   "${CMAKE_INSTALL_FULL_LIBDIR}/libclang_tracer_object_cache_arm.so")

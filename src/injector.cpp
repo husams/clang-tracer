@@ -58,6 +58,20 @@
 #define NT_X86_XSTATE 0x202
 #endif
 
+#if defined(__aarch64__)
+// Linux UAPI note IDs absent from older glibc elf.h headers. Runtime hardware
+// capability checks below still gate access to these optional register sets.
+#ifndef NT_ARM_SSVE
+#define NT_ARM_SSVE 0x40b
+#endif
+#ifndef NT_ARM_ZA
+#define NT_ARM_ZA 0x40c
+#endif
+#ifndef NT_ARM_ZT
+#define NT_ARM_ZT 0x40d
+#endif
+#endif
+
 // glibc exposes the seize requests even with this SDK's older kernel headers.
 // The running kernel must still support the existing seize/interrupt protocol.
 
