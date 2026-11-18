@@ -45,12 +45,14 @@ def main():
         syntax = root / "syntax-error.cpp"
         syntax.write_text('class Interceptor {\npublic:\n'
                           '  void pre(const Call &call) { call.field("x", 1 }\n};\n')
-        record_method = "RecordCalculator::label() const"
+        record_method = "RecordCalculator::result() const"
+        module_options = ("--module", str(args.target))
         for selector in ("InheritedCalculator::read(int) const", record_method):
             for level in ("syntax", "compile"):
                 diagnostic = text(run(
                     args.client, endpoint, "validate", str(target.pid), selector,
-                    "--callback", str(syntax), "--level", level, ok=False, timeout=45))
+                    "--callback", str(syntax), *module_options,
+                    "--level", level, ok=False, timeout=45))
                 (root / f"{selector.split('::')[0]}-{level}.log").write_text(diagnostic)
                 require("expected ')'" in diagnostic and
                         re.search(r"callback_source:3:\d+", diagnostic),
@@ -61,12 +63,13 @@ def main():
         plain.write_text("class Interceptor { public: void pre(const Call&) {} };\n")
         valid = text(run(
             args.client, endpoint, "validate", str(target.pid),
-            "PointerCalculator::read(int) const", "--callback", str(plain), timeout=45))
+            "PointerCalculator::read(int) const", "--callback", str(plain),
+            *module_options, timeout=45))
         require("validation success=true" in valid,
                 f"valid method callback failed after syntax rejection: {valid}")
         abi_error = text(run(
             args.client, endpoint, "validate", str(target.pid), record_method,
-            "--callback", str(plain), ok=False, timeout=45))
+            "--callback", str(plain), *module_options, ok=False, timeout=45))
         require("record ABI" in abi_error or
                 "standard-library record types require their real headers" in abi_error,
                 f"valid callback lost its legitimate ABI diagnostic: {abi_error}")
