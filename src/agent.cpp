@@ -5478,16 +5478,16 @@ bool compile_probe(Probe &p, clangtracer::v1::ProbeSpec &target_specification,
   clang::CXXRecordDecl *receiver_record = nullptr;
   if (!typed_prepared &&
       !build_and_validate_receiver_ast(specification, p.request, p.receiver_ast,
-                                       receiver_record, error, p.debug_records,
-                                       has_header_context ? callback_includes
-                                                          : type_header_prefix,
-                                       verified_entry)) {
+                                      receiver_record, error, p.debug_records,
+                                      has_header_context ? callback_includes
+                                                         : type_header_prefix,
+                                      verified_entry)) {
     return false;
   }
   bool result_sret = false;
   if (!typed_prepared &&
       !determine_object_result_sret(specification, p.debug_records,
-                                    result_sret, error))
+                                   result_sret, error))
     return false;
   if (!bind_probe_symbols(*p.interpreter, specification, error))
     return false;
