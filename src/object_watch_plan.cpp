@@ -2622,13 +2622,19 @@ Plan::Plan(std::uint32_t pid, std::string executable,
   }
 
   Range writer;
+  bool missing_elf_symbol = false;
   try {
-    writer = image_->function(pid, request.code_symbol(),
-        request.backend() == clangtracer::v1::ObjectWatchRequest::CODE_CACHE);
+    try {
+      writer = image_->function(pid, request.code_symbol(),
+          request.backend() == clangtracer::v1::ObjectWatchRequest::CODE_CACHE);
+    } catch (const MissingElfSymbol &) {
+      missing_elf_symbol = true;
+      throw;
+    }
   } catch (const std::exception &error) {
     const std::string message = error.what();
     const bool missing_main_match = pid && !main_ && request.code_module().empty() &&
-        (dynamic_cast<const MissingElfSymbol *>(&error) ||
+        (missing_elf_symbol ||
          ::tracer::compat::starts_with(message, "no supported matching callable in mapped ELF debug information"));
     if (!missing_main_match)
       throw;
