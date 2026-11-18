@@ -107,6 +107,19 @@ AArch64 build repairs do not change x86-64 executable logic. There is no
 dependency on the separate alias or constructor/destructor feature work in
 issues #118 and #119.
 
+The full GCC 8.5 Linux CTest suite covered 217 tests in two batches. Initially,
+193 passed, 23 failed and one perf test skipped. Correct SELinux text-relocation
+labels on three task-owned test DSOs let five failed cases pass on retry;
+the final result was 198 passed, 18 failed and one skipped. The remaining
+failures concern unsupported GCC 8 language-standard flags, DWARF/ABI
+admission, plugin cache mode, unresolved `__pthread_key_create`, and unsupported
+target entry instructions. The complete failure list is recorded in the PR.
+All 18 remaining failures reproduced after restoring the three affected x86-64
+implementation files from `abb467ca` and rebuilding the server with GCC 8.5.
+The other x86-64 implementation files and existing tests are unchanged by this
+PR. This was a filtered baseline run of those 18 tests, not a second full-suite
+run. The feature sources and build were restored afterward.
+
 The GCC 8.5 tracer also passed eight two-method snapshot-watch cycles against
 the private application in `~/banking-fixture`: 96 SQLite-recorded events,
 both method probes' live bytes restored each time, the same attached session,
