@@ -377,11 +377,6 @@ public:
     clang::DiagnosticConsumer::HandleDiagnostic(level, info);
     if (level >= clang::DiagnosticsEngine::Error) {
       had_error_ = true;
-      const auto category =
-          clang::DiagnosticIDs::getCategoryNumberForDiag(info.getID());
-      had_syntax_error_ |=
-          category == clang::diag::DiagCat_Parse_Issue ||
-          category == clang::diag::DiagCat_Lexical_or_Preprocessor_Issue;
     }
     llvm::SmallString<256> formatted;
     info.FormatDiagnostic(formatted);
@@ -399,6 +394,16 @@ public:
         diagnostic.file = presumed.getFilename();
         diagnostic.line = presumed.getLine();
         diagnostic.column = presumed.getColumn();
+        // Recovered type aliases can fail to parse before the real receiver
+        // is imported. Only the callback body can prove malformed user input.
+        if (level >= clang::DiagnosticsEngine::Error &&
+            diagnostic.file == "callback_source") {
+          const auto category =
+              clang::DiagnosticIDs::getCategoryNumberForDiag(info.getID());
+          had_syntax_error_ |=
+              category == clang::diag::DiagCat_Parse_Issue ||
+              category == clang::diag::DiagCat_Lexical_or_Preprocessor_Issue;
+        }
       }
     }
     if (!diagnostic.message.empty())
