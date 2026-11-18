@@ -232,7 +232,8 @@ const CommandTopic commands[] = {
      "Preview bulk C++ matches, ABI status and retained probe capacity without installing probes.",
      R"example(%trace preview --module "libapp*" --include "app::*" --exclude "app::detail::*")example"},
     {"trace apply", "%trace apply --manifest FILE [--callback FILE]",
-     "Install a typed observer for each eligible manifest match. Restore newly installed probes on partial failure.",
+     "Install a typed observer for each eligible match. The apply deadline is 120 seconds by default. "
+     "Override it with the REPL's --timeout. Partial failures restore the batch's probes.",
      "%trace apply --manifest trace.textproto"},
     {"trace remove", "%trace remove BATCH_ID",
      "Remove or retry restoration of the probes owned by a batch in the selected session."},

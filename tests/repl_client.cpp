@@ -4,6 +4,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -122,6 +123,9 @@ void check_trace_statistics() {
 }
 
 class Service final : public api::Tracer::Service {
+  std::mutex bulk_mutex_;
+  std::string interrupted_batch_;
+
 public:
   std::atomic<bool> attached{false};
   std::atomic<bool> failed{false};
@@ -133,6 +137,36 @@ public:
   std::function<void()> on_watch;
   std::atomic<int> watch_mode{0};
   std::atomic<unsigned> active_watches{0};
+
+  grpc::Status ApplyBulkTrace(grpc::ServerContext *context,
+                              const api::ApplyBulkTraceRequest *request,
+                              api::BulkTraceReport *response) override {
+    const auto remaining = context->deadline() - std::chrono::system_clock::now();
+    if (remaining <= std::chrono::seconds(3)) {
+      std::lock_guard lock(bulk_mutex_);
+      interrupted_batch_ = request->batch_id();
+      return {grpc::StatusCode::DEADLINE_EXCEEDED, "lost bulk reply"};
+    }
+    if (remaining < std::chrono::seconds(110))
+      return {grpc::StatusCode::INVALID_ARGUMENT, "bulk apply used the ordinary RPC deadline"};
+    response->set_batch_id(request->batch_id());
+    response->set_complete(true);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status RemoveBulkTrace(grpc::ServerContext *context,
+                               const api::RemoveBulkTraceRequest *request,
+                               api::BulkTraceReport *response) override {
+    std::lock_guard lock(bulk_mutex_);
+    if (request->session_id() != "s1" || interrupted_batch_.empty() ||
+        request->batch_id() != interrupted_batch_ ||
+        context->deadline() - std::chrono::system_clock::now() < std::chrono::seconds(110))
+      return {grpc::StatusCode::INVALID_ARGUMENT, "wrong bulk cleanup request"};
+    interrupted_batch_.clear();
+    response->set_batch_id(request->batch_id());
+    response->set_complete(true);
+    return grpc::Status::OK;
+  }
 
   grpc::Status ListSessions(grpc::ServerContext *,
                             const api::ListSessionsRequest *,
@@ -678,7 +712,6 @@ int main(int argc, char **argv) {
       require(!live.running(), "shutdown joins workers while handles survive");
     }
     service.watch_mode = 0;
-    server->Shutdown();
     EventBuffer limited(2, 4096);
     for (unsigned i = 0; i < 5; ++i) {
       api::TraceEvent e;
@@ -744,6 +777,30 @@ int main(int argc, char **argv) {
             "shared state decodes with its attached descriptor");
     char directory[] = "/tmp/tracer-repl-records.XXXXXX";
     require(::mkdtemp(directory), "recording directory");
+    {
+      const auto manifest = std::string(directory) + "/bulk.textproto";
+      std::ofstream(manifest) << "version: 1\nexact_selectors: \"multiply(int, int)\"\n";
+      const auto apply = parse_command("%trace apply --manifest \"" + manifest + "\"");
+      std::ostringstream output;
+      Controller default_client(settings, output);
+      default_client.attach(7);
+      default_client.execute(apply);
+      require(output.str().find("complete=true") != std::string::npos,
+              "bulk apply succeeds with its longer default deadline");
+
+      auto short_settings = settings;
+      short_settings.bulk_apply_timeout_seconds = 1;
+      Controller short_client(short_settings, output);
+      short_client.attach(7);
+      try {
+        short_client.execute(apply);
+        throw std::logic_error("accepted a failed bulk apply");
+      } catch (const std::runtime_error &error) {
+        require(std::string(error.what()) == "bulk trace apply: lost bulk reply | batch restored",
+                "bulk apply restores the same batch with a fresh deadline");
+      }
+    }
+    server->Shutdown();
     const auto path = std::string(directory) + "/events.pb";
     const int fd = create_recording(path);
     auto with_stack = limited.events().front()->message;

@@ -2206,18 +2206,43 @@ void Controller::apply_bulk_trace(const Command &command) {
 
   grpc::ClientContext context;
   context.set_deadline(std::chrono::system_clock::now() +
-                       std::chrono::seconds(settings_.timeout_seconds));
-  Cancellation cancellation(context);
+                       std::chrono::seconds(settings_.bulk_apply_timeout_seconds));
   api::BulkTraceReport report;
-  const auto status = stub_->ApplyBulkTrace(&context, request, &report);
+  grpc::Status status;
+  {
+    Cancellation cancellation(context);
+    status = stub_->ApplyBulkTrace(&context, request, &report);
+  }
   if (!status.ok()) {
     auto message = "bulk trace apply: " + status.error_message();
     if (status.error_code() == grpc::StatusCode::CANCELLED ||
         status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED ||
         status.error_code() == grpc::StatusCode::UNAVAILABLE ||
         status.error_code() == grpc::StatusCode::UNKNOWN ||
-        status.error_code() == grpc::StatusCode::INTERNAL)
-      message += " | check or restore with %trace remove " + request.batch_id();
+        status.error_code() == grpc::StatusCode::INTERNAL) {
+      // Removal takes the session operation lock after apply's own rollback.
+      // Use a fresh deadline so cancellation cannot also cancel restoration.
+      api::RemoveBulkTraceRequest remove;
+      remove.set_session_id(request.session_id());
+      remove.set_batch_id(request.batch_id());
+      grpc::ClientContext cleanup_context;
+      cleanup_context.set_deadline(std::chrono::system_clock::now() +
+          std::chrono::seconds(std::max(default_bulk_apply_timeout_seconds,
+                                       settings_.bulk_apply_timeout_seconds)));
+      api::BulkTraceReport cleanup;
+      const auto restored = stub_->RemoveBulkTrace(&cleanup_context, remove, &cleanup);
+      if (restored.ok())
+        print_bulk_report(out_, "restore", cleanup);
+      if (restored.ok() && cleanup.complete()) {
+        message += " | batch restored";
+      } else if (restored.error_code() == grpc::StatusCode::NOT_FOUND) {
+        message += " | cleanup: " + restored.error_message();
+      } else {
+        message += restored.ok() ? " | batch restoration incomplete" :
+                                   " | cleanup: " + restored.error_message();
+        message += " | retry with %trace remove " + request.batch_id();
+      }
+    }
     throw std::runtime_error(message);
   }
   print_bulk_report(out_, "apply", report);

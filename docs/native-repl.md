@@ -536,10 +536,13 @@ unmatched selections, entries requiring prepared packages, and entries with
 active probes block installation.
 
 The REPL prints the batch ID before applying and reports the status of each
-entry. If an install fails, the server restores this batch's probes in
-reverse order. Use the same batch ID with `%trace remove` to retry entries
-reported as `RESTORE_PENDING` or to check a batch after an interrupted
-command. Removal is repeatable for a retained batch in its original session.
+entry. Apply has a 120-second default deadline. Starting the REPL with
+`--timeout SECONDS` overrides it. If installation fails or is cancelled, the
+server restores this batch's probes in reverse order. If apply loses its reply
+after a timeout or interruption, the REPL uses a separate deadline to confirm
+restoration or retry it. Use the same batch ID with `%trace remove` to retry
+any pending restoration. Removal is repeatable for a retained batch in its
+original session.
 Removal and rollback restore entry bytes. The agent still retains compiled
 slots until the target exits.
 

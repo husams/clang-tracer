@@ -2491,6 +2491,11 @@ public:
     if (!session)
       return {grpc::StatusCode::NOT_FOUND, "session does not exist"};
     std::lock_guard operation_lock(session->operation_mutex());
+    const auto cancelled = [&] {
+      return context->IsCancelled() || std::chrono::system_clock::now() >= context->deadline();
+    };
+    if (cancelled())
+      return {grpc::StatusCode::CANCELLED, "bulk trace apply cancelled before preflight"};
     const auto snapshot = session->snapshot();
     if (std::any_of(snapshot.probes().begin(), snapshot.probes().end(),
                     [&](const auto &probe) { return probe.bulk_batch_id() == batch_id; }))
@@ -2537,7 +2542,7 @@ public:
     std::vector<api::ProbeSpec> specs;
     specs.reserve(response->entries_size());
     client::DebugLookupOptions lookup;
-    lookup.is_cancelled = [&] { return context->IsCancelled(); };
+    lookup.is_cancelled = cancelled;
     for (auto &row : *response->mutable_entries()) {
       const auto &function = row.function();
       lookup.module = function.module_path();
@@ -2554,7 +2559,7 @@ public:
           throw std::runtime_error(validation.error_message());
         specs.push_back(std::move(spec));
       } catch (const std::exception &error) {
-        if (context->IsCancelled())
+        if (cancelled())
           return {grpc::StatusCode::CANCELLED, "bulk trace apply cancelled during preflight"};
         row.set_status(Entry::BLOCKED);
         row.set_diagnostic(error.what());
@@ -2569,20 +2574,22 @@ public:
     // Keep the attempted IDs even when installation throws after preparing
     // or writing an entry. Only IDs retained by this batch can be restored.
     std::vector<std::uint64_t> attempted(specs.size());
-    for (std::size_t i = 0; i < specs.size() && !context->IsCancelled(); ++i) {
+    for (std::size_t i = 0; i < specs.size() && !cancelled(); ++i) {
       auto &row = *response->mutable_entries(i);
       api::Probe probe;
-      const auto result = install_probe(session, specs[i], batch_id, attempted[i], &probe);
+      const auto result = install_probe(session, specs[i], batch_id, attempted[i], &probe,
+                                        0, cancelled);
       if (!result.ok()) {
         row.set_status(Entry::INSTALL_FAILED);
         row.set_diagnostic(result.error_message());
-        response->set_diagnostic("bulk installation failed");
+        response->set_diagnostic(cancelled() ? "bulk trace apply cancelled" :
+                                               "bulk installation failed");
         break;
       }
       *row.mutable_probe() = std::move(probe);
       row.set_status(Entry::INSTALLED);
     }
-    if (context->IsCancelled() && response->diagnostic().empty())
+    if (cancelled() && response->diagnostic().empty())
       response->set_diagnostic("bulk trace apply cancelled");
     if (response->diagnostic().empty()) {
       response->set_complete(true);
