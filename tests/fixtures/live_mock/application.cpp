@@ -9,6 +9,10 @@
 #include <poll.h>
 #include <unistd.h>
 #include <sys/prctl.h>
+#ifndef PR_SET_PTRACER
+#define PR_SET_PTRACER 0x59616d61
+#define PR_SET_PTRACER_ANY ((unsigned long)-1)
+#endif
 
 namespace {
 int buffers = 0;

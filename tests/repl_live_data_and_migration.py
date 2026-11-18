@@ -79,9 +79,15 @@ DATA_MAIN = r"""
 #include <poll.h>
 #include <sys/prctl.h>
 #include <unistd.h>
+#ifndef PR_SET_PTRACER
+#define PR_SET_PTRACER 0x59616d61
+#define PR_SET_PTRACER_ANY ((unsigned long)-1)
+#endif
+#if defined(__GLIBCXX__) && defined(__cpp_lib_atomic_shared_ptr)
 std::atomic<std::shared_ptr<example::Cache>> auto_cache;
 std::atomic<std::shared_ptr<example::Account>> auto_account;
 std::atomic<std::shared_ptr<example::Account>> auto_alias;
+#endif
 int main() {
   if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)) return 1;
   using namespace example;
@@ -90,10 +96,16 @@ int main() {
   g_active_account = std::make_shared<Account>(1);
   accounts = {std::make_shared<Account>(2), std::make_shared<Account>(3)};
   auto unowned = std::make_unique<Account>(7);
+#if defined(__GLIBCXX__) && defined(__cpp_lib_atomic_shared_ptr)
   auto_cache.store(std::dynamic_pointer_cast<Cache>(g_primary_cache));
   auto_account.store(g_active_account);
   auto_alias.store(std::shared_ptr<Account>(g_active_account, unowned.get()));
+  constexpr bool atomic_owners = true;
+#else
+  constexpr bool atomic_owners = false;
+#endif
   std::cout << "ready" << std::endl;
+  std::cout << "atomic owners=" << atomic_owners << std::endl;
   for (std::string input;;) {
     usleep(2000);
     pollfd ready{STDIN_FILENO, POLLIN, 0};
@@ -102,7 +114,9 @@ int main() {
     if (!std::getline(std::cin, input))
       break;
     if (input == "clear") {
+#if defined(__GLIBCXX__) && defined(__cpp_lib_atomic_shared_ptr)
       auto_account.store({});
+#endif
       std::puts("cleared");
     } else if (input == "addresses") {
       std::printf("known cache=0x%lx account=0x%lx unowned=0x%lx\n",
@@ -127,7 +141,8 @@ def live_data(args, folder):
     (folder / "main.cpp").write_text(DATA_MAIN)
     target = build_target(args, folder, ["main.cpp", "model.cpp"], ["model.hpp"])
     with ExitStack() as cleanup:
-        app, repl, _, result_line = attach(args, target, cleanup)
+        app, repl, app_line, result_line = attach(args, target, cleanup)
+        atomic_owners = app_line(r"^atomic owners=([01])$")[1] == "1"
         app("status", r"^cache=100/0 other=100/0 account=200/0 unowned=200/0$")
         update = "%live update-data shared.cpp --discover-file discover.cpp --discover-function discover"
         repl(update + " --module libc.so.6", r"^live BLOCKED .*module filter differs")
@@ -148,16 +163,24 @@ def live_data(args, folder):
              r"^live APPLIED .*updated=2 skipped=1 failed=0")
         app("status", r"^cache=999/2 other=999/1 account=5000/2 unowned=200/0$")
         repl("%live scan-heap --type example::Cache --type example::Account", r"^live CURRENT")
-        roots = dict(zip(addresses.groups(), ("auto_cache", "auto_account", None)))
+        owner_names = ("auto_cache", "auto_account", None) if atomic_owners else (None,) * 3
+        roots = dict(zip(addresses.groups(), owner_names))
         ids = []
         for address in sorted(roots, key=lambda value: int(value, 16)):
             root = roots[address]
             evidence = f"shared owner observed under {root}" if root else "ownership unknown"
             ids.append(result_line(rf"\[(H\d+)\].*address={address}\b.*{evidence}")[1])
-        app("clear", r"^cleared$")
-        repl("%live update-data raw.cpp --from-scan " + " ".join(ids),
-             r"^live APPLIED .*updated=1 skipped=2 failed=0")
-        app("status", r"^cache=999/3 other=999/1 account=5000/2 unowned=200/0$")
+        if atomic_owners:
+            app("clear", r"^cleared$")
+            repl("%live update-data raw.cpp --from-scan " + " ".join(ids),
+                 r"^live APPLIED .*updated=1 skipped=2 failed=0")
+            app("status", r"^cache=999/3 other=999/1 account=5000/2 unowned=200/0$")
+        else:
+            # Older SDK libraries cannot instantiate atomic<shared_ptr<T>>;
+            # automatic discovery must not invent ownership of these objects.
+            repl("%live update-data raw.cpp --from-scan " + " ".join(ids),
+                 r"^live UNCHANGED .*updated=0 skipped=3 failed=0")
+            app("status", r"^cache=999/2 other=999/1 account=5000/2 unowned=200/0$")
 
 
 

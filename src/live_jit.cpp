@@ -49,7 +49,15 @@ void checked(llvm::Error error) {
   std::abort();
 }
 
+std::uintptr_t standard_runtime_import(llvm::StringRef name);
+
 std::uintptr_t runtime_import(llvm::StringRef name) {
+  // GCC 8's gthread-active predicate references this pthread alias. Depending
+  // on glibc's version it belongs to libc or libpthread; bind the loaded runtime
+  // provider rather than treating shared-ownership code as an unknown import.
+  if (name == "__pthread_key_create") {
+    return standard_runtime_import(name);
+  }
   const auto malloc_family = llvm::StringSwitch<bool>(name)
       .Cases("malloc", "calloc", "free", "realloc", true)
       .Cases("aligned_alloc", "posix_memalign", "memalign", "valloc", "pvalloc", true)
