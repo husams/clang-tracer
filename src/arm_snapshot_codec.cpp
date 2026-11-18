@@ -150,6 +150,7 @@ extern "C" bool ct_arm_snapshot_sample(const void *receiver, std::string &output
     tracer::TraceContext ctx{};
     ctx.object_address = reinterpret_cast<std::uintptr_t>(receiver);
 )cpp";
+  source += snapshots.receiver_storage;
   source += snapshots.receiver;
   source += R"cpp(
     return ctx.receiver_snapshot && reinterpret_cast<bool (*)(const tracer::ValueSnapshot &, std::string &) noexcept>(
