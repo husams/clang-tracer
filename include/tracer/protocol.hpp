@@ -19,7 +19,8 @@ inline constexpr std::uint32_t kProtocolVersion = 2;
 // Version 28 also carries the shared transport memory budget.
 // Version 30 combines scalar control and native patch ownership.
 // Version 31 carries the type registration ID for grouped method callbacks.
-inline constexpr std::uint32_t kBootstrapVersion = 31;
+// Version 32 sizes the per-call argument arrays from TRACER_MAX_ARGUMENTS.
+inline constexpr std::uint32_t kBootstrapVersion = 32;
 inline constexpr std::uint32_t kDefaultContextEventBytes = 256 * 1024;
 inline constexpr std::uint64_t kDefaultContextTransportMemoryBytes = 64ull * 1024 * 1024;
 struct ContextTransportBudget {
@@ -27,7 +28,17 @@ struct ContextTransportBudget {
   std::uint64_t memory_bytes = kDefaultContextTransportMemoryBytes;
 };
 inline constexpr unsigned kMaxPatchBytes = 64;
-inline constexpr unsigned kMaxArguments = 8;
+// Maximum arguments a probe can observe. Raise it with
+// -DTRACER_MAX_ARGUMENTS=N (CMake: TRACER_MAX_ARGUMENTS); the context structs
+// size their per-call argument arrays from it.
+#ifndef TRACER_MAX_ARGUMENTS
+#define TRACER_MAX_ARGUMENTS 16
+#endif
+inline constexpr unsigned kMaxArguments = TRACER_MAX_ARGUMENTS;
+// Named values hold every argument plus the values a callback adds (eight by default).
+inline constexpr unsigned kMaxNamedValues = kMaxArguments + 8;
+static_assert(kMaxArguments >= 8 && kMaxArguments <= 64,
+              "TRACER_MAX_ARGUMENTS must be in [8, 64]");
 inline constexpr unsigned kMaxProbes = 32;
 inline constexpr std::uint32_t kUnlimitedStackDepth = UINT32_MAX;
 
@@ -195,7 +206,7 @@ struct TraceContext {
     TraceValue value{};
   };
   mutable std::uint32_t named_count = 0;
-  mutable NamedValue named_values[16]{};
+  mutable NamedValue named_values[kMaxNamedValues]{};
   // Entry caller state, recovered from Clang's forced wrapper frame pointer.
   // Only RBP/RSP/RIP are known initially; unsupported CFI stops explicitly.
   std::uint64_t wrapper_frame = 0;

@@ -283,7 +283,7 @@ bool write_trace_context(BoundedProtoWriter &writer,
         !writer.end_message())
       return false;
   }
-  const auto named_count = std::min<std::uint32_t>(context.named_count, 16);
+  const auto named_count = std::min<std::uint32_t>(context.named_count, tracer::kMaxNamedValues);
   for (std::uint32_t i = 0; print_arguments && i < named_count; ++i) {
     const auto &named = context.named_values[i];
     if (!writer.begin_message(14) || !writer.u64(1, named.kind) ||

@@ -1370,7 +1370,8 @@ private:
       };
       // Bound named snapshots and reject ambiguous or unsafe terminal names.
       bool valid_named =
-          event.named_arguments_size() + event.object_fields_size() <= 16;
+          event.named_arguments_size() + event.object_fields_size() <=
+          static_cast<int>(kMaxNamedValues);
       std::set<std::string> argument_names, field_names;
       std::set<std::uint32_t> indices;
       const auto check_named = [&](const clangtracer::v1::NamedValue &item,
@@ -3616,7 +3617,7 @@ public:
         return {grpc::StatusCode::INVALID_ARGUMENT, error.what()};
       }
     }
-    if (spec.argument_names_size() > 8 || spec.include_headers_size() > 16 ||
+    if (spec.argument_names_size() > static_cast<int>(tracer::kMaxArguments) || spec.include_headers_size() > 16 ||
         (spec.has_debug_info() &&
          (spec.debug_info().ByteSizeLong() > 64 * 1024 ||
           spec.debug_info().module().empty() ||
@@ -3631,7 +3632,7 @@ public:
           spec.debug_info().record_calling_convention() >
               clangtracer::v1::RECORD_PASS_BY_REFERENCE ||
           spec.debug_info().fields_size() > 128 ||
-          spec.debug_info().arguments_size() > 8))) {
+          spec.debug_info().arguments_size() > static_cast<int>(tracer::kMaxArguments)))) {
       return {grpc::StatusCode::INVALID_ARGUMENT,
               "invalid debug callable metadata"};
     }

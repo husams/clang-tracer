@@ -9,6 +9,7 @@
 #include "tracer_runtime_config.hpp"
 
 #include "../include/tracer/receiver_abi.hpp"
+#include "tracer/protocol.hpp"
 #include "tracer/compat.hpp"
 #include "tracer/compiler_options.hpp"
 
@@ -70,7 +71,7 @@ namespace api = clangtracer::v1;
 
 constexpr std::size_t kMaxTranslationUnits = 256;
 constexpr std::size_t kMaxExplicitSources = 128;
-constexpr std::size_t kMaxArguments = 8;
+constexpr std::size_t kMaxArguments = tracer::kMaxArguments;
 constexpr std::size_t kMaxReceiverFields = 128;
 constexpr std::size_t kMaxReceiverSourcePath = 4096;
 constexpr std::size_t kMaxReceiverArguments = 512;
@@ -1170,7 +1171,7 @@ public:
         throw std::runtime_error("variadic callables are unsupported");
       }
       if (declaration->getNumParams() > kMaxArguments) {
-        throw std::runtime_error("callables with more than eight arguments are unsupported");
+        throw std::runtime_error("callables with more than " + std::to_string(kMaxArguments) + " arguments are unsupported (rebuild with -DTRACER_MAX_ARGUMENTS=N)");
       }
       if (prototype->hasExtParameterInfos()) {
         for (const auto& info : prototype->getExtParameterInfos()) {

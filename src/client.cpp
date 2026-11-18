@@ -37,6 +37,7 @@
 #include "header_context.hpp"
 #include "sqlite_events.hpp"
 #include "tracer.grpc.pb.h"
+#include "tracer/protocol.hpp"
 #include "tracer/compat.hpp"
 
 namespace {
@@ -334,8 +335,9 @@ Options parse_options(int argc, char **argv) {
       throw std::runtime_error("choose either a positional C++ declaration or "
                                "--function/--method");
     }
-    if (o.argument_types.size() > 8) {
-      throw std::runtime_error("trace accepts at most eight --arg types");
+    if (o.argument_types.size() > tracer::kMaxArguments) {
+      throw std::runtime_error("trace accepts at most " + std::to_string(tracer::kMaxArguments) +
+                               " --arg types (rebuild with -DTRACER_MAX_ARGUMENTS=N to raise)");
     }
     if (!o.return_set && !o.argument_types.empty()) {
       throw std::runtime_error("--arg requires --return in raw-symbol mode");

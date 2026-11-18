@@ -246,10 +246,27 @@ public:
   }
   const char *argument_name(std::size_t index) const {
     (void)argument_value(index);
-    static constexpr const char *fallback[kMaxArguments] = {
-        "arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6", "arg7"};
     const char *name = context_.argument_names[index];
-    return name && name[0] ? name : fallback[index];
+    if (name && name[0])
+      return name;
+    // "arg<N>" for any index below kMaxArguments (at most two digits). A constant table: the
+    // observer is JIT-compiled in the target, where thread-local storage is not available.
+    struct FallbackNames {
+      char text[kMaxArguments][8]{};
+      constexpr FallbackNames() {
+        for (unsigned i = 0; i < kMaxArguments; ++i) {
+          text[i][0] = 'a';
+          text[i][1] = 'r';
+          text[i][2] = 'g';
+          unsigned n = 3;
+          if (i >= 10)
+            text[i][n++] = static_cast<char>('0' + i / 10);
+          text[i][n++] = static_cast<char>('0' + i % 10);
+        }
+      }
+    };
+    static constexpr FallbackNames fallback{};
+    return fallback.text[index];
   }
   const TraceValue &result_value() const {
     if (context_.phase != TracePhase::Post)
@@ -338,14 +355,14 @@ private:
       ++length;
     }
     unsigned field_count = 0;
-    for (std::uint32_t i = 0; i < context_.named_count && i < 16; ++i)
+    for (std::uint32_t i = 0; i < context_.named_count && i < kMaxNamedValues; ++i)
       if (context_.named_values[i].kind == 2)
         ++field_count;
-    if (kind == 2 && field_count + context_.argument_count >= 16)
+    if (kind == 2 && field_count + context_.argument_count >= kMaxNamedValues)
       throw std::out_of_range(
-          "at most 16 arguments and fields combined per hook");
-    if (context_.named_count >= 16) {
-      throw std::out_of_range("at most 16 named values per hook are supported");
+          "too many arguments and fields combined per hook (raise TRACER_MAX_ARGUMENTS)");
+    if (context_.named_count >= kMaxNamedValues) {
+      throw std::out_of_range("too many named values per hook (raise TRACER_MAX_ARGUMENTS)");
     }
     for (std::uint32_t i = 0; i < context_.named_count; ++i) {
       const auto &previous = context_.named_values[i];

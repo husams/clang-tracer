@@ -6190,7 +6190,7 @@ static void tracer_event_dispatch_impl(unsigned long long id,
          i < ctx->argument_count && i < tracer::kMaxArguments; ++i) {
       *event.add_arguments() = to_proto_value(ctx->arguments[i]);
     }
-    if (ctx->named_count > 16) {
+    if (ctx->named_count > tracer::kMaxNamedValues) {
       throw std::invalid_argument("invalid named value count");
     }
     for (std::uint32_t i = 0; i < ctx->named_count; ++i) {
@@ -6326,7 +6326,7 @@ bool validate_request(const tracer::Request &r, std::string &error) {
     return false;
   }
   if (r.argument_count > tracer::kMaxArguments) {
-    error = "at most eight explicit arguments are supported";
+    error = "more explicit arguments than TRACER_MAX_ARGUMENTS are not supported";
     return false;
   }
   if (!valid_type(r.result, true)) {

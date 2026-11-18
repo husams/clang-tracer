@@ -235,6 +235,14 @@ cmake --build build -j4
 ctest --test-dir build --output-on-failure
 ```
 
+`TRACER_MAX_ARGUMENTS` (default 16, range 8 to 64) is the most arguments one probed
+callable can have (a method prepared from ELF symbols alone also counts its receiver). Raise it with
+`-DTRACER_MAX_ARGUMENTS=N` at configure time; it sizes the per-call context arrays, so
+the tool, the agent and the observers the agent compiles in the target are all built from
+the same value, and a callable with more arguments is rejected with a message that names
+the option. Arguments and fields captured by a hook share `TRACER_MAX_ARGUMENTS + 8` named
+slots.
+
 Adjust package paths for your installation. CMake generates the C++ message and
 service bindings from `proto/tracer.proto`. The agent's Protobuf and shared-context
 gRPC transport are linked privately; its build rejects dependency symbol exports
@@ -551,8 +559,8 @@ final validation/JIT compilation. Other expressions require the explicit
 `field(name, value)` form. Member expressions inside macros are rejected for
 inference. Use `call.argument<int>(0)` for checked access without a label; all
 arguments are already captured and named by debug metadata. Explicit labels remain
-available when desired. Arguments and fields together are bounded to 16 named
-values. Ordinary C++ access and target lifetime/synchronization rules apply.
+available when desired. Arguments and fields together are bounded to
+`TRACER_MAX_ARGUMENTS + 8` named values (24 in the default build). Ordinary C++ access and target lifetime/synchronization rules apply.
 The validator rejects constructing/copying the receiver and calling its methods.
 
 One interceptor instance belongs to each probe and is shared by calling

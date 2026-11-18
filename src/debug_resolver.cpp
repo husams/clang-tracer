@@ -36,6 +36,7 @@
 #include <sys/sysmacros.h>
 #include <fnmatch.h>
 
+#include "tracer/protocol.hpp"
 #include "tracer/compat.hpp"
 #include "tracer/override_target.hpp"
 #include "linux_syscalls.hpp"
@@ -800,7 +801,7 @@ void describe_methods(DWARFDie record, api::DebugInfo &info) {
         continue;
       }
       if (number(parameter, dw::DW_AT_artificial) ||
-          described.cpp_parameter_types_size() >= 8) {
+          described.cpp_parameter_types_size() >= ::tracer::kMaxArguments) {
         unsupported = true;
         break;
       }
@@ -910,8 +911,10 @@ CallableShape describe_callable(DWARFDie die, DWARFDie decl,
     }
     const auto type = read_type(type_of(parameter));
     if (type.value == api::VALUE_TYPE_UNSPECIFIED || type.value == api::VOID ||
-        types.size() == 8) {
-      throw std::runtime_error("unsupported debug parameter ABI");
+        types.size() == ::tracer::kMaxArguments) {
+      throw std::runtime_error("unsupported debug parameter ABI: more than " +
+                               std::to_string(::tracer::kMaxArguments) +
+                               " arguments (rebuild with -DTRACER_MAX_ARGUMENTS=N)");
     }
     api::DebugArgument argument;
     argument.set_index(types.size());
@@ -1828,7 +1831,7 @@ ResolvedCallable bind_prepared_callable(std::uint32_t pid,
       prepared.target_triple().find("gnux32") != std::string::npos ||
       (signature.kind() != api::FUNCTION && !(typed && signature.kind() == api::METHOD)) ||
       !supported(signature.result(), true) ||
-      signature.arguments_size() > 8 ||
+      signature.arguments_size() > static_cast<int>(::tracer::kMaxArguments) ||
       prepared.argument_names_size() != signature.arguments_size())
     throw std::invalid_argument(
         "invalid or unsupported prepared injector contract");

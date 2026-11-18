@@ -83,6 +83,24 @@ Keep the target and callback ABI compatible, including standard-library versions
 when exchanging library types. Linking the tracer against LLVM/Clang does not
 bundle a C++ SDK or alter the target's loaded standard library.
 
+## Argument limit
+
+A probe observes at most `TRACER_MAX_ARGUMENTS` arguments per call (default 16, allowed
+range 8 to 64). The limit sizes per-call structures shared by the server, the agent and the
+observers the agent compiles inside the target, so it is fixed when the tool is built and
+every component of one installation uses the same value. Raise it at configure time:
+
+```sh
+cmake -S . -B build -G Ninja -DTRACER_MAX_ARGUMENTS=24 ...
+```
+
+A callable with more arguments is rejected with a message that names the option, for example
+`unsupported debug parameter ABI: more than 16 arguments (rebuild with -DTRACER_MAX_ARGUMENTS=N)`.
+Arguments and fields captured by a hook share `TRACER_MAX_ARGUMENTS + 8` named values. A larger
+limit enlarges every call context in proportion. Only callables observed by
+a probe are affected; target calls made from the REPL keep their own limit of eight scalar
+arguments.
+
 ## Installation layout
 
 ```sh

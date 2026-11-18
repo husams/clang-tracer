@@ -217,7 +217,7 @@ Use `--endpoint ENDPOINT` to select the server. The default is `CLANG_TRACER_END
 | `--debug-max-entries N`, `--debug-max-depth N` | Bound DWARF traversal. Zero means unlimited. |
 | `--compile-option ARG` | Append one compiler flag. Repeat to pass more flags. |
 | `--callback FILE` | Read C++ source from the client filesystem. |
-| `--return TYPE`, `--arg TYPE` | Specify raw ABI types. Arguments are ordered, up to eight. Valid types are `bool`, `int32`, `int64`, `uint64`, `float32`, `float64`, and `pointer`. Return type can also be `void`. |
+| `--return TYPE`, `--arg TYPE` | Specify raw ABI types. Arguments are ordered, up to `TRACER_MAX_ARGUMENTS` (16 unless the build raised it). Valid types are `bool`, `int32`, `int64`, `uint64`, `float32`, `float64`, and `pointer`. Return type can also be `void`. |
 | `--stack N\|full` | Capture entry stacks to the given depth or through the supported unwind chain. |
 | `--stack-application-only true\|false` | Filter frames to application code by default. |
 | `--callback-print-arguments true\|false`, `--callback-print-result true\|false` | Include automatic argument or result snapshots. Both default to false. |

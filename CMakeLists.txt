@@ -77,6 +77,14 @@ if(TRACER_SDK_ROOT)
   endforeach()
 endif()
 
+# Maximum arguments one probed call can carry (8..64). It sizes the per-call context arrays, so
+# the host build and the protocol header that the agent JIT embeds for observers must agree:
+# the value is a compile definition for the host and is written into the embedded header text.
+set(TRACER_MAX_ARGUMENTS 16 CACHE STRING "Maximum arguments per probed call (8..64)")
+if(NOT TRACER_MAX_ARGUMENTS MATCHES "^[0-9]+$" OR TRACER_MAX_ARGUMENTS LESS 8 OR TRACER_MAX_ARGUMENTS GREATER 64)
+  message(FATAL_ERROR "TRACER_MAX_ARGUMENTS must be an integer in [8, 64], got '${TRACER_MAX_ARGUMENTS}'")
+endif()
+add_compile_definitions(TRACER_MAX_ARGUMENTS=${TRACER_MAX_ARGUMENTS})
 set(TRACER_PROTO_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 file(MAKE_DIRECTORY ${TRACER_PROTO_DIR})
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
@@ -88,7 +96,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/protocol.hpp)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/protocol.hpp TRACER_PROTOCOL_HEADER)
 # Incremental input is a synthetic main file, not an includable disk header.
-string(REPLACE "#pragma once" "" TRACER_PROTOCOL_HEADER "${TRACER_PROTOCOL_HEADER}")
+string(REPLACE "#pragma once" "#define TRACER_MAX_ARGUMENTS ${TRACER_MAX_ARGUMENTS}" TRACER_PROTOCOL_HEADER "${TRACER_PROTOCOL_HEADER}")
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/callback.hpp TRACER_CALLBACK_HEADER)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/tracer/context.hpp TRACER_CONTEXT_HEADER)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/repl/clang_tracer_repl_plugin.h TRACER_PLUGIN_HEADER)

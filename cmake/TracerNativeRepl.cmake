@@ -746,6 +746,13 @@ function(tracer_add_native_repl)
           --agent $<TARGET_FILE:clang_tracer_agent> --module-tool $<TARGET_FILE:clang-tracer-module>
           --compiler "${CMAKE_CXX_COMPILER}")
       set_tests_properties(native_repl_module_index PROPERTIES TIMEOUT 240)
+      add_test(NAME native_repl_wide_arguments
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_wide_arguments.py"
+          --repl $<TARGET_FILE:clang-tracer-repl> --server $<TARGET_FILE:clang-tracer-server>
+          --agent $<TARGET_FILE:clang_tracer_agent> --module-tool $<TARGET_FILE:clang-tracer-module>
+          --preparer $<TARGET_FILE:clang-tracer-prepare-injectors-native>
+          --compiler "${CMAKE_CXX_COMPILER}" --max-arguments ${TRACER_MAX_ARGUMENTS})
+      set_tests_properties(native_repl_wide_arguments PROPERTIES TIMEOUT 300)
       add_executable(repl-launch-target tests/fixtures/repl_launch.cpp)
       target_include_directories(repl-launch-target PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
       target_compile_options(repl-launch-target PRIVATE -g -O0 -fno-omit-frame-pointer -fcf-protection=none)

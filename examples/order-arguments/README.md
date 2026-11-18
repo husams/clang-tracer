@@ -227,7 +227,8 @@ class layout and ABI must still match the binary's DWARF before patching.
 
 ## Supported boundary
 
-Up to eight explicit arguments and 16 named arguments/fields per hook. Flat named
+Up to `TRACER_MAX_ARGUMENTS` explicit arguments (16 by default) and
+`TRACER_MAX_ARGUMENTS + 8` named arguments/fields per hook. Flat named
 class/struct types must have complete embedded DWARF and matching ordinary layout
 with supported scalar/builtin-pointer members. The agent constructs all argument
 record declarations with Clang APIs and checks type, access, size and every

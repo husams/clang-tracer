@@ -223,8 +223,11 @@ ResolvedCallable resolve_elf_signature(
     parameters += argument + " arg" + std::to_string(i);
   }
   declarations += "Result target(" + parameters + ") __asm__(\"" + target.symbol + "\");\n}\n";
-  if (supplied->getNumParams() + !target.receiver.empty() > kMaxArguments)
-    throw std::invalid_argument("ELF signature has too many ABI arguments");
+  // The receiver of a method is passed to the observer as its first argument here.
+  if (supplied->getNumParams() + !target.receiver.empty() > tracer::kMaxArguments)
+    throw std::invalid_argument("ELF signature has more than " + std::to_string(tracer::kMaxArguments) +
+                                " arguments, counting the receiver"
+                                " (rebuild with -DTRACER_MAX_ARGUMENTS=N to raise the limit)");
 
   auto adapter = parse(declarations);
   auto &adapter_ast = adapter->getASTContext();
