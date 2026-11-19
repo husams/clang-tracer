@@ -104,6 +104,12 @@ file paths and prints JSON for index metadata and queries.
 | `%trace apply --manifest trace.textproto --callback hook.cpp` | Install eligible probes in a batch. `--callback FILE` overrides the default observer. The server attempts to restore newly installed probes on partial failure. |
 | `%trace remove batch-1` | Restore the probes owned by the returned batch ID, or retry restoration. |
 
+A constructor or destructor has several entry points (`C1`/`C2`, `D0`/`D1`/`D2`).
+Select one by its linkage symbol (`%probe inject _ZN3app4LeafC1Ei`); the error for
+an ambiguous selector lists the symbols. `%trace preview` and `%trace apply` cover
+every entry point, and a prepared package binds the complete-object entry point
+(`C1`/`D1`). See [Observe constructors and destructors](../native-repl.md#observe-constructors-and-destructors).
+
 For indexed preparation, supply neither headers nor an explicit signature.
 The search order is `--module-index INDEX`, then `<ELF>.tracer.sqlite` when
 `--module ELF` is given, then the index selected with `%module index` or

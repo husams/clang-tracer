@@ -241,7 +241,15 @@ inline std::string mangle(const clang::FunctionDecl* declaration, clang::ASTCont
   }
   std::string symbol;
   llvm::raw_string_ostream output(symbol);
-  mangler->mangleName(clang::GlobalDecl(declaration), output);
+  // A constructor or destructor has several entry points (C1/C2, D0/D1/D2). The prepared path
+  // binds the complete-object entry point, the one called for a most-derived object. The other
+  // entry points (deleting D0, base-object C2/D2) are reached on the DWARF path by symbol.
+  if (const auto *constructor = llvm::dyn_cast<clang::CXXConstructorDecl>(declaration))
+    mangler->mangleName(clang::GlobalDecl(constructor, clang::Ctor_Complete), output);
+  else if (const auto *destructor = llvm::dyn_cast<clang::CXXDestructorDecl>(declaration))
+    mangler->mangleName(clang::GlobalDecl(destructor, clang::Dtor_Complete), output);
+  else
+    mangler->mangleName(clang::GlobalDecl(declaration), output);
   output.flush();
   return symbol;
 }

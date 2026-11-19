@@ -89,7 +89,9 @@ ElfCallable select_symbol(const llvm::object::ELF64LEObjectFile &image,
         match = ElfCallable{linkage, "", "", "", *address, elf.getSize()};
       return;
     }
-    if (!demangler.isFunction() || demangler.isSpecialName() || demangler.isCtorOrDtor())
+    // Constructors and destructors are ordinary callables here. Their entry points (C1/C2,
+    // D0/D1/D2) are told apart by linkage name (--id); aliases share one address.
+    if (!demangler.isFunction() || demangler.isSpecialName())
       return;
     using Text = std::unique_ptr<char, decltype(&std::free)>;
     std::size_t capacity = 0;
@@ -106,8 +108,9 @@ ElfCallable select_symbol(const llvm::object::ELF64LEObjectFile &image,
     if (start == display.npos || (!indexed && compact(display.substr(start)) != wanted))
       return;
     if (match) {
-      if (match->symbol != linkage || match->address != *address ||
-          match->size != elf.getSize())
+      // Two names for the same code (C1/C2 or D1/D2 aliases) are one callable; different code
+      // is ambiguous and is selected by linkage name.
+      if (match->address != *address || match->size != elf.getSize())
         throw std::invalid_argument("selector matches multiple ELF function symbols");
       return;
     }

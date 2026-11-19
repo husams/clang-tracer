@@ -2860,7 +2860,13 @@ std::string make_wrapper(const tracer::Request &r,
   const bool callable_original = spec && spec->allow_call_original();
   const bool trace_exceptions = spec && spec->trace_exceptions();
   const bool overrides = override_arguments || override_result || replace || callable_original;
-  const bool refresh_receiver = spec && spec->snapshot_receiver_at_return();
+  // At constructor entry the receiver is raw storage (no vptr, no members): reading it through
+  // its class layout can fault. Sample it when the constructor returns instead.
+  const bool constructor_entry = spec && tracer::client::is_constructor_symbol(spec->symbol());
+  const bool refresh_receiver =
+      (spec && spec->snapshot_receiver_at_return()) ||
+      (constructor_entry && typed && r.kind == tracer::CallableKind::Method && !shared_mode &&
+       has_pre && has_post && snapshots && !snapshots->receiver.empty());
   const bool observe_returns = tracer::agent_has_observers(r.session_id);
   if (refresh_receiver && (!typed || r.kind != tracer::CallableKind::Method ||
                            shared_mode || !has_pre || !has_post || !snapshots ||
@@ -3048,9 +3054,9 @@ std::string make_wrapper(const tracer::Request &r,
   if (snapshots) {
     if (grouped)
       code += "if(object_identity_active){\n" + snapshots->arguments +
-              snapshots->receiver + "}\n";
+              (constructor_entry ? std::string() : snapshots->receiver) + "}\n";
     else
-      code += snapshots->arguments + snapshots->receiver;
+      code += snapshots->arguments + (constructor_entry ? std::string() : snapshots->receiver);
   }
   if (!shared_mode && spec && spec->stack_depth())
     code += "tracer_capture_entry_stack(&ctx," +
@@ -5007,7 +5013,11 @@ bool bind_probe_symbols(clang::Interpreter &interpreter,
   bind("tracer_capture_entry_stack", &tracer_capture_entry_stack);
   auto bind_debug_methods = [&](const clangtracer::v1::DebugInfo &info) {
     for (const auto &method : info.methods()) {
-      if (method.is_virtual() || method.is_variadic() ||
+      // A virtual member of the receiver class is not bound as a direct symbol (a call to it
+      // dispatches through the vtable), so it must not block probes on the class's other entries.
+      if (method.is_virtual())
+        continue;
+      if (method.is_variadic() ||
           method.calling_convention() != llvm::dwarf::DW_CC_normal) {
         error = "debug method uses an unsupported virtual, variadic, or "
                 "nondefault calling convention: " + method.name();
@@ -6540,7 +6550,11 @@ extern "C" int tracer_agent_start(tracer::Request *request) {
       set_error(request, invalid);
       return operation.finish(-1);
     }
-    p->receiver_sampled_at_return = specification.snapshot_receiver_at_return();
+    // A prepared constructor probe samples its receiver when the constructor returns.
+    p->receiver_sampled_at_return =
+        specification.snapshot_receiver_at_return() ||
+        (tracer::client::is_constructor_symbol(specification.symbol()) &&
+         tracer::prepared::is_typed_version(specification.prepared().format_version()));
     p->object_snapshot = specification.snapshot_report_unavailable();
     // Named tracing uses the target's own independently re-read DWARF and ELF
     // mappings. No dynamic symbol lookup is involved, including for local and
