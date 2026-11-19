@@ -59,21 +59,31 @@ public:
 };
 """
 
+PASSIVE_CALLBACK = """class Interceptor {
+public:
+  void pre(const Call &call) { call.field("cents_arg", call.arg<long>(0)); }
+  void post(const Call &call) { call.field("returned", call.result<long>()); }
+};
+"""
+
 
 def main(repl, server, agent, target, source, compdb):
     source = Path(source).resolve()
-    cases = ("dwarf", "header", "header-compdb", "header-named", "header-methods",
+    cases = ("header-passive", "dwarf", "header", "header-compdb", "header-named", "header-methods",
              "header-methods-compdb", "records", "records-compdb")
     for case in cases:
         with tempfile.TemporaryDirectory(prefix=f"ct-receiver-{case}-") as directory, ExitStack() as stack:
             root = Path(directory)
             records = case.startswith("records")
             methods = case.startswith("header-methods")
+            passive = case == "header-passive"
             total, charges = (41, 2) if methods else (40, 1)
             env = dict(os.environ, XDG_CACHE_HOME=str(root / "cache"))
             env.pop("CLANG_TRACER_ENDPOINT", None)
             callback = root / "observer.cpp"
             code = RECORD_CALLBACK if records else RECEIVER_CALLBACK
+            if passive:
+                code = PASSIVE_CALLBACK
             if methods:
                 code = METHOD_CALLBACK
             if case in ("header-compdb", "header-methods-compdb"):
@@ -135,6 +145,8 @@ if (captured.at(0).callback_error() || captured.at(1).callback_error()) throw st
             transcript = "".join(output.seen)
             fields = {"requested": 40, "quoted": 47} if records else {
                 "cents_arg": 40, "charges_after": 1, "total_after": 40, "returned": 40}
+            if passive:
+                fields = {"cents_arg": 40, "returned": 40}
             if methods:
                 fields = {"getter": 0, "member_getter": 0, "overload": 0,
                           "member_overload": 0, "nested_result": 2, "charges_after": charges,
@@ -144,7 +156,7 @@ if (captured.at(0).callback_error() || captured.at(1).callback_error()) throw st
                 assert re.search(r'object_fields\s*\{\s*name: "' + name +
                                  r'"\s*value\s*\{\s*type: \w+' + encoded,
                                  transcript), transcript
-            if not records and not methods:
+            if not records and not methods and not passive:
                 for name in ("total_cents", "charges", "rate", "frozen"):
                     assert f'name: "{name}"' in transcript, transcript
                 for name in ("total_cents", "charges", "frozen"):
@@ -191,6 +203,8 @@ if (captured.at(0).callback_error() || captured.at(1).callback_error()) throw st
                     ("legacy_address", "auto method = static_cast<long (receiver_header::Meter::*)(long)>"
                      "(&receiver_header::Meter::charge); (void)method;", r"cannot call.*probed method"),
                     ("helper", "invoke_target(call.self());", r"cannot call.*probed method"),
+                    ("helper_without_self", "invoke_target(reinterpret_cast<receiver_header::Meter *>"
+                     "(call.object_address()));", r"cannot call.*probed method"),
                     ("copy", "auto copy = *call.self(); (void)copy;", r"cannot construct.*receiver"),
                     ("construct", "receiver_header::Meter value; (void)value;", r"cannot construct.*receiver"),
                     ("new", "(void)new receiver_header::Meter;", r"cannot (allocate|construct).*receiver"),
@@ -198,7 +212,7 @@ if (captured.at(0).callback_error() || captured.at(1).callback_error()) throw st
                     ("static", "(void)receiver_header::Meter::static_total;", r"cannot odr-use.*static"),
                 ):
                     invalid = root / f"{label}.cpp"
-                    prefix = f'#include "{helper}"\n' if label == "helper" else ""
+                    prefix = f'#include "{helper}"\n' if label.startswith("helper") else ""
                     if label == "legacy_address":
                         invalid.write_text('extern "C" long long trace_callback(const TraceContext&) { '
                                            + body + ' return 0; }\n')
@@ -245,6 +259,10 @@ if (captured.at(0).callback_error() || captured.at(1).callback_error()) throw st
                     assert section and "error:" in section[1], diagnostics
                     assert "success: true" not in section[1], diagnostics
                     assert re.search(expected, section[1], re.I), diagnostics
+                    if label in ("invoke", "invoke_without_self", "address", "legacy_address"):
+                        assert re.search(r"callback_source:\d+:\d+", section[1]), diagnostics
+                    if label.startswith("helper"):
+                        assert re.search(r"helper\.hpp:\d+:\d+", section[1]), diagnostics
                 for label in accepted_labels:
                     section = re.search(rf'^GUARD_{label}\n(.*?)(?=^GUARD_\w+\n|\Z)',
                                         diagnostics, re.M | re.S)

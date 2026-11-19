@@ -23,4 +23,15 @@ private:
 inline std::int64_t Meter::bump(std::int64_t cents) const {
   return const_cast<Meter *>(this)->charge(cents) + 1;
 }
+
+// Unused application code in this header must not become callback code.
+class Biller {
+public:
+  std::int64_t run() { return meter_.charge(1); }
+
+private:
+  Meter meter_;
+};
+
+inline std::int64_t bill(Meter &meter) { return meter.charge(1); }
 } // namespace receiver_header

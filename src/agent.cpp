@@ -4151,11 +4151,16 @@ private:
         const std::unordered_set<const clang::Decl *> &imported,
         const std::vector<clang::CXXRecordDecl *> &targets,
         std::string target_symbol, bool methods_only = false)
-        : imported_(imported), target_symbol_(std::move(target_symbol)),
+        : source_manager_(target->getASTContext().getSourceManager()),
+          imported_(imported), target_symbol_(std::move(target_symbol)),
           methods_only_(methods_only) {
       targets_.insert(target->getCanonicalDecl());
       for (auto *t : targets)
         targets_.insert(t->getCanonicalDecl());
+      const auto location =
+          source_manager_.getExpansionLoc(target->getLocation());
+      if (location.isValid() && !source_manager_.isWrittenInMainFile(location))
+        receiver_header_file_ = source_manager_.getFileID(location);
     }
     bool is_target(const clang::CXXRecordDecl *record) const {
       return record && targets_.count(record->getCanonicalDecl());
@@ -4178,6 +4183,16 @@ private:
     bool shouldVisitImplicitCode() const { return true; }
 
     bool TraverseDecl(clang::Decl *declaration) {
+      // Other classes and free functions in the receiver header are also
+      // application code, not callback helpers. Keep checking callback code
+      // and helpers from other files, including their direct method references.
+      if (declaration && receiver_header_file_.isValid()) {
+        const auto location =
+            source_manager_.getExpansionLoc(declaration->getLocation());
+        if (location.isValid() &&
+            source_manager_.getFileID(location) == receiver_header_file_)
+          return true;
+      }
       // Out-of-class definitions belong to the receiver implementation too.
       // Calls from these bodies run under the existing callback-depth guard.
       if (const auto *method =
@@ -4222,7 +4237,7 @@ private:
         if (const auto *method =
                 llvm::dyn_cast<clang::CXXMethodDecl>(member->getMemberDecl());
             is_probed_method(method)) {
-          error_ = "callback cannot call or take the address of the probed method";
+          reject_probed_method(expression);
         }
       }
       return true;
@@ -4232,7 +4247,7 @@ private:
       if (const auto *method =
               llvm::dyn_cast<clang::CXXMethodDecl>(expression->getMemberDecl());
           is_probed_method(method)) {
-        error_ = "callback cannot call or take the address of the probed method";
+        reject_probed_method(expression);
       }
       return true;
     }
@@ -4254,7 +4269,7 @@ private:
       if (const auto *method =
               llvm::dyn_cast<clang::CXXMethodDecl>(expression->getDecl());
           is_probed_method(method)) {
-        error_ = "callback cannot call or take the address of the probed method";
+        reject_probed_method(expression);
       } else if (const auto *variable =
                      llvm::dyn_cast<clang::VarDecl>(expression->getDecl());
                  variable && variable->getDeclContext()->isRecord() &&
@@ -4309,7 +4324,21 @@ private:
     const std::string &error() const { return error_; }
 
   private:
+    void reject_probed_method(const clang::Expr *expression) {
+      if (!error_.empty())
+        return;
+      error_ = "callback cannot call or take the address of the probed method";
+      const auto location = source_manager_.getPresumedLoc(
+          source_manager_.getExpansionLoc(expression->getExprLoc()));
+      if (location.isValid())
+        error_ += " at " + std::string(location.getFilename()) + ":" +
+                  std::to_string(location.getLine()) + ":" +
+                  std::to_string(location.getColumn());
+    }
+
     std::unordered_set<const clang::CXXRecordDecl *> targets_;
+    clang::SourceManager &source_manager_;
+    clang::FileID receiver_header_file_;
     const std::unordered_set<const clang::Decl *> &imported_;
     std::string target_symbol_;
     bool methods_only_;
