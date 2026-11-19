@@ -70,6 +70,8 @@ public:
   // A stopped task suffices for code restoration. This mode cannot run
   // remote calls or syscalls, and does not require a loader rendezvous.
   void attach_for_patch(pid_t process_id);
+  // The caller verifies that the complete rendezvous range is executable
+  // application text. AArch64 admission requires room for SVC and BRK at PC.
   void attach_at_application_point(pid_t process_id, std::uintptr_t entry, std::size_t size);
   void adopt_executable_entry(object_launch::Child &child,
                               std::chrono::steady_clock::time_point deadline,

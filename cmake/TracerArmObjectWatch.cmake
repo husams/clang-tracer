@@ -36,10 +36,32 @@ target_include_directories(tracer_arm_object_watch SYSTEM PRIVATE ${LLVM_INCLUDE
 target_link_libraries(tracer_arm_object_watch PUBLIC tracer_arm_object_rpc
   PRIVATE LLVM Threads::Threads ${CMAKE_DL_LIBS})
 target_compile_options(tracer_arm_object_watch PRIVATE -Wall -Wextra)
+if(BUILD_TESTING)
+  add_executable(aarch64-syscall-boundary tests/aarch64_syscall_boundary.cpp)
+  target_include_directories(aarch64-syscall-boundary PRIVATE src)
+  target_link_libraries(aarch64-syscall-boundary PRIVATE tracer_arm_object_watch)
+  target_link_options(aarch64-syscall-boundary PRIVATE "LINKER:--wrap=ptrace")
+  target_compile_options(aarch64-syscall-boundary PRIVATE -Wall -Wextra -Wpedantic -g -O1)
+  add_test(NAME native_aarch64_syscall_boundary COMMAND aarch64-syscall-boundary)
+  set_tests_properties(native_aarch64_syscall_boundary PROPERTIES TIMEOUT 60)
+  if(TRACER_BUILD_REPL)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_executable(aarch64-boundary-target tests/fixtures/aarch64_boundary/target.cpp)
+    set_target_properties(aarch64-boundary-target PROPERTIES CXX_STANDARD 17)
+    target_compile_options(aarch64-boundary-target PRIVATE -g -O1 -fno-omit-frame-pointer)
+    add_test(NAME native_aarch64_two_method_stop
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/repl_aarch64_method_stop.py"
+        $<TARGET_FILE:clang-tracer-repl> $<TARGET_FILE:clang-tracer-server>
+        $<TARGET_FILE:clang_tracer_object_cache_arm> $<TARGET_FILE:aarch64-boundary-target>
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/aarch64_boundary/state.hpp")
+    set_tests_properties(native_aarch64_two_method_stop PROPERTIES TIMEOUT 180)
+  endif()
+endif()
 add_executable(clang-tracer-object-watch src/object_watch_main.cpp)
 target_link_libraries(clang-tracer-object-watch PRIVATE tracer_arm_object_watch)
 add_executable(clang-tracer-server src/arm_object_server.cpp)
 target_link_libraries(clang-tracer-server PRIVATE tracer_arm_object_watch)
+target_include_directories(clang-tracer-server SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
 target_sources(clang-tracer-server PRIVATE src/arm_method_watch.cpp)
 file(RELATIVE_PATH arm_agent_relative "${CMAKE_INSTALL_FULL_BINDIR}"
   "${CMAKE_INSTALL_FULL_LIBDIR}/libclang_tracer_object_cache_arm.so")

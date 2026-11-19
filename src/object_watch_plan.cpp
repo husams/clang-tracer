@@ -2288,7 +2288,14 @@ Plan::Plan(std::uint32_t pid, std::string executable,
     };
     if (pid) {
       try {
+#if defined(__aarch64__)
+        // The CFI admission module is x86-only. Keep the cross-image check on
+        // AArch64 using the existing module reader, including runtime images.
+        const auto modules = client::list_debug_module_mappings(pid, {}, true);
+        for (const auto &path : modules.modules()) {
+#else
         for (const auto &path : injector::mapped_application_files(static_cast<pid_t>(pid))) {
+#endif
           const auto normalized = normalize_path(path);
           if (normalized == selected_path || (main_ && normalized == normalize_path(main_->path)))
             continue;
