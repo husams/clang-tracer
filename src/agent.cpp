@@ -67,6 +67,7 @@
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/SmallString.h>
 #include <llvm/BinaryFormat/Dwarf.h>
+#include <llvm/Demangle/Demangle.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/Bitcode/BitcodeReader.h>
@@ -4947,6 +4948,62 @@ bool compile_shared_probe(Probe &p,
   return true;
 }
 
+// The agent's version script keeps BoundedProtoWriter's out-of-line members
+// local, so dlsym cannot resolve them for generated snapshot code. Answer only
+// those lookups, per interpreter, by demangling the requested name and
+// matching the member. Nothing is exported from the agent.
+class HiddenSnapshotSymbols final : public llvm::orc::DefinitionGenerator {
+public:
+  llvm::Error tryToGenerate(llvm::orc::LookupState &, llvm::orc::LookupKind,
+                            llvm::orc::JITDylib &dylib,
+                            llvm::orc::JITDylibLookupFlags,
+                            const llvm::orc::SymbolLookupSet &names) override {
+    using Writer = tracer::context_engine::BoundedProtoWriter;
+    static constexpr llvm::StringLiteral prefix(
+        "tracer::context_engine::BoundedProtoWriter::");
+    const std::pair<llvm::StringLiteral, void *> members[] = {
+        {"finish", address(&Writer::finish)},
+        {"u64", address(&Writer::u64)},
+        {"s64", address(&Writer::s64)},
+        {"boolean", address(&Writer::boolean)},
+        {"f32", address(&Writer::f32)},
+        {"f64", address(&Writer::f64)},
+        {"string", address(&Writer::string)},
+        {"begin_message", address(&Writer::begin_message)},
+        {"end_message", address(&Writer::end_message)},
+        {"container_items", address(&Writer::container_items)},
+    };
+    llvm::orc::SymbolMap found;
+    for (const auto &entry : names) {
+      const auto &name = entry.first;
+      const std::string demangled = llvm::demangle(std::string(*name));
+      llvm::StringRef text(demangled);
+      if (!text.consume_front(prefix))
+        continue;
+      const auto method = text.substr(0, text.find('('));
+      for (const auto &member : members)
+        if (method == member.first) {
+          found[name] = llvm::orc::ExecutorSymbolDef(
+              llvm::orc::ExecutorAddr::fromPtr(member.second),
+              llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
+          break;
+        }
+    }
+    if (found.empty())
+      return llvm::Error::success();
+    return dylib.define(llvm::orc::absoluteSymbols(std::move(found)));
+  }
+
+private:
+  // Non-virtual Itanium member pointers keep the entry address in word one.
+  template <class Member> static void *address(Member member) {
+    static_assert(sizeof(Member) == 2 * sizeof(void *));
+    std::uintptr_t words[2];
+    std::memcpy(words, &member, sizeof(words));
+    return reinterpret_cast<void *>(words[0]);
+  }
+};
+
 bool bind_probe_symbols(clang::Interpreter &interpreter,
                         const clangtracer::v1::ProbeSpec &spec,
                         std::string &error) {
@@ -5049,6 +5106,7 @@ bool bind_probe_symbols(clang::Interpreter &interpreter,
     error = llvm::toString(std::move(failure));
     return false;
   }
+  jit->getMainJITDylib().addGenerator(std::make_unique<HiddenSnapshotSymbols>());
   return true;
 }
 
